@@ -95,6 +95,43 @@ class TestRpcProxy:
                 assert similar(tokenizer.decode(result.outputs[0].token_ids),
                                'E F G H I J K L')
 
+    def test_hmac_key_generation(self):
+        """Test that HMAC key is automatically generated and properly propagated."""
+        tokenizer = TransformersTokenizer.from_pretrained(model_path)
+        prompt = "A B C D"
+        prompt_token_ids = tokenizer.encode(prompt)
+        max_tokens = 8
+
+        with self.create_proxy(tp_size=1) as proxy:
+            assert proxy.hmac_key is not None, "HMAC key should be generated"
+            assert len(
+                proxy.hmac_key
+            ) == 32, f"HMAC key should be 32 bytes, got {len(proxy.hmac_key)}"
+
+            # Verify key is properly stored in worker_kwargs
+            assert 'hmac_key' in proxy.worker_kwargs, "HMAC key should be in worker_kwargs"
+            assert proxy.worker_kwargs[
+                'hmac_key'] is not None, "HMAC key in worker_kwargs should not be None"
+
+            # Verify both references point to the same key object
+            assert proxy.hmac_key is proxy.worker_kwargs['hmac_key'], \
+                "HMAC key should be the same object in both locations"
+
+            logger_debug(
+                f"[Test] HMAC key verified: length={len(proxy.hmac_key)} bytes",
+                color="green")
+
+            # Verify RPC communication works with the generated key
+            sampling_params = SamplingParams(max_tokens=max_tokens)
+            result = proxy.generate(prompt_token_ids, sampling_params)
+            assert similar(
+                tokenizer.decode(result.outputs[0].token_ids), 'E F G H I J K L'
+            ), "Generation should work with auto-generated HMAC key"
+
+            logger_debug(
+                f"[Test] HMAC key test passed: RPC communication successful",
+                color="green")
+
 
 if __name__ == "__main__":
     TestRpcProxy().test_tp1(20)

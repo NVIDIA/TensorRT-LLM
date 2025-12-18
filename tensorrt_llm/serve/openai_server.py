@@ -3,6 +3,7 @@ import asyncio
 import os
 import re
 import signal
+import socket
 import traceback
 from collections import deque
 from contextlib import asynccontextmanager
@@ -20,6 +21,7 @@ from starlette.routing import Mount
 from transformers import AutoProcessor
 
 from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm._torch.async_llm import AsyncLLM
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocParams
@@ -45,9 +47,11 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ChatMessage, CompletionRequest,
                                                 CompletionResponse,
                                                 CompletionResponseChoice,
-                                                ErrorResponse, ModelCard,
+                                                ErrorResponse,
+                                                MemoryUpdateRequest, ModelCard,
                                                 ModelList, PromptTokensDetails,
-                                                ResponsesRequest, UsageInfo,
+                                                ResponsesRequest,
+                                                UpdateWeightsRequest, UsageInfo,
                                                 to_llm_disaggregated_params)
 from tensorrt_llm.serve.postprocess_handlers import (
     ChatCompletionPostprocArgs, ChatPostprocArgs, CompletionPostprocArgs,
@@ -108,7 +112,8 @@ class OpenAIServer:
             from tensorrt_llm._torch.pyexecutor.config_utils import \
                 load_pretrained_config
             self.model_config = load_pretrained_config(hf_tokenizer_path,
-                                                       trust_remote_code=trust_remote_code)
+                                                       trust_remote_code=trust_remote_code,
+                                                       checkpoint_format=getattr(self.llm.args, "checkpoint_format", None))
         except Exception:
             logger.debug("Failed to load AutoConfig for %s", hf_tokenizer_path)
             self.model_config = None
@@ -147,6 +152,10 @@ class OpenAIServer:
             self.use_harmony = False
         else:
             self.use_harmony = (self.model_config.model_type == "gpt_oss")
+
+        self.tool_call_id_type = "random" # default tool call id type is random
+        if self.model_config.model_type == "kimi_k2":
+            self.tool_call_id_type = "kimi_k2"
 
         # as disagg-worker
         self.disagg_cluster_storage = None
@@ -236,6 +245,9 @@ class OpenAIServer:
             status_code=HTTPStatus.NOT_FOUND,
         )
 
+    def _check_health(self) -> bool:
+        return self.llm._check_health()
+
     def register_routes(self):
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/health_generate", self.health_generate, methods=["GET"])
@@ -258,6 +270,16 @@ class OpenAIServer:
         self.app.add_api_route("/v1/responses",
                                self.openai_responses,
                                methods=["POST"])
+        # RL-only endpoints
+        self.app.add_api_route("/release_memory",
+                                self.release_memory,
+                                methods=["POST"])
+        self.app.add_api_route("/resume_memory",
+                                self.resume_memory,
+                                methods=["POST"])
+        self.app.add_api_route("/update_weights",
+                                self.update_weights,
+                                methods=["POST"])
         if self.llm.args.return_perf_metrics:
             # register /prometheus/metrics
             self.mount_metrics()
@@ -294,9 +316,22 @@ class OpenAIServer:
         self.app.add_api_route("/v1/chat/completions",
                                self.openai_mm_encoder,
                                methods=["POST"])
+        # RL-only endpoints
+        self.app.add_api_route("/release_memory",
+                                self.release_memory,
+                                methods=["POST"])
+        self.app.add_api_route("/resume_memory",
+                                self.resume_memory,
+                                methods=["POST"])
+        self.app.add_api_route("/update_weights",
+                                self.update_weights,
+                                methods=["POST"])
 
     async def health(self) -> Response:
-        return Response(status_code=200)
+        if self._check_health():
+            return Response(status_code=200)
+        else:
+            return Response(status_code=503, content="LLM is unavailable. Please check the server logs for more details.")
 
     async def health_generate(self, raw_request: Request) -> Response:
         """Health check that performs a minimal generation."""
@@ -524,6 +559,7 @@ class OpenAIServer:
 
             postproc_args.reasoning_parser = self.llm.args.reasoning_parser
             postproc_args.tool_parser = self.tool_parser
+            postproc_args.tool_call_id_type = self.tool_call_id_type
             if conversation and conversation[-1].get(
                     "content") and conversation[-1].get("role") == get_role():
                 postproc_args.last_message_content = conversation[-1]["content"]
@@ -983,8 +1019,22 @@ class OpenAIServer:
 
         return JSONResponse(content={"detail": "None"})
 
+    async def release_memory(self, request: MemoryUpdateRequest) -> JSONResponse:
+        assert isinstance(self.llm, AsyncLLM), "/release_memory endpoint is only supported with AsyncLLM()"
+        await self.llm.collective_rpc('sleep', args=(request.tags,))
+        return JSONResponse(content={"status": "success"})
 
-    async def __call__(self, host, port):
+    async def resume_memory(self, request: MemoryUpdateRequest) -> JSONResponse:
+        assert isinstance(self.llm, AsyncLLM), "/resume_memory endpoint is only supported with AsyncLLM()"
+        await self.llm.collective_rpc('wakeup', args=(request.tags,))
+        return JSONResponse(content={"status": "success"})
+
+    async def update_weights(self, request: UpdateWeightsRequest) -> JSONResponse:
+        assert isinstance(self.llm, AsyncLLM), "/update_weights endpoint is only supported with AsyncLLM()"
+        await self.llm.collective_rpc('update_weights', args=(request.weights,))
+        return JSONResponse(content={"status": "success"})
+
+    async def __call__(self, host, port, sockets: list[socket.socket] | None = None):
         # Store the binding address for server registration
         self.binding_addr = f"http://{host}:{port}"
         self.host = host
@@ -994,4 +1044,4 @@ class OpenAIServer:
                                 port=port,
                                 log_level="info",
                                 timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
-        await uvicorn.Server(config).serve()
+        await uvicorn.Server(config).serve(sockets=sockets)

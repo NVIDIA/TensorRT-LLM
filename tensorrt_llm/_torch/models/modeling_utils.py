@@ -18,7 +18,7 @@ from tensorrt_llm.models.convert_utils import split_matrix_tp
 from ...logger import logger
 from ...models.modeling_utils import QuantConfig
 from ..attention_backend import AttentionMetadata
-from ..distributed.communicator import pp_recv, pp_send
+from ..distributed.communicator import pp_recv_tensors, pp_send_tensors
 from ..model_config import ModelConfig, TConfig
 from ..modules.attention import Attention
 from ..modules.embedding import Embedding, LMHead
@@ -173,11 +173,12 @@ def forward_after_recv(forward_fn):
         residual=...,
         **kwargs,
     ):
-        pp_recv(hidden_states)
         if residual is not ...:
             if residual is None:
                 residual = torch.empty_like(hidden_states)
-            pp_recv(residual)
+            pp_recv_tensors([hidden_states, residual])
+        else:
+            pp_recv_tensors([hidden_states])
         return forward_fn(
             position_ids,
             hidden_states,
@@ -210,11 +211,10 @@ def forward_before_send(forward_fn):
         )
         if residual is not ...:
             hidden_states, residual = output
-            pp_send(hidden_states)
-            pp_send(residual)
+            pp_send_tensors([hidden_states, residual])
         else:
             hidden_states = output
-            pp_send(hidden_states)
+            pp_send_tensors([hidden_states])
         return output
 
     forward_before_send_fn.__wrapped_by_forward_before_send__ = True
@@ -561,6 +561,7 @@ class DecoderModelForCausalLM(nn.Module,
                      weights: Dict,
                      weight_mapper: Optional["BaseWeightMapper"] = None,
                      skip_modules: List[str] = [],
+                     params_map: Optional[Dict[str, str]] = None,
                      allow_partial_loading: bool = False):
         # TODO smor- this solution is a temporary solution to load weights while we are still using
         # the old checkpoint format loading process. Once checkpoint format is unified
@@ -570,6 +571,7 @@ class DecoderModelForCausalLM(nn.Module,
             _load_weights_impl(self,
                                weights,
                                skip_modules,
+                               params_map=params_map,
                                preload_weight_modules=preload_weight_modules,
                                allow_partial_loading=allow_partial_loading)
         else:
@@ -577,6 +579,7 @@ class DecoderModelForCausalLM(nn.Module,
                                   weights,
                                   weight_mapper,
                                   skip_modules,
+                                  params_map=params_map,
                                   preload_weight_modules=preload_weight_modules,
                                   allow_partial_loading=allow_partial_loading)
 

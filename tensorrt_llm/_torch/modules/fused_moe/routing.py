@@ -1,9 +1,13 @@
 import math
+import warnings
 from enum import IntEnum
-from typing import Optional
+from typing import Callable, Dict, Optional, Type
 
 import torch
+import torch.nn.functional as F
 from torch import nn
+
+from tensorrt_llm.llmapi.utils import enable_llm_debug
 
 # Global cache for perfect router logits to share across all MLP blocks
 _PERFECT_ROUTER_LOGITS_CACHE = {}
@@ -152,12 +156,12 @@ class RoutingMethodType(IntEnum):
     # Qwen3: Softmax -> TopK -> Renormalize
     RenormalizeNaive = 4,
     # Unspecified
-    Unspecified = 5.
+    Unspecified = 5,
 
 
 class BaseMoeRoutingMethod(nn.Module):
 
-    def apply(self, _router_logits) -> (torch.Tensor, torch.Tensor):
+    def apply(self, _router_logits) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Applies the routing method to the router logits.
         Router logits are usually the output of the router Linear layer, but can be any type for more complex routing methods.
@@ -193,7 +197,8 @@ class DefaultMoeRoutingMethod(BaseMoeRoutingMethod):
         self.output_dtype = output_dtype
 
     def apply_pytorch(
-            self, router_logits: torch.Tensor) -> (torch.Tensor, torch.Tensor):
+            self,
+            router_logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         topk_values, topk_indices = torch.topk(torch.nn.functional.softmax(
             router_logits.to(self.output_dtype), dim=-1),
                                                k=self.top_k,
@@ -201,7 +206,7 @@ class DefaultMoeRoutingMethod(BaseMoeRoutingMethod):
         return topk_indices.to(torch.int32), topk_values
 
     def apply(self,
-              router_logits: torch.Tensor) -> (torch.Tensor, torch.Tensor):
+              router_logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         num_experts = router_logits.shape[-1]
         if self.force_enable_pytorch_op or num_experts > 128 or self.top_k > 8:
             return self.apply_pytorch(router_logits)
@@ -214,13 +219,148 @@ class DefaultMoeRoutingMethod(BaseMoeRoutingMethod):
         return RoutingMethodType.Default
 
 
-class DeepSeekV3MoeRoutingMethod(BaseMoeRoutingMethod):
+class Deepseekv3RoutingImpl:
 
-    # Intentionally leave apply() unimplemented.
-    # See comments in DeepseekV3Gate on why routing is done by DeepseekV3Gate.
-    def __init__(self, top_k: int):
+    def __init__(
+            self,
+            top_k: int,
+            n_group: int,
+            topk_group: int,
+            routed_scaling_factor: float,
+            is_fused: bool = True,  # fuse_routing_kernel
+    ):
         super().__init__()
         self.top_k = top_k
+        self.topk_group = topk_group
+        self.n_group = n_group
+        self.routed_scaling_factor = routed_scaling_factor
+        self.is_fused = is_fused
+
+    @staticmethod
+    @torch.compile(options={"max-autotune": True})
+    def get_scores(logits, e_score_correction_bias):
+        scores = F.sigmoid(logits)
+        scores_with_bias = scores + e_score_correction_bias
+        if enable_llm_debug():
+            has_nan = torch.isnan(scores_with_bias).any()
+            if has_nan:
+                warnings.warn(
+                    "Detected NAN in the tensor scores_with_bias. Please check if it matches the expectation."
+                )
+
+        return scores, scores_with_bias
+
+    def noaux_tc(self, logits, e_score_correction_bias):
+        n_group = self.n_group
+
+        _, num_experts = logits.shape
+        if self.n_group > 1:
+            if self.top_k > 8 or (num_experts / n_group) > 32 or (
+                    num_experts / n_group) * self.topk_group > 128:
+                if (self.is_fused):
+                    warnings.warn(
+                        "The configuration is not supported by the fused routing kernel. We have to use the original pytorch implementation."
+                    )
+                self.is_fused = False
+        else:
+            # We have special implementation for n_group == 1, top_k == 22 and num_experts == 512 for Nemotron Super v3.
+            if num_experts > 512 or (self.top_k > 8 and self.top_k != 22):
+                if (self.is_fused):
+                    warnings.warn(
+                        "The configuration is not supported by the fused routing kernel. We have to use the original pytorch implementation."
+                    )
+                self.is_fused = False
+
+        if not self.is_fused:
+            scores, scores_with_bias = self.get_scores(logits,
+                                                       e_score_correction_bias)
+            scores_shape = list(scores_with_bias.shape)
+            group_scores = torch.sum(torch.topk(
+                scores_with_bias.view(scores_shape[:-1] +
+                                      [n_group, scores_shape[-1] // n_group]),
+                k=2,
+                dim=-1,
+                largest=True,
+                sorted=True)[0],
+                                     dim=-1)
+            _, group_idx = torch.topk(group_scores,
+                                      k=self.topk_group,
+                                      dim=-1,
+                                      largest=True,
+                                      sorted=True)
+            group_mask = torch.zeros_like(group_scores)
+            group_mask.scatter_(-1, group_idx, 1)
+            score_mask = group_mask.unsqueeze(-1).expand(
+                scores_shape[:-1] +
+                [n_group, scores_shape[-1] // n_group]).reshape(scores_shape)
+            scores_with_bias = torch.where(
+                score_mask.bool(), scores_with_bias,
+                torch.tensor(float('-inf'),
+                             dtype=scores_with_bias.dtype,
+                             device=scores_with_bias.device))
+            _, topk_idx = torch.topk(scores_with_bias,
+                                     k=self.top_k,
+                                     dim=-1,
+                                     largest=True,
+                                     sorted=True)
+            new_mask = torch.zeros_like(scores)
+            new_mask.scatter_(-1, topk_idx, 1)
+            scores = scores * new_mask
+            score_sum = torch.sum(scores, dim=-1, keepdim=True) + 1e-20
+            scores = scores / score_sum * self.routed_scaling_factor
+            topk_values, topk_indices = torch.topk(scores,
+                                                   k=self.top_k,
+                                                   dim=-1,
+                                                   largest=True)
+            return topk_values, topk_indices
+        else:
+            topk_values, topk_indices = torch.ops.trtllm.noaux_tc_op(
+                logits, e_score_correction_bias, n_group, self.topk_group,
+                self.top_k, self.routed_scaling_factor)
+            return topk_values, topk_indices
+
+    def apply(
+        self, logits: torch.Tensor, e_score_correction_bias: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        topk_values, topk_indices = self.noaux_tc(logits,
+                                                  e_score_correction_bias)
+        return topk_indices.to(torch.int32), topk_values.to(torch.float32)
+
+
+class DeepSeekV3MoeRoutingMethod(BaseMoeRoutingMethod):
+
+    # See comments in DeepseekV3Gate on why routing is done by DeepseekV3Gate.
+    def __init__(
+            self,
+            top_k: int,
+            n_group: int,
+            topk_group: int,
+            routed_scaling_factor: float,
+            callable_e_score_correction_bias: Callable[[], torch.Tensor],
+            is_fused: bool = True,  # fuse_routing_kernel
+    ):
+        super().__init__()
+        self.routing_impl = Deepseekv3RoutingImpl(
+            top_k=top_k,
+            n_group=n_group,
+            topk_group=topk_group,
+            routed_scaling_factor=routed_scaling_factor,
+            is_fused=is_fused,
+        )
+        # Pass a callable to fetch the tensor from DeepseekV3Gate at runtime, ensuring it is on the correct device
+        assert callable(callable_e_score_correction_bias)
+        self.callable_e_score_correction_bias = callable_e_score_correction_bias
+
+    def apply(self, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.routing_impl.apply(logits, self.e_score_correction_bias)
+
+    @property
+    def e_score_correction_bias(self) -> torch.Tensor:
+        return self.callable_e_score_correction_bias()
+
+    @property
+    def top_k(self):
+        return self.routing_impl.top_k
 
     @property
     def routing_method_type(self):
@@ -241,7 +381,8 @@ class RenormalizeMoeRoutingMethod(BaseMoeRoutingMethod):
         self.output_dtype = output_dtype
 
     def apply_pytorch(
-            self, router_logits: torch.Tensor) -> (torch.Tensor, torch.Tensor):
+            self,
+            router_logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         topk_values, topk_indices = torch.topk(router_logits,
                                                k=self.top_k,
                                                dim=-1)
@@ -249,7 +390,7 @@ class RenormalizeMoeRoutingMethod(BaseMoeRoutingMethod):
             topk_values.to(self.output_dtype), dim=-1)
 
     def apply(self,
-              router_logits: torch.Tensor) -> (torch.Tensor, torch.Tensor):
+              router_logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         num_experts = router_logits.shape[-1]
         if self.force_enable_pytorch_op or num_experts > 128 or self.top_k > 8:
             return self.apply_pytorch(router_logits)
@@ -270,7 +411,7 @@ class Llama4RenormalizeMoeRoutingMethod(BaseMoeRoutingMethod):
         self.output_dtype = output_dtype
 
     def apply(self,
-              router_logits: torch.Tensor) -> (torch.Tensor, torch.Tensor):
+              router_logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         topk_values, topk_indices = torch.topk(router_logits,
                                                k=self.top_k,
                                                dim=-1)
@@ -295,7 +436,7 @@ class Llama4RenormalizeMoeRoutingMethod(BaseMoeRoutingMethod):
 #         self.end_expert = self.start_expert + self.num_experts_per_node
 
 #     def apply(self,
-#               router_logits: torch.Tensor) -> (torch.Tensor, torch.Tensor):
+#               router_logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 #         unpermuted_scales, indices = torch.ops.trtllm.fused_topk_softmax(
 #             router_logits, self.top_k, self.num_experts_total,
 #             self.start_expert, self.end_expert)
@@ -311,7 +452,7 @@ class SparseMixerMoeRoutingMethod(BaseMoeRoutingMethod):
         self.eps = eps
 
     def apply(self,
-              router_logits: torch.Tensor) -> (torch.Tensor, torch.Tensor):
+              router_logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         router_logits = router_logits.float()
         topk_values = torch.empty(router_logits.shape[0],
                                   self.top_k,
@@ -364,7 +505,7 @@ class StaticMoeRoutingMethod(BaseMoeRoutingMethod):
         self.routing_scales = routing_scales
 
     def apply(self,
-              router_logits: torch.Tensor) -> (torch.Tensor, torch.Tensor):
+              router_logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.routing_tensor, self.routing_scales
 
     def get_experts_per_token(self):
@@ -378,7 +519,7 @@ class LoadBalancedMoeRoutingMethod(BaseMoeRoutingMethod):
         self.top_k = top_k
 
     def apply(self,
-              router_logits: torch.Tensor) -> (torch.Tensor, torch.Tensor):
+              router_logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         balanced_values = torch.ones(router_logits.shape[0],
                                      self.top_k,
                                      device=router_logits.device,
@@ -410,7 +551,7 @@ class RenormalizeNaiveMoeRoutingMethod(RenormalizeMoeRoutingMethod):
         self.output_dtype = output_dtype
 
     def apply(self,
-              router_logits: torch.Tensor) -> (torch.Tensor, torch.Tensor):
+              router_logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         #x = topk(softmax()); x /= x.sum() is mathematically equivalent to softmax(topk)
         topk_indices, topk_values = self.apply_pytorch(router_logits)
         return topk_indices.to(torch.int32), topk_values.to(self.output_dtype)
@@ -418,6 +559,23 @@ class RenormalizeNaiveMoeRoutingMethod(RenormalizeMoeRoutingMethod):
     @property
     def routing_method_type(self) -> RoutingMethodType:
         return RoutingMethodType.RenormalizeNaive
+
+
+ROUTING_METHOD_TYPE_TO_CLASS: Dict[RoutingMethodType,
+                                   Type[BaseMoeRoutingMethod]] = {
+                                       RoutingMethodType.Default:
+                                       DefaultMoeRoutingMethod,
+                                       RoutingMethodType.Renormalize:
+                                       RenormalizeMoeRoutingMethod,
+                                       RoutingMethodType.DeepSeekV3:
+                                       DeepSeekV3MoeRoutingMethod,
+                                       RoutingMethodType.Llama4:
+                                       Llama4RenormalizeMoeRoutingMethod,
+                                       RoutingMethodType.RenormalizeNaive:
+                                       RenormalizeNaiveMoeRoutingMethod,
+                                       RoutingMethodType.Unspecified:
+                                       BaseMoeRoutingMethod,
+                                   }
 
 
 def create_renormalize_expert_load_balanced_logits(

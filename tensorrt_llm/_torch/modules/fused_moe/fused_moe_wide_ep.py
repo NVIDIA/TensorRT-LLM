@@ -382,6 +382,13 @@ class WideEPMoE(MoE):
         else:
             return False
 
+    def is_low_precision_combine_supported(self):
+        if not self.use_low_precision_combine:
+            return False
+        if self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
+            return self.has_fp8_qdq or self.has_nvfp4 or self.has_w4afp8
+        return False
+
     def forward_chunk(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
@@ -671,8 +678,7 @@ class WideEPMoE(MoE):
                 final_hidden_states = final_hidden_states.view(
                     self.expert_size_per_partition,
                     num_tokens_per_expert_for_fused_moe, self.hidden_size)
-                if self.use_low_precision_combine:
-                    assert self.has_nvfp4 or self.has_w4afp8 or self.has_fp8_qdq, "Low precision combine only supports nvfp4, w4afp8 and fp8 qdq"
+                if self.is_low_precision_combine_supported():
                     precision = "fp8"
                     global_scales = None
                     if self.has_nvfp4:
@@ -966,6 +972,7 @@ class WideEPMoE(MoE):
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
+        alltoall_result_do_sum: bool = True,
         **kwargs,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
         moe_output = super().forward_fake(
@@ -976,7 +983,7 @@ class WideEPMoE(MoE):
             all_rank_num_tokens=all_rank_num_tokens,
             use_dp_padding=use_dp_padding,
             **kwargs)
-        if self.alltoall_method_type == AlltoallMethodType.MNNVL:
+        if self.alltoall_method_type == AlltoallMethodType.NVLinkTwoSided and not alltoall_result_do_sum:
             shape = moe_output.shape
             top_k = self.routing_method.experts_per_token
             new_shape = [shape[0], top_k, shape[1]]

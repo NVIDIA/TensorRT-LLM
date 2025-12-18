@@ -3,6 +3,7 @@ from unittest import mock
 import pytest
 
 from tensorrt_llm._torch.models.checkpoints import HfWeightLoader
+from tensorrt_llm.mapping import Mapping
 
 
 class MyError(Exception):
@@ -69,7 +70,7 @@ def test_load_weights_ignores_consolidated_ckpt_when_sharded_ckpt_exists(
         mock.patch.object(loader, "prefetch_files") as prefetch_files,
         pytest.raises(MyError),
     ):
-        loader.load_weights(checkpoint_dir=str(checkpoint_dir))
+        loader.load_weights(checkpoint_dir=str(checkpoint_dir), mapping=Mapping())
 
     prefetch_files.assert_called_once()
     prefetched_files = prefetch_files.call_args[0][0]

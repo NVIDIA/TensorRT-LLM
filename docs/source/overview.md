@@ -4,7 +4,7 @@
 
 ## About TensorRT LLM
 
-[TensorRT LLM](https://developer.nvidia.com/tensorrt) is NVIDIA's comprehensive open-source library for accelerating and optimizing inference performance of the latest large language models (LLMs) on NVIDIA GPUs. 
+[TensorRT LLM](https://developer.nvidia.com/tensorrt) is NVIDIA's comprehensive open-source library for accelerating and optimizing inference performance of the latest large language models (LLMs) on NVIDIA GPUs.
 
 ## Key Capabilities
 
@@ -38,24 +38,23 @@ TensorRT LLM strives to support the most popular models on **Day 0**.
 TensorRT LLM strives to support the most popular models on **Day 0**.
 
 ### 🚀 **Advanced Optimization & Production Features**
-- **In-Flight Batching & Paged Attention**: {ref}`inflight-batching` eliminates wait times by dynamically managing request execution, processing context and generation phases together for maximum GPU utilization and reduced latency.
-- **Multi-GPU Multi-Node Inference**: Seamless distributed inference with tensor, pipeline, and expert parallelism across multiple GPUs and nodes through the Model Definition API.
-- **Advanced Quantization**: 
+- **[In-Flight Batching & Paged Attention](./features/paged-attention-ifb-scheduler.md)**: In-flight batching eliminates wait times by dynamically managing request execution, processing context and generation phases together for maximum GPU utilization and reduced latency.
+- **[Multi-GPU Multi-Node Inference](./features/parallel-strategy.md)**: Seamless distributed inference with tensor, pipeline, and expert parallelism across multiple GPUs and nodes through the Model Definition API.
+- **[Advanced Quantization](./features/quantization.md)**:
   - **FP4 Quantization**: Native support on NVIDIA B200 GPUs with optimized FP4 kernels
   - **FP8 Quantization**: Automatic conversion on NVIDIA H100 GPUs leveraging Hopper architecture
-- **Speculative Decoding**: Multiple algorithms including EAGLE, MTP and NGram
-- **KV Cache Management**: Paged KV cache with intelligent block reuse and memory optimization
-- **Chunked Prefill**: Efficient handling of long sequences by splitting context into manageable chunks
-- **LoRA Support**: Multi-adapter support with HuggingFace and NeMo formats, efficient fine-tuning and adaptation
-- **Checkpoint Loading**: Flexible model loading from various formats (HuggingFace, NeMo, custom)
-- **Guided Decoding**: Advanced sampling with stop words, bad words, and custom constraints
-- **Disaggregated Serving (Beta)**: Separate context and generation phases across different GPUs for optimal resource utilization
+- **[Speculative Decoding](./features/speculative-decoding.md)**: Multiple algorithms including EAGLE, MTP and NGram
+- **[KV Cache Management](./features/kvcache.md)**: Paged KV cache with intelligent block reuse and memory optimization
+- **[Chunked Prefill](./features/paged-attention-ifb-scheduler.md)**: Efficient handling of long sequences by splitting context into manageable chunks
+- **[LoRA Support](./features/lora.md)**: Multi-adapter support with HuggingFace and NeMo formats, efficient fine-tuning and adaptation
+- **[Checkpoint Loading](./features/checkpoint-loading.md)**: Flexible model loading from various formats (HuggingFace, NeMo, custom)
+- **[Guided Decoding](./features/guided-decoding.md)**: Advanced sampling with stop words, bad words, and custom constraints
+- **[Disaggregated Serving (Beta)](./features/disagg-serving.md)**: Separate context and generation phases across different GPUs for optimal resource utilization
 
 ### 🔧 **Latest GPU Architecture Support**
 
 TensorRT LLM supports the full spectrum of NVIDIA GPU architectures:
-- **NVIDIA Blackwell**: B200, GB200, RTX Pro 6000 SE with FP4 optimization
-- **NVIDIA Hopper**: H100, H200,GH200 with FP8 acceleration
+- **NVIDIA Blackwell**: B200, GB200, B300, GB300, and RTX Pro 6000 SE with FP4 optimization
 - **NVIDIA Ada Lovelace**: L40/L40S, RTX 40 series with FP8 acceleration
 - **NVIDIA Ampere**: A100, RTX 30 series for production workloads
 

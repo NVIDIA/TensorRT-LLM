@@ -108,7 +108,8 @@ class RPCServer:
         self._client_socket = ZeroMqQueue(address=(address, self._hmac_key),
                                           is_server=True,
                                           is_async=True,
-                                          use_hmac_encryption=False,
+                                          use_hmac_encryption=self._hmac_key
+                                          is not None,
                                           socket_type=socket_type,
                                           name="rpc_server")
         logger.info(f"RPCServer is bound to {self._address}")
@@ -227,8 +228,10 @@ class RPCServer:
 
         while asyncio.get_event_loop().time() < end_time:
             try:
-                req: RPCRequest = await asyncio.wait_for(
-                    self._client_socket.get_async_noblock(), timeout=2)
+                req, routing_id = await asyncio.wait_for(
+                    self._client_socket.get_async_noblock(return_identity=True),
+                    timeout=2)
+                req.routing_id = routing_id
                 drained_count += 1
                 logger_debug(f"[server] Draining request after shutdown: {req}")
 
@@ -298,13 +301,16 @@ class RPCServer:
                     error=error,
                     is_streaming=
                     True,  # Important: mark as streaming so it gets routed correctly
-                    stream_status='error'))
+                    stream_status='error'),
+                routing_id=req.routing_id)
             logger_debug(
                 f"[server] Sent error response for request {req.request_id}",
                 color="green")
         else:
-            await self._client_socket.put_async(
-                RPCResponse(req.request_id, result=None, error=error))
+            await self._client_socket.put_async(RPCResponse(req.request_id,
+                                                            result=None,
+                                                            error=error),
+                                                routing_id=req.routing_id)
             logger_debug(
                 f"[server] Sent error response for request {req.request_id}",
                 color="green")
@@ -334,8 +340,10 @@ class RPCServer:
             try:
                 #logger_debug(f"[server] Worker waiting for request", color="green")
                 # Read request directly from socket with timeout
-                req: RPCRequest = await asyncio.wait_for(
-                    self._client_socket.get_async_noblock(), timeout=2)
+                req, routing_id = await asyncio.wait_for(
+                    self._client_socket.get_async_noblock(return_identity=True),
+                    timeout=2)
+                req.routing_id = routing_id
                 logger_debug(f"[server] Worker got request: {req}",
                              color="green")
             except asyncio.TimeoutError:
@@ -491,15 +499,15 @@ class RPCServer:
         func = self._functions[req.method_name]
 
         if not inspect.isasyncgenfunction(func):
-            await self._client_socket.put_async(
-                RPCResponse(
-                    req.request_id,
-                    result=None,
-                    error=RPCStreamingError(
-                        f"Method '{req.method_name}' is not an async generator.",
-                        traceback=traceback.format_exc()),
-                    is_streaming=True,
-                    stream_status='error'))
+            await self._client_socket.put_async(RPCResponse(
+                req.request_id,
+                result=None,
+                error=RPCStreamingError(
+                    f"Method '{req.method_name}' is not an async generator.",
+                    traceback=traceback.format_exc()),
+                is_streaming=True,
+                stream_status='error'),
+                                                routing_id=req.routing_id)
             return
 
         chunk_index = 0
@@ -511,13 +519,14 @@ class RPCServer:
             logger_debug(
                 f"[server] RPC Server running streaming task {req.method_name}")
             # Send start signal
-            await self._client_socket.put_async(
-                RPCResponse(req.request_id,
-                            result=None,
-                            error=None,
-                            is_streaming=True,
-                            chunk_index=chunk_index,
-                            stream_status='start'))
+            await self._client_socket.put_async(RPCResponse(
+                req.request_id,
+                result=None,
+                error=None,
+                is_streaming=True,
+                chunk_index=chunk_index,
+                stream_status='start'),
+                                                routing_id=req.routing_id)
             logger_debug(
                 f"[server] Sent start signal for request {req.request_id}",
                 color="green")
@@ -583,39 +592,41 @@ class RPCServer:
                     chunk_index += 1
 
             # Send end signal
-            await self._client_socket.put_async(
-                RPCResponse(req.request_id,
-                            result=None,
-                            error=None,
-                            is_streaming=True,
-                            chunk_index=chunk_index,
-                            stream_status='end'))
+            await self._client_socket.put_async(RPCResponse(
+                req.request_id,
+                result=None,
+                error=None,
+                is_streaming=True,
+                chunk_index=chunk_index,
+                stream_status='end'),
+                                                routing_id=req.routing_id)
             logger_debug(
                 f"[server] Sent end signal for request {req.request_id}",
                 color="green")
         except RPCCancelled as e:
             # Server is shutting down, send cancelled error
-            await self._client_socket.put_async(
-                RPCResponse(req.request_id,
-                            result=None,
-                            error=e,
-                            is_streaming=True,
-                            chunk_index=chunk_index,
-                            stream_status='error'))
+            await self._client_socket.put_async(RPCResponse(
+                req.request_id,
+                result=None,
+                error=e,
+                is_streaming=True,
+                chunk_index=chunk_index,
+                stream_status='error'),
+                                                routing_id=req.routing_id)
             logger_debug(
                 f"[server] Sent error signal for request {req.request_id}",
                 color="green")
         except asyncio.TimeoutError:
-            await self._client_socket.put_async(
-                RPCResponse(
-                    req.request_id,
-                    result=None,
-                    error=RPCTimeout(
-                        f"Streaming method '{req.method_name}' timed out",
-                        traceback=traceback.format_exc()),
-                    is_streaming=True,
-                    chunk_index=chunk_index,
-                    stream_status='error'))
+            await self._client_socket.put_async(RPCResponse(
+                req.request_id,
+                result=None,
+                error=RPCTimeout(
+                    f"Streaming method '{req.method_name}' timed out",
+                    traceback=traceback.format_exc()),
+                is_streaming=True,
+                chunk_index=chunk_index,
+                stream_status='error'),
+                                                routing_id=req.routing_id)
 
         except Exception as e:
             response = RPCResponse(
@@ -632,7 +643,8 @@ class RPCServer:
                              response: RPCResponse) -> bool:
         """Safely sends a response, handling pickle errors."""
         try:
-            await self._client_socket.put_async(response)
+            await self._client_socket.put_async(response,
+                                                routing_id=req.routing_id)
             logger_debug(f"[server] Sent response for request {req.request_id}",
                          color="green")
             return True
@@ -660,7 +672,8 @@ class RPCServer:
                                     traceback=traceback.format_exc()))
 
             try:
-                await self._client_socket.put_async(error_response)
+                await self._client_socket.put_async(error_response,
+                                                    routing_id=req.routing_id)
                 logger_debug(
                     f"[server] Sent error response for request {req.request_id}",
                     color="green")

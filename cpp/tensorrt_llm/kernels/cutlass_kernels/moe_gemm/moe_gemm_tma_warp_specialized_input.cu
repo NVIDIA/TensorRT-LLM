@@ -15,6 +15,7 @@
  */
 
 #include "../include/moe_gemm_kernels.h"
+#include "tensorrt_llm/common/config.h"
 
 #include "cutlass/cutlass.h"
 
@@ -25,7 +26,9 @@
 
 #include "tensorrt_llm/common/logger.h"
 
-namespace tensorrt_llm::kernels::cutlass_kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::cutlass_kernels
 {
 std::array<size_t, 20> TmaWarpSpecializedGroupedGemmInput::workspaceBuffers(
     int num_experts, FpXBlockScalingType scaling_type)
@@ -166,4 +169,6 @@ std::string TmaWarpSpecializedGroupedGemmInput::toString() const
 
     return ss.str();
 }
-} // namespace tensorrt_llm::kernels::cutlass_kernels
+} // namespace kernels::cutlass_kernels
+
+TRTLLM_NAMESPACE_END

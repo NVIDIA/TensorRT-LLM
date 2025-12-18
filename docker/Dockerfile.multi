@@ -71,6 +71,10 @@ RUN GITHUB_MIRROR=${GITHUB_MIRROR} \
     rm install_pytorch.sh && \
     rm install.sh
 
+# Copy and install dependencies from constraints.txt
+COPY constraints.txt /tmp/constraints.txt
+RUN pip3 install --no-cache-dir -r /tmp/constraints.txt && rm /tmp/constraints.txt
+
 # Install UCX, NIXL, etcd
 # TODO: Combine these into the main install.sh script
 RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install_ucx.sh && \
@@ -79,6 +83,13 @@ RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install_ucx.sh && \
     rm install_ucx.sh && \
     rm install_nixl.sh && \
     rm install_etcd.sh
+
+# Generate OSS attribution file for devel image
+ARG TRT_LLM_VER
+ARG TARGETARCH
+COPY scripts/generate_container_oss_attribution.sh /tmp/generate_container_oss_attribution.sh
+RUN bash /tmp/generate_container_oss_attribution.sh "devel" "${TRT_LLM_VER}" "${TARGETARCH}" && \
+    rm /tmp/generate_container_oss_attribution.sh
 
 FROM ${TRITON_IMAGE}:${TRITON_BASE_TAG} AS triton
 
@@ -167,8 +178,13 @@ RUN chmod -R a+w examples && \
 
 ARG GIT_COMMIT
 ARG TRT_LLM_VER
+ARG TARGETARCH
 ENV TRT_LLM_GIT_COMMIT=${GIT_COMMIT} \
     TRT_LLM_VERSION=${TRT_LLM_VER}
+
+# Generate OSS attribution file for release image
+COPY scripts/generate_container_oss_attribution.sh /tmp/generate_container_oss_attribution.sh
+RUN bash /tmp/generate_container_oss_attribution.sh "release" "${TRT_LLM_VER}" "${TARGETARCH}" && rm /tmp/generate_container_oss_attribution.sh
 
 FROM wheel AS tritonbuild
 

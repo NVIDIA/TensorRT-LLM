@@ -3,6 +3,7 @@ import gc
 import json
 import os
 import signal  # Added import
+import socket
 import subprocess  # nosec B404
 import sys
 from pathlib import Path
@@ -176,37 +177,43 @@ def launch_server(
 
     backend = llm_args["backend"]
     model = llm_args["model"]
-    if backend == 'pytorch':
-        llm_args.pop("build_config", None)
-        llm = PyTorchLLM(**llm_args)
-    elif backend == '_autodeploy':
-        from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind((host, port))
+        except OSError as e:
+            raise RuntimeError(f"Failed to bind socket to {host}:{port}: {e}")
 
-        # AutoDeploy does not support build_config
-        llm_args.pop("build_config", None)
-        llm = AutoDeployLLM(**llm_args)
-    elif backend == 'tensorrt' or backend == 'trt':
-        llm_args.pop("backend")
-        llm = LLM(**llm_args)
-    else:
-        raise click.BadParameter(
-            f"{backend} is not a known backend, check help for available options.",
-            param_hint="backend")
+        if backend == 'pytorch':
+            llm_args.pop("build_config", None)
+            llm = PyTorchLLM(**llm_args)
+        elif backend == '_autodeploy':
+            from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 
-    server = OpenAIServer(llm=llm,
-                          model=model,
-                          tool_parser=tool_parser,
-                          server_role=server_role,
-                          metadata_server_cfg=metadata_server_cfg,
-                          disagg_cluster_config=disagg_cluster_config,
-                          multimodal_server_config=multimodal_server_config,
-                          chat_template=chat_template)
+            # AutoDeploy does not support build_config
+            llm_args.pop("build_config", None)
+            llm = AutoDeployLLM(**llm_args)
+        elif backend == 'tensorrt' or backend == 'trt':
+            llm_args.pop("backend")
+            llm = LLM(**llm_args)
+        else:
+            raise click.BadParameter(
+                f"{backend} is not a known backend, check help for available options.",
+                param_hint="backend")
 
-    # Optionally disable GC (default: not disabled)
-    if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
-        gc.disable()
+        server = OpenAIServer(llm=llm,
+                              model=model,
+                              tool_parser=tool_parser,
+                              server_role=server_role,
+                              metadata_server_cfg=metadata_server_cfg,
+                              disagg_cluster_config=disagg_cluster_config,
+                              multimodal_server_config=multimodal_server_config,
+                              chat_template=chat_template)
 
-    asyncio.run(server(host, port))
+        # Optionally disable GC (default: not disabled)
+        if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
+            gc.disable()
+
+        asyncio.run(server(host, port, sockets=[s]))
 
 
 def launch_mm_encoder_server(
@@ -216,12 +223,14 @@ def launch_mm_encoder_server(
     metadata_server_cfg: Optional[MetadataServerConfig] = None,
 ):
     model = encoder_args["model"]
+    encoder_args.pop("build_config")
     mm_encoder = MultimodalEncoder(**encoder_args)
 
     server = OpenAIServer(llm=mm_encoder,
                           model=model,
                           server_role=ServerRole.MM_ENCODER,
-                          metadata_server_cfg=metadata_server_cfg)
+                          metadata_server_cfg=metadata_server_cfg,
+                          tool_parser=None)
     asyncio.run(server(host, port))
 
 
@@ -626,29 +635,38 @@ def disaggregated(
 
     disagg_cfg = parse_disagg_config_file(config_file)
 
-    metadata_server_cfg = parse_metadata_server_config_file(
-        metadata_server_config_file)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind((disagg_cfg.hostname, disagg_cfg.port))
+        except OSError as e:
+            raise RuntimeError(
+                f"Failed to bind socket to {disagg_cfg.hostname}:{disagg_cfg.port}: {e}"
+            )
 
-    server = OpenAIDisaggServer(config=disagg_cfg,
-                                req_timeout_secs=request_timeout,
-                                server_start_timeout_secs=server_start_timeout,
-                                metadata_server_cfg=metadata_server_cfg,
-                                metrics_interval_secs=metrics_log_interval)
+        metadata_server_cfg = parse_metadata_server_config_file(
+            metadata_server_config_file)
 
-    # Disable GC by default
-    #   When concurrency is high, the number of Python objects increases, so
-    #   GC runs frequently and takes a long time to process. In this case,
-    #   requests are not immediately forwarded to CTX workers and GEN workers,
-    #   causing them to run with small batch sizes. Disabling GC can mitigate
-    #   this problem.
-    #   By testing this feature, we didn't observe significant RSS or VMS
-    #   increment, and observed that `count0` (obtained by `gc.get_count()`)
-    #   increases by fewer than 1,000 after every 200,000 requests, while the
-    #   maximum value of `count0` exceeded 3,000,000 during the test.
-    if os.getenv("TRTLLM_DISAGG_SERVER_DISABLE_GC", "1") == "1":
-        gc.disable()
+        server = OpenAIDisaggServer(
+            config=disagg_cfg,
+            req_timeout_secs=request_timeout,
+            server_start_timeout_secs=server_start_timeout,
+            metadata_server_cfg=metadata_server_cfg,
+            metrics_interval_secs=metrics_log_interval)
 
-    asyncio.run(server(disagg_cfg.hostname, disagg_cfg.port))
+        # Disable GC by default
+        #   When concurrency is high, the number of Python objects increases, so
+        #   GC runs frequently and takes a long time to process. In this case,
+        #   requests are not immediately forwarded to CTX workers and GEN workers,
+        #   causing them to run with small batch sizes. Disabling GC can mitigate
+        #   this problem.
+        #   By testing this feature, we didn't observe significant RSS or VMS
+        #   increment, and observed that `count0` (obtained by `gc.get_count()`)
+        #   increases by fewer than 1,000 after every 200,000 requests, while the
+        #   maximum value of `count0` exceeded 3,000,000 during the test.
+        if os.getenv("TRTLLM_DISAGG_SERVER_DISABLE_GC", "1") == "1":
+            gc.disable()
+
+        asyncio.run(server(disagg_cfg.hostname, disagg_cfg.port, sockets=[s]))
 
 
 def set_cuda_device():

@@ -81,6 +81,9 @@ def run_with_autodeploy(model, speculative_model_dir, batch_size):
         "world_size": 1,
         "kv_cache_config": kv_cache_config,
         "disable_overlap_scheduler": True,
+        "transforms": {
+            "fuse_rmsnorm": {"rmsnorm_backend": "triton"},
+        },
         "max_num_tokens": 64,
     }
 

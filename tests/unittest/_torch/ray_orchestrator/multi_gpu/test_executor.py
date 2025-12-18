@@ -9,27 +9,23 @@ from utils.llm_data import llm_models_root
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.utils import get_device_uuid
 from tensorrt_llm.llmapi import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import RayPlacementConfig
 
 
-class DummyWorkerExtension:
-
-    def additional_method(self):
-        return "SUCCESS"
-
-
+@pytest.mark.gpu2
 def test_worker_extension():
     llm = LLM(model=llm_models_root() /
               "llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
-              ray_worker_extension_cls="test_executor.DummyWorkerExtension",
-              orchestrator_type="ray")
-    result = llm._collective_rpc("additional_method")
-    assert result[0] == "SUCCESS"
+              ray_worker_extension_cls=
+              "tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
+              orchestrator_type="ray",
+              tensor_parallel_size=2)
+    result = llm._collective_rpc("check_weights_updated")
+    assert isinstance(result[0], bool)
 
 
 @pytest.mark.gpu4
-def test_bundle_indices(monkeypatch):
-    """Placement via bundle indices"""
-
+def test_placement_env_vars(monkeypatch):
     monkeypatch.setenv("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", "1")
 
     pg = None
@@ -70,6 +66,52 @@ def test_bundle_indices(monkeypatch):
 
         assert sorted(inference_actor_uuids) == sorted(expected_uuids), \
             f"Workers not placed on expected GPUs. Expected UUIDs: {expected_uuids}, Got: {inference_actor_uuids}"
+
+    finally:
+        if pg is not None:
+            remove_placement_group(pg)
+        ray.shutdown()
+
+
+@pytest.mark.gpu2
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("n_gpus,bundle_indices", [
+    (2, [1]),
+],
+                         ids=["gpu2_tp1"])
+def test_placement_api(monkeypatch, n_gpus, bundle_indices):
+    monkeypatch.setenv("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", "1")
+
+    tp_size = n_gpus // 2
+    pg = None
+    try:
+        ray.init()
+        pg = placement_group([{"GPU": 1, "CPU": 1}] * n_gpus)
+        ray.get(pg.ready())
+        print(f"Placement group ready with bundles {pg.bundle_specs}")
+
+        llm = LLM(
+            model=os.path.join(llm_models_root(), "llama-models-v2",
+                               "TinyLlama-1.1B-Chat-v1.0"),
+            kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1),
+            tensor_parallel_size=tp_size,
+            orchestrator_type="ray",
+            ray_placement_config=RayPlacementConfig(
+                placement_groups=[pg],
+                placement_bundle_indices=[bundle_indices],
+                per_worker_gpu_share=0.8,
+            ),
+        )
+
+        inference_actor_uuids = llm._collective_rpc("report_device_id")
+        expected_uuids = [get_device_uuid(idx) for idx in bundle_indices]
+
+        print(
+            f"{inference_actor_uuids=}, all_uuids={[get_device_uuid(i) for i in range(n_gpus)]}"
+        )
+
+        assert sorted(inference_actor_uuids) == sorted(expected_uuids), \
+            f"Workers not placed on expected GPUs. Expected: {expected_uuids}, Got: {inference_actor_uuids}"
 
     finally:
         if pg is not None:

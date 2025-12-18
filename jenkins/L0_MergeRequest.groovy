@@ -371,8 +371,11 @@ def mergeWaiveList(pipeline, globalVars)
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
-        echo "Merge test waive list failed. Error: ${e.toString()}"
-        echo "Fallback to use the default test waive list from the PR"
+        catchError(
+            buildResult: 'SUCCESS',
+            stageResult: 'UNSTABLE') {
+            error "Merge test waive list failed. Fallback to use the default test waive list from the PR. Error: ${e.toString()}"
+        }
     }
 }
 
@@ -602,6 +605,8 @@ def getMergeRequestChangedFileList(pipeline, globalVars) {
 }
 
 def getMergeRequestOneFileChanges(pipeline, globalVars, filePath) {
+    // Note: This function intentionally propagates exceptions to the caller.
+    // If there is an error to get the changed file diff, skip merging the waive list.
     def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
     if (env.alternativeTRT || isOfficialPostMergeJob) {
         pipeline.echo("Force set changed file diff to empty string.")
@@ -611,20 +616,13 @@ def getMergeRequestOneFileChanges(pipeline, globalVars, filePath) {
     def githubPrApiUrl = globalVars[GITHUB_PR_API_URL]
     def diff = ""
 
-    try {
-        if (githubPrApiUrl != null) {
-            diff = getGithubMRChangedFile(pipeline, githubPrApiUrl, "getOneFileChanges", filePath)
-        } else {
-            diff = getGitlabMRChangedFile(pipeline, "getOneFileChanges", filePath)
-        }
-        pipeline.echo("The change of ${filePath} is: ${diff}")
-        return diff
-    } catch (InterruptedException e) {
-        throw e
-    } catch (Exception e) {
-        pipeline.echo("Get merge request one changed file diff failed. Error: ${e.toString()}")
-        return ""
+    if (githubPrApiUrl != null) {
+        diff = getGithubMRChangedFile(pipeline, githubPrApiUrl, "getOneFileChanges", filePath)
+    } else {
+        diff = getGitlabMRChangedFile(pipeline, "getOneFileChanges", filePath)
     }
+    pipeline.echo("The change of ${filePath} is: ${diff}")
+    return diff
 }
 
 def getAutoTriggerTagList(pipeline, testFilter, globalVars) {
@@ -640,6 +638,8 @@ def getAutoTriggerTagList(pipeline, testFilter, globalVars) {
     }
     def specialFileToTagMap = [
         "tensorrt_llm/_torch/models/modeling_deepseekv3.py": ["-DeepSeek-"],
+        "tests/integration/defs/triton_server/": ["-Triton-"],
+        "triton_backend/": ["-Triton-"],
         "cpp/kernels/fmha_v2/": ["-FMHA-"],
         "tensorrt_llm/_torch/models/modeling_gpt_oss.py": ["-GptOss-"],
     ]
@@ -712,7 +712,9 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/_torch/compilation/patterns/ub_allreduce.py",
         "tensorrt_llm/_torch/custom_ops/torch_custom_ops.py",
         "tensorrt_llm/_torch/custom_ops/userbuffers_custom_ops.py",
+        "tensorrt_llm/_torch/distributed/",
         "tensorrt_llm/_torch/models/modeling_llama.py",
+        "tensorrt_llm/_torch/models/modeling_qwen3_next.py",
         "tensorrt_llm/_torch/modules/fused_moe/",
         "tensorrt_llm/_torch/pyexecutor/_util.py",
         "tensorrt_llm/_torch/pyexecutor/model_engine.py",
@@ -735,6 +737,10 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/unittest/disaggregated/",
         "tests/unittest/llmapi/test_llm_multi_gpu.py",
         "tests/unittest/llmapi/test_llm_multi_gpu_pytorch.py",
+        "tests/integration/defs/accuracy/test_disaggregated_serving.py",
+        "tests/unittest/_torch/ray_orchestrator/multi_gpu/",
+        "tests/integration/defs/examples/test_ray.py",
+        "tests/unittest/llmapi/test_async_llm.py",
     ]
 
     def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)

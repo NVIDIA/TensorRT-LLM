@@ -125,7 +125,7 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
                               f'results-sub-unittests-{case_fn}.xml')
 
     command = [
-        '-m', 'pytest', ignore_opt, "-v", "--timeout=2400",
+        '-m', 'pytest', ignore_opt, "-v", "--tb=short", "-rF", "--timeout=2400",
         "--timeout-method=thread"
     ]
     if test_prefix:
@@ -153,7 +153,19 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
                 cwd=test_root,
                 env=env,
             )
-        except CalledProcessError:
+        except CalledProcessError as e:
+            print(f"\n{'='*60}")
+            print(f"UNITTEST FAILED with exit code: {e.returncode}")
+            print(f"Command: {' '.join(cmd)}")
+            if hasattr(e, 'stdout') and e.stdout:
+                print(
+                    f"STDOUT:\n{e.stdout.decode() if isinstance(e.stdout, bytes) else e.stdout}"
+                )
+            if hasattr(e, 'stderr') and e.stderr:
+                print(
+                    f"STDERR:\n{e.stderr.decode() if isinstance(e.stderr, bytes) else e.stderr}"
+                )
+            print(f"{'='*60}\n")
             return False
         return True
 

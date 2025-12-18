@@ -2,9 +2,10 @@ import asyncio
 import json
 import os
 import random
+import socket
 import time
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, List, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from tensorrt_llm.llmapi.disagg_utils import DisaggClusterConfig, ServerRole
 from tensorrt_llm.logger import logger
@@ -29,6 +30,18 @@ def get_worker_key(name: str, role: ServerRole, worker_id: str = "") -> str:
     return f"{get_worker_key_prefix(name)}/{worker_id}"
 
 
+def get_host_from_uri(uri: str) -> str:
+    return uri.split("://")[1].split(":")[0]
+
+
+# Get the local ip address from a remote host,
+# if remote host is not provided, use Google's public DNS server "8.8.8.8"
+def get_local_ip(remote_host: str = "8.8.8.8") -> str:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.connect((remote_host, 80))
+        return s.getsockname()[0]
+
+
 class DisaggClusterManager:
     """
     The cluster manager is responsible for managing the workers in the cluster.
@@ -44,6 +57,7 @@ class DisaggClusterManager:
         self._current_ctx_workers = {}  # worker_id -> WorkerInfo
         self._current_gen_workers = {}  # worker_id -> WorkerInfo
         self._watch_handle = None
+        self._watch_task = None
 
     def __del__(self):
         try:
@@ -92,7 +106,14 @@ class DisaggClusterManager:
     def worker_key_prefix(self) -> str:
         return get_worker_key_prefix(self._config.cluster_name)
 
-    async def watch_workers(self, get_existing_first: bool = True):
+    async def watch_workers(
+        self,
+        get_existing_first: bool = True,
+        on_event: Optional[Callable[[WorkerInfo, WatchEventType],
+                                    Awaitable[Any]]] = None):
+        if self._watch_handle:
+            logger.error("Watch handle is already initialized")
+            return []
         workers = []
         self._watch_handle = await self._cluster_storage.watch(
             self.worker_key_prefix)
@@ -109,12 +130,41 @@ class DisaggClusterManager:
                 workers.append(self._parse_worker_info(event))
                 events.append(event)
             await self._watch_handle.add_events(events)
+
+        self._watch_handle = await self._cluster_storage.watch(
+            self.worker_key_prefix)
+
+        async def worker_event_loop():
+            logger.info(
+                f"Start watching worker events with {len(workers)} existing workers"
+            )
+            for worker_info in workers:
+                await on_event(worker_info, WatchEventType.SET)
+            while True:
+                try:
+                    worker_events = await self._watch_handle.drain()
+                    for event in worker_events:
+                        worker_info = self._parse_worker_info(event)
+                        await on_event(worker_info, event.event_type)
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.error(
+                        f"Error updating routers by worker events: {e}")
+                    await asyncio.sleep(1)
+            logger.info("Stop watching worker events")
+
+        if on_event:
+            self._watch_task = asyncio.create_task(worker_event_loop())
         return workers
 
     async def unwatch_workers(self) -> None:
         if self._watch_handle:
             await self._cluster_storage.unwatch(self.worker_key_prefix)
             self._watch_handle = None
+        if self._watch_task:
+            self._watch_task.cancel()
+            self._watch_task = None
 
     async def get_worker_events(
             self) -> List[Tuple[WorkerInfo, WatchEventType]]:
@@ -201,18 +251,25 @@ class DisaggClusterWorker:
     It will send heartbeat to the cluster storage every heartbeat_interval_sec seconds.
     If the worker heartbeat fails, it will re-register itself.
     """
+    LOCALHOST_IPS = ["localhost", "127.0.0.1", "0.0.0.0", "::1",
+                     "::"]  # nosec B104
 
     def __init__(self, role: ServerRole, host: str, port: int,
                  config: DisaggClusterConfig, storage: ClusterStorage):
         self._role = role
-        self._host = host
         self._port = port
         self._config = config
         self._cluster_storage = storage
         self._stop = False
         self._heartbeat_task = None
         self._last_heartbeat = 0
-        self._worker_id = f"{role.name}-{host}:{port}-{int(time.time()*1000)}-{os.getpid()}-{random.randint(0, 1000):03}"
+        register_host = host
+        # if the host is localhost and the cluster uri is not localhost, use the hostname to register the worker
+        disagg_host = get_host_from_uri(self._config.cluster_uri)
+        if host in self.LOCALHOST_IPS and disagg_host not in self.LOCALHOST_IPS:
+            register_host = get_local_ip(disagg_host)
+        self._host = register_host
+        self._worker_id = f"{role.name}-{register_host}:{port}-{int(time.time()*1000)}-{os.getpid()}-{random.randint(0, 1000):03}"
 
     def __del__(self):
         try:

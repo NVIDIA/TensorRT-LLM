@@ -3,7 +3,7 @@ import math
 import pickle  # nosec B403
 from abc import ABC, abstractmethod
 from functools import wraps
-from typing import Optional
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -790,11 +790,23 @@ class PPCommNCCL:
             self.mapping.world_size,
             self.mapping.rank,
         )
+        self.tensor_ready_event = torch.cuda.Event()
+        self.send_stream = torch.cuda.Stream()
 
     def send(self, tensor: torch.Tensor, dest: Optional[int] = None):
         if dest is None:
             dest = self.mapping.next_pp_rank()
-        self.nccl_comm.send(tensor, dest)
+
+        # NCCL send kernel in send_stream cannot be captured,
+        # so we send in the current stream instead in CUDA graph cases.
+        if torch.cuda.is_current_stream_capturing():
+            self.nccl_comm.send(tensor, dest)
+            return
+
+        self.tensor_ready_event.record()
+        with torch.cuda.stream(self.send_stream):
+            self.tensor_ready_event.wait()
+            self.nccl_comm.send(tensor, dest)
 
     def recv(self, tensor: torch.Tensor, src: Optional[int] = None):
         if src is None:
@@ -817,13 +829,18 @@ class PPCommTorch:
         if dest is None:
             dest = self.mapping.next_pp_rank()
 
-        self.pg.send([tensor], self._global_to_local_rank(dest), tag=0).wait()
+        work = self.pg.send([tensor], self._global_to_local_rank(dest), tag=0)
+        # Send operation cannot be captured without blocking wait,
+        # so we block the current stream in CUDA graph cases.
+        if torch.cuda.is_current_stream_capturing():
+            work.block_current_stream()
 
     def recv(self, tensor: torch.Tensor, src: Optional[int] = None):
         if src is None:
             src = self.mapping.prev_pp_rank()
 
-        self.pg.recv([tensor], self._global_to_local_rank(src), tag=0).wait()
+        work = self.pg.recv([tensor], self._global_to_local_rank(src), tag=0)
+        work.block_current_stream()
 
 
 _pp_comm = None
@@ -848,3 +865,19 @@ def pp_recv(tensor):
 def pp_send(tensor):
     """Send tensors to next pp rank."""
     _pp_comm.send(tensor)
+
+
+@torch.library.custom_op("trtllm::pp_recv_tensors", mutates_args=("tensors", ))
+def pp_recv_tensors(tensors: List[torch.Tensor]) -> None:
+    """
+    Receive tensors from previous pp rank.
+    """
+    for tensor in tensors:
+        pp_recv(tensor)
+
+
+@torch.library.custom_op("trtllm::pp_send_tensors", mutates_args=("tensors", ))
+def pp_send_tensors(tensors: List[torch.Tensor]) -> None:
+    """Send tensors to next pp rank."""
+    for tensor in tensors:
+        pp_send(tensor)

@@ -27,6 +27,10 @@ def test_deepseek_r1_ctx_dep(llm_root, world_size):
             "PROFILE_DIR": profile_dir,
         },
     )
+    check_call(
+        ["python3", "parse.py", "--profile-dir", profile_dir, f"--world-size={world_size}"],
+        cwd=llm_root / "examples" / "layer_wise_benchmarks",
+    )
 
 
 @pytest.mark.parametrize("world_size", [1, 4])
@@ -54,6 +58,10 @@ def test_deepseek_r1_ctx_tep(llm_root, world_size):
             "TRTLLM_ENABLE_PDL": "1",
         },
     )
+    check_call(
+        ["python3", "parse.py", "--profile-dir", profile_dir, f"--world-size={world_size}"],
+        cwd=llm_root / "examples" / "layer_wise_benchmarks",
+    )
 
 
 @pytest.mark.parametrize("world_size", [1, 4])
@@ -78,6 +86,10 @@ def test_deepseek_v32_ctx_dep(llm_root, world_size):
             "NP": f"{world_size:d}",
             "PROFILE_DIR": profile_dir,
         },
+    )
+    check_call(
+        ["python3", "parse.py", "--profile-dir", profile_dir, f"--world-size={world_size}"],
+        cwd=llm_root / "examples" / "layer_wise_benchmarks",
     )
 
 
