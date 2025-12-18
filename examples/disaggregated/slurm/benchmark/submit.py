@@ -322,6 +322,18 @@ def submit_job(config, log_dir, dry_run):
         f"&> {log_dir}/4_output_server.log &",
     ]
     start_server_cmds.append(" ".join(cmd))
+
+    # Generate wait server command
+    cmd = [
+        "srun -l",
+        f"--container-name={container_name}",
+        f"--container-mounts={env_config['container_mount']}",
+        f"--mpi=pmix --overlap -N 1 -n 1",
+        f"bash {env_config['work_dir']}/wait_server.sh {disagg_server_hostname} {disagg_server_port}",
+        f"&> {log_dir}/5_wait_server.log",
+    ]
+    start_server_cmds.append(" ".join(cmd))
+
     with open(os.path.join(log_dir, "start_server_cmds.sh"), "w") as f:
         f.write("\n".join(start_server_cmds) + "\n")
 
@@ -335,21 +347,21 @@ def submit_job(config, log_dir, dry_run):
     if benchmark_config['use_nv_sa_benchmark']:
         benchmark_cmd = [
             f"bash {env_config['work_dir']}/run_benchmark_nv_sa.sh",
-            f"{env_config['model_path']} {isl} {osl} {benchmark_config['benchmark_ratio']} {benchmark_config['multi_round']} {gen_num} {benchmark_config['concurrency_list']} {benchmark_config['streaming']} {log_dir}",
+            f"{env_config['model_path']} {isl} {osl} {benchmark_config['benchmark_ratio']} {benchmark_config['multi_round']} {gen_num} {benchmark_config['concurrency_list']} {benchmark_config['streaming']} {log_dir} {disagg_server_hostname} {disagg_server_port}",
             f"&> {log_dir}/6_bench.log"
         ]
         client_cmds.append(" ".join(client_slurm_prefix + benchmark_cmd))
     else:
         benchmark_cmd = [
             f"bash {env_config['work_dir']}/run_benchmark.sh",
-            f"{env_config['model_path']} {benchmark_config['dataset_file']} {benchmark_config['multi_round']} {gen_num} {benchmark_config['concurrency_list']} {benchmark_config['streaming']} {log_dir}",
+            f"{env_config['model_path']} {benchmark_config['dataset_file']} {benchmark_config['multi_round']} {gen_num} {benchmark_config['concurrency_list']} {benchmark_config['streaming']} {log_dir} {disagg_server_hostname} {disagg_server_port}",
             f"&> {log_dir}/6_bench.log"
         ]
         client_cmds.append(" ".join(client_slurm_prefix + benchmark_cmd))
     if config['accuracy']['enable_accuracy_test']:
         accuracy_cmd = [
             f"bash {env_config['work_dir']}/accuracy_eval.sh",
-            f"{log_dir} {config['accuracy']['model']} {config['accuracy']['tasks']} {env_config['model_path']} {config['accuracy']['model_args_extra']} {log_dir}/accuracy_eval",
+            f"{log_dir} {config['accuracy']['model']} {config['accuracy']['tasks']} {env_config['model_path']} {config['accuracy']['model_args_extra']} {log_dir}/accuracy_eval {disagg_server_hostname} {disagg_server_port}",
             f"&> {log_dir}/7_accuracy_eval.log"
         ]
         client_cmds.append(" ".join(client_slurm_prefix + accuracy_cmd))
