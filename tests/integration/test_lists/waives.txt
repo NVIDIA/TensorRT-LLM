@@ -492,3 +492,5 @@ accuracy/test_llm_api_pytorch.py::TestLlama4ScoutInstruct::test_fp4[tp4-cuda_gra
 disaggregated/test_auto_scaling.py::test_minimal_instances[etcd-round_robin] SKIP (https://nvbugs/5748564)
 unittest/llmapi/apps/test_disagg_serving_perf_metrics.py SKIP (https://nvbugs/5752516)
 unittest/_torch/attention/test_trtllm_flashinfer_symbol_collision.py::test_flashinfer_fused_moe_matches_torch_moe SKIP (https://nvbugs/5752521)
+unittest/llmapi/apps/_test_openai_responses.py::test_reasoning_effort[DeepSeek-R1-Distill-Qwen-1.5B] SKIP (https://nvbugs/5753250)
+unittest/llmapi/apps/_test_openai_responses.py::test_multi_turn_chat[Qwen3/Qwen3-0.6B] SKIP (https://nvbugs/5753250)
