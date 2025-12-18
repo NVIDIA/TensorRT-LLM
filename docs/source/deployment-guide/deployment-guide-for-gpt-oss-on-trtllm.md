@@ -43,7 +43,7 @@ docker run --rm -it \
 -p 8000:8000 \
 -v ~/.cache:/root/.cache:rw \
 --name tensorrt_llm \
-nvcr.io/nvidia/tensorrt-llm/release:x.y.z \
+nvcr.io/nvidia/tensorrt-llm/release:1.2.0rc6 \
 /bin/bash
 ```
 
@@ -381,6 +381,11 @@ $$
 ## Preconfigured Recipes
 
 The following table lists recommended configurations from the comprehensive database for different performance profiles.
+
+```{eval-rst}
+.. trtllm_config_selector::
+   :models: openai/gpt-oss-120b
+```
 
 ```{eval-rst}
 .. include:: ../_includes/note_sections.rst
