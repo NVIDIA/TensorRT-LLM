@@ -251,6 +251,8 @@ def vectorized_atomic_add_bf16x8(rOut_epi_packed,
         "red.global.v4.bf16x2.add.noftz [$0], {$1, $2, $3, $4};",
         "l,r,r,r,r",
         has_side_effects=True,
+        loc=loc,
+        ip=ip,
     )
 
 
@@ -269,6 +271,8 @@ def vectorized_atomic_add_fp32x2(rOut_epi_packed,
         "red.global.v2.f32.add [$0], {$1, $2};",
         "l,f,f",
         has_side_effects=True,
+        loc=loc,
+        ip=ip,
     )
 
 

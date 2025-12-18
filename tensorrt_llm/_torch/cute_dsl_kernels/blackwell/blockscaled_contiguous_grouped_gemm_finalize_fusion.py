@@ -36,7 +36,6 @@ import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cutlass_dsl import Int32
 
 from .utils import (
     TRTLLM_ENABLE_PDL,
@@ -266,8 +265,8 @@ def hooked_PersistentTileSchedulerParams_init(
 
 
 def hooked_get_cluster_work_idx_with_fastdivmod(
-    self, current_work_linear_idx: Int32, *, loc=None, ip=None
-) -> Tuple[Int32, Int32, Int32]:
+    self, current_work_linear_idx: cutlass.Int32, *, loc=None, ip=None
+) -> Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32]:
     work_iteration, work_unit_id = divmod(current_work_linear_idx, self.params.batch_fdd)
 
     if self.params._raster_along_m:
