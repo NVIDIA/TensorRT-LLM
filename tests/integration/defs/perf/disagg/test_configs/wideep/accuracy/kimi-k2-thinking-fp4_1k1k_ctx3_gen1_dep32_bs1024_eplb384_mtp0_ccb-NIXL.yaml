@@ -6,9 +6,15 @@ metadata:
   - GB200
   - GB300
   script_file: disaggr_torch.slurm
-  benchmark_type: 8k1k
+  benchmark_type: 1k1k
   config_index: 6
-  dataset_file: disagg_datasets/kimi-k2-8192-1024-20000-ratio-1_for_serve.json
+  dataset_file: disagg_datasets/kimi-k2-1024-1024-100000-ratio-1_for_serve.json
+  accuracy:
+    datasets:
+    - dataset_name: gsm8k
+      expected_value: 0.9454
+      threshold_type: hypothesis_test
+      filter_type: flexible-extract
 slurm:
   script_file: disaggr_torch.slurm
   partition: <partition>
@@ -23,13 +29,13 @@ benchmark:
   multi_round: 8
   benchmark_ratio: 1.0
   streaming: true
-  concurrency_list: '8192'
-  input_length: 8192
+  concurrency_list: '16384'
+  input_length: 1024
   output_length: 1024
   dataset_file: <dataset_file>
 hardware:
   gpus_per_node: 4
-  num_ctx_servers: 8
+  num_ctx_servers: 3
   num_gen_servers: 1
 environment:
   container_mount: <container_mount>
@@ -41,21 +47,21 @@ environment:
 profiling:
   nsys_on: false
 accuracy:
-  enable_accuracy_test: false
+  enable_accuracy_test: true
   model: local-completions
   tasks: gsm8k
   model_args_extra: num_concurrent=512,max_retries=3,tokenized_requests=false,timeout=1200,max_gen_toks=256,max_length=4096
 worker_config:
   gen:
     enable_layerwise_nvtx_marker: true
-    tensor_parallel_size: 32
-    moe_expert_parallel_size: 32
+    tensor_parallel_size: 16
+    moe_expert_parallel_size: 16
     enable_attention_dp: true
     enable_lm_head_tp_in_adp: false
     pipeline_parallel_size: 1
-    max_batch_size: 256
-    max_num_tokens: 256
-    max_seq_len: 9256
+    max_batch_size: 1024
+    max_num_tokens: 1024
+    max_seq_len: 5120
     cuda_graph_config:
       enable_padding: true
       batch_sizes:
@@ -72,29 +78,29 @@ worker_config:
       - 768
       - 1024
       - 2048
-      - 256
+      - 1024
     print_iter_log: true
     kv_cache_config:
       enable_block_reuse: false
-      free_gpu_memory_fraction: 0.6
+      free_gpu_memory_fraction: 0.8
       dtype: fp8
     moe_config:
       backend: WIDEEP
       use_low_precision_moe_combine: true
       load_balancer:
-        num_slots: 416
+        num_slots: 384
         layer_updates_per_iter: 1
     cache_transceiver_config:
       max_tokens_in_buffer: 8448
-      backend: UCX
+      backend: NIXL
     stream_interval: 100
     num_postprocess_workers: 4
     trust_remote_code: true
   ctx:
     enable_layerwise_nvtx_marker: true
-    max_batch_size: 1
+    max_batch_size: 8
     max_num_tokens: 8448
-    max_seq_len: 8232
+    max_seq_len: 5120
     tensor_parallel_size: 4
     moe_expert_parallel_size: 4
     enable_attention_dp: true
@@ -108,5 +114,5 @@ worker_config:
       dtype: fp8
     cache_transceiver_config:
       max_tokens_in_buffer: 8448
-      backend: UCX
+      backend: NIXL
     trust_remote_code: true
