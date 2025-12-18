@@ -267,9 +267,11 @@ def submit_job(config, log_dir, dry_run):
         json.dump(allocations, f, indent=2)
 
     # Generate disagg server config
-    server_config=convert_allocations_to_server_config(allocations)
+    server_config = convert_allocations_to_server_config(allocations)
     with open(os.path.join(log_dir, "server_config.yaml"), "w") as f:
         yaml.dump(server_config, f)
+    disagg_server_hostname = server_config['hostname']
+    disagg_server_port = server_config['port']
 
     container_name = "disaggr-test"
     start_server_cmds = []
@@ -310,11 +312,13 @@ def submit_job(config, log_dir, dry_run):
 
     # Generate start server commands
     cmd = [
-        f"srun -l --container-name={container_name}",
+        "srun -l",
+        f"--nodelist {disagg_server_hostname}",
+        f"--container-name={container_name}",
         f"--container-image={env_config['container_image']}",
         f"--container-mounts={env_config['container_mount']}",
         f"--mpi=pmix --overlap -N 1 -n 1",
-        f"bash {env_config['work_dir']}/start_server.sh {ctx_num} {gen_num} {log_dir} {env_config['work_dir']} \"{server_env_var}\"",
+        f"bash {env_config['work_dir']}/start_server.sh {os.path.join(log_dir, 'server_config.yaml')} \"{server_env_var}\"",
         f"&> {log_dir}/4_output_server.log &",
     ]
     start_server_cmds.append(" ".join(cmd))

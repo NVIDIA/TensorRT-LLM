@@ -3,11 +3,8 @@ set -u
 set -e
 set -x
 
-num_ctx_servers=$1
-num_gen_servers=$2
-work_dir=$3
-script_dir=$4
-server_env_var=$5
+config_file=$1
+server_env_var=$2
 
 # Export server environment variables from config
 for env_var in ${server_env_var}; do
@@ -15,4 +12,4 @@ for env_var in ${server_env_var}; do
     echo "Exported: ${env_var}"
 done
 
-trtllm-serve disaggregated -c ${work_dir}/server_config.yaml -t 7200 -r 7200
+trtllm-serve disaggregated -c ${config_file} -t 7200 -r 7200
