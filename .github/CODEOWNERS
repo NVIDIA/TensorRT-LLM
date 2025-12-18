@@ -13,6 +13,11 @@
 
 ## TensorRT-LLM - Docs
 /docs @NVIDIA/trt-llm-doc-owners
+/CODING_GUIDELINES.md @NVIDIA/trt-llm-doc-owners
+/CODE_OF_CONDUCT.md @NVIDIA/trt-llm-doc-owners
+/CONTAINER_SOURCE.md @NVIDIA/trt-llm-doc-owners
+/CONTRIBUTING.md @NVIDIA/trt-llm-doc-owners
+/README.md @NVIDIA/trt-llm-doc-owners
 
 ## Examples
 /examples @NVIDIA/trt-llm-doc-owners
@@ -183,6 +188,7 @@ docs/source/performance/perf-benchmarking.md @NVIDIA/trtllm-bench-reviewers
 ## and license compliance when adding, removing, or changing versions of dependencies.
 ### License Files
 /LICENSE @NVIDIA/trt-llm-oss-compliance
+/ATTRIBUTIONS-*.md @NVIDIA/trt-llm-oss-compliance
 /jenkins/license_cpp.json @NVIDIA/trt-llm-ci-infra-devs @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
 
 ### Python Dependency Management
