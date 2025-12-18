@@ -316,6 +316,11 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false) {
                     foundRunningLine = true
                     return false  // Don't include the "Running" line itself
                 }
+                // Stop collecting when we hit the warnings/errors summary separator
+                if (foundRunningLine && line.contains('======================')) {
+                    foundRunningLine = false  // Stop collecting
+                    return false
+                }
 
                 def hasDoubleColon = line.contains('::')
                 def shouldInclude = foundRunningLine && hasDoubleColon
