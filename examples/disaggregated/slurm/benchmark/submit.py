@@ -322,6 +322,18 @@ def submit_job(config, log_dir, dry_run):
         f"&> {log_dir}/4_output_server.log &",
     ]
     start_server_cmds.append(" ".join(cmd))
+
+    # Generate wait server command
+    cmd = [
+        "srun -l",
+        f"--container-name={container_name}",
+        f"--container-mounts={env_config['container_mount']}",
+        f"--mpi=pmix --overlap -N 1 -n 1",
+        f"bash {env_config['work_dir']}/wait_server.sh {disagg_server_hostname} {disagg_server_port}",
+        f"&> {log_dir}/5_wait_server.log",
+    ]
+    start_server_cmds.append(" ".join(cmd))
+
     with open(os.path.join(log_dir, "start_server_cmds.sh"), "w") as f:
         f.write("\n".join(start_server_cmds) + "\n")
 
