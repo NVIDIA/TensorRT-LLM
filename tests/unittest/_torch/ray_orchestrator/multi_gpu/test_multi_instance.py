@@ -65,7 +65,7 @@ def test_multi_instance(setup_ray_cluster, tp_size, num_instances):
         }
     )
 
-    # Run multiple iterations to catch intermittent port conflict issues
+    # Run multiple iterations to guard against port conflict issues
     execution_times = 5
     for iteration in range(execution_times):
         pg = None
