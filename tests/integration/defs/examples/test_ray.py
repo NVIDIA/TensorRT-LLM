@@ -11,6 +11,11 @@ from defs.common import venv_check_call, wait_for_server
 from defs.conftest import get_device_count, llm_models_root
 from defs.trt_test_alternative import popen
 
+try:
+    RAY_AVAILABLE = True
+except ImportError:
+    RAY_AVAILABLE = False
+
 
 @pytest.fixture(scope="module")
 def ray_example_root(llm_root):
@@ -62,8 +67,14 @@ def test_llm_inference_distributed_ray(ray_example_root, llm_venv, tp_size,
 @pytest.mark.skip_less_device(2)
 @pytest.mark.parametrize("tp_size", [1, 2], ids=["tp1", "tp2"])
 def test_ray_disaggregated_serving(ray_example_root, llm_venv, tp_size):
-    if tp_size == 1:
-        pytest.skip("https://nvbugs/5682551")
+    # NOTE: Ray backend with disaggregated serving has known GPU allocation issues.
+    # The Ray orchestrator is designed for Ray actors, not subprocess-based serving.
+    # Each trtllm-serve subprocess starts its own Ray instance, preventing proper
+    # communication between components. This causes RPC failures with errors like:
+    # 'NoneType' object has no attribute 'has_error'
+
+    # if tp_size == 1:
+    #     pytest.skip("https://nvbugs/5682551")
 
     if get_device_count() < tp_size * 2:
         pytest.skip(f"Need {tp_size * 2} GPUs.")
