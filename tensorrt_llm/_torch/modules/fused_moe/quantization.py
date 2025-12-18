@@ -475,12 +475,21 @@ class FusedMoEMethodBase(ABC):
             TensorParallelMode.COLUMN,
             device=device) if w3_weight is not None else None
 
-        dst_w3_weight, dst_w1_weight = dst_w3_w1_weight.chunk(2, dim=0)
+        src_w3_size_shard = w3_weight_shard.shape[
+            0] if w3_weight_shard is not None else 0
+        src_w1_size_shard = w1_weight_shard.shape[
+            0] if w1_weight_shard is not None else 0
         if w1_weight is not None:
+            dst_w1_weight = dst_w3_w1_weight.narrow(dim=0,
+                                                    start=src_w3_size_shard,
+                                                    length=src_w1_size_shard)
             dst_w1_weight.copy_(w1_weight_shard.contiguous().view(
                 dst_w3_w1_weight.dtype),
                                 non_blocking=True)
         if w3_weight is not None:
+            dst_w3_weight = dst_w3_w1_weight.narrow(dim=0,
+                                                    start=0,
+                                                    length=src_w3_size_shard)
             dst_w3_weight.copy_(w3_weight_shard.contiguous().view(
                 dst_w3_w1_weight.dtype),
                                 non_blocking=True)
@@ -700,6 +709,43 @@ class FP8QDQFusedMoEMethod(FusedMoEMethodBase):
         module.fc2_quant.data.copy_(max_fc2_input_scale.reciprocal())
         module.fc2_dequant.data.copy_(tmp_w2_weight_scale * max_fc2_input_scale)
         module.fc31_input_dequant.data.copy_(max_fc31_input_scale)
+
+    def post_load_weights(self, module):
+        if getattr(module, "moe_backend", None) != "CUTLASS":
+            return
+
+        super().post_load_weights(module)
+        """
+        Pad weight and weight_scale tensors to meet torch trtllm NVFP4 GEMM alignment requirements.
+
+        Args:
+            row_alignment: Required row alignment (default: 32)
+            col_alignment: Required column alignment (default: 16)
+        """
+
+        def _maybe_padding_weights(tensor: torch.Tensor, row_alignment: int,
+                                   col_alignment: int):
+            row_pad_size = (row_alignment - tensor.size(1)) % row_alignment
+            col_pad_size = (col_alignment - tensor.size(2)) % col_alignment
+            is_padded = row_pad_size != 0 or col_pad_size != 0
+            if is_padded:
+                return F.pad(tensor, (0, col_pad_size, 0, row_pad_size),
+                             mode='constant',
+                             value=0), is_padded
+            return tensor, is_padded
+
+        row_alignment, col_alignment = 32, 16
+        padded_w3_w1_weight, is_padded_w3_w1_weight = _maybe_padding_weights(
+            module.w3_w1_weight, row_alignment, col_alignment)
+        # Use `row_alignment` for `w2_weight.shape[2]` to match the shape of `w3_w1_weight.shape[1]`.
+        padded_w2_weight, is_padded_w2_weight = _maybe_padding_weights(
+            module.w2_weight, row_alignment, row_alignment)
+        if is_padded_w3_w1_weight:
+            module.w3_w1_weight = nn.Parameter(padded_w3_w1_weight,
+                                               requires_grad=False)
+        if is_padded_w2_weight:
+            module.w2_weight = nn.Parameter(padded_w2_weight,
+                                            requires_grad=False)
 
 
 class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
@@ -2079,10 +2125,12 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
 
     def create_weights(self, module: torch.nn.Module):
         weight_vec_size = torch.iinfo(self.weight_dtype).bits // 4
-        block_scales_vec_size = torch.iinfo(self.block_scales_dtype).bits // 8
+        self.block_scales_vec_size = torch.iinfo(
+            self.block_scales_dtype).bits // 8
 
         super().create_weights(module, self.weight_dtype, weight_vec_size,
-                               self.block_scales_dtype, block_scales_vec_size)
+                               self.block_scales_dtype,
+                               self.block_scales_vec_size)
 
     def load_expert_w3_w1_weight_scale_nvfp4(
             self, module: torch.nn.Module, w1_weight_scale: torch.Tensor,
@@ -2131,6 +2179,14 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
                                             module.tp_rank,
                                             TensorParallelMode.ROW,
                                             device=device)
+        # Padding w2_weight_scale (dtype=float8_e4m3fn) to match the shape of dst_w2_weight_scale (dtype=float32)
+        src_w2_scale_size = w2_weight_scale.shape[1]
+        adjusted_dst_w2_scale_size = dst_w2_weight_scale.shape[
+            1] * self.block_scales_vec_size
+        w2_weight_scale = torch.nn.functional.pad(
+            w2_weight_scale,
+            (0, adjusted_dst_w2_scale_size - src_w2_scale_size), "constant",
+            0).contiguous()
 
         cast_w2_weight_scale = w2_weight_scale.view(dst_w2_weight_scale.dtype)
         cast_w2_weight_scale = self._maybe_padding_shape(

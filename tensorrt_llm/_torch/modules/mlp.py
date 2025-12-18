@@ -19,7 +19,8 @@ class MLP(nn.Module):
                  activation: Callable[[torch.Tensor], torch.Tensor] = None,
                  dtype: Optional[torch.dtype] = None,
                  config: Optional[ModelConfig] = None,
-                 layer_idx: Optional[int] = None):
+                 layer_idx: Optional[int] = None,
+                 reduce_output: bool = True):
 
         super().__init__()
         self.layer_idx = layer_idx
@@ -60,7 +61,8 @@ class MLP(nn.Module):
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             lora=self.down_lora,
             allreduce_strategy=config.allreduce_strategy,
-            force_dynamic_quantization=config.force_dynamic_quantization)
+            force_dynamic_quantization=config.force_dynamic_quantization,
+            reduce_output=reduce_output)
 
     def forward(
         self,
