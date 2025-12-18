@@ -23,7 +23,7 @@ def run_test(eagle_model_dir, max_seq_len, beam_width, use_dynamic_tree,
     spec_config = EagleDecodingConfig(
         max_draft_len=max_draft_len,
         max_total_draft_tokens=max_total_draft_tokens,
-        speculative_model_dir=eagle_model_dir,
+        speculative_model=eagle_model_dir,
         eagle3_one_model=False,
         eagle_choices=eagle_choices,
         use_dynamic_tree=use_dynamic_tree,

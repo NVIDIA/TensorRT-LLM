@@ -109,8 +109,8 @@ class ModelLoader:
 
         self.model_obj = _ModelWrapper(self.llm_args.model)
         self.speculative_model_obj = _ModelWrapper(
-            self.llm_args.speculative_model_dir
-        ) if self.llm_args.speculative_model_dir is not None else None
+            self.llm_args.speculative_model
+        ) if self.llm_args.speculative_model is not None else None
 
         if isinstance(self.llm_args, TrtLlmArgs):
             self.convert_checkpoint_options = self.llm_args._convert_checkpoint_options
@@ -440,8 +440,8 @@ class ModelLoader:
         model_cls = AutoModelForCausalLM.get_trtllm_model_class(
             self._model_dir, self.llm_args.trust_remote_code,
             self.llm_args.decoding_config.decoding_mode
-            if hasattr(self.llm_args, "speculative_model_dir")
-            and self.llm_args.speculative_model_dir else None)
+            if hasattr(self.llm_args, "speculative_model")
+            and self.llm_args.speculative_model else None)
 
         prequantized = self._update_from_hf_quant_config()
 
@@ -643,14 +643,25 @@ class CachedModelLoader:
         if self.llm_args.model_format is _ModelFormatKind.TLLM_ENGINE:
             return Path(self.llm_args.model), None
 
+        self.engine_cache_stage: Optional[CachedStage] = None
+        self._hf_model_dir = None
+        self.model_loader = ModelLoader(self.llm_args)
+
+        # Download speculative model from HuggingFace if needed
+        if (self.model_loader.speculative_model_obj is not None
+                and self.model_loader.speculative_model_obj.is_hub_model):
+            spec_model_dirs = self._submit_to_all_workers(
+                CachedModelLoader._node_download_hf_model,
+                model=self.model_loader.speculative_model_obj.model_name,
+                revision=None)
+            spec_model_dir = spec_model_dirs[0]
+            self.model_loader.speculative_model_obj.model_dir = spec_model_dir
+            # Update llm_args so PyTorch/AutoDeploy executor gets the local path
+            if self.llm_args.speculative_config is not None:
+                self.llm_args.speculative_config.speculative_model = spec_model_dir
+
         if self.llm_args.backend == "_autodeploy":
             return None, ""
-
-        self.engine_cache_stage: Optional[CachedStage] = None
-
-        self._hf_model_dir = None
-
-        self.model_loader = ModelLoader(self.llm_args)
 
         if self.llm_args.backend is not None:
             if self.llm_args.backend not in ["pytorch", "_autodeploy"]:

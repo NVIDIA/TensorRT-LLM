@@ -651,7 +651,12 @@ class DecodingBaseConfig(StrictBaseModel):
     # If it's a static or dynamic tree, each draft layer may generate more than one draft token.
     # In this case, max_total_draft_tokens >= max_draft_len.
     max_total_draft_tokens: Optional[int] = None
-    speculative_model_dir: Optional[Union[str, Path]] = None
+    # The speculative (draft) model. Accepts either:
+    # - A HuggingFace Hub model ID (str), e.g., "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B"
+    #   which will be automatically downloaded.
+    # - A local filesystem path to a downloaded model directory.
+    speculative_model: Optional[Union[str, Path]] = Field(
+        default=None, alias="speculative_model_dir")
 
     # PyTorch only.
     # When specified, speculation will be disabled at batch sizes above
@@ -918,7 +923,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
     decoding_type: ClassVar[str] = "Eagle"
 
     def validate(self) -> None:
-        if self.speculative_model_dir is None:
+        if self.speculative_model is None:
             raise ValueError("Draft model must be provided for EAGLE")
 
     def check_eagle_choices(self):
@@ -2132,7 +2137,7 @@ class BaseLlmArgs(StrictBaseModel):
         return self._model_format
 
     @property
-    def speculative_model_dir(self) -> Optional[_ModelFormatKind]:
+    def speculative_model(self) -> Optional[str]:
         return self._speculative_model
 
     @property
@@ -2508,7 +2513,7 @@ class TrtLlmArgs(BaseLlmArgs):
 
             elif isinstance(self.speculative_config, EagleDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0
-                assert self.speculative_config.speculative_model_dir is not None, "Path to EAGLE3 weights must be specified."
+                assert self.speculative_config.speculative_model is not None, "EAGLE3 draft model must be specified."
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
                 self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.EAGLE
                 eagle_config = _EagleConfig(
@@ -2529,7 +2534,7 @@ class TrtLlmArgs(BaseLlmArgs):
             self.decoding_config = None
 
         self._speculative_model = getattr(self.speculative_config,
-                                          "speculative_model_dir", None)
+                                          "speculative_model", None)
         speculative_model_obj = _ModelWrapper(
             self._speculative_model
         ) if self._speculative_model is not None else None
@@ -3025,12 +3030,12 @@ class TorchLlmArgs(BaseLlmArgs):
 
             if isinstance(self.speculative_config, EagleDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0
-                assert self.speculative_config.speculative_model_dir is not None, "Path to EAGLE3 weights must be specified."
+                assert self.speculative_config.speculative_model is not None, "EAGLE3 draft model must be specified."
             elif isinstance(self.speculative_config, NGramDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0 and self.speculative_config.max_matching_ngram_size > 0
             elif isinstance(self.speculative_config, DraftTargetDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0
-                assert self.speculative_config.speculative_model_dir is not None, "Path to draft model must be specified."
+                assert self.speculative_config.speculative_model is not None, "Draft model must be specified."
             elif isinstance(self.speculative_config, MTPDecodingConfig):
                 assert self.speculative_config.num_nextn_predict_layers > 0
                 self.speculative_config.max_draft_len = self.speculative_config.num_nextn_predict_layers
@@ -3058,7 +3063,7 @@ class TorchLlmArgs(BaseLlmArgs):
             self.decoding_config = None
 
         self._speculative_model = getattr(self.speculative_config,
-                                          "speculative_model_dir", None)
+                                          "speculative_model", None)
         speculative_model_obj = _ModelWrapper(
             self._speculative_model
         ) if self._speculative_model is not None else None

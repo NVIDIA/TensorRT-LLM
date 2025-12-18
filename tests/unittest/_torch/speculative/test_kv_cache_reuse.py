@@ -52,7 +52,7 @@ def test_kv_cache_reuse(use_cuda_graph: bool, attn_backend: str):
 
     spec_config = EagleDecodingConfig(
         max_draft_len=max_draft_len,
-        speculative_model_dir=eagle_model_dir,
+        speculative_model=eagle_model_dir,
         eagle3_one_model=False,
     )
 

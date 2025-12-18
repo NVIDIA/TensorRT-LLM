@@ -93,7 +93,7 @@ def test_spec_decoding_metrics_eagle3_one_model():
         "speculative_config": {
             "decoding_type": "Eagle",
             "max_draft_len": 4,
-            "speculative_model_dir": eagle3_path,
+            "speculative_model": eagle3_path,
             "eagle3_one_model": True,
         },
     }
@@ -174,7 +174,7 @@ def test_spec_decoding_metrics_eagle3_two_model():
         "speculative_config": {
             "decoding_type": "Eagle",
             "max_draft_len": 4,
-            "speculative_model_dir": eagle3_path,
+            "speculative_model": eagle3_path,
             "eagle3_one_model": False,  # Two-model mode
         },
     }
