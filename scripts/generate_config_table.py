@@ -241,8 +241,9 @@ def generate_rst(yaml_path, output_file=None):
 
         lines.append(f".. _{model}:")
         lines.append("")
+        # Use a low-level section heading so it nests under "Recipe database".
         lines.append(title_text)
-        lines.append("^" * len(title_text))
+        lines.append("~" * len(title_text))
         lines.append("")
 
         lines.append(".. list-table::")

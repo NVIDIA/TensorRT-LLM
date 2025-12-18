@@ -434,7 +434,6 @@ $$
 
 The following sections help you pick a known-good `trtllm-serve --config` for your target GPU and traffic pattern.
 
-
 ### Recipe selector
 
 ```{eval-rst}
