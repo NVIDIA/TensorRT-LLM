@@ -1863,6 +1863,16 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     server: 10.20.162.212
                     path: /vol/scratch26/scratch.trt_llm_data
         """
+    } else {
+        if (type.equals("rtx-pro-6000")) {
+            // rtx-pro-6000 nodes are located in PDX DC, we use the FlexCache to speed up the data access.
+            llmModelVolume = """
+                    - name: scratch-trt-llm-data
+                    nfs:
+                        server: ipp6-cdot01-fcache01
+                        path: /vol/fcscratch1/scratch.michaeln_blossom
+            """
+        }
     }
 
     def podConfig = [
@@ -3259,8 +3269,13 @@ def launchTestJobs(pipeline, testFilter)
         // "RTXPro6000-PyTorch-Post-Merge-1": ["rtx-pro-6000", "l0_rtx_pro_6000", 1, 1],
         // "RTXPro6000-4_GPUs-PyTorch-Post-Merge-1": ["rtx-pro-6000-x4", "l0_rtx_pro_6000", 1, 2, 4],
         // "RTXPro6000-4_GPUs-PyTorch-Post-Merge-2": ["rtx-pro-6000-x4", "l0_rtx_pro_6000", 2, 2, 4],
+<<<<<<< HEAD
         "RTXPro6000D-PyTorch-1": ["rtx-pro-6000d", "l0_rtx_pro_6000", 1, 2],
         "RTXPro6000D-PyTorch-2": ["rtx-pro-6000d", "l0_rtx_pro_6000", 2, 2],
+=======
+        "RTXPro6000-PyTorch-Post-Merge-1": ["rtx-pro-6000", "l0_rtx_pro_6000", 1, 1],
+        "RTXPro6000D-PyTorch-Post-Merge-1": ["rtx-pro-6000d", "l0_rtx_pro_6000", 1, 1],
+>>>>>>> 47be38fb6 (Test for PDX flexcache)
         "RTXPro6000D-4_GPUs-PyTorch-Post-Merge-1": ["rtx-pro-6000d-x4", "l0_rtx_pro_6000", 1, 2, 4],
         "RTXPro6000D-4_GPUs-PyTorch-Post-Merge-2": ["rtx-pro-6000d-x4", "l0_rtx_pro_6000", 2, 2, 4],
     ]
