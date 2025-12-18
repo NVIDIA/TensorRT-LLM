@@ -10,6 +10,7 @@ from strenum import StrEnum
 from tensorrt_llm.bindings import internal as tb_internal
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
 
+# Assuming these imports exist in your environment
 from .llm_request import LlmRequest, LlmRequestState
 
 RequestList = list[LlmRequest]
@@ -247,6 +248,10 @@ class ContextChunkingConfig:
     chunk_unit_size: int
 
 
+class MicroBatchScheduler:
+    """Base class to match structure."""
+
+
 class PyMicroBatchScheduler(MicroBatchScheduler):
 
     def __init__(
@@ -259,6 +264,7 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
         self.max_batch_size = max_batch_size
         self.max_num_tokens = max_num_tokens
         self.ctx_chunk_config = ctx_chunk_config
+        self.max_context_length = max_num_tokens
 
     def schedule(
             self, active_requests: RequestList,
@@ -267,102 +273,137 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
         context_requests: RequestList = []
         generation_requests: RequestList = []
 
-        current_batch_tokens = 0
-        scheduled_req_count = 0
+        # Current total tokens in the scheduled batch (Generation + Context)
+        batch_num_tokens = 0
+        scheduled_req_size = 0
         scheduled_beam_width = 0
 
         contexts_to_be_chunked: RequestList = []
+        # Total tokens required by chunked requests (calculated tentatively)
         num_chunked_tokens = 0
-        all_context_fits = True
+        all_context_requests_fit = True
 
-        # 1. First Pass: Filter & Categorize (Generation First)
+        # 1. Main Scheduling Loop
         for req in active_requests:
-            # Skip invalid states (Simplified check, assuming caller filters mostly)
+            # Skip requests already in flight (should be filtered by caller, but C++ checks)
             if req.request_id in inflight_request_ids:
                 continue
 
-            # --- Generation Handling ---
-            if req.state == LlmRequestState.GENERATION_IN_PROGRESS:
-                beam_width = req.sampling_config.beam_width
-                req_num_tokens = beam_width + req.num_draft_tokens
+            req_num_tokens = 0
 
-                # Check Global Token Budget
-                if self.max_num_tokens is not None and (current_batch_tokens +
+            # --- A. Encoder Request Handling (Previously Missing) ---
+            if req.state == LlmRequestState.ENCODER_INIT:
+                # C++: reqNumTokens = llmReq->getEncoderOutputLen();
+                req_num_tokens = req.encoder_output_len
+
+                if self.max_context_length is not None and req_num_tokens > self.max_context_length:
+                    # C++ does TLLM_CHECK here. We skip or log.
+                    continue
+
+                # Check Batch Token Budget
+                if self.max_num_tokens is not None and (batch_num_tokens +
                                                         req_num_tokens
                                                         > self.max_num_tokens):
                     break
 
-                # Check Beam Width Consistency (Batch constraint)
-                if scheduled_beam_width == 0:
-                    scheduled_beam_width = beam_width
-                elif scheduled_beam_width != beam_width:
-                    continue
+                context_requests.append(req)
+                batch_num_tokens += req_num_tokens
 
-                generation_requests.append(req)
-                current_batch_tokens += req_num_tokens
-
-            # --- Context Handling ---
+            # --- B. Context Request Handling ---
             elif req.state == LlmRequestState.CONTEXT_INIT:
                 if not self.ctx_chunk_config:
-                    # No Chunking: Greedy allocation
-                    req_num_tokens = req.context_remaining_length
+                    # No Chunking: Schedule full context
+                    # C++: getNumTokens(beam) + (hasDraft ? getNumDraftTokens : 0)
+                    base_tokens = req.context_remaining_length  # effectively getNumTokens(0)
                     draft_tokens = req.num_draft_tokens if req.has_draft_tokens else 0
-                    total_tokens = req_num_tokens + draft_tokens
+                    req_num_tokens = base_tokens + draft_tokens
+
+                    if self.max_context_length is not None and req_num_tokens > self.max_context_length:
+                        continue
 
                     if self.max_num_tokens is not None and (
-                            current_batch_tokens + total_tokens
+                            batch_num_tokens + req_num_tokens
                             > self.max_num_tokens):
                         break
 
                     context_requests.append(req)
-                    current_batch_tokens += total_tokens
+                    batch_num_tokens += req_num_tokens
                 else:
-                    # Chunking Enabled: Defer calculation
-                    remaining = req.context_remaining_length
-                    # Just an estimate for budget check
-                    req.context_chunk_size = remaining
+                    # Chunking Enabled: Tentative schedule
+                    # C++: setContextChunkSize(remaining); reqNumTokens = size + draft
+                    req.context_chunk_size = req.context_remaining_length
 
                     draft_tokens = req.num_draft_tokens if (
                         req.is_last_context_chunk
                         and req.has_draft_tokens) else 0
-                    req_num_tokens = remaining + draft_tokens
+                    req_num_tokens = req.context_chunk_size + draft_tokens
+
+                    # C++: Check maxContextLength constraints
+                    if self.max_context_length is not None:
+                        if self.max_context_length < req_num_tokens:
+                            req_num_tokens = self.max_context_length
+                            all_context_requests_fit = False
 
                     contexts_to_be_chunked.append(req)
                     num_chunked_tokens += req_num_tokens
 
-            # Batch Size Check
-            scheduled_req_count += 1
-            if scheduled_req_count >= self.max_batch_size:
+            # --- C. Generation Request Handling ---
+            else:
+                beam_width = req.sampling_config.beam_width
+                req_num_tokens = beam_width + req.num_draft_tokens
+
+                if self.max_num_tokens is not None and (batch_num_tokens +
+                                                        req_num_tokens
+                                                        > self.max_num_tokens):
+                    break
+
+                # Beam Width Consistency Check (C++ Logic)
+                if scheduled_beam_width == 0:
+                    scheduled_beam_width = beam_width
+                elif scheduled_beam_width != beam_width:
+                    # Skip requests with different beam width in this batch
+                    continue
+
+                generation_requests.append(req)
+                batch_num_tokens += req_num_tokens
+
+            # --- Batch Size Limit Check ---
+            scheduled_req_size += 1
+            if scheduled_req_size >= self.max_batch_size:
                 break
 
-        # 2. Check if chunking logic is needed
+        # 2. Verify Chunking Fits
         if self.max_num_tokens is not None and num_chunked_tokens > (
-                self.max_num_tokens - current_batch_tokens):
-            all_context_fits = False
+                self.max_num_tokens - batch_num_tokens):
+            all_context_requests_fit = False
 
-        # 3. Apply Chunking Strategy
-        if not all_context_fits and contexts_to_be_chunked:
+        # 3. Apply Chunking Strategy if needed
+        if not all_context_requests_fit and contexts_to_be_chunked:
             if not self.ctx_chunk_config:
-                # Should effectively be handled above, but as a fallback
-                pass
+                pass  # Error in C++: "If chunking not enabled..."
             else:
                 remaining_capacity = (
-                    self.max_num_tokens - current_batch_tokens
+                    self.max_num_tokens - batch_num_tokens
                 ) if self.max_num_tokens is not None else None
+
                 self._set_ctx_requests_chunk_size(contexts_to_be_chunked,
                                                   remaining_capacity)
 
-        # 4. Finalize Context Requests
+        # 4. Finalize Chunked Requests
         for req in contexts_to_be_chunked:
             if req.context_chunk_size > 0:
                 context_requests.append(req)
-                current_batch_tokens += req.context_chunk_size
+                # C++: batchNumTokens += chunk size
+                batch_num_tokens += req.context_chunk_size
+
+        # Note: C++ calls utils::sortRequests here. Python lists preserve order,
+        # usually acceptable unless specific downstream kernel requirements exist.
 
         return context_requests, generation_requests
 
     def _set_ctx_requests_chunk_size(self, requests: RequestList,
                                      capacity: Optional[int]):
-        # Reset
+        # C++: Resets all chunk sizes to 0 at start
         for req in requests:
             req.context_chunk_size = 0
 
@@ -374,84 +415,95 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
         elif policy == ChunkingPolicy.FIRST_COME_FIRST_SERVED:
             self._chunk_fcfs(requests, capacity, unit_size)
 
-        # Optimization: Fit draft tokens if space allows
         self._fit_draft_tokens(requests, capacity, unit_size)
 
-    def _chunk_equal_progress(self, requests, capacity, unit_size):
+    def _chunk_equal_progress(self, requests: RequestList,
+                              capacity: Optional[int], unit_size: int):
         num_ctx_tokens = 0
-        made_progress = True
+        num_tokens_single_loop = 1
 
-        while (capacity is None or num_ctx_tokens < capacity) and made_progress:
-            made_progress = False
+        # C++ Loop: while ((!capacity || numCtxTokens < capacity) && numTokensSingleLoop)
+        while (capacity is None
+               or num_ctx_tokens < capacity) and num_tokens_single_loop > 0:
+            num_tokens_single_loop = 0
             for req in requests:
                 past_size = req.context_chunk_size
-                remaining = req.context_remaining_length
 
-                if past_size >= remaining:
+                # C++ logic: suggested = past + unit
+                suggested_size = past_size + unit_size
+
+                # Ensure we don't exceed what the request actually needs
+                remaining_total = req.context_remaining_length
+                suggested_size = min(suggested_size, remaining_total)
+
+                req.context_chunk_size = suggested_size
+
+                actual_size = req.context_chunk_size
+                actual_increment = actual_size - past_size
+
+                # Check Constraints
+                # 1. Capacity
+                if capacity is not None and (num_ctx_tokens + actual_increment
+                                             > capacity):
+                    req.context_chunk_size = past_size  # Revert
                     continue
 
-                suggested_size = past_size + unit_size
-                actual_size = min(suggested_size, remaining)
-                increment = actual_size - past_size
+                # 2. Max Context Length
+                if self.max_context_length is not None and actual_size > self.max_context_length:
+                    req.context_chunk_size = past_size  # Revert
+                    continue
 
-                if increment > 0:
-                    if capacity is not None and (num_ctx_tokens + increment
-                                                 > capacity):
-                        # Cannot fit this increment, stop growing this request
-                        req.context_chunk_size = past_size
-                        continue
+                num_ctx_tokens += actual_increment
+                num_tokens_single_loop += actual_increment
 
-                    req.context_chunk_size = actual_size
-                    num_ctx_tokens += increment
-                    made_progress = True
-
-    def _chunk_fcfs(self, requests, capacity, unit_size):
+    def _chunk_fcfs(self, requests: RequestList, capacity: Optional[int],
+                    unit_size: int):
         current_capacity = capacity if capacity is not None else float('inf')
 
         for req in requests:
-            remaining = req.context_remaining_length
-            actual_size = remaining
+            suggested_size = req.context_remaining_length
+            actual_size = suggested_size
 
             if current_capacity < actual_size:
                 actual_size = current_capacity
 
-            # Align if truncated
-            if actual_size < remaining:
+            if self.max_context_length is not None:
+                actual_size = min(self.max_context_length, actual_size)
+
+            # Round down to unit size if we had to truncate
+            if actual_size < suggested_size:
                 actual_size = (int(actual_size) // unit_size) * unit_size
 
             req.context_chunk_size = int(actual_size)
-            current_capacity -= req.context_chunk_size
 
-            if current_capacity <= 0:
-                break
+            # C++: ctxTokensCapacity = ctxTokensCapacity - actualChunkSize
+            if capacity is not None:
+                current_capacity -= req.context_chunk_size
 
-    def _fit_draft_tokens(self, requests, capacity, unit_size):
-        # Python port of fitDraftTokens
-        # Logic: If it is the last chunk, try to fit draft tokens without using a new KV block
-        current_tokens = sum(r.context_chunk_size for r in requests)
+    def _fit_draft_tokens(self, requests: RequestList, capacity: Optional[int],
+                          unit_size: int):
+        # Calculate tokens already taken by the batch so far
+        num_ctx_tokens = sum(req.context_chunk_size for req in requests)
 
         for req in requests:
             if req.is_last_context_chunk and req.has_draft_tokens:
-                chunk_size = req.context_chunk_size
-                remainder = chunk_size % unit_size
-                # Space left in the last block
-                space_in_block = 0 if remainder == 0 else (unit_size -
-                                                           remainder)
+                remainder = req.context_chunk_size % unit_size
+                remaining_space = 0 if remainder == 0 else unit_size - remainder
 
-                # Check constraints
-                allowed_space = space_in_block
+                if self.max_context_length is not None:
+                    remaining_context_len = self.max_context_length - req.context_chunk_size
+                    remaining_space = min(remaining_space,
+                                          remaining_context_len)
+
                 if capacity is not None:
-                    allowed_space = min(allowed_space,
-                                        capacity - current_tokens)
+                    remaining_space = min(remaining_space,
+                                          capacity - num_ctx_tokens)
+                    num_ctx_tokens += remaining_space
 
-                # If we can't fit all draft tokens in the existing block/capacity, discard them
-                draft_needed = req.num_draft_tokens
-                if draft_needed > allowed_space:
-                    # In python we might need a method to discard/update draft tokens on req
-                    # req.discard_draft_tokens(draft_needed - allowed_space)
-                    pass
-                else:
-                    current_tokens += draft_needed
+                draft_discard = req.num_draft_tokens - remaining_space
+                if draft_discard > 0:
+                    if hasattr(req, "discard_draft_tokens"):
+                        req.discard_draft_tokens(draft_discard)
 
 
 class PyCapacityScheduler:
@@ -495,39 +547,6 @@ class PyCapacityScheduler:
             raise NotImplementedError(
                 f"Policy {self.policy} not implemented in PyCapacityScheduler")
 
-    def _get_req_needed_blocks(self, req: LlmRequest,
-                               is_guaranteed_no_evict: bool) -> int:
-        """
-        Robustly calculate needed blocks.
-        Tries to use C++ API if safe, otherwise falls back to Python math.
-        """
-        # For GuaranteedNoEvict, we need Total Blocks to completion.
-        # For MaxUtilization, we typically need incremental blocks (1 step).
-
-        # Scenario A: Disagg Init or Context Init (New Requests)
-        # The sequence might NOT be in C++ Manager yet. Do math manually to be safe.
-        if req.state == LlmRequestState.DISAGG_GENERATION_INIT or req.state == LlmRequestState.CONTEXT_INIT:
-            if is_guaranteed_no_evict:
-                # Need TOTAL blocks for the whole request
-                total_len = req.prompt_len + req.max_new_tokens
-                return math.ceil(total_len / self.tokens_per_block)
-            else:
-                # Need just the Context blocks for now (Simplified)
-                # Or use C++ get_needed_blocks_one_step if it doesn't lookup sequence
-                return math.ceil(req.prompt_len / self.tokens_per_block)
-
-        # Scenario B: Generation (Running Requests)
-        # Sequence IS in C++ Manager. Use C++ API for accuracy (shared blocks, beam width, etc).
-        if req.state == LlmRequestState.GENERATION_IN_PROGRESS or req.state == LlmRequestState.GENERATION_TO_COMPLETE:
-            if is_guaranteed_no_evict:
-                return self.kv_cache_manager_cpp.get_remaining_blocks_to_completion(
-                    req, self.default_window_size)
-            else:
-                return self.kv_cache_manager_cpp.get_needed_blocks_one_step(
-                    req, False, self.default_window_size)
-
-        return 0
-
     def _schedule_max_requests(self, active_requests: RequestList):
         scheduled_requests: RequestList = []
         paused_requests: RequestList = []
@@ -561,8 +580,7 @@ class PyCapacityScheduler:
         scheduled_requests: RequestList = []
         paused_requests: RequestList = []
 
-        if hasattr(self.kv_cache_manager, "start_scheduling"):
-            self.kv_cache_manager.start_scheduling()
+        self.kv_cache_manager_cpp.start_scheduling()
 
         # Track free blocks manually in Python to simulate transactional state.
         stats = self.kv_cache_manager_cpp.get_kv_cache_stats()
@@ -573,6 +591,9 @@ class PyCapacityScheduler:
 
         while idx < len(cached_active_list):
             req = cached_active_list[idx]
+
+            # 1. State Filter
+            # Allow Disagg Gen Init to pass through (matching C++ logic)
             is_disagg_init = (
                 req.state == LlmRequestState.DISAGG_GENERATION_INIT)
 
@@ -582,12 +603,21 @@ class PyCapacityScheduler:
                 idx += 1
                 continue
 
+            # 2. Max Requests Check
             if len(scheduled_requests) >= self.max_num_requests:
                 break
 
-            # 3. Try Allocation
-            needed_blocks = self._get_req_needed_blocks(
-                req, is_guaranteed_no_evict=False)
+            # 3. Try Allocation (Python Manual Check)
+            needed_blocks = 0
+            if is_disagg_init:
+                needed_blocks = self.kv_cache_manager_cpp.get_needed_blocks_one_step(
+                    req, False, self.default_window_size)
+            elif req.state == LlmRequestState.GENERATION_IN_PROGRESS:
+                needed_blocks = self.kv_cache_manager_cpp.get_needed_blocks_one_step(
+                    req, False, self.default_window_size)
+            elif req.state == LlmRequestState.CONTEXT_INIT:
+                needed_blocks = self.kv_cache_manager_cpp.get_needed_blocks_one_step(
+                    req, False, self.default_window_size)
 
             if current_free_blocks >= needed_blocks:
                 current_free_blocks -= needed_blocks
@@ -595,7 +625,7 @@ class PyCapacityScheduler:
                 idx += 1
                 continue
 
-            # 4. Backtracking
+            # 4. Backtracking / Eviction Logic
             victim_idx = -1
             for i in range(len(scheduled_requests) - 1, -1, -1):
                 r = scheduled_requests[i]
@@ -609,9 +639,10 @@ class PyCapacityScheduler:
                 paused_requests.append(victim_req)
 
                 # Reclaim victim's blocks manually
-                victim_needed = self._get_req_needed_blocks(
-                    victim_req, is_guaranteed_no_evict=False)
+                victim_needed = self.kv_cache_manager_cpp.get_needed_blocks_one_step(
+                    victim_req, False, self.default_window_size)
                 current_free_blocks += victim_needed
+
                 # Retry current req without incrementing idx
                 continue
             else:
@@ -623,15 +654,12 @@ class PyCapacityScheduler:
 
     def _schedule_guaranteed_no_evict(self, active_requests: RequestList):
         scheduled_requests: RequestList = []
-
-        # Pending lists separated to enforce priority: Disagg Init > Context Init
         pending_disagg_requests: RequestList = []
-        pending_context_requests: RequestList = []
+        pending_requests: RequestList = []
 
         stats = self.kv_cache_manager_cpp.get_kv_cache_stats()
-        max_blocks = stats.max_num_blocks
-        used_blocks = stats.used_num_blocks
-        available_blocks = max_blocks - used_blocks
+        # available_blocks represents PHYSICAL free blocks
+        available_blocks = stats.max_num_blocks - stats.used_num_blocks
 
         # --- Pass 1: Running Requests ---
         for request in active_requests:
@@ -639,46 +667,50 @@ class PyCapacityScheduler:
             is_disagg_init = (
                 req_state == LlmRequestState.DISAGG_GENERATION_INIT)
 
-            # Filter valid states (Allow Disagg Init)
             if not is_disagg_init and (
                     req_state.value < self.no_schedule_until_state.value
                     or req_state.value >= self.no_schedule_after_state.value):
                 continue
 
-            # Capacity Check
+            # If capacity is full, move to pending
             if len(scheduled_requests) >= self.max_num_requests:
                 if is_disagg_init:
                     pending_disagg_requests.append(request)
                 else:
-                    pending_context_requests.append(request)
+                    pending_requests.append(request)
                 continue
 
-            # Prioritize Running Requests (Generation)
-            # In C++ NoEvict, running requests are scheduled unconditionally in the first pass
+            # Unconditionally schedule Running Requests (Match C++ NoEvict logic)
             if (req_state == LlmRequestState.GENERATION_IN_PROGRESS
                     or req_state == LlmRequestState.GENERATION_TO_COMPLETE):
 
-                needed = self._get_req_needed_blocks(
-                    request, is_guaranteed_no_evict=True)
+                needed = self.kv_cache_manager_cpp.get_remaining_blocks_to_completion(
+                    request, self.default_window_size)
+
                 scheduled_requests.append(request)
+                # Subtract needed blocks from availability.
+                # This can go negative, effectively reserving space for these requests
+                # and blocking new ones in Pass 2.
                 available_blocks -= needed
             else:
-                # Non-running requests go to pending
                 if is_disagg_init:
                     pending_disagg_requests.append(request)
                 else:
-                    pending_context_requests.append(request)
+                    pending_requests.append(request)
 
-        # --- Pass 2: New / Context Requests ---
-        # Critical: Process Disagg Init requests BEFORE standard Context Init
-        all_pending = pending_disagg_requests + pending_context_requests
+        # --- Pass 2: New / Context Requests (Disagg First) ---
+        all_pending = pending_disagg_requests + pending_requests
 
         for request in all_pending:
             if len(scheduled_requests) >= self.max_num_requests:
                 break
 
-            needed_blocks = self._get_req_needed_blocks(
-                request, is_guaranteed_no_evict=True)
+            # If running requests have reserved all (or more) than available space, stop.
+            if available_blocks <= 0:
+                break
+
+            needed_blocks = self.kv_cache_manager_cpp.get_remaining_blocks_to_completion(
+                request, self.default_window_size)
 
             if needed_blocks <= available_blocks:
                 scheduled_requests.append(request)
