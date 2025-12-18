@@ -89,6 +89,8 @@ class GenerationTask(Task):
     logprobs: Optional[TokenLogprobs] = None
     customized_result_fields: Dict[str, Any] = field(default_factory=dict)
 
+    perf_metrics: Optional[dict[str, float]] = None
+
     @staticmethod
     def create_from_prompt(prompt: str) -> "GenerationTask":
         task = GenerationTask()
