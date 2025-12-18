@@ -1,3 +1,4 @@
+import warnings
 from typing import Dict, Generic, List, Optional, Tuple
 
 import torch
@@ -266,6 +267,13 @@ class Eagle3DraftModel(DecoderModel):
                                                      False)
         self._use_mla = use_mla
 
+        if not hasattr(config, "draft_vocab_size"):
+            warnings.warn(
+                "Pretrained config does not define 'draft_vocab_size'; assuming it matches 'vocab_size'. "
+                "If the draft head uses a different vocabulary, set 'draft_vocab_size' explicitly "
+                "before exporting to TensorRT-LLM.")
+            config.draft_vocab_size = config.vocab_size
+
         if hasattr(config, "target_hidden_size"):
             self.hidden_size_in = config.target_hidden_size
         else:
@@ -417,9 +425,13 @@ class Eagle3ForCausalLM(DecoderModelForCausalLM[Eagle3DraftModel,
         model_config: ModelConfig[PretrainedConfig],
         start_layer_idx: int = 0,
     ):
-        draft_vocab_size = model_config.pretrained_config.vocab_size
         if model_config.pretrained_config.draft_vocab_size is not None:
             draft_vocab_size = model_config.pretrained_config.draft_vocab_size
+        else:
+            draft_vocab_size = model_config.pretrained_config.vocab_size
+            warnings.warn(
+                "Pretrained config does not define 'draft_vocab_size'; assuming it matches 'vocab_size'. "
+                "If the draft head uses a different vocabulary, set 'draft_vocab_size' explicitly. ")
 
         # Determine if we should use MLA attention based on config
         # MLA is used for DeepSeekV3-style models that have kv_lora_rank
@@ -435,7 +447,7 @@ class Eagle3ForCausalLM(DecoderModelForCausalLM[Eagle3DraftModel,
         super().__init__(
             draft_model,
             config=model_config,
-            hidden_size=model_config.pretrained_config.hidden_size,
+            hidden_size=config.hidden_size,
             vocab_size=draft_vocab_size,
         )
         self.load_lm_head_from_target = True
