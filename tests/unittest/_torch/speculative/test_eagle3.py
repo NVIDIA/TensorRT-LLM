@@ -449,7 +449,6 @@ def test_deepseek_eagle3():
         'transformers_version': '4.52.4',
         'use_cache': True,
         'vocab_size': 129280,
-        'draft_vocab_size': 129280
     }
     with tempfile.TemporaryDirectory() as temp_dir:
         eagle_model_dir = Path(temp_dir)
@@ -659,7 +658,6 @@ def test_multi_eagle3(use_one_model: bool):
         'transformers_version': '4.52.4',
         'use_cache': True,
         'vocab_size': 128256,
-        'draft_vocab_size': 128256
     }
     with tempfile.TemporaryDirectory() as temp_dir:
         eagle_model_dir = Path(temp_dir)
