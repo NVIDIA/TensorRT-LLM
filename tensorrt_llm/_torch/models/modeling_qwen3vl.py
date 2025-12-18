@@ -1026,16 +1026,14 @@ class Qwen3VLModel(Qwen3VLModelBase):
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         # NOTE: HF implementation.
         kwargs["vision_model_class"] = Qwen3VisionModel
+        kwargs["disable_fuse_rope"] = kwargs.get(
+            "disable_fuse_rope", False
+        )  # TODO: Make this ModelConfig's argument
         super().__init__(model_config, *args, **kwargs)
 
     @property
     def multimodal_data_device_paths(self) -> List[str]:
-        return [
-            "image.pixel_values",
-            "video.pixel_values_videos",
-            "multimodal_embedding",
-            "deepstack_feature",
-        ]
+        return ["image.pixel_values", "video.pixel_values_videos", "multimodal_embedding"]
 
     def load_weights(self, weights: Dict[str, torch.Tensor], weight_mapper: BaseWeightMapper):
         if not _is_disagg():

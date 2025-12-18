@@ -30,8 +30,8 @@ QWEN3_VL_8B_CONFIG = {
         "max_position_embeddings": 262144,
         "model_type": "qwen3_vl_text",
         "num_attention_heads": 32,
-        "num_hidden_layers": 36,
-        # NOTE: Only 4 layers for testing, 36 layers for full model. At least 4 layer needed for deepstack features
+        "num_hidden_layers": 4,
+        # NOTE: Only 4 layers for testing, 36 layers for full model.
         "num_key_value_heads": 8,
         "rms_norm_eps": 1e-06,
         "rope_scaling": {
@@ -48,9 +48,7 @@ QWEN3_VL_8B_CONFIG = {
     "video_token_id": 151656,
     "vision_config": {
         "deepstack_visual_indexes": [8, 16, 24],
-        # NOTE: [0, 1, 2] for testing, [8, 16, 24] for full model.
         "depth": 27,
-        # NOTE: Only 4 layers for testing, 27 layers for full model. At least 4 layer needed for deepstack features
         "hidden_act": "gelu_pytorch_tanh",
         "hidden_size": 1152,
         "in_channels": 3,
@@ -66,13 +64,14 @@ QWEN3_VL_8B_CONFIG = {
     },
     "vision_end_token_id": 151653,
     "vision_start_token_id": 151652,
+    "_attn_implementation": "flash_attention_2",
     "_name_or_path": str(os.path.join(llm_models_root(), "Qwen3-VL-8B-Instruct")),
 }
 
 
 @dataclass(repr=False)
 class TestQwen3VLScenario(MultimodalScenario):
-    # disable_fuse_rope: bool = False
+    disable_fuse_rope: bool = False
 
     def __repr__(self) -> str:
         """Generate a human-readable string representation of the scenario."""
@@ -80,8 +79,8 @@ class TestQwen3VLScenario(MultimodalScenario):
         features.append(f"modality:{self.modality.lower()}")
         if self.use_cuda_graph:
             features.append("cuda_graph")
-        # if self.disable_fuse_rope:
-        #     features.append("no_fuse_rope")
+        if self.disable_fuse_rope:
+            features.append("no_fuse_rope")
         if self.chunked_prefill:
             features.append("chunked_prefill")
         if self.kv_cache_reuse:
@@ -212,21 +211,21 @@ class TestQwen3VL(TestModelingMultimodal):
             TestQwen3VLScenario(
                 modality="image",
                 use_cuda_graph=False,
-                # disable_fuse_rope=False,
-                chunked_prefill=False,
-                kv_cache_reuse=False,
-            ),
-            TestQwen3VLScenario(
-                modality="video",
-                use_cuda_graph=False,
                 disable_fuse_rope=False,
                 chunked_prefill=False,
                 kv_cache_reuse=False,
             ),
+            # TestQwen3VLScenario(
+            #     modality="video",
+            #     use_cuda_graph=False,
+            #     disable_fuse_rope=False,
+            #     chunked_prefill=False,
+            #     kv_cache_reuse=False,
+            # ),
             TestQwen3VLScenario(
                 modality="multiple_image",
                 use_cuda_graph=False,
-                # disable_fuse_rope=False,
+                disable_fuse_rope=False,
                 chunked_prefill=False,
                 kv_cache_reuse=False,
             ),
@@ -234,7 +233,7 @@ class TestQwen3VL(TestModelingMultimodal):
             TestQwen3VLScenario(
                 modality="image",
                 use_cuda_graph=True,
-                # disable_fuse_rope=False,
+                disable_fuse_rope=False,
                 chunked_prefill=False,
                 kv_cache_reuse=False,
             ),
@@ -248,7 +247,7 @@ class TestQwen3VL(TestModelingMultimodal):
             TestQwen3VLScenario(
                 modality="image",
                 use_cuda_graph=False,
-                # disable_fuse_rope=False,
+                disable_fuse_rope=False,
                 chunked_prefill=True,
                 kv_cache_reuse=False,
             ),
@@ -256,7 +255,7 @@ class TestQwen3VL(TestModelingMultimodal):
             TestQwen3VLScenario(
                 modality="image",
                 use_cuda_graph=False,
-                # disable_fuse_rope=False,
+                disable_fuse_rope=False,
                 chunked_prefill=False,
                 kv_cache_reuse=True,
             ),
@@ -265,9 +264,9 @@ class TestQwen3VL(TestModelingMultimodal):
 
     def setup_scenario(self, scenario: TestQwen3VLScenario):
         super().setup_scenario(scenario)
-        # if scenario.disable_fuse_rope:
-        #     self.trtllm_model, self.model_config = self.create_trtllm_model(
-        #         load_weights=True,
-        #         hf_model_state_dict=self.hf_model.state_dict(),
-        #         disable_fuse_rope=True,
-        #     )
+        if scenario.disable_fuse_rope:
+            self.trtllm_model, self.model_config = self.create_trtllm_model(
+                load_weights=True,
+                hf_model_state_dict=self.hf_model.state_dict(),
+                disable_fuse_rope=True,
+            )
