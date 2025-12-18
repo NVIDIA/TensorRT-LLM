@@ -66,11 +66,8 @@ llm_perf_sanity:
 # 3: A100, H20, H100, H200, Blackwell
 - condition:
     ranges:
-      system_gpu_count:
-        gte: 2
       gpu_memory:
         gt: 80000
-
   tests:
   - perf/test_perf.py::test_perf[llama_v3.1_70b-bench-pytorch-bfloat16-maxbs:1-input_output_len:128,128-reqs:10-gpus:2]
   - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1-bench-pytorch-float16-input_output_len:128,128-gpus:2]
