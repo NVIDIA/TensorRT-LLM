@@ -757,7 +757,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         gC_mnl = cute.local_tile(mC_mnl,
                                  cute.slice_(self.mma_tiler, (None, None, 0)),
                                  (None, None, None))
-        k_block_cnt = cute.size(gA_mkl, mode=[3])
+        k_block_cnt = cutlass.Int32(cute.size(gA_mkl, mode=[3]))
 
         #
         # Partition global tensor for TiledMMA_A/B/C
@@ -1910,10 +1910,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
     @staticmethod
     def is_valid_tensor_alignment(
-        m: int,
-        n: int,
-        k: int,
-        l: int,
+        m: cutlass.Int64,
+        n: cutlass.Int64,
+        k: cutlass.Int64,
+        l: cutlass.Int64,
         ab_dtype: Type[cutlass.Numeric],
         c_dtype: Type[cutlass.Numeric],
         a_major: str,
@@ -1923,10 +1923,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         """Checks if the tensor dimensions are valid for memory alignment.
 
         Args:
-            m (int): The M dimension of the GEMM problem.
-            n (int): The N dimension of the GEMM problem.
-            k (int): The K dimension of the GEMM problem.
-            l (int): The batch dimension (L) of the GEMM problem.
+            m (cutlass.Int64): The M dimension of the GEMM problem.
+            n (cutlass.Int64): The N dimension of the GEMM problem.
+            k (cutlass.Int64): The K dimension of the GEMM problem.
+            l (cutlass.Int64): The batch dimension (L) of the GEMM problem.
             ab_dtype (Type[cutlass.Numeric]): Data type of operands A and B.
             c_dtype (Type[cutlass.Numeric]): Data type of the output tensor C.
             a_major (str): The major layout of tensor A ('k' or 'm').
@@ -1962,10 +1962,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         c_dtype: Type[cutlass.Numeric],
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
-        m: int,
-        n: int,
-        k: int,
-        l: int,
+        m: cutlass.Int64,
+        n: cutlass.Int64,
+        k: cutlass.Int64,
+        l: cutlass.Int64,
         a_major: str,
         b_major: str,
         c_major: str,
@@ -1983,10 +1983,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             mma_tiler_mn (Tuple[int, int]): The (M, N) shape of the MMA tiler.
             cluster_shape_mn (Tuple[int, int]): The (M, N) shape of the CTA
                 cluster.
-            m (int): The M dimension of the GEMM problem.
-            n (int): The N dimension of the GEMM problem.
-            k (int): The K dimension of the GEMM problem.
-            l (int): The batch dimension (L) of the GEMM problem.
+            m (cutlass.Int64): The M dimension of the GEMM problem.
+            n (cutlass.Int64): The N dimension of the GEMM problem.
+            k (cutlass.Int64): The K dimension of the GEMM problem.
+            l (cutlass.Int64): The batch dimension (L) of the GEMM problem.
             a_major (str): The major layout of tensor A ('k' or 'm').
             b_major (str): The major layout of tensor B ('k' or 'n').
             c_major (str): The major layout of tensor C ('n' or 'm').
@@ -2017,12 +2017,12 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
     @cute.jit
     def wrapper(
         self,
-        m: cutlass.Int32,
-        n: cutlass.Int32,
-        k: cutlass.Int32,
-        sf_m: cutlass.Int32,
-        sf_n: cutlass.Int32,
-        sf_k: cutlass.Int32,
+        m: cutlass.Int64,
+        n: cutlass.Int64,
+        k: cutlass.Int64,
+        sf_m: cutlass.Int64,
+        sf_n: cutlass.Int64,
+        sf_k: cutlass.Int64,
         l: cutlass.Constexpr,
         a_ptr: cute.Pointer,
         b_ptr: cute.Pointer,
@@ -2038,12 +2038,12 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         """Executes the wrapped GEMM kernel with dynamically shaped tensors.
 
         Args:
-            m (int): The M dimension of the GEMM problem.
-            n (int): The N dimension of the GEMM problem.
-            k (int): The K dimension of the GEMM problem.
-            sf_m (int): The M dimension of the scale factor tensor.
-            sf_n (int): The N dimension of the scale factor tensor.
-            sf_k (int): The K dimension of the scale factor tensor.
+            m (cutlass.Int64): The M dimension of the GEMM problem.
+            n (cutlass.Int64): The N dimension of the GEMM problem.
+            k (cutlass.Int64): The K dimension of the GEMM problem.
+            sf_m (cutlass.Int64): The M dimension of the scale factor tensor.
+            sf_n (cutlass.Int64): The N dimension of the scale factor tensor.
+            sf_k (cutlass.Int64): The K dimension of the scale factor tensor.
             l (cutlass.Constexpr): The batch dimension (L) of the GEMM problem.
             a_ptr (cute.Pointer): Pointer to the A tensor.
             b_ptr (cute.Pointer): Pointer to the B tensor.

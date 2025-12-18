@@ -1788,12 +1788,11 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("moe_backend", ["CUTLASS", "TRTLLM", "CUTEDSL"])
     def test_nvfp4(self, fp8kv, attention_dp, cuda_graph, overlap_scheduler,
                    torch_compile, mtp_nextn, moe_backend):
-        if moe_backend == "TRTLLM" and (get_sm_version() == 120
-                                        or get_sm_version() == 121):
-            pytest.skip(
-                "MOE TRTLLM backend does not support SM version 120 or 121")
-        if moe_backend == "CUTEDSL" and get_sm_version() != 100:
-            pytest.skip(f"{moe_backend} backend supports SM 100 only")
+        sm_version = get_sm_version()
+        if moe_backend == "TRTLLM" and sm_version in (120, 121):
+            pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
+        if moe_backend == "CUTEDSL" and sm_version not in (100, 103):
+            pytest.skip(f"{moe_backend} backend supports SM 100 and 103 only")
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         torch_compile_config = TorchCompileConfig(
@@ -1903,12 +1902,11 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         patch_mpi_pool_session_for_env(mocker,
                                        {"ENABLE_CONFIGURABLE_MOE": env_value})
 
-        if moe_backend == "TRTLLM" and (get_sm_version() == 120
-                                        or get_sm_version() == 121):
-            pytest.skip(
-                "MOE TRTLLM backend does not support SM version 120 or 121")
-        if moe_backend == "CUTEDSL" and get_sm_version() != 100:
-            pytest.skip(f"{moe_backend} backend supports SM 100 only")
+        sm_version = get_sm_version()
+        if moe_backend == "TRTLLM" and sm_version in (120, 121):
+            pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
+        if moe_backend == "CUTEDSL" and sm_version not in (100, 103):
+            pytest.skip(f"{moe_backend} backend supports SM 100 and 103 only")
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         # Picewise Cuda Graph cannot be enabled for nvfp4 attention dp.
@@ -2261,10 +2259,9 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                               attention_dp, enable_lm_head_tp_in_adp,
                               cuda_graph, overlap_scheduler, max_batch_size,
                               moe_backend):
-        if moe_backend == "TRTLLM" and (get_sm_version() == 120
-                                        or get_sm_version() == 121):
-            pytest.skip(
-                "MOE TRTLLM backend does not support SM version 120 or 121")
+        sm_version = get_sm_version()
+        if moe_backend == "TRTLLM" and sm_version in (120, 121):
+            pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.70)
         pytorch_config = dict(
@@ -2395,10 +2392,9 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                                     fp8kv, attention_dp, cuda_graph,
                                     overlap_scheduler, max_batch_size,
                                     moe_backend):
-        if moe_backend == "TRTLLM" and (get_sm_version() == 120
-                                        or get_sm_version() == 121):
-            pytest.skip(
-                "MOE TRTLLM backend does not support SM version 120 or 121")
+        sm_version = get_sm_version()
+        if moe_backend == "TRTLLM" and sm_version in (120, 121):
+            pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.70)
         pytorch_config = dict(
@@ -2744,10 +2740,9 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
     def test_nvfp4_multi_gpus(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                               attention_dp, cuda_graph, overlap_scheduler,
                               max_batch_size, moe_backend, skip_indexer):
-        if moe_backend == "TRTLLM" and (get_sm_version() == 120
-                                        or get_sm_version() == 121):
-            pytest.skip(
-                "MOE TRTLLM backend does not support SM version 120 or 121")
+        sm_version = get_sm_version()
+        if moe_backend == "TRTLLM" and sm_version in (120, 121):
+            pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
 
         moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
@@ -2810,10 +2805,9 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                                               mtp_nextn, fp8kv, attention_dp,
                                               cuda_graph, overlap_scheduler,
                                               max_batch_size, moe_backend):
-        if moe_backend == "TRTLLM" and (get_sm_version() == 120
-                                        or get_sm_version() == 121):
-            pytest.skip(
-                "MOE TRTLLM backend does not support SM version 120 or 121")
+        sm_version = get_sm_version()
+        if moe_backend == "TRTLLM" and sm_version in (120, 121):
+            pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
 
         moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
@@ -3003,6 +2997,35 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_blackwell
+    @pytest.mark.timeout(7200)
+    @pytest.mark.skip_less_device_memory(120000)
+    @pytest.mark.parametrize("tp_size", [
+        pytest.param(4, marks=pytest.mark.skip_less_device(4)),
+        pytest.param(8, marks=pytest.mark.skip_less_device(8)),
+    ],
+                             ids=["4gpus", "8gpus"])
+    def test_nvfp4(self, tp_size):
+        model_name = "moonshotai/Kimi-K2-Thinking"
+        model_path = f"{llm_models_root()}/Kimi-K2-Thinking-NVFP4"
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
+
+        with LLM(model_path,
+                 tensor_parallel_size=tp_size,
+                 max_batch_size=16,
+                 pipeline_parallel_size=1,
+                 moe_expert_parallel_size=1,
+                 kv_cache_config=kv_cache_config,
+                 enable_attention_dp=True,
+                 trust_remote_code=True,
+                 speculative_config=None) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+
+            task = MMLU(model_name)
+            task.evaluate(llm)
+            task = GSM8K(model_name)
             task.evaluate(llm)
 
 
@@ -3538,10 +3561,9 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
         torch_compile,
     ):
 
-        if moe_backend == "TRTLLM" and (get_sm_version() == 120
-                                        or get_sm_version() == 121):
-            pytest.skip(
-                "MOE TRTLLM backend does not support SM version 120 or 121")
+        sm_version = get_sm_version()
+        if moe_backend == "TRTLLM" and sm_version in (120, 121):
+            pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
 
         torch_compile_config = TorchCompileConfig(
             enable_fullgraph=True,
@@ -3765,10 +3787,9 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
     def test_nvfp4(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
                    overlap_scheduler, moe_backend, eagle3):
 
-        if moe_backend == "TRTLLM" and (get_sm_version() == 120
-                                        or get_sm_version() == 121):
-            pytest.skip(
-                "MOE TRTLLM backend does not support SM version 120 or 121")
+        sm_version = get_sm_version()
+        if moe_backend == "TRTLLM" and sm_version in (120, 121):
+            pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
 
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
@@ -4913,10 +4934,9 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
     def test_nvfp4_4gpus(self, tp_size, pp_size, ep_size, attention_dp,
                          cuda_graph, overlap_scheduler, moe_backend, eagle3):
 
-        if moe_backend == "TRTLLM" and (get_sm_version() == 120
-                                        or get_sm_version() == 121):
-            pytest.skip(
-                "MOE TRTLLM backend does not support SM version 120 or 121")
+        sm_version = get_sm_version()
+        if moe_backend == "TRTLLM" and sm_version in (120, 121):
+            pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
 
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
@@ -4997,3 +5017,43 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+
+class TestNemotronV3Nano(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "nvidia/Nemotron-3-Nano"
+    # Test with no thinking to save time.
+    EXTRA_EVALUATOR_KWARGS = dict(chat_template_kwargs=dict(
+        enable_thinking=False))
+
+    def test_auto_dtype(self):
+        with LLM(
+                f"{llm_models_root()}/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+                kv_cache_config=KvCacheConfig(
+                    enable_block_reuse=False,
+                    mamba_ssm_cache_dtype="float32",
+                ),
+                max_batch_size=32,
+        ) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @skip_pre_hopper
+    def test_fp8(self):
+        with LLM(
+                f"{llm_models_root()}/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8",
+                kv_cache_config=KvCacheConfig(
+                    enable_block_reuse=False,
+                    mamba_ssm_cache_dtype="float32",
+                ),
+                max_batch_size=32,
+        ) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
