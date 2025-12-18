@@ -333,8 +333,18 @@ def submit_job(config, log_dir, dry_run):
         *([arg for arg in slurm_config['extra_args'].split() if arg]),
         slurm_config['script_file'],
 
-        # Benchmark Configuration
-        '--benchmark-mode', benchmark_config['mode'],
+        # Worker configuration
+        '--num-ctx-servers', str(ctx_num),
+        '--num-gen-servers', str(gen_num),
+        '--concurrency-list', f"'{config['benchmark']['concurrency_list']}'",
+
+        # Sequence and benchmark parameters
+        '--isl', str(config['benchmark']['input_length']),
+        '--osl', str(config['benchmark']['output_length']),
+        '--multi-round', str(config['benchmark']['multi_round']),
+        '--benchmark-ratio', str(config['benchmark']['benchmark_ratio']),
+        '--streaming', str(config['benchmark']['streaming']).lower(),
+        '--use-nv-sa-benchmark', str(config['benchmark']['use_nv_sa_benchmark']).lower(),
 
         # Environment and paths
         '--trtllm-repo', env_config['trtllm_repo'],
@@ -346,6 +356,15 @@ def submit_job(config, log_dir, dry_run):
         '--build-wheel', str(env_config['build_wheel']).lower(),
         '--cuda-architectures', env_config['cuda_architectures'],
         '--trtllm-wheel-path', env_config['trtllm_wheel_path'],
+
+        # Accuracy evaluation
+        '--enable-accuracy-test', str(config['accuracy']['enable_accuracy_test']).lower(),
+        '--accuracy-model', config['accuracy']['model'],
+        '--accuracy-tasks', f"'{config['accuracy']['tasks']}'",
+        '--model-args-extra', f"'{config['accuracy']['model_args_extra']}'",
+
+        # Server environment variables
+        '--server-env-var', f"'{env_config['server_env_var']}'"
     ]
     # yapf: enable
 
