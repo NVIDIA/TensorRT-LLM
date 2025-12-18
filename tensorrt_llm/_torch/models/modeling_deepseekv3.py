@@ -1739,7 +1739,7 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                                return_context_logits=return_context_logits,
                                **kwargs)
 
-    def load_weights(self, weights: Dict, weight_mapper=None):
+    def load_weights(self, weights: Dict, weight_mapper=None, params_map=None):
         weight_loader = DeepseekV3WeightLoader(self)
         # TODO: remove when DeepSeek is integrated with _load_weights_impl_v2
         if weight_mapper is not None:

@@ -482,7 +482,7 @@ class MistralCommonInputProcessor(Mistral3InputProcessor):
                 return MistralTokenizer.from_pretrained(model_path)
 
             except ValueError:
-                logger.info(
+                logger.warning(
                     f"Could not load mistral-common tokenizer from {model_path}, falling back to HuggingFace"
                 )
 
@@ -597,7 +597,7 @@ class Mistral3VLM(PreTrainedModel):
 
         llm_model_config.pretrained_config.gate_cls = "Mistral3Gate"
 
-        logger.info(f"Loaded llm model config: {llm_model_config}")
+        logger.debug(f"Loaded llm model config: {llm_model_config}")
 
         self.llm = llm_class(llm_model_config)
         self.model_config.extra_attrs.update(llm_model_config.extra_attrs)
@@ -609,7 +609,7 @@ class Mistral3VLM(PreTrainedModel):
                                                          attn_backend="VANILLA",
                                                          quant_config=None)
 
-        logger.info(f"Loaded vision model config: {vision_model_config}")
+        logger.debug(f"Loaded vision model config: {vision_model_config}")
 
         self._vision_tower = modeling_pixtral.PixtralVisionModel(
             vision_model_config)
