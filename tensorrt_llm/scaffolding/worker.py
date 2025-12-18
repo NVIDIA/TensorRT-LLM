@@ -7,9 +7,6 @@ from enum import Enum
 from typing import Callable, List, Optional
 
 import openai
-from enum import Enum
-import requests
-from enum import Enum
 import requests
 from enum import Enum
 import requests
@@ -151,8 +148,6 @@ class OpenaiWorker(Worker):
         add_param_if_not_none(params, "temperature", [task.temperature])
         add_param_if_not_none(params, "top_p", [task.top_p])
         add_param_if_not_none(params, "user", [task.user])
-        add_param_if_not_none(params, "reasoning_effort",
-                              [task.reasoning_effort])
 
         # Override parameters for deterministic inference
         if is_deterministic_mode():
@@ -176,6 +171,7 @@ class OpenaiWorker(Worker):
         task.output_tokens = response.choices[0].token_ids
         task.finish_reason = response.choices[0].finish_reason
         task.logprobs = response.choices[0].logprobs
+        task.perf_metrics = response.perf_metrics
 
     async def generation_handler(self, task: GenerationTask) -> TaskStatus:
         params = self.convert_task_params(task)
@@ -202,6 +198,7 @@ class OpenaiWorker(Worker):
         try:
             response = await self.async_client.chat.completions.create(**params)
             task.finish_reason = response.choices[0].finish_reason
+            task.perf_metrics = response.perf_metrics
             content = response.choices[0].message.content
             reasoning = response.choices[0].message.reasoning
             reasoning_content = response.choices[0].message.reasoning_content
