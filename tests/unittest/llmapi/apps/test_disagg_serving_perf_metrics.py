@@ -11,6 +11,7 @@ from test_common.perf_metrics_utils import (
 )
 
 from tensorrt_llm._utils import get_free_ports
+from tests.unittest.utils.llm_data import llm_models_root
 
 from ..test_llm import get_model_path
 from .openai_server import RemoteDisaggOpenAIServer, RemoteOpenAIServer
@@ -38,7 +39,10 @@ def gen_port(test_ports: list[int]):
 
 @pytest.fixture
 def model_name():
-    return "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    model_path = os.path.join(llm_models_root(),
+                              "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+    assert os.path.exists(model_path), f"Model path {model_path} does not exist"
+    return model_path
 
 
 @pytest.fixture
