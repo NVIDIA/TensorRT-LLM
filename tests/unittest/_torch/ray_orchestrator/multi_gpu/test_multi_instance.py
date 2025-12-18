@@ -31,20 +31,22 @@ class TRTLLMInstance:
     async def init_llm(self):
         await self.llm.setup_async()
 
+    def shutdown_llm(self):
+        self.llm.shutdown()
+        self.llm = None
+
 
 @pytest.mark.gpu4
 @pytest.mark.parametrize(
     "tp_size, num_instances", [(2, 2), (1, 4)], ids=["tp2_instances2", "tp1_instances4"]
 )
-def test_multi_instance(monkeypatch, tp_size, num_instances):
+def test_multi_instance(setup_ray_cluster, tp_size, num_instances):
     """Test that multiple TRTLLMInstance actors can be started without port conflicts.
 
     This test guards against port conflict failures when launching multiple
     TensorRT-LLM instances concurrently. It runs multiple iterations to ensure
     reliable instance creation and teardown.
     """
-    monkeypatch.setenv("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", "1")
-
     num_gpus = tp_size * num_instances
     available_gpus = torch.cuda.device_count()
     if num_gpus > 8:
@@ -55,13 +57,20 @@ def test_multi_instance(monkeypatch, tp_size, num_instances):
         raise ValueError(
             f"Number of GPUs ({available_gpus}) is less than number of GPUs required ({num_gpus})."
         )
+    runtime_env = ray.runtime_env.RuntimeEnv()
+    runtime_env["env_vars"] = os.environ.copy()
+    runtime_env["env_vars"].update(
+        {
+            "TLLM_RAY_FORCE_LOCAL_CLUSTER": "0",
+        }
+    )
 
     # Run multiple iterations to catch intermittent port conflict issues
-    excution_times = 5
-    for i in range(excution_times):
+    execution_times = 5
+    for iteration in range(execution_times):
         pg = None
+        llm_instances = []
         try:
-            ray.init(address="local")
             pg = placement_group(
                 [{"GPU": 1, "CPU": 2} for _ in range(num_gpus)], strategy="STRICT_PACK"
             )
@@ -73,7 +82,6 @@ def test_multi_instance(monkeypatch, tp_size, num_instances):
                 [list(range(i * tp_size, (i + 1) * tp_size))] for i in range(num_instances)
             ]
 
-            llm_instances = []
             for i in range(num_instances):
                 llm_instances.append(
                     TRTLLMInstance.options(
@@ -83,6 +91,7 @@ def test_multi_instance(monkeypatch, tp_size, num_instances):
                             placement_group=pg,
                             placement_group_capture_child_tasks=True,
                         ),
+                        runtime_env=runtime_env,
                     ).remote(
                         async_llm_kwargs={
                             "model": os.path.join(
@@ -102,6 +111,8 @@ def test_multi_instance(monkeypatch, tp_size, num_instances):
             ray.get([llm.__ray_ready__.remote() for llm in llm_instances])
             ray.get([llm.init_llm.remote() for llm in llm_instances])
         finally:
+            # Clean up actors before removing placement group
+            for llm in llm_instances:
+                ray.get(llm.shutdown_llm.remote())
             if pg is not None:
                 remove_placement_group(pg)
-            ray.shutdown()
