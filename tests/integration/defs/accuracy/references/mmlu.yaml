@@ -346,3 +346,8 @@ mistralai/Mistral-Nemo-12b-Base:
     accuracy: 69.66
 mistral/Mistral-Large-3-675B:
   - accuracy: 87.54
+nvidia/Nemotron-3-Nano:
+  - accuracy: 73.85
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 74.35
