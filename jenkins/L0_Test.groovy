@@ -1538,16 +1538,14 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     server: 10.20.162.212
                     path: /vol/scratch26/scratch.trt_llm_data
         """
-    } else {
-        if (type.equals("rtx-pro-6000")) {
-            // rtx-pro-6000 nodes are located in PDX DC, we use the FlexCache to speed up the data access.
-            llmModelVolume = """
-                    - name: scratch-trt-llm-data
-                    nfs:
-                        server: ipp6-cdot01-fcache01
-                        path: /vol/fcscratch1/scratch.michaeln_blossom
+    } else if (type.equals("rtx-pro-6000")) {
+        // rtx-pro-6000 nodes are located in PDX DC, we use the FlexCache to speed up the data access.
+        llmModelVolume = """
+                - name: scratch-trt-llm-data
+                  nfs:
+                    server: ipp6-cdot01-fcache01
+                    path: /vol/fcscratch1/scratch.michaeln_blossom
             """
-        }
     }
 
     def podConfig = [
