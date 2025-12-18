@@ -111,10 +111,10 @@ public:
             requestId, llmRequest, pinOnRelease);
     }
 
-    std::optional<tbk::KVCacheBlock::IdType> storeBlocksForReuse(tb::LlmRequest::RequestIdType requestId,
+    std::vector<tbk::KVCacheBlock::IdType> storeBlocksForReuse(tb::LlmRequest::RequestIdType requestId,
         tensorrt_llm::common::OptionalRef<tb::LlmRequest const> llmRequest, bool pinBlocks) override
     {
-        PYBIND11_OVERLOAD_PURE(std::optional<tbk::KVCacheBlock::IdType>, tbk::BaseKVCacheManager, storeBlocksForReuse,
+        PYBIND11_OVERLOAD_PURE(std::vector<tbk::KVCacheBlock::IdType>, tbk::BaseKVCacheManager, storeBlocksForReuse,
             requestId, llmRequest, pinBlocks);
     }
 
@@ -367,7 +367,22 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
             py::call_guard<py::gil_scoped_release>())
         .def("add_token", &BaseKVCacheManager::addToken, py::call_guard<py::gil_scoped_release>())
         .def("add_sequence", &BaseKVCacheManager::addSequence, py::call_guard<py::gil_scoped_release>())
-        .def("remove_sequence", &BaseKVCacheManager::removeSequence, py::call_guard<py::gil_scoped_release>())
+        .def(
+            "remove_sequence",
+            [](tbk::BaseKVCacheManager& self, tb::LlmRequest::RequestIdType requestId, tb::LlmRequest const* llmRequest,
+                bool pinOnRelease)
+            {
+                if (llmRequest != nullptr)
+                {
+                    return self.removeSequence(requestId, *llmRequest, pinOnRelease);
+                }
+                else
+                {
+                    return self.removeSequence(requestId, std::nullopt, pinOnRelease);
+                }
+            },
+            py::arg("request_id"), py::arg("llm_request") = nullptr, py::arg("pin_on_release") = false,
+            py::call_guard<py::gil_scoped_release>())
         .def("pin_blocks", &BaseKVCacheManager::pinBlocks, py::call_guard<py::gil_scoped_release>())
         .def("scheduling_remove_sequence", &BaseKVCacheManager::schedulingRemoveSequence,
             py::call_guard<py::gil_scoped_release>())

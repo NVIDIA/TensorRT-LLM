@@ -685,8 +685,13 @@ class KVCacheManager(BaseResourceManager):
                 None,
             )
 
-    def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
-        return self.impl.remove_sequence(request.py_request_id, request,
+    def free_resources(self,
+                       request: LlmRequest,
+                       pin_on_release: bool = False,
+                       store_blocks_for_reuse: bool = True):
+        # When store_blocks_for_reuse is False, pass None to prevent block storage
+        llm_request = request if store_blocks_for_reuse else None
+        return self.impl.remove_sequence(request.py_request_id, llm_request,
                                          pin_on_release)
 
     def store_blocks_for_reuse(self,
@@ -1430,10 +1435,17 @@ class ResourceManager:
                 else:
                     resource_manager.update_resources(scheduled_batch)
 
-    def free_resources(self, request: LlmRequest):
-        for _, resource_manager in reversed(self.resource_managers.items()):
+    def free_resources(self,
+                       request: LlmRequest,
+                       store_blocks_for_reuse: bool = True):
+        for resource_type, resource_manager in reversed(
+                self.resource_managers.items()):
             if hasattr(resource_manager, "free_resources"):
-                resource_manager.free_resources(request)
+                if resource_type == ResourceManagerType.KV_CACHE_MANAGER:
+                    resource_manager.free_resources(
+                        request, store_blocks_for_reuse=store_blocks_for_reuse)
+                else:
+                    resource_manager.free_resources(request)
 
     def reorder_pipeline(self,
                          resource_manager_list: list[ResourceManagerType]):
