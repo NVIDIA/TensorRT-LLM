@@ -308,8 +308,10 @@ class KvCacheCreator:
         estimating_kv_cache = False
         if 'cp_type' not in self._mapping.cp_config:
             estimating_kv_cache = True
-            self._kv_cache_config.max_tokens = self._get_token_num_for_estimation(
-            )
+            estimate_max_tokens = self._get_token_num_for_estimation()
+            self._kv_cache_config.max_tokens = min(
+                estimate_max_tokens, self._kv_cache_config.max_tokens
+            ) if self._kv_cache_config.max_tokens is not None else estimate_max_tokens
         model_config = self._model_engine.model.model_config
         if model_config.attn_backend == "VANILLA":
             logger.info(
