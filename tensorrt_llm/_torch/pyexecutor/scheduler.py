@@ -619,33 +619,28 @@ class PyCapacityScheduler:
             is_disagg_init = (
                 req_state == LlmRequestState.DISAGG_GENERATION_INIT)
 
-            # Filter valid states (Allow Disagg Init)
             if not is_disagg_init and (
                     req_state.value < self.no_schedule_until_state.value
                     or req_state.value >= self.no_schedule_after_state.value):
                 continue
 
-            # Capacity Check
             if len(scheduled_requests) >= self.max_num_requests:
+                # Still sort into correct pending list for potential future logic
                 if is_disagg_init:
                     pending_disagg_requests.append(request)
                 else:
                     pending_context_requests.append(request)
                 continue
 
-            # Prioritize Running Requests (Generation)
             if (req_state == LlmRequestState.GENERATION_IN_PROGRESS
                     or req_state == LlmRequestState.GENERATION_TO_COMPLETE):
 
                 needed = self.kv_cache_manager_cpp.get_remaining_blocks_to_completion(
                     request, self.default_window_size)
 
-                if needed > available_blocks:
-                    # If running req doesn't fit, skip it (effectively pause)
-                    pending_context_requests.append(request)
-                    continue
-
                 scheduled_requests.append(request)
+                # Decrement available. It is allowed to go negative (temporarily)
+                # to represent over-subscription, which stops new requests in Pass 2.
                 available_blocks -= needed
             else:
                 # Non-running requests go to pending
@@ -662,8 +657,6 @@ class PyCapacityScheduler:
             if len(scheduled_requests) >= self.max_num_requests:
                 break
 
-            # Note: For Disagg Init, get_remaining_blocks_to_completion calculates
-            # full prompt + generation needs, which is what we want.
             needed_blocks = self.kv_cache_manager_cpp.get_remaining_blocks_to_completion(
                 request, self.default_window_size)
 
@@ -671,7 +664,7 @@ class PyCapacityScheduler:
                 scheduled_requests.append(request)
                 available_blocks -= needed_blocks
             else:
-                # Head-of-line blocking (Standard NoEvict behavior)
+                # Head-of-line blocking
                 break
 
         return self._classify_output(active_requests, scheduled_requests, [])
