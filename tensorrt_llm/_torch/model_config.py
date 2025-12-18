@@ -329,10 +329,8 @@ class ModelConfig(Generic[TConfig]):
                     128), "FP8_BLOCK_SCALES only supports block_size=(128,128)"
                 quant_config.group_size = block_size[0]
 
-            # DeepSeek V3 FP8 per tensor hack
             elif hf_quant_config.get("activation_scheme", None) == "static":
-                logger.debug(f"Expanding weight scale to mimic DS FP8 recipe")
-                quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
+                quant_config.quant_algo = QuantAlgo.FP8
                 if moe_backend == 'TRTLLM':
                     # TODO: This is a hack. Remove after fp8 bmm is integrated.
                     quant_config.exclude_modules = [
@@ -340,9 +338,6 @@ class ModelConfig(Generic[TConfig]):
                     ]
                 else:
                     quant_config.exclude_modules = ["*eh_proj"]
-
-                block_size = (128, 128)
-                quant_config.group_size = block_size[0]
 
         # MXFP4 checkpoints.
         elif hf_quant_config.get("quant_method") == "mxfp4":

@@ -411,10 +411,11 @@ class ModelLoader:
                     f"Found quantization_config field in {hf_config_path}, pre-quantized checkpoint is used."
                 )
                 # DeepSeek V3 FP8 ckpt
-                if hf_quant_config.get(
-                        "quant_method") == "fp8" and hf_quant_config.get(
-                            "weight_block_size"):
-                    quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
+                if hf_quant_config.get("quant_method") == "fp8":
+                    if hf_quant_config.get("weight_block_size"):
+                        quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
+                    elif hf_quant_config.get("activation_scheme") == "static":
+                        quant_config.quant_algo = QuantAlgo.FP8
                     quant_config.exclude_modules = ["*eh_proj"]
                 elif hf_quant_config.get("quant_method") == "mxfp4":
                     from .._torch.model_config import ModelConfig

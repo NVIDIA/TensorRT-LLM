@@ -518,13 +518,21 @@ class FP8QDQLinearMethod(LinearMethodBase):
                 v_scale.append(w["v_scale"][...].reshape([]))
         return k_scale, v_scale
 
+    def _get_scale_name(self, weights: List[Dict]):
+        # `weight_scale_inv` for Mistral HF models
+        scale_name = "weight_scale"
+        if scale_name not in weights[0]:
+            scale_name = "weight_scale_inv"
+        return scale_name
+
     def load_weight_scales(self, weights: List[Dict]):
         input_scale, weight_scale = [], []
+        scale_name = self._get_scale_name(weights)
         for w in weights:
             if "input_scale" in w:
                 input_scale.append(w["input_scale"][...].reshape([]))
-            if "weight_scale" in w:
-                weight_scale.append(w["weight_scale"][...].reshape([]))
+            if scale_name in w:
+                weight_scale.append(w[scale_name][...].reshape([]))
         return input_scale, weight_scale
 
     def load_weights_vanilla(self, module: Linear, weights: List[Dict]) -> None:

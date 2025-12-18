@@ -839,7 +839,6 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
         raise ValueError("model must have a config attribute")
 
     if params_map is not None:
-        print(f"Params map is not None")
         weights = rename_weights_with_regex(params_map, weights)
         logger.info(f"Renamed weights with params_map: {params_map}")
 

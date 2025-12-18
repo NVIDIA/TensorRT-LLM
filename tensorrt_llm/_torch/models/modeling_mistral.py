@@ -43,6 +43,7 @@ from tensorrt_llm.inputs import (BaseMultimodalDummyInputsBuilder,
                                  MultimodalPlaceholderPlacement, TextPrompt,
                                  register_input_processor)
 from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.utils import encode_base64_image
 from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.llmapi.tokenizer import MistralTokenizer
 from tensorrt_llm.logger import logger
@@ -65,16 +66,28 @@ class MistralAttention(Attention):
         layer_idx: Optional[int] = None,
     ):
         config = model_config.pretrained_config
+        rope_params = RopeParams.from_config(config)
+        rope_params_section = getattr(config, "rope_scaling") or getattr(
+            config, "rope_parameters")
+        rope_type = rope_params_section.get("rope_type")
+        if rope_type == "yarn":
+            pos_embd_params = PositionalEmbeddingParams(
+                type=PositionEmbeddingType.yarn,
+                rope=rope_params,
+                is_neox=False)
+        else:
+            pos_embd_params = PositionalEmbeddingParams(
+                type=PositionEmbeddingType.rope_gpt_neox,
+                rope=rope_params,
+            )
+
         super().__init__(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
             num_key_value_heads=config.num_key_value_heads,
             max_position_embeddings=config.max_position_embeddings,
             bias=False,
-            pos_embd_params=PositionalEmbeddingParams(
-                type=PositionEmbeddingType.rope_gpt_neox,
-                rope=RopeParams.from_config(config),
-            ),
+            pos_embd_params=pos_embd_params,
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             config=model_config,
@@ -273,18 +286,18 @@ class MistralCommonImageProcessor:
         }
 
     def get_num_tokens_per_image(self, image_sizes):
-        # FIXME avoid double loading with custom loader
         h, w = image_sizes
         ncols, nrows = self.image_processor._image_to_num_tokens(
             Image.new("RGB", (w, h)))
         return ncols * nrows + nrows
 
-    def __call__(self, text, images, media, **kwargs):
-        assert media is not None
-        if isinstance(media, str):
-            media = [media]
-
-        mm_items = [{"type": "image_url", "image_url": url} for url in media]
+    def __call__(self, text, images, **kwargs):
+        mm_items = []
+        if images:
+            mm_items = [{
+                "type": "image",
+                "base64": encode_base64_image(image)
+            } for image in images]
 
         conversation = [{
             "role": "user",
@@ -299,10 +312,17 @@ class MistralCommonImageProcessor:
 
         processed = {
             "input_ids": encoded.input_ids,
-            "pixel_values": encoded.pixel_values.to(self.dtype),
-            "attention_mask": encoded.attention_mask,
-            "image_sizes": torch.tensor([encoded.pixel_values.shape[2:]])
         }
+        # text-only mode for VLM
+        if "pixel_values" in encoded:
+            processed.update({
+                "pixel_values":
+                encoded.pixel_values.to(self.dtype),
+                "attention_mask":
+                encoded.attention_mask,
+                "image_sizes":
+                torch.tensor([encoded.pixel_values.shape[2:]])
+            })
         return processed
 
 
@@ -374,7 +394,6 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         images = inputs.get("multi_modal_data", {}).get("image")
-        mm_processor_kwargs = inputs.get("mm_processor_kwargs", {})
         do_rescale = getattr(self.processor.image_processor, "do_rescale",
                              False)
         if images is not None and isinstance(images[0], torch.Tensor):
@@ -384,8 +403,7 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
 
         processed = self.processor(text=inputs["prompt"],
                                    images=images,
-                                   do_rescale=do_rescale,
-                                   **mm_processor_kwargs)
+                                   do_rescale=do_rescale)
         input_ids = processed.pop("input_ids").tolist()[0]
         # Remaining in `processed`:
         # * "attention_mask": [B, num_input_tokens]
@@ -459,7 +477,7 @@ class MistralCommonInputProcessor(Mistral3InputProcessor):
     def load_tokenizer(model_path: str,
                        config: PretrainedConfig,
                        checkpoint_format: Optional[str] = "mistral_large_3"):
-        if checkpoint_format == "mistral_large_3":
+        if checkpoint_format in ("mistral", "mistral_large_3"):
             try:
                 return MistralTokenizer.from_pretrained(model_path)
 
@@ -578,6 +596,9 @@ class Mistral3VLM(PreTrainedModel):
             llm_class = DeepseekV3ForCausalLM
 
         llm_model_config.pretrained_config.gate_cls = "Mistral3Gate"
+
+        logger.info(f"Loaded llm model config: {llm_model_config}")
+
         self.llm = llm_class(llm_model_config)
         self.model_config.extra_attrs.update(llm_model_config.extra_attrs)
 
@@ -587,6 +608,8 @@ class Mistral3VLM(PreTrainedModel):
                                                          "vision_config",
                                                          attn_backend="VANILLA",
                                                          quant_config=None)
+
+        logger.info(f"Loaded vision model config: {vision_model_config}")
 
         self._vision_tower = modeling_pixtral.PixtralVisionModel(
             vision_model_config)
@@ -604,15 +627,17 @@ class Mistral3VLM(PreTrainedModel):
         self.model_config.pretrained_config = self.llm.config
 
     def load_weights(self, weights: Dict, weight_mapper=None, *args, **kwargs):
-        vit_params_map = None
+        vit_params_map, llm_params_map = None, None
         if weight_mapper:
             if isinstance(weight_mapper, MistralWeightMapper):
                 vit_params_map = weight_mapper.pixtral_mapping
+                llm_params_map = weight_mapper.mistral_llm_mapping
 
         llm_weights = filter_weights(weights=weights, prefix="language_model")
         logger.debug(f"Loading weights for {type(self.llm)}")
         self.llm.load_weights(llm_weights,
                               weight_mapper=weight_mapper,
+                              params_map=llm_params_map,
                               *args,
                               **kwargs)
         logger.debug(f"Successfully loaded weights for {type(self.llm)}")
@@ -707,7 +732,6 @@ class Mistral3VLM(PreTrainedModel):
         sub_model_config: ModelConfig[MistralConfig] = dataclasses.replace(
             model_config,
             pretrained_config=pretrained_config,
-            # attention_backend=preferred_backend, # TODO FIXME
             **changes,
         )
         if name == "text_config":

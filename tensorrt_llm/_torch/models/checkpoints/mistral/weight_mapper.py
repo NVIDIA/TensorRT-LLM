@@ -10,9 +10,9 @@ class MistralWeightMapper(HfWeightMapper):
     def __init__(self):
         super().__init__()
 
-        self._callbacks.append(self._permute_qk)
+        self._callbacks = [self._permute_qk] + self._callbacks
 
-        # TODO move to registry
+        # TODO weight mapping registry
         self.pixtral_mapping = {
             "wq": "q_proj",
             "wk": "k_proj",
@@ -29,7 +29,7 @@ class MistralWeightMapper(HfWeightMapper):
             "layers": "model.layers",
             "attention": "self_attn",
             "qscale_act": "input_scale",
-            "qscale_weight": "weight_scale_inv",
+            "qscale_weight": "weight_scale",
             "kv_fake_quantizer.qscale_act": "kv_scale",
             "q_fake_quantizer.qscale_act": "attn.q_scale",
             "k_fake_quantizer.qscale_act": "k_scale",
@@ -76,7 +76,10 @@ class MistralWeightMapper(HfWeightMapper):
         # https://github.com/vllm-project/vllm/blob/883b42896a9ed9791750d721fad26005b7569eba/vllm/model_executor/models/llama.py#L657
 
         processed_weights = {}
-        config = self.config.pretrained_config
+        if self.config.pretrained_config.architectures[0] == "PixtralForConditionalGeneration":
+            config = self.config.pretrained_config.text_config
+        else:
+            config = self.config.pretrained_config
 
         def permute(w, n_heads: int, attn_out: int):
             attn_in = config.head_dim * n_heads
@@ -95,11 +98,14 @@ class MistralWeightMapper(HfWeightMapper):
             n_heads = (
                 config.num_key_value_heads if new_name == "k_proj" else config.num_attention_heads
             )
-
+            processed_weights = weights
             processed_weights["weight"] = permute(weights["weight"], n_heads, config.hidden_size)
-
-            if "qscale_weight" in weights and weights["qscale_weight"].numel() > 1:
-                processed_weights["qscale_weight"] = permute(weights["qscale_weight"], n_heads, 1)
+            scale_name = "weight_scale" if "weight_scale" in weights else "weight_scale_inv"
+            if scale_name in weights:
+                if weights[scale_name].numel() > 1:
+                    processed_weights[scale_name] = permute(weights[scale_name], n_heads, 1)
+                else:
+                    processed_weights[scale_name] = weights[scale_name]
 
             return processed_weights
 
@@ -115,6 +121,7 @@ class MistralLarge3WeightMapper(MistralWeightMapper):
 
         self.mistral_llm_mapping.update(
             {
+                "qscale_weight": "weight_scale_inv",
                 "wkv_a_with_mqa": "kv_a_proj_with_mqa",
                 "wkv_b": "kv_b_proj",
                 "wq_a": "q_a_proj",

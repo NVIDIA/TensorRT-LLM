@@ -621,7 +621,6 @@ def default_multimodal_input_loader(
         prompts: List[str],
         processor: Optional[BaseMultimodalInputProcessor] = None,
         media: Optional[Union[List[str], List[List[str]]]] = None,
-        keep_source_media: bool = False,
         image_data_format: str = "pt",
         num_frames: int = 8,
         mm_embeddings: Optional[Union[List[torch.Tensor],

@@ -65,10 +65,10 @@ class MistralCheckpointLoader(HfCheckpointLoader):
                 weights[key] = 1.0 / weights[key]
 
     def load_weights(self, checkpoint_dir: str, **kwargs):
-        weights = super().weight_loader.load_weights(checkpoint_dir, **kwargs)
+        weights = super().weight_loader.load_weights(
+            checkpoint_dir, use_consolidated=True, **kwargs
+        )
         weights = self.preprocess_weights(weights)
-        # FIXME mimic DS fp8 till per tensor supported
-        self.broadcast_per_tensor_scales(weights)
         self.reverse_nvfp4_global_scales(weights)
         return weights
 

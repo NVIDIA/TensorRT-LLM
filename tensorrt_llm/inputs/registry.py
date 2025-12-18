@@ -598,7 +598,9 @@ def create_input_processor(
             from tensorrt_llm._torch.models.modeling_mistral import \
                 MistralCommonInputProcessor
             tokenizer = MistralCommonInputProcessor.load_tokenizer(
-                model_path_or_dir, config=None)
+                model_path_or_dir,
+                config=None,
+                checkpoint_format=checkpoint_format)
 
     else:
         logger.debug(

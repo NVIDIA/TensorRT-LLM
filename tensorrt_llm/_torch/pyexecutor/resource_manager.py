@@ -697,7 +697,8 @@ class KVCacheManager(BaseResourceManager):
                 num_key_value_heads)
 
         # get head dim
-        mla = hasattr(config, "kv_lora_rank")
+        mla = hasattr(config,
+                      "kv_lora_rank") and config.kv_lora_rank is not None
         if mla:
             head_dim = config.kv_lora_rank + config.qk_rope_head_dim
             kv_factor = 1

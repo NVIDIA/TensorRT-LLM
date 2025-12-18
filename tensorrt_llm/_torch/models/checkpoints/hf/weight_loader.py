@@ -26,13 +26,16 @@ class HfWeightLoader(BaseWeightLoader):
     Loads weights from SafeTensors/bin/pth files.
     """
 
-    def load_weights(self, checkpoint_dir: str) -> dict[str, Any]:
+    def load_weights(self,
+                     checkpoint_dir: str,
+                     use_consolidated: bool = False) -> dict[str, Any]:
         weight_files = glob.glob(f"{checkpoint_dir}/*.safetensors")
         # Some model checkpoint directories contain not only the sharded safetensors, but one
-        # consolidated tensor. In the presence of both, we favor the former, as there really is no need
-        # to prefetch the (usually) ridiculously large consolidated tensor into memory in such a case.
+        # consolidated tensor. In the presence of both, unless specified explicitly, we favor the former,
+        # as there really is no need to prefetch the (usually) ridiculously large consolidated tensor into memory in such a case.
         filtered_weight_files = [
-            x for x in weight_files if "consolidated" not in os.path.split(x)[1]
+            x for x in weight_files
+            if ("consolidated" in os.path.split(x)[1] == use_consolidated)
         ]
         if len(filtered_weight_files) > 0:
             weight_files = filtered_weight_files
