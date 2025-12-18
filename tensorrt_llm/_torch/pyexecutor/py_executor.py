@@ -2327,8 +2327,9 @@ class PyExecutor:
         requests_in_transfer = self.async_transfer_manager.requests_in_transfer(
         )
 
-        for request in requests_in_transfer.values():
-            if request.py_kv_transfer_timed_out and request.py_request_id not in completed_req_ids:
+        for request_id in list(requests_in_transfer.keys()):
+            request = requests_in_transfer[request_id]
+            if request.py_kv_transfer_timed_out and request_id not in completed_req_ids:
                 is_cancelled = self.kv_cache_transceiver.cancel_request(request)
                 # If cancel is successful, mark as complete so it can be cleaned up
                 # Otherwise, try at next iteration
