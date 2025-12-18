@@ -2411,11 +2411,15 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         ]
 
     def _request_indices_with_stop_words(self, requests: list[LlmRequest]) -> torch.Tensor:
-        return [
-            ridx
-            for ridx, r in enumerate(requests)
-            if (r.py_stop_words_list is not None and len(r.py_stop_words_list[0]) > 0)
-        ]
+        return torch.tensor(
+            [
+                ridx
+                for ridx, r in enumerate(requests)
+                if (r.py_stop_words_list is not None and len(r.py_stop_words_list[0]) > 0)
+            ],
+            dtype=torch.int32,
+            pin_memory=True,
+        ).to(device="cuda", non_blocking=True)
 
     @nvtx_range("_write_finish_reasons")
     def _write_finish_reasons(
@@ -2619,12 +2623,11 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
 
         padded_tokens = self._padded_old_tokens(requests, tokens, predecessor_beams)
 
-        def request_stop_words(request: LlmRequest, new_tokens: torch.Tensor):
+        for request_idx, request in enumerate(requests):
             swl, ends = request.py_stop_words_list
             if -1 in ends:
                 ends = ends[: ends.index(-1)]
             lens = np.diff(ends, prepend=0)
-            lens_device = torch.tensor(list(lens), pin_memory=True).to("cuda", non_blocking=True)
             max_len = np.max(lens)
 
             words = torch.zeros(len(lens), max_len, dtype=torch.int32, pin_memory=True)
@@ -2633,20 +2636,16 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
             words_device = words.to("cuda", non_blocking=True)
 
             draft_token_length = get_draft_token_length(request)
-            for step_idx in range(draft_token_length + 1):
-                size_per_step = new_tokens.size(0) - draft_token_length + step_idx
-                for word, L in zip(words_device, lens_device):
-                    truncated_seq = new_tokens[size_per_step - L : size_per_step]
-                    if torch.equal(truncated_seq, word[:L]):
-                        # We don't care about subsequent steps because we already found a stop word match
-                        return step_idx
-            return None
 
-        for request_idx, request in enumerate(requests):
             for beam_idx in range(self.max_beam_width):
-                step = request_stop_words(request, padded_tokens[request_idx, beam_idx])
-                if step is not None:
-                    per_step[step, request_idx, beam_idx] = True
+                new_tokens = padded_tokens[request_idx, beam_idx]
+                for step_idx in range(draft_token_length + 1):
+                    size_per_step = new_tokens.size(0) - draft_token_length + step_idx
+                    for word, L in zip(words_device, lens):
+                        truncated_seq = new_tokens[size_per_step - L : size_per_step]
+                        match = (truncated_seq == word[:L]).all()
+                        per_step[step_idx, request_idx, beam_idx] = match
+
         return per_step
 
     @nvtx_range("_process_requests")
