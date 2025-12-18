@@ -155,16 +155,6 @@ def worker_main(
 
     mpi_comm().barrier()
 
-    if mpi_rank() == 0 and "VSCODE_DEBUGPY_ADAPTER_ENDPOINTS" in os.environ:
-        # cf. https://github.com/microsoft/vscode-python-debugger/blob/f64b217c4d2445f7f55255b102de1d94c19cf450/bundled/scripts/noConfigScripts/debugpy#L4
-        os.environ["DEBUGPY_ADAPTER_ENDPOINTS"] = os.environ[
-            "VSCODE_DEBUGPY_ADAPTER_ENDPOINTS"]
-        # TODO: is listen() needed?
-        # TODO: Could use 'env' in MpiPoolExecutor instead (and if-env-contains-vscode...)
-        import debugpy
-        debugpy.listen(0)
-        debugpy.wait_for_client()
-
     if llm_args is not None and llm_args.env_overrides:
         # this is needed because MPI_Init seems to cache the env at import time.
         # The cached env snapshot is used to spawn workers.
