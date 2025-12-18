@@ -15,9 +15,12 @@
  */
 
 #pragma once
+#include "tensorrt_llm/common/config.h"
 #include <cstdint>
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
 
 struct WarpSpecializedCounters
@@ -43,4 +46,6 @@ enum class SCALE_TYPE
 template <typename T>
 void invokeWSLayerNorm(WarpSpecializedParam<T> param, bool use_rms_norm, int ctas);
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

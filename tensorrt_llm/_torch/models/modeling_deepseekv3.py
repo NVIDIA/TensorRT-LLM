@@ -518,7 +518,7 @@ class DeepseekV3Linear(Linear):
                      layer_idx: Optional[int] | None = None):
         num_tokens = input.shape[0]
         if (not self.has_any_quant and 1 <= num_tokens <= 16
-                and get_sm_version() != 120):
+                and get_sm_version() not in [120, 121]):
             output = torch.ops.trtllm.dsv3_fused_a_gemm_op(
                 input, self.weight.t(), bias, None)
         else:
@@ -746,17 +746,19 @@ class Deepseekv3MoE(nn.Module):
         config = model_config.pretrained_config
         self.top_k = top_k
         self.use_dp = model_config.mapping.enable_attention_dp
-        self.gate = DeepseekV3Gate(
-            hidden_size,
-            num_experts,
-            top_k=top_k,
-            n_group=config.n_group,
-            topk_group=config.topk_group,
-            routed_scaling_factor=config.routed_scaling_factor,
-            dtype=dtype,
-            fuse_routing_kernel=True,
-            apply_routing=False,
-            moe_backend=model_config.moe_backend)
+        gate_cls = DeepseekV3Gate
+        if hasattr(model_config.pretrained_config, "gate_cls"):
+            gate_cls = model_config.pretrained_config.gate_cls
+        self.gate = gate_cls(hidden_size,
+                             num_experts,
+                             top_k=top_k,
+                             n_group=config.n_group,
+                             topk_group=config.topk_group,
+                             routed_scaling_factor=config.routed_scaling_factor,
+                             dtype=dtype,
+                             fuse_routing_kernel=True,
+                             apply_routing=False,
+                             moe_backend=model_config.moe_backend)
         self.experts = create_moe(
             num_experts=num_experts,
             routing_method=self.gate.routing_method,

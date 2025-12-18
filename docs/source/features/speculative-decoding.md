@@ -38,7 +38,7 @@ Draft/target is the simplest form of speculative decoding. In this approach, an 
 from tensorrt_llm.llmapi import DraftTargetDecodingConfig
 
 speculative_config = DraftTargetDecodingConfig(
-    max_draft_len=3, speculative_model="/path/to/draft_model")
+    max_draft_len=3, speculative_model_dir="/path/to/draft_model")
 
 llm = LLM("/path/to/target_model", speculative_config=speculative_config, disable_overlap_scheduler=True)
 ```
@@ -59,7 +59,7 @@ from tensorrt_llm.llmapi import EagleDecodingConfig
 eagle3_one_model = False
 
 speculative_config = EagleDecodingConfig(
-    max_draft_len=3, speculative_model="/path/to/draft_model", eagle3_one_model=eagle3_one_model)
+    max_draft_len=3, speculative_model_dir="/path/to/draft_model", eagle3_one_model=eagle3_one_model)
 
 # Only need to disable overlap scheduler if eagle3_one_model is False.
 llm = LLM("/path/to/target_model", speculative_config=speculative_config, disable_overlap_scheduler=True)

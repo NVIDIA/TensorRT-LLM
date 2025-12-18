@@ -15,13 +15,17 @@
  */
 #pragma once
 
-// Avoid circular dependency
+#include "tensorrt_llm/common/config.h"
+
 namespace tensorrt_llm::runtime
 {
 class McastDeviceMemory;
-}
+} // namespace tensorrt_llm::runtime
 
-namespace tensorrt_llm::common
+// Avoid circular dependency
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common
 {
 using McastDeviceMemory = tensorrt_llm::runtime::McastDeviceMemory;
 // Register a buffer with the McastDeviceMemory class. This function does not check if the ptr belongs to the buffer!
@@ -31,4 +35,6 @@ void unregisterMcastDevMemBuffer(McastDeviceMemory* buf);
 // information. Thus a derived pointer cannot used as the key.
 McastDeviceMemory* findMcastDevMemBuffer(void* ptr);
 
-} // namespace tensorrt_llm::common
+} // namespace common
+
+TRTLLM_NAMESPACE_END

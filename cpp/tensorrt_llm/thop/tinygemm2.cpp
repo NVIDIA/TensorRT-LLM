@@ -26,6 +26,8 @@
 torch::Tensor tinygemm2_cuda_forward(torch::Tensor input, torch::Tensor weight, torch::Tensor bias);
 
 // C++ interface
+TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 torch::Tensor tinygemm2_forward(torch::Tensor input, torch::Tensor weight, torch::Tensor bias)
@@ -45,6 +47,8 @@ torch::Tensor tinygemm2_forward(torch::Tensor input, torch::Tensor weight, torch
 }
 } // namespace torch_ext
 
+TRTLLM_NAMESPACE_END
+
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def("tinygemm2(Tensor input, Tensor weight, Tensor bias) -> Tensor");
@@ -52,5 +56,5 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("tinygemm2", &torch_ext::tinygemm2_forward);
+    m.impl("tinygemm2", &tensorrt_llm::torch_ext::tinygemm2_forward);
 }

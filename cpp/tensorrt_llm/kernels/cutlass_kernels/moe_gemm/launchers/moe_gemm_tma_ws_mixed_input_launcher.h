@@ -17,10 +17,11 @@
 #include "../../include/moe_gemm_kernels.h"
 #include "cutlass_extensions/gemm_configs.h"
 #include "cutlass_extensions/weight_only_quant_op.h"
+#include "tensorrt_llm/common/config.h"
 #include <cuda_runtime_api.h>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace cutlass_kernels_oss
@@ -36,4 +37,5 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(
 
 } // namespace cutlass_kernels_oss
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

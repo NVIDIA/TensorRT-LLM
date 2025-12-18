@@ -837,7 +837,7 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
         gC_mnl = cute.local_tile(
             mC_mnl, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
         )
-        k_tile_cnt = cute.size(gA_mkl, mode=[3])
+        k_tile_cnt = cutlass.Int32(cute.size(gA_mkl, mode=[3]))
 
         #
         # Partition global tensor for TiledMMA_A/B/C
@@ -2021,7 +2021,7 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
         use_2cta_instrs: bool,
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
-        m_aligned: int,
+        m_aligned: cutlass.Int64,
     ) -> bool:
         """
         Check if the mma tiler and cluster shape are valid
@@ -2033,7 +2033,7 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
         :param cluster_shape_mn: The (ClusterM, ClusterN) shape of the CTA cluster
         :type cluster_shape_mn: Tuple[int, int]
         :param m_aligned: The alignment requirement for group M dimension (default: 128)
-        :type m_aligned: int
+        :type m_aligned: cutlass.Int64
 
         :return: True if the mma tiler and cluster shape are valid, False otherwise
         :rtype: bool
@@ -2086,10 +2086,10 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
 
     @staticmethod
     def is_valid_tensor_alignment(
-        m: int,
-        n: int,
-        k: int,
-        l: int,  # noqa: E741
+        m: cutlass.Int64,
+        n: cutlass.Int64,
+        k: cutlass.Int64,
+        l: cutlass.Int64,  # noqa: E741
         ab_dtype: Type[cutlass.Numeric],
         c_dtype: Type[cutlass.Numeric],
         a_major: str,
@@ -2100,13 +2100,13 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
         Check if the tensor alignment is valid
 
         :param m: The number of rows in the A tensor
-        :type m: int
+        :type m: cutlass.Int64
         :param n: The number of columns in the B tensor
-        :type n: int
+        :type n: cutlass.Int64
         :param k: The number of columns in the A tensor
-        :type k: int
+        :type k: cutlass.Int64
         :param l: The number of columns in the C tensor
-        :type l: int
+        :type l: cutlass.Int64
         :param ab_dtype: The data type of the A and B operands
         :type ab_dtype: Type[cutlass.Numeric]
         :param c_dtype: The data type of the output tensor
@@ -2148,14 +2148,14 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
         use_2cta_instrs: bool,
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
-        m: int,
-        n: int,
-        k: int,
-        l: int,  # noqa: E741
+        m: cutlass.Int64,
+        n: cutlass.Int64,
+        k: cutlass.Int64,
+        l: cutlass.Int64,  # noqa: E741
         a_major: str,
         b_major: str,
         c_major: str,
-        m_aligned: int,
+        m_aligned: cutlass.Int64,
     ) -> bool:
         """
         Check if the gemm can be implemented
@@ -2177,13 +2177,13 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
         :param cluster_shape_mn: The (ClusterM, ClusterN) shape of the CTA cluster
         :type cluster_shape_mn: Tuple[int, int]
         :param m: The number of rows in the A tensor
-        :type m: int
+        :type m: cutlass.Int64
         :param n: The number of columns in the B tensor
-        :type n: int
+        :type n: cutlass.Int64
         :param k: The number of columns in the A tensor
-        :type k: int
+        :type k: cutlass.Int64
         :param l: The number of columns in the C tensor
-        :type l: int
+        :type l: cutlass.Int64
         :param a_major: The major axis of the A tensor
         :type a_major: str
         :param b_major: The major axis of the B tensor
@@ -2191,7 +2191,7 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
         :param c_major: The major axis of the C tensor
         :type c_major: str
         :param m_aligned: The alignment requirement for group M dimension (default: 128)
-        :type m_aligned: int
+        :type m_aligned: cutlass.Int64
 
         :return: True if the gemm can be implemented, False otherwise
         :rtype: bool
@@ -2233,10 +2233,10 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
         alpha_ptr: cute.Pointer,
         tile_idx_to_group_idx_ptr: cute.Pointer,
         num_non_exiting_tiles_ptr: cute.Pointer,
-        m: int,
-        n: int,
-        k: int,
-        l: int,  # noqa: E741
+        m: cutlass.Int64,
+        n: cutlass.Int64,
+        k: cutlass.Int64,
+        l: cutlass.Int64,  # noqa: E741
         tile_size: cutlass.Constexpr,
         scaling_vector_size: cutlass.Constexpr,
         max_active_clusters: cutlass.Constexpr,

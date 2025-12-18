@@ -13,13 +13,14 @@ from ...custom_ops.attention_interface import (
     AttentionRegistry,
     CacheConfig,
     Constant,
+    PrepareMetadataCallable,
 )
 from ...distributed.common import all_gather_object, get_world_size
 from ...distributed.common import is_initialized as is_distributed_initialized
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils._graph import add_graph_input
-from ...utils.node_utils import get_all_input_output_nodes, is_op
+from ...utils.node_utils import is_op
 from ..interface import (
     BaseTransform,
     SharedConfig,
@@ -27,44 +28,6 @@ from ..interface import (
     TransformInfo,
     TransformRegistry,
 )
-
-
-@TransformRegistry.register("update_in_out_nodes")
-class UpdateInOutNodes(BaseTransform):
-    """Modify the graph module by adding new input nodes.
-
-    The new input nodes correspond to the extra arguments needed for cached and flattened attention.
-
-    Args:
-        egm: The graph module to analyze and modify.
-        cm: Cached sequence interface containing extra argument information.
-    """
-
-    def _apply(
-        self,
-        gm: GraphModule,
-        cm: CachedSequenceInterface,
-        factory: ModelFactory,
-        shared_config: SharedConfig,
-    ) -> Tuple[GraphModule, TransformInfo]:
-        # loop through nodes to get input, output, and get_attr nodes
-        input_nodes, output_nodes = get_all_input_output_nodes(gm.graph)
-
-        # NOTE: for now, we wanna make sure we *only* return the final output and no hidden states.
-        # Later on, we can revisit how to support returning hidden states.
-        assert len(output_nodes) == 1, "Expected exactly one output node!"
-        assert len(output_nodes[0].all_input_nodes) == 1, (
-            "Expected to only return final tensor output!"
-        )
-
-        # Activate and add extra argument nodes
-        new_args = cm.info.switch_to_cached_attn_inputs()
-        for name in new_args:
-            input_nodes.append(add_graph_input(gm, name))
-
-        info = TransformInfo(skipped=False, num_matches=1, is_clean=False, has_valid_shapes=False)
-
-        return gm, info
 
 
 class InsertCachedAttentionConfig(TransformConfig):
@@ -91,26 +54,57 @@ class InsertCachedAttention(BaseTransform):
     def attn_descriptor(self) -> Type[AttentionDescriptor]:
         return AttentionRegistry.get(self.config.backend)
 
-    def _process_get_metadata(
-        self, gm: GraphModule, m_args: List[str], const_args: List[Constant]
+    def _process_metadata_std(self, gm: GraphModule, cm: CachedSequenceInterface) -> List[Node]:
+        """Process the standard metadata nodes."""
+        return [
+            self._add_or_retrieve_input(gm, cm, arg_name)
+            for arg_name in self.attn_descriptor.get_standard_metadata_args()
+        ]
+
+    def _insert_extra_metadata_op(
+        self,
+        gm: GraphModule,
+        prep_meta_op: PrepareMetadataCallable,
+        inputs_for_prep_meta: List[Node],
+        const_args: List[Constant],
+        num_meta_out: int,
+    ) -> List[Node]:
+        # add the computed extra metadata nodes to the graph and add to meta for cached attention op
+        meta_nodes_extra = []
+        node_last_input = gm.graph.find_nodes(op="placeholder", sort=True)[-1]
+        with gm.graph.inserting_before(node_last_input.next):
+            ret_node = gm.graph.call_function(
+                prep_meta_op, args=(*inputs_for_prep_meta, *const_args)
+            )
+            for idx in range(num_meta_out):
+                meta_extra_node = gm.graph.call_function(operator.getitem, args=(ret_node, idx))
+                meta_nodes_extra.append(meta_extra_node)
+
+        return meta_nodes_extra
+
+    def _process_metadata_extra(
+        self, gm: GraphModule, cm: CachedSequenceInterface, any_source_attn_node: Node
     ) -> List[Node]:
         """Process the get_metadata function into an op and return node references."""
-        # retrieve input nodes
-        input_nodes, _ = get_all_input_output_nodes(gm.graph)
-        input_nodes_mapping = {n.target: n for n in input_nodes}
+        # get the metadata op for extra metadata and number of return values
+        prep_meta_op, num_meta_out, const_args = (
+            self.attn_descriptor.get_prepare_extra_metadata_info(any_source_attn_node)
+        )
 
-        # filtered and sorted for SequenceInfo arguments + constants (input_ids, position_ids, etc.)
-        inputs_from_info = [input_nodes_mapping[k] for k in m_args]
+        # if there is no extra metadata op or no return values, we can return early
+        if prep_meta_op is None or num_meta_out == 0:
+            return []
 
-        # insert metadata computation and extract each argument as a node
-        get_metadata, num_metadata = self.attn_descriptor.get_prepare_metadata_op()
-        with gm.graph.inserting_before(input_nodes[-1].next):
-            ret_node = gm.graph.call_function(get_metadata, args=(*inputs_from_info, *const_args))
-            metadata_nodes = [
-                gm.graph.call_function(operator.getitem, args=(ret_node, idx))
-                for idx in range(num_metadata)
-            ]
-        return metadata_nodes
+        # check what inputs the extra metadata op expects
+        inputs_for_prep_meta = [
+            self._add_or_retrieve_input(gm, cm, arg.name)
+            for arg in prep_meta_op._schema.arguments
+            if arg.name in cm.info.available_args
+        ]
+
+        return self._insert_extra_metadata_op(
+            gm, prep_meta_op, inputs_for_prep_meta, const_args, num_meta_out
+        )
 
     def _process_cache_node(self, gm: GraphModule, cache_name: str) -> Node:
         """Process the cache nodes by inserting a cached attention replacement op."""
@@ -121,7 +115,8 @@ class InsertCachedAttention(BaseTransform):
         gm: GraphModule,
         attn_node: Node,
         qkv_nodes: List[Node],
-        meta_nodes: List[Node],
+        meta_nodes_std: List[Node],
+        meta_nodes_extra: List[Node],
         cache_nodes: List[Node],
         buffer_nodes: List[Node],
         constants: List[Constant],
@@ -130,7 +125,14 @@ class InsertCachedAttention(BaseTransform):
         with gm.graph.inserting_before(attn_node):
             cached_attn_node = gm.graph.call_function(
                 self.attn_descriptor.get_cached_attention_op(),
-                args=(*qkv_nodes, *meta_nodes, *cache_nodes, *buffer_nodes, *constants),
+                args=(
+                    *qkv_nodes,
+                    *meta_nodes_std,
+                    *meta_nodes_extra,
+                    *cache_nodes,
+                    *buffer_nodes,
+                    *constants,
+                ),
             )
         attn_node.replace_all_uses_with(cached_attn_node)
         gm.graph.erase_node(attn_node)
@@ -165,10 +167,11 @@ class InsertCachedAttention(BaseTransform):
         if cm.info.is_paged:
             assert attn_descriptor.is_paged(), "Paged sequence info requires paged attention op."
 
+        # get standard metadata nodes for all source attention nodes
+        meta_nodes_std = self._process_metadata_std(gm, cm)
+
         # insert metadata computation and extract each argument as a node
-        metadata_nodes = self._process_get_metadata(
-            gm, cm.info.args_for_prepare_metadata, cm.info.const_args_for_prepare_metadata
-        )
+        meta_nodes_extra = self._process_metadata_extra(gm, cm, source_attn_nodes[0])
 
         buffer_in_lookup: Dict[str, Node] = {}
 
@@ -201,7 +204,14 @@ class InsertCachedAttention(BaseTransform):
 
             # insert cached attention replacement op
             self._insert_cached_attn_node(
-                gm, attn_node, qkv, metadata_nodes, cache_in_nodes, buffer_in_nodes, constants
+                gm,
+                attn_node,
+                qkv,
+                meta_nodes_std,
+                meta_nodes_extra,
+                cache_in_nodes,
+                buffer_in_nodes,
+                constants,
             )
             num_cached_attn_replacements += 1
 

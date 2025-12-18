@@ -702,7 +702,7 @@ pipeline {
                     container("python3") {
                         trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade pip")
                         trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade requests")
-                        def nspect_commit = "0e46042381ae25cb7af2f1d45853dfd8e1d54e2d"
+                        def nspect_commit = "4cb9c0c42d44ebeeba1e40d2c3eb6aab6fb90173"
                         withCredentials([string(credentialsId: "TRTLLM_NSPECT_REPO", variable: "NSPECT_REPO")]) {
                             trtllm_utils.checkoutSource("${NSPECT_REPO}", nspect_commit, "nspect")
                         }
@@ -723,6 +723,7 @@ pipeline {
                             cmd += "--check_launch_api "
                             cmd += "--wait_success 1800 "
                         }
+                        cmd += "--image "
                         cmd += imageKeyToTag.values().join(" ")
                         withCredentials([usernamePassword(credentialsId: "NSPECT_CLIENT-${nspect_env}", usernameVariable: 'NSPECT_CLIENT_ID', passwordVariable: 'NSPECT_CLIENT_SECRET')]) {
                             trtllm_utils.llmExecStepWithRetry(this, script: cmd, numRetries: 6, shortCommondRunTimeMax: 7200)
