@@ -220,9 +220,11 @@ def generate_rst(yaml_path, output_file=None):
     lines = []
 
     # Include note_sections.rst at the top (relative include for Sphinx)
+    lines.append(".. start-config-table-note")
     lines.append(".. include:: ../_includes/note_sections.rst")
     lines.append("   :start-after: .. start-note-traffic-patterns")
     lines.append("   :end-before: .. end-note-traffic-patterns")
+    lines.append(".. end-config-table-note")
     lines.append("")
 
     sorted_models = sorted(model_groups.keys())

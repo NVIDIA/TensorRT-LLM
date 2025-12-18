@@ -105,6 +105,24 @@ Comprehensive Configuration Database
 
 The table below lists all available pre-configured model scenarios in the TensorRT LLM configuration database. Each row represents a specific model, GPU, and performance profile combination with recommended request settings.
 
+Preconfigured Recipes
+^^^^^^^^^^^^^^^^^^^^^
+
+.. include:: note_sections.rst
+   :start-after: .. start-note-traffic-patterns
+   :end-before: .. end-note-traffic-patterns
+
+.. _recipe-selector:
+
+Recipe selector
+~~~~~~~~~~~~~~~
+
 .. trtllm_config_selector::
 
+.. _recipe-database:
+
+Recipe database
+~~~~~~~~~~~~~~~
+
 .. include:: config_table.rst
+   :start-after: .. end-config-table-note

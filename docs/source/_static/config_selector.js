@@ -208,7 +208,6 @@
     container.classList.add("trtllm-config-selector");
 
     const header = el("div", { class: "trtllm-config-selector__header" }, [
-      el("div", { class: "trtllm-config-selector__title", text: "Interactive configuration" }),
       el("div", {
         class: "trtllm-config-selector__subtitle",
         text: "Select a model + deployment shape to generate a trtllm-serve command.",

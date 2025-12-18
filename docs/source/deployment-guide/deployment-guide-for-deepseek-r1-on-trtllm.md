@@ -432,7 +432,10 @@ $$
 
 ## Preconfigured Recipes
 
-The following tables list recommended configurations from the comprehensive database for different performance profiles.
+The following sections help you pick a known-good `trtllm-serve --config` for your target GPU and traffic pattern.
+
+
+### Recipe selector
 
 ```{eval-rst}
 .. trtllm_config_selector::
@@ -444,6 +447,9 @@ The following tables list recommended configurations from the comprehensive data
    :start-after: .. start-note-traffic-patterns
    :end-before: .. end-note-traffic-patterns
 
+### Recipe database
+
+```{eval-rst}
 .. include:: config_table.rst
    :start-after: .. start-deepseek-ai/DeepSeek-R1-0528
    :end-before: .. end-deepseek-ai/DeepSeek-R1-0528
