@@ -11,10 +11,11 @@ This module implements real multi-turn conversation benchmarking with:
 import asyncio
 import json
 import os
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import numpy as np
 from openai import AsyncOpenAI
@@ -23,7 +24,13 @@ from transformers import AutoTokenizer
 from tensorrt_llm.scaffolding import Controller, ScaffoldingLlm, TRTOpenaiWorker, Worker
 from tensorrt_llm.scaffolding.benchmark import ScaffoldingBenchRequest, async_scaffolding_benchmark
 from tensorrt_llm.scaffolding.load_generation_strategy import ConcurrentStrategy
-from tensorrt_llm.scaffolding.task import ChatTask, SystemMessage, TaskStatus, UserMessage
+from tensorrt_llm.scaffolding.task import ChatTask, SystemMessage, Task, TaskStatus, UserMessage
+from tensorrt_llm.scaffolding.task_collection import (
+    DropKVCacheWorkerTag,
+    TaskCollection,
+    drop_kv_cache_scope,
+    with_task_collection,
+)
 
 # =============================================================================
 # Type Aliases
@@ -214,7 +221,6 @@ class GenConvArgs(NamedTuple):
     num_conversations: int
     text_files: List[str]
     input_num_turns: Distribution
-    input_common_prefix_num_tokens: Distribution
     input_prefix_num_tokens: Distribution
     input_num_tokens: Distribution
     output_num_tokens: Distribution
@@ -293,9 +299,6 @@ class MultiroundDataConfig:
     prefix_tokens_max: int = 5000
     prefix_tokens_alpha: float = 2.0
     prefix_tokens_average: int = 1000
-
-    # Common prefix (shared across conversations)
-    common_prefix_tokens: int = 500
 
     # Print statistics
     print_stats: bool = False
@@ -422,9 +425,6 @@ def parse_json_config_file(config_path: str) -> GenConvArgs:
         num_conversations=conf["num_conversations"],
         text_files=conf["text_files"],
         input_num_turns=get_distribution_from_json(conf, "prompt_input", "num_turns"),
-        input_common_prefix_num_tokens=get_distribution_from_json(
-            conf, "prompt_input", "common_prefix_num_tokens", optional=True
-        ),
         input_prefix_num_tokens=get_distribution_from_json(
             conf, "prompt_input", "prefix_num_tokens"
         ),
@@ -472,14 +472,10 @@ def build_gen_conv_args_from_config(config: MultiroundDataConfig) -> GenConvArgs
         average=config.prefix_tokens_average,
     )
 
-    # Common prefix (constant)
-    input_common_prefix_num_tokens = ConstantDistribution(config.common_prefix_tokens)
-
     return GenConvArgs(
         num_conversations=config.num_conversations,
         text_files=config.text_files,
         input_num_turns=input_num_turns,
-        input_common_prefix_num_tokens=input_common_prefix_num_tokens,
         input_prefix_num_tokens=input_prefix_num_tokens,
         input_num_tokens=input_num_tokens,
         output_num_tokens=output_num_tokens,
@@ -527,15 +523,7 @@ def generate_conversations(args: GenConvArgs, tokenizer: AutoTokenizer) -> Conve
     # Sample prefix tokens for all conversations
     conv_prefix_tokens: np.ndarray = args.input_prefix_num_tokens.sample(args.num_conversations)
 
-    # Common prefix for all conversations
-    common_prefix_text = ""
-    common_prefix_tokens: int = int(args.input_common_prefix_num_tokens.sample(1)[0])
     base_offset = 0
-
-    if common_prefix_tokens > 0 and len(list_of_tokens) > common_prefix_tokens:
-        common_prefix_text = tokenizer.decode(list_of_tokens[: common_prefix_tokens - 2]) + "."
-        base_offset += common_prefix_tokens
-
     for conv_id in range(args.num_conversations):
         messages: MessagesList = []
         nturns = int(turn_count[conv_id])
@@ -554,11 +542,7 @@ def generate_conversations(args: GenConvArgs, tokenizer: AutoTokenizer) -> Conve
                 num_tokens = int(input_token_count[turn_id])
 
                 # Build user prompt
-                content = f"{conv_id} is a nice number... "
-
-                if len(common_prefix_text) > 0 and turn_id == 0:
-                    content = common_prefix_text + content
-
+                content = f"<header>conv_{conv_id}, user_message_{turn_id // 2}</header>"
                 num_tokens -= len(tokenizer.encode(content, add_special_tokens=False))
 
                 if turn_id == 0:
@@ -567,8 +551,10 @@ def generate_conversations(args: GenConvArgs, tokenizer: AutoTokenizer) -> Conve
                         start_offset = base_offset
                         end_offset = start_offset + prefix_num_tokens
                         if len(list_of_tokens) > end_offset:
-                            content += f"{conv_id}, " + tokenizer.decode(
-                                list_of_tokens[start_offset:end_offset]
+                            content += (
+                                f"<conv_prefix conv_id={conv_id}>"
+                                + tokenizer.decode(list_of_tokens[start_offset:end_offset])
+                                + "</conv_prefix>"
                             )
                             base_offset += prefix_num_tokens
 
@@ -671,8 +657,218 @@ def load_sharegpt_conversations(
 
 
 # =============================================================================
-# Worker and Controller
+# Worker, Controller and TaskCollection
 # =============================================================================
+class ChatTaskTraceCollector(TaskCollection):
+    """Task collection that captures comprehensive trace information for all ChatTask instances.
+
+    Records messages, token counts, timing, and other relevant trace data for debugging and analysis.
+    """
+
+    # Global traces: controller_name -> List[trace_dict]
+    traces: Dict[str, List[Dict[str, Any]]] = {}
+
+    def __init__(
+        self, controller_name: str, enable_print: bool = False, capture_messages: bool = True
+    ):
+        super().__init__()
+        self.controller_name = controller_name
+        self.enable_print = enable_print
+        self.capture_messages = capture_messages
+        self.start_time_map: Dict[int, float] = {}
+        self.pre_message_count_map: Dict[int, int] = {}
+
+        if controller_name not in ChatTaskTraceCollector.traces:
+            ChatTaskTraceCollector.traces[controller_name] = []
+
+    def _is_task_already_traced(self, task: ChatTask) -> bool:
+        return getattr(task, "_trace_in_progress", False)
+
+    def _mark_task_trace_start(self, task: ChatTask):
+        task._trace_in_progress = True
+
+    def _mark_task_trace_end(self, task: ChatTask):
+        task._trace_in_progress = False
+
+    def before_yield(self, tasks: List[Task]):
+        for task in tasks:
+            if not isinstance(task, ChatTask):
+                continue
+            if self._is_task_already_traced(task):
+                continue
+
+            self._mark_task_trace_start(task)
+            task_id = id(task)
+            self.start_time_map[task_id] = time.time()
+            self.pre_message_count_map[task_id] = len(task.messages)
+
+            # Enable token counting to capture token usage
+            task.enable_token_counting = True
+
+    def after_yield(self, tasks: List[Task]):
+        for task in tasks:
+            if not isinstance(task, ChatTask):
+                continue
+
+            task_id = id(task)
+            if task_id not in self.start_time_map:
+                continue
+
+            end_time = time.time()
+            start_time = self.start_time_map[task_id]
+            duration = end_time - start_time
+            pre_message_count = self.pre_message_count_map[task_id]
+
+            del self.start_time_map[task_id]
+            del self.pre_message_count_map[task_id]
+            self._mark_task_trace_end(task)
+
+            # Build trace record
+            trace_record = {
+                "controller": self.controller_name,
+                "timestamp": end_time,
+                "duration_ms": duration * 1000,
+                "prompt_tokens": getattr(task, "prompt_tokens_num", 0),
+                "completion_tokens": getattr(task, "completion_tokens_num", 0),
+                "reasoning_tokens": getattr(task, "reasoning_tokens_num", 0),
+                "total_tokens": getattr(task, "prompt_tokens_num", 0)
+                + getattr(task, "completion_tokens_num", 0),
+                "message_count_before": pre_message_count,
+                "message_count_after": len(task.messages),
+                "finish_reason": getattr(task, "finish_reason", None),
+                "unique_id": getattr(task, "unique_id", None),
+                "sub_request_markers": getattr(task, "sub_request_markers", []),
+                "perf_metrics": getattr(task, "perf_metrics", None),
+            }
+
+            # Capture messages if enabled
+            if self.capture_messages:
+                trace_record["messages"] = [self._serialize_message(msg) for msg in task.messages]
+                # Capture only the new messages added during this yield
+                if len(task.messages) > pre_message_count:
+                    trace_record["new_messages"] = [
+                        self._serialize_message(msg) for msg in task.messages[pre_message_count:]
+                    ]
+                else:
+                    trace_record["new_messages"] = []
+
+            ChatTaskTraceCollector.traces[self.controller_name].append(trace_record)
+
+            if self.enable_print:
+                self._print_trace(trace_record)
+
+    def _serialize_message(self, message) -> Dict[str, Any]:
+        """Serialize a RoleMessage to a dictionary."""
+        result = {
+            "role": getattr(message, "role", None),
+            "content": getattr(message, "content", None),
+        }
+        # Capture additional fields for AssistantMessage
+        if hasattr(message, "reasoning") and message.reasoning is not None:
+            result["reasoning"] = message.reasoning
+        if hasattr(message, "reasoning_content") and message.reasoning_content is not None:
+            result["reasoning_content"] = message.reasoning_content
+        if hasattr(message, "tool_calls") and message.tool_calls is not None:
+            result["tool_calls"] = [str(tc) for tc in message.tool_calls]
+        return result
+
+    def _print_trace(self, trace_record: Dict[str, Any]):
+        """Print a single trace record."""
+        print(f"\n{'=' * 60}")
+        print(f"[ChatTask Trace] Controller: {trace_record['controller']}")
+        print(f"Duration: {trace_record['duration_ms']:.2f}ms")
+        print(
+            f"Tokens: prompt={trace_record['prompt_tokens']}, "
+            f"completion={trace_record['completion_tokens']}, "
+            f"reasoning={trace_record['reasoning_tokens']}, "
+            f"total={trace_record['total_tokens']}"
+        )
+        print(
+            f"Messages: {trace_record['message_count_before']} -> {trace_record['message_count_after']}"
+        )
+        if "new_messages" in trace_record and trace_record["new_messages"]:
+            print("New Messages:")
+            for msg in trace_record["new_messages"]:
+                role = msg.get("role", "unknown")
+                content = msg.get("content", "")
+                # Truncate long content for display
+                if content and len(content) > 200:
+                    content = content[:200] + "..."
+                print(f"  [{role}]: {content}")
+        print(f"{'=' * 60}\n")
+
+    @staticmethod
+    def get_traces(controller_name: str = None) -> Dict[str, List[Dict[str, Any]]]:
+        """Get traces for a specific controller or all controllers."""
+        if controller_name is not None:
+            return {controller_name: ChatTaskTraceCollector.traces.get(controller_name, [])}
+        return ChatTaskTraceCollector.traces
+
+    @staticmethod
+    def get_all_traces() -> List[Dict[str, Any]]:
+        """Get all traces across all controllers as a flat list."""
+        all_traces = []
+        for traces in ChatTaskTraceCollector.traces.values():
+            all_traces.extend(traces)
+        # Sort by timestamp
+        all_traces.sort(key=lambda x: x.get("timestamp", 0))
+        return all_traces
+
+    @staticmethod
+    def export_traces(file_path: str, controller_name: str = None):
+        """Export traces to a JSON file."""
+        if controller_name is not None:
+            data = ChatTaskTraceCollector.traces.get(controller_name, [])
+        else:
+            data = ChatTaskTraceCollector.traces
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False, default=str)
+
+    @staticmethod
+    def print_summary():
+        """Print summary of all collected traces."""
+        print("\n" + "=" * 80)
+        print("CHAT TASK TRACE SUMMARY")
+        print("=" * 80)
+
+        for controller_name, traces in ChatTaskTraceCollector.traces.items():
+            if not traces:
+                continue
+
+            print(f"\n📋 {controller_name} ({len(traces)} traces)")
+            print("-" * 70)
+
+            total_duration = sum(t["duration_ms"] for t in traces)
+            total_prompt_tokens = sum(t["prompt_tokens"] for t in traces)
+            total_completion_tokens = sum(t["completion_tokens"] for t in traces)
+            total_reasoning_tokens = sum(t["reasoning_tokens"] for t in traces)
+
+            print(f"  Total Duration: {total_duration:.2f}ms")
+            print(f"  Total Prompt Tokens: {total_prompt_tokens}")
+            print(f"  Total Completion Tokens: {total_completion_tokens}")
+            print(f"  Total Reasoning Tokens: {total_reasoning_tokens}")
+            print(f"  Total Tokens: {total_prompt_tokens + total_completion_tokens}")
+
+            if traces:
+                avg_duration = total_duration / len(traces)
+                print(f"  Average Duration: {avg_duration:.2f}ms")
+
+        print("\n" + "=" * 80 + "\n")
+
+    @staticmethod
+    def reset(controller_name: str = None):
+        """Reset traces for a specific controller or all controllers."""
+        if controller_name is not None:
+            if controller_name in ChatTaskTraceCollector.traces:
+                ChatTaskTraceCollector.traces[controller_name] = []
+        else:
+            ChatTaskTraceCollector.traces.clear()
+
+    @staticmethod
+    def get_global_info() -> Any:
+        return ChatTaskTraceCollector.traces
+
+
 class MultiroundChatWorker(Worker):
     """Worker that manages multi-turn conversations with real data."""
 
@@ -760,8 +956,14 @@ class MultiroundChatWorker(Worker):
     }
 
 
+@drop_kv_cache_scope()
+@with_task_collection(
+    "trace", ChatTaskTraceCollector, controller_name="MultiroundChatController", enable_print=False
+)
 class MultiroundChatController(Controller):
     """Controller for multi-turn chat conversations."""
+
+    request_index = 0
 
     class WorkerTag(Enum):
         GENERATION = "generation"
@@ -777,6 +979,9 @@ class MultiroundChatController(Controller):
             [SystemMessage(content="You are a helpful assistant.")],
             None,  # No tools
         )
+        task.customized_result_fields["request_index"] = MultiroundChatController.request_index
+        MultiroundChatController.request_index += 1
+
         yield from self.process([task])
         return task.create_scaffolding_output()
 
@@ -877,8 +1082,6 @@ async def async_multiround_chat_benchmark(args):
         prefix_tokens_max=getattr(args, "multiround_prefix_max", 5000),
         prefix_tokens_alpha=getattr(args, "multiround_prefix_alpha", 2.0),
         prefix_tokens_average=getattr(args, "multiround_prefix_average", 1000),
-        # Common prefix
-        common_prefix_tokens=getattr(args, "multiround_common_prefix_tokens", 0),
         print_stats=getattr(args, "multiround_print_stats", False),
         user_delay=user_delay_config,
     )
@@ -925,6 +1128,7 @@ async def async_multiround_chat_benchmark(args):
         {
             MultiroundChatController.WorkerTag.GENERATION: generation_worker,
             MultiroundChatController.WorkerTag.MULTIROUND: multiround_worker,
+            DropKVCacheWorkerTag.DROP_KV_CACHE: generation_worker,
         },
     )
 
@@ -976,6 +1180,12 @@ async def async_multiround_chat_benchmark(args):
         print(f"P99: {sorted_times[min(p99_idx, len(sorted_times) - 1)]:.3f}s")
 
     print("=" * 60 + "\n")
+
+    # Dump trace data
+    ChatTaskTraceCollector.print_summary()
+    trace_file = getattr(args, "trace_output_file", "multiround_traces.json")
+    ChatTaskTraceCollector.export_traces(trace_file)
+    print(f"Traces exported to: {trace_file}")
 
     chat_llm.shutdown(shutdown_workers=True)
 
