@@ -367,6 +367,10 @@ class SequenceInfo:
       of decode sequences.
     - cache_loc: [c_0, c_1, ..., c_{np-1}] where np is total number of pages allocated to describe
       all sequences in the batch. Each value is a page index in the cache.
+    - logits_gather_indices: [g_0, g_1, ..., g_{s_total-1}]
+      Gather indices used by the gather_logits_before_lm_head custom op to gather logits before the LM head.
+    - logits_gather_info: [num_tokens_to_gather, gather_required]. Info for the
+      gather_logits_before_lm_head custom op to gather logits before the LM head.
     - _gather_idx: [g_0, g_1, ..., g_{s_total-1}]
       Gather indices used by the overlap scheduler to reorder input tokens.
     - _mask_scatter_indices: [m_0, m_1, ..., m_{s_total-1}]
@@ -480,6 +484,8 @@ class SequenceInfo:
             ("slot_idx", self.max_batch_size, torch.long),
             ("use_initial_states", self.max_batch_size, torch.bool),
             ("batch_info", 3, torch.int),
+            ("logits_gather_indices", self.max_num_tokens, torch.long),
+            ("logits_gather_info", 2, torch.int),
             # OTHER FIELDS WHERE WE NEED EFFICIENT HOST<>DEVICE TRANSFER
             ("_gather_idx", self.max_num_tokens, torch.int),
             ("_mask_scatter_indices", self.max_num_tokens, torch.int),
@@ -499,7 +505,7 @@ class SequenceInfo:
         self._active_args = ("input_ids", "position_ids")
         self._shapeable_args = ("input_ids", "position_ids")
         # Args that should be returned from host (pinned memory) instead of device in _named_args
-        self._host_return_args = ("batch_info",)
+        self._host_return_args = ("batch_info", "logits_gather_info")
         ############################################################################################
 
         # EXTRA TENSOR FIELDS ######################################################################
@@ -535,15 +541,17 @@ class SequenceInfo:
         # truncate to total tokens now, reshape, and return
         return tnsr[: self.total_num_tokens].view(bs, sl, *tnsr.shape[1:])
 
+    def _get_arg(self, name: str) -> torch.Tensor:
+        """Get the argument from the input buffer either on device or host."""
+        if name in self._host_return_args:
+            arg = self._input_buffer.get_host_view(name)
+        else:
+            arg = self._input_buffer.get_view(name)
+        return self._shape_for_forward(arg) if name in self._shapeable_args else arg
+
     def _named_args(self, include_extra_args: bool = True) -> Dict[str, torch.Tensor]:
         # Build args dict, using host views for _host_return_args, device views otherwise
-        args = {}
-        for name in self._active_args:
-            if name in self._host_return_args:
-                view = self._input_buffer.get_host_view(name)
-            else:
-                view = self._input_buffer.get_view(name)
-            args[name] = self._shape_for_forward(view) if name in self._shapeable_args else view
+        args = {k: self._get_arg(k) for k in self._active_args}
 
         # check other args to include
         if include_extra_args:
@@ -801,7 +809,11 @@ class SequenceInfo:
 
     def set_generate_only_batch(self, batch_size: Optional[int] = None) -> None:
         """Set an example sequence for generate-only batch."""
-        self.set_example_sequence([[1]] * (batch_size or self.max_batch_size))
+        batch_size = batch_size or self.max_batch_size
+        self.set_example_sequence(
+            [[1]] * batch_size,
+            logits_gather_info=[batch_size, 0],
+        )
 
     def reset(self) -> None:
         """Reset the sequence information.
@@ -887,6 +899,8 @@ class SequenceInfo:
         last_page_len: Optional[Sequence[int]] = None,
         slot_idx: Optional[Sequence[int]] = None,
         use_initial_states: Optional[Sequence[bool]] = None,
+        logits_gather_indices: Optional[Sequence[int]] = None,
+        logits_gather_info: Optional[Sequence[int]] = None,
         _gather_idx: Optional[Sequence[int]] = None,
         _mask_scatter_indices: Optional[Sequence[int]] = None,
         **extra_args: Dict[str, Union[torch.Tensor, Sequence[torch.Tensor]]],
@@ -917,6 +931,8 @@ class SequenceInfo:
             slot_idx: Slot index for each sequence in the batch.
             use_initial_states: Per-sequence boolean indicating if the initial states should be
                 used. If None, auto-computed as (input_pos > 0).
+            logits_gather_indices: Gather indices for the logits before/after the LM head.
+            logits_gather_info: Info list containing [num_tokens_to_gather, gather_required].
             _gather_idx: Gather indices for the overlap scheduler to reorder input tokens.
             _mask_scatter_indices: Mask scatter indices for the overlap scheduler.
             extra_args: Extra arguments to be stored in the interface.
@@ -999,6 +1015,17 @@ class SequenceInfo:
             use_initial_states = [i_p > 0 for i_p in self.input_pos]
         self._store_arg("use_initial_states", use_initial_states)
 
+        # check for updated logits_gather_indices
+        if logits_gather_indices is None:
+            # default is to gather all logits
+            logits_gather_indices = list(range(self.total_num_tokens))
+        self._store_arg("logits_gather_indices", logits_gather_indices, force_copy=True)
+
+        # check for updated logits_gather_info
+        if logits_gather_info is None:
+            logits_gather_info = [len(logits_gather_indices), 1]
+        self._store_arg("logits_gather_info", logits_gather_info, force_copy=True)
+
         ### UPDATE OVERLAP SCHEDULER METADATA ######################################################
         # check for updated _gather_idx
         if _gather_idx is not None:
@@ -1042,9 +1069,24 @@ class SequenceInfo:
             ungathered_input_ids, gather_ids_device, mask_scatter_indices_device, input_ids_device
         )
 
+    # TODO: remove once https://github.com/NVIDIA/TensorRT-LLM/issues/9878 is fixed and
+    # logits gather is enabled by default (only keep squeeze_logits)
+    @nvtx_range("ad_maybe_gather_logits")
+    def maybe_gather_and_squeeze_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """Maybe gather the logits if logits have not been gathered yet."""
+        num_tokens = logits.shape[0] * logits.shape[1]
+        num_tokens_to_gather, gather_required = self._get_arg("logits_gather_info").tolist()
+        if gather_required and num_tokens_to_gather < num_tokens:
+            logits = torch.ops.auto_deploy.gather_logits_before_lm_head(
+                logits,
+                self._get_arg("logits_gather_indices"),
+                self._get_arg("logits_gather_info"),
+            )
+        return logits.squeeze(int(self.is_generate))
+
     @nvtx_range("ad_unnest_sequences")
     def unnest_sequences(self, t_nested: torch.Tensor) -> List[torch.Tensor]:
-        t_squeezed = t_nested.squeeze(1) if self.is_generate else t_nested.squeeze(0)
+        t_squeezed = t_nested.squeeze(int(self.is_generate))
         return list(torch.split(t_squeezed, self.seq_len))
 
 

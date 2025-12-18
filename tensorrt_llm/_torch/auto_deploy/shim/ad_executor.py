@@ -10,6 +10,7 @@
 # limitations under the License.
 
 import copy
+import types
 from collections import defaultdict
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -319,7 +320,7 @@ class ADEngine(ModelEngine):
         return self.cache_seq_interface.device
 
     @classmethod
-    def build_from_config(cls, ad_config: LlmArgs):
+    def build_from_config(cls, ad_config: LlmArgs, mapping: Optional[Mapping] = None):
         """Build the ADEngine using the LlmArgs that gets passed through from the LLM."""
 
         max_batch_size = ad_config.max_batch_size
@@ -360,6 +361,7 @@ class ADEngine(ModelEngine):
             seq_info,
             device,
             ad_config=ad_config,
+            mapping=mapping,
             reporting_info=reporting_info,
         )
 
@@ -370,6 +372,7 @@ class ADEngine(ModelEngine):
         seq_info: SequenceInfo,
         device: DeviceLikeType,
         ad_config: Optional[LlmArgs] = None,
+        mapping: Optional[Mapping] = None,
         reporting_info: ReportingInfo = ReportingInfo(),
     ) -> None:
         """Initialize the engine with model and sequence information."""
@@ -439,13 +442,20 @@ class ADEngine(ModelEngine):
         # keep a reference for one dummy request around
         self.padding_dummy_request: Optional[LlmRequest] = None
 
+        # Reuse _execute_logit_post_processors from PyTorchModelEngine
+        self.mapping = mapping
+        self._execute_logit_post_processors = types.MethodType(
+            PyTorchModelEngine._execute_logit_post_processors, self
+        )
+
     @nvtx_range("ad_prepare_inputs")
     def _prepare_inputs(
         self,
         scheduled_requests: ScheduledRequests,
         resource_manager: ResourceManager,
         new_tokens: Optional[torch.Tensor] = None,
-    ) -> List[bool]:
+        gather_context_logits: bool = False,
+    ) -> None:
         """Prepare inputs for AD Model from scheduled requests."""
         # cache manager
         kv_cache_manager = resource_manager.get_resource_manager(
@@ -467,7 +477,6 @@ class ADEngine(ModelEngine):
         input_pos: List[int] = []
         seq_len: List[int] = []
         cu_seqlen: List[int] = [0]
-        last_logit_only: List[bool] = []
         cache_loc: List[int] = []
         pages_per_seq: List[int] = []
         cu_num_pages: List[int] = [0]
@@ -480,6 +489,9 @@ class ADEngine(ModelEngine):
         flat_gather_indices: List[int] = []
         mask_scatter_indices: List[int] = []
         extra_args: Dict[str, List[torch.Tensor]] = defaultdict(list)
+
+        # gather indices for logits
+        logits_gather_indices: List[int] = []
 
         page_size = self.cache_seq_interface.info.page_size
         dummy_token = -1
@@ -505,7 +517,11 @@ class ADEngine(ModelEngine):
             cu_seqlen.append(cu_seqlen[-1] + seq_len[-1])
 
             request.py_batch_idx = request.seq_slot
-            last_logit_only.append(True)
+
+            if gather_context_logits:
+                logits_gather_indices.extend(range(cu_seqlen[-2], cu_seqlen[-1]))
+            else:
+                logits_gather_indices.append(cu_seqlen[-1] - 1)
 
             # get cache indices and truncate the number of blocks according to end_compute
             cache_indices = kv_cache_manager.get_cache_indices(request)
@@ -600,10 +616,12 @@ class ADEngine(ModelEngine):
             request.py_batch_idx = request.seq_slot
             slot_idx.append(request.seq_slot)
             use_initial_states.append(input_pos[-1] > 0)
-            last_logit_only.append(False)
 
             seq_len.append(len(input_ids[-1]))
             cu_seqlen.append(cu_seqlen[-1] + seq_len[-1])
+
+            # for generate requests, we always keep all logits (target logits + draft logits)
+            logits_gather_indices.extend(range(cu_seqlen[-2], cu_seqlen[-1]))
 
             if use_overlap:
                 mask_scatter_indices.extend(list(range(cu_seqlen[-2], cu_seqlen[-1])))
@@ -617,6 +635,14 @@ class ADEngine(ModelEngine):
             last_page_len.append((seq_len_with_cache[-1] - 1) % page_size + 1)
 
             position_ids.append(list(range(input_pos[-1], seq_len_with_cache[-1])))
+
+        # check for logits_gather_info
+        # we only need to gather in the following situation:
+        # 1. there are context requests and
+        # 2. we are not gathering context logits
+        # In other cases (decode-only) or when we keep all logits, we do not need to gather.
+        gather_required = len(context_requests) > 0 and not gather_context_logits
+        logits_gather_info = [len(logits_gather_indices), int(gather_required)]
 
         # update the sequence info object now
         self.cache_seq_interface.info.nest_sequences(
@@ -632,6 +658,8 @@ class ADEngine(ModelEngine):
             last_page_len=last_page_len,
             slot_idx=slot_idx,
             use_initial_states=use_initial_states,
+            logits_gather_indices=logits_gather_indices,
+            logits_gather_info=logits_gather_info,
             _gather_idx=None if new_tokens is None else flat_gather_indices,
             _mask_scatter_indices=None if new_tokens is None else mask_scatter_indices,
             **extra_args,
@@ -644,18 +672,15 @@ class ADEngine(ModelEngine):
         self.iter_states["num_ctx_tokens"] = num_ctx_tokens
         # TODO: handle extend requests and draft requests for specdec
         self.iter_states["num_generation_tokens"] = num_generation_tokens
-        return last_logit_only
 
     @nvtx_range("ad_compute_logits")
     def _compute_logits(self) -> List[torch.Tensor]:
         # run the model
         logits: torch.Tensor = self.model(**self.cache_seq_interface.named_args)[0]
+        logits = self.cache_seq_interface.info.maybe_gather_and_squeeze_logits(logits)
 
         # TRTLLMSampler expects float32 logits. PyTorchModelEngine always casts to float32 regardless.
-        logits = logits.float()
-
-        # return a list of tensors
-        return self.cache_seq_interface.info.unnest_sequences(logits)
+        return logits.float()
 
     def get_max_num_sequences(self) -> int:
         """Maximum number of sequences supported by the engine."""
@@ -674,19 +699,18 @@ class ADEngine(ModelEngine):
         """Run forward from scheduled requests; main entrypoint that gets called by the executor."""
         # convert requests and store in sequence info object
         new_tokens = getattr(new_tensors_device, "new_tokens", None)
-        last_logit_only = self._prepare_inputs(scheduled_requests, resource_manager, new_tokens)
+        self._prepare_inputs(
+            scheduled_requests, resource_manager, new_tokens, gather_context_logits
+        )
         self.iter_counter += 1
 
-        # compute all logits
-        logits = self._compute_logits()
+        outputs = {
+            "logits": self._compute_logits(),
+        }
+        if self.mapping is not None:
+            self._execute_logit_post_processors(scheduled_requests, outputs)
 
-        # gather+cat logits
-        logits_flat = torch.cat(
-            [ls_one_seq[-last_only:] for ls_one_seq, last_only in zip(logits, last_logit_only)],
-            dim=0,
-        )
-
-        return {"logits": logits_flat}
+        return outputs
 
 
 def create_draft_model_engine_maybe(
@@ -825,7 +849,7 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     )
 
     # initialize model engine
-    engine = ADEngine.build_from_config(ad_config=ad_config)
+    engine = ADEngine.build_from_config(ad_config=ad_config, mapping=dist_mapping)
 
     spec_config = ad_config.speculative_config
     if spec_config is not None and not spec_config.spec_dec_mode.is_draft_target():
