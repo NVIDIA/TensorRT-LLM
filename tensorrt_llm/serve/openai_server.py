@@ -128,6 +128,8 @@ class OpenAIServer:
         # The steady clock offset (in seconds) between this server and the disagg server
         self.disagg_server_steady_clock_offset = 0
 
+        self.background_tasks: dict[str, asyncio.Task] = {}
+
         # as disagg-worker
         self.disagg_cluster_storage = None
         self.disagg_cluster_worker = None
@@ -1203,6 +1205,27 @@ class OpenAIServer:
                         logger.debug(f"response_id {prev_response_id} not found")
                         return self._create_response_id_not_found_error(prev_response_id)
 
+            if request.background:
+                if request.store and not self.enable_store:
+                    return self.create_error_response(
+                        err_type="invalid_request_error",
+                        message=(
+                            "trtllm-serve does not support `store=True` and "
+                            "therefore does not support the background mode."
+                        ),
+                        status_code=HTTPStatus.BAD_REQUEST,
+                    )
+
+                if request.stream:
+                    return self.create_error_response(
+                        err_type="invalid_request_error",
+                        message=(
+                            "trtllm-serve does not support the background mode "
+                            "with streaming."
+                        ),
+                        status_code=HTTPStatus.BAD_REQUEST,
+                    )
+
             input_tokens, sampling_params = await responses_api_request_preprocess(
                 request=request,
                 prev_response=prev_response,
@@ -1252,6 +1275,31 @@ class OpenAIServer:
 
             if self.postproc_worker_enabled and request.store:
                 logger.warning("Postproc workers are enabled, request will not be stored!")
+
+            if request.background:
+                create_time = int(time.time())
+                resp = ResponsesResponse.from_request(
+                    request=request,
+                    sampling_params=sampling_params,
+                    model_name=self.model,
+                    created_time=create_time,
+                    output=[],
+                    status="queued",
+                    usage=None,
+                )
+
+                # Create background task
+                task = asyncio.create_task(create_response(promise, postproc_params))
+
+                # Response will be stored in `create_response`
+                # User is supposed to query the responses with the response_id
+                response_id = resp.id
+                self.background_tasks[response_id] = task
+                task.add_done_callback(
+                    lambda _: self.background_tasks.pop(response_id, None)
+                )
+
+                return JSONResponse(content=resp.model_dump())
 
             asyncio.create_task(self.await_disconnected(raw_request, promise))
 
