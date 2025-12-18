@@ -62,19 +62,35 @@ if [[ "$BACKEND" == "ray" ]]; then
 # extra_llm_config.yaml when launching disaggregated server instances.
 cache_transceiver_config:
     backend: "UCX"
-    max_tokens_in_buffer: 2048
+    max_tokens_in_buffer: 1024
 disable_overlap_scheduler: true
 # Ray executor configuration
 orchestrator_type: "ray"
+# Memory-saving parameters
+max_batch_size: 1
+max_num_tokens: 512
+max_seq_len: 128
+kv_cache_config:
+    free_gpu_memory_fraction: 0.8
+# Ensure Ray respects CUDA_VISIBLE_DEVICES
+env_overrides:
+    RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES: "1"
+    RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO: "0"
 EOF
 else
     cat > extra_llm_config.yaml << EOF
 # extra_llm_config.yaml when launching disaggregated server instances.
 cache_transceiver_config:
     backend: "UCX"
-    max_tokens_in_buffer: 2048
+    max_tokens_in_buffer: 1024
 disable_overlap_scheduler: true
 # Using default executor MPI (no orchestrator_type specified)
+# Memory-saving parameters
+max_batch_size: 1
+max_num_tokens: 512
+max_seq_len: 128
+kv_cache_config:
+    free_gpu_memory_fraction: 0.8
 EOF
 fi
 
@@ -84,15 +100,18 @@ cat > disagg_config_local.yaml << EOF
 hostname: localhost
 port: 8000
 model: $MODEL_DIR
-free_gpu_memory_fraction: 0.25
+free_gpu_memory_fraction: 0.8
 backend: "pytorch"
 disable_overlap_scheduler: True
 context_servers:
   num_instances: 1
   tensor_parallel_size: $TP_SIZE
   pipeline_parallel_size: 1
+  max_batch_size: 1
+  max_num_tokens: 512
+  max_seq_len: 128
   kv_cache_config:
-    free_gpu_memory_fraction: 0.2
+    free_gpu_memory_fraction: 0.8
   cache_transceiver_config:
     backend: "UCX"
   urls:
@@ -101,6 +120,11 @@ generation_servers:
   num_instances: 1
   tensor_parallel_size: $TP_SIZE
   pipeline_parallel_size: 1
+  max_batch_size: 1
+  max_num_tokens: 512
+  max_seq_len: 128
+  kv_cache_config:
+    free_gpu_memory_fraction: 0.8
   cache_transceiver_config:
     backend: "UCX"
   urls:
@@ -126,26 +150,56 @@ fi
 # Launching context servers
 echo "Launching context servers..."
 if [[ "$BACKEND" == "mpi" ]]; then
-    export CUDA_VISIBLE_DEVICES=0
+    CTX_GPUS=$(seq -s, 0 $((TP_SIZE - 1)))
+    echo "Context server using GPUs: $CTX_GPUS"
+    (
+        export CUDA_VISIBLE_DEVICES=$CTX_GPUS
+        trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port 8001 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --extra_llm_api_options extra_llm_config.yaml
+    ) &> output_ctx0 &
 elif [[ "$BACKEND" == "ray" ]]; then
-    # For Ray with TP>1, explicitly set CUDA_VISIBLE_DEVICES to ensure GPU isolation
-    CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((TP_SIZE - 1)))
-    export CUDA_VISIBLE_DEVICES
-    echo "Context server using CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
-fi
+    CTX_GPUS=$(seq -s, 0 $((TP_SIZE - 1)))
+    echo "Context server using GPUs: $CTX_GPUS"
+    (
+        # Use MPI-style launch even with Ray orchestrator
+        export CUDA_VISIBLE_DEVICES=$CTX_GPUS
+        # Force local cluster to avoid Ray GPU management issues
+        export TLLM_RAY_FORCE_LOCAL_CLUSTER=1
+        export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
 
-trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port 8001 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --config extra_llm_config.yaml &> output_ctx0 &
-
-if [[ "$BACKEND" == "mpi" ]]; then
-    export CUDA_VISIBLE_DEVICES=1
-elif [[ "$BACKEND" == "ray" ]]; then
-    CUDA_VISIBLE_DEVICES=$(seq -s, $TP_SIZE $((2 * TP_SIZE - 1)))
-    export CUDA_VISIBLE_DEVICES
-    echo "Generation server using CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+        trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port 8001 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --extra_llm_api_options extra_llm_config.yaml
+    ) &> output_ctx0 &
+else
+    trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port 8001 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --extra_llm_api_options extra_llm_config.yaml &> output_ctx0 &
 fi
+CTX_PID=$!
+echo "Context server started with PID: $CTX_PID"
+
 # Launching generation servers
 echo "Launching generation servers..."
-trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port 8002 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --config extra_llm_config.yaml &> output_gen0 &
+if [[ "$BACKEND" == "mpi" ]]; then
+    GEN_GPUS=$(seq -s, $TP_SIZE $((2 * TP_SIZE - 1)))
+    echo "Generation server using GPUs: $GEN_GPUS"
+    (
+        export CUDA_VISIBLE_DEVICES=$GEN_GPUS
+        trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port 8002 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --extra_llm_api_options extra_llm_config.yaml
+    ) &> output_gen0 &
+elif [[ "$BACKEND" == "ray" ]]; then
+    GEN_GPUS=$(seq -s, $TP_SIZE $((2 * TP_SIZE - 1)))
+    echo "Generation server using GPUs: $GEN_GPUS"
+    (
+        # Use MPI-style launch even with Ray orchestrator
+        export CUDA_VISIBLE_DEVICES=$GEN_GPUS
+        # Force local cluster to avoid Ray GPU management issues
+        export TLLM_RAY_FORCE_LOCAL_CLUSTER=1
+        export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
+
+        trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port 8002 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --extra_llm_api_options extra_llm_config.yaml
+    ) &> output_gen0 &
+else
+    trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port 8002 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --extra_llm_api_options extra_llm_config.yaml &> output_gen0 &
+fi
+GEN_PID=$!
+echo "Generation server started with PID: $GEN_PID"
 
 # Launching disaggregated server
 echo "Launching disaggregated server..."

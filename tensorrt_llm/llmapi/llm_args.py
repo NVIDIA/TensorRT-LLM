@@ -1828,6 +1828,7 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
     )
 
     def _to_pybind(self):
+        print(f"CacheTransceiverConfig: {self.backend}")
         return _CacheTransceiverConfig(
             backend=_CacheTransceiverBackendType.from_string(self.backend),
             max_tokens_in_buffer=self.max_tokens_in_buffer,
