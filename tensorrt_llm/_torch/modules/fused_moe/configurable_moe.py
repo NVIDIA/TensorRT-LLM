@@ -991,23 +991,17 @@ class ConfigurableMoE(MoE):
         if not isinstance(self.comm, NVLinkOneSided):
             return None
 
+        if not self.backend.supports_moe_output_in_alltoall_workspace():
+            # Ensure payload_in_workspace is False if backend doesn't support it
+            self.comm.payload_in_workspace = False
+            return None
+
         # Determine workspace dtype and whether backend supports workspace output
         workspace_dtype = output_dtype
-        backend_supports_workspace = False
-
         if isinstance(self.backend, TRTLLMGenFusedMoE):
             # TRTLLMGen specific configuration
             self.comm.invalid_token_expert_id = -1
             workspace_dtype = torch.bfloat16
-            backend_supports_workspace = self.backend.has_w4a8_mxfp4_mxfp8
-        elif isinstance(self.backend, CutlassFusedMoE):
-            # Cutlass always supports workspace output with NVLinkOneSided
-            backend_supports_workspace = True
-
-        if not backend_supports_workspace:
-            # Ensure payload_in_workspace is False if backend doesn't support it
-            self.comm.payload_in_workspace = False
-            return None
 
         # Calculate runtime max tokens per rank
         assert all_rank_num_tokens is not None, (
@@ -1022,7 +1016,6 @@ class ConfigurableMoE(MoE):
 
         # Dynamically enable payload_in_workspace for this forward pass
         self.comm.payload_in_workspace = True
-
         return moe_output
 
     def _get_backend_kwargs(
@@ -1096,12 +1089,17 @@ class ConfigurableMoE(MoE):
 
             # Get moe_output for NVLinkOneSided backend
             kwargs["moe_output"] = self._get_nvlink_onesided_moe_output(
-                all_rank_num_tokens, output_dtype
+                all_rank_num_tokens=all_rank_num_tokens, output_dtype=output_dtype
             )
 
         # CuteDSL-specific parameters
         elif self.backend.__class__ == CuteDslFusedMoE:
             kwargs["enable_alltoall"] = self.enable_alltoall
+
+            # Get moe_output for NVLinkOneSided backend
+            kwargs["moe_output"] = self._get_nvlink_onesided_moe_output(
+                all_rank_num_tokens=all_rank_num_tokens, output_dtype=output_dtype
+            )
 
         # DeepGemm-specific parameters
         elif self.backend.__class__ == DeepGemmFusedMoE:
@@ -1123,7 +1121,7 @@ class ConfigurableMoE(MoE):
 
             # Get moe_output for NVLinkOneSided backend
             kwargs["moe_output"] = self._get_nvlink_onesided_moe_output(
-                all_rank_num_tokens, output_dtype
+                all_rank_num_tokens=all_rank_num_tokens, output_dtype=output_dtype
             )
 
         return kwargs
