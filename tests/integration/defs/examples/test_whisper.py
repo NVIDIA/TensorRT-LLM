@@ -47,7 +47,8 @@ def test_llm_whisper_general(llm_venv, engine_dir, data_type,
                              weight_only_precision, use_attention_plugin,
                              use_gemm_plugin, whisper_example_root,
                              whisper_model_root, num_beams, use_cpp_runtime,
-                             whisper_example_audio_file, llm_datasets_root):
+                             whisper_example_audio_file, llm_datasets_root,
+                             llm_models_root):
     print("Locate model checkpoints in test storage...")
     tllm_model_name, model_ckpt_dir = whisper_model_root
 
@@ -115,6 +116,7 @@ def test_llm_whisper_general(llm_venv, engine_dir, data_type,
         print("Run inference using Python bindings of C++ runtime...")
         run_cmd = [
             f'{whisper_example_root}/../../../run.py',
+            f'--tokenizer_dir={llm_models_root}/whisper-{tllm_model_name}',
             f'--multimodal_input_file={whisper_example_audio_file}',
             f'--engine_dir={whisper_engine_dir}',
             f'--max_output_len=96',
