@@ -1,11 +1,11 @@
-"""Multiround chat benchmark implementation for scaffolding benchmarks.
+"""Multi-turn conversation benchmark for scaffolding.
 
-This module implements real multi-turn conversation benchmarking with:
-- ShareGPT dataset loading or synthetic conversation generation
-- Multiple distribution types: Uniform, Constant, Zipf, Poisson, Lognormal
-- Configurable distributions for turns, tokens, prefixes, and user delays
-- JSON config file support for complex workload specifications
-- Real conversation context management across turns
+This benchmark simulates multi-turn conversations with realistic user behavior
+and conversation context management. It supports various distribution types for
+turns, tokens, prefixes, and user delays, as well as JSON config file support
+for complex workload specifications.
+
+Adapted from: https://github.com/vllm-project/vllm/tree/main/benchmarks/multi_turn
 """
 
 import asyncio
