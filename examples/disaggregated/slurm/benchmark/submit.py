@@ -108,19 +108,36 @@ def allocate_gpus(
 
     return allocations
 
-def convert_allocations_to_server_config(allocations):
+def convert_allocations_to_server_config(allocations, server_port=8333):
+    generation_servers={}
+    context_servers={}
+    server_hostname=None
+    for server_type in allocations.keys():
+        num_servers=len(allocations[server_type])
+        urls=[]
+        for server_id in allocations[server_type].keys():
+            instance=allocations[server_type][server_id]
+            urls.append(f"{list(instance['nodes'].keys())[0]}:{instance['port']}")
+        if server_type == "GEN":
+            generation_servers={
+                'num_instances': num_servers,
+                'urls': urls
+            }
+            server_hostname=urls[0].split(':')[0]
+            if allocations[server_type][server_id]['port']==server_port:
+                server_port+=1 # Avoid port conflict
+        elif server_type == "CTX":
+            context_servers={
+                'num_instances': num_servers,
+                'urls': urls
+            }
+
     server_config = {
         'backend': 'pytorch',
-        'hostname': hostname,
-        'port': port,
-        'context_servers': {
-            'num_instances': 0 if gen_only else args.num_ctx_servers,
-            'urls': [] if gen_only else ctx_urls
-        },
-        'generation_servers': {
-            'num_instances': args.num_gen_servers,
-            'urls': gen_urls
-        }
+        'hostname': server_hostname,
+        'port': server_port,
+        'context_servers': context_servers,
+        'generation_servers': generation_servers
     }
     return server_config
 
@@ -248,6 +265,11 @@ def submit_job(config, log_dir, dry_run):
     )
     with open(os.path.join(log_dir, "allocations.json"), "w") as f:
         json.dump(allocations, f, indent=2)
+
+    # Generate disagg server config
+    server_config=convert_allocations_to_server_config(allocations)
+    with open(os.path.join(log_dir, "server_config.yaml"), "w") as f:
+        yaml.dump(server_config, f)
 
     container_name = "disaggr-test"
     start_server_cmds = []
