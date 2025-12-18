@@ -30,13 +30,16 @@ from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformReg
 
 
 def _make_allreduce_residual_rmsnorm_pattern(
-    add_order: str = "residual_first", strategy: str = "AUTO"
+    add_order: str = "residual_first", strategy: str = "AUTO", post_folding: bool = False
 ):
     """Factory function to create pattern functions for allreduce+residual+rmsnorm fusion.
 
     Args:
         add_order: Either "residual_first" (residual + x) or "x_first" (x + residual)
         strategy: AllReduce strategy to use in the pattern
+        post_folding: If True, matches the pattern after constant folding where:
+            - There's an extra to(input_dtype) before to(float32)
+            - Weight multiply happens in float32 with to(input_dtype) at the end
 
     Returns:
         A pattern function that can be used with register_ad_pattern
@@ -62,11 +65,24 @@ def _make_allreduce_residual_rmsnorm_pattern(
         else:  # x_first
             add = hidden_states + residual
 
-        hidden_states = add.to(torch.float32)
+        if post_folding:
+            # After constant folding: extra to(input_dtype) before to(float32)
+            hidden_states = add.to(input_dtype)
+            hidden_states = hidden_states.to(torch.float32)
+        else:
+            # Before constant folding: direct to(float32)
+            hidden_states = add.to(torch.float32)
+
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + eps)
 
-        normed = weight * hidden_states.to(input_dtype)
+        if post_folding:
+            # After constant folding: weight is float32, multiply in float32,
+            # then convert to input_dtype at the end
+            normed = (weight * hidden_states).to(input_dtype)
+        else:
+            # Before constant folding: convert to input_dtype first, then multiply
+            normed = weight * hidden_states.to(input_dtype)
 
         return normed, add
 
@@ -124,16 +140,24 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
         # Get the allreduce strategy from shared_config
         strategy = shared_config.sharding_transform_container.allreduce_strategy.name
 
-        # TRT-LLM backend (MPI mode) - two patterns for different addition orders
+        # TRT-LLM backend (MPI mode) - patterns for different addition orders
+        # Pre-constant-folding patterns
         _allreduce_residual_rmsnorm_pattern_trtllm = _make_allreduce_residual_rmsnorm_pattern(
-            add_order="residual_first", strategy=strategy
+            add_order="residual_first", strategy=strategy, post_folding=False
         )
         _allreduce_residual_rmsnorm_pattern2_trtllm = _make_allreduce_residual_rmsnorm_pattern(
-            add_order="x_first", strategy=strategy
+            add_order="x_first", strategy=strategy, post_folding=False
+        )
+        # Post-constant-folding patterns (weight is float32, different dtype conversion order)
+        _allreduce_residual_rmsnorm_pattern_post_fold = _make_allreduce_residual_rmsnorm_pattern(
+            add_order="residual_first", strategy=strategy, post_folding=True
+        )
+        _allreduce_residual_rmsnorm_pattern2_post_fold = _make_allreduce_residual_rmsnorm_pattern(
+            add_order="x_first", strategy=strategy, post_folding=True
         )
 
         # Register TRT-LLM backend patterns only (no torch backend fusion)
-        # Pattern 1: residual + allreduce(x)
+        # Pattern 1: residual + allreduce(x) (pre-folding)
         register_ad_pattern(
             search_fn=_allreduce_residual_rmsnorm_pattern_trtllm,
             replace_fn=partial(_allreduce_residual_rmsnorm_replacement, strategy=strategy),
@@ -143,9 +167,29 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
             scalar_workaround=scalar_workaround,
         )
 
-        # Pattern 2: allreduce(x) + residual
+        # Pattern 2: allreduce(x) + residual (pre-folding)
         register_ad_pattern(
             search_fn=_allreduce_residual_rmsnorm_pattern2_trtllm,
+            replace_fn=partial(_allreduce_residual_rmsnorm_replacement, strategy=strategy),
+            patterns=patterns,
+            dummy_args=dummy_args,
+            op_ignore_types=op_ignore_types,
+            scalar_workaround=scalar_workaround,
+        )
+
+        # Pattern 3: residual + allreduce(x) (post-folding)
+        register_ad_pattern(
+            search_fn=_allreduce_residual_rmsnorm_pattern_post_fold,
+            replace_fn=partial(_allreduce_residual_rmsnorm_replacement, strategy=strategy),
+            patterns=patterns,
+            dummy_args=dummy_args,
+            op_ignore_types=op_ignore_types,
+            scalar_workaround=scalar_workaround,
+        )
+
+        # Pattern 4: allreduce(x) + residual (post-folding)
+        register_ad_pattern(
+            search_fn=_allreduce_residual_rmsnorm_pattern2_post_fold,
             replace_fn=partial(_allreduce_residual_rmsnorm_replacement, strategy=strategy),
             patterns=patterns,
             dummy_args=dummy_args,
