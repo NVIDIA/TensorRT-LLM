@@ -479,6 +479,10 @@ class PyExecutor:
                     module.register_forward_hook(
                         self.kv_connector_manager.layer_post_hook)
 
+    def _end_transfer_and_maybe_terminate(self, request: LlmRequest):
+        if self.async_transfer_manager.end_transfer(request):
+            self._terminate_request(request)
+
     def _event_loop_wrapper(self):
         try:
             with customized_gc_thresholds(
@@ -1418,8 +1422,7 @@ class PyExecutor:
         if self.kv_connector_manager:
             reqs_to_terminate = self.kv_connector_manager.get_finished()
             for req in reqs_to_terminate:
-                if self.async_transfer_manager.end_transfer(req):
-                    self._terminate_request(req)
+                self._end_transfer_and_maybe_terminate(req)
 
     def _kv_connector_wait_for_save(self):
         if self.kv_connector_manager is not None:
@@ -2306,16 +2309,25 @@ class PyExecutor:
 
         completed_req_ids = set(finished_requests + error_requests)
 
+        requests_in_transfer = self.async_transfer_manager.requests_in_transfer(
+        )
+
         for request_id in completed_req_ids:
 
-            request = self.async_transfer_manager.requests_in_transfer(
-            )[request_id]
+            if request_id not in requests_in_transfer:
+                logger.warning(
+                    f"Request {request_id} not found in transfer manager")
+                continue
 
-            if self.async_transfer_manager.end_transfer(request):
-                self._terminate_request(request)
+            request = requests_in_transfer[request_id]
 
-        for request in list(
-                self.async_transfer_manager.requests_in_transfer().values()):
+            self._end_transfer_and_maybe_terminate(request)
+
+        # The set of requests in transfer may have changed since we terminated some requests.
+        requests_in_transfer = self.async_transfer_manager.requests_in_transfer(
+        )
+
+        for request in requests_in_transfer.values():
             if request.py_kv_transfer_timed_out and request.py_request_id not in completed_req_ids:
                 is_cancelled = self.kv_cache_transceiver.cancel_request(request)
                 # If cancel is successful, mark as complete so it can be cleaned up
@@ -2324,8 +2336,7 @@ class PyExecutor:
                     request.py_kv_transfer_start_time = None
                     request.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
 
-                    if self.async_transfer_manager.end_transfer(request):
-                        self._terminate_request(request)
+                    self._end_transfer_and_maybe_terminate(request)
 
         self._check_cache_transfer_errors("context requests")
 
