@@ -295,15 +295,6 @@ class JobManager:
             shutil.copytree(result_dir, backup_dir)
             logger.success(f"Backup created successfully: {backup_dir}")
 
-            # Copy SLURM log file
-            work_dir = EnvManager.get_work_dir()
-            slurm_out_file = os.path.join(work_dir, f"slurm-{job_id}.out")
-            if os.path.exists(slurm_out_file):
-                shutil.copy(slurm_out_file, backup_dir)
-                logger.success(f"SLURM log copied successfully: {slurm_out_file}")
-            else:
-                logger.warning(f"SLURM log not found: {slurm_out_file}")
-
             # Move temporary config file to backup directory (not copy)
             temp_config_path = test_config.temp_config_path
             if os.path.exists(temp_config_path):

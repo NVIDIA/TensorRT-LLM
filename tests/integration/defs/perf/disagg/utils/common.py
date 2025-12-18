@@ -63,8 +63,15 @@ class EnvManager:
     @staticmethod
     def get_slurm_set_segment() -> bool:
         gpu_type = EnvManager.get_gpu_type()
-        gpu_type_support_segment = {"GB200": True, "GB300": False}
+        gpu_type_support_segment = {"GB200": True, "GB300": True}
         return gpu_type_support_segment.get(gpu_type, False)
+    
+    @staticmethod
+    def get_slurm_extra_args() -> str:
+        gpu_type = EnvManager.get_gpu_type()
+        gpu_type_support_extra_args = {"GB200": "--gres=gpu:4", 
+                                       "GB300": ""}
+        return gpu_type_support_extra_args.get(gpu_type, "")
 
     @staticmethod
     def get_container_image() -> str:
