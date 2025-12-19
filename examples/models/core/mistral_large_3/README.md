@@ -19,7 +19,7 @@ mpirun -n 1 --allow-run-as-root --oversubscribe python3 examples/llm-api/quickst
     --checkpoint_format mistral_large_3 \
     --model_type mistral3 \ 
     --kv_cache_fraction 0.25 \
-    --moe_backend TRTLLM # optional
+    --image_format pil
 ```
 
 ## LLM-only run

@@ -67,9 +67,9 @@ class MistralAttention(Attention):
     ):
         config = model_config.pretrained_config
         rope_params = RopeParams.from_config(config)
-        rope_params_section = getattr(config, "rope_scaling") or getattr(
-            config, "rope_parameters")
-        rope_type = rope_params_section.get("rope_type")
+        rope_params_section = getattr(config, "rope_scaling", None) or getattr(
+            config, "rope_parameters", None)
+        rope_type = getattr(rope_params_section, "rope_type", None)
         if rope_type == "yarn":
             pos_embd_params = PositionalEmbeddingParams(
                 type=PositionEmbeddingType.yarn,

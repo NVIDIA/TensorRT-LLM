@@ -68,7 +68,9 @@ class MistralCheckpointLoader(HfCheckpointLoader):
         weights = super().weight_loader.load_weights(
             checkpoint_dir, use_consolidated=True, **kwargs
         )
-        weights = self.preprocess_weights(weights)
+        mm_key = next((x for x in weights.keys() if x.startswith("vision_encoder")), None)
+        if mm_key is not None:
+            weights = self.preprocess_weights(weights)
         self.reverse_nvfp4_global_scales(weights)
         return weights
 
