@@ -25,17 +25,14 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
-from einops import rearrange
 from torch import nn
 from transformers.activations import ACT2FN
 from transformers.generation import GenerationMixin
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
-from tensorrt_llm._torch.auto_deploy.models.patches.nemotron_h import (
-    _nemotron_h_moe_forward,
-    _nemotron_h_topk_router_forward,
-)
+from tensorrt_llm._torch.auto_deploy.custom_ops.rms_norm import gated_rms_norm_ref
+from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
 
 
 class MambaRMSNormGated(torch.nn.Module):
@@ -46,7 +43,7 @@ class MambaRMSNormGated(torch.nn.Module):
         self.group_size = group_size
 
     def forward(self, hidden_states, gate=None):
-        return _rms_norm_ref(
+        return gated_rms_norm_ref(
             x=hidden_states,
             weight=self.weight,
             bias=None,
@@ -55,38 +52,6 @@ class MambaRMSNormGated(torch.nn.Module):
             group_size=self.group_size,
             norm_before_gate=False,
         )
-
-
-# Forked from:
-# https://github.com/state-spaces/mamba/blob/6b32be06d026e170b3fdaf3ae6282c5a6ff57b06/mamba_ssm/ops/triton/layernorm_gated.py
-# NOTES:
-# 1. At time of writing (09/25/2025), the nano nemotron v2 modeling code expects `mamba_ssm`
-#    to be installed so as to be able to make use of its grouped gated RMS norm operation.
-#    We therefore replace it with one that uses einops + pytorch.
-def _rms_norm_ref(
-    x, weight, bias, z=None, eps=1e-6, group_size=None, norm_before_gate=True, upcast=True
-):
-    dtype = x.dtype
-    # N = x.shape[-1]
-    weight = weight.float()
-    bias = bias.float() if bias is not None else None
-    if upcast:
-        x = x.float()
-        z = z.float() if z is not None else z
-    if z is not None and not norm_before_gate:
-        x = x * F.silu(z)
-    if group_size is None:
-        rstd = 1 / torch.sqrt((x.square()).mean(dim=-1, keepdim=True) + eps)
-        out = (x * rstd * weight) + bias if bias is not None else (x * rstd * weight)
-    else:
-        x_group = rearrange(x, "... (g d) -> ... g d", d=group_size)
-        rstd = 1 / torch.sqrt((x_group.square()).mean(dim=-1, keepdim=True) + eps)
-        out = rearrange(x_group * rstd, "... g d -> ... (g d)") * weight
-        if bias is not None:
-            out = out + bias
-    if z is not None and norm_before_gate:
-        out *= F.silu(z)
-    return out.to(dtype)
 
 
 class NemotronHMamba2Mixer(nn.Module):
@@ -149,9 +114,9 @@ class NemotronHMamba2Mixer(nn.Module):
         self.A_log._no_weight_decay = True
         # Instead of recomputing `torch.exp(self.A_log.float())` on every forward pass, we will register a hook
         # that sets this appropriately when loading weights.
-        # NOTE: we explicitly do NOT make this a `nn.Parameter` so that it does not appear in the state dict of
-        # this module, or an equivalent graph module trace from it.
-        self._minus_A = -A.float()
+        # NOTE: we explicitly register this as a non-persistent buffer so that it does not appear in the state dict of
+        # this module, or an equivalent graph module trace from it, but still gets included in e.g. `to()` calls.
+        self.register_buffer("_minus_A", -A.float(), persistent=False)
         self.norm = MambaRMSNormGated(
             self.intermediate_size,
             eps=self.layer_norm_epsilon,
@@ -317,8 +282,43 @@ class NemotronHMOE(nn.Module):
             layer_idx=layer_idx,
         )
 
-    # TODO: inline code from `_nemotron_h_moe_forward` when removing patches.
-    forward = _nemotron_h_moe_forward
+    def forward(self, hidden_states: torch.Tensor):
+        residuals = hidden_states
+        orig_shape = hidden_states.shape
+        topk_indices, topk_weights = self.gate(hidden_states)
+        x_flat = hidden_states.view(-1, hidden_states.shape[-1])
+
+        # NOTE: So far we've seen that the dispatch order in eager code is the same as the node order in the exported
+        # graph.
+        # We dispatch shared expert first so that we can easily fork the execution of the routed experts
+        # (using the custom op below) to an auxiliary stream.
+        shared_out = self.shared_experts(residuals)
+        # Check if this is a latent MOE (has fc1_latent_proj and fc2_latent_proj)
+        has_latent_proj = hasattr(self, "fc1_latent_proj") and hasattr(self, "fc2_latent_proj")
+
+        if has_latent_proj:
+            # Latent MOE: project to latent space before routing
+            x_flat = self.fc1_latent_proj(x_flat)
+
+        # Route through experts (operates in latent space if latent MOE, full space otherwise)
+        out_flat = torch.ops.auto_deploy.torch_moe(
+            x_flat,
+            topk_indices,
+            topk_weights,
+            w1_weight=[e.up_proj.weight for e in self.experts],
+            w2_weight=[e.down_proj.weight for e in self.experts],
+            w3_weight=[],
+            act_fn="relu2",
+            mlp_style="mlp",
+        )
+
+        if has_latent_proj:
+            # Latent MOE: project back from latent space
+            out_flat = self.fc2_latent_proj(out_flat)
+
+        routed_out = out_flat.view(*orig_shape)
+        out = shared_out + routed_out
+        return out
 
 
 class NemotronHTopkRouter(nn.Module):
@@ -339,22 +339,33 @@ class NemotronHTopkRouter(nn.Module):
             "e_score_correction_bias", torch.zeros(self.n_routed_experts, dtype=torch.float32)
         )
 
-    forward = _nemotron_h_topk_router_forward
+    def forward(self, hidden_states):
+        """
+        Forward pass for NemotronHTopkRouter using the optimized noaux_tc_op kernel.
 
+        This replaces the original forward method which used pure PyTorch operations
+        with optimized CUDA kernels:
+        """
+        hidden_states = hidden_states.view(-1, self.config.hidden_size)
+        if self.weight.dtype == torch.float32:
+            router_logits = F.linear(hidden_states.type(torch.float32), self.weight)
+        else:
+            router_logits = torch.ops.trtllm.dsv3_router_gemm_op(
+                hidden_states, self.weight.t(), bias=None, out_dtype=torch.float32
+            )
 
-# Copied from transformers.models.llama.modeling_llama.repeat_kv
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """
-    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
-    """
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(
-        batch, num_key_value_heads, n_rep, slen, head_dim
-    )
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+        # Use the fused noaux_tc_op kernel which applies sigmoid internally
+        # and performs group-based top-k selection with normalization
+        topk_weights, topk_indices = torch.ops.trtllm.noaux_tc_op(
+            router_logits,
+            self.e_score_correction_bias,
+            self.n_group,
+            self.topk_group,
+            self.top_k,
+            self.routed_scaling_factor,
+        )
+
+        return topk_indices, topk_weights
 
 
 class NemotronHAttention(nn.Module):
@@ -369,8 +380,23 @@ class NemotronHAttention(nn.Module):
 
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
-        if config.head_dim is not None:
-            self.head_dim = config.head_dim
+
+        # At some point during NemotronH development, what used to be called `attention_head_dim`
+        # was renamed to `head_dim`. Since no configuration class's code (nor the modeling code,
+        # for that matter) was ever upstreamed into `transformers`, we have to resort to the below
+        # hack in order to support multiple iterations of NemotronH models.
+        if hasattr(config, "head_dim"):
+            head_dim = config.head_dim
+        elif hasattr(config, "attention_head_dim"):
+            head_dim = config.attention_head_dim
+        else:
+            raise AttributeError(
+                "Expected either `head_dim` or `attention_head_dim` to be present in the config "
+                "class, found neither."
+            )
+
+        if head_dim is not None:
+            self.head_dim = head_dim
         else:
             self.head_dim = config.hidden_size // config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
@@ -594,7 +620,4 @@ class NemotronHForCausalLM(NemotronHPreTrainedModel, GenerationMixin):
         return NemotronHCausalLMOutput(logits)
 
 
-# TODO: uncomment after removing patches (and make sure it is imported in `__init__.py`).
-# from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
-#
-# AutoModelForCausalLMFactory.register_custom_model_cls("NemotronHConfig", NemotronHForCausalLM)
+AutoModelForCausalLMFactory.register_custom_model_cls("NemotronHConfig", NemotronHForCausalLM)
