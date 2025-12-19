@@ -45,15 +45,9 @@ templates_path = ['_templates']
 exclude_patterns = ['performance/performance-tuning-guide/introduction.md']
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
-
-# ------------------------  C++ Doc related  --------------------------
-# Breathe configuration (optional for local builds).
-#
-# If the Doxygen XML isn't present, we skip generating C++ API stubs and
-# disable Breathe to avoid hard failures during doc builds.
-BREATHE_XML_DIR = os.path.abspath(
-    os.path.join(SCRIPT_DIR, "..", "cpp_docs", "xml"))
-HAS_CPP_XML = os.path.exists(os.path.join(BREATHE_XML_DIR, "index.xml"))
+CPP_XML_INDEX = os.path.abspath(
+    os.path.join(SCRIPT_DIR, "..", "cpp_docs", "xml", "index.xml"))
+HAS_CPP_XML = os.path.exists(CPP_XML_INDEX)
 if not HAS_CPP_XML:
     exclude_patterns.append('_cpp_gen/**')
 

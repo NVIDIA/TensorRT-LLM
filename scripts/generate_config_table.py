@@ -14,7 +14,6 @@
 # limitations under the License.
 
 
-import importlib
 import json
 import os
 import sys
@@ -36,25 +35,22 @@ from examples.configs.database.database import (  # noqa: E402
 )
 
 def _ensure_repo_root_on_syspath() -> None:
-    # Make repo root importable so this script works when executed as
-    # `python3 scripts/generate_config_table.py` from the repo root.
     if str(REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(REPO_ROOT))
 
 
-def _load_database_module():
+def _load_recipe_list(yaml_path: Path):
     _ensure_repo_root_on_syspath()
-    return importlib.import_module("examples.configs.database.database")
+    from examples.configs.database.database import RecipeList
+
+    return RecipeList.from_yaml(yaml_path)
 
 
-def _get_database_list_path() -> Path:
-    mod = _load_database_module()
-    return Path(mod.DATABASE_LIST_PATH)
+def _default_database_list_path() -> Path:
+    _ensure_repo_root_on_syspath()
+    from examples.configs.database.database import DATABASE_LIST_PATH
 
-
-def _get_recipe_list_cls():
-    mod = _load_database_module()
-    return mod.RecipeList
+    return Path(DATABASE_LIST_PATH)
 
 
 MODEL_INFO = {
@@ -96,7 +92,6 @@ def _model_display_and_url(model: str) -> tuple[str, str]:
     if model in MODEL_INFO:
         info = MODEL_INFO[model]
         return info["display_name"], info["url"]
-    # Fallbacks: keep table working for unknown models.
     return model, ""
 
 
@@ -124,16 +119,8 @@ def _profile_from_sorted_entries(concurrencies: list[int], idx: int) -> str:
 
 
 def build_rows(yaml_path) -> list[RecipeRow]:
-    """Build structured rows from YAML config database (single source of truth).
+    recipe_list = _load_recipe_list(Path(yaml_path))
 
-    This is the common data model used to generate both:
-    - docs/source/deployment-guide/config_table.rst
-    - docs/source/_static/config_db.json
-    """
-    RecipeList = _get_recipe_list_cls()
-    recipe_list = RecipeList.from_yaml(Path(yaml_path))
-
-    # Group by model -> (gpu, num_gpus, isl, osl) -> list of recipes
     model_groups = defaultdict(lambda: defaultdict(list))
     for recipe in recipe_list:
         key = (recipe.gpu, recipe.num_gpus, recipe.isl, recipe.osl)
@@ -144,7 +131,6 @@ def build_rows(yaml_path) -> list[RecipeRow]:
     sorted_models = sorted(model_groups.keys())
     for model in sorted_models:
         subgroups = model_groups[model]
-        # Sort by gpu, num_gpus, isl, osl for stable output ordering.
         sorted_keys = sorted(
             subgroups.keys(),
             key=lambda k: (str(k[0]), int(k[1] or 0), int(k[2] or 0), int(k[3] or 0)),
@@ -205,21 +191,13 @@ def build_rows(yaml_path) -> list[RecipeRow]:
 
 
 def generate_rst(yaml_path, output_file=None):
-    """Generate RST table from YAML config database.
-
-    Args:
-        yaml_path: Path to lookup.yaml (str or Path)
-        output_file: Optional output file path. If None, prints to stdout.
-    """
     rows = build_rows(yaml_path)
-    # Group by model for sectioning in the RST output.
     model_groups = defaultdict(list)
     for row in rows:
         model_groups[row.model].append(row)
 
     lines = []
 
-    # Include note_sections.rst at the top (relative include for Sphinx)
     lines.append(".. start-config-table-note")
     lines.append(".. include:: ../_includes/note_sections.rst")
     lines.append("   :start-after: .. start-note-traffic-patterns")
@@ -241,7 +219,6 @@ def generate_rst(yaml_path, output_file=None):
 
         lines.append(f".. _{model}:")
         lines.append("")
-        # Use a low-level section heading so it nests under "Recipe database".
         lines.append(title_text)
         lines.append("~" * len(title_text))
         lines.append("")
@@ -258,8 +235,6 @@ def generate_rst(yaml_path, output_file=None):
         lines.append("     - Config")
         lines.append("     - Command")
 
-        # Keep RST row ordering stable and intuitive by sorting by:
-        # gpu, num_gpus, isl, osl, concurrency.
         entries = sorted(
             model_groups[model],
             key=lambda r: (
@@ -288,21 +263,19 @@ def generate_rst(yaml_path, output_file=None):
     if output_file:
         with open(output_file, "w") as f:
             f.write(output_text)
-        print(f"Generated table written to: {output_file}", file=sys.stderr)
     else:
         print(output_text)
 
 
 def generate_json(yaml_path, output_file):
-    """Generate machine-readable JSON from YAML config database."""
     rows = build_rows(yaml_path)
 
     source_path = Path(yaml_path)
-    try:
-        # Keep this stable across machines so the JSON can be committed.
-        source = str(source_path.relative_to(REPO_ROOT))
-    except ValueError:
-        source = str(source_path)
+    source = (
+        str(source_path.relative_to(REPO_ROOT))
+        if source_path.is_relative_to(REPO_ROOT)
+        else str(source_path)
+    )
 
     models = {}
     for row in rows:
@@ -324,7 +297,7 @@ def generate_json(yaml_path, output_file):
 
 
 if __name__ == "__main__":
-    yaml_path = _get_database_list_path()
+    yaml_path = _default_database_list_path()
     if not yaml_path.exists():
         print(f"Error: YAML file not found at {yaml_path}", file=sys.stderr)
         sys.exit(1)

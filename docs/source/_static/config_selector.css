@@ -9,11 +9,6 @@
   margin-bottom: 12px;
 }
 
-.trtllm-config-selector__title {
-  font-weight: 600;
-  font-size: 1.05rem;
-}
-
 .trtllm-config-selector__subtitle {
   font-size: 0.95rem;
   opacity: 0.8;
@@ -58,20 +53,6 @@
   padding-right: 54px; /* room for inline copy button */
 }
 
-.trtllm-config-selector__copy {
-  margin-top: 10px;
-  padding: 8px 12px;
-  border-radius: 8px;
-  border: 1px solid rgba(0, 0, 0, 0.18);
-  background: transparent;
-  cursor: pointer;
-}
-
-.trtllm-config-selector__copy:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
 .trtllm-config-selector__meta {
   margin-top: 8px;
   font-size: 0.9rem;
@@ -89,17 +70,6 @@
 
 .trtllm-config-selector__yamlBox {
   margin-top: 10px;
-}
-
-.trtllm-config-selector__yamlActions {
-  display: flex;
-  gap: 10px;
-  align-items: center;
-  margin-bottom: 10px;
-}
-
-.trtllm-config-selector__yamlLink {
-  font-size: 0.95rem;
 }
 
 .trtllm-config-selector__yamlPre {
@@ -138,7 +108,6 @@
   text-decoration: underline;
 }
 
-/* Minimal YAML syntax highlighting (no hard-coded colors). */
 .yaml-key {
   font-weight: 600;
 }

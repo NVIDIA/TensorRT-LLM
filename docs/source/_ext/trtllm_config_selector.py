@@ -8,19 +8,11 @@ from docutils.parsers.rst import Directive, directives
 
 
 class TRTLLMConfigSelector(Directive):
-    """Embed the interactive config selector widget.
-
-    Usage:
-        .. trtllm_config_selector::
-           :models: deepseek-ai/DeepSeek-R1-0528, nvidia/DeepSeek-R1-0528-FP4-v2
-           :config_db: _static/config_db.json
-    """
+    """Embed the interactive config selector widget."""
 
     has_content = False
     option_spec = {
-        # Comma-separated list of HF model ids to include (optional).
         "models": directives.unchanged,
-        # Path relative to doc root (optional).
         "config_db": directives.unchanged,
     }
 
@@ -39,7 +31,6 @@ class TRTLLMConfigSelector(Directive):
 
 
 def setup(app):
-    # Static assets live under docs/source/_static/.
     app.add_css_file("config_selector.css")
     app.add_js_file("config_selector.js")
     app.add_directive("trtllm_config_selector", TRTLLMConfigSelector)

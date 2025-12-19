@@ -1,11 +1,11 @@
 (function () {
   "use strict";
 
-  /** @type {Promise<any>|null} */
   let dbPromise = null;
+  let widgetId = 0;
 
   function $(root, sel) {
-    return /** @type {HTMLElement|null} */ (root.querySelector(sel));
+    return root.querySelector(sel);
   }
 
   function el(tag, attrs = {}, children = []) {
@@ -55,8 +55,6 @@
   }
 
   function defaultDbUrl() {
-    // Robust default: derive the DB URL from the *script URL* so it works
-    // for nested pages (e.g. /deployment-guide/index.html).
     const scriptEl = document.querySelector('script[src*="config_selector.js"]');
     if (scriptEl && scriptEl.src) {
       const u = new URL(scriptEl.src, document.baseURI);
@@ -65,7 +63,6 @@
       u.hash = "";
       return u.toString();
     }
-    // Fallback: best-effort relative to current page.
     return new URL("_static/config_db.json", document.baseURI).toString();
   }
 
@@ -74,7 +71,6 @@
       await navigator.clipboard.writeText(text);
       return;
     }
-    // Fallback
     const ta = el("textarea", { "aria-hidden": "true" });
     ta.value = text;
     ta.style.position = "fixed";
@@ -95,14 +91,10 @@
   }
 
   function highlightYaml(yamlText) {
-    // Lightweight YAML highlighting without external deps (best-effort).
-    // IMPORTANT: never run regex replacements on strings that already contain HTML
-    // tags (it will corrupt markup). We only wrap *escaped* text fragments.
     const lines = String(yamlText).split("\n");
     const out = [];
 
     function highlightScalar(raw) {
-      // Preserve whitespace around the scalar.
       const m = String(raw).match(/^(\s*)(.*?)(\s*)$/);
       const lead = m ? m[1] : "";
       const core = m ? m[2] : String(raw);
@@ -128,19 +120,16 @@
     }
 
     for (const line of lines) {
-      // Split off trailing comment (best-effort; ignores quotes).
       const hashIdx = line.indexOf("#");
       const hasComment = hashIdx >= 0;
       const codePart = hasComment ? line.slice(0, hashIdx) : line;
       const commentPart = hasComment ? line.slice(hashIdx) : "";
 
-      // Preserve indentation + optional list marker.
       const mList = codePart.match(/^(\s*)(-\s+)?(.*)$/);
       const indent = mList ? mList[1] : "";
       const dash = mList && mList[2] ? mList[2] : "";
       const rest = mList ? mList[3] : codePart;
 
-      // Key/value split (first colon).
       const idx = rest.indexOf(":");
       let html = "";
       if (idx >= 0) {
@@ -166,7 +155,6 @@
   }
 
   function formatCommand(entry) {
-    // Multi-line bash command to avoid horizontal scrolling.
     const model = entry.model || "";
     const configPath = entry.config_path || "";
     if (!model || !configPath) return entry.command || "";
@@ -188,7 +176,6 @@
   function initOne(container, payload) {
     const allowedModels = parseCsvModels(container.getAttribute("data-models"));
 
-    /** @type {Array<any>} */
     const allEntries = Array.isArray(payload.entries) ? payload.entries : [];
     const entries = allowedModels
       ? allEntries.filter((e) => allowedModels.includes(e.model))
@@ -217,19 +204,22 @@
     const form = el("div", { class: "trtllm-config-selector__form" });
 
     function mkSelect(labelText, id) {
-      const label = el("label", { class: "trtllm-config-selector__label", for: id, text: labelText });
-      const select = /** @type {HTMLSelectElement} */ (
-        el("select", { class: "trtllm-config-selector__select", id })
-      );
+      const label = el("label", {
+        class: "trtllm-config-selector__label",
+        for: id,
+        text: labelText,
+      });
+      const select = el("select", { class: "trtllm-config-selector__select", id });
       const wrap = el("div", { class: "trtllm-config-selector__field" }, [label, select]);
       return { wrap, select };
     }
 
-    const selModel = mkSelect("Model", `trtllm-model-${Math.random().toString(16).slice(2)}`);
-    const selTopo = mkSelect("Topology", `trtllm-topo-${Math.random().toString(16).slice(2)}`);
-    const selSeq = mkSelect("ISL / OSL", `trtllm-seq-${Math.random().toString(16).slice(2)}`);
-    const selProf = mkSelect("Performance profile", `trtllm-prof-${Math.random().toString(16).slice(2)}`);
-    const selConc = mkSelect("Concurrency", `trtllm-conc-${Math.random().toString(16).slice(2)}`);
+    const id = ++widgetId;
+    const selModel = mkSelect("Model", `trtllm-model-${id}`);
+    const selTopo = mkSelect("Topology", `trtllm-topo-${id}`);
+    const selSeq = mkSelect("ISL / OSL", `trtllm-seq-${id}`);
+    const selProf = mkSelect("Performance profile", `trtllm-prof-${id}`);
+    const selConc = mkSelect("Concurrency", `trtllm-conc-${id}`);
 
     form.appendChild(selModel.wrap);
     form.appendChild(selTopo.wrap);
@@ -241,15 +231,13 @@
     const cmdPre = el("pre", { class: "trtllm-config-selector__cmd" }, [
       el("code", { class: "trtllm-config-selector__cmdcode", text: "" }),
     ]);
-    const cmdCopyBtn = /** @type {HTMLButtonElement} */ (
-      el("button", {
-        class: "trtllm-config-selector__copyInline",
-        type: "button",
-        title: "Copy command",
-        "aria-label": "Copy command",
-        text: "Copy",
-      })
-    );
+    const cmdCopyBtn = el("button", {
+      class: "trtllm-config-selector__copyInline",
+      type: "button",
+      title: "Copy command",
+      "aria-label": "Copy command",
+      text: "Copy",
+    });
     const meta = el("div", { class: "trtllm-config-selector__meta", text: "" });
 
     output.appendChild(cmdPre);
@@ -263,15 +251,13 @@
     const yamlPre = el("pre", { class: "trtllm-config-selector__yamlPre" }, [
       el("code", { class: "trtllm-config-selector__yamlCode", text: "" }),
     ]);
-    const yamlCopyBtn = /** @type {HTMLButtonElement} */ (
-      el("button", {
-        class: "trtllm-config-selector__copyInline",
-        type: "button",
-        title: "Copy YAML",
-        "aria-label": "Copy YAML",
-        text: "Copy",
-      })
-    );
+    const yamlCopyBtn = el("button", {
+      class: "trtllm-config-selector__copyInline",
+      type: "button",
+      title: "Copy YAML",
+      "aria-label": "Copy YAML",
+      text: "Copy",
+    });
     yamlBox.appendChild(yamlPre);
     yamlDetails.appendChild(yamlBox);
     output.appendChild(yamlDetails);
@@ -284,12 +270,10 @@
     container.appendChild(output);
     container.appendChild(errorBox);
 
-    /** @type {Map<string, string>} */
     const yamlCache = new Map();
-    /** @type {any|null} */
     let currentEntry = null;
     let currentYamlText = "";
-    const yamlCodeEl = /** @type {HTMLElement} */ ($(yamlPre, "code"));
+    const yamlCodeEl = $(yamlPre, "code");
 
     async function fetchYamlFor(entry) {
       const url = entry.config_raw_url || "";
@@ -551,8 +535,8 @@
     });
 
     cmdCopyBtn.addEventListener("click", async () => {
-      const code = /** @type {HTMLElement} */ ($(cmdPre, "code"));
-      const txt = code.textContent || "";
+      const code = $(cmdPre, "code");
+      const txt = (code && code.textContent) || "";
       if (!txt) return;
       try {
         await copyText(txt);
@@ -571,8 +555,6 @@
     const containers = Array.from(document.querySelectorAll("[data-trtllm-config-selector]"));
     if (!containers.length) return;
 
-    // Allow overriding the DB path per-widget, else fall back to default.
-    // Note: all widgets share the first-loaded DB for simplicity.
     const first = containers[0];
     const dbPath = first.getAttribute("data-config-db");
     const dbUrl = dbPath
