@@ -1231,7 +1231,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             self.cta_sync_barrier.arrive_and_wait()
 
         griddepcontrol_wait()
-        griddepcontrol_launch_dependents()
 
         #
         # Specialized Schedule warp
@@ -1886,6 +1885,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             tmem.relinquish_alloc_permit()
             self.epilog_sync_barrier.arrive_and_wait()
             tmem.free(tmem_ptr)
+
+        griddepcontrol_launch_dependents()
 
     def epilog_tmem_copy_and_partition(
         self,

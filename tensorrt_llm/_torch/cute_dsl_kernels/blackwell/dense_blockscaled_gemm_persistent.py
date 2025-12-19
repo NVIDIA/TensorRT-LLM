@@ -872,7 +872,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                               number_of_threads=self.threads_per_cta)
 
         griddepcontrol_wait()
-        griddepcontrol_launch_dependents()
 
         #
         # Specialized TMA load warp
@@ -1477,6 +1476,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             # Wait for C store complete
             #
             c_pipeline.producer_tail()
+
+        griddepcontrol_launch_dependents()
 
     def mainloop_s2t_copy_and_partition(
         self,
