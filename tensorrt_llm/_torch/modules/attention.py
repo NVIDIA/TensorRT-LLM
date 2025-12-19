@@ -190,6 +190,15 @@ class Attention(nn.Module):
         if self.attn_output_gate:
             logger.info_once("using attn output gate!", key="attn_output_gate")
 
+        if hasattr(config.pretrained_config, 'llama_4_scaling'):
+            self.llama_4_scaling = True
+            self.floor_scale = getattr(config.pretrained_config.llama_4_scaling,
+                                       'original_max_position_embeddings', 8192)
+            self.attn_scale = getattr(config.pretrained_config.llama_4_scaling,
+                                      'beta', 0.1)
+        else:
+            self.llama_4_scaling = False
+
         # [Chunked Attention]
         # Chunked attention is applied to context requests only. Chunked attention will be
         # applied when this field is specified and mMaskType == CAUSAL.
@@ -388,6 +397,18 @@ class Attention(nn.Module):
         output = q.new_empty([num_tokens, hidden_size], dtype=out_dtype)
         return output
 
+    def _attention_scaling(self, q, position_ids):
+
+        def _get_attn_scale(position_ids: torch.Tensor) -> torch.Tensor:
+            positions = position_ids.view(-1)
+            floor = torch.floor((positions + 1.0) / self.floor_scale)
+            attn_scale = torch.log(floor + 1.0) * self.attn_scale + 1.0
+            return attn_scale.unsqueeze(-1)
+
+        attn_scale = _get_attn_scale(position_ids)
+        q = (q * attn_scale).to(q.dtype)
+        return q
+
     def _attn_impl(
         self,
         q: torch.Tensor,
@@ -572,6 +593,8 @@ class Attention(nn.Module):
             q, k, v = qkv, None, None
 
         q, k, v = self.apply_rope(q, k, v, position_ids)
+        if self.llama_4_scaling:
+            q = self._attention_scaling(q, position_ids[...])
         q, k, v = self.convert_qkv(q, k, v)
 
         if attention_sinks is not None:
