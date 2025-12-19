@@ -100,9 +100,19 @@ def add_llm_args(parser):
     parser.add_argument('--disable_overlap_scheduler',
                         default=False,
                         action='store_true')
-    parser.add_argument('--enable_chunked_prefill',
-                        default=False,
-                        action='store_true')
+    parser.add_argument(
+        '--enable_chunked_prefill',
+        default=False,
+        action='store_true',
+        help=
+        'Enable chunked prefill. This is now enabled by default on applicable models, so this flag '
+        'is deprecated and will be removed in a future release.')
+    parser.add_argument(
+        '--disable_chunked_prefill',
+        default=False,
+        action='store_true',
+        help='Disable chunked prefill (required for some models like Gemma3VL).'
+    )
     parser.add_argument('--use_cuda_graph', default=False, action='store_true')
     parser.add_argument('--cuda_graph_padding_enabled',
                         default=False,
@@ -249,6 +259,15 @@ def setup_llm(args, **kwargs):
         batching_wait_iters=args.attention_dp_batching_wait_iters,
     )
 
+    if args.enable_chunked_prefill:
+        print(
+            "[WARNING] --enable_chunked_prefill is deprecated: chunked prefill is now enabled by default. "
+            "This flag will be removed in a future release.")
+
+    # Translate --disable_chunked_prefill to enable_chunked_prefill=False
+    if args.disable_chunked_prefill:
+        kwargs['enable_chunked_prefill'] = False
+
     llm = LLM(
         model=args.model_dir,
         backend='pytorch',
@@ -278,7 +297,6 @@ def setup_llm(args, **kwargs):
         moe_expert_parallel_size=args.moe_ep_size,
         moe_tensor_parallel_size=args.moe_tp_size,
         moe_cluster_parallel_size=args.moe_cluster_size,
-        enable_chunked_prefill=args.enable_chunked_prefill,
         speculative_config=spec_config,
         trust_remote_code=args.trust_remote_code,
         gather_generation_logits=args.return_generation_logits,

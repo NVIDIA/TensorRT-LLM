@@ -181,8 +181,8 @@ def _torch_cached_ssm(
         # TODO(https://github.com/NVIDIA/TensorRT-LLM/issues/8170): update torch
         # reference implementation to support chunked prefill.
         raise ValueError(
-            "torch mamba backend does not yet support chunked prefill "
-            "and can not correctly handle initial states."
+            "Mamba/SSM models do not support chunked prefill. "
+            "Please set enable_chunked_prefill=False in your LLM API config."
         )
     # Context/mixed phase (flattened sequences). Expect b == 1, but handle general b robustly.
     # We'll iterate over sequences defined by (seq_len, seq_start) and update state per slot.

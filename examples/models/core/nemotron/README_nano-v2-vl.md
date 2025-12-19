@@ -48,6 +48,7 @@ TLLM_VIDEO_PRUNING_RATIO=0.9 python3 examples/llm-api/quickstart_multimodal.py -
 ```bash
 # Create extra config file.
 cat > ./extra-llm-api-config.yml << EOF
+enable_chunked_prefill: false
 kv_cache_config:
   enable_block_reuse: false
   mamba_ssm_cache_dtype: float32
@@ -80,5 +81,5 @@ nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16\
 
 # Known issue:
  * Don't set too large batch size, otherwise the Mamba cache might raise OOM error.
- * Video modality cannot support chunked prefill yet.
+ * Video modality cannot support chunked prefill yet. Since chunked prefill is now enabled by default, video modality commands should explicitly disable it either by passing `--disable_chunked_prefill` in CLI or `enable_chunked_prefill: false` in extra llm api options file.
  * Prefix-caching is not supported for Nemotron-nano-v2-VL yet .

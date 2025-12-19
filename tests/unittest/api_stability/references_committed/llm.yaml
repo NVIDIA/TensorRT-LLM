@@ -86,7 +86,7 @@ methods:
         default: false
       enable_chunked_prefill:
         annotation: bool
-        default: false
+        default: true
       kv_cache_config:
         annotation: tensorrt_llm.llmapi.llm_args.KvCacheConfig
         default: null

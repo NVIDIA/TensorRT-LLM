@@ -77,7 +77,7 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
         Dict[str, Union[str, int]]: Properties for runtime config.
     """
     extra_llm_api_options = params.get("extra_llm_api_options")
-    enable_chunked_prefill = params.get("enable_chunked_prefill", False)
+    enable_chunked_prefill = params.get("enable_chunked_prefill", True)
 
     kv_cache_dtype = "auto"
     mamba_ssm_cache_dtype = params.get("mamba_ssm_cache_dtype", "auto")

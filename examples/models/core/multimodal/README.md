@@ -383,7 +383,7 @@ git clone https://huggingface.co/google/${MODEL_NAME}
 
 #### 2. Interactive Testing
 
-Use the `quickstart_multimodal.py` script for quick testing:
+Use the `quickstart_multimodal.py` script for quick testing. Note that chunked prefill must be disabled for Gemma3VL:
 
 ```bash
 python3 examples/llm-api/quickstart_multimodal.py \
@@ -391,7 +391,8 @@ python3 examples/llm-api/quickstart_multimodal.py \
     --modality image \
     --image_format pil \
     --attention_backend FLASHINFER \
-    --disable_kv_cache_reuse
+    --disable_kv_cache_reuse \
+    --disable_chunked_prefill
 ```
 
 #### 3. Model Serving
