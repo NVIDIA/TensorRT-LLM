@@ -929,6 +929,9 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
     class Store:
         new_tokens: torch.Tensor
         """Shape: See cpp DecoderState.getAllNewTokens()"""
+        max_lengths_tensor: torch.Tensor
+        """Shape: batch_size
+           Usage: Stores the maximum lengths for each request"""
         finish_reasons: torch.Tensor
         """Shape: max_tokens, batch_size, beam_width
            Usage: Stores the currently estimated finish_reasons for each request"""
@@ -974,6 +977,7 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         # Tensors necessary for all sampling methods
         new_tokens = int_tensor(self.NEW_TOKENS_SHAPE)
         finish_reasons = int_tensor(self.NEW_TOKENS_SHAPE)
+        max_lengths_tensor=int_tensor(self.max_num_sequences),
 
         # Only used for logprobs processing or beam search
         sampled_log_probs = torch.empty(self.LOGPROBS_SHAPE, device="cuda", dtype=torch.float32)
@@ -1007,6 +1011,7 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         return self.Store(
             new_tokens=new_tokens,
             finish_reasons=finish_reasons,
+            max_lengths_tensor=max_lengths_tensor,
             cache_indirection=cache_indirection,
             cache_indirection_buffer=cache_indirection_buffer,
             cum_log_probs=cum_log_probs,
@@ -1525,6 +1530,12 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
 
         return num_accepted_draft_tokens - 1
 
+    def _is_new_request(self, request: LlmRequest) -> bool:
+        return not request.is_finished and (
+            (request.is_context_init_state and request.is_last_context_chunk)
+            or request.is_disagg_generation_transmission_complete
+        )
+
     def setup_sampler_step(self, requests: ScheduledRequests):
         """Setup the sampler step for the requests
 
@@ -1533,6 +1544,11 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         """
         if self._use_beam_search:
             self._prepare_beam_search(requests.all_requests())
+        for request in requests.all_requests():
+            if self._is_new_request(request):
+                self.store.max_lengths_tensor[request.py_seq_slot].fill_(
+                    min(self.max_seq_len, request.orig_prompt_len + request.py_max_new_tokens)
+                )
 
     def _prepare_beam_search(
         self,
@@ -1544,10 +1560,7 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         initialize/reset the buffers for the request
         """
         for request in requests:
-            if not request.is_finished and (
-                (request.is_context_init_state and request.is_last_context_chunk)
-                or request.is_disagg_generation_transmission_complete
-            ):
+            if self._is_new_request(request):
                 if request.py_return_log_probs and request.py_num_logprobs > 1:
                     raise ValueError("Beam search does not support multiple logprobs")
                 self.store.cache_indirection[request.py_seq_slot, :, request.py_prompt_len].fill_(0)
@@ -2083,13 +2096,9 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
             dtype=torch.int64,  # for index_fill_
             pin_memory=True,
         )
-        # necessary for beam search
-        seq_lens_host = (
-            torch.tensor(
-                [r.max_beam_num_tokens for r in requests], dtype=torch.int32, pin_memory=True
-            )
-            if self._use_beam_search
-            else None
+        # necessary for beam search and max_length checks
+        seq_lens_host = torch.tensor(
+            [r.max_beam_num_tokens for r in requests], dtype=torch.int32, pin_memory=True
         )
         new_tokens_host = self._process_requests(
             scheduled_requests,
@@ -2102,12 +2111,14 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
 
         finish_reasons = self.store.finish_reasons
         seq_slots = seq_slots_host.to(device="cuda", non_blocking=True)
+        seq_lens = seq_lens_host.to(device="cuda", non_blocking=True)
         first_finish_reasons = self.store.first_finish_reasons if self._use_beam_search else None
 
         self._write_finish_reasons(
             requests,
             finish_reasons=finish_reasons,
             seq_slots=seq_slots,
+            seq_lens=seq_lens,
             new_tokens=new_tokens,
             first_finish_reasons=first_finish_reasons,
             predecessor_beams=self.store.predecessor_beams,
@@ -2760,6 +2771,7 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         *,
         finish_reasons: torch.Tensor,
         seq_slots: torch.Tensor,
+        seq_lens: torch.Tensor,
         new_tokens: torch.Tensor,
         first_finish_reasons: torch.Tensor | None = None,
         predecessor_beams: torch.Tensor | None = None,
@@ -2775,7 +2787,11 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
             new_tokens: a buffer containing the newly generated tokens.
             Shape: (max_tokens, max_batch_size, max_beam_width)
         """
-        tokens = new_tokens[:, seq_slots.to(device=new_tokens.device, non_blocking=True)]
+
+        # Seq Slots should be on the same device as new_tokens
+        assert seq_slots.device == new_tokens.device
+        assert seq_lens.device == new_tokens.device
+        tokens = new_tokens[:, seq_slots]
 
         # we need to fill with NOT_FINISHED so we can differentiate between previous requests that had the same seq slot
         finish_reasons.index_fill_(1, seq_slots, FinishReason.NOT_FINISHED.value)
@@ -2801,7 +2817,7 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
             )
 
         batched_finish_reasons = torch.where(
-            self._are_max_length(requests),
+            self._are_max_length(seq_lens, self.store.max_lengths_tensor[seq_slots]),
             self._reason_tensors[FinishReason.LENGTH],
             batched_finish_reasons,
         )
@@ -2838,41 +2854,26 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         )
         return tokens == end_ids_tensor
 
-    def _are_max_length(self, requests: list[LlmRequest]) -> torch.Tensor:
+    def _are_max_length(self, seq_lens: torch.Tensor, max_seq_lens: torch.Tensor) -> torch.Tensor:
         """Checks which sequences are at or beyond the max length
 
         Args:
-            requests: the requests to check the max length of
-
+            seq_lens: the sequence lengths of the requests to check the max length of
+            max_seq_lens: the maximum sequence lengths of the requests to check the max length of
         Returns:
             A tensor of shape (max_tokens, len(requests), max_beam_width)
             where each element is True if the sequence is at or beyond the max length, False otherwise
         """
-        lengths_tensor = torch.tensor(
-            [
-                [
-                    [
-                        (req.get_num_tokens(beam_idx) + num_tokens)
-                        for beam_idx in range(self.max_beam_width)
-                    ]
-                    for req in requests
-                ]
-                for num_tokens in range(1, self.max_tokens + 1)
-            ]
+        lengths_tensor = (
+            seq_lens.view(1, -1, 1)
+            + torch.arange(
+                1, self.max_tokens + 1, device=seq_lens.device, dtype=seq_lens.dtype
+            ).view(-1, 1, 1)
+        ).expand(self.max_tokens, -1, self.max_beam_width)
+        max_lengths_tensor = max_seq_lens.view(1, -1, 1).expand(
+            self.max_tokens, -1, self.max_beam_width
         )
-        max_lengths_tensor = torch.tensor(
-            [
-                (
-                    [min(req.py_max_new_tokens + req.orig_prompt_len, self.max_seq_len)]
-                    * self.max_beam_width
-                )
-                for req in requests
-            ]
-            * self.max_tokens
-        ).view(self.max_tokens, len(requests), self.max_beam_width)
-        return (
-            (lengths_tensor >= max_lengths_tensor).pin_memory().to(device="cuda", non_blocking=True)
-        )
+        return lengths_tensor >= max_lengths_tensor
 
     _PAD_ID = -1
     """Pad with negative, doesn't matter what"""
