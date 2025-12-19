@@ -1,10 +1,19 @@
 ..
-   Reusable note sections for deployment guides.
+   Reusable note sections for docs.
    Include specific notes using:
 
-   .. include:: note_sections.rst
+   .. include:: <path-to>/note_sections.rst
       :start-after: .. start-note-<name>
       :end-before: .. end-note-<name>
+
+.. start-note-config-flag-alias
+
+.. note::
+
+   **Non-breaking**: ``--config <file.yaml>`` is the preferred flag for passing a :ref:`YAML configuration file <configuring-with-yaml-files>`.
+   Existing workflows using ``--extra_llm_api_options <file.yaml>`` continue to work; it is an equivalent alias.
+
+.. end-note-config-flag-alias
 
 .. start-note-traffic-patterns
 

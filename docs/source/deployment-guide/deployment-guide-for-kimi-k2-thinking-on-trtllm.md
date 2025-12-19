@@ -60,7 +60,7 @@ With the `EXTRA_OPTIONS_YAML_FILE`, use the following example command to launch 
 ```bash
 trtllm-serve nvidia/Kimi-K2-Thinking-NVFP4 \
     --host 0.0.0.0 --port 8000 \
-    --extra_llm_api_options ${EXTRA_OPTIONS_YAML_FILE}
+    --config ${EXTRA_OPTIONS_YAML_FILE}
 ```
 
 TensorRT LLM will load weights and select the best kernels during startup. The server is successfully launched when the following log is shown:
