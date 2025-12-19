@@ -1,0 +1,10 @@
+OpenAI Chat Client
+==================
+Refer to the `trtllm-serve documentation <https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve.html>`_ for starting a server.
+
+Source https://github.com/NVIDIA/TensorRT-LLM/blob/48b7b5d8b7ed1e6bff57aecc6ff7d1533288bed8/examples/serve/openai_chat_client.py.
+
+.. literalinclude:: ../../../examples/serve/openai_chat_client.py
+    :lines: 2-21
+    :language: python
+    :linenos:
