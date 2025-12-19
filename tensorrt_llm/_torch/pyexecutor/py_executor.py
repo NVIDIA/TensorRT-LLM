@@ -136,7 +136,9 @@ class PyExecutor:
                  kv_connector_manager: Optional[KvCacheConnectorManager] = None,
                  max_seq_len: Optional[int] = None,
                  peft_cache_config: Optional[PeftCacheConfig] = None,
-                 virtual_memory_pools: Optional[dict] = None):
+                 virtual_memory_pools: Optional[dict] = None,
+                 min_fetch_batch_size: Optional[int] = None,
+                 min_fetch_batch_timeout: Optional[float] = None):
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
         self.global_rank = dist.rank
@@ -268,9 +270,17 @@ class PyExecutor:
             max_num_active_requests=self.max_num_active_requests,
             enable_iter_perf_stats=self.enable_iter_perf_stats,
             batch_wait_timeout_ms=self.batch_wait_timeout_ms,
+            min_fetch_batch_size=min_fetch_batch_size,
+            min_fetch_batch_timeout=min_fetch_batch_timeout,
         )
         self.executor_request_queue.set_exclude_last_generation_logits(
             self.disable_overlap_scheduler, self.dist.pp_size)
+
+        # Log if minimum fetch batch size is configured
+        if min_fetch_batch_size is not None and min_fetch_batch_size > 0:
+            logger.info(
+                f"[PyExecutor] Minimum fetch batch size enabled: will wait for at least {min_fetch_batch_size} requests "
+                f"before processing (timeout: {min_fetch_batch_timeout}s)")
         self.control_request_barrier = threading.Event()
         self.control_action_done = threading.Event()
 
@@ -948,6 +958,11 @@ class PyExecutor:
 
                 # Fetch new requests from request queue
                 new_requests = self._fetch_and_activate_new_requests()
+                if len(new_requests) > 0:
+                    logger.info(
+                        f'[BATCH DEBUG PP] iter={self.iter_counter}, '
+                        f'fetched_new_requests={len(new_requests)}, '
+                        f'total_active_requests={len(self.active_requests)}')
                 if self.should_stop_processing:
                     break
 
@@ -987,12 +1002,12 @@ class PyExecutor:
 
                 self.num_scheduled_requests = scheduled_batch.batch_size
 
-                logger.debug(
-                    f'iteration {self.iter_counter}, microbatch {microbatch_id}, '
-                    f'has {len(self.active_requests)} active_requests, '
-                    f'scheduled {len(scheduled_batch.context_requests)} context requests and '
-                    f'{len(scheduled_batch.generation_requests)} generation requests'
-                )
+                logger.info(
+                    f'[BATCH DEBUG PP] iter={self.iter_counter}, microbatch={microbatch_id}, '
+                    f'active_requests={len(self.active_requests)}, '
+                    f'scheduled_context={len(scheduled_batch.context_requests)}, '
+                    f'scheduled_generation={len(scheduled_batch.generation_requests)}, '
+                    f'total_batch_size={scheduled_batch.batch_size}')
 
                 can_queue = self._can_queue(scheduled_batch)
                 if not can_queue:
@@ -1199,6 +1214,10 @@ class PyExecutor:
 
     def _prepare_and_schedule_batch(self):
         new_requests = self._fetch_and_activate_new_requests()
+        if len(new_requests) > 0:
+            logger.info(f'[BATCH DEBUG] iter={self.iter_counter}, '
+                        f'fetched_new_requests={len(new_requests)}, '
+                        f'total_active_requests={len(self.active_requests)}')
         if self.should_stop_processing:
             return None, None
 
@@ -1275,10 +1294,12 @@ class PyExecutor:
                 self._check_disagg_ctx_cache_transfer_status(1)
 
         self.num_scheduled_requests = scheduled_batch.batch_size
-        logger.debug(
-            f'has {len(self.active_requests)} active_requests, '
-            f'scheduled {len(scheduled_batch.context_requests)} context requests and '
-            f'{len(scheduled_batch.generation_requests)} generation requests')
+        logger.info(
+            f'[BATCH DEBUG] iter={self.iter_counter}, '
+            f'active_requests={len(self.active_requests)}, '
+            f'scheduled_context={len(scheduled_batch.context_requests)}, '
+            f'scheduled_generation={len(scheduled_batch.generation_requests)}, '
+            f'total_batch_size={scheduled_batch.batch_size}')
         return scheduled_batch, iter_stats
 
     def _kv_connector_start_batch(self, scheduled_batch):

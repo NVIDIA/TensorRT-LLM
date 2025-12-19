@@ -696,6 +696,8 @@ def create_py_executor_instance(
     scheduler_config: Optional[SchedulerConfig] = None,
     cache_transceiver_config: Optional[CacheTransceiverConfig] = None,
     virtual_memory_pools: Optional[dict] = None,
+    min_fetch_batch_size: Optional[int] = None,
+    min_fetch_batch_timeout: Optional[float] = None,
 ) -> PyExecutor:
     kv_cache_manager = resources.get(ResourceManagerType.KV_CACHE_MANAGER, None)
 
@@ -844,7 +846,9 @@ def create_py_executor_instance(
         kv_connector_manager=kv_connector_manager,
         max_seq_len=max_seq_len,
         peft_cache_config=peft_cache_config,
-        virtual_memory_pools=virtual_memory_pools)
+        virtual_memory_pools=virtual_memory_pools,
+        min_fetch_batch_size=min_fetch_batch_size,
+        min_fetch_batch_timeout=min_fetch_batch_timeout)
 
 
 def create_torch_sampler_args(

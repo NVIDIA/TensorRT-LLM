@@ -2750,6 +2750,22 @@ class TorchLlmArgs(BaseLlmArgs):
         "If greater than 0, the request queue might wait up to batch_wait_timeout_ms to receive max_batch_size requests, if fewer than max_batch_size requests are currently available. If 0, no waiting occurs.",
         status="prototype")
 
+    min_fetch_batch_size: Optional[int] = Field(
+        default=None,
+        description=
+        "Minimum number of requests to fetch from queue before proceeding with scheduling. "
+        "Useful for ensuring deterministic batching with STATIC_BATCH scheduler. "
+        "If None or 0, no minimum is enforced (default behavior).",
+        status="prototype")
+
+    min_fetch_batch_timeout: Optional[float] = Field(
+        default=None,
+        description=
+        "Maximum time in seconds to wait for min_fetch_batch_size requests. "
+        "After this timeout, proceeds with whatever requests are available. "
+        "Only applies when min_fetch_batch_size is set.",
+        status="prototype")
+
     batch_wait_timeout_iters: int = Field(
         default=0,
         description=

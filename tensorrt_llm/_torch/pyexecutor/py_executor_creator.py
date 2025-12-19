@@ -713,6 +713,11 @@ def create_py_executor(
 
             # run gc.collect() to free memory of the previous py_executor, avoid cudaFree overlap with cuda graph capture
             gc.collect()
+            min_fetch_batch_size = getattr(llm_args, 'min_fetch_batch_size',
+                                           None)
+            min_fetch_batch_timeout = getattr(llm_args,
+                                              'min_fetch_batch_timeout', None)
+
             py_executor = create_py_executor_instance(
                 dist=dist,
                 resources=resources,
@@ -736,6 +741,8 @@ def create_py_executor(
                 scheduler_config=scheduler_config,
                 cache_transceiver_config=cache_transceiver_config,
                 virtual_memory_pools=vm_pools,
+                min_fetch_batch_size=min_fetch_batch_size,
+                min_fetch_batch_timeout=min_fetch_batch_timeout,
             )
 
     _adjust_torch_mem_fraction()
