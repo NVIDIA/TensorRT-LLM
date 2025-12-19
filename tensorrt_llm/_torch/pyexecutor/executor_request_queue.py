@@ -12,6 +12,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import torch
 
 from tensorrt_llm._utils import mpi_disabled, nvtx_range
+from tensorrt_llm.llmapi.disagg_utils import get_local_request_id
 from tensorrt_llm.mapping import CpType
 
 from ..distributed import Distributed
@@ -207,10 +208,15 @@ class ExecutorRequestQueue:
 
         return False
 
-    def _get_request_id(self):
-        # (next_request_id + 1) % UINT64_MAX
+    def _get_request_id(self, request: ExecutorRequest):
+        if request.disaggregated_params is not None and \
+             request.disaggregated_params.ctx_request_id is not None and \
+             request.disaggregated_params.ctx_request_id > 0:
+            # If this is a disagg request and it has a global request id, use it
+            return request.disaggregated_params.ctx_request_id
+        # (next_request_id + 1) % (MIN_GLOBAL_ID - 1)
         current_id = self.next_request_id
-        self.next_request_id = (self.next_request_id + 1) & ((1 << 64) - 1)
+        self.next_request_id = get_local_request_id(current_id)
         return current_id
 
     def _generate_child_request_ids(
