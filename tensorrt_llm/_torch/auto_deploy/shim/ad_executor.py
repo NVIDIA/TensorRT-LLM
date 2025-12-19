@@ -21,9 +21,14 @@ from strenum import StrEnum
 from torch._prims_common import DeviceLikeType
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionRuntimeFeatures
-from tensorrt_llm._torch.pyexecutor._util import _create_kv_cache_manager, get_kv_cache_manager_cls
+from tensorrt_llm._torch.pyexecutor._util import (
+    _create_kv_cache_manager,
+    get_decoding_mode,
+    get_kv_cache_manager_cls,
+)
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._torch.pyexecutor.guided_decoder import GuidedDecoder
-from tensorrt_llm._torch.pyexecutor.llm_request import get_draft_token_length
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, get_draft_token_length
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import get_guided_decoding_config
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm._torch.speculative import get_spec_drafter
@@ -31,7 +36,7 @@ from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.llmapi.llm_args import (
     ContextChunkingPolicy,
     LoadFormat,
-    SpeculativeConfig,
+    SamplerType,
     TorchLlmArgs,
 )
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase
@@ -42,8 +47,13 @@ from ....mapping import Mapping
 from ...distributed import MPIDist
 from ...pyexecutor.model_engine import ModelEngine, PyTorchModelEngine
 from ...pyexecutor.py_executor import PyExecutor
-from ...pyexecutor.resource_manager import KVCacheManager, ResourceManager, ResourceManagerType
-from ...pyexecutor.sampler import TorchSampler
+from ...pyexecutor.resource_manager import (
+    BaseResourceManager,
+    KVCacheManager,
+    ResourceManager,
+    ResourceManagerType,
+)
+from ...pyexecutor.sampler import TorchSampler, TRTLLMSampler
 from ...pyexecutor.scheduler import (
     BindCapacityScheduler,
     BindMicroBatchScheduler,
@@ -199,6 +209,104 @@ def create_draft_kv_cache_manager_maybe(
     )
 
 
+def _round_up_to_closest(batch_sizes: List[int], bs: int) -> Optional[int]:
+    """Return closest batch size larger or equal to bs."""
+    if bs > max(batch_sizes, default=0):
+        return None
+    return min(batch_sizes, key=lambda x: (x < bs, abs(x - bs)), default=None)
+
+
+def _generate_dummy_request(
+    resource_manager: ResourceManager, request_id: int, **request_kwargs
+) -> Optional[LlmRequest]:
+    # get resource managers we want
+    kv_cache_manager: KVCacheManager = resource_manager.get_resource_manager(
+        ResourceManagerType.KV_CACHE_MANAGER
+    )
+    slot_manager: SeqSlotManager = resource_manager.get_resource_manager(
+        ResourceManagerType.SEQ_SLOT_MANAGER
+    )
+    spec_res_mgr: Optional[BaseResourceManager] = resource_manager.get_resource_manager(
+        ResourceManagerType.SPEC_RESOURCE_MANAGER
+    )
+
+    # check if we have a free slot available and free page available
+    if not slot_manager.slot_manager.free_slots or kv_cache_manager.get_num_free_blocks() == 0:
+        return None
+
+    # generate a dummy request
+    dummy_request = kv_cache_manager.add_dummy_requests([request_id], **request_kwargs)[0]
+    dummy_request.is_cuda_graph_dummy = True
+
+    # add to spec resource manager
+    if spec_res_mgr:
+        spec_res_mgr.add_dummy_requests([request_id])
+
+    # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/9883 clean up this hack
+    dummy_request.seq_slot = slot_manager.get_max_resource_count()
+    dummy_request.py_seq_slot = dummy_request.seq_slot
+
+    return dummy_request
+
+
+def maybe_pad_for_cuda_graph(func):
+    def wrapper(
+        self: "ADEngine",
+        scheduled_requests: ScheduledRequests,
+        resource_manager: ResourceManager,
+        *args,
+        **kwargs,
+    ):
+        def _call_func():
+            return func(self, scheduled_requests, resource_manager, *args, **kwargs)
+
+        # check if we use cuda graph and we can run it
+        if not (self.cuda_graph_used and scheduled_requests.can_run_cuda_graph):
+            return _call_func()
+
+        # generate a persistent dummy request right away to ensure we can reserve the necessary
+        # resources (kv page and slot)
+        if self.padding_dummy_request is None:
+            self.padding_dummy_request = _generate_dummy_request(
+                resource_manager,
+                request_id=CUDA_GRAPH_DUMMY_REQUEST_ID,
+                is_gen=True,
+                max_num_draft_tokens=self.max_total_draft_tokens,
+                use_mrope=False,
+                max_beam_width=self.max_beam_width,
+            )
+
+        # check closest cuda graph batch size
+        closest_cg_bs = _round_up_to_closest(
+            self.cuda_graph_batch_sizes, scheduled_requests.batch_size
+        )
+
+        # check if we need to pad
+        num_padding = closest_cg_bs - scheduled_requests.batch_size
+
+        if num_padding <= 0:
+            return _call_func()
+
+        # check if we have a dummy request to use
+        if self.padding_dummy_request is None:
+            ad_logger.error("No CUDA graph padding possible due to missing dummy request.")
+            return _call_func()
+
+        # pad the scheduled requests with the dummy request
+        scheduled_requests.generation_requests.extend([self.padding_dummy_request] * num_padding)
+
+        ret = _call_func()
+
+        # truncate requests to remove the dummy requests we added
+        scheduled_requests.generation_requests = scheduled_requests.generation_requests[
+            :-num_padding
+        ]
+
+        return ret
+
+    return wrapper
+
+
 class ADEngine(ModelEngine):
     """The AutoDeploy Engine (ADEngine) is the main engine interface to execute AutoDeploy models.
 
@@ -219,7 +327,6 @@ class ADEngine(ModelEngine):
         max_seq_len = ad_config.max_seq_len
         attn_page_size = ad_config.attn_page_size
         max_num_tokens = ad_config.max_num_tokens
-        max_beam_width = ad_config.max_beam_width
 
         # update device to contain the current default device if it's in cuda
         device = torch.device(ad_config.device)
@@ -258,6 +365,7 @@ class ADEngine(ModelEngine):
             reporting_info=reporting_info,
         )
         _configure_vlm_mask_settings(engine, ad_config)
+
         return engine
 
     @torch.inference_mode()
@@ -283,16 +391,27 @@ class ADEngine(ModelEngine):
         self.llm_args.batch_wait_timeout_iters = 0
         self.llm_args.batch_wait_max_tokens_ratio = 0.0
         self.llm_args.max_num_tokens = seq_info.max_num_tokens
+        self.llm_args.max_seq_len = seq_info.max_seq_len
         self.iter_counter = 0
         self.iter_states = {}
-        self.llm_args.max_seq_len = seq_info.max_seq_len
 
         # NOTE (lucaslie): not a declared base member in the base class; required by PyExecutor...
-        self.max_beam_width = max_beam_width
         self.enable_attention_dp = False
-        self._disable_overlap_scheduler = disable_overlap_scheduler
 
-        self.spec_config = spec_config
+        if ad_config is not None:
+            self.max_beam_width = ad_config.max_beam_width
+            self.spec_config = ad_config.speculative_config
+            self._disable_overlap_scheduler = ad_config.disable_overlap_scheduler
+        else:
+            self.max_beam_width = 1
+            self.spec_config = None
+            self._disable_overlap_scheduler = False
+
+        # check for max total draft tokens
+        if self.spec_config is not None:
+            self.max_total_draft_tokens = self.spec_config.max_total_draft_tokens
+        else:
+            self.max_total_draft_tokens = 0
 
         # TODO(govind): Enable overlap scheduler for speculation.
         assert self.spec_config is None or self._disable_overlap_scheduler, (
@@ -357,6 +476,7 @@ class ADEngine(ModelEngine):
         gen_requests = extend_requests + generation_requests
         # info to be extracted
         input_ids: List[List[int]] = []
+        position_ids: List[List[int]] = []
         input_pos: List[int] = []
         seq_len: List[int] = []
         cu_seqlen: List[int] = [0]
@@ -366,9 +486,11 @@ class ADEngine(ModelEngine):
         seq_len_with_cache: List[int] = []
         last_page_len: List[int] = []
         slot_idx: List[int] = []
+        use_initial_states: List[bool] = []
 
         # gather indices are used to gather tokens in new_tokens into input_ids
-        flat_gather_indices: List[List[int]] = []
+        flat_gather_indices: List[int] = []
+        mask_scatter_indices: List[int] = []
         extra_args: Dict[str, List[torch.Tensor]] = defaultdict(list)
 
         # gather indices for logits
@@ -394,6 +516,9 @@ class ADEngine(ModelEngine):
             input_ids.append(prompt_tokens)
             input_pos.append(begin_compute)
 
+            seq_len.append(len(input_ids[-1]))
+            cu_seqlen.append(cu_seqlen[-1] + seq_len[-1])
+
             request.py_batch_idx = request.seq_slot
 
             if gather_context_logits:
@@ -404,39 +529,22 @@ class ADEngine(ModelEngine):
             # get cache indices and truncate the number of blocks according to end_compute
             cache_indices = kv_cache_manager.get_cache_indices(request)
             num_active_blocks = kv_cache_manager.get_num_kv_blocks(end_compute)
-            page_assignments.append(cache_indices[:num_active_blocks])
+            cache_loc.extend(cache_indices[:num_active_blocks])
+            pages_per_seq.append(num_active_blocks)
+            cu_num_pages.append(cu_num_pages[-1] + pages_per_seq[-1])
+            seq_len_with_cache.append(input_pos[-1] + seq_len[-1])
+            last_page_len.append((seq_len_with_cache[-1] - 1) % page_size + 1)
+
+            position_ids.append(list(range(input_pos[-1], seq_len_with_cache[-1])))
 
             # store seq slot idx
             slot_idx.append(request.seq_slot)
+            use_initial_states.append(input_pos[-1] > 0)
 
             # store extra arguments
             if request.py_multimodal_data is not None:
                 for k, v in request.py_multimodal_data.items():
                     extra_args[k].append(v)
-
-        # VLM constraint check: Gemma3 with image tokens requires chunked_prefill and block_reuse disabled
-        # This is because image tokens need bidirectional attention which is incompatible with these features
-        if "token_type_ids" in extra_args:
-            # Check if any token_type_ids tensor has image tokens (value == 1)
-            has_image_tokens = any(
-                (t == 1).any() if isinstance(t, torch.Tensor) else False
-                for t in extra_args["token_type_ids"]
-            )
-            if has_image_tokens:
-                # These checks would ideally be done at config time, but we also check here
-                # since the config might not know whether images will be present at runtime
-                if hasattr(self, "_ad_config"):
-                    if getattr(self._ad_config, "enable_chunked_prefill", False):
-                        raise RuntimeError(
-                            "Gemma3 VLM with image tokens requires enable_chunked_prefill=False. "
-                            "Chunked prefill would break bidirectional attention for image tokens."
-                        )
-                    kv_cache_config = getattr(self._ad_config, "kv_cache_config", None)
-                    if kv_cache_config and getattr(kv_cache_config, "enable_block_reuse", False):
-                        raise RuntimeError(
-                            "Gemma3 VLM with image tokens requires kv_cache_config.enable_block_reuse=False. "
-                            "Block reuse could partially match image tokens, breaking attention correctness."
-                        )
 
         def _use_overlap_scheduler(request) -> bool:
             """Check if we should use overlap scheduler behavior."""
@@ -465,7 +573,7 @@ class ADEngine(ModelEngine):
                 else:
                     return request.max_beam_num_tokens - 1
 
-        def _build_input_ids(request) -> Tuple[List[int], List[int]]:
+        def _build_input_ids(request) -> Tuple[List[int], List[int], bool]:
             """Build input_ids and gather indices for a request.
             Gather indices are used to gather tokens from new_tokens into input_ids when we run the overlap scheduler.
             """
@@ -497,11 +605,11 @@ class ADEngine(ModelEngine):
                     gather_indices = [request.py_batch_idx]
                     input_ids = [dummy_token]
 
-            return input_ids, gather_indices
+            return input_ids, gather_indices, use_overlap
 
         for request in gen_requests:
             num_tokens_seen = _compute_num_tokens_seen(request)
-            input_ids_for_request, gather_indices_to_append = _build_input_ids(request)
+            input_ids_for_request, gather_indices_to_append, use_overlap = _build_input_ids(request)
 
             input_ids.append(input_ids_for_request)
             input_pos.append(num_tokens_seen)
@@ -521,9 +629,21 @@ class ADEngine(ModelEngine):
             if use_overlap:
                 mask_scatter_indices.extend(list(range(cu_seqlen[-2], cu_seqlen[-1])))
 
+            seq_len.append(len(input_ids[-1]))
+            cu_seqlen.append(cu_seqlen[-1] + seq_len[-1])
+
+            if use_overlap:
+                mask_scatter_indices.extend(list(range(cu_seqlen[-2], cu_seqlen[-1])))
+
             # get cache indices
             cache_indices = kv_cache_manager.get_cache_indices(request)
-            page_assignments.append(cache_indices)
+            cache_loc.extend(cache_indices)
+            pages_per_seq.append(len(cache_indices))
+            cu_num_pages.append(cu_num_pages[-1] + pages_per_seq[-1])
+            seq_len_with_cache.append(input_pos[-1] + seq_len[-1])
+            last_page_len.append((seq_len_with_cache[-1] - 1) % page_size + 1)
+
+            position_ids.append(list(range(input_pos[-1], seq_len_with_cache[-1])))
 
         # check for logits_gather_info
         # we only need to gather in the following situation:
@@ -536,8 +656,15 @@ class ADEngine(ModelEngine):
         # update the sequence info object now
         self.cache_seq_interface.info.nest_sequences(
             input_ids,
+            position_ids=position_ids,
+            seq_len=seq_len,
             input_pos=input_pos,
-            page_assignments=page_assignments,
+            cu_seqlen=cu_seqlen,
+            cache_loc=cache_loc,
+            pages_per_seq=pages_per_seq,
+            cu_num_pages=cu_num_pages,
+            seq_len_with_cache=seq_len_with_cache,
+            last_page_len=last_page_len,
             slot_idx=slot_idx,
             use_initial_states=use_initial_states,
             logits_gather_indices=logits_gather_indices,
@@ -548,11 +675,7 @@ class ADEngine(ModelEngine):
         )
         # scatter the new tokens into the input_ids tensor if provided
         if new_tokens is not None:
-            self.cache_seq_interface.info.rescatter_input_ids(
-                ungathered_input_ids=new_tokens.flatten(),  # ensure it's flattened
-                gather_idx=flat_gather_indices,
-                scatter_ref=dummy_token,
-            )
+            self.cache_seq_interface.info.rescatter_input_ids(new_tokens.flatten())
 
         self.iter_states["num_ctx_requests"] = num_ctx_requests
         self.iter_states["num_ctx_tokens"] = num_ctx_tokens
@@ -562,7 +685,6 @@ class ADEngine(ModelEngine):
     @nvtx_range("ad_compute_logits")
     def _compute_logits(self) -> List[torch.Tensor]:
         kwargs = self._prepare_vlm_kwargs(dict(self.cache_seq_interface.named_args))
-
         # run the model
         logits: torch.Tensor = self.model(**kwargs)[0]
         logits = self.cache_seq_interface.info.maybe_gather_and_squeeze_logits(logits)
@@ -572,7 +694,6 @@ class ADEngine(ModelEngine):
 
     def _prepare_vlm_kwargs(self, kwargs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Prepare kwargs for calling the exported inference model in VLM scenarios.
-
         Goals:
         - Generate FlashInfer-compatible VLM custom masks outside the exported HF GraphModule.
         - Strip VLM-only kwargs (e.g., token_type_ids) before calling the exported GraphModule to
@@ -652,6 +773,7 @@ class ADEngine(ModelEngine):
         return self.cache_seq_interface.info.max_batch_size
 
     @torch.inference_mode()
+    @maybe_pad_for_cuda_graph
     def forward(
         self,
         scheduled_requests: ScheduledRequests,
@@ -680,7 +802,6 @@ class ADEngine(ModelEngine):
 
 def _configure_vlm_mask_settings(engine: ADEngine, ad_config: LlmArgs) -> None:
     """Configure VLM custom mask settings on the engine.
-
     This is used to:
     - enable/disable external VLM custom mask generation based on (graph input contract, backend)
     - best-effort extract VLM mask parameters (e.g., sliding_window) from HF config when needed
@@ -793,6 +914,59 @@ def create_draft_model_engine_maybe(
     draft_model_engine.kv_cache_manager_key = ResourceManagerType.DRAFT_KV_CACHE_MANAGER
 
     return draft_model_engine
+
+
+class TRTLLMSamplerModelConfig:
+    def __init__(self, vocab_size_padded: int):
+        self.config = SimpleNamespace()
+        self.config.vocab_size = vocab_size_padded
+
+        # Initialized to dummy values as they are not used in the C++ code underlying TRTLLMSampler.
+        self.config.num_hidden_layers = 42
+        self.config.hidden_size = 42
+        self.config.num_attention_heads = 42
+
+
+def instantiate_sampler(
+    ad_config: LlmArgs,
+    max_num_sequences: int,
+    max_draft_len: int,
+    max_total_draft_tokens: int,
+    dist_mapping: Mapping,
+    engine: ADEngine,
+):
+    if ad_config.sampler_type == SamplerType.TorchSampler:
+        # search sampler with speculative decoding
+        sampler_args = TorchSampler.Args(
+            max_seq_len=ad_config.max_seq_len,
+            max_draft_len=max_draft_len,
+            max_total_draft_tokens=max_total_draft_tokens,
+            max_num_sequences=max_num_sequences,
+            max_beam_width=ad_config.max_beam_width,
+            disable_overlap_scheduler=ad_config.disable_overlap_scheduler,
+        )
+        sampler = TorchSampler(sampler_args)
+
+    elif ad_config.sampler_type == SamplerType.TRTLLMSampler:
+        vocab_size_padded: int = engine.cache_seq_interface.info.vocab_size_padded
+        sampler_model_config = TRTLLMSamplerModelConfig(vocab_size_padded)
+        decoding_mode = get_decoding_mode(ad_config.decoding_config, ad_config.max_beam_width)
+        sampler = TRTLLMSampler(
+            model=sampler_model_config,
+            model_dtype=torch.bfloat16,  # hardcoded as bfloat16; does not seem necessary in C++ code.
+            mapping=dist_mapping,
+            decoding_mode=decoding_mode,
+            disable_overlap_scheduler=ad_config.disable_overlap_scheduler,
+            max_seq_len=ad_config.max_seq_len,
+            max_batch_size=ad_config.max_batch_size,
+            max_beam_width=ad_config.max_beam_width,
+            decoding_config=ad_config.decoding_config,
+            kv_cache_config=ad_config.kv_cache_config,
+        )
+    else:
+        raise ValueError(f"Sampler type {ad_config.sampler_type} is not supported.")
+
+    return sampler
 
 
 def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[TokenizerBase] = None):
@@ -916,23 +1090,21 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     )
     scheduler = SimpleScheduler(capacitor_scheduler, mb_scheduler)
 
-    # search sampler with speculative decoding
-    sampler_args = TorchSampler.Args(
-        max_seq_len=ad_config.max_seq_len,
+    vocab_size_padded = engine.cache_seq_interface.info.vocab_size_padded
+    sampler = instantiate_sampler(
+        ad_config=ad_config,
+        max_num_sequences=max_num_sequences,
         max_draft_len=max_draft_len,
         max_total_draft_tokens=max_total_draft_tokens,
-        max_num_sequences=max_num_sequences,
-        max_beam_width=ad_config.max_beam_width,
-        disable_overlap_scheduler=ad_config.disable_overlap_scheduler,
+        dist_mapping=dist_mapping,
+        engine=engine,
     )
-    sampler = TorchSampler(sampler_args)
 
     # Guided (structured) decoding.
     guided_decoder = None
     if (
         (guided_decoding_backend := ad_config.guided_decoding_backend) is not None
     ) and dist_mapping.is_last_pp_rank():
-        vocab_size_padded = engine.cache_seq_interface.info.vocab_size_padded
         if vocab_size_padded is None:
             raise RuntimeError(
                 "Could not determine the vocabulary size. Required for guided decoding."
