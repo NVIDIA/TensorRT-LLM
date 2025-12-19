@@ -662,6 +662,7 @@
             "routeAct": "ldgsts",
             "fusedAct": true,
             "sfLayoutB": "linear",
+            "mmaK": 32,
             "useUnrollLoop2xForMma": [true, false],
             "dtypeC": "e4m3",
             "mmaN,tileN,epilogueTileN,tileK,numStages": [
@@ -681,6 +682,7 @@
             "_template": "BatchedGemmE2m1E4m3LowLatency",
             "routeAct": false,
             "fusedAct": false,
+            "mmaK": 32,
             "useUnrollLoop2xForMma": [true, false],
             "dtypeC": "bf16",
             "mmaN,tileN,epilogueTileN,tileK,numStages": [

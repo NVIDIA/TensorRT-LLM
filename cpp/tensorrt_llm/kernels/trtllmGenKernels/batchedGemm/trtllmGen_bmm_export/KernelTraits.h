@@ -163,7 +163,7 @@ private:
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-inline int getNumSmemBitsPerElt(tg::Dtype dtype, tg::MmaKind mmaKind)
+inline int getNumSmemBitsPerElt(tg::Dtype dtype, tg::MmaKind mmaKind, int mmaK)
 {
     if (mmaKind == tg::MmaKind::Auto)
     {
@@ -198,6 +198,7 @@ public:
         : mMmaKind{mmaKind}
         , mFuseUtccpWithUtcmma{fuseUtccpWithUtcmma}
         , mUseMaxTmemOverlap{useMaxTmemOverlap}
+        , mNumEpilogueWarps{numEpilogueWarps}
     {
         //
         // SMEM
@@ -233,7 +234,7 @@ public:
             {
                 // Number of bytes in load A shared memory.
                 auto const numSmemBytesLoadA
-                    = numStages * tileM * tileK * getNumSmemBitsPerElt(dtypeA, mMmaKind) / 8 /* bits */;
+                    = numStages * tileM * tileK * getNumSmemBitsPerElt(dtypeA, mMmaKind, mmaK) / 8 /* bits */;
                 // Number of bytes for load A alignment for TMA load.
                 auto const numBytesAlignmentLoadA = 1024;
                 // loadA is already at first chunk. No need to reuse it.
@@ -249,7 +250,7 @@ public:
             {
                 // Number of bytes in load B shared memory.
                 auto const numSmemBytesLoadB = numStages * (useTwoCtas ? tileN / 2 : tileN) * tileK
-                    * getNumSmemBitsPerElt(dtypeB, mMmaKind) / 8 /* bits */;
+                    * getNumSmemBitsPerElt(dtypeB, mMmaKind, mmaK) / 8 /* bits */;
                 // Number of bytes for load B alignment for TMA load.
                 auto const numBytesAlignmentLoadB = 1024;
                 // No need to reuse the first chunk.
@@ -269,7 +270,7 @@ public:
             {
                 // Number of bytes in save shuffled B in shared memory.
                 auto const numSmemBytesLoadB = numSlicesForSliceK > 1
-                    ? numStages * tileN * tileK * getNumSmemBitsPerElt(dtypeB, mMmaKind) / 8 /* bits */
+                    ? numStages * tileN * tileK * getNumSmemBitsPerElt(dtypeB, mMmaKind, mmaK) / 8 /* bits */
                     : 0;
                 // Number of bytes for load B alignment for TMA load.
                 auto const numBytesAlignmentLoadB = 1024;
@@ -506,12 +507,17 @@ public:
                 bool const useBlockScalingA = tg::dtypeIsBlockFmt(dtypeMmaA);
                 // Are the block scales constant?
                 bool const useConstSfA = useBlockScalingA && !tg::dtypeIsBlockFmt(dtypeA);
+                // Number elements per scaling factor.
+                int32_t const numEltsPerSf = useBlockScalingA ? tg::dtypeNumEltsPerSf(dtypeMmaA) : -1;
+                // TMEM cols group size in the K dimension.
+                int32_t kGroupSize = 4;
+                // Number of columns per stage.
+                int32_t const numColsPerStage = useBlockScalingA
+                    ? ((tileK / (kGroupSize * numEltsPerSf)) * tg::getTmemColStridePerGroup(tileM, mmaK, kGroupSize))
+                    : 0;
                 // Number of columns for scaling factors of A.
-                auto const numTmemColsSfA = useConstSfA
-                    ? tg::roundUp((tileK / 64) * tg::getTmemColStridePerGroup(tileM, mmaK), 4)
-                    : (useBlockScalingA ? ((tileK / 64) * tg::getTmemColStridePerGroup(tileM, mmaK))
-                                * (mFuseUtccpWithUtcmma ? 1 : numStages)
-                                        : 0);
+                auto const numTmemColsSfA = useConstSfA ? tg::roundUp(numColsPerStage, 4)
+                                                        : (numColsPerStage * (mFuseUtccpWithUtcmma ? 1 : numStages));
                 // Number of columns for Sf alignment.
                 auto const numColsAlignmentSfA = 4;
                 // No need to reuse TMEM.
@@ -529,12 +535,17 @@ public:
                 bool const useBlockScalingB = tg::dtypeIsBlockFmt(dtypeMmaB);
                 // Are the block scales constant?
                 bool const useConstSfB = useBlockScalingB && !tg::dtypeIsBlockFmt(dtypeB);
+                // Number elements per scaling factor.
+                int32_t const numEltsPerSf = useBlockScalingB ? tg::dtypeNumEltsPerSf(dtypeMmaB) : -1;
+                // TMEM cols group size in the K dimension.
+                int32_t kGroupSize = 4;
+                // Number of columns per stage.
+                int32_t const numColsPerStage = useBlockScalingB
+                    ? ((tileK / (kGroupSize * numEltsPerSf)) * tg::getTmemColStridePerGroup(tileN, mmaK, kGroupSize))
+                    : 0;
                 // Number of columns for scaling factors of B.
-                auto const numTmemColsSfB = useConstSfB
-                    ? tg::roundUp((tileK / 64) * tg::getTmemColStridePerGroup(tileN, mmaK), 4)
-                    : (useBlockScalingB ? ((tileK / 64) * tg::getTmemColStridePerGroup(tileN, mmaK))
-                                * (mFuseUtccpWithUtcmma ? 1 : numStages)
-                                        : 0);
+                auto const numTmemColsSfB = useConstSfB ? tg::roundUp(numColsPerStage, 4)
+                                                        : (numColsPerStage * (mFuseUtccpWithUtcmma ? 1 : numStages));
                 // Number of columns for Sf alignment.
                 auto const numColsAlignmentSfB = 4;
                 // No need to reuse TMEM.
@@ -559,6 +570,8 @@ public:
     bool mFuseUtccpWithUtcmma;
     // Whether use the max TMEM overlap trick.
     bool mUseMaxTmemOverlap;
+    // The number of epilogue warps.
+    int32_t mNumEpilogueWarps;
     // Helper for SMEM allocation.
     MemAllocatorHelper mSmemAllocatorHelper;
     // Helper for TMEM allocation.

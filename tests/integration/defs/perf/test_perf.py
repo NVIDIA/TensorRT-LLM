@@ -29,7 +29,8 @@ from defs.trt_test_alternative import (is_linux, is_windows, print_info,
                                        print_warning)
 
 from ..conftest import get_llm_root, llm_models_root, trt_environment
-from .open_search_db_utils import (add_id, get_history_data, get_job_info,
+from .open_search_db_utils import (SCENARIO_MATCH_FIELDS, add_id,
+                                   get_history_data, get_job_info,
                                    post_new_perf_data, prepare_baseline_data,
                                    prepare_regressive_test_cases,
                                    write_regressive_test_cases)
@@ -597,6 +598,11 @@ class ServerConfig:
         self.max_draft_len = speculative_config.get('max_draft_len', 0)
         self.speculative_model_dir = speculative_config.get(
             'speculative_model_dir', "")
+
+        # match_mode: "config" (default, 40+ fields) or "scenario" (benchmark scenario fields for recipe testing)
+        # When match_mode is "scenario", baselines are matched by scenario identity
+        # (model, gpu, isl, osl, concurrency, num_gpus) instead of full config fields.
+        self.match_mode = server_config_data.get('match_mode', "config")
 
         # Store filtered config for extra_llm_api_config (exclude name, model_name, gpus, client_configs)
         self.extra_llm_api_config_data = {
@@ -2439,9 +2445,12 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                     new_data_dict[cmd_idx] = new_data
                     cmd_idx += 1
                     if not match_keys:
-                        match_keys.append("s_runtime")
-                        match_keys.extend(server_config_dict.keys())
-                        match_keys.extend(client_config_dict.keys())
+                        if server_config.match_mode == "scenario":
+                            match_keys = SCENARIO_MATCH_FIELDS.copy()
+                        else:
+                            match_keys.append("s_runtime")
+                            match_keys.extend(server_config_dict.keys())
+                            match_keys.extend(client_config_dict.keys())
 
         elif self._config.runtime == "multi_node_disagg_server":
             if self._config.disagg_configs[0][
