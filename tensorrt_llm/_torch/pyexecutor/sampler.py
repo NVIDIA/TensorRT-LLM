@@ -2641,10 +2641,12 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
                 new_tokens = padded_tokens[request_idx, beam_idx]
                 for step_idx in range(draft_token_length + 1):
                     size_per_step = new_tokens.size(0) - draft_token_length + step_idx
+                    matches = []
                     for word, L in zip(words_device, lens):
                         truncated_seq = new_tokens[size_per_step - L : size_per_step]
                         match = (truncated_seq == word[:L]).all()
-                        per_step[step_idx, request_idx, beam_idx] = match
+                        matches.append(match)
+                    per_step[step_idx, request_idx, beam_idx] = torch.stack(matches).any()
 
         return per_step
 
