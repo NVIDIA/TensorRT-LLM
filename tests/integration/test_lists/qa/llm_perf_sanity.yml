@@ -4,12 +4,12 @@ llm_perf_sanity:
 # Test Conditions Index
 # ===============================================================================
 # 1: All GPUs
-# 2: L40S, L20, H20, H100, H200, Blackwell
-# 3: A100, H20, H100, H200, Blackwell
-# 4: A100, L40S, H20, H100, H200, Blackwell
-# 5: L40S, H20, H100, H200, Blackwell
-# 6: H20, H100, H200, Blackwell
-# 7: H20, H100, H200
+# 2: L40S, L20, H20, H100, H200, B200, B300, GB200, GB300, RTX6000-Server
+# 3: A100, H20, H100, H200, B200, B300, RTX6000-Server
+# 4: A100, L40S, H20, H100, H200, B200, B300, GB200, GB300, RTX6000-Server
+# 5: L40S, H20, H100, H200, B200, B300, RTX6000-Server
+# 6: H20, H100, H200, B200, B300, RTX6000-Server
+# 7: H20, H100, H200, B200, B300
 # ===============================================================================
 
 # 1: All GPUs
@@ -46,7 +46,7 @@ llm_perf_sanity:
   - perf/test_perf.py::test_perf[llama_v3.2_1b-bench-pytorch-bfloat16-input_output_len:128,128-gpus:2]
 
 
-# 2: L40S, L20, H20, H100, H200, Blackwell
+# 2: L40S, L20, H20, H100, H200, B200, B300, GB200, GB300, RTX6000-Server
 - condition:
     terms:
       supports_fp8: true
@@ -63,7 +63,7 @@ llm_perf_sanity:
   - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1_instruct_fp8-bench-pytorch-float8-input_output_len:128,128-gpus:2]
 
 
-# 3: A100, H20, H100, H200, Blackwell
+# 3: A100, H20, H100, H200, B200, B300, RTX6000-Server
 - condition:
     ranges:
       gpu_memory:
@@ -76,26 +76,30 @@ llm_perf_sanity:
   - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct-bench-pytorch-bfloat16-input_output_len:500,2000-gpus:8]
   - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct-bench-pytorch-bfloat16-input_output_len:2000,500-gpus:8]
 
-# 4: A100, L40S, H20, H100, H200, Blackwell
+# 4: A100, L40S, H20, H100, H200, B200, B300, GB200, GB300, RTX6000-Server
 - condition:
     ranges:
       system_gpu_count:
         gte: 4
 
   tests:
-  #llama_v3.1_70b
-  #trt backend
-  #pytorch backend
+    # llama_v3.1_70b
+    # trt backend
+    # pytorch backend
   - perf/test_perf.py::test_perf[llama_v3.1_70b-bench-pytorch-bfloat16-input_output_len:128,128-gpus:4]
   - perf/test_perf.py::test_perf[llama_v3.1_70b-bench-pytorch-bfloat16-maxbs:1-input_output_len:128,128-reqs:10-gpus:4]
+   # test overlap scheduler
+  - perf/test_perf.py::test_perf[qwen3_0.6b-bench-pytorch-bfloat16-maxnt:2048-input_output_len:8000,1000-reqs:256-con:1-pp:4-gpus:4]
+  - perf/test_perf.py::test_perf[llama_v3.1_8b-bench-pytorch-streaming-bfloat16-input_output_len:1000,1000-reqs:1000-con:200]
 
-# 5: L40S, H20, H100, H200, Blackwell
+
+# 5: L40S, H20, H100, H200, B200, B300, RTX6000-Server
 - condition:
     terms:
       supports_fp8: true
     ranges:
       system_gpu_count:
-        gte: 4
+        gte: 8
 
   tests:
   - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp8-bench-pytorch-float8-input_output_len:2000,500-gpus:4]
@@ -106,7 +110,7 @@ llm_perf_sanity:
   - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1_instruct-bench-pytorch-float16-input_output_len:128,128-reqs:64-gpus:8]
 
 
-# 6: H20, H100, H200, Blackwell
+# 6: H20, H100, H200, B200, B300, RTX6000-Server
 - condition:
     ranges:
       system_gpu_count:
@@ -128,11 +132,9 @@ llm_perf_sanity:
   - perf/test_perf.py::test_perf[llama_v3.1_8b-disagg_server-ctx_dp:4-gen_tp:4]
   # gpt_oss_20b_fp4
   - perf/test_perf.py::test_perf[gpt_oss_20b_fp4-bench-pytorch-float4-input_output_len:512,512]
-  # test overlap scheduler
-  - perf/test_perf.py::test_perf[qwen3_0.6b-bench-pytorch-bfloat16-maxnt:2048-input_output_len:8000,1000-reqs:256-con:1-pp:4-gpus:4]
-  - perf/test_perf.py::test_perf[llama_v3.1_8b-bench-pytorch-streaming-bfloat16-input_output_len:1000,1000-reqs:1000-con:200]
+ 
 
-# 7: H20, H100, H200
+# 7: H20, H100, H200, B200, B300
 - condition:
     ranges:
       system_gpu_count:
