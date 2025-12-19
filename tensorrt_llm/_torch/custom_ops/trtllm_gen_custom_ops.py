@@ -277,16 +277,14 @@ class FP4BlockScaleMoERunner(TunableRunner):
 
         m_values = get_last_power_of_2_num_tokens_buckets(MAX_PROFILE_BUCKET)
 
-        def round_rule(x: int, ep_size_: int) -> int:
-            value = last_positive_power_of_2(x) // ep_size_
+        def round_rule(x: int) -> int:
+            value = last_positive_power_of_2(x) // ep_size
             return min(max(1, value), MAX_PROFILE_BUCKET)
 
-        specs = (DynamicTensorSpec(
-            HIDDEN_STATES_IDX,
-            TUNED_DIM,
-            m_values,
-            map_to_tuning_buckets=lambda x: round_rule(x, 1),
-            map_to_runtime_buckets=lambda x: round_rule(x, ep_size)), )
+        specs = (DynamicTensorSpec(HIDDEN_STATES_IDX,
+                                   TUNED_DIM,
+                                   m_values,
+                                   map_to_tuning_buckets=round_rule), )
 
         return specs
 
@@ -623,16 +621,14 @@ class FP8BlockScaleMoERunner(TunableRunner):
 
         m_values = get_last_power_of_2_num_tokens_buckets(MAX_PROFILE_BUCKET)
 
-        def round_rule(x: int, ep_size_: int) -> int:
-            value = last_positive_power_of_2(x) // ep_size_
+        def round_rule(x: int) -> int:
+            value = last_positive_power_of_2(x) // ep_size
             return min(max(1, value), MAX_PROFILE_BUCKET)
 
-        specs = (DynamicTensorSpec(
-            HIDDEN_STATES_IDX,
-            TUNED_DIM,
-            m_values,
-            map_to_tuning_buckets=lambda x: round_rule(x, 1),
-            map_to_runtime_buckets=lambda x: round_rule(x, ep_size)), )
+        specs = (DynamicTensorSpec(HIDDEN_STATES_IDX,
+                                   TUNED_DIM,
+                                   m_values,
+                                   map_to_tuning_buckets=round_rule), )
 
         return specs
 
@@ -918,16 +914,14 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
 
         m_values = get_last_power_of_2_num_tokens_buckets(MAX_PROFILE_BUCKET)
 
-        def round_rule(x: int, ep_size_: int) -> int:
-            value = last_positive_power_of_2(x) // ep_size_
+        def round_rule(x: int) -> int:
+            value = last_positive_power_of_2(x) // ep_size
             return min(max(1, value), MAX_PROFILE_BUCKET)
 
-        specs = (DynamicTensorSpec(
-            HIDDEN_STATES_IDX,
-            TUNED_DIM,
-            m_values,
-            map_to_tuning_buckets=lambda x: round_rule(x, 1),
-            map_to_runtime_buckets=lambda x: round_rule(x, ep_size)), )
+        specs = (DynamicTensorSpec(HIDDEN_STATES_IDX,
+                                   TUNED_DIM,
+                                   m_values,
+                                   map_to_tuning_buckets=round_rule), )
 
         return specs
 
@@ -1218,16 +1212,14 @@ class E4m3MxE2m1BlockScaleMoERunner(TunableRunner):
 
         m_values = get_last_power_of_2_num_tokens_buckets(MAX_PROFILE_BUCKET)
 
-        def round_rule(x: int, ep_size_: int) -> int:
-            value = last_positive_power_of_2(x) // ep_size_
+        def round_rule(x: int) -> int:
+            value = last_positive_power_of_2(x) // ep_size
             return min(max(1, value), MAX_PROFILE_BUCKET)
 
-        specs = (DynamicTensorSpec(
-            HIDDEN_STATES_IDX,
-            TUNED_DIM,
-            m_values,
-            map_to_tuning_buckets=lambda x: round_rule(x, 1),
-            map_to_runtime_buckets=lambda x: round_rule(x, ep_size)), )
+        specs = (DynamicTensorSpec(HIDDEN_STATES_IDX,
+                                   TUNED_DIM,
+                                   m_values,
+                                   map_to_tuning_buckets=round_rule), )
 
         return specs
 
@@ -1496,16 +1488,14 @@ class Bf16MxE2m1BlockScaleMoERunner(TunableRunner):
 
         m_values = get_last_power_of_2_num_tokens_buckets(MAX_PROFILE_BUCKET)
 
-        def round_rule(x: int, ep_size_: int) -> int:
-            value = last_positive_power_of_2(x) // ep_size_
+        def round_rule(x: int) -> int:
+            value = last_positive_power_of_2(x) // ep_size
             return min(max(1, value), MAX_PROFILE_BUCKET)
 
-        specs = (DynamicTensorSpec(
-            HIDDEN_STATES_IDX,
-            TUNED_DIM,
-            m_values,
-            map_to_tuning_buckets=lambda x: round_rule(x, 1),
-            map_to_runtime_buckets=lambda x: round_rule(x, ep_size)), )
+        specs = (DynamicTensorSpec(HIDDEN_STATES_IDX,
+                                   TUNED_DIM,
+                                   m_values,
+                                   map_to_tuning_buckets=round_rule), )
 
         return specs
 
@@ -1759,16 +1749,14 @@ class FP8FP4BlockScaleMoERunner(TunableRunner):
 
         m_values = get_last_power_of_2_num_tokens_buckets(MAX_PROFILE_BUCKET)
 
-        def round_rule(x: int, ep_size_: int) -> int:
-            value = last_positive_power_of_2(x) // ep_size_
+        def round_rule(x: int) -> int:
+            value = last_positive_power_of_2(x) // ep_size
             return min(max(1, value), MAX_PROFILE_BUCKET)
 
-        specs = (DynamicTensorSpec(
-            HIDDEN_STATES_IDX,
-            TUNED_DIM,
-            m_values,
-            map_to_tuning_buckets=lambda x: round_rule(x, 1),
-            map_to_runtime_buckets=lambda x: round_rule(x, ep_size)), )
+        specs = (DynamicTensorSpec(HIDDEN_STATES_IDX,
+                                   TUNED_DIM,
+                                   m_values,
+                                   map_to_tuning_buckets=round_rule), )
 
         return specs
 

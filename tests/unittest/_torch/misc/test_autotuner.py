@@ -38,18 +38,21 @@ pytestmark = pytest.mark.threadleak(enabled=False)
 def test_multi_dynamic_dims():
     tuner = autotuner.AutoTuner()
     x = torch.rand([5, 1024])
-    w = torch.rand([7, 19])
+    w = torch.rand([7, 9])
     dynamic_tensor_specs = (
         DynamicTensorSpec(0, 0, [1, 3, 5]),
         DynamicTensorSpec(0, 1, [16, 24, 1024]),
-        DynamicTensorSpec(1, 1, [3, 7, 9], lambda x: x // 2),
+        # map_to_tuning_buckets is only applied at runtime, not during tuning
+        DynamicTensorSpec(1,
+                          1, [3, 7, 9],
+                          map_to_tuning_buckets=lambda x: x // 2),
     )
 
     profiles = tuner._optimization_profiles(
         tuning_config=TuningConfig(dynamic_tensor_specs=dynamic_tensor_specs),
         inputs=[x, w])
     # choice(0, 0) * choice(0, 1) * choice(1, 1)
-    # 3 * 3 * 3 = 27, because 19 is mapped to 9 and already inside the bucket
+    # 3 * 3 * 3 = 27, input value 9 is already inside the bucket
     assert len(profiles) == 27
     sample_0 = OptimizationProfile(shapes=[[
         DynamicDim(min=1, opt=1, max=3),
@@ -171,47 +174,45 @@ def test_autotuner_cache_basic():
         m //= 2
 
 
-def test_runtime_bucket_mapping():
-    """Test that map_to_runtime_buckets correctly maps runtime sizes to tuning buckets.
+def test_bucket_mapping():
+    """Test that map_to_tuning_buckets correctly maps runtime sizes to tuning buckets.
 
-    This test demonstrates the distinction between map_to_tuning_buckets and map_to_runtime_buckets:
-    - map_to_tuning_buckets: used during tuning to store cache keys with raw bucket values
-    - map_to_runtime_buckets: used during runtime to map input sizes to tuning buckets
+    This test demonstrates the single mapper approach:
+    - During tuning: NO mapper is applied, raw bucket values are used as cache keys
+    - During runtime: map_to_tuning_buckets is applied to map buffer size to actual work size
 
     With sparsity=0.25, the buffer contains 25% actual work:
-    - Tuning stores buckets: 1, 2, 4, 8, 16, 32
+    - Tuning stores buckets: 1, 2, 4, 8, 16, 32 as raw cache keys
     - Runtime buffer 4 -> maps to bucket int(4 * 0.25) = 1
     - Runtime buffer 16 -> maps to bucket int(16 * 0.25) = 4
 
     In MoE EP, the input buffer is allocated for worst-case but sparsely filled.
-    Using map_to_runtime_buckets allows us to map buffer size to actual work size.
+    Using map_to_tuning_buckets allows us to map buffer size to actual work size at runtime.
     """
     w = torch.randn(64, 128)
     tuner = AutoTuner.get()
     tuner.clear_cache()
 
     # Sparsity indicates the fraction of buffer containing valid work
-    def bucket_mapper(x: int, sparsity: float) -> int:
-        return int(x * sparsity)
+    sparsity = 0.25
 
     tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
         input_idx=0,
         dim_idx=0,
         gen_tuning_buckets=get_power_of_2_num_tokens_buckets(M),
-        map_to_tuning_buckets=lambda x: bucket_mapper(x, sparsity=1.0),
-        map_to_runtime_buckets=lambda x: bucket_mapper(x, sparsity=0.25)), ), )
+        map_to_tuning_buckets=lambda x: int(x * sparsity)), ), )
 
     with autotune():
-        tuner.choose_one("test_runtime_bucket_mapping", [GemmRunner()],
-                         tuning_config, [torch.randn(1, 64), w])
+        tuner.choose_one("test_bucket_mapping", [GemmRunner()], tuning_config,
+                         [torch.randn(1, 64), w])
 
-    # Verify cache entries use raw tuning bucket values, not deflated values
+    # Verify cache entries use raw tuning bucket values
     cache_entries = tuner.profiling_cache.get_specific_custom_op(
-        "test_runtime_bucket_mapping")
+        "test_bucket_mapping")
 
     # Extract the first dimension of the first input shape from each cache key
     assert len(cache_entries) == len(tuning_config.dynamic_tensor_specs[0].gen_tuning_buckets), \
-        f"Expected len(({len(tuning_config.dynamic_tensor_specs[0].gen_tuning_buckets)}) cache entries, got len({(cache_entries)})"
+        f"Expected {len(tuning_config.dynamic_tensor_specs[0].gen_tuning_buckets)} cache entries, got {len(cache_entries)}"
 
     # Test runtime mapping: buffer size is mapped via map_to_runtime_buckets
     # to find the correct tuning bucket based on actual work size
@@ -235,8 +236,8 @@ def test_runtime_bucket_mapping():
     for buffer_size, valid_size, expected_tactic in test_cases:
         # Verify cache lookup succeeds with the mapped bucket
         x = torch.randn(buffer_size, 64)
-        runner, tactic = tuner.choose_one("test_runtime_bucket_mapping",
-                                          [GemmRunner()], tuning_config, [x, w])
+        runner, tactic = tuner.choose_one("test_bucket_mapping", [GemmRunner()],
+                                          tuning_config, [x, w])
         assert (
             tactic == expected_tactic
         ), f"buffer size={buffer_size} -> valid work size={valid_size}, expected tactic {expected_tactic} but got {tactic}"
