@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+from test_common.llm_data import with_mocked_hf_download
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM, SamplingParams
@@ -145,10 +146,11 @@ def test_kv_lens_runtime_with_eagle3_one_model():
             False, "FLASHINFER", False, False, False, False, True, False, False,
             False
         ],
-        # HF download variant - tests speculative model auto-download from HuggingFace Hub
+        # Tests (mocked) speculative model auto-download from HuggingFace
         [False, "TRTLLM", True, False, False, False, True, False, False, True],
     ])
 @pytest.mark.high_cuda_memory
+@with_mocked_hf_download
 def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
                       disable_overlap_scheduler: bool, enable_block_reuse: bool,
                       use_one_model: bool, enable_chunked_prefill: bool,
