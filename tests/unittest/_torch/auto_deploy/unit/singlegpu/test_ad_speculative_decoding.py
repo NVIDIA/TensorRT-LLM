@@ -16,11 +16,13 @@
 import pytest
 from _model_test_utils import get_small_model_config
 from build_and_run_ad import ExperimentConfig, main
+from test_common.llm_data import with_mocked_hf_download
 
 from tensorrt_llm.llmapi import DraftTargetDecodingConfig, KvCacheConfig
 
 
 @pytest.mark.parametrize("use_hf_speculative_model", [False, True])
+@with_mocked_hf_download
 def test_ad_speculative_decoding_smoke(use_hf_speculative_model: bool):
     """Test speculative decoding with AutoDeploy using the build_and_run_ad main()."""
 
@@ -31,6 +33,7 @@ def test_ad_speculative_decoding_smoke(use_hf_speculative_model: bool):
     experiment_config = get_small_model_config("meta-llama/Meta-Llama-3.1-8B-Instruct")
     speculative_model_hf_id = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
     if use_hf_speculative_model:
+        # NOTE: this will still mock out the actual HuggingFace download
         speculative_model = speculative_model_hf_id
     else:
         speculative_model = get_small_model_config(speculative_model_hf_id)["args"]["model"]
