@@ -231,7 +231,7 @@ bool AgentConnection::recvReadySignal(DataContext const& ctx) const
 {
     ReadySignalInfo readySignalInfo{mAgentName, ctx, false};
     mAgentConnectionManager->waitForReadySignal(mRemoteAgentName, readySignalInfo);
-    return true;
+    return readySignalInfo.mIsReady;
 }
 
 AgentConnectionManager::AgentConnectionManager(
