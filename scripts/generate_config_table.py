@@ -19,7 +19,6 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-
 SCRIPT_DIR = Path(__file__).parent.resolve()
 REPO_ROOT = SCRIPT_DIR.parent
 
@@ -27,7 +26,11 @@ REPO_ROOT = SCRIPT_DIR.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from examples.configs.database.database import DATABASE_LIST_PATH, RecipeList, assign_profile  # noqa: E402
+from examples.configs.database.database import (  # noqa: E402
+    DATABASE_LIST_PATH,
+    RecipeList,
+    assign_profile,
+)
 
 MODEL_INFO = {
     "deepseek-ai/DeepSeek-R1-0528": {
@@ -62,8 +65,10 @@ def generate_rst(yaml_path, output_file=None):
 
     lines = []
 
-    # Include note_sections.rst at the top (relative include for Sphinx)
-    lines.append(".. include:: note_sections.rst")
+    # Include note_sections.rst at the top (relative include for Sphinx).
+    # `config_table.rst` lives under `docs/source/deployment-guide/`, while
+    # `note_sections.rst` is under `docs/source/_includes/`.
+    lines.append(".. include:: ../_includes/note_sections.rst")
     lines.append("   :start-after: .. start-note-traffic-patterns")
     lines.append("   :end-before: .. end-note-traffic-patterns")
     lines.append("")
@@ -121,7 +126,8 @@ def generate_rst(yaml_path, output_file=None):
                 profile = assign_profile(n, idx, conc)
 
                 full_config_path = config_path
-                command = f"trtllm-serve {model} --extra_llm_api_options ${{TRTLLM_DIR}}/{full_config_path}"
+                # `--config` is the preferred flag; `--extra_llm_api_options` remains a supported alias.
+                command = f"trtllm-serve {model} --config ${{TRTLLM_DIR}}/{full_config_path}"
 
                 config_filename = os.path.basename(full_config_path)
 
