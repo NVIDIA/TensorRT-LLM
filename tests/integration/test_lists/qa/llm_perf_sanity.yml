@@ -132,7 +132,7 @@ llm_perf_sanity:
   - perf/test_perf.py::test_perf[llama_v3.1_8b-disagg_server-ctx_dp:4-gen_tp:4]
   # gpt_oss_20b_fp4
   - perf/test_perf.py::test_perf[gpt_oss_20b_fp4-bench-pytorch-float4-input_output_len:512,512]
- 
+
 
 # 7: H20, H100, H200, B200, B300
 - condition:
