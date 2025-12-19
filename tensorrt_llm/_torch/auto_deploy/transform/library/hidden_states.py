@@ -25,12 +25,9 @@ from ...custom_ops.attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
-    BufferInitializerDict,
     CacheConfig,
     CacheInitializerDict,
-    Constant,
     MHACallable,
-    PrepareMetadataCallable,
     SequenceInfo,
 )
 from ...models.factory import ModelFactory
@@ -73,52 +70,6 @@ def cached_residual_add_fake(
     t1: torch.Tensor, t2: torch.Tensor, hidden_states_cache: torch.Tensor
 ) -> torch.Tensor:
     return torch.ops.aten.add(t1, t2)
-
-
-@torch.library.custom_op("auto_deploy::cached_residual_add_prepare_metadata", mutates_args=())
-def cached_residual_add_prepare_metadata(
-    position_ids: torch.Tensor,
-    seq_len: torch.Tensor,
-    input_pos: torch.Tensor,
-    cache_loc: torch.Tensor,
-    pages_per_seq: torch.Tensor,
-    slot_idx: torch.Tensor,
-    page_size: int,
-    chunk_size: int,
-) -> List[torch.Tensor]:
-    return [
-        position_ids,
-        seq_len,
-        input_pos,
-        cache_loc,
-        pages_per_seq,
-        slot_idx,
-        page_size,
-        chunk_size,
-    ]
-
-
-@cached_residual_add_prepare_metadata.register_fake
-def cached_residual_add_prepare_metadata_fake(
-    position_ids: torch.Tensor,
-    seq_len: torch.Tensor,
-    input_pos: torch.Tensor,
-    cache_loc: torch.Tensor,
-    pages_per_seq: torch.Tensor,
-    slot_idx: torch.Tensor,
-    page_size: int,
-    chunk_size: int,
-) -> List[torch.Tensor]:
-    return [
-        position_ids,
-        seq_len,
-        input_pos,
-        cache_loc,
-        pages_per_seq,
-        slot_idx,
-        page_size,
-        chunk_size,
-    ]
 
 
 class DetectHiddenStatesForCaptureConfig(TransformConfig):
@@ -235,10 +186,6 @@ class CachedResidualAdd(AttentionDescriptor):
         return torch.ops.auto_deploy.cached_residual_add
 
     @classmethod
-    def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:
-        return torch.ops.auto_deploy.cached_residual_add_prepare_metadata, 0
-
-    @classmethod
     def get_cache_initializers(
         cls, source_attn_node: Node, cache_config: CacheConfig
     ) -> CacheInitializerDict:
@@ -251,16 +198,7 @@ class CachedResidualAdd(AttentionDescriptor):
         return {"hidden_states_cache": _get_hidden_states_cache}
 
     @classmethod
-    def get_global_buffer_initializers(cls, source_attn_node: Node) -> BufferInitializerDict:
-        return {}
-
-    @classmethod
-    def get_constants(cls, source_attn_node: Node) -> List[Constant]:
-        return []
-
-    @classmethod
     def get_standard_metadata_args(cls) -> List[str]:
-        # unused, I think?
         return []
 
 
