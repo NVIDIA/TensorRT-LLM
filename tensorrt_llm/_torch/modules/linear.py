@@ -1149,9 +1149,10 @@ class NVFP4LinearMethod(LinearMethodBase):
                 module.in_features // module.scaling_vector_size, 4)
             scale_pad_row = fp4_utils.pad_up(module.out_features + row_pad_size,
                                              128) - scale_rows
+            # here one col_size of weight equals two linear in_features
             scale_pad_col = fp4_utils.pad_up(
                 (module.in_features + (col_pad_size * 2)) //
-                module.scaling_vector_size, 4) - scale_rows
+                module.scaling_vector_size, 4) - scale_cols
             # Pad weight_scale to match padded weight dimensions
             # Padding should be performed on unswizzled weight_scale tensor
             if scale_pad_row != 0 or scale_pad_col != 0:
