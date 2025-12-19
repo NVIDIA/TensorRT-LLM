@@ -770,7 +770,9 @@ def getPytestBaseCommandLine(
     String trtllmWheelPath,
     String coverageConfigFile,
     String pytestUtil = "",
-    List<String> extraArgs = []
+    List<String> extraArgs = [],
+    int containerPortStart = 0,
+    int containerPortNum = 0
 ) {
     def extraInternalEnv = ""
     def pytestTestTimeout = "3600"
@@ -782,6 +784,12 @@ def getPytestBaseCommandLine(
     // Enable NCCL debug information for multi-GPU tests
     extraInternalEnv += " NCCL_DEBUG=INFO"
 
+    // Container port allocation environment variables for avoiding port conflicts
+    def portEnvVars = ""
+    if (containerPortStart > 0 && containerPortNum > 0) {
+        portEnvVars = "CONTAINER_PORT_START=${containerPortStart} CONTAINER_PORT_NUM=${containerPortNum}"
+    }
+
     def testCmdLine = [
         "LLM_ROOT=${llmSrc}",
         "LLM_BACKEND_ROOT=${llmSrc}/triton_backend",
@@ -789,6 +797,7 @@ def getPytestBaseCommandLine(
         "MODEL_CACHE_DIR=${MODEL_CACHE_DIR}",
         "COLUMNS=200",
         extraInternalEnv,
+        portEnvVars,
         pytestUtil,
         "pytest",
         "-v",
@@ -1264,6 +1273,61 @@ def globalVars = [
 
 class GlobalState {
     static def uploadResultStageNames = []
+
+    // HOST_NODE_NAME to starting port section map
+    // This map maintains the next available starting port for each host node
+    // to avoid port conflicts when running parallel tests on the same node.
+    // Key: HOST_NODE_NAME (e.g., "node-01.cluster.local")
+    // Value: Next available starting port number for that node
+    static def hostNodePortMap = [:]
+
+    // Port allocation configuration
+    static final int BASE_PORT = 10000           // Base starting port
+    static final int PORT_SECTION_SIZE = 1000    // Number of ports per section/stage
+    static final int MAX_PORT = 32000            // Maximum port number to avoid system ports
+}
+
+/**
+ * Allocates and returns a starting port section for the given host node.
+ * This function is thread-safe and ensures each stage running on the same
+ * host node gets a unique port range to avoid conflicts.
+ *
+ * @param hostNodeName The HOST_NODE_NAME of the node running the stage
+ * @param stageName Optional stage name for logging purposes
+ * @return The starting port number for this stage's port section
+ */
+def getStartingPortForHost(String hostNodeName, String stageName = "") {
+    lock(resource: 'globalstate-hostNodePortMap') {
+        def startingPort = GlobalState.hostNodePortMap.get(hostNodeName, GlobalState.BASE_PORT)
+
+        // Store the next available starting port for this host
+        def nextPort = startingPort + GlobalState.PORT_SECTION_SIZE
+
+        // Wrap around if we exceed MAX_PORT
+        if (nextPort > GlobalState.MAX_PORT) {
+            nextPort = GlobalState.BASE_PORT
+        }
+
+        GlobalState.hostNodePortMap[hostNodeName] = nextPort
+
+        return startingPort
+    }
+}
+
+/**
+ * Gets the HOST_NODE_NAME from the current environment.
+ * Falls back to hostname if HOST_NODE_NAME is not set.
+ *
+ * @return The host node name
+ */
+def getHostNodeName() {
+    return sh(script: '''
+        if [ -n "$HOST_NODE_NAME" ]; then
+            echo "$HOST_NODE_NAME"
+        else
+            hostname -f || hostname
+        fi
+    ''', returnStdout: true).trim()
 }
 
 String getShortenedJobName(String path)
@@ -2449,6 +2513,12 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             cat ${coverageConfigFile}
         """
         echoNodeAndGpuInfo(pipeline, stageName)
+
+        // Allocate a unique port section for this container to avoid port conflicts
+        def hostNodeName = getHostNodeName()
+        def containerPortStart = getStartingPortForHost(hostNodeName, stageName)
+        def containerPortNum = GlobalState.PORT_SECTION_SIZE
+
         // Some clusters do not allow dmesg -C so we add || true
         sh 'if [ "$(id -u)" -eq 0 ]; then dmesg -C || true; fi'
         def pytestCommand = getPytestBaseCommandLine(
@@ -2458,7 +2528,11 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             perfMode,
             "${WORKSPACE}/${stageName}",
             TRTLLM_WHL_PATH,
-            coverageConfigFile
+            coverageConfigFile,
+            "",  // pytestUtil
+            [],  // extraArgs
+            containerPortStart,
+            containerPortNum
         )
 
         // Only add --test-list if there are regular tests to run
