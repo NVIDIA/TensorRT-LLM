@@ -702,22 +702,17 @@ class Attention(Module):
                           is_buffer=True))
         else:
 
-            def register_rope_params(rotary_base,
-                                     names_to_register,
-                                     is_local=False):
+            def register_rope_params(rotary_base, scale, scale_type, scaling,
+                                     names_to_register):
                 # Rotary const weights.
                 embed_positions = RopeEmbeddingUtils.create_sinusoidal_positions(
                     max_position_embeddings,
                     rotary_embedding_dim,
                 )
-                # For local attention, use no scaling (consistent with forward pass)
-                local_scale = 1.0 if is_local else rotary_embedding_scale
-                local_scale_type = RotaryScalingType.none if is_local else rotary_embedding_scale_type
-                local_scaling = None if is_local else rotary_embedding_scaling
 
                 rotary_inv_freq, embed_positions_for_gpt_attention = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
                     max_position_embeddings, rotary_embedding_dim, rotary_base,
-                    local_scale, local_scale_type, local_scaling)
+                    scale, scale_type, scaling)
                 model_cls.register_parameter(
                     names_to_register[0],
                     Parameter(embed_positions, dtype='float32', is_buffer=True))
@@ -731,6 +726,9 @@ class Attention(Module):
                               is_buffer=True))
 
             register_rope_params(rotary_base=rotary_embedding_base,
+                                 scale=rotary_embedding_scale,
+                                 scale_type=rotary_embedding_scale_type,
+                                 scaling=rotary_embedding_scaling,
                                  names_to_register=[
                                      'embed_positions', 'rotary_inv_freq',
                                      'embed_positions_for_gpt_attention'
@@ -742,11 +740,13 @@ class Attention(Module):
             if rotary_embedding_base_local is not None:
                 register_rope_params(
                     rotary_base=rotary_embedding_base_local,
+                    scale=1.0,
+                    scale_type=RotaryScalingType.none,
+                    scaling=None,
                     names_to_register=[
                         'embed_positions_local', 'rotary_inv_freq_local',
                         'embed_positions_for_gpt_attention_local'
-                    ],
-                    is_local=True)
+                    ])
 
     @staticmethod
     def fill_attention_params(model_cls, attention_params):
