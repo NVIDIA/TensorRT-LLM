@@ -835,6 +835,9 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         max_lengths_tensor: torch.Tensor
         """Shape: batch_size
            Usage: Stores the maximum lengths for each request"""
+        end_ids: torch.Tensor
+        """Shape: batch_size
+           Usage: Stores the end ids for each request"""
         finish_reasons: torch.Tensor
         """Shape: max_tokens, batch_size, beam_width
            Usage: Stores the currently estimated finish_reasons for each request"""
@@ -889,6 +892,7 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
             return self.Store(
                 new_tokens=int_tensor(self.NEW_TOKENS_SHAPE),
                 max_lengths_tensor=int_tensor(self.max_num_sequences),
+                end_ids=int_tensor(self.max_num_sequences),
                 finish_reasons=int_tensor(self.NEW_TOKENS_SHAPE),
             )
 
@@ -1338,6 +1342,9 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
             if self._is_new_request(request):
                 self.store.max_lengths_tensor[request.py_seq_slot].fill_(
                     min(self.max_seq_len, request.orig_prompt_len + request.py_max_new_tokens)
+                )
+                self.store.end_ids[request.py_seq_slot].fill_(
+                    request.py_end_id if request.py_end_id is not None else -1
                 )
 
     def _prepare_beam_search(
@@ -2504,7 +2511,7 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
             batched_finish_reasons,
         )
         batched_finish_reasons = torch.where(
-            self._are_end_id(requests, tokens),
+            self._are_end_id(self.store.end_ids[seq_slots], tokens),
             self._reason_tensors[FinishReason.END_ID],
             batched_finish_reasons,
         )
@@ -2520,21 +2527,8 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
             )
             first_finish_reasons[seq_slots] = batched_first_finish_reasons
 
-    def _are_end_id(self, requests: list[LlmRequest], tokens: torch.Tensor) -> torch.Tensor:
-        end_ids_tensor = (
-            torch.tensor(
-                [
-                    ([req.py_end_id if req.py_end_id is not None else -1] * self.max_beam_width)
-                    for req in requests
-                ]
-                * self.max_tokens,
-                pin_memory=True,
-                dtype=tokens.dtype,
-            )
-            .view(self.max_tokens, len(requests), self.max_beam_width)
-            .to(device="cuda", non_blocking=True)
-        )
-        return tokens == end_ids_tensor
+    def _are_end_id(self, end_ids: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
+        return tokens == end_ids.view(1, -1, 1).expand(self.max_tokens, -1, self.max_beam_width)
 
     def _are_max_length(self, seq_lens: torch.Tensor, max_seq_lens: torch.Tensor) -> torch.Tensor:
         """Checks which sequences are at or beyond the max length
