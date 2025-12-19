@@ -1,4 +1,8 @@
 import logging
+import os
+import threading
+import time
+import uuid
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any, Dict, List, Literal, Optional, Tuple
@@ -76,6 +80,8 @@ class DisaggServerConfig():
     max_retries: int = 1
     perf_metrics_max_requests: int = 0
     disagg_cluster_config: Optional[DisaggClusterConfig] = None
+    node_id: int = uuid.getnode(
+    ) % 1021  # moding mac by the largest 10-bit prime
 
 
 @dataclass
@@ -331,3 +337,56 @@ def parse_metadata_server_config_file(
     with open(metadata_server_config_file, 'r') as file:
         config = yaml.safe_load(file)
         return MetadataServerConfig(**config)
+
+
+def get_enable_prealloc_disagg():
+    return os.environ.get("TLLM_ENABLE_PREALLOC_DISAGG", "0") == "1"
+
+
+MIN_GLOBAL_ID = 1 << 42
+
+# Consider GIL being removed in the future, use a lock to protect the counter
+_global_disagg_request_id_lock = threading.Lock()
+_global_disagg_request_id_counter = 0
+_last_timestamp_ms_in_request_id = 0
+
+
+# Request ID usually doesn't have to be monotonic, but it's useful for debugging
+def get_global_disagg_request_id(machine_id: int,
+                                 monotonic: bool = False) -> int:
+    """
+    a snowflake global disagg request id
+    0: positive integer
+    1-41  41 bits: timestamp_ms
+    42-51 10 bits: machine_id
+    52-63 12 bits: counter
+    """
+    global _global_disagg_request_id_lock
+    global _global_disagg_request_id_counter
+    global _last_timestamp_ms_in_request_id
+
+    if machine_id not in range(0, 1 << 10):
+        raise ValueError(f"machine_id must be in range [0, {1<<10})")
+
+    timestamp_ms = int(time.time() * 1000)
+    with _global_disagg_request_id_lock:
+        last_counter = _global_disagg_request_id_counter & 0xFFF
+        counter = (_global_disagg_request_id_counter + 1) & 0xFFF
+        _global_disagg_request_id_counter += 1
+        if monotonic and timestamp_ms == _last_timestamp_ms_in_request_id and counter < last_counter:
+            # sleep 1ms and update timestamp_ms when the counter rotates and timestamp_ms remains the same
+            time.sleep(0.001)
+            timestamp_ms = int(time.time() * 1000)
+        _last_timestamp_ms_in_request_id = timestamp_ms
+
+    # keep the first bit 0 to get positive integer
+    # [0, MIN_GLOBAL_ID] range is reserved for local ids
+    global_id = (timestamp_ms << 22 | machine_id << 12
+                 | counter) + MIN_GLOBAL_ID
+    global_id_int64 = global_id & ((1 << 63) - 1)
+    return global_id_int64
+
+
+def get_local_request_id(last_id: int) -> int:
+    """ increment the last_id by 1 and mod by MIN_GLOBAL_ID """
+    return (last_id + 1) & (MIN_GLOBAL_ID - 1)
