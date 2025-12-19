@@ -3,9 +3,9 @@ import yaml
 
 # isort: off
 from tensorrt_llm.llmapi.disagg_utils import (
-    CtxGenServerConfig, DisaggServerConfig, extract_ctx_gen_cfgs,
-    extract_router_config, extract_disagg_cfg, get_server_configs_dict,
-    parse_disagg_config_file)
+    MIN_GLOBAL_ID, CtxGenServerConfig, DisaggServerConfig, extract_ctx_gen_cfgs,
+    extract_router_config, extract_disagg_cfg, get_global_disagg_request_id,
+    get_local_request_id, get_server_configs_dict, parse_disagg_config_file)
 # isort: on
 
 
@@ -155,3 +155,40 @@ def test_get_server_configs_dict():
     assert len(server_dict) == 2
     assert ("host1", 8001) in server_dict
     assert ("host2", 8002) in server_dict
+
+
+# test get_global_disagg_request_id
+@pytest.mark.parametrize("monotonic", [True, False])
+def test_get_global_disagg_request_id(monotonic):
+    node_ids = [0, 1, 2]
+    all_node_ids = [[] for _ in range(len(node_ids))]
+    iter = 10000
+    for i in range(iter):
+        for node_id in node_ids:
+            all_node_ids[node_id].append(
+                get_global_disagg_request_id(node_id, monotonic=monotonic))
+
+    def issorted(l):
+        return all(l[i] < l[i + 1] for i in range(len(l) - 1))
+
+    for node_id in node_ids:
+        ids = all_node_ids[node_id]
+        assert not monotonic or issorted(ids)
+    all_ids = set(i for ids in all_node_ids for i in ids)
+    assert len(all_ids) == iter * len(node_ids)
+    assert all(id >= MIN_GLOBAL_ID and id < ((1 << 63) - 1) for id in all_ids)
+
+
+def test_get_local_request_id():
+    last_id = MIN_GLOBAL_ID - 100
+    ids = set()
+    for i in range(1000):
+        last_id = get_local_request_id(last_id)
+        assert last_id >= 0
+        assert last_id < MIN_GLOBAL_ID
+        ids.add(last_id)
+    assert len(ids) == 1000
+    assert min(ids) == 0
+    assert max(ids) == MIN_GLOBAL_ID - 1
+    assert max(ids) - min(ids) > (
+        1 << 40)  # ensure there is enough space for local ids
