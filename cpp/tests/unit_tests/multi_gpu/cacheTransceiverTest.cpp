@@ -46,6 +46,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <memory>
 #include <random>
 #include <tensorrt_llm/batch_manager/cacheTransBuffer.h>
@@ -713,7 +714,7 @@ protected:
             return;
         }
         else if (tensorrt_llm::common::getEnvUseMPIKvCache() || tensorrt_llm::common::getEnvUseUCXKvCache()
-            || tensorrt_llm::common::getEnvUseNixlKvCache())
+            || tensorrt_llm::common::getEnvUseNixlKvCache() || tensorrt_llm::common::getEnvUseMooncakeKvCache())
         {
             int maxNumTokens = 2048;
             mCacheTransBufferManagers.clear();
@@ -729,7 +730,15 @@ protected:
             }
             bool isUcx = tensorrt_llm::common::getEnvUseUCXKvCache();
             bool isNixl = tensorrt_llm::common::getEnvUseNixlKvCache();
-            TLLM_LOG_INFO("Enable %s KV cache transport.", isUcx ? "UCX" : isNixl ? "NIXL" : "MPI");
+            bool isMooncake = tensorrt_llm::common::getEnvUseMooncakeKvCache();
+            // Skip tests for MOONCAKE when on Rocky8
+            bool isRocky8 = std::filesystem::exists("/etc/redhat-release");
+            isMooncake = isMooncake && !isRocky8;
+            TLLM_LOG_INFO("Enable %s KV cache transport.",
+                isUcx            ? "UCX"
+                    : isNixl     ? "NIXL"
+                    : isMooncake ? "MOONCAKE"
+                                 : "MPI");
 
             if (isUcx)
             {
@@ -756,7 +765,12 @@ protected:
                 setenv("TRTLLM_NIXL_PORT", std::to_string(port).c_str(), 1);
 
                 mConnectionManager
-                    = std::make_unique<texec::kv_cache::AgentConnectionManager>(bufferManagers, *mCacheState);
+                    = std::make_unique<texec::kv_cache::AgentConnectionManager>(bufferManagers, *mCacheState, "nixl");
+            }
+            else if (isMooncake)
+            {
+                mConnectionManager = std::make_unique<texec::kv_cache::AgentConnectionManager>(
+                    bufferManagers, *mCacheState, "mooncake");
             }
             else
             {
@@ -783,7 +797,7 @@ protected:
             std::vector<int> contextRankVec(mContextRankSize);
             std::iota(contextRankVec.begin(), contextRankVec.end(), 0);
 
-            if (isUcx || isNixl)
+            if (isUcx || isNixl || isMooncake)
             {
                 auto commState = mConnectionManager->getCommState();
                 namespace su = tensorrt_llm::executor::serialize_utils;
@@ -1286,9 +1300,9 @@ TEST_P(AsymmetricalCacheTest, TestCase)
     int indexerDimPerHead = std::get<17>(param);
     int indexerKCacheQuantBlockSize = std::get<18>(param);
 
-    if (genCp > 1 && tensorrt_llm::common::getEnvUseNixlKvCache())
+    if (genCp > 1 && (tensorrt_llm::common::getEnvUseNixlKvCache() || tensorrt_llm::common::getEnvUseMooncakeKvCache()))
     {
-        GTEST_SKIP() << "Temporarily skipping cache transceiver tests with NIXL backend for CP.";
+        GTEST_SKIP() << "Temporarily skipping cache transceiver tests with NIXL and MOONCAKE backend for CP.";
     }
     std::vector<int> lenList = {30, 10, 60, 80};
     if (genCp > 1)
@@ -1410,9 +1424,9 @@ TEST_P(AsymmetricalCacheTestWithDP, TestCase)
     int indexerDimPerHead = std::get<17>(param);
     int indexerKCacheQuantBlockSize = std::get<18>(param);
 
-    if (genCp > 1 && tensorrt_llm::common::getEnvUseNixlKvCache())
+    if (genCp > 1 && (tensorrt_llm::common::getEnvUseNixlKvCache() || tensorrt_llm::common::getEnvUseMooncakeKvCache()))
     {
-        GTEST_SKIP() << "Temporarily skipping cache transceiver tests with NIXL backend for CP.";
+        GTEST_SKIP() << "Temporarily skipping cache transceiver tests with NIXL and MOONCAKE backend for CP.";
     }
     setUpCommunicator(contextTp, contextPp, contextCp, genTp, genPp, genCp, isMLA, contextDP, generationDP);
 
