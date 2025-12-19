@@ -808,15 +808,12 @@ def create_py_executor_instance(
 
     use_python_scheduler = os.getenv("TLLM_USE_PYTHON_SCHEDULER", "0") == "1"
     if use_python_scheduler:
-        if peft_cache_manager is not None:
-            logger.warning(
-                "PeftCacheManager is currently ignored by Python Scheduler (Phase 1)."
-            )
 
         scheduler = SimpleUnifiedScheduler(
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
             kv_cache_manager=kv_cache_manager,
+            peft_cache_manager=peft_cache_manager,
             scheduler_policy=scheduler_config.capacity_scheduler_policy,
             ctx_chunk_config=ctx_chunk_config)
     else:

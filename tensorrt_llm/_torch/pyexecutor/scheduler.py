@@ -516,6 +516,7 @@ class PyCapacityScheduler:
         self,
         max_num_requests: int,
         kv_cache_manager,
+        peft_cache_manager=None,
         scheduler_policy: CapacitySchedulerPolicy = CapacitySchedulerPolicy.
         MAX_UTILIZATION,
         no_schedule_until_state=LlmRequestState.CONTEXT_INIT,
@@ -523,6 +524,7 @@ class PyCapacityScheduler:
     ):
         self.max_num_requests = max_num_requests
         self.kv_cache_manager = kv_cache_manager
+        self.peft_cache_manager = peft_cache_manager
         self.policy = scheduler_policy
         self.no_schedule_until_state = no_schedule_until_state
         self.no_schedule_after_state = no_schedule_after_state
@@ -530,6 +532,12 @@ class PyCapacityScheduler:
         if self.kv_cache_manager is not None:
             self.kv_cache_manager_cpp = kv_cache_manager.impl
             self.default_window_size = self.kv_cache_manager.max_seq_len
+
+        if self.peft_cache_manager:
+            self.peft_cache_manager_cpp = self.peft_cache_manager.impl
+            self.max_peft_pages = self.peft_cache_manager_cpp.max_device_pages
+        else:
+            self.max_peft_pages = float('inf')  # Effectively infinite
 
     def schedule_request(
         self, active_requests: RequestList
@@ -659,8 +667,7 @@ class PyCapacityScheduler:
         scheduled_requests: RequestList = []
         paused_requests: RequestList = []
 
-        if hasattr(self.kv_cache_manager, "start_scheduling"):
-            self.kv_cache_manager.start_scheduling()
+        self.kv_cache_manager_cpp.start_scheduling()
 
         # [FIX] Use Map tracking for multiple window sizes
         current_free_blocks_map = self._get_initial_available_blocks_map()
@@ -724,9 +731,12 @@ class PyCapacityScheduler:
         pending_disagg_requests: RequestList = []
         pending_context_requests: RequestList = []
 
-        # [FIX] Use Map tracking for multiple window sizes
-        # Note: C++ NoEvictScheduledBlocksManager initializes with getNumFreeBlocksPerWindowSize()
+        # KV Cache Resource Tracking
         available_blocks_map = self._get_initial_available_blocks_map()
+
+        # PEFT Resource Tracking
+        claimed_peft_pages = 0
+        uniq_task_ids: Set[int] = set()
 
         # --- Pass 1: Running Requests ---
         for request in active_requests:
@@ -746,38 +756,68 @@ class PyCapacityScheduler:
                     pending_context_requests.append(request)
                 continue
 
-            # Unconditionally schedule Running Requests
             if (req_state == LlmRequestState.GENERATION_IN_PROGRESS
                     or req_state == LlmRequestState.GENERATION_TO_COMPLETE):
 
-                scheduled_requests.append(request)
-
-                # [FIX] Update Map unconditionally (can go negative)
+                # 1. Update KV Cache Map (Unconditional)
                 self._req_force_update_map(request,
                                            available_blocks_map,
                                            is_guaranteed_no_evict=True)
+
+                # 2. Update PEFT Usage
+                # C++: if (isNewTask) claimedPeftPages += determineNumPages(req);
+                if self.peft_cache_manager and request.lora_task_id is not None:
+                    task_id = request.lora_task_id
+                    if task_id not in uniq_task_ids:
+                        # Binding check: determine_num_pages
+                        pages = self.peft_cache_manager_cpp.determine_num_pages(
+                            request)
+                        claimed_peft_pages += pages
+                        uniq_task_ids.add(task_id)
+
+                scheduled_requests.append(request)
             else:
                 if is_disagg_init:
                     pending_disagg_requests.append(request)
                 else:
                     pending_context_requests.append(request)
 
-        # --- Pass 2: New / Context Requests (Disagg First) ---
+        # --- Pass 2: New / Context Requests ---
+        available_peft_pages = self.max_peft_pages - claimed_peft_pages
         all_pending = pending_disagg_requests + pending_context_requests
 
         for request in all_pending:
             if len(scheduled_requests) >= self.max_num_requests:
                 break
 
-            # [FIX] Check using Map logic
-            # C++ enoughAvailableBlocks checks: needed <= available for ALL window sizes
-            if self._req_check_and_update_map(request,
-                                              available_blocks_map,
-                                              is_guaranteed_no_evict=True):
-                scheduled_requests.append(request)
-            else:
-                # Head-of-line blocking
+            # 1. Check PEFT Capacity
+            needed_peft_pages = 0
+            is_new_task = False
+            task_id = None
+
+            if self.peft_cache_manager and request.lora_task_id is not None:
+                task_id = request.lora_task_id
+                is_new_task = (task_id not in uniq_task_ids)
+                if is_new_task:
+                    needed_peft_pages = self.peft_cache_manager_cpp.determine_num_pages(
+                        request)
+                    if needed_peft_pages > available_peft_pages:
+                        # Not enough PEFT memory
+                        break  # Head-of-line blocking
+
+            # 2. Check KV Cache Capacity
+            if not self._req_check_and_update_map(
+                    request, available_blocks_map, is_guaranteed_no_evict=True):
+                # Not enough KV blocks
                 break
+
+            # 3. Commit Schedule
+            scheduled_requests.append(request)
+
+            # Commit PEFT usage
+            if is_new_task:
+                available_peft_pages -= needed_peft_pages
+                uniq_task_ids.add(task_id)
 
         return self._classify_output(active_requests, scheduled_requests, [])
 
@@ -812,6 +852,7 @@ class SimpleUnifiedScheduler(RequestScheduler):
         max_batch_size: int,
         max_num_tokens: int,
         kv_cache_manager,
+        peft_cache_manager,
         scheduler_policy: CapacitySchedulerPolicy,
         ctx_chunk_config: Optional[Tuple[StrEnum, int]] = None,
     ):
@@ -819,6 +860,7 @@ class SimpleUnifiedScheduler(RequestScheduler):
         self.capacity_scheduler = PyCapacityScheduler(
             max_num_requests=max_batch_size,
             kv_cache_manager=kv_cache_manager,
+            peft_cache_manager=peft_cache_manager,
             scheduler_policy=scheduler_policy)
 
         # 2. Initialize Python MicroBatch Scheduler
