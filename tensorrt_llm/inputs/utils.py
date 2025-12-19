@@ -24,7 +24,8 @@ from tensorrt_llm.inputs.multimodal import (MultimodalServerConfig,
 from tensorrt_llm.inputs.registry import (MULTIMODAL_PLACEHOLDER_REGISTRY,
                                           MultimodalPlaceholderPlacement)
 from tensorrt_llm.llmapi.llm_utils import ModelLoader
-from tensorrt_llm.llmapi.tokenizer import TokenizerBase, TransformersTokenizer
+from tensorrt_llm.tokenizer import TokenizerBase, TransformersTokenizer
+from tensorrt_llm.tokenizer.deepseek_v32 import DeepseekV32Tokenizer
 
 logger = logging.get_logger(__name__)
 
@@ -580,6 +581,18 @@ def apply_chat_template(
     if model_type in HF_CHAT_TEMPLATE_EXCEPTIONS:
         # special path for models like llava-llama
         return "".join([conv["content"] for conv in conversation])
+
+    # Handle DeepSeek V32 tokenizer with custom chat template
+    if isinstance(tokenizer, DeepseekV32Tokenizer):
+        prompt = tokenizer.apply_chat_template(
+            messages=conversation,
+            tools=tools,
+            **(chat_template_kwargs or {}),
+        )
+        if enable_tokenize:
+            return tokenizer.encode(prompt)
+        return prompt
+
     if isinstance(tokenizer, TransformersTokenizer):
         tokenizer = tokenizer.tokenizer  # we need the TokenizerBase for apply_chat_template
 

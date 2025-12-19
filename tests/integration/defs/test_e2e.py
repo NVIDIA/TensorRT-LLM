@@ -3155,13 +3155,12 @@ def test_ptp_quickstart_advanced_llama_multi_nodes(llm_root, llm_venv,
     pytest.param('Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf',
                  marks=skip_pre_blackwell),
     pytest.param('DeepSeek-R1/DeepSeek-R1-0528-FP4', marks=skip_pre_blackwell),
-    pytest.param('Kimi-K2-Instruct',
-                 marks=(skip_pre_hopper, skip_post_blackwell)),
+    pytest.param('Kimi-K2-Thinking-NVFP4', marks=skip_pre_blackwell),
     pytest.param('nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1',
                  marks=skip_pre_hopper),
 ])
-def test_multi_nodes_eval(llm_venv, model_path, tp_size, pp_size, ep_size,
-                          eval_task, mmlu_dataset_root):
+def test_multi_nodes_eval(model_path, tp_size, pp_size, ep_size, eval_task,
+                          mmlu_dataset_root):
     if "Llama-4" in model_path and tp_size == 16:
         pytest.skip("Llama-4 with tp16 is not supported")
 
@@ -3176,6 +3175,7 @@ def test_multi_nodes_eval(llm_venv, model_path, tp_size, pp_size, ep_size,
         f"--pp_size={pp_size}",
         f"--kv_cache_free_gpu_memory_fraction={_MEM_FRACTION_80}",
         "--max_batch_size=32",
+        "--enable_attention_dp",
         "--backend=pytorch",
     ]
 
@@ -3369,3 +3369,15 @@ def test_eagle3_output_consistency_4gpus(model_dir: str, draft_model_dir: str):
         f"Eagle3 output contains repetitive characters: {output_spec[:500]}")
     assert not repetitive_pattern.search(output_ref), (
         f"Baseline output contains repetitive characters: {output_ref[:500]}")
+
+
+def test_get_ci_container_port():
+    container_port_start = os.environ.get("CONTAINER_PORT_START", None)
+    container_port_num = os.environ.get("CONTAINER_PORT_NUM", None)
+    assert container_port_start is not None
+    assert container_port_num is not None
+    container_port_start = int(container_port_start)
+    container_port_num = int(container_port_num)
+    assert container_port_start > 0
+    assert container_port_num > 0
+    assert container_port_start + container_port_num <= 60000

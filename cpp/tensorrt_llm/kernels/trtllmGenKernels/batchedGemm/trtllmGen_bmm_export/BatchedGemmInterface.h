@@ -102,7 +102,7 @@ struct BatchedGemmData
         // The matrix A. The data type is controlled by options.mDtypeA.
         //
         // If (routeAct == true && batchM), the shape is [M, K]
-        // Else
+        // Elseif (batchStrideInTokens > 0)
         //   If batchM:
         //      Logical shape is [sum(divUpMul(M[bi], tileM) for bi in B), K].
         //      Logical strides are [K, 1].
@@ -118,6 +118,14 @@ struct BatchedGemmData
         //         Logical shape is [B, K / blockK, divUpMul(M, tileM), blockK].
         //         Logical strides are [K * divUpMul(M, tileM), divUpMul(M, tileM) * blockK, blockK, 1].
         //         where blockK is 128B.
+        // Else // batchStrideInTokens == 0
+        //   If batchM:
+        //      Logical shape is [M, K].
+        //      Logical strides are [K, 1].
+        //
+        //   If batchN:
+        //      Logical shape is [B, divUpMul(M, tileM), K].
+        //      Logical strides are [divUpMul(M, tileM) * K, K, 1].
         void const* mPtrA{nullptr};
 
         // The block scaling factors to dequantize A.
@@ -165,7 +173,7 @@ struct BatchedGemmData
         //
         // If (routeAct == true && batchN), the shape is [N, K]
         //
-        // Else
+        // Else if (batchStrideInTokens > 0)
         //   If batchN:
         //      Logical shape is [sum(divUpMul(N[bi], tileN) for bi in B), K].
         //      Logical strides are [K, 1].
@@ -181,6 +189,15 @@ struct BatchedGemmData
         //         Logical shape is [B, K / blockK, divUpMul(N, tileN), blockK].
         //         Logical strides are [K * divUpMul(N, tileN), divUpMul(N, tileN) * blockK, blockK, 1].
         //         where blockK is 128B.
+        //
+        // Else // batchStrideInTokens == 0
+        //   If batchN:
+        //      Logical shape is [N, K].
+        //      Logical strides are [K, 1].
+        //
+        //   If batchM:
+        //      Logical shape is [B, divUpMul(N, tileN), K].
+        //      Logical strides are [divUpMul(N, tileN) * K, K, 1].
         void const* mPtrB{nullptr};
 
         // The scaling factors to dequantize B.

@@ -23,6 +23,8 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionToolsParam,
                                                 FunctionDefinition)
 from tensorrt_llm.serve.tool_parser.base_tool_parser import BaseToolParser
 from tensorrt_llm.serve.tool_parser.core_types import StructureInfo
+from tensorrt_llm.serve.tool_parser.deepseekv3_parser import DeepSeekV3Parser
+from tensorrt_llm.serve.tool_parser.deepseekv31_parser import DeepSeekV31Parser
 from tensorrt_llm.serve.tool_parser.kimi_k2_tool_parser import KimiK2ToolParser
 from tensorrt_llm.serve.tool_parser.qwen3_coder_parser import \
     Qwen3CoderToolParser
@@ -36,42 +38,42 @@ def sample_tools():
     return [
         ChatCompletionToolsParam(
             type="function",
-            function=FunctionDefinition(name="get_weather",
-                                        description="Get the current weather",
-                                        parameters={
-                                            "type": "object",
-                                            "properties": {
-                                                "location": {
-                                                    "type":
-                                                    "string",
-                                                    "description":
-                                                    "The city and state"
-                                                },
-                                                "unit": {
-                                                    "type":
-                                                    "string",
-                                                    "enum":
-                                                    ["celsius", "fahrenheit"]
-                                                }
-                                            },
-                                            "required": ["location"]
-                                        })),
+            function=FunctionDefinition(
+                name="get_weather",
+                description="Get the current weather",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "location": {
+                            "type": "string",
+                            "description": "The city and state",
+                        },
+                        "unit": {
+                            "type": "string",
+                            "enum": ["celsius", "fahrenheit"],
+                        },
+                    },
+                    "required": ["location"],
+                },
+            ),
+        ),
         ChatCompletionToolsParam(
             type="function",
-            function=FunctionDefinition(name="search_web",
-                                        description="Search the web",
-                                        parameters={
-                                            "type": "object",
-                                            "properties": {
-                                                "query": {
-                                                    "type":
-                                                    "string",
-                                                    "description":
-                                                    "The search query"
-                                                }
-                                            },
-                                            "required": ["query"]
-                                        })),
+            function=FunctionDefinition(
+                name="search_web",
+                description="Search the web",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "The search query",
+                        }
+                    },
+                    "required": ["query"],
+                },
+            ),
+        ),
     ]
 
 
@@ -1033,6 +1035,140 @@ class TestQwen3CoderToolParser(BaseToolParserTestClass):
         assert json.loads(result.calls[0].parameters) == {
             "command": "pwd && ls"
         }
+
+
+# ============================================================================
+# DeepSeek Parser Tests
+# ============================================================================
+
+
+class TestDeepSeekV3Parser(BaseToolParserTestClass):
+    """Test suite for DeepSeekV3Parser class."""
+
+    def make_parser(self):
+        return DeepSeekV3Parser()
+
+    def make_tool_parser_test_cases(self):
+        calls_begin = "<｜tool▁calls▁begin｜>"
+        calls_end = "<｜tool▁calls▁end｜>"
+        call_begin = "<｜tool▁call▁begin｜>"
+        call_end = "<｜tool▁call▁end｜>"
+        sep = "<｜tool▁sep｜>"
+
+        single_text = (
+            f"Lead {calls_begin}{call_begin}function{sep}get_weather\n```json\n"
+            f"{json.dumps({'location': 'Tokyo'})}\n```{call_end}{calls_end}")
+        single_expected_normal = "Lead"  # the text is stripped
+        single_expected_name = "get_weather"
+        single_expected_params = {"location": "Tokyo"}
+
+        # Provide one tool to satisfy type hints (tuple[str, tuple[str]])
+        multiple_text = (
+            f"{calls_begin}{call_begin}function{sep}get_weather\n```json\n"
+            f"{json.dumps({'location': 'Paris'})}\n```{call_end}"
+            f"{calls_begin}{call_begin}function{sep}search_web\n```json\n"
+            f"{json.dumps({'query': 'AI'})}\n```{call_end}{calls_end}")
+        multiple_names = ("get_weather", "search_web")
+
+        malformed_text = (
+            f"{calls_begin}{call_begin}function{sep}get_weather\n```json\n"
+            "{'location': 'Paris'}\n```"
+            f"{call_end}{calls_end}")
+
+        with_parameters_key_text = (
+            f"{calls_begin}{call_begin}function{sep}search_web\n```json\n"
+            f"{json.dumps({'parameters': {'query': 'TensorRT'}})}\n```{call_end}{calls_end}"
+        )
+        with_parameters_key_name = "search_web"
+        with_parameters_key_params = {"parameters": {"query": "TensorRT"}}
+
+        partial_bot_token = "<｜tool▁cal"
+
+        undefined_tool_text = (
+            f"{calls_begin}{call_begin}function{sep}unknown\n```json\n"
+            f"{json.dumps({'x': 1})}\n```{call_end}{calls_end}")
+
+        return ToolParserTestCases(
+            has_tool_call_true=f"Hello {calls_begin}",
+            detect_and_parse_single_tool=(
+                single_text,
+                single_expected_normal,
+                single_expected_name,
+                single_expected_params,
+            ),
+            detect_and_parse_multiple_tools=(multiple_text, multiple_names),
+            detect_and_parse_malformed_tool=malformed_text,
+            detect_and_parse_with_parameters_key=(
+                with_parameters_key_text,
+                with_parameters_key_name,
+                with_parameters_key_params,
+            ),
+            parse_streaming_increment_partial_bot_token=partial_bot_token,
+            undefined_tool=undefined_tool_text,
+        )
+
+
+class TestDeepSeekV31Parser(BaseToolParserTestClass):
+    """Test suite for DeepSeekV31Parser class."""
+
+    def make_parser(self):
+        return DeepSeekV31Parser()
+
+    def make_tool_parser_test_cases(self):
+        calls_begin = "<｜tool▁calls▁begin｜>"
+        calls_end = "<｜tool▁calls▁end｜>"
+        call_begin = "<｜tool▁call▁begin｜>"
+        call_end = "<｜tool▁call▁end｜>"
+        sep = "<｜tool▁sep｜>"
+
+        single_text = (
+            f"Intro {calls_begin}{call_begin}get_weather{sep}"
+            f"{json.dumps({'location': 'Tokyo'})}{call_end}{calls_end}")
+        single_expected_normal = "Intro"  # the text is stripped
+        single_expected_name = "get_weather"
+        single_expected_params = {"location": "Tokyo"}
+
+        multiple_text = (f"{calls_begin}{call_begin}get_weather{sep}"
+                         f"{json.dumps({'location': 'Paris'})}{call_end}"
+                         f"{calls_begin}{call_begin}search_web{sep}"
+                         f"{json.dumps({'query': 'AI'})}{call_end}{calls_end}")
+        multiple_names = ("get_weather", "search_web")
+
+        malformed_text = (
+            f"{calls_begin}{call_begin}get_weather{sep}{{'location':'Paris'}}"
+            f"{call_end}{calls_end}")
+
+        with_parameters_key_text = (
+            f"{calls_begin}{call_begin}search_web{sep}"
+            f"{json.dumps({'parameters': {'query': 'TensorRT'}})}{call_end}{calls_end}"
+        )
+        with_parameters_key_name = "search_web"
+        with_parameters_key_params = {"parameters": {"query": "TensorRT"}}
+
+        partial_bot_token = "<｜tool▁cal"
+
+        undefined_tool_text = (
+            f"{calls_begin}{call_begin}unknown{sep}{json.dumps({'x': 1})}{call_end}{calls_end}"
+        )
+
+        return ToolParserTestCases(
+            has_tool_call_true=f"Hi {calls_begin}",
+            detect_and_parse_single_tool=(
+                single_text,
+                single_expected_normal,
+                single_expected_name,
+                single_expected_params,
+            ),
+            detect_and_parse_multiple_tools=(multiple_text, multiple_names),
+            detect_and_parse_malformed_tool=malformed_text,
+            detect_and_parse_with_parameters_key=(
+                with_parameters_key_text,
+                with_parameters_key_name,
+                with_parameters_key_params,
+            ),
+            parse_streaming_increment_partial_bot_token=partial_bot_token,
+            undefined_tool=undefined_tool_text,
+        )
 
 
 # ============================================================================
