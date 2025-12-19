@@ -381,7 +381,8 @@ def test_logprobs_with_grouped_samplings_strategies(logprobs_k: int,
         simple_llm.generate(test_prompts, sampling_params=sampling_params_list))
 
     for req_idx, output in enumerate(outputs):
-        generation_logits = output.outputs[0].generation_logits
+        generation_logits = output.outputs[0].generation_logits.to(
+            device="cuda")
         token_ids = output.outputs[0].token_ids
         logprobs = output.outputs[0].logprobs
         if sampling_params_list[req_idx].logprobs is None:
@@ -400,30 +401,18 @@ def test_logprobs_with_grouped_samplings_strategies(logprobs_k: int,
 
             logits_for_token = generation_logits[token_idx]
             expected_logprobs = torch.nn.functional.log_softmax(
-                logits_for_token.to(dtype=torch.float32), dim=-1)
+                logits_for_token, dim=-1).to(device="cpu")
             expected_logprob = expected_logprobs[sampled_token_id].item()
-
-            logprob_diff = abs(returned_logprob - expected_logprob)
             print(
-                f"Req {req_idx}, Token {token_idx}: returned={returned_logprob:.6f}, expected={expected_logprob:.6f}, diff={logprob_diff:.6f}"
+                f"Req {req_idx}, Token {token_idx}: returned={returned_logprob:.6f}, expected={expected_logprob:.6f}"
             )
-
-            assert logprob_diff < 1e-4, \
-                f"Req {req_idx}, Token {token_idx}: Logprob mismatch! " \
-                f"Returned {returned_logprob:.6f} but expected {expected_logprob:.6f} " \
-                f"(diff={logprob_diff:.6f}). This indicates the logprob might be extracted from " \
-                f"the wrong token position."
+            torch.testing.assert_close(returned_logprob, expected_logprob)
 
 
 @pytest.mark.parametrize("logprobs_k", [0, 2], ids=["top_0", "top_2"])
 @pytest.mark.threadleak(enabled=False)
 def test_processed_logprobs_e2e(logprobs_k: int, simple_llm: LLM):
     """Test logprobs when requests are reordered by sampling strategy grouping"""
-    if logprobs_k == 0 and simple_llm.args.disable_flashinfer_sampling:
-        pytest.skip(
-            "top_0 does currently not work without flashinfer sampling. Remove this skip once this is fixed."
-        )
-
     test_prompts = [
         "The capital of France is",
         "The future of AI is",
@@ -481,7 +470,8 @@ def test_processed_logprobs_e2e(logprobs_k: int, simple_llm: LLM):
         simple_llm.generate(test_prompts, sampling_params=sampling_params_list))
 
     for req_idx, output in enumerate(outputs):
-        generation_logits = output.outputs[0].generation_logits
+        generation_logits = output.outputs[0].generation_logits.to(
+            device="cuda")
         token_ids = output.outputs[0].token_ids
         logprobs = output.outputs[0].logprobs
 
@@ -515,7 +505,6 @@ def test_processed_logprobs_e2e(logprobs_k: int, simple_llm: LLM):
                         top_p=topp,
                         temperature=temperature)
                 else:
-                    logits_for_token = logits_for_token.to(device="cuda")
                     _, probs = _StrategyImpls.StrategyImplWithProbs._sample_with_probs(
                         logits_for_token,
                         group_logit_indices=None,
@@ -540,18 +529,10 @@ def test_processed_logprobs_e2e(logprobs_k: int, simple_llm: LLM):
             for logprob_token, logprob_values in token_logprobs_dict.items():
                 expected_logprob = expected_logprobs[logprob_token].item()
                 returned_logprob = logprob_values.logprob
-                logprob_diff = abs(returned_logprob - expected_logprob)
-                if returned_logprob == float(
-                        "-inf") and expected_logprob == float("-inf"):
-                    logprob_diff = 0
                 print(
-                    f"Req {req_idx}, Token {token_idx} ({logprob_token}): returned={returned_logprob:.6f}, expected={expected_logprob:.6f}, diff={logprob_diff:.6f}"
+                    f"Req {req_idx}, Token {token_idx}: returned={returned_logprob:.6f}, expected={expected_logprob:.6f}"
                 )
-
-                assert logprob_diff < 1e-4, \
-                    f"Req {req_idx}, Token {token_idx}: Logprob mismatch! " \
-                    f"Returned {returned_logprob:.6f} but expected {expected_logprob:.6f} " \
-                    f"(diff={logprob_diff:.6f})."
+                torch.testing.assert_close(returned_logprob, expected_logprob)
 
 
 @force_ampere
@@ -601,5 +582,4 @@ def test_logprobs_match_hf_tp2():
     print(f"HuggingFace logprobs:  {hf_logprobs}")
     print(f"Diff: {(trtllm_logprobs - hf_logprobs).abs()}")
 
-    max_diff = (trtllm_logprobs - hf_logprobs).abs().max().item()
-    assert max_diff < 0.15, f"Max logprob diff {max_diff:.4f} exceeds threshold"
+    torch.testing.assert_close(trtllm_logprobs, hf_logprobs, atol=0.15, rtol=0)
