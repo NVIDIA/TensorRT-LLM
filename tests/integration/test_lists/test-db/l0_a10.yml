@@ -20,6 +20,7 @@ l0_a10:
   - unittest/_torch/modeling/test_modeling_mistral.py
   - unittest/_torch/modeling/test_modeling_pixtral.py
   - unittest/_torch/sampler/test_trtllm_sampler.py
+  - unittest/_torch/executor/test_async_transfer_manager.py
   - unittest/_torch/executor/test_scheduler_serializable_output.py
   # NOTE: this is a CPU-only test, but we do not have a dedicated job for this (and therefore no
   # test list either).
@@ -80,7 +81,6 @@ l0_a10:
   # executor
   - unittest/executor/test_rpc.py
   - unittest/executor/test_ipc.py
-  - unittest/executor/_torch/test_async_transfer_manager.py
   # trtllm-serve CPU-only
   - unittest/llmapi/apps/test_chat_utils.py
   - unittest/llmapi/apps/test_tool_parsers.py
