@@ -167,6 +167,15 @@ You will receive three reports, each containing kernel timing statistics grouped
 2. A CSV report at `profiles/report_np4_rank0.csv`
 3. An HTML report at `profiles/report_np4_rank0.html`
 
+## Developer utilities
+
+1. Less startup time when debug a model
+   1. Disable autotuner: add `--no-enable-autotuner` option
+   2. Disable nsys profile: set `PROFILE=0` environment variable
+2. Capture more information
+   1. Enable GPU metrics: set `GPU_METRICS=1` environment variable
+   2. Enable backtrace: set `BACKTRACE=1` environment variable
+
 ## Trouble shooting
 
 1. Error `fp8 blockscale gemm only support Hopper` on Blackwell.

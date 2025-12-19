@@ -640,7 +640,7 @@ class RunnerMixin(ABC):
             kv_cache_manager = kv_cache_manager_cls(
                 kv_cache_config,
                 CacheType.SELFKONLY,
-                num_layers=sum(layer_mask),
+                num_layers=num_layers,
                 num_kv_heads=1,
                 head_dim=model_config.pretrained_config.kv_lora_rank
                 + model_config.pretrained_config.qk_rope_head_dim,

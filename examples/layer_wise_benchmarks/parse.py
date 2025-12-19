@@ -319,6 +319,7 @@ parser_keywords = [
     ("routingInitExpertCounts", "routingInitExpertCounts"),
     ("routingIndicesCluster", "routingIndicesClusterKernel"),
     ("routingIndicesCoop", "routingIndicesCoopKernel"),
+    ("router_gemm", "router_gemm_kernel"),
     ("bmm_4_44_32", "bmm_E2m1_E2m1E2m1_Fp32_t"),
     ("finalize", "finalize::finalizeKernel"),
     ("bmm_16_44_32", "bmm_Bfloat16_E2m1E2m1_Fp32_"),
