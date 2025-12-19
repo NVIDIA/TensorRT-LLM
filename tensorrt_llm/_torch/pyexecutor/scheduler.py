@@ -3,7 +3,7 @@ from abc import ABC, abstractmethod
 from collections import namedtuple
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional, Set, Tuple
+from typing import Dict, Optional, Set, Tuple
 
 from strenum import StrEnum
 
@@ -509,6 +509,7 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
 class PyCapacityScheduler:
     """
     Python implementation of the C++ CapacityScheduler.
+    Aligned with C++ logic to support Multiple Window Sizes (VSWA).
     """
 
     def __init__(
@@ -534,11 +535,9 @@ class PyCapacityScheduler:
         self, active_requests: RequestList
     ) -> Tuple[RequestList, RequestList, RequestList]:
 
-        # 1. Handle No KV Cache Manager -> MaxRequestsScheduler Logic
         if self.kv_cache_manager is None:
             return self._schedule_max_requests(active_requests)
 
-        # 2. Handle Policies with KV Cache Manager
         if self.policy == CapacitySchedulerPolicy.MAX_UTILIZATION:
             return self._schedule_max_utilization(active_requests)
         elif self.policy == CapacitySchedulerPolicy.GUARANTEED_NO_EVICT:
@@ -547,13 +546,95 @@ class PyCapacityScheduler:
             raise NotImplementedError(
                 f"Policy {self.policy} not implemented in PyCapacityScheduler")
 
+    def _get_initial_available_blocks_map(self) -> Dict[int, int]:
+        """
+        Mimics C++: mKvCacheManager.getBlockManager().getNumFreeBlocksPerWindowSize()
+        Returns a dict {window_size: free_blocks}.
+        """
+        stats = self.kv_cache_manager_cpp.get_kv_cache_stats()
+
+        # Nanobind binds std::map to python dict
+        # Property name from binding: .def_rw("num_free_blocks_per_window_size", ...)
+        free_map = stats.num_free_blocks_per_window_size
+
+        if not free_map:
+            # Fallback for simple cases or if map is empty (though unlikely in C++)
+            # Calculate scalar free blocks
+            free_scalar = stats.max_num_blocks - stats.used_num_blocks
+            return {self.default_window_size: free_scalar}
+
+        # Ensure we return a copy so we can modify it during scheduling
+        return dict(free_map)
+
+    def _req_check_and_update_map(self, req: LlmRequest,
+                                  available_map: Dict[int, int],
+                                  is_guaranteed_no_evict: bool) -> bool:
+        """
+        Checks if a request fits in ALL window sizes tracked in available_map.
+        If it fits, decrements the map and returns True.
+        If it doesn't fit, leaves map untouched and returns False.
+        """
+        # 1. Calculate needed blocks for all window sizes
+        needed_per_window = {}
+        for window_size in available_map.keys():
+            if is_guaranteed_no_evict:
+                # C++: getRemainingBlocksToCompletion(req, windowSize)
+                needed = self.kv_cache_manager_cpp.get_remaining_blocks_to_completion(
+                    req, window_size)
+            else:
+                # C++: getNeededBlocksOneStep(req, twoStepsLookAhead, windowSize)
+                needed = self.kv_cache_manager_cpp.get_needed_blocks_one_step(
+                    req, False, window_size)
+            needed_per_window[window_size] = needed
+
+        # 2. Check if fits (All or Nothing)
+        for window_size, available in available_map.items():
+            if needed_per_window[window_size] > available:
+                return False
+
+        # 3. Commit update
+        for window_size in available_map.keys():
+            available_map[window_size] -= needed_per_window[window_size]
+
+        return True
+
+    def _req_force_update_map(self, req: LlmRequest, available_map: Dict[int,
+                                                                         int],
+                              is_guaranteed_no_evict: bool):
+        """
+        Unconditionally decrements the available blocks (used for Running requests in NoEvict).
+        Allowed to go negative.
+        """
+        for window_size in available_map.keys():
+            if is_guaranteed_no_evict:
+                needed = self.kv_cache_manager_cpp.get_remaining_blocks_to_completion(
+                    req, window_size)
+            else:
+                needed = self.kv_cache_manager_cpp.get_needed_blocks_one_step(
+                    req, False, window_size)
+
+            available_map[window_size] -= needed
+
+    def _req_revert_map(self, req: LlmRequest, available_map: Dict[int, int],
+                        is_guaranteed_no_evict: bool):
+        """
+        Reverts a decrement (used for Backtracking in MaxUtilization).
+        """
+        for window_size in available_map.keys():
+            if is_guaranteed_no_evict:
+                needed = self.kv_cache_manager_cpp.get_remaining_blocks_to_completion(
+                    req, window_size)
+            else:
+                needed = self.kv_cache_manager_cpp.get_needed_blocks_one_step(
+                    req, False, window_size)
+
+            available_map[window_size] += needed
+
     def _schedule_max_requests(self, active_requests: RequestList):
         scheduled_requests: RequestList = []
         paused_requests: RequestList = []
 
         for req in active_requests:
-            # 1. State Filter
-            # Allow Disagg Gen Init to pass through
             is_disagg_init = (
                 req.state == LlmRequestState.DISAGG_GENERATION_INIT)
 
@@ -562,11 +643,9 @@ class PyCapacityScheduler:
                     or req.state.value >= self.no_schedule_after_state.value):
                 continue
 
-            # 2. Max Requests Check
             if len(scheduled_requests) >= self.max_num_requests:
                 break
 
-            # 3. Schedule valid states
             if (req.state == LlmRequestState.ENCODER_INIT
                     or req.state == LlmRequestState.CONTEXT_INIT
                     or req.state == LlmRequestState.GENERATION_IN_PROGRESS
@@ -580,11 +659,11 @@ class PyCapacityScheduler:
         scheduled_requests: RequestList = []
         paused_requests: RequestList = []
 
-        self.kv_cache_manager_cpp.start_scheduling()
+        if hasattr(self.kv_cache_manager, "start_scheduling"):
+            self.kv_cache_manager.start_scheduling()
 
-        # Track free blocks manually in Python to simulate transactional state.
-        stats = self.kv_cache_manager_cpp.get_kv_cache_stats()
-        current_free_blocks = stats.free_num_blocks
+        # [FIX] Use Map tracking for multiple window sizes
+        current_free_blocks_map = self._get_initial_available_blocks_map()
 
         cached_active_list = list(active_requests)
         idx = 0
@@ -592,8 +671,6 @@ class PyCapacityScheduler:
         while idx < len(cached_active_list):
             req = cached_active_list[idx]
 
-            # 1. State Filter
-            # Allow Disagg Gen Init to pass through (matching C++ logic)
             is_disagg_init = (
                 req.state == LlmRequestState.DISAGG_GENERATION_INIT)
 
@@ -603,29 +680,19 @@ class PyCapacityScheduler:
                 idx += 1
                 continue
 
-            # 2. Max Requests Check
             if len(scheduled_requests) >= self.max_num_requests:
                 break
 
-            # 3. Try Allocation (Python Manual Check)
-            needed_blocks = 0
-            if is_disagg_init:
-                needed_blocks = self.kv_cache_manager_cpp.get_needed_blocks_one_step(
-                    req, False, self.default_window_size)
-            elif req.state == LlmRequestState.GENERATION_IN_PROGRESS:
-                needed_blocks = self.kv_cache_manager_cpp.get_needed_blocks_one_step(
-                    req, False, self.default_window_size)
-            elif req.state == LlmRequestState.CONTEXT_INIT:
-                needed_blocks = self.kv_cache_manager_cpp.get_needed_blocks_one_step(
-                    req, False, self.default_window_size)
-
-            if current_free_blocks >= needed_blocks:
-                current_free_blocks -= needed_blocks
+            # 3. Try Allocation
+            # C++ Logic: Checks if it fits in *all* window sizes
+            if self._req_check_and_update_map(req,
+                                              current_free_blocks_map,
+                                              is_guaranteed_no_evict=False):
                 scheduled_requests.append(req)
                 idx += 1
                 continue
 
-            # 4. Backtracking / Eviction Logic
+            # 4. Backtracking (Evict Generation requests only)
             victim_idx = -1
             for i in range(len(scheduled_requests) - 1, -1, -1):
                 r = scheduled_requests[i]
@@ -638,12 +705,12 @@ class PyCapacityScheduler:
                 victim_req = scheduled_requests.pop(victim_idx)
                 paused_requests.append(victim_req)
 
-                # Reclaim victim's blocks manually
-                victim_needed = self.kv_cache_manager_cpp.get_needed_blocks_one_step(
-                    victim_req, False, self.default_window_size)
-                current_free_blocks += victim_needed
+                # Revert victim's usage in the map
+                self._req_revert_map(victim_req,
+                                     current_free_blocks_map,
+                                     is_guaranteed_no_evict=False)
 
-                # Retry current req without incrementing idx
+                # Retry current req (do NOT increment idx)
                 continue
             else:
                 # No victim found, and current request doesn't fit. Stop.
@@ -655,11 +722,11 @@ class PyCapacityScheduler:
     def _schedule_guaranteed_no_evict(self, active_requests: RequestList):
         scheduled_requests: RequestList = []
         pending_disagg_requests: RequestList = []
-        pending_requests: RequestList = []
+        pending_context_requests: RequestList = []
 
-        stats = self.kv_cache_manager_cpp.get_kv_cache_stats()
-        # available_blocks represents PHYSICAL free blocks
-        available_blocks = stats.max_num_blocks - stats.used_num_blocks
+        # [FIX] Use Map tracking for multiple window sizes
+        # Note: C++ NoEvictScheduledBlocksManager initializes with getNumFreeBlocksPerWindowSize()
+        available_blocks_map = self._get_initial_available_blocks_map()
 
         # --- Pass 1: Running Requests ---
         for request in active_requests:
@@ -672,51 +739,44 @@ class PyCapacityScheduler:
                     or req_state.value >= self.no_schedule_after_state.value):
                 continue
 
-            # If capacity is full, move to pending
             if len(scheduled_requests) >= self.max_num_requests:
                 if is_disagg_init:
                     pending_disagg_requests.append(request)
                 else:
-                    pending_requests.append(request)
+                    pending_context_requests.append(request)
                 continue
 
-            # Unconditionally schedule Running Requests (Match C++ NoEvict logic)
+            # Unconditionally schedule Running Requests
             if (req_state == LlmRequestState.GENERATION_IN_PROGRESS
                     or req_state == LlmRequestState.GENERATION_TO_COMPLETE):
 
-                needed = self.kv_cache_manager_cpp.get_remaining_blocks_to_completion(
-                    request, self.default_window_size)
-
                 scheduled_requests.append(request)
-                # Subtract needed blocks from availability.
-                # This can go negative, effectively reserving space for these requests
-                # and blocking new ones in Pass 2.
-                available_blocks -= needed
+
+                # [FIX] Update Map unconditionally (can go negative)
+                self._req_force_update_map(request,
+                                           available_blocks_map,
+                                           is_guaranteed_no_evict=True)
             else:
                 if is_disagg_init:
                     pending_disagg_requests.append(request)
                 else:
-                    pending_requests.append(request)
+                    pending_context_requests.append(request)
 
         # --- Pass 2: New / Context Requests (Disagg First) ---
-        all_pending = pending_disagg_requests + pending_requests
+        all_pending = pending_disagg_requests + pending_context_requests
 
         for request in all_pending:
             if len(scheduled_requests) >= self.max_num_requests:
                 break
 
-            # If running requests have reserved all (or more) than available space, stop.
-            if available_blocks <= 0:
-                break
-
-            needed_blocks = self.kv_cache_manager_cpp.get_remaining_blocks_to_completion(
-                request, self.default_window_size)
-
-            if needed_blocks <= available_blocks:
+            # [FIX] Check using Map logic
+            # C++ enoughAvailableBlocks checks: needed <= available for ALL window sizes
+            if self._req_check_and_update_map(request,
+                                              available_blocks_map,
+                                              is_guaranteed_no_evict=True):
                 scheduled_requests.append(request)
-                available_blocks -= needed_blocks
             else:
-                # Head-of-line blocking (Standard NoEvict behavior)
+                # Head-of-line blocking
                 break
 
         return self._classify_output(active_requests, scheduled_requests, [])
@@ -730,7 +790,6 @@ class PyCapacityScheduler:
         scheduled_ids = set(r.request_id for r in scheduled_requests)
         paused_ids = set(r.request_id for r in paused_requests)
 
-        # Identify running requests that were implicitly paused (dropped)
         for req in active_requests:
             if (req.request_id not in scheduled_ids
                     and req.request_id not in paused_ids
