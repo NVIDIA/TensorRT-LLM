@@ -123,7 +123,7 @@ class Quantization(BaseTransform):
             cnt += 1
 
         return gm, TransformInfo(
-            skipped=False, num_matches=cnt, is_clean=False, has_valid_shapes=True
+            skipped=False, num_matches=cnt, is_clean=False, has_valid_shapes=(cnt == 0)
         )
 
     def _insert_quantized_linear(
