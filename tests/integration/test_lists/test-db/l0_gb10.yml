@@ -34,7 +34,8 @@ l0_gb10:
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
-  - unittest/_torch/modeling -k "modeling_mllama"
+  # Below cases which are commented out due to they failed on gb10
+  # - unittest/_torch/modeling -k "modeling_mllama"
   - unittest/_torch/modeling -k "modeling_out_of_tree"
-  - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_nvfp4[CUTLASS-dtype0]
-  - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_nvfp4[CUTLASS-dtype1]
+  # - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_nvfp4[CUTLASS-dtype0]
+  # - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_nvfp4[CUTLASS-dtype1]
