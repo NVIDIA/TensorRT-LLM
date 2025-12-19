@@ -22,40 +22,6 @@ HF_ATTN_KWARGS_MAPPING = {
 }
 
 
-def _mask_kind_from_layer_type(layer_type: str) -> str:
-    if layer_type == "full_attention":
-        return "full"
-    if layer_type == "sliding_attention":
-        return "sliding"
-    return "none"
-
-
-def _infer_mask_kind_from_module(module: torch.nn.Module) -> str:
-    """Best-effort infer VLM mask kind for models like Gemma3.
-
-    Gemma3 stores per-layer attention type in config.layer_types or config.text_config.layer_types.
-    During export, we have access to the attention module instance and can read its layer_idx.
-    """
-    try:
-        layer_idx = getattr(module, "layer_idx", None)
-        cfg = getattr(module, "config", None)
-        if layer_idx is None or cfg is None:
-            return "none"
-
-        layer_types = getattr(cfg, "layer_types", None)
-        if layer_types is None and hasattr(cfg, "text_config"):
-            layer_types = getattr(cfg.text_config, "layer_types", None)
-
-        if not isinstance(layer_types, (list, tuple)):
-            return "none"
-        if layer_idx < 0 or layer_idx >= len(layer_types):
-            return "none"
-
-        return _mask_kind_from_layer_type(layer_types[layer_idx])
-    except Exception:
-        return "none"
-
-
 def torch_attention_hf_wrapper(
     self: torch.nn.Module,
     query: torch.Tensor,
@@ -83,10 +49,6 @@ def torch_attention_hf_wrapper(
         layout="bsnd",
         **ad_attn_kwargs,
     )
-
-    # Note: we don't force metadata tagging here because `attn_output` may be a real Tensor in
-    # non-export execution. Deterministic tagging for Gemma3 happens in KV-cache insertion by
-    # inspecting the per-layer `sliding_window` argument already present in the FX graph.
 
     return attn_output, None
 

@@ -16,6 +16,8 @@ from typing import List, Optional, Tuple
 import torch
 from torch import Tensor
 
+from .vlm_mask_registry import VlmMaskGeneratorRegistry
+
 
 def _get_context_mask(
     image_token_mask: Tensor,
@@ -186,4 +188,31 @@ def _flashinfer_gemma3_mask_gen_fake(
     return (
         torch.empty((max_size,), dtype=torch.bool, device=device),
         torch.empty((max_size,), dtype=torch.bool, device=device),
+    )
+
+
+# Register Gemma3 mask generator with the VLM mask registry
+@VlmMaskGeneratorRegistry.register("gemma3")
+def generate_gemma3_vlm_masks(
+    image_token_mask: Tensor,
+    qo_indptr: Tensor,
+    seq_len: Tensor,
+    sliding_window: int,
+) -> Tuple[Tensor, Tensor]:
+    """Generate FlashInfer custom masks for Gemma3 VLM.
+
+    This is the registry entry point for Gemma3 VLM mask generation.
+    It delegates to the torch custom op for the actual mask computation.
+
+    Args:
+        image_token_mask: Boolean tensor [total_tokens] where True = image token.
+        qo_indptr: Tensor [num_contexts + 1] from flashinfer prepare_metadata.
+        seq_len: Tensor [num_seqs] with sequence lengths.
+        sliding_window: Sliding window size from Gemma3 config.
+
+    Returns:
+        Tuple of (custom_mask_full, custom_mask_sliding).
+    """
+    return torch.ops.auto_deploy.flashinfer_gemma3_mask_gen(
+        image_token_mask, qo_indptr, seq_len, sliding_window
     )

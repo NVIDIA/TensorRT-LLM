@@ -44,6 +44,7 @@ from tensorrt_llm.llmapi.tokenizer import TokenizerBase
 from ...._utils import mpi_rank, mpi_world_size
 from ....bindings.internal.batch_manager import CacheType
 from ....mapping import Mapping
+from ...custom_ops.vlm_mask_registry import VlmMaskGeneratorRegistry
 from ...distributed import MPIDist
 from ...pyexecutor.model_engine import ModelEngine, PyTorchModelEngine
 from ...pyexecutor.py_executor import PyExecutor
@@ -731,36 +732,36 @@ class ADEngine(ModelEngine):
                 )
             seq_len = torch.tensor(seq_info.seq_len, dtype=torch.int, device=position_ids.device)
 
-            # Ensure custom op is registered.
-            from ..custom_ops import flashinfer_gemma3_mask  # noqa: F401
+            # Look up the mask generator for this model type from the registry.
+            model_type = getattr(self, "_vlm_model_type", None)
+            mask_generator = VlmMaskGeneratorRegistry.get(model_type)
 
-            # Flatten token types to align with the flattened token stream used by cached attention.
-            total_tokens = position_ids.numel()
-            token_type_ids_flat = token_type_ids.reshape(-1)[:total_tokens]
-            image_token_mask = token_type_ids_flat == 1
+            if mask_generator is not None:
+                # Flatten token types to align with the flattened token stream used by cached attention.
+                total_tokens = position_ids.numel()
+                token_type_ids_flat = token_type_ids.reshape(-1)[:total_tokens]
+                image_token_mask = token_type_ids_flat == 1
 
-            # Match FlashInfer metadata conventions: sanitize seq_len like the metadata op does.
-            seq_len_sanitized = SequenceInfo._get_sanitized_seq_len(position_ids, seq_len)
-            qo_indptr = torch.zeros(
-                len(seq_len_sanitized) + 1,
-                dtype=torch.int,
-                device=seq_len_sanitized.device,
-            )
-            qo_indptr[1:] = torch.cumsum(seq_len_sanitized, 0)
+                # Match FlashInfer metadata conventions: sanitize seq_len like the metadata op does.
+                seq_len_sanitized = SequenceInfo._get_sanitized_seq_len(position_ids, seq_len)
+                qo_indptr = torch.zeros(
+                    len(seq_len_sanitized) + 1,
+                    dtype=torch.int,
+                    device=seq_len_sanitized.device,
+                )
+                qo_indptr[1:] = torch.cumsum(seq_len_sanitized, 0)
 
-            # Sliding window is model-dependent; default to 0 (i.e., no extra constraint).
-            sliding_window = int(getattr(self, "_vlm_sliding_window", 0) or 0)
+                # Sliding window is model-dependent; default to 0 (i.e., no extra constraint).
+                sliding_window = int(getattr(self, "_vlm_sliding_window", 0) or 0)
 
-            custom_mask_full, custom_mask_sliding = (
-                torch.ops.auto_deploy.flashinfer_gemma3_mask_gen(
+                custom_mask_full, custom_mask_sliding = mask_generator(
                     image_token_mask,
                     qo_indptr,
                     seq_len_sanitized,
                     sliding_window,
                 )
-            )
-            kwargs["custom_mask_full"] = custom_mask_full
-            kwargs["custom_mask_sliding"] = custom_mask_sliding
+                kwargs["custom_mask_full"] = custom_mask_full
+                kwargs["custom_mask_sliding"] = custom_mask_sliding
 
         # Strip kwargs that we intentionally keep outside the exported HF GraphModule.
         kwargs.pop("token_type_ids", None)
@@ -838,9 +839,10 @@ def _configure_vlm_mask_settings(engine: ADEngine, ad_config: LlmArgs) -> None:
     engine._expects_vlm_custom_masks = (
         ad_config.attn_backend == "flashinfer" and _model_expects_custom_masks(engine.model)
     )
-    # Best-effort extract `sliding_window` for FlashInfer Gemma3 mask generation.
+    # Best-effort extract VLM mask parameters (model_type, sliding_window) from HF config.
     # Only needed if we will actually be passing/producing custom masks.
     engine._vlm_sliding_window = 0
+    engine._vlm_model_type = None
     if not engine._expects_vlm_custom_masks:
         return
 
@@ -850,6 +852,15 @@ def _configure_vlm_mask_settings(engine: ADEngine, ad_config: LlmArgs) -> None:
         cfg, _ = AutoConfig.from_pretrained(
             ad_config.model, return_unused_kwargs=True, trust_remote_code=True
         )
+
+        # Extract model_type (needed for registry lookup)
+        model_type = getattr(cfg, "model_type", None)
+        # For VLMs with nested configs (e.g., Gemma3), check text_config
+        if model_type is None and hasattr(cfg, "text_config"):
+            model_type = getattr(cfg.text_config, "model_type", None)
+        engine._vlm_model_type = model_type
+
+        # Extract sliding_window
         sliding_window = getattr(cfg, "sliding_window", None)
         if sliding_window is None:
             for sub_config_key in getattr(cfg, "sub_configs", []):
@@ -861,6 +872,7 @@ def _configure_vlm_mask_settings(engine: ADEngine, ad_config: LlmArgs) -> None:
     except Exception:
         # Not all environments/models have an HF config with these fields; ignore.
         engine._vlm_sliding_window = 0
+        engine._vlm_model_type = None
 
 
 def create_draft_model_engine_maybe(

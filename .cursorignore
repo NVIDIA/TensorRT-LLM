@@ -4,4 +4,3 @@
 *cubin.h
 3rdparty/
 data/
-tensorrt_llm/_torch/models/

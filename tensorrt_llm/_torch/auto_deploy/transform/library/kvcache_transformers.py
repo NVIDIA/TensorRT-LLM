@@ -13,9 +13,11 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from ...custom_ops.attention_interface import AttentionDescriptor, Constant, PrepareMetadataCallable
+from ...custom_ops.vlm_mask_registry import VlmMaskGeneratorRegistry
 from ...export.library.unified_attn import HF_ATTN_KWARGS_MAPPING
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
+from ...utils.vlm_utils import get_image_token_mask
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 from .kvcache import InsertCachedAttention
 
@@ -218,29 +220,26 @@ def forward_with_prepare_metadata(mod: nn.Module, **cm_kwargs):
     cm_kwargs["custom_mask_full"] = None
     cm_kwargs["custom_mask_sliding"] = None
     if hasattr(gm, "_vlm_mask_config"):
-        # Ensure the custom op is registered
-        from ...custom_ops import flashinfer_gemma3_mask  # noqa: F401
-        from ...utils.vlm_utils import get_image_token_mask
-
         model_type = gm._vlm_mask_config["model_type"]
         sliding_window = gm._vlm_mask_config["sliding_window"]
 
-        image_token_mask = get_image_token_mask(model_type, cm_kwargs)
-        if image_token_mask is not None and image_token_mask.any():
-            # Generate custom masks for FlashInfer
-            qo_indptr = cm_kwargs["metadata_0"]  # qo_indptr from prepare_metadata
-            seq_len = cm_kwargs["seq_len"]
+        # Look up the mask generator for this model type from the registry
+        mask_generator = VlmMaskGeneratorRegistry.get(model_type)
+        if mask_generator is not None:
+            image_token_mask = get_image_token_mask(model_type, cm_kwargs)
+            if image_token_mask is not None and image_token_mask.any():
+                # Generate custom masks for FlashInfer
+                qo_indptr = cm_kwargs["metadata_0"]  # qo_indptr from prepare_metadata
+                seq_len = cm_kwargs["seq_len"]
 
-            custom_mask_full, custom_mask_sliding = (
-                torch.ops.auto_deploy.flashinfer_gemma3_mask_gen(
+                custom_mask_full, custom_mask_sliding = mask_generator(
                     image_token_mask,
                     qo_indptr,
                     seq_len,
                     sliding_window or 0,
                 )
-            )
-            cm_kwargs["custom_mask_full"] = custom_mask_full
-            cm_kwargs["custom_mask_sliding"] = custom_mask_sliding
+                cm_kwargs["custom_mask_full"] = custom_mask_full
+                cm_kwargs["custom_mask_sliding"] = custom_mask_sliding
 
     return mod._original_forward(**cm_kwargs)
 
