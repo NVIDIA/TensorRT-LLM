@@ -1739,10 +1739,11 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
     Configuration for the cache transceiver.
     """
 
-    backend: Optional[Literal["DEFAULT", "UCX", "NIXL", "MPI"]] = Field(
-        default=None,
-        description=
-        "The communication backend type to use for the cache transceiver.")
+    backend: Optional[Literal[
+        "DEFAULT", "UCX", "NIXL", "MOONCAKE", "MPI"]] = Field(
+            default=None,
+            description=
+            "The communication backend type to use for the cache transceiver.")
 
     max_tokens_in_buffer: Optional[int] = Field(
         default=None,
@@ -1836,6 +1837,14 @@ class BaseLlmArgs(StrictBaseModel):
         default='auto',
         description="The mode to initialize the tokenizer.",
         json_schema_extra={"type": "Literal['auto', 'slow']"})
+
+    custom_tokenizer: Optional[str] = Field(
+        default=None,
+        description="Specify a custom tokenizer implementation. Accepts either: "
+        "(1) a built-in alias (e.g., 'deepseek_v32'), or "
+        "(2) a Python import path (e.g., 'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer'). "
+        "The tokenizer class must implement 'from_pretrained(path, **kwargs)' and the TokenizerBase interface.",
+        status="prototype")
 
     skip_tokenizer_init: bool = Field(
         default=False,
@@ -2186,6 +2195,41 @@ class BaseLlmArgs(StrictBaseModel):
         """Initialize tokenizer based on configuration."""
         if self.skip_tokenizer_init:
             self.tokenizer = None
+        elif self.custom_tokenizer:
+            # If tokenizer is already a tokenizer object, custom_tokenizer is not compatible
+            if isinstance(self.tokenizer,
+                          (TokenizerBase, PreTrainedTokenizerBase)):
+                raise ValueError(
+                    "Cannot use custom_tokenizer when tokenizer is already a tokenizer object. "
+                    "Please specify a tokenizer path or leave it as None to load from model path."
+                )
+
+            # Support short aliases for built-in tokenizers
+            TOKENIZER_ALIASES = {
+                'deepseek_v32':
+                'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer',
+            }
+
+            tokenizer_path = TOKENIZER_ALIASES.get(self.custom_tokenizer,
+                                                   self.custom_tokenizer)
+
+            # Dynamically import and use custom tokenizer
+            from importlib import import_module
+            try:
+                module_path, class_name = tokenizer_path.rsplit('.', 1)
+                module = import_module(module_path)
+                tokenizer_class = getattr(module, class_name)
+                # Use tokenizer path if specified, otherwise use model path
+                load_path = self.tokenizer if self.tokenizer else self.model
+                self.tokenizer = tokenizer_class.from_pretrained(
+                    load_path,
+                    trust_remote_code=self.trust_remote_code,
+                    use_fast=self.tokenizer_mode != 'slow')
+            except (ValueError, ImportError, AttributeError) as e:
+                raise ValueError(
+                    f"Failed to load custom tokenizer '{self.custom_tokenizer}': {e}. "
+                    "Expected format: 'module.path.ClassName' or a recognized alias."
+                ) from e
         else:
             self.tokenizer = tokenizer_factory(
                 self.tokenizer,
