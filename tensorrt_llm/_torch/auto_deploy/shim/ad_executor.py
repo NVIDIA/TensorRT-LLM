@@ -44,7 +44,6 @@ from tensorrt_llm.llmapi.tokenizer import TokenizerBase
 from ...._utils import mpi_rank, mpi_world_size
 from ....bindings.internal.batch_manager import CacheType
 from ....mapping import Mapping
-from ...custom_ops.vlm_mask_registry import VlmMaskGeneratorRegistry
 from ...distributed import MPIDist
 from ...pyexecutor.model_engine import ModelEngine, PyTorchModelEngine
 from ...pyexecutor.py_executor import PyExecutor
@@ -62,6 +61,7 @@ from ...pyexecutor.scheduler import (
     SimpleScheduler,
 )
 from ..custom_ops.attention_interface import SequenceInfo
+from ..custom_ops.vlm_mask_registry import VlmMaskGeneratorRegistry
 from ..distributed import common as dist
 from ..llm_args import LlmArgs
 from ..transform.optimizer import InferenceOptimizer
