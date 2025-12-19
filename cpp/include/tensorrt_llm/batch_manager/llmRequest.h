@@ -49,6 +49,7 @@ enum class LlmRequestState : int32_t
     kUNKNOWN = 0,                             ///< Unknown state
     kENCODER_INIT = 1,                        ///< Encoder phase starts (for encoder-decoder models)
 
+    kDISAGG_CONTEXT_WAIT_SCHEDULE = 7,        ///< Context-only request waiting for scheduling
     kDISAGG_GENERATION_INIT = 8,              ///< New Generation request arrived at generation model
     kDISAGG_GENERATION_TRANS_IN_PROGRESS = 9, ///< Transmitting the kv cache
 
@@ -65,6 +66,7 @@ enum class LlmRequestState : int32_t
     kDISAGG_CONTEXT_TRANS_IN_PROGRESS = 21, ///< Waiting context-only request transmitting the kv cache,
                                             /// after computation finished
     kDISAGG_CONTEXT_COMPLETE = 22,          ///< Context-only request finished kv cache transmission.
+    kDISAGG_GENERATION_WAIT_TOKENS = 23,    ///< Generation-only request waiting for context tokens to be received.
 
     // error states
     kDISAGG_TRANS_ERROR = -1, ///< Error occurred during kv cache transmission

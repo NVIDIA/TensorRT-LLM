@@ -306,6 +306,13 @@ public:
                 std::scoped_lock lkResp(mSenderMutex);
                 mReadyResponses.emplace(
                     llmRequest.mRequestId, Response{std::addressof(llmRequest), std::move(promise)});
+                // if the request is already in the pending queue, submit a send request to ready queue
+                auto it = mPendingRequests.find(llmRequest.mRequestId);
+                if (it != mPendingRequests.end())
+                {
+                    mReadyPendingRequests.push(std::move(it->second));
+                    mPendingRequests.erase(it);
+                }
             }
             std::unique_lock lkCond(mCondMutex);
             mAnyReady = true;
@@ -353,6 +360,17 @@ public:
 
     [[nodiscard]] RequestInfo recvRequestInfo()
     {
+        // if there is a pending request in the ready queue, respond to it first
+        {
+            std::scoped_lock lk(mSenderMutex);
+            if (!mReadyPendingRequests.empty())
+            {
+                auto info = std::move(mReadyPendingRequests.front());
+                mReadyPendingRequests.pop();
+                return info;
+            }
+        }
+
         auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
         bool isAgent = agentConnectionManager != nullptr;
 
@@ -619,14 +637,14 @@ private:
                 {
                     break;
                 }
+                auto const& requestInfo = recvRequestInfo();
+                auto reqId = requestInfo.getRequestId();
                 if (!mReadyResponses.empty())
                 {
-                    auto const& requestInfo = recvRequestInfo();
                     if (mTerminate || !mManager->isRunning())
                     {
                         return;
                     }
-                    auto reqId = requestInfo.getRequestId();
 
                     {
                         std::scoped_lock lk(mSenderMutex);
@@ -638,24 +656,9 @@ private:
                         mRemainSendCount[reqId] = getCounterpartsCount(reqId);
                     }
                 }
-                auto it = getCurrentResponse();
+                auto it = getReadyResponse(requestInfo);
                 if (it != mReadyResponses.end())
                 {
-                    sendResponse(it);
-                }
-                else
-                {
-                    auto it = getCurrentResponse();
-                    while (it == mReadyResponses.end())
-                    {
-                        std::unique_lock lk(mCondMutex);
-                        mSenderCv.wait(lk, [this]() { return (mAnyReady || mTerminate); });
-                        if (mTerminate)
-                        {
-                            break;
-                        }
-                        it = getCurrentResponse();
-                    }
                     sendResponse(it);
                 }
             }
@@ -692,6 +695,7 @@ private:
         {
             std::scoped_lock lkResp(mSenderMutex);
             mReadyResponses.erase(it);
+            mPendingRequests.erase(it->first);
         }
         if (mReadyResponses.empty())
         {
@@ -705,10 +709,29 @@ private:
         return mCurrentRequest.value();
     }
 
-    [[nodiscard]] std::map<RequestIdType, Response>::iterator getCurrentResponse()
+    [[nodiscard]] std::map<RequestIdType, Response>::iterator getReadyResponse(RequestInfo const& requestInfo)
     {
         std::scoped_lock lk(mSenderMutex);
-        return mReadyResponses.find(getCurrentRequestId());
+        auto reqId = requestInfo.getRequestId();
+        auto it = mReadyResponses.find(reqId);
+        if (it != mReadyResponses.end())
+        {
+            return it;
+        }
+        else
+        {
+            // If a request is received but response is not ready, stash it in the pending map to send it later
+            TLLM_LOG_INFO("No ready response found for request %zu", reqId);
+            mPendingRequests[reqId] = requestInfo;
+        }
+        return mReadyResponses.end();
+    }
+
+    bool checkContextRequestReady(LlmRequest const& llmRequest)
+    {
+        std::scoped_lock lk(mSenderMutex);
+        auto it = mPendingRequests.find(llmRequest.mRequestId);
+        return it != mPendingRequests.end();
     }
 
 private:
@@ -723,6 +746,8 @@ private:
     AsyncSendResource mAsyncSendResource;
     std::vector<std::future<void>> mAsyncSendFutures;
     int mDeviceId{-1};
+    std::unordered_map<LlmRequest::RequestIdType, RequestInfo> mPendingRequests;
+    std::queue<RequestInfo> mReadyPendingRequests;
 
     executor::kv_cache::ConnectionManager* mManager;
     std::map<LlmRequest::RequestIdType, TransferSession> mRequestToSession;
@@ -1187,6 +1212,11 @@ bool CacheSender::cancelRequest(LlmRequest const& llmRequest)
 void CacheSender::sendReadySignal(LlmRequest::RequestIdType requestId, bool isReady)
 {
     mImpl->sendReadySignal(requestId, isReady);
+}
+
+void CacheSender::checkContextRequestReady(LlmRequest const& llmRequest)
+{
+    return mImpl->checkContextRequestReady(llmRequest);
 }
 
 CacheReceiver::CacheReceiver(executor::kv_cache::ConnectionManager* manager,

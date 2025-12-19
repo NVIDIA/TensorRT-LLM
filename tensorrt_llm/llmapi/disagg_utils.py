@@ -76,6 +76,7 @@ class DisaggServerConfig():
     max_retries: int = 1
     perf_metrics_max_requests: int = 0
     disagg_cluster_config: Optional[DisaggClusterConfig] = None
+    enable_prealloc: bool = False
 
 
 @dataclass

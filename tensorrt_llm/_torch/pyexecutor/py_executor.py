@@ -1146,6 +1146,7 @@ class PyExecutor:
         if self.kv_cache_transceiver:
             self._check_disagg_gen_transfer_status()
             self._check_kv_transfer_timeout()
+            self._prepare_disagg_ctx_init(new_requests)
 
         iter_stats = None
         if self.enable_iter_perf_stats:
@@ -1930,6 +1931,13 @@ class PyExecutor:
             at_least_num = 1 if need_check_one else 0
             self._check_disagg_gen_cache_transfer_status(at_least_num)
 
+        return
+
+    @nvtx_range("_prepare_disagg_ctx_init")
+    def _prepare_disagg_ctx_init(self, new_requests):
+        for req in new_requests:
+            if req.is_context_only_request:
+                self.kv_cache_transceiver.prepare_context_request(req)
         return
 
     @nvtx_range("_check_kv_transfer_timeout")

@@ -695,4 +695,13 @@ bool CacheTransceiver::cancelRequest(LlmRequest* llmRequest)
     return false;
 }
 
+void CacheTransceiver::prepareContextRequest(LlmRequest* llmRequest)
+{
+    if (llmRequest->isContextOnlyRequest() && llmRequest->getState() == LlmRequestState::kDISAGG_CONTEXT_WAIT_SCHEDULE
+        && mCacheSender->checkContextRequestReady(*llmRequest))
+    {
+        llmRequest->setState(LlmRequestState::kCONTEXT_INIT);
+    }
+}
+
 } // namespace tensorrt_llm::batch_manager

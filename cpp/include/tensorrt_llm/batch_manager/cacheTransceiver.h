@@ -209,6 +209,8 @@ public:
     [[nodiscard]] virtual bool checkGenTransferComplete() const = 0;
 
     virtual bool cancelRequest(LlmRequest* llmRequest) = 0;
+
+    virtual void prepareContextRequest(LlmRequest* llmRequest) = 0;
 };
 
 class CacheTransceiver : public BaseCacheTransceiver
@@ -250,6 +252,8 @@ public:
     [[nodiscard]] bool checkGenTransferComplete() const override;
 
     virtual bool cancelRequest(LlmRequest* llmRequest) override;
+
+    void prepareContextRequest(LlmRequest* llmRequest) override;
 
 private:
     void initializeCommState();

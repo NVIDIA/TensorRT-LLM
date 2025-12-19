@@ -79,6 +79,11 @@ public:
     {
         NB_OVERRIDE_PURE(cancelRequest, llmRequest);
     }
+
+    void prepareContextRequest(tb::LlmRequest* llmRequest) override
+    {
+        NB_OVERRIDE_PURE(prepareContextRequest, llmRequest);
+    }
 };
 } // namespace
 
@@ -93,7 +98,8 @@ void tb::CacheTransceiverBindings::initBindings(nb::module_& m)
         .def("check_gen_transfer_status", &BaseCacheTransceiver::checkGenTransferStatus,
             nb::call_guard<nb::gil_scoped_release>())
         .def("check_gen_transfer_complete", &BaseCacheTransceiver::checkGenTransferComplete)
-        .def("cancel_request", &BaseCacheTransceiver::cancelRequest);
+        .def("cancel_request", &BaseCacheTransceiver::cancelRequest)
+        .def("prepare_context_request", &BaseCacheTransceiver::prepareContextRequest);
 
     nb::enum_<executor::kv_cache::CacheState::AttentionType>(m, "AttentionType")
         .value("DEFAULT", executor::kv_cache::CacheState::AttentionType::kDEFAULT)
