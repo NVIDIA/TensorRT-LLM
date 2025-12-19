@@ -1472,3 +1472,9 @@ repos:
         entry: ./scripts/dco_check.py
         language: script
         stages: [commit-msg]
+    -   id: sort-lookup-yaml
+        name: Sort database lookup.yaml
+        entry: ./scripts/sort_lookup_yaml.py examples/configs/database/lookup.yaml
+        language: script
+        files: examples/configs/database/lookup\.yaml$
+        pass_filenames: false
