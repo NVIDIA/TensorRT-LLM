@@ -62,10 +62,22 @@ class _FlashInferPlanner:
         self.cached_decode_wrappers = {}
         self.plan_params = None
 
-    def _init_decode_wrapper(self):
+    def _init_decode_wrapper(
+        self,
+        kv_page_indptr: Optional[torch.Tensor] = None,
+        kv_page_indices: Optional[torch.Tensor] = None,
+        kv_last_page_len: Optional[torch.Tensor] = None,
+    ):
         assert self.workspace_buffer is not None
+        use_cuda_graph = kv_page_indptr is not None
         return flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-            self.workspace_buffer, "NHD", use_tensor_cores=True
+            self.workspace_buffer,
+            "NHD",
+            use_tensor_cores=True,
+            use_cuda_graph=use_cuda_graph,
+            paged_kv_indptr_buffer=kv_page_indptr,
+            paged_kv_indices_buffer=kv_page_indices,
+            paged_kv_last_page_len_buffer=kv_last_page_len,
         )
 
     def init_workspace(self, workspace_buffer: torch.Tensor):
@@ -96,11 +108,16 @@ class _FlashInferPlanner:
         flashinfer.BatchDecodeWithPagedKVCacheWrapper,
     ]:
         # plan decode helper function
-        def _plan_decode(wrapper: flashinfer.BatchDecodeWithPagedKVCacheWrapper):
+        def _plan_decode(
+            wrapper: flashinfer.BatchDecodeWithPagedKVCacheWrapper,
+            indptr: torch.Tensor,
+            indices: torch.Tensor,
+            last_page_len: torch.Tensor,
+        ):
             wrapper.plan(
-                kv_page_indptr,
-                kv_page_indices,
-                kv_last_page_len,
+                indptr,
+                indices,
+                last_page_len,
                 plan_params.n_heads,
                 plan_params.n_kv_heads,
                 plan_params.head_dim,
@@ -112,8 +129,16 @@ class _FlashInferPlanner:
 
         # we want to plan during warm-up of cuda graph capture to ensure we have the plan cached
         if cuda_graph_state.in_warm_up() and plan_params not in self.cached_decode_wrappers:
-            self.cached_decode_wrappers[plan_params] = self._init_decode_wrapper()
-            _plan_decode(self.cached_decode_wrappers[plan_params])
+            # During CUDA graph capture, the metadata tensors provided by auto-deploy are stable.
+            self.cached_decode_wrappers[plan_params] = self._init_decode_wrapper(
+                kv_page_indptr, kv_page_indices, kv_last_page_len
+            )
+            _plan_decode(
+                self.cached_decode_wrappers[plan_params],
+                kv_page_indptr,
+                kv_page_indices,
+                kv_last_page_len,
+            )
 
         # check if we are in cuda graph capture and just return the pre-cached decode wrapper
         if torch.cuda.is_current_stream_capturing() or cuda_graph_state.in_warm_up():
@@ -125,30 +150,45 @@ class _FlashInferPlanner:
             wrapper._paged_kv_last_page_len_buf.copy_(kv_last_page_len)
             return wrapper
 
-        # check for re-planning
-        if plan_params != self.plan_params:
-            if plan_params.is_generate:
-                _plan_decode(self.decode_wrapper)
-            else:
-                # plan prefill
-                self.prefill_wrapper.plan(
-                    qo_indptr,
-                    kv_page_indptr,
-                    kv_page_indices,
-                    kv_last_page_len,
-                    plan_params.n_heads,  # Q heads
-                    plan_params.n_kv_heads,  # KV heads
-                    plan_params.head_dim,
-                    plan_params.page_size,
-                    causal=plan_params.causal,
-                    q_data_type=plan_params.q_dtype,
-                    kv_data_type=plan_params.kv_dtype,
-                    sm_scale=plan_params.sm_scale,
+        # handle decode
+        if plan_params.is_generate:
+            wrapper = self.decode_wrapper
+            # Update internal buffers in-place (constant time)
+            wrapper._paged_kv_indptr_buf.copy_(kv_page_indptr)
+            wrapper._paged_kv_indices_buf[: len(kv_page_indices)].copy_(kv_page_indices)
+            wrapper._paged_kv_last_page_len_buf.copy_(kv_last_page_len)
+
+            if plan_params != self.plan_params:
+                _plan_decode(
+                    wrapper,
+                    wrapper._paged_kv_indptr_buf,
+                    wrapper._paged_kv_indices_buf,
+                    wrapper._paged_kv_last_page_len_buf,
                 )
+                self.plan_params = plan_params
+
+            return wrapper
+
+        # handle prefill
+        if plan_params != self.plan_params:
+            # plan prefill
+            self.prefill_wrapper.plan(
+                qo_indptr,
+                kv_page_indptr,
+                kv_page_indices,
+                kv_last_page_len,
+                plan_params.n_heads,  # Q heads
+                plan_params.n_kv_heads,  # KV heads
+                plan_params.head_dim,
+                plan_params.page_size,
+                causal=plan_params.causal,
+                q_data_type=plan_params.q_dtype,
+                kv_data_type=plan_params.kv_dtype,
+                sm_scale=plan_params.sm_scale,
+            )
             self.plan_params = plan_params
 
-        # return desired wrapper
-        return self.decode_wrapper if plan_params.is_generate else self.prefill_wrapper
+        return self.prefill_wrapper
 
 
 _GlobalFlashInferPlanner = _FlashInferPlanner()
@@ -167,13 +207,14 @@ def prepare_flashinfer_metadata(
     https://docs.flashinfer.ai/api/prefill.html#flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper.plan
     to understand the convention.
     """
-    # reset the planner
-    _GlobalFlashInferPlanner.reset()
-
     # retrieve host-side metadata
     num_prefill, num_prefill_tokens, num_decode = batch_info.tolist()
     num_seq = num_prefill + num_decode
     num_tokens = num_prefill_tokens + num_decode
+
+    # Only reset the planner if we have prefill work to do.
+    if num_prefill > 0:
+        _GlobalFlashInferPlanner.reset()
 
     qo_indptr = cu_seqlen[: num_seq + 1]
 
