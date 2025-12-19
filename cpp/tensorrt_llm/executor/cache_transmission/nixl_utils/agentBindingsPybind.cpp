@@ -16,7 +16,15 @@
  */
 
 #include "tensorrt_llm/executor/transferAgent.h"
+
+#ifdef ENABLE_NIXL
 #include "transferAgent.h"
+#endif
+
+#ifdef ENABLE_MOONCAKE
+#include "../mooncake_utils/transferAgent.h"
+#endif
+
 #include <pybind11/functional.h>
 #include <pybind11/operators.h>
 #include <pybind11/pybind11.h>
@@ -95,12 +103,6 @@ PYBIND11_MODULE(tensorrt_llm_transfer_agent_binding, m)
         .def("is_completed", &kvc::TransferStatus::isCompleted)
         .def("wait", &kvc::TransferStatus::wait, py::arg("timeout_ms") = -1);
 
-    // NixlTransferStatus class - release GIL for blocking operations
-    py::class_<kvc::NixlTransferStatus, kvc::TransferStatus>(m, "NixlTransferStatus")
-        .def("is_completed", &kvc::NixlTransferStatus::isCompleted, py::call_guard<py::gil_scoped_release>())
-        .def("wait", &kvc::NixlTransferStatus::wait, py::arg("timeout_ms") = -1,
-            py::call_guard<py::gil_scoped_release>());
-
     // BaseAgentConfig struct
     py::class_<kvc::BaseAgentConfig>(m, "BaseAgentConfig")
         .def(py::init<>())
@@ -142,6 +144,13 @@ PYBIND11_MODULE(tensorrt_llm_transfer_agent_binding, m)
         .def("get_local_connection_info", &kvc::BaseTransferAgent::getLocalConnectionInfo)
         .def("check_remote_descs", &kvc::BaseTransferAgent::checkRemoteDescs, py::arg("name"), py::arg("memory_descs"));
 
+#ifdef ENABLE_NIXL
+    // NixlTransferStatus class - release GIL for blocking operations
+    py::class_<kvc::NixlTransferStatus, kvc::TransferStatus>(m, "NixlTransferStatus")
+        .def("is_completed", &kvc::NixlTransferStatus::isCompleted, py::call_guard<py::gil_scoped_release>())
+        .def("wait", &kvc::NixlTransferStatus::wait, py::arg("timeout_ms") = -1,
+            py::call_guard<py::gil_scoped_release>());
+
     // NixlTransferAgent class
     py::class_<kvc::NixlTransferAgent, kvc::BaseTransferAgent>(m, "NixlTransferAgent")
         .def(py::init<kvc::BaseAgentConfig const&>(), py::arg("config"))
@@ -166,4 +175,60 @@ PYBIND11_MODULE(tensorrt_llm_transfer_agent_binding, m)
             "notify_sync_message", &kvc::NixlTransferAgent::notifySyncMessage, py::arg("name"), py::arg("sync_message"))
         .def("get_notified_sync_messages", &kvc::NixlTransferAgent::getNotifiedSyncMessages)
         .def("check_remote_descs", &kvc::NixlTransferAgent::checkRemoteDescs, py::arg("name"), py::arg("memory_descs"));
+#endif
+
+#ifdef ENABLE_MOONCAKE
+    // MooncakeTransferStatus class - release GIL for blocking operations
+    py::class_<kvc::MooncakeTransferStatus, kvc::TransferStatus>(m, "MooncakeTransferStatus")
+        .def("is_completed", &kvc::MooncakeTransferStatus::isCompleted, py::call_guard<py::gil_scoped_release>())
+        .def("wait", &kvc::MooncakeTransferStatus::wait, py::arg("timeout_ms") = -1,
+            py::call_guard<py::gil_scoped_release>());
+
+    // MooncakeTransferAgent class
+    py::class_<kvc::MooncakeTransferAgent, kvc::BaseTransferAgent>(m, "MooncakeTransferAgent")
+        .def(py::init<kvc::BaseAgentConfig const&>(), py::arg("config"))
+        .def("register_memory", &kvc::MooncakeTransferAgent::registerMemory, py::arg("descs"))
+        .def("deregister_memory", &kvc::MooncakeTransferAgent::deregisterMemory, py::arg("descs"))
+        .def("load_remote_agent",
+            py::overload_cast<std::string const&, kvc::AgentDesc const&>(&kvc::MooncakeTransferAgent::loadRemoteAgent),
+            py::arg("name"), py::arg("agent_desc"))
+        .def("load_remote_agent_by_connection",
+            py::overload_cast<std::string const&, kvc::ConnectionInfoType const&>(
+                &kvc::MooncakeTransferAgent::loadRemoteAgent),
+            py::arg("name"), py::arg("connection_info"))
+        .def("get_local_agent_desc", &kvc::MooncakeTransferAgent::getLocalAgentDesc)
+        .def("get_local_connection_info", &kvc::MooncakeTransferAgent::getLocalConnectionInfo)
+        .def("invalidate_remote_agent", &kvc::MooncakeTransferAgent::invalidateRemoteAgent, py::arg("name"))
+        .def(
+            "submit_transfer_requests",
+            [](kvc::MooncakeTransferAgent& self, kvc::TransferRequest const& request)
+            { return self.submitTransferRequests(request).release(); },
+            py::arg("request"), py::return_value_policy::take_ownership, py::call_guard<py::gil_scoped_release>())
+        .def("notify_sync_message", &kvc::MooncakeTransferAgent::notifySyncMessage, py::arg("name"),
+            py::arg("sync_message"))
+        .def("get_notified_sync_messages", &kvc::MooncakeTransferAgent::getNotifiedSyncMessages)
+        .def("check_remote_descs", &kvc::MooncakeTransferAgent::checkRemoteDescs, py::arg("name"),
+            py::arg("memory_descs"));
+#endif
+
+    // Factory function to create transfer agent by backend name (uses dynamic loading)
+    m.def(
+        "make_transfer_agent",
+        [](std::string const& backend, kvc::BaseAgentConfig const& config) -> kvc::BaseTransferAgent*
+        { return kvc::makeTransferAgent(backend, &config).release(); },
+        py::arg("backend"), py::arg("config"), py::return_value_policy::take_ownership,
+        "Create a transfer agent by backend name ('nixl' or 'mooncake'). Uses dynamic loading.");
+
+    // Expose which backends are available
+#ifdef ENABLE_NIXL
+    m.attr("NIXL_ENABLED") = true;
+#else
+    m.attr("NIXL_ENABLED") = false;
+#endif
+
+#ifdef ENABLE_MOONCAKE
+    m.attr("MOONCAKE_ENABLED") = true;
+#else
+    m.attr("MOONCAKE_ENABLED") = false;
+#endif
 }

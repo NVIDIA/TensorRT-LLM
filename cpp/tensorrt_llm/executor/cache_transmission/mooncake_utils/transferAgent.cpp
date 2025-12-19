@@ -47,11 +47,76 @@ MooncakeTransferStatus::MooncakeTransferStatus(transfer_engine_t engine, uint64_
     TLLM_CHECK(mEngine);
 }
 
-void MooncakeTransferStatus::wait() const
+TransferState MooncakeTransferStatus::wait(int64_t timeout_ms) const
 {
-    while (!isCompleted())
+    auto startTime = std::chrono::steady_clock::now();
+
+    while (true)
     {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (mBatchFreed)
+        {
+            return TransferState::kSUCCESS;
+        }
+
+        bool has_failed = false;
+        bool all_completed = true;
+
+        for (size_t index = 0; index < mRequestCount; ++index)
+        {
+            transfer_status_t status;
+            int rc = getTransferStatus(mEngine, mBatchId, index, &status);
+            if (rc || status.status == STATUS_FAILED)
+            {
+                has_failed = true;
+                if (rc)
+                {
+                    TLLM_LOG_ERROR(
+                        "Failed to get transfer status for batch %lu, task %zu: error code %d", mBatchId, index, rc);
+                }
+                else
+                {
+                    TLLM_LOG_ERROR(
+                        "Transfer failed for batch %lu, task %zu: status %d", mBatchId, index, status.status);
+                }
+            }
+            else if (status.status == STATUS_PENDING || status.status == STATUS_WAITING)
+            {
+                all_completed = false;
+            }
+        }
+
+        // If any request failed, return failure
+        if (has_failed)
+        {
+            return TransferState::kFAILURE;
+        }
+
+        // If all requests completed successfully
+        if (all_completed)
+        {
+            freeBatchID(mEngine, mBatchId);
+            mBatchFreed = true;
+            TLLM_LOG_DEBUG("Batch ID %lu freed in wait()", mBatchId);
+            return TransferState::kSUCCESS;
+        }
+
+        // If timeout_ms < 0, wait indefinitely
+        if (timeout_ms < 0)
+        {
+            std::this_thread::yield();
+            continue;
+        }
+
+        // Check if timeout has elapsed
+        auto elapsed
+            = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startTime)
+                  .count();
+        if (elapsed >= timeout_ms)
+        {
+            return TransferState::kIN_PROGRESS;
+        }
+
+        std::this_thread::yield();
     }
 }
 
@@ -100,7 +165,7 @@ void MooncakeTransferStatus::wait() const
     return true;
 }
 
-const std::string MooncakeBase64Helper::STANDARD_CHARS
+std::string const MooncakeBase64Helper::STANDARD_CHARS
     = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
       "abcdefghijklmnopqrstuvwxyz"
       "0123456789+/";
@@ -361,7 +426,7 @@ AgentDesc MooncakeTransferAgent::getLocalAgentDesc()
     TLLM_LOG_DEBUG("MooncakeTransferAgent::getLocalAgentDesc");
 
     // Using connection info as agent desc
-    const static size_t kBufLen = 64;
+    static size_t const kBufLen = 64;
     char connectionInfo[kBufLen];
 
     int ret = getLocalIpAndPort(mEngine, connectionInfo, kBufLen);
@@ -375,7 +440,7 @@ ConnectionInfoType MooncakeTransferAgent::getLocalConnectionInfo()
 {
     TLLM_LOG_DEBUG("MooncakeTransferAgent::getLocalConnectionInfo");
 
-    const static size_t kBufLen = 64;
+    static size_t const kBufLen = 64;
     char connectionInfo[kBufLen];
 
     int ret = getLocalIpAndPort(mEngine, connectionInfo, kBufLen);
@@ -399,7 +464,7 @@ ConnectionInfoType MooncakeTransferAgent::getLocalConnectionInfo()
         syncMessage = request.getSyncMessage().value();
     }
 
-    const static size_t kMaxRequestCount = 1024;
+    static size_t const kMaxRequestCount = 1024;
     uint64_t batchId = allocateBatchID(mEngine, kMaxRequestCount);
 
     TLLM_CHECK_WITH_INFO(batchId != INVALID_BATCH, "allocateBatchID failed");

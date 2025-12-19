@@ -248,7 +248,7 @@ AgentConnectionManager::AgentConnectionManager(
     mAgentName = genUniqueAgentName();
     // Create Agent
     BaseAgentConfig config{mAgentName, true, false, true, 1};
-    m_Agent = makeTransferAgent("nixl", &config);
+    m_Agent = makeTransferAgent(backendType, &config);
     TLLM_CHECK(!mCacheTransBufferManagers.empty());
     std::vector<MemoryDesc> memDescs;
     for (auto* cacheTransBufferManager : mCacheTransBufferManagers)
