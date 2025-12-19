@@ -89,7 +89,8 @@ class InsertCachedAttention(BaseTransform):
         We keep this check isolated since OpOverload equality can be brittle in some environments.
         """
         try:
-            return cached_attn_op == torch.ops.auto_deploy.flashinfer_attention_mha_with_cache
+            # Use string comparison to be robust against different op object instances
+            return "flashinfer_attention_mha_with_cache" in str(cached_attn_op)
         except Exception:
             return False
 
@@ -194,7 +195,14 @@ class InsertCachedAttention(BaseTransform):
         """Insert a cached attention node into the graph."""
         with gm.graph.inserting_before(attn_node):
             cached_attn_op = self.attn_descriptor.get_cached_attention_op()
-            args = (*qkv_nodes, *meta_nodes_std, *meta_nodes_extra, *cache_nodes, *buffer_nodes, *constants)
+            args = (
+                *qkv_nodes,
+                *meta_nodes_std,
+                *meta_nodes_extra,
+                *cache_nodes,
+                *buffer_nodes,
+                *constants,
+            )
             # FlashInfer cached attention op optionally accepts two extra args for VLM custom masks:
             #   custom_mask_full, custom_mask_sliding
             # In graph-mode we want to be able to compute these masks outside the exported HF graph
