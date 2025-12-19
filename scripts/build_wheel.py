@@ -826,9 +826,6 @@ def main(*,
             trtllm_dir = project_dir / "tensorrt_llm"
             install_file(agent_binding_so[0],
                          trtllm_dir / agent_binding_so[0].name)
-            build_run(
-                f'patchelf --set-rpath \'$ORIGIN/libs:$ORIGIN/libs/nixl/\' {trtllm_dir / agent_binding_so[0].name}'
-            )
             if os.path.exists("/opt/nvidia/nvda_nixl"):
                 nixl_dir = lib_dir / "nixl"
                 if nixl_dir.exists():

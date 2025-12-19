@@ -44,39 +44,40 @@ if(NIXL_ROOT)
   # of main trtllm bindings) Uses BINDING_TYPE to choose between pybind11 and
   # nanobind
   # ============================================================================
-  set(AGENT_BINDING_TARGET "tensorrt_llm_transfer_agent_binding")
+  set(TRANSFER_AGENT_BINDING_TARGET "tensorrt_llm_transfer_agent_binding")
 
   if(BINDING_TYPE STREQUAL "pybind")
     # Use pybind11 (already fetched via FetchContent)
-    pybind11_add_module(${AGENT_BINDING_TARGET} agentBindingsPybind.cpp)
+    pybind11_add_module(${TRANSFER_AGENT_BINDING_TARGET}
+                        agentBindingsPybind.cpp)
     message(STATUS "Building tensorrt_llm_transfer_agent_binding with pybind11")
   else()
     # Default to nanobind (already fetched via FetchContent)
-    nanobind_add_module(${AGENT_BINDING_TARGET} agentBindingsNanobind.cpp)
+    nanobind_add_module(${TRANSFER_AGENT_BINDING_TARGET}
+                        agentBindingsNanobind.cpp)
     message(STATUS "Building tensorrt_llm_transfer_agent_binding with nanobind")
   endif()
 
-  target_compile_options(${AGENT_BINDING_TARGET} PRIVATE -Wno-error)
+  target_compile_options(${TRANSFER_AGENT_BINDING_TARGET} PRIVATE -Wno-error)
 
   # Add include directories
-  target_include_directories(${AGENT_BINDING_TARGET} PRIVATE NIXL::nixl)
-  target_include_directories(${AGENT_BINDING_TARGET}
+  target_include_directories(${TRANSFER_AGENT_BINDING_TARGET}
+                             PRIVATE NIXL::nixl)
+  target_include_directories(${TRANSFER_AGENT_BINDING_TARGET}
                              PRIVATE ${PROJECT_SOURCE_DIR}/include)
 
   # Link against NIXL wrapper and NIXL libraries
-  target_link_libraries(${AGENT_BINDING_TARGET} PRIVATE ${NIXL_WRAPPER_TARGET})
-  target_link_libraries(${AGENT_BINDING_TARGET} PRIVATE NIXL::nixl)
-  target_link_libraries(${AGENT_BINDING_TARGET} PRIVATE CUDA::cudart)
+  target_link_libraries(${TRANSFER_AGENT_BINDING_TARGET}
+                        PRIVATE ${NIXL_WRAPPER_TARGET})
+  target_link_libraries(${TRANSFER_AGENT_BINDING_TARGET} PRIVATE NIXL::nixl)
+  target_link_libraries(${TRANSFER_AGENT_BINDING_TARGET} PRIVATE CUDA::cudart)
+  target_link_libraries(${TRANSFER_AGENT_BINDING_TARGET}
+                        PRIVATE ${SHARED_TARGET})
 
   # Set RPATH for the module to find libtensorrt_llm_nixl_wrapper.so
   set_target_properties(
-    ${AGENT_BINDING_TARGET} PROPERTIES BUILD_RPATH "$ORIGIN;$ORIGIN/libs"
-                                       INSTALL_RPATH "$ORIGIN;$ORIGIN/libs")
-
-  # Export the agent binding target name to parent scope so it can be added as
-  # dependency to tensorrt_llm main library
-  set(AGENT_BINDING_TARGET
-      ${AGENT_BINDING_TARGET}
-      PARENT_SCOPE)
+    ${TRANSFER_AGENT_BINDING_TARGET}
+    PROPERTIES BUILD_RPATH "$ORIGIN;$ORIGIN/libs;$ORIGIN/libs/nixl"
+               INSTALL_RPATH "$ORIGIN;$ORIGIN/libs;$ORIGIN/libs/nixl")
 
 endif()
