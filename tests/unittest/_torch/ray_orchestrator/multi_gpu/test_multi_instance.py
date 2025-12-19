@@ -38,7 +38,7 @@ class TRTLLMInstance:
 
 @pytest.mark.gpu4
 @pytest.mark.parametrize(
-    "tp_size, num_instances", [(2, 2), (1, 4)], ids=["tp2_instances2", "tp1_instances4"]
+    "tp_size, num_instances", [(2, 2), (1, 4)], ids=["tp2_2instances", "tp1_4instances"]
 )
 def test_multi_instance(setup_ray_cluster, tp_size, num_instances):
     """Test that multiple TRTLLMInstance actors can be started without port conflicts.

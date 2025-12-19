@@ -10,7 +10,7 @@ from transformers import AutoTokenizer
 
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize(
-    "tp_size, num_instances", [(2, 2), (1, 4)], ids=["tp2_instances2", "tp1_instances4"]
+    "tp_size, num_instances", [(2, 2), (1, 4)], ids=["tp2_2instances", "tp1_4instances"]
 )
 def test_rl_perf_reproduce(llm_venv, tp_size, num_instances):
     script_path = (

@@ -1,6 +1,6 @@
 # RL Framework Integration Tests
 
-This directory contains integration tests for TensorRT-LLM with Ray orchestrator, specifically designed to cover usage patterns from various RL (Reinforcement Learning) frameworks.
+This directory contains integration tests for TensorRT-LLM with [Ray orchestrator](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/ray_orchestrator), specifically designed to cover usage patterns from various RL (Reinforcement Learning) frameworks such as VeRL and NeMo RL. 
 
 ## Available Scripts
 
