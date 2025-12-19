@@ -29,6 +29,17 @@ _module = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_module)
 generate_rst = _module.generate_rst
 
+# Dynamically load generate_config_database_tests module without modifying sys.path
+_db_spec = importlib.util.spec_from_file_location(
+    "generate_config_database_tests",
+    REPO_ROOT / "scripts" / "generate_config_database_tests.py",
+)
+_db_module = importlib.util.module_from_spec(_db_spec)
+_db_spec.loader.exec_module(_db_module)
+generate_tests = _db_module.generate_tests
+TEST_LIST_PATH = _db_module.TEST_LIST_PATH
+PERF_SANITY_DIR = _db_module.PERF_SANITY_DIR
+
 
 class TestConfigDatabaseSync(unittest.TestCase):
     def test_config_table_sync(self):

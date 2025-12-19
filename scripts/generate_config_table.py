@@ -65,9 +65,7 @@ def generate_rst(yaml_path, output_file=None):
 
     lines = []
 
-    # Include note_sections.rst at the top (relative include for Sphinx).
-    # `config_table.rst` lives under `docs/source/deployment-guide/`, while
-    # `note_sections.rst` is under `docs/source/_includes/`.
+    # Include note_sections.rst at the top (relative include for Sphinx)
     lines.append(".. include:: ../_includes/note_sections.rst")
     lines.append("   :start-after: .. start-note-traffic-patterns")
     lines.append("   :end-before: .. end-note-traffic-patterns")
@@ -126,7 +124,6 @@ def generate_rst(yaml_path, output_file=None):
                 profile = assign_profile(n, idx, conc)
 
                 full_config_path = config_path
-                # `--config` is the preferred flag; `--extra_llm_api_options` remains a supported alias.
                 command = f"trtllm-serve {model} --config ${{TRTLLM_DIR}}/{full_config_path}"
 
                 config_filename = os.path.basename(full_config_path)

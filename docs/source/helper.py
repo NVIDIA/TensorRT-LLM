@@ -358,11 +358,7 @@ def update_version():
     docs_source_dir = Path(__file__).parent.resolve()
     md_files = list(docs_source_dir.rglob("*.md"))
 
-    # NOTE: This helper mutates docs sources in-place (replacing the container tag
-    # placeholder) so that CI/pipeline builds don't publish docs with `x.y.z`.
-    #
-    # Local devs who prefer a no-diff Sphinx build can opt out:
-    #   TRTLLM_DOCS_REPLACE_CONTAINER_TAG=0 make -C docs html
+    # Default is to replace `release:x.y.z` placeholders; set to 0 to disable.
     if os.environ.get("TRTLLM_DOCS_REPLACE_CONTAINER_TAG", "1") != "1":
         return
 
