@@ -354,6 +354,9 @@ class TRTLLMGenFusedMoE(MoE):
 
         return x, x_sf
 
+    def supports_moe_output_in_alltoall_workspace(self):
+        return self.has_w4a8_mxfp4_mxfp8
+
     def run_moe(
         self,
         x: torch.Tensor,
