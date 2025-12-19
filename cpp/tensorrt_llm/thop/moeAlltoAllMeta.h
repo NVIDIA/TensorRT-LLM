@@ -16,10 +16,14 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
+
 #include <array>
 #include <cstdint>
 #include <utility>
 #include <vector>
+
+TRTLLM_NAMESPACE_BEGIN
 
 namespace torch_ext
 {
@@ -63,3 +67,5 @@ inline std::vector<std::pair<char const*, int64_t>> getMoeA2AMetaInfoIndexPairs(
 
 } // namespace moe_comm
 } // namespace torch_ext
+
+TRTLLM_NAMESPACE_END

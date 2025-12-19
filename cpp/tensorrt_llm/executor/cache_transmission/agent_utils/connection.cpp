@@ -231,12 +231,12 @@ bool AgentConnection::recvReadySignal(DataContext const& ctx) const
 {
     ReadySignalInfo readySignalInfo{mAgentName, ctx, false};
     mAgentConnectionManager->waitForReadySignal(mRemoteAgentName, readySignalInfo);
-    return true;
+    return readySignalInfo.mIsReady;
 }
 
 AgentConnectionManager::AgentConnectionManager(
     std::vector<batch_manager::kv_cache_manager::CacheTransBufferManager*> cacheTransBufferManagers,
-    CacheState cacheState)
+    CacheState cacheState, std::string const& backendType)
     : mCacheState(std::move(cacheState))
     , mCacheTransBufferManagers(std::move(cacheTransBufferManagers))
     , mRegMemDescs(MemoryType::kVRAM, {})
@@ -247,7 +247,7 @@ AgentConnectionManager::AgentConnectionManager(
     mAgentName = genUniqueAgentName();
     // Create Agent
     BaseAgentConfig config{mAgentName, true};
-    m_Agent = makeTransferAgent("nixl", &config);
+    m_Agent = makeTransferAgent(backendType, &config);
     TLLM_CHECK(!mCacheTransBufferManagers.empty());
     std::vector<MemoryDesc> memDescs;
     for (auto* cacheTransBufferManager : mCacheTransBufferManagers)
@@ -319,6 +319,10 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(batc
 {
     while (true)
     {
+        if (!mIsRunning)
+        {
+            return nullptr;
+        }
         updateUnhandledNotifications();
         std::scoped_lock lock(mNotificationMutex);
         auto it = mUnhandledNotifications.begin();
@@ -491,6 +495,11 @@ void AgentConnectionManager::waitForNotification(std::string const& remoteAgentN
     while (true)
     {
 
+        if (!mIsRunning)
+        {
+            return;
+        }
+
         updateUnhandledNotifications();
         std::scoped_lock lock(mNotificationMutex);
         auto it = mUnhandledNotifications.begin();
@@ -587,6 +596,13 @@ std::string const& AgentConnectionManager::getAgentName() const
 
 AgentConnectionManager::~AgentConnectionManager()
 {
+    mIsRunning = false;
     m_Agent->deregisterMemory(mRegMemDescs);
 }
+
+bool AgentConnectionManager::isRunning() const
+{
+    return mIsRunning;
+}
+
 } // namespace tensorrt_llm::executor::kv_cache

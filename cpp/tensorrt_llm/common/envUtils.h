@@ -16,13 +16,16 @@
  */
 
 #pragma once
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <optional>
 #include <string>
 
-namespace tensorrt_llm::common
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common
 {
 // Useful when you want to inject some debug code controllable with env var.
 std::optional<int32_t> getIntEnv(char const* name);
@@ -80,7 +83,10 @@ inline void launchWithPdlWhenEnabled(char const* name, KernelFn kernelFn, dim3 g
 bool getEnvUseUCXKvCache();
 
 bool getEnvUseMPIKvCache();
+
 bool getEnvUseNixlKvCache();
+
+bool getEnvUseMooncakeKvCache();
 
 bool getEnvUseRoundRobinBlockDistForCP();
 
@@ -89,6 +95,8 @@ std::string getEnvUCXInterface();
 std::string getEnvNixlInterface();
 
 std::string getEnvNixlBackend();
+
+std::string getEnvMooncakeInterface();
 
 bool getEnvDisaggLayerwise();
 
@@ -153,4 +161,6 @@ bool getEnvKVCacheTransferAllBlocksForWindow();
 
 bool getEnvEplbForceGdrcopy();
 
-} // namespace tensorrt_llm::common
+} // namespace common
+
+TRTLLM_NAMESPACE_END

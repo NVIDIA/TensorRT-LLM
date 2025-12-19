@@ -83,6 +83,8 @@ In addition, the following models have been officially validated using the defau
 - nvidia/Llama-3_1-Nemotron-Ultra-253B-v1-FP8
 - nvidia/Llama-3_3-Nemotron-Super-49B-v1
 - nvidia/Mistral-NeMo-Minitron-8B-Base
+- nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+- nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8
 - perplexity-ai/r1-1776-distill-llama-70b
 
 </details>

@@ -6,15 +6,16 @@ enable_chunked_prefill: true
 attn_backend: flashinfer
 model_factory: AutoModelForCausalLM
 skip_loading_weights: false
-free_mem_ratio: 0.9
+# TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/9884
+free_mem_ratio: 0.88
 cuda_graph_batch_sizes: [1, 2, 4, 8, 16, 24, 32, 64, 128, 256, 320, 384]
 kv_cache_config:
   # disable kv_cache reuse since not supported for hybrid/ssm models
   enable_block_reuse: false
 transforms:
   detect_sharding:
+    allreduce_strategy: SYMM_MEM
     sharding_dims: ['ep', 'bmm']
-    allreduce_strategy: 'AUTO'
     manual_config:
       head_dim: 128
       tp_plan:
@@ -44,6 +45,9 @@ transforms:
       cache_config:
         # mamba_dtype: float32
         mamba_dtype: null
+  gather_logits_before_lm_head:
+    # TODO: fix https://github.com/NVIDIA/TensorRT-LLM/issues/9878 to enable by default
+    enabled: true
   fuse_mamba_a_log:
     stage: post_load_fusion
     enabled: true

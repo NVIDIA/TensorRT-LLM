@@ -71,6 +71,10 @@ RUN GITHUB_MIRROR=${GITHUB_MIRROR} \
     rm install_pytorch.sh && \
     rm install.sh
 
+# Copy and install dependencies from constraints.txt
+COPY constraints.txt /tmp/constraints.txt
+RUN pip3 install --no-cache-dir -r /tmp/constraints.txt && rm /tmp/constraints.txt
+
 # Install UCX, NIXL, etcd
 # TODO: Combine these into the main install.sh script
 RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install_ucx.sh && \

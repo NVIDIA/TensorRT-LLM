@@ -277,7 +277,7 @@ class AgentConnectionManager : public ConnectionManager
 public:
     AgentConnectionManager(
         std::vector<batch_manager::kv_cache_manager::CacheTransBufferManager*> cacheTransBufferManagers,
-        CacheState cacheState);
+        CacheState cacheState, std::string const& backendType);
     ~AgentConnectionManager();
     AgentConnection* recvConnect(DataContext const& ctx, void* data, size_t size) override;
     [[nodiscard]] std::vector<Connection const*> getConnections(CommState const& state) override;
@@ -296,6 +296,7 @@ public:
     void waitForNotification(std::string const& remoteAgentName, NotificationType& expectedInfo);
     void waitForSyncInfo(std::string const& remoteAgentName, NotificationSyncInfo& syncInfo);
     void waitForReadySignal(std::string const& remoteAgentName, ReadySignalInfo& readySignalInfo);
+    [[nodiscard]] bool isRunning() const override;
 
 private:
     std::map<std::string, std::shared_ptr<AgentConnection>> mConnections;
@@ -309,6 +310,7 @@ private:
     int mDeviceId;
     std::string mAgentName;
     MemoryDescs mRegMemDescs;
+    std::atomic<bool> mIsRunning{true};
 };
 
 } // namespace tensorrt_llm::executor::kv_cache

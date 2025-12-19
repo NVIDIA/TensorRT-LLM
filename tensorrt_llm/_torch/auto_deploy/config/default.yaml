@@ -128,10 +128,16 @@ transforms:
   # TODO (lucaslie): add backend selection as part of configurable inference optimizers
   fuse_rmsnorm:
     stage: post_load_fusion
-    rmsnorm_backend: triton
+    rmsnorm_backend: flashinfer
     gated_rmsnorm_backend: triton
     requires_shape_prop: true
-
+  fuse_add_rms_norm:
+    stage: post_load_fusion
+    enabled: true
+  gather_logits_before_lm_head:
+    stage: post_load_fusion
+    # TODO: fix https://github.com/NVIDIA/TensorRT-LLM/issues/9878 to enable by default
+    enabled: false
   ############################################################################################
   # VISUALIZE GRAPH
   ############################################################################################
@@ -141,8 +147,6 @@ transforms:
   ############################################################################################
   # SWITCH TO CACHED+FLATTENED ATTENTION + INITIALIZE CACHES
   ############################################################################################
-  update_in_out_nodes:
-    stage: cache_init
   insert_cached_attention:
     stage: cache_init
     backend: flashinfer

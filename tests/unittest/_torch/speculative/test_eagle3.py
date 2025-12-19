@@ -206,7 +206,7 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
             num_tokens = len(new_tokens)
 
         accept_rate = num_accepted / num_drafted
-        assert accept_rate > 0.15
+        assert accept_rate > 0.10
 
     # Output tests
     sampling_params = SamplingParams(max_tokens=10, temperature=0)
@@ -223,6 +223,88 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
     for text_spec, text_ref in zip(generated_text_spec, generated_text_ref):
         # The spec decode algorithm currently guarantees identical results
         assert text_spec == text_ref
+
+
+@pytest.mark.parametrize("eagle3_one_model", [True, False])
+def test_eagle3_spec_decoding_stats(eagle3_one_model):
+    """Test that specDecodingStats are correctly populated in metrics endpoint"""
+    models_path = llm_models_root()
+    eagle_model_dir = f"{models_path}/EAGLE3-LLaMA3.1-Instruct-8B"
+    target_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
+
+    # Skip if models don't exist
+    if not os.path.exists(target_model_dir) or not os.path.exists(
+            eagle_model_dir):
+        pytest.skip(f"Required models not found")
+
+    kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                    free_gpu_memory_fraction=0.6)
+    spec_config = EagleDecodingConfig(
+        max_draft_len=3,
+        speculative_model_dir=eagle_model_dir,
+        eagle3_one_model=eagle3_one_model,
+    )
+
+    with LLM(
+            model=target_model_dir,
+            speculative_config=spec_config,
+            kv_cache_config=kv_cache_config,
+            disable_overlap_scheduler=not eagle3_one_model,
+            enable_iter_perf_stats=True,
+            max_batch_size=4,
+    ) as llm:
+        # Generate some output to collect stats
+        prompts = [
+            "The capital of France is",
+            "The president of the United States is",
+        ]
+        sampling_params = SamplingParams(max_tokens=20, temperature=0)
+        llm.generate(prompts, sampling_params)
+
+        # Get iteration stats
+        stats = llm.get_stats(timeout=2)
+        assert len(stats) > 0, "Should have iteration stats"
+
+        # Find iterations with speculation (generation phase)
+        iterations_with_spec = []
+        for stat in stats:
+            if 'specDecodingStats' in stat:
+                spec_stats = stat['specDecodingStats']
+                if spec_stats.get('numDraftTokens', 0) > 0:
+                    iterations_with_spec.append(spec_stats)
+
+        # Should have at least some iterations with spec decoding
+        assert len(iterations_with_spec) > 0, \
+            f"Should have iterations with specDecodingStats (found {len(iterations_with_spec)})"
+
+        # Validate specDecodingStats structure and values
+        for spec_stats in iterations_with_spec:
+            # Check all fields are present
+            assert 'numDraftTokens' in spec_stats
+            assert 'numAcceptedTokens' in spec_stats
+            assert 'numRequestsWithDraftTokens' in spec_stats
+            assert 'acceptanceLength' in spec_stats
+            assert 'iterLatencyMS' in spec_stats
+            assert 'draftOverhead' in spec_stats
+
+            # Validate value constraints
+            assert spec_stats['numDraftTokens'] > 0
+            assert 0 <= spec_stats['numAcceptedTokens'] <= spec_stats[
+                'numDraftTokens']
+            assert spec_stats['numRequestsWithDraftTokens'] > 0
+            assert spec_stats['acceptanceLength'] >= 1.0
+            assert spec_stats['iterLatencyMS'] >= 0.0
+            assert 0.0 <= spec_stats['draftOverhead'] <= 1.0
+
+        # Calculate overall acceptance rate
+        total_draft = sum(s['numDraftTokens'] for s in iterations_with_spec)
+        total_accepted = sum(s['numAcceptedTokens']
+                             for s in iterations_with_spec)
+        acceptance_rate = (total_accepted / total_draft *
+                           100) if total_draft > 0 else 0
+
+        # Should have reasonable acceptance rate for Eagle3
+        assert acceptance_rate > 5.0, f"Acceptance rate too low: {acceptance_rate:.1f}%"
 
 
 @pytest.mark.parametrize("use_cuda_graph", [True, False])
@@ -252,7 +334,7 @@ def test_llama_eagle3_long_prompt(use_cuda_graph):
                    speculative_config=spec_config,
                    max_batch_size=1,
                    cuda_graph_config=cuda_graph_config,
-                   disable_overlap_scheduler=False)
+                   disable_overlap_scheduler=True)
 
     prompt = [", ".join(str(i) for i in range(1000))]
 

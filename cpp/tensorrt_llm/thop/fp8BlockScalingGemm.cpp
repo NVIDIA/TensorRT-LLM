@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/gemm/KernelRunner.h"
@@ -25,6 +26,8 @@
 
 using namespace tensorrt_llm::kernels::fp8_blockscale_gemm;
 using namespace tensorrt_llm::kernels;
+
+TRTLLM_NAMESPACE_BEGIN
 
 namespace torch_ext
 {
@@ -308,8 +311,19 @@ extern torch::Tensor fp8_block_scaling_moe_gemm(torch::Tensor const& mat1, torch
 torch::Tensor fp8_block_scaling_bmm_out(torch::Tensor const& mat1, torch::Tensor const& mat2,
     torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale, torch::Tensor& out)
 {
-    check_input_dtypes(mat1, mat1Scale);
-    check_input_dtypes(mat2, mat2Scale);
+    auto const sm = tensorrt_llm::common::getSMVersion();
+    if (sm == 120)
+    {
+        TORCH_CHECK(mat1.scalar_type() == at::ScalarType::Float8_e4m3fn, "Matrix dtype must be FP8.");
+        TORCH_CHECK(mat2.scalar_type() == at::ScalarType::Float8_e4m3fn, "Matrix dtype must be FP8.");
+        TORCH_CHECK(mat1Scale.scalar_type() == at::ScalarType::Int, "Scale dtype must be Int32.");
+        TORCH_CHECK(mat2Scale.scalar_type() == at::ScalarType::Int, "Scale dtype must be Int32.");
+    }
+    else
+    {
+        check_input_dtypes(mat1, mat1Scale);
+        check_input_dtypes(mat2, mat2Scale);
+    }
 
     TORCH_CHECK(mat1.dim() == 3, "mat1 must be a batched matrix");
     TORCH_CHECK(mat2.dim() == 3, "mat2 must be a batched matrix");
@@ -337,8 +351,19 @@ torch::Tensor fp8_block_scaling_bmm_out(torch::Tensor const& mat1, torch::Tensor
 
     auto stream = at::cuda::getCurrentCUDAStream(mat1.get_device());
 
-    float* mat1ScalePtr = mat1Scale.data_ptr<float>();
-    float* mat2ScalePtr = mat2Scale.data_ptr<float>();
+    float* mat1ScalePtr = nullptr;
+    float* mat2ScalePtr = nullptr;
+
+    if (sm == 120)
+    {
+        mat1ScalePtr = reinterpret_cast<float*>(mat1Scale.data_ptr());
+        mat2ScalePtr = reinterpret_cast<float*>(mat2Scale.data_ptr());
+    }
+    else
+    {
+        mat1ScalePtr = mat1Scale.data_ptr<float>();
+        mat2ScalePtr = mat2Scale.data_ptr<float>();
+    }
 
     auto* out_ptr = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
     auto* mat1_ptr = reinterpret_cast<__nv_fp8_e4m3*>(mat1.data_ptr());
@@ -357,7 +382,7 @@ torch::Tensor fp8_block_scaling_bmm_out(torch::Tensor const& mat1, torch::Tensor
     auto const strideB = mat2.strides()[0];
     auto const ldb = mat2.strides()[1];
 
-    // mat1Scale is a 1D tensor which doesn't carry any stride information
+    // mat1Scale is a 1D tensor which doesn't carry any stride information, no effect on sm120
     auto const strideScalesA = ((m + 4 - 1) / 4 * 4) * ((k + 128 - 1) / 128);
 
     gemm_runner->strideBatchGemm(out_ptr, ldd, strideD, mat1_ptr, lda, strideA, mat2_ptr, ldb, strideB, b, m, n, k,
@@ -382,6 +407,8 @@ torch::Tensor fp8_block_scaling_bmm(torch::Tensor const& mat1, torch::Tensor con
 
 } // namespace torch_ext
 
+TRTLLM_NAMESPACE_END
+
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def("fp8_block_scaling_gemm(Tensor mat1, Tensor mat2, Tensor mat1Scale, Tensor mat2Scale) -> Tensor");
@@ -398,8 +425,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("fp8_block_scaling_gemm", &torch_ext::fp8_block_scaling_gemm);
-    m.impl("fp8_block_scaling_bmm", &torch_ext::fp8_block_scaling_bmm);
-    m.impl("fp8_block_scaling_bmm_out", &torch_ext::fp8_block_scaling_bmm_out);
-    m.impl("fp8_block_scaling_moe_gemm", &torch_ext::fp8_block_scaling_moe_gemm);
+    m.impl("fp8_block_scaling_gemm", &tensorrt_llm::torch_ext::fp8_block_scaling_gemm);
+    m.impl("fp8_block_scaling_bmm", &tensorrt_llm::torch_ext::fp8_block_scaling_bmm);
+    m.impl("fp8_block_scaling_bmm_out", &tensorrt_llm::torch_ext::fp8_block_scaling_bmm_out);
+    m.impl("fp8_block_scaling_moe_gemm", &tensorrt_llm::torch_ext::fp8_block_scaling_moe_gemm);
 }
