@@ -101,42 +101,43 @@ def test_spec_gate_e2e(enforce_single_worker):
 
     llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
 
-    with patch.object(SpeculationGate, 'record_avg_decoded',
-                      mock_record_avg_decoded):
-        llm_spec.generate(prompts, sampling_params)
+    try:
+        with patch.object(SpeculationGate, 'record_avg_decoded',
+                          mock_record_avg_decoded):
+            llm_spec.generate(prompts, sampling_params)
 
-    # Verify the mock was called (requests completed)
-    assert len(gate_state["record_calls"]
-               ) > 0, "record_avg_decoded should have been called"
+        # Verify the mock was called (requests completed)
+        assert len(gate_state["record_calls"]
+                   ) > 0, "record_avg_decoded should have been called"
 
-    # Verify the gate was disabled after enough requests with low acceptance
-    assert gate_state["gate_disabled"], \
-        f"Gate should have been disabled with simulated low acceptance. Calls: {gate_state['record_calls']}"
+        # Verify the gate was disabled after enough requests with low acceptance
+        assert gate_state["gate_disabled"], \
+            f"Gate should have been disabled with simulated low acceptance. Calls: {gate_state['record_calls']}"
 
-    # Verify the gate triggered at the right time (after window is filled)
-    # The gate should trigger on the `acceptance_window`-th call (index = window - 1)
-    disable_indices = [
-        i for i, call in enumerate(gate_state["record_calls"])
-        if call["disabled_now"]
-    ]
-    assert len(disable_indices) == 1, \
-        f"Gate should have triggered exactly once, but triggered at indices: {disable_indices}"
-    assert disable_indices[0] >= acceptance_window - 1, \
-        f"Gate should trigger after window ({acceptance_window}) is filled, but triggered at index {disable_indices[0]}"
+        # Verify the gate triggered at the right time (after window is filled)
+        # The gate should trigger on the `acceptance_window`-th call (index = window - 1)
+        disable_indices = [
+            i for i, call in enumerate(gate_state["record_calls"])
+            if call["disabled_now"]
+        ]
+        assert len(disable_indices) == 1, \
+            f"Gate should have triggered exactly once, but triggered at indices: {disable_indices}"
+        assert disable_indices[0] >= acceptance_window - 1, \
+            f"Gate should trigger after window ({acceptance_window}) is filled, but triggered at index {disable_indices[0]}"
 
-    # Verify the average acceptance was below threshold when disabled
-    disable_call = gate_state["record_calls"][disable_indices[0]]
-    assert disable_call["avg_accept"] is not None
-    assert disable_call["avg_accept"] < acceptance_threshold, \
-        f"Avg acceptance ({disable_call['avg_accept']}) should be below threshold ({acceptance_threshold})"
+        # Verify the average acceptance was below threshold when disabled
+        disable_call = gate_state["record_calls"][disable_indices[0]]
+        assert disable_call["avg_accept"] is not None
+        assert disable_call["avg_accept"] < acceptance_threshold, \
+            f"Avg acceptance ({disable_call['avg_accept']}) should be below threshold ({acceptance_threshold})"
 
-    logger.debug(
-        f"Gate correctly triggered after {disable_indices[0] + 1} requests")
-    logger.debug(
-        f"Final avg acceptance: {disable_call['avg_accept']:.3f} < threshold {acceptance_threshold}"
-    )
-
-    llm_spec.shutdown()
+        logger.debug(
+            f"Gate correctly triggered after {disable_indices[0] + 1} requests")
+        logger.debug(
+            f"Final avg acceptance: {disable_call['avg_accept']:.3f} < threshold {acceptance_threshold}"
+        )
+    finally:
+        llm_spec.shutdown()
 
 
 def test_returns_none_until_window_and_enabled_when_above_threshold():
