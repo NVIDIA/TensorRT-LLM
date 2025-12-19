@@ -5,6 +5,7 @@ import openai
 import pytest
 import requests
 import yaml
+from utils.llm_data import llm_models_root
 
 from ..test_llm import get_model_path
 from .openai_server import RemoteMMEncoderServer
@@ -69,7 +70,8 @@ def async_client(server: RemoteMMEncoderServer):
 def test_multimodal_content_mm_encoder(client: openai.OpenAI, model_name: str):
 
     content_text = "Describe the natural environment in the image."
-    image_url = "https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/seashore.png"
+    image_url = str(llm_models_root() / "multimodals" / "test_data" /
+                    "seashore.png")
     messages = [{
         "role":
         "user",
