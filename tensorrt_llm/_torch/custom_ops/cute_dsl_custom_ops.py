@@ -371,7 +371,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         def __init__(self,
                      output_dtype: torch.dtype,
                      to_userbuffers: bool = False,
-                     use_tvm_ffi: bool = True):
+                     use_tvm_ffi: bool = False):
             super().__init__()
 
             if output_dtype != torch.bfloat16:
@@ -775,7 +775,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         alpha: torch.Tensor,
         output_dtype: torch.dtype,
         to_userbuffers: bool = False,
-        use_tvm_ffi: bool = True,
+        use_tvm_ffi: bool = False,
     ) -> torch.Tensor:
         """CuteDSL-based NVFP4 GEMM optimized for Blackwell.
 
@@ -825,7 +825,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         alpha: torch.Tensor,  # Match custom op signature
         output_dtype: torch.dtype,
         to_userbuffers: bool = False,
-        use_tvm_ffi: bool = True,
+        use_tvm_ffi: bool = False,
     ):
         # [m, k]
         shape = list(mat_a.shape)
@@ -1151,6 +1151,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     f"{self.__class__.kernel_class.__name__} supports SM 100 (B200) and SM 103 (B300) only, but got SM {sm_version}"
                 )
 
+            if self.tile_size not in [128, 256]:
+                raise ValueError(
+                    f"{self.__class__.kernel_class.__name__} supports tile size (mma tile M dimension) 128 and 256 only, but got {self.tile_size}"
+                )
+
         def unique_id(self):
             return (
                 self.num_experts,
@@ -1173,19 +1178,21 @@ if IS_CUTLASS_DSL_AVAILABLE:
             l, n = b.size(0), b.size(1)
 
             # TODO: Add full shmoo
-            mma_tiler_mn_candidates = [(128, 128), (128, 256)]
-            cluster_shape_mn_candidates = [(1, 1), (1, 2)]
+            mma_tiler_mn_candidates = [(self.tile_size, 128),
+                                       (self.tile_size, 256)]
+            cluster_shape_mn_candidates = [(self.tile_size // 128, 1),
+                                           (self.tile_size // 128, 2)]
+            raster_along_m_candidates = [True, False]
 
             valid_tactics = []
-            for mma_tiler_mn, cluster_shape_mn in itertools.product(
-                    mma_tiler_mn_candidates, cluster_shape_mn_candidates):
+            for mma_tiler_mn, cluster_shape_mn, raster_along_m in itertools.product(
+                    mma_tiler_mn_candidates, cluster_shape_mn_candidates,
+                    raster_along_m_candidates):
                 if self.__class__.kernel_class.can_implement(
                         ab_dtype=cutlass.Float4E2M1FN,
                         sf_dtype=cutlass.Float8E4M3FN,
                         sf_vec_size=self.scaling_vector_size,
-                        acc_dtype=cutlass.Float32,
                         out_dtype=cutlass.BFloat16,
-                        use_2cta_instrs=False,
                         mma_tiler_mn=mma_tiler_mn,
                         cluster_shape_mn=cluster_shape_mn,
                         m=m,
@@ -1194,10 +1201,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         l=l,
                         a_major="k",
                         b_major="k",
-                        c_major="n",
-                        m_aligned=self.tile_size,
+                        out_major="n",
                 ):
-                    valid_tactics.append((mma_tiler_mn, cluster_shape_mn))
+                    valid_tactics.append(
+                        (mma_tiler_mn, cluster_shape_mn, raster_along_m))
 
             return valid_tactics
 
@@ -1311,19 +1318,19 @@ if IS_CUTLASS_DSL_AVAILABLE:
             stream = cuda.CUstream(torch_stream.cuda_stream)
 
             if isinstance(tactic, tuple):
-                mma_tiler_mn, cluster_shape_mn = tactic
+                mma_tiler_mn, cluster_shape_mn, raster_along_m = tactic
             else:
-                mma_tiler_mn, cluster_shape_mn = (128, 128), (1, 1)
+                mma_tiler_mn, cluster_shape_mn, raster_along_m = (
+                    self.tile_size, 128), (self.tile_size // 128, 1), False
 
             cache_key = (self.scaling_vector_size, self.tile_size, mma_tiler_mn,
                          cluster_shape_mn)
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
                     sf_vec_size=self.scaling_vector_size,
-                    acc_dtype=cutlass.Float32,
-                    use_2cta_instrs=False,
                     mma_tiler_mn=mma_tiler_mn,
                     cluster_shape_mn=cluster_shape_mn,
+                    raster_along_m=raster_along_m,
                 )
                 # Compute max active clusters on current device
                 hardware_info = cutlass.utils.HardwareInfo()
