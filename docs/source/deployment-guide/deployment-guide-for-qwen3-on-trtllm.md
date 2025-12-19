@@ -66,7 +66,7 @@ append: EOF
 Below is an example command to launch the TensorRT LLM server with the Qwen3 model from within the container.
 
 ```shell
-trtllm-serve Qwen/Qwen3-30B-A3B --host 0.0.0.0 --port 8000 --extra_llm_api_options ${EXTRA_LLM_API_FILE}
+trtllm-serve Qwen/Qwen3-30B-A3B --host 0.0.0.0 --port 8000 --config ${EXTRA_LLM_API_FILE}
 ```
 
 After the server is set up, the client can now send prompt requests to the server and receive results.
@@ -75,7 +75,7 @@ After the server is set up, the client can now send prompt requests to the serve
 
 <!-- TODO: this section is duplicated across the deployment guides; they should be consolidated to a central file and imported as needed, or we can remove this and link to LLM API reference -->
 
-These options provide control over TensorRT LLM's behavior and are set within the YAML file passed to the `trtllm-serve` command via the `--extra_llm_api_options` argument.
+These options provide control over TensorRT LLM's behavior and are set within the YAML file passed to the `trtllm-serve` command via the `--config` argument.
 
 #### `tensor_parallel_size`
 
@@ -127,10 +127,10 @@ These options provide control over TensorRT LLM's behavior and are set within th
 * **Options**:
 
   * `backend`: The backend to use for MoE operations.
-    
+
     **Default**: `CUTLASS`
 
-See the [`TorchLlmArgs` class](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs) for the full list of options which can be used in the `extra_llm_api_options`.
+See the [`TorchLlmArgs` class](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs) for the full list of options which can be used in the YAML configuration file.
 
 ## Testing API Endpoint
 
@@ -247,7 +247,7 @@ If you want to save the results to a file add the following options.
 --result-filename "concurrency_${concurrency}.json"
 ```
 
-For more benchmarking options see [benchmark_serving.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/serve/scripts/benchmark_serving.py) 
+For more benchmarking options see [benchmark_serving.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/serve/scripts/benchmark_serving.py)
 
 Run `bench.sh` to begin a serving benchmark. This will take a long time if you run all the concurrencies mentioned in the above `bench.sh` script.
 

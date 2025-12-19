@@ -35,7 +35,7 @@ checkpoint_format: mistral
 mpirun -n 1 --allow-run-as-root --oversubscribe python3 -m tensorrt_llm.commands.serve serve \
     ${mistral_large_3_model_path} \
     --host localhost --port 8001 --backend pytorch \
-    --extra_llm_api_options serve.yml \
+    --config serve.yml \
     --tokenizer ${mistral_large_3_model_path} \
     2>&1 | tee serve_debug.log &
 

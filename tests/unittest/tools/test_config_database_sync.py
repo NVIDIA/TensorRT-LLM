@@ -13,23 +13,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
 import os
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-# Add scripts directory to path
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
-SCRIPTS_DIR = os.path.join(REPO_ROOT, "scripts")
-sys.path.insert(0, SCRIPTS_DIR)
+REPO_ROOT = Path(__file__).parent.parent.parent.parent.resolve()
 
-from generate_config_database_tests import (  # noqa: E402
-    PERF_SANITY_DIR,
-    TEST_LIST_PATH,
-    generate_tests,
+# Dynamically load generate_config_table module without modifying sys.path
+_spec = importlib.util.spec_from_file_location(
+    "generate_config_table", REPO_ROOT / "scripts" / "generate_config_table.py"
 )
-from generate_config_table import generate_rst  # noqa: E402
+_module = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_module)
+generate_rst = _module.generate_rst
+
+# Dynamically load generate_config_database_tests module without modifying sys.path
+_db_spec = importlib.util.spec_from_file_location(
+    "generate_config_database_tests",
+    REPO_ROOT / "scripts" / "generate_config_database_tests.py",
+)
+_db_module = importlib.util.module_from_spec(_db_spec)
+_db_spec.loader.exec_module(_db_module)
+generate_tests = _db_module.generate_tests
+TEST_LIST_PATH = _db_module.TEST_LIST_PATH
+PERF_SANITY_DIR = _db_module.PERF_SANITY_DIR
 
 
 class TestConfigDatabaseSync(unittest.TestCase):

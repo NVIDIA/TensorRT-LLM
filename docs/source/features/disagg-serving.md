@@ -1,4 +1,4 @@
-# Disaggregated Serving 
+# Disaggregated Serving
 
 - [Motivation](#Motivation)
 - [KV Cache Exchange](#KV-Cache-Exchange)
@@ -100,6 +100,12 @@ For more information on how to use Dynamo with TensorRT-LLM, please refer to [th
 
 The second approach to evaluate disaggregated LLM inference with TensorRT LLM involves launching a separate OpenAI-compatible server per context and generation instance using `trtllm-serve`. An additional server, referred to as the "disaggregated" server, is also launched with `trtllm-serve` and acts as an orchestrator which receives client requests and dispatches them to the appropriate context and generation servers via OpenAI REST API. Figure 6 below illustrates the disaggregated serving workflow when using this approach. When a context instance is done generating the KV blocks associated with the prompt, it returns a response to the disaggregated server. This response includes the prompt tokens, the first generated token and metadata associated with the context request and context instance. This metadata is referred to as context parameters (`ctx_params` in Figure 6). These parameters are then used by the generation instances to establish communication with the context instance and retrieve the KV cache blocks associated with the request.
 
+```{eval-rst}
+.. include:: ../_includes/note_sections.rst
+   :start-after: .. start-note-config-flag-alias
+   :end-before: .. end-note-config-flag-alias
+```
+
 <div align="center">
 <figure>
   <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog5_Picture3.png" width="800" height="auto">
@@ -126,19 +132,19 @@ For example, you could launch two context servers and one generation servers as 
 
 ```
 
-# Generate context_extra-llm-api-config.yml
+# Generate context_config.yml
 # Overlap scheduler for context servers are disabled because it's not supported for disaggregated context servers yet
-echo -e "disable_overlap_scheduler: True\ncache_transceiver_config:\n  backend: UCX\n  max_tokens_in_buffer: 2048" > context_extra-llm-api-config.yml
+echo -e "disable_overlap_scheduler: True\ncache_transceiver_config:\n  backend: UCX\n  max_tokens_in_buffer: 2048" > context_config.yml
 
 # Start Context servers
-CUDA_VISIBLE_DEVICES=0 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8001 --backend pytorch --extra_llm_api_options ./context_extra-llm-api-config.yml &> log_ctx_0 &
-CUDA_VISIBLE_DEVICES=1 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8002 --backend pytorch --extra_llm_api_options ./context_extra-llm-api-config.yml &> log_ctx_1 &
+CUDA_VISIBLE_DEVICES=0 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8001 --backend pytorch --config ./context_config.yml &> log_ctx_0 &
+CUDA_VISIBLE_DEVICES=1 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8002 --backend pytorch --config ./context_config.yml &> log_ctx_1 &
 
-# Generate gen_extra-llm-api-config.yml
-echo -e "cache_transceiver_config:\n  backend: UCX\n  max_tokens_in_buffer: 2048" > gen_extra-llm-api-config.yml
+# Generate gen_config.yml
+echo -e "cache_transceiver_config:\n  backend: UCX\n  max_tokens_in_buffer: 2048" > gen_config.yml
 
 # Start Generation servers
-CUDA_VISIBLE_DEVICES=2 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8003 --backend pytorch --extra_llm_api_options ./gen_extra-llm-api-config.yml &> log_gen_0 &
+CUDA_VISIBLE_DEVICES=2 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8003 --backend pytorch --config ./gen_config.yml &> log_gen_0 &
 ```
 Once the context and generation servers are launched, you can launch the disaggregated
 server, which will accept requests from clients and do the orchestration between context

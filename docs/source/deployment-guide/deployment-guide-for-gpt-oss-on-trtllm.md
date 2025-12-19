@@ -113,7 +113,7 @@ append: EOF
 Below is an example command to launch the TensorRT LLM server with the GPT-OSS model from within the container. The command is specifically configured for the 1024/1024 Input/Output Sequence Length test. The explanation of each flag is shown in the “LLM API Options (YAML Configuration)” section.
 
 ```shell
-trtllm-serve openai/gpt-oss-120b --host 0.0.0.0 --port 8000 --extra_llm_api_options ${EXTRA_LLM_API_FILE}
+trtllm-serve openai/gpt-oss-120b --host 0.0.0.0 --port 8000 --config ${EXTRA_LLM_API_FILE}
 ```
 
 After the server is set up, the client can now send prompt requests to the server and receive results.
@@ -122,7 +122,7 @@ After the server is set up, the client can now send prompt requests to the serve
 
 <!-- TODO: this section is duplicated across the deployment guides; they should be consolidated to a central file and imported as needed, or we can remove this and link to LLM API reference -->
 
-These options provide control over TensorRT LLM's behavior and are set within the YAML file passed to the `trtllm-serve` command via the `--extra_llm_api_options` argument.
+These options provide control over TensorRT LLM's behavior and are set within the YAML file passed to the `trtllm-serve` command via the `--config` argument.
 
 #### `tensor_parallel_size`
 
@@ -178,7 +178,7 @@ These options provide control over TensorRT LLM's behavior and are set within th
   * `backend`: The backend to use for MoE operations.
     **Default**: `CUTLASS`
 
-See the [`TorchLlmArgs` class](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs) for the full list of options which can be used in the `extra_llm_api_options`.
+See the [`TorchLlmArgs` class](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs) for the full list of options which can be used in the YAML configuration file.
 
 ## Testing API Endpoint
 
@@ -383,7 +383,7 @@ $$
 The following table lists recommended configurations from the comprehensive database for different performance profiles.
 
 ```{eval-rst}
-.. include:: note_sections.rst
+.. include:: ../_includes/note_sections.rst
    :start-after: .. start-note-traffic-patterns
    :end-before: .. end-note-traffic-patterns
 

@@ -589,7 +589,7 @@ def stress_test(config,
         str(test_server_config.max_num_tokens),
         "--kv_cache_free_gpu_memory_fraction",
         str(test_server_config.kv_cache_free_gpu_memory_fraction),
-        "--extra_llm_api_options",
+        "--config",
         extra_llm_options_path,
     ])
 

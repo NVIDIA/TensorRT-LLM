@@ -63,4 +63,4 @@ fi
 ${nsys_prefix} trtllm-llmapi-launch ${numa_bind_cmd} \
     trtllm-serve ${model_path} \
         --host $(hostname) --port ${port} \
-        --extra_llm_api_options ${config_file}
+        --config ${config_file}
