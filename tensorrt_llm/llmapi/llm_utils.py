@@ -638,6 +638,23 @@ class CachedModelLoader:
         else:
             return [task(*args, **kwargs)]
 
+    def _download_hf_model_if_needed(self,
+                                     model_obj: _ModelWrapper,
+                                     revision: Optional[str] = None) -> Path:
+        """Download a model from HF hub if needed.
+
+        Also updates the model_obj.model_dir with the local model dir on rank 0.
+        """
+        if model_obj.is_hub_model:
+            model_dirs = self._submit_to_all_workers(
+                CachedModelLoader._node_download_hf_model,
+                model=model_obj.model_name,
+                revision=revision)
+            model_dir = model_dirs[0]
+            model_obj.model_dir = model_dir
+            return model_dir
+        return model_obj.model_dir
+
     def __call__(self) -> Tuple[Path, Union[Path, None]]:
 
         if self.llm_args.model_format is _ModelFormatKind.TLLM_ENGINE:
@@ -648,14 +665,9 @@ class CachedModelLoader:
         self.model_loader = ModelLoader(self.llm_args)
 
         # Download speculative model from HuggingFace if needed
-        if (self.model_loader.speculative_model_obj is not None
-                and self.model_loader.speculative_model_obj.is_hub_model):
-            spec_model_dirs = self._submit_to_all_workers(
-                CachedModelLoader._node_download_hf_model,
-                model=self.model_loader.speculative_model_obj.model_name,
-                revision=None)
-            spec_model_dir = spec_model_dirs[0]
-            self.model_loader.speculative_model_obj.model_dir = spec_model_dir
+        if self.model_loader.speculative_model_obj is not None:
+            spec_model_dir = self._download_hf_model_if_needed(
+                self.model_loader.speculative_model_obj)
             # Update llm_args so PyTorch/AutoDeploy executor gets the local path
             if self.llm_args.speculative_config is not None:
                 self.llm_args.speculative_config.speculative_model = spec_model_dir
@@ -668,14 +680,8 @@ class CachedModelLoader:
                 raise ValueError(
                     f'backend {self.llm_args.backend} is not supported.')
 
-            if self.model_loader.model_obj.is_hub_model:
-                hf_model_dirs = self._submit_to_all_workers(
-                    CachedModelLoader._node_download_hf_model,
-                    model=self.model_loader.model_obj.model_name,
-                    revision=self.llm_args.revision)
-                self._hf_model_dir = hf_model_dirs[0]
-            else:
-                self._hf_model_dir = self.model_loader.model_obj.model_dir
+            self._hf_model_dir = self._download_hf_model_if_needed(
+                self.model_loader.model_obj, revision=self.llm_args.revision)
 
             if self.llm_args.quant_config.quant_algo is not None:
                 logger.warning(
