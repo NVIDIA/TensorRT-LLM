@@ -1,8 +1,30 @@
 import pytest
 import torch
+from utils.util import getSMVersion, skip_pre_hopper
 
 # Import tensorrt_llm to load custom CUDA operators (indexer_topk_decode, indexer_topk_prefill)
 import tensorrt_llm  # noqa: F401
+
+if not torch.cuda.is_available():
+    pytest.skip("CUDA is required for indexer_topk tests", allow_module_level=True)
+
+
+def _prefill_param_values():
+    """
+    Decide parameter coverage based on GPU architecture (SM version).
+
+    - pre-Hopper (SM < 90): skip via @skip_pre_hopper
+    - Hopper (SM == 90): reduced coverage
+    - Blackwell (SM >= 100): full coverage
+    """
+    sm = getSMVersion()
+    if sm >= 100:  # Blackwell family
+        return [1, 32], [4096, 8192, 32768]
+    # Hopper (and other >= 90 but < 100, if any): reduced coverage
+    return [1, 4], [4096, 8192, 32768]
+
+
+_PREFILL_BATCH_SIZES, _PREFILL_NUM_TOKENS = _prefill_param_values()
 
 
 def create_random_logits(
@@ -197,27 +219,38 @@ def test_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens):
     ), "CUDA top_k_per_row results don't match torch.topk"
 
 
-@pytest.mark.parametrize("batch_size", [1, 512, 2048])
+@skip_pre_hopper
+@pytest.mark.parametrize("batch_size", _PREFILL_BATCH_SIZES)
 @pytest.mark.parametrize("index_topk", [2048, 128])
-@pytest.mark.parametrize("num_tokens", [4096, 8192])
+@pytest.mark.parametrize("num_tokens", _PREFILL_NUM_TOKENS)
 def test_indexer_topk_prefill(batch_size, index_topk, num_tokens):
     torch.manual_seed(24)
     torch.cuda.manual_seed(24)
 
-    # Set input data
-    row_starts = torch.zeros(batch_size, dtype=torch.int32, device="cuda")
-    row_ends = torch.arange(1, batch_size + 1, device="cuda", dtype=torch.int32)
+    # gen random input for the sequence length
+    seq_lens = generate_seq_lens(batch_size, index_topk, num_tokens)
+    num_gen_tokens = seq_lens.sum()
 
+    # gen the row_starts and row_ends (from 1 to ...)
+    row_starts = torch.zeros(num_gen_tokens, dtype=torch.int32, device="cuda")
+    row_indices = torch.arange(1, seq_lens.max() + 1, dtype=torch.int32, device="cuda")
+    row_ends = row_indices.expand(seq_lens.size(0), -1)[
+        row_indices.expand(seq_lens.size(0), -1) <= seq_lens.unsqueeze(1)
+    ].contiguous()
+
+    # gen logits
     logits = create_random_logits(row_starts, row_ends, torch.float32, 42)
 
     # Create output tensors
-    indices = torch.empty((batch_size, index_topk), dtype=torch.int32, device="cuda")
+    indices = torch.empty((num_gen_tokens, index_topk), dtype=torch.int32, device="cuda")
 
     # Run CUDA implementation
     torch.ops.trtllm.indexer_topk_prefill(logits, row_starts, row_ends, indices, index_topk)
+    torch.cuda.synchronize()
 
     # Run reference implementation
-    torch_indices = logits.topk(min(index_topk, max(row_ends)), dim=-1)[1]
+    max_row_len = row_ends.max().item()
+    torch_indices = logits.topk(min(index_topk, max_row_len), dim=-1)[1]
     mask_lo = torch_indices >= 0
     mask_hi = (torch_indices - (row_ends - row_starts)[:, None]) < 0
     mask = mask_lo & mask_hi

@@ -25,7 +25,7 @@ This section provides the steps to launch TensorRT LLM server and run performanc
 
 #### 1. Prepare TensorRT LLM extra configs
 ```bash
-cat >./extra-llm-api-config.yml <<EOF
+cat >./config.yml <<EOF
 enable_attention_dp: true
 stream_interval: 10
 cuda_graph_config:
@@ -50,7 +50,7 @@ trtllm-serve nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8 \
     --ep_size 8 \
     --num_postprocess_workers 2 \
     --trust_remote_code \
-    --extra_llm_api_options ./extra-llm-api-config.yml
+    --config ./config.yml
 ```
 
 
@@ -75,7 +75,7 @@ python -m tensorrt_llm.serve.scripts.benchmark_serving \
 
 #### 1. Prepare TensorRT LLM extra configs
 ```bash
-cat >./extra-llm-api-config.yml <<EOF
+cat >./config.yml <<EOF
 enable_attention_dp: false
 enable_min_latency: true
 stream_interval: 10
@@ -101,7 +101,7 @@ trtllm-serve nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8 \
     --tp_size 8 \
     --ep_size 1 \
     --trust_remote_code \
-    --extra_llm_api_options ./extra-llm-api-config.yml
+    --config ./config.yml
 ```
 
 
@@ -125,7 +125,7 @@ python -m tensorrt_llm.serve.scripts.benchmark_serving \
 
 #### 1. Prepare TensorRT LLM extra configs
 ```bash
-cat >./extra-llm-api-config.yml <<EOF
+cat >./config.yml <<EOF
 stream_interval: 10
 cuda_graph_config:
   max_batch_size: 1024
@@ -147,7 +147,7 @@ trtllm-serve nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8 \
     --ep_size 2 \
     --num_postprocess_workers 2 \
     --trust_remote_code \
-    --extra_llm_api_options ./extra-llm-api-config.yml
+    --config ./config.yml
 ```
 
 

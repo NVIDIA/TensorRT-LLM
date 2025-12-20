@@ -688,7 +688,7 @@ To run the benchmark, we suggest using the `trtllm-bench` tool. Please refer to 
 #!/bin/bash
 
 folder_model=Model-Optimizer/examples/llm_ptq/saved_models_Qwen3-235B-A22B_nvfp4_hf/
-path_config=extra-llm-api-config.yml
+path_config=config.yml
 num_gpus=8
 ep_size=8
 max_input_len=1024
@@ -717,7 +717,7 @@ trtllm-bench --model ${folder_model} --model_path ${folder_model} throughput \
   --tp ${num_gpus}\
   --ep ${ep_size} \
   --kv_cache_free_gpu_mem_fraction ${kv_cache_free_gpu_mem_fraction} \
-  --extra_llm_api_options ${path_config} \
+  --config ${path_config} \
   --concurrency ${concurrency} \
   --num_requests $(( concurrency * 5 )) \
   --warmup 0 \
@@ -756,7 +756,7 @@ EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/curated/qwen3.yaml
 To serve the model using `trtllm-serve`:
 
 ```bash
-trtllm-serve Qwen3-30B-A3B/ --port 8000 --extra_llm_api_options ${EXTRA_LLM_API_FILE}
+trtllm-serve Qwen3-30B-A3B/ --port 8000 --config ${EXTRA_LLM_API_FILE}
 ```
 
 To query the server, you can start with a `curl` command:
@@ -781,7 +781,7 @@ export TRTLLM_USE_UCX_KVCACHE=1
 export TRTLLM_DIR=/app/tensorrt_llm
 export EXTRA_LLM_API_FILE="${TRTLLM_DIR}/examples/configs/curated/qwen3-disagg-prefill.yaml"
 
-trtllm-serve Qwen3-30B-A3B/ --port 8001 --extra_llm_api_options ${EXTRA_LLM_API_FILE} &> output_ctx &
+trtllm-serve Qwen3-30B-A3B/ --port 8001 --config ${EXTRA_LLM_API_FILE} &> output_ctx &
 ```
 
 And you can launch two generation servers on port 8002 and 8003 with:
@@ -792,7 +792,7 @@ export TRTLLM_DIR=/app/tensorrt_llm
 export EXTRA_LLM_API_FILE="${TRTLLM_DIR}/examples/configs/curated/qwen3.yaml"
 
 for port in {8002..8003}; do \
-trtllm-serve Qwen3-30B-A3B/ --port ${port} --extra_llm_api_options ${EXTRA_LLM_API_FILE} &> output_gen_${port} & \
+trtllm-serve Qwen3-30B-A3B/ --port ${port} --config ${EXTRA_LLM_API_FILE} &> output_gen_${port} & \
 done
 ```
 
@@ -849,7 +849,7 @@ Currently, there are some limitations when enabling Eagle3:
 1. `attention_dp` is not supported. Please disable it or do not set the related flag (it is disabled by default).
 2. If you want to use `enable_block_reuse`, the kv cache type of the target model and the draft model must be the same. Since the draft model only supports fp16/bf16, you need to disable `enable_block_reuse` when using fp8 kv cache.
 
-Example `extra-llm-api-config.yml` snippet for Eagle3:
+Example `config.yml` snippet for Eagle3:
 
 ```bash
 echo "

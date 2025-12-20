@@ -56,7 +56,7 @@ tensorrt_llm/scripts
 docs/source/**/*.rst
 !docs/source/examples/index.rst
 !docs/source/deployment-guide/config_table.rst
-!docs/source/deployment-guide/note_sections.rst
+!docs/source/_includes/note_sections.rst
 *.swp
 
 # Testing
