@@ -6,7 +6,6 @@ cuda_graph_config:
 enable_attention_dp: false
 kv_cache_config:
   dtype: auto
-  enable_block_reuse: false
   free_gpu_memory_fraction: 0.85
 moe_config:
   backend: TRITON

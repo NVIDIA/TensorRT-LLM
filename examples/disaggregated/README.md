@@ -23,10 +23,10 @@ cache_transceiver_config:
   kv_transfer_sender_future_timeout_ms: <int>
 ```
 
-The following is an example, consisting of the `ctx_extra-llm-api-config.yaml` and `gen_extra-llm-api-config.yaml` files needed in the sections below.
+The following is an example, consisting of the `ctx_config.yaml` and `gen_config.yaml` files needed in the sections below.
 
 ```yaml
-# ctx_extra-llm-api-config.yaml
+# ctx_config.yaml
 
 # The overlap scheduler for context servers is currently disabled, as it is
 # not yet supported in disaggregated context server architectures.
@@ -37,7 +37,7 @@ cache_transceiver_config:
 ```
 
 ```yaml
-# gen_extra-llm-api-config.yaml
+# gen_config.yaml
 
 cache_transceiver_config:
   backend: UCX
@@ -54,16 +54,16 @@ Suppose we have three CUDA devices on the same machine. The first two devices ar
 # Start context servers
 CUDA_VISIBLE_DEVICES=0 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
     --host localhost --port 8001 \
-    --extra_llm_api_options ./ctx_extra-llm-api-config.yaml &> log_ctx_0 &
+    --config ./ctx_config.yaml &> log_ctx_0 &
 
 CUDA_VISIBLE_DEVICES=1 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
     --host localhost --port 8002 \
-    --extra_llm_api_options ./ctx_extra-llm-api-config.yaml &> log_ctx_1 &
+    --config ./ctx_config.yaml &> log_ctx_1 &
 
 # Start generation server
 CUDA_VISIBLE_DEVICES=2 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
     --host localhost --port 8003 \
-    --extra_llm_api_options ./gen_extra-llm-api-config.yaml &> log_gen_0 &
+    --config ./gen_config.yaml &> log_gen_0 &
 ```
 
 Once the context and generation servers are launched, you can launch the disaggregated
@@ -131,16 +131,16 @@ After starting the node and entering interactive mode, you can run the following
 # Start context servers
 CUDA_VISIBLE_DEVICES=0 trtllm-llmapi-launch trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
     --host localhost --port 8001 \
-    --extra_llm_api_options ./ctx_extra-llm-api-config.yaml &> log_ctx_0 &
+    --config ./ctx_config.yaml &> log_ctx_0 &
 
 CUDA_VISIBLE_DEVICES=1 trtllm-llmapi-launch trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
     --host localhost --port 8002 \
-    --extra_llm_api_options ./ctx_extra-llm-api-config.yaml &> log_ctx_1 &
+    --config ./ctx_config.yaml &> log_ctx_1 &
 
 # Start generation server
 CUDA_VISIBLE_DEVICES=2 trtllm-llmapi-launch trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
     --host localhost --port 8003 \
-    --extra_llm_api_options ./gen_extra-llm-api-config.yaml &> log_gen_0 &
+    --config ./gen_config.yaml &> log_gen_0 &
 
 # Start proxy
 trtllm-llmapi-launch trtllm-serve disaggregated -c disagg_config.yaml
@@ -182,7 +182,7 @@ srun -A <account> -p <partition> -t <time> \
     --container-image=<container_image> \
     --container-mounts=<mount_paths> \
     --mpi=pmix \
-    bash -c "trtllm-llmapi-launch trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --tp_size 8 --host 0.0.0.0 --port $PORT --extra_llm_api_options $WORK/ctx_extra-llm-api-config.yaml"
+    bash -c "trtllm-llmapi-launch trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --tp_size 8 --host 0.0.0.0 --port $PORT --config $WORK/ctx_config.yaml"
 
 # Launch a generation with `tp_size=4` using one 4-GPU node.
 srun -A <account> -p <partition> -t <time> \
@@ -190,7 +190,7 @@ srun -A <account> -p <partition> -t <time> \
     --container-image=<container_image> \
     --container-mounts=<mount_paths> \
     --mpi=pmix \
-    bash -c "trtllm-llmapi-launch trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --tp_size 4 --host 0.0.0.0 --port $PORT --extra_llm_api_options $WORK/gen_extra-llm-api-config.yaml"
+    bash -c "trtllm-llmapi-launch trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --tp_size 4 --host 0.0.0.0 --port $PORT --config $WORK/gen_config.yaml"
 
 # Launch a proxy.
 # The above-mentioned value needs to be replaced with the IP address of the host machine accessible to external
@@ -241,20 +241,20 @@ Verify both checkpoints have the same KV cache dtype by checking `hf_quant_confi
 CUDA_VISIBLE_DEVICES=0 trtllm-serve meta-llama/Llama-3.1-8B-Instruct \
     --host localhost --port 8001 \
     --server_role CONTEXT \
-    --extra_llm_api_options ./ctx_extra-llm-api-config.yaml \
+    --config ./ctx_config.yaml \
     --metadata_server_config_file ./metadata_config.yaml &> log_ctx_0 &
 
 CUDA_VISIBLE_DEVICES=1 trtllm-serve meta-llama/Llama-3.1-8B-Instruct \
     --host localhost --port 8002 \
     --server_role CONTEXT \
-    --extra_llm_api_options ./ctx_extra-llm-api-config.yaml \
+    --config ./ctx_config.yaml \
     --metadata_server_config_file ./metadata_config.yaml &> log_ctx_1 &
 
 # Start generation server with FP8 quantized checkpoint
 CUDA_VISIBLE_DEVICES=2 trtllm-serve ./weights/Llama-3.1-8B-Instruct-FP8-KV-BF16 \
     --host localhost --port 8003 \
     --server_role GENERATION \
-    --extra_llm_api_options ./gen_extra-llm-api-config.yaml \
+    --config ./gen_config.yaml \
     --metadata_server_config_file ./metadata_config.yaml &> log_gen_0 &
 
 # Start disaggregated server
@@ -308,11 +308,11 @@ After this, you can enable the dynamic scaling feature for the use case above as
 
 ```bash
 # Context servers
-CUDA_VISIBLE_DEVICES=0 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8001  --server_role CONTEXT --extra_llm_api_options ./ctx_extra-llm-api-config.yaml --metadata_server_config_file ./metadata_config.yaml &> log_ctx_0 &
-CUDA_VISIBLE_DEVICES=1 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8002  --server_role CONTEXT --extra_llm_api_options ./ctx_extra-llm-api-config.yaml --metadata_server_config_file ./metadata_config.yaml &> log_ctx_1 &
+CUDA_VISIBLE_DEVICES=0 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8001  --server_role CONTEXT --config ./ctx_config.yaml --metadata_server_config_file ./metadata_config.yaml &> log_ctx_0 &
+CUDA_VISIBLE_DEVICES=1 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8002  --server_role CONTEXT --config ./ctx_config.yaml --metadata_server_config_file ./metadata_config.yaml &> log_ctx_1 &
 
 # Generation servers
-CUDA_VISIBLE_DEVICES=2 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8003  --server_role GENERATION --extra_llm_api_options ./gen_extra-llm-api-config.yaml --metadata_server_config_file ./metadata_config.yaml &> log_gen_0 &
+CUDA_VISIBLE_DEVICES=2 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8003  --server_role GENERATION --config ./gen_config.yaml --metadata_server_config_file ./metadata_config.yaml &> log_gen_0 &
 ```
 
 As for the disaggregated server, you should also specify the --metadata_server_config_file like the following
@@ -339,7 +339,7 @@ Users can add servers by directly launching them with trtllm-serve. For example,
 CUDA_VISIBLE_DEVICES=3 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
     --host localhost --port 8004 \
      --server_role GENERATION \
-    --extra_llm_api_options ./gen_extra-llm-api-config.yaml \
+    --config ./gen_config.yaml \
     --metadata_server_config_file ./metadata_config.yaml &> log_gen_0 &
 ```
 TensorRT LLM will automatically register any newly launched server with the ETCD server, allowing the router to send new requests to the added server.
