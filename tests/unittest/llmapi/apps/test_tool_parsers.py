@@ -25,8 +25,7 @@ from tensorrt_llm.serve.tool_parser.base_tool_parser import BaseToolParser
 from tensorrt_llm.serve.tool_parser.core_types import StructureInfo
 from tensorrt_llm.serve.tool_parser.deepseekv3_parser import DeepSeekV3Parser
 from tensorrt_llm.serve.tool_parser.deepseekv31_parser import DeepSeekV31Parser
-from tensorrt_llm.serve.tool_parser.deepseek_v32_tool_parser import \
-    DeepSeekV32ToolParser
+from tensorrt_llm.serve.tool_parser.deepseekv32_parser import DeepSeekV32Parser
 from tensorrt_llm.serve.tool_parser.kimi_k2_tool_parser import KimiK2ToolParser
 from tensorrt_llm.serve.tool_parser.qwen3_coder_parser import \
     Qwen3CoderToolParser
@@ -1174,15 +1173,15 @@ class TestDeepSeekV31Parser(BaseToolParserTestClass):
 
 
 # ============================================================================
-# DeepSeekV32ToolParser Tests
+# DeepSeekV32Parser Tests
 # ============================================================================
 
 
-class TestDeepSeekV32ToolParser(BaseToolParserTestClass):
-    """Test suite for DeepSeekV32ToolParser class."""
+class TestDeepSeekV32Parser(BaseToolParserTestClass):
+    """Test suite for DeepSeekV32Parser class."""
 
     def make_parser(self):
-        return DeepSeekV32ToolParser()
+        return DeepSeekV32Parser()
 
     def make_tool_parser_test_cases(self):
         return ToolParserTestCases(
@@ -1231,7 +1230,7 @@ class TestDeepSeekV32ToolParser(BaseToolParserTestClass):
         )
 
     def test_initialization(self, parser):
-        """Test that DeepSeekV32ToolParser initializes correctly."""
+        """Test that DeepSeekV32Parser initializes correctly."""
         assert parser.bot_token == "<｜DSML｜function_calls>"
         assert parser.eot_token == "</｜DSML｜function_calls>"
         assert parser.invoke_end_token == "</｜DSML｜invoke>"
@@ -1282,8 +1281,8 @@ class TestDeepSeekV32ToolParser(BaseToolParserTestClass):
         assert result.calls[1].tool_index == 1
 
     def test_structure_info_function(self):
-        """Test that DeepSeekV32ToolParser structure_info returns correct lambda function."""
-        parser = DeepSeekV32ToolParser()
+        """Test that DeepSeekV32Parser structure_info returns correct lambda function."""
+        parser = DeepSeekV32Parser()
         func = parser.structure_info()
 
         info = func("get_weather")
@@ -1293,8 +1292,8 @@ class TestDeepSeekV32ToolParser(BaseToolParserTestClass):
         assert info.trigger == "<｜DSML｜invoke name=\"get_weather\">"
 
     def test_structure_info_different_names(self):
-        """Test that DeepSeekV32ToolParser structure_info returns correct lambda function."""
-        parser = DeepSeekV32ToolParser()
+        """Test that DeepSeekV32Parser structure_info returns correct lambda function."""
+        parser = DeepSeekV32Parser()
         func = parser.structure_info()
 
         info1 = func("get_weather")
@@ -1305,7 +1304,7 @@ class TestDeepSeekV32ToolParser(BaseToolParserTestClass):
         assert info1.end == info2.end == "</｜DSML｜invoke>"
 
     def test_deepseek_v32_format_compliance(self, sample_tools, parser):
-        """Test that DeepSeekV32ToolParser follows the documented format structure."""
+        """Test that DeepSeekV32Parser follows the documented format structure."""
 
         # Test the exact format from the docstring
         text = "<｜DSML｜function_calls> <｜DSML｜invoke name=\"get_weather\"> <｜DSML｜parameter name=\"location\" string=\"true\">NYC</｜DSML｜parameter> </｜DSML｜invoke> </｜DSML｜function_calls>"

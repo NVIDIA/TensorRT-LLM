@@ -10,9 +10,8 @@ from .base_tool_parser import BaseToolParser
 from .core_types import StreamingParseResult, StructureInfo, ToolCallItem, _GetInfoFunc
 
 
-class DeepSeekV32ToolParser(BaseToolParser):
-    """
-    Tool parser for DeepSeek V3.2 model function call format.
+class DeepSeekV32Parser(BaseToolParser):
+    """Tool parser for DeepSeek V3.2 model function call format.
 
     The DeepSeek V3.2 format uses XML-like DSML tags to delimit function calls.
     Supports two parameter formats:
@@ -68,7 +67,9 @@ class DeepSeekV32ToolParser(BaseToolParser):
         self.eot_token = "</｜DSML｜function_calls>"
         self.invoke_begin_regex = r'<｜DSML｜invoke\s+name="([^"]+)"\s*>'
         self.invoke_end_token = "</｜DSML｜invoke>"
-        self.parameter_regex = r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="([^"]+)"\s*>(.*?)</｜DSML｜parameter>'
+        self.parameter_regex = (
+            r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="([^"]+)"\s*>(.*?)</｜DSML｜parameter>'
+        )
         self._last_arguments = ""
         self.current_tool_id = -1
 
@@ -77,8 +78,7 @@ class DeepSeekV32ToolParser(BaseToolParser):
         return self.bot_token in text
 
     def _parse_parameters_from_xml(self, invoke_content: str) -> dict:
-        """
-        Parse parameters from either XML-like format or JSON format to dict.
+        """Parse parameters from either XML-like format or JSON format to dict.
 
         Supports two formats:
         1. XML parameter tags: <｜DSML｜parameter name="..." string="...">value</｜DSML｜parameter>
@@ -87,9 +87,7 @@ class DeepSeekV32ToolParser(BaseToolParser):
         # First, try to parse as direct JSON (new format)
         invoke_content_stripped = invoke_content.strip()
 
-        if invoke_content_stripped.startswith("{") and invoke_content_stripped.endswith(
-            "}"
-        ):
+        if invoke_content_stripped.startswith("{") and invoke_content_stripped.endswith("}"):
             try:
                 parameters = json.loads(invoke_content_stripped)
                 if isinstance(parameters, dict):
@@ -114,8 +112,7 @@ class DeepSeekV32ToolParser(BaseToolParser):
         return parameters
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
-        """
-        One-time parsing: Detects and parses tool calls in the provided text.
+        """One-time parsing: Detects and parses tool calls in the provided text.
 
         :param text: The complete text to parse.
         :param tools: List of available tools.
@@ -140,12 +137,8 @@ class DeepSeekV32ToolParser(BaseToolParser):
             function_calls_content = function_calls_match.group(1)
 
             # Find all invoke blocks
-            invoke_pattern = (
-                r'<｜DSML｜invoke\s+name="([^"]+)"\s*>(.*?)</｜DSML｜invoke>'
-            )
-            invoke_matches = re.findall(
-                invoke_pattern, function_calls_content, re.DOTALL
-            )
+            invoke_pattern = r'<｜DSML｜invoke\s+name="([^"]+)"\s*>(.*?)</｜DSML｜invoke>'
+            invoke_matches = re.findall(invoke_pattern, function_calls_content, re.DOTALL)
 
             for func_name, invoke_content in invoke_matches:
                 # Parse parameters from XML format
@@ -160,11 +153,8 @@ class DeepSeekV32ToolParser(BaseToolParser):
             # return the normal text if parsing fails
             return StreamingParseResult(normal_text=text)
 
-    def parse_streaming_increment(
-        self, new_text: str, tools: List[Tool]
-    ) -> StreamingParseResult:
-        """
-        Streaming incremental parsing tool calls for DeepSeekV32 format.
+    def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
+        """Streaming incremental parsing tool calls for DeepSeekV32 format.
         Supports multiple consecutive invoke blocks.
         """
         self._buffer += new_text
@@ -173,9 +163,7 @@ class DeepSeekV32ToolParser(BaseToolParser):
         # Check if we have a tool call or any DSML-related content
         # Key insight: DSML tags contain distinctive markers like "｜DSML｜"
         # If we see these markers anywhere, we should keep buffering
-        has_tool_call = (
-            self.bot_token in current_text or "<｜DSML｜invoke" in current_text
-        )
+        has_tool_call = self.bot_token in current_text or "<｜DSML｜invoke" in current_text
 
         # Check if buffer contains any DSML markers or ends with potential tag prefix
         # This handles partial/streaming DSML content
@@ -184,9 +172,7 @@ class DeepSeekV32ToolParser(BaseToolParser):
 
         # Also check if text ends with start of a tag (to handle "<" arriving separately)
         dsml_prefixes = ["<", "<｜", "</", "</｜"]
-        ends_with_prefix = any(
-            current_text.rstrip().endswith(prefix) for prefix in dsml_prefixes
-        )
+        ends_with_prefix = any(current_text.rstrip().endswith(prefix) for prefix in dsml_prefixes)
 
         if not has_tool_call and not potentially_dsml and not ends_with_prefix:
             self._buffer = ""
@@ -269,9 +255,7 @@ class DeepSeekV32ToolParser(BaseToolParser):
                         "name": func_name,
                         "arguments": current_params,
                     }
-                    self.streamed_args_for_tool[self.current_tool_id] = (
-                        current_args_json
-                    )
+                    self.streamed_args_for_tool[self.current_tool_id] = current_args_json
 
                     # Remove the completed tool call from buffer
                     self._buffer = current_text[invoke_match.end() :]
