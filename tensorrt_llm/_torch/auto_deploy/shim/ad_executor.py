@@ -61,7 +61,6 @@ from ...pyexecutor.scheduler import (
     SimpleScheduler,
 )
 from ..custom_ops.attention_interface import SequenceInfo
-from ..custom_ops.vlm_mask_registry import VlmMaskGeneratorRegistry
 from ..distributed import common as dist
 from ..llm_args import LlmArgs
 from ..transform.optimizer import InferenceOptimizer
@@ -695,77 +694,20 @@ class ADEngine(ModelEngine):
 
     def _prepare_vlm_kwargs(self, kwargs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Prepare kwargs for calling the exported inference model in VLM scenarios.
-        Goals:
-        - Generate FlashInfer-compatible VLM custom masks outside the exported HF GraphModule.
-        - Strip VLM-only kwargs (e.g., token_type_ids) before calling the exported GraphModule to
-          avoid torch.export strict in_spec mismatches.
+
+        VLM custom mask generation now happens inside the exported GraphModule using token_type_ids.
+        This function ensures token_type_ids is properly set (defaulting to all-text if not present).
         """
-        # Only provide VLM custom mask kwargs if the optimized model actually expects them.
-        # For torch.export GraphModules, passing unexpected kwargs can fail strict in_spec checks.
+        # For VLM models, ensure token_type_ids is present (default to all-text tokens if missing)
         if getattr(self, "_expects_vlm_custom_masks", False):
-            # The optimized graph expects custom mask tensors. Always generate and supply them.
-            # (Even if there are no image tokens, the generated masks reduce to causal/sliding masks.)
-            # NOTE:
-            # - token_type_ids/mm_token_type_ids may be absent for text-only prompts; default to all-text.
-            # - seq_len is always maintained by SequenceInfo but may be omitted from `named_args`
-            #   before cached attention is activated. Pull it from the underlying interface if needed.
             position_ids = kwargs.get("position_ids", None)
-            if position_ids is None:
-                raise RuntimeError(
-                    "Graph expects VLM custom masks (custom_mask_full/custom_mask_sliding) but "
-                    "position_ids is missing from kwargs."
-                )
-
-            token_type_ids = kwargs.get("token_type_ids", None)
-            if token_type_ids is None:
-                token_type_ids = kwargs.get("mm_token_type_ids", None)
-            if token_type_ids is None:
-                # Default: no image tokens present (all text tokens).
-                token_type_ids = torch.zeros_like(position_ids, dtype=torch.long)
-
-            # Get seq_len from SequenceInfo (FlashInfer-only path).
-            seq_info = getattr(getattr(self, "cache_seq_interface", None), "info", None)
-            if seq_info is None:
-                raise RuntimeError(
-                    "Graph expects VLM custom masks (custom_mask_full/custom_mask_sliding) but "
-                    "SequenceInfo is unavailable; cannot read seq_len."
-                )
-            seq_len = torch.tensor(seq_info.seq_len, dtype=torch.int, device=position_ids.device)
-
-            # Look up the mask generator for this model type from the registry.
-            model_type = getattr(self, "_vlm_model_type", None)
-            mask_generator = VlmMaskGeneratorRegistry.get(model_type)
-
-            if mask_generator is not None:
-                # Flatten token types to align with the flattened token stream used by cached attention.
-                total_tokens = position_ids.numel()
-                token_type_ids_flat = token_type_ids.reshape(-1)[:total_tokens]
-                image_token_mask = token_type_ids_flat == 1
-
-                # Match FlashInfer metadata conventions: sanitize seq_len like the metadata op does.
-                seq_len_sanitized = SequenceInfo._get_sanitized_seq_len(position_ids, seq_len)
-                qo_indptr = torch.zeros(
-                    len(seq_len_sanitized) + 1,
-                    dtype=torch.int,
-                    device=seq_len_sanitized.device,
-                )
-                qo_indptr[1:] = torch.cumsum(seq_len_sanitized, 0)
-
-                # Sliding window is model-dependent; default to 0 (i.e., no extra constraint).
-                sliding_window = int(getattr(self, "_vlm_sliding_window", 0) or 0)
-
-                custom_mask_full, custom_mask_sliding = mask_generator(
-                    image_token_mask,
-                    qo_indptr,
-                    seq_len_sanitized,
-                    sliding_window,
-                )
-                kwargs["custom_mask_full"] = custom_mask_full
-                kwargs["custom_mask_sliding"] = custom_mask_sliding
-
-        # Strip kwargs that we intentionally keep outside the exported HF GraphModule.
-        kwargs.pop("token_type_ids", None)
-        kwargs.pop("mm_token_type_ids", None)
+            if position_ids is not None:
+                token_type_ids = kwargs.get("token_type_ids", None)
+                if token_type_ids is None:
+                    token_type_ids = kwargs.get("mm_token_type_ids", None)
+                if token_type_ids is None:
+                    # Default: no image tokens present (all text tokens).
+                    kwargs["token_type_ids"] = torch.zeros_like(position_ids, dtype=torch.long)
 
         return kwargs
 
@@ -803,14 +745,14 @@ class ADEngine(ModelEngine):
 
 def _configure_vlm_mask_settings(engine: ADEngine, ad_config: LlmArgs) -> None:
     """Configure VLM custom mask settings on the engine.
-    This is used to:
-    - enable/disable external VLM custom mask generation based on (graph input contract, backend)
-    - best-effort extract VLM mask parameters (e.g., sliding_window) from HF config when needed
+
+    This detects if the model is a VLM that expects token_type_ids for mask generation.
+    Mask generation now happens inside the exported GraphModule rather than externally.
     """
     engine._ad_config = ad_config  # so _prepare_inputs() constraint checks actually run
 
-    def _model_expects_custom_masks(mod: torch.nn.Module) -> bool:
-        """Return True if any nested GraphModule takes custom mask placeholders as inputs."""
+    def _model_expects_token_type_ids(mod: torch.nn.Module) -> bool:
+        """Return True if any nested GraphModule takes token_type_ids as an input."""
         try:
             import torch.fx  # local import to keep module import surface small
 
@@ -822,10 +764,7 @@ def _configure_vlm_mask_settings(engine: ADEngine, ad_config: LlmArgs) -> None:
                             for n in m.graph.nodes
                             if n.op == "placeholder" and isinstance(n.target, str)
                         }
-                        if (
-                            "custom_mask_full" in placeholders
-                            and "custom_mask_sliding" in placeholders
-                        ):
+                        if "token_type_ids" in placeholders or "mm_token_type_ids" in placeholders:
                             return True
                     except Exception:
                         continue
@@ -833,46 +772,11 @@ def _configure_vlm_mask_settings(engine: ADEngine, ad_config: LlmArgs) -> None:
             pass
         return False
 
-    # Only pass VLM mask kwargs if:
-    # - runtime backend is FlashInfer, AND
-    # - the optimized model graph actually expects these extra inputs
+    # Detect if the model is a VLM that expects token_type_ids for internal mask generation
+    # This is relevant for FlashInfer backend with VLM models like Gemma3
     engine._expects_vlm_custom_masks = (
-        ad_config.attn_backend == "flashinfer" and _model_expects_custom_masks(engine.model)
+        ad_config.attn_backend == "flashinfer" and _model_expects_token_type_ids(engine.model)
     )
-    # Best-effort extract VLM mask parameters (model_type, sliding_window) from HF config.
-    # Only needed if we will actually be passing/producing custom masks.
-    engine._vlm_sliding_window = 0
-    engine._vlm_model_type = None
-    if not engine._expects_vlm_custom_masks:
-        return
-
-    try:
-        from transformers import AutoConfig
-
-        cfg, _ = AutoConfig.from_pretrained(
-            ad_config.model, return_unused_kwargs=True, trust_remote_code=True
-        )
-
-        # Extract model_type (needed for registry lookup)
-        model_type = getattr(cfg, "model_type", None)
-        # For VLMs with nested configs (e.g., Gemma3), check text_config
-        if model_type is None and hasattr(cfg, "text_config"):
-            model_type = getattr(cfg.text_config, "model_type", None)
-        engine._vlm_model_type = model_type
-
-        # Extract sliding_window
-        sliding_window = getattr(cfg, "sliding_window", None)
-        if sliding_window is None:
-            for sub_config_key in getattr(cfg, "sub_configs", []):
-                sub_cfg = getattr(cfg, sub_config_key, None)
-                if sub_cfg is not None and getattr(sub_cfg, "sliding_window", None) is not None:
-                    sliding_window = getattr(sub_cfg, "sliding_window", None)
-                    break
-        engine._vlm_sliding_window = int(sliding_window or 0)
-    except Exception:
-        # Not all environments/models have an HF config with these fields; ignore.
-        engine._vlm_sliding_window = 0
-        engine._vlm_model_type = None
 
 
 def create_draft_model_engine_maybe(

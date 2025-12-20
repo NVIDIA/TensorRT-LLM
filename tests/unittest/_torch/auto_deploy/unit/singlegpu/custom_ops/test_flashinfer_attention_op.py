@@ -115,11 +115,9 @@ def test_flashinfer_attention_op_context(seq_length, n_heads, batch_size, dtype,
         None,
         1.0,
         1.0,
-        "none",  # mask_kind
         -1,  # window_left (disabled)
         0.0,  # logits_soft_cap (disabled)
-        None,  # custom_mask_full
-        None,  # custom_mask_sliding
+        None,  # custom_mask
     )
 
     # Use torch backend as clean reference
@@ -255,11 +253,9 @@ def test_flashinfer_attention_op_decode(
         None,
         1.0,
         1.0,
-        "none",  # mask_kind
         -1,  # window_left (disabled)
         0.0,  # logits_soft_cap (disabled)
-        None,  # custom_mask_full
-        None,  # custom_mask_sliding
+        None,  # custom_mask
     )
 
     assert torch.allclose(
@@ -384,11 +380,9 @@ def test_flashinfer_attention_context_and_generate(
         None,
         1.0,
         1.0,
-        "none",  # mask_kind
         -1,  # window_left (disabled)
         0.0,  # logits_soft_cap (disabled)
-        None,  # custom_mask_full
-        None,  # custom_mask_sliding
+        None,  # custom_mask
     )
 
     # Generate reference outputs
@@ -470,11 +464,9 @@ def test_flashinfer_attention_context_and_generate(
         None,
         1.0,
         1.0,
-        "none",  # mask_kind
         -1,  # window_left (disabled)
         0.0,  # logits_soft_cap (disabled)
-        None,  # custom_mask_full
-        None,  # custom_mask_sliding
+        None,  # custom_mask
     )
 
     # Generate reference outputs
@@ -590,11 +582,9 @@ def test_flashinfer_attention_op_context_input_pos(seq, batch_size, n_heads, dty
         None,
         1.0,
         1.0,
-        "none",  # mask_kind
         -1,  # window_left (disabled)
         0.0,  # logits_soft_cap (disabled)
-        None,  # custom_mask_full
-        None,  # custom_mask_sliding
+        None,  # custom_mask
     )
 
     # Generate ref
@@ -748,11 +738,9 @@ def test_flashinfer_attention_with_fp8_cache(
         None,
         K_SCALE,
         V_SCALE,
-        "none",  # mask_kind
         -1,  # window_left (disabled)
         0.0,  # logits_soft_cap (disabled)
-        None,  # custom_mask_full
-        None,  # custom_mask_sliding
+        None,  # custom_mask
     )
 
     y = flashinfer_output.view(BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD)
@@ -853,11 +841,9 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
         None,
         1.0,
         1.0,
-        "none",  # mask_kind
         -1,  # window_left (disabled)
         0.0,  # logits_soft_cap (disabled)
-        None,  # custom_mask_full
-        None,  # custom_mask_sliding
+        None,  # custom_mask
     )
 
     # Compute reference
@@ -945,11 +931,9 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
         None,
         1.0,
         1.0,
-        "none",  # mask_kind
         -1,  # window_left (disabled)
         0.0,  # logits_soft_cap (disabled)
-        None,  # custom_mask_full
-        None,  # custom_mask_sliding
+        None,  # custom_mask
     )
 
     # Compute reference

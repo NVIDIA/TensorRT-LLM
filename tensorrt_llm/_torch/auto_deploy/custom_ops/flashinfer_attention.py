@@ -245,12 +245,12 @@ def flashinfer_mha_with_cache(
     scale: Optional[float],
     k_scale: float,
     v_scale: float,
-    mask_kind: str,  # "full", "sliding", or "none"
     window_left: int,  # FlashInfer inclusive sliding window (use -1 to disable)
     logits_soft_cap: float,  # FlashInfer logits softcap (use 0.0 to disable)
-    # VLM CUSTOM MASKS (optional, for Gemma3 etc.)
-    custom_mask_full: Optional[torch.Tensor],
-    custom_mask_sliding: Optional[torch.Tensor],
+    # VLM CUSTOM MASK (optional, for Gemma3 etc.)
+    # Contains bidirectional attention for image tokens. Sliding window is
+    # handled separately by the window_left parameter.
+    custom_mask: Optional[torch.Tensor],
 ) -> torch.Tensor:
     # reshape to standard [b*s, n_heads, head_dim] layout
     head_dim = k_cache.shape[-1]
@@ -277,20 +277,8 @@ def flashinfer_mha_with_cache(
     n_kv_heads = k.shape[1]
 
     is_generate = s == 1
-    # Determine which custom mask to use (if any)
-    # Custom masks only apply during prefill, not generation
-    if mask_kind == "none" or is_generate:
-        custom_mask = None
-    elif mask_kind == "full" and custom_mask_full is not None:
-        custom_mask = custom_mask_full
-    elif mask_kind == "sliding" and custom_mask_sliding is not None:
-        custom_mask = custom_mask_sliding
-    else:
-        custom_mask = None
-
-    # If a custom mask is provided, force-disable sliding window at the FlashInfer level.
-    # Custom masks only apply during prefill; decode should always have custom_mask=None.
-    effective_window_left = -1 if custom_mask is not None else window_left
+    # Custom mask only applies during prefill, not generation
+    effective_mask = None if is_generate else custom_mask
 
     pp = PlanParams(
         n_heads=n_heads,
@@ -302,8 +290,8 @@ def flashinfer_mha_with_cache(
         q_dtype=q.dtype,
         kv_dtype=k_cache.dtype,
         sm_scale=scale,
-        has_custom_mask=(custom_mask is not None),
-        window_left=effective_window_left,
+        has_custom_mask=(effective_mask is not None),
+        window_left=window_left,
         logits_soft_cap=float(logits_soft_cap or 0.0),
     )
 
@@ -332,7 +320,7 @@ def flashinfer_mha_with_cache(
         paged_kv_indices,
         paged_kv_last_page_len,
         pp,
-        custom_mask=custom_mask,
+        custom_mask=effective_mask,
     )
 
     y = wrapper.run(
@@ -366,12 +354,10 @@ def flashinfer_mha_with_cache_fake(
     scale: Optional[float],
     k_scale: float,
     v_scale: float,
-    mask_kind: str,
     window_left: int,
     logits_soft_cap: float,
-    # VLM CUSTOM MASKS
-    custom_mask_full: Optional[torch.Tensor],
-    custom_mask_sliding: Optional[torch.Tensor],
+    # VLM CUSTOM MASK
+    custom_mask: Optional[torch.Tensor],
 ) -> torch.Tensor:
     return torch.empty_like(q.contiguous())
 
@@ -509,30 +495,10 @@ class FlashInferAttention(AttentionDescriptor):
             )
             logits_soft_cap = 0.0
 
-        # Determine mask_kind based on layer's attention type.
-        # Priority:
-        #   1. FX node metadata (set during transforms)
-        #   2. FX node kwargs (legacy/profiling path)
-        #   3. Infer from sliding_window: None -> "full", int -> "sliding"
-        # NOTE: For Gemma3 VLM, all layers need VLM masks (either "full" or "sliding").
-        # The sliding_window parameter tells us which type of attention this layer uses.
-        mask_kind = source_attn_node.meta.get("mask_kind", None)
-        if mask_kind is None:
-            mask_kind = source_attn_node.kwargs.get("mask_kind", None)
-        if mask_kind is None:
-            # Infer from sliding_window for Gemma3-style VLM models
-            if sliding_window is None:
-                mask_kind = "full"  # Global attention layer
-            elif isinstance(sliding_window, int) and sliding_window > 0:
-                mask_kind = "sliding"  # Sliding window attention layer
-            else:
-                mask_kind = "none"  # Fall back to no VLM mask
-
         return [
             scale,  # softmax scale
             1.0,  # k_scale
             1.0,  # v_scale
-            mask_kind,  # VLM mask selection: "full", "sliding", or "none"
             window_left,  # FlashInfer inclusive sliding window size (-1 disables)
             logits_soft_cap,  # FlashInfer logits softcap (0 disables)
         ]

@@ -1,6 +1,6 @@
 """Unit tests for FlashInfer attention op with VLM custom masks.
 
-Tests the mask selection logic and PlanParams hashing for VLM support.
+Tests the custom mask handling and PlanParams hashing for VLM support.
 """
 
 # ruff: noqa: I001
@@ -14,116 +14,35 @@ import torch
 from torch.fx import Graph
 
 
-class TestMaskKindSelection:
-    """Tests for mask_kind selection logic in flashinfer_mha_with_cache."""
+class TestCustomMaskHandling:
+    """Tests for custom mask handling in flashinfer_mha_with_cache."""
 
-    def test_mask_selection_full(self):
-        """mask_kind='full' should select custom_mask_full."""
-        mask_kind = "full"
+    def test_mask_used_during_prefill(self):
+        """Custom mask should be used during prefill (is_generate=False)."""
         is_generate = False
-        custom_mask_full = torch.tensor([True, True, False, True])
-        custom_mask_sliding = torch.tensor([True, False, False, True])
+        custom_mask = torch.tensor([True, True, False, True])
 
-        if mask_kind == "none" or is_generate:
-            custom_mask = None
-        elif mask_kind == "full" and custom_mask_full is not None:
-            custom_mask = custom_mask_full
-        elif mask_kind == "sliding" and custom_mask_sliding is not None:
-            custom_mask = custom_mask_sliding
-        else:
-            custom_mask = None
+        effective_mask = None if is_generate else custom_mask
 
-        assert custom_mask is custom_mask_full
-
-    def test_mask_selection_sliding(self):
-        """mask_kind='sliding' should select custom_mask_sliding."""
-        mask_kind = "sliding"
-        is_generate = False
-        custom_mask_full = torch.tensor([True, True, False, True])
-        custom_mask_sliding = torch.tensor([True, False, False, True])
-
-        if mask_kind == "none" or is_generate:
-            custom_mask = None
-        elif mask_kind == "full" and custom_mask_full is not None:
-            custom_mask = custom_mask_full
-        elif mask_kind == "sliding" and custom_mask_sliding is not None:
-            custom_mask = custom_mask_sliding
-        else:
-            custom_mask = None
-
-        assert custom_mask is custom_mask_sliding
-
-    def test_mask_selection_none(self):
-        """mask_kind='none' should result in no custom mask."""
-        mask_kind = "none"
-        is_generate = False
-        custom_mask_full = torch.tensor([True, True, False, True])
-        custom_mask_sliding = torch.tensor([True, False, False, True])
-
-        if mask_kind == "none" or is_generate:
-            custom_mask = None
-        elif mask_kind == "full" and custom_mask_full is not None:
-            custom_mask = custom_mask_full
-        elif mask_kind == "sliding" and custom_mask_sliding is not None:
-            custom_mask = custom_mask_sliding
-        else:
-            custom_mask = None
-
-        assert custom_mask is None
+        assert effective_mask is custom_mask
 
     def test_mask_ignored_during_generate(self):
-        """Custom masks should be ignored when is_generate=True (s=1)."""
-        mask_kind = "full"  # Would normally select full mask
-        is_generate = True  # Decode phase
-        custom_mask_full = torch.tensor([True, True, False, True])
-        custom_mask_sliding = torch.tensor([True, False, False, True])
+        """Custom mask should be ignored during generate (is_generate=True)."""
+        is_generate = True
+        custom_mask = torch.tensor([True, True, False, True])
 
-        if mask_kind == "none" or is_generate:
-            custom_mask = None
-        elif mask_kind == "full" and custom_mask_full is not None:
-            custom_mask = custom_mask_full
-        elif mask_kind == "sliding" and custom_mask_sliding is not None:
-            custom_mask = custom_mask_sliding
-        else:
-            custom_mask = None
+        effective_mask = None if is_generate else custom_mask
 
-        assert custom_mask is None
+        assert effective_mask is None
 
-    def test_mask_selection_with_none_masks(self):
-        """mask_kind='full' with None masks should result in None."""
-        mask_kind = "full"
+    def test_none_mask_stays_none(self):
+        """None mask should stay None regardless of phase."""
         is_generate = False
-        custom_mask_full = None
-        custom_mask_sliding = None
+        custom_mask = None
 
-        if mask_kind == "none" or is_generate:
-            custom_mask = None
-        elif mask_kind == "full" and custom_mask_full is not None:
-            custom_mask = custom_mask_full
-        elif mask_kind == "sliding" and custom_mask_sliding is not None:
-            custom_mask = custom_mask_sliding
-        else:
-            custom_mask = None
+        effective_mask = None if is_generate else custom_mask
 
-        assert custom_mask is None
-
-    def test_mask_selection_unknown_kind(self):
-        """Unknown mask_kind should result in None."""
-        mask_kind = "unknown"
-        is_generate = False
-        custom_mask_full = torch.tensor([True, True])
-        custom_mask_sliding = torch.tensor([True, False])
-
-        if mask_kind == "none" or is_generate:
-            custom_mask = None
-        elif mask_kind == "full" and custom_mask_full is not None:
-            custom_mask = custom_mask_full
-        elif mask_kind == "sliding" and custom_mask_sliding is not None:
-            custom_mask = custom_mask_sliding
-        else:
-            custom_mask = None
-
-        assert custom_mask is None
+        assert effective_mask is None
 
 
 class TestPlanParamsWithCustomMask:
@@ -287,36 +206,24 @@ class TestGenerateVsPrefillPhase:
         assert is_generate is False
 
     def test_mask_logic_prefill(self):
-        """Prefill phase should use custom masks."""
+        """Prefill phase should use custom mask."""
         s = 128
-        mask_kind = "full"
         is_generate = s == 1
-        custom_mask_full = torch.tensor([True, False])
+        custom_mask = torch.tensor([True, False])
 
-        if mask_kind == "none" or is_generate:
-            custom_mask = None
-        elif mask_kind == "full" and custom_mask_full is not None:
-            custom_mask = custom_mask_full
-        else:
-            custom_mask = None
+        effective_mask = None if is_generate else custom_mask
 
-        assert custom_mask is custom_mask_full
+        assert effective_mask is custom_mask
 
     def test_mask_logic_generate(self):
-        """Generate phase should not use custom masks."""
+        """Generate phase should not use custom mask."""
         s = 1  # Single token (decode)
-        mask_kind = "full"
         is_generate = s == 1
-        custom_mask_full = torch.tensor([True, False])
+        custom_mask = torch.tensor([True, False])
 
-        if mask_kind == "none" or is_generate:
-            custom_mask = None
-        elif mask_kind == "full" and custom_mask_full is not None:
-            custom_mask = custom_mask_full
-        else:
-            custom_mask = None
+        effective_mask = None if is_generate else custom_mask
 
-        assert custom_mask is None
+        assert effective_mask is None
 
 
 class TestFlashInferConstantsExtraction:
@@ -337,7 +244,6 @@ class TestFlashInferConstantsExtraction:
                 "sliding_window": sliding_window,
                 "logit_cap": logit_cap,
                 "layout": "bsnd",
-                "mask_kind": "none",
             },
         )
         return attn

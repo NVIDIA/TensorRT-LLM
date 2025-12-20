@@ -59,19 +59,6 @@ def fake_profiler_mha(
 
     node_kwargs["layout"] = "bsnd"
 
-    # Capture layer's attention_type for VLM mask selection (e.g., Gemma3)
-    # Maps to mask_kind: "full_attention" -> "full", "sliding_attention" -> "sliding"
-    if hasattr(module, "attention_type"):
-        attn_type = module.attention_type
-        if attn_type == "full_attention":
-            node_kwargs["mask_kind"] = "full"
-        elif attn_type == "sliding_attention":
-            node_kwargs["mask_kind"] = "sliding"
-        else:
-            node_kwargs["mask_kind"] = "none"
-    else:
-        node_kwargs["mask_kind"] = "none"
-
     module._node_ref = graph.call_function(
         torch.ops.auto_deploy.torch_attention,
         args=(q_fake, k_fake, v_fake),
@@ -184,9 +171,8 @@ def get_cached_attn(
             *[kwargs[k] for k in module._node_ref.meta["metadata_cache_buffer_keys"]],
             # constants set up during kvcache transform
             *module._node_ref.meta["constants"],
-            # VLM custom masks (may be None for non-VLM models)
-            kwargs.get("custom_mask_full"),
-            kwargs.get("custom_mask_sliding"),
+            # VLM custom mask (may be None for non-VLM models)
+            kwargs.get("custom_mask"),
         )
 
         # check if we need to transpose the outputs, outgoing layout is bsnd in HF attn interface
@@ -216,30 +202,27 @@ def forward_with_prepare_metadata(mod: nn.Module, **cm_kwargs):
         return_names = gm._prepare_metadata_info["return_names"]
         cm_kwargs.update({k: v for k, v in zip(return_names, metadata)})
 
-    # Generate VLM custom masks if configured (e.g., Gemma3 with image tokens)
-    cm_kwargs["custom_mask_full"] = None
-    cm_kwargs["custom_mask_sliding"] = None
+    # Generate VLM custom mask if configured (e.g., Gemma3 with image tokens)
+    cm_kwargs["custom_mask"] = None
     if hasattr(gm, "_vlm_mask_config"):
         model_type = gm._vlm_mask_config["model_type"]
-        sliding_window = gm._vlm_mask_config["sliding_window"]
 
         # Look up the mask generator for this model type from the registry
         mask_generator = VlmMaskGeneratorRegistry.get(model_type)
         if mask_generator is not None:
             image_token_mask = get_image_token_mask(model_type, cm_kwargs)
             if image_token_mask is not None and image_token_mask.any():
-                # Generate custom masks for FlashInfer
+                # Generate custom mask for FlashInfer - bidirectional for image tokens.
+                # Sliding window is handled separately by FlashInfer's window_left.
                 qo_indptr = cm_kwargs["metadata_0"]  # qo_indptr from prepare_metadata
                 seq_len = cm_kwargs["seq_len"]
 
-                custom_mask_full, custom_mask_sliding = mask_generator(
+                custom_mask = mask_generator(
                     image_token_mask,
                     qo_indptr,
                     seq_len,
-                    sliding_window or 0,
                 )
-                cm_kwargs["custom_mask_full"] = custom_mask_full
-                cm_kwargs["custom_mask_sliding"] = custom_mask_sliding
+                cm_kwargs["custom_mask"] = custom_mask
 
     return mod._original_forward(**cm_kwargs)
 
@@ -310,33 +293,15 @@ class HFReplaceCachedAttn(InsertCachedAttention):
         # run actual insert cached attn transform with fake graph module
         mod._gm, info = super()._apply(mod._gm, cm, factory, shared_config)
 
-        # Auto-detect if VLM mask generation is needed by checking if any layer
-        # has a non-"none" mask_kind (captured during profiling from attention_type)
-        needs_vlm_masks = any(
-            submod._node_ref.kwargs.get("mask_kind", "none") != "none"
-            for submod in mod.modules()
-            if hasattr(submod, "_node_ref")
-        )
-        if needs_vlm_masks:
-            # Get model_type from config (standard HF attribute)
-            model_type = getattr(mod.config, "model_type", None)
-            # For VLMs with nested configs (e.g., Gemma3), check text_config
-            if model_type is None and hasattr(mod.config, "text_config"):
-                model_type = getattr(mod.config.text_config, "model_type", None)
+        # Get model_type from config (standard HF attribute)
+        model_type = getattr(mod.config, "model_type", None)
+        # For VLMs with nested configs (e.g., Gemma3), check text_config
+        if model_type is None and hasattr(mod.config, "text_config"):
+            model_type = getattr(mod.config.text_config, "model_type", None)
 
-            # Get sliding_window from config (check main config and sub-configs)
-            sliding_window = getattr(mod.config, "sliding_window", None)
-            if sliding_window is None:
-                for sub_config_key in getattr(mod.config, "sub_configs", []):
-                    sub_config = getattr(mod.config, sub_config_key, None)
-                    if sub_config:
-                        sliding_window = getattr(sub_config, "sliding_window", None)
-                        if sliding_window is not None:
-                            break
-            mod._gm._vlm_mask_config = {
-                "model_type": model_type,
-                "sliding_window": sliding_window,
-            }
+        # Check if VLM mask generation is supported for this model type
+        if VlmMaskGeneratorRegistry.get(model_type) is not None:
+            mod._gm._vlm_mask_config = {"model_type": model_type}
 
         # register cached attn operator and switch to cached forward function
         ALL_ATTENTION_FUNCTIONS.register("ad_cached_mha", get_cached_attn(self.attn_descriptor))

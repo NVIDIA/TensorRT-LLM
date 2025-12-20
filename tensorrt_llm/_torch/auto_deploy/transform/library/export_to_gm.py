@@ -19,7 +19,6 @@ from ..interface import (
     TransformInfo,
     TransformRegistry,
 )
-from .tag_vlm_mask_kind import _build_mask_kind_by_module, _is_vlm_config
 
 _DROP_GM_KWARGS = {
     # HF often passes these, but we don't want them to participate in torch.export in_spec matching.
@@ -27,11 +26,8 @@ _DROP_GM_KWARGS = {
     "output_attentions",
     "output_hidden_states",
     "return_dict",
-    # VLM-only inputs that we may want to handle outside the exported GraphModule.
-    # In particular, AutoDeploy can use these to build custom attention masks for cached attention
-    # backends (e.g., FlashInfer) without passing them into the exported HF submodule.
-    "token_type_ids",
-    "mm_token_type_ids",
+    # NOTE: token_type_ids and mm_token_type_ids are now included in the export so that
+    # VLM custom mask generation can happen inside the exported GraphModule.
 }
 
 
@@ -158,17 +154,6 @@ class ExportToGM(BaseTransform):
         # set the example sequence
         cm.info.set_example_sequence(**factory.get_example_inputs())
 
-        # Determine whether the overall model is multimodal (VLM) once.
-        # `sub_mod` exported below can be a nested text submodule whose config is `text_config`
-        # and does not carry vision fields; relying on `sub_mod.config` would incorrectly disable
-        # VLM tagging for models like Gemma3 VLM.
-        root_cfg = getattr(mod, "config", None)
-        root_is_vlm = _is_vlm_config(root_cfg)
-        # Fallback heuristic: factory choice can imply multimodal even if config is nested.
-        try:
-            root_is_vlm = root_is_vlm or ("ImageTextToText" in type(factory).__name__)
-        except Exception:
-            pass
         export_infos = factory.get_export_infos(mod)
 
         # check if any submodules to be exported are children of other submodules that need to be
@@ -198,6 +183,14 @@ class ExportToGM(BaseTransform):
                     clone=self.config.clone_state_dict,
                     patch_list=self.config.patch_list,
                 )
+
+            # For VLM models, inject token_type_ids into captured kwargs if it was in the
+            # original input but didn't flow through (e.g., Gemma3 uses it for mask creation
+            # but doesn't pass it to the text model). This allows mask generation to happen
+            # inside the exported GraphModule.
+            for vlm_kwarg in ("token_type_ids", "mm_token_type_ids"):
+                if vlm_kwarg in cm.named_args and vlm_kwarg not in captured_kwargs:
+                    captured_kwargs[vlm_kwarg] = cm.named_args[vlm_kwarg]
 
             # We intentionally do not export certain HF-only kwargs as GraphModule inputs.
             # Some HF call sites will still pass these at runtime; we will drop them before
@@ -232,13 +225,6 @@ class ExportToGM(BaseTransform):
             # torch.export's strict input spec checks (e.g., HF passing attention_mask).
             sub_gm.register_forward_pre_hook(_ad_sanitize_gm_kwargs, prepend=True, with_kwargs=True)
 
-            # Stash VLM mask-kind metadata for a dedicated post-export tagging transform.
-            # This keeps operator schemas unchanged while enabling deterministic per-layer tagging.
-            if not hasattr(sub_gm, "meta"):
-                sub_gm.meta = {}
-            sub_gm.meta["ad_is_vlm"] = bool(root_is_vlm)
-            if sub_gm.meta["ad_is_vlm"]:
-                sub_gm.meta["ad_mask_kind_by_module"] = _build_mask_kind_by_module(sub_mod)
             # post process the sub graph module
             e_info.post_process(sub_mod, sub_gm)
 

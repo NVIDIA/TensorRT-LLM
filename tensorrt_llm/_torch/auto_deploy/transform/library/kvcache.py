@@ -95,63 +95,84 @@ class InsertCachedAttention(BaseTransform):
             return False
 
     def _maybe_init_flashinfer_vlm_custom_mask_inputs(
-        self, gm: GraphModule, source_attn_nodes: List[Node]
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        meta_nodes_std: List[Node],
     ) -> None:
-        """Create optional VLM custom mask graph inputs once if any layer needs them.
+        """Create VLM custom mask node inside the graph if token_type_ids is present.
 
-        A layer needs VLM masks if its source attention node has `mask_kind != "none"`.
-        We create the placeholders once in _apply() (if any layer needs masks).
-        Later, each _insert_cached_attn_node() call needs to reference the same placeholder nodes; storing them on self
-        is the simplest way to share them across the per-node calls without re-adding duplicate graph inputs.
+        This inserts the mask generation op (flashinfer_vlm_mask_gen) into the graph
+        using token_type_ids as input. The generated mask provides:
+        - Causal attention for text tokens
+        - Bidirectional attention for image tokens
+
+        Sliding window constraints are handled separately by FlashInfer's window_left
+        parameter, not baked into the mask.
         """
         # Only relevant for FlashInfer backend
         cached_attn_op = self.attn_descriptor.get_cached_attention_op()
         if not self._is_flashinfer_cached_attn_op(cached_attn_op):
             return
 
-        def _get_mask_kind(n: Node) -> str:
-            # Prefer metadata (set during export-time attention wrapping); fall back to kwargs.
-            try:
-                mk = getattr(n, "meta", {}).get("mask_kind", None)
-                if isinstance(mk, str):
-                    return mk
-            except Exception:
-                pass
-            return getattr(n, "kwargs", {}).get("mask_kind", "none")
+        if hasattr(self, "_vlm_custom_mask_node"):
+            return
 
-        needs_vlm_masks_any = any(_get_mask_kind(n) != "none" for n in source_attn_nodes)
-        if needs_vlm_masks_any and not hasattr(self, "_vlm_custom_mask_inputs"):
-            self._vlm_custom_mask_inputs = {
-                "custom_mask_full": add_graph_input(gm, "custom_mask_full", val=None),
-                "custom_mask_sliding": add_graph_input(gm, "custom_mask_sliding", val=None),
-            }
+        # Check if token_type_ids is available as a graph input
+        token_type_ids_nodes = gm.graph.find_nodes(op="placeholder", target="token_type_ids")
+        if not token_type_ids_nodes:
+            # Also check for mm_token_type_ids (used by some VLMs)
+            token_type_ids_nodes = gm.graph.find_nodes(op="placeholder", target="mm_token_type_ids")
 
-    def _maybe_append_flashinfer_vlm_custom_masks(
-        self, attn_node: Node, cached_attn_op, args: Tuple
-    ) -> Tuple:
-        """Append FlashInfer VLM custom mask args (or None placeholders) to `args`."""
+        if not token_type_ids_nodes:
+            # No VLM token type ids - no custom mask needed
+            self._vlm_custom_mask_node = None
+            return
+
+        token_type_ids_node = token_type_ids_nodes[0]
+
+        # Add seq_len as graph input if not already present
+        seq_len_node = self._add_or_retrieve_input(gm, cm, "seq_len")
+
+        # Get cu_seqlen from standard metadata (index 1 in FlashInfer standard args)
+        # Standard args are: ["batch_info", "cu_seqlen", "cu_num_pages", "cache_loc", "last_page_len"]
+        cu_seqlen_node = meta_nodes_std[1]  # cu_seqlen
+
+        # Find the last placeholder to insert after it
+        node_last_input = gm.graph.find_nodes(op="placeholder", sort=True)[-1]
+
+        with gm.graph.inserting_after(node_last_input):
+            # Compute image_token_mask = (token_type_ids == 1)
+            # First flatten token_type_ids
+            flatten_node = gm.graph.call_function(
+                torch.ops.aten.reshape.default, args=(token_type_ids_node, [-1])
+            )
+            # Compare with 1 to get image token mask
+            image_token_mask_node = gm.graph.call_function(
+                torch.ops.aten.eq.Scalar, args=(flatten_node, 1)
+            )
+
+            # Call the mask generation op - returns single mask with bidirectional
+            # image attention. Sliding window is handled by FlashInfer's window_left.
+            custom_mask_node = gm.graph.call_function(
+                torch.ops.auto_deploy.flashinfer_vlm_mask_gen.default,
+                args=(image_token_mask_node, cu_seqlen_node, seq_len_node),
+            )
+
+        self._vlm_custom_mask_node = custom_mask_node
+
+    def _maybe_append_flashinfer_vlm_custom_mask(self, cached_attn_op, args: Tuple) -> Tuple:
+        """Append FlashInfer VLM custom mask arg (or None) to `args`.
+
+        All layers receive the same mask - it provides bidirectional attention
+        for image tokens. Sliding window is handled separately by window_left.
+        """
         if not self._is_flashinfer_cached_attn_op(cached_attn_op):
             return args
 
-        mask_kind = getattr(attn_node, "meta", {}).get(
-            "mask_kind", getattr(attn_node, "kwargs", {}).get("mask_kind", "none")
-        )
-        need_vlm_masks = mask_kind != "none"
-
-        if need_vlm_masks:
-            if not hasattr(self, "_vlm_custom_mask_inputs"):
-                raise RuntimeError(
-                    "need_vlm_masks=True but _vlm_custom_mask_inputs is missing. "
-                    "Expected VLM custom mask graph inputs to be created in InsertCachedAttention._apply."
-                )
-            return (
-                *args,
-                self._vlm_custom_mask_inputs["custom_mask_full"],
-                self._vlm_custom_mask_inputs["custom_mask_sliding"],
-            )
-
-        # This layer does not require VLM masks: pass explicit None placeholders to satisfy the op schema.
-        return (*args, None, None)
+        # Append the custom mask node (or None if no VLM)
+        custom_mask = getattr(self, "_vlm_custom_mask_node", None)
+        return (*args, custom_mask)
 
     def _process_metadata_extra(
         self, gm: GraphModule, cm: CachedSequenceInterface, any_source_attn_node: Node
@@ -203,12 +224,10 @@ class InsertCachedAttention(BaseTransform):
                 *buffer_nodes,
                 *constants,
             )
-            # FlashInfer cached attention op optionally accepts two extra args for VLM custom masks:
-            #   custom_mask_full, custom_mask_sliding
-            # In graph-mode we want to be able to compute these masks outside the exported HF graph
-            # (e.g., from token_type_ids) and pass them in as extra graph inputs. If the caller
-            # doesn't provide them, they can still be None.
-            args = self._maybe_append_flashinfer_vlm_custom_masks(attn_node, cached_attn_op, args)
+            # FlashInfer cached attention op optionally accepts a custom mask arg for VLM.
+            # The mask provides bidirectional attention for image tokens. Sliding window
+            # is handled separately by FlashInfer's window_left parameter.
+            args = self._maybe_append_flashinfer_vlm_custom_mask(cached_attn_op, args)
             cached_attn_node = gm.graph.call_function(
                 cached_attn_op,
                 args=args,
@@ -253,7 +272,8 @@ class InsertCachedAttention(BaseTransform):
         meta_nodes_extra = self._process_metadata_extra(gm, cm, source_attn_nodes[0])
 
         buffer_in_lookup: Dict[str, Node] = {}
-        self._maybe_init_flashinfer_vlm_custom_mask_inputs(gm, source_attn_nodes)
+
+        self._maybe_init_flashinfer_vlm_custom_mask_inputs(gm, cm, meta_nodes_std)
 
         # replace fused attention node with attention node that has kv cache
         num_cached_attn_replacements = 0

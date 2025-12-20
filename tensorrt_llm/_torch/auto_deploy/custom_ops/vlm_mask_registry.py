@@ -18,26 +18,27 @@ FlashInfer custom mask generation logic.
 Usage:
     # Register a mask generator for a model type
     @VlmMaskGeneratorRegistry.register("gemma3")
-    def generate_gemma3_masks(image_token_mask, qo_indptr, seq_len, sliding_window):
+    def generate_gemma3_mask(image_token_mask, qo_indptr, seq_len):
         ...
-        return custom_mask_full, custom_mask_sliding
+        return custom_mask
 
     # Look up and use a mask generator
     mask_gen = VlmMaskGeneratorRegistry.get("gemma3")
     if mask_gen:
-        masks = mask_gen(image_token_mask, qo_indptr, seq_len, sliding_window)
+        mask = mask_gen(image_token_mask, qo_indptr, seq_len)
 """
 
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, Optional
 
 from torch import Tensor
 
 # Type alias for mask generator functions
-# Args: (image_token_mask, qo_indptr, seq_len, sliding_window)
-# Returns: (custom_mask_full, custom_mask_sliding)
+# Args: (image_token_mask, qo_indptr, seq_len)
+# Returns: custom_mask (single mask with bidirectional for image tokens)
+# Note: Sliding window is handled separately by FlashInfer's window_left parameter.
 VlmMaskGeneratorFn = Callable[
-    [Tensor, Tensor, Tensor, int],
-    Tuple[Tensor, Tensor],
+    [Tensor, Tensor, Tensor],
+    Tensor,
 ]
 
 
@@ -48,6 +49,10 @@ class VlmMaskGeneratorRegistry:
     (e.g., Gemma3 uses bidirectional attention for image tokens). This registry
     allows each model to register its own mask generation function, which is
     then looked up at runtime based on model_type.
+
+    Note: The generated mask should only include bidirectional attention for
+    image tokens. Sliding window constraints are handled separately by
+    FlashInfer's window_left parameter.
     """
 
     _registry: Dict[str, VlmMaskGeneratorFn] = {}
@@ -65,7 +70,7 @@ class VlmMaskGeneratorRegistry:
 
         Example:
             @VlmMaskGeneratorRegistry.register("gemma3")
-            def generate_gemma3_masks(image_token_mask, qo_indptr, seq_len, sliding_window):
+            def generate_gemma3_mask(image_token_mask, qo_indptr, seq_len):
                 ...
         """
 

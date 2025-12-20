@@ -1,17 +1,20 @@
-"""FlashInfer custom mask generation for Gemma3 VLM.
+"""FlashInfer custom mask generation for VLM models (e.g., Gemma3).
 
 This module provides a custom op for generating FlashInfer-compatible attention masks
-for Gemma3 VLM. The masks support:
+for VLM models. The masks support:
 - Causal attention for text tokens
 - Bidirectional attention for image tokens (image tokens attend to each other)
-- Optional sliding window constraint for sliding attention layers
+
+Note: Sliding window constraints are handled separately by FlashInfer's window_left
+parameter, not baked into the mask. This allows the same mask to be used for both
+full attention and sliding attention layers.
 
 The masks are generated in the flattened format expected by FlashInfer's
 BatchPrefillWithPagedKVCacheWrapper, where the mask is a 1D boolean tensor
 of shape [sum(q_len[i] * k_len[i]) for context sequences].
 """
 
-from typing import List, Optional, Tuple
+from typing import List
 
 import torch
 from torch import Tensor
@@ -19,18 +22,16 @@ from torch import Tensor
 from .vlm_mask_registry import VlmMaskGeneratorRegistry
 
 
-def _get_context_mask(
-    image_token_mask: Tensor,
-    sliding_window: Optional[int],
-) -> Tensor:
+def _get_context_mask(image_token_mask: Tensor) -> Tensor:
     """Generate attention mask for a single context sequence.
 
     Args:
         image_token_mask: Boolean tensor of shape [seq_len] where True = image token.
-        sliding_window: If not None, apply sliding window constraint.
 
     Returns:
         Boolean mask of shape [seq_len, seq_len] where True = attention allowed.
+        The mask is causal (lower triangular) with bidirectional override for
+        image-image token pairs.
     """
     seq_len = image_token_mask.shape[0]
     device = image_token_mask.device
@@ -48,38 +49,24 @@ def _get_context_mask(
     # Override causal restriction for image-image pairs
     mask = mask | bidir_image
 
-    # Apply sliding window constraint if specified
-    if sliding_window is not None and sliding_window > 0:
-        positions = torch.arange(seq_len, device=device)
-        # distance[q, k] = q_pos - k_pos
-        distance = positions.unsqueeze(1) - positions.unsqueeze(0)  # [seq_len, seq_len]
-
-        # Block if key is too far back (distance >= sliding_window)
-        # But still allow if both are image tokens (bidir_image overrides)
-        outside_window = distance >= sliding_window
-        mask = mask & ~(outside_window & ~bidir_image)
-
     return mask
 
 
-def _flashinfer_gemma3_mask_gen_impl(
+def _flashinfer_vlm_mask_gen_impl(
     image_token_mask: Tensor,
     qo_indptr: Tensor,
     seq_len: Tensor,
-    sliding_window: int,
-) -> Tuple[Tensor, Tensor]:
-    """Implementation of Gemma3 mask generation for FlashInfer.
+) -> Tensor:
+    """Implementation of VLM mask generation for FlashInfer.
 
     Args:
         image_token_mask: Boolean tensor [total_tokens] where True = image token.
         qo_indptr: Tensor [num_contexts + 1] with cumulative token counts per context seq.
         seq_len: Tensor [num_seqs] with sequence lengths (used to identify context seqs).
-        sliding_window: Sliding window size from Gemma3 config.
 
     Returns:
-        Tuple of:
-            - custom_mask_full: Flattened bool mask for full attention layers
-            - custom_mask_sliding: Flattened bool mask for sliding attention layers
+        Flattened bool mask for attention (causal + image-image bidirectional).
+        Sliding window is handled separately by FlashInfer's window_left parameter.
     """
     device = image_token_mask.device
 
@@ -88,14 +75,10 @@ def _flashinfer_gemma3_mask_gen_impl(
     num_contexts = (seq_len > 1).sum().item()
 
     if num_contexts == 0:
-        # No context requests → return empty masks
-        return (
-            torch.empty(0, dtype=torch.bool, device=device),
-            torch.empty(0, dtype=torch.bool, device=device),
-        )
+        # No context requests → return empty mask
+        return torch.empty(0, dtype=torch.bool, device=device)
 
-    full_masks: List[Tensor] = []
-    sliding_masks: List[Tensor] = []
+    masks: List[Tensor] = []
 
     # Process only context sequences
     qo_indptr_ctx = qo_indptr[: num_contexts + 1]
@@ -107,36 +90,35 @@ def _flashinfer_gemma3_mask_gen_impl(
         # Extract image mask for this sequence
         img_mask_i = image_token_mask[start:end]
 
-        # Generate masks for this sequence
-        full_mask_i = _get_context_mask(img_mask_i, sliding_window=None)
-        sliding_mask_i = _get_context_mask(img_mask_i, sliding_window=sliding_window)
+        # Generate mask for this sequence (causal + bidirectional for images)
+        mask_i = _get_context_mask(img_mask_i)
 
         # Flatten and append
-        full_masks.append(full_mask_i.flatten())
-        sliding_masks.append(sliding_mask_i.flatten())
+        masks.append(mask_i.flatten())
 
-    # Concatenate all sequence masks into single flattened vectors
-    custom_mask_full = torch.cat(full_masks).contiguous()
-    custom_mask_sliding = torch.cat(sliding_masks).contiguous()
+    # Concatenate all sequence masks into single flattened vector
+    custom_mask = torch.cat(masks).contiguous()
 
-    return custom_mask_full, custom_mask_sliding
+    return custom_mask
 
 
 # Register the custom op
-@torch.library.custom_op("auto_deploy::flashinfer_gemma3_mask_gen", mutates_args=())
-def flashinfer_gemma3_mask_gen(
+@torch.library.custom_op("auto_deploy::flashinfer_vlm_mask_gen", mutates_args=())
+def flashinfer_vlm_mask_gen(
     image_token_mask: Tensor,
     qo_indptr: Tensor,
     seq_len: Tensor,
-    sliding_window: int,
-) -> Tuple[Tensor, Tensor]:
-    """Generate FlashInfer custom masks for Gemma3 VLM.
+) -> Tensor:
+    """Generate FlashInfer custom mask for VLM models.
 
-    This custom op generates two flattened boolean masks for FlashInfer:
-    - One for full attention layers (causal + image-image bidirectional)
-    - One for sliding attention layers (same + sliding window constraint)
+    This custom op generates a flattened boolean mask for FlashInfer that provides:
+    - Causal attention (query attends to earlier keys)
+    - Bidirectional attention for image tokens (image tokens attend to each other)
 
-    The masks are in FlashInfer's expected format: a 1D boolean tensor where
+    Sliding window constraints are NOT baked into this mask - they are handled
+    separately by FlashInfer's window_left parameter per attention layer.
+
+    The mask is in FlashInfer's expected format: a 1D boolean tensor where
     True = attention allowed, with shape [sum(q_len[i] * k_len[i])] over
     context sequences only.
 
@@ -147,24 +129,20 @@ def flashinfer_gemma3_mask_gen(
             Defines the boundaries of each context sequence in the flattened stream.
         seq_len: Tensor [num_seqs] with sequence lengths.
             Used to distinguish context (seq_len > 1) from generation (seq_len == 1).
-        sliding_window: Sliding window size from Gemma3 config.
 
     Returns:
-        Tuple of:
-            - custom_mask_full: Flattened bool mask for full attention layers
-            - custom_mask_sliding: Flattened bool mask for sliding attention layers
+        custom_mask: Flattened bool mask for attention layers.
     """
-    return _flashinfer_gemma3_mask_gen_impl(image_token_mask, qo_indptr, seq_len, sliding_window)
+    return _flashinfer_vlm_mask_gen_impl(image_token_mask, qo_indptr, seq_len)
 
 
-@flashinfer_gemma3_mask_gen.register_fake
-def _flashinfer_gemma3_mask_gen_fake(
+@flashinfer_vlm_mask_gen.register_fake
+def _flashinfer_vlm_mask_gen_fake(
     image_token_mask: Tensor,
     qo_indptr: Tensor,
     seq_len: Tensor,
-    sliding_window: int,
-) -> Tuple[Tensor, Tensor]:
-    """Fake implementation for tracing - returns tensors with correct dtype.
+) -> Tensor:
+    """Fake implementation for tracing - returns tensor with correct dtype.
 
     Note: The exact size depends on runtime values (num_contexts, seq_lens),
     so we return a conservatively sized tensor for tracing purposes.
@@ -185,21 +163,17 @@ def _flashinfer_gemma3_mask_gen_fake(
     else:
         max_size = 0
 
-    return (
-        torch.empty((max_size,), dtype=torch.bool, device=device),
-        torch.empty((max_size,), dtype=torch.bool, device=device),
-    )
+    return torch.empty((max_size,), dtype=torch.bool, device=device)
 
 
 # Register Gemma3 mask generator with the VLM mask registry
 @VlmMaskGeneratorRegistry.register("gemma3")
-def generate_gemma3_vlm_masks(
+def generate_gemma3_vlm_mask(
     image_token_mask: Tensor,
     qo_indptr: Tensor,
     seq_len: Tensor,
-    sliding_window: int,
-) -> Tuple[Tensor, Tensor]:
-    """Generate FlashInfer custom masks for Gemma3 VLM.
+) -> Tensor:
+    """Generate FlashInfer custom mask for Gemma3 VLM.
 
     This is the registry entry point for Gemma3 VLM mask generation.
     It delegates to the torch custom op for the actual mask computation.
@@ -208,11 +182,8 @@ def generate_gemma3_vlm_masks(
         image_token_mask: Boolean tensor [total_tokens] where True = image token.
         qo_indptr: Tensor [num_contexts + 1] from flashinfer prepare_metadata.
         seq_len: Tensor [num_seqs] with sequence lengths.
-        sliding_window: Sliding window size from Gemma3 config.
 
     Returns:
-        Tuple of (custom_mask_full, custom_mask_sliding).
+        custom_mask: Flattened bool mask for attention layers.
     """
-    return torch.ops.auto_deploy.flashinfer_gemma3_mask_gen(
-        image_token_mask, qo_indptr, seq_len, sliding_window
-    )
+    return torch.ops.auto_deploy.flashinfer_vlm_mask_gen(image_token_mask, qo_indptr, seq_len)
