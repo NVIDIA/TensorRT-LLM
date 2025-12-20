@@ -878,44 +878,45 @@ all = ["cuda-bindings[all] (>=13.1.1,<13.2.0)"]
 
 [[package]]
 name = "cuda-toolkit"
-version = "13.0.1"
+version = "13.1.0"
 description = "CUDA Toolkit meta-package"
 optional = false
 python-versions = "*"
 files = [
-    {file = "cuda_toolkit-13.0.1-py2.py3-none-any.whl", hash = "sha256:fc763424c5f5dde5c865358777928d23aa18a0165d380980bd3a792176188ffa"},
+    {file = "cuda_toolkit-13.1.0-py2.py3-none-any.whl", hash = "sha256:eab684dc673884bbaee94b8ce09521a1a9469ddf58be70122b63589f813cff92"},
 ]
 
 [package.dependencies]
-nvidia-cuda-runtime = {version = "==13.0.88.*", optional = true, markers = "(sys_platform == \"linux\" or sys_platform == \"win32\") and extra == \"cudart\""}
+nvidia-cuda-runtime = {version = "==13.1.80.*", optional = true, markers = "(sys_platform == \"linux\" or sys_platform == \"win32\") and extra == \"cudart\""}
 
 [package.extras]
-all = ["nvidia-cublas (==13.0.2.14.*)", "nvidia-cuda-cccl (==13.0.85.*)", "nvidia-cuda-crt (==13.0.88.*)", "nvidia-cuda-culibos (==13.0.85.*)", "nvidia-cuda-cupti (==13.0.85.*)", "nvidia-cuda-cuxxfilt (==13.0.85.*)", "nvidia-cuda-nvcc (==13.0.88.*)", "nvidia-cuda-nvrtc (==13.0.88.*)", "nvidia-cuda-opencl (==13.0.85.*)", "nvidia-cuda-profiler-api (==13.0.85.*)", "nvidia-cuda-runtime (==13.0.88.*)", "nvidia-cuda-sanitizer-api (==13.0.85.*)", "nvidia-cufft (==12.0.0.61.*)", "nvidia-cufile (==1.15.1.6.*)", "nvidia-curand (==10.4.0.35.*)", "nvidia-cusolver (==12.0.4.66.*)", "nvidia-cusparse (==12.6.3.3.*)", "nvidia-npp (==13.0.1.2.*)", "nvidia-nvfatbin (==13.0.85.*)", "nvidia-nvjitlink (==13.0.88.*)", "nvidia-nvjpeg (==13.0.1.86.*)", "nvidia-nvml-dev (==13.0.87.*)", "nvidia-nvptxcompiler (==13.0.88.*)", "nvidia-nvtx (==13.0.85.*)", "nvidia-nvvm (==13.0.88.*)"]
-cccl = ["nvidia-cuda-cccl (==13.0.85.*)"]
-crt = ["nvidia-cuda-crt (==13.0.88.*)"]
-cublas = ["nvidia-cublas (==13.0.2.14.*)"]
-cudart = ["nvidia-cuda-runtime (==13.0.88.*)"]
-cufft = ["nvidia-cufft (==12.0.0.61.*)"]
-cufile = ["nvidia-cufile (==1.15.1.6.*)"]
-culibos = ["nvidia-cuda-culibos (==13.0.85.*)"]
-cupti = ["nvidia-cuda-cupti (==13.0.85.*)"]
-curand = ["nvidia-curand (==10.4.0.35.*)"]
-cusolver = ["nvidia-cusolver (==12.0.4.66.*)"]
-cusparse = ["nvidia-cusparse (==12.6.3.3.*)"]
-cuxxfilt = ["nvidia-cuda-cuxxfilt (==13.0.85.*)"]
-npp = ["nvidia-npp (==13.0.1.2.*)"]
-nvcc = ["nvidia-cuda-nvcc (==13.0.88.*)"]
-nvfatbin = ["nvidia-nvfatbin (==13.0.85.*)"]
-nvjitlink = ["nvidia-nvjitlink (==13.0.88.*)"]
-nvjpeg = ["nvidia-nvjpeg (==13.0.1.86.*)"]
-nvml = ["nvidia-nvml-dev (==13.0.87.*)"]
-nvptxcompiler = ["nvidia-nvptxcompiler (==13.0.88.*)"]
-nvrtc = ["nvidia-cuda-nvrtc (==13.0.88.*)"]
-nvtx = ["nvidia-nvtx (==13.0.85.*)"]
-nvvm = ["nvidia-nvvm (==13.0.88.*)"]
-opencl = ["nvidia-cuda-opencl (==13.0.85.*)"]
-profiler = ["nvidia-cuda-profiler-api (==13.0.85.*)"]
-sanitizer = ["nvidia-cuda-sanitizer-api (==13.0.85.*)"]
+all = ["nvidia-cublas (==13.2.0.9.*)", "nvidia-cuda-cccl (==13.1.78.*)", "nvidia-cuda-crt (==13.1.80.*)", "nvidia-cuda-culibos (==13.1.68.*)", "nvidia-cuda-cupti (==13.1.75.*)", "nvidia-cuda-cuxxfilt (==13.1.80.*)", "nvidia-cuda-nvcc (==13.1.80.*)", "nvidia-cuda-nvrtc (==13.1.80.*)", "nvidia-cuda-opencl (==13.1.80.*)", "nvidia-cuda-profiler-api (==13.1.80.*)", "nvidia-cuda-runtime (==13.1.80.*)", "nvidia-cuda-sanitizer-api (==13.1.75.*)", "nvidia-cuda-tileiras (==13.1.80.*)", "nvidia-cufft (==12.1.0.31.*)", "nvidia-cufile (==1.16.0.49.*)", "nvidia-curand (==10.4.1.34.*)", "nvidia-cusolver (==12.0.7.41.*)", "nvidia-cusparse (==12.7.2.19.*)", "nvidia-npp (==13.0.2.21.*)", "nvidia-nvfatbin (==13.1.80.*)", "nvidia-nvjitlink (==13.1.80.*)", "nvidia-nvjpeg (==13.0.2.28.*)", "nvidia-nvml-dev (==13.1.68.*)", "nvidia-nvptxcompiler (==13.1.80.*)", "nvidia-nvtx (==13.1.68.*)", "nvidia-nvvm (==13.1.80.*)"]
+cccl = ["nvidia-cuda-cccl (==13.1.78.*)"]
+crt = ["nvidia-cuda-crt (==13.1.80.*)"]
+cublas = ["nvidia-cublas (==13.2.0.9.*)"]
+cudart = ["nvidia-cuda-runtime (==13.1.80.*)"]
+cufft = ["nvidia-cufft (==12.1.0.31.*)"]
+cufile = ["nvidia-cufile (==1.16.0.49.*)"]
+culibos = ["nvidia-cuda-culibos (==13.1.68.*)"]
+cupti = ["nvidia-cuda-cupti (==13.1.75.*)"]
+curand = ["nvidia-curand (==10.4.1.34.*)"]
+cusolver = ["nvidia-cusolver (==12.0.7.41.*)"]
+cusparse = ["nvidia-cusparse (==12.7.2.19.*)"]
+cuxxfilt = ["nvidia-cuda-cuxxfilt (==13.1.80.*)"]
+npp = ["nvidia-npp (==13.0.2.21.*)"]
+nvcc = ["nvidia-cuda-nvcc (==13.1.80.*)"]
+nvfatbin = ["nvidia-nvfatbin (==13.1.80.*)"]
+nvjitlink = ["nvidia-nvjitlink (==13.1.80.*)"]
+nvjpeg = ["nvidia-nvjpeg (==13.0.2.28.*)"]
+nvml = ["nvidia-nvml-dev (==13.1.68.*)"]
+nvptxcompiler = ["nvidia-nvptxcompiler (==13.1.80.*)"]
+nvrtc = ["nvidia-cuda-nvrtc (==13.1.80.*)"]
+nvtx = ["nvidia-nvtx (==13.1.68.*)"]
+nvvm = ["nvidia-nvvm (==13.1.80.*)"]
+opencl = ["nvidia-cuda-opencl (==13.1.80.*)"]
+profiler = ["nvidia-cuda-profiler-api (==13.1.80.*)"]
+sanitizer = ["nvidia-cuda-sanitizer-api (==13.1.75.*)"]
+tileiras = ["nvidia-cuda-tileiras (==13.1.80.*)"]
 
 [[package]]
 name = "cycler"
@@ -3066,14 +3067,14 @@ files = [
 
 [[package]]
 name = "nvidia-cuda-runtime"
-version = "13.0.88"
+version = "13.1.80"
 description = "CUDA Runtime native Libraries"
 optional = false
 python-versions = ">=3"
 files = [
-    {file = "nvidia_cuda_runtime-13.0.88-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:8ba16a33998ee3ee2bf11c8f13e36e3ff86a1d6ad165ffeee863d6eabd0b5f67"},
-    {file = "nvidia_cuda_runtime-13.0.88-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:422a38f7c739ecbdd3a4b6ec7ed0a1d74db43d8e9bc26685f3d845638922b178"},
-    {file = "nvidia_cuda_runtime-13.0.88-py3-none-win_amd64.whl", hash = "sha256:0156cf8f3453025938aab80bcca909506f4e82f1584a17736df7edeba882cc02"},
+    {file = "nvidia_cuda_runtime-13.1.80-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:5f1aa8fd779cae1a78aa8fdbaa5e4f245300baff120099d9b5ee84e3f4506a29"},
+    {file = "nvidia_cuda_runtime-13.1.80-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:dac25b52e69050e5a7a84957e6df470a85b185f8f648a99a1ab1dfce027576cf"},
+    {file = "nvidia_cuda_runtime-13.1.80-py3-none-win_amd64.whl", hash = "sha256:00db7158108d3ec7fe213fa78e2640d664b5b1b6b85485007dde29ccaa6abef6"},
 ]
 
 [[package]]
@@ -3105,30 +3106,30 @@ nvidia-cublas-cu12 = "*"
 
 [[package]]
 name = "nvidia-cudnn-frontend"
-version = "1.16.0"
+version = "1.17.0"
 description = "CUDNN FrontEnd python library"
 optional = false
 python-versions = ">=3.9"
 files = [
-    {file = "nvidia_cudnn_frontend-1.16.0-cp310-cp310-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:83ecbe6d1145dc208a9ae82aa0b45b2c8f74ed8a43d3a102a13eef2117e2fedd"},
-    {file = "nvidia_cudnn_frontend-1.16.0-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:77cb06b91877c8489363867434ba1d9936f3e10bf7ed98d82e98f5f578611920"},
-    {file = "nvidia_cudnn_frontend-1.16.0-cp310-cp310-win_amd64.whl", hash = "sha256:ee3f3886f107919dad48cbc905fa6ae9207c8d7d5a24165e55625ea96f0fe40f"},
-    {file = "nvidia_cudnn_frontend-1.16.0-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:c360d5840d6eb597aade9e9c8780e24aec283b8e6bc97d52881c821a35c92aa9"},
-    {file = "nvidia_cudnn_frontend-1.16.0-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:5c4a8fc573d85a86e08b15d9bf37f729e2487298781867a492a59cde6ac295e2"},
-    {file = "nvidia_cudnn_frontend-1.16.0-cp311-cp311-win_amd64.whl", hash = "sha256:a257f10a932ffde9741f644efd3611acf77e2fd89d493d81bc6a8353c48f1ec2"},
-    {file = "nvidia_cudnn_frontend-1.16.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:dd6fdd71c0896ff2ca1809d914cbd17f2904d55863f8881f47946e1d634c7a88"},
-    {file = "nvidia_cudnn_frontend-1.16.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:16efb069d4bda4d3b99134f59f376cfd4d09558298bd96af778fdc7f2851e696"},
-    {file = "nvidia_cudnn_frontend-1.16.0-cp312-cp312-win_amd64.whl", hash = "sha256:7b7860db03767c158accbe0b4e9c9553506513cc970ff08ed28c7761681ac466"},
-    {file = "nvidia_cudnn_frontend-1.16.0-cp313-cp313-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:b6bcb3a2fbff80538958e21e2227520f082a961164865aaeedaac527f61084f9"},
-    {file = "nvidia_cudnn_frontend-1.16.0-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:cbdad88b2bec5dde837f8fa7632022334cddb4756f923b5421c06a712cb59d31"},
-    {file = "nvidia_cudnn_frontend-1.16.0-cp313-cp313-win_amd64.whl", hash = "sha256:138de2bc4697fabb2eb2f0f601a7e31f8fe97874908e26e33d737276f335473c"},
-    {file = "nvidia_cudnn_frontend-1.16.0-cp39-cp39-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:a77818c92a556be9287b4d53457cc6df0e01982ffaf1c1f6754bab7913f9baad"},
-    {file = "nvidia_cudnn_frontend-1.16.0-cp39-cp39-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:8ebe416807207b6d3283541c7a2945dfd4feba61bcbffb3adf99b33f7a326df3"},
-    {file = "nvidia_cudnn_frontend-1.16.0-cp39-cp39-win_amd64.whl", hash = "sha256:bb8bccde48e62363e8458f3a860ae11a11dd6a5dffef6ca987c826ef2a4a8c38"},
+    {file = "nvidia_cudnn_frontend-1.17.0-cp310-cp310-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:4835ee3fc350782c89cdd290088ade69464faaa5dd66ccb0b215ad481ab3b41b"},
+    {file = "nvidia_cudnn_frontend-1.17.0-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:1da7e972dbba939ad21111f1208815b8c8024cbf72aa6c1eb223b14b2049d4b6"},
+    {file = "nvidia_cudnn_frontend-1.17.0-cp310-cp310-win_amd64.whl", hash = "sha256:21c5b2ce097f72c6510cbf974ce8ea9a31b34989dd9209d7187584a6100e57e5"},
+    {file = "nvidia_cudnn_frontend-1.17.0-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:961004000a2c21dd4a03f816534629105cf49125a643dbb49abbc97021e66d20"},
+    {file = "nvidia_cudnn_frontend-1.17.0-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:6ea44a8f2c0cfd20868b239ea13a2e0f32895dab868f6ff2bee01caf3778d273"},
+    {file = "nvidia_cudnn_frontend-1.17.0-cp311-cp311-win_amd64.whl", hash = "sha256:8dd6cc197a58d63da4d146a1febc1f99d425374d159f9b00628b140c65acb486"},
+    {file = "nvidia_cudnn_frontend-1.17.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:de0c473f32d705abcf14f351615f7ffbeed7320e3499cf2195ae5689652a2592"},
+    {file = "nvidia_cudnn_frontend-1.17.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:c913c87fca691a91385287f2587575531933acfebc85c33dbcecb191886c7a53"},
+    {file = "nvidia_cudnn_frontend-1.17.0-cp312-cp312-win_amd64.whl", hash = "sha256:a0d4cfd03961592108abd1ba246e43c8bb7540aed984df860256d0bff181de98"},
+    {file = "nvidia_cudnn_frontend-1.17.0-cp313-cp313-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:3800a1fe3d41a9206281475b1c8c438b02cb7e3c7e262d13f0a101edec223cb6"},
+    {file = "nvidia_cudnn_frontend-1.17.0-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:5adaf4a930b3be5ed019e1a25cfec7cc2bf444592a54a7639c28149b9227c2a4"},
+    {file = "nvidia_cudnn_frontend-1.17.0-cp313-cp313-win_amd64.whl", hash = "sha256:5c6a120fb54b157585ce6587153fc7086081af961f284f2553e01ba7c7a80c1a"},
+    {file = "nvidia_cudnn_frontend-1.17.0-cp39-cp39-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:b85dafc1aff310ff2c7b19ea16d21ab5948fa798f6abea0956b0544c8bed404f"},
+    {file = "nvidia_cudnn_frontend-1.17.0-cp39-cp39-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:3cab1f6de0a1d17b40839269c788178b0e58764ed0f05f6e8e4c671ebe587f36"},
+    {file = "nvidia_cudnn_frontend-1.17.0-cp39-cp39-win_amd64.whl", hash = "sha256:94528a4f58c31f07690fbab1390d80460fbc2276b11fcdae938a4db35351a163"},
 ]
 
 [package.extras]
-cutedsl = ["cuda-python", "nvidia-cutlass-dsl", "torch"]
+cutedsl = ["cuda-python", "nvidia-cutlass-dsl (==4.3.1)", "torch"]
 
 [[package]]
 name = "nvidia-cufft-cu12"
@@ -3461,13 +3462,13 @@ onnx = ">=1.14.0"
 
 [[package]]
 name = "openai"
-version = "2.13.0"
+version = "2.14.0"
 description = "The official Python library for the openai API"
 optional = false
 python-versions = ">=3.9"
 files = [
-    {file = "openai-2.13.0-py3-none-any.whl", hash = "sha256:746521065fed68df2f9c2d85613bb50844343ea81f60009b60e6a600c9352c79"},
-    {file = "openai-2.13.0.tar.gz", hash = "sha256:9ff633b07a19469ec476b1e2b5b26c5ef700886524a7a72f65e6f0b5203142d5"},
+    {file = "openai-2.14.0-py3-none-any.whl", hash = "sha256:7ea40aca4ffc4c4a776e77679021b47eec1160e341f42ae086ba949c9dcc9183"},
+    {file = "openai-2.14.0.tar.gz", hash = "sha256:419357bedde9402d23bf8f2ee372fca1985a73348debba94bddff06f19459952"},
 ]
 
 [package.dependencies]
@@ -3517,13 +3518,13 @@ demo = ["fastapi", "uvicorn"]
 
 [[package]]
 name = "optimum"
-version = "2.0.0"
+version = "2.1.0"
 description = "Optimum Library is an extension of the Hugging Face Transformers library, providing a framework to integrate third-party libraries from Hardware Partners and interface with their specific functionality."
 optional = false
 python-versions = ">=3.9.0"
 files = [
-    {file = "optimum-2.0.0-py3-none-any.whl", hash = "sha256:23bc60a679db676b578c7692bab7a62af31e27fe648fdc45d2bd4d3aabfcb2d9"},
-    {file = "optimum-2.0.0.tar.gz", hash = "sha256:4e59e51128ed6311b615dcee84c1559702d82cbd4bae18fd3031f4fe927c484c"},
+    {file = "optimum-2.1.0-py3-none-any.whl", hash = "sha256:bc3af32e1236a9b2c2ca1d27ed9d3ab1b6591e24c6bcd47f9671a8198a30ea88"},
+    {file = "optimum-2.1.0.tar.gz", hash = "sha256:0a2a13f91500e41d34863ffdb08fcb886b3ce68a84a386e59653e3064a45dd4b"},
 ]
 
 [package.dependencies]
@@ -6327,4 +6328,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.0"
 python-versions = ">=3.10,<3.13"
-content-hash = "d44d9d44355bac8ca580030e7e4eeb0a7cfdff7cf25045ffd8f38d077b27306c"
+content-hash = "44627163fbd7d37244d14d96ae0b8dcf65588d66c4cc1260257c10dd31b219da"

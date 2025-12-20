@@ -135,10 +135,12 @@ def _load_tokenizer(tokenizer_dir: Optional[str] = None,
                     tokenizer_type: Optional[str] = None):
     if vocab_file is None:
         if 'whisper' in model_name.lower():
-            tokenizer = AutoTokenizer.from_pretrained('openai/whisper-large-v3',
-                                                      language='english',
-                                                      task='transcribe',
-                                                      predict_timestamps=False)
+            tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_dir or 'openai/whisper-large-v3',
+                language='english',
+                task='transcribe',
+                predict_timestamps=False,
+            )
         elif tokenizer_type == 'language_adapter':
             tokenizer = None
         else:
