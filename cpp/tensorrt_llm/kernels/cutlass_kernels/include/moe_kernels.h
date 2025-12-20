@@ -978,7 +978,9 @@ public:
         }
     }
 
-    void prepare(int num_tokens, char* workspace, void const* expert_weights, cudaStream_t stream);
+    void prepare(int num_tokens, char* workspace, void const* expert_weights,
+        void const* token_selected_experts_customized = nullptr, bool use_customized_router = false,
+        cudaStream_t stream = nullptr);
 
     std::map<std::string, std::pair<size_t, size_t>> getProfilerWorkspaces(int maxM, bool is_tma_ws);
     size_t getWorkspaceSize(int maxM);
@@ -1002,6 +1004,7 @@ public:
     bool mEnableAlltoall = false;
 
     int mSampleIndex = 0;
+    bool mIsCustomizedRouter = false;
 
     nvinfer1::DataType mDType{};
     nvinfer1::DataType mWType{};
@@ -1024,8 +1027,9 @@ public:
     TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType mScalingType{};
 
 private:
-    void prepareRouting(int num_tokens, char* workspace, cudaStream_t stream);
     void prepareQuantParams(int num_tokens, char* workspace, cudaStream_t stream);
+    void prepareRouting(int num_tokens, char* workspace, void const* token_selected_experts_customized,
+        bool use_customized_router, cudaStream_t stream);
     void prepareTmaWsInputs(int num_tokens, char* workspace, void const* expert_weights,
         TmaWarpSpecializedGroupedGemmInput::EpilogueFusion fusion, bool swap_ab, cudaStream_t stream);
 };
