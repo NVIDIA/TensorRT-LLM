@@ -434,17 +434,11 @@ class LlmArgs(AutoDeployConfig, BaseLlmArgs, BaseSettings):
         return _check_for_default_value_only(cls, value, info, msg)
 
     @model_validator(mode="after")
-    def set_eagle3_layers_to_capture(self):
+    def setup_hidden_state_capture(self):
         if self.speculative_config is None or not isinstance(
             self.speculative_config, EagleDecodingConfig
         ):
             return self
-
-        if self.speculative_config.eagle3_layers_to_capture is None:
-            num_hidden_layers = self.create_factory()._get_model_config()[0].num_hidden_layers
-            self.speculative_config.eagle3_layers_to_capture = default_eagle3_layers_to_capture(
-                num_hidden_layers
-            )
 
         # insert the layers to capture into the transforms config.
         if self.transforms is None:
@@ -453,6 +447,7 @@ class LlmArgs(AutoDeployConfig, BaseLlmArgs, BaseSettings):
         if "detect_hidden_states_for_capture" not in self.transforms:
             self.transforms["detect_hidden_states_for_capture"] = {}
 
+        self.transforms["detect_hidden_states_for_capture"]["capture_hidden_states"] = True
         self.transforms["detect_hidden_states_for_capture"]["eagle3_layers_to_capture"] = (
             self.speculative_config.eagle3_layers_to_capture
         )

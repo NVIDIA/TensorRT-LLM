@@ -75,10 +75,19 @@ def cached_residual_add_fake(
 class DetectHiddenStatesForCaptureConfig(TransformConfig):
     """Configuration for the hidden states detection transform."""
 
+    # Whether to capture hidden states at all. If False we will not capture any layers.
+    capture_hidden_states: bool = False
+
     # TODO: figure out how to get layers to capture.
     # We should consider if we can use the layer indices stored in eagle checkpoints, e.g.
     # https://huggingface.co/nvidia/gpt-oss-120b-Eagle3/blob/main/config.json#L9-L14
     eagle3_layers_to_capture: Optional[Set[int]] = None  # Default: Do not capture any layers
+
+    @classmethod
+    def default_eagle3_layers_to_capture(cls, num_hidden_layers: int) -> Set[int]:
+        if num_hidden_layers <= 6:
+            raise ValueError("Not enough hidden layers for default EAGLE3 capture")
+        return {1, num_hidden_layers // 2 - 1, num_hidden_layers - 4}
 
 
 @TransformRegistry.register("detect_hidden_states_for_capture")
@@ -91,17 +100,7 @@ class DetectHiddenStatesForCapture(BaseTransform):
     def get_config_class(cls) -> Type[TransformConfig]:
         return DetectHiddenStatesForCaptureConfig
 
-    def _apply(
-        self,
-        gm: GraphModule,
-        cm: CachedSequenceInterface,
-        factory: ModelFactory,
-        shared_config: SharedConfig,
-    ) -> Tuple[GraphModule, TransformInfo]:
-        if not self.config.eagle3_layers_to_capture:
-            info = TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
-            return gm, info
-
+    def collect_residual_add_nodes(self, gm: GraphModule) -> Dict[int, Node]:
         def _get_layer_number(lin_node: Node) -> Optional[int]:
             weight = lin_node.args[1]
             if weight.op == "get_attr":
@@ -119,7 +118,7 @@ class DetectHiddenStatesForCapture(BaseTransform):
         for _, _, lin_node_closing in layer_subgraphs:
             # need layer number to correctly identify the residual add node
             layer_number = _get_layer_number(lin_node_closing)
-            if layer_number is None or layer_number not in self.config.eagle3_layers_to_capture:
+            if layer_number is None:
                 continue
 
             # Conditions to identify as the hidden states after the residual
@@ -139,6 +138,33 @@ class DetectHiddenStatesForCapture(BaseTransform):
             if is_op(res_node, torch.ops.aten.add):
                 # this stores the last residual add node encountered for each layer
                 residual_add_nodes[layer_number] = res_node
+
+        return residual_add_nodes
+
+    def _apply(
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        if not self.config.capture_hidden_states:
+            info = TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
+            return gm, info
+
+        residual_add_nodes = self.collect_residual_add_nodes(gm)
+
+        if self.config.eagle3_layers_to_capture is None:
+            num_hidden_layers = len(residual_add_nodes)
+            self.config.eagle3_layers_to_capture = (
+                DetectHiddenStatesForCaptureConfig.default_eagle3_layers_to_capture(
+                    num_hidden_layers
+                )
+            )
+
+        residual_add_nodes = {
+            k: v for k, v in residual_add_nodes.items() if k in self.config.eagle3_layers_to_capture
+        }
 
         assert residual_add_nodes.keys() == self.config.eagle3_layers_to_capture, (
             f"Unable to find residual add nodes for layers. Expected: {self.config.eagle3_layers_to_capture}, \
