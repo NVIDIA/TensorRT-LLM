@@ -30,7 +30,7 @@ from utils.llm_data import llm_models_root
 # TODO: add disable_overlap_scheduler=False
 @pytest.mark.parametrize(
     "disable_overlap_scheduler,use_cuda_graph,attn_backend",
-    [[True, False, "TRTLLM"], [True, True, "TRTLLM"], [True, False, "FLASHINFER"]]
+    [[True, False, "TRTLLM"], [True, True, "TRTLLM"], [True, False, "FLASHINFER"]],
 )
 @pytest.mark.high_cuda_memory
 def test_llama_suffix(
