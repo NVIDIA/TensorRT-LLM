@@ -183,15 +183,6 @@ class ExportToGM(BaseTransform):
                     clone=self.config.clone_state_dict,
                     patch_list=self.config.patch_list,
                 )
-
-            # For VLM models, inject token_type_ids into captured kwargs if it was in the
-            # original input but didn't flow through (e.g., Gemma3 uses it for mask creation
-            # but doesn't pass it to the text model). This allows mask generation to happen
-            # inside the exported GraphModule.
-            for vlm_kwarg in ("token_type_ids", "mm_token_type_ids"):
-                if vlm_kwarg in cm.named_args and vlm_kwarg not in captured_kwargs:
-                    captured_kwargs[vlm_kwarg] = cm.named_args[vlm_kwarg]
-
             # We intentionally do not export certain HF-only kwargs as GraphModule inputs.
             # Some HF call sites will still pass these at runtime; we will drop them before
             # calling the exported GraphModule to avoid torch.export strict in_spec matching.

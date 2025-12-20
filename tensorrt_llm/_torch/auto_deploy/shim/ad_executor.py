@@ -684,32 +684,12 @@ class ADEngine(ModelEngine):
 
     @nvtx_range("ad_compute_logits")
     def _compute_logits(self) -> List[torch.Tensor]:
-        kwargs = self._prepare_vlm_kwargs(dict(self.cache_seq_interface.named_args))
         # run the model
-        logits: torch.Tensor = self.model(**kwargs)[0]
+        logits: torch.Tensor = self.model(**self.cache_seq_interface.named_args)[0]
         logits = self.cache_seq_interface.info.maybe_gather_and_squeeze_logits(logits)
 
         # TRTLLMSampler expects float32 logits. PyTorchModelEngine always casts to float32 regardless.
         return logits.float()
-
-    def _prepare_vlm_kwargs(self, kwargs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """Prepare kwargs for calling the exported inference model in VLM scenarios.
-
-        VLM custom mask generation now happens inside the exported GraphModule using token_type_ids.
-        This function ensures token_type_ids is properly set (defaulting to all-text if not present).
-        """
-        # For VLM models, ensure token_type_ids is present (default to all-text tokens if missing)
-        if getattr(self, "_expects_vlm_custom_masks", False):
-            position_ids = kwargs.get("position_ids", None)
-            if position_ids is not None:
-                token_type_ids = kwargs.get("token_type_ids", None)
-                if token_type_ids is None:
-                    token_type_ids = kwargs.get("mm_token_type_ids", None)
-                if token_type_ids is None:
-                    # Default: no image tokens present (all text tokens).
-                    kwargs["token_type_ids"] = torch.zeros_like(position_ids, dtype=torch.long)
-
-        return kwargs
 
     def get_max_num_sequences(self) -> int:
         """Maximum number of sequences supported by the engine."""
@@ -748,11 +728,15 @@ def _configure_vlm_mask_settings(engine: ADEngine, ad_config: LlmArgs) -> None:
 
     This detects if the model is a VLM that expects token_type_ids for mask generation.
     Mask generation now happens inside the exported GraphModule rather than externally.
+
+    For VLM models where the outer model doesn't forward token_type_ids to the inner
+    GraphModule (e.g., Gemma3), this function registers a forward pre-hook on the inner
+    GraphModule to inject token_type_ids from _extra_args.
     """
     engine._ad_config = ad_config  # so _prepare_inputs() constraint checks actually run
 
-    def _model_expects_token_type_ids(mod: torch.nn.Module) -> bool:
-        """Return True if any nested GraphModule takes token_type_ids as an input."""
+    def _get_graphmodule_with_token_type_ids(mod: torch.nn.Module) -> Optional[torch.nn.Module]:
+        """Find and return the nested GraphModule that takes token_type_ids as an input."""
         try:
             import torch.fx  # local import to keep module import surface small
 
@@ -765,18 +749,62 @@ def _configure_vlm_mask_settings(engine: ADEngine, ad_config: LlmArgs) -> None:
                             if n.op == "placeholder" and isinstance(n.target, str)
                         }
                         if "token_type_ids" in placeholders or "mm_token_type_ids" in placeholders:
-                            return True
+                            return m
                     except Exception:
                         continue
         except Exception:
             pass
-        return False
+        return None
+
+    # Find the inner GraphModule that expects token_type_ids
+    inner_gm = _get_graphmodule_with_token_type_ids(engine.model)
 
     # Detect if the model is a VLM that expects token_type_ids for internal mask generation
     # This is relevant for FlashInfer backend with VLM models like Gemma3
     engine._expects_vlm_custom_masks = (
-        ad_config.attn_backend == "flashinfer" and _model_expects_token_type_ids(engine.model)
+        ad_config.attn_backend == "flashinfer" and inner_gm is not None
     )
+
+    # If the model expects token_type_ids, register a forward pre-hook to inject it
+    # This is needed because the outer VLM model (e.g., Gemma3Model) may not forward
+    # token_type_ids to the inner GraphModule
+    if engine._expects_vlm_custom_masks and inner_gm is not None:
+
+        def _inject_token_type_ids_hook(module, args, kwargs):
+            """Forward pre-hook to inject token_type_ids into the GraphModule kwargs.
+
+            This hook runs BEFORE the GraphModule's input validation hook, ensuring
+            token_type_ids is present in kwargs when the GraphModule is called.
+            """
+            # Check if token_type_ids is already in kwargs
+            if "token_type_ids" in kwargs and kwargs["token_type_ids"] is not None:
+                return args, kwargs
+
+            # Try to get token_type_ids from _extra_args
+            extra_args = engine.cache_seq_interface.info._extra_args
+            token_type_ids = extra_args.get("token_type_ids")
+
+            # If not in _extra_args, try mm_token_type_ids
+            if token_type_ids is None:
+                token_type_ids = extra_args.get("mm_token_type_ids")
+
+            # If still not available, create a default (all zeros = all text tokens)
+            if token_type_ids is None:
+                position_ids = kwargs.get("position_ids")
+                if position_ids is not None:
+                    token_type_ids = torch.zeros_like(position_ids, dtype=torch.long)
+
+            # Inject token_type_ids into kwargs
+            if token_type_ids is not None:
+                kwargs = dict(kwargs)  # Make a mutable copy
+                kwargs["token_type_ids"] = token_type_ids
+
+            return args, kwargs
+
+        # Register the hook with prepend=True to run before other hooks (like input validation)
+        inner_gm.register_forward_pre_hook(
+            _inject_token_type_ids_hook, with_kwargs=True, prepend=True
+        )
 
 
 def create_draft_model_engine_maybe(

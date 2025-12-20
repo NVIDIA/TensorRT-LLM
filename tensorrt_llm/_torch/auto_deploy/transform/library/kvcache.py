@@ -141,17 +141,23 @@ class InsertCachedAttention(BaseTransform):
         # Find the last placeholder to insert after it
         node_last_input = gm.graph.find_nodes(op="placeholder", sort=True)[-1]
 
+        # Use sequential inserting_after calls to ensure proper topological ordering.
+        # Each node must be inserted after the previously created node to maintain
+        # the correct dependency order: flatten -> eq_scalar -> mask_gen
         with gm.graph.inserting_after(node_last_input):
             # Compute image_token_mask = (token_type_ids == 1)
             # First flatten token_type_ids
             flatten_node = gm.graph.call_function(
                 torch.ops.aten.reshape.default, args=(token_type_ids_node, [-1])
             )
+
+        with gm.graph.inserting_after(flatten_node):
             # Compare with 1 to get image token mask
             image_token_mask_node = gm.graph.call_function(
                 torch.ops.aten.eq.Scalar, args=(flatten_node, 1)
             )
 
+        with gm.graph.inserting_after(image_token_mask_node):
             # Call the mask generation op - returns single mask with bidirectional
             # image attention. Sliding window is handled by FlashInfer's window_left.
             custom_mask_node = gm.graph.call_function(
