@@ -487,11 +487,13 @@ class MTPDraftModelForCausalLM(DecoderModelForCausalLM[MTPDraftModel,
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         self.model_config = model_config
-        aux_stream_list = [torch.cuda.Stream() for _ in range(2)]
+        aux_stream_list = [torch.cuda.Stream() for _ in range(4)]
         self.aux_stream_dict = {
             AuxStreamType.Attention: aux_stream_list[0],
             AuxStreamType.MoeShared: aux_stream_list[0],
             AuxStreamType.MoeChunkingOverlap: aux_stream_list[1],
+            AuxStreamType.MoeBalancer: aux_stream_list[2],
+            AuxStreamType.MoeOutputMemset: aux_stream_list[3],
         }
         super().__init__(
             MTPDraftModel(self.model_config,

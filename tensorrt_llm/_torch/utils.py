@@ -21,6 +21,7 @@ aux_stream_name_list = [
     'MoeShared',
     'MoeChunkingOverlap',
     'MoeBalancer',
+    'MoeOutputMemset',
 ]
 AuxStreamType = Enum(
     'AuxStreamType',
