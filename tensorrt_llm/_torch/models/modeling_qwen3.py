@@ -221,7 +221,10 @@ class Qwen3Model(DecoderModel):
                 residual=residual,
                 spec_metadata=spec_metadata,
                 mrope_config=mrope_config,
-                deepstack_embeds=deepstack_embeds)
+                deepstack_embeds=deepstack_embeds,
+                **kwargs,
+            )
+
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 

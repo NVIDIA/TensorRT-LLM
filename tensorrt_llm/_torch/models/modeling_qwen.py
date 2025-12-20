@@ -230,7 +230,8 @@ class QwenModel(DecoderModel):
                                                     attn_metadata=attn_metadata,
                                                     residual=residual,
                                                     mrope_config=mrope_config,
-                                                    spec_metadata=spec_metadata)
+                                                    spec_metadata=spec_metadata,
+                                                    **kwargs)
 
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
@@ -265,7 +266,8 @@ class Qwen2ForCausalLM(DecoderModelForCausalLM[QwenModel, Qwen2Config]):
                             position_ids=position_ids,
                             inputs_embeds=inputs_embeds,
                             mrope_config=mrope_config,
-                            spec_metadata=spec_metadata)
+                            spec_metadata=spec_metadata,
+                            **kwargs)
 
         return self.logits_processor.forward(
             output,
