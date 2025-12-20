@@ -711,6 +711,7 @@ class PyTorchModelEngine(ModelEngine):
             else:
                 draft_lengths.append(self.max_total_draft_tokens)
         else:
+            draft_lengths.append(self.max_total_draft_tokens)
             # For non-draft model, we also capture the CUDA graph instance for draft length 0,
             # so that when we disable spec decode at runtime, we can still run the captured graph.
             # Note that for one engine mode, we are not able to turn off spec decode at runtime.
@@ -720,7 +721,8 @@ class PyTorchModelEngine(ModelEngine):
                     # value. This will save on memory.
                     and self.spec_config.max_concurrency is not None):
                 draft_lengths.append(0)
-            draft_lengths = [self.max_total_draft_tokens]
+        # Reverse order so smaller graphs can reuse memory from larger ones
+        draft_lengths = sorted(set(draft_lengths), reverse=True)
 
         # Create CUDA graphs for short and long sequences separately for sparse attention.
         sparse_config = self.sparse_attention_config
@@ -969,26 +971,6 @@ class PyTorchModelEngine(ModelEngine):
             spec_resource_manager.add_dummy_requests(
                 request_ids=list(range(batch_size)))
         return result
-
-    def _get_cuda_graph_draft_lengths(
-            self, resource_manager: ResourceManager) -> List[int]:
-        """Determines the draft lengths for which to capture CUDA graphs."""
-        draft_lengths = [self.max_total_draft_tokens]
-        spec_resource_manager = resource_manager.get_resource_manager(
-            ResourceManagerType.SPEC_RESOURCE_MANAGER)
-
-        # For non-draft model, also capture a graph for draft_len=0
-        if (not self.is_draft_model and self.max_draft_len > 0
-                and not self.spec_config.spec_dec_mode.use_one_engine()
-                and self.spec_config.max_concurrency is not None):
-            draft_lengths.append(0)
-
-        # Special case for Eagle3 draft model
-        if (self.is_spec_decode and self.is_draft_model
-                and isinstance(spec_resource_manager, Eagle3ResourceManager)):
-            draft_lengths.append(self.original_max_draft_len)
-
-        return list(set(draft_lengths))  # Use set to remove duplicates
 
     def _update_draft_inference_state_for_warmup(
             self, batch: ScheduledRequests, is_first_draft: bool,
