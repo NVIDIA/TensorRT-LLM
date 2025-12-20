@@ -40,6 +40,7 @@ class SpeculativeDecodingMode(IntEnum):
     EAGLE3 = auto()
     EAGLE3_ONE_MODEL = auto()
     NGRAM = auto()
+    SUFFIX = auto()
     DRAFT_TARGET = auto()
     USER_PROVIDED = auto()
     SAVE_HIDDEN_STATES = auto()
@@ -70,6 +71,9 @@ class SpeculativeDecodingMode(IntEnum):
     def is_ngram(self):
         return self == SpeculativeDecodingMode.NGRAM
 
+    def is_suffix(self):
+        return self == SpeculativeDecodingMode.SUFFIX
+
     def is_user_provided(self):
         return self == SpeculativeDecodingMode.USER_PROVIDED
 
@@ -91,7 +95,7 @@ class SpeculativeDecodingMode(IntEnum):
 
     def support_overlap_scheduler(self):
         return self.is_mtp_one_model() or self.is_eagle3_one_model(
-        ) or self.has_draft_model()
+        ) or self.has_draft_model() or self.is_suffix()
 
     def support_guided_decoder(self):
         return self.is_none() or self.has_spec_drafter()
@@ -122,9 +126,9 @@ class SpeculativeDecodingMode(IntEnum):
         ) or self.is_eagle3_one_model()
 
     def has_spec_drafter(self):
-        return self.is_eagle3(
-        ) or self.is_draft_target() or self.is_ngram() or self.is_user_provided(
-        ) or self.is_mtp_eagle() or self.is_save_hidden_states()
+        return self.is_eagle3() or self.is_draft_target() or self.is_ngram(
+        ) or self.is_suffix() or self.is_user_provided() or self.is_mtp_eagle(
+        ) or self.is_save_hidden_states()
 
     def extend_ctx(self, attention_backend: Type[AttentionBackend]):
         """
