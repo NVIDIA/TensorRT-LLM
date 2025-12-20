@@ -81,13 +81,16 @@ class DetectHiddenStatesForCaptureConfig(TransformConfig):
     # TODO: figure out how to get layers to capture.
     # We should consider if we can use the layer indices stored in eagle checkpoints, e.g.
     # https://huggingface.co/nvidia/gpt-oss-120b-Eagle3/blob/main/config.json#L9-L14
-    eagle3_layers_to_capture: Optional[Set[int]] = None  # Default: Do not capture any layers
+    eagle3_layers_to_capture: Optional[Set[int]] = None
 
-    @classmethod
-    def default_eagle3_layers_to_capture(cls, num_hidden_layers: int) -> Set[int]:
+    def set_default_eagle3_layers_to_capture(self, num_hidden_layers: int):
+        """
+        Used to set default layers to capture when we want to capture hidden states, but
+        no layers to capture are provided.
+        """
         if num_hidden_layers <= 6:
             raise ValueError("Not enough hidden layers for default EAGLE3 capture")
-        return {1, num_hidden_layers // 2 - 1, num_hidden_layers - 4}
+        self.eagle3_layers_to_capture = {1, num_hidden_layers // 2 - 1, num_hidden_layers - 4}
 
 
 @TransformRegistry.register("detect_hidden_states_for_capture")
@@ -156,11 +159,7 @@ class DetectHiddenStatesForCapture(BaseTransform):
 
         if self.config.eagle3_layers_to_capture is None:
             num_hidden_layers = len(residual_add_nodes)
-            self.config.eagle3_layers_to_capture = (
-                DetectHiddenStatesForCaptureConfig.default_eagle3_layers_to_capture(
-                    num_hidden_layers
-                )
-            )
+            self.config.set_default_eagle3_layers_to_capture(num_hidden_layers)
 
         residual_add_nodes = {
             k: v for k, v in residual_add_nodes.items() if k in self.config.eagle3_layers_to_capture
