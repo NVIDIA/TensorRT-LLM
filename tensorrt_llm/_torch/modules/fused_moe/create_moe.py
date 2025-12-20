@@ -20,8 +20,6 @@ from .interface import MoE, MoEWeightLoadingMode
 from .moe_load_balancer import get_moe_load_balancer
 from .routing import BaseMoeRoutingMethod
 
-ENABLE_CONFIGURABLE_MOE = os.environ.get("ENABLE_CONFIGURABLE_MOE", "0") == "1"
-
 
 def get_moe_cls(
         model_config: ModelConfig,
@@ -344,7 +342,9 @@ def create_moe(
 
     moe_cls = get_moe_cls(model_config, override_quant_config)
 
-    if ENABLE_CONFIGURABLE_MOE or moe_cls == CuteDslFusedMoE:
+    enable_configurable_moe = os.environ.get("ENABLE_CONFIGURABLE_MOE",
+                                             "1") == "1"
+    if enable_configurable_moe or moe_cls == CuteDslFusedMoE:
         if moe_cls in (DeepGemmFusedMoE, TRTLLMGenFusedMoE, CuteDslFusedMoE,
                        CutlassFusedMoE):
             return ConfigurableMoE(
@@ -359,6 +359,7 @@ def create_moe(
                 weight_loading_mode=weight_loading_mode,
                 apply_router_weight_on_input=apply_router_weight_on_input,
                 layer_idx=layer_idx,
+                override_quant_config=override_quant_config,
                 bias=bias,
                 swiglu_alpha=swiglu_alpha,
                 swiglu_beta=swiglu_beta,
@@ -375,11 +376,11 @@ def create_moe(
                     f"ENABLE_CONFIGURABLE_MOE is set but TRTLLM backend fallback to {moe_cls.__name__} due to quant_config. "
                     f"ConfigurableMoE only supports TRTLLMGenFusedMoE and CuteDslFusedMoE backends. "
                     f"Continuing with legacy MoE backend {moe_cls.__name__}.")
-            else:
-                # For other incompatible backends, raise error
-                raise ValueError(
-                    f"ENABLE_CONFIGURABLE_MOE is set but backend {moe_cls.__name__} is not supported. "
-                    f"ConfigurableMoE only supports TRTLLMGenFusedMoE backend.")
+            # else:
+            #     # For other incompatible backends, raise error
+            #     raise ValueError(
+            #         f"ENABLE_CONFIGURABLE_MOE is set but backend {moe_cls.__name__} is not supported. "
+            #         f"ConfigurableMoE only supports TRTLLMGenFusedMoE backend.")
 
     # Use legacy create_moe_backend for other backends or when ConfigurableMoE is disabled
     return create_moe_backend(
