@@ -60,6 +60,10 @@ methods:
         annotation: Optional[str]
         default: null
         status: prototype
+      custom_tokenizer:
+        annotation: Optional[str]
+        default: null
+        status: prototype
       # reasoning
       reasoning_parser:
         annotation: Optional[str]

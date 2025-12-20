@@ -269,7 +269,7 @@ Testing was performed using the PyTorch backend - this workflow does not require
 | Stage | Description | Command |
 | :- | - | - |
 | [Dataset](#preparing-a-dataset) | Create a synthetic dataset | `python benchmarks/cpp/prepare_dataset.py --tokenizer=$model_name --stdout token-norm-dist --num-requests=$num_requests --input-mean=$isl --output-mean=$osl --input-stdev=0 --output-stdev=0 > $dataset_file` |
-| [Run](#running-the-benchmark) | Run a benchmark with a dataset | `trtllm-bench --model $model_name throughput --dataset $dataset_file --backend pytorch --extra_llm_api_options $llm_options` |
+| [Run](#running-the-benchmark) | Run a benchmark with a dataset | `trtllm-bench --model $model_name throughput --dataset $dataset_file --backend pytorch --config $llm_options` |
 
 ### Variables
 
@@ -323,7 +323,7 @@ a model name (HuggingFace reference or path to a local model), a [generated data
 
 For dense / non-MoE models:
 ```shell
-trtllm-bench --tp $tp_size --pp $pp_size --model $model_name throughput --dataset $dataset_file --backend pytorch --extra_llm_api_options $llm_options
+trtllm-bench --tp $tp_size --pp $pp_size --model $model_name throughput --dataset $dataset_file --backend pytorch --config $llm_options
 ```
 Llama 3.3
 
@@ -337,7 +337,7 @@ cuda_graph_config:
 For MoE models:
 
 ```shell
-trtllm-bench --tp $tp_size --pp $pp_size --ep $ep_size --model $model_name throughput --dataset $dataset_file --backend pytorch --extra_llm_api_options $llm_options
+trtllm-bench --tp $tp_size --pp $pp_size --ep $ep_size --model $model_name throughput --dataset $dataset_file --backend pytorch --config $llm_options
 ```
 
 GPT-OSS:

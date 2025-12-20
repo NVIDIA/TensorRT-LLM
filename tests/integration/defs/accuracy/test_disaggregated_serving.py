@@ -177,7 +177,7 @@ def launch_disaggregated_llm(
 
         ctx_server_args = ctx_args + [
             "--port",
-            str(port), "--extra_llm_api_options", ctx_server_config_path,
+            str(port), "--config", ctx_server_config_path,
             f"--tp_size={ctx_tp}", f"--pp_size={ctx_pp}", f"--cp_size={ctx_cp}"
         ]
         if "max_num_tokens" in ctx_server_config:
@@ -200,7 +200,7 @@ def launch_disaggregated_llm(
 
         gen_server_args = gen_args + [
             "--port",
-            str(port), "--extra_llm_api_options", gen_server_config_path,
+            str(port), "--config", gen_server_config_path,
             f"--tp_size={gen_tp}", f"--pp_size={gen_pp}", f"--cp_size={gen_cp}"
         ]
         if "max_num_tokens" in gen_server_config:
@@ -863,10 +863,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "disable_overlap_scheduler": True,
             "kv_cache_config": kv_cache_config,
             "enable_chunked_prefill": False,
-            "cuda_graph_config": {
-                "enable_padding": True,
-                "batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128]
-            },
+            "cuda_graph_config": None,
             "cache_transceiver_config": {
                 "backend": "UCX"
             },
