@@ -31,7 +31,13 @@ Piecewise CUDA Graph is a technique that runs cudagraph-unsupported components (
 
 ## Usage
 
-To enable torch.compile and Piecewise CUDA Graph, add the following configuration to `extra_config.yml`. Typically, the `extra_config.yml` can be used by adding launching args `--extra_llm_api_options extra_config.yml` to `trtllm-serve` or `trtllm-bench`.
+To enable torch.compile and Piecewise CUDA Graph, add the following configuration to `config.yml`. Typically, the `config.yml` can be used by adding launching args `--config config.yml` to `trtllm-serve` or `trtllm-bench`.
+
+```{eval-rst}
+.. include:: ../_includes/note_sections.rst
+   :start-after: .. start-note-config-flag-alias
+   :end-before: .. end-note-config-flag-alias
+```
 
 ```yaml
 ... # Other extra config
@@ -50,7 +56,7 @@ Piecewise CUDA Graph only handles context-only and mixed context+generation iter
 ```yaml
 cuda_graph_config:
   enable_padding: true
-  max_batch_size: 1024 # Specify max capture batch size for generation only cuda graph. By default, TensorRT LLM will generate a capture list based on it. 
+  max_batch_size: 1024 # Specify max capture batch size for generation only cuda graph. By default, TensorRT LLM will generate a capture list based on it.
 
 torch_compile_config:
   capture_num_tokens: '${capture_num_tokens}' # Specify capture_num_tokens for piecewise cuda graph
@@ -72,7 +78,7 @@ Guidelines for `capture_num_tokens`:
 
 - Define bounds:
   - Lower bound: base it on typical context lengths. In low-latency workflows with KV-cache reuse, it can be as small as <10 tokens.
-  - Upper bound: set by hardware and model configuration—choose the largest token count that still provides a measurable benefit from Piecewise CUDA Graph even after padding. 
+  - Upper bound: set by hardware and model configuration—choose the largest token count that still provides a measurable benefit from Piecewise CUDA Graph even after padding.
 - Choose step size: Choose step sizes that balance coverage and memory overhead. Use denser steps in a smaller number of token ranges, and a fixed step (e.g., 256) for larger ranges.
 - Manage trade-offs: more capture points reduce padding but increase memory use and can lower max concurrency; fewer points save memory but increase padding and compute cost.
 
@@ -80,7 +86,7 @@ Even with Piecewise CUDA Graph enabled, you may still observe bubbles in the con
 
 ## Known Issue
 
-Torch compile cannot work with multi-ModelEngine config. 
+Torch compile cannot work with multi-ModelEngine config.
 
 1. Speculative Decoding in Two-Model Style
 
@@ -104,14 +110,14 @@ Currently, TRT-LLM mainly relies on torch.compile **fullgraph** mode to enable P
 
 #### Custom Op
 
-For ops that cannot be represented by a torch native op, developers need to wrap them into a custom op so that they can work properly with torch.compile. A custom op mainly contains two parts: Op forward implementation & Fake kernel. 
+For ops that cannot be represented by a torch native op, developers need to wrap them into a custom op so that they can work properly with torch.compile. A custom op mainly contains two parts: Op forward implementation & Fake kernel.
 
-1. Op forward implementation: Define how this op does forward calculation. Including custom CUDA kernel, etc. 
+1. Op forward implementation: Define how this op does forward calculation. Including custom CUDA kernel, etc.
 2. Fake kernel: Help torch.compile to do the output tensor dtype/shape inference.
 
-After wrapping the op into a torch custom op, the implementation is a completely **black box** for torch compile. Instead, torch.compile will fully rely on a fake kernel to do the tracing. 
+After wrapping the op into a torch custom op, the implementation is a completely **black box** for torch compile. Instead, torch.compile will fully rely on a fake kernel to do the tracing.
 
-Below is a simple example of flashinfer op’s fake kernel. 
+Below is a simple example of flashinfer op’s fake kernel.
 
 ```python
 @torch.library.custom_op("trtllm::flashinfer_silu_and_mul", mutates_args=())
@@ -127,9 +133,9 @@ For more examples, please refer to `tensorrt_llm/_torch/custom_ops`.
 
 #### Current Status
 
-For hot models like deepseek/qwen/lllama, we’ve already wrapped some large modules into a custom op to avoid trace failure/graph breaks and exclude output projection & MTP from torch.compile's scope. 
+For hot models like deepseek/qwen/lllama, we’ve already wrapped some large modules into a custom op to avoid trace failure/graph breaks and exclude output projection & MTP from torch.compile's scope.
 
-This means developing the inside attention custom op part, the MoE routed export part, and the MPT part don’t need to worry about complex torch.compile constraints since they are treated as a black box for Torch compile. Developers should only make sure the fake kernels of attention custom op, and routed expert are aligned with the actual implementation. 
+This means developing the inside attention custom op part, the MoE routed export part, and the MPT part don’t need to worry about complex torch.compile constraints since they are treated as a black box for Torch compile. Developers should only make sure the fake kernels of attention custom op, and routed expert are aligned with the actual implementation.
 
 
 <div align="center">
@@ -158,21 +164,21 @@ For the op outside of attention and MLP, the developer should obey the torch.com
 </div>
 <p align="center"><sub><em>Figure 2. TensorRT LLM Custom torch.compile Backend Overview</em></sub></p>
 
-Above is the overview of the TensorRT LLM custom backend for `torch.compile`. 
+Above is the overview of the TensorRT LLM custom backend for `torch.compile`.
 
 #### Torch IR Optimization
 
 Torch IR is the Fx graph that is directly traced by Torch Dynamo. It has several important features for us to do some graph rewriting and get information:
 
 1. Preserve the operations as is: We can easily find a specific operation and then transform it to arbitrary operations. No need to deal with `auto_functionalize`, etc.
-2. Preserve original variable tensor name in the Fx graph: For Piecewise CUDA Graph, it needs to find the correct `SymInt` which represents the token number. Hence, we rely on the `input_ids`'s shape to make it find the `SymInt` correctly. 
+2. Preserve original variable tensor name in the Fx graph: For Piecewise CUDA Graph, it needs to find the correct `SymInt` which represents the token number. Hence, we rely on the `input_ids`'s shape to make it find the `SymInt` correctly.
 
 #### ATen IR Optimization
 
 We get ATen IR after explicitly calling `aot_module_simplified` on the Fx graph. ATen IR is
 
 1. In SSA format (no input mutations)
-2. Strict subset of aten op (<250): In Torch IR, Python native add op, `torch.Tensor().add()`, `torch.aten.add.Tensor` could be three different ops. After the transform, they will be the same op. 
+2. Strict subset of aten op (<250): In Torch IR, Python native add op, `torch.Tensor().add()`, `torch.aten.add.Tensor` could be three different ops. After the transform, they will be the same op.
 3. Guaranteed metadata information, e.g., dtype and shape propagation
 
 On this IR level, TensorRT LLM will do the following optimization
@@ -183,16 +189,16 @@ All fusions are located in `tensorrt_llm/_torch/compilation/patterns` and implem
 
 1. Inadequate handling of scalars and lists:
    - Scalars get specialized into the traced pattern, forcing one pattern per value—impractical and non-general.
-   - Lists are flattened, turning elements into separate input arguments, making it impossible to match the original operation. 
+   - Lists are flattened, turning elements into separate input arguments, making it impossible to match the original operation.
 2. Trace-driven pitfalls: Because it’s trace-based, the generated source patterns may not meet our needs and can introduce additional issues as we expand pattern coverage.
 
 We mainly do the operation fusion for AllReduce & RMSNorm.
 
 1. AllReduce related fusion: Fuse the following operations into one AllReduce op.
    + AllReduce + Residual + RMSNorm
-   + AllReduce + Residual + RMSNorm + FP8 Quantization 
+   + AllReduce + Residual + RMSNorm + FP8 Quantization
    + AllReduce + Residual + RMSNorm + FP4 Quantization
-2. AllReduce with User Buffer: Converts AllReduce operations to use userbuffers to avoid extra copy overhead. 
+2. AllReduce with User Buffer: Converts AllReduce operations to use userbuffers to avoid extra copy overhead.
 
 We enable these fusions in torch.compile because they’re difficult to express in eager mode. For the AllReduce + RMSNorm fusion, which is cross-module, implementing it in eager mode would require moving code between modules, leading to redundant, complex, and hard-to-maintain logic.
 
@@ -204,7 +210,7 @@ Because ATen IR is SSA, in-place operations are rewritten as out-of-place via a 
 
 ##### Auto Multi-stream
 
-Currently torch.compile won't create a subgraph for user user-defined CUDA stream. Instead, it will convert it to `set_stream`. The set_stream op doesn't have any consumers, so it will be removed in the Torch IR to ATen IR transformation, thus losing all the multi-stream scheduling. 
+Currently torch.compile won't create a subgraph for user user-defined CUDA stream. Instead, it will convert it to `set_stream`. The set_stream op doesn't have any consumers, so it will be removed in the Torch IR to ATen IR transformation, thus losing all the multi-stream scheduling.
 
 To address this, we implemented an auto multi-stream scheduler:
 
@@ -214,7 +220,7 @@ To address this, we implemented an auto multi-stream scheduler:
 
 3. Schedules nodes onto up to `max_num_streams` specified by user config
 
-4. Insert multi-stream related custom op: since the Fx graph executes operators in list order, so we insert streaming-control operators directly into the graph. Moreover, as these operators have no users, we cannot perform dead-code elimination after multi-stream scheduling. Below is an example of multi-stream, which `trtllm.dsv3_router_gemm_op.default` and `trtllm.silu_and_mul.default` + `trtllm.fp4_quantize.default` execute in parallel. 
+4. Insert multi-stream related custom op: since the Fx graph executes operators in list order, so we insert streaming-control operators directly into the graph. Moreover, as these operators have no users, we cannot perform dead-code elimination after multi-stream scheduling. Below is an example of multi-stream, which `trtllm.dsv3_router_gemm_op.default` and `trtllm.silu_and_mul.default` + `trtllm.fp4_quantize.default` execute in parallel.
 
    ```
    call_function  record_event                             trtllm.record_event                          (1,)                                                                                   {}
@@ -238,7 +244,7 @@ To address this, we implemented an auto multi-stream scheduler:
    call_function  record_stream_1                          trtllm.record_stream                         (mm_1, 1)                                                                              {}
    call_function  record_event_4                           trtllm.record_event                          (2,)                                                                                   {}
    call_function  set_stream_1                             trtllm.set_stream                            (0,)                                                                                   {}
-   call_function  wait_event_2                             trtllm.wait_event                            (2,)                        
+   call_function  wait_event_2                             trtllm.wait_event                            (2,)
    ```
 
 #### Piecewise CUDA Graph
@@ -254,14 +260,14 @@ In the current design, we assume the attention block is the only non-capturable 
 
 Notes:
 
-1. Attention **MUST NOT** have any output. The output tensor should be allocated by CUDA Graph. 
-2. Each sub-cudagraph **MUST** have at least one input tensor that contains the number of tokens in the shape. 
-3. Only allow dynamic shape for `num_of_tokens` dim. 
+1. Attention **MUST NOT** have any output. The output tensor should be allocated by CUDA Graph.
+2. Each sub-cudagraph **MUST** have at least one input tensor that contains the number of tokens in the shape.
+3. Only allow dynamic shape for `num_of_tokens` dim.
 
 ### Common Trace Failure
 
 1. Custom op fake kernel: For every custom op, developers must implement a correct fake kernel. **Make sure to update the corresponding fake kernel when the custom op is changed**
-2. Dynamic Iteration Number Loop: This is technically not a trace failure, but it will introduce long-time tracing that is generally not acceptable. When torch.compile tries to convert PyTorch modeling code to Fx graph, it will try to unroll the loop. For a loop that has a large and dynamic loop number with a large loop body, the tracing process will take a long time to do the unrolling. 
+2. Dynamic Iteration Number Loop: This is technically not a trace failure, but it will introduce long-time tracing that is generally not acceptable. When torch.compile tries to convert PyTorch modeling code to Fx graph, it will try to unroll the loop. For a loop that has a large and dynamic loop number with a large loop body, the tracing process will take a long time to do the unrolling.
    1. If the IO of the loop can be easily written into a custom op format, try to replace it with a custom op
    2. If the loop num is unchanged during the whole inference service lifetime, then it is ok to leave the loop as is. (e.g., Model decoder layer loop)
 
@@ -276,30 +282,30 @@ Notes:
      + `torch.nonzeros()`: Produce data-dependent dynamic shape tensor
      + `torch.sym_min`: `SymInt` aware min
      + `torch.Tensor.tolist()`, `torch.Tensor.item()`
-     + **Solution:** Use them inside a custom op if these operators don't get involved in producing the custom op's output tensor. 
+     + **Solution:** Use them inside a custom op if these operators don't get involved in producing the custom op's output tensor.
 
-2. Use a custom object’s method: For a class like mapping config, we cannot directly use its method like has_pp() in the model forward. 
+2. Use a custom object’s method: For a class like mapping config, we cannot directly use its method like has_pp() in the model forward.
 
-   + **Solution**: We should convert it to a bool in the model init and use the bool. 
+   + **Solution**: We should convert it to a bool in the model init and use the bool.
 
    ```python
    class Mapping(object):
        def __init__(self, ...):
            ...
-         
+
        def has_pp(self): # Cannot use this method in torch.compile
            return self.pp_size > 1
    ```
 
 3. Data Dependent Control(DDC) flow involved in code
 
-   + **Solution**: Try to avoid DDC in the code. Try to pre-compute the result outside of torch.compile's scope. For the following example, try to pre-compute the `torch.sum(data)` at the data preparation stage, and pass the result to the `forward`. 
+   + **Solution**: Try to avoid DDC in the code. Try to pre-compute the result outside of torch.compile's scope. For the following example, try to pre-compute the `torch.sum(data)` at the data preparation stage, and pass the result to the `forward`.
 
    ```python
    class TestCase(torch.nn.Module):
        def __init__(self):
            super().__init__()
-   
+
     def forward(self, x, data):
         y = x ** 2
         if torch.sum(data) >= 4: # Data Dependent Control Here!
@@ -308,7 +314,7 @@ Notes:
             t = y / 2
         t = t + 10
         return t
-   
+
    test_case = TestCase()
    test_case = torch.compile(test_case, backend=Backend())
    x = torch.randn(5).cuda()
@@ -320,15 +326,15 @@ Notes:
 
 ### Recompilation
 
-1. Try not to use data-dependent dynamic shapes in the model forward. (e.g., slice the tensor based on input value). This will introduce 0/1 specialization to the model and will possibly introduce recompile. 
+1. Try not to use data-dependent dynamic shapes in the model forward. (e.g., slice the tensor based on input value). This will introduce 0/1 specialization to the model and will possibly introduce recompile.
 
    1. **0/1 specialization**: torch.compile will recompile the model if a dynamic tensor’s dim equals 0 or 1. In the worst case, it will recompile 3 times for 1 dimension: 0,1, >2
 
-2. For an int argument that would change during runtime, use `SymInt` rather than int in the C++ custom op definition. Otherwise, it will trigger a recompile when the value changes. 
+2. For an int argument that would change during runtime, use `SymInt` rather than int in the C++ custom op definition. Otherwise, it will trigger a recompile when the value changes.
 
    ```c++
    TORCH_LIBRARY_FRAGMENT(trtllm, m)
-   {    
+   {
        m.def("allgather(Tensor input, SymInt[]? sizes, int[] group) -> Tensor");
        m.def("allgather_list(Tensor[] input_list, SymInt[]? sizes, int[] group) -> Tensor[]");
    }
@@ -340,13 +346,13 @@ Notes:
 
    2. Control Flow based on dynamic shape
 
-   3. Next power of two: Previously, we used `bit_length()` to implement the next power of 2 function. However, it will cause a recompile for every int value. Now rewrite the code to be torch.compile-friendly. 
+   3. Next power of two: Previously, we used `bit_length()` to implement the next power of 2 function. However, it will cause a recompile for every int value. Now rewrite the code to be torch.compile-friendly.
 
       ```python
       def next_positive_power_of_2(x: int) -> int:
           if x < 1:
               return 1
-      
+
           # Following code is equivalent to 1 << (x - 1).bit_length()
           # But this impl does not contain bit_length(), so it can be used by torch compile.
           # It can correctly handle 64-bit numbers, which should be enough for now.
@@ -359,5 +365,3 @@ Notes:
           n |= n >> 32
           return n + 1
       ```
-
-      

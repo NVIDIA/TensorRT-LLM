@@ -3,30 +3,11 @@
 TensorRT LLM provides the OpenAI-compatible API via `trtllm-serve` command.
 A complete reference for the API is available in the [OpenAI API Reference](https://platform.openai.com/docs/api-reference).
 
-This step-by-step tutorial covers the following topics for running online serving benchmarking with Llama 3.1 70B and Qwen2.5-VL-7B for multimodal models:
- * Methodology Introduction
- * Launch the OpenAI-Compatible Server with NGC container
- * Run the performance benchmark
- * Using `extra_llm_api_options`
- * Multimodal Serving and Benchmarking
-
-## Table of Contents
-- [Run benchmarking with `trtllm-serve`](#run-benchmarking-with-trtllm-serve)
-  - [Table of Contents](#table-of-contents)
-  - [Methodology Introduction](#methodology-introduction)
-  - [Preparation](#preparation)
-    - [Launch the NGC container](#launch-the-ngc-container)
-    - [Start the trtllm-serve service](#start-the-trtllm-serve-service)
-  - [Benchmark using `tensorrt_llm.serve.scripts.benchmark_serving`](#benchmark-using-tensorrt_llmservescriptsbenchmark_serving)
-    - [Key Metrics](#key-metrics)
-  - [About `extra_llm_api_options`](#about-extra_llm_api_options)
-      - [`kv_cache_config`](#kv_cache_config)
-      - [`cuda_graph_config`](#cuda_graph_config)
-      - [`moe_config`](#moe_config)
-      - [`attention_backend`](#attention_backend)
-  - [Multimodal Serving and Benchmarking](#multimodal-serving-and-benchmarking)
-    - [Setting up Multimodal Serving](#setting-up-multimodal-serving)
-    - [Multimodal Benchmarking](#multimodal-benchmarking)
+```{contents}
+:Contents
+:local:
+:depth: 3
+```
 
 
 ## Methodology Introduction
@@ -57,9 +38,9 @@ For benchmarking purposes, first create a bash script using the following code a
 ```bash
 #! /bin/bash
 model_path=/path/to/llama3.1_70B
-extra_llm_api_file=/tmp/extra-llm-api-config.yml
+config_file=/tmp/config.yml
 
-cat << EOF > ${extra_llm_api_file}
+cat << EOF > ${config_file}
 enable_attention_dp: false
 print_iter_log: true
 cuda_graph_config:
@@ -77,7 +58,7 @@ trtllm-serve ${model_path} \
     --tp_size 1 \
     --ep_size 1 \
     --trust_remote_code \
-    --extra_llm_api_options ${extra_llm_api_file}
+    --config ${config_file}
 ```
 > [!NOTE]
 > The trtllm-llmapi-launch is a script that launches the LLM-API code on
@@ -215,17 +196,24 @@ $$
 
 To get more detailed metrics besides the key metrics above, there is an [experimental tool](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/serve/scripts/time_breakdown) for request time breakdown.
 
-## About `extra_llm_api_options`
-   trtllm-serve provides `extra_llm_api_options` knob to **overwrite** the parameters specified by trtllm-serve.
-   Generally, We create a YAML file that contains various performance switches.
-   e.g
-   ```yaml
-     cuda_graph_config:
-      padding_enabled: true
-     print_iter_log: true
-     kv_cache_dtype: fp8
-     enable_attention_dp: true
-   ```
+## About `--config`
+
+```{eval-rst}
+.. include:: ../../_includes/note_sections.rst
+   :start-after: .. start-note-config-flag-alias
+   :end-before: .. end-note-config-flag-alias
+```
+
+`trtllm-serve` provides `--config` to **overwrite** the parameters specified by `trtllm-serve`.
+Generally, we create a YAML file that contains various performance switches. For example:
+
+```yaml
+cuda_graph_config:
+  padding_enabled: true
+print_iter_log: true
+kv_cache_dtype: fp8
+enable_attention_dp: true
+```
 
 The following is a list of common performance switches.
 #### `kv_cache_config`
@@ -274,7 +262,7 @@ The following is a list of common performance switches.
 
 &emsp;**Default**: TRTLLM
 
-See the [TorchLlmArgs class](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs) for the full list of options which can be used in the extra\_llm\_api\_options`.`
+See the [TorchLlmArgs class](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs) for the full list of options which can be used in the `--config`.
 
 ## Multimodal Serving and Benchmarking
 
