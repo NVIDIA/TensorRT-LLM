@@ -22,6 +22,9 @@ from strenum import StrEnum
 from torch._prims_common import DeviceLikeType
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionRuntimeFeatures
+from tensorrt_llm._torch.auto_deploy.utils._graph import find_embedding_node, find_lm_head_node
+from tensorrt_llm._torch.auto_deploy.utils.node_utils import get_weight_tensor
+from tensorrt_llm._torch.models.modeling_speculative import Eagle3ForCausalLM
 from tensorrt_llm._torch.pyexecutor._util import (
     _create_kv_cache_manager,
     get_decoding_mode,
@@ -826,26 +829,56 @@ class ADEngine(ModelEngine):
         return outputs
 
 
-def share_embedding_weights(
+def share_target_weights_with_draft(
     target_model_engine: "ADEngine", draft_model_engine: PyTorchModelEngine
 ):
-    # This function is necessary for supporting Eagle and other speculative decoding methods that
-    # copy the embed_tokens submodule. It is not necessary for MTP and other speculative decoding methods that
-    # use the draft model engine directly.
+    """
+    Certain speculative decoding methods (e.g. Eagle3) require sharing the target model's embedding and lm_head weights
+    with the draft model. This function does this sharing if necessary.
+    """
 
-    submodule = target_model_engine.model.model.embed_tokens
+    assert isinstance(draft_model_engine.model, Eagle3ForCausalLM), (
+        f"Expected draft_model_engine.model to be Eagle3ForCausalLM, got {type(draft_model_engine.model)}"
+    )
 
-    world_size = mpi_world_size()
-    assert world_size <= 1, f"This code assumes tp<=1. World size: {world_size}"
+    def share_embedding_weights_with_draft(
+        target_model_engine: "ADEngine", draft_model_engine: PyTorchModelEngine
+    ):
+        gm, embedding_node = find_embedding_node(target_model_engine.model)
+        embedding_weight = get_weight_tensor(gm, embedding_node)
 
-    # Note: This simple forward function implementation assumes tp=1.
-    # TODO(govind): Handle the tp>1 case.
-    def new_embedding_forward(self, input_ids):
-        return F.embedding(input_ids, self.weight)
+        world_size = mpi_world_size()
+        assert world_size <= 1, f"This code assumes tp<=1. World size: {world_size}"
 
-    submodule.forward = MethodType(new_embedding_forward, submodule)
+        # Note: This simple forward function implementation assumes tp=1.
+        # TODO(govind): Handle the tp>1 case.
+        def new_embedding_forward(self, input_ids):
+            return F.embedding(input_ids, self.weight)
 
-    draft_model_engine.load_weights_from_target_model(target_model_engine.model)
+        if draft_model_engine.model.model.embed_tokens is None:
+            submodule = torch.nn.Module()
+            submodule.forward = MethodType(new_embedding_forward, submodule)
+            submodule.weight = embedding_weight
+            draft_model_engine.model.model.embed_tokens = submodule
+
+    def share_lm_head_weights_with_draft(
+        target_model_engine: "ADEngine", draft_model_engine: PyTorchModelEngine
+    ):
+        vocab_size = target_model_engine.cache_seq_interface.info.vocab_size_padded
+
+        gm, lm_head_node = find_lm_head_node(target_model_engine.model)
+        lm_head_weight = get_weight_tensor(gm, lm_head_node)
+
+        assert lm_head_weight.shape[0] == vocab_size, (
+            f"Expected lm_head weight first dimension to be vocab_size={vocab_size}, "
+            f"but got shape {lm_head_weight.shape}"
+        )
+
+        if draft_model_engine.model.load_lm_head_from_target:
+            draft_model_engine.model.lm_head.weight = lm_head_weight
+
+    share_embedding_weights_with_draft(target_model_engine, draft_model_engine)
+    share_lm_head_weights_with_draft(target_model_engine, draft_model_engine)
 
 
 def create_draft_model_engine_maybe(
@@ -900,9 +933,10 @@ def create_draft_model_engine_maybe(
         drafting_loop_wrapper=drafting_loop_wrapper,
     )
 
-    share_embedding_weights(
-        target_model_engine=target_engine, draft_model_engine=draft_model_engine
-    )
+    if draft_spec_config.spec_dec_mode.is_eagle3():
+        share_target_weights_with_draft(
+            target_model_engine=target_engine, draft_model_engine=draft_model_engine
+        )
 
     draft_model_engine.kv_cache_manager_key = ResourceManagerType.DRAFT_KV_CACHE_MANAGER
 

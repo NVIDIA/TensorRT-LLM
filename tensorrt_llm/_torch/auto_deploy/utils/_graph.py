@@ -1,5 +1,6 @@
 """Graph-related utilities for transformations."""
 
+from collections import deque
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, Optional, Tuple, Union
 
@@ -17,7 +18,7 @@ from torch.fx.passes.shape_prop import _extract_tensor_metadata
 from torch.utils._pytree import _LEAF_SPEC
 
 from .logger import ad_logger
-from .node_utils import is_op
+from .node_utils import is_linear_op, is_op
 
 _NoValType = type("_NoValType", (), {})
 _NO_VAL = _NoValType()
@@ -344,3 +345,70 @@ def placeholders_on_meta(mod: nn.Module) -> bool:
                 return True
 
     return False
+
+
+def find_embedding_node(model: nn.Module) -> tuple[GraphModule, Node]:
+    """Find the unique embedding node across all graph modules."""
+    embedding_nodes = []
+    for _, gm in named_graphmodules(model):
+        found_nodes = gm.graph.find_nodes(
+            op="call_function", target=torch.ops.aten.embedding.default
+        )
+        for node in found_nodes:
+            embedding_nodes.append((gm, node))
+
+    assert len(embedding_nodes) == 1, (
+        f"Expected exactly 1 aten.embedding.default node, but found {len(embedding_nodes)}."
+    )
+
+    return embedding_nodes[0]
+
+
+def find_output_node(model: nn.Module) -> tuple[GraphModule, Node]:
+    """Find the unique output node across all graph modules."""
+    output_nodes = []
+    for _, gm in named_graphmodules(model):
+        for node in gm.graph.nodes:
+            if node.op == "output":
+                output_nodes.append((gm, node))
+
+    assert len(output_nodes) == 1, f"Expected exactly 1 output node, but found {len(output_nodes)}."
+
+    return output_nodes[0]
+
+
+def find_lm_head_node(model: nn.Module) -> tuple[GraphModule, Node]:
+    """Find the lm_head node by traversing backwards from the output node."""
+    gm, output_node = find_output_node(model)
+
+    visited = set()
+    queue = deque()
+
+    for arg in output_node.args:
+        if isinstance(arg, Node):
+            queue.append(arg)
+        elif isinstance(arg, (list, tuple)):
+            for item in arg:
+                if isinstance(item, Node):
+                    queue.append(item)
+
+    lm_head_node = None
+    while queue:
+        node = queue.popleft()
+        if node in visited:
+            continue
+        visited.add(node)
+
+        if is_linear_op(node):
+            lm_head_node = node
+            break
+
+        for arg in node.args:
+            if isinstance(arg, Node) and arg not in visited:
+                queue.append(arg)
+
+    assert lm_head_node is not None, (
+        "Could not find lm_head linear op by traversing backwards from output node."
+    )
+
+    return gm, lm_head_node

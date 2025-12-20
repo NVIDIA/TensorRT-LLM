@@ -916,11 +916,18 @@ def get_layer_after_linear_node(
 def has_shape(node: Node) -> bool:
     return hasattr(node, "meta") and "val" in node.meta and hasattr(node.meta["val"], "shape")
 
-
 def shape(node: Node) -> Tuple[int, ...]:
     if not has_shape(node):
         return None
     return node.meta["val"].shape
+
+def get_weight_tensor(gm: GraphModule, node: Node) -> "torch.Tensor":
+    """Extract the weight tensor from a node within a GraphModule."""
+    weight_name = extract_param_names_from_node(node)[0]
+    weight_tensor = gm
+    for part in weight_name.split("."):
+        weight_tensor = getattr(weight_tensor, part)
+    return weight_tensor
 
 
 def draw_graph(gm: GraphModule, filename: str):
