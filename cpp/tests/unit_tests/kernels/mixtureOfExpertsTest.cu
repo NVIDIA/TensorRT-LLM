@@ -2569,7 +2569,8 @@ TYPED_TEST(MixtureOfExpertsTest, RunProfiler)
 
         for (int64_t num_tokens : {1, 128})
         {
-            backend.prepare(num_tokens, workspace, /*expert_weights=*/nullptr, this->mStream->get());
+            backend.prepare(num_tokens, workspace, /*expert_weights=*/nullptr,
+                /*token_selected_experts_customized=*/nullptr, /*use_customized_router=*/false, this->mStream->get());
             for (auto const& tactic : this->getAllTileConfigsToTest())
             {
                 backend.runProfiler(num_tokens,
@@ -2616,7 +2617,8 @@ TEST_F(MixtureOfExpertsProfilerTest, TestGeneratedProfilerDistribution)
             auto workspace = this->allocBuffer<char>(ws_size);
             int64_t num_experts_per_node = num_experts / ep;
 
-            backend.prepare(num_tokens, workspace, /*expert_weights=*/nullptr, mStream->get());
+            backend.prepare(num_tokens, workspace, /*expert_weights=*/nullptr,
+                /*token_selected_experts_customized=*/nullptr, /*use_customized_router=*/false, mStream->get());
 
             auto workspaces = backend.getProfilerWorkspaces(num_tokens, getSMVersion() >= 90 && getSMVersion() < 120);
 #define GET_WS_PTR(type, name) auto* name = reinterpret_cast<type>(workspace + workspaces.at(#name).second)
