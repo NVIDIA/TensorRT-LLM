@@ -236,7 +236,7 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
 
 class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Nemotron-Super-V3"
-    MODEL_PATH_BF16 = "/scratch/models/super-v3-iter_0440000/hf"  # add to llm_models_root? I don't have permissions
+    MODEL_PATH_BF16 = f"{llm_models_root()}/Nemotron-Super-3-120B-A12B-dev"
 
     def get_default_kwargs(self):
         return {
