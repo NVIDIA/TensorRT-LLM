@@ -155,6 +155,7 @@ class DeepSeekV32Parser(BaseToolParser):
 
     def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
         """Streaming incremental parsing tool calls for DeepSeekV32 format.
+
         Supports multiple consecutive invoke blocks.
         """
         self._buffer += new_text
