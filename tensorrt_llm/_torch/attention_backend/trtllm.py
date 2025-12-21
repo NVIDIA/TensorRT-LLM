@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
+from tensorrt_llm.llmapi import SkipSoftmaxAttentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -147,6 +148,12 @@ class TrtllmAttentionWrapper:
         self.rotary_embedding_original_max_positions = rope_params.original_max_positions
         self.kwargs = {}
         self.kwargs.update(kwargs)
+        self.skip_softmax_stat = torch.zeros(2,
+                                             dtype=torch.uint32,
+                                             device='cuda')
+        # Default disabled, but allow manual enabling through `TRTLLM_PRINT_SKIP_SOFTMAX_STAT=1`
+        self.print_skip_softmax_stat = os.environ.get(
+            "TRTLLM_PRINT_SKIP_SOFTMAX_STAT", "0") == "1"
 
     def update_quant_config(self, quant_config: Optional[QuantConfig] = None):
         quant_config = quant_config or QuantConfig()
@@ -206,6 +213,8 @@ class TrtllmAttentionWrapper:
         sparse_attn_offsets: Optional[torch.Tensor] = None,
         sparse_attn_indices_block_size: int = 1,
         sparse_mla_topk: int = 0,
+        skip_softmax_threshold_scale_factor_prefill: Optional[float] = None,
+        skip_softmax_threshold_scale_factor_decode: Optional[float] = None,
         helix_position_offsets: Optional[torch.Tensor] = None,
         helix_is_inactive_rank: Optional[torch.Tensor] = None,
         **kwargs,
@@ -252,6 +261,8 @@ class TrtllmAttentionWrapper:
             sparse_attn_offsets (torch.Tensor): The batch offsets for the sparse attention indices, with shape of (num_generations + 1) on GPU.
             sparse_attn_indices_block_size (int): The granularity of the sparse attention indices, used by block sparse attention.
             sparse_mla_topk (int): The topk for the sparse MLA, used by DSA attention.
+            skip_softmax_threshold_scale_factor_prefill (float): The scale factor for the skip softmax threshold in prefill phase.
+            skip_softmax_threshold_scale_factor_decode (float): The scale factor for the skip softmax threshold in decode phase.
             helix_position_offsets (torch.Tensor): The tensor to store the helix position offsets, with shape (num_tokens) on GPU.
             helix_is_inactive_rank (torch.Tensor): For Helix: whether the current rank is inactive, with shape (batch_size) on GPU.
         """
@@ -317,6 +328,8 @@ class TrtllmAttentionWrapper:
         self.spec_decoding_bl_tree_mask = spec_decoding_bl_tree_mask
         self.spec_bl_tree_first_sparse_mask_offset_kv = spec_bl_tree_first_sparse_mask_offset_kv
         self.chunked_prefill_buffer_batch_size = chunked_prefill_buffer_batch_size
+        self.skip_softmax_threshold_scale_factor_prefill = skip_softmax_threshold_scale_factor_prefill
+        self.skip_softmax_threshold_scale_factor_decode = skip_softmax_threshold_scale_factor_decode
         self.kwargs.update(kwargs)
 
     def create_output(self, q: torch.Tensor, out_dtype: torch.dtype):
@@ -485,6 +498,9 @@ class TrtllmAttentionWrapper:
             self.helix_position_offsets, self.helix_is_inactive_rank
         ]
 
+        if self.print_skip_softmax_stat:
+            self.skip_softmax_stat.zero_()
+
         thop.attention(
             q,
             k,
@@ -557,6 +573,9 @@ class TrtllmAttentionWrapper:
             self.sparse_attn_offsets,
             self.sparse_attn_indices_block_size,
             self.sparse_mla_topk,
+            self.skip_softmax_threshold_scale_factor_prefill,
+            self.skip_softmax_threshold_scale_factor_decode,
+            self.skip_softmax_stat,
             cu_q_seqlens,
             cu_kv_seqlens,
             fmha_scheduler_counter,
@@ -564,6 +583,14 @@ class TrtllmAttentionWrapper:
             mla_bmm2_scale,
             quant_q_buffer,
         )
+
+        if self.print_skip_softmax_stat:
+            (total_blocks, skipped_blocks) = self.skip_softmax_stat
+            if total_blocks != 0:
+                print(
+                    f"SKIP_SOFTMAX_STAT: layer{self.layer_idx}: {skipped_blocks} / {total_blocks}"
+                    f" = {skipped_blocks / total_blocks * 100: .2f}%")
+
         # reset the planned states (especially tensors) to avoid memory leak
         self.plan()
         return output, output_sf
@@ -1528,13 +1555,21 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets = None, None, None, None
         sparse_attn_indices_block_size = 1
+        skip_softmax_threshold_scale_factor_prefill = None
+        skip_softmax_threshold_scale_factor_decode = None
         if self.sparse_attention_config is not None:
-            sparse_kv_indices, sparse_kv_offsets = self.sparse_kv_predict(
-                q, k, metadata, **kwargs)
-            sparse_attn_indices, sparse_attn_offsets = self.sparse_attn_predict(
-                q, k, metadata, **kwargs)
-            sparse_attn_indices_block_size = self.sparse_attention_config.get_indices_block_size(
-            )
+            if isinstance(self.sparse_attention_config,
+                          SkipSoftmaxAttentionConfig):
+                skip_softmax_threshold_scale_factor_prefill = self.sparse_attention_config.threshold_scale_factor_prefill
+                skip_softmax_threshold_scale_factor_decode = self.sparse_attention_config.threshold_scale_factor_decode
+
+            else:
+                sparse_kv_indices, sparse_kv_offsets = self.sparse_kv_predict(
+                    q, k, metadata, **kwargs)
+                sparse_attn_indices, sparse_attn_offsets = self.sparse_attn_predict(
+                    q, k, metadata, **kwargs)
+                sparse_attn_indices_block_size = self.sparse_attention_config.get_indices_block_size(
+                )
 
         self.wrapper.plan(
             layer_idx=self.get_local_layer_idx(metadata),
@@ -1596,6 +1631,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             sparse_attn_indices_block_size=sparse_attn_indices_block_size,
             sparse_mla_topk=metadata.sparse_mla_topk if hasattr(
                 metadata, 'sparse_mla_topk') else 0,
+            skip_softmax_threshold_scale_factor_prefill=
+            skip_softmax_threshold_scale_factor_prefill,
+            skip_softmax_threshold_scale_factor_decode=
+            skip_softmax_threshold_scale_factor_decode,
             helix_position_offsets=helix_position_offsets,
             helix_is_inactive_rank=metadata.helix_is_inactive_rank,
         )

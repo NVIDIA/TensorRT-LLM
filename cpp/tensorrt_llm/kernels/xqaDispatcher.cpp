@@ -504,6 +504,7 @@ void XqaDispatcher::runImpl(
         tllmRunnerParams.customMaskPtr = params.spec_decoding_bl_tree_mask;
         tllmRunnerParams.customMaskOffsetsPtr = params.spec_decoding_bl_tree_mask_offset;
         tllmRunnerParams.firstSparseMaskOffsetsKvPtr = params.spec_bl_tree_first_sparse_mask_offset_kv;
+        tllmRunnerParams.mSkipSoftmaxThresholdScaleFactor = params.skip_softmax_threshold_scale_factor;
         mTllmGenFMHARunner->run(tllmRunnerParams);
     }
     else

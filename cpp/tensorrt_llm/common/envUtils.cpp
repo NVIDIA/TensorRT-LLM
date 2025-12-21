@@ -554,6 +554,11 @@ bool getEnvEplbForceGdrcopy()
     return getBoolEnv("TRTLLM_EPLB_FORCE_GDRCOPY");
 }
 
+bool getEnvPrintSkipSoftmaxStat()
+{
+    return getBoolEnv("TRTLLM_PRINT_SKIP_SOFTMAX_STAT");
+}
+
 } // namespace common
 
 TRTLLM_NAMESPACE_END
