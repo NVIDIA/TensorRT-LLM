@@ -177,7 +177,6 @@ class ConfigurableMoE(MoE):
             assert not torch.compiler.is_compiling(), (
                 "Backend should not be none if not in torch.compile"
             )
-            self.backend.aux_stream_dict = self.aux_stream_dict
             self.backend.layer_idx = self.layer_idx
             self.backend.layer_idx_str = self.layer_idx_str
             self.backend.num_slots = self.num_slots

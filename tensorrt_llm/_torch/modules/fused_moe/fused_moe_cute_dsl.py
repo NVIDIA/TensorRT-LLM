@@ -8,7 +8,7 @@ from tensorrt_llm._utils import is_sm_100f
 
 from ...distributed import allgather
 from ...model_config import ModelConfig
-from ...utils import AuxStreamType, Fp4QuantizedTensor
+from ...utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from .fused_moe_cutlass import CutlassFusedMoE
 from .interface import AlltoallMethodType
 from .quantization import MoEWeightLoadingMode, NVFP4CuteDslFusedMoEMethod
@@ -183,7 +183,6 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         init_load_balancer: bool = True,
         without_comm: bool = False,
     ):
-
         super().__init__(
             routing_method=routing_method,
             num_experts=num_experts,
@@ -199,6 +198,16 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             init_load_balancer=init_load_balancer,
             without_comm=without_comm,
         )
+        if self.aux_stream_dict is None:
+            self.aux_stream_dict = aux_stream_dict if aux_stream_dict is not None else {}
+        if AuxStreamType.MoeOutputMemset not in self.aux_stream_dict:
+            self.aux_stream_dict[
+                AuxStreamType.MoeOutputMemset] = torch.cuda.Stream()
+        if self.event_dict is None:
+            self.event_dict = {}
+        for key in [EventType.Main, EventType.MoeOutputMemset]:
+            if key not in self.event_dict:
+                self.event_dict[key] = torch.cuda.Event()
 
     def select_alltoall_method_type(self) -> AlltoallMethodType:
         return AlltoallMethodType.NotEnabled
@@ -288,6 +297,11 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                                          self.hidden_size)
             assert moe_output.dtype == output_dtype
 
+        if self.use_fused_finalize:
+            self.event_dict[EventType.Main].record()
+            moe_output.record_stream(
+                self.aux_stream_dict[AuxStreamType.MoeOutputMemset])
+
         x, x_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell(
             input=x.view(torch.float4_e2m1fn_x2),
             weight=self.w3_w1_weight.view(torch.float4_e2m1fn_x2),
@@ -307,17 +321,24 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         )
 
         if self.use_fused_finalize:
-            torch.ops.trtllm.moe_output_memset_inplace(
-                input=moe_output,
-                tile_idx_to_mn_limit=tile_idx_to_mn_limit,
-                expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
-                permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
-                num_non_exiting_tiles=num_non_exiting_tiles,
-                tile_tokens_dim=tile_size,
-                top_k=self.routing_method.experts_per_token,
-                ep_size=self.mapping.moe_ep_size,
-                enable_alltoall=enable_alltoall,
-            )
+            with torch.cuda.stream(
+                    self.aux_stream_dict[AuxStreamType.MoeOutputMemset]):
+                self.event_dict[EventType.Main].wait()
+                torch.ops.trtllm.moe_output_memset_inplace(
+                    input=moe_output,
+                    tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+                    expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                    permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+                    num_non_exiting_tiles=num_non_exiting_tiles,
+                    tile_tokens_dim=tile_size,
+                    top_k=self.routing_method.experts_per_token,
+                    ep_size=self.mapping.moe_ep_size,
+                    enable_alltoall=enable_alltoall,
+                )
+                self.event_dict[EventType.MoeOutputMemset].record()
+
+            self.event_dict[EventType.MoeOutputMemset].wait()
+
             torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell(
                 input=x.view(torch.float4_e2m1fn_x2),
                 weight=self.w2_weight.view(torch.float4_e2m1fn_x2),
