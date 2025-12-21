@@ -322,15 +322,22 @@ class NVFP4LinearQuantizationFromConfig(Quantization):
         # scaling factors m is padded along 128 and n is padded along 4.
         # check cpp/tensorrt_llm/plugins/fp4GemmPlugin/fp4GemmPlugin.cpp for more details.
         n = n // TRTLLM_NVFP4_SCALING_VECTOR_SIZE
-        padded_m = (m + 127) // 128 * 128
-        padded_n = (n + 3) // 4 * 4
+        # padded_m = (m + 127) // 128 * 128
+        # padded_n = (n + 3) // 4 * 4
         # definition of scales
         # input_scale: FP4_GLOBAL_SCALE_MAX / input_amax
         # weight_scale_2: FP4_GLOBAL_SCALE_MAX / weight_amax
         # alpha: 1 / (input_scale * weight_scale_2)
         return {
             "input_scale": torch.tensor(1.0 / 6.0),
-            "weight_scale": torch.empty((padded_m * padded_n), dtype=torch.uint8),
+            # RuntimeError: mat2Scale dtype is Float8_e4m3fn, while Byte is expected -
+            #    size mismatch for backbone.layers.0.mixer.in_proj.weight_scale: copying a param
+            #  with shape torch.Size([1741824]) from checkpoint, the shape in current model is torch.Size([1731072]).
+            #    == but only when skip_loading_weights==false
+            # "weight_scale": torch.empty(padded_m, padded_n, dtype=torch.uint8),
+            "weight_scale": torch.empty(m, n, dtype=torch.uint8),
+            # "weight_scale": torch.empty(padded_m * padded_n, dtype=torch.float8_e4m3fn),
+            # # ==> RuntimeError: mat2Scale dtype is Float8_e4m3fn, while Byte is expected
             "alpha": torch.tensor(1.0 / 6.0),
         }
 

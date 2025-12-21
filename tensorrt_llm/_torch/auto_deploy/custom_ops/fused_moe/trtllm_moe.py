@@ -277,12 +277,14 @@ def trtllm_quant_nvfp4_moe_fused(
         output_dtype = x.dtype
     else:
         x_q_fp4 = x
+        input_blockscale = None
+        output_dtype = x.dtype
 
     trtllm_output = torch.ops.trtllm.fused_moe(
         x_q_fp4,
         selected_experts.to(torch.int),
-        routing_weights,
-        fc1_expert_weights=fc1_expert_weights_fp4,
+        routing_weights.to(torch.float32),
+        fc1_expert_weights=fc1_expert_weights_fp4.view(torch.long),
         fc1_expert_biases=None,
         fc2_expert_weights=fc2_expert_weights_fp4.view(torch.long),
         fc2_expert_biases=None,
