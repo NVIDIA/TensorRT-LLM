@@ -491,3 +491,4 @@ examples/test_qwenvl.py::test_llm_qwenvl_single_gpu_summary[qwen-vl-chat] SKIP (
 examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-enable_attention_plugin-int8-float16-nb:1-use_cpp_runtime] SKIP (https://nvbugs/5568052)
 accuracy/test_llm_api_pytorch_multimodal.py::TestQwen3VL_MOE::test_auto_dtype SKIP (https://nvbugs/5588376)
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_tp_pp_symmetric[MMLU-tp2pp2] SKIP (https://nvbugs/5756008)
+unittest/executor/test_base_worker.py::TestWorkerBase SKIP (https://nvbugs/5759698)
