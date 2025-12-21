@@ -283,12 +283,12 @@ class RunnerMixin(ABC):
             WideEPMoE.select_alltoall_method_type = select_alltoall_method_type_wide_ep
 
     @staticmethod
-    def apply_quant_config_exclude_modules(layers, quant_config):
+    def apply_quant_config_exclude_modules(layers, quant_config, prefix="layers"):
         # Please refer to tensorrt_llm/_torch/models/modeling_utils.py
         new_quant_config = QuantConfig(kv_cache_quant_algo=quant_config.kv_cache_quant_algo)
         for layer in layers:
             for name, module in layer.named_modules():
-                name = f"model.layers.{layer.layer_idx}.{name}"
+                name = f"model.{prefix}.{layer.layer_idx}.{name}"
                 candidates = [name]
                 if isinstance(module, Linear):
                     weight_mode = module.weights_loading_config.weight_mode
@@ -307,9 +307,11 @@ class RunnerMixin(ABC):
                             name.replace("qkv_proj", "k_proj"),
                             name.replace("qkv_proj", "v_proj"),
                         ]
+
                 is_excluded = any(
                     quant_config.is_module_excluded_from_quantization(n) for n in candidates
                 )
+
                 if is_excluded and getattr(module, "quant_config", None) is not None:
                     module.quant_config = new_quant_config
 
@@ -520,7 +522,34 @@ class RunnerMixin(ABC):
                 spec_config=None,
             )
         else:
-            raise NotImplementedError("Unsupported config")
+            # NOTE: this is a workaround for VSWA to switch to calculate_max_num_blocks_from_cpp in KVCahceManager
+            is_vswa = kv_cache_config.max_attention_window is not None and len(
+                set(kv_cache_config.max_attention_window)) > 1
+            binding_model_config = model_config.get_bindings_model_config(
+                tokens_per_block=tokens_per_block) if is_vswa else None
+
+            layer_mask = [i in layer_indices for i in range(config.num_hidden_layers)]
+            num_layers = sum(layer_mask)
+
+            kv_cache_manager = kv_cache_manager_cls(
+                kv_cache_config,
+                CacheType.SELF,
+                num_layers=num_layers,
+                num_kv_heads=config.num_key_value_heads,
+                head_dim=config.head_dim,
+                tokens_per_block=tokens_per_block,
+                max_seq_len=max_seq_len,
+                max_batch_size=max_batch_size,
+                mapping=mapping,
+                dtype=kv_cache_dtype,
+                spec_config=None,
+                max_num_tokens=16384,
+                model_config=binding_model_config,
+                max_beam_width=1,
+                is_draft=False,
+                kv_connector_manager=None,
+            )
+        
         kv_cache_manager.add_dummy_requests(
             list(range(max_batch_size)), [max_seq_len] * max_batch_size
         )
