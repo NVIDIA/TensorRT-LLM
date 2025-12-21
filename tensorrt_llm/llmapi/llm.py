@@ -30,7 +30,7 @@ from ..disaggregated_params import DisaggregatedParams
 from ..executor import (DetokenizedGenerationResultBase, GenerationExecutor,
                         GenerationResult, IterationResult, LoRARequest,
                         PostprocWorkerConfig, PromptAdapterRequest)
-from ..executor.postproc_worker import PostprocParams
+from ..executor.postproc_worker import PostprocArgs, PostprocParams
 from ..executor.utils import (create_mpi_comm_session,
                               get_spawn_proxy_process_env)
 from ..inputs import (PromptInputs, create_input_processor,
@@ -316,6 +316,13 @@ class BaseLLM:
             else:
                 return maybe_batched
 
+        # Create postproc_params if reasoning_parser is configured
+        postproc_params = None
+        reasoning_parser_name = getattr(self.args, 'reasoning_parser', None)
+        if reasoning_parser_name:
+            postproc_params = PostprocParams(postproc_args=PostprocArgs(
+                reasoning_parser=reasoning_parser_name))
+
         futures = []
         for i, request_inputs in enumerate(inputs):
             future = self.generate_async(
@@ -329,6 +336,7 @@ class BaseLLM:
                 scheduling_params=_item_at(scheduling_params, i),
                 cache_salt=_item_at(cache_salt, i),
                 streaming=False,
+                _postproc_params=postproc_params,
             )
             futures.append(future)
 

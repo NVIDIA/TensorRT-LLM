@@ -30,6 +30,8 @@ class PostprocArgs:
     first_iteration: bool = True
     num_prompt_tokens: Optional[int] = None
     tokenizer: Optional[TransformersTokenizer] = None
+    reasoning_parser: Optional[
+        str] = None  # For LLM API reasoning parser support
 
 
 @dataclass(kw_only=True)

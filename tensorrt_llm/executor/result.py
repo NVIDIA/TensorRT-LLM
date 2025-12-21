@@ -117,6 +117,7 @@ class CompletionOutput:
     """
     index: int
     text: str = ""
+    reasoning_content: Optional[str] = None
     token_ids: Optional[List[int]] = field(default_factory=list)
     cumulative_logprob: Optional[float] = None
     logprobs: Optional[TokenLogprobs
@@ -757,6 +758,27 @@ class GenerationResult(GenerationResultBase):
         global_tracer().log_instant("result_step.get")
         self._handle_response(response)
 
+    def _apply_reasoning_parser_if_needed(self) -> None:
+        """Apply reasoning parser to completed outputs (non-streaming, no postproc workers)."""
+        if self.postproc_params is None:
+            return
+        postproc_args = self.postproc_params.postproc_args
+        if postproc_args is None:
+            return
+        reasoning_parser_name = getattr(postproc_args, 'reasoning_parser', None)
+        if not reasoning_parser_name:
+            return
+        # Avoid re-parsing if already done by postproc workers
+        if self.postproc_params.post_processor is not None:
+            return
+        from ..llmapi.reasoning_parser import ReasoningParserFactory
+        parser = ReasoningParserFactory.create_reasoning_parser(
+            reasoning_parser_name)
+        for output in self._outputs:
+            parsed = parser.parse(output.text)
+            output.text = parsed.content
+            output.reasoning_content = parsed.reasoning_content
+
     def result(self, timeout: Optional[float] = None) -> "GenerationResult":
         """Wait for the completion of the request, and return the result.
 
@@ -768,6 +790,7 @@ class GenerationResult(GenerationResultBase):
         """
         while not self._done:
             self._result_step(timeout)
+        self._apply_reasoning_parser_if_needed()
         return self
 
     async def aresult(self) -> "GenerationResult":
@@ -778,6 +801,7 @@ class GenerationResult(GenerationResultBase):
         """
         while not self._done:
             await self._aresult_step()
+        self._apply_reasoning_parser_if_needed()
         return self
 
     def __await__(self):
