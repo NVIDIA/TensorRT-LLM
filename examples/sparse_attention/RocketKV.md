@@ -93,7 +93,7 @@ python3 ../llm-api/llm_sparse_attention.py \
 
 ### Usage with `trtllm-bench` and `trtllm-serve`
 
-Sparse attention options must be specified via `--extra_llm_api_options config.yaml` for both `trtllm-bench` and `trtllm-serve`. All sparse attetnion options can be specified in this YAML file and the argument names/valid values are the same as in their corresponding configuration described in the Configuration Arguments section. For example, a YAML configuration could look like this:
+Sparse attention options must be specified via `--config config.yaml` for both `trtllm-bench` and `trtllm-serve`. All sparse attetnion options can be specified in this YAML file and the argument names/valid values are the same as in their corresponding configuration described in the Configuration Arguments section. For example, a YAML configuration could look like this:
 
 ```
 backend: pytorch
@@ -110,13 +110,13 @@ enable_chunked_prefill: false
 
 Run the command with the config file:
 ```bash
-trtllm-eval/trtllm-bench/trtllm-serve --model <model_path> --extra_llm_api_options extra_config.yaml ...
+trtllm-eval/trtllm-bench/trtllm-serve --model <model_path> --config extra_config.yaml ...
 ```
 
 For example, users can evaluate a model with trtllm-eval on LongBenchV2 task like this:
 
 ```bash
-trtllm-eval --model <path_to_model> --extra_llm_api_options extra_config.yaml longbench_v2 --max_output_length 1024 ...
+trtllm-eval --model <path_to_model> --config extra_config.yaml longbench_v2 --max_output_length 1024 ...
 ```
 
 ## Configuration Arguments

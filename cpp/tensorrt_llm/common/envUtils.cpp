@@ -281,6 +281,12 @@ bool getEnvUseNixlKvCache()
     return useNixlKvCache;
 }
 
+bool getEnvUseMooncakeKvCache()
+{
+    static bool const useMooncakeKvCache = getBoolEnv("TRTLLM_USE_MOONCAKE_KVCACHE");
+    return useMooncakeKvCache;
+}
+
 bool getEnvUseRoundRobinBlockDistForCP()
 {
     static bool const useRoundRobinBlockDistForCP = getBoolEnv("TRTLLM_USE_ROUND_ROBIN_BLOCK_DIST_FOR_CP");
@@ -341,6 +347,23 @@ std::string getEnvNixlBackend()
             }
         });
     return nixlBackend;
+}
+
+std::string getEnvMooncakeInterface()
+{
+    static std::once_flag flag;
+    static std::string mooncakeInterface;
+
+    std::call_once(flag,
+        [&]()
+        {
+            char const* mooncake_interface = std::getenv("TRTLLM_MOONCAKE_INTERFACE");
+            if (mooncake_interface)
+            {
+                mooncakeInterface = mooncake_interface;
+            }
+        });
+    return mooncakeInterface;
 }
 
 bool getEnvDisaggLayerwise()
@@ -529,6 +552,11 @@ int getEnvMoeA2ACombineBlockSize()
 bool getEnvEplbForceGdrcopy()
 {
     return getBoolEnv("TRTLLM_EPLB_FORCE_GDRCOPY");
+}
+
+bool getEnvPrintSkipSoftmaxStat()
+{
+    return getBoolEnv("TRTLLM_PRINT_SKIP_SOFTMAX_STAT");
 }
 
 } // namespace common

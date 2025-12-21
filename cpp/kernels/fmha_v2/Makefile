@@ -69,6 +69,11 @@ PREPROCESSOR_FLAGS += -DUSE_SAME_SUM_ORDER_IN_SOFTMAX_AS_REF_CODE
 # Do we want to use half accumulation for flash attention
 PREPROCESSOR_FLAGS += -DHALF_ACCUMULATION_FOR_FLASH_ATTENTION
 
+# Print the resulted sparsity given threshold in Skip-Softmax attention
+# Note: You only need to "python scripts/build_wheel.py -D SKIP_SOFTMAX_STAT=ON ..." to use it inside TRTLLM.
+# Turn this on manually only if you want to build&run the unittest (bin/fmha.exe) with SKIP_SOFTMAX_STAT.
+# PREPROCESSOR_FLAGS += -DSKIP_SOFTMAX_STAT
+
 # Add FLAGS when generating cubins.
 ifdef GENERATE_CUBIN
 	PREPROCESSOR_FLAGS += -DGENERATE_CUBIN

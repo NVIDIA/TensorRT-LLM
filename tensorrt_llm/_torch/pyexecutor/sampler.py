@@ -3088,13 +3088,8 @@ class TRTLLMSampler(Sampler, AsyncWorkerMixin):
     @nvtx_range("update_requests_single_beam_single_step")
     def update_requests_single_beam_single_step(self, state: SampleStateTRTLLM):
         """Specialization of update_requests for single beam and single step"""
-        new_tokens_host = state.host.new_tokens.flatten().tolist()
         sequence_lengths_host_data = state.host.sequence_lengths.flatten().tolist()
         finish_reasons = state.host.finish_reasons.flatten().tolist()
-        log_probs_host_tensor = state.host.log_probs
-        cum_log_probs_host = (
-            state.host.cum_log_probs.tolist() if state.host.cum_log_probs is not None else None
-        )
 
         reqs = [
             r for r in state.scheduled_requests.context_requests if not r.is_context_init_state
@@ -3104,40 +3099,53 @@ class TRTLLMSampler(Sampler, AsyncWorkerMixin):
             if not r.is_generation_complete_state
         ]
 
-        reqs_with_new_tokens = [
-            r for r in reqs if (sequence_lengths_host_data[r.py_seq_slot] > r.get_num_tokens(0))
-        ]
+        # NB: To ensure good performance, we must
+        #  1. Avoid accessing torch.Tensor object inside the for-each-request loops
+        #  2. Convert only necessary data to Python list
 
         # Add new tokens
-        new_tokens = [new_tokens_host[r.py_seq_slot] for r in reqs_with_new_tokens]
+        reqs_with_new_tokens = []
+        seq_slots = []
+        seq_slots_need_log_probs = []
+        for request in reqs:
+            if sequence_lengths_host_data[request.py_seq_slot] <= request.get_num_tokens(0):
+                continue
+
+            reqs_with_new_tokens.append(request)
+            seq_slots.append(request.py_seq_slot)
+
+            if request.py_return_log_probs:
+                seq_slots_need_log_probs.append(request.py_seq_slot)
+
+        # [maxTokensPerStep, batchSize, maxBeamWidth]
+        new_tokens = state.host.new_tokens[0, seq_slots, 0].tolist()
         add_new_tokens_to_requests(reqs_with_new_tokens, new_tokens, 0)
 
         # Log probs
-        if log_probs_host_tensor is not None:
-            # Log probs
-            seq_slots = []
-            seq_lens = []
-            for request in reqs_with_new_tokens:
-                if request.py_return_log_probs:
-                    seq_slot = request.py_seq_slot
-                    seq_slots.append(seq_slot)
-                    seq_lens.append(sequence_lengths_host_data[seq_slot] - 1)
+        if state.host.log_probs is not None:
+            # [batchSize, maxBeamWidth]
+            seq_last_idx = state.host.sequence_lengths[seq_slots_need_log_probs, 0] - 1
+            # [batchSize, maxBeamWidth, maxSequenceLength]
+            log_probs_host = state.host.log_probs[
+                seq_slots_need_log_probs, 0, seq_last_idx
+            ].tolist()
+            # [batchSize, maxBeamWidth]
+            cum_log_probs_host = state.host.cum_log_probs[seq_slots_need_log_probs, 0].tolist()
 
-            log_probs_host = log_probs_host_tensor[seq_slots, 0, seq_lens].tolist()
-            idx = 0
-            for request in reqs_with_new_tokens:
+            log_probs_idx = 0
+            for request, new_token in zip(reqs_with_new_tokens, new_tokens):
                 if request.py_return_log_probs:
                     log_probs = [
                         {
-                            new_tokens_host[seq_slot]: Logprob(
-                                logprob=log_probs_host[idx],
+                            new_token: Logprob(
+                                logprob=log_probs_host[log_probs_idx],
                                 rank=1,
                             )
                         }
                     ]
-                    cum_log_probs = [cum_log_probs_host[seq_slot]]
+                    cum_log_probs = [cum_log_probs_host[log_probs_idx]]
                     request.py_result.append_log_probs([log_probs], cum_log_probs)
-                    idx += 1
+                    log_probs_idx += 1
 
         for request in reqs:
             request.py_decoding_iter += 1

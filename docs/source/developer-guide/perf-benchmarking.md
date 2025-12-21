@@ -2,9 +2,11 @@
 
 # TensorRT LLM Benchmarking
 
-```{important}
-This benchmarking suite is a work in progress.
-Expect breaking API changes.
+
+```{eval-rst}
+.. include:: ../_includes/note_sections.rst
+   :start-after: .. start-note-config-flag-alias
+   :end-before: .. end-note-config-flag-alias
 ```
 
 TensorRT LLM provides the `trtllm-bench` CLI, a packaged benchmarking utility that aims to make it
@@ -14,9 +16,31 @@ easier for users to reproduce our officially published [performance overview](./
 - An entirely Python workflow for benchmarking.
 - Ability to benchmark various flows and features within TensorRT LLM.
 
-`trtllm-bench` executes all benchmarks using `in-flight batching` -- for more information see
-the [in-flight batching section](../features/attention.md#inflight-batching) that describes the concept
-in further detail.
+TensorRT LLM also provides the OpenAI-compatible API via `trtllm-serve` command, which starts an OpenAI compatible server that supports the following endpoints:
+- `/v1/models`
+- `/v1/completions`
+- `/v1/chat/completions`
+
+The following guidance will mostly focus on benchmarks using `trtllm-bench` CLI. To benchmark the OpenAI-compatible `trtllm-serve`, please refer to the [run benchmarking with `trtllm-serve`](../commands/trtllm-serve/run-benchmark-with-trtllm-serve.md) section.
+
+## Table of Contents
+- [TensorRT LLM Benchmarking](#tensorrt-llm-benchmarking)
+  - [Table of Contents](#table-of-contents)
+  - [Before Benchmarking](#before-benchmarking)
+    - [Persistence mode](#persistence-mode)
+    - [GPU Clock Management](#gpu-clock-management)
+    - [Set power limits](#set-power-limits)
+    - [Boost settings](#boost-settings)
+  - [Throughput Benchmarking](#throughput-benchmarking)
+    - [Limitations and Caveats](#limitations-and-caveats)
+      - [Validated Networks for Benchmarking](#validated-networks-for-benchmarking)
+      - [Supported Quantization Modes](#supported-quantization-modes)
+    - [Preparing a Dataset](#preparing-a-dataset)
+    - [Running with the PyTorch Workflow](#running-with-the-pytorch-workflow)
+      - [Benchmarking with LoRA Adapters in PyTorch workflow](#benchmarking-with-lora-adapters-in-pytorch-workflow)
+      - [Running multi-modal models in the PyTorch Workflow](#running-multi-modal-models-in-the-pytorch-workflow)
+      - [Quantization in the PyTorch Flow](#quantization-in-the-pytorch-flow)
+  - [Online Serving Benchmarking](#online-serving-benchmarking)
 
 To benchmark the OpenAI-compatible `trtllm-serve`, please refer to the [run benchmarking with `trtllm-serve`](../commands/trtllm-serve/run-benchmark-with-trtllm-serve.md) section.
 
@@ -159,7 +183,7 @@ trtllm-bench --model meta-llama/Llama-3.1-8B prepare-dataset --output /tmp/synth
 
 To benchmark the PyTorch backend (`tensorrt_llm._torch`), use the following command with [dataset](#preparing-a-dataset) generated from previous steps. The `throughput` benchmark initializes the backend by tuning against the dataset provided via `--dataset` (or the other build mode settings described above).
 
-Note that CUDA graph is enabled by default. You can add additional pytorch config with `--extra_llm_api_options` followed by the path to a YAML file. For more details, please refer to the help text by running the command with `--help`.
+Note that CUDA graph is enabled by default. You can add additional pytorch config with `--config` followed by the path to a YAML file. For more details, please refer to the help text by running the command with `--help`.
 
 ```{tip}
 The command below specifies the `--model_path` option. The model path is optional and used only when you want to run a locally
@@ -272,7 +296,7 @@ The generated dataset will include LoRA request metadata. Below is an example of
 
 **LoRA Configuration**
 
-Create an `extra-llm-api-options.yaml` file with LoRA configuration:
+Create a `config.yaml` file with LoRA configuration:
 
 ```yaml
 lora_config:
@@ -297,7 +321,7 @@ trtllm-bench --model /path/to/base/model \
   throughput \
   --dataset synthetic_lora_data.json \
   --backend pytorch \
-  --extra_llm_api_options extra-llm-api-options.yaml
+  --config config.yaml
 ```
 
 ```{note}
@@ -424,7 +448,7 @@ checkpoint. For the Llama-3.1 models, TensorRT LLM provides the following checkp
 - [`nvidia/Llama-3.1-70B-Instruct-FP8`](https://huggingface.co/nvidia/Llama-3.1-70B-Instruct-FP8)
 - [`nvidia/Llama-3.1-405B-Instruct-FP8`](https://huggingface.co/nvidia/Llama-3.1-405B-Instruct-FP8)
 
-To understand more about how to quantize your own checkpoints, refer to ModelOpt [documentation](https://nvidia.github.io/Model-Optimizer/deployment/1_tensorrt_llm.html).
+To understand more about how to quantize your own checkpoints, refer to ModelOpt [documentation](https://nvidia.github.io/Model-Optimizer/deployment/3_unified_hf.html).
 
 `trtllm-bench` utilizes the `hf_quant_config.json` file present in the pre-quantized checkpoints above. The configuration
 file is present in checkpoints quantized with [Model Optimizer](https://github.com/NVIDIA/Model-Optimizer)
@@ -468,3 +492,9 @@ kv_cache_config:
 ```{tip}
 The two valid values for `kv_cache_config.dtype` are `auto` and `fp8`.
 ```
+
+## Online Serving Benchmarking
+
+TensorRT LLM provides the OpenAI-compatible API via `trtllm-serve` command, and `tensorrt_llm.serve.scripts.benchmark_serving` package to benchmark the online server. Alternatively, [AIPerf](https://github.com/ai-dynamo/aiperf) is a comprehensive benchmarking tool that can also measure the performance of the OpenAI-compatible server launched by `trtllm-serve`.
+
+To benchmark the OpenAI-compatible `trtllm-serve`, please refer to the [run benchmarking with `trtllm-serve`](../commands/trtllm-serve/run-benchmark-with-trtllm-serve.md) section.
