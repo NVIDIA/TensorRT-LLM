@@ -63,10 +63,10 @@ class DeepSeekV32Parser(BaseToolParser):
 
     def __init__(self):
         super().__init__()
-        self.bot_token = "<｜DSML｜function_calls>"
-        self.eot_token = "</｜DSML｜function_calls>"
+        self.bot_token = "<｜DSML｜function_calls>"  # nosec B105
+        self.eot_token = "</｜DSML｜function_calls>"  # nosec B105
         self.invoke_begin_regex = r'<｜DSML｜invoke\s+name="([^"]+)"\s*>'
-        self.invoke_end_token = "</｜DSML｜invoke>"
+        self.invoke_end_token = "</｜DSML｜invoke>"  # nosec B105
         self.parameter_regex = (
             r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="([^"]+)"\s*>(.*?)</｜DSML｜parameter>'
         )
