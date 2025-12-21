@@ -447,7 +447,6 @@ examples/test_phi.py::test_phi_fp8_with_bf16_lora[phi-2] SKIP (https://nvbugs/57
 examples/test_phi.py::test_llm_phi_1node_2gpus_summary[Phi-3.5-MoE-instruct-nb:1] SKIP (https://nvbugs/5744293)
 examples/test_phi.py::test_llm_phi_quantization_1gpu[phi-2-fp8-bfloat16] SKIP (https://nvbugs/5744293)
 disaggregated/test_disaggregated.py::test_disaggregated_trtllm_sampler[TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/5741884)
-accuracy/test_llm_api_pytorch_multimodal.py::TestGemma3_27BInstruct::test_auto_dtype SKIP (https://nvbugs/5744427)
 test_e2e.py::test_trtllm_bench_llmapi_launch[pytorch_backend-llama-v3-llama3-8b] SKIP (https://nvbugs/5744432)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus[tp2pp2-mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=True] SKIP (https://nvbugs/5740087)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus[tp4-mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=True] SKIP (https://nvbugs/5740075)
@@ -491,3 +490,4 @@ examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-
 accuracy/test_llm_api_pytorch_multimodal.py::TestQwen3VL_MOE::test_auto_dtype SKIP (https://nvbugs/5588376)
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_tp_pp_symmetric[MMLU-tp2pp2] SKIP (https://nvbugs/5756008)
 unittest/_torch/speculative/test_dynamic_spec_decode.py::test_dynamic_spec_decode SKIP (https://nvbugs/5758449)
+unittest/executor/test_base_worker.py::TestWorkerBase SKIP (https://nvbugs/5759698)
