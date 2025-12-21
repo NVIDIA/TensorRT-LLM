@@ -5,13 +5,13 @@ import torch
 
 from tensorrt_llm.logger import logger
 
-from ..._utils import get_sm_version
+from ..._utils import get_sm_version, is_sm_100f
 from ...math_utils import ceil_div, pad_up
 from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
                          DynamicTensorSpec, OptimizationProfile, TunableRunner,
                          TuningConfig)
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
-from ..utils import (fp4_scale_infer_shape,
+from ..utils import (fp4_scale_infer_shape, fp8_a_sf_m_shape,
                      get_last_power_of_2_num_tokens_buckets,
                      last_positive_power_of_2)
 
@@ -337,6 +337,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
         Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel
     from ..cute_dsl_kernels.blackwell.blockscaled_contiguous_grouped_gemm_swiglu_fusion import \
         Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel
+    from ..cute_dsl_kernels.blackwell.blockwise_gemm.blockwise_gemm import \
+        BlockwiseGemmKernel
+    from ..cute_dsl_kernels.blackwell.blockwise_gemm.continuous_grouped_gemm import \
+        BlockwiseContiguousGroupedGemmKernel
     from ..cute_dsl_kernels.blackwell.dense_blockscaled_gemm_persistent import \
         Sm100BlockScaledPersistentDenseGemmKernel
     from ..cute_dsl_kernels.blackwell.utils import make_ptr
@@ -523,7 +527,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             **kwargs,
         ) -> torch.Tensor:
             """
-            Performs fp8 blockwise gemm operation using CuTe DSL.
+            Performs fp4 blockwise gemm operation using CuTe DSL.
 
             Args:
                 inputs (List[torch.Tensor]):
@@ -552,6 +556,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             a_tensor, b_tensor, a_sf_tensor, b_sf_tensor, alpha_tensor = inputs
             m, k, n = a_tensor.shape[0], a_tensor.shape[1], b_tensor.shape[0]
+            # it is mk x nk
 
             # Allocate output tensor from UserBuffers or regular CUDA memory
             if self.to_userbuffers:
@@ -2179,3 +2184,993 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                    dtype=input_scale.dtype,
                                    device=input_scale.device)
         return output, output_scale
+
+    class FusedMoEInputsHelper:
+
+        def __init__(self, num_experts: int, top_k: int, num_local_experts: int,
+                     local_expert_offset: int):
+            self.num_experts = num_experts
+            self.top_k = top_k
+            self.num_local_experts = num_local_experts
+            self.local_expert_offset = local_expert_offset
+
+        def infer_shape_num_tokens(self, input_shapes: List[torch.Size]) -> int:
+            return input_shapes[0][0]
+
+        def inputs_pre_hook(self,
+                            inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+            x, x_sf, token_selected_experts, token_final_scales, *others = inputs
+            num_tokens = token_selected_experts.size(0)
+            new_token_final_scales, new_token_selected_experts = torch.randn(
+                num_tokens,
+                self.num_experts,
+                device=token_selected_experts.device).topk(self.top_k, dim=-1)
+            new_token_selected_experts = new_token_selected_experts.to(
+                token_selected_experts.dtype)
+            new_token_final_scales = new_token_final_scales.softmax(dim=-1).to(
+                token_final_scales.dtype)
+            return x, x_sf, new_token_selected_experts, new_token_final_scales, *others
+
+    class Sm100BlockScaledFusedMoERunner(TunableRunner):
+        tuning_config_cache = dict()
+
+        def __init__(self,
+                     num_experts: int,
+                     top_k: int,
+                     num_local_experts: int,
+                     local_expert_offset: int,
+                     output_dtype: torch.dtype,
+                     scaling_vector_size: int = 16):
+            super().__init__()
+            self.num_experts = num_experts
+            self.top_k = top_k
+            self.num_local_experts = num_local_experts
+            self.local_expert_offset = local_expert_offset
+
+            assert output_dtype == torch.bfloat16
+            self.output_dtype = output_dtype
+            self.scaling_vector_size = scaling_vector_size
+
+        def unique_id(self):
+            return (
+                self.num_experts,
+                self.top_k,
+                self.num_local_experts,
+                self.local_expert_offset,
+                self.output_dtype,
+                self.scaling_vector_size,
+            )
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+            **kwargs,
+        ) -> List[int]:
+            return [128]
+
+        def get_tuning_config(self) -> TuningConfig:
+            key = self.unique_id()
+            if key not in self.__class__.tuning_config_cache:
+                helper = FusedMoEInputsHelper(self.num_experts, self.top_k,
+                                              self.num_local_experts,
+                                              self.local_expert_offset)
+                self.__class__.tuning_config_cache[key] = TuningConfig(
+                    dynamic_tensor_specs=(DynamicTensorSpec(
+                        0, 0, get_last_power_of_2_num_tokens_buckets,
+                        last_positive_power_of_2), ),
+                    constraint_specs=(ConstraintSpec(1, 0,
+                                                     fp4_scale_infer_shape),
+                                      ConstraintSpec(
+                                          2, 0, helper.infer_shape_num_tokens),
+                                      ConstraintSpec(
+                                          3, 0, helper.infer_shape_num_tokens)),
+                    inputs_pre_hook=helper.inputs_pre_hook,
+                    use_cuda_graph=True,
+                )
+            return self.__class__.tuning_config_cache[key]
+
+        def forward(self, inputs: List[torch.Tensor],
+                    tactic: Optional[int]) -> torch.Tensor:
+            if isinstance(tactic, int):
+                tile_size = tactic
+            else:
+                tile_size = 128
+
+            x, x_sf, token_selected_experts, token_final_scales, gemm1_weight, gemm1_weight_scale, gemm1_alpha, gemm2_input_global_scale, gemm2_weight, gemm2_weight_scale, gemm2_alpha = inputs
+            tile_idx_to_expert_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx, total_num_padded_tokens, num_non_exiting_tiles = torch.ops.trtllm.moe_sort(
+                token_selected_experts=token_selected_experts,
+                token_final_scales=token_final_scales,
+                num_experts=self.num_experts,
+                top_k=self.top_k,
+                local_expert_offset=self.local_expert_offset,
+                local_num_experts=self.num_local_experts,
+                tile_tokens_dim=tile_size,
+            )
+            x, x_sf = torch.ops.trtllm.moe_permute(
+                input=x,
+                input_sf=x_sf,
+                tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+                permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+                num_non_exiting_tiles=num_non_exiting_tiles,
+                tile_tokens_dim=tile_size,
+                top_k=self.top_k,
+            )
+            x = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_blackwell(
+                input=x.view(torch.float4_e2m1fn_x2),
+                weight=gemm1_weight.view(torch.float4_e2m1fn_x2),
+                input_scale=x_sf.view(torch.uint8),
+                weight_scale=gemm1_weight_scale.view(torch.uint8),
+                alpha=gemm1_alpha,
+                tile_idx_to_group_idx=tile_idx_to_expert_idx,
+                num_non_exiting_tiles=num_non_exiting_tiles,
+                num_experts=self.num_experts,
+                top_k=self.top_k,
+                num_local_experts=self.num_local_experts,
+                local_expert_offset=self.local_expert_offset,
+                tile_size=tile_size,
+                output_dtype=self.output_dtype,
+            )
+            x, x_sf = torch.ops.trtllm.moe_swiglu_nvfp4_quantize(
+                input=x,
+                global_sf=gemm2_input_global_scale,
+                tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+                num_non_exiting_tiles=num_non_exiting_tiles,
+                tile_tokens_dim=tile_size,
+            )
+            x = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_blackwell(
+                input=x.view(torch.float4_e2m1fn_x2),
+                weight=gemm2_weight.view(torch.float4_e2m1fn_x2),
+                input_scale=x_sf.view(torch.uint8),
+                weight_scale=gemm2_weight_scale.view(torch.uint8),
+                alpha=gemm2_alpha,
+                tile_idx_to_group_idx=tile_idx_to_expert_idx,
+                num_non_exiting_tiles=num_non_exiting_tiles,
+                num_experts=self.num_experts,
+                top_k=self.top_k,
+                num_local_experts=self.num_local_experts,
+                local_expert_offset=self.local_expert_offset,
+                tile_size=tile_size,
+                output_dtype=self.output_dtype,
+            )
+            x = torch.ops.trtllm.moe_unpermute(
+                permuted_input=x,
+                expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                topk_scales=token_final_scales,
+            )
+            return x
+
+    @torch.library.custom_op("trtllm::cute_dsl_nvfp4_fused_moe_blackwell",
+                             mutates_args=(),
+                             device_types="cuda")
+    def cute_dsl_nvfp4_fused_moe_blackwell(
+        input: torch.Tensor,
+        input_scale: torch.Tensor,
+        token_selected_experts: torch.Tensor,
+        token_final_scales: torch.Tensor,
+        gemm1_weight: torch.Tensor,
+        gemm1_weight_scale: torch.Tensor,
+        gemm1_alpha: torch.Tensor,
+        gemm2_input_global_scale: torch.Tensor,
+        gemm2_weight: torch.Tensor,
+        gemm2_weight_scale: torch.Tensor,
+        gemm2_alpha: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        num_local_experts: int,
+        local_expert_offset: int,
+        output_dtype: torch.dtype,
+        scaling_vector_size: int = 16,
+    ) -> torch.Tensor:
+        tuner = AutoTuner.get()
+        runner = Sm100BlockScaledFusedMoERunner(num_experts, top_k,
+                                                num_local_experts,
+                                                local_expert_offset,
+                                                output_dtype,
+                                                scaling_vector_size)
+        inputs = [
+            input, input_scale, token_selected_experts, token_final_scales,
+            gemm1_weight, gemm1_weight_scale, gemm1_alpha,
+            gemm2_input_global_scale, gemm2_weight, gemm2_weight_scale,
+            gemm2_alpha
+        ]
+
+        _, best_tactic = tuner.choose_one(
+            "trtllm::cute_dsl_nvfp4_fused_moe_blackwell",
+            [runner],
+            runner.get_tuning_config(),
+            inputs,
+        )
+        output = runner(inputs, tactic=best_tactic)
+        return output
+
+    @torch.library.register_fake("trtllm::cute_dsl_nvfp4_fused_moe_blackwell")
+    def _(
+        input: torch.Tensor,
+        input_scale: torch.Tensor,
+        token_selected_experts: torch.Tensor,
+        token_final_scales: torch.Tensor,
+        gemm1_weight: torch.Tensor,
+        gemm1_weight_scale: torch.Tensor,
+        gemm1_alpha: torch.Tensor,
+        gemm2_input_global_scale: torch.Tensor,
+        gemm2_weight: torch.Tensor,
+        gemm2_weight_scale: torch.Tensor,
+        gemm2_alpha: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        num_local_experts: int,
+        local_expert_offset: int,
+        output_dtype: torch.dtype,
+        scaling_vector_size: int = 16,
+    ):
+        m, k = input.size(0), input.size(1) * 2
+        return torch.empty(m, k, dtype=output_dtype, device=input.device)
+
+    class CuteDSLFp8BlackwellLinear(TunableRunner):
+        kernel_class = BlockwiseGemmKernel
+        kernel_cache = dict()
+
+        tuning_config = TuningConfig(
+            dynamic_tensor_specs=(DynamicTensorSpec(
+                0, 0, get_last_power_of_2_num_tokens_buckets,
+                last_positive_power_of_2), ),
+            constraint_specs=(ConstraintSpec(2, 1, fp8_a_sf_m_shape), ),
+        )
+
+        def __init__(self):
+            super().__init__()
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+            **kwargs,
+        ) -> List[int]:
+            # Early exit: Check SM version - CuteDSL FP8 is only supported on Blackwell.
+            if not is_sm_100f():
+                logger.debug(
+                    f"CuteDSL: SM version {sm_version} is not supported. "
+                    f"CuteDSL FP8 GEMM only supports SM 100 family. Skipping all tactics."
+                )
+                return []
+
+            m = inputs[0].shape[0]
+            n = inputs[1].shape[0]
+            k = inputs[0].shape[1]
+            batch_size = 1
+            # m,k
+            a_major = "k"
+            # n, k
+            b_major = "k"
+            # m, n
+            c_major = "n"
+
+            use_2cta_instrs_candi = [False, True]
+            mma_tiler_mn_candi = [(64, 128), (128, 128), (256, 128)]
+            cluster_shape_mn_candi = [
+                (1, 1),
+                (1, 2),
+                (1, 4),
+                (2, 1),
+                (2, 2),
+                (2, 4),
+                (4, 1),
+                (4, 2),
+                (4, 4),
+            ]
+            return [
+                (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn)
+                for use_2cta_instrs in use_2cta_instrs_candi
+                for mma_tiler_mn in mma_tiler_mn_candi
+                for cluster_shape_mn in cluster_shape_mn_candi
+                if self.__class__.kernel_class.can_implement(
+                    cutlass.Float8E4M3FN,  # ab_dtype,
+                    cutlass.Float32,  # acc_dtype,
+                    cutlass.BFloat16,  # c_dtype,
+                    use_2cta_instrs,
+                    mma_tiler_mn,
+                    cluster_shape_mn,
+                    m,
+                    n,
+                    k,
+                    batch_size,
+                    a_major,
+                    b_major,
+                    c_major,
+                )
+            ]
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic,
+        ) -> torch.Tensor:
+            """
+            Performs fp8 blockwise (deepgemm like) operation using CuTe DSL.
+
+            Args:
+                inputs (List[torch.Tensor]):
+                    inputs[0]: Input tensor of shape (m, k), dtype: fp8.
+                    inputs[1]: Weight tensor of shape (n, k), dtype: fp8.
+                    inputs[2]: Input scale factor tensor of shape (k//128, m), dtype: fp32.
+                    inputs[3]: Weight scale factor tensor of shape (n//128, k//128), dtype: fp32.
+                tactic: Tiling and cluster strategy, typically a tuple (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn).
+
+            Returns:
+                torch.Tensor: Output tensor of shape (m, n), dtype: bf16.
+            """
+            if isinstance(tactic, tuple):
+                use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = tactic
+            else:
+                # fallback to default tactic
+                use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = [
+                    False,
+                    (128, 128),
+                    (1, 1),
+                ]
+            a_tensor, b_tensor, a_sf_tensor, b_sf_tensor = inputs
+            m, n, k = a_tensor.shape[0], b_tensor.shape[0], b_tensor.shape[1]
+            sf_m = m
+            sf_k = ceil_div(k, 128)
+            sf_n = ceil_div(n, 128)
+            # TODO: add the logic of 'to_userbuffers'
+            c_tensor = torch.empty(*(m, n),
+                                   dtype=torch.bfloat16,
+                                   device=a_tensor.device)
+
+            a_ptr = make_ptr(
+                cutlass.Float8E4M3FN,
+                a_tensor.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            b_ptr = make_ptr(
+                cutlass.Float8E4M3FN,
+                b_tensor.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            a_sf_ptr = make_ptr(
+                cutlass.Float32,
+                a_sf_tensor.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            b_sf_ptr = make_ptr(
+                cutlass.Float32,
+                b_sf_tensor.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            c_ptr = make_ptr(
+                cutlass.BFloat16,
+                c_tensor.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+
+            # get stream
+            torch_stream = torch.cuda.current_stream()
+            stream = cuda.CUstream(torch_stream.cuda_stream)
+
+            cache_key = (
+                use_2cta_instrs,
+                mma_tiler_mn,
+                cluster_shape_mn,
+            )
+            if cache_key not in self.__class__.kernel_cache:
+                gemm = self.__class__.kernel_class(
+                    cutlass.Float32,  # acc_dtype,
+                    use_2cta_instrs=use_2cta_instrs,
+                    mma_tiler_mn=mma_tiler_mn,
+                    cluster_shape_mn=cluster_shape_mn,
+                )
+                # Compute max active clusters on current device
+                hardware_info = cutlass.utils.HardwareInfo()
+                max_active_clusters = hardware_info.get_max_active_clusters(
+                    cluster_shape_mn[0] * cluster_shape_mn[1])
+
+                compiled_gemm = cute.compile(
+                    gemm.wrapper,
+                    m,
+                    n,
+                    k,
+                    sf_m,
+                    sf_n,
+                    sf_k,
+                    1,  # batch
+                    a_ptr,
+                    b_ptr,
+                    a_sf_ptr,
+                    b_sf_ptr,
+                    c_ptr,
+                    max_active_clusters=max_active_clusters,
+                    stream=stream,
+                )
+                self.__class__.kernel_cache[cache_key] = compiled_gemm
+            else:
+                compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+            # launch gemm kernel
+            compiled_gemm(
+                m,
+                n,
+                k,
+                sf_m,
+                sf_n,
+                sf_k,
+                1,  # batch
+                a_ptr,
+                b_ptr,
+                a_sf_ptr,
+                b_sf_ptr,
+                c_ptr,
+                stream=stream,
+            )
+            return c_tensor
+
+    # a/b: fp8, scale: fp32, output: bf16
+    @torch.library.custom_op("trtllm::cute_dsl_fp8_gemm_blackwell",
+                             mutates_args=(),
+                             device_types="cuda")
+    def cute_dsl_fp8_gemm_blackwell(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        tuner = AutoTuner.get()
+
+        runner = CuteDSLFp8BlackwellLinear()
+
+        inputs = [input, weight, input_scale, weight_scale]
+        _, best_tactic = tuner.choose_one(
+            "trtllm::cute_dsl_fp8_gemm_blackwell::gemm",
+            [runner],
+            runner.__class__.tuning_config,
+            inputs,
+        )
+        return runner(inputs, tactic=best_tactic)
+
+    @torch.library.register_fake("trtllm::cute_dsl_fp8_gemm_blackwell")
+    def _(
+        mat_a: torch.Tensor,
+        mat_b: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+    ):
+        # [m, k]
+        shape = [i for i in mat_a.shape]
+        # [n, k]
+        shape[-1] = mat_b.shape[-2]
+        # output is fixed as bf16
+        ret = mat_a.new_empty(shape, dtype=torch.bfloat16)
+        return ret
+
+    class CuteDSLFp8BlackwellBmm(TunableRunner):
+        kernel_class = BlockwiseGemmKernel
+        kernel_cache = dict()
+
+        tuning_config = TuningConfig(
+            dynamic_tensor_specs=(DynamicTensorSpec(
+                0, 1, get_last_power_of_2_num_tokens_buckets,
+                last_positive_power_of_2), ),
+            constraint_specs=(ConstraintSpec(2, 0, fp8_a_sf_m_shape), ),
+        )
+
+        def __init__(self):
+            super().__init__()
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+            **kwargs,
+        ) -> List[int]:
+
+            if not is_sm_100f():
+                logger.debug(
+                    f"CuteDSL: SM version {sm_version} is not supported. "
+                    f"CuteDSL FP8 BMM only supports SM 100 family. Skipping all tactics."
+                )
+                return []
+            # [b, m, k]
+            batch_size, m, k = inputs[0].shape[0], inputs[0].shape[1], inputs[
+                0].shape[2]
+            # [b, n, k]
+            n = inputs[1].shape[1]
+            # m,k
+            a_major = "k"
+            # n, k
+            b_major = "k"
+            # m, n
+            c_major = "n"
+
+            use_2cta_instrs_candi = [False, True]
+            mma_tiler_mn_candi = [(64, 128), (128, 128), (256, 128)]
+            cluster_shape_mn_candi = [
+                (1, 1),
+                (1, 2),
+                (1, 4),
+                (2, 1),
+                (2, 2),
+                (2, 4),
+                (4, 1),
+                (4, 2),
+                (4, 4),
+            ]
+            return [
+                (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn)
+                for use_2cta_instrs in use_2cta_instrs_candi
+                for mma_tiler_mn in mma_tiler_mn_candi
+                for cluster_shape_mn in cluster_shape_mn_candi
+                if self.__class__.kernel_class.can_implement(
+                    cutlass.Float8E4M3FN,  # ab_dtype,
+                    cutlass.Float32,  # acc_dtype,
+                    cutlass.BFloat16,  # c_dtype,
+                    use_2cta_instrs,
+                    mma_tiler_mn,
+                    cluster_shape_mn,
+                    m,
+                    n,
+                    k,
+                    batch_size,
+                    a_major,
+                    b_major,
+                    c_major,
+                )
+            ]
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic,
+        ) -> None:
+            """
+            Performs fp8 blockwise (deepgemm like) batched gemm operation using CuTe DSL.
+
+            Args:
+                inputs (List[torch.Tensor]):
+                    inputs[0]: Input tensor of shape (b, m, k), dtype: fp8.
+                    inputs[1]: Weight tensor of shape (b, n, k), dtype: fp8.
+                    inputs[2]: Input scale tensor of shape (b, pad_up(m, 4), ceil_div(k, 128)), dtype: fp32.
+                    inputs[3]: Weight scale tensor of shape (B, Wn, Wk), dtype: fp32.
+                tactic: Tiling and cluster strategy, typically a tuple (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn).
+
+            Returns:
+                torch.Tensor: Output tensor of shape (b, m, n), dtype: bf16.
+            """
+            if isinstance(tactic, tuple):
+                use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = tactic
+            else:
+                # fallback to default tactic
+                use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = [
+                    False,
+                    (128, 128),
+                    (1, 1),
+                ]
+
+            a_tensor, b_tensor, a_sf_tensor, b_sf_tensor, c_tensor = inputs
+
+            batch_size = a_tensor.shape[0]
+            m = a_tensor.shape[1]
+            k = a_tensor.shape[2]
+            n = b_tensor.shape[1]
+            sf_m = pad_up(m, 4)
+            sf_k = ceil_div(k, 128)
+            sf_n = ceil_div(n, 128)
+
+            a_ptr = make_ptr(
+                cutlass.Float8E4M3FN,
+                a_tensor.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            b_ptr = make_ptr(
+                cutlass.Float8E4M3FN,
+                b_tensor.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            a_sf_ptr = make_ptr(
+                cutlass.Float32,
+                a_sf_tensor.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            b_sf_ptr = make_ptr(
+                cutlass.Float32,
+                b_sf_tensor.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            c_ptr = make_ptr(
+                cutlass.BFloat16,
+                c_tensor.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+
+            # get stream
+            stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+            cache_key = (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn)
+            if cache_key not in self.__class__.kernel_cache:
+                gemm = self.__class__.kernel_class(
+                    cutlass.Float32,  # acc_dtype,
+                    use_2cta_instrs=use_2cta_instrs,
+                    mma_tiler_mn=mma_tiler_mn,
+                    cluster_shape_mn=cluster_shape_mn,
+                )
+                # Compute max active clusters on current device
+                hardware_info = cutlass.utils.HardwareInfo()
+                max_active_clusters = hardware_info.get_max_active_clusters(
+                    cluster_shape_mn[0] * cluster_shape_mn[1])
+
+                compiled_gemm = cute.compile(
+                    gemm.wrapper,
+                    m,
+                    n,
+                    k,
+                    sf_m,
+                    sf_n,
+                    sf_k,
+                    batch_size,
+                    a_ptr,
+                    b_ptr,
+                    a_sf_ptr,
+                    b_sf_ptr,
+                    c_ptr,
+                    max_active_clusters=max_active_clusters,
+                    stream=stream,
+                )
+                self.__class__.kernel_cache[cache_key] = compiled_gemm
+            else:
+                compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+            # launch gemm kernel
+            compiled_gemm(
+                m,
+                n,
+                k,
+                sf_m,
+                sf_n,
+                sf_k,
+                batch_size,  # batch
+                a_ptr,
+                b_ptr,
+                a_sf_ptr,
+                b_sf_ptr,
+                c_ptr,
+                stream=stream,
+            )
+
+    # a/b: fp8, scale: fp32, out: bf16
+    @torch.library.custom_op("trtllm::cute_dsl_fp8_bmm_blackwell",
+                             mutates_args=(),
+                             device_types="cuda")
+    def cute_dsl_fp8_bmm_blackwell(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        tuner = AutoTuner.get()
+
+        runner = CuteDSLFp8BlackwellBmm()
+
+        inputs = [input, weight, input_scale, weight_scale, out]
+
+        _, best_tactic = tuner.choose_one(
+            "trtllm::cute_dsl_fp8_bmm_blackwell::gemm",
+            [runner],
+            runner.__class__.tuning_config,
+            inputs,
+        )
+        runner(inputs, tactic=best_tactic)
+
+    @torch.library.register_fake("trtllm::cute_dsl_fp8_bmm_blackwell")
+    def _(
+        mat_a: torch.Tensor,
+        mat_b: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        batch_size, m, k = mat_a.shape[0], mat_a.shape[1], mat_a.shape[2]
+        n = mat_b.shape[1]
+        if out.dtype != torch.bfloat16:
+            assert False, "out.dtype != bf16"
+        if out.shape != (batch_size, m, n):
+            assert False, "out.shape != (batch_size, m, n)"
+
+    class CuteDSLFp8BlackwellGroupGemm(TunableRunner):
+        kernel_class = BlockwiseContiguousGroupedGemmKernel
+        kernel_cache = dict()
+
+        tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+            0, 0, get_last_power_of_2_num_tokens_buckets,
+            last_positive_power_of_2), ),
+                                     constraint_specs=(
+                                         ConstraintSpec(2, 1, fp8_a_sf_m_shape),
+                                         ConstraintSpec(
+                                             4, 0, lambda shapes: shapes[0][0]),
+                                     ))
+
+        def __init__(self):
+            super().__init__()
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+            **kwargs,
+        ) -> List[int]:
+            if not is_sm_100f():
+                logger.debug(
+                    f"CuteDSL: SM version {sm_version} is not supported. "
+                    f"CuteDSL FP8 Group Gemm only supports SM 100 family. Skipping all tactics."
+                )
+                return []
+            # [m, k]
+            m, k = inputs[0].shape[0], inputs[0].shape[1]
+            # [group_num, n, k]
+            group_num, n, k = inputs[1].shape[0], inputs[1].shape[1], inputs[
+                1].shape[2]
+            # m,k
+            a_major = "k"
+            # n, k
+            b_major = "k"
+            # m, n
+            c_major = "n"
+
+            use_2cta_instrs_candi = [False, True]
+            mma_tiler_mn_candi = [(64, 128), (128, 128), (256, 128)]
+            cluster_shape_mn_candi = [
+                (1, 1),
+                (1, 2),
+                (1, 4),
+                (2, 1),
+                (2, 2),
+                (2, 4),
+                (4, 1),
+                (4, 2),
+                (4, 4),
+            ]
+            return [
+                (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn)
+                for use_2cta_instrs in use_2cta_instrs_candi
+                for mma_tiler_mn in mma_tiler_mn_candi
+                for cluster_shape_mn in cluster_shape_mn_candi
+                if self.__class__.kernel_class.can_implement(
+                    cutlass.Float8E4M3FN,  # ab_dtype,
+                    cutlass.Float32,  # acc_dtype,
+                    cutlass.BFloat16,  # c_dtype,
+                    use_2cta_instrs,
+                    mma_tiler_mn,
+                    cluster_shape_mn,
+                    m,
+                    n,
+                    k,
+                    batch_size,
+                    a_major,
+                    b_major,
+                    c_major,
+                )
+            ]
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic,
+        ) -> torch.Tensor:
+            """
+            Performs fp8 grouped gemm operation using CuTe DSL.
+
+            Args:
+                inputs (List[torch.Tensor]):
+                    inputs[0]: Input tensor of shape (m, k), dtype: fp8.
+                    inputs[1]: Weight tensor of shape (group_num, n, k), dtype: fp8.
+                    inputs[2]: Input scale tensor of shape (k // 128, m), dtype: fp32.
+                    inputs[3]: Weight scale tensor of shape (group_num, n // 128, k // 128), dtype: fp32.
+                    inputs[4]: Group offset tensor of shape (m), dtype: int32.
+                tactic: Tiling and cluster strategy, typically a tuple (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn).
+
+            Returns:
+                torch.Tensor: Output tensor of shape (m, n), dtype: bf16.
+            """
+
+            if isinstance(tactic, tuple):
+                use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = tactic
+            else:
+                # fallback to default tactic
+                use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = [
+                    False,
+                    (128, 128),
+                    (1, 1),
+                ]
+
+            a, b, a_sf, b_sf, group_offset = inputs
+            m, k, n = a.shape[0], a.shape[1], b.shape[1]
+            group_num = b.shape[0]
+            sf_m = m
+            sf_n = ceil_div(n, 128)
+            sf_k = ceil_div(k, 128)
+            c = torch.empty(*(m, n), dtype=torch.bfloat16, device="cuda")
+
+            a_ptr = make_ptr(
+                cutlass.Float8E4M3FN,
+                a.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            b_ptr = make_ptr(
+                cutlass.Float8E4M3FN,
+                b.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            c_ptr = make_ptr(
+                cutlass.BFloat16,
+                c.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            a_sf_ptr = make_ptr(
+                cutlass.Float32,
+                a_sf.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            b_sf_ptr = make_ptr(
+                cutlass.Float32,
+                b_sf.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            group_offset_ptr = make_ptr(
+                cutlass.Int32,
+                group_offset.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+
+            # a_tmp = a.view(torch.uint8)
+            # b_tmp = b.view(torch.uint8)
+
+            # mA = from_dlpack(a_tmp,
+            #                 assumed_align=16).mark_layout_dynamic(leading_dim=1)
+            # mB = from_dlpack(b_tmp,
+            #                 assumed_align=16).mark_layout_dynamic(leading_dim=2)
+            # mC = from_dlpack(c, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+            # mA.element_type = cutlass.Float8E4M3FN
+            # mB.element_type = cutlass.Float8E4M3FN
+
+            # mSFB = from_dlpack(b_sf,
+            #                 assumed_align=16).mark_layout_dynamic(leading_dim=2)
+            # mSFA = from_dlpack(a_sf,
+            #                 assumed_align=16).mark_layout_dynamic(leading_dim=1)
+            # group_offset_cute_tensor = from_dlpack(
+            #     group_offset).mark_layout_dynamic()
+
+            # get stream
+            torch_stream = torch.cuda.current_stream()
+            stream = cuda.CUstream(torch_stream.cuda_stream)
+
+            cache_key = (
+                use_2cta_instrs,
+                mma_tiler_mn,
+                cluster_shape_mn,
+            )
+            if cache_key not in self.__class__.kernel_cache:
+                gemm = self.__class__.kernel_class(
+                    cutlass.Float32,  # acc_dtype,
+                    use_2cta_instrs=use_2cta_instrs,
+                    mma_tiler_mn=mma_tiler_mn,
+                    cluster_shape_mn=cluster_shape_mn,
+                )
+                # Compute max active clusters on current device
+                hardware_info = cutlass.utils.HardwareInfo()
+                max_active_clusters = hardware_info.get_max_active_clusters(
+                    cluster_shape_mn[0] * cluster_shape_mn[1])
+
+                # @cute.jit
+                # def group_gemm_permute_wrapper(
+                #     a: cute.Tensor,
+                #     b: cute.Tensor,
+                #     c: cute.Tensor,
+                #     a_sf: cute.Tensor,
+                #     b_sf: cute.Tensor,
+                #     group_offset: cute.Tensor,
+                #     max_active_clusters: cutlass.Constexpr,
+                #     stream: cuda.CUstream,
+                # ):
+                #     a = append_ones_wrapper(a)
+                #     c = append_ones_wrapper(c)
+                #     b = permute(b, (1, 2, 0))
+                #     b_sf = permute(b_sf, (1, 2, 0))
+                #     a_sf = permute(a_sf, (1, 0))
+                #     a_sf = append_ones_wrapper(a_sf)
+                #     gemm(a, b, c, a_sf, b_sf, group_offset, max_active_clusters,
+                #         stream)
+
+                compiled_gemm = cute.compile(
+                    gemm.wrapper,
+                    m,
+                    n,
+                    k,
+                    sf_m,
+                    sf_n,
+                    sf_k,
+                    1,
+                    group_num,
+                    a_ptr,
+                    b_ptr,
+                    a_sf_ptr,
+                    b_sf_ptr,
+                    c_ptr,
+                    group_offset_ptr,
+                    max_active_clusters,
+                    stream,
+                )
+                self.__class__.kernel_cache[cache_key] = compiled_gemm
+            else:
+                compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+            # launch gemm kernel
+            compiled_gemm(
+                m,
+                n,
+                k,
+                sf_m,
+                sf_n,
+                sf_k,
+                1,
+                group_num,
+                a_ptr,
+                b_ptr,
+                a_sf_ptr,
+                b_sf_ptr,
+                c_ptr,
+                group_offset_ptr,
+                stream=stream,
+            )
+            return c
+
+    # a/b: fp8, scale: fp32, out: bf16
+    @torch.library.custom_op("trtllm::cute_dsl_fp8_group_gemm_blackwell",
+                             mutates_args=(),
+                             device_types="cuda")
+    def cute_dsl_fp8_group_gemm_blackwell(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        group_offset: torch.Tensor,
+    ) -> torch.Tensor:
+
+        tuner = AutoTuner.get()
+        runner = CuteDSLFp8BlackwellGroupGemm()
+
+        inputs = [input, weight, input_scale, weight_scale, group_offset]
+        _, best_tactic = tuner.choose_one(
+            "trtllm::cute_dsl_fp8_group_gemm_blackwell::gemm",
+            [runner],
+            runner.__class__.tuning_config,
+            inputs,
+        )
+        return runner(inputs, tactic=best_tactic)
+
+    @torch.library.register_fake("trtllm::cute_dsl_fp8_group_gemm_blackwell")
+    def _(
+        mat_a: torch.Tensor,
+        mat_b: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        group_offset: torch.Tensor,
+    ) -> torch.Tensor:
+        m, k = mat_a.shape[0], mat_a.shape[1]
+        num_group, n, k = mat_b.shape[0], mat_b.shape[1], mat_b.shape[2]
+        return mat_a.new_empty((m, n), dtype=torch.bfloat16)
