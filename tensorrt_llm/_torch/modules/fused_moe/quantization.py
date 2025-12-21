@@ -2101,9 +2101,9 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
                                             TensorParallelMode.COLUMN,
                                             device=device)
 
-        cast_w3_weight_scale = w3_weight_scale.view(
+        cast_w3_weight_scale = w3_weight_scale.contiguous().view(
             dst_w3_w1_weight_scale.dtype)
-        cast_w1_weight_scale = w1_weight_scale.view(
+        cast_w1_weight_scale = w1_weight_scale.contiguous().view(
             dst_w3_w1_weight_scale.dtype)
         cast_w31_weight_scale = torch.cat(
             [cast_w3_weight_scale, cast_w1_weight_scale], dim=0)
@@ -2165,8 +2165,10 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
                                             TensorParallelMode.COLUMN,
                                             device=device)
 
-        cast_w1_weight_shard = w1_weight_shard.view(dst_w3_w1_weight.dtype)
-        cast_w3_weight_shard = w3_weight_shard.view(dst_w3_w1_weight.dtype)
+        cast_w1_weight_shard = w1_weight_shard.contiguous().view(
+            dst_w3_w1_weight.dtype)
+        cast_w3_weight_shard = w3_weight_shard.contiguous().view(
+            dst_w3_w1_weight.dtype)
         cast_w31_weight_shard = torch.cat(
             [cast_w3_weight_shard, cast_w1_weight_shard], dim=0)
         cast_w31_weight_shard = self._maybe_padding_shape(
