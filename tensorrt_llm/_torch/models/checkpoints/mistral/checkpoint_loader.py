@@ -1,3 +1,5 @@
+import math
+
 from tensorrt_llm._torch.models.checkpoints.base_config_loader import BaseConfigLoader
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import BaseWeightLoader
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
@@ -44,6 +46,18 @@ class MistralCheckpointLoader(HfCheckpointLoader):
 
         return hf_weights
 
+    def broadcast_per_tensor_scales(self, weights):
+        # Used to support FP8 per tensor scale by block-wise scale workflow.
+        scales = [k for k in weights.keys() if k.endswith("qscale_weight")]
+        for scale in scales:
+            name = ".".join(scale.split(".")[:-1])
+            weight_shape = weights[f"{name}.weight"].shape
+            broadcast = weights[scale].expand(
+                math.ceil(weight_shape[0] / 128),
+                math.ceil(weight_shape[1] / 128),
+            )
+            weights[scale] = broadcast[:]
+
     def inverse_nvfp4_global_scales(self, weights):
         for key in weights.keys():
             if "global_scale" in key:
@@ -52,6 +66,7 @@ class MistralCheckpointLoader(HfCheckpointLoader):
     def load_weights(self, checkpoint_dir: str, **kwargs):
         weights = super().weight_loader.load_weights(checkpoint_dir, **kwargs)
         weights = self.preprocess_weights(weights)
+        self.broadcast_per_tensor_scales(weights)
         # The definition of global_scale is different in Mistral, need to inverse the scale
         self.inverse_nvfp4_global_scales(weights)
         return weights

@@ -140,7 +140,7 @@ class DeepseekV3WeightLoader:
         self.model_config = model.model_config
         self.is_draft_model = is_draft_model
 
-    def load_weights(self, weights: Dict):
+    def load_weights(self, weights: Dict, skip_modules: List[str] = []):
 
         def rename_moe_weight(weights: Dict, rename_rules: Dict):
             result = {}
@@ -282,6 +282,8 @@ class DeepseekV3WeightLoader:
         for name, module in tqdm(all_named_modules.items(),
                                  desc="Loading weights"):
             if len(module._parameters) <= 0 or name.startswith("draft_model"):
+                continue
+            elif any(skip_module in name for skip_module in skip_modules):
                 continue
             else:
                 names = name.split('.')
