@@ -139,7 +139,6 @@ class _FlashInferPlanner:
                 kv_page_indices,
                 kv_last_page_len,
             )
-
         # check if we are in cuda graph capture and just return the pre-cached decode wrapper
         if torch.cuda.is_current_stream_capturing() or cuda_graph_state.in_warm_up():
             assert plan_params.is_generate, "Only generate is supported during cuda graph capture."
@@ -153,19 +152,14 @@ class _FlashInferPlanner:
         # handle decode
         if plan_params.is_generate:
             wrapper = self.decode_wrapper
-            # Update internal buffers in-place (constant time)
-            wrapper._paged_kv_indptr_buf.copy_(kv_page_indptr)
-            wrapper._paged_kv_indices_buf[: len(kv_page_indices)].copy_(kv_page_indices)
-            wrapper._paged_kv_last_page_len_buf.copy_(kv_last_page_len)
-
             if plan_params != self.plan_params:
                 _plan_decode(
                     wrapper,
-                    wrapper._paged_kv_indptr_buf,
-                    wrapper._paged_kv_indices_buf,
-                    wrapper._paged_kv_last_page_len_buf,
+                    kv_page_indptr,
+                    kv_page_indices,
+                    kv_last_page_len,
                 )
-                self.plan_params = plan_params
+            self.plan_params = plan_params
 
             return wrapper
 
