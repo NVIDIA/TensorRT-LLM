@@ -255,6 +255,9 @@ class Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_key_value_heads * self.head_dim
 
+        self.use_cute_dsl_blockscaling_mm = config.use_cute_dsl_blockscaling_mm
+        self.use_cute_dsl_blockscaling_bmm = config.use_cute_dsl_blockscaling_bmm
+
         qkv_shard_indices_mapping = {
             "q": (0, self.q_size * (2 if self.attn_output_gate else 1)),
             "k":
@@ -280,7 +283,8 @@ class Attention(nn.Module):
             force_dynamic_quantization=config.force_dynamic_quantization,
             disable_deep_gemm=disable_deep_gemm,
             use_custom_cublas_mm=use_custom_cublas_mm,
-            fused_weight_shard_indices_mapping=qkv_shard_indices_mapping)
+            fused_weight_shard_indices_mapping=qkv_shard_indices_mapping,
+            use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
 
         self.o_lora = LoraLayer([LoraModuleType.ATTENTION_DENSE],
                                 [self.hidden_size])
@@ -299,7 +303,8 @@ class Attention(nn.Module):
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization,
             disable_deep_gemm=disable_deep_gemm,
-            use_custom_cublas_mm=use_custom_cublas_mm)
+            use_custom_cublas_mm=use_custom_cublas_mm,
+            use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
 
         self.quant_config = config.get_quant_config()
         self.attn_backend = config.attn_backend
@@ -686,6 +691,7 @@ def fp8_block_scaling_bmm_out(
     mat2_scale: torch.Tensor,
     out: torch.Tensor,
     mat2_dequant: Optional[torch.Tensor] = None,
+    use_cute_dsl_blockscaling_bmm: bool = False,
 ) -> torch.Tensor:
     sm_version = get_sm_version()
     if sm_version == 90 or sm_version == 89:
@@ -706,7 +712,17 @@ def fp8_block_scaling_bmm_out(
                                                    output)
         out.copy_(output)
     elif is_sm_100f(sm_version):
-        torch.bmm(mat1.transpose(0, 1), mat2_dequant.transpose(1, 2), out=out)
+        if use_cute_dsl_blockscaling_bmm:
+            mat1_fp8, mat1_scale = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(
+                mat1)
+            torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(mat1_fp8, mat2_fp8,
+                                                        mat1_scale, mat2_scale,
+                                                        out)
+            mat1_scale = None
+        else:
+            torch.bmm(mat1.transpose(0, 1),
+                      mat2_dequant.transpose(1, 2),
+                      out=out)
     else:
         raise NotImplementedError(f"SM{sm_version} is not supported")
 
@@ -851,6 +867,9 @@ class MLA(nn.Module):
         quant_config = config.get_quant_config()
         self.quant_config = quant_config
 
+        self.use_cute_dsl_blockscaling_mm = config.use_cute_dsl_blockscaling_mm
+        self.use_cute_dsl_blockscaling_bmm = config.use_cute_dsl_blockscaling_bmm
+
         if not self.is_lite:
             self.kv_a_proj_with_mqa = Linear(
                 hidden_size,
@@ -860,7 +879,8 @@ class MLA(nn.Module):
                 quant_config=quant_config,
                 skip_create_weights_in_init=config.skip_create_weights_in_init,
                 use_custom_cublas_mm=True,
-                force_dynamic_quantization=config.force_dynamic_quantization)
+                force_dynamic_quantization=config.force_dynamic_quantization,
+                use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
 
             self.q_a_layernorm = RMSNorm(hidden_size=self.q_lora_rank,
                                          eps=rms_norm_eps,
@@ -876,7 +896,8 @@ class MLA(nn.Module):
                 quant_config=quant_config,
                 skip_create_weights_in_init=config.skip_create_weights_in_init,
                 allreduce_strategy=config.allreduce_strategy,
-                force_dynamic_quantization=config.force_dynamic_quantization)
+                force_dynamic_quantization=config.force_dynamic_quantization,
+                use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
         else:
             self.kv_a_proj_with_mqa = Linear(
                 hidden_size,
@@ -886,7 +907,8 @@ class MLA(nn.Module):
                 quant_config=quant_config,
                 skip_create_weights_in_init=config.skip_create_weights_in_init,
                 use_custom_cublas_mm=True,
-                force_dynamic_quantization=config.force_dynamic_quantization)
+                force_dynamic_quantization=config.force_dynamic_quantization,
+                use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
 
             self.q_proj = Linear(
                 self.q_lora_rank,
@@ -898,7 +920,8 @@ class MLA(nn.Module):
                 quant_config=quant_config,
                 skip_create_weights_in_init=config.skip_create_weights_in_init,
                 allreduce_strategy=config.allreduce_strategy,
-                force_dynamic_quantization=config.force_dynamic_quantization)
+                force_dynamic_quantization=config.force_dynamic_quantization,
+                use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
             self.q_b_proj = self.q_proj
 
         self.kv_a_layernorm = RMSNorm(hidden_size=kv_lora_rank,
@@ -915,7 +938,8 @@ class MLA(nn.Module):
             quant_config=quant_config,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             allreduce_strategy=config.allreduce_strategy,
-            force_dynamic_quantization=config.force_dynamic_quantization)
+            force_dynamic_quantization=config.force_dynamic_quantization,
+            use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
         # This parameter will view into self.kv_b_proj.weight after loading weights.
         # For dummy weight initialization, this parameter is initialized with empty tensor.
         # Used in forward_absorption only
@@ -947,7 +971,8 @@ class MLA(nn.Module):
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             reduce_output=reduce_output,
             allreduce_strategy=config.allreduce_strategy,
-            force_dynamic_quantization=config.force_dynamic_quantization)
+            force_dynamic_quantization=config.force_dynamic_quantization,
+            use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
 
         def yarn_get_mscale(scale=1, mscale=1):
             if scale <= 1:
@@ -1083,7 +1108,7 @@ class MLA(nn.Module):
                 ),
                 requires_grad=False,
             )
-            if is_sm_100f():
+            if is_sm_100f() and not self.use_cute_dsl_blockscaling_bmm:
                 assert self.dtype == torch.bfloat16
                 self.k_b_proj_trans_dequant = nn.Parameter(
                     torch.empty(
@@ -1875,6 +1900,7 @@ class MLA(nn.Module):
                     self.k_b_proj_trans_scale,
                     q_nope_out,
                     self.k_b_proj_trans_dequant,
+                    self.use_cute_dsl_blockscaling_bmm,
                 ),
                 lambda: self.mqa.mla_rope_generation(
                     fused_q,
@@ -1952,6 +1978,7 @@ class MLA(nn.Module):
                 self.v_b_proj_scale,
                 attn_output.transpose(0, 1),
                 self.v_b_proj_dequant,
+                self.use_cute_dsl_blockscaling_bmm,
             )
         else:
             raise NotImplementedError(
@@ -2007,6 +2034,7 @@ class MLA(nn.Module):
                 self.k_b_proj_trans_scale,
                 q_nope_out,
                 self.k_b_proj_trans_dequant,
+                self.use_cute_dsl_blockscaling_bmm,
             )
         else:
             raise NotImplementedError(
@@ -2062,6 +2090,7 @@ class MLA(nn.Module):
                 self.v_b_proj_scale,
                 attn_output.transpose(0, 1),
                 self.v_b_proj_dequant,
+                self.use_cute_dsl_blockscaling_bmm,
             )
         else:
             raise NotImplementedError(
@@ -2129,6 +2158,7 @@ class MLA(nn.Module):
                 self.k_b_proj_trans_scale,
                 q_nope_out,
                 self.k_b_proj_trans_dequant,
+                self.use_cute_dsl_blockscaling_bmm,
             )
         else:
             raise NotImplementedError(
@@ -2205,6 +2235,7 @@ class MLA(nn.Module):
                 self.v_b_proj_scale,
                 attn_output.transpose(0, 1),
                 self.v_b_proj_dequant,
+                self.use_cute_dsl_blockscaling_bmm,
             )
         else:
             raise NotImplementedError(

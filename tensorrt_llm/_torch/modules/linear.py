@@ -984,10 +984,9 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
 
         if is_sm_100f():
             if module.use_cute_dsl_blockscaling_mm or module.disable_deep_gemm:
-                # TODO (@lmin): replace with cute_dsl gemm
                 act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
                     input)
-                output = torch.ops.trtllm.fp8_block_scaling_gemm(
+                output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
                     act_input_fp8, module.weight, act_input_sf,
                     module.weight_scale)
             else:
