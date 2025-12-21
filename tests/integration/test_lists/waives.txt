@@ -495,3 +495,4 @@ triton_server/test_triton.py::test_gpt_disaggregated_serving_bls[gpt-disaggregat
 cpp/test_multi_gpu.py::test_cache_transceiver[8proc-mooncake_kvcache-90] SKIP (https://nvbugs/5760737)
 unittest/_torch/ray_orchestrator/multi_gpu/test_ops.py::test_allreduce_pg_op[seqlen:16-hidden:1024] SKIP (https://nvbugs/5760740)
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[trtllm-two_model-no_overlap_scheduler] SKIP (https://nvbugs/5760747)
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[True-True-cutlass-auto] SKIP (https://nvbugs/5744328)
