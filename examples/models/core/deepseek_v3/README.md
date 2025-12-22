@@ -148,7 +148,7 @@ trtllm-bench --model ${DS_R1_NVFP4_MODEL_PATH} \
         --input-stdev 0 --output-stdev 0 \
         --num-requests 24
 
-cat <<EOF > /tmp/extra-llm-api-config.yml
+cat <<EOF > /tmp/config.yml
 cuda_graph_config:
   enable_padding: true
   batch_sizes: [1, 4, 8, 12]
@@ -161,7 +161,7 @@ trtllm-bench -m deepseek-ai/DeepSeek-R1 --model_path ${DS_R1_NVFP4_MODEL_PATH} t
         --max_batch_size 12 \
         --max_num_tokens 65548 \
         --kv_cache_free_gpu_mem_fraction 0.6 \
-        --extra_llm_api_options /tmp/extra-llm-api-config.yml
+        --config /tmp/config.yml
 ```
 
 #### ISL-128k-OSL-1024
@@ -175,7 +175,7 @@ trtllm-bench --model ${DS_R1_NVFP4_MODEL_PATH} \
         --input-stdev 0 --output-stdev 0 \
         --num-requests 4
 
-cat <<EOF > /tmp/extra-llm-api-config.yml
+cat <<EOF > /tmp/config.yml
 cuda_graph_config:
   enable_padding: true
   batch_sizes: [1, 2]
@@ -190,7 +190,7 @@ trtllm-bench -m deepseek-ai/DeepSeek-R1 --model_path ${DS_R1_NVFP4_MODEL_PATH} t
         --max_batch_size 2 \
         --max_num_tokens 131074 \
         --kv_cache_free_gpu_mem_fraction 0.3 \
-        --extra_llm_api_options /tmp/extra-llm-api-config.yml
+        --config /tmp/config.yml
 ```
 
 ## Evaluation
@@ -199,7 +199,7 @@ Evaluate the model accuracy using `trtllm-eval`.
 
 1. (Optional) Prepare an advanced configuration file:
 ```bash
-cat >./extra-llm-api-config.yml <<EOF
+cat >./config.yml <<EOF
 enable_attention_dp: true
 EOF
 ```
@@ -209,7 +209,7 @@ EOF
 trtllm-eval --model  <YOUR_MODEL_DIR> \
   --tp_size 8 \
   --kv_cache_free_gpu_memory_fraction 0.8 \
-  --extra_llm_api_options ./extra-llm-api-config.yml \
+  --config ./config.yml \
   mmlu
 ```
 
@@ -218,7 +218,7 @@ trtllm-eval --model  <YOUR_MODEL_DIR> \
 trtllm-eval --model  <YOUR_MODEL_DIR> \
   --tp_size 8 \
   --kv_cache_free_gpu_memory_fraction 0.8 \
-  --extra_llm_api_options ./extra-llm-api-config.yml \
+  --config ./config.yml \
   gsm8k
 ```
 
@@ -229,7 +229,7 @@ trtllm-eval --model  <YOUR_MODEL_DIR> \
 trtllm-eval --model  <YOUR_MODEL_DIR> \
   --tp_size 8 \
   --kv_cache_free_gpu_memory_fraction 0.8 \
-  --extra_llm_api_options ./extra-llm-api-config.yml \
+  --config ./config.yml \
   gpqa_diamond \
   --apply_chat_template
 ```
@@ -243,7 +243,7 @@ To serve the model using `trtllm-serve`:
 
 #### B200 FP4 min-latency config
 ```bash
-cat >./extra-llm-api-config.yml <<EOF
+cat >./config.yml <<EOF
 cuda_graph_config:
     enable_padding: true
     max_batch_size: 1024
@@ -257,7 +257,7 @@ EOF
 
 #### B200 FP4 max-throughput config
 ```bash
-cat >./extra-llm-api-config.yml <<EOF
+cat >./config.yml <<EOF
 cuda_graph_config:
   enable_padding: true
   batch_sizes:
@@ -294,7 +294,7 @@ EOF
 
 #### B200 FP8 min-latency config
 ```bash
-cat >./extra-llm-api-config.yml <<EOF
+cat >./config.yml <<EOF
 cuda_graph_config:
     enable_padding: true
     max_batch_size: 1024
@@ -312,7 +312,7 @@ EOF
 
 #### B200 FP8 max-throughput config
 ```bash
-cat >./extra-llm-api-config.yml <<EOF
+cat >./config.yml <<EOF
 cuda_graph_config:
     enable_padding: true
     max_batch_size: 512
@@ -342,7 +342,7 @@ trtllm-serve \
   --tp_size 8 \
   --ep_size 8 \
   --pp_size 1 \
-  --extra_llm_api_options ./extra-llm-api-config.yml
+  --config ./config.yml
 ```
 It's possible seeing OOM issues on some configs. Considering reducing `kv_cache_free_gpu_mem_fraction` to a smaller value as a workaround. We're working on the investigation and addressing the problem. If you are using max-throughput config, reduce `max_num_tokens` to `3072` to avoid OOM issues.
 
@@ -370,7 +370,7 @@ For example, you can launch a single context server on port 8001 with:
 ```bash
 export TRTLLM_USE_UCX_KVCACHE=1
 
-cat >./ctx-extra-llm-api-config.yml <<EOF
+cat >./ctx_config.yml <<EOF
 print_iter_log: true
 enable_attention_dp: true
 EOF
@@ -386,7 +386,7 @@ trtllm-serve \
   --ep_size 8 \
   --pp_size 1 \
   --kv_cache_free_gpu_memory_fraction 0.95 \
-  --extra_llm_api_options ./ctx-extra-llm-api-config.yml &> output_ctx &
+  --config ./ctx_config.yml &> output_ctx &
 ```
 
 And you can launch two generation servers on port 8002 and 8003 with:
@@ -394,7 +394,7 @@ And you can launch two generation servers on port 8002 and 8003 with:
 ```bash
 export TRTLLM_USE_UCX_KVCACHE=1
 
-cat >./gen-extra-llm-api-config.yml <<EOF
+cat >./gen_config.yml <<EOF
 cuda_graph_config:
   enable_padding: true
   batch_sizes:
@@ -424,7 +424,7 @@ trtllm-serve \
   --ep_size 8 \
   --pp_size 1 \
   --kv_cache_free_gpu_memory_fraction 0.95 \
-  --extra_llm_api_options ./gen-extra-llm-api-config.yml \
+  --config ./gen_config.yml \
   &> output_gen_${port} & \
 done
 ```
@@ -483,7 +483,7 @@ The model configuration file is located at https://github.com/triton-inference-s
 model: <replace with the deepseek model or path to the checkpoints>
 backend: "pytorch"
 ```
-Additional configs similar to `extra-llm-api-config.yml` can be added to the yaml file and will be used to configure the LLM model. At the minimum, `tensor_parallel_size` needs to be set to 8 on H200 and B200 machines and 16 on H100.
+Additional configs similar to `config.yml` can be added to the yaml file and will be used to configure the LLM model. At the minimum, `tensor_parallel_size` needs to be set to 8 on H200 and B200 machines and 16 on H100.
 
 The initial loading of the model can take around one hour and the following runs will take advantage of the weight caching.
 
@@ -592,7 +592,7 @@ mpirun \
 -H <HOST1>:8,<HOST2>:8 \
 -mca plm_rsh_args "-p 2233" \
 --allow-run-as-root -n 16 \
-trtllm-llmapi-launch trtllm-bench --model deepseek-ai/DeepSeek-V3 --model_path /models/DeepSeek-V3 throughput --max_batch_size 161 --max_num_tokens 1160 --dataset /workspace/tensorrt_llm/dataset_isl1000.txt --tp 16 --ep 8 --kv_cache_free_gpu_mem_fraction 0.95 --extra_llm_api_options /workspace/tensorrt_llm/extra-llm-api-config.yml --concurrency 4096 --streaming
+trtllm-llmapi-launch trtllm-bench --model deepseek-ai/DeepSeek-V3 --model_path /models/DeepSeek-V3 throughput --max_batch_size 161 --max_num_tokens 1160 --dataset /workspace/tensorrt_llm/dataset_isl1000.txt --tp 16 --ep 8 --kv_cache_free_gpu_mem_fraction 0.95 --config /workspace/tensorrt_llm/config.yml --concurrency 4096 --streaming
 ```
 
 #### Slurm
@@ -604,20 +604,20 @@ trtllm-llmapi-launch trtllm-bench --model deepseek-ai/DeepSeek-V3 --model_path /
   --container-image=<CONTAINER_IMG> \
   --container-mounts=/workspace:/workspace \
   --container-workdir /workspace \
-  bash -c "trtllm-llmapi-launch trtllm-bench --model deepseek-ai/DeepSeek-V3 --model_path <YOUR_MODEL_DIR> throughput --max_batch_size 161 --max_num_tokens 1160 --dataset /workspace/dataset.txt --tp 16 --ep 4 --kv_cache_free_gpu_mem_fraction 0.95 --extra_llm_api_options ./extra-llm-api-config.yml"
+  bash -c "trtllm-llmapi-launch trtllm-bench --model deepseek-ai/DeepSeek-V3 --model_path <YOUR_MODEL_DIR> throughput --max_batch_size 161 --max_num_tokens 1160 --dataset /workspace/dataset.txt --tp 16 --ep 4 --kv_cache_free_gpu_mem_fraction 0.95 --config ./config.yml"
 ```
 
 
 #### Example: Multi-node benchmark on GB200 Slurm cluster
 
-Step 1: Prepare dataset and `extra-llm-api-config.yml`.
+Step 1: Prepare dataset and `config.yml`.
 ```bash
 trtllm-bench --model /path/to/DeepSeek-R1 \
     prepare-dataset --output /tmp/dataset.txt \
     token-norm-dist --num-requests=49152 \
     --input-mean=1024 --output-mean=2048 --input-stdev=0 --output-stdev=0
 
-cat >/path/to/TensorRT-LLM/extra-llm-api-config.yml <<EOF
+cat >/path/to/TensorRT-LLM/config.yml <<EOF
 cuda_graph_config:
   enable_padding: true
   batch_sizes:
@@ -678,7 +678,7 @@ trtllm-llmapi-launch trtllm-bench \
     --concurrency 3072 \
     --dataset /path/to/dataset.txt \
     --tp 8 --pp 1 --ep 8 --kv_cache_free_gpu_mem_fraction 0.85 \
-    --extra_llm_api_options ./extra-llm-api-config.yml --warmup 0
+    --config ./config.yml --warmup 0
 ```
 
 Step 4: Submit the job to Slurm cluster to launch the benchmark by executing:
@@ -730,7 +730,7 @@ trtllm-bench \
       --tp 8 \
       --ep 8 \
       --kv_cache_free_gpu_mem_fraction 0.9 \
-      --extra_llm_api_options /workspace/extra-llm-api-config.yml \
+      --config /workspace/config.yml \
       --concurrency ${CONCURRENCY} \
       --num_requests ${NUM_REQUESTS} \
       --streaming \
@@ -751,7 +751,7 @@ mpirun -H <HOST1>:8,<HOST2>:8 \
       --tp 16 \
       --ep 16 \
       --kv_cache_free_gpu_mem_fraction 0.9 \
-      --extra_llm_api_options /workspace/extra-llm-api-config.yml \
+      --config /workspace/config.yml \
       --concurrency ${CONCURRENCY} \
       --num_requests ${NUM_REQUESTS} \
       --streaming \
@@ -790,7 +790,7 @@ To enable FP8 MLA, modify the `kv_cache_quant_algo` property. The following show
 
 **Option 2: PyTorch backend config**
 
-Alternatively, configure FP8 MLA through the `kv_cache_dtype` of the PyTorch backend config. An example is to use `--kv_cache_dtype` of `quickstart_advanced.py`. Also, you can edit `extra-llm-api-config.yml` consumed by `--extra_llm_api_options` of `trtllm-serve`, `trtllm-bench` and so on:
+Alternatively, configure FP8 MLA through the `kv_cache_dtype` of the PyTorch backend config. An example is to use `--kv_cache_dtype` of `quickstart_advanced.py`. Also, you can edit `config.yml` consumed by `--config` of `trtllm-serve`, `trtllm-bench` and so on:
 ```yaml
 # ...
 kv_cache_dtype: fp8

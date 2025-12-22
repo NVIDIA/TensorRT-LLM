@@ -1601,9 +1601,10 @@ class PyExecutor:
                     # When there's any accepted tokens, we can't directly use the previous batch's outputs in this iteration for the target model,
                     # so we'll set the target model's input to None and skip updating the target requests after target model forward.
                     use_previous_draft_tokens = self.has_previous_draft_tokens
+                    num_accepted_tokens_device = None
                     if self.drafter is not None and (self.use_spec_decode or
                                                      use_previous_draft_tokens):
-                        target_inputs = self._handle_speculative_decoding(
+                        target_inputs, num_accepted_tokens_device = self._handle_speculative_decoding(
                             scheduled_batch, previous_tensors,
                             previous_tensors_device)
 
@@ -1616,8 +1617,9 @@ class PyExecutor:
                     else:
                         previous_tensors_device = self.previous_batch and self.previous_batch.sample_state and self.previous_batch.sample_state.device
 
-                    batch_outputs = self._forward_step(scheduled_batch,
-                                                       previous_tensors_device)
+                    batch_outputs = self._forward_step(
+                        scheduled_batch, previous_tensors_device,
+                        num_accepted_tokens_device)
 
                 if self.previous_batch is not None:
                     self._update_requests(self.previous_batch.sample_state)
@@ -1684,6 +1686,8 @@ class PyExecutor:
 
                 self.iter_counter += 1
 
+    @nvtx_range("_accept_draft_tokens")
+    @torch.compile(options={"max-autotune": True})
     def _accept_draft_tokens(
         self, scheduled_batch: ScheduledRequests,
         target_outputs: SampleStateTensors,
@@ -2184,22 +2188,26 @@ class PyExecutor:
         self.kv_cache_transceiver.check_gen_transfer_status(atLeastNum)
         self._check_cache_transfer_errors("generation requests")
 
-    def _forward_step(self,
-                      scheduled_requests,
-                      new_tensors_device: Optional[SampleStateTensors] = None):
+    def _forward_step(
+            self,
+            scheduled_requests,
+            new_tensors_device: Optional[SampleStateTensors] = None,
+            num_accepted_tokens_device: Optional[torch.Tensor] = None):
         ExpertStatistic.set_iter(self.iter_counter)
 
         @nvtx_range(
             f"[Executor] _forward_step {self.iter_counter}: {len(scheduled_requests.context_requests)} ctx reqs, {len(scheduled_requests.generation_requests)} gen reqs"
         )
         def forward(scheduled_requests, resource_manager, new_tensors_device,
-                    gather_context_logits, cache_indirection_buffer):
+                    gather_context_logits, cache_indirection_buffer,
+                    num_accepted_tokens_device):
             return self.model_engine.forward(
                 scheduled_requests,
                 resource_manager,
                 new_tensors_device,
                 gather_context_logits=gather_context_logits,
-                cache_indirection_buffer=cache_indirection_buffer)
+                cache_indirection_buffer=cache_indirection_buffer,
+                num_accepted_tokens_device=num_accepted_tokens_device)
 
         try:
             gather_context_logits = any(
@@ -2208,7 +2216,8 @@ class PyExecutor:
             cache_indirection_buffer = self.sampler.get_cache_indirection()
             outputs = forward(scheduled_requests, self.resource_manager,
                               new_tensors_device, gather_context_logits,
-                              cache_indirection_buffer)
+                              cache_indirection_buffer,
+                              num_accepted_tokens_device)
 
             self._kv_connector_wait_for_save()
 
@@ -2732,8 +2741,9 @@ class PyExecutor:
             )
             self.inflight_req_ids.erase(req.request_id)
 
-    def _handle_speculative_decoding(self, scheduled_batch, previous_tensors,
-                                     target_inputs):
+    def _handle_speculative_decoding(
+        self, scheduled_batch, previous_tensors, target_inputs
+    ) -> Tuple[Optional[SampleStateTensorsMTP], Optional[torch.Tensor]]:
         with request_context(is_draft=self.draft_model_engine is not None,
                              scheduled_requests=scheduled_batch):
             # Do an early checking to see if we need to forward the draft model.
@@ -2744,6 +2754,7 @@ class PyExecutor:
                 and self.drafter.should_forward_draft_model(scheduled_batch))
 
             new_target_inputs = None
+            num_accepted_tokens_device = None
             if has_draft_batch:
                 target_outputs = self.previous_batch.sample_state and self.previous_batch.sample_state.device
                 assert target_outputs is not None, "target_outputs should not be None"
@@ -2774,7 +2785,7 @@ class PyExecutor:
                     for request in scheduled_batch.all_requests():
                         request.py_draft_tokens = []
 
-        return new_target_inputs
+        return new_target_inputs, num_accepted_tokens_device
 
     def reset_prefix_cache(self):
         self.kv_cache_manager.reset_reuse_state()
