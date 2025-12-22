@@ -27,7 +27,6 @@
 #include <pybind11/operators.h>
 #include <pybind11/stl.h>
 #include <pybind11/stl_bind.h>
-#include <pybind11/stl_unordered_map.h>
 #include <torch/extension.h>
 
 namespace tb = tensorrt_llm::batch_manager;
