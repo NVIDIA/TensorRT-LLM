@@ -5,7 +5,7 @@ import sys
 
 import cloudpickle
 import pytest
-from defs.conftest import skip_no_hopper
+from defs.conftest import skip_no_hopper, skip_ray
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 
@@ -244,6 +244,7 @@ def verify_disaggregated(model, generation_overlap, enable_cuda_graph, prompt,
             print("All workers terminated.")
 
 
+@skip_ray
 @pytest.mark.parametrize("model", ["TinyLlama-1.1B-Chat-v1.0"])
 @pytest.mark.parametrize("generation_overlap", [False, True])
 @pytest.mark.parametrize("enable_cuda_graph", [False, True])
@@ -259,6 +260,7 @@ def test_disaggregated_simple_llama(model, generation_overlap,
         ])
 
 
+@skip_ray
 @skip_no_hopper
 @pytest.mark.parametrize("model", ["DeepSeek-V3-Lite-fp8/fp8"])
 @pytest.mark.parametrize("generation_overlap", [False, True])
@@ -276,6 +278,7 @@ def test_disaggregated_simple_deepseek(model, generation_overlap,
         ])
 
 
+@skip_ray
 @skip_no_hopper
 @pytest.mark.parametrize("model", ["Qwen3-8B-FP8"])
 @pytest.mark.parametrize("generation_overlap", [False, True])
