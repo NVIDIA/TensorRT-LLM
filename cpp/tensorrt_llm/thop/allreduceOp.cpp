@@ -57,6 +57,10 @@
 #include <limits>
 #include <unordered_set>
 
+#include "tensorrt_llm/common/stringUtils.h"
+
+namespace tc = tensorrt_llm::common;
+
 // using namespace nvinfer1;
 using tensorrt_llm::kernels::AllReduceFusionOp;
 using tensorrt_llm::kernels::AllReduceStrategyType;
@@ -472,7 +476,14 @@ private:
         auto rawComm = std::get<0>(mNcclComm);
         ncclComm_t comm = *rawComm;
         TLLM_CHECK_WITH_INFO(comm != nullptr, "NCCL communicator is null");
-        TLLM_LOG_DEBUG("[runNCCLAllReduceSymmetric] Using raw NCCL comm path (not ProcessGroup)");
+        // Convert shape to string using helper function
+        std::vector<int64_t> shape_vec(input.sizes().begin(), input.sizes().end());
+        std::string shape_str = "[" + tc::vec2str(shape_vec) + "]";
+
+        TLLM_LOG_DEBUG(
+            "[runNCCLAllReduceSymmetric] Using raw NCCL comm path (not ProcessGroup): "
+            "input_shape=%s, input_dtype=%d, fusion_op=%d",
+            shape_str.c_str(), static_cast<int>(input.scalar_type()), static_cast<int>(mOp));
 
         using tensorrt_llm::common::nccl_util::NCCLWindowAllocator;
         using tensorrt_llm::common::nccl_util::createNCCLWindowTensor;
@@ -515,6 +526,11 @@ private:
         torch::Tensor inputTensor = input;
         void* inputPtr = input.data_ptr();
 
+        TLLM_LOG_DEBUG(
+            "[runNCCLAllReduceSymmetric] Buffer search result: input_ptr=%p, "
+            "buffer_found=%d, buffer_size_bytes=%zu, threshold=%zu",
+            input.data_ptr(), windowBuffer0.isValid() ? 1 : 0, bufferSizeBytes, minRegistrationThreshold);
+
         // If buffer is not registered, decide whether to register based on size
         if (!windowBuffer0.isValid())
         {
@@ -522,26 +538,55 @@ private:
             {
                 // Small buffer: use input directly without window registration
                 TLLM_LOG_DEBUG(
-                    "[runNCCLAllReduceSymmetric] Buffer size %zu bytes < threshold %zu bytes, "
-                    "skipping window registration",
+                    "[runNCCLAllReduceSymmetric] PATH: Small buffer - using input directly "
+                    "without window registration (size %zu < threshold %zu)",
                     bufferSizeBytes, minRegistrationThreshold);
                 // inputTensor and inputPtr remain pointing to original input
             }
             else
             {
-                // Large buffer: create window buffer and copy input (can swap inputTensor reference)
-                auto [symmetricInput, symmetricBuffer0]
-                    = createNCCLWindowTensor(comm, input.sizes(), input.scalar_type());
-                TLLM_CUDA_CHECK(cudaMemcpyAsync(
-                    symmetricBuffer0.ptr, input.data_ptr(), bufferSizeBytes, cudaMemcpyDeviceToDevice, stream));
-                windowBuffer0 = symmetricBuffer0;
-                inputTensor = symmetricInput; // Swap to window-backed tensor
-                inputPtr = windowBuffer0.ptr;
+                // Large buffer: use copy_to_nccl_window op instead of manual memcpy
+                TLLM_LOG_DEBUG(
+                    "[runNCCLAllReduceSymmetric] PATH: Large buffer - calling copy_to_nccl_window "
+                    "to create window buffer and copy input (size %zu >= threshold %zu)",
+                    bufferSizeBytes, minRegistrationThreshold);
+
+                // Convert mGroup (std::set<int>) to torch::List<int64_t>
+                std::vector<int64_t> groupList(mGroup.begin(), mGroup.end());
+                torch::List<int64_t> groupTorchList(groupList);
+
+                // Use the new op to create window buffer and copy input
+                inputTensor = torch::ops::trtllm::copy_to_nccl_window(input, groupTorchList);
+
+                // Search again to get the buffer info
+                windowBuffer0 = allocator.searchBuffer(comm, inputTensor.data_ptr());
+                if (windowBuffer0.isValid())
+                {
+                    inputPtr = windowBuffer0.ptr;
+                    TLLM_LOG_DEBUG(
+                        "[runNCCLAllReduceSymmetric] Window buffer created successfully: "
+                        "new_ptr=%p, buffer_ptr=%p",
+                        inputTensor.data_ptr(), inputPtr);
+                }
+                else
+                {
+                    // Fallback: if search fails, use tensor data pointer directly
+                    // This shouldn't happen if copy_to_nccl_window worked correctly
+                    TLLM_LOG_WARNING(
+                        "[runNCCLAllReduceSymmetric] Window buffer not found after copy_to_nccl_window, "
+                        "using tensor data pointer directly (new_ptr=%p)",
+                        inputTensor.data_ptr());
+                    inputPtr = inputTensor.data_ptr();
+                }
             }
         }
         else
         {
             // Buffer already registered - use it directly
+            TLLM_LOG_DEBUG(
+                "[runNCCLAllReduceSymmetric] PATH: Buffer already registered - using existing "
+                "window buffer directly (input_ptr=%p, buffer_ptr=%p)",
+                input.data_ptr(), windowBuffer0.ptr);
             inputPtr = windowBuffer0.ptr;
         }
 

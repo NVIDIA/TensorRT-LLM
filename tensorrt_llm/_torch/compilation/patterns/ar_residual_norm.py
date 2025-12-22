@@ -11,6 +11,7 @@ from torch._inductor.pattern_matcher import (MULTIPLE, CallFunction, Ignored,
 from ...distributed import AllReduceFusionOp, AllReduceStrategy
 
 aten = torch.ops.aten
+from tensorrt_llm import logger
 from tensorrt_llm.mapping import Mapping
 
 
@@ -716,6 +717,295 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
     register_ub_finalize_patterns(custom_passes[-1])
 
 
+def register_nccl_symmetric_patterns(custom_passes: List[PatternMatcherPass],
+                                     mapping: Mapping):
+
+    def register_convert_supported_ar_to_nccl_symmetric(
+            custom_pass: PatternMatcherPass):
+        strategy = int(AllReduceStrategy.NCCL_SYMMETRIC)
+        input_node = KeywordArg('input')
+        fusion = KeywordArg('fusion_op')
+        trtllm_allreduce_default = CallFunction(
+            torch.ops.trtllm.allreduce.default, input_node,
+            KeywordArg('residual_in'), KeywordArg('gamma'), KeywordArg('scale'),
+            None, Ignored(), mapping.tp_group, strategy, fusion,
+            KeywordArg('eps'), Ignored())
+
+        def empty_convert_supported_ar_to_nccl_symmetric(
+            input: torch.Tensor,
+            residual_in: torch.Tensor,
+            gamma: torch.Tensor,
+            scale: Optional[torch.Tensor],
+            fusion_op: int,
+            eps: float,
+        ):
+            return
+
+        def target_convert_supported_ar_to_nccl_symmetric(
+            input: torch.Tensor,
+            residual_in: torch.Tensor,
+            gamma: torch.Tensor,
+            scale: Optional[torch.Tensor],
+            fusion_op: int,
+            eps: float,
+        ):
+            logger.debug(
+                "[NCCL_SYMMETRIC Pattern] Initial pattern matched: inserting copy_to_nccl_window "
+                f"before allreduce (fusion_op={fusion_op}, input_shape={input.shape}, "
+                f"input_dtype={input.dtype})")
+            input = torch.ops.trtllm.copy_to_nccl_window(
+                input, mapping.tp_group)
+            all_reduce_output = torch.ops.trtllm.allreduce(
+                input, residual_in, gamma, scale, None, None, mapping.tp_group,
+                int(AllReduceStrategy.NCCL_SYMMETRIC), fusion_op, eps, False)
+            return all_reduce_output
+
+        def extra_check_convert_supported_ar_to_nccl_symmetric(
+                match: Match) -> bool:
+            if not check_f16_bf16_input(match, input_node):
+                return False
+
+            fusion_value = match.ctx.pattern_to_node[fusion]
+            if not isinstance(fusion_value, int):
+                return False
+            if fusion_value != int(
+                    AllReduceFusionOp.RESIDUAL_RMS_NORM
+            ) and fusion_value != int(
+                    AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8
+            ) and fusion_value != int(
+                    AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4):
+                return False
+
+            return True
+
+        register_replacement(
+            empty_convert_supported_ar_to_nccl_symmetric,
+            target_convert_supported_ar_to_nccl_symmetric,
+            [],
+            fwd_only,
+            custom_pass,
+            search_fn_pattern=trtllm_allreduce_default,
+            extra_check=extra_check_convert_supported_ar_to_nccl_symmetric,
+        )
+
+    def register_nccl_symmetric_prologue_patterns(
+            custom_pass: PatternMatcherPass):
+
+        def register_scaled_mm_prologue(custom_pass: PatternMatcherPass):
+            trtllm_cublas_scaled_mm_default = CallFunction(
+                torch.ops.trtllm.cublas_scaled_mm.default, KeywordArg('mm0_a'),
+                KeywordArg('mm0_b'), KeywordArg('mm0_a_scale'),
+                KeywordArg('mm0_b_scale'), KeywordArg('mm0_bias'),
+                KeywordArg('mm_dtype'))
+            nccl_copy = CallFunction(torch.ops.trtllm.copy_to_nccl_window,
+                                     trtllm_cublas_scaled_mm_default,
+                                     mapping.tp_group)
+
+            def empty_scaled_mm_prologue_pattern(
+                mm0_a: torch.Tensor,
+                mm0_b: torch.Tensor,
+                mm0_a_scale: torch.Tensor,
+                mm0_b_scale: torch.Tensor,
+                mm0_bias: Optional[torch.Tensor],
+                mm_dtype: torch.dtype,
+            ):
+                return
+
+            def target_scaled_mm_prologue_pattern(
+                mm0_a: torch.Tensor,
+                mm0_b: torch.Tensor,
+                mm0_a_scale: torch.Tensor,
+                mm0_b_scale: torch.Tensor,
+                mm0_bias: Optional[torch.Tensor],
+                mm_dtype: torch.dtype,
+            ):
+                logger.debug(
+                    "[NCCL_SYMMETRIC Pattern] Prologue pattern matched: replacing "
+                    "copy_to_nccl_window(cublas_scaled_mm(...)) with direct allocation"
+                )
+                # TODO: When GEMM refactoring is done, use allocator parameter
+                # For now, create window tensor and use it as output
+                scaled_mm_output = torch.ops.trtllm.cublas_scaled_mm(
+                    mm0_a, mm0_b, mm0_a_scale, mm0_b_scale, mm0_bias, mm_dtype,
+                    False)  # Keep False for now until allocator refactoring
+                return torch.ops.trtllm.copy_to_nccl_window(
+                    scaled_mm_output, mapping.tp_group)
+
+            register_replacement(
+                empty_scaled_mm_prologue_pattern,
+                target_scaled_mm_prologue_pattern,
+                [],
+                fwd_only,
+                custom_pass,
+                search_fn_pattern=nccl_copy,
+            )
+
+        def register_nvfp4_gemm_prologue(custom_pass: PatternMatcherPass):
+            act_fp4_key = KeywordArg('act_fp4')
+            weight_key = KeywordArg('weight')
+            act_sf_key = KeywordArg('act_sf')
+            weight_scale_key = KeywordArg('weight_scale')
+            alpha_key = KeywordArg('alpha')
+            output_dtype_key = KeywordArg('output_dtype')
+            to_userbuffers_key = KeywordArg('to_userbuffers')
+            allowed_backends_key = KeywordArg('allowed_backends')
+            trtllm_nvfp4_gemm_default = CallFunction(
+                torch.ops.trtllm.nvfp4_gemm.default,
+                act_fp4_key,
+                weight_key,
+                act_sf_key,
+                weight_scale_key,
+                alpha_key,
+                output_dtype_key,
+                to_userbuffers=to_userbuffers_key,
+                allowed_backends=allowed_backends_key)
+            nccl_copy = CallFunction(torch.ops.trtllm.copy_to_nccl_window,
+                                     trtllm_nvfp4_gemm_default,
+                                     mapping.tp_group)
+
+            def empty_nvfp4_gemm_prologue_pattern(
+                act_fp4: torch.Tensor,
+                weight: torch.Tensor,
+                act_sf: torch.Tensor,
+                weight_scale: torch.Tensor,
+                alpha: torch.Tensor,
+                output_dtype: torch.dtype,
+                to_userbuffers: bool,
+                allowed_backends: str,
+            ):
+                return
+
+            def target_nvfp4_gemm_prologue_pattern(
+                act_fp4: torch.Tensor,
+                weight: torch.Tensor,
+                act_sf: torch.Tensor,
+                weight_scale: torch.Tensor,
+                alpha: torch.Tensor,
+                output_dtype: torch.dtype,
+                to_userbuffers: bool,
+                allowed_backends: str,
+            ):
+                logger.debug(
+                    "[NCCL_SYMMETRIC Pattern] Prologue pattern matched: replacing "
+                    "copy_to_nccl_window(nvfp4_gemm(...)) with direct allocation"
+                )
+                # TODO: When GEMM refactoring is done, use allocator parameter
+                # For now, create window tensor and use it as output
+                nvfp4_gemm_output = torch.ops.trtllm.nvfp4_gemm(
+                    act_fp4, weight, act_sf, weight_scale, alpha, output_dtype,
+                    False, allowed_backends
+                )  # Keep False for now until allocator refactoring
+                return torch.ops.trtllm.copy_to_nccl_window(
+                    nvfp4_gemm_output, mapping.tp_group)
+
+            def extra_check(match: Match) -> bool:
+                # Validate allowed_backends if present (now a comma-separated string)
+                allowed_backends_value = match.kwargs.get('allowed_backends')
+                if allowed_backends_value is not None:
+                    # allowed_backends should be a comma-separated string
+                    if not isinstance(allowed_backends_value, str):
+                        return False
+                    backends_list = [
+                        b.strip() for b in allowed_backends_value.split(',')
+                        if b.strip()
+                    ]
+                    valid_individual = {
+                        'cutlass', 'cublaslt', 'cutedsl', 'cuda_core'
+                    }
+                    if not all(b in valid_individual for b in backends_list):
+                        return False
+
+                return True
+
+            register_replacement(
+                empty_nvfp4_gemm_prologue_pattern,
+                target_nvfp4_gemm_prologue_pattern,
+                [],
+                fwd_only,
+                custom_pass,
+                search_fn_pattern=nccl_copy,
+                extra_check=extra_check,
+            )
+
+        def register_mm_prologue(custom_pass: PatternMatcherPass):
+            aten_mm_default = CallFunction(aten.mm.default, KeywordArg('mm0_a'),
+                                           KeywordArg('mm0_b'))
+            nccl_copy = CallFunction(torch.ops.trtllm.copy_to_nccl_window,
+                                     aten_mm_default, mapping.tp_group)
+
+            def empty_mm_prologue_pattern(
+                mm0_a: torch.Tensor,
+                mm0_b: torch.Tensor,
+            ):
+                return
+
+            def target_mm_prologue_pattern(
+                mm0_a: torch.Tensor,
+                mm0_b: torch.Tensor,
+            ):
+                logger.debug(
+                    "[NCCL_SYMMETRIC Pattern] Prologue pattern matched: replacing "
+                    "copy_to_nccl_window(aten.mm(...)) with matmul_to_nccl_window"
+                )
+                mm_output = torch.ops.trtllm.matmul_to_nccl_window(
+                    mm0_a, mm0_b, mapping.tp_group)
+                return mm_output
+
+            register_replacement(
+                empty_mm_prologue_pattern,
+                target_mm_prologue_pattern,
+                [],
+                fwd_only,
+                custom_pass,
+                search_fn_pattern=nccl_copy,
+            )
+
+        def register_add_prologue(custom_pass: PatternMatcherPass):
+            aten_add_default = CallFunction(aten.add.Tensor,
+                                            KeywordArg('add_a'),
+                                            KeywordArg('add_b'))
+            nccl_copy = CallFunction(torch.ops.trtllm.copy_to_nccl_window,
+                                     aten_add_default, mapping.tp_group)
+
+            def empty_add_prologue_pattern(
+                add_a: torch.Tensor,
+                add_b: torch.Tensor,
+            ):
+                return
+
+            def target_add_prologue_pattern(
+                add_a: torch.Tensor,
+                add_b: torch.Tensor,
+            ):
+                logger.debug(
+                    "[NCCL_SYMMETRIC Pattern] Prologue pattern matched: replacing "
+                    "copy_to_nccl_window(aten.add(...)) with add_to_nccl_window"
+                )
+                add_output = torch.ops.trtllm.add_to_nccl_window(
+                    add_a, add_b, mapping.tp_group)
+                return add_output
+
+            register_replacement(
+                empty_add_prologue_pattern,
+                target_add_prologue_pattern,
+                [],
+                fwd_only,
+                custom_pass,
+                search_fn_pattern=nccl_copy,
+            )
+
+        register_scaled_mm_prologue(custom_pass)
+        register_nvfp4_gemm_prologue(custom_pass)
+        register_mm_prologue(custom_pass)
+        register_add_prologue(custom_pass)
+
+    custom_passes.append(PatternMatcherPass())
+    register_convert_supported_ar_to_nccl_symmetric(custom_passes[-1])
+
+    custom_passes.append(PatternMatcherPass())
+    register_nccl_symmetric_prologue_patterns(custom_passes[-1])
+
+
 def register_ar_fusions(custom_passes: List[PatternMatcherPass],
                         mapping: Mapping, enable_ub: bool):
     register_ar_residual_norm(custom_passes[-1], mapping)
@@ -730,3 +1020,6 @@ def register_ar_fusions(custom_passes: List[PatternMatcherPass],
 
     if enable_ub:
         register_ub_patterns(custom_passes, mapping)
+
+    # Always register NCCL_SYMMETRIC patterns (they only match when strategy is explicitly NCCL_SYMMETRIC)
+    register_nccl_symmetric_patterns(custom_passes, mapping)
