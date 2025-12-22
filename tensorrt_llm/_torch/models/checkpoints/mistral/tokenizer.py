@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Union
+from typing import Union
 
 from mistral_common.tokens.tokenizers.base import SpecialTokenPolicy, SpecialTokens
 from mistral_common.tokens.tokenizers.sentencepiece import SentencePieceTokenizer
@@ -113,18 +113,18 @@ class MistralTokenizer(TransformersTokenizer):
     def pad_token_id(self) -> int:
         return self.transformers_tokenizer.pad_token_id
 
-    def __call__(self, text: str, *args, **kwargs) -> Any:
+    def __call__(self, text: str, *args, **kwargs) -> any:
         return self.transformers_tokenizer(text=text, *args, **kwargs)
 
     @property
     def name_or_path(self) -> str:
         raise NotImplementedError
 
-    def batch_encode_plus(self, texts: List[str], *args, **kwargs) -> dict:
+    def batch_encode_plus(self, texts: list[str], *args, **kwargs) -> dict:
         raise NotImplementedError
 
     def get_chat_template(
-        self, chat_template: str | None = None, tools: List[Dict] | None = None
+        self, chat_template: str | None = None, tools: list[dict] | None = None
     ) -> str:
         raise NotImplementedError
 
@@ -135,7 +135,7 @@ class MistralTokenizer(TransformersTokenizer):
     def is_fast(self) -> bool:
         return True
 
-    def get_added_vocab(self) -> Dict[str, int]:
+    def get_added_vocab(self) -> dict[str, int]:
         # Mistral tokenizers have no added vocabulary
         return {}
 
@@ -213,7 +213,7 @@ class MistralTokenizer(TransformersTokenizer):
         truncation: bool | None = None,
         max_length: int | None = None,
         add_special_tokens: bool | None = None,
-    ) -> List[int]:
+    ) -> list[int]:
         if add_special_tokens is not None:
             return self.transformers_tokenizer.encode(
                 text,
@@ -238,9 +238,9 @@ class MistralTokenizer(TransformersTokenizer):
 
     def convert_ids_to_tokens(
         self,
-        ids: Union[int, List[int]],
+        ids: list[int],
         skip_special_tokens: bool = True,
-    ) -> Union[str, List[str]]:
+    ) -> list[str]:
         from mistral_common.tokens.tokenizers.base import SpecialTokenPolicy, SpecialTokens
         from mistral_common.tokens.tokenizers.instruct import InstructTokenizerV13
 
@@ -289,16 +289,16 @@ class MistralTokenizer(TransformersTokenizer):
 
     def hf_decode_incrementally(
         self,
-        token_ids: List[int],
+        token_ids: list[int],
         prev_text: str | None = None,
         states: dict | None = None,
         *,
         skip_special_tokens: bool = False,
         clean_up_tokenization_spaces: bool | None = None,
-    ) -> Tuple[str, dict]:
+    ) -> tuple[str, dict]:
         raise NotImplementedError
 
     def apply_chat_template(
-        self, conversation: Union[List[Dict[str, str]], List[List[Dict[str, str]]]], *args, **kwargs
-    ) -> Union[str, List[int], List[str], List[List[int]]]:
+        self, conversation: Union[list[dict[str, str]], list[list[dict[str, str]]]], *args, **kwargs
+    ) -> Union[str, list[int], list[str], list[list[int]]]:
         raise NotImplementedError
