@@ -87,7 +87,8 @@ public:
 // Specializations for Turing+ when B is quantized. These can use the operator OpMultiplyAddDequantizeInterleavedBToA,
 // which signals that we want to dequantize after loading from smem.
 template <typename TypeA, typename Arch>
-struct LayoutDetailsB<TypeA, uint8_t, Arch, typename platform::enable_if<Arch::kMinComputeCapability != 100>::type>
+struct LayoutDetailsB<TypeA, uint8_t, Arch,
+    typename platform::enable_if<Arch::kMinComputeCapability >= 75 && Arch::kMinComputeCapability != 100>::type>
 {
     static constexpr int ThreadblockK = 128 * 8 / cutlass::sizeof_bits<TypeA>::value;
 
@@ -102,7 +103,8 @@ public:
 };
 
 template <typename TypeA, typename Arch>
-struct LayoutDetailsB<TypeA, uint4b_t, Arch, typename platform::enable_if<Arch::kMinComputeCapability != 100>::type>
+struct LayoutDetailsB<TypeA, uint4b_t, Arch,
+    typename platform::enable_if<Arch::kMinComputeCapability >= 75 && Arch::kMinComputeCapability != 100>::type>
 {
     static constexpr int ThreadblockK = 128 * 8 / cutlass::sizeof_bits<TypeA>::value;
 

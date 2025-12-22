@@ -292,8 +292,7 @@ public:
         append(shape(SmemLayoutAtomScale{}), Int<DispatchPolicy::Load2TransformPipelineStageCount>{}),
         append(stride(SmemLayoutAtomScale{}), size(filter_zeros(SmemLayoutAtomScale{})))));
 
-    static_assert(
-        DispatchPolicy::Load2TransformPipelineStageCount >= 2 && DispatchPolicy::Load2TransformPipelineStageCount >= 2,
+    static_assert(DispatchPolicy::Load2TransformPipelineStageCount >= 2,
         "Specialization requires Stages set to value 2 or more.");
     static_assert((cute::is_base_of<cute::UMMA::DescriptorIterator, typename TiledMma::FrgTypeA>::value
                       || cute::is_base_of<cute::UMMA::tmem_frg_base, typename TiledMma::FrgTypeA>::value)
@@ -626,19 +625,21 @@ public:
         }
         if (!check_aligned_A)
         {
-            CUTLASS_TRACE_HOST("  CAN IMPLEMENT: Tensor A meet the minimum alignment requirements for TMA.\n");
+            CUTLASS_TRACE_HOST("  CAN IMPLEMENT: Tensor A does not meet the minimum alignment requirements for TMA.\n");
         }
         if (!check_aligned_B)
         {
-            CUTLASS_TRACE_HOST("  CAN IMPLEMENT: Tensor B meet the minimum alignment requirements for TMA.\n");
+            CUTLASS_TRACE_HOST("  CAN IMPLEMENT: Tensor B does not meet the minimum alignment requirements for TMA.\n");
         }
         if (!check_aligned_S)
         {
-            CUTLASS_TRACE_HOST("  CAN IMPLEMENT: Tensor S (scale) meet the minimum alignment requirements for TMA.\n");
+            CUTLASS_TRACE_HOST(
+                "  CAN IMPLEMENT: Tensor S (scale) does not meet the minimum alignment requirements for TMA.\n");
         }
         if (!check_aligned_Z)
         {
-            CUTLASS_TRACE_HOST("  CAN IMPLEMENT: Tensor Z (zeros) meet the minimum alignment requirements for TMA.\n");
+            CUTLASS_TRACE_HOST(
+                "  CAN IMPLEMENT: Tensor Z (zeros) does not meet the minimum alignment requirements for TMA.\n");
         }
 
         return check_mode_args && check_aligned_A && check_aligned_B && check_aligned_S && check_aligned_Z;
@@ -897,8 +898,8 @@ public:
             }
             else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero)
             {
-                Tensor mZ_mkl = params.tma_load_scale.get_tma_tensor(shape(LayoutScale{}));
-                Tensor gZ_mkl = local_tile(mS_mkl, TileShape{}, make_coord(_, _, _), Step<_1, X, _1>{});
+                Tensor mZ_mkl = params.tma_load_zero.get_tma_tensor(shape(LayoutScale{}));
+                Tensor gZ_mkl = local_tile(mZ_mkl, TileShape{}, make_coord(_, _, _), Step<_1, X, _1>{});
                 Tensor sZ = make_tensor(make_smem_ptr(shared_storage.input.smem_zero.begin()), SmemLayoutScale{});
 
                 Tensor tCgZ_mkl = cta_mma.partition_A(gZ_mkl); // (MMA, MMA_M, MMA_K, m, k, l)

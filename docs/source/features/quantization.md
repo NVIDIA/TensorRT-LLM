@@ -123,7 +123,8 @@ The language component decides which quantization methods are supported by a giv
 | Model          |  NVFP4  | MXFP4  | FP8(per tensor)| FP8(block scaling) | FP8(rowwise) | FP8 KV Cache | NVFP4 KV Cache | W4A8 AWQ  | W4A16 AWQ | W4A8 GPTQ  | W4A16 GPTQ |
 | :------------- | :---:   | :---:  | :---: | :---: | :---: | :---: | :---: | :-------: | :-------: | :--------: | :--------: |
 | Blackwell(sm120)       |   Y     |   Y    |   Y   |   .   |   .   |   Y   |   .   |     .     |     .     |     .      |     .      |
-| Blackwell(sm100/103)       |   Y     |   Y    |   Y   |   Y   |   .   |   Y   |   Y   |     .     |     .     |     .      |     .      |
+| Blackwell(sm103)       |   Y     |   Y    |   Y   |   Y   |   .   |   Y   |   Y   |     .     |     .     |     .      |     .      |
+| Blackwell(sm100)       |   Y     |   Y    |   Y   |   Y   |   .   |   Y   |   Y   |     .     |     Y     |     .      |     Y      |
 | Hopper           |   .     |   .    |   Y   |   Y   |   Y   |   Y   |   .   |     Y     |     Y     |     Y      |     Y      |
 | Ada Lovelace          |   .     |   .    |   Y   |   .   |   .   |   Y   |   .   |     Y     |     Y     |     Y      |     Y      |
 | Ampere         |   .     |   .    |   .   |   .   |   .   |   Y   |   .   |     .     |     Y     |     .      |     Y      |

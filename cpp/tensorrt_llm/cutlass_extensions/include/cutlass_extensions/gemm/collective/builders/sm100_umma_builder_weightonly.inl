@@ -129,15 +129,6 @@ constexpr cute::tuple<int, int, int> sm100_compute_stage_count_or_override_weigh
 
 } // namespace detail
 
-// template <typename LayoutScale>
-// constexpr int get_ScaleGranularityK() {
-//   if constexpr (cute::is_void_v<LayoutScale>) {
-//     return 1;
-//   } else {
-//     return size<1,0>(LayoutScale{});
-//   }
-// }
-
 // Mixed Input MMA kernels builder
 template <class ElementAOptionalTuple, class GmemLayoutATagTuple, int AlignmentA, class ElementBOptionalTuple,
     class GmemLayoutBTag, int AlignmentB, class ElementAccumulator,

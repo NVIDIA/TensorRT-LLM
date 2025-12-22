@@ -544,7 +544,7 @@ CutlassFpAIntBGemmRunner<ActivationType, WeightType, QuantOp, ScaleZeroType, Bia
 {
 
     static constexpr bool is_weight_only = !std::is_same<ActivationType, WeightType>::value;
-    tkc::CutlassGemmConfig::CandidateConfigTypeParam config_type_param = sm_ >= 100
+    tkc::CutlassGemmConfig::CandidateConfigTypeParam config_type_param = (sm_ == 100)
         ? tkc::CutlassGemmConfig::CandidateConfigTypeParam::BLACKWELL
         : tkc::CutlassGemmConfig::CandidateConfigTypeParam::HOPPER;
     if (is_weight_only)

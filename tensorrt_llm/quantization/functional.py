@@ -959,7 +959,7 @@ def preprocess_weights_for_mixed_gemm(
     sm_ = sm_ if sm_ > 0 else get_sm_version()
     if len(tensor.shape) == 2:
         tensor = tensor.unsqueeze(0)
-    elif sm_ > 100:
+    elif sm_ >= 90:
         sm_ = 80
     if sm_ == 100:
         do_weight_interleave = False

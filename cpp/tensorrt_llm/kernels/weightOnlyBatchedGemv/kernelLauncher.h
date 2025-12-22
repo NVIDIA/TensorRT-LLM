@@ -96,6 +96,7 @@ inline void kernel_launcher(int arch, Params& params, cudaStream_t s)
         EXEC(KernelType::FP16Int4PerChannel, FP16DetailsA, Int4DetailsW, ColumnMajor, false);
         EXEC(KernelType::BF16Int4PerChannel, BF16DetailsA, Int4DetailsW, ColumnMajor, false);
     }
+#undef EXEC_W4A8
 #undef EXEC
 }
 
