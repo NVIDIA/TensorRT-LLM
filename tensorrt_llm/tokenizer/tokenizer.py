@@ -213,6 +213,13 @@ class TransformersTokenizer(TokenizerBase):
 
         new_tokens = self.convert_ids_to_tokens(
             token_ids, skip_special_tokens=skip_special_tokens)
+        # filter out None tokens
+        if None in new_tokens:
+            logger.warning(
+                "An unexpected \"None\" token was generated. This may be caused by a generated token ID being out of the "
+                "tokenizer's vocabulary. Filtering out \"None\" tokens from the newly generated tokens."
+            )
+            new_tokens = [token for token in new_tokens if token is not None]
         pending_tokens.extend(new_tokens)
 
         curr_new_text = self.convert_tokens_to_string(
