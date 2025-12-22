@@ -1053,7 +1053,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 def envVarNames = [
                     'OPEN_SEARCH_DB_BASE_URL',
                     'OPEN_SEARCH_DB_CREDENTIALS',
-                    'HOST_NODE_NAME',
                     'BUILD_ID',
                     'BUILD_URL',
                     'JOB_NAME',
