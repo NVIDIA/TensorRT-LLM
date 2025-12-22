@@ -1,5 +1,18 @@
 # This file defines code ownership rules for the repository.
 
+## TensorRT-LLM QA
+### Integration Tests
+/tests/integration/test_lists/qa @NVIDIA/trt-llm-qa
+/tests/integration/defs/examples/test_ray.py @NVIDIA/trt-llm-qa-function
+/tests/integration/defs/examples/test_redrafter.py @NVIDIA/trt-llm-qa-function
+/tests/integration/defs/accuracy @NVIDIA/trt-llm-qa-function
+/tests/integration/defs/stress_test @NVIDIA/trt-llm-qa-function
+/tests/integration/defs/triton_server @NVIDIA/trt-llm-qa-function
+/tests/integration/defs/test_e2e.py @NVIDIA/trt-llm-qa-function
+/tests/integration/defs/disaggregated @NVIDIA/trt-llm-qa-serving
+/tests/integration/defs/sysinfo @NVIDIA/trt-llm-qa-perf
+/tests/integration/defs/perf @NVIDIA/trt-llm-qa-perf
+/tests/integration/defs/perf/disagg @NVIDIA/trt-llm-qa-serving
 
 ## TensorRT-LLM Infra
 ### CI
@@ -13,6 +26,11 @@
 
 ## TensorRT-LLM - Docs
 /docs @NVIDIA/trt-llm-doc-owners
+/CODING_GUIDELINES.md @NVIDIA/trt-llm-doc-owners
+/CODE_OF_CONDUCT.md @NVIDIA/trt-llm-doc-owners
+/CONTAINER_SOURCE.md @NVIDIA/trt-llm-doc-owners
+/CONTRIBUTING.md @NVIDIA/trt-llm-doc-owners
+/README.md @NVIDIA/trt-llm-doc-owners
 
 ## Examples
 /examples @NVIDIA/trt-llm-doc-owners
@@ -183,6 +201,7 @@ docs/source/performance/perf-benchmarking.md @NVIDIA/trtllm-bench-reviewers
 ## and license compliance when adding, removing, or changing versions of dependencies.
 ### License Files
 /LICENSE @NVIDIA/trt-llm-oss-compliance
+/ATTRIBUTIONS-*.md @NVIDIA/trt-llm-oss-compliance
 /jenkins/license_cpp.json @NVIDIA/trt-llm-ci-infra-devs @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
 
 ### Python Dependency Management

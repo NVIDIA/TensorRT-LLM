@@ -2,6 +2,8 @@
 
 import flashinfer
 import torch
+import torch.nn.functional as F
+from einops import rearrange
 
 from ...flashinfer_utils import get_env_enable_pdl
 from ...modules.mamba.layernorm_gated import _layer_norm_fwd
@@ -159,3 +161,35 @@ def _triton_rmsnorm_gated_meta(
         assert gate.shape == x.shape, "gate must match x shape"
 
     return x.new_empty(x.shape, dtype=torch.float32)
+
+
+# Forked from:
+# https://github.com/state-spaces/mamba/blob/6b32be06d026e170b3fdaf3ae6282c5a6ff57b06/mamba_ssm/ops/triton/layernorm_gated.py
+# NOTES:
+# 1. At time of writing (09/25/2025), the nano nemotron v2 modeling code expects `mamba_ssm`
+#    to be installed so as to be able to make use of its grouped gated RMS norm operation.
+#    We therefore replace it with one that uses einops + pytorch.
+def gated_rms_norm_ref(
+    x, weight, bias, z=None, eps=1e-6, group_size=None, norm_before_gate=True, upcast=True
+):
+    dtype = x.dtype
+    # N = x.shape[-1]
+    weight = weight.float()
+    bias = bias.float() if bias is not None else None
+    if upcast:
+        x = x.float()
+        z = z.float() if z is not None else z
+    if z is not None and not norm_before_gate:
+        x = x * F.silu(z)
+    if group_size is None:
+        rstd = 1 / torch.sqrt((x.square()).mean(dim=-1, keepdim=True) + eps)
+        out = (x * rstd * weight) + bias if bias is not None else (x * rstd * weight)
+    else:
+        x_group = rearrange(x, "... (g d) -> ... g d", d=group_size)
+        rstd = 1 / torch.sqrt((x_group.square()).mean(dim=-1, keepdim=True) + eps)
+        out = rearrange(x_group * rstd, "... g d -> ... (g d)") * weight
+        if bias is not None:
+            out = out + bias
+    if z is not None and norm_before_gate:
+        out *= F.silu(z)
+    return out.to(dtype)
