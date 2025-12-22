@@ -35,6 +35,7 @@
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
 #include "tensorrt_llm/thop/fp4Quantize.h"
 #include "tensorrt_llm/thop/fp8Op.h"
+#include "tensorrt_llm/thop/ncclWindowTensor.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include "tensorrt_llm/thop/userbuffersTensor.h"
 
@@ -556,7 +557,7 @@ private:
                 torch::List<int64_t> groupTorchList(groupList);
 
                 // Use the new op to create window buffer and copy input
-                inputTensor = torch::ops::trtllm::copy_to_nccl_window(input, groupTorchList);
+                inputTensor = torch_ext::copy_to_nccl_window(input, groupTorchList);
 
                 // Search again to get the buffer info
                 windowBuffer0 = allocator.searchBuffer(comm, inputTensor.data_ptr());
