@@ -117,15 +117,13 @@ For the expansibility, figure 1 illustrates the overall design. The architecture
 
 TensorRT LLM currently supports the following operations for standard attention:
 
-1.  **Context Phase (sparse KV cache)**:
-    *   **Goal**: Reduce the size of the KV cache populated during the context phase.
-    *   **Mechanism**: Identify important tokens from the prompt and permanently evict non-essential tokens before entering the generation phase.
+1.  **Context Phase**:
+    *   **sparse computation**: only for MLA
+    *   **sparse KV cache**: MQA/GQA
 
-2.  **Generation Phase (sparse computation)**:
-    *   **Goal**: Accelerate attention computation during token generation.
-    *   **Mechanism**: For each new token, dynamically select a subset of relevant blocks/tokens from the kv cache to attend to.
-
-However, Multi-head Latent Attention (MLA), used by algorithms like DSA, is a special case. TensorRT LLM currently supports sparse computation in both context and generation phases for MLA but does not support sparse KV cache. The implementation is handled directly within the TRTLLM-GEN MLA kernel and does not use the general pass described below.
+2.  **Generation Phase**:
+    *   **sparse computation**: MLA/MQA/GQA
+    *   **sparse KV cache**: no support yet
 
 ### Framework Implementation
 
