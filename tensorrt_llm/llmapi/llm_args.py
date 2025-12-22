@@ -769,6 +769,7 @@ class DecodingBaseConfig(StrictBaseModel):
             "MTP": MTPDecodingConfig,
             "Medusa": MedusaDecodingConfig,
             "Eagle": EagleDecodingConfig,
+            "Eagle3": Eagle3DecodingConfig,
             "Lookahead": LookaheadDecodingConfig,
             "NGram": NGramDecodingConfig,
             "DraftTarget": DraftTargetDecodingConfig,
@@ -988,6 +989,10 @@ class EagleDecodingConfig(DecodingBaseConfig):
         if self.eagle_choices is None and self.use_dynamic_tree is False:
             return True
         return False
+
+
+class Eagle3DecodingConfig(EagleDecodingConfig):
+    decoding_type: ClassVar[str] = "Eagle3"
 
 
 class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
@@ -2523,6 +2528,12 @@ class TrtLlmArgs(BaseLlmArgs):
                     decoding_mode=DecodingMode.Medusa(),
                     medusa_choices=self.speculative_config.medusa_choices)
 
+            elif isinstance(self.speculative_config, Eagle3DecodingConfig):
+                raise ValueError(
+                    "speculative_config.decoding_type 'Eagle3' is only supported on the PyTorch backend. "
+                    "Use decoding_type: Eagle with --backend tensorrt, or switch to --backend pytorch for Eagle3."
+                )
+
             elif isinstance(self.speculative_config, EagleDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0
                 assert self.speculative_config.speculative_model is not None, "EAGLE3 draft model must be specified."
@@ -3039,6 +3050,10 @@ class TorchLlmArgs(BaseLlmArgs):
                     f"support backend {self.backend}")
 
             if isinstance(self.speculative_config, EagleDecodingConfig):
+                if type(self.speculative_config) is EagleDecodingConfig:
+                    logger.warning(
+                        "speculative_config.decoding_type 'Eagle' maps to Eagle3 in the PyTorch backend; "
+                        "use 'Eagle3' to be explicit.")
                 assert self.speculative_config.max_draft_len > 0
                 assert self.speculative_config.speculative_model is not None, "EAGLE3 draft model must be specified."
             elif isinstance(self.speculative_config, NGramDecodingConfig):

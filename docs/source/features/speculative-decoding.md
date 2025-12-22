@@ -141,9 +141,11 @@ llm = LLM("/path/to/target_model", speculative_config=speculative_config)
 Speculative decoding options must be specified via `--config config.yaml` for both `trtllm-bench` and `trtllm-serve`. All speculative decoding options can be specified in this YAML file. An additional `decoding_type` option is used to specify the type of speculation to use. The available options are:
 
 * `MTP`
-* `Eagle` (for EAGLE 3)
+* `Eagle3` (EAGLE 3)
 * `NGram`
 * `DraftTarget`
+
+> Note: `decoding_type: Eagle` is accepted as a PyTorch-backend alias for `Eagle3`, but `Eagle3` is preferred for clarity.
 
 The rest of the argument names/valid values are the same as in their corresponding configuration class described in the Quick Start section. For example, a YAML configuration could look like this:
 
@@ -160,7 +162,7 @@ speculative_config:
 # Or using a local path
 disable_overlap_scheduler: true
 speculative_config:
-  decoding_type: Eagle
+  decoding_type: Eagle3
   max_draft_len: 4
   speculative_model: /path/to/draft/model
 ```
