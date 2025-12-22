@@ -30,8 +30,8 @@ from ..module import Module
 from .build_cache import (BuildCache, BuildCacheConfig, CachedStage,
                           get_build_cache_config_from_env)
 from .llm_args import (CalibConfig, CudaGraphConfig, DraftTargetDecodingConfig,
-                       EagleDecodingConfig, KvCacheConfig, LlmArgs,
-                       LookaheadDecodingConfig, MedusaDecodingConfig,
+                       Eagle3DecodingConfig, EagleDecodingConfig, KvCacheConfig,
+                       LlmArgs, LookaheadDecodingConfig, MedusaDecodingConfig,
                        MTPDecodingConfig, NGramDecodingConfig,
                        UserProvidedDecodingConfig, _ModelFormatKind,
                        _ModelWrapper, _ParallelConfig,
@@ -926,6 +926,7 @@ __all__ = [
     'KvCacheConfig',
     'CachedModelLoader',
     'EagleDecodingConfig',
+    'Eagle3DecodingConfig',
     'update_llm_args_with_extra_dict',
     'update_llm_args_with_extra_options',
 ]
