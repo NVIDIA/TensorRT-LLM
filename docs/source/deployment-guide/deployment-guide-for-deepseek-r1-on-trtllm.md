@@ -445,6 +445,7 @@ The following sections help you pick a known-good `trtllm-serve --config` for yo
 .. include:: ../_includes/note_sections.rst
    :start-after: .. start-note-traffic-patterns
    :end-before: .. end-note-traffic-patterns
+```
 
 ### Recipe database
 
