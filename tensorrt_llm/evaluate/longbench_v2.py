@@ -51,26 +51,23 @@ class LongBenchV2(Evaluator):
     DIFFICULTIES = ['easy', 'hard']
     LENGTHS = ['short', 'medium', 'long']
 
-    def __init__(
-        self,
-        dataset_path: str = 'THUDM/LongBench-v2',
-        prompts_dir: Optional[str] = None,
-        num_samples: Optional[int] = None,
-        start_idx: int = 0,
-        difficulty: Optional[str] = None,
-        length: str = 'medium',
-        domain: Optional[str] = None,
-        cot: bool = False,
-        no_context: bool = False,
-        rag: int = 0,
-        max_len: int = 128000,
-        output_dir: Optional[str] = None,
-        random_seed: int = 0,
-        apply_chat_template: bool = False,
-        system_prompt: Optional[str] = None,
-        max_output_length: int = 32000,
-        chat_template_kwargs: Optional[dict[str, Any]] = None,
-    ):
+    def __init__(self,
+                 dataset_path: str = 'THUDM/LongBench-v2',
+                 prompts_dir: Optional[str] = None,
+                 num_samples: Optional[int] = None,
+                 start_idx: int = 0,
+                 difficulty: Optional[str] = None,
+                 length: str = 'medium',
+                 domain: Optional[str] = None,
+                 cot: bool = False,
+                 no_context: bool = False,
+                 rag: int = 0,
+                 max_input_length: int = 128000,
+                 output_dir: Optional[str] = None,
+                 random_seed: int = 0,
+                 apply_chat_template: bool = False,
+                 system_prompt: Optional[str] = None,
+                 chat_template_kwargs: Optional[dict[str, Any]] = None):
         """Initialize LongBench v2 evaluator.
 
         Args:
@@ -84,12 +81,11 @@ class LongBenchV2(Evaluator):
             cot: Enable Chain-of-Thought reasoning
             no_context: Test without context (memorization test)
             rag: Number of top retrieved contexts to use (0 to disable)
-            max_len: Maximum prompt length for truncation
+            max_input_length: Maximum prompt length in tokens for truncation
             output_dir: Directory to save evaluation results
             random_seed: Random seed for reproducibility
             apply_chat_template: Whether to apply model's chat template
             system_prompt: System prompt to prepend
-            max_output_length: Maximum output length in tokens. Should keep this value as small as possible to avoid unnecessary truncation.
             chat_template_kwargs: Chat template kwargs as JSON string
         """
         super().__init__(random_seed=random_seed,
@@ -106,13 +102,11 @@ class LongBenchV2(Evaluator):
         self.cot = cot
         self.no_context = no_context
         self.rag = rag
-        self.max_len = max_len
-        self.max_output_length = max_output_length
         self.output_dir = output_dir
+        self.max_input_length = max_input_length
 
         # Will be set during evaluation
         self.tokenizer = None
-        self.chat_template_name = 'none'
 
         # Load templates
         self.templates = self._load_templates(prompts_dir)
@@ -296,25 +290,20 @@ class LongBenchV2(Evaluator):
             pred: Raw prediction string
 
         Returns:
-            Cleaned prediction string
+            Cleaned prediction string that strips thinking content (if any)
         """
-        pred = pred.split("</s")[0].strip()
-        if self.chat_template_name == "qwen":
-            pred = pred.split("<|im_end|>")[0]
-        elif "llama2" in self.chat_template_name.lower():
-            pred = (pred.split("(Document")[0].split("\n\nQuestion")[0].split(
-                "\n\nAnswer")[0].split("[INST]")[0].split("[/INST]")[0].split(
-                    "(Passage")[0].strip())
-        elif "deepseek" in self.chat_template_name.lower():
-            if "</think>" in pred:
-                pred = pred.split("</think>", 1)[1].lstrip()
 
-        return pred
+        try:
+            idx = pred.rindex("</think>") + len("</think>")
+        except ValueError:
+            idx = 0
+
+        return pred[idx:].strip()
 
     def _truncate_prompt(self, prompt: str, tokenizer: Any) -> str:
-        """Truncate prompt using needle-in-haystack strategy.
+        """Truncate prompt to max_input_length tokens using needle-in-haystack strategy.
 
-        If the prompt exceeds (max_len - max_output_length), it takes the first half and last half
+        If the prompt exceeds max_input_length, it takes the first half and last half
         to preserve both context beginning and end.
         We need to minus max_output_length from max_len to reserve budget for output tokens.
 
@@ -331,9 +320,9 @@ class LongBenchV2(Evaluator):
         try:
             input_ids = tokenizer.encode(prompt, add_special_tokens=False)
 
-            max_input_len = self.max_len - self.max_output_length
-            if len(input_ids) > max_input_len:
-                half = max_input_len // 2
+            # Preferred truncation path; SamplingParams.truncate_prompt_tokens is deprecated here.
+            if self.max_input_length and len(input_ids) > self.max_input_length:
+                half = max(self.max_input_length // 2, 1)
                 truncated_ids = input_ids[:half] + input_ids[-half:]
                 prompt = tokenizer.decode(truncated_ids,
                                           skip_special_tokens=True)
@@ -346,62 +335,6 @@ class LongBenchV2(Evaluator):
                 f"Failed to truncate prompt: {e}. Using original prompt.")
 
         return prompt
-
-    def _determine_chat_template_name(self, tokenizer: Any) -> str:
-        """Determine chat template type from tokenizer.
-
-        Args:
-            tokenizer: Model tokenizer
-
-        Returns:
-            Chat template name
-        """
-        if tokenizer is None:
-            return 'none'
-
-        if hasattr(tokenizer, 'name_or_path'):
-            model_name = str(tokenizer.name_or_path).lower()
-        else:
-            model_name = ''
-
-        if 'qwen' in model_name:
-            return 'qwen'
-        elif 'llama2' in model_name:
-            return 'llama2'
-        elif 'llama3' in model_name:
-            return 'llama3'
-        elif 'deepseek' in model_name:
-            return 'deepseek'
-
-        return 'none'
-
-    def _get_extra_end_token_ids(self) -> list:
-        """
-        Get extra end token IDs for specific chat templates.
-
-        Returns:
-            A list of token IDs that should be treated as end tokens for the current chat template.
-        """
-        extra_end_token_ids = []
-        if self.tokenizer is not None:
-            if self.chat_template_name == "llama3":
-                try:
-                    eot_id = self.tokenizer.encode("<|eot_id|>",
-                                                   add_special_tokens=False)[0]
-                    extra_end_token_ids.append(eot_id)
-                    logger.info(f"Added llama3 end token: {eot_id}")
-                except Exception as e:
-                    logger.warning(f"Failed to add llama3 end token: {e}")
-
-            if self.chat_template_name == "qwen":
-                try:
-                    im_end_id = self.tokenizer.encode(
-                        "<|im_end|>", add_special_tokens=False)[0]
-                    extra_end_token_ids.append(im_end_id)
-                    logger.info(f"Added qwen end token: {im_end_id}")
-                except Exception as e:
-                    logger.warning(f"Failed to add qwen end token: {e}")
-        return extra_end_token_ids
 
     def evaluate(self,
                  llm: Any,
@@ -423,23 +356,9 @@ class LongBenchV2(Evaluator):
         # Initialize tokenizer and chat template
         if hasattr(llm, 'tokenizer'):
             self.tokenizer = llm.tokenizer
-            self.chat_template_name = self._determine_chat_template_name(
-                self.tokenizer)
-            logger.info(f"Detected chat template: {self.chat_template_name}")
         else:
             logger.warning(
                 "LLM does not have tokenizer attribute. Truncation disabled.")
-
-        # Setup extra end token IDs for specific chat templates using a separate function
-        self.extra_end_token_ids = self._get_extra_end_token_ids()
-
-        # Update sampling params with extra end tokens if available
-        if self.extra_end_token_ids and sampling_params is not None:
-            if sampling_params.stop_token_ids is None:
-                sampling_params.stop_token_ids = self.extra_end_token_ids
-            else:
-                sampling_params.stop_token_ids = list(
-                    sampling_params.stop_token_ids) + self.extra_end_token_ids
 
         # Store llm reference for CoT second pass
         self.llm = llm
@@ -476,8 +395,7 @@ class LongBenchV2(Evaluator):
         for sample in self.dataset:
             prompt = self._format_prompt(sample, template)
 
-            # Apply truncation if needed and tokenizer is available
-            if self.tokenizer is not None and self.max_len > 0:
+            if self.tokenizer is not None and self.max_input_length > 0:
                 prompt = self._truncate_prompt(prompt, self.tokenizer)
 
             # Yield: prompt, sampling_args, reference, sample_id, sample_dict
@@ -517,8 +435,7 @@ class LongBenchV2(Evaluator):
                     cot_ans_prompt = cot_ans_prompt.replace(
                         '$COT$', cot_response)
 
-                    # Apply truncation if needed
-                    if self.tokenizer is not None and self.max_len > 0:
+                    if self.tokenizer is not None and self.max_input_length > 0:
                         cot_ans_prompt = self._truncate_prompt(
                             cot_ans_prompt, self.tokenizer)
 
@@ -527,8 +444,6 @@ class LongBenchV2(Evaluator):
                         max_tokens=128,
                         temperature=0.6,
                         top_p=0.95,
-                        stop_token_ids=self.extra_end_token_ids
-                        if self.extra_end_token_ids else None,
                     )
 
                     try:
@@ -781,10 +696,13 @@ class LongBenchV2(Evaluator):
                   default='medium',
                   help="Filter by length category.")
     @click.option("--domain", type=str, default=None, help="Filter by domain.")
-    @click.option("--cot",
-                  is_flag=True,
-                  default=False,
-                  help="Enable Chain-of-Thought reasoning.")
+    @click.option(
+        "--cot",
+        is_flag=True,
+        default=False,
+        help=
+        "Enable Chain-of-Thought reasoning using prompt engineering. Note: Modern models with thinking capability (e.g., DeepSeek-R1 and Qwen3) typically should not use this."
+    )
     @click.option("--no_context",
                   is_flag=True,
                   default=False,
@@ -793,13 +711,6 @@ class LongBenchV2(Evaluator):
                   type=int,
                   default=0,
                   help="Use top-N retrieved contexts (0 to disable).")
-    @click.option(
-        "--max_len",
-        type=int,
-        default=128000,
-        help=
-        "Maximum input and output length in tokens for truncation when building prompts."
-    )
     @click.option("--output_dir",
                   type=str,
                   default=None,
@@ -816,10 +727,13 @@ class LongBenchV2(Evaluator):
                   type=str,
                   default=None,
                   help="System prompt.")
-    @click.option("--max_input_length",
-                  type=int,
-                  default=128000,
-                  help="Maximum prompt length in sampling parameters.")
+    @click.option(
+        "--max_input_length",
+        type=int,
+        default=128000,
+        help=
+        "Maximum prompt length before apply chat template. If exceeds, the prompt will be truncated in the middle."
+    )
     @click.option("--max_output_length",
                   type=int,
                   default=32000,
@@ -833,43 +747,47 @@ class LongBenchV2(Evaluator):
         'A JSON string specifying chat template arguments, used to enable features like thinking mode. Examples: '
         '\'{"enable_thinking": true}\' for Qwen3, or \'{"thinking": true}\' for DeepSeek-V3.2.'
     )
+    @click.option("--temperature",
+                  type=float,
+                  default=0.6,
+                  help="Temperature for sampling.")
+    @click.option("--top_p",
+                  type=float,
+                  default=0.95,
+                  help="Top p for sampling.")
     @click.pass_context
     @staticmethod
     def command(ctx, dataset_path: str, prompts_dir: Optional[str],
                 num_samples: Optional[int], start_idx: int,
                 difficulty: Optional[str], length: str, domain: Optional[str],
-                cot: bool, no_context: bool, rag: int, max_len: int,
+                cot: bool, no_context: bool, rag: int,
                 output_dir: Optional[str], random_seed: int,
                 apply_chat_template: bool, system_prompt: Optional[str],
                 max_input_length: int, max_output_length: int,
-                chat_template_kwargs: Optional[dict[str, Any]]) -> None:
+                chat_template_kwargs: Optional[dict[str, Any]],
+                temperature: float, top_p: float) -> None:
         llm: Union[LLM, PyTorchLLM] = ctx.obj
 
-        sampling_params = SamplingParams(
-            max_tokens=max_output_length,
-            truncate_prompt_tokens=max_input_length,
-            temperature=0.6,
-            top_p=0.95)
+        sampling_params = SamplingParams(max_tokens=max_output_length,
+                                         temperature=temperature,
+                                         top_p=top_p)
 
-        evaluator = LongBenchV2(
-            dataset_path=dataset_path,
-            prompts_dir=prompts_dir,
-            num_samples=num_samples,
-            start_idx=start_idx,
-            difficulty=difficulty,
-            length=length,
-            domain=domain,
-            cot=cot,
-            no_context=no_context,
-            rag=rag,
-            max_len=max_len,
-            output_dir=output_dir,
-            random_seed=random_seed,
-            apply_chat_template=apply_chat_template,
-            system_prompt=system_prompt,
-            max_output_length=max_output_length,
-            chat_template_kwargs=chat_template_kwargs,
-        )
+        evaluator = LongBenchV2(dataset_path=dataset_path,
+                                prompts_dir=prompts_dir,
+                                num_samples=num_samples,
+                                start_idx=start_idx,
+                                difficulty=difficulty,
+                                length=length,
+                                domain=domain,
+                                cot=cot,
+                                no_context=no_context,
+                                rag=rag,
+                                max_input_length=max_input_length,
+                                output_dir=output_dir,
+                                random_seed=random_seed,
+                                apply_chat_template=apply_chat_template,
+                                system_prompt=system_prompt,
+                                chat_template_kwargs=chat_template_kwargs)
 
         evaluator.evaluate(llm, sampling_params)
         llm.shutdown()
