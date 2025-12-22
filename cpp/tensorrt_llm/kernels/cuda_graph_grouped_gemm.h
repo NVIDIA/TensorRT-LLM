@@ -59,4 +59,5 @@ void cudaGraphSplitKGroupedGemm(cutlass::gemm::GemmCoord* problemSizesPtr, int p
     cutlass::gemm::GemmCoord* hostMaxProblemSizesPtr, int64_t* splitKOffsetsGpu, cudaStream_t stream);
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END
