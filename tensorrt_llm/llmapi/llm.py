@@ -41,13 +41,12 @@ from ..sampling_params import SamplingParams
 from ..scheduling_params import SchedulingParams
 from .llm_args import (TORCH_LLMARGS_EXPLICIT_DOCSTRING,
                        TRT_LLMARGS_EXPLICIT_DOCSTRING, PeftCacheConfig,
-                       PybindMirror, TorchLlmArgs, TrtLlmArgs,
-                       infer_architecture_from_config_dict)
+                       PybindMirror, TorchLlmArgs, TrtLlmArgs)
 from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig,
                         LlmBuildStats, ModelLoader, _ModelRuntimeContext)
-from .model_support_matrix import Feature as _SupportFeature
-from .model_support_matrix import SupportStatus as _SupportStatus
-from .model_support_matrix import get_status as _get_support_status
+from .model_support_matrix import Feature as SupportFeature
+from .model_support_matrix import SupportStatus
+from .model_support_matrix import get_status as get_support_status
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
 from .tokenizer import TokenizerBase, _xgrammar_tokenizer_info
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
@@ -256,106 +255,53 @@ class BaseLLM:
         exception_handler.register(self, 'shutdown')
         atexit.register(LLM._shutdown_wrapper, weakref.ref(self))
 
-    def _get_hf_architecture_key(self) -> Optional[str]:
-        """Best-effort lookup of the model architecture key used by the support matrix.
-
-        Preference order:
-        1) HuggingFace config: `transformers.PretrainedConfig.architectures[0]`
-        2) TRT-LLM engine config.json: `pretrained_config.architecture`
-        3) TRT-LLM checkpoint config.json: `architecture`
-
-        This allows the same feature gating logic to work for:
-        - HF hub models (string IDs)
-        - local HF model dirs
-        - local TRT-LLM checkpoints
-        - local TRT-LLM engine dirs
-        """
+    def _apply_model_feature_fallbacks(self) -> None:
         cfg = getattr(self, "_hf_model_config", None)
-        if cfg is not None:
-            archs = getattr(cfg, "architectures", None)
-            if isinstance(archs, (list, tuple)) and archs and isinstance(
-                    archs[0], str):
-                return archs[0]
-
-        # Fall back to reading config.json for TRT-LLM engine/ckpt directories.
-        candidates: list[Path] = []
-        if getattr(self, "_engine_dir", None) is not None:
-            candidates.append(Path(self._engine_dir))
-        if isinstance(getattr(self.args, "model", None), Path):
-            candidates.append(Path(self.args.model))
-        if getattr(self, "_hf_model_dir", None) is not None:
-            candidates.append(Path(self._hf_model_dir))
-
-        for d in candidates:
-            cfg_path = d / "config.json"
-            if not cfg_path.exists():
-                continue
-            try:
-                with open(cfg_path, "r") as f:
-                    data = json.load(f)
-            except Exception:
-                continue
-
-            if not isinstance(data, dict):
-                continue
-
-            arch = infer_architecture_from_config_dict(data)
-            if isinstance(arch, str) and arch:
-                return arch
-
-        return None
-
-    def _apply_model_support_matrix_overrides(self) -> None:
-        """Auto-disable unsupported features per model with a warning.
-
-        This is the runtime companion to the docs support matrix. It is applied
-        after the HF config is loaded, so we can key off `config.architectures`.
-
-        Design principles:
-        - Only override when the matrix explicitly says **No** or **N/A**
-        - Leave **Untested** / unknown models untouched
-        - Emit a warning when we override user-provided / default values
-        """
-        arch = self._get_hf_architecture_key()
-        if not arch:
+        if cfg is None:
             return
+        archs = getattr(cfg, "architectures", None)
+        if not (isinstance(archs, (list, tuple)) and archs
+                and isinstance(archs[0], str)):
+            return
+        arch = archs[0]
 
-        def _is_unsupported(feature: _SupportFeature) -> bool:
-            status = _get_support_status(arch, feature)
-            return status in (_SupportStatus.NO, _SupportStatus.NA)
-
-        # KV cache reuse -> KvCacheConfig.enable_block_reuse
         kv_cfg = getattr(self.args, "kv_cache_config", None)
         if kv_cfg is not None and getattr(kv_cfg, "enable_block_reuse", False):
-            if _is_unsupported(_SupportFeature.KV_CACHE_REUSE):
+            if get_support_status(
+                    arch, SupportFeature.KV_CACHE_REUSE) in (SupportStatus.NO,
+                                                             SupportStatus.NA):
                 logger.warning(
-                    f"{arch}: KV cache reuse is not supported per support matrix; "
-                    "overriding kv_cache_config.enable_block_reuse=False")
+                    f"{arch}: KV cache reuse unsupported; setting kv_cache_config.enable_block_reuse=False"
+                )
                 kv_cfg.enable_block_reuse = False
 
-        # Chunked prefill/context -> BaseLlmArgs.enable_chunked_prefill
         if getattr(self.args, "enable_chunked_prefill", False):
-            if _is_unsupported(_SupportFeature.CHUNKED_PREFILL):
+            if get_support_status(
+                    arch, SupportFeature.CHUNKED_PREFILL) in (SupportStatus.NO,
+                                                              SupportStatus.NA):
                 logger.warning(
-                    f"{arch}: Chunked prefill is not supported per support matrix; "
-                    "overriding enable_chunked_prefill=False")
+                    f"{arch}: Chunked prefill unsupported; setting enable_chunked_prefill=False"
+                )
                 self.args.enable_chunked_prefill = False
 
-        # Attention DP -> BaseLlmArgs.enable_attention_dp
         if getattr(self.args, "enable_attention_dp", False):
-            if _is_unsupported(_SupportFeature.ATTENTION_DP):
+            if get_support_status(
+                    arch, SupportFeature.ATTENTION_DP) in (SupportStatus.NO,
+                                                           SupportStatus.NA):
                 logger.warning(
-                    f"{arch}: Attention data parallelism is not supported per support matrix; "
-                    "overriding enable_attention_dp=False")
+                    f"{arch}: Attention DP unsupported; setting enable_attention_dp=False"
+                )
                 self.args.enable_attention_dp = False
 
-        # Overlap scheduler -> TorchLlmArgs.disable_overlap_scheduler (inverted)
         if hasattr(self.args, "disable_overlap_scheduler") and getattr(
                 self.args, "disable_overlap_scheduler") is False:
-            if _is_unsupported(_SupportFeature.OVERLAP_SCHEDULER):
+            if get_support_status(
+                    arch,
+                    SupportFeature.OVERLAP_SCHEDULER) in (SupportStatus.NO,
+                                                          SupportStatus.NA):
                 logger.warning(
-                    f"{arch}: Overlap scheduler is not supported per support matrix; "
-                    "overriding disable_overlap_scheduler=True")
+                    f"{arch}: Overlap scheduler unsupported; setting disable_overlap_scheduler=True"
+                )
                 self.args.disable_overlap_scheduler = True
 
     @property
@@ -916,11 +862,6 @@ class BaseLLM:
 
     def _try_load_hf_model_config(
             self) -> Optional[transformers.PretrainedConfig]:
-        # Prefer a locally available HF model/config directory when present.
-        # - Torch backend: CachedModelLoader typically provides a local HF model dir
-        # - TRT backend: CachedModelLoader may provide a local dir containing only
-        #   the downloaded HF `config.json` (enough for `from_pretrained`)
-        # Fall back to `self.args.model` (hub ID or local path).
         model_dir = self._hf_model_dir if self._hf_model_dir is not None else self.args.model
         return ModelLoader.load_hf_model_config(
             model_dir, trust_remote_code=self.args.trust_remote_code)
@@ -1035,7 +976,7 @@ class _TrtLLM(BaseLLM):
         # It should also be before bindings ExecutorConfig, which may depend on tokenizer info.
         self._tokenizer = self._try_load_tokenizer()
         self._hf_model_config = self._try_load_hf_model_config()
-        self._apply_model_support_matrix_overrides()
+        self._apply_model_feature_fallbacks()
         self._generation_config = self._try_load_generation_config()
 
         # Multimodal special handling:
@@ -1230,7 +1171,7 @@ class _TorchLLM(BaseLLM):
         # It should also be before bindings ExecutorConfig, which may depend on tokenizer info.
         self._tokenizer = self._try_load_tokenizer()
         self._hf_model_config = self._try_load_hf_model_config()
-        self._apply_model_support_matrix_overrides()
+        self._apply_model_feature_fallbacks()
         self._generation_config = self._try_load_generation_config()
 
         # Multimodal special handling:

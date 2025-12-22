@@ -3371,46 +3371,6 @@ def update_llm_args_with_extra_options(llm_args: Dict,
     return llm_args
 
 
-def infer_model_format_from_config_dict(config: dict) -> _ModelFormatKind:
-    """Infer model format from a parsed config.json dict (lightweight).
-
-    This mirrors the detection logic in `get_model_format()` but intentionally
-    performs no heavy validation/parsing (EngineConfig / PretrainedConfig / HF).
-    """
-    if 'pretrained_config' in config and 'build_config' in config:
-        return _ModelFormatKind.TLLM_ENGINE
-    if 'architecture' in config and 'dtype' in config:
-        return _ModelFormatKind.TLLM_CKPT
-    return _ModelFormatKind.HF
-
-
-def infer_architecture_from_config_dict(config: dict) -> Optional[str]:
-    """Infer architecture key (used by support matrix) from config.json dict."""
-    model_format = infer_model_format_from_config_dict(config)
-
-    # Engine format: {'pretrained_config': {..., 'architecture': 'LlamaForCausalLM'}, 'build_config': {...}}
-    if model_format is _ModelFormatKind.TLLM_ENGINE:
-        pretrained = config.get("pretrained_config")
-        if isinstance(pretrained, dict):
-            arch = pretrained.get("architecture")
-            if isinstance(arch, str) and arch:
-                return arch
-        return None
-
-    # Checkpoint format: {'architecture': 'LlamaForCausalLM', 'dtype': 'float16', ...}
-    if model_format is _ModelFormatKind.TLLM_CKPT:
-        arch = config.get("architecture")
-        if isinstance(arch, str) and arch:
-            return arch
-        return None
-
-    # HF format: try standard HF 'architectures' list
-    archs = config.get("architectures")
-    if isinstance(archs, list) and archs and isinstance(archs[0], str):
-        return archs[0]
-    return None
-
-
 def get_model_format(model_dir: str,
                      trust_remote_code: bool = False) -> _ModelFormatKind:
     ''' Get the format of the model.  '''
@@ -3423,12 +3383,14 @@ def get_model_format(model_dir: str,
         config = json.load(f)
 
     try:
-        model_format = infer_model_format_from_config_dict(config)
-        if model_format is _ModelFormatKind.TLLM_ENGINE:
+        if 'pretrained_config' in config and 'build_config' in config:
+            model_format = _ModelFormatKind.TLLM_ENGINE
             EngineConfig.from_json_file(Path(model_dir) / 'config.json')
-        elif model_format is _ModelFormatKind.TLLM_CKPT:
+        elif 'architecture' in config and 'dtype' in config:
+            model_format = _ModelFormatKind.TLLM_CKPT
             PretrainedConfig.from_checkpoint(model_dir)
         else:
+            model_format = _ModelFormatKind.HF
             AutoConfig.from_hugging_face(model_dir,
                                          trust_remote_code=trust_remote_code)
     except Exception as e:

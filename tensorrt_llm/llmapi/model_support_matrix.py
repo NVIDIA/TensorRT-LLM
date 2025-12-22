@@ -13,15 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Programmatic model support metadata + feature support matrices.
-
-This module is intentionally **stdlib-only** so it can be imported from:
-- runtime (LLM API feature gating), and
-- docs generation (without pulling heavy deps).
-
-The canonical rendered view is `docs/source/models/supported-models.md` which is
-auto-generated from the data in this file.
-"""
+"""Supported models and feature support matrices (stdlib-only)."""
 
 from __future__ import annotations
 
@@ -38,7 +30,6 @@ class SupportStatus(str, Enum):
 
 
 class Feature(str, Enum):
-    # Key models matrix
     OVERLAP_SCHEDULER = "Overlap Scheduler"
     CUDA_GRAPH = "CUDA Graph"
     ATTENTION_DP = "Attention Data Parallelism"
@@ -54,7 +45,6 @@ class Feature(str, Enum):
     LOGITS_POST_PROCESSOR = "Logits Post Processor"
     GUIDED_DECODING = "Guided Decoding"
 
-    # Multimodal matrix (additional columns)
     EPD_DISAGG_SERVING = "EPD Disaggregated Serving"
     MODALITY = "Modality"
 
@@ -69,8 +59,8 @@ class SupportedModel:
 @dataclass(frozen=True)
 class FeatureCell:
     status: Optional[SupportStatus] = None
-    footnote: Optional[str] = None  # e.g. "[^1]"
-    text: Optional[str] = None  # for non-status cells (e.g. modality)
+    footnote: Optional[str] = None
+    text: Optional[str] = None
 
     def render(self) -> str:
         if self.text is not None:
@@ -82,10 +72,6 @@ class FeatureCell:
             out = f"{out} {self.footnote}"
         return out
 
-
-# ----------------------------
-# Supported models (PyTorch)
-# ----------------------------
 
 SUPPORTED_MODELS_PYTORCH: Tuple[SupportedModel, ...] = (
     SupportedModel(
@@ -204,12 +190,6 @@ SUPPORTED_MODELS_PYTORCH: Tuple[SupportedModel, ...] = (
         huggingface_example="Qwen/Qwen3-Next-80B-A3B-Thinking",
     ),
 )
-
-
-# -------------------------------------------------
-# Model-Feature Support Matrix (Key Models)
-# -------------------------------------------------
-
 KEY_MODEL_FEATURES: Tuple[Feature, ...] = (
     Feature.OVERLAP_SCHEDULER,
     Feature.CUDA_GRAPH,
@@ -326,7 +306,6 @@ KEY_MODEL_MATRIX: Mapping[str, Mapping[Feature, FeatureCell]] = {
     },
 }
 
-# Keep row order stable (and matching docs)
 KEY_MODEL_ARCH_ORDER: Tuple[str, ...] = (
     "DeepseekV3ForCausalLM",
     "DeepseekV32ForCausalLM",
@@ -348,10 +327,6 @@ KEY_MODEL_ARCH_FOOTNOTES: Mapping[str, str] = {
     "Qwen3NextForCausalLM": "[^3]",
 }
 
-
-# -------------------------------------------------
-# Multimodal Feature Support Matrix (PyTorch)
-# -------------------------------------------------
 
 MULTIMODAL_FEATURES: Tuple[Feature, ...] = (
     Feature.OVERLAP_SCHEDULER,
@@ -492,45 +467,45 @@ MULTIMODAL_ARCH_ORDER: Tuple[str, ...] = (
 )
 
 
-# ----------------------------
-# Lookup helpers (runtime)
-# ----------------------------
-
-
 def get_cell(architecture: str, feature: Feature) -> Optional[FeatureCell]:
-    """Return the feature cell for an architecture if known.
-
-    Runtime precedence: multimodal matrix first (if present), then key models.
-    """
-    if architecture in MULTIMODAL_MATRIX and feature in MULTIMODAL_MATRIX[architecture]:
-        return MULTIMODAL_MATRIX[architecture][feature]
-    if architecture in KEY_MODEL_MATRIX and feature in KEY_MODEL_MATRIX[architecture]:
-        return KEY_MODEL_MATRIX[architecture][feature]
+    row = MULTIMODAL_MATRIX.get(architecture)
+    if row is not None:
+        cell = row.get(feature)
+        if cell is not None:
+            return cell
+    row = KEY_MODEL_MATRIX.get(architecture)
+    if row is not None:
+        cell = row.get(feature)
+        if cell is not None:
+            return cell
     return None
 
 
 def get_status(architecture: str, feature: Feature) -> Optional[SupportStatus]:
-    """Return the support status for (architecture, feature), if known."""
     cell = get_cell(architecture, feature)
     if cell is None:
         return None
     return cell.status
 
 
-# ----------------------------
-# Markdown rendering (docs)
-# ----------------------------
-
-
 def _render_md_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+
     def _row(cells: Sequence[str]) -> str:
-        return "| " + " | ".join(cells) + " |"
+        padded = [cells[i].ljust(widths[i]) for i in range(len(widths))]
+        return "| " + " | ".join(padded) + " |"
+
+    def _sep() -> str:
+        return _row(["-" * w for w in widths])
 
     lines: List[str] = []
-    lines.append(_row(list(headers)))
-    lines.append(_row(["-" * len(h) if len(h) > 0 else "-" for h in headers]))
-    for r in rows:
-        lines.append(_row(list(r)))
+    lines.append(_row(headers))
+    lines.append(_sep())
+    for row in rows:
+        lines.append(_row(row))
     return "\n".join(lines)
 
 
@@ -566,14 +541,15 @@ def render_supported_models_markdown() -> str:
     )
     out.append("")
 
-    key_headers = ["Model Architecture/Feature"] + [f.value for f in KEY_MODEL_FEATURES]
+    key_headers = ["Model Architecture/Feature"] + [feature.value for feature in KEY_MODEL_FEATURES]
     key_rows: List[List[str]] = []
     for arch in KEY_MODEL_ARCH_ORDER:
         cells = KEY_MODEL_MATRIX.get(arch, {})
         arch_footnote = KEY_MODEL_ARCH_FOOTNOTES.get(arch, "")
         arch_cell = f"`{arch}` {arch_footnote}".rstrip() if arch_footnote else f"`{arch}`"
         key_rows.append(
-            [arch_cell] + [cells.get(f, FeatureCell()).render() for f in KEY_MODEL_FEATURES]
+            [arch_cell]
+            + [cells.get(feature, FeatureCell()).render() for feature in KEY_MODEL_FEATURES]
         )
     out.append(_render_md_table(headers=key_headers, rows=key_rows))
     out.append("")
@@ -584,12 +560,13 @@ def render_supported_models_markdown() -> str:
     out.append("# Multimodal Feature Support Matrix (PyTorch Backend)")
     out.append("")
 
-    mm_headers = ["Model Architecture/Feature"] + [f.value for f in MULTIMODAL_FEATURES]
+    mm_headers = ["Model Architecture/Feature"] + [feature.value for feature in MULTIMODAL_FEATURES]
     mm_rows: List[List[str]] = []
     for arch in MULTIMODAL_ARCH_ORDER:
         cells = MULTIMODAL_MATRIX.get(arch, {})
         mm_rows.append(
-            [f"`{arch}`"] + [cells.get(f, FeatureCell()).render() for f in MULTIMODAL_FEATURES]
+            [f"`{arch}`"]
+            + [cells.get(feature, FeatureCell()).render() for feature in MULTIMODAL_FEATURES]
         )
     out.append(_render_md_table(headers=mm_headers, rows=mm_rows))
     out.append("")
