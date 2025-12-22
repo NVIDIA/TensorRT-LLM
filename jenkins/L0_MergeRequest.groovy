@@ -1559,7 +1559,7 @@ pipeline {
                     } else if (isRetagImageMode) {
                         stage("Retag Image") {
                             script {
-                                runRetagImage(this)
+                                runRetagImage(this, globalVars)
                             }
                         }
                     } else {
