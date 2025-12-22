@@ -3,6 +3,7 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import flashinfer
 import torch
+from flashinfer.page import get_seq_lens
 from torch._ops import OpOverloadPacket
 from torch._subclasses import FakeTensor
 from torch.fx import Node
@@ -91,7 +92,7 @@ class _FlashInferPlanner:
                 "NHD",
                 use_cuda_graph=True,
                 paged_kv_indptr_buffer=self.paged_kv_indptr_buffer[: batch_size + 1],
-                paged_kv_indices_buffer=self.paged_kv_indices_buffer[:num_pages],
+                paged_kv_indices_buffer=self.paged_kv_indices_buffer,
                 paged_kv_last_page_len_buffer=self.paged_kv_last_page_len_buffer[:batch_size],
                 use_tensor_cores=True,
             )
@@ -102,7 +103,7 @@ class _FlashInferPlanner:
                 use_tensor_cores=True,
             )
 
-    def init_workspace(self, workspace_buffer: torch.Tensor):
+    def init_workspace(self, workspace_buffer: torch.Tensor, max_batch_size: int, num_pages: int):
         self.__init__()  # reset all state
 
         self.workspace_buffer = workspace_buffer
@@ -112,6 +113,15 @@ class _FlashInferPlanner:
             self.workspace_buffer,
             "NHD",
             backend="fa2",
+        )
+        self.paged_kv_indptr_buffer = torch.empty(
+            max_batch_size + 1, dtype=torch.int, device=workspace_buffer.device
+        )
+        self.paged_kv_indices_buffer = torch.empty(
+            num_pages, dtype=torch.int, device=workspace_buffer.device
+        )
+        self.paged_kv_last_page_len_buffer = torch.empty(
+            max_batch_size, dtype=torch.int, device=workspace_buffer.device
         )
         self.decode_wrapper = self._init_decode_wrapper()
 
@@ -155,18 +165,39 @@ class _FlashInferPlanner:
             wrapper = self._init_decode_wrapper(
                 use_cuda_graph=True,
                 num_pages=len(kv_page_indices),
-                batch_size=len(kv_page_indptr) - 1,
+                batch_size=plan_params.num_seq,
             )
-            _plan_decode(wrapper)
             self.cached_cuda_graph_decode_wrappers[plan_params] = wrapper
+            _plan_decode(self.cached_cuda_graph_decode_wrappers[plan_params])
+            wrapper._paged_kv_indptr_buf.copy_(kv_page_indptr)
+            wrapper._paged_kv_indices_buf.copy_(kv_page_indices)
+            wrapper._paged_kv_last_page_len_buf.copy_(kv_last_page_len)
+            qo_indptr_host = qo_indptr.cpu()
+            indptr_host = kv_page_indptr.cpu()
+            last_page_len_host = kv_last_page_len.cpu()
+            kv_lens_arr_host = get_seq_lens(indptr_host, last_page_len_host, plan_params.page_size)
+            wrapper._plan_info = wrapper._cached_module.plan(
+                wrapper._float_workspace_buffer,
+                wrapper._int_workspace_buffer,
+                wrapper._pin_memory_int_workspace_buffer,
+                qo_indptr_host,
+                indptr_host,
+                kv_lens_arr_host,
+                plan_params.num_seq,  # total_num_rows
+                plan_params.num_seq,
+                plan_params.n_heads,
+                plan_params.n_kv_heads,
+                plan_params.page_size,
+                wrapper.is_cuda_graph_enabled,
+                plan_params.head_dim,
+                plan_params.head_dim,
+                False,  # causal
+            )
 
         # check if we are in cuda graph capture and just return the pre-cached decode wrapper
         if torch.cuda.is_current_stream_capturing() or cuda_graph_state.in_warm_up():
             assert plan_params.is_generate, "Only generate is supported during cuda graph capture."
             wrapper = self.cached_cuda_graph_decode_wrappers[plan_params]
-            wrapper._paged_kv_indptr_buf[: len(kv_page_indptr)].copy_(kv_page_indptr)
-            wrapper._paged_kv_indices_buf[: len(kv_page_indices)].copy_(kv_page_indices)
-            wrapper._paged_kv_last_page_len_buf[: len(kv_last_page_len)].copy_(kv_last_page_len)
             return wrapper
 
         # check for re-planning
@@ -436,16 +467,7 @@ class FlashInferAttention(AttentionDescriptor):
             # NOTE (lucaslie): avoid OOM for many cudagraphs,
             # see https://github.com/NVIDIA/TensorRT-LLM/pull/3686
             buffer = torch.empty(320 * 1024 * 1024, dtype=torch.uint8, device=si.device)
-            cls._get_planner().init_workspace(buffer)
-            cls._get_planner().paged_kv_indptr_buffer = torch.empty(
-                si.max_batch_size + 1, dtype=torch.int, device=si.device
-            )
-            cls._get_planner().paged_kv_indices_buffer = torch.empty(
-                si.num_pages, dtype=torch.int, device=si.device
-            )
-            cls._get_planner().paged_kv_last_page_len_buffer = torch.empty(
-                si.max_batch_size, dtype=torch.int, device=si.device
-            )
+            cls._get_planner().init_workspace(buffer, si.max_batch_size, si.num_pages)
             return buffer
 
         return {"workspace_buffer": _init_workspace}
