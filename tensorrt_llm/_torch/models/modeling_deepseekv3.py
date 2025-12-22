@@ -492,8 +492,8 @@ class DeepseekV3WeightLoader:
                             fused_a_scale = kv_a_proj_with_mqa_scale
                         # For DeepseekV32: kv_a_proj_with_mqa is oversized
                         # to include indexer k weights, which is filled in post_load_weights.
-                        module.weight_scale[0:fused_a_scale.
-                                            shape[0]].data.copy_(fused_a_scale)
+                        module.weight_scale.data[0:fused_a_scale.
+                                            shape[0]].copy_(fused_a_scale)
                     else:
                         fused_a = weights[
                             f"{'.'.join(names[:-1])}.kv_a_proj_with_mqa.weight"][:]
