@@ -42,6 +42,18 @@ namespace kernels
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Check if two SM values are family/specific versions of the same architecture
+// Returns true only if one is a family version and the other is a compatible specific version
+constexpr bool isFamilySpecificSMPair(int sm1, int sm2)
+{
+    if ((sm1 == kSM_100f && (sm2 == kSM_100 || sm2 == kSM_103))
+        || (sm2 == kSM_100f && (sm1 == kSM_100 || sm1 == kSM_103)))
+    {
+        return true;
+    }
+    return false;
+}
+
 constexpr bool isSMCompatible(int gpuSM, int kernelSM)
 {
     if (gpuSM == kSM_103)
@@ -107,9 +119,24 @@ public:
                         CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, kernelMeta.mSharedMemBytes));
                 }
                 // Make sure the hashIds are not duplicated.
-                TLLM_CHECK_WITH_INFO(mFunctions.find(hashID(kernelMeta)) == mFunctions.end(),
-                    "The kernel's hashId has conflicts with others.");
-                mFunctions.insert(std::make_pair(hashID(kernelMeta), funcInfo));
+                // Except for the case where we have both family version and specific version of the same config.
+                auto const hash = hashID(kernelMeta);
+                auto it = mFunctions.find(hash);
+                if (it != mFunctions.end())
+                {
+                    auto const& existingKernelMeta = mKernelMeta[it->second.mMetaInfoIndex];
+                    TLLM_CHECK_WITH_INFO(isFamilySpecificSMPair(existingKernelMeta.mSM, kernelMeta.mSM),
+                        "The kernel's hashId has conflicts with others.");
+                    // Prefer specific SM version over family version
+                    if (existingKernelMeta.mSM == kSM_100f)
+                    {
+                        it->second = funcInfo;
+                    }
+                }
+                else
+                {
+                    mFunctions[hash] = funcInfo;
+                }
             }
         }
     }
