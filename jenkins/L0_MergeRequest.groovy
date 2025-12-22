@@ -1516,7 +1516,7 @@ def runRetagImage(pipeline, globalVars)
 {
     collectResultPodSpec = createKubernetesPodConfig("", "agent")
     trtllm_utils.launchKubernetesPod(pipeline, collectResultPodSpec, "alpine", {
-        oldTagToNewTagMap = getImageTags(globalVars)
+        oldTagToNewTagMap = getImageTags(pipeline, globalVars)
         renameDockerImages(oldTagToNewTagMap)
         updateImageTag(oldTagToNewTagMap)
     })
