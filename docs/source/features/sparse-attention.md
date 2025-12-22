@@ -34,7 +34,7 @@ To support these emerging techniques, TensorRT LLM has designed a general, exten
 
 ## Quick Start
 
-This section provides a brief guide on enabling sparse attention in TensorRT LLM. For a detailed walkthrough of a specific algorithm, please refer to [RocketKV sparse attention](../../examples/sparse_attention/RocketKV.md).
+This section provides a brief guide on enabling sparse attention in TensorRT LLM, using RocketKV as an example. For more details, please refer to [RocketKV sparse attention](../../examples/sparse_attention/RocketKV.md).
 
 ### Python API
 
@@ -98,7 +98,7 @@ trtllm-eval --model <path_to_model> --extra_llm_api_options extra_config.yaml lo
 
 ## Developer Guide
 
-This section describes the sparse attention framework architecture and guides developers on how to implement new sparse attention algorithms in TensorRT LLM. Unless otherwise specified, this framework primarily targets **MHA/MQA/GQA-based** attention mechanisms.
+This section describes the sparse attention framework architecture and guides developers on how to implement new sparse attention algorithms in TensorRT LLM. Unless otherwise specified, this framework primarily targets **MQA/GQA/MLA-based** attention mechanisms.
 
 ### Architecture Overview
 
@@ -109,13 +109,15 @@ This section describes the sparse attention framework architecture and guides de
 </div>
 <p align="center"><sub><em>Figure 1: The sparse attention framework in TensorRT LLM.</em></sub></p>
 
-Our goal is to design a generic, extensible, and flexible sparse attention framework. Figure 1 illustrates the overall design. The architecture is built by inheriting from the existing `AttentionBackend` to define algorithm-specific sparse attention backends. Within these backends, a `prediction` method is implemented to generate the corresponding sparse indices. These indices are then passed as arguments to the `AttentionOp` to perform the sparse attention computation. This approach balances system flexibility with extensibility, allowing new algorithms to be integrated by simply defining their prediction logic **without** modifying the core attention kernels.
+Our goal is to design a general, extensible, and flexible sparse attention framework. In this framework, the attention operator provides the unified APIs to support both **sparse computation** and **sparse KV cache** that leverage token sparsity, while the users/developers can only focus on the algorithm of sparse attentions, i.e. how to accurately identify important query-key pairs.
 
-TensorRT LLM abstracts sparse attention into a prediction-based workflow: *a prediction module first identifies the sparse indices (tokens/blocks to keep or attend to), which are then used by the subsequent attention operator*. Currently, for standard attention, TensorRT LLM supports **KV cache compression** in the context phase and **sparse computation** in the generation phase as mentioned above. Different KV heads are allowed to use different sparse indices, while Q heads that map to the same KV head share the same sparse pattern. It does **not** yet support sparse computation in the context phase or KV cache compression in the generation phase.
+For the generalization, TensorRT LLM abstracts sparse attention into a prediction-based workflow: *a prediction module first identifies the sparse indices (tokens/blocks to keep or attend to), which are then used by the subsequent attention operator*. Currently, for standard attention (MQA/GQA), TensorRT LLM supports **sparse KV cache** in the context phase and **sparse computation** in the generation phase as mentioned above. Different KV heads are allowed to use different sparse indices, while Q heads that map to the same KV head share the same sparse pattern. It does **not** yet support sparse computation in the context phase or KV cache compression in the generation phase.
+
+For the expansibility, figure 1 illustrates the overall design. The architecture is built by inheriting from the existing `AttentionBackend` to define algorithm-specific sparse attention backends. Within these backends, `prediction` methods are implemented to generate the corresponding sparse indices. These indices are then passed as arguments to the `AttentionOp` to perform the sparse attention computation. This approach balances system flexibility with extensibility, allowing new algorithms to be integrated by simply defining their prediction logic **without** modifying the core attention kernels.
 
 TensorRT LLM currently supports the following operations for standard attention:
 
-1.  **Context Phase (KV cache compression)**:
+1.  **Context Phase (sparse KV cache)**:
     *   **Goal**: Reduce the size of the KV cache populated during the context phase.
     *   **Mechanism**: Identify important tokens from the prompt and permanently evict non-essential tokens before entering the generation phase.
 
@@ -123,7 +125,7 @@ TensorRT LLM currently supports the following operations for standard attention:
     *   **Goal**: Accelerate attention computation during token generation.
     *   **Mechanism**: For each new token, dynamically select a subset of relevant blocks/tokens from the kv cache to attend to.
 
-However, Multi-head Latent Attention (MLA), used by algorithms like DSA, is a special case. It currently supports sparse computation in both context and generation phases, but does not support KV cache compression. Its sparse computation implementation is handled directly within the TRTLLM-GEN MLA kernel and does not use the general pass described below.
+However, Multi-head Latent Attention (MLA), used by algorithms like DSA, is a special case. TensorRT LLM currently supports sparse computation in both context and generation phases for MLA but does not support sparse KV cache. The implementation is handled directly within the TRTLLM-GEN MLA kernel and does not use the general pass described below.
 
 ### Framework Implementation
 
