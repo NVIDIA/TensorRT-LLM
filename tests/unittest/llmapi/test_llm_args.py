@@ -157,10 +157,12 @@ def test_decoding_type_eagle_warns_on_pytorch_backend(monkeypatch):
 
     monkeypatch.setattr(llm_args_mod.logger, "warning", _capture_warning)
 
-    spec_cfg = DecodingBaseConfig.from_dict(
-        dict(decoding_type="Eagle",
-             max_draft_len=3,
-             speculative_model_dir="/path/to/draft/model"))
+    spec_cfg = DecodingBaseConfig.from_dict(dict(
+        decoding_type="Eagle",
+        max_draft_len=3,
+        speculative_model_dir="/path/to/draft/model"),
+                                            backend="pytorch")
+    assert isinstance(spec_cfg, Eagle3DecodingConfig)
 
     TorchLlmArgs(model=llama_model_path, speculative_config=spec_cfg)
 

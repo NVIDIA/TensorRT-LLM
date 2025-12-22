@@ -59,14 +59,14 @@ The following draft model checkpoints can be used for EAGLE 3:
 * Other models, including `gpt-oss-120b` and `Qwen3`: check out the [Speculative Decoding Modules](https://huggingface.co/collections/nvidia/speculative-decoding-modules) collection from NVIDIA.
 
 ```python
-from tensorrt_llm.llmapi import EagleDecodingConfig
+from tensorrt_llm.llmapi import Eagle3DecodingConfig
 
 # Enable to use the faster one-model implementation for Llama 4.
 eagle3_one_model = False
 model = "meta-llama/Llama-3.1-8B-Instruct"
 speculative_model = "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B"
 
-speculative_config = EagleDecodingConfig(
+speculative_config = Eagle3DecodingConfig(
     max_draft_len=3,
     speculative_model=speculative_model,
     eagle3_one_model=eagle3_one_model)
