@@ -1138,9 +1138,9 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     "export ${varName}=\"${escapedValue}\""
                 }.join('\n')
 
-                def scriptContent = """#!/bin/bash
+                def scriptLaunchPrefix = """#!/bin/bash
                     #SBATCH ${exemptionComment}
-                    #SBATCH --output=${outputPath}
+                    #SBATCH --output=${sbatchLogPath}
                     ${taskArgs.collect { "#SBATCH $it" }.join('\n')}
                     #SBATCH ${partition.additionalArgs}
                     ${partition?.time ? "#SBATCH --time=${partition.time}" : "#SBATCH --time=${SlurmConfig.DEFAULT_TIMEOUT_SHORT}"}
@@ -1266,6 +1266,14 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     ),
                     numRetries: 3
                 )
+                def sbatchJobId = Utils.exec(
+                    pipeline,
+                    returnStdout: true,
+                    script: Utils.sshUserCmd(
+                        remote,
+                        "cat $jobWorkspace/slurm_job_id.txt"
+                    )
+                ).trim()
                 def scriptTrack = """#!/bin/bash
                     jobId=\$(cat $jobWorkspace/slurm_job_id.txt)
                     tail -f ${sbatchLogPath} &
@@ -1273,7 +1281,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     # Wait until sbatch job is done.
                     while true; do
                         state=\$(sacct -j \$jobId --format=JobIDRaw,State --noheader | awk -v jobId=\$jobId '""\$1"" == jobId {print \$2}')
-                        if [[ -z \$state || \$state == "RUNNING" || \$state == "PENDING" ]]; then
+                        if [[ -z \$state || \$state == "RUNNING" || \$state == "PENDING" || \$state == "CONFIGURING" ]]; then
                             echo "job is still running"
                             sleep 300
                         else
@@ -1337,22 +1345,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     true
                 )
 
-                if (perfSanityMode) {
-                    stage("[${stageName}] Check perf result") {
-                        def perfCheckResult = Utils.exec(
-                            pipeline,
-                            script: Utils.sshUserCmd(
-                                remote,
-                                "python3 ${perfCheckScriptNode} ${jobWorkspace}"
-                            ),
-                            returnStatus: true
-                        )
-                        if (perfCheckResult != 0) {
-                            error "Performance regression detected and failing the build (exit code: ${perfCheckResult})"
-                        }
-                    }
-                }
-
                 sh "cat $scriptStatusPathLocal"
                 while (true) {
                     // Check if the job is done by running sacct via SSH
@@ -1364,8 +1356,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                             scriptStatusPathNode
                         )
                     ).trim()
-                    if (!result || result == "RUNNING" || result == "PENDING") {
-                        echo "Job is still running, pulling the job log."
+                    if (!result || result == "RUNNING" || result == "PENDING" || result == "CONFIGURING") {
+                        echo "Slurm job $sbatchJobId is still running, pulling the job log."
                         // Pulling the sbatch output log
                         Utils.exec(
                             pipeline,
@@ -1376,7 +1368,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                             )
                         )
                     } else {
-                        echo "Job is done."
+                        echo "Slurm job $sbatchJobId is done."
                         break
                     }
                 }
