@@ -109,7 +109,8 @@ class LongBenchV2(Evaluator):
         self.rag = rag
         self.output_dir = output_dir
         # We need to minus max_output_length from max_len to reserve budget for output tokens.
-        self.max_input_length = min(max_input_length, max_len - max_output_length)
+        self.max_input_length = min(max_input_length,
+                                    max_len - max_output_length)
 
         # Will be set during evaluation
         self.tokenizer = None
@@ -739,10 +740,13 @@ class LongBenchV2(Evaluator):
         help=
         "Maximum length (input + output) in tokens which can be supported by the model."
     )
-    @click.option("--max_input_length",
-                  type=int,
-                  default=128000,
-                  help="Maximum context length in tokens. If exceeds, the prompt will be truncated in the middle.")
+    @click.option(
+        "--max_input_length",
+        type=int,
+        default=128000,
+        help=
+        "Maximum context length in tokens. If exceeds, the prompt will be truncated in the middle."
+    )
     @click.option("--max_output_length",
                   type=int,
                   default=32000,
