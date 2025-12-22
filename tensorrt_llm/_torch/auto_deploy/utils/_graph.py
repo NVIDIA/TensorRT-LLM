@@ -18,7 +18,7 @@ from torch.fx.passes.shape_prop import _extract_tensor_metadata
 from torch.utils._pytree import _LEAF_SPEC
 
 from .logger import ad_logger
-from .node_utils import is_linear_op, is_op
+from .node_utils import get_weight_tensor, is_linear_op, is_op
 
 _NoValType = type("_NoValType", (), {})
 _NO_VAL = _NoValType()
@@ -347,21 +347,35 @@ def placeholders_on_meta(mod: nn.Module) -> bool:
     return False
 
 
-def find_embedding_node(model: nn.Module) -> tuple[GraphModule, Node]:
+def get_input_embeddings(model: nn.Module) -> torch.Tensor:
     """Find the unique embedding node across all graph modules."""
-    embedding_nodes = []
+    embedding_weights = []
     for _, gm in named_graphmodules(model):
         found_nodes = gm.graph.find_nodes(
             op="call_function", target=torch.ops.aten.embedding.default
         )
         for node in found_nodes:
-            embedding_nodes.append((gm, node))
+            embedding_weights.append(get_weight_tensor(gm, node))
 
-    assert len(embedding_nodes) == 1, (
-        f"Expected exactly 1 aten.embedding.default node, but found {len(embedding_nodes)}."
+    if hasattr(model, "get_input_embeddings"):
+        embedding_weights.append(model.get_input_embeddings())
+
+    for _, gm in named_graphmodules(model):
+        if hasattr(gm, "get_input_embeddings"):
+            embedding_weights.append(gm.get_input_embeddings())
+
+    assert len(embedding_weights) > 0, "No embedding weights found"
+    unique_embedding_weights = [embedding_weights[0]]
+    for weight in embedding_weights:
+        if weight is not unique_embedding_weights[0]:
+            unique_embedding_weights.append(weight)
+
+    assert len(unique_embedding_weights) == 1, (
+        f"Expected exactly 1 unique embedding weight, but found {len(unique_embedding_weights)}."
     )
 
-    return embedding_nodes[0]
+    print(f"Unique embedding weights: {unique_embedding_weights}")
+    return unique_embedding_weights[0]
 
 
 def find_output_node(model: nn.Module) -> tuple[GraphModule, Node]:
@@ -379,7 +393,12 @@ def find_output_node(model: nn.Module) -> tuple[GraphModule, Node]:
 
 def find_lm_head_node(model: nn.Module) -> tuple[GraphModule, Node]:
     """Find the lm_head node by traversing backwards from the output node."""
+    print(
+        f"Finding lm_head node in model: {model}"
+    )  # Want to see if model is already a graph module.
     gm, output_node = find_output_node(model)
+
+    print(f"Output node: {output_node}")
 
     visited = set()
     queue = deque()

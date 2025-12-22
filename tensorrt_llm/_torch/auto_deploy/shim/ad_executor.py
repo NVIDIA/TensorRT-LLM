@@ -22,7 +22,7 @@ from strenum import StrEnum
 from torch._prims_common import DeviceLikeType
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionRuntimeFeatures
-from tensorrt_llm._torch.auto_deploy.utils._graph import find_embedding_node, find_lm_head_node
+from tensorrt_llm._torch.auto_deploy.utils._graph import find_lm_head_node, get_input_embeddings
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import get_weight_tensor
 from tensorrt_llm._torch.models.modeling_speculative import Eagle3ForCausalLM
 from tensorrt_llm._torch.pyexecutor._util import (
@@ -844,8 +844,7 @@ def share_target_weights_with_draft(
     def share_embedding_weights_with_draft(
         target_model_engine: "ADEngine", draft_model_engine: PyTorchModelEngine
     ):
-        gm, embedding_node = find_embedding_node(target_model_engine.model)
-        embedding_weight = get_weight_tensor(gm, embedding_node)
+        embedding_weight = get_input_embeddings(target_model_engine.model)
 
         world_size = mpi_world_size()
         assert world_size <= 1, f"This code assumes tp<=1. World size: {world_size}"

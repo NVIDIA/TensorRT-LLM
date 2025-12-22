@@ -1,6 +1,6 @@
 from importlib.resources import files
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Set, Type, Union
+from typing import Any, Dict, List, Literal, Optional, Type, Union
 
 import torch
 from pydantic import Field, PrivateAttr, ValidationInfo, field_validator, model_validator
@@ -43,12 +43,6 @@ def _check_for_default_value_only(
     if value != cls.model_fields[field_name].get_default(call_default_factory=True):
         raise ValueError(msg)
     return value
-
-
-def default_eagle3_layers_to_capture(num_hidden_layers: int) -> Set[int]:
-    if num_hidden_layers <= 6:
-        raise ValueError("Not enough hidden layers for default EAGLE3 capture")
-    return {1, num_hidden_layers // 2 - 1, num_hidden_layers - 4}
 
 
 _TRANSFORMS_SHORTCUT_LOOKUP = {
@@ -440,18 +434,10 @@ class LlmArgs(AutoDeployConfig, BaseLlmArgs, BaseSettings):
         ):
             return self
 
-        # insert the layers to capture into the transforms config.
-        if self.transforms is None:
-            self.transforms = {}
-
-        if "detect_hidden_states_for_capture" not in self.transforms:
-            self.transforms["detect_hidden_states_for_capture"] = {}
-
         self.transforms["detect_hidden_states_for_capture"]["capture_hidden_states"] = True
         self.transforms["detect_hidden_states_for_capture"]["eagle3_layers_to_capture"] = (
             self.speculative_config.eagle3_layers_to_capture
         )
-
         return self
 
     @model_validator(mode="after")
