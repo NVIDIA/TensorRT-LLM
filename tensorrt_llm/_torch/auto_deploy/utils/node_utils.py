@@ -35,7 +35,7 @@ class LayerType(Enum):
     """Enum for layer type."""
 
     ATTENTION = "attention"
-    MAMBA = "mamba"
+    SSM = "ssm"
     MLP = "mlp"
     MOE = "moe"
     MLA = "mla"
@@ -871,12 +871,12 @@ def get_layer_after_linear_node(
         assert len(ssm_nodes) == 1, "SSM layer must have exactly one SSM node"
         layer_type = LayerType.SSM
         # determine head size
-        min_local_shape = get_weight_shape(ssm_nodes[0], dim=-1)
+        min_local_shape = shape(ssm_nodes[0])[-1]
     if len(attention_nodes) > 0:
         assert len(attention_nodes) == 1, "Attention layer must have exactly one attention node"
         layer_type = LayerType.ATTENTION
         # determine head size
-        min_local_shape = attention_nodes[0].meta["val"].shape[-1]
+        min_local_shape = shape(attention_nodes[0])[-1]
     if len(intermediate_lin_nodes) > 0:
         assert len(intermediate_lin_nodes) == 2, (
             "MLA layer must have exactly two intermediate linear nodes"
