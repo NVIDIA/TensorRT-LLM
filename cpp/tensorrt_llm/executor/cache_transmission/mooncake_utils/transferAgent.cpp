@@ -79,7 +79,7 @@ TransferState MooncakeTransferStatus::wait(int64_t timeout_ms) const
                         "Transfer failed for batch %lu, task %zu: status %d", mBatchId, index, status.status);
                 }
             }
-            else if (status.status == STATUS_PENDING || status.status == STATUS_WAITING)
+            else if (status.status != STATUS_COMPLETED)
             {
                 all_completed = false;
             }
@@ -97,6 +97,7 @@ TransferState MooncakeTransferStatus::wait(int64_t timeout_ms) const
             freeBatchID(mEngine, mBatchId);
             mBatchFreed = true;
             TLLM_LOG_DEBUG("Batch ID %lu freed in wait()", mBatchId);
+            syncSegmentCache(mEngine);
             return TransferState::kSUCCESS;
         }
 
