@@ -484,15 +484,13 @@ class JobManager:
     @staticmethod
     def check_job_exists(job_id: str) -> bool:
         """Check if job still exists in SLURM queue.
-        
+
         Returns:
             True if job exists (running or pending), False if job is gone
         """
         try:
             # Use squeue to check if job exists in queue
-            squeue_output = exec_cmd_with_output(
-                ["squeue", "-j", job_id, "--noheader"], timeout=30
-            )
+            squeue_output = exec_cmd_with_output(["squeue", "-j", job_id, "--noheader"], timeout=30)
             # If output is not empty, job exists
             return bool(squeue_output.strip())
         except Exception as e:
@@ -527,11 +525,11 @@ class JobManager:
         time.sleep(60)  # Initial wait for job to be scheduled
 
         logger.info(f"Waiting for job {job_id} to finish...")
-        
+
         while time.time() - start_time < timeout:
             # Simple check: does job still exist?
             job_exists = JobManager.check_job_exists(job_id)
-            
+
             if not job_exists:
                 # Job has disappeared from queue - it's done (whatever the status was)
                 logger.success(f"Job {job_id} finished (no longer in queue)")
@@ -597,9 +595,7 @@ class JobManager:
         log_writer = LogWriter(result_dir)
         files_to_print = []
         for file in os.listdir(result_dir):
-            if (
-                file.endswith(".log") or file.endswith(".yaml")
-            ) and file != "output_server.log":
+            if (file.endswith(".log") or file.endswith(".yaml")) and file != "output_server.log":
                 files_to_print.append(file)
 
         # Sort files for consistent output order

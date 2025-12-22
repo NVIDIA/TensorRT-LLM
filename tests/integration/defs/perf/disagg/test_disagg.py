@@ -79,7 +79,7 @@ class TestDisaggBenchmark:
 
         job_id = None
         result = None
-        
+
         try:
             logger.info(f"\n{'=' * 60}")
             logger.info(f"Performance Test: {test_config.display_name}")
@@ -92,7 +92,7 @@ class TestDisaggBenchmark:
             logger.info(f"Metrics log: {test_config.metrics_config.log_file}")
             logger.info(f"Supported GPUs: {', '.join(test_config.supported_gpus)}")
             logger.info(f"{'=' * 60}")
-            
+
             if EnvManager.get_debug_mode():
                 logger.debug(
                     f"Debug mode: Skipping job submission, using job_id: {EnvManager.get_debug_job_id()}"
@@ -107,9 +107,7 @@ class TestDisaggBenchmark:
                 assert job_id, "Unable to get job ID"
 
                 # Wait for completion (timeout/early failure handled inside)
-                JobManager.wait_for_completion(
-                    job_id, 7200, test_config, check_early_failure=True
-                )
+                JobManager.wait_for_completion(job_id, 7200, test_config, check_early_failure=True)
 
             # End tracking test case
             test_tracker.end_test_case()
@@ -155,7 +153,7 @@ class TestDisaggBenchmark:
 
         job_id = None
         result = None
-        
+
         try:
             logger.info(f"\n{'=' * 60}")
             logger.info(f"Accuracy Test: {test_config.display_name}")
@@ -187,16 +185,14 @@ class TestDisaggBenchmark:
                 assert job_id, "Unable to get job ID"
 
                 # Wait for completion (timeout/early failure handled inside)
-                JobManager.wait_for_completion(
-                    job_id, 10800, test_config, check_early_failure=True
-                )
+                JobManager.wait_for_completion(job_id, 10800, test_config, check_early_failure=True)
 
             # End tracking test case
             test_tracker.end_test_case()
 
             # Get timestamps information
             timestamps = test_tracker.get_timestamps()
-            
+
             # Check results and validate accuracy
             result = JobManager.check_result(job_id, test_config, timestamps, full_test_name)
             assert result["success"], (
