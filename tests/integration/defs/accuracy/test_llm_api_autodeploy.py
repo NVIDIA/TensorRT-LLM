@@ -14,7 +14,7 @@
 # limitations under the License.
 
 import pytest
-from test_common.llm_data import hf_model_dir_or_hub_id
+from test_common.llm_data import hf_model_dir_or_hub_id, llm_models_root
 
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 from tensorrt_llm.quantization import QuantAlgo
