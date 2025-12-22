@@ -2184,7 +2184,6 @@ class TestLayer(unittest.TestCase):
         # The global and local inv_freq should be different because:
         # 1. Global uses rope_scaling with factor=8.0 (linear scaling applies 1/8 to inv_freq)
         # 2. Local uses scale=1.0 (no scaling)
-        # Also they use different base frequencies (1000000 vs 10000)
         self.assertFalse(
             np.allclose(global_inv_freq, local_inv_freq),
             "Global and local rotary_inv_freq should be different "
@@ -2197,8 +2196,8 @@ class TestLayer(unittest.TestCase):
             "(global has scaling, local does not)")
 
         # Additional verification: Check that local inv_freq matches unscaled calculation
-        # For local attention with scale=1.0 and base=10000:
-        # inv_freq = 1.0 / (10000 ** (arange(0, dim, 2) / dim))
+        # For local attention with scale=1.0 and base=10:
+        # inv_freq = 1.0 / (10 ** (arange(0, dim, 2) / dim))
         dim = config.head_size  # rotary_embedding_dim = head_size * rotary_pct = 128
         expected_local_inv_freq = 1.0 / (config.rope_local_base_freq
                                          **(np.arange(0, dim, 2) / dim))
@@ -2211,7 +2210,7 @@ class TestLayer(unittest.TestCase):
 
         # For global attention with linear scaling (factor=8.0):
         # scale = 1.0 / 8.0 = 0.125
-        # inv_freq = 0.125 / (1000000 ** (arange(0, dim, 2) / dim))
+        # inv_freq = 0.125 / (100 ** (arange(0, dim, 2) / dim))
         expected_global_inv_freq = (1.0 / 8.0) / (config.rotary_base**
                                                   (np.arange(0, dim, 2) / dim))
 
