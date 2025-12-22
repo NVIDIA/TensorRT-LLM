@@ -1378,6 +1378,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
     def jobName = getShortenedJobName(env.JOB_NAME)
     def buildID = env.BUILD_ID
     def tolerations = ""
+    def extraDeviceEnv = ""
 
     def archSuffix = arch == "arm64" ? "arm" : "amd"
     def jnlpImage = "urm.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
@@ -1473,7 +1474,13 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                 - key: "node_for_blossom_trt"
                   operator: "Exists"
                   effect: "NoSchedule"
-                """
+            """
+            extraDeviceEnv = """
+                    - name: NVIDIA_VISIBLE_DEVICES
+                      value: "all"
+                    - name: NVIDIA_DRIVER_CAPABILITIES
+                      value: "compute,utility"
+            """
         }
 
         // The following GPU types doesn't support dynamic driver flashing.
@@ -1597,14 +1604,11 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                 containers:
                   ${containerConfig}
                     env:
-                    - name: NVIDIA_VISIBLE_DEVICES
-                      value: "all"
-                    - name: NVIDIA_DRIVER_CAPABILITIES
-                      value: "compute,utility"
                     - name: HOST_NODE_NAME
                       valueFrom:
                         fieldRef:
                           fieldPath: spec.nodeName
+                    ${extraDeviceEnv}
                   - name: jnlp
                     image: ${jnlpImage}
                     args: ['\$(JENKINS_SECRET)', '\$(JENKINS_NAME)']
