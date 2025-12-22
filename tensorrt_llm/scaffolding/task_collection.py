@@ -195,7 +195,10 @@ class QueryCollector(TaskCollection):
 class TaskMetricsCollector(TaskCollection):
     """
     Task profiler that captures tasks at yield points, avoiding duplicate counting.
-    Records token usage and execution time for each task.
+    Records token usage, execution time, and perf_metrics for each task.
+
+    Supports filtering by task types and captures additional fields for ChatTask
+    including perf_metrics, finish_reason, and unique_id.
     """
 
     # Global statistics: controller_name -> List[task_info_dict]
@@ -209,7 +212,7 @@ class TaskMetricsCollector(TaskCollection):
         self.controller_name = controller_name
         self.task_types = task_types
         self.enable_print = enable_print
-        self.start_time_map = {}
+        self.start_time_map: Dict[int, float] = {}
 
         if controller_name not in TaskMetricsCollector.statistics:
             TaskMetricsCollector.statistics[controller_name] = []
@@ -269,6 +272,10 @@ class TaskMetricsCollector(TaskCollection):
                                                         0)
                 task_info['total_tokens'] = task_info[
                     'prompt_tokens'] + task_info['completion_tokens']
+                task_info['finish_reason'] = getattr(task, 'finish_reason',
+                                                     None)
+                task_info['unique_id'] = getattr(task, 'unique_id', None)
+                task_info['perf_metrics'] = getattr(task, 'perf_metrics', None)
 
             TaskMetricsCollector.statistics[self.controller_name].append(
                 task_info)
@@ -288,13 +295,19 @@ class TaskMetricsCollector(TaskCollection):
                              f"reasoning={task_info['reasoning_tokens']} "
                              f"total={task_info['total_tokens']}")
 
+        if task_info.get('perf_metrics'):
+            perf_str = ", ".join(
+                f"{k}={v:.2f}" if isinstance(v, float) else f"{k}={v}"
+                for k, v in task_info['perf_metrics'].items())
+            log_parts.append(f"📊 {perf_str}")
+
         print(" | ".join(log_parts))
 
     @staticmethod
     def _compute_stats(values: List[float]) -> Dict[str, float]:
-        """Compute avg, median, min, max for a list of values."""
+        """Compute avg, median, min, max, sum for a list of values."""
         if not values:
-            return {'avg': 0, 'median': 0, 'min': 0, 'max': 0}
+            return {'avg': 0, 'median': 0, 'min': 0, 'max': 0, 'sum': 0}
         sorted_vals = sorted(values)
         n = len(sorted_vals)
         median = sorted_vals[n //
@@ -305,13 +318,14 @@ class TaskMetricsCollector(TaskCollection):
             'median': median,
             'min': min(values),
             'max': max(values),
+            'sum': sum(values),
         }
 
     @staticmethod
     def print_summary():
         """Print summary statistics for all controllers."""
         print("\n" + "=" * 80)
-        print("TASK PROFILER SUMMARY")
+        print("TASK METRICS SUMMARY")
         print("=" * 80)
 
         for controller_name, task_list in TaskMetricsCollector.statistics.items(
@@ -319,11 +333,13 @@ class TaskMetricsCollector(TaskCollection):
             if not task_list:
                 continue
 
-            print(f"\n📊 {controller_name}")
+            print(f"\n📊 {controller_name} ({len(task_list)} records)")
             print("-" * 70)
 
             # Group by task type
             task_type_data: Dict[str, Dict[str, List[float]]] = {}
+            perf_metrics_agg: Dict[str, Dict[str, List[float]]] = {}
+
             for task_info in task_list:
                 task_type = task_info['task_type']
                 if task_type not in task_type_data:
@@ -334,6 +350,7 @@ class TaskMetricsCollector(TaskCollection):
                         'reasoning_tokens': [],
                         'total_tokens': [],
                     }
+                    perf_metrics_agg[task_type] = {}
 
                 data = task_type_data[task_type]
                 data['duration_ms'].append(task_info['duration_ms'])
@@ -344,6 +361,15 @@ class TaskMetricsCollector(TaskCollection):
                     task_info.get('reasoning_tokens', 0))
                 data['total_tokens'].append(task_info.get('total_tokens', 0))
 
+                # Aggregate perf_metrics
+                if task_info.get('perf_metrics'):
+                    for key, value in task_info['perf_metrics'].items():
+                        if isinstance(value, (int, float)):
+                            if key not in perf_metrics_agg[task_type]:
+                                perf_metrics_agg[task_type][key] = []
+                            perf_metrics_agg[task_type][key].append(
+                                float(value))
+
             # Print statistics for each task type
             for task_type, data in task_type_data.items():
                 count = len(data['duration_ms'])
@@ -353,7 +379,8 @@ class TaskMetricsCollector(TaskCollection):
                 duration_stats = TaskMetricsCollector._compute_stats(
                     data['duration_ms'])
                 print(
-                    f"    Duration (ms):     avg={duration_stats['avg']:.2f}, "
+                    f"    Duration (ms):     sum={duration_stats['sum']:.2f}, "
+                    f"avg={duration_stats['avg']:.2f}, "
                     f"median={duration_stats['median']:.2f}, "
                     f"min={duration_stats['min']:.2f}, max={duration_stats['max']:.2f}"
                 )
@@ -370,37 +397,87 @@ class TaskMetricsCollector(TaskCollection):
                         data['total_tokens'])
 
                     print(
-                        f"    Prompt tokens:     avg={prompt_stats['avg']:.1f}, "
+                        f"    Prompt tokens:     sum={prompt_stats['sum']:.0f}, "
+                        f"avg={prompt_stats['avg']:.1f}, "
                         f"median={prompt_stats['median']:.1f}, "
                         f"min={prompt_stats['min']:.0f}, max={prompt_stats['max']:.0f}"
                     )
                     print(
-                        f"    Completion tokens: avg={completion_stats['avg']:.1f}, "
+                        f"    Completion tokens: sum={completion_stats['sum']:.0f}, "
+                        f"avg={completion_stats['avg']:.1f}, "
                         f"median={completion_stats['median']:.1f}, "
                         f"min={completion_stats['min']:.0f}, max={completion_stats['max']:.0f}"
                     )
                     print(
-                        f"    Reasoning tokens:  avg={reasoning_stats['avg']:.1f}, "
+                        f"    Reasoning tokens:  sum={reasoning_stats['sum']:.0f}, "
+                        f"avg={reasoning_stats['avg']:.1f}, "
                         f"median={reasoning_stats['median']:.1f}, "
                         f"min={reasoning_stats['min']:.0f}, max={reasoning_stats['max']:.0f}"
                     )
                     print(
-                        f"    Total tokens:      avg={total_stats['avg']:.1f}, "
+                        f"    Total tokens:      sum={total_stats['sum']:.0f}, "
+                        f"avg={total_stats['avg']:.1f}, "
                         f"median={total_stats['median']:.1f}, "
                         f"min={total_stats['min']:.0f}, max={total_stats['max']:.0f}"
                     )
 
+                # Perf metrics stats
+                if perf_metrics_agg[task_type]:
+                    print("\n    Perf Metrics:")
+                    for metric_name, values in sorted(
+                            perf_metrics_agg[task_type].items()):
+                        stats = TaskMetricsCollector._compute_stats(values)
+                        print(f"      {metric_name}: sum={stats['sum']:.2f}, "
+                              f"avg={stats['avg']:.2f}, "
+                              f"median={stats['median']:.2f}, "
+                              f"min={stats['min']:.2f}, "
+                              f"max={stats['max']:.2f}")
+
         print("\n" + "=" * 80 + "\n")
 
     @staticmethod
-    def get_statistics() -> Dict[str, List[Dict[str, Any]]]:
-        """Get global statistics."""
+    def get_statistics(
+            controller_name: str = None) -> Dict[str, List[Dict[str, Any]]]:
+        """Get statistics for a specific controller or all controllers."""
+        if controller_name is not None:
+            return {
+                controller_name:
+                TaskMetricsCollector.statistics.get(controller_name, [])
+            }
         return TaskMetricsCollector.statistics
 
     @staticmethod
-    def reset():
-        """Reset all statistics."""
-        TaskMetricsCollector.statistics.clear()
+    def get_all_records() -> List[Dict[str, Any]]:
+        """Get all records across all controllers as a flat list."""
+        all_records = []
+        for records in TaskMetricsCollector.statistics.values():
+            all_records.extend(records)
+        # Sort by timestamp
+        all_records.sort(key=lambda x: x.get('timestamp', 0))
+        return all_records
+
+    @staticmethod
+    def export_to_json(file_path: str, controller_name: str = None):
+        """Export metrics to a JSON file."""
+        if controller_name is not None:
+            data = TaskMetricsCollector.statistics.get(controller_name, [])
+        else:
+            data = TaskMetricsCollector.statistics
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False, default=str)
+
+    @staticmethod
+    def reset(controller_name: str = None):
+        """Reset statistics for a specific controller or all controllers."""
+        if controller_name is not None:
+            if controller_name in TaskMetricsCollector.statistics:
+                TaskMetricsCollector.statistics[controller_name] = []
+        else:
+            TaskMetricsCollector.statistics.clear()
+
+    @staticmethod
+    def get_global_info() -> Any:
+        return TaskMetricsCollector.statistics
 
 
 class SubRequestMarker(TaskCollection):
