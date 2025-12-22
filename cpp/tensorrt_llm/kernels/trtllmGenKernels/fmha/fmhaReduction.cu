@@ -363,7 +363,7 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams 
     cudaLaunchAttribute attribute[1];
     attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attribute[0].val.programmaticStreamSerializationAllowed
-        = (tensorrt_llm::common::getEnvEnablePDL() && !tensorrt_llm::common::getEnvDisableMhaPDL()) ? 1 : 0;
+        = (tensorrt_llm::common::getEnvEnablePDL_() && !tensorrt_llm::common::getEnvDisableMhaPDL()) ? 1 : 0;
     cudaLaunchConfig_t config;
     config.gridDim = gridDim;
     config.blockDim = blockDim;

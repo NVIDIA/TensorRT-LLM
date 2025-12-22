@@ -80,7 +80,7 @@ void invokeQuantizeMatrix(T_OUT* output, T_S const* input_scale, T_IN const* inp
     config.stream = stream;
     cudaLaunchAttribute attrs[1];
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL_();
     config.numAttrs = 1;
     config.attrs = attrs;
     if (quantize_mode == QuantizeMode::PER_CHANNEL)
@@ -114,7 +114,7 @@ void invokeDequantizeMatrix(T_OUT* output, T_S const* input_scale, T_IN const* i
     config.stream = stream;
     cudaLaunchAttribute attrs[1];
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL_();
     config.numAttrs = 1;
     config.attrs = attrs;
     if (quantize_mode == QuantizeMode::PER_CHANNEL)

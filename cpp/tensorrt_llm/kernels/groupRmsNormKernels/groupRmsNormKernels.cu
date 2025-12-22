@@ -625,7 +625,7 @@ void GroupRMSNormBaseKernel(GroupRMSParams<n>& params)
     cfg.dynamicSmemBytes = 0;
     cfg.stream = params.stream;
     attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attribute[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0;
+    attribute[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL_() ? 1 : 0;
     cfg.attrs = attribute;
     cfg.numAttrs = 1;
     if (rounds > 1)
@@ -702,7 +702,7 @@ void GroupRMSNormKernelLargeBatch(GroupRMSParams<n>& params)
     cfg.dynamicSmemBytes = 0;
     cfg.stream = params.stream;
     attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attribute[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0;
+    attribute[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL_() ? 1 : 0;
     cfg.attrs = attribute;
     cfg.numAttrs = 1;
     bool MultiRounds_0 = rounds_0 > 1;
