@@ -1144,24 +1144,31 @@ class NVFP4LinearMethod(LinearMethodBase):
             assert (
                 weight_col_size * 2
             ) % module.scaling_vector_size == 0, f"weight column size after padding {weight_col_size} must be divisible by scaling_vector_size {module.scaling_vector_size}"
-            # Pad weight_scale to match padded weight dimensions
-            # Padding should be performed on unswizzled weight_scale tensor
             scale_rows = fp4_utils.pad_up(module.out_features, 128)
             scale_cols = fp4_utils.pad_up(
                 module.in_features // module.scaling_vector_size, 4)
-            weight_scale_unswizzle = unswizzle_sf(module.weight_scale.data,
-                                                  scale_rows, scale_cols,
-                                                  module.scaling_vector_size)
-            weight_scale_unswizzle_pad = F.pad(
-                weight_scale_unswizzle,
-                (0, (col_pad_size * 2) // module.scaling_vector_size, 0,
-                 row_pad_size),
-                mode='constant',
-                value=0)
-            module.weight_scale = Parameter(
-                torch.ops.trtllm.block_scale_interleave(
-                    weight_scale_unswizzle_pad),
-                requires_grad=False)
+            scale_pad_row = fp4_utils.pad_up(module.out_features + row_pad_size,
+                                             128) - scale_rows
+            # here one col_size of weight equals two linear in_features
+            scale_pad_col = fp4_utils.pad_up(
+                (module.in_features + (col_pad_size * 2)) //
+                module.scaling_vector_size, 4) - scale_cols
+            # Pad weight_scale to match padded weight dimensions
+            # Padding should be performed on unswizzled weight_scale tensor
+            if scale_pad_row != 0 or scale_pad_col != 0:
+                weight_scale_unswizzle = unswizzle_sf(
+                    module.weight_scale.data, scale_rows,
+                    scale_cols * module.scaling_vector_size,
+                    module.scaling_vector_size)
+                weight_scale_unswizzle_pad = F.pad(
+                    weight_scale_unswizzle,
+                    (0, scale_pad_col, 0, scale_pad_row),
+                    mode='constant',
+                    value=0)
+                module.weight_scale = Parameter(
+                    torch.ops.trtllm.block_scale_interleave(
+                        weight_scale_unswizzle_pad),
+                    requires_grad=False)
 
 
 class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
