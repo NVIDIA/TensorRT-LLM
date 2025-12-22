@@ -1,6 +1,5 @@
 """Graph-related utilities for transformations."""
 
-from collections import deque
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, Optional, Tuple, Union
 
@@ -18,7 +17,7 @@ from torch.fx.passes.shape_prop import _extract_tensor_metadata
 from torch.utils._pytree import _LEAF_SPEC
 
 from .logger import ad_logger
-from .node_utils import get_weight_tensor, is_linear_op, is_op
+from .node_utils import get_weight_tensor, is_op
 
 _NoValType = type("_NoValType", (), {})
 _NO_VAL = _NoValType()
@@ -374,60 +373,31 @@ def get_input_embeddings(model: nn.Module) -> torch.Tensor:
         f"Expected exactly 1 unique embedding weight, but found {len(unique_embedding_weights)}."
     )
 
-    print(f"Unique embedding weights: {unique_embedding_weights}")
     return unique_embedding_weights[0]
 
 
-def find_output_node(model: nn.Module) -> tuple[GraphModule, Node]:
+def get_output_node(model: nn.Module) -> tuple[GraphModule, Node]:
     """Find the unique output node across all graph modules."""
     output_nodes = []
     for _, gm in named_graphmodules(model):
-        for node in gm.graph.nodes:
-            if node.op == "output":
-                output_nodes.append((gm, node))
+        output_nodes.extend([(gm, node) for node in gm.graph.find_nodes(op="output")])
 
     assert len(output_nodes) == 1, f"Expected exactly 1 output node, but found {len(output_nodes)}."
-
     return output_nodes[0]
 
 
-def find_lm_head_node(model: nn.Module) -> tuple[GraphModule, Node]:
-    """Find the lm_head node by traversing backwards from the output node."""
-    print(
-        f"Finding lm_head node in model: {model}"
-    )  # Want to see if model is already a graph module.
-    gm, output_node = find_output_node(model)
+def get_lm_head_node(gm: GraphModule, output_node: Optional[Node] = None) -> Node:
+    if output_node is None:
+        output_node = gm.graph.find_nodes(op="output")[0]
 
-    print(f"Output node: {output_node}")
+    lm_head_node = output_node.all_input_nodes[0]
+    if is_op(lm_head_node, torch.ops.aten.to):
+        lm_head_node = lm_head_node.all_input_nodes[0]
 
-    visited = set()
-    queue = deque()
+    return lm_head_node
 
-    for arg in output_node.args:
-        if isinstance(arg, Node):
-            queue.append(arg)
-        elif isinstance(arg, (list, tuple)):
-            for item in arg:
-                if isinstance(item, Node):
-                    queue.append(item)
 
-    lm_head_node = None
-    while queue:
-        node = queue.popleft()
-        if node in visited:
-            continue
-        visited.add(node)
-
-        if is_linear_op(node):
-            lm_head_node = node
-            break
-
-        for arg in node.args:
-            if isinstance(arg, Node) and arg not in visited:
-                queue.append(arg)
-
-    assert lm_head_node is not None, (
-        "Could not find lm_head linear op by traversing backwards from output node."
-    )
-
-    return gm, lm_head_node
+def get_lm_head_weights(model: nn.Module) -> torch.Tensor:
+    gm, output_node = get_output_node(model)
+    lm_head_node = get_lm_head_node(gm, output_node)
+    return get_weight_tensor(gm, lm_head_node)

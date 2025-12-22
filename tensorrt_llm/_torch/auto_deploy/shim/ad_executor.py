@@ -22,8 +22,7 @@ from strenum import StrEnum
 from torch._prims_common import DeviceLikeType
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionRuntimeFeatures
-from tensorrt_llm._torch.auto_deploy.utils._graph import find_lm_head_node, get_input_embeddings
-from tensorrt_llm._torch.auto_deploy.utils.node_utils import get_weight_tensor
+from tensorrt_llm._torch.auto_deploy.utils._graph import get_input_embeddings, get_lm_head_weights
 from tensorrt_llm._torch.models.modeling_speculative import Eagle3ForCausalLM
 from tensorrt_llm._torch.pyexecutor._util import (
     _create_kv_cache_manager,
@@ -865,8 +864,7 @@ def share_target_weights_with_draft(
     ):
         vocab_size = target_model_engine.cache_seq_interface.info.vocab_size_padded
 
-        gm, lm_head_node = find_lm_head_node(target_model_engine.model)
-        lm_head_weight = get_weight_tensor(gm, lm_head_node)
+        lm_head_weight = get_lm_head_weights(target_model_engine.model)
 
         assert lm_head_weight.shape[0] == vocab_size, (
             f"Expected lm_head weight first dimension to be vocab_size={vocab_size}, "

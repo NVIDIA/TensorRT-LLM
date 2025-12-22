@@ -155,6 +155,12 @@ class DetectHiddenStatesForCapture(BaseTransform):
             info = TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
             return gm, info
 
+        if gm.graph.find_nodes(
+            op="call_function", target=torch.ops.auto_deploy.residual_add_for_capture.default
+        ):
+            info = TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
+            return gm, info
+
         residual_add_nodes = self.collect_residual_add_nodes(gm)
 
         if self.config.eagle3_layers_to_capture is None:
