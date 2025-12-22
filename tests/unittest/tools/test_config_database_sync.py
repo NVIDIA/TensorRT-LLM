@@ -14,7 +14,9 @@
 # limitations under the License.
 
 import importlib.util
+import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -26,8 +28,11 @@ _spec = importlib.util.spec_from_file_location(
     "generate_config_table", REPO_ROOT / "scripts" / "generate_config_table.py"
 )
 _module = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = _module
 _spec.loader.exec_module(_module)
 generate_rst = _module.generate_rst
+generate_json = _module.generate_json
+RecipeList = _module.RecipeList
 
 # Dynamically load generate_config_database_tests module without modifying sys.path
 _db_spec = importlib.util.spec_from_file_location(
@@ -35,6 +40,7 @@ _db_spec = importlib.util.spec_from_file_location(
     REPO_ROOT / "scripts" / "generate_config_database_tests.py",
 )
 _db_module = importlib.util.module_from_spec(_db_spec)
+sys.modules[_db_spec.name] = _db_module
 _db_spec.loader.exec_module(_db_module)
 generate_tests = _db_module.generate_tests
 TEST_LIST_PATH = _db_module.TEST_LIST_PATH
@@ -75,6 +81,77 @@ class TestConfigDatabaseSync(unittest.TestCase):
             "config_table.rst is not synchronized with lookup.yaml. "
             "Please run 'python3 scripts/generate_config_table.py' from the repo root to update it.",
         )
+
+    def test_config_db_json_generation(self):
+        """Test that config_db.json generation matches lookup.yaml entries.
+
+        Validates the generated JSON payload shape and that its entries correspond 1:1
+        with lookup.yaml recipes, without relying on a committed JSON artifact.
+        """
+        if generate_json is None or RecipeList is None:
+            self.skipTest("generate_config_table not available")
+
+        yaml_path = os.path.join(REPO_ROOT, "examples/configs/database/lookup.yaml")
+        self.assertTrue(os.path.exists(yaml_path), f"YAML file not found: {yaml_path}")
+
+        recipes = RecipeList.from_yaml(Path(yaml_path))
+        expected = {
+            (
+                r.model,
+                r.gpu,
+                int(r.num_gpus),
+                int(r.isl),
+                int(r.osl),
+                int(r.concurrency),
+                r.config_path,
+            )
+            for r in recipes
+        }
+
+        with tempfile.NamedTemporaryFile(mode="w+", suffix=".json", delete=True) as tmp:
+            generate_json(yaml_path, output_file=tmp.name)
+            tmp.seek(0)
+            payload = json.load(tmp)
+
+        self.assertEqual(
+            payload.get("source"),
+            "examples/configs/database/lookup.yaml",
+            "Generated JSON 'source' field is unexpected.",
+        )
+
+        entries = payload.get("entries") or []
+        got = {
+            (
+                e.get("model"),
+                e.get("gpu"),
+                int(e.get("num_gpus")),
+                int(e.get("isl")),
+                int(e.get("osl")),
+                int(e.get("concurrency")),
+                e.get("config_path"),
+            )
+            for e in entries
+        }
+
+        self.assertEqual(
+            expected,
+            got,
+            "Generated config_db.json entries do not match lookup.yaml recipes.",
+        )
+
+        for e in entries:
+            cmd = e.get("command") or ""
+            self.assertIn("--config", cmd)
+            self.assertNotIn("extra_llm_api_options", cmd)
+            self.assertIn("${TRTLLM_DIR}/", cmd)
+
+            config_path = e.get("config_path") or ""
+            self.assertTrue(config_path)
+
+            gh = e.get("config_github_url") or ""
+            raw = e.get("config_raw_url") or ""
+            self.assertTrue(gh.endswith(config_path))
+            self.assertTrue(raw.endswith(config_path))
 
     def test_config_database_tests_sync(self):
         """Test that config database test files are synchronized with lookup.yaml.
