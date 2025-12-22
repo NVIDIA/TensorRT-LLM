@@ -461,6 +461,7 @@ class MistralCommonInputProcessor(Mistral3InputProcessor):
         super().__init__(model_path=model_path,
                          config=config,
                          tokenizer=tokenizer,
+                         trust_remote_code=trust_remote_code,
                          model_type="mistral_large_3",
                          **kwargs)
 
