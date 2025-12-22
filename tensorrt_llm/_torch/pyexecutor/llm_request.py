@@ -262,6 +262,8 @@ class PyResult:
             chunk_size=self._chunk_size) if return_generation_logits else None
         self._log_probs = LogProbStorage() if return_log_probs else None
         self._mm_embeddings = None
+        self._mrope_position_ids = None
+        self._mrope_position_deltas = None
         self._additional_context_outputs = {
             name: []
             for name in additional_outputs
@@ -292,6 +294,16 @@ class PyResult:
     def append_mm_embeddings(self, mm_embeddings: torch.Tensor):
         self._mm_embeddings = SharedTensorContainer.from_tensor(
             mm_embeddings).dump_to_dict()
+
+    def set_mrope_position(
+        self,
+        mrope_position_ids: torch.Tensor,
+        mrope_position_deltas: torch.Tensor,
+    ):
+        self._mrope_position_ids = (SharedTensorContainer.from_tensor(
+            mrope_position_ids).dump_to_dict())
+        self._mrope_position_deltas = (SharedTensorContainer.from_tensor(
+            mrope_position_deltas).dump_to_dict())
 
     def transfer_remaining_device_logits(self):
         """Finalize any remaining generation logits transfers (for chunked mode)"""
@@ -353,6 +365,18 @@ class PyResult:
         return self._mm_embeddings
 
     @property
+    def mrope_position_ids_handle(self) -> Dict[str, Any] | None:
+        # NOTE: when populated, the returned `dict` contains the information necessary to rebuild
+        # the `SharedTensorContainer` using the `from_dict` class method.
+        return self._mrope_position_ids
+
+    @property
+    def mrope_position_deltas_handle(self) -> Dict[str, Any] | None:
+        # NOTE: when populated, the returned `dict` contains the information necessary to rebuild
+        # the `SharedTensorContainer` using the `from_dict` class method.
+        return self._mrope_position_deltas
+
+    @property
     def additional_context_outputs(self) -> Dict[str, torch.Tensor] | None:
         if self._additional_context_outputs is None:
             return None
@@ -382,7 +406,8 @@ class LlmResult:
     py_result_properties = frozenset(
         ('context_logits', 'generation_logits', 'log_probs', 'cum_log_probs',
          'mm_embedding_handle', 'additional_context_outputs',
-         'additional_generation_outputs'))
+         'additional_generation_outputs', 'mrope_position_ids_handle',
+         'mrope_position_deltas_handle'))
 
     def __init__(self,
                  result: Union[bytes, tensorrt_llm.bindings.executor.Result],
