@@ -23,10 +23,33 @@
 }
 
 .trtllm-config-selector__label {
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: 8px;
   font-size: 0.85rem;
   margin-bottom: 6px;
   opacity: 0.9;
+}
+
+.trtllm-config-selector__step {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  border: 1px solid rgba(127, 127, 127, 0.18);
+  background: rgba(127, 127, 127, 0.06);
+  color: inherit;
+  opacity: 0.65;
+}
+
+.trtllm-config-selector__labelText {
+  line-height: 1.2;
 }
 
 .trtllm-config-selector__select {

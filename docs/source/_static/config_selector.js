@@ -203,23 +203,35 @@
 
     const form = el("div", { class: "trtllm-config-selector__form" });
 
-    function mkSelect(labelText, id) {
+    function mkSelect(labelText, id, stepNumber) {
       const label = el("label", {
         class: "trtllm-config-selector__label",
         for: id,
-        text: labelText,
       });
+      label.appendChild(
+        el("span", {
+          class: "trtllm-config-selector__step",
+          "aria-hidden": "true",
+          text: String(stepNumber),
+        }),
+      );
+      label.appendChild(
+        el("span", {
+          class: "trtllm-config-selector__labelText",
+          text: labelText,
+        }),
+      );
       const select = el("select", { class: "trtllm-config-selector__select", id });
       const wrap = el("div", { class: "trtllm-config-selector__field" }, [label, select]);
       return { wrap, select };
     }
 
     const id = ++widgetId;
-    const selModel = mkSelect("Model", `trtllm-model-${id}`);
-    const selTopo = mkSelect("Topology", `trtllm-topo-${id}`);
-    const selSeq = mkSelect("ISL / OSL", `trtllm-seq-${id}`);
-    const selProf = mkSelect("Performance profile", `trtllm-prof-${id}`);
-    const selConc = mkSelect("Concurrency", `trtllm-conc-${id}`);
+    const selModel = mkSelect("Model", `trtllm-model-${id}`, 1);
+    const selTopo = mkSelect("GPU(s)", `trtllm-topo-${id}`, 2);
+    const selSeq = mkSelect("ISL / OSL", `trtllm-seq-${id}`, 3);
+    const selProf = mkSelect("Performance profile", `trtllm-prof-${id}`, 4);
+    const selConc = mkSelect("Concurrency", `trtllm-conc-${id}`, 5);
 
     form.appendChild(selModel.wrap);
     form.appendChild(selTopo.wrap);
@@ -386,7 +398,7 @@
       if (!state.model && modelOpts.length === 1) state.model = modelOpts[0].value;
       setSelectOptions(selModel.select, modelOpts, state.model, "Select a model…");
 
-      // Topology options
+      // GPU(s) options
       const topoEntries = entries.filter((e) => !state.model || e.model === state.model);
       const topoOpts = uniqBy(
         topoEntries.map((e) => ({
@@ -400,7 +412,7 @@
         .sort((a, b) => sortNums(a.num_gpus, b.num_gpus) || sortStrings(a.gpu, b.gpu));
       if (state.topology && !topoOpts.some((o) => o.value === state.topology)) state.topology = "";
       if (!state.topology && topoOpts.length === 1) state.topology = topoOpts[0].value;
-      setSelectOptions(selTopo.select, topoOpts, state.topology, "Select a topology…");
+      setSelectOptions(selTopo.select, topoOpts, state.topology, "Select GPU(s)…");
 
       // ISL/OSL options
       const seqEntries = entries.filter((e) => {
