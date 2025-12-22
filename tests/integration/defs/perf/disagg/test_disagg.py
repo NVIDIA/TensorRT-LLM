@@ -77,6 +77,9 @@ class TestDisaggBenchmark:
         # Start tracking test case
         test_tracker.start_test_case(test_case_name)
 
+        job_id = None
+        result = None
+        
         try:
             logger.info(f"\n{'=' * 60}")
             logger.info(f"Performance Test: {test_config.display_name}")
@@ -89,6 +92,7 @@ class TestDisaggBenchmark:
             logger.info(f"Metrics log: {test_config.metrics_config.log_file}")
             logger.info(f"Supported GPUs: {', '.join(test_config.supported_gpus)}")
             logger.info(f"{'=' * 60}")
+            
             if EnvManager.get_debug_mode():
                 logger.debug(
                     f"Debug mode: Skipping job submission, using job_id: {EnvManager.get_debug_job_id()}"
@@ -102,20 +106,10 @@ class TestDisaggBenchmark:
                 assert success, f"Job submission failed: {test_config.test_id}"
                 assert job_id, "Unable to get job ID"
 
-                # Wait for completion (with early failure detection)
-                completed, error_msg = JobManager.wait_for_completion(
+                # Wait for completion (timeout/early failure handled inside)
+                JobManager.wait_for_completion(
                     job_id, 7200, test_config, check_early_failure=True
                 )
-                if not completed:
-                    JobManager.cancel_job(job_id)
-                    result_dir = JobManager.get_result_dir(test_config)
-                    JobManager.backup_logs(job_id, test_config, result_dir, False)
-                    JobManager.cleanup_result_dir(result_dir)
-                    # Provide detailed error message
-                    if error_msg == "timeout":
-                        assert False, f"Job execution timeout after 7200s: {job_id}"
-                    else:
-                        assert False, f"Job failed early: {error_msg} (job_id: {job_id})"
 
             # End tracking test case
             test_tracker.end_test_case()
@@ -130,6 +124,15 @@ class TestDisaggBenchmark:
         except Exception as e:
             test_tracker.end_test_case()
             raise e
+        finally:
+            # Always backup logs, regardless of success or failure
+            if job_id:
+                result_dir = JobManager.get_result_dir(test_config)
+                is_passed = result.get("success", False) if result else False
+                try:
+                    JobManager.backup_logs(job_id, test_config, result_dir, is_passed)
+                except Exception as backup_error:
+                    logger.error(f"Failed to backup logs: {backup_error}")
 
     @pytest.mark.accuracy
     @pytest.mark.parametrize("test_config", ACCURACY_TEST_CASES)
@@ -150,6 +153,9 @@ class TestDisaggBenchmark:
         # Start tracking test case
         test_tracker.start_test_case(test_case_name)
 
+        job_id = None
+        result = None
+        
         try:
             logger.info(f"\n{'=' * 60}")
             logger.info(f"Accuracy Test: {test_config.display_name}")
@@ -180,26 +186,17 @@ class TestDisaggBenchmark:
                 assert success, f"Job submission failed: {test_config.test_id}"
                 assert job_id, "Unable to get job ID"
 
-                # Wait for completion (accuracy tests may need more time - 3 hours timeout)
-                completed, error_msg = JobManager.wait_for_completion(
-                    job_id, 7200, test_config, check_early_failure=True
+                # Wait for completion (timeout/early failure handled inside)
+                JobManager.wait_for_completion(
+                    job_id, 10800, test_config, check_early_failure=True
                 )
-                if not completed:
-                    JobManager.cancel_job(job_id)
-                    result_dir = JobManager.get_result_dir(test_config)
-                    JobManager.backup_logs(job_id, test_config, result_dir, False)
-                    JobManager.cleanup_result_dir(result_dir)
-                    # Provide detailed error message
-                    if error_msg == "timeout":
-                        assert False, f"Accuracy test timeout after 10800s: {job_id}"
-                    else:
-                        assert False, f"Accuracy test failed early: {error_msg} (job_id: {job_id})"
 
             # End tracking test case
             test_tracker.end_test_case()
 
             # Get timestamps information
             timestamps = test_tracker.get_timestamps()
+            
             # Check results and validate accuracy
             result = JobManager.check_result(job_id, test_config, timestamps, full_test_name)
             assert result["success"], (
@@ -209,6 +206,15 @@ class TestDisaggBenchmark:
         except Exception as e:
             test_tracker.end_test_case()
             raise e
+        finally:
+            # Always backup logs, regardless of success or failure
+            if job_id:
+                result_dir = JobManager.get_result_dir(test_config)
+                is_passed = result.get("success", False) if result else False
+                try:
+                    JobManager.backup_logs(job_id, test_config, result_dir, is_passed)
+                except Exception as backup_error:
+                    logger.error(f"Failed to backup logs: {backup_error}")
 
 
 if __name__ == "__main__":
