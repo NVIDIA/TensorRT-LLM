@@ -90,6 +90,9 @@ struct BeamSearchParams
                                              // match trt-llm API.
 };
 
+uint32_t computeNbSubSeqPerSeqMHA(
+    cudaDeviceProp const& prop, uint32_t batchSize, uint32_t nbKHeads, uint32_t maxSeqLen);
+
 void launchMHA(cudaDeviceProp const& prop, uint32_t const nbKHeads,
 #if SLIDING_WINDOW
     uint32_t slidingWinSize,
@@ -135,6 +138,9 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t const nbKHeads,
 #endif
 #endif
     uint32_t* semaphores, void* scratch, cudaStream_t stream);
+
+uint32_t computeNbSubSeqPerSeqHopperF8MHA(
+    cudaDeviceProp const& prop, uint32_t batchSize, uint32_t nbKHeads, uint32_t maxSeqLen);
 
 void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #if SLIDING_WINDOW

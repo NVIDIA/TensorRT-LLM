@@ -52,7 +52,7 @@ template <typename MathElem, uint32_t tileSize, bool isPaged, bool useBeamSearch
 Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refFlashAttention(IOHead const* q,
     CacheSeq<isPaged, useBeamSearch> const& k, CacheSeq<isPaged, useBeamSearch> const& v, uint32_t seqLen, float qScale,
     float kvScale, float xScale, uint32_t slidingWinSize, float* attentionSinks, float skip_softmax_threshold,
-    uint32_t* skipped_block_count, uint32_t* total_block_count)
+    uint32_t* skipped_block_count, uint32_t* total_block_count, uint32_t multi_block_num)
 {
     uint32_t const nbTiles = divUp(seqLen, tileSize);
     auto gemm1Acc = Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor>::Zero().eval();
@@ -63,6 +63,15 @@ Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refFlashAt
     float const qkScale = qScale * kvScale / sqrtf(validElemsPerHead);
     uint32_t const seqBeg = (seqLen < slidingWinSize ? 0 : seqLen - slidingWinSize);
     uint32_t const idxTileBeg = seqBeg / tileSize;
+
+    uint32_t const nbSubSeq = (multi_block_num > 0 && nbTiles >= 2) ? mha::min(nbTiles, multi_block_num) : 1;
+    // uint32_t const nbSubSeq = 1;
+    std::vector<Eigen::Vector<float, headGrpSize>> skipRowMaxs(nbSubSeq);
+    for (uint32_t i = 0; i < nbSubSeq; i++)
+    {
+        skipRowMaxs[i].fill(-INFINITY);
+    }
+
     for (uint32_t idxTile = idxTileBeg; idxTile < nbTiles; idxTile++)
     {
         Eigen::Matrix<float, headGrpSize, tileSize, Eigen::RowMajor> gemm0Acc;
@@ -92,6 +101,7 @@ Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refFlashAt
 
         Eigen::Vector<float, headGrpSize> const localRowMax = gemm0Acc.rowwise().maxCoeff().eval();
         Eigen::Vector<float, headGrpSize> const tileRowMax = localRowMax.cwiseMax(rowMax).eval();
+        skipRowMaxs[idxTile % nbSubSeq] = localRowMax.cwiseMax(skipRowMaxs[idxTile % nbSubSeq]).eval();
 
         // printf("\n===================\n");
 
@@ -99,7 +109,8 @@ Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refFlashAt
         if (skip_softmax_threshold > 0)
         {
             *total_block_count += 1;
-            auto const skip_softmax_mask = ((localRowMax - tileRowMax).array().exp() < skip_softmax_threshold);
+            auto const skip_softmax_mask
+                = ((localRowMax - skipRowMaxs[idxTile % nbSubSeq]).array() < std::log(skip_softmax_threshold));
             bool const skip_block = skip_softmax_mask.all() && (idxTile != nbTiles - 1);
             if (skip_block)
             {
@@ -157,7 +168,8 @@ Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refFlashAt
     refFlashAttention<prec, tileSize, isPaged, useBeamSearch>(IOHead const* q,                                         \
         CacheSeq<isPaged, useBeamSearch> const& k, CacheSeq<isPaged, useBeamSearch> const& v, uint32_t seqLen,         \
         float qScale, float kvScale, float xScale, uint32_t slidingWinSize, float* attentionSinks,                     \
-        float skip_softmax_threshold, uint32_t* skipped_block_count, uint32_t* total_block_count)
+        float skip_softmax_threshold, uint32_t* skipped_block_count, uint32_t* total_block_count,                      \
+        uint32_t multi_block_num)
 
 INSTANTIATE_refFlashAttention(CacheElem, 64, false, false);
 INSTANTIATE_refFlashAttention(CacheElem, 64, false, true);

@@ -786,11 +786,6 @@ CUBIN_EXPORT __global__
     static_assert(multiBlockMinNbTiles >= multiBlockMinNbTilesPerCta * 2);
     assert(isMultiBlockMode == (nbSubSeq > 1));
 #if SKIP_SOFTMAX_ATTN
-    if (isMultiBlockMode)
-    {
-        // printf("MultiBlockMode is not implemented for skip softmax attention!\n");
-        __trap();
-    }
     float const skipSoftmaxThreshold = skipSoftmaxThresholdPtr == nullptr ? 0.0f : skipSoftmaxThresholdPtr[0];
 #endif
     if (idxSubSeq >= nbSubSeq)
@@ -3413,6 +3408,24 @@ __device__ inline void storeRotatedPairsForQ(SharedMem::QBuffer& dst,
 }
 
 #ifndef GENERATE_CUBIN
+uint32_t computeNbSubSeqPerSeqHopperF8MHA(
+    cudaDeviceProp const& prop, uint32_t batchSize, uint32_t nbKHeads, uint32_t maxSeqLen)
+{
+    auto const env = std::getenv("XQA_NB_SUB_SEQ");
+    if (env != nullptr)
+    {
+        int32_t const val = std::stoi(env);
+        if (val > 0)
+        {
+            return val;
+        }
+    }
+    float const factor = 0.25f;
+    return mha::min<uint32_t>(
+        mha::max<uint32_t>(1U, (uint32_t) round(prop.multiProcessorCount * 3 / (batchSize * nbKHeads) * factor)),
+        divUp(maxSeqLen, gemm0CtaTileNbTokens));
+}
+
 void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #if SLIDING_WINDOW
     uint32_t slidingWinSize,
@@ -3474,22 +3487,7 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
     uint32_t const nbVHeads = nbKHeads;
     uint32_t const nbQHeads = nbKHeads * headGrpSize;
     uint32_t const nbQKVHeads = nbQHeads + nbKHeads + nbVHeads;
-    uint32_t const nbSubSeqPerSeq = [&]() -> uint32_t
-    {
-        auto const env = std::getenv("XQA_NB_SUB_SEQ");
-        if (env != nullptr)
-        {
-            int32_t const val = std::stoi(env);
-            if (val > 0)
-            {
-                return val;
-            }
-        }
-        float const factor = 0.25f;
-        return mha::min<uint32_t>(
-            mha::max<uint32_t>(1U, (uint32_t) round(prop.multiProcessorCount * 3 / (batchSize * nbKHeads) * factor)),
-            divUp(maxSeqLen, gemm0CtaTileNbTokens));
-    }();
+    uint32_t const nbSubSeqPerSeq = computeNbSubSeqPerSeqHopperF8MHA(prop, batchSize, nbKHeads, maxSeqLen);
 #if SPEC_DEC
     uint32_t const qSeqLen = specDecParams.qSeqLen;
 #else

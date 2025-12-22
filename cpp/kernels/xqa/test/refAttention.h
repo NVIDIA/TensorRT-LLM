@@ -89,7 +89,7 @@ template <typename MathElem, uint32_t tileSize, bool isPaged, bool useBeamSearch
 Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refFlashAttention(IOHead const* q,
     CacheSeq<isPaged, useBeamSearch> const& k, CacheSeq<isPaged, useBeamSearch> const& v, uint32_t seqLen, float qScale,
     float kvScale, float xScale, uint32_t slidingWinSize, float* attentionSinks, float skip_softmax_threshold,
-    uint32_t* skipped_block_count, uint32_t* total_block_count);
+    uint32_t* skipped_block_count, uint32_t* total_block_count, uint32_t multi_block_num);
 
 template <typename MathElem, bool isPaged, bool useBeamSearch>
 #if SPEC_DEC

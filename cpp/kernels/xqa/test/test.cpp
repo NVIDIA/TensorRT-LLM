@@ -747,6 +747,11 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
             maxSeqLen, &seqLenList[0][0], batchSize, kvCacheScale.get(), semaphores.get(), scratch, stream);
     };
 #else
+    auto multiBlockNum = [&]()
+    {
+        auto const calcFunc = useQGMMA ? &computeNbSubSeqPerSeqHopperF8MHA : &computeNbSubSeqPerSeqMHA;
+        return calcFunc(prop, batchSize, nbKHeads, maxSeqLen);
+    }();
     auto runKernel = [&]()
     {
         auto const launchFunc = useQGMMA ? &launchHopperF8MHA : &launchMHA;
@@ -1135,7 +1140,7 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
                     {
                         refOutput = refFlashAttention<CacheElem, 64>(&qHeads[req][b][headGrpSize * idxKHead], kCacheSeq,
                             vCacheSeq, seqLen, qScaleForRef, kvCacheScale[0], xScale, slidingWinSize, refAttentionSinks,
-                            skip_softmax_threshold, &skipped_block_count, &total_block_count);
+                            skip_softmax_threshold, &skipped_block_count, &total_block_count, multiBlockNum);
                         // refOutput = refAttention<CacheElem>(&qHeads[req][b][headGrpSize * idxKHead], kCacheSeq,
                         // vCacheSeq, seqLen, qScaleForRef, kvCacheScale[0], xScale, slidingWinSize);
                     }
