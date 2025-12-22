@@ -82,7 +82,7 @@ class _FlashInferPlanner:
             assert self.paged_kv_indices_buffer is not None
             assert self.paged_kv_last_page_len_buffer is not None
             if len(self.paged_kv_indices_buffer) < num_pages:
-                print(
+                ad_logger.info(
                     f"Resizing paged_kv_indices_buffer from {len(self.paged_kv_indices_buffer)} to {num_pages}"
                 )
                 self.paged_kv_indices_buffer.resize_(num_pages)
@@ -132,14 +132,11 @@ class _FlashInferPlanner:
         # plan decode helper function
         def _plan_decode(
             wrapper: flashinfer.BatchDecodeWithPagedKVCacheWrapper,
-            indptr: torch.Tensor,
-            indices: torch.Tensor,
-            last_page_len: torch.Tensor,
         ):
             wrapper.plan(
-                indptr,
-                indices,
-                last_page_len,
+                kv_page_indptr,
+                kv_page_indices,
+                kv_last_page_len,
                 plan_params.n_heads,
                 plan_params.n_kv_heads,
                 plan_params.head_dim,
@@ -156,17 +153,13 @@ class _FlashInferPlanner:
         ):
             # During CUDA graph capture, the metadata tensors provided by auto-deploy are stable.
             wrapper = self._init_decode_wrapper(
-                use_cuda_graph=False,
+                use_cuda_graph=True,
                 num_pages=len(kv_page_indices),
                 batch_size=len(kv_page_indptr) - 1,
             )
+            _plan_decode(wrapper)
             self.cached_cuda_graph_decode_wrappers[plan_params] = wrapper
-            _plan_decode(
-                wrapper,
-                kv_page_indptr,
-                kv_page_indices,
-                kv_last_page_len,
-            )
+
         # check if we are in cuda graph capture and just return the pre-cached decode wrapper
         if torch.cuda.is_current_stream_capturing() or cuda_graph_state.in_warm_up():
             assert plan_params.is_generate, "Only generate is supported during cuda graph capture."
@@ -179,7 +172,7 @@ class _FlashInferPlanner:
         # check for re-planning
         if plan_params != self.plan_params:
             if plan_params.is_generate:
-                _plan_decode(self.decode_wrapper, kv_page_indptr, kv_page_indices, kv_last_page_len)
+                _plan_decode(self.decode_wrapper)
             else:
                 # plan prefill
                 self.prefill_wrapper.plan(
