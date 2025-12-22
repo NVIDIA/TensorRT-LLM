@@ -18,6 +18,10 @@
 #include <torch/extension.h>
 #include <vector>
 
+namespace tensorrt_llm
+{
+inline namespace _v1
+{
 namespace torch_ext
 {
 
@@ -31,3 +35,5 @@ torch::Tensor matmul_to_nccl_window(torch::Tensor const& a, torch::Tensor const&
 torch::Tensor add_to_nccl_window(torch::Tensor const& a, torch::Tensor const& b, torch::List<int64_t> const& group);
 
 } // namespace torch_ext
+} // namespace _v1
+} // namespace tensorrt_llm

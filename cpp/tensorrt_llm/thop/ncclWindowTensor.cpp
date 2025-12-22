@@ -23,6 +23,10 @@
 
 namespace tc = tensorrt_llm::common;
 
+namespace tensorrt_llm
+{
+inline namespace _v1
+{
 namespace torch_ext
 {
 
@@ -138,11 +142,13 @@ torch::Tensor add_to_nccl_window(torch::Tensor const& a, torch::Tensor const& b,
 }
 
 } // namespace torch_ext
+} // namespace _v1
+} // namespace tensorrt_llm
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.def("create_nccl_window_tensor", &torch_ext::create_nccl_window_tensor);
-    m.def("copy_to_nccl_window", &torch_ext::copy_to_nccl_window);
-    m.def("matmul_to_nccl_window", &torch_ext::matmul_to_nccl_window);
-    m.def("add_to_nccl_window", &torch_ext::add_to_nccl_window);
+    m.def("create_nccl_window_tensor", &tensorrt_llm::torch_ext::create_nccl_window_tensor);
+    m.def("copy_to_nccl_window", &tensorrt_llm::torch_ext::copy_to_nccl_window);
+    m.def("matmul_to_nccl_window", &tensorrt_llm::torch_ext::matmul_to_nccl_window);
+    m.def("add_to_nccl_window", &tensorrt_llm::torch_ext::add_to_nccl_window);
 }
