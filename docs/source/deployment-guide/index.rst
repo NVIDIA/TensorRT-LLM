@@ -110,7 +110,7 @@ Recipe selector
 
 .. trtllm_config_selector::
 
-.. include:: note_sections.rst
+.. include:: ../_includes/note_sections.rst
    :start-after: .. start-note-traffic-patterns
    :end-before: .. end-note-traffic-patterns
 
