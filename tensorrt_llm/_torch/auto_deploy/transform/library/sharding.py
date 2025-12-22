@@ -135,6 +135,11 @@ class ShardingTransformConfig(TransformConfig):
     sharding_dims: List[ShardingDim] = Field(
         default_factory=lambda: [ShardingDim.TP, ShardingDim.EP, ShardingDim.BMM]
     )
+    shard_all_unprocessed: bool = Field(
+        default=False,
+        description="When True, apply simple shard (column split + all_gather) to "
+        "'leftover' linear nodes that are not part of any layer subgraph.",
+    )
     allreduce_strategy: AllReduceStrategy = Field(
         default=AllReduceStrategy.AUTO,
         description="AllReduce strategy for distributed operations. "
@@ -2535,8 +2540,9 @@ def detect_column_row_shard(
                 num_mha_shards += 1
 
     # simple shard remaining linear nodes
-    num_simple_shards += _process_simple_shard(unprocessed_linear_nodes, transform_container)
-    num_column_row_shards += num_ssm_shards + num_mla_shards
+    if config.shard_all_unprocessed:
+        num_simple_shards += _process_simple_shard(unprocessed_linear_nodes, transform_container)
+    num_column_row_shards += num_ssm_shards
     num_shards = num_simple_shards + num_column_row_shards
     ad_logger.info(
         f"Heuristics found {num_shards} TP shards. Simple: {num_simple_shards}, "
