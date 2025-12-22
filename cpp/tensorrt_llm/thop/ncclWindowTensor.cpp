@@ -59,7 +59,7 @@ torch::Tensor copy_to_nccl_window(torch::Tensor const& input, torch::List<int64_
     std::string shape_str = "[" + tc::vec2str(shape_vec) + "]";
 
     TLLM_LOG_DEBUG(
-        "[copy_to_nccl_window] Creating NCCL window tensor and copying input: "
+        "[NCCL_SYMMETRIC] copy_to_nccl_window: Creating NCCL window tensor and copying input: "
         "shape=%s, dtype=%d, group_size=%zu, buffer_size=%zu bytes",
         shape_str.c_str(), static_cast<int>(input.scalar_type()), group.size(), input.numel() * input.element_size());
 
@@ -69,12 +69,12 @@ torch::Tensor copy_to_nccl_window(torch::Tensor const& input, torch::List<int64_
     // Copy input data to window buffer (async copy)
     auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
     size_t buffer_size_bytes = input.numel() * input.element_size();
-    TLLM_LOG_DEBUG("[copy_to_nccl_window] Performing async memcpy: src=%p, dst=%p, size=%zu bytes", input.data_ptr(),
-        window_tensor.data_ptr(), buffer_size_bytes);
+    TLLM_LOG_DEBUG("[NCCL_SYMMETRIC] copy_to_nccl_window: Performing async memcpy: src=%p, dst=%p, size=%zu bytes",
+        input.data_ptr(), window_tensor.data_ptr(), buffer_size_bytes);
     TLLM_CUDA_CHECK(cudaMemcpyAsync(
         window_tensor.data_ptr(), input.data_ptr(), buffer_size_bytes, cudaMemcpyDeviceToDevice, stream));
 
-    TLLM_LOG_DEBUG("[copy_to_nccl_window] Copy completed successfully");
+    TLLM_LOG_DEBUG("[NCCL_SYMMETRIC] copy_to_nccl_window: Copy completed successfully");
     return window_tensor;
 }
 
@@ -92,7 +92,7 @@ torch::Tensor matmul_to_nccl_window(torch::Tensor const& a, torch::Tensor const&
     std::string out_shape_str = "[" + tc::vec2str(output_shape) + "]";
 
     TLLM_LOG_DEBUG(
-        "[matmul_to_nccl_window] Allocating NCCL window tensor for matmul output: "
+        "[NCCL_SYMMETRIC] matmul_to_nccl_window: Allocating NCCL window tensor for matmul output: "
         "a_shape=%s, b_shape=%s, output_shape=%s, dtype=%d",
         a_shape_str.c_str(), b_shape_str.c_str(), out_shape_str.c_str(), static_cast<int>(a.scalar_type()));
 
@@ -102,7 +102,7 @@ torch::Tensor matmul_to_nccl_window(torch::Tensor const& a, torch::Tensor const&
     // Perform matmul directly into window tensor
     torch::matmul_out(output_tensor, a, b);
 
-    TLLM_LOG_DEBUG("[matmul_to_nccl_window] Matmul completed into NCCL window tensor");
+    TLLM_LOG_DEBUG("[NCCL_SYMMETRIC] matmul_to_nccl_window: Matmul completed into NCCL window tensor");
     return output_tensor;
 }
 
@@ -128,7 +128,7 @@ torch::Tensor add_to_nccl_window(torch::Tensor const& a, torch::Tensor const& b,
     std::string out_shape_str = "[" + tc::vec2str(output_shape) + "]";
 
     TLLM_LOG_DEBUG(
-        "[add_to_nccl_window] Allocating NCCL window tensor for add output: "
+        "[NCCL_SYMMETRIC] add_to_nccl_window: Allocating NCCL window tensor for add output: "
         "a_shape=%s, b_shape=%s, output_shape=%s, dtype=%d",
         a_shape_str.c_str(), b_shape_str.c_str(), out_shape_str.c_str(), static_cast<int>(a.scalar_type()));
 
@@ -138,7 +138,7 @@ torch::Tensor add_to_nccl_window(torch::Tensor const& a, torch::Tensor const& b,
     // Perform add directly into window tensor
     torch::add_out(output_tensor, a, b);
 
-    TLLM_LOG_DEBUG("[add_to_nccl_window] Add completed into NCCL window tensor");
+    TLLM_LOG_DEBUG("[NCCL_SYMMETRIC] add_to_nccl_window: Add completed into NCCL window tensor");
     return output_tensor;
 }
 

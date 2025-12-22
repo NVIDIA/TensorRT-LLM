@@ -565,7 +565,7 @@ private:
                 {
                     inputPtr = windowBuffer0.ptr;
                     TLLM_LOG_DEBUG(
-                        "[runNCCLAllReduceSymmetric] Window buffer created successfully: "
+                        "[NCCL_SYMMETRIC] runNCCLAllReduceSymmetric: Window buffer created successfully: "
                         "new_ptr=%p, buffer_ptr=%p",
                         inputTensor.data_ptr(), inputPtr);
                 }
@@ -574,7 +574,8 @@ private:
                     // Fallback: if search fails, use tensor data pointer directly
                     // This shouldn't happen if copy_to_nccl_window worked correctly
                     TLLM_LOG_WARNING(
-                        "[runNCCLAllReduceSymmetric] Window buffer not found after copy_to_nccl_window, "
+                        "[NCCL_SYMMETRIC] runNCCLAllReduceSymmetric: Window buffer not found after "
+                        "copy_to_nccl_window, "
                         "using tensor data pointer directly (new_ptr=%p)",
                         inputTensor.data_ptr());
                     inputPtr = inputTensor.data_ptr();

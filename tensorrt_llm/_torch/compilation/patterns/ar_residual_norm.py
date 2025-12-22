@@ -750,7 +750,7 @@ def register_nccl_symmetric_patterns(custom_passes: List[PatternMatcherPass],
             eps: float,
         ):
             logger.debug(
-                "[NCCL_SYMMETRIC Pattern] Initial pattern matched: inserting copy_to_nccl_window "
+                "[NCCL_SYMMETRIC] Pattern: Initial pattern matched: inserting copy_to_nccl_window "
                 f"before allreduce (fusion_op={fusion_op}, input_shape={input.shape}, "
                 f"input_dtype={input.dtype})")
             input = torch.ops.trtllm.copy_to_nccl_window(
@@ -820,7 +820,7 @@ def register_nccl_symmetric_patterns(custom_passes: List[PatternMatcherPass],
                 mm_dtype: torch.dtype,
             ):
                 logger.debug(
-                    "[NCCL_SYMMETRIC Pattern] Prologue pattern matched: replacing "
+                    "[NCCL_SYMMETRIC] Pattern: Prologue pattern matched: replacing "
                     "copy_to_nccl_window(cublas_scaled_mm(...)) with direct allocation"
                 )
                 # TODO: When GEMM refactoring is done, use allocator parameter
@@ -886,7 +886,7 @@ def register_nccl_symmetric_patterns(custom_passes: List[PatternMatcherPass],
                 allowed_backends: str,
             ):
                 logger.debug(
-                    "[NCCL_SYMMETRIC Pattern] Prologue pattern matched: replacing "
+                    "[NCCL_SYMMETRIC] Pattern: Prologue pattern matched: replacing "
                     "copy_to_nccl_window(nvfp4_gemm(...)) with direct allocation"
                 )
                 # TODO: When GEMM refactoring is done, use allocator parameter
@@ -944,7 +944,7 @@ def register_nccl_symmetric_patterns(custom_passes: List[PatternMatcherPass],
                 mm0_b: torch.Tensor,
             ):
                 logger.debug(
-                    "[NCCL_SYMMETRIC Pattern] Prologue pattern matched: replacing "
+                    "[NCCL_SYMMETRIC] Pattern: Prologue pattern matched: replacing "
                     "copy_to_nccl_window(aten.mm(...)) with matmul_to_nccl_window"
                 )
                 mm_output = torch.ops.trtllm.matmul_to_nccl_window(
@@ -978,7 +978,7 @@ def register_nccl_symmetric_patterns(custom_passes: List[PatternMatcherPass],
                 add_b: torch.Tensor,
             ):
                 logger.debug(
-                    "[NCCL_SYMMETRIC Pattern] Prologue pattern matched: replacing "
+                    "[NCCL_SYMMETRIC] Pattern: Prologue pattern matched: replacing "
                     "copy_to_nccl_window(aten.add(...)) with add_to_nccl_window"
                 )
                 add_output = torch.ops.trtllm.add_to_nccl_window(
