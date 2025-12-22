@@ -254,8 +254,6 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         """Set the sharding config for the model."""
         if hasattr(model_config, "base_model_tp_plan"):
             self._sharding_config["tp_plan"] = model_config.base_model_tp_plan
-        if hasattr(model_config, "num_hidden_layers"):
-            self._sharding_config["num_hidden_layers"] = model_config.num_hidden_layers
 
     def get_quant_config(self) -> Dict:
         """Returns the quantization config for this model or an empty dict if not quantized."""
@@ -635,8 +633,6 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
             text_config = model_config.text_config
             if hasattr(text_config, "base_model_tp_plan"):
                 self._sharding_config["tp_plan"] = text_config.base_model_tp_plan
-            if hasattr(text_config, "num_hidden_layers"):
-                self._sharding_config["num_hidden_layers"] = text_config.num_hidden_layers
 
     @property
     def automodel_cls(self) -> Type[_BaseAutoModelClass]:
