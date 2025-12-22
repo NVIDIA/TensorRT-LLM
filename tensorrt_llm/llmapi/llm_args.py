@@ -2531,8 +2531,7 @@ class TrtLlmArgs(BaseLlmArgs):
             elif isinstance(self.speculative_config, Eagle3DecodingConfig):
                 raise ValueError(
                     "speculative_config.decoding_type 'Eagle3' is only supported on the PyTorch backend. "
-                    "Use decoding_type: Eagle with --backend tensorrt, or switch to --backend pytorch for Eagle3."
-                )
+                    "Use decoding_type 'Eagle' for the TensorRT backend.")
 
             elif isinstance(self.speculative_config, EagleDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0
@@ -3052,8 +3051,10 @@ class TorchLlmArgs(BaseLlmArgs):
             if isinstance(self.speculative_config, EagleDecodingConfig):
                 if type(self.speculative_config) is EagleDecodingConfig:
                     logger.warning(
-                        "speculative_config.decoding_type 'Eagle' maps to Eagle3 in the PyTorch backend; "
-                        "use 'Eagle3' to be explicit.")
+                        "speculative_config.decoding_type 'Eagle' is not supported on the PyTorch backend; only 'Eagle3' is supported. "
+                        "'Eagle' is treated as 'Eagle3' for backward compatibility. "
+                        "EAGLE (v1/v2) draft checkpoints are incompatible with Eagle3—use an Eagle3 draft model."
+                    )
                 assert self.speculative_config.max_draft_len > 0
                 assert self.speculative_config.speculative_model is not None, "EAGLE3 draft model must be specified."
             elif isinstance(self.speculative_config, NGramDecodingConfig):
