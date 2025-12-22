@@ -15,6 +15,8 @@
 
 from typing import Any, Dict
 
+from ...utils.logger import ad_logger
+
 DRIVEOS_LLM_VERSION = "0.5.0.0"
 
 
@@ -51,7 +53,7 @@ def _export_native_llm_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
     if "head_dim" in config_dict:
         llm_config["head_dim"] = config_dict["head_dim"]
     else:
-        print(
+        ad_logger.warning(
             "Warning: head_dim not found in config, calculating as hidden_size // num_attention_heads"
         )
         llm_config["head_dim"] = config_dict["hidden_size"] // config_dict["num_attention_heads"]
@@ -89,7 +91,7 @@ def _export_eagle_base_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
     if "head_dim" in config_dict:
         eagle_config["head_dim"] = config_dict["head_dim"]
     else:
-        print(
+        ad_logger.warning(
             "Warning: head_dim not found in config, calculating as hidden_size // num_attention_heads"
         )
         eagle_config["head_dim"] = config_dict["hidden_size"] // config_dict["num_attention_heads"]
@@ -125,7 +127,7 @@ def _export_eagle_draft_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
     if "head_dim" in config_dict:
         draft_config["head_dim"] = config_dict["head_dim"]
     else:
-        print(
+        ad_logger.warning(
             "Warning: head_dim not found in config, calculating as hidden_size // num_attention_heads"
         )
         draft_config["head_dim"] = config_dict["hidden_size"] // config_dict["num_attention_heads"]
@@ -143,7 +145,7 @@ def _export_eagle_draft_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
     else:
         # Fallback: assume base model hidden size is 3x draft model (Eagle3 default)
         draft_config["base_model_hidden_size"] = config_dict["hidden_size"] * 3
-        print(
+        ad_logger.warning(
             f"Warning: target_hidden_size not found, using default 3x draft hidden size: "
             f"{draft_config['base_model_hidden_size']}"
         )
@@ -164,7 +166,7 @@ def export_vision_config(config: Any) -> Dict[str, Any]:
         raise KeyError(
             "Required field 'vision_config' or 'image_embd_layer' in 'embd_layer' not found in config"
         )
-    # Add TensorRT Edge-LLM version
+    # Add DriveOS LLM API version
     config_dict["driveos_llm_version"] = DRIVEOS_LLM_VERSION
 
     # Return the original config_dict as-is without any modification
@@ -182,7 +184,7 @@ def export_llm_config(config: Any, model_type: str) -> Dict[str, Any]:
 
     # For other model types, use text_config if available
     if "text_config" in config_dict:
-        print("Detected multimodal model, using text_config")
+        ad_logger.info("Detected multimodal model, using text_config")
         config_dict = config_dict["text_config"]
 
     if model_type == "llm":
@@ -197,7 +199,7 @@ def export_llm_config(config: Any, model_type: str) -> Dict[str, Any]:
     # Add model name to output
     output_config["model"] = model_name
 
-    # Add TensorRT Edge-LLM version
+    # Add DriveOS LLM API version
     output_config["driveos_llm_version"] = DRIVEOS_LLM_VERSION
 
     return output_config

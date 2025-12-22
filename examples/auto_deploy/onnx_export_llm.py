@@ -23,29 +23,14 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        default="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B ",
         help="The HF model to use for onnx export.",
-    )
-    parser.add_argument(
-        "--max_seq_len",
-        type=int,
-        default=4,
-        help="The max sequence length to use for the model.",
-    )
-    parser.add_argument(
-        "--max_batch_size",
-        type=int,
-        # NOTE(yoco): Originally this is 2, however, don't know why, when set to 2,
-        # the batch_size will collapse static int 2 even we explicitly it is dynamic axis.
-        # And more weird, when set to 13, the batch_size will be dynamic.
-        default=13,  # to enable dynamic batch_size, the match size must > 1
-        help="The max batch size to use for the model.",
     )
     parser.add_argument(
         "--device",
         type=str,
         default="cpu",
-        help="The device to use for the model.",
+        help="The device to use when exporting the model.",
     )
     parser.add_argument(
         "--output_dir",
@@ -53,29 +38,30 @@ def main():
         default=None,
         help="The directory to save the exported ONNX model.",
     )
-    parser.add_argument(
-        "--output_name",
-        type=str,
-        default=None,
-        help="The name of the exported ONNX model.",
-    )
     args = parser.parse_args()
 
     print(f"Constructing model from {args.model}")
+
+    # to enable dynamic batch_size, the match size must > 1
+    # NOTE(yoco): Originally this is 2, however, don't know why, when set to 2,
+    # the batch_size will collapse static int 2 even we explicitly it is dynamic axis.
+    # And more weird, when set to 13, the batch_size will be dynamic.
+    # Probably some value between 2 and 13 will work,
+    # We use 13 here for debugging purpose.
+    max_batch_size = 13
+    max_seq_len = 4
 
     # Prepare the AutoDeploy config, mode is export_driveos_llm_onnx
     ad_config = AutoDeployConfig(
         model=args.model,
         mode="export_driveos_llm_onnx",
-        max_batch_size=args.max_batch_size,
-        max_seq_len=args.max_seq_len,
+        max_batch_size=max_batch_size,
+        max_seq_len=max_seq_len,
         device=args.device,
     )
     ad_config.attn_backend = "torch"
     if args.output_dir is not None:
         ad_config.transforms["export_to_onnx"]["output_dir"] = args.output_dir
-    if args.output_name is not None:
-        ad_config.transforms["export_to_onnx"]["output_name"] = args.output_name
     _ = LLM(**ad_config.to_llm_kwargs())
 
 
