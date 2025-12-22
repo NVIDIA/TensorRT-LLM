@@ -149,7 +149,6 @@ torch::Tensor add_to_nccl_window(torch::Tensor const& a, torch::Tensor const& b,
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def("create_nccl_window_tensor", &tensorrt_llm::torch_ext::create_nccl_window_tensor);
-    m.def("copy_to_nccl_window", &tensorrt_llm::torch_ext::copy_to_nccl_window);
-    m.def("matmul_to_nccl_window", &tensorrt_llm::torch_ext::matmul_to_nccl_window);
-    m.def("add_to_nccl_window", &tensorrt_llm::torch_ext::add_to_nccl_window);
+    // Note: copy_to_nccl_window, matmul_to_nccl_window, and add_to_nccl_window are
+    // registered as Python custom ops, not here, to avoid duplicate registration.
 }
