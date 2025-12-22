@@ -21,7 +21,7 @@ from concurrent import futures
 from dataclasses import dataclass
 from functools import cached_property
 from itertools import repeat
-from typing import Any, Callable, Generic, List, Optional, Type, TypeVar, cast
+from typing import Any, Callable, Dict, Generic, List, Optional, Type, TypeVar, cast
 
 import numpy as np
 import torch
@@ -199,6 +199,8 @@ class EarlyStopSampler(Sampler):
 @dataclass(kw_only=True)
 class MultimodalResult:
     mm_embeddings: List[torch.Tensor]
+    # Can be used to include e.g. `mrope_position_ids`, etc.
+    extra_data: Optional[Dict[str, Any]] = None
 
     def values(self):
         return vars(self).values()
@@ -262,7 +264,10 @@ class EarlyStopWithMMResult(Sampler):
         resource_manager: Optional[ResourceManager] = None,
     ) -> SampleStateWithMMResult:
         # from model_outputs to MultimodalResult
-        data = MultimodalResult(mm_embeddings=model_outputs["mm_embeddings"])
+        data = MultimodalResult(
+            mm_embeddings=model_outputs.pop("mm_embeddings"),
+            extra_data={**model_outputs},
+        )
         return SampleStateWithMMResult(scheduled_requests=scheduled_requests, data=data)
 
     @override
@@ -276,7 +281,12 @@ class EarlyStopWithMMResult(Sampler):
         scheduled_requests = state.scheduled_requests
         assert not scheduled_requests.generation_requests
         mm_embeddings = state.data.mm_embeddings
-        for request, mm_embedding in zip(scheduled_requests.context_requests, mm_embeddings):
+        extra_data = state.data.extra_data or {}
+        mrope_position_ids = extra_data.get("mrope_position_ids", None)
+        mrope_position_deltas = extra_data.get("mrope_position_deltas", None)
+        for i, (request, mm_embedding) in enumerate(
+            zip(scheduled_requests.context_requests, mm_embeddings)
+        ):
             request.state = LlmRequestState.GENERATION_COMPLETE
             # NOTE: This is a hack: set finish reason manually and set the beam 0
             request.set_finished_reason(FinishReason.LENGTH, 0)
@@ -286,6 +296,12 @@ class EarlyStopWithMMResult(Sampler):
                 )
 
             request.py_result.append_mm_embeddings(mm_embedding)
+
+            # Store mrope data if available
+            if mrope_position_ids is not None and mrope_position_deltas is not None:
+                request.py_result.set_mrope_position(
+                    mrope_position_ids[i], mrope_position_deltas[i]
+                )
 
     @override
     def is_generation_model(self) -> bool:
