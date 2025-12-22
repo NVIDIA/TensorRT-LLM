@@ -21,11 +21,18 @@ def model(request):
     return request.param
 
 
+@pytest.fixture(scope="module",
+                params=[0, 2],
+                ids=["disable_processpool", "enable_processpool"])
+def num_postprocess_workers(request):
+    return request.param
+
+
 @pytest.fixture(scope="module")
-def server(model: str):
+def server(model: str, num_postprocess_workers: int):
     model_path = get_model_path(model)
 
-    args = []
+    args = ["--num_postprocess_workers", f"{num_postprocess_workers}"]
     if model.startswith("Qwen3"):
         args.extend(["--reasoning_parser", "qwen3"])
     elif model.startswith("DeepSeek-R1"):
