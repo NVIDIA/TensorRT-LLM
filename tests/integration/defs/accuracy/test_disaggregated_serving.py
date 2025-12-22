@@ -1,8 +1,11 @@
 import concurrent
 import contextlib
+import functools
 import itertools
 import json
 import os
+import re
+import subprocess
 import tempfile
 import time
 from collections import namedtuple
@@ -47,6 +50,40 @@ DuckLLM = namedtuple('DuckLLM', ['args', 'tokenizer', 'generate_async'])
 
 DEFAULT_TEST_TIMEOUT = 1200
 DEFAULT_SERVER_WAITING_TIMEOUT = 1200
+
+
+@functools.lru_cache(maxsize=1)
+def has_nvlink():
+    """
+    Check if the system has NVLink connectivity between GPUs.
+
+    Returns:
+        bool: True if NVLink is detected, False otherwise.
+    """
+    try:
+        # Execute nvidia-smi nvlink command to query NVLink status
+        result = subprocess.run(['nvidia-smi', 'nvlink', '-s'],
+                                capture_output=True,
+                                text=True,
+                                check=False)
+
+        # Check if the command executed successfully
+        if result.returncode != 0:
+            return False
+
+        # Look for bandwidth information (Link X: XX.XXX GB/s pattern)
+        # which indicates active NVLink connections
+        if re.search(r'Link \d+:\s+[\d.]+\s+GB/s', result.stdout):
+            return True
+
+        return False
+
+    except (FileNotFoundError, subprocess.SubprocessError):
+        # nvidia-smi not found or execution failed
+        return False
+    except Exception:
+        # Any other unexpected error
+        return False
 
 
 class MyThreadPoolExecutor(ThreadPoolExecutor):
@@ -196,6 +233,8 @@ def launch_disaggregated_llm(
         gpu_range = range(current_gpu_offset,
                           current_gpu_offset + gen_total_gpus)
         env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_range))
+        if not has_nvlink():
+            env["UCX_TLS"] = "^cuda_ipc"
         current_gpu_offset += gen_total_gpus
 
         gen_server_args = gen_args + [
@@ -833,7 +872,22 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device(4)
-    def test_auto_dtype_with_helix(self):
+    @pytest.mark.parametrize("cuda_graph_config", [
+        None,
+        {
+            "enable_padding": False,
+            "batch_sizes": [1, 2, 4, 8, 16, 32, 64]
+        },
+        {
+            "enable_padding": True,
+            "batch_sizes": [1, 2, 4, 8, 16, 32, 64]
+        },
+    ],
+                             ids=[
+                                 "cudagraph:none", "cudagraph:without_padding",
+                                 "cudagraph:with_padding"
+                             ])
+    def test_auto_dtype_with_helix(self, cuda_graph_config):
         kv_cache_config = {
             "free_gpu_memory_fraction": 0.5,
             "enable_block_reuse": False,
@@ -863,7 +917,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "disable_overlap_scheduler": True,
             "kv_cache_config": kv_cache_config,
             "enable_chunked_prefill": False,
-            "cuda_graph_config": None,
+            "cuda_graph_config": cuda_graph_config,
             "cache_transceiver_config": {
                 "backend": "UCX"
             },
@@ -951,6 +1005,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(2)
     @pytest.mark.parametrize("block_reuse", [False, True])
+    @skip_pre_hopper
     def test_auto_dtype(self, block_reuse):
 
         ctx_server_config = {

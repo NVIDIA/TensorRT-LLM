@@ -286,6 +286,13 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
     mKernelParams.sage.q.max_nblock = runnerParams.qMaxNBlock;
     mKernelParams.sage.k.max_nblock = runnerParams.kMaxNBlock;
     mKernelParams.sage.v.max_nblock = runnerParams.vMaxNBlock;
+
+    // for skip-softmax attention
+    mKernelParams.skip_softmax_threshold_scale_factor = runnerParams.skipSoftmaxThresholdScaleFactor;
+#ifdef SKIP_SOFTMAX_STAT
+    mKernelParams.skip_softmax_total_blocks = runnerParams.skipSoftmaxTotalBlocks;
+    mKernelParams.skip_softmax_skipped_blocks = runnerParams.skipSoftmaxSkippedBlocks;
+#endif
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -493,6 +500,18 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
             && ((!isHopperContextMLA && mLaunchParams.attention_input_layout == AttentionInputLayout::Q_CONTIGUOUS_KV)
                 || (isHopperContextMLA
                     && (mLaunchParams.attention_input_layout == AttentionInputLayout::SEPARATE_Q_K_V))));
+    }
+
+    // Setup launch params for skip softmax attention
+    mLaunchParams.enableSkipSoftmax = false;
+    if (runnerParams.skipSoftmaxThresholdScaleFactor > 0)
+    {
+        if (!isSm90 || !mLaunchParams.warp_specialization || !mLaunchParams.flash_attention)
+        {
+            TLLM_CHECK_WITH_INFO(false,
+                "Skip softmax attention is only supported on Hopper with warp specialization and flash attention.");
+        }
+        mLaunchParams.enableSkipSoftmax = true;
     }
 }
 

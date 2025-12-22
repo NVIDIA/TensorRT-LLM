@@ -488,9 +488,10 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_orig_prompt_len = self.orig_prompt_len
         self.py_max_new_tokens = self.max_new_tokens
         self.py_min_length = self.sampling_config.min_length
+        # `seqlen_this_rank_cp`, `total_input_len_cp`, and `py_helix_is_inactive_rank` are relevant to helix parallelism.
+        self.seqlen_this_rank_cp = self.prompt_len
+        self.total_input_len_cp = self.prompt_len
         self.py_helix_is_inactive_rank = False
-        self.seqlen_this_rank_cp = 0
-        self.total_input_len_cp = 0
         self.py_batch_idx = None
         self.py_draft_pages_allocated = 0
         self.py_rewind_len = 0

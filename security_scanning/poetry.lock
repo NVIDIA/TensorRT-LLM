@@ -1687,13 +1687,13 @@ all = ["flake8 (>=7.1.1)", "mypy (>=1.11.2)", "pytest (>=8.3.2)", "ruff (>=0.6.2
 
 [[package]]
 name = "importlib-metadata"
-version = "8.7.0"
+version = "8.7.1"
 description = "Read metadata from Python packages"
 optional = false
 python-versions = ">=3.9"
 files = [
-    {file = "importlib_metadata-8.7.0-py3-none-any.whl", hash = "sha256:e5dd1551894c77868a30651cef00984d50e1002d06942a7101d34870c5f02afd"},
-    {file = "importlib_metadata-8.7.0.tar.gz", hash = "sha256:d13b81ad223b890aa16c5471f2ac3056cf76c5f10f82d6f9292f0b415f389000"},
+    {file = "importlib_metadata-8.7.1-py3-none-any.whl", hash = "sha256:5a1f80bf1daa489495071efbb095d75a634cf28a8bc299581244063b53176151"},
+    {file = "importlib_metadata-8.7.1.tar.gz", hash = "sha256:49fef1ae6440c182052f407c8d34a68f72efc36db9ca90dc0113398f2fdde8bb"},
 ]
 
 [package.dependencies]
@@ -1703,10 +1703,10 @@ zipp = ">=3.20"
 check = ["pytest-checkdocs (>=2.4)", "pytest-ruff (>=0.2.1)"]
 cover = ["pytest-cov"]
 doc = ["furo", "jaraco.packaging (>=9.3)", "jaraco.tidelift (>=1.4)", "rst.linker (>=1.9)", "sphinx (>=3.5)", "sphinx-lint"]
-enabler = ["pytest-enabler (>=2.2)"]
+enabler = ["pytest-enabler (>=3.4)"]
 perf = ["ipython"]
-test = ["flufl.flake8", "importlib_resources (>=1.3)", "jaraco.test (>=5.4)", "packaging", "pyfakefs", "pytest (>=6,!=8.1.*)", "pytest-perf (>=0.9.2)"]
-type = ["pytest-mypy"]
+test = ["flufl.flake8", "jaraco.test (>=5.4)", "packaging", "pyfakefs", "pytest (>=6,!=8.1.*)", "pytest-perf (>=0.9.2)"]
+type = ["mypy (<1.19)", "pytest-mypy (>=1.0.1)"]
 
 [[package]]
 name = "jinja2"
@@ -5936,13 +5936,13 @@ zstd = ["backports-zstd (>=1.0.0)"]
 
 [[package]]
 name = "uvicorn"
-version = "0.38.0"
+version = "0.40.0"
 description = "The lightning-fast ASGI server."
 optional = false
-python-versions = ">=3.9"
+python-versions = ">=3.10"
 files = [
-    {file = "uvicorn-0.38.0-py3-none-any.whl", hash = "sha256:48c0afd214ceb59340075b4a052ea1ee91c16fbc2a9b1469cca0e54566977b02"},
-    {file = "uvicorn-0.38.0.tar.gz", hash = "sha256:fd97093bdd120a2609fc0d3afe931d4d4ad688b6e75f0f929fde1bc36fe0e91d"},
+    {file = "uvicorn-0.40.0-py3-none-any.whl", hash = "sha256:c6c8f55bc8bf13eb6fa9ff87ad62308bbbc33d0b67f84293151efe87e0d5f2ee"},
+    {file = "uvicorn-0.40.0.tar.gz", hash = "sha256:839676675e87e73694518b5574fd0f24c9d97b46bea16df7b8c05ea1a51071ea"},
 ]
 
 [package.dependencies]
@@ -6328,4 +6328,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.0"
 python-versions = ">=3.10,<3.13"
-content-hash = "44627163fbd7d37244d14d96ae0b8dcf65588d66c4cc1260257c10dd31b219da"
+content-hash = "6dd0726d69be11161ebbf3fea63d14e0ece7a14988e439e67539bc84dea75972"
