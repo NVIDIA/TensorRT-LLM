@@ -88,14 +88,14 @@ class TestConfigDatabaseSync(unittest.TestCase):
         Validates the generated JSON payload shape and that its entries correspond 1:1
         with lookup.yaml recipes, without relying on a committed JSON artifact.
         """
-        if generate_json is None or RecipeList is None:
-            self.skipTest("generate_config_table not available")
+        self.assertIsNotNone(generate_json)
+        self.assertIsNotNone(RecipeList)
 
         yaml_path = os.path.join(REPO_ROOT, "examples/configs/database/lookup.yaml")
         self.assertTrue(os.path.exists(yaml_path), f"YAML file not found: {yaml_path}")
 
         recipes = RecipeList.from_yaml(Path(yaml_path))
-        expected = {
+        expected_keys = {
             (
                 r.model,
                 r.gpu,
@@ -120,8 +120,8 @@ class TestConfigDatabaseSync(unittest.TestCase):
         )
 
         entries = payload.get("entries") or []
-        got = {
-            (
+        for e in entries:
+            key = (
                 e.get("model"),
                 e.get("gpu"),
                 int(e.get("num_gpus")),
@@ -130,16 +130,13 @@ class TestConfigDatabaseSync(unittest.TestCase):
                 int(e.get("concurrency")),
                 e.get("config_path"),
             )
-            for e in entries
-        }
+            self.assertIn(
+                key,
+                expected_keys,
+                f"Generated config_db.json contains an unexpected entry key: {key}",
+            )
+            expected_keys.remove(key)
 
-        self.assertEqual(
-            expected,
-            got,
-            "Generated config_db.json entries do not match lookup.yaml recipes.",
-        )
-
-        for e in entries:
             cmd = e.get("command") or ""
             self.assertIn("--config", cmd)
             self.assertNotIn("extra_llm_api_options", cmd)
@@ -152,6 +149,11 @@ class TestConfigDatabaseSync(unittest.TestCase):
             raw = e.get("config_raw_url") or ""
             self.assertTrue(gh.endswith(config_path))
             self.assertTrue(raw.endswith(config_path))
+
+        self.assertFalse(
+            expected_keys,
+            "Generated config_db.json is missing entries from lookup.yaml.",
+        )
 
     def test_config_database_tests_sync(self):
         """Test that config database test files are synchronized with lookup.yaml.
