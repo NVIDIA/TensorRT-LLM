@@ -140,14 +140,10 @@ max_seq_len: 128
 
 
 def test_decoding_type_eagle3_parses_to_eagle3_decoding_config():
-    spec_cfg = DecodingBaseConfig.from_dict({
-        "decoding_type":
-        "Eagle3",
-        "max_draft_len":
-        3,
-        "speculative_model_dir":
-        "/path/to/draft/model",
-    })
+    spec_cfg = DecodingBaseConfig.from_dict(
+        dict(decoding_type="Eagle3",
+             max_draft_len=3,
+             speculative_model_dir="/path/to/draft/model"))
     assert isinstance(spec_cfg, Eagle3DecodingConfig)
 
 
@@ -161,30 +157,23 @@ def test_decoding_type_eagle_warns_on_pytorch_backend(monkeypatch):
 
     monkeypatch.setattr(llm_args_mod.logger, "warning", _capture_warning)
 
-    spec_cfg = DecodingBaseConfig.from_dict({
-        "decoding_type":
-        "Eagle",
-        "max_draft_len":
-        3,
-        "speculative_model_dir":
-        "/path/to/draft/model",
-    })
+    spec_cfg = DecodingBaseConfig.from_dict(
+        dict(decoding_type="Eagle",
+             max_draft_len=3,
+             speculative_model_dir="/path/to/draft/model"))
 
     TorchLlmArgs(model=llama_model_path, speculative_config=spec_cfg)
 
-    assert any("maps to Eagle3 in the PyTorch backend" in m
-               for m in warnings_seen)
+    assert any(
+        "EAGLE (v1/v2) draft checkpoints are incompatible with Eagle3" in m
+        for m in warnings_seen)
 
 
 def test_decoding_type_eagle3_errors_on_tensorrt_backend():
-    spec_cfg = DecodingBaseConfig.from_dict({
-        "decoding_type":
-        "Eagle3",
-        "max_draft_len":
-        3,
-        "speculative_model_dir":
-        "/path/to/draft/model",
-    })
+    spec_cfg = DecodingBaseConfig.from_dict(
+        dict(decoding_type="Eagle3",
+             max_draft_len=3,
+             speculative_model_dir="/path/to/draft/model"))
     with pytest.raises(ValueError,
                        match="only supported on the PyTorch backend"):
         TrtLlmArgs(model=llama_model_path, speculative_config=spec_cfg)

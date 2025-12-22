@@ -145,7 +145,7 @@ Speculative decoding options must be specified via `--config config.yaml` for bo
 * `NGram`
 * `DraftTarget`
 
-> Note: `decoding_type: Eagle` is accepted as a PyTorch-backend alias for `Eagle3`, but `Eagle3` is preferred for clarity.
+> Note: The PyTorch backend supports only `Eagle3`. `decoding_type: Eagle` is accepted as a backward-compatible alias for `Eagle3`, but EAGLE (v1/v2) draft checkpoints are incompatible.
 
 The rest of the argument names/valid values are the same as in their corresponding configuration class described in the Quick Start section. For example, a YAML configuration could look like this:
 
