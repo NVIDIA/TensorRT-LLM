@@ -14,6 +14,8 @@
 # limitations under the License.
 
 
+from __future__ import annotations
+
 import json
 import os
 import sys
@@ -73,6 +75,7 @@ def _model_display_and_url(model: str) -> tuple[str, str]:
         info = MODEL_INFO[model]
         return info["display_name"], info["url"]
     return model, ""
+
 
 def build_rows(yaml_path) -> list[RecipeRow]:
     recipe_list = RecipeList.from_yaml(Path(yaml_path))
@@ -225,11 +228,10 @@ def generate_json(yaml_path, output_file):
     rows = build_rows(yaml_path)
 
     source_path = Path(yaml_path)
-    source = (
-        str(source_path.relative_to(REPO_ROOT))
-        if source_path.is_relative_to(REPO_ROOT)
-        else str(source_path)
-    )
+    try:
+        source = str(source_path.relative_to(REPO_ROOT))
+    except ValueError:
+        source = str(source_path)
 
     models = {}
     for row in rows:
