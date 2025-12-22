@@ -19,49 +19,23 @@ example_images = [
     str(test_data_root / "61.jpg"),
 ]
 
-
-@pytest.fixture(scope="function")
-def multimodal_model_config():
-    """Get multimodal model configuration similar to integration tests"""
-    # You can extend this to support multiple models or get from environment
-    model_configs = {
-        'llava-v1.6-mistral-7b-hf': {
-            'model_name':
-            'llava-v1.6-mistral-7b-hf',
-            'hf_model_dir':
-            'llava-hf/llava-v1.6-mistral-7b-hf',
-            'model_dir':
-            llm_models_root() / "multimodals" / "llava-v1.6-mistral-7b-hf",
-        }
-    }
-
-    return model_configs['llava-v1.6-mistral-7b-hf']
+_LLAVA_DIR = llm_models_root() / "multimodals" / "llava-v1.6-mistral-7b-hf"
+_QWEN_2_5_VL_DIR = llm_models_root() / "Qwen2.5-VL-3B-Instruct"
 
 
 # TODO: Add multi-image in single chat test
-@pytest.mark.parametrize("model_key", [
-    "llava-v1.6-mistral-7b-hf",
-])
+@pytest.mark.parametrize("model_dir", [_LLAVA_DIR, _QWEN_2_5_VL_DIR])
 @pytest.mark.parametrize("pd_disagg", [False, True])
-def test_single_image_chat(model_key, pd_disagg, multimodal_model_config):
+def test_single_image_chat(model_dir, pd_disagg):
     """Test processing single image using encoder (pass mm_embeddings) + LLM API.
 
     This test verifies that encoder (pass mm_embeddings) + LLM API produces identical
     results to standard llm generation (pass raw image) by comparing outputs.
     """
-    # Get model configuration
-    if model_key != "llava-v1.6-mistral-7b-hf":
-        #TODO: add more model tests progressively here
-        pytest.skip(
-            f"Skipping test for {model_key} - only testing llava-v1.6-mistral-7b-hf for now"
-        )
-
-    # Extract model information from config
-    encoder_model_dir = multimodal_model_config['model_dir']
 
     # Test configuration
     max_tokens = 64
-    free_gpu_memory_fraction = 0.6 if not pd_disagg else 0.2
+    free_gpu_memory_fraction = 0.2
     max_batch_size = 1
 
     # Test data - OpenAI chat completion format
@@ -76,15 +50,14 @@ def test_single_image_chat(model_key, pd_disagg, multimodal_model_config):
     )
 
     # Process multimodal data using encoder (pass mm_embeddings)
-    encoder = MultimodalEncoder(model=encoder_model_dir,
-                                max_batch_size=max_batch_size)
+    encoder = MultimodalEncoder(model=model_dir, max_batch_size=max_batch_size)
 
     cache_transceiver_cfg = CacheTransceiverConfig(
         backend="DEFAULT") if pd_disagg else None
 
     disable_overlap_scheduler = pd_disagg
 
-    llm = LLM(model=encoder_model_dir,
+    llm = LLM(model=model_dir,
               backend='pytorch',
               kv_cache_config=kv_cache_config,
               trust_remote_code=True,
@@ -93,7 +66,7 @@ def test_single_image_chat(model_key, pd_disagg, multimodal_model_config):
 
     llm_decode = None
     if pd_disagg:
-        llm_decode = LLM(model=encoder_model_dir,
+        llm_decode = LLM(model=model_dir,
                          backend='pytorch',
                          kv_cache_config=kv_cache_config,
                          trust_remote_code=True,
@@ -141,6 +114,7 @@ def test_single_image_chat(model_key, pd_disagg, multimodal_model_config):
 
     assert ep_disaggregated_params is not None, "Encoder output disaggregated params is None"
     ep_disaggregated_params.request_type = "context_and_generation" if not pd_disagg else "context_only"
+
     outputs = llm.generate(inputs,
                            sampling_params=sampling_params,
                            disaggregated_params=ep_disaggregated_params)
@@ -151,10 +125,10 @@ def test_single_image_chat(model_key, pd_disagg, multimodal_model_config):
         pd_disaggregated_params = outputs[0].disaggregated_params
         pd_disaggregated_params.request_type = "generation_only"
         sampling_params = SamplingParams(max_tokens=max_tokens)
-        inputs[0][
-            'multi_modal_data'] = None  # remove multimodal data from input as decoder worker doesn't need it
-        inputs[0]['prompt_token_ids'] = outputs[
-            0].prompt_token_ids  # use prompt token ids from encoder output
+        # remove multimodal data from input as decoder worker doesn't need it
+        inputs[0]['multi_modal_data'] = None
+        # use prompt token ids from encoder output
+        inputs[0]['prompt_token_ids'] = outputs[0].prompt_token_ids
 
         outputs = llm_decode.generate(
             inputs,
@@ -199,24 +173,23 @@ def test_single_image_chat(model_key, pd_disagg, multimodal_model_config):
                     f"Log probabilities don't match for output {i}, generation {j}"
 
 
-@pytest.mark.parametrize("model_key", [
-    "llava-v1.6-mistral-7b-hf",
-])
-def test_multi_request_batch_chat(model_key, multimodal_model_config):
+@pytest.mark.parametrize(
+    "model_dir, encoder_max_batch_size",
+    [
+        (_LLAVA_DIR, 3),
+        # Qwen2.5 VL's vision encoder seems to output different embeddings based on this value.
+        # The test only passes with this set to 1.
+        (_QWEN_2_5_VL_DIR, 1),
+    ],
+)
+def test_multi_request_batch_chat(model_dir, encoder_max_batch_size):
     """Test batching multiple multimodal requests and verify encoder path matches raw path.
 
     This mirrors test_single_image_chat but with a batch of size 3.
     """
-    if model_key != "llava-v1.6-mistral-7b-hf":
-        pytest.skip(
-            f"Skipping test for {model_key} - only testing llava-v1.6-mistral-7b-hf for now"
-        )
-
-    encoder_model_dir = multimodal_model_config['model_dir']
 
     max_tokens = 64
     free_gpu_memory_fraction = 0.6
-    max_batch_size = 3
 
     prompts = [
         "Describe the natural environment in the image.",
@@ -232,10 +205,10 @@ def test_multi_request_batch_chat(model_key, multimodal_model_config):
         free_gpu_memory_fraction=free_gpu_memory_fraction,
     )
 
-    encoder = MultimodalEncoder(model=encoder_model_dir,
-                                max_batch_size=max_batch_size)
+    encoder = MultimodalEncoder(model=model_dir,
+                                max_batch_size=encoder_max_batch_size)
     llm = LLM(
-        model=encoder_model_dir,
+        model=model_dir,
         backend='pytorch',
         kv_cache_config=kv_cache_config,
         max_batch_size=1,  # fix batch size to reduce non-determinism in tests
@@ -305,8 +278,7 @@ def test_multi_request_batch_chat(model_key, multimodal_model_config):
             "Describe the weather in the image.",
         ], 2),
     ])
-def test_kv_event_mm_keys_with_reuse(prompts, expected_num_duplicates,
-                                     multimodal_model_config):
+def test_kv_event_mm_keys_with_reuse(prompts, expected_num_duplicates):
     """Test mm_keys in KV cache events with cache reuse scenarios.
 
     This test verifies:
@@ -316,7 +288,7 @@ def test_kv_event_mm_keys_with_reuse(prompts, expected_num_duplicates,
        - Same media + same prompts: full reuse (0 duplicate offsets)
        - Same media + different prompts: partial reuse (prefix blocks reused)
     """
-    encoder_model_dir = multimodal_model_config['model_dir']
+    encoder_model_dir = _LLAVA_DIR
 
     max_tokens = 16
     free_gpu_memory_fraction = 0.6

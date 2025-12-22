@@ -711,6 +711,7 @@ class PyTorchModelEngine(ModelEngine):
             else:
                 draft_lengths.append(self.max_total_draft_tokens)
         else:
+            draft_lengths.append(self.max_total_draft_tokens)
             # For non-draft model, we also capture the CUDA graph instance for draft length 0,
             # so that when we disable spec decode at runtime, we can still run the captured graph.
             # Note that for one engine mode, we are not able to turn off spec decode at runtime.
@@ -720,7 +721,8 @@ class PyTorchModelEngine(ModelEngine):
                     # value. This will save on memory.
                     and self.spec_config.max_concurrency is not None):
                 draft_lengths.append(0)
-            draft_lengths = [self.max_total_draft_tokens]
+        # Reverse order so smaller graphs can reuse memory from larger ones
+        draft_lengths = sorted(set(draft_lengths), reverse=True)
 
         # Create CUDA graphs for short and long sequences separately for sparse attention.
         sparse_config = self.sparse_attention_config
@@ -969,26 +971,6 @@ class PyTorchModelEngine(ModelEngine):
             spec_resource_manager.add_dummy_requests(
                 request_ids=list(range(batch_size)))
         return result
-
-    def _get_cuda_graph_draft_lengths(
-            self, resource_manager: ResourceManager) -> List[int]:
-        """Determines the draft lengths for which to capture CUDA graphs."""
-        draft_lengths = [self.max_total_draft_tokens]
-        spec_resource_manager = resource_manager.get_resource_manager(
-            ResourceManagerType.SPEC_RESOURCE_MANAGER)
-
-        # For non-draft model, also capture a graph for draft_len=0
-        if (not self.is_draft_model and self.max_draft_len > 0
-                and not self.spec_config.spec_dec_mode.use_one_engine()
-                and self.spec_config.max_concurrency is not None):
-            draft_lengths.append(0)
-
-        # Special case for Eagle3 draft model
-        if (self.is_spec_decode and self.is_draft_model
-                and isinstance(spec_resource_manager, Eagle3ResourceManager)):
-            draft_lengths.append(self.original_max_draft_len)
-
-        return list(set(draft_lengths))  # Use set to remove duplicates
 
     def _update_draft_inference_state_for_warmup(
             self, batch: ScheduledRequests, is_first_draft: bool,
@@ -2157,7 +2139,7 @@ class PyTorchModelEngine(ModelEngine):
             # update batch index
             request.py_batch_idx = request.py_seq_slot
 
-        helix_is_inactive_rank = [] if self.mapping.has_cp_helix() else None
+        helix_is_inactive_rank, helix_position_offsets = [], []
         for request in generation_requests:
             request_ids.append(request.py_request_id)
             beam_width = request.sampling_config.beam_width
@@ -2193,9 +2175,10 @@ class PyTorchModelEngine(ModelEngine):
 
                 position_id = past_seen_token_num
                 if self.mapping.has_cp_helix():
-                    # Warmup doesn't have `total_input_len_cp` set because merge_helix_requests is not called.
-                    if not self.is_warmup and not request.is_cuda_graph_dummy:
-                        position_id = request.total_input_len_cp + request.py_decoding_iter - 1
+                    assert not self.is_warmup, "Warmup is not called for helix parallelism."
+                    # We compute a global position_id because each helix rank has only a subset of
+                    # tokens for a sequence.
+                    position_id = request.total_input_len_cp + request.py_decoding_iter - 1
                     if request.py_helix_is_inactive_rank:
                         past_seen_token_num = request.seqlen_this_rank_cp
                     else:
@@ -2203,13 +2186,15 @@ class PyTorchModelEngine(ModelEngine):
                         # been previously seen.
                         past_seen_token_num = request.seqlen_this_rank_cp - 1
 
+                    # Update helix-specific parameters.
+                    helix_is_inactive_rank.append(
+                        request.py_helix_is_inactive_rank)
+                    helix_position_offsets.append(position_id)
+
                 position_ids.append(position_id)
                 num_cached_tokens_per_seq.append(past_seen_token_num)
                 request.cached_tokens = num_cached_tokens_per_seq[-1]
                 prompt_lengths.append(request.py_prompt_len)
-                if self.mapping.has_cp_helix():
-                    helix_is_inactive_rank.append(
-                        request.py_helix_is_inactive_rank)
                 draft_lens.append(0)
                 sequence_lengths.append(1)
                 num_accepted_draft_tokens.append(0)
@@ -2228,13 +2213,14 @@ class PyTorchModelEngine(ModelEngine):
                                                   mrope_position_deltas).expand(
                                                       3, 1, 1)
                         mrope_position_ids.append(gen_mrope_position_ids)
-                        multimodal_params.to_device(
-                            "multimodal_data",
-                            "cuda",
-                            pin_memory=True,
-                            target_keywords=[
-                                "mrope_config.mrope_position_deltas"
-                            ])
+                        if mrope_position_deltas.device.type == "cpu":
+                            multimodal_params.to_device(
+                                "multimodal_data",
+                                "cuda",
+                                pin_memory=True,
+                                target_keywords=[
+                                    "mrope_config.mrope_position_deltas"
+                                ])
                         multimodal_params_list.append(multimodal_params)
 
             request.py_batch_idx = request.py_seq_slot
@@ -2463,8 +2449,9 @@ class PyTorchModelEngine(ModelEngine):
             # NOTE: self.use_mrope is enough for differentiating whether to use mrope_position_ids but
             # `_create_dummy_context_requests` from `kv_cache_creater` makes an exception that I can not add multimodal_data to the dummy_request
             # so that we only replace position_ids with mrope_position_ids when it is not a dummy request and for models who is using mrope.
-            mrope_position_ids = torch.cat(mrope_position_ids,
-                                           dim=-1).pin_memory()
+            mrope_position_ids = torch.cat(mrope_position_ids, dim=-1)
+            if mrope_position_ids.device.type == "cpu":
+                mrope_position_ids = mrope_position_ids.pin_memory()
             self.mrope_position_ids_cuda[:, :, :total_num_tokens].copy_(
                 mrope_position_ids[:, :, :total_num_tokens], non_blocking=True)
             final_position_ids = self.mrope_position_ids_cuda[:, :, :
@@ -2512,6 +2499,12 @@ class PyTorchModelEngine(ModelEngine):
                     draft_request_indices_buffer_cuda[:
                                                       num_first_draft]] += accepted_tokens
 
+        if self.mapping.has_cp_helix():
+            attn_metadata.update_helix_param(
+                helix_position_offsets=helix_position_offsets,
+                helix_is_inactive_rank=helix_is_inactive_rank,
+            )
+
         if not attn_metadata.is_cuda_graph:
             # Assumes seq lens do not change between CUDA graph invocations. This applies
             # to draft sequences too. This means that all draft sequences must be padded.
@@ -2540,12 +2533,6 @@ class PyTorchModelEngine(ModelEngine):
 
         attn_metadata.request_ids = request_ids
         attn_metadata.prompt_lens = prompt_lengths
-        if helix_is_inactive_rank is not None and len(
-                helix_is_inactive_rank) > 0:
-            helix_is_inactive_rank = torch.tensor(helix_is_inactive_rank,
-                                                  dtype=torch.bool,
-                                                  device='cuda')
-        attn_metadata.helix_is_inactive_rank = helix_is_inactive_rank
         attn_metadata.num_contexts = len(scheduled_requests.context_requests)
         # Use num_chunked_ctx_requests to record the number of extend context requests,
         # so that we can update the kv_lens_cuda correctly in _preprocess_inputs.
@@ -3377,7 +3364,26 @@ class PyTorchModelEngine(ModelEngine):
             mm_embeddings = list(
                 torch.split(mm_embeddings[0], multimodal_chunks, dim=0))
 
-        return {'mm_embeddings': mm_embeddings, 'logits': None}
+        # Extract mrope position data from multimodal_params if available
+        mrope_position_ids_list = []
+        mrope_position_deltas_list = []
+        for multimodal_param in multimodal_params:
+            mrope_config = multimodal_param.multimodal_data.get(
+                'mrope_config', {})
+            mrope_position_ids = mrope_config.get('mrope_position_ids')
+            mrope_position_deltas = mrope_config.get('mrope_position_deltas')
+            if mrope_position_ids is not None:
+                mrope_position_ids_list.append(mrope_position_ids)
+            if mrope_position_deltas is not None:
+                mrope_position_deltas_list.append(mrope_position_deltas)
+
+        result = {'mm_embeddings': mm_embeddings, 'logits': None}
+        if mrope_position_ids_list:
+            result['mrope_position_ids'] = mrope_position_ids_list
+        if mrope_position_deltas_list:
+            result['mrope_position_deltas'] = mrope_position_deltas_list
+
+        return result
 
     def _init_userbuffers(self, hidden_size):
         if self.mapping.tp_size <= 1 or self.mapping.pp_size > 1:

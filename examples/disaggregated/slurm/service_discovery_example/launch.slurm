@@ -38,14 +38,14 @@ disagg_cluster:
   cluster_name: example_cluster
 EOL
 
-cat >${work_path}/ctx_extra-llm-api-config.yaml << EOL
+cat >${work_path}/ctx_config.yaml << EOL
 disable_overlap_scheduler: True
 cache_transceiver_config:
   backend: UCX
   max_tokens_in_buffer: 2048
 EOL
 
-cat >${work_path}/gen_extra-llm-api-config.yaml << EOL
+cat >${work_path}/gen_config.yaml << EOL
 cache_transceiver_config:
   backend: UCX
   max_tokens_in_buffer: 2048
@@ -63,11 +63,11 @@ srun --container-image=${container_image} \
      --container-mounts=${mount_paths} \
      -N 2 --ntasks-per-node=4 \
      --mpi=pmix \
-     bash -c "trtllm-llmapi-launch trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --tp_size 8 --host 0.0.0.0 --port ${ctx_port} --extra_llm_api_options ${work_path}/ctx_extra-llm-api-config.yaml --disagg_cluster_uri ${disagg_cluster_uri} --server-role context" &
+     bash -c "trtllm-llmapi-launch trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --tp_size 8 --host 0.0.0.0 --port ${ctx_port} --config ${work_path}/ctx_config.yaml --disagg_cluster_uri ${disagg_cluster_uri} --server-role context" &
 
 # Launch a generation with `tp_size=4` using one 4-GPU node.
 srun --container-image=${container_image} \
      --container-mounts=${mount_paths} \
      -N 1 --ntasks-per-node=4 \
      --mpi=pmix \
-     bash -c "trtllm-llmapi-launch trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --tp_size 4 --host 0.0.0.0 --port ${gen_port} --extra_llm_api_options ${work_path}/gen_extra-llm-api-config.yaml --disagg_cluster_uri ${disagg_cluster_uri} --server-role generation" &
+     bash -c "trtllm-llmapi-launch trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --tp_size 4 --host 0.0.0.0 --port ${gen_port} --config ${work_path}/gen_config.yaml --disagg_cluster_uri ${disagg_cluster_uri} --server-role generation" &

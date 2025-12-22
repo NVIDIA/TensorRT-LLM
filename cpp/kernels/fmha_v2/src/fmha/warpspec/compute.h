@@ -256,7 +256,8 @@ struct Compute
         actual_kv_seqlen, alibi_head_scale,                                                                            \
         USE_CUSTOM_MASK ? (head_info.mask_sum_s + q_step_idx * STEP_Q + local_q_tile_offset)                           \
                         : (q_step_idx * STEP_Q + head_info.q_tile_offset),                                             \
-        kv_step_idx * STEP_KV, sage_scale_row, cbr, cbr_v, mutex_accessor, kv_step_idx == kv_idx_end - 1);
+        kv_step_idx * STEP_KV, sage_scale_row, cbr, cbr_v, mutex_accessor,                                             \
+        &shared->skip_softmax_votes[kv_step_idx & 1][warpgroup_id], kv_step_idx == kv_idx_end - 1);
 
     ////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -359,6 +360,12 @@ struct Compute
             int const actual_q_seqlen = head_info.actual_seqlen;
             // Contiguous QKV FMHA assumes q, and kv have the same sequence length.
             int const actual_kv_seqlen = SEPARATE_Q_KV_BUFFER ? head_info.actual_kv_seqlen : actual_q_seqlen;
+
+            // Update threshold of Skip-Softmax
+            if constexpr (Kernel_traits::ENABLE_SKIP_SOFTMAX)
+            {
+                softmax.skip_softmax_threshold = params.skip_softmax_threshold_scale_factor / actual_kv_seqlen;
+            }
 
             // Calculate the alibi head_scaling_factor.
             float alibi_head_scale
@@ -513,6 +520,13 @@ struct Compute
                 }
             }
         }
+#ifdef SKIP_SOFTMAX_STAT
+        if (tidx == 0)
+        {
+            atomicAdd(params.skip_softmax_total_blocks, softmax.total_blocks);
+            atomicAdd(params.skip_softmax_skipped_blocks, softmax.skipped_blocks);
+        }
+#endif
     }
 
     ////////////////////////////////////////////////////////////////////////////////////////////////
@@ -522,8 +536,15 @@ struct Compute
         Compute_tile_o& ctile_o, float (&p_max)[Mma_tile_p::CORES_M], float (&p_sum)[Mma_tile_p::CORES_M],
         int const tidx, int const actual_kv_seqlen, float const alibi_head_scale, int const row_offset,
         int const col_offset, int const sage_scale_row, Circular_buffer_q_reader& cbr, Circular_buffer_kv_reader& cbr_v,
-        OrderedMutexAccessor& mutex, bool complete = false)
+        OrderedMutexAccessor& mutex, uint32_t* skip_softmax_vote, bool complete = false)
     {
+
+        // Skip-softmax vote initialization
+        if (tidx == 0)
+        {
+            // Note that we need a named_barrier_wait in compute_single_tile to make sure init is before voting.
+            *skip_softmax_vote = 1;
+        }
 // load the scales of K/V from global memory
 #define LOAD_SCALES_KV(dst, which, blocks_per_step, block_size)                                                        \
     if constexpr (block_size > 0)                                                                                      \
@@ -556,6 +577,10 @@ struct Compute
 
         // Ctile_p is only used once by each n step.
         ctile_p.clear();
+
+        // If skip_softmax is enabled, make sure there is no racing between the initialization and writing of
+        // skip_softmax_vote.
+        named_barrier_wait(Kernel_traits::SKIP_SOFTMAX_BARRIER_ID + threadIdx.x / 128, 128);
 
         // BMM1 (Q x K').
         warpgroup_arrive();
@@ -626,8 +651,22 @@ struct Compute
         softmax.apply_alibi_and_mask<APPLY_MASK>(
             ctile_p, params.alibi_params, alibi_head_scale, actual_kv_seqlen, row_offset, col_offset);
 
-        // Softmax Exp, max/sum, and update scales.
-        softmax.compute_and_update_scale<IS_FIRST_COL>(p_max, p_sum);
+        // Softmax Exp, max/sum, and update scales. If returns false we skip the rest.
+        if (!softmax.compute_and_update_scale<IS_FIRST_COL>(p_max, p_sum, skip_softmax_vote))
+        {
+            if constexpr (ENABLE_MUTEX && Kernel_traits::ELEMENT_BYTES == 1)
+            {
+                // Notify another warpgroup to execute QGMMA.
+                mutex.named_bar_arrive();
+            }
+            // Need to wait V, otherwise compute-sanitizer synccheck will fail.
+            int ready2 = cbr_v.peek();
+            if (!ready2)
+            {
+                cbr_v.wait();
+            }
+            return;
+        }
 
         // experiments show that here is the best place to load scales of V
         float scales_v[SAGE_BLOCKS_PER_STEP_V];
