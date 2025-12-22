@@ -30,13 +30,13 @@ curl -s http://localhost:8000/v1/chat/completions \
 
 ## Configuration via YAML
 
-Use `--extra_llm_api_options` to supply a YAML file that augments or overrides server/runtime settings.
+Use `--config` to supply a YAML file that augments or overrides server/runtime settings.
 
 ```bash
 trtllm-serve \
   meta-llama/Llama-3.1-8B \
   --backend _autodeploy \
-  --extra_llm_api_options autodeploy_config.yaml
+  --config autodeploy_config.yaml
 ```
 
 Example `autodeploy_config.yaml`:

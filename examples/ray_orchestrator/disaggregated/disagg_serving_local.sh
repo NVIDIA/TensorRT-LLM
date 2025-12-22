@@ -129,14 +129,14 @@ if [[ "$BACKEND" == "mpi" ]]; then
     export CUDA_VISIBLE_DEVICES=0
 fi
 
-trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port 8001 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --extra_llm_api_options extra_llm_config.yaml &> output_ctx0 &
+trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port 8001 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --config extra_llm_config.yaml &> output_ctx0 &
 
 if [[ "$BACKEND" == "mpi" ]]; then
     export CUDA_VISIBLE_DEVICES=1
 fi
 # Launching generation servers
 echo "Launching generation servers..."
-trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port 8002 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --extra_llm_api_options extra_llm_config.yaml &> output_gen0 &
+trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port 8002 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --config extra_llm_config.yaml &> output_gen0 &
 
 # Launching disaggregated server
 echo "Launching disaggregated server..."

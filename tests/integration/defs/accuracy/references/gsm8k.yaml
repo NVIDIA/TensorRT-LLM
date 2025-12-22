@@ -288,7 +288,11 @@ bigcode/starcoder2-7b:
 bigcode/starcoder2-15b:
   - accuracy: 54.5
 mistral/Mistral-Large-3-675B:
-  - accuracy: 90.83
+  - accuracy: 86.1
+  - spec_dec_algo: Eagle
+    accuracy: 86.1
+nvidia/Nemotron-Super-V3:
+  - accuracy: 84.38
 nvidia/Nemotron-3-Nano:
   - accuracy: 69.37
   - quant_algo: FP8

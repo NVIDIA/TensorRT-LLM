@@ -177,4 +177,13 @@ struct Fused_multihead_attention_params_v2
             float* scales;
         } q, k, v;
     } sage;
+
+    // Skip softmax when exp(local_max - global_max) < skip_softmax_threshold_scale_factor / seqlen.
+    // A positive value means skip-softmax is enabled.
+    float skip_softmax_threshold_scale_factor = 0;
+#ifdef SKIP_SOFTMAX_STAT
+    // Statistics of skip-softmax, pointers of device memory for output
+    uint32_t* skip_softmax_total_blocks;
+    uint32_t* skip_softmax_skipped_blocks;
+#endif
 };
