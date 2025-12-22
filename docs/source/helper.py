@@ -347,29 +347,22 @@ def generate_llmapi():
 
 
 def generate_supported_models():
-    """Regenerate `docs/source/models/supported-models.md` from in-code matrix.
-
-    This keeps the docs GitHub-readable while ensuring the tables are sourced
-    from a single programmatic definition.
-    """
+    """Regenerate `docs/source/models/supported-models.md` from in-code matrix."""
     root_dir = Path(__file__).parent.parent.parent.resolve()
     doc_path = root_dir / "docs/source/models/supported-models.md"
 
-    # Load stdlib-only module by path to avoid importing `tensorrt_llm/__init__.py`
-    # (which brings in heavy runtime deps like torch).
     module_path = root_dir / "tensorrt_llm/llmapi/model_support_matrix.py"
     spec = importlib.util.spec_from_file_location("tllm_model_support_matrix",
                                                   module_path)
-    assert spec is not None and spec.loader is not None, f"Failed to load {module_path}"
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Failed to load {module_path}")
     module = importlib.util.module_from_spec(spec)
-    # Python 3.13 dataclasses expects the module to be present in sys.modules
-    # during class creation.
+    # Needed for dataclasses/type evaluation during module exec.
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
 
     content = module.render_supported_models_markdown()
 
-    # Write only if changed to minimize churn in local docs builds.
     prev = ""
     if doc_path.exists():
         with open(doc_path, "r") as f:

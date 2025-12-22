@@ -21,14 +21,13 @@ from pathlib import Path
 
 
 def _render_supported_models_markdown(repo_root: Path) -> str:
-    """Render supported-models.md via the stdlib-only generator."""
     module_path = repo_root / "tensorrt_llm/llmapi/model_support_matrix.py"
     spec = importlib.util.spec_from_file_location("tllm_model_support_matrix", module_path)
-    assert spec is not None and spec.loader is not None, f"Failed to load {module_path}"
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Failed to load {module_path}")
     module = importlib.util.module_from_spec(spec)
 
-    # Python 3.13 dataclasses expects the module to be present in sys.modules
-    # during class creation.
+    # Needed for dataclasses/type evaluation during module exec.
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module.render_supported_models_markdown()
