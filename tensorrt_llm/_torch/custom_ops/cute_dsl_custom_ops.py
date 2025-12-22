@@ -886,8 +886,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             l, n = b.size(0), b.size(1)
 
             # TODO: Add full shmoo
-            mma_tiler_mn_candidates = [(128, 128), (128, 256)]
-            cluster_shape_mn_candidates = [(1, 1), (1, 2)]
+            mma_tiler_mn_candidates = [(128, 128), (128, 256), (256, 128),
+                                       (256, 256)]
+            cluster_shape_mn_candidates = [(1, 1), (1, 2), (2, 1), (2, 2)]
 
             valid_tactics = []
             for mma_tiler_mn, cluster_shape_mn in itertools.product(
@@ -896,9 +897,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         ab_dtype=cutlass.Float4E2M1FN,
                         sf_dtype=cutlass.Float8E4M3FN,
                         sf_vec_size=self.scaling_vector_size,
-                        acc_dtype=cutlass.Float32,
                         c_dtype=cutlass.BFloat16,
-                        use_2cta_instrs=False,
                         mma_tiler_mn=mma_tiler_mn,
                         cluster_shape_mn=cluster_shape_mn,
                         m=m,
@@ -908,7 +907,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         a_major="k",
                         b_major="k",
                         c_major="n",
-                        m_aligned=self.tile_size,
                 ):
                     valid_tactics.append((mma_tiler_mn, cluster_shape_mn))
 
@@ -1004,15 +1002,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if isinstance(tactic, tuple):
                 mma_tiler_mn, cluster_shape_mn = tactic
             else:
-                mma_tiler_mn, cluster_shape_mn = (128, 128), (1, 1)
+                mma_tiler_mn, cluster_shape_mn = (self.tile_size,
+                                                  128), (self.tile_size // 128,
+                                                         1)
 
             cache_key = (self.scaling_vector_size, self.tile_size, mma_tiler_mn,
                          cluster_shape_mn)
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
                     sf_vec_size=self.scaling_vector_size,
-                    acc_dtype=cutlass.Float32,
-                    use_2cta_instrs=False,
                     mma_tiler_mn=mma_tiler_mn,
                     cluster_shape_mn=cluster_shape_mn,
                 )
