@@ -1071,7 +1071,10 @@ class PyTorchModelEngine(ModelEngine):
         num_key_value_heads = getattr(config, 'num_key_value_heads', None)
 
         if num_attention_heads is not None and num_key_value_heads is not None:
-            num_heads_per_kv = num_attention_heads // num_key_value_heads
+            if isinstance(num_key_value_heads, (list, tuple)):
+                num_key_value_heads = min(
+                    (kv for kv in num_key_value_heads if kv), default=0)
+            num_heads_per_kv = num_attention_heads // num_key_value_heads if num_key_value_heads else 1
         else:
             num_heads_per_kv = 1
 
