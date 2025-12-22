@@ -360,6 +360,17 @@ def parse_arguments():
         default=10.0,
         help="Maximum cap for any delay in seconds (default: 10.0)",
     )
+    parser.add_argument(
+        "--kv_cache_hint_enabled",
+        action="store_true",
+        help="Enable KV cache hint",
+    )
+    parser.add_argument(
+        "--export_task_metrics_path",
+        type=str,
+        default=None,
+        help="If specified, export task metrics to this JSON file",
+    )
 
     return parser.parse_args()
 

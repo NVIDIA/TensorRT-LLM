@@ -8,8 +8,6 @@ from typing import Callable, List, Optional
 
 import openai
 import requests
-from enum import Enum
-import requests
 from transformers import AutoTokenizer
 
 from tensorrt_llm import LLM
@@ -80,6 +78,7 @@ class OpenaiWorker(Worker):
         self,
         async_client: openai.AsyncOpenAI,
         model: str,
+        kv_cache_hint_enabled: bool = False,
     ):
         # Dynamic patch to support KV cache hint
         async def send_kv_cache_hint(self, task: DropKVCacheTask, params: dict):
@@ -118,6 +117,7 @@ class OpenaiWorker(Worker):
 
         self.model = model
         self.async_client = async_client
+        self.kv_cache_hint_enabled = kv_cache_hint_enabled
 
     def convert_task_params(self, task: GenerationTask | ChatTask):
         params = {
@@ -220,6 +220,9 @@ class OpenaiWorker(Worker):
             return TaskStatus.WORKER_EXECEPTION
 
     async def drop_kv_cache_handler(self, task: DropKVCacheTask) -> TaskStatus:
+        if not self.kv_cache_hint_enabled:
+            return TaskStatus.SUCCESS
+
         params = self.convert_task_params(task.chat_task)
         params["messages"] = task.chat_task.messages_to_dict_content()
         params["model"] = self.model
