@@ -50,35 +50,57 @@ class _FlashInferPlanner:
     """A class interface to handle flashinfer-related planning/wrapping operations."""
 
     workspace_buffer: Optional[torch.Tensor]
+    paged_kv_indptr_buffer: Optional[torch.Tensor]
+    paged_kv_indices_buffer: Optional[torch.Tensor]
+    paged_kv_last_page_len_buffer: Optional[torch.Tensor]
     prefill_wrapper: Optional[flashinfer.BatchPrefillWithPagedKVCacheWrapper]
     decode_wrapper: Optional[flashinfer.BatchDecodeWithPagedKVCacheWrapper]
-    cached_decode_wrappers: Dict[PlanParams, flashinfer.BatchDecodeWithPagedKVCacheWrapper]
+    cached_cuda_graph_decode_wrappers: Dict[
+        PlanParams, flashinfer.BatchDecodeWithPagedKVCacheWrapper
+    ]
     plan_params: Optional[PlanParams]
 
     def __init__(self):
         self.workspace_buffer = None
+        self.paged_kv_indptr_buffer = None
+        self.paged_kv_indices_buffer = None
+        self.paged_kv_last_page_len_buffer = None
         self.prefill_wrapper = None
         self.decode_wrapper = None
-        self.cached_decode_wrappers = {}
+        self.cached_cuda_graph_decode_wrappers = {}
         self.plan_params = None
 
     def _init_decode_wrapper(
         self,
-        kv_page_indptr: Optional[torch.Tensor] = None,
-        kv_page_indices: Optional[torch.Tensor] = None,
-        kv_last_page_len: Optional[torch.Tensor] = None,
+        use_cuda_graph: bool = False,
+        num_pages: Optional[int] = None,
+        batch_size: Optional[int] = None,
     ):
         assert self.workspace_buffer is not None
-        use_cuda_graph = kv_page_indptr is not None
-        return flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-            self.workspace_buffer,
-            "NHD",
-            use_tensor_cores=True,
-            use_cuda_graph=use_cuda_graph,
-            paged_kv_indptr_buffer=kv_page_indptr,
-            paged_kv_indices_buffer=kv_page_indices,
-            paged_kv_last_page_len_buffer=kv_last_page_len,
-        )
+        if use_cuda_graph:
+            assert self.paged_kv_indptr_buffer is not None
+            assert self.paged_kv_indices_buffer is not None
+            assert self.paged_kv_last_page_len_buffer is not None
+            if len(self.paged_kv_indices_buffer) < num_pages:
+                print(
+                    f"Resizing paged_kv_indices_buffer from {len(self.paged_kv_indices_buffer)} to {num_pages}"
+                )
+                self.paged_kv_indices_buffer.resize_(num_pages)
+            return flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+                self.workspace_buffer,
+                "NHD",
+                use_cuda_graph=True,
+                paged_kv_indptr_buffer=self.paged_kv_indptr_buffer[: batch_size + 1],
+                paged_kv_indices_buffer=self.paged_kv_indices_buffer[:num_pages],
+                paged_kv_last_page_len_buffer=self.paged_kv_last_page_len_buffer[:batch_size],
+                use_tensor_cores=True,
+            )
+        else:
+            return flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+                self.workspace_buffer,
+                "NHD",
+                use_tensor_cores=True,
+            )
 
     def init_workspace(self, workspace_buffer: torch.Tensor):
         self.__init__()  # reset all state
@@ -128,13 +150,19 @@ class _FlashInferPlanner:
             )
 
         # we want to plan during warm-up of cuda graph capture to ensure we have the plan cached
-        if cuda_graph_state.in_warm_up() and plan_params not in self.cached_decode_wrappers:
+        if (
+            cuda_graph_state.in_warm_up()
+            and plan_params not in self.cached_cuda_graph_decode_wrappers
+        ):
             # During CUDA graph capture, the metadata tensors provided by auto-deploy are stable.
-            self.cached_decode_wrappers[plan_params] = self._init_decode_wrapper(
-                kv_page_indptr, kv_page_indices, kv_last_page_len
+            wrapper = self._init_decode_wrapper(
+                use_cuda_graph=False,
+                num_pages=len(kv_page_indices),
+                batch_size=len(kv_page_indptr) - 1,
             )
+            self.cached_cuda_graph_decode_wrappers[plan_params] = wrapper
             _plan_decode(
-                self.cached_decode_wrappers[plan_params],
+                wrapper,
                 kv_page_indptr,
                 kv_page_indices,
                 kv_last_page_len,
@@ -142,47 +170,36 @@ class _FlashInferPlanner:
         # check if we are in cuda graph capture and just return the pre-cached decode wrapper
         if torch.cuda.is_current_stream_capturing() or cuda_graph_state.in_warm_up():
             assert plan_params.is_generate, "Only generate is supported during cuda graph capture."
-            wrapper = self.cached_decode_wrappers[plan_params]
-            # copy the metadata to the wrapper to ensure it is up-to-date for graph replay!
-            wrapper._paged_kv_indptr_buf.copy_(kv_page_indptr)
-            wrapper._paged_kv_indices_buf.copy_(kv_page_indices)
-            wrapper._paged_kv_last_page_len_buf.copy_(kv_last_page_len)
+            wrapper = self.cached_cuda_graph_decode_wrappers[plan_params]
+            wrapper._paged_kv_indptr_buf[: len(kv_page_indptr)].copy_(kv_page_indptr)
+            wrapper._paged_kv_indices_buf[: len(kv_page_indices)].copy_(kv_page_indices)
+            wrapper._paged_kv_last_page_len_buf[: len(kv_last_page_len)].copy_(kv_last_page_len)
             return wrapper
 
-        # handle decode
-        if plan_params.is_generate:
-            wrapper = self.decode_wrapper
-            if plan_params != self.plan_params:
-                _plan_decode(
-                    wrapper,
+        # check for re-planning
+        if plan_params != self.plan_params:
+            if plan_params.is_generate:
+                _plan_decode(self.decode_wrapper, kv_page_indptr, kv_page_indices, kv_last_page_len)
+            else:
+                # plan prefill
+                self.prefill_wrapper.plan(
+                    qo_indptr,
                     kv_page_indptr,
                     kv_page_indices,
                     kv_last_page_len,
+                    plan_params.n_heads,  # Q heads
+                    plan_params.n_kv_heads,  # KV heads
+                    plan_params.head_dim,
+                    plan_params.page_size,
+                    causal=plan_params.causal,
+                    q_data_type=plan_params.q_dtype,
+                    kv_data_type=plan_params.kv_dtype,
+                    sm_scale=plan_params.sm_scale,
                 )
             self.plan_params = plan_params
 
-            return wrapper
-
-        # handle prefill
-        if plan_params != self.plan_params:
-            # plan prefill
-            self.prefill_wrapper.plan(
-                qo_indptr,
-                kv_page_indptr,
-                kv_page_indices,
-                kv_last_page_len,
-                plan_params.n_heads,  # Q heads
-                plan_params.n_kv_heads,  # KV heads
-                plan_params.head_dim,
-                plan_params.page_size,
-                causal=plan_params.causal,
-                q_data_type=plan_params.q_dtype,
-                kv_data_type=plan_params.kv_dtype,
-                sm_scale=plan_params.sm_scale,
-            )
-            self.plan_params = plan_params
-
-        return self.prefill_wrapper
+        # return desired wrapper
+        return self.decode_wrapper if plan_params.is_generate else self.prefill_wrapper
 
 
 _GlobalFlashInferPlanner = _FlashInferPlanner()
@@ -206,9 +223,7 @@ def prepare_flashinfer_metadata(
     num_seq = num_prefill + num_decode
     num_tokens = num_prefill_tokens + num_decode
 
-    # Only reset the planner if we have prefill work to do.
-    if num_prefill > 0:
-        _GlobalFlashInferPlanner.reset()
+    _GlobalFlashInferPlanner.reset()
 
     qo_indptr = cu_seqlen[: num_seq + 1]
 
@@ -429,6 +444,15 @@ class FlashInferAttention(AttentionDescriptor):
             # see https://github.com/NVIDIA/TensorRT-LLM/pull/3686
             buffer = torch.empty(320 * 1024 * 1024, dtype=torch.uint8, device=si.device)
             cls._get_planner().init_workspace(buffer)
+            cls._get_planner().paged_kv_indptr_buffer = torch.empty(
+                si.max_batch_size + 1, dtype=torch.int, device=si.device
+            )
+            cls._get_planner().paged_kv_indices_buffer = torch.empty(
+                si.num_pages, dtype=torch.int, device=si.device
+            )
+            cls._get_planner().paged_kv_last_page_len_buffer = torch.empty(
+                si.max_batch_size, dtype=torch.int, device=si.device
+            )
             return buffer
 
         return {"workspace_buffer": _init_workspace}
