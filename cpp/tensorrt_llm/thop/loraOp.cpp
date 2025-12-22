@@ -419,5 +419,6 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("lora_grouped_gemm", &tensorrt_llm::torch_ext::lora_grouped_gemm);
     m.impl("lora_grouped_gemm_cuda_graph", &tensorrt_llm::torch_ext::lora_grouped_gemm_cuda_graph);
-    m.impl("lora_group_gemm_param_fill_row_reorder_fusion", &tensorrt_llm::torch_ext::lora_group_gemm_param_fill_row_reorder_fusion);
+    m.impl("lora_group_gemm_param_fill_row_reorder_fusion",
+        &tensorrt_llm::torch_ext::lora_group_gemm_param_fill_row_reorder_fusion);
 }

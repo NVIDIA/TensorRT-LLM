@@ -307,8 +307,8 @@ void launchKernelWithModuleCount(int32_t* in_sizes, int32_t* out_sizes, int64_t*
     int const itemsPerRow = ITEMS_PER_BLOCK * gridDimX;
     gridDimY = std::max(gridDimY,
         common::ceilDiv(static_cast<int>(module_count * batch_size * max_lora_rank * dtype_element_size), itemsPerRow));
-    gridDimY = std::max(
-        gridDimY, common::ceilDiv(static_cast<int>(batch_size * sum_output_hidden_size * dtype_element_size), itemsPerRow));
+    gridDimY = std::max(gridDimY,
+        common::ceilDiv(static_cast<int>(batch_size * sum_output_hidden_size * dtype_element_size), itemsPerRow));
 
     dim3 grid(gridDimX, gridDimY);
     dim3 block(BlockDim);
