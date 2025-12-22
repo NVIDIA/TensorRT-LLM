@@ -160,7 +160,7 @@
     if (!model || !configPath) return entry.command || "";
     return [
       `trtllm-serve ${model} \\`,
-      `  --extra_llm_api_options \${TRTLLM_DIR}/${configPath}`,
+      `  --config \${TRTLLM_DIR}/${configPath}`,
     ].join("\n");
   }
 
@@ -467,11 +467,11 @@
         return true;
       });
 
-      const code = /** @type {HTMLElement} */ ($(cmdPre, "code"));
+      const code = cmdPre.querySelector("code");
       if (finalEntries.length === 1) {
         const e = finalEntries[0];
         code.textContent = formatCommand(e);
-        cmdCopyBtn.disabled = !e.command;
+        cmdCopyBtn.disabled = !code.textContent;
         meta.textContent = "";
         meta.appendChild(el("span", { text: "Config: " }));
         const cfgHref = e.config_github_url || e.config_raw_url || "";

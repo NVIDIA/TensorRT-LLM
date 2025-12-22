@@ -24,7 +24,6 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).parent.resolve()
 REPO_ROOT = SCRIPT_DIR.parent
 
-# Add repo root to path for examples.configs.database import
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -33,25 +32,6 @@ from examples.configs.database.database import (  # noqa: E402
     RecipeList,
     assign_profile,
 )
-
-def _ensure_repo_root_on_syspath() -> None:
-    if str(REPO_ROOT) not in sys.path:
-        sys.path.insert(0, str(REPO_ROOT))
-
-
-def _load_recipe_list(yaml_path: Path):
-    _ensure_repo_root_on_syspath()
-    from examples.configs.database.database import RecipeList
-
-    return RecipeList.from_yaml(yaml_path)
-
-
-def _default_database_list_path() -> Path:
-    _ensure_repo_root_on_syspath()
-    from examples.configs.database.database import DATABASE_LIST_PATH
-
-    return Path(DATABASE_LIST_PATH)
-
 
 MODEL_INFO = {
     "deepseek-ai/DeepSeek-R1-0528": {
@@ -94,32 +74,8 @@ def _model_display_and_url(model: str) -> tuple[str, str]:
         return info["display_name"], info["url"]
     return model, ""
 
-
-def _profile_from_sorted_entries(concurrencies: list[int], idx: int) -> str:
-    """Assign a performance profile given entries sorted by concurrency."""
-    n = len(concurrencies)
-    conc = concurrencies[idx]
-
-    if n == 1:
-        if conc <= LOW_LATENCY_CONCURRENCY_THRESHOLD:
-            return "Low Latency"
-        if conc >= HIGH_THROUGHPUT_CONCURRENCY_THRESHOLD:
-            return "High Throughput"
-        return "Balanced"
-
-    if idx == 0:
-        return "Min Latency"
-    if idx == n - 1:
-        return "Max Throughput"
-    if idx in ((n - 1) // 2, n // 2):
-        return "Balanced"
-    if idx < n // 2:
-        return "Low Latency"
-    return "High Throughput"
-
-
 def build_rows(yaml_path) -> list[RecipeRow]:
-    recipe_list = _load_recipe_list(Path(yaml_path))
+    recipe_list = RecipeList.from_yaml(Path(yaml_path))
 
     model_groups = defaultdict(lambda: defaultdict(list))
     for recipe in recipe_list:
@@ -141,7 +97,6 @@ def build_rows(yaml_path) -> list[RecipeRow]:
         for key in sorted_keys:
             entries = subgroups[key]
             entries.sort(key=lambda x: x.concurrency)
-            concurrencies = [e.concurrency for e in entries]
 
             for idx, entry in enumerate(entries):
                 gpu = entry.gpu
@@ -152,11 +107,10 @@ def build_rows(yaml_path) -> list[RecipeRow]:
                 conc = entry.concurrency
                 config_path = entry.config_path
 
-                # profile = _profile_from_sorted_entries(concurrencies, idx)
                 profile = assign_profile(len(entries), idx, conc)
 
                 command = (
-                    f"trtllm-serve {model} --extra_llm_api_options ${{TRTLLM_DIR}}/{config_path}"
+                    f"trtllm-serve {model} --config ${{TRTLLM_DIR}}/{config_path}"
                 )
 
                 config_filename = os.path.basename(config_path)
@@ -297,7 +251,7 @@ def generate_json(yaml_path, output_file):
 
 
 if __name__ == "__main__":
-    yaml_path = _default_database_list_path()
+    yaml_path = Path(DATABASE_LIST_PATH)
     if not yaml_path.exists():
         print(f"Error: YAML file not found at {yaml_path}", file=sys.stderr)
         sys.exit(1)
