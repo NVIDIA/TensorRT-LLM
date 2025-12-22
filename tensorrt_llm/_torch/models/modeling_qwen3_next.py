@@ -826,7 +826,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         self,
         conv_states,
         ssm_states,
-        num_decodes,
         query_start_loc_long,
         **kwargs,
     ):
@@ -1065,7 +1064,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             "state_indices_p": state_indices_p,
             "state_indices_d": state_indices_d,
             "num_prefill": num_prefills,
-            "num_decodes": num_decodes,
         }
         if num_prefills > 0:
             attn_out = self.forward_extend(conv_states, ssm_states, **kwargs)
