@@ -196,7 +196,8 @@ def construct_gpu_properties(mako_opts, device_index=0):
                                                                          2)
         except pynvml.NVMLError_NotSupported as e:
             logger.warning("Unable to get GPU memory info: {}".format(e))
-            gpu_memory = 8 * 1024**3
+            # Fallback to 8 GiB, expressed in MiB to match the nvml path above.
+            gpu_memory = 8 * 1024
         # Gather GPU information
         mako_opt_dict["gpu"] = gpu_name
         mako_opt_dict["gpu_memory"] = gpu_memory
