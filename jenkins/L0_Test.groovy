@@ -1061,7 +1061,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 ]
                 def envVarsToExport = [:]
                 envVarNames.each { varName ->
-                    envVarsToExport[varName] = env[varName]
+                    envVarsToExport[varName] = env."${varName}"
                 }
 
                 srunArgs = [
