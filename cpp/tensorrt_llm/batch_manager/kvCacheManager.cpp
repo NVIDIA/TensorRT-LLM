@@ -1016,8 +1016,7 @@ void WindowBlockManager::releaseChildren(BlockPtr const& block, bool toFront)
     // Release block to free queue if no refs
     if (!block->hasRefs())
     {
-        // Set to lowest priority so it gets evicted first
-        block->setPriority(executor::KvCacheRetentionConfig::kMinRetentionPriority);
+        mEvictionPolicy->claimBlock(block, executor::KvCacheRetentionConfig::kMinRetentionPriority, std::nullopt);
         mEvictionPolicy->releaseBlock(block, toFront);
     }
 }

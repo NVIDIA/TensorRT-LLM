@@ -56,6 +56,9 @@ async def run_agent_benchmark_core(llm, prompts, concurrency, benchmark_name, ar
             QueryCollector.get_global_info()
             print(f"Query info dumped to query_result.json! ({benchmark_name})")
 
+        if args.export_task_metrics_path is not None:
+            TaskMetricsCollector.export_to_json(args.export_task_metrics_path)
+
     return results
 
 
@@ -66,7 +69,7 @@ async def create_agent_resources(args):
         Tuple of (llm, mcp_worker, generation_worker) for cleanup
     """
     client = AsyncOpenAI(api_key=args.openai_api_key, base_url=args.base_url)
-    generation_worker = TRTOpenaiWorker(client, args.model)
+    generation_worker = TRTOpenaiWorker(client, args.model, args.kv_cache_hint_enabled)
 
     mcp_worker = MCPWorker.init_with_urls(["http://0.0.0.0:8082/sse"])
     await mcp_worker.init_in_asyncio_event_loop()
