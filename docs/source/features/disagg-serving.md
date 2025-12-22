@@ -3,7 +3,7 @@
 - [Motivation](#Motivation)
 - [KV Cache Exchange](#KV-Cache-Exchange)
   - [Multi-backend Support](#Multi-backend-Support)
-  - [NIXL Backend Configuration](#NIXL-Backend-Configuration)
+  - [NIXL Backend Configuration](#nixl-backend-configuration)
   - [Overlap Optimization](#Overlap-Optimization)
   - [Cache Layout Transformation](#Cache-Layout-Transformation)
 - [Usage](#Usage)
@@ -74,7 +74,7 @@ The prerequisites depend on which NIXL backend you choose:
 
 **Installation Options:**
 
-**Option 1: Rebuild NIXL with LIBFABRIC Support (Recommended)**
+###### Option 1: Rebuild NIXL with LIBFABRIC Support (Recommended)
 
 1. **Install libfabric dependencies:**
    - Custom libfabric installation is available via [https://ofiwg.github.io/libfabric/](https://ofiwg.github.io/libfabric/)
@@ -97,7 +97,7 @@ The prerequisites depend on which NIXL backend you choose:
      ```
    - For more details, see the [NIXL LIBFABRIC Plugin documentation](https://github.com/ai-dynamo/nixl/tree/6ee64753605b3110f8ef96c7cfc2f1315675c9c7/src/plugins/libfabric#nixl-libfabric-plugin)
 
-**Option 2: Use Pre-compiled LIBFABRIC Plugin**
+###### Option 2: Use Pre-compiled LIBFABRIC Plugin
 
 If you have a pre-compiled `libplugin_LIBFABRIC.so` that matches your NIXL version:
 
