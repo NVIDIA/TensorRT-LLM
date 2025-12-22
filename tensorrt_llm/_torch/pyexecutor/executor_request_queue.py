@@ -12,7 +12,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import torch
 
 from tensorrt_llm._utils import mpi_disabled, nvtx_range
-from tensorrt_llm.llmapi.disagg_utils import get_local_request_id
+from tensorrt_llm.llmapi.disagg_utils import MIN_GLOBAL_ID, get_local_request_id
 from tensorrt_llm.mapping import CpType
 
 from ..distributed import Distributed
@@ -208,12 +208,16 @@ class ExecutorRequestQueue:
 
         return False
 
-    def _get_request_id(self, request: ExecutorRequest):
-        if request.disaggregated_params is not None and \
-             request.disaggregated_params.ctx_request_id is not None and \
-             request.disaggregated_params.ctx_request_id > 0:
-            # If this is a disagg request and it has a global request id, use it
-            return request.disaggregated_params.ctx_request_id
+    def _get_request_id(self, request: Optional[ExecutorRequest] = None):
+        try:
+            # if client id is a global disagg request id, use it
+            if request and request.client_id is not None and request.client_id >= MIN_GLOBAL_ID:
+                return request.client_id
+        except:
+            print(
+                f"Failed to get request id for request: {request}, {list(request.__dict__.keys())}"
+            )
+            raise
         # (next_request_id + 1) % (MIN_GLOBAL_ID - 1)
         current_id = self.next_request_id
         self.next_request_id = get_local_request_id(current_id)
@@ -243,7 +247,7 @@ class ExecutorRequestQueue:
             assert self.active, "PyExecutor has already been shutdown."
             start_time = time.time()
             for request, query in requests_and_queries:
-                req_id = self._get_request_id()
+                req_id = self._get_request_id(request)
                 if self.enable_iter_perf_stats:
                     self.start_times[req_id] = start_time
                 child_req_ids = self._generate_child_request_ids(request)

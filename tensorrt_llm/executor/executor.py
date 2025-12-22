@@ -15,6 +15,7 @@ import numpy as np
 import torch
 
 from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.llmapi.disagg_utils import get_local_request_id
 from tensorrt_llm.logger import logger, set_level
 
 from .._utils import mpi_world_size
@@ -213,8 +214,7 @@ class GenerationExecutor(ABC):
         return futures
 
     def _get_next_client_id(self):
-        # (self._last_client_id + 1) % UINT64_MAX
-        self._last_client_id = (self._last_client_id + 1) & ((1 << 64) - 1)
+        self._last_client_id = get_local_request_id(self._last_client_id)
         return self._last_client_id
 
     def _get_logprob_params(

@@ -342,7 +342,11 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         self._start_dispatch_threads()
 
-        request.set_id(self._get_next_client_id())
+        if request.disaggregated_params is not None \
+            and request.disaggregated_params.ctx_request_id is not None:
+            request.set_id(request.disaggregated_params.ctx_request_id)
+        else:
+            request.set_id(self._get_next_client_id())
         logprob_params = self._get_logprob_params(request)
 
         result = GenerationResult(
