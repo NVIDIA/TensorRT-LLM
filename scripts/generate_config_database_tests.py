@@ -40,6 +40,14 @@ TEST_LIST_PATH = (
     REPO_ROOT / "tests" / "integration" / "test_lists" / "qa" / "llm_config_database.yml"
 )
 ITERATIONS = 10
+# Mapping from HuggingFace model IDs to MODEL_PATH_DICT keys used by the test framework
+# in tests/integration/defs/perf/test_perf.py
+MODEL_NAME_MAPPING = {
+    "deepseek-ai/DeepSeek-R1-0528": "deepseek_r1_0528_fp8",
+    "nvidia/DeepSeek-R1-0528-FP4-v2": "deepseek_r1_0528_fp4_v2",
+    "openai/gpt-oss-120b": "gpt_oss_120b_fp4",
+}
+
 
 # GPU type to condition wildcards mapping for test list
 # Note: cpu is used to distinguish between e.g. H200_SXM and GH200
@@ -65,9 +73,13 @@ def generate_client_name(recipe: Recipe) -> str:
 
 def recipe_to_server_config(recipe: Recipe, llm_api_config: dict) -> dict:
     """Convert a recipe + LLM API config to aggr_server format."""
+    model_name = MODEL_NAME_MAPPING.get(recipe.model)
+    if not model_name:
+        raise ValueError(f"Model not found in MODEL_NAME_MAPPING: {recipe.model}")
+
     server_config = {
         "name": generate_server_name(recipe),
-        "model_name": recipe.model,
+        "model_name": model_name,
         "gpus": recipe.num_gpus,
         # Enable scenario-only matching for baseline comparison
         "match_mode": "scenario",
