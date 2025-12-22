@@ -51,13 +51,6 @@ transforms:
   ############################################################################################
   eliminate_redundant_transposes:
     stage: pattern_matcher
-  # TODO (lucaslie): let's move this to perf optimization once TP sharding is improved
-  # see https://github.com/NVIDIA/TensorRT-LLM/pull/3668#discussion_r2052714528
-  # NOTE (yoco): To export ONNX for DriveOS LLM, we don't need this optimization,
-  # because the rope will be fused into the AttentionPlugin operation
-  # in the fuse_rope_attention transform.
-  # optimize_rope:
-  #   stage: pattern_matcher
   quantize_int4_linear_from_config:
     stage: pattern_matcher
   quantize_fp8_linear_from_config:
@@ -76,17 +69,6 @@ transforms:
     stage: pattern_matcher
   quantize_mxfp4_moe:
     stage: pattern_matcher
-  detect_sharding:
-    stage: sharding
-    simple_shard_only: false
-    sharding_source: ["manual", "factory", "heuristic"]
-    support_partial_config: true
-    sharding_dims: ["tp", "ep", "bmm"]
-    allreduce_strategy: "AUTO"
-    requires_shape_prop: true
-  sharding_transform_executor:
-    stage: sharding
-    run_shape_prop: true
   ############################################################################################
   # MOVE MODEL AND LOAD WEIGHTS
   ############################################################################################
@@ -104,23 +86,7 @@ transforms:
   fuse_gemms:
     stage: post_load_fusion
     enabled: false # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
-  fuse_fp4_gemms:
-    stage: post_load_fusion
-    enabled: false # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
-  fuse_fp8_gemms:
-    stage: post_load_fusion
-    enabled: false # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
-  fuse_fp8_linear:
-    stage: post_load_fusion
-    backend: trtllm
-  fuse_nvfp4_linear:
-    stage: post_load_fusion
-    backend: trtllm
   fuse_moe:
-    stage: post_load_fusion
-    enabled: true
-    backend: trtllm
-  fuse_fp8_moe:
     stage: post_load_fusion
     enabled: true
     backend: trtllm

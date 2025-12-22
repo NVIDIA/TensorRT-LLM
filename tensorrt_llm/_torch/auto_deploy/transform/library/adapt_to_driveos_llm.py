@@ -41,7 +41,7 @@ class AdaptToDriveOSLLM(BaseTransform):
     while maintaining numerical precision where needed (e.g., logits output).
     """
 
-    def _add_cast_after_last_linear(self, gm: GraphModule) -> bool:
+    def _add_cast_after_last_linear(self, gm: GraphModule) -> torch.fx.Node:
         """Add a float32 cast operation after the final linear layer.
 
         The final linear layer produces logits which are typically kept in
@@ -54,15 +54,17 @@ class AdaptToDriveOSLLM(BaseTransform):
             The newly created cast node.
         """
         graph = gm.graph
-        last_linear_node = graph.find_nodes(
-            op="call_function", target=torch.ops.auto_deploy.torch_linear_simple.default
-        )[-1]
+        linear_nodes = graph.find_nodes(
+            op="call_function", target=torch.ops.auto_deploy.torch_linear_simple.default, sort=True
+        )
+        assert len(linear_nodes) > 0, "No linear nodes found"
+        last_linear_node = linear_nodes[-1]
         with graph.inserting_after(last_linear_node):
             cast_node = graph.call_function(
                 torch.ops.aten.to.dtype, args=(last_linear_node, torch.float32)
             )
         last_linear_node.replace_all_uses_with(cast_node)
-        # Fix: restore cast_node's input to last_linear_node (replace_all_uses_with also replaced it)
+        # Restore cast_node's input to last_linear_node
         cast_node.update_arg(0, last_linear_node)
         return cast_node
 
