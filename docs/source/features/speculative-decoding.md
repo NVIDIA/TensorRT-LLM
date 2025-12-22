@@ -53,12 +53,12 @@ The following draft model checkpoints can be used for EAGLE 3:
 * Llama 4 Maverick: [use the checkpoint from the NVIDIA HuggingFace repository](https://huggingface.co/nvidia/Llama-4-Maverick-17B-128E-Eagle3).
 
 ```python
-from tensorrt_llm.llmapi import EagleDecodingConfig
+from tensorrt_llm.llmapi import Eagle3DecodingConfig
 
 # Enable to use the faster one-model implementation for Llama 4.
 eagle3_one_model = False
 
-speculative_config = EagleDecodingConfig(
+speculative_config = Eagle3DecodingConfig(
     max_draft_len=3, speculative_model_dir="/path/to/draft_model", eagle3_one_model=eagle3_one_model)
 
 # Only need to disable overlap scheduler if eagle3_one_model is False.
