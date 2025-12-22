@@ -14,7 +14,9 @@ from utils.llm_data import llm_models_root
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
-from tensorrt_llm.llmapi import (CudaGraphConfig, EagleDecodingConfig,
+from tensorrt_llm._torch.models.modeling_speculative import \
+    _ensure_draft_vocab_size
+from tensorrt_llm.llmapi import (CudaGraphConfig, Eagle3DecodingConfig,
                                  KvCacheConfig)
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -24,6 +26,18 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 def enforce_single_worker(monkeypatch):
     monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
     yield
+
+
+def test_eagle3_defaults_draft_vocab_size_when_missing():
+    from transformers import LlamaConfig
+
+    config = LlamaConfig(vocab_size=128)
+    assert not hasattr(config, "draft_vocab_size")
+
+    with pytest.warns(UserWarning, match="Missing 'draft_vocab_size'"):
+        _ensure_draft_vocab_size(config)
+
+    assert config.draft_vocab_size == config.vocab_size
 
 
 def test_kv_lens_runtime_with_eagle3_one_model():
@@ -199,7 +213,7 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
         # Use a small max_num_tokens so that the chunked prefill path gets exercised.
         llm_common_config['max_num_tokens'] = 64
 
-    spec_config = EagleDecodingConfig(
+    spec_config = Eagle3DecodingConfig(
         max_draft_len=max_draft_len,
         speculative_model=eagle_model,
         # Llama 3 does not support one model eagle.
@@ -355,7 +369,7 @@ def test_llama_eagle3_long_prompt(use_cuda_graph):
     eagle_model_dir = f"{models_path}/EAGLE3-LLaMA3.1-Instruct-8B"
     target_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
 
-    spec_config = EagleDecodingConfig(
+    spec_config = Eagle3DecodingConfig(
         max_draft_len=3,
         speculative_model=eagle_model_dir,
         eagle3_one_model=False,
@@ -449,6 +463,7 @@ def test_deepseek_eagle3():
         'transformers_version': '4.52.4',
         'use_cache': True,
         'vocab_size': 129280,
+        'draft_vocab_size': 129280,
     }
     with tempfile.TemporaryDirectory() as temp_dir:
         eagle_model_dir = Path(temp_dir)
@@ -478,7 +493,7 @@ def test_deepseek_eagle3():
             enable_chunked_prefill=enable_chunked_prefill,
         )
 
-        spec_config = EagleDecodingConfig(
+        spec_config = Eagle3DecodingConfig(
             max_draft_len=max_draft_len,
             speculative_model=eagle_model_dir,
             # Llama 3 does not support one model eagle.
@@ -658,6 +673,7 @@ def test_multi_eagle3(use_one_model: bool):
         'transformers_version': '4.52.4',
         'use_cache': True,
         'vocab_size': 128256,
+        'draft_vocab_size': 128256,
     }
     with tempfile.TemporaryDirectory() as temp_dir:
         eagle_model_dir = Path(temp_dir)
@@ -686,7 +702,7 @@ def test_multi_eagle3(use_one_model: bool):
             load_format="dummy",
         )
 
-        spec_config = EagleDecodingConfig(
+        spec_config = Eagle3DecodingConfig(
             max_draft_len=max_draft_len,
             speculative_model=eagle_model_dir,
             # Llama 3 does not support one model eagle.
@@ -745,7 +761,7 @@ def test_eagle3_cuda_graph_padding(disable_overlap_scheduler: bool):
         enable_chunked_prefill=enable_chunked_prefill,
     )
 
-    spec_config = EagleDecodingConfig(
+    spec_config = Eagle3DecodingConfig(
         max_draft_len=max_draft_len,
         speculative_model=eagle_model_dir,
         eagle3_one_model=use_one_model,
@@ -798,7 +814,7 @@ def test_eagle3_cdl_sampling(disable_overlap_scheduler: bool):
         enable_chunked_prefill=enable_chunked_prefill,
     )
 
-    spec_config = EagleDecodingConfig(
+    spec_config = Eagle3DecodingConfig(
         max_draft_len=max_draft_len,
         speculative_model=eagle_model_dir,
         eagle3_one_model=use_one_model,
