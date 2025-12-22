@@ -124,6 +124,8 @@ class CompletionOutput:
     @property
     def text_diff(self) -> str:
         diff = self.text[len(self._last_text):]
+        if diff.endswith('�'):
+            return ''
         self._last_text = self.text
         return diff
 
