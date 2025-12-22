@@ -864,6 +864,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     f"{self.__class__.kernel_class.__name__} supports SM 100 (B200) and SM 103 (B300) only, but got SM {sm_version}"
                 )
 
+            if self.tile_size not in (128, ):
+                raise ValueError(
+                    f"{self.__class__.kernel_class.__name__} supports tile_size (MMA tile M dimension) 128 only, but got {self.tile_size}"
+                )
+
         def unique_id(self):
             return (
                 self.num_experts,
@@ -885,10 +890,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             m, k = a.size(0), a.size(1) * 2
             l, n = b.size(0), b.size(1)
 
-            # TODO: Add full shmoo
-            mma_tiler_mn_candidates = [(128, 128), (128, 256), (256, 128),
-                                       (256, 256)]
-            cluster_shape_mn_candidates = [(1, 1), (1, 2), (2, 1), (2, 2)]
+            mma_tiler_mn_candidates = [(self.tile_size, 128),
+                                       (self.tile_size, 256)]
+            cluster_shape_mn_candidates = [(self.tile_size // 128, 1),
+                                           (self.tile_size // 128, 2)]
 
             valid_tactics = []
             for mma_tiler_mn, cluster_shape_mn in itertools.product(
@@ -929,7 +934,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                           5, 0,
                                           helper.infer_shape_max_num_tiles)),
                     inputs_pre_hook=helper.inputs_pre_hook,
-                    use_cuda_graph=True,
                 )
             return self.__class__.tuning_config_cache[key]
 
@@ -1002,9 +1006,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if isinstance(tactic, tuple):
                 mma_tiler_mn, cluster_shape_mn = tactic
             else:
-                mma_tiler_mn, cluster_shape_mn = (self.tile_size,
-                                                  128), (self.tile_size // 128,
-                                                         1)
+                mma_tiler_mn = (self.tile_size, 128)
+                cluster_shape_mn = (self.tile_size // 128, 1)
 
             cache_key = (self.scaling_vector_size, self.tile_size, mma_tiler_mn,
                          cluster_shape_mn)
@@ -1149,9 +1152,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     f"{self.__class__.kernel_class.__name__} supports SM 100 (B200) and SM 103 (B300) only, but got SM {sm_version}"
                 )
 
-            if self.tile_size not in [128, 256]:
+            if self.tile_size not in (128, 256):
                 raise ValueError(
-                    f"{self.__class__.kernel_class.__name__} supports tile size (mma tile M dimension) 128 and 256 only, but got {self.tile_size}"
+                    f"{self.__class__.kernel_class.__name__} supports tile_size (MMA tile M dimension) 128 and 256 only, but got {self.tile_size}"
                 )
 
         def unique_id(self):
@@ -1175,7 +1178,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             m, k = a.size(0), a.size(1) * 2
             l, n = b.size(0), b.size(1)
 
-            # TODO: Add full shmoo
             mma_tiler_mn_candidates = [(self.tile_size, 128),
                                        (self.tile_size, 256)]
             cluster_shape_mn_candidates = [(self.tile_size // 128, 1),
@@ -1226,7 +1228,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             8, 0, helper.infer_shape_max_num_permuted_tokens),
                         ConstraintSpec(10, 0, helper.infer_shape_num_tokens)),
                     inputs_pre_hook=helper.inputs_pre_hook_finalize_fusion,
-                    use_cuda_graph=True,
                 )
             return self.__class__.tuning_config_cache[key]
 
@@ -1535,6 +1536,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     f"{self.__class__.kernel_class.__name__} supports SM 100 (B200) and SM 103 (B300) only, but got SM {sm_version}"
                 )
 
+            if self.tile_size not in (128, ):
+                raise ValueError(
+                    f"{self.__class__.kernel_class.__name__} supports tile_size (MMA tile M dimension) 128 only, but got {self.tile_size}"
+                )
+
         def unique_id(self):
             return (
                 self.num_experts,
@@ -1555,9 +1561,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             m, k = a.size(0), a.size(1) * 2
             l, n = b.size(0), b.size(1)
 
-            # TODO: Add full shmoo
-            mma_tiler_mn_candidates = [(128, 128), (128, 256)]
-            cluster_shape_mn_candidates = [(1, 1), (1, 2)]
+            mma_tiler_mn_candidates = [(self.tile_size, 128),
+                                       (self.tile_size, 256)]
+            cluster_shape_mn_candidates = [(self.tile_size // 128, 1),
+                                           (self.tile_size // 128, 2)]
 
             valid_tactics = []
             for mma_tiler_mn, cluster_shape_mn in itertools.product(
@@ -1568,7 +1575,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         sf_vec_size=self.scaling_vector_size,
                         acc_dtype=cutlass.Float32,
                         c_dtype=cutlass.Float4E2M1FN,
-                        use_2cta_instrs=False,
                         mma_tiler_mn=mma_tiler_mn,
                         cluster_shape_mn=cluster_shape_mn,
                         m=m,
@@ -1578,7 +1584,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         a_major="k",
                         b_major="k",
                         c_major="n",
-                        m_aligned=self.tile_size,
                 ):
                     valid_tactics.append((mma_tiler_mn, cluster_shape_mn))
 
@@ -1601,7 +1606,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                           5, 0,
                                           helper.infer_shape_max_num_tiles)),
                     inputs_pre_hook=helper.inputs_pre_hook,
-                    use_cuda_graph=True,
                 )
             return self.__class__.tuning_config_cache[key]
 
@@ -1687,7 +1691,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if isinstance(tactic, tuple):
                 mma_tiler_mn, cluster_shape_mn = tactic
             else:
-                mma_tiler_mn, cluster_shape_mn = (128, 128), (1, 1)
+                mma_tiler_mn = (self.tile_size, 128)
+                cluster_shape_mn = (self.tile_size // 128, 1)
 
             cache_key = (self.scaling_vector_size, self.tile_size, mma_tiler_mn,
                          cluster_shape_mn)
@@ -1695,7 +1700,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 gemm = self.__class__.kernel_class(
                     sf_vec_size=self.scaling_vector_size,
                     acc_dtype=cutlass.Float32,
-                    use_2cta_instrs=False,
                     mma_tiler_mn=mma_tiler_mn,
                     cluster_shape_mn=cluster_shape_mn,
                     vectorized_f32=True,
@@ -1843,9 +1847,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.tile_size = tile_size
             self.scaling_vector_size = scaling_vector_size
 
-            if get_sm_version() != 100 and get_sm_version() != 103:
+            if (sm_version := get_sm_version()) not in (100, 103):
                 raise ValueError(
-                    f"SM version {get_sm_version()} is not supported for {self.__class__.__name__}, it only supports SM 100 and SM 103"
+                    f"{self.__class__.kernel_class.__name__} supports SM 100 (B200) and SM 103 (B300) only, but got SM {sm_version}"
+                )
+
+            if self.tile_size not in (128, 256):
+                raise ValueError(
+                    f"{self.__class__.kernel_class.__name__} supports tile_size (MMA tile M dimension) 128 and 256 only, but got {self.tile_size}"
                 )
 
         def unique_id(self):
@@ -1870,14 +1879,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             k = a.size(1) * 2
             l, n = b.size(0), b.size(1)
 
-            if self.tile_size == 128:
-                mma_tiler_mn_candidates = [(128, 128), (128, 256)]
-                cluster_shape_mn_candidates = [(1, 1)]
-            elif self.tile_size == 256:
-                mma_tiler_mn_candidates = [(256, 128), (256, 256)]
-                cluster_shape_mn_candidates = [(2, 1)]
-            else:
-                raise ValueError(f"Tile size {self.tile_size} is not supported")
+            mma_tiler_mn_candidates = [(self.tile_size, 128),
+                                       (self.tile_size, 256)]
+            cluster_shape_mn_candidates = [(self.tile_size // 128, 1)]
 
             valid_tactics = []
             for mma_tiler_mn, cluster_shape_mn in itertools.product(
@@ -1897,7 +1901,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         a_major="k",
                         b_major="k",
                         c_major="n",
-                        m_aligned=self.tile_size,
                 ):
                     valid_tactics.append((mma_tiler_mn, cluster_shape_mn))
 
@@ -1928,7 +1931,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                           6, 0,
                                           helper.infer_shape_max_num_tiles)),
                     inputs_pre_hook=helper.inputs_pre_hook,
-                    use_cuda_graph=True,
                 )
             return self.__class__.tuning_config_cache[key]
 
@@ -2032,9 +2034,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if isinstance(tactic, tuple):
                 mma_tiler_mn, cluster_shape_mn = tactic
             else:
-                mma_tiler_mn, cluster_shape_mn = (self.tile_size,
-                                                  128), (self.tile_size // 128,
-                                                         1)
+                mma_tiler_mn = (self.tile_size, 128)
+                cluster_shape_mn = (self.tile_size // 128, 1)
 
             cache_key = (self.scaling_vector_size, self.tile_size, self.top_k,
                          mma_tiler_mn, cluster_shape_mn)
@@ -2231,7 +2232,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                       ConstraintSpec(
                                           3, 0, helper.infer_shape_num_tokens)),
                     inputs_pre_hook=helper.inputs_pre_hook,
-                    use_cuda_graph=True,
                 )
             return self.__class__.tuning_config_cache[key]
 

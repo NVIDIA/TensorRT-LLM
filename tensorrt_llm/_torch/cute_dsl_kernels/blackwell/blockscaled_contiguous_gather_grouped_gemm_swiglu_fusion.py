@@ -2717,7 +2717,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         use_2cta_instrs: bool,
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
-        m_aligned: cutlass.Int64,
     ) -> bool:
         """
         Check if the mma tiler and cluster shape are valid
@@ -2728,8 +2727,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :type mma_tiler_mn: Tuple[int, int]
         :param cluster_shape_mn: The (ClusterM, ClusterN) shape of the CTA cluster
         :type cluster_shape_mn: Tuple[int, int]
-        :param m_aligned: The alignment requirement for group M dimension (default: 128)
-        :type m_aligned: cutlass.Int64
 
         :return: True if the mma tiler and cluster shape are valid, False otherwise
         :rtype: bool
@@ -2769,13 +2766,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         # It can't handle runtime oob when alignment is not align with the tile_M,
         # since the problem shape of TMA store can't be changed at runtime.
         if cluster_tiler_m not in [64, 128, 256]:
-            is_valid = False
-
-        # Check if m_aligned is a multiple of cluster_tiler_m
-        # This ensures that each group's M dimension (which is a multiple of m_aligned)
-        # won't be split across tiles, preventing a single tile from loading data
-        # from multiple groups (which would access wrong B matrix data)
-        if m_aligned % mma_tiler_mn[0] != 0:
             is_valid = False
 
         return is_valid
@@ -2849,7 +2839,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         a_major: str,
         b_major: str,
         c_major: str,
-        m_aligned: cutlass.Int64,
     ) -> bool:
         """
         Check if the gemm can be implemented
@@ -2884,8 +2873,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :type b_major: str
         :param c_major: The major axis of the C tensor
         :type c_major: str
-        :param m_aligned: The alignment requirement for group M dimension (default: 128)
-        :type m_aligned: cutlass.Int64
 
         :return: True if the gemm can be implemented, False otherwise
         :rtype: bool
@@ -2903,10 +2890,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         ):
             can_implement = False
 
-        use_2cta_instrs = mma_tiler_mn[0] == 256
         # Skip invalid mma tile shape and cluster shape
+        use_2cta_instrs = mma_tiler_mn[0] == 256
         if not BlockScaledContiguousGatherGroupedGemmKernel.is_valid_mma_tiler_and_cluster_shape(
-            use_2cta_instrs, mma_tiler_mn, cluster_shape_mn, m_aligned
+            use_2cta_instrs, mma_tiler_mn, cluster_shape_mn
         ):
             can_implement = False
         # Skip illegal problem shape for load/store alignment

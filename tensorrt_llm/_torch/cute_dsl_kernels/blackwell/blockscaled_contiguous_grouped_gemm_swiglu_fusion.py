@@ -107,7 +107,7 @@ The accumulator in TMEM must then be loaded to registers before writing back to 
       --ab_dtype Float4E2M1FN --c_dtype BFloat16 --acc_dtype Float32            \
       --sf_dtype Float8E4M3FN --sf_vec_size 16                                   \
       --mma_tiler_mn 256,128 --cluster_shape_mn 2,1                             \
-      --mnkl 256,4096,7168,1 --use_2cta_instrs --m_aligned 256
+      --mnkl 256,4096,7168,1
 
 To collect performance with NCU profiler:
 
@@ -117,7 +117,7 @@ To collect performance with NCU profiler:
       --ab_dtype Float4E2M1FN --c_dtype BFloat16 --acc_dtype Float32            \
       --sf_dtype Float8E4M3FN --sf_vec_size 16                                   \
       --mma_tiler_mn 256,128 --cluster_shape_mn 2,1                             \
-      --mnkl 256,4096,7168,1 --use_2cta_instrs --m_aligned 256
+      --mnkl 256,4096,7168,1
 
 Constraints:
 * Supported input data types: mxf8, mxf4, nvf4
@@ -196,7 +196,6 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
         self,
         sf_vec_size: int,
         acc_dtype: Type[cutlass.Numeric],
-        use_2cta_instrs: bool,
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
         vectorized_f32: bool,
@@ -218,20 +217,18 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
         :type acc_dtype: type[cutlass.Numeric]
         :param mma_tiler_mn: Tuple (M, N) shape of the MMA instruction.
         :type mma_tiler_mn: Tuple[int, int]
-        :param use_2cta_instrs: Boolean, True to use cta_group=2 MMA variant.
-        :type use_2cta_instrs: bool
         :param cluster_shape_mn: Tuple (ClusterM, ClusterN) shape of the cluster.
         :type cluster_shape_mn: Tuple[int, int]
         """
 
         self.sf_vec_size = sf_vec_size
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
-        self.use_2cta_instrs = use_2cta_instrs
+        self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
         # K dimension is deferred in _setup_attributes
         self.mma_tiler = (*mma_tiler_mn, 1)
 
-        self.cta_group = tcgen05.CtaGroup.TWO if use_2cta_instrs else tcgen05.CtaGroup.ONE
+        self.cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
 
         self.occupancy = 1
         self.epilog_warp_id = (0, 1, 2, 3)
@@ -2384,7 +2381,6 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
         use_2cta_instrs: bool,
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
-        m_aligned: cutlass.Int64,
     ) -> bool:
         """
         Check if the mma tiler and cluster shape are valid
@@ -2395,8 +2391,6 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
         :type mma_tiler_mn: Tuple[int, int]
         :param cluster_shape_mn: The (ClusterM, ClusterN) shape of the CTA cluster
         :type cluster_shape_mn: Tuple[int, int]
-        :param m_aligned: The alignment requirement for group M dimension (default: 128)
-        :type m_aligned: cutlass.Int64
 
         :return: True if the mma tiler and cluster shape are valid, False otherwise
         :rtype: bool
@@ -2436,13 +2430,6 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
         # It can't handle runtime oob when alignment is not align with the tile_M,
         # since the problem shape of TMA store can't be changed at runtime.
         if cluster_tiler_m not in [64, 128, 256]:
-            is_valid = False
-
-        # Check if m_aligned is a multiple of cluster_tiler_m
-        # This ensures that each group's M dimension (which is a multiple of m_aligned)
-        # won't be split across tiles, preventing a single tile from loading data
-        # from multiple groups (which would access wrong B matrix data)
-        if m_aligned % mma_tiler_mn[0] != 0:
             is_valid = False
 
         return is_valid
@@ -2508,7 +2495,6 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
         sf_vec_size: int,
         acc_dtype: Type[cutlass.Numeric],
         c_dtype: Type[cutlass.Numeric],
-        use_2cta_instrs: bool,
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
         m: cutlass.Int64,
@@ -2518,7 +2504,6 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
         a_major: str,
         b_major: str,
         c_major: str,
-        m_aligned: cutlass.Int64,
     ) -> bool:
         """
         Check if the gemm can be implemented
@@ -2533,8 +2518,6 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
         :type acc_dtype: Type[cutlass.Numeric]
         :param c_dtype: The data type of the output tensor
         :type c_dtype: Type[cutlass.Numeric]
-        :param use_2cta_instrs: Whether to use 2 CTA groups
-        :type use_2cta_instrs: bool
         :param mma_tiler_mn: The (M, N) shape of the MMA instruction tiler
         :type mma_tiler_mn: Tuple[int, int]
         :param cluster_shape_mn: The (ClusterM, ClusterN) shape of the CTA cluster
@@ -2553,8 +2536,6 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
         :type b_major: str
         :param c_major: The major axis of the C tensor
         :type c_major: str
-        :param m_aligned: The alignment requirement for group M dimension (default: 128)
-        :type m_aligned: cutlass.Int64
 
         :return: True if the gemm can be implemented, False otherwise
         :rtype: bool
@@ -2571,8 +2552,9 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
             can_implement = False
 
         # Skip invalid mma tile shape and cluster shape
+        use_2cta_instrs = mma_tiler_mn[0] == 256
         if not cls.is_valid_mma_tiler_and_cluster_shape(
-            use_2cta_instrs, mma_tiler_mn, cluster_shape_mn, m_aligned
+            use_2cta_instrs, mma_tiler_mn, cluster_shape_mn
         ):
             can_implement = False
         # Skip illegal problem shape for load/store alignment
