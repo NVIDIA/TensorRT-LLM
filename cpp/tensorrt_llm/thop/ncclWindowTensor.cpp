@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/ncclUtils.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/common/stringUtils.h"
+#include <ATen/cuda/CUDAContext.h>
 #include <set>
 
 namespace tc = tensorrt_llm::common;
