@@ -2213,13 +2213,14 @@ class PyTorchModelEngine(ModelEngine):
                                                   mrope_position_deltas).expand(
                                                       3, 1, 1)
                         mrope_position_ids.append(gen_mrope_position_ids)
-                        multimodal_params.to_device(
-                            "multimodal_data",
-                            "cuda",
-                            pin_memory=True,
-                            target_keywords=[
-                                "mrope_config.mrope_position_deltas"
-                            ])
+                        if mrope_position_deltas.device.type == "cpu":
+                            multimodal_params.to_device(
+                                "multimodal_data",
+                                "cuda",
+                                pin_memory=True,
+                                target_keywords=[
+                                    "mrope_config.mrope_position_deltas"
+                                ])
                         multimodal_params_list.append(multimodal_params)
 
             request.py_batch_idx = request.py_seq_slot
@@ -2448,8 +2449,9 @@ class PyTorchModelEngine(ModelEngine):
             # NOTE: self.use_mrope is enough for differentiating whether to use mrope_position_ids but
             # `_create_dummy_context_requests` from `kv_cache_creater` makes an exception that I can not add multimodal_data to the dummy_request
             # so that we only replace position_ids with mrope_position_ids when it is not a dummy request and for models who is using mrope.
-            mrope_position_ids = torch.cat(mrope_position_ids,
-                                           dim=-1).pin_memory()
+            mrope_position_ids = torch.cat(mrope_position_ids, dim=-1)
+            if mrope_position_ids.device.type == "cpu":
+                mrope_position_ids = mrope_position_ids.pin_memory()
             self.mrope_position_ids_cuda[:, :, :total_num_tokens].copy_(
                 mrope_position_ids[:, :, :total_num_tokens], non_blocking=True)
             final_position_ids = self.mrope_position_ids_cuda[:, :, :
@@ -3362,7 +3364,26 @@ class PyTorchModelEngine(ModelEngine):
             mm_embeddings = list(
                 torch.split(mm_embeddings[0], multimodal_chunks, dim=0))
 
-        return {'mm_embeddings': mm_embeddings, 'logits': None}
+        # Extract mrope position data from multimodal_params if available
+        mrope_position_ids_list = []
+        mrope_position_deltas_list = []
+        for multimodal_param in multimodal_params:
+            mrope_config = multimodal_param.multimodal_data.get(
+                'mrope_config', {})
+            mrope_position_ids = mrope_config.get('mrope_position_ids')
+            mrope_position_deltas = mrope_config.get('mrope_position_deltas')
+            if mrope_position_ids is not None:
+                mrope_position_ids_list.append(mrope_position_ids)
+            if mrope_position_deltas is not None:
+                mrope_position_deltas_list.append(mrope_position_deltas)
+
+        result = {'mm_embeddings': mm_embeddings, 'logits': None}
+        if mrope_position_ids_list:
+            result['mrope_position_ids'] = mrope_position_ids_list
+        if mrope_position_deltas_list:
+            result['mrope_position_deltas'] = mrope_position_deltas_list
+
+        return result
 
     def _init_userbuffers(self, hidden_size):
         if self.mapping.tp_size <= 1 or self.mapping.pp_size > 1:
