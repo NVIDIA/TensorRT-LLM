@@ -271,38 +271,40 @@ def submit_job(config, log_dir, dry_run):
     container_name = "disaggr-test"
     start_server_cmds = []
     # Generate start worker commands with placeholder hostnames
-    for allocation in allocations:
-        server_type = allocation["server_type"]
-        cuda_devices = ",".join(
-            [str(device) for device in list(allocation["nodes"].values())[0]])
-        cur_worker_env_var = worker_env_var + f" CUDA_VISIBLE_DEVICES={cuda_devices}"
-        cmd = [
-            "srun -l",
-            f"--nodelist {','.join(allocation['nodes'].keys())}",
-            f"-N {len(allocation['nodes'])}",
-            f"--ntasks {gen_world_size if server_type == 'GEN' else ctx_world_size}",
-            f"--ntasks-per-node {gpus_per_node}",
-            f"--container-image {env_config['container_image']}",
-            f"--container-name {container_name}",
-            f"--container-mounts {env_config['container_mount']}",
-            "--mpi=pmix --overlap",
-            f"bash {os.path.join(env_config['work_dir'], 'start_worker.sh')}",
-            server_type,
-            str(allocation['server_id']),
-            env_config['model_path'],
-            str(allocation["port"]),
-            benchmark_config['mode'],
-            f"'{benchmark_config['concurrency_list']}'",
-            str(slurm_config['numa_bind']).lower(),
-            log_dir,
-            str(profiling_config['nsys_on']).lower(),
-            f"'{profiling_config['gen_profile_range']}'" if server_type == "GEN"
-            else f"'{profiling_config['ctx_profile_range']}'",
-            gen_config_path if server_type == "GEN" else ctx_config_path,
-            f"'{cur_worker_env_var}'",
-            f"&> {log_dir}/3_output_{server_type}_{allocation['server_id']}.log &",
-        ]
-        start_server_cmds.append(" ".join(cmd))
+    for server_type in allocations.keys():
+        for server_id in allocations[server_type].keys():
+            allocation = allocations[server_type][server_id]
+            cuda_devices = ",".join([
+                str(device) for device in list(allocation["nodes"].values())[0]
+            ])
+            cur_worker_env_var = worker_env_var + f" CUDA_VISIBLE_DEVICES={cuda_devices}"
+            cmd = [
+                "srun -l",
+                f"--nodelist {','.join(allocation['nodes'].keys())}",
+                f"-N {len(allocation['nodes'])}",
+                f"--ntasks {gen_world_size if server_type == 'GEN' else ctx_world_size}",
+                f"--ntasks-per-node {gpus_per_node}",
+                f"--container-image {env_config['container_image']}",
+                f"--container-name {container_name}",
+                f"--container-mounts {env_config['container_mount']}",
+                "--mpi=pmix --overlap",
+                f"bash {os.path.join(env_config['work_dir'], 'start_worker.sh')}",
+                server_type,
+                str(server_id),
+                env_config['model_path'],
+                str(allocation["port"]),
+                benchmark_config['mode'],
+                f"'{benchmark_config['concurrency_list']}'",
+                str(slurm_config['numa_bind']).lower(),
+                log_dir,
+                str(profiling_config['nsys_on']).lower(),
+                f"'{profiling_config['gen_profile_range']}'" if server_type == "GEN"
+                else f"'{profiling_config['ctx_profile_range']}'",
+                gen_config_path if server_type == "GEN" else ctx_config_path,
+                f"'{cur_worker_env_var}'",
+                f"&> {log_dir}/3_output_{server_type}_{server_id}.log &",
+            ]
+            start_server_cmds.append(" ".join(cmd))
 
     # Generate start server commands
     cmd = [
@@ -341,21 +343,21 @@ def submit_job(config, log_dir, dry_run):
     if benchmark_config['use_nv_sa_benchmark']:
         benchmark_cmd = [
             f"bash {env_config['work_dir']}/run_benchmark_nv_sa.sh",
-            f"'{env_config['model_path']}' {isl} {osl} {benchmark_config['benchmark_ratio']} {benchmark_config['multi_round']} {gen_num} '{benchmark_config['concurrency_list']}' {benchmark_config['streaming']} '{log_dir}'",
+            f"'{env_config['model_path']}' {isl} {osl} {benchmark_config['benchmark_ratio']} {benchmark_config['multi_round']} {gen_num} '{benchmark_config['concurrency_list']}' {benchmark_config['streaming']} '{log_dir}' {disagg_server_hostname} {disagg_server_port}",
             f"&> {log_dir}/6_bench.log"
         ]
         client_cmds.append(" ".join(client_slurm_prefix + benchmark_cmd))
     else:
         benchmark_cmd = [
             f"bash {env_config['work_dir']}/run_benchmark.sh",
-            f"'{env_config['model_path']}' '{benchmark_config['dataset_file']}' {benchmark_config['multi_round']} {gen_num} '{benchmark_config['concurrency_list']}' {benchmark_config['streaming']} '{log_dir}'",
+            f"'{env_config['model_path']}' '{benchmark_config['dataset_file']}' {benchmark_config['multi_round']} {gen_num} '{benchmark_config['concurrency_list']}' {benchmark_config['streaming']} '{log_dir}' {disagg_server_hostname} {disagg_server_port}",
             f"&> {log_dir}/6_bench.log"
         ]
         client_cmds.append(" ".join(client_slurm_prefix + benchmark_cmd))
     if config['accuracy']['enable_accuracy_test']:
         accuracy_cmd = [
             f"bash {env_config['work_dir']}/accuracy_eval.sh",
-            f"'{log_dir}' '{config['accuracy']['model']}' '{config['accuracy']['tasks']}' '{env_config['model_path']}' '{config['accuracy']['model_args_extra']}' '{log_dir}/accuracy_eval'",
+            f"'{log_dir}' '{config['accuracy']['model']}' '{config['accuracy']['tasks']}' '{env_config['model_path']}' '{config['accuracy']['model_args_extra']}' '{log_dir}/accuracy_eval' {disagg_server_hostname} {disagg_server_port}",
             f"&> {log_dir}/7_accuracy_eval.log"
         ]
         client_cmds.append(" ".join(client_slurm_prefix + accuracy_cmd))
