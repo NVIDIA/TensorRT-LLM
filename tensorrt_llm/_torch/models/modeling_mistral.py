@@ -317,6 +317,7 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
         config: PretrainedConfig,
         tokenizer: AutoTokenizer | None,
         trust_remote_code: bool = False,
+        model_type: str = "mistral3",
         **kwargs,
     ):
         super().__init__(model_path=model_path,
@@ -332,12 +333,19 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
             use_fast=self.use_fast,
             trust_remote_code=trust_remote_code)
         self._model_path = model_path
-        self._processor = MistralCommonImageProcessor(tokenizer=self._tokenizer,
-                                                      dtype=self.dtype)
-        self.text_processor = AutoProcessor.from_pretrained(
-            model_path,
-            use_fast=self.use_fast,
-            trust_remote_code=trust_remote_code)
+        if model_type == "mistral_large_3":
+            self._processor = MistralCommonImageProcessor(tokenizer=self._tokenizer,
+                                                        dtype=self.dtype)
+            self.text_processor = AutoProcessor.from_pretrained(
+                model_path,
+                use_fast=self.use_fast,
+                trust_remote_code=trust_remote_code)
+        else:
+            self._processor = AutoProcessor.from_pretrained(
+                model_path,
+                use_fast=self.use_fast,
+                trust_remote_code=trust_remote_code)
+            self.text_processor = None
 
     @property
     def config(self) -> PretrainedConfig:
@@ -453,6 +461,7 @@ class MistralCommonInputProcessor(Mistral3InputProcessor):
         super().__init__(model_path=model_path,
                          config=config,
                          tokenizer=tokenizer,
+                         model_type="mistral_large_3",
                          **kwargs)
 
     @staticmethod
@@ -479,7 +488,7 @@ class MistralCommonInputProcessor(Mistral3InputProcessor):
 @register_auto_model("PixtralForConditionalGeneration")
 @register_input_processor(
     MistralCommonInputProcessor,
-    model_type="mistral3",
+    model_type="mistral_large_3",
     placeholder_metadata=MultimodalPlaceholderMetadata(
         placeholder_map={
             # NOTE: mistral-common uses the tokenizer to set placeholders, this will be ignored
@@ -489,7 +498,7 @@ class MistralCommonInputProcessor(Mistral3InputProcessor):
     ))
 @register_input_processor(
     Mistral3InputProcessor,
-    model_type="mistral3_hf",
+    model_type="mistral3",
     placeholder_metadata=MultimodalPlaceholderMetadata(
         placeholder_map={
             "image": "[IMG]",
