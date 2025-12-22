@@ -1319,7 +1319,7 @@ def _(
 
 class FinegrainedMixedDtypeGemm(TunableRunner):
     _runner_dict = dict()
-    MAX_SUPPORTED_SM_VERSION = 90
+    MAX_SUPPORTED_SM_VERSION = 100
 
     def __init__(self, activation_dtype: torch.dtype, output_dtype: torch.dtype,
                  quant_mode: int):
@@ -1354,7 +1354,7 @@ class FinegrainedMixedDtypeGemm(TunableRunner):
 
         if get_sm_version() > self.MAX_SUPPORTED_SM_VERSION:
             raise ValueError(
-                f"SM version {get_sm_version()} is not supported for W4A16 GEMM"
+                f"SM version {get_sm_version()} is not supported for W4A16/W4A8 finegrained mixed dtype GEMM"
             )
 
         activation, weights_packed, scales = inputs

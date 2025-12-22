@@ -40,6 +40,7 @@
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fpA_intB_gemm/fpA_intB_gemm.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/fpA_intB_gemm/fpA_intB_gemm_template_sm100.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fpA_intB_gemm/fpA_intB_gemm_template_sm90.h"
 
 namespace tk = tensorrt_llm::common;
@@ -429,7 +430,7 @@ void CutlassFpAIntBGemmRunner<ActivationType, WeightType, QuantOp, ScaleZeroType
             QuantOp, EpilogueTag>(A, B, weight_scales, weight_zero_points, biases, alpha, C, m, n, k, group_size,
             workspace_ptr, workspace_bytes, gemm_config, stream, occupancy);
     }
-    else if ((sm_ >= 80 && sm_ < 89) || sm_ >= 100)
+    else if ((sm_ >= 80 && sm_ < 89) || sm_ > 100)
     {
         dispatch_gemm_to_cutlass<ActivationType, WeightType, ScaleZeroType, BiasType, OutputType, cutlass::arch::Sm80,
             QuantOp, EpilogueTag>(A, B, weight_scales, weight_zero_points, biases, alpha, C, m, n, k, group_size,
@@ -455,6 +456,12 @@ void CutlassFpAIntBGemmRunner<ActivationType, WeightType, QuantOp, ScaleZeroType
                 || cutlass::platform::is_same<ScaleZeroType, half>::value,
             "ScaleZeroType must be half for activation=fp8");
         cutlass_kernels_oss::sm90_dispatch_gemm_to_cutlass<ActivationType, WeightType, ScaleZeroType, BiasType,
+            OutputType, QuantOp, EpilogueTag>(A, B, weight_scales, weight_zero_points, biases, alpha, C, m, n, k,
+            group_size, workspace_ptr, workspace_bytes, gemm_config, stream, occupancy);
+    }
+    else if (sm_ == 100)
+    {
+        cutlass_kernels_oss::sm100_dispatch_gemm_to_cutlass<ActivationType, WeightType, ScaleZeroType, BiasType,
             OutputType, QuantOp, EpilogueTag>(A, B, weight_scales, weight_zero_points, biases, alpha, C, m, n, k,
             group_size, workspace_ptr, workspace_bytes, gemm_config, stream, occupancy);
     }
@@ -537,8 +544,9 @@ CutlassFpAIntBGemmRunner<ActivationType, WeightType, QuantOp, ScaleZeroType, Bia
 {
 
     static constexpr bool is_weight_only = !std::is_same<ActivationType, WeightType>::value;
-    tkc::CutlassGemmConfig::CandidateConfigTypeParam config_type_param
-        = tkc::CutlassGemmConfig::CandidateConfigTypeParam::HOPPER;
+    tkc::CutlassGemmConfig::CandidateConfigTypeParam config_type_param = sm_ >= 100
+        ? tkc::CutlassGemmConfig::CandidateConfigTypeParam::BLACKWELL
+        : tkc::CutlassGemmConfig::CandidateConfigTypeParam::HOPPER;
     if (is_weight_only)
     {
         config_type_param = static_cast<tkc::CutlassGemmConfig::CandidateConfigTypeParam>(
