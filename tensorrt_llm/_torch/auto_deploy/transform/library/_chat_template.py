@@ -13,8 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Processes the chat template to create a JSON file with chat template data for
-the following:
+For DriveOS LLM API. Processes the chat template to create a JSON file with
+chat template data for the following:
 
 Roles:
 - System
@@ -44,6 +44,8 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from transformers import AutoConfig, AutoProcessor, AutoTokenizer
 
+from ...utils.logger import ad_logger
+
 
 def is_vlm(model_dir: str) -> bool:
     """Check if the model is a VLM."""
@@ -52,10 +54,10 @@ def is_vlm(model_dir: str) -> bool:
     has_vision = "vision_config" in cfg_dict
     has_phi4_vision = "image_embd_layer" in cfg_dict.get("embd_layer", {})
     if has_vision or has_phi4_vision:
-        print("Set use_prompt_tuning to True")
+        ad_logger.debug("Set use_prompt_tuning to True")
         return True
     else:
-        print("Set use_prompt_tuning to False")
+        ad_logger.debug("Set use_prompt_tuning to False")
         return False
 
 
@@ -249,7 +251,7 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
     Returns:
         None
     """
-    print(f"Processing chat template from {model_dir}")
+    ad_logger.info(f"Processing chat template from {model_dir}")
 
     tokenizer = None
     loaders = (
@@ -259,20 +261,20 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
         try:
             tokenizer = ldr.from_pretrained(model_dir, trust_remote_code=True)
             if getattr(tokenizer, "chat_template", None):
-                print(f"Successfully loaded chat template from {ldr.__name__}")
+                ad_logger.debug(f"Successfully loaded chat template from {ldr.__name__}")
                 break
             else:
-                print(f"{ldr.__name__} loaded but no chat template found")
+                ad_logger.debug(f"{ldr.__name__} loaded but no chat template found")
                 tokenizer = None
         except Exception as e:
-            print(f"Failed to load {ldr.__name__}: {e}")
+            ad_logger.error(f"Failed to load {ldr.__name__}: {e}")
             tokenizer = None
 
     if tokenizer is None:
-        print("Skipping chat template processing - no chat template available")
+        ad_logger.debug("Skipping chat template processing - no chat template available")
         return
 
-    print("Extracting patterns from chat template...")
+    ad_logger.debug("Extracting patterns from chat template...")
 
     # Extract system role patterns (base case)
     system_prompt = SystemMessage()
@@ -306,7 +308,7 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
 
     # Only extract multimodal patterns if this is a VLM model
     if is_vlm(model_dir):
-        print("Detected VLM model, extracting multimodal content patterns...")
+        ad_logger.debug("Detected VLM model, extracting multimodal content patterns...")
         # Get base text-only formatted message for comparison
         user_text_only = MultimodalUserMessage()
         text_only_formatted = _format_messages(tokenizer, [system_prompt, user_text_only])
@@ -336,7 +338,7 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
         if video_pattern:
             content_types["video"] = {"format": video_pattern}
     else:
-        print("Text-only LLM detected, skipping multimodal content pattern extraction")
+        ad_logger.debug("Text-only LLM detected, skipping multimodal content pattern extraction")
 
     # Extract default system prompt by testing without system message
     user_only_prompt = UserMessage()
@@ -377,4 +379,4 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
     with open(output_path, "w") as f:
         json.dump(chat_template_data, f, indent=2)
 
-    print(f"Chat template saved to {output_path}")
+    ad_logger.info(f"Chat template saved to {output_path}")

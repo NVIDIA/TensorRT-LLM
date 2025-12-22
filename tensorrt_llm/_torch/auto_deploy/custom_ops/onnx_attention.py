@@ -41,9 +41,9 @@ def attention_plugin(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Fused attention operation with integrated RoPE (Rotary Position Embedding).
 
-    This custom operation combines query-key-value projection, rotary position
-    embedding, and scaled dot-product attention into a single fused operation.
-    It also handles KV-cache management for efficient autoregressive generation.
+    This custom operation combines rotary position embedding, and scaled
+    dot-product attention into a single fused operation. It also handles
+    KV-cache management for efficient autoregressive generation.
 
     Note:
         This is a placeholder implementation for ONNX export. The actual computation
@@ -117,7 +117,7 @@ def attention_plugin_fake(
     )
 
 
-def _dummy_gather_nd(data: torch.Tensor, indices: torch.Tensor, batch_dims: int) -> torch.Tensor:
+def _fake_gather_nd(data: torch.Tensor, indices: torch.Tensor, batch_dims: int) -> torch.Tensor:
     """Compute output shape for GatherND operation without actual gathering.
 
     This helper function creates an empty tensor with the correct output shape
@@ -173,7 +173,7 @@ def gather_nd(
     Returns:
         Gathered tensor of shape [batch_size, num_selected, embedding_dim].
     """
-    return _dummy_gather_nd(data, indices, batch_dims)
+    return _fake_gather_nd(data, indices, batch_dims)
 
 
 @gather_nd.register_fake
@@ -192,4 +192,4 @@ def gather_nd_fake(
     Returns:
         Empty tensor with the correct output shape.
     """
-    return _dummy_gather_nd(data, indices, batch_dims)
+    return _fake_gather_nd(data, indices, batch_dims)

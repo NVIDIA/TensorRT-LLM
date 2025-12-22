@@ -17,12 +17,8 @@ import os
 from pathlib import Path
 from typing import Optional, Tuple, Type
 
-import onnx
-import onnxscript
 import torch
-from onnx.defs import OpSchema
-from onnxscript import ir, opset17, opset20
-from onnxscript.values import Opset
+from onnxscript import ir, opset20
 from pydantic import Field
 from torch.export import Dim
 from torch.fx import GraphModule
@@ -37,6 +33,7 @@ from ..interface import (
     TransformInfo,
     TransformRegistry,
 )
+from . import _onnx_schemas
 from ._chat_template import process_chat_template
 from ._config_export import export_llm_config
 
@@ -47,192 +44,37 @@ class ExportToONNXConfig(TransformConfig):
     output_dir: Path = Field(
         description="The directory to save the exported ONNX model.",
     )
-    output_name: str = Field(
-        description="The name of the exported ONNX model.",
-        default="model.onnx",
-    )
     is_eagle_base: bool = Field(
         description="Whether the model is an Eagle base model.",
         default=False,
     )
 
 
-custom_rope_schema = OpSchema(
-    name="rope_with_explicit_cos_sin",
-    domain="auto_deploy",
-    since_version=1,
-    doc="Rope with explicit cos and sin caches.",
-    inputs=[
-        OpSchema.FormalParameter(
-            name="q",
-            description="Q tensor",
-            type_str="T",
-        ),
-        OpSchema.FormalParameter(
-            name="k",
-            description="K tensor",
-            type_str="T",
-        ),
-        OpSchema.FormalParameter(
-            name="cos",
-            description="Cos cache",
-            type_str="T",
-        ),
-        OpSchema.FormalParameter(
-            name="sin",
-            description="Sin cache",
-            type_str="T",
-        ),
-    ],
-    outputs=[
-        OpSchema.FormalParameter(
-            name="output",
-            description="Output tensor",
-            type_str="T",
-        )
-    ],
-    type_constraints=[
-        (
-            "T",
-            ["tensor(float)", "tensor(float16)", "tensor(bfloat16)"],
-            "Input and output data type.",
-        ),
-    ],
-    attributes=[
-        OpSchema.Attribute(
-            name="unsqueeze_dim",
-            type=OpSchema.AttrType.INT,
-            description="Unsqueeze dimension. Must be 1 or 2.",
-            required=True,
-        ),
-    ],
-)
-onnx.defs.register_schema(custom_rope_schema)
+# ============================================================================
+# Custom translation functions for ONNX export
+# ============================================================================
 
 
-def custom_rope_op(
-    q: ir.Tensor, k: ir.Tensor, cos: ir.Tensor, sin: ir.Tensor, unsqueeze_dim: int = 1
+def _translate_rope_op(
+    q: ir.Tensor, k: ir.Tensor, cos: ir.Tensor, sin: ir.Tensor, unsqueeze_dim: int
 ):
-    auto_deploy_op = onnxscript.values.Opset(domain="auto_deploy", version=1)
-    return auto_deploy_op.rope_with_explicit_cos_sin(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
+    return _onnx_schemas.auto_deploy_opset.rope_with_explicit_cos_sin(
+        q, k, cos, sin, unsqueeze_dim=unsqueeze_dim
+    )
 
 
-# ============================================================================
-# ONNX Custom Op Registration for simple_linear
-# ============================================================================
-
-
-def custom_simple_linear_op(input: ir.Tensor, weight: ir.Tensor, bias: Optional[ir.Tensor]):
+def _translate_simple_linear_op(input: ir.Tensor, weight: ir.Tensor, bias: Optional[ir.Tensor]):
     weight = opset20.Transpose(weight, perm=[1, 0])
     if bias is None:
         return opset20.MatMul(input, weight)
     return opset20.Add(opset20.MatMul(input, weight), bias)
 
 
-auto_deploy_opset = Opset("auto_deploy", 1)
-trt_domain_name = "trt"
-trt_opset = Opset(trt_domain_name, 1)
-
-# ============================================================================
-# ONNX Custom Op Registration for GatherND
-# ============================================================================
+def _translate_gather_nd_op(data: ir.Tensor, indices: ir.Tensor, batch_dims: int):
+    return opset20.GatherND(data, indices, batch_dims=batch_dims)
 
 
-def custom_gather_nd_op(data: ir.Tensor, indices: ir.Tensor, batch_dims: int):
-    return opset17.GatherND(data, indices, batch_dims=batch_dims)
-
-
-# ============================================================================
-# ONNX Custom Op Registration for AttentionPlugin
-# ============================================================================
-
-# Define ONNX OpSchema for AttentionPlugin
-rope_attention_schema = OpSchema(
-    name="AttentionPlugin",
-    domain=trt_domain_name,
-    since_version=1,
-    doc="Fused RoPE + Attention operation for efficient inference.",
-    inputs=[
-        OpSchema.FormalParameter(
-            name="qkv",
-            description="Concatenated Q, K, V tensors in shape [batch, seq_len, qkv_hidden_size]",
-            type_str="T",
-        ),
-        OpSchema.FormalParameter(
-            name="past_key_values",
-            description="Concatenated past K and V cache in shape [batch, 2, num_kv_heads, past_len, head_size]",
-            type_str="T",
-        ),
-        OpSchema.FormalParameter(
-            name="context_lengths",
-            description="Context lengths for each sequence in shape [batch]",
-            type_str="T1",
-        ),
-        OpSchema.FormalParameter(
-            name="rope_rotary_cos_sin",
-            description="Concatenated cos and sin values for RoPE in shape [max_seq_len, head_dim]",
-            type_str="T",
-        ),
-        OpSchema.FormalParameter(
-            name="kvcache_start_index",
-            description="KV cache start index for each sequence in shape [batch]",
-            type_str="T1",
-        ),
-    ],
-    outputs=[
-        OpSchema.FormalParameter(
-            name="output",
-            description="Attention output in shape [batch, seq_len, hidden_size]",
-            type_str="T",
-        ),
-        OpSchema.FormalParameter(
-            name="updated_past_key_values",
-            description="Updated past K and V cache",
-            type_str="T",
-        ),
-    ],
-    type_constraints=[
-        (
-            "T",
-            ["tensor(float16)", "tensor(float)", "tensor(bfloat16)"],
-            "Input and output data type for floating point tensors.",
-        ),
-        (
-            "T1",
-            ["tensor(int32)", "tensor(int64)"],
-            "Input data type for integer tensors.",
-        ),
-    ],
-    attributes=[
-        OpSchema.Attribute(
-            name="enable_tree_attention",
-            type=OpSchema.AttrType.INT,
-            description="Whether to enable tree attention (0 or 1).",
-            required=True,
-        ),
-        OpSchema.Attribute(
-            name="head_size",
-            type=OpSchema.AttrType.INT,
-            description="Size of each attention head.",
-            required=True,
-        ),
-        OpSchema.Attribute(
-            name="num_kv_heads",
-            type=OpSchema.AttrType.INT,
-            description="Number of key-value heads.",
-            required=True,
-        ),
-        OpSchema.Attribute(
-            name="num_q_heads",
-            type=OpSchema.AttrType.INT,
-            description="Number of query heads.",
-            required=True,
-        ),
-    ],
-)
-
-
-def onnx_rope_attention_op(
+def _translate_rope_attention_op(
     qkv: ir.Tensor,
     past_key_values: ir.Tensor,
     context_lengths: ir.Tensor,
@@ -246,15 +88,15 @@ def onnx_rope_attention_op(
     """
     ONNX custom op translation function for AttentionPlugin.
 
-    This function creates a custom ONNX op node in the auto_deploy domain.
+    This function creates a custom ONNX op node in the trt domain.
     The actual implementation will need to be provided in the inference engine
     (e.g., ONNX Runtime or TensorRT) that loads this ONNX model.
 
     Note: This is a translation function for torch.onnx.export's custom_translation_table,
     so it should NOT have @script() decorator.
     """
-    # Call the custom op from the auto_deploy domain
-    return trt_opset.AttentionPlugin(
+    # Call the custom op from the trt domain
+    return _onnx_schemas.trt_opset.AttentionPlugin(
         qkv,
         past_key_values,
         context_lengths,
@@ -267,102 +109,7 @@ def onnx_rope_attention_op(
     )
 
 
-# Register the schema
-onnx.defs.register_schema(rope_attention_schema)
-
-# ============================================================================
-# ONNX Custom Op Registration for torch_attention
-# ============================================================================
-
-# Define ONNX OpSchema for torch_attention
-torch_attention_schema = OpSchema(
-    name="torch_attention",
-    domain="auto_deploy",
-    since_version=1,
-    doc="SDPA attention (with optional GQA) that supports bnsd and bsnd memory layouts.",
-    inputs=[
-        OpSchema.FormalParameter(
-            name="query",
-            description="Query tensor [batch, seq_len_q/num_heads, num_heads/seq_len_q, head_dim]",
-            type_str="T",
-        ),
-        OpSchema.FormalParameter(
-            name="key",
-            description="Key tensor [batch, seq_len_k/num_kv_heads, num_kv_heads/seq_len_k, head_dim]",
-            type_str="T",
-        ),
-        OpSchema.FormalParameter(
-            name="value",
-            description="Value tensor [batch, seq_len_k/num_kv_heads, num_kv_heads/seq_len_k, head_dim]",
-            type_str="T",
-        ),
-        OpSchema.FormalParameter(
-            name="attn_mask",
-            description="Optional attention mask in [batch, num_heads, seq_len_q, seq_len_k] layout",
-            type_str="T",
-        ),
-        OpSchema.FormalParameter(
-            name="sinks",
-            description="Optional sinks tensor",
-            type_str="T",
-        ),
-    ],
-    outputs=[
-        OpSchema.FormalParameter(
-            name="output",
-            description="Attention output in the same layout as inputs",
-            type_str="T",
-        )
-    ],
-    type_constraints=[
-        (
-            "T",
-            ["tensor(float16)", "tensor(float)", "tensor(bfloat16)"],
-            "Input and output data type for floating point tensors.",
-        ),
-    ],
-    attributes=[
-        OpSchema.Attribute(
-            name="dropout_p",
-            type=OpSchema.AttrType.FLOAT,
-            description="Dropout probability.",
-            required=False,
-        ),
-        OpSchema.Attribute(
-            name="is_causal",
-            type=OpSchema.AttrType.INT,
-            description="Whether to apply causal masking (0 or 1).",
-            required=False,
-        ),
-        OpSchema.Attribute(
-            name="scale",
-            type=OpSchema.AttrType.FLOAT,
-            description="Attention scale factor.",
-            required=False,
-        ),
-        OpSchema.Attribute(
-            name="sliding_window",
-            type=OpSchema.AttrType.INT,
-            description="Sliding window size for attention.",
-            required=False,
-        ),
-        OpSchema.Attribute(
-            name="logit_cap",
-            type=OpSchema.AttrType.FLOAT,
-            description="Logit capping value.",
-            required=False,
-        ),
-        OpSchema.Attribute(
-            name="layout",
-            type=OpSchema.AttrType.STRING,
-            description="Memory layout: 'bnsd' or 'bsnd'.",
-            required=False,
-        ),
-    ],
-)
-
-
-def onnx_torch_attention_op(
+def _translate_torch_attention_op(
     query: ir.Tensor,
     key: ir.Tensor,
     value: ir.Tensor,
@@ -386,7 +133,7 @@ def onnx_torch_attention_op(
     so it should NOT have @script() decorator.
     """
     # Call the custom op from the auto_deploy domain
-    return auto_deploy_opset.torch_attention(
+    return _onnx_schemas.auto_deploy_opset.torch_attention(
         query,
         key,
         value,
@@ -401,27 +148,60 @@ def onnx_torch_attention_op(
     )
 
 
-# Register the schema
-onnx.defs.register_schema(torch_attention_schema)
-
-# ============================================================================
-
-
 @TransformRegistry.register("export_to_onnx")
 class ExportToONNX(BaseTransform):
+    """Transform that exports a PyTorch GraphModule to ONNX format for deployment.
+
+    This transform is responsible for:
+    1. Exporting the model graph to ONNX format with dynamic shapes support
+    2. Generating configuration files (config.json) for the exported model
+    3. Saving tokenizer files (tokenizer.json, vocab.json, etc.)
+    4. Processing and exporting chat templates
+
+    The exported ONNX model includes custom ops from the auto_deploy. These custom ops include:
+    - AttentionPlugin: Fused RoPE + Attention for efficient inference(exported as DriveOS LLM's custom op)
+    - GatherND: N-dimensional gather operation (exported as onnxscript.opset20.GatherND)
+
+    Note:
+        This transform does NOT modify the input graph. It only exports the graph
+        to external files and returns the original graph unchanged.
+
+    Attributes:
+        config: ExportToONNXConfig containing output directory, and is_eagle_base flag.
+    """
+
     config: ExportToONNXConfig
 
     @classmethod
     def get_config_class(cls) -> Type[TransformConfig]:
+        """Return the configuration class for this transform."""
         return ExportToONNXConfig
 
     def _export_onnx_model(
         self,
         gm: GraphModule,
         cm: CachedSequenceInterface,
-        factory: ModelFactory,
-        shared_config: SharedConfig,
-    ) -> None:
+        _factory: ModelFactory,
+        _shared_config: SharedConfig,
+    ) -> bool:
+        """Export the GraphModule to ONNX format using torch.onnx.export with dynamo.
+
+        This method handles the core ONNX export logic:
+        1. Extracts input placeholders and their metadata from the graph
+        2. Configures dynamic shapes for batch size, sequence length, and KV cache
+        3. Sets up custom translation table for auto_deploy custom ops
+        4. Exports the model using torch.onnx.export with dynamo=True
+
+        Args:
+            gm: The PyTorch FX GraphModule to export.
+            cm: CachedSequenceInterface containing max batch size and sequence length info.
+            _factory: ModelFactory instance (unused in this method).
+            _shared_config: SharedConfig instance (unused in this method).
+
+        Returns:
+            bool: True if export was successful.
+        """
+        # Extract input placeholders from graph to build kwargs for export
         args = []
         kwargs = {}
         placeholders = gm.graph.find_nodes(op="placeholder")
@@ -438,7 +218,7 @@ class ExportToONNX(BaseTransform):
             ad_logger.info(f"  {k}: {v}")
 
         # Build output path
-        output_path = self.config.output_dir / self.config.output_name
+        output_path = self.config.output_dir / "model.onnx"
 
         # Build dynamic_shapes for dynamo export
         # For dynamo, we need to specify dynamic dimensions for each input tensor
@@ -474,14 +254,8 @@ class ExportToONNX(BaseTransform):
             1: Dim("num_selected_tokens", min=1, max=cm.info.max_seq_len),
         }
 
-        ad_logger.info(f"Exporting GraphModule to ONNX with dynamo: {output_path}")
-
-        # Register ONNX function for custom ops before export
-        ad_logger.info("Registering ONNX custom op handlers...")
-
         # Create custom translation table for ONNX export
-        # Map the torch custom op to the onnxscript function
-        # Use the global onnx_prepare_metadata_op directly
+        # Map torch custom ops to their corresponding onnxscript translation functions
         custom_translation_table = {
             # Before fuse rope attention
             # NOTE (yoco): This 2 ops will be fused into the AttentionPlugin operation
@@ -489,13 +263,13 @@ class ExportToONNX(BaseTransform):
             # However, when TensorRT-LLM changed, the fusion might not be applied.
             # And for debug purpose we might want to export the .onnx to check the graph.
             # So let's just keep them here.
-            torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin.default: custom_rope_op,
-            torch.ops.auto_deploy.torch_attention.default: onnx_torch_attention_op,
+            torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin.default: _translate_rope_op,
+            torch.ops.auto_deploy.torch_attention.default: _translate_torch_attention_op,
             # Before and after fuse rope attention
-            torch.ops.auto_deploy.torch_linear_simple.default: custom_simple_linear_op,
+            torch.ops.auto_deploy.torch_linear_simple.default: _translate_simple_linear_op,
             # After fuse rope attention
-            torch.ops.auto_deploy.AttentionPlugin.default: onnx_rope_attention_op,
-            torch.ops.auto_deploy.GatherND.default: custom_gather_nd_op,
+            torch.ops.auto_deploy.AttentionPlugin.default: _translate_rope_attention_op,
+            torch.ops.auto_deploy.GatherND.default: _translate_gather_nd_op,
         }
 
         # Prepare output names
@@ -506,7 +280,11 @@ class ExportToONNX(BaseTransform):
             output_names.append(output.name)
         output_names[0] = "logits"
 
+        # Register ONNX custom ops
+        _onnx_schemas.register_onnx_schemas()
+
         # Export the graph module to ONNX using dynamo (more advanced tracer)
+        ad_logger.info(f"Exporting GraphModule to ONNX with dynamo: {output_path}")
         torch.onnx.export(
             gm,
             tuple(args),
@@ -519,12 +297,22 @@ class ExportToONNX(BaseTransform):
             output_names=output_names,
             custom_translation_table=custom_translation_table,
         )
-        # export_output.save(output_path)
 
         ad_logger.info(f"Successfully exported ONNX model to {output_path}")
         return True
 
     def _export_config_json(self, gm: GraphModule, output_dir: str, is_eagle_base: bool) -> None:
+        """Export model configuration to config.json.
+
+        Generates a configuration file containing model architecture parameters
+        such as hidden size, number of layers, attention heads, etc.
+
+        Args:
+            gm: The GraphModule containing model configuration in gm.config.
+            output_dir: Directory path where config.json will be saved.
+            is_eagle_base: If True, exports as "eagle3_base" model type,
+                otherwise exports as "llm" model type.
+        """
         model_type = "eagle3_base" if is_eagle_base else "llm"
         model_config = export_llm_config(gm.config, model_type)
         # Add reduced_vocab_size to config if vocabulary reduction is used
@@ -541,21 +329,36 @@ class ExportToONNX(BaseTransform):
     def _export_json_files(
         self,
         gm: GraphModule,
-        cm: CachedSequenceInterface,
+        _cm: CachedSequenceInterface,
         factory: ModelFactory,
-        shared_config: SharedConfig,
+        _shared_config: SharedConfig,
     ) -> None:
-        # Handle config.json
+        """Export all JSON configuration and tokenizer files required for deployment.
+
+        This method orchestrates the export of:
+        1. config.json - Model architecture configuration
+        2. Tokenizer files - added_tokens.json, special_tokens_map.json,
+           tokenizer.json, tokenizer_config.json, vocab.json
+        3. processed_chat_template.json - Processed chat template for inference
+
+        Args:
+            gm: The GraphModule containing model configuration.
+            _cm: CachedSequenceInterface (unused, kept for interface consistency).
+            factory: ModelFactory used to initialize tokenizer and get model directory.
+            _shared_config: SharedConfig (unused, kept for interface consistency).
+        """
+        # Export model configuration (architecture params, layer counts, etc.)
         is_eagle_base = self.config.is_eagle_base
         output_dir = self.config.output_dir
         self._export_config_json(gm, output_dir, is_eagle_base)
 
-        # Handle: added_tokens.json, special_tokens_map.json, tokenizer.json,
+        # Export tokenizer files for text processing during inference
+        # Includes: added_tokens.json, special_tokens_map.json, tokenizer.json,
         # tokenizer_config.json, vocab.json
         tokenizer = factory.init_tokenizer()
         tokenizer.save_pretrained(output_dir)
 
-        # Handle processed_chat_template.json
+        # Export processed chat template for conversational inference
         model_dir = factory.model
         process_chat_template(model_dir, output_dir)
 
@@ -566,23 +369,45 @@ class ExportToONNX(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        # Create output directory
+        """Apply the ONNX export transform to the graph module.
+
+        This is the main entry point that orchestrates the export process:
+        1. Creates the output directory if it doesn't exist
+        2. Exports all JSON configuration files (config, tokenizer, chat template)
+        3. Exports the ONNX model with dynamic shapes and custom ops
+
+        Note:
+            Unlike other transforms, this does NOT modify the graph.
+            It only performs side effects (writing files to disk).
+
+        Args:
+            gm: The PyTorch FX GraphModule to export.
+            cm: CachedSequenceInterface containing runtime constraints.
+            factory: ModelFactory for tokenizer initialization.
+            shared_config: SharedConfig for transform coordination.
+
+        Returns:
+            Tuple containing:
+            - gm: The original GraphModule (unchanged)
+            - info: TransformInfo with export status (is_clean=True since graph is unmodified)
+        """
+        # Ensure output directory exists before writing any files
         if not self.config.output_dir.exists():
             self.config.output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Export JSON files
+        # Step 1: Export all auxiliary JSON files (config, tokenizer, chat template)
         self._export_json_files(gm, cm, factory, shared_config)
 
-        # Export the ONNX model
+        # Step 2: Export the ONNX model with dynamic shapes
         success = self._export_onnx_model(gm, cm, factory, shared_config)
 
-        # Return the original graph module unchanged and transform info
-        # This transform doesn't modify the graph, it only exports it
+        # Return original graph unchanged with export status info
+        # This transform is "clean" because it doesn't modify the graph structure
         info = TransformInfo(
             skipped=not success,
             num_matches=1 if success else 0,
-            is_clean=True,  # We don't modify the graph
-            has_valid_shapes=True,  # We don't affect shapes
+            is_clean=True,  # Graph is not modified
+            has_valid_shapes=True,  # Shape validity is preserved
         )
 
         return gm, info
