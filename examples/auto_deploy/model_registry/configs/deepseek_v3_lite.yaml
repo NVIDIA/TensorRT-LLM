@@ -1,0 +1,4 @@
+# Configuration for DeepSeek V3 and R1 with reduced layers
+# Full models are too large, so we test with limited layers
+model_kwargs:
+  num_hidden_layers: 10

@@ -217,7 +217,8 @@ class TRTLLMGenFusedMoE(MoE):
             assert self.has_w4a16_mxfp4 or self.has_w4a8_mxfp4_fp8 or self.has_w4a8_mxfp4_mxfp8, "TRTLLMGenFusedMoE only supports mxfp4 quantization with bias, swiglu_alpha, swiglu_beta and swiglu_limit."
 
     def _get_quant_method(self):
-        if self.quant_config is not None:
+        if self.quant_config is not None and self.quant_config.layer_quant_mode.has_any_quant(
+                exclude_kv_cache=True):
             if self.quant_config.layer_quant_mode.has_fp8_block_scales():
                 return DeepSeekFP8BlockScalesFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_nvfp4():
@@ -353,6 +354,9 @@ class TRTLLMGenFusedMoE(MoE):
             x_sf = x_sf.view(x_row, -1)
 
         return x, x_sf
+
+    def supports_moe_output_in_alltoall_workspace(self):
+        return self.has_w4a8_mxfp4_mxfp8
 
     def run_moe(
         self,

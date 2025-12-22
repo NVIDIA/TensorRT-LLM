@@ -1,13 +1,12 @@
 import asyncio
 import atexit
-import json
 import os
 import threading
 from typing import Callable, List, Optional
 
 from .._utils import nvtx_range_debug
 from ..llmapi.tracer import global_tracer
-from ..llmapi.utils import AsyncQueue, _SyncQueue
+from ..llmapi.utils import _SyncQueue
 from ..logger import logger
 from .request import GenerationRequest
 from .result import GenerationResult
@@ -47,15 +46,16 @@ class RpcExecutorMixin:
         Args:
             tasks: List of async coroutine functions to run.
             thread_name: Name for the main loop thread
+
+        Note: Stats and kv_events are now fetched on-demand via direct RPC calls
+        (get_stats, aget_stats, get_kv_events, aget_kv_events), so the default
+        tasks only include the responses loop. Callers can still provide custom
+        tasks including stats/kv_events loops if needed for streaming use cases.
         """
         if tasks is None:
             tasks = [
                 self._fetch_responses_loop_async,
-                self._fetch_stats_loop_async,
             ]
-            # Only add kv_cache_events loop if it's enabled
-            if self._iter_kv_events_result:
-                tasks.append(self._fetch_kv_cache_events_loop_async)
 
         async def main_loop_task():
             await asyncio.gather(*[task() for task in tasks])
@@ -136,22 +136,6 @@ class RpcExecutorMixin:
         if async_queues:
             _SyncQueue.notify_many(event_loop, async_queues)
 
-    def handle_stats(self, stats):
-        """Handle stats received from RPC worker and put them into the stats result queue.
-
-        Args:
-            stats: Statistics data from the RPC worker (can be dict, str, or list)
-        """
-        self._handle_iteration_data(stats, self._iter_stats_result, "stats")
-
-    def handle_kv_cache_events(self, events):
-        """Handle KV cache events received from RPC worker and put them into the events result queue.
-
-        Args:
-            events: KV cache events data from the RPC worker (can be dict, str, or list)
-        """
-        self._handle_iteration_data(events, self._iter_kv_events_result, "kv_cache_events")
-
     async def _generic_fetch_loop_async(
         self, fetch_method_name: str, handler_method: Callable, method_name: str
     ):
@@ -181,86 +165,6 @@ class RpcExecutorMixin:
             method_name="_fetch_responses_loop_async",
         )
 
-    async def _fetch_stats_loop_async(self):
-        await self._generic_fetch_loop_async(
-            fetch_method_name="fetch_stats_loop_async",
-            handler_method=self.handle_stats,
-            method_name="_fetch_stats_loop_async",
-        )
-
-    async def _fetch_kv_cache_events_loop_async(self):
-        await self._generic_fetch_loop_async(
-            fetch_method_name="fetch_kv_cache_events_loop_async",
-            handler_method=self.handle_kv_cache_events,
-            method_name="_fetch_kv_cache_events_loop_async",
-        )
-
-    def _handle_iteration_data(self, data, result_singleton, data_type: str):
-        """Generic method to handle iteration data received from RPC worker.
-
-        Args:
-            data: Data from the RPC worker (can be dict, str, or list)
-            result_singleton: The iteration result singleton to put data into
-            data_type: Type of data for logging (e.g., "stats", "kv_cache_events")
-        """
-        # Make sure we have initialized the iteration results
-        self._maybe_initialize_iteration_results()
-
-        if not result_singleton:
-            logger.debug(f"Skipping {data_type} handling while result_singleton=None")
-            return
-
-        # Get the queue from the result singleton
-        queue = result_singleton.queue
-        async_queues = []
-
-        # Clear old data if queue is full (similar to _iteration_result_task)
-        while queue.full():
-            queue.get()
-
-        try:
-            # Handle different types of data
-            if isinstance(data, str):
-                # Already JSON serialized
-                data_json = data
-            elif isinstance(data, list):
-                # Skip empty lists to avoid putting nothing in the queue
-                if not data:
-                    logger.debug(f"rpc_proxy.py: Skipping empty {data_type} list")
-                    return
-
-                # Handle list of data (multiple iterations)
-                for item in data:
-                    if isinstance(item, str):
-                        item_json = item
-                    else:
-                        item_json = json.dumps(item)
-
-                    if isinstance(queue, _SyncQueue):
-                        queue.put_nowait(item_json)
-                        async_queues.append(queue)
-                    else:
-                        queue.put(item_json)
-
-                if async_queues:
-                    _SyncQueue.notify_many(queue.loop, async_queues)
-                return
-            else:
-                # Convert dict/other to JSON string as expected by IterationResult
-                data_json = json.dumps(data)
-
-            if isinstance(queue, _SyncQueue):
-                queue.put_nowait(data_json)
-                async_queues.append(queue)
-            else:
-                queue.put(data_json)
-
-            if async_queues:
-                _SyncQueue.notify_many(queue.loop, async_queues)
-
-        except AsyncQueue.EventLoopShutdownError:
-            # This happens when the event loop is already closed
-            logger.debug(f"rpc_proxy.py: EventLoopShutdownError in handle_{data_type}")
-        except Exception as e:
-            logger.error(f"rpc_proxy.py: Error in handle_{data_type}: {e}")
-            raise e
+    # NOTE: _fetch_stats_loop_async and _fetch_kv_cache_events_loop_async have been removed.
+    # Stats and kv_events are now fetched on-demand via direct RPC calls
+    # (get_stats, aget_stats, get_kv_events, aget_kv_events) instead of streaming loops.

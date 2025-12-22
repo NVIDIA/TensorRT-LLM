@@ -277,7 +277,7 @@ class AgentConnectionManager : public ConnectionManager
 public:
     AgentConnectionManager(
         std::vector<batch_manager::kv_cache_manager::CacheTransBufferManager*> cacheTransBufferManagers,
-        CacheState cacheState);
+        CacheState cacheState, std::string const& backendType);
     ~AgentConnectionManager();
     AgentConnection* recvConnect(DataContext const& ctx, void* data, size_t size) override;
     [[nodiscard]] std::vector<Connection const*> getConnections(CommState const& state) override;

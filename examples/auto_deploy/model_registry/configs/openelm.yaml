@@ -1,0 +1,3 @@
+# Configuration for Apple OpenELM models
+# These models require Llama-2 tokenizer
+tokenizer: meta-llama/Llama-2-7b-hf

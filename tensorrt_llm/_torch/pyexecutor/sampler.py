@@ -21,7 +21,7 @@ from concurrent import futures
 from dataclasses import dataclass
 from functools import cached_property
 from itertools import repeat
-from typing import Any, Callable, Generic, List, Optional, Type, TypeVar, cast
+from typing import Any, Callable, Dict, Generic, List, Optional, Type, TypeVar, cast
 
 import numpy as np
 import torch
@@ -199,6 +199,8 @@ class EarlyStopSampler(Sampler):
 @dataclass(kw_only=True)
 class MultimodalResult:
     mm_embeddings: List[torch.Tensor]
+    # Can be used to include e.g. `mrope_position_ids`, etc.
+    extra_data: Optional[Dict[str, Any]] = None
 
     def values(self):
         return vars(self).values()
@@ -262,7 +264,10 @@ class EarlyStopWithMMResult(Sampler):
         resource_manager: Optional[ResourceManager] = None,
     ) -> SampleStateWithMMResult:
         # from model_outputs to MultimodalResult
-        data = MultimodalResult(mm_embeddings=model_outputs["mm_embeddings"])
+        data = MultimodalResult(
+            mm_embeddings=model_outputs.pop("mm_embeddings"),
+            extra_data={**model_outputs},
+        )
         return SampleStateWithMMResult(scheduled_requests=scheduled_requests, data=data)
 
     @override
@@ -276,7 +281,12 @@ class EarlyStopWithMMResult(Sampler):
         scheduled_requests = state.scheduled_requests
         assert not scheduled_requests.generation_requests
         mm_embeddings = state.data.mm_embeddings
-        for request, mm_embedding in zip(scheduled_requests.context_requests, mm_embeddings):
+        extra_data = state.data.extra_data or {}
+        mrope_position_ids = extra_data.get("mrope_position_ids", None)
+        mrope_position_deltas = extra_data.get("mrope_position_deltas", None)
+        for i, (request, mm_embedding) in enumerate(
+            zip(scheduled_requests.context_requests, mm_embeddings)
+        ):
             request.state = LlmRequestState.GENERATION_COMPLETE
             # NOTE: This is a hack: set finish reason manually and set the beam 0
             request.set_finished_reason(FinishReason.LENGTH, 0)
@@ -286,6 +296,12 @@ class EarlyStopWithMMResult(Sampler):
                 )
 
             request.py_result.append_mm_embeddings(mm_embedding)
+
+            # Store mrope data if available
+            if mrope_position_ids is not None and mrope_position_deltas is not None:
+                request.py_result.set_mrope_position(
+                    mrope_position_ids[i], mrope_position_deltas[i]
+                )
 
     @override
     def is_generation_model(self) -> bool:
@@ -3088,13 +3104,8 @@ class TRTLLMSampler(Sampler, AsyncWorkerMixin):
     @nvtx_range("update_requests_single_beam_single_step")
     def update_requests_single_beam_single_step(self, state: SampleStateTRTLLM):
         """Specialization of update_requests for single beam and single step"""
-        new_tokens_host = state.host.new_tokens.flatten().tolist()
         sequence_lengths_host_data = state.host.sequence_lengths.flatten().tolist()
         finish_reasons = state.host.finish_reasons.flatten().tolist()
-        log_probs_host_tensor = state.host.log_probs
-        cum_log_probs_host = (
-            state.host.cum_log_probs.tolist() if state.host.cum_log_probs is not None else None
-        )
 
         reqs = [
             r for r in state.scheduled_requests.context_requests if not r.is_context_init_state
@@ -3104,44 +3115,53 @@ class TRTLLMSampler(Sampler, AsyncWorkerMixin):
             if not r.is_generation_complete_state
         ]
 
-        reqs_with_new_tokens = [
-            r for r in reqs if (sequence_lengths_host_data[r.py_seq_slot] > r.get_num_tokens(0))
-        ]
+        # NB: To ensure good performance, we must
+        #  1. Avoid accessing torch.Tensor object inside the for-each-request loops
+        #  2. Convert only necessary data to Python list
 
         # Add new tokens
-        new_tokens = [new_tokens_host[r.py_seq_slot] for r in reqs_with_new_tokens]
+        reqs_with_new_tokens = []
+        seq_slots = []
+        seq_slots_need_log_probs = []
+        for request in reqs:
+            if sequence_lengths_host_data[request.py_seq_slot] <= request.get_num_tokens(0):
+                continue
+
+            reqs_with_new_tokens.append(request)
+            seq_slots.append(request.py_seq_slot)
+
+            if request.py_return_log_probs:
+                seq_slots_need_log_probs.append(request.py_seq_slot)
+
+        # [maxTokensPerStep, batchSize, maxBeamWidth]
+        new_tokens = state.host.new_tokens[0, seq_slots, 0].tolist()
         add_new_tokens_to_requests(reqs_with_new_tokens, new_tokens, 0)
 
         # Log probs
-        if log_probs_host_tensor is not None:
-            # Log probs
-            seq_slots = []
-            seq_lens = []
-            for request in reqs_with_new_tokens:
-                if request.py_return_log_probs:
-                    seq_slot = request.py_seq_slot
-                    seq_slots.append(seq_slot)
-                    seq_lens.append(sequence_lengths_host_data[seq_slot] - 1)
+        if state.host.log_probs is not None:
+            # [batchSize, maxBeamWidth]
+            seq_last_idx = state.host.sequence_lengths[seq_slots_need_log_probs, 0] - 1
+            # [batchSize, maxBeamWidth, maxSequenceLength]
+            log_probs_host = state.host.log_probs[
+                seq_slots_need_log_probs, 0, seq_last_idx
+            ].tolist()
+            # [batchSize, maxBeamWidth]
+            cum_log_probs_host = state.host.cum_log_probs[seq_slots_need_log_probs, 0].tolist()
 
-            log_probs_host = log_probs_host_tensor[seq_slots, 0, seq_lens].tolist()
-            idx = 0
-            for request in reqs_with_new_tokens:
+            log_probs_idx = 0
+            for request, new_token in zip(reqs_with_new_tokens, new_tokens):
                 if request.py_return_log_probs:
                     log_probs = [
                         {
-                            new_tokens_host[seq_slot]: Logprob(
-                                logprob=log_probs_host[idx],
+                            new_token: Logprob(
+                                logprob=log_probs_host[log_probs_idx],
                                 rank=1,
                             )
                         }
                     ]
-                    cum_log_probs = [
-                        cum_log_probs_host[seq_slot][0]
-                        if isinstance(cum_log_probs_host[seq_slot], list)
-                        else cum_log_probs_host[seq_slot]
-                    ]
+                    cum_log_probs = [cum_log_probs_host[log_probs_idx]]
                     request.py_result.append_log_probs([log_probs], cum_log_probs)
-                    idx += 1
+                    log_probs_idx += 1
 
         for request in reqs:
             request.py_decoding_iter += 1

@@ -5,6 +5,7 @@ from typing import Optional, Union, cast
 import torch
 from torch import nn
 
+import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f, nvtx_range,
                                  nvtx_range_debug)
 from tensorrt_llm.logger import logger
@@ -303,10 +304,20 @@ class Attention(nn.Module):
         # Whether to fuse RoPE into the attention OP.
         # If true, RoPE will be applied in self.attn.forward.
         # If false, RoPE will be applied in self.apply_rope.
-        if config.sparse_attention_config is not None:
-            logger.warning("disable rope_fusion for sparse attention.")
-            rope_fusion = False
         self.rope_fusion = rope_fusion
+
+        if config.sparse_attention_config is not None:
+            # Log sparse attention configuration once
+            algo = config.sparse_attention_config.algorithm
+            cfg_dump = config.sparse_attention_config.model_dump(
+                exclude_none=True)
+            logger.info_once(f"Using sparse attention: {algo} {cfg_dump}",
+                             key="sparse_attention_config")
+
+            if config.sparse_attention_config.algorithm == "rocket":
+                logger.warning("disable rope_fusion for RocketKV.")
+                self.rope_fusion = False
+
         if self.rope_fusion and not attn_cls.support_fused_rope():
             logger.warning(
                 "rope_fusion is true but the attention backend does not support it. Will disable rope_fusion."
@@ -662,7 +673,7 @@ def fp8_block_scaling_bmm_out(
     mat2_dequant: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     sm_version = get_sm_version()
-    if sm_version == 90 or sm_version == 89 or sm_version == 120:
+    if sm_version == 90 or sm_version == 89:
         mat1_fp8, mat1_scale = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(
             mat1)
 
@@ -671,7 +682,14 @@ def fp8_block_scaling_bmm_out(
                                                    mat1_scale, mat2_scale,
                                                    output)
         out.copy_(output)
-
+    elif sm_version == 120:
+        mat1_fp8, mat1_scale = fp8_utils.per_token_quant_and_transform(
+            mat1, need_permute102=True)
+        output = out.new_empty(out.shape, dtype=out.dtype, device=out.device)
+        torch.ops.trtllm.fp8_block_scaling_bmm_out(mat1_fp8, mat2_fp8,
+                                                   mat1_scale, mat2_scale,
+                                                   output)
+        out.copy_(output)
     elif is_sm_100f(sm_version):
         torch.bmm(mat1.transpose(0, 1), mat2_dequant.transpose(1, 2), out=out)
     else:
@@ -700,7 +718,7 @@ class MLA(nn.Module):
         dtype: torch.dtype = None,
         dense_bias: Optional[bool] = None,
         config: Optional[ModelConfig] = None,
-        enable_unit_test: bool = False,
+        enable_helix_test: bool = False,
         mapping_with_cp: Optional[Mapping] = None,
         reduce_output: bool = True,
     ):
@@ -725,7 +743,7 @@ class MLA(nn.Module):
             dtype (torch.dtype): The data type.
             dense_bias (bool): Whether to use bias in the output projection layer.
             config (ModelConfig): The model configuration.
-            enable_unit_test (bool): Whether to enable unit test.
+            enable_helix_test (bool): Whether to enable helix unit test.
         """
         super().__init__()
         self.layer_idx = layer_idx
@@ -746,7 +764,7 @@ class MLA(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.pos_embd_params = pos_embd_params
         self.dense_bias = dense_bias
-        self.enable_unit_test = enable_unit_test
+        self.enable_helix_test = enable_helix_test
         if dense_bias is None:
             self.dense_bias = bias
 
@@ -767,7 +785,7 @@ class MLA(nn.Module):
             self.register_to_config = True
 
         # only support one kind of sparse attention, dsa now.
-        if config is not None and config.sparse_attention_config is not None:
+        if config is not None and config.sparse_attention_config is not None and config.sparse_attention_config.algorithm == "dsa":
             self.is_dsa = True
         else:
             self.is_dsa = False
@@ -808,7 +826,7 @@ class MLA(nn.Module):
         self.num_key_value_heads_tp = (self.num_key_value_heads + tp_size -
                                        1) // tp_size
 
-        if self.enable_unit_test:
+        if self.enable_helix_test:
             rms_norm_eps = getattr(config.pretrained_config, "rms_norm_eps",
                                    1e-6)
         else:
@@ -1100,8 +1118,8 @@ class MLA(nn.Module):
                 v,
                 attn_metadata,
                 softmax_stats_tensor=softmax_stats,
-                helix_position_offsets=position_ids,
-                **kwargs)
+                **kwargs,
+            )
             # this is the post-processing of helix parallel attention,
             # similar to the post-processing of ring attention
             kv_lora_rank = partial_o.shape[-1] // self.num_heads_tp
@@ -1127,7 +1145,7 @@ class MLA(nn.Module):
     def create_output(self, hidden_states: torch.Tensor, num_contexts: int):
         num_tokens = hidden_states.shape[0]
         hidden_size = self.o_proj.in_features
-        if self.enable_unit_test and num_contexts > 0:
+        if self.enable_helix_test and num_contexts > 0:
             # note: for testing Helix parallelism, we ensure that the output is
             # large enough for the context phase, but we then cut it again in
             # `forward_context`
@@ -1371,6 +1389,12 @@ class MLA(nn.Module):
             -1,
         )
 
+        if self.enable_helix_test:
+            # While helix parallelism is mainly meant for generation, we set the
+            # helix position offsets for the context phase to get the math right
+            # in test_mla_helix.py.
+            attn_metadata.helix_position_offsets = position_ids
+
         k = torch.empty_like(q).view(-1, self.num_heads_tp, self.qk_head_dim)
         maybe_compiled_copy_(
             k[..., :self.qk_nope_head_dim],
@@ -1380,9 +1404,6 @@ class MLA(nn.Module):
                                                        self.qk_rope_head_dim)
         k = k.view(-1, self.num_heads_tp * self.qk_head_dim)
 
-        helix_position_offsets = position_ids if self.mapping.has_cp_helix(
-        ) else None
-
         attn_output = self.mha.forward(
             q,
             k,
@@ -1390,7 +1411,6 @@ class MLA(nn.Module):
             attn_metadata,
             attention_input_type=AttentionInputType.context_only,
             latent_cache=latent_cache,
-            helix_position_offsets=helix_position_offsets,
             out_scale=self.out_scale,
             output=output,
         )
@@ -1761,12 +1781,6 @@ class MLA(nn.Module):
             device=q.device,
         )
 
-        helix_position_offsets, helix_is_inactive_rank = None, None
-        if self.mapping.has_cp_helix():
-            helix_position_offsets = position_ids
-            helix_is_inactive_rank = attn_metadata.helix_is_inactive_rank
-            assert helix_position_offsets is not None and helix_is_inactive_rank is not None, "helix_position_offsets and helix_is_inactive_rank must be provided for helix parallelism."
-
         rope_stream = self.aux_stream if not has_fp8_kv_cache else None
         if self.k_b_proj_trans.dtype == torch.bfloat16:
             # [num_heads, num_tokens, self.qk_nope_head_dim]
@@ -1791,8 +1805,7 @@ class MLA(nn.Module):
                     mla_bmm1_scale,
                     mla_bmm2_scale,
                     quant_q_buffer,
-                    helix_position_offsets=helix_position_offsets,
-                    helix_is_inactive_rank=helix_is_inactive_rank),
+                ),
                 self.ln_events[0],
                 self.ln_events[1],
                 rope_stream,
@@ -1821,8 +1834,7 @@ class MLA(nn.Module):
                     mla_bmm1_scale,
                     mla_bmm2_scale,
                     quant_q_buffer,
-                    helix_position_offsets=helix_position_offsets,
-                    helix_is_inactive_rank=helix_is_inactive_rank),
+                ),
                 self.ln_events[0],
                 self.ln_events[1],
                 rope_stream,
@@ -2174,7 +2186,7 @@ class MLA(nn.Module):
                               output=attn_output,
                               latent_cache_gen=latent_cache_gen)
 
-        if self.enable_unit_test and self.mapping.has_cp_helix():
+        if self.enable_helix_test and self.mapping.has_cp_helix():
             # note: for allowing testing Helix parallelism, we ensure that
             # the output is compatible with o_proj even in the context phase,
             # thus we cut it to num_heads_tp_cp * v_head_dim
@@ -2184,3 +2196,37 @@ class MLA(nn.Module):
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params)
         return attn_output
+
+    def resmooth_parameters(self,
+                            module_weight,
+                            module_weight_scale,
+                            recipe=(1, 128, 128)):
+        weight, weight_scale = fp8_utils.resmooth_to_fp8_e8m0(
+            module_weight, module_weight_scale)
+
+        transfromed_scale = fp8_utils.transform_sf_into_required_layout(
+            weight_scale,
+            mn=weight.shape[1],
+            k=weight.shape[2],
+            recipe=recipe,
+            num_groups=weight.shape[0],
+            is_sfa=False)
+
+        weight_param = torch.nn.Parameter(weight, requires_grad=False)
+        scale_param = torch.nn.Parameter(transfromed_scale, requires_grad=False)
+
+        return weight_param, scale_param
+
+    def post_load_weights(self):
+        has_fp8_block_scales = (
+            self.kv_b_proj.quant_config
+            and self.kv_b_proj.quant_config.quant_mode.has_fp8_block_scales())
+        is_sm120 = get_sm_version() == 120
+        if is_sm120 and has_fp8_block_scales:
+            self.k_b_proj_trans, self.k_b_proj_trans_scale = self.resmooth_parameters(
+                self.k_b_proj_trans,
+                self.k_b_proj_trans_scale,
+                recipe=(1, 128, 128))
+
+            self.v_b_proj, self.v_b_proj_scale = self.resmooth_parameters(
+                self.v_b_proj, self.v_b_proj_scale, recipe=(1, 128, 128))
