@@ -47,6 +47,7 @@ def test_multi_instance(setup_ray_cluster, tp_size, num_instances):
     TensorRT-LLM instances concurrently. It runs multiple iterations to ensure
     reliable instance creation and teardown.
     """
+    port = setup_ray_cluster
     num_gpus = tp_size * num_instances
     available_gpus = torch.cuda.device_count()
     if num_gpus > 8:
@@ -62,6 +63,7 @@ def test_multi_instance(setup_ray_cluster, tp_size, num_instances):
     runtime_env["env_vars"].update(
         {
             "TLLM_RAY_FORCE_LOCAL_CLUSTER": "0",
+            "RAY_ADDRESS": f"localhost:{port}",
         }
     )
 

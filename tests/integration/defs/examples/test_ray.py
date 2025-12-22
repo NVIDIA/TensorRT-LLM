@@ -5,6 +5,8 @@ import pytest
 from defs.common import venv_check_call, wait_for_server
 from defs.conftest import get_device_count, llm_models_root
 
+from tensorrt_llm._utils import get_free_port
+
 
 @pytest.fixture(scope="module")
 def ray_example_root(llm_root):
@@ -66,16 +68,24 @@ def test_ray_disaggregated_serving(ray_example_root, llm_venv, tp_size):
     script_path = os.path.join(disagg_dir, "disagg_serving_local.sh")
     model_dir = f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
     subprocess.run("ray stop --force", shell=True, check=False)
+    ray_port = get_free_port()
+    subprocess.run(f"ray start --head --port {ray_port} --disable-usage-stats",
+                   shell=True,
+                   check=False)
 
+    env_copy = os.environ.copy()
+    env_copy.update({"RAY_ADDRESS": f"localhost:{ray_port}"},
+                    {"TLLM_RAY_FORCE_LOCAL_CLUSTER": "0"})
     proc = subprocess.Popen(
         [
-            "bash", script_path, "--executor", "ray", "--model", model_dir,
-            "--tp_size",
+            "bash", script_path, "--executor", "ray", "--attach", "--model",
+            model_dir, "--tp_size",
             str(tp_size)
         ],
         cwd=disagg_dir,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=env_copy,
     )
     try:
         assert wait_for_server("localhost", 8000, timeout_seconds=180), \

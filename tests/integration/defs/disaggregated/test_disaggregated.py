@@ -357,8 +357,14 @@ def run_disaggregated_test(example_dir,
 
         extra_config_files = []
         workers_cmds = []
-        subprocess.run(['ray', 'start', '--head', '--disable-usage-stats'],
+        ray_port = get_free_port()
+        subprocess.run([
+            'ray', 'start', '--head', '--port',
+            str(ray_port), '--disable-usage-stats'
+        ],
                        check=True)
+        run_env["RAY_ADDRESS"] = f"localhost:{ray_port}"
+        run_env["TLLM_RAY_FORCE_LOCAL_CLUSTER"] = "0"
 
         # Generate ctx and gen server worker commands
         ctx_extra_config_file = get_extra_llm_config(config['context_servers'],

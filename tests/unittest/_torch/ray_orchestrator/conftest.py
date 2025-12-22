@@ -1,5 +1,6 @@
 import os
 import sys
+from typing import Generator
 
 import pytest
 
@@ -29,7 +30,7 @@ if not mpi_disabled():
 
 
 @pytest.fixture(scope="function")
-def setup_ray_cluster():
+def setup_ray_cluster() -> Generator[int, None, None]:
     runtime_env = {
         "env_vars": {
             "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"
@@ -43,7 +44,9 @@ def setup_ray_cluster():
     }
     try:
         ray.init(address="local", **ray_init_args)
-        yield
+        gcs_addr = ray.get_runtime_context().gcs_address
+        port = int(gcs_addr.split(":")[1])
+        yield port
     finally:
         if ray.is_initialized():
             ray.shutdown()

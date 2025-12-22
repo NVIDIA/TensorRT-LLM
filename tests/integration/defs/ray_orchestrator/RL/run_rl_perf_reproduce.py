@@ -132,7 +132,11 @@ async def setup_rl_llm(args):
     pg = None
 
     try:
-        ray.init()
+        ray.init(address="local")
+        gcs_addr = ray.get_runtime_context().gcs_address
+        port = int(gcs_addr.split(":")[1])
+        # Force ray.init("auto") to attach to a specific cluster via RAY_ADDRESS
+        os.environ["RAY_ADDRESS"] = f"localhost:{port}"
 
         # Create placement group with one bundle per GPU
         # STRICT_PACK ensures all bundles are on the same node
