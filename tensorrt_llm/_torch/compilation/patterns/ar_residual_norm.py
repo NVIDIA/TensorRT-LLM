@@ -724,14 +724,16 @@ def register_nccl_symmetric_patterns(custom_passes: List[PatternMatcherPass],
             custom_pass: PatternMatcherPass):
         strategy = int(AllReduceStrategy.NCCL_SYMMETRIC)
         input_node = KeywordArg('input')
-        # Use actual schema parameter names for matching: 'residual', 'norm_weight', 'op'
+        # Use actual schema parameter names for matching: 'residual', 'norm_weight', 'op', 'group'
         # But keep 'residual_in', 'gamma', 'fusion_op' in function signatures for clarity
         fusion = KeywordArg('op')  # Schema uses 'op', not 'fusion_op'
+        group_arg = KeywordArg(
+            'group')  # Use KeywordArg to match keyword arguments
         trtllm_allreduce_default = CallFunction(
             torch.ops.trtllm.allreduce.default, input_node,
             KeywordArg('residual'), KeywordArg('norm_weight'),
-            KeywordArg('scale'), None, Ignored(), mapping.tp_group, strategy,
-            fusion, KeywordArg('eps'), Ignored())
+            KeywordArg('scale'), None, Ignored(), group_arg, strategy, fusion,
+            KeywordArg('eps'), Ignored())
 
         def empty_convert_supported_ar_to_nccl_symmetric(
             input: torch.Tensor,
@@ -772,6 +774,20 @@ def register_nccl_symmetric_patterns(custom_passes: List[PatternMatcherPass],
                 f"pattern_to_node keys: {list(match.ctx.pattern_to_node.keys())}"
             )
 
+            # Verify group matches mapping.tp_group
+            try:
+                group_value = match.ctx.pattern_to_node[group_arg]
+                if group_value != mapping.tp_group:
+                    logger.debug(
+                        f"[NCCL_SYMMETRIC] Pattern: extra_check failed: group={group_value} "
+                        f"does not match mapping.tp_group={mapping.tp_group}")
+                    return False
+            except KeyError as e:
+                logger.debug(
+                    f"[NCCL_SYMMETRIC] Pattern: extra_check failed: group not found: {e}"
+                )
+                return False
+
             try:
                 fusion_value = match.ctx.pattern_to_node[fusion]
                 logger.debug(
@@ -801,7 +817,7 @@ def register_nccl_symmetric_patterns(custom_passes: List[PatternMatcherPass],
                 return False
 
             logger.debug(
-                f"[NCCL_SYMMETRIC] Pattern: extra_check passed: fusion_value={fusion_value}"
+                f"[NCCL_SYMMETRIC] Pattern: extra_check passed: fusion_value={fusion_value}, group={group_value}"
             )
             return True
 
