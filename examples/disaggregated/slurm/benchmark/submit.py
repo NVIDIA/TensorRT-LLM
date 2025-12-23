@@ -174,7 +174,7 @@ def submit_job(config, log_dir, dry_run):
     server_env_var = env_config.get('server_env_var')
     if benchmark_config['mode'] == "gen_only":
         worker_env_var += " TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1"
-        worker_env_var += f" TLLM_BENCHMARK_REQ_QUEUES_SIZE=${benchmark_config['concurrency_list']}"
+        worker_env_var += f" TLLM_BENCHMARK_REQ_QUEUES_SIZE={benchmark_config['concurrency_list']}"
     if benchmark_config['mode'] == "gen_only_no_context":
         worker_env_var += " TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1"
         server_env_var += " TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1"
@@ -278,7 +278,7 @@ def submit_job(config, log_dir, dry_run):
         if server_type == "GEN":
             profile_range = profiling_config['gen_profile_range']
             config_path = gen_config_path
-        if server_type == "CTX":
+        else:
             profile_range = profiling_config['ctx_profile_range']
             config_path = ctx_config_path
         for server_id in allocations[server_type].keys():
