@@ -3,7 +3,8 @@
 set -euo pipefail
 
 CONTAINER_NAME=${CONTAINER_NAME:-layer_wise_benchmarks}
-CONTAINER_MOUNTS=$(realpath "$(pwd)/../.."):$(realpath "$(pwd)/../..")
+TRTLLM_ROOT=$(realpath "$(dirname -- "$0")"/../..)
+CONTAINER_MOUNTS=$TRTLLM_ROOT:$TRTLLM_ROOT
 
 if [ -z "${SLURM_JOB_ID:-}" ]; then
     echo "Please set SLURM_JOB_ID"
