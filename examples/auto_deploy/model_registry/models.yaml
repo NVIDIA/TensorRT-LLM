@@ -37,7 +37,7 @@ models:
 - name: Qwen/Qwen2.5-7B-Instruct
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'compile_backend_torch_cudagraph.yaml']
 - name: Qwen/Qwen2.5-7B-Instruct-AWQ
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'compile_backend_torch_cudagraph.yaml']
 - name: Qwen/Qwen3-4B
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: Qwen/Qwen3-8B
@@ -85,9 +85,9 @@ models:
 - name: ibm-granite/granite-guardian-3.2-5b
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: meta-llama/CodeLlama-7b-Instruct-hf
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'compile_backend_torch_cudagraph.yaml']
 - name: meta-llama/CodeLlama-7b-Python-hf
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'compile_backend_torch_cudagraph.yaml']
 - name: meta-llama/Llama-2-7b-chat-hf
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'compile_backend_torch_cudagraph.yaml']
 # DISABLED: FakeTensorMode error in unified_attn export
@@ -98,7 +98,7 @@ models:
 - name: nvidia/Llama-3.1-Minitron-4B-Width-Base
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'compile_backend_torch_cudagraph.yaml']
 - name: nvidia/Llama-3.1-Nemotron-Nano-8B-v1
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'compile_backend_torch_cudagraph.yaml']
 - name: nvidia/Mistral-NeMo-Minitron-8B-Base
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: openai/gpt-oss-20b
@@ -133,9 +133,9 @@ models:
 # - name: meta-llama/Llama-3.3-70B-Instruct
 #   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'llama3_3_70b.yaml']
 - name: meta-llama/CodeLlama-34b-Instruct-hf
-  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'compile_backend_torch_cudagraph.yaml']
 - name: meta-llama/Llama-2-13b-chat-hf
-  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'compile_backend_torch_cudagraph.yaml']
 - name: microsoft/Phi-3-medium-128k-instruct
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
 - name: microsoft/Phi-3-medium-4k-instruct
@@ -186,7 +186,7 @@ models:
 # - name: nvidia/Llama-3.1-405B-Instruct-FP8
 #   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
 - name: nvidia/Llama-3.1-Nemotron-70B-Instruct-HF
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'compile_backend_torch_cudagraph.yaml']
 # DISABLED: Model loading failure - dynamic module registry issue
 # - name: nvidia/Llama-3_1-Nemotron-51B-Instruct
 #   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
@@ -211,7 +211,7 @@ models:
 - name: Qwen/Qwen3-VL-8B-Instruct
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
 - name: Qwen/Qwen2-VL-72B-Instruct-GPTQ-Int4
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml', 'compile_backend_torch_cudagraph.yaml']
 - name: codellama/CodeLlama-70b-Instruct-hf
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'compile_backend_torch_cudagraph.yaml']
 - name: meta-llama/Llama-3.2-90B-Vision-Instruct
