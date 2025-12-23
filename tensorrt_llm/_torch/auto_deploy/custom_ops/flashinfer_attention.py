@@ -278,7 +278,6 @@ class _FlashInferPlanner:
                     kv_data_type=plan_params.kv_dtype,
                     sm_scale=plan_params.sm_scale,
                 )
-                break
 
     def plan(
         self,
