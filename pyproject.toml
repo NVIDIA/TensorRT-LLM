@@ -848,6 +848,7 @@ exclude = [
     "tensorrt_llm/serve/tool_parser/base_tool_parser.py",
     "tensorrt_llm/serve/tool_parser/qwen3_tool_parser.py",
     "tensorrt_llm/serve/tool_parser/utils.py",
+    "tensorrt_llm/tokenizer/tokenizer.py",
     "tensorrt_llm/tools/__init__.py",
     "tensorrt_llm/tools/importlib_utils.py",
     "tensorrt_llm/tools/multimodal_builder.py",

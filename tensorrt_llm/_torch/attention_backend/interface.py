@@ -354,6 +354,15 @@ class AttentionMetadata:
         Hook to be called when using TRTLLM attention backend in spec-dec mode.
         """
 
+    def update_helix_param(
+        self,
+        helix_position_offsets: List[int],
+        helix_is_inactive_rank: List[bool],
+    ) -> None:
+        """
+        Hook to be called when using helix parallelism.
+        """
+
     def update_for_spec_dec(self) -> None:
         """
         Hook to be called during forward when using spec-dec one-model mode.

@@ -6,6 +6,7 @@ import torch
 
 import tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe.torch_moe  # noqa: F401
 import tensorrt_llm._torch.custom_ops.torch_custom_ops as trt_ops  # noqa: F401
+from tensorrt_llm._torch.utils import ActivationType
 
 
 def test_flashinfer_fused_moe_matches_torch_moe():
@@ -75,8 +76,8 @@ def test_flashinfer_fused_moe_matches_torch_moe():
         w1_weight=w1_list,  # gate projection
         w2_weight=w2_list,  # down projection
         w3_weight=w3_list,  # up projection
-        mlp_style="gated_mlp",
-        act_fn="silu",
+        is_gated_mlp=True,
+        act_fn=int(ActivationType.Silu),
     )
 
     # Compare outputs

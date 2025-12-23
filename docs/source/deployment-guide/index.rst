@@ -17,7 +17,7 @@ The TensorRT LLM Docker container makes these config files available at ``/app/t
 
    export TRTLLM_DIR="/app/tensorrt_llm" # path to the TensorRT LLM repo in your local environment
 
-.. include:: note_sections.rst
+.. include:: ../_includes/note_sections.rst
    :start-after: .. start-note-quick-start-isl-osl
    :end-before: .. end-note-quick-start-isl-osl
 
@@ -36,52 +36,52 @@ This table is designed to provide a straightforward starting point; for detailed
      - H100, H200
      - Max Throughput
      - `deepseek-r1-throughput.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/deepseek-r1-throughput.yaml>`_
-     - ``trtllm-serve deepseek-ai/DeepSeek-R1-0528 --extra_llm_api_options ${TRTLLM_DIR}/examples/configs/curated/deepseek-r1-throughput.yaml``
+     - ``trtllm-serve deepseek-ai/DeepSeek-R1-0528 --config ${TRTLLM_DIR}/examples/configs/curated/deepseek-r1-throughput.yaml``
    * - `DeepSeek-R1 <https://huggingface.co/deepseek-ai/DeepSeek-R1-0528>`_
      - B200, GB200
      - Max Throughput
      - `deepseek-r1-deepgemm.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/deepseek-r1-deepgemm.yaml>`_
-     - ``trtllm-serve deepseek-ai/DeepSeek-R1-0528 --extra_llm_api_options ${TRTLLM_DIR}/examples/configs/curated/deepseek-r1-deepgemm.yaml``
+     - ``trtllm-serve deepseek-ai/DeepSeek-R1-0528 --config ${TRTLLM_DIR}/examples/configs/curated/deepseek-r1-deepgemm.yaml``
    * - `DeepSeek-R1 (NVFP4) <https://huggingface.co/nvidia/DeepSeek-R1-FP4>`_
      - B200, GB200
      - Max Throughput
      - `deepseek-r1-throughput.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/deepseek-r1-throughput.yaml>`_
-     - ``trtllm-serve nvidia/DeepSeek-R1-FP4 --extra_llm_api_options ${TRTLLM_DIR}/examples/configs/curated/deepseek-r1-throughput.yaml``
+     - ``trtllm-serve nvidia/DeepSeek-R1-FP4 --config ${TRTLLM_DIR}/examples/configs/curated/deepseek-r1-throughput.yaml``
    * - `DeepSeek-R1 (NVFP4) <https://huggingface.co/nvidia/DeepSeek-R1-FP4-v2>`_
      - B200, GB200
      - Min Latency
      - `deepseek-r1-latency.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/deepseek-r1-latency.yaml>`_
-     - ``trtllm-serve nvidia/DeepSeek-R1-FP4-v2 --extra_llm_api_options ${TRTLLM_DIR}/examples/configs/curated/deepseek-r1-latency.yaml``
+     - ``trtllm-serve nvidia/DeepSeek-R1-FP4-v2 --config ${TRTLLM_DIR}/examples/configs/curated/deepseek-r1-latency.yaml``
    * - `gpt-oss-120b <https://huggingface.co/openai/gpt-oss-120b>`_
      - Any
      - Max Throughput
      - `gpt-oss-120b-throughput.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/gpt-oss-120b-throughput.yaml>`_
-     - ``trtllm-serve openai/gpt-oss-120b --extra_llm_api_options ${TRTLLM_DIR}/examples/configs/curated/gpt-oss-120b-throughput.yaml``
+     - ``trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/curated/gpt-oss-120b-throughput.yaml``
    * - `gpt-oss-120b <https://huggingface.co/openai/gpt-oss-120b>`_
      - Any
      - Min Latency
      - `gpt-oss-120b-latency.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/gpt-oss-120b-latency.yaml>`_
-     - ``trtllm-serve openai/gpt-oss-120b --extra_llm_api_options ${TRTLLM_DIR}/examples/configs/curated/gpt-oss-120b-latency.yaml``
+     - ``trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/curated/gpt-oss-120b-latency.yaml``
    * - `Qwen3-Next-80B-A3B-Thinking <https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Thinking>`_
      - Any
      - Max Throughput
      - `qwen3-next.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/qwen3-next.yaml>`_
-     - ``trtllm-serve Qwen/Qwen3-Next-80B-A3B-Thinking --extra_llm_api_options ${TRTLLM_DIR}/examples/configs/curated/qwen3-next.yaml``
+     - ``trtllm-serve Qwen/Qwen3-Next-80B-A3B-Thinking --config ${TRTLLM_DIR}/examples/configs/curated/qwen3-next.yaml``
    * - Qwen3 family (e.g. `Qwen3-30B-A3B <https://huggingface.co/Qwen/Qwen3-30B-A3B>`_)
      - Any
      - Max Throughput
      - `qwen3.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/qwen3.yaml>`_
-     - ``trtllm-serve Qwen/Qwen3-30B-A3B --extra_llm_api_options ${TRTLLM_DIR}/examples/configs/curated/qwen3.yaml`` (swap to another Qwen3 model name as needed)
+     - ``trtllm-serve Qwen/Qwen3-30B-A3B --config ${TRTLLM_DIR}/examples/configs/curated/qwen3.yaml`` (swap to another Qwen3 model name as needed)
    * - `Llama-3.3-70B (FP8) <https://huggingface.co/nvidia/Llama-3.3-70B-Instruct-FP8>`_
      - Any
      - Max Throughput
      - `llama-3.3-70b.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/llama-3.3-70b.yaml>`_
-     - ``trtllm-serve nvidia/Llama-3.3-70B-Instruct-FP8 --extra_llm_api_options ${TRTLLM_DIR}/examples/configs/curated/llama-3.3-70b.yaml``
+     - ``trtllm-serve nvidia/Llama-3.3-70B-Instruct-FP8 --config ${TRTLLM_DIR}/examples/configs/curated/llama-3.3-70b.yaml``
    * - `Llama 4 Scout (FP8) <https://huggingface.co/nvidia/Llama-4-Scout-17B-16E-Instruct-FP8>`_
      - Any
      - Max Throughput
      - `llama-4-scout.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/llama-4-scout.yaml>`_
-     - ``trtllm-serve nvidia/Llama-4-Scout-17B-16E-Instruct-FP8 --extra_llm_api_options ${TRTLLM_DIR}/examples/configs/curated/llama-4-scout.yaml``
+     - ``trtllm-serve nvidia/Llama-4-Scout-17B-16E-Instruct-FP8 --config ${TRTLLM_DIR}/examples/configs/curated/llama-4-scout.yaml``
 
 Model-Specific Deployment Guides
 ---------------------------------
