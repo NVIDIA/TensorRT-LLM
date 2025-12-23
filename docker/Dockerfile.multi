@@ -2,7 +2,7 @@
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch
 ARG TRITON_IMAGE=gitlab-master.nvidia.com:5005/dl/dgx/tritonserver
 ARG BASE_TAG=25.12-py3
-ARG TRITON_BASE_TAG=25.12-py3.40375264-stage
+ARG TRITON_BASE_TAG=25.12-py3.40375264
 ARG DEVEL_IMAGE=devel
 
 FROM ${BASE_IMAGE}:${BASE_TAG} AS base
