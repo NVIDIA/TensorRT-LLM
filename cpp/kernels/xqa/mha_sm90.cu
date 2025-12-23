@@ -703,7 +703,7 @@ CUBIN_EXPORT __global__
             SpecDecParams const specDecParams,
 #endif
 #if SKIP_SOFTMAX_ATTN
-            float const* __restrict__ const skipSoftmaxThresholdPtr,
+            float const skipSoftmaxThresholdScaleFactor,
 #if SKIP_SOFTMAX_ATTN_BLOCK_STATS
             uint32_t* __restrict__ skipped_block_count, uint32_t* __restrict__ total_block_count,
 #endif
@@ -786,7 +786,7 @@ CUBIN_EXPORT __global__
     static_assert(multiBlockMinNbTiles >= multiBlockMinNbTilesPerCta * 2);
     assert(isMultiBlockMode == (nbSubSeq > 1));
 #if SKIP_SOFTMAX_ATTN
-    float const skipSoftmaxThreshold = skipSoftmaxThresholdPtr == nullptr ? 0.0f : skipSoftmaxThresholdPtr[0];
+    float const skipSoftmaxThreshold = skipSoftmaxThresholdScaleFactor / cacheSeqLen;
 #endif
     if (idxSubSeq >= nbSubSeq)
     {
@@ -2182,7 +2182,7 @@ __device__ inline RegColWiseVec computeWarpGrpColMax_sync(
     uint32_t const lane = laneId();
 #if SKIP_SOFTMAX_ATTN
     auto prevOrCurrentMax = RegColWiseVec();
-#endif
+#if SKIP_SOFTMAX_ATTN_FIX_THRESHOLD_GREATER_THAN_ONE
     if (lane < 4)
     {
 #pragma unroll
@@ -2191,13 +2191,30 @@ __device__ inline RegColWiseVec computeWarpGrpColMax_sync(
 #pragma unroll
             for (uint32_t j = 0; j < 2; j++)
             {
-#if SKIP_SOFTMAX_ATTN
+                prevOrCurrentMax[n][j] = smemColMax[8 * n + 2 * lane + j];
+            }
+        }
+    }
+    warpGrpBar.arrive_and_wait();
+#endif
+#endif
+
+    if (lane < 4)
+    {
+#pragma unroll
+        for (uint32_t n = 0; n < src.cols; n++)
+        {
+#pragma unroll
+            for (uint32_t j = 0; j < 2; j++)
+            {
+#if SKIP_SOFTMAX_ATTN && !SKIP_SOFTMAX_ATTN_FIX_THRESHOLD_GREATER_THAN_ONE
                 // prevOrCurrentMax <= actual smemColMax (after updates from all 4 warps done), but always >=
                 // smemColMax(Prev), the smemColMax value *before* this tile is computed.
                 // When determine whether to skip, it is safe to use prevOrCurrentMax: 1) all 4 warps' localmax <
                 // smemColMax(Prev), then prevOrCurrentMax == smemColMax(Prev), result not affected; 2) if some localmax
                 // > smemColMax(Prev), prevOrCurrentMax > smemColMax(Prev), some warps may incorrectly vote skip, but
-                // at least one warp whose localColMax is larger will not skip, then the tile is not skipped
+                // at least one warp whose localColMax is larger will not skip, then the tile is not skipped.
+                // This reduces some sync and check, but has issue when threshold > 1.
                 prevOrCurrentMax[n][j] = atomicMax(&smemColMax[8 * n + 2 * lane + j], colMax[n][j]);
 #else
                 atomicMax(&smemColMax[8 * n + 2 * lane + j], colMax[n][j]);
@@ -3467,7 +3484,7 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
     SpecDecParams const& specDecParams,
 #endif
 #if SKIP_SOFTMAX_ATTN
-    float const* __restrict__ const skipSoftmaxThresholdPtr,
+    float const skipSoftmaxThresholdScaleFactor,
 #if SKIP_SOFTMAX_ATTN_BLOCK_STATS
     uint32_t* __restrict__ skipped_block_count, uint32_t* __restrict__ total_block_count,
 #endif
@@ -3563,7 +3580,7 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
         specDecParams,
 #endif
 #if SKIP_SOFTMAX_ATTN
-        skipSoftmaxThresholdPtr,
+        skipSoftmaxThresholdScaleFactor,
 #if SKIP_SOFTMAX_ATTN_BLOCK_STATS
         skipped_block_count, total_block_count,
 #endif

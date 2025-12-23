@@ -151,7 +151,7 @@ template <uint32_t nbKHeads>
 #endif
 void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, bool verbose = false,
     bool saveData = false, bool hasAttentionSinks = false, uint32_t ctxLen = ~0U, uint32_t slidingWinSize = 1U << 30,
-    float skipSoftmaxThreshold = 0.0f)
+    float skipSoftmaxThresholdScaleFactor = 0.0f)
 {
 #if IS_MLA
     if (nbKHeads != 1)
@@ -225,10 +225,10 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
         seqLen = (16U << 20) / gmemCacheHeadBytes; // 32MB per K+V head.
     }
     ctxLen = std::min(ctxLen, seqLen);
-    float skip_softmax_threshold = skipSoftmaxThreshold;
+    float skip_softmax_threshold_scale_factor = skipSoftmaxThresholdScaleFactor;
     uint32_t skipped_block_count = 0;
     uint32_t total_block_count = 0;
-    if (skip_softmax_threshold > 0)
+    if (skip_softmax_threshold_scale_factor > 0)
     {
         assert(useQGMMA);
     }
@@ -338,8 +338,6 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
     auto const seqLenList = ManagedMemBuf<uint32_t[beamWidth]>(batchSize);
     auto const ctxLenList = ManagedMemBuf<uint32_t[beamWidth]>(batchSize);
 #if SKIP_SOFTMAX_ATTN
-    auto const skipSoftmaxThresholdPtr = ManagedMemBuf<float>(1);
-    skipSoftmaxThresholdPtr[0] = skip_softmax_threshold;
 #ifdef SKIP_SOFTMAX_ATTN_BLOCK_STATS
     auto const kernel_skipped_block_count = ManagedMemBuf<uint32_t>(1);
     auto const kernel_total_block_count = ManagedMemBuf<uint32_t>(1);
@@ -347,8 +345,8 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
     kernel_total_block_count[0] = 0;
 #endif
 #else
-    EXPECT_EQ(skipSoftmaxThreshold, 0.0f)
-        << "Got non-zero skipSoftmaxThreshold while SKIP_SOFTMAX_ATTN is not enabled.";
+    EXPECT_EQ(skipSoftmaxThresholdScaleFactor, 0.0f)
+        << "Got non-zero skipSoftmaxThresholdScaleFactor while SKIP_SOFTMAX_ATTN is not enabled.";
 #endif
 #if USE_PAGED_KV_CACHE
     auto const pageListBuf = ManagedMemBuf<std::byte>(pageListBytes);
@@ -804,7 +802,7 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
             specDecParams,
 #endif
 #if SKIP_SOFTMAX_ATTN
-            skipSoftmaxThresholdPtr.get(),
+            skipSoftmaxThresholdScaleFactor,
 #if SKIP_SOFTMAX_ATTN_BLOCK_STATS
             kernel_skipped_block_count.get(), kernel_total_block_count.get(),
 #endif
@@ -1140,7 +1138,8 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
                     {
                         refOutput = refFlashAttention<CacheElem, 64>(&qHeads[req][b][headGrpSize * idxKHead], kCacheSeq,
                             vCacheSeq, seqLen, qScaleForRef, kvCacheScale[0], xScale, slidingWinSize, refAttentionSinks,
-                            skip_softmax_threshold, &skipped_block_count, &total_block_count, multiBlockNum);
+                            skip_softmax_threshold_scale_factor, &skipped_block_count, &total_block_count,
+                            multiBlockNum);
                         // refOutput = refAttention<CacheElem>(&qHeads[req][b][headGrpSize * idxKHead], kCacheSeq,
                         // vCacheSeq, seqLen, qScaleForRef, kvCacheScale[0], xScale, slidingWinSize);
                     }
@@ -1321,9 +1320,10 @@ TEST(RefCheck, llama_V2_70b)
 #endif
 #if SKIP_SOFTMAX_ATTN
     runTest<1>(32, 2048, false, true, false, false, false, ~0U, 1U << 30, 0.f);
-    runTest<4>(32, 1538, false, true, false, false, false, ~0U, 1U << 30, 0.75f);
-    runTest<2>(32, 4096, false, true, false, false, false, ~0U, 1U << 30, 0.75f);
-    runTest<4>(32, 300, false, true, false, false, false, ~0U, 1U << 30, 0.75f);
+    runTest<4>(32, 1538, false, true, false, false, false, ~0U, 1U << 30, 55.f);
+    runTest<2>(32, 4096, false, true, false, false, false, ~0U, 1U << 30, 125.f);
+    runTest<4>(32, 300, false, true, false, false, false, ~0U, 1U << 30, 80.f);
+    runTest<4>(32, 500, false, true, false, false, false, ~0U, 1U << 30, 455.f);
 #endif
     runTest<8>(120, 367, false, true);
     runTest<8>(1792, 2048, false, true);

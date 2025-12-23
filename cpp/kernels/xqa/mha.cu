@@ -2792,10 +2792,10 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
     SpecDecParams const& specDecParams,
 #endif
 #if SKIP_SOFTMAX_ATTN
-    float const* __restrict__ const skipSoftmaxThresholdPtr, // for compatibility with mha_sm90.cu only
+    float const skipSoftmaxThresholdScaleFactor, // for compatibility with mha_sm90.cu only
 #if SKIP_SOFTMAX_ATTN_BLOCK_STATS
-    uint32_t* __restrict__ skipped_block_count,              // for compatibility with mha_sm90.cu only
-    uint32_t* __restrict__ total_block_count,                // for compatibility with mha_sm90.cu only
+    uint32_t* __restrict__ skipped_block_count,  // for compatibility with mha_sm90.cu only
+    uint32_t* __restrict__ total_block_count,    // for compatibility with mha_sm90.cu only
 #endif
 #endif
     uint32_t* semaphores, void* scratch, cudaStream_t stream)
