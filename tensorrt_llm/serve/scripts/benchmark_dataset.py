@@ -737,7 +737,9 @@ class CustomDataset(BenchmarkDataset):
             max_tokens = entry["input"]["max_tokens"]
             prompts.append(prompt)
             max_tokens_list.append(max_tokens)
-            if "num_tokens" in entry["input"]:
+            if "num_tokens" in entry["input"] and isinstance(
+                    entry["input"]["num_tokens"],
+                    int) and entry["input"]["num_tokens"] > 0:
                 prompt_lengths.append(entry["input"]["num_tokens"])
 
         if len(prompt_lengths) > 0 and len(prompt_lengths) == len(prompts):
