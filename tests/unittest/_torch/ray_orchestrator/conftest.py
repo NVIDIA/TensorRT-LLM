@@ -1,13 +1,7 @@
 import os
 import sys
-from typing import Generator
 
 import pytest
-
-try:
-    import ray
-except ModuleNotFoundError:
-    from tensorrt_llm import ray_stub as ray
 
 from tensorrt_llm._utils import mpi_disabled
 
@@ -27,26 +21,3 @@ if not mpi_disabled():
     pytest.skip(
         "Ray tests are only tested in Ray CI stage or with --run-ray flag",
         allow_module_level=True)
-
-
-@pytest.fixture(scope="function")
-def setup_ray_cluster() -> Generator[int, None, None]:
-    runtime_env = {
-        "env_vars": {
-            "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"
-        }
-    }
-    ray_init_args = {
-        "include_dashboard": False,
-        "namespace": "test",
-        "ignore_reinit_error": True,
-        "runtime_env": runtime_env
-    }
-    try:
-        ray.init(address="local", **ray_init_args)
-        gcs_addr = ray.get_runtime_context().gcs_address
-        port = int(gcs_addr.split(":")[1])
-        yield port
-    finally:
-        if ray.is_initialized():
-            ray.shutdown()
