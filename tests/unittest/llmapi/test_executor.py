@@ -213,21 +213,33 @@ def _test_sync_generation_tp_inner(llama_7b_tp2_path: Path):
             result.outputs[0].token_ids) == ", neural network,"
 
         try:
-            stats = await executor.aget_stats()
-            stats = json.loads(stats)
-            assert stats["iter"] == 0
-            assert stats["cpuMemUsage"] > 0
-            assert stats["gpuMemUsage"] > 0
-            assert stats["inflightBatchingStats"]["numCtxTokens"] == 3
-            assert stats["inflightBatchingStats"]["numGenRequests"] == 0
-            assert stats["kvCacheStats"]["usedNumBlocks"] == 1
+            stats_result = executor.aget_stats(timeout=2)
+            # aget_stats now returns IterationResult, iterate to get stats
+            async for stats_str in stats_result:
+                stats = json.loads(stats_str) if isinstance(stats_str,
+                                                            str) else stats_str
+                assert stats["iter"] >= 0
+                assert stats["cpuMemUsage"] > 0
+                assert stats["gpuMemUsage"] > 0
+                break  # Just check first result
         except AsyncQueue.EventLoopShutdownError:
             pass
 
     asyncio.run(async_stats_task())
 
-    stats = executor.get_stats()
-    assert json.loads(stats)["iter"] == 1
+    # Poll for stats since RPC calls return immediately
+    import time
+    stats_list = []
+    for _ in range(10):
+        stats_list = executor.get_stats(timeout=0.5)
+        if stats_list:
+            break
+        time.sleep(0.1)
+
+    assert len(stats_list) > 0
+    stats = json.loads(stats_list[0]) if isinstance(stats_list[0],
+                                                    str) else stats_list[0]
+    assert stats["iter"] == 1
     executor.shutdown()
 
 

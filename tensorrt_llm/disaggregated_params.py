@@ -40,6 +40,8 @@ class DisaggregatedParams:
     multimodal_hashes: Optional[List[List[int]]] = (
         None  # user provided mm hashes should be a list of 8 integers
     )
+    mrope_position_ids_handle: Optional[Dict[str, Any]] = None
+    mrope_position_deltas_handle: Optional[Dict[str, Any]] = None
 
     def get_context_phase_params(self) -> tllme.ContextPhaseParams:
         return tllme.ContextPhaseParams(
