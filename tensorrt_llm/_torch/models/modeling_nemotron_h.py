@@ -200,18 +200,26 @@ class NemotronHMOE(nn.Module):
         )
 
         # Setup latent projection layers.
+        # These layers should NOT be TP-sharded to ensure MoE receives
+        # full latent representation. They are replicated across all GPUs.
         if self.use_latent_moe:
             self.fc1_latent_proj = Linear(
                 in_features=self.hidden_size,
                 out_features=self.moe_hidden_size,
                 bias=self.mlp_bias,
                 dtype=config.torch_dtype,
+                quant_config=model_config.get_quant_config(),
+                skip_create_weights_in_init=model_config.
+                skip_create_weights_in_init,
             )
             self.fc2_latent_proj = Linear(
                 in_features=self.moe_hidden_size,
                 out_features=self.hidden_size,
                 bias=self.mlp_bias,
                 dtype=config.torch_dtype,
+                quant_config=model_config.get_quant_config(),
+                skip_create_weights_in_init=model_config.
+                skip_create_weights_in_init,
             )
         else:
             self.fc1_latent_proj = None
