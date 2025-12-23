@@ -14,8 +14,8 @@ class ToolParserFactory:
         "qwen3": Qwen3ToolParser,
         "qwen3_coder": Qwen3CoderToolParser,
         "kimi_k2": KimiK2ToolParser,
-        "deepseekv3": DeepSeekV3Parser,
-        "deepseekv3.1": DeepSeekV31Parser,
+        "deepseek_v3": DeepSeekV3Parser,
+        "deepseek_v31": DeepSeekV31Parser,
         "deepseek_v32": DeepSeekV32Parser,
     }
 
