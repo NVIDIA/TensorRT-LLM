@@ -776,10 +776,6 @@ quantize_with_block_size(
     static constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / ELTS_PER_THREAD; // 2 or 4
     static_assert(sizeof(PackedVec) == sizeof(Type) * ELTS_PER_THREAD, "Vec size is not matched.");
 
-    // Get the global scaling factor, which will be applied to the SF.
-    // Note SFScale is the same as next GEMM's alpha, which is (448.f / (Alpha_A / 6.f)).
-    float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[0];
-
     // Is it swizzled layout?
     bool isSfSwizzledLayout = layout == QuantizationSFLayout::SWIZZLED;
 
@@ -794,6 +790,10 @@ quantize_with_block_size(
     int numColThreadsForSf = numColsForSf / ELTS_PER_THREAD;
 
     asm volatile("griddepcontrol.wait;");
+    // Get the global scaling factor, which will be applied to the SF.
+    // Note SFScale is the same as next GEMM's alpha, which is (448.f / (Alpha_A / 6.f)).
+    float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[0];
+
     // Input tensor batch/row/col loops.
     // Optimization: Iterate over actual rows first (hot path), then padding rows (cold path)
     // This improves performance for small batch sizes with swizzled layout
