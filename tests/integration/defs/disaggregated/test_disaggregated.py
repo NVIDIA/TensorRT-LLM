@@ -207,8 +207,8 @@ def generate_worker_commands(model_path, config, server_config,
         host, port = url.split(':')
         cmd = [
             'trtllm-serve', model_path, '--host', host, '--port', port,
-            '--backend', config['backend'], '--extra_llm_api_options',
-            extra_config_file, '--server_role', server_role
+            '--backend', config['backend'], '--config', extra_config_file,
+            '--server_role', server_role
         ]
         worker_commands.append(cmd)
     return worker_commands

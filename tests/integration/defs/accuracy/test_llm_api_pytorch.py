@@ -2644,7 +2644,6 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3.2-Exp-hf"
 
     @pytest.mark.skip_less_mpi_world_size(8)
-    @pytest.mark.skip_less_device(8)
     @skip_pre_hopper
     @pytest.mark.skip_less_device_memory(140000)
     @pytest.mark.parametrize(
@@ -2722,7 +2721,6 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                 task.evaluate(llm)
 
     @pytest.mark.skip_less_mpi_world_size(8)
-    @pytest.mark.skip_less_device(8)
     @skip_pre_blackwell
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend,skip_indexer",
@@ -2792,7 +2790,6 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                 task.evaluate(llm)
 
     @pytest.mark.skip_less_mpi_world_size(8)
-    @pytest.mark.skip_less_device(8)
     @skip_pre_blackwell
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend",
@@ -2997,6 +2994,35 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_blackwell
+    @pytest.mark.timeout(7200)
+    @pytest.mark.skip_less_device_memory(120000)
+    @pytest.mark.parametrize("tp_size", [
+        pytest.param(4, marks=pytest.mark.skip_less_device(4)),
+        pytest.param(8, marks=pytest.mark.skip_less_device(8)),
+    ],
+                             ids=["4gpus", "8gpus"])
+    def test_nvfp4(self, tp_size):
+        model_name = "moonshotai/Kimi-K2-Thinking"
+        model_path = f"{llm_models_root()}/Kimi-K2-Thinking-NVFP4"
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
+
+        with LLM(model_path,
+                 tensor_parallel_size=tp_size,
+                 max_batch_size=16,
+                 pipeline_parallel_size=1,
+                 moe_expert_parallel_size=1,
+                 kv_cache_config=kv_cache_config,
+                 enable_attention_dp=True,
+                 trust_remote_code=True,
+                 speculative_config=None) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+
+            task = MMLU(model_name)
+            task.evaluate(llm)
+            task = GSM8K(model_name)
             task.evaluate(llm)
 
 
@@ -4897,9 +4923,11 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler,moe_backend,eagle3",
         [
             (4, 1, 4, False, True, True, "TRTLLM", False),
+            (4, 1, 4, False, True, True, "TRTLLM", True),
         ],
         ids=[
             "latency_moe_trtllm",
+            "latency_moe_trtllm_eagle",
         ],
     )
     def test_nvfp4_4gpus(self, tp_size, pp_size, ep_size, attention_dp,
@@ -4922,7 +4950,8 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
                 max_draft_len=2,
                 speculative_model_dir=
                 f"{llm_models_root()}/Mistral-Large-3-675B/Mistral-Large-3-675B-Instruct-2512-Eagle/",
-                eagle3_one_model=True)
+                eagle3_one_model=True,
+                eagle3_model_arch="mistral_large3")
         with LLM(
                 f"{llm_models_root()}/Mistral-Large-3-675B/Mistral-Large-3-675B-Instruct-2512-NVFP4/",
                 checkpoint_format="mistral",
@@ -4972,7 +5001,8 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
                 max_draft_len=2,
                 speculative_model_dir=
                 f"{llm_models_root()}/Mistral-Large-3-675B/Mistral-Large-3-675B-Instruct-2512-Eagle/",
-                eagle3_one_model=True)
+                eagle3_one_model=True,
+                eagle3_model_arch="mistral_large3")
         with LLM(
                 f"{llm_models_root()}/Mistral-Large-3-675B/Mistral-Large-3-675B-Instruct-2512/",
                 checkpoint_format="mistral",
@@ -4988,3 +5018,43 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+
+class TestNemotronV3Nano(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "nvidia/Nemotron-3-Nano"
+    # Test with no thinking to save time.
+    EXTRA_EVALUATOR_KWARGS = dict(chat_template_kwargs=dict(
+        enable_thinking=False))
+
+    def test_auto_dtype(self):
+        with LLM(
+                f"{llm_models_root()}/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+                kv_cache_config=KvCacheConfig(
+                    enable_block_reuse=False,
+                    mamba_ssm_cache_dtype="float32",
+                ),
+                max_batch_size=32,
+        ) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @skip_pre_hopper
+    def test_fp8(self):
+        with LLM(
+                f"{llm_models_root()}/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8",
+                kv_cache_config=KvCacheConfig(
+                    enable_block_reuse=False,
+                    mamba_ssm_cache_dtype="float32",
+                ),
+                max_batch_size=32,
+        ) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)

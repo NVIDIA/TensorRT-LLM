@@ -3,9 +3,12 @@ trtllm-bench
 
 trtllm-bench is a comprehensive benchmarking tool for TensorRT LLM engines. It provides three main subcommands for different benchmarking scenarios:
 
-**Common Options for All Commands:**
+.. include:: ../_includes/note_sections.rst
+   :start-after: .. start-note-config-flag-alias
+   :end-before: .. end-note-config-flag-alias
 
-**Usage:**
+Syntax
+------
 
 .. click:: tensorrt_llm.commands.bench:main
    :prog: trtllm-bench
@@ -14,8 +17,11 @@ trtllm-bench is a comprehensive benchmarking tool for TensorRT LLM engines. It p
 
 
 
+Dataset preparation
+------------------
+
 prepare_dataset.py
-===========================
+^^^^^^^^^^^^^^^^^^
 
 trtllm-bench is designed to work with the `prepare_dataset.py <https://github.com/NVIDIA/TensorRT-LLM/blob/main/benchmarks/cpp/prepare_dataset.py>`_ script, which generates benchmark datasets in the required format. The prepare_dataset script supports:
 
@@ -38,7 +44,7 @@ trtllm-bench is designed to work with the `prepare_dataset.py <https://github.co
 **Usage:**
 
 prepare_dataset
--------------------
+"""""""""""""""
 
 .. code-block:: bash
 
@@ -72,7 +78,7 @@ prepare_dataset
      - Logging level: info or debug (default: info)
 
 dataset
--------------------
+"""""""
 
 Process real datasets from various sources.
 
@@ -103,7 +109,7 @@ Process real datasets from various sources.
 
 
 token_norm_dist
--------------------
+"""""""""""""""
 
 Generate synthetic datasets with normal token distribution.
 
@@ -134,7 +140,7 @@ Generate synthetic datasets with normal token distribution.
 
 
 token_unif_dist
--------------------
+"""""""""""""""
 
 Generate synthetic datasets with uniform token distribution
 
