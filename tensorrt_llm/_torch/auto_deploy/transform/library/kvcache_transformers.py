@@ -13,7 +13,7 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from ...custom_ops.attention_interface import AttentionDescriptor, Constant, PrepareMetadataCallable
-from ...custom_ops.vlm_mask_registry import VlmMaskGeneratorRegistry
+from ...custom_ops.vlm_mask_registry import VlmMaskGeneratorRegistry, VlmMetadataKeys
 from ...export.library.unified_attn import HF_ATTN_KWARGS_MAPPING
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
@@ -204,9 +204,8 @@ def forward_with_prepare_metadata(mod: nn.Module, **cm_kwargs):
 
     # Generate VLM custom mask if configured (e.g., Gemma3 with image tokens)
     cm_kwargs["custom_mask"] = None
-    if hasattr(gm, "_vlm_mask_config"):
-        model_type = gm._vlm_mask_config["model_type"]
-
+    model_type = getattr(gm, "_vlm_model_type", None)
+    if model_type is not None:
         # Look up the mask generator for this model type from the registry
         mask_generator = VlmMaskGeneratorRegistry.get(model_type)
         if mask_generator is not None:
@@ -217,10 +216,12 @@ def forward_with_prepare_metadata(mod: nn.Module, **cm_kwargs):
                 qo_indptr = cm_kwargs["metadata_0"]  # qo_indptr from prepare_metadata
                 seq_len = cm_kwargs["seq_len"]
 
+                # sliding_window=-1 means backend handles it
                 custom_mask = mask_generator(
                     image_token_mask,
                     qo_indptr,
                     seq_len,
+                    -1,  # sliding_window
                 )
                 cm_kwargs["custom_mask"] = custom_mask
 
@@ -299,9 +300,27 @@ class HFReplaceCachedAttn(InsertCachedAttention):
         if model_type is None and hasattr(mod.config, "text_config"):
             model_type = getattr(mod.config.text_config, "model_type", None)
 
-        # Check if VLM mask generation is supported for this model type
+        # Set VLM metadata on the GraphModule for mask generation
+        # This uses the same metadata format as TextModelExportInfo.post_process
         if VlmMaskGeneratorRegistry.get(model_type) is not None:
-            mod._gm._vlm_mask_config = {"model_type": model_type}
+            setattr(mod._gm, VlmMetadataKeys.GRAPH_MODEL_TYPE, model_type)
+
+            # Get VLM input candidates from module metadata (set by model patches)
+            # Search through submodules to find one with _vlm_input_names set on its class
+            vlm_input_candidates = []
+            for submod in mod.modules():
+                candidates = getattr(type(submod), VlmMetadataKeys.MODULE_INPUT_NAMES, None)
+                if candidates:
+                    vlm_input_candidates = candidates
+                    break
+
+            # Determine which VLM inputs are actually present in the graph
+            vlm_inputs = [
+                n.target
+                for n in mod._gm.graph.nodes
+                if n.op == "placeholder" and n.target in vlm_input_candidates
+            ]
+            setattr(mod._gm, VlmMetadataKeys.GRAPH_INPUTS, vlm_inputs)
 
         # register cached attn operator and switch to cached forward function
         ALL_ATTENTION_FUNCTIONS.register("ad_cached_mha", get_cached_attn(self.attn_descriptor))

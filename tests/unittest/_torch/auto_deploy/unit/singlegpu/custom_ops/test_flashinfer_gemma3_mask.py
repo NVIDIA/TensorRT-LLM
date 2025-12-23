@@ -1,16 +1,16 @@
-"""Unit tests for FlashInfer VLM mask generation custom op."""
+"""Unit tests for VLM mask generation custom op."""
 
 import pytest
 import torch
 
-from tensorrt_llm._torch.auto_deploy.custom_ops.flashinfer_gemma3_mask import (
-    _get_context_mask,
-    flashinfer_vlm_mask_gen,
+from tensorrt_llm._torch.auto_deploy.custom_ops.vlm_mask_ops import (
+    _get_context_mask_with_bidir_images,
+    create_attention_mask,
 )
 
 
 class TestGetContextMask:
-    """Tests for _get_context_mask function (core mask logic).
+    """Tests for _get_context_mask_with_bidir_images function (core mask logic).
 
     This tests the core masking behavior:
     - Text tokens: Causal attention (lower triangular)
@@ -21,7 +21,7 @@ class TestGetContextMask:
         """No image tokens -> standard causal (lower triangular) mask."""
         image_token_mask = torch.tensor([False, False, False, False])
 
-        result = _get_context_mask(image_token_mask)
+        result = _get_context_mask_with_bidir_images(image_token_mask)
 
         # Standard causal mask: position i can attend to positions 0..i
         expected = torch.tensor(
@@ -39,7 +39,7 @@ class TestGetContextMask:
         # All image tokens
         image_token_mask = torch.tensor([True, True, True])
 
-        result = _get_context_mask(image_token_mask)
+        result = _get_context_mask_with_bidir_images(image_token_mask)
 
         # Image-to-image is fully bidirectional -> all True
         expected = torch.ones(3, 3, dtype=torch.bool)
@@ -50,7 +50,7 @@ class TestGetContextMask:
         # [text, image, image, text]
         image_token_mask = torch.tensor([False, True, True, False])
 
-        result = _get_context_mask(image_token_mask)
+        result = _get_context_mask_with_bidir_images(image_token_mask)
 
         # Position 0 (text): can attend to [0]
         # Position 1 (image): can attend to [0, 1, 2] (causal + bidir with pos 2)
@@ -70,7 +70,7 @@ class TestGetContextMask:
         """Single token should produce 1x1 True mask."""
         image_token_mask = torch.tensor([False])
 
-        result = _get_context_mask(image_token_mask)
+        result = _get_context_mask_with_bidir_images(image_token_mask)
 
         expected = torch.tensor([[True]])
         assert torch.equal(result, expected)
@@ -79,7 +79,7 @@ class TestGetContextMask:
         """Image tokens at end of sequence."""
         image_token_mask = torch.tensor([False, False, True, True])
 
-        result = _get_context_mask(image_token_mask)
+        result = _get_context_mask_with_bidir_images(image_token_mask)
 
         # Images at 2 and 3 should be bidirectional
         assert result[2, 3]  # image at 2 can attend to 3
@@ -89,7 +89,7 @@ class TestGetContextMask:
         """Image tokens at start of sequence."""
         image_token_mask = torch.tensor([True, True, False, False])
 
-        result = _get_context_mask(image_token_mask)
+        result = _get_context_mask_with_bidir_images(image_token_mask)
 
         # Images at 0 and 1 should be bidirectional
         assert result[0, 1]  # image at 0 can attend to 1
@@ -105,7 +105,7 @@ class TestGetContextMask:
         # [text, image, image, text, text, image, image, text]
         image_token_mask = torch.tensor([False, True, True, False, False, True, True, False])
 
-        result = _get_context_mask(image_token_mask)
+        result = _get_context_mask_with_bidir_images(image_token_mask)
 
         # First image block (positions 1, 2) should be bidirectional with each other
         assert result[1, 2]  # image at 1 can attend to image at 2
@@ -130,8 +130,8 @@ class TestGetContextMask:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-class TestFlashinferVlmMaskGen:
-    """Tests for flashinfer_vlm_mask_gen custom op."""
+class TestCreateAttentionMask:
+    """Tests for create_attention_mask custom op."""
 
     def test_single_context_sequence(self):
         """Single context sequence generates correct mask."""
@@ -141,7 +141,7 @@ class TestFlashinferVlmMaskGen:
         qo_indptr = torch.tensor([0, 4], dtype=torch.int32, device=device)
         seq_len = torch.tensor([4], dtype=torch.int32, device=device)
 
-        mask = flashinfer_vlm_mask_gen(image_token_mask, qo_indptr, seq_len)
+        mask = create_attention_mask(image_token_mask, qo_indptr, seq_len, -1, "gemma3")
 
         # Mask should be flattened 4x4 = 16 elements
         assert mask.shape == (16,)
@@ -155,7 +155,7 @@ class TestFlashinferVlmMaskGen:
         qo_indptr = torch.tensor([0, 3, 5], dtype=torch.int32, device=device)
         seq_len = torch.tensor([3, 2], dtype=torch.int32, device=device)
 
-        mask = flashinfer_vlm_mask_gen(image_token_mask, qo_indptr, seq_len)
+        mask = create_attention_mask(image_token_mask, qo_indptr, seq_len, -1, "gemma3")
 
         # Total: 3*3 + 2*2 = 9 + 4 = 13 elements
         assert mask.shape == (13,)
@@ -167,7 +167,7 @@ class TestFlashinferVlmMaskGen:
         qo_indptr = torch.tensor([0, 1, 2], dtype=torch.int32, device=device)
         seq_len = torch.tensor([1, 1], dtype=torch.int32, device=device)  # All generate
 
-        mask = flashinfer_vlm_mask_gen(image_token_mask, qo_indptr, seq_len)
+        mask = create_attention_mask(image_token_mask, qo_indptr, seq_len, -1, "gemma3")
 
         # No context requests -> empty
         assert mask.shape == (0,)
@@ -183,7 +183,7 @@ class TestFlashinferVlmMaskGen:
         qo_indptr = torch.tensor(cumsum, dtype=torch.int32, device=device)
         seq_len = torch.tensor(seq_lens, dtype=torch.int32, device=device)
 
-        mask = flashinfer_vlm_mask_gen(image_token_mask, qo_indptr, seq_len)
+        mask = create_attention_mask(image_token_mask, qo_indptr, seq_len, -1, "gemma3")
 
         expected_size = sum(s * s for s in seq_lens)
         assert mask.shape == (expected_size,)
@@ -195,7 +195,7 @@ class TestFlashinferVlmMaskGen:
         qo_indptr = torch.tensor([0, 4], dtype=torch.int32, device=device)
         seq_len = torch.tensor([4], dtype=torch.int32, device=device)
 
-        mask = flashinfer_vlm_mask_gen(image_token_mask, qo_indptr, seq_len)
+        mask = create_attention_mask(image_token_mask, qo_indptr, seq_len, -1, "gemma3")
 
         assert mask.is_contiguous()
 
@@ -207,7 +207,7 @@ class TestFlashinferVlmMaskGen:
         qo_indptr = torch.tensor([0, 4], dtype=torch.int32, device=device)
         seq_len = torch.tensor([4], dtype=torch.int32, device=device)
 
-        mask = flashinfer_vlm_mask_gen(image_token_mask, qo_indptr, seq_len)
+        mask = create_attention_mask(image_token_mask, qo_indptr, seq_len, -1, "gemma3")
 
         # Expected 2D mask:
         # [True,  False, False, False]  # text at 0
@@ -234,7 +234,7 @@ class TestFlashinferVlmMaskGen:
         qo_indptr = torch.tensor([0, 3], dtype=torch.int32, device=device)
         seq_len = torch.tensor([3], dtype=torch.int32, device=device)
 
-        mask = flashinfer_vlm_mask_gen(image_token_mask, qo_indptr, seq_len)
+        mask = create_attention_mask(image_token_mask, qo_indptr, seq_len, -1, "gemma3")
 
         # Expected: lower triangular (causal)
         expected_2d = torch.tensor(
@@ -256,9 +256,21 @@ class TestFlashinferVlmMaskGen:
         qo_indptr = torch.tensor([0, 3], dtype=torch.int32, device=device)
         seq_len = torch.tensor([3], dtype=torch.int32, device=device)
 
-        mask = flashinfer_vlm_mask_gen(image_token_mask, qo_indptr, seq_len)
+        mask = create_attention_mask(image_token_mask, qo_indptr, seq_len, -1, "gemma3")
 
         # Expected: all True (bidirectional)
         expected = torch.ones(9, dtype=torch.bool, device=device)
 
         assert torch.equal(mask, expected)
+
+    def test_unknown_model_type_returns_empty(self):
+        """Unknown model type should return empty mask (no custom masking)."""
+        device = "cuda"
+        image_token_mask = torch.tensor([False, True, True, False], device=device)
+        qo_indptr = torch.tensor([0, 4], dtype=torch.int32, device=device)
+        seq_len = torch.tensor([4], dtype=torch.int32, device=device)
+
+        mask = create_attention_mask(image_token_mask, qo_indptr, seq_len, -1, "unknown_model")
+
+        # Unknown model type -> empty mask
+        assert mask.shape == (0,)

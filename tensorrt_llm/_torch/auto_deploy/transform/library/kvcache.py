@@ -15,6 +15,7 @@ from ...custom_ops.attention_interface import (
     Constant,
     PrepareMetadataCallable,
 )
+from ...custom_ops.vlm_mask_registry import VlmMetadataKeys
 from ...distributed.common import all_gather_object, get_world_size
 from ...distributed.common import is_initialized as is_distributed_initialized
 from ...models.factory import ModelFactory
@@ -94,75 +95,78 @@ class InsertCachedAttention(BaseTransform):
         except Exception:
             return False
 
-    def _maybe_init_flashinfer_vlm_custom_mask_inputs(
+    def _maybe_init_vlm_custom_mask(
         self,
         gm: GraphModule,
         cm: CachedSequenceInterface,
         meta_nodes_std: List[Node],
     ) -> None:
-        """Create VLM custom mask node inside the graph if token_type_ids is present.
+        """Initialize VLM custom mask node if VLM inputs are present in the graph.
 
-        This inserts the mask generation op (flashinfer_vlm_mask_gen) into the graph
-        using token_type_ids as input. The generated mask provides:
-        - Causal attention for text tokens
-        - Bidirectional attention for image tokens
+        This method is model-agnostic: it checks for VLM inputs based on graph metadata
+        (_vlm_inputs) set during export, then inserts the generic create_attention_mask op.
 
-        Sliding window constraints are handled separately by FlashInfer's window_left
-        parameter, not baked into the mask.
+        The generated mask provides model-specific attention patterns (e.g., bidirectional
+        for image tokens in Gemma3). Sliding window constraints are handled separately
+        by the backend (e.g., FlashInfer's window_left parameter).
         """
         # Only relevant for FlashInfer backend
         cached_attn_op = self.attn_descriptor.get_cached_attention_op()
         if not self._is_flashinfer_cached_attn_op(cached_attn_op):
+            self._vlm_custom_mask_node = None
             return
 
         if hasattr(self, "_vlm_custom_mask_node"):
             return
 
-        # Check if token_type_ids is available as a graph input
-        token_type_ids_nodes = gm.graph.find_nodes(op="placeholder", target="token_type_ids")
-        if not token_type_ids_nodes:
-            # Also check for mm_token_type_ids (used by some VLMs)
-            token_type_ids_nodes = gm.graph.find_nodes(op="placeholder", target="mm_token_type_ids")
+        # Check for VLM metadata (model-agnostic)
+        vlm_inputs = getattr(gm, VlmMetadataKeys.GRAPH_INPUTS, [])
+        model_type = getattr(gm, VlmMetadataKeys.GRAPH_MODEL_TYPE, None)
 
-        if not token_type_ids_nodes:
-            # No VLM token type ids - no custom mask needed
+        if not vlm_inputs or model_type is None:
             self._vlm_custom_mask_node = None
             return
 
-        token_type_ids_node = token_type_ids_nodes[0]
+        # Find the VLM input node (first available from vlm_inputs)
+        vlm_input_node = None
+        for input_name in vlm_inputs:
+            nodes = gm.graph.find_nodes(op="placeholder", target=input_name)
+            if nodes:
+                vlm_input_node = nodes[0]
+                break
+
+        if vlm_input_node is None:
+            self._vlm_custom_mask_node = None
+            return
 
         # Add seq_len as graph input if not already present
         seq_len_node = self._add_or_retrieve_input(gm, cm, "seq_len")
 
         # Get cu_seqlen from standard metadata (index 1 in FlashInfer standard args)
-        # Standard args are: ["batch_info", "cu_seqlen", "cu_num_pages", "cache_loc", "last_page_len"]
         cu_seqlen_node = meta_nodes_std[1]  # cu_seqlen
 
         # Find the last placeholder to insert after it
         node_last_input = gm.graph.find_nodes(op="placeholder", sort=True)[-1]
 
-        # Use sequential inserting_after calls to ensure proper topological ordering.
-        # Each node must be inserted after the previously created node to maintain
-        # the correct dependency order: flatten -> eq_scalar -> mask_gen
+        # Use sequential inserting_after calls to ensure proper topological ordering
         with gm.graph.inserting_after(node_last_input):
-            # Compute image_token_mask = (token_type_ids == 1)
-            # First flatten token_type_ids
+            # Flatten the VLM input tensor
             flatten_node = gm.graph.call_function(
-                torch.ops.aten.reshape.default, args=(token_type_ids_node, [-1])
+                torch.ops.aten.reshape.default, args=(vlm_input_node, [-1])
             )
 
         with gm.graph.inserting_after(flatten_node):
-            # Compare with 1 to get image token mask
-            image_token_mask_node = gm.graph.call_function(
+            # Convert to boolean mask (e.g., token_type_ids == 1 for image tokens)
+            token_info_node = gm.graph.call_function(
                 torch.ops.aten.eq.Scalar, args=(flatten_node, 1)
             )
 
-        with gm.graph.inserting_after(image_token_mask_node):
-            # Call the mask generation op - returns single mask with bidirectional
-            # image attention. Sliding window is handled by FlashInfer's window_left.
+        with gm.graph.inserting_after(token_info_node):
+            # Call the generic mask generation op with model_type for dispatch
+            # sliding_window=-1 means backend handles it (FlashInfer uses window_left)
             custom_mask_node = gm.graph.call_function(
-                torch.ops.auto_deploy.flashinfer_vlm_mask_gen.default,
-                args=(image_token_mask_node, cu_seqlen_node, seq_len_node),
+                torch.ops.auto_deploy.create_attention_mask.default,
+                args=(token_info_node, cu_seqlen_node, seq_len_node, -1, model_type),
             )
 
         self._vlm_custom_mask_node = custom_mask_node
@@ -279,7 +283,7 @@ class InsertCachedAttention(BaseTransform):
 
         buffer_in_lookup: Dict[str, Node] = {}
 
-        self._maybe_init_flashinfer_vlm_custom_mask_inputs(gm, cm, meta_nodes_std)
+        self._maybe_init_vlm_custom_mask(gm, cm, meta_nodes_std)
 
         # replace fused attention node with attention node that has kv cache
         num_cached_attn_replacements = 0

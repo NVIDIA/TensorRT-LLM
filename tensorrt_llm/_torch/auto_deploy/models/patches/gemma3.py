@@ -13,6 +13,7 @@ kwargs BEFORE any pre-hooks run. This ensures the capture hook sees token_type_i
 
 import functools
 import torch
+from ...custom_ops.vlm_mask_registry import VlmMetadataKeys
 from ...export.interface import BaseExportPatch, ExportPatchRegistry
 
 from transformers.models.gemma3 import modeling_gemma3
@@ -38,7 +39,14 @@ def _create_patched_text_model_call(original_call):
 
 @ExportPatchRegistry.register("hf_gemma3")
 class Gemma3ModelPatch(BaseExportPatch):
-    """Patch for Gemma3 to make mask functions export-compatible and pass token_type_ids."""
+    """Patch for Gemma3 to make mask functions export-compatible and pass token_type_ids.
+
+    This patch sets `_vlm_input_names` on the model class to specify which kwargs
+    should be captured as VLM inputs for mask generation.
+    """
+
+    # VLM inputs that this patch injects and expects to be captured
+    VLM_INPUT_NAMES = ["token_type_ids"]
 
     def _apply_patch(self):
         """Apply the Gemma3Model patch."""
@@ -55,6 +63,13 @@ class Gemma3ModelPatch(BaseExportPatch):
                 modeling_gemma3.Gemma3TextModel.__call__
             )
 
+            # Set VLM input names on the class so _set_vlm_metadata can discover them
+            attr_name = VlmMetadataKeys.MODULE_INPUT_NAMES
+            self.original_values[f"Gemma3TextModel.{attr_name}"] = getattr(
+                modeling_gemma3.Gemma3TextModel, attr_name, None
+            )
+            setattr(modeling_gemma3.Gemma3TextModel, attr_name, self.VLM_INPUT_NAMES)
+
     def _revert_patch(self):
         """Revert the Gemma3Model patch."""
         # Revert __call__ patch
@@ -62,3 +77,14 @@ class Gemma3ModelPatch(BaseExportPatch):
             modeling_gemma3.Gemma3TextModel.__call__ = self.original_values[
                 "Gemma3TextModel.__call__"
             ]
+
+        # Revert VLM input names
+        attr_name = VlmMetadataKeys.MODULE_INPUT_NAMES
+        key = f"Gemma3TextModel.{attr_name}"
+        if key in self.original_values:
+            original = self.original_values[key]
+            if original is None:
+                if hasattr(modeling_gemma3.Gemma3TextModel, attr_name):
+                    delattr(modeling_gemma3.Gemma3TextModel, attr_name)
+            else:
+                setattr(modeling_gemma3.Gemma3TextModel, attr_name, original)
