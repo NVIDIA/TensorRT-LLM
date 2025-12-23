@@ -239,7 +239,7 @@ class _FlashInferPlanner:
                 use_tensor_cores=True,
             )
 
-    def init_workspace(self, workspace_buffer: torch.Tensor, max_batch_size: int, num_pages: int):
+    def init_workspace(self, workspace_buffer):
         self.__init__()  # reset all state
 
         self.workspace_buffer = workspace_buffer
