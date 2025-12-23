@@ -568,7 +568,8 @@ def local_mpi_rank():
             return torch.cuda.current_device()
         except ValueError:
             return 0
-    return local_comm.Get_rank() if ENABLE_MULTI_DEVICE else 0
+    return mpi_comm().Get_rank() % torch.cuda.device_count(
+    ) if ENABLE_MULTI_DEVICE else 0
 
 
 def local_mpi_size():
