@@ -343,14 +343,11 @@ MIN_GLOBAL_ID = 1 << 42
 # Consider GIL being removed in the future, use a lock to protect the counter
 _global_disagg_request_id_lock = threading.Lock()
 _global_disagg_request_id_counter = 0
-_last_timestamp_ms_in_request_id = 0
 
 
-# Request ID usually doesn't have to be monotonic, but it's useful for debugging
-def get_global_disagg_request_id(machine_id: int,
-                                 monotonic: bool = False) -> int:
+def get_global_disagg_request_id(machine_id: int) -> int:
     """
-    a snowflake global disagg request id
+    a snowflake global disagg request id that doesn't guarantee monotonicity
     0: positive integer
     1-41  41 bits: timestamp_ms
     42-51 10 bits: machine_id
@@ -358,33 +355,26 @@ def get_global_disagg_request_id(machine_id: int,
     """
     global _global_disagg_request_id_lock
     global _global_disagg_request_id_counter
-    global _last_timestamp_ms_in_request_id
 
     COUNTER_BITS = 12
     MACHINE_ID_BITS = 10
     COUNTER_MASK = (1 << COUNTER_BITS) - 1
+    MAX_INT64 = (1 << 63) - 1
 
     if machine_id not in range(0, (1 << MACHINE_ID_BITS) - 1):
         raise ValueError(
             f"machine_id must be in range [0, {(1 << MACHINE_ID_BITS) - 1})")
 
-    timestamp_ms = int(time.time() * 1000)
+    timestamp_ms = int(time.monotonic() * 1000)
     with _global_disagg_request_id_lock:
-        last_counter = _global_disagg_request_id_counter & COUNTER_MASK
-        counter = (_global_disagg_request_id_counter + 1) & COUNTER_MASK
+        counter = _global_disagg_request_id_counter & COUNTER_MASK
         _global_disagg_request_id_counter += 1
-        if monotonic and timestamp_ms == _last_timestamp_ms_in_request_id and counter < last_counter:
-            # sleep 1ms and update timestamp_ms when the counter rotates and timestamp_ms remains the same
-            time.sleep(0.001)
-            timestamp_ms = int(time.time() * 1000)
-        _last_timestamp_ms_in_request_id = timestamp_ms
 
-    # keep the first bit 0 to get positive integer
-    # [0, MIN_GLOBAL_ID] range is reserved for local ids
-    global_id = (timestamp_ms <<
-                 (MACHINE_ID_BITS + COUNTER_BITS) | machine_id << COUNTER_BITS
-                 | counter) + MIN_GLOBAL_ID
-    global_id_int64 = global_id & ((1 << 63) - 1)
+    # Rotate in [MIN_GLOBAL_ID, MAX_INT64)
+    # [0, MIN_GLOBAL_ID) is reserved for local ids
+    global_id = (timestamp_ms << (MACHINE_ID_BITS + COUNTER_BITS)) | (
+        machine_id << COUNTER_BITS) | counter
+    global_id_int64 = global_id % (MAX_INT64 - MIN_GLOBAL_ID) + MIN_GLOBAL_ID
     return global_id_int64
 
 
