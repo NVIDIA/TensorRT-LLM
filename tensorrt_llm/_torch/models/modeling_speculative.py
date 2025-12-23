@@ -754,19 +754,6 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         skip_create_weights_in_init=True,
                     )
                     self.draft_config.extra_attrs = model_config.extra_attrs
-                    from tensorrt_llm._utils import get_sm_version
-                    from tensorrt_llm.quantization.mode import QuantAlgo
-                    if get_sm_version(
-                    ) == 100 and self.draft_config.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
-                        # FIXME There is a known issue on TRTLLM moe backend + FP8 blockwise
-                        logger.warning(
-                            "Switching moe_backend of draft model to DEEPGEMM for FP8_BLOCK_SCALES quantization on SM100"
-                            "This is a workaround for the known issue on TRTLLM moe backend + FP8 blockwise"
-                        )
-                        self.draft_config._frozen = False
-                        self.draft_config.moe_backend = "DEEPGEMM"
-                        self.draft_config._frozen = True
-
                 elif spec_config.eagle3_model_arch == "llama3":
                     self.draft_config = ModelConfig.from_pretrained(
                         model_config.spec_config.speculative_model_dir,
