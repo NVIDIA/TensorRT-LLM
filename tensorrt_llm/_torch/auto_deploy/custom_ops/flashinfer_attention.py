@@ -467,6 +467,21 @@ class FlashInferAttention(AttentionDescriptor):
         return {"workspace_buffer": _init_workspace}
 
     @classmethod
+    def host_prepare_for_forward(cls, sequence_info: SequenceInfo):
+        print("DEBUG: host_prepare_for_forward called for flashinfer attention")
+        batch_info = sequence_info._input_buffer.get_host_view("batch_info")
+        num_prefill, num_prefill_tokens, num_decode = batch_info.tolist()
+        # Call plan for generate-only batches.
+        if num_prefill == 0:
+            _GlobalFlashInferPlanner.plan_generate_only(
+                num_decode,
+                sequence_info._input_buffer.get_host_view("cu_num_pages")[: num_decode + 1],
+                sequence_info._input_buffer.get_host_view("cache_loc"),
+                sequence_info._input_buffer.get_host_view("last_page_len")[:num_decode],
+            )
+        return
+
+    @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
         # Sanity check: layout == "bsnd"
         # Prefer kwargs; fall back to the final positional arg if it's a string.

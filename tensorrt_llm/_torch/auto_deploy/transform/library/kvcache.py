@@ -226,6 +226,11 @@ class InsertCachedAttention(BaseTransform):
                 buffer_in_nodes,
                 constants,
             )
+            # Attention descriptor should register its host function with SequenceInfo.
+            # This function will be called before graph invocation.
+            cm.info.register_host_prepare_for_attention_forward(
+                attn_descriptor.host_prepare_for_forward
+            )
             num_cached_attn_replacements += 1
 
         info = TransformInfo(
