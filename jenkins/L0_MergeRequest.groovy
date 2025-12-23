@@ -1497,22 +1497,31 @@ def updateImageTag(oldTagToNewTagMap, globalVars) {
         // 3. Read current file and update content
         def filePath = "jenkins/current_image_tags.properties"
         echo "Reading and updating ${filePath}"
-        def currentContent = readFile("${workDir}/repo/${filePath}")
+        
+        // Read file content
+        def currentContent = sh(script: "cat ${workDir}/repo/${filePath}", returnStdout: true)
         def lines = currentContent.split("\n") as List
+        
+        // Apply tag replacements line by line
         def updatedLines = lines.collect { line ->
             // For each line, check if it contains an old tag that needs to be replaced
             def updatedLine = line
             oldTagToNewTagMap.each { oldTag, newTag ->
                 if (line.contains(oldTag)) {
                     updatedLine = line.replace(oldTag, newTag)
+                    echo "Replaced in line: ${oldTag} -> ${newTag}"
                 }
             }
             return updatedLine
         }
         def updatedContent = updatedLines.join("\n") + "\n"
-
-        // Write updated content
-        writeFile file: "${workDir}/repo/${filePath}", text: updatedContent
+        
+        // Write updated content using shell command to avoid permission issues
+        sh """
+        cd ${workDir}/repo
+        cat > ${filePath} << 'EOF'
+${updatedContent}EOF
+        """
 
         // 4. Commit and push back to contributor's fork
         echo "Committing and pushing changes"
