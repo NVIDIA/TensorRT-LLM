@@ -359,7 +359,7 @@ _GlobalFlashInferPlanner = _FlashInferPlanner()
 @torch.library.custom_op("auto_deploy::flashinfer_attention_prepare_metadata", mutates_args=())
 def prepare_flashinfer_metadata(
     position_ids: torch.Tensor,
-    batch_info: torch.Tensor,
+    batch_info_host: torch.Tensor,
     cu_seqlen: torch.Tensor,
     seq_len_with_cache: torch.Tensor,
 ) -> List[torch.Tensor]:
@@ -370,7 +370,7 @@ def prepare_flashinfer_metadata(
     to understand the convention.
     """
     # retrieve host-side metadata
-    num_prefill, num_prefill_tokens, num_decode = batch_info.tolist()
+    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
     num_seq = num_prefill + num_decode
     num_tokens = num_prefill_tokens + num_decode
 
@@ -393,7 +393,7 @@ def prepare_flashinfer_metadata(
 @prepare_flashinfer_metadata.register_fake
 def prepare_flashinfer_metadata_fake(
     position_ids: torch.Tensor,
-    batch_info: torch.Tensor,
+    batch_info_host: torch.Tensor,
     cu_seqlen: torch.Tensor,
     seq_len_with_cache: torch.Tensor,
 ):
@@ -411,7 +411,7 @@ def flashinfer_mha_with_cache(
     k: torch.Tensor,
     v: torch.Tensor,
     # STANDARD METADATA
-    batch_info: torch.Tensor,
+    batch_info_host: torch.Tensor,
     cu_seqlen: torch.Tensor,
     cu_num_pages: torch.Tensor,
     cache_loc: torch.Tensor,
@@ -439,7 +439,7 @@ def flashinfer_mha_with_cache(
     v = v.reshape(b * s, -1, head_dim)
 
     # convert to flashinfer-style metadata
-    num_prefill, num_prefill_tokens, num_decode = batch_info.tolist()
+    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
     num_seq = num_prefill + num_decode
 
     qo_indptr = cu_seqlen[: num_seq + 1]
@@ -506,7 +506,7 @@ def flashinfer_mha_with_cache_fake(
     k: torch.Tensor,
     v: torch.Tensor,
     # STANDARD METADATA
-    batch_info: torch.Tensor,
+    batch_info_host: torch.Tensor,
     cu_seqlen: torch.Tensor,
     cu_num_pages: torch.Tensor,
     cache_loc: torch.Tensor,
@@ -559,7 +559,7 @@ class FlashInferAttention(AttentionDescriptor):
 
     @classmethod
     def get_standard_metadata_args(cls) -> List[str]:
-        return ["batch_info", "cu_seqlen", "cu_num_pages", "cache_loc", "last_page_len"]
+        return ["batch_info_host", "cu_seqlen", "cu_num_pages", "cache_loc", "last_page_len"]
 
     @classmethod
     def get_prepare_extra_metadata_info(
