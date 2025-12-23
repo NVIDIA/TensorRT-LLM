@@ -213,7 +213,7 @@ def submit_job(config, log_dir, dry_run):
 
     if log_dir is None:
         # Create base log directory path
-        date_prefix = datetime.now().strftime("%Y%m%d")
+        date_prefix = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
         log_base = os.path.join(env_config['work_dir'],
                                 f"{date_prefix}/{isl}-{osl}")
 
@@ -293,6 +293,7 @@ def submit_job(config, log_dir, dry_run):
                 str(device) for device in list(allocation["nodes"].values())[0]
             ])
             cur_worker_env_var += f" CUDA_VISIBLE_DEVICES={cuda_devices}"
+            cur_worker_env_var = cur_worker_env_var.replace(" ", ",")
             cmd = [
                 "srun -l",
                 f"--nodelist {','.join(allocation['nodes'].keys())}",
@@ -303,6 +304,7 @@ def submit_job(config, log_dir, dry_run):
                 f"--container-name {container_name}",
                 f"--container-mounts {env_config['container_mount']}",
                 "--mpi=pmix --overlap",
+                f"--export={cur_worker_env_var}",
                 f"bash {os.path.join(env_config['work_dir'], 'start_worker.sh')}",
                 server_type,
                 str(server_id),
@@ -312,12 +314,12 @@ def submit_job(config, log_dir, dry_run):
                 log_dir,
                 str(profiling_config['nsys_on']).lower(),
                 config_path,
-                f"'{cur_worker_env_var}'",
                 f"&> {log_dir}/3_output_{server_type}_{server_id}.log &",
             ]
             start_server_cmds.append(" ".join(cmd))
 
     # Generate start server commands
+    server_env_var = server_env_var.replace(" ", ",")
     cmd = [
         "srun -l",
         f"--nodelist {disagg_server_hostname}",
@@ -325,7 +327,8 @@ def submit_job(config, log_dir, dry_run):
         f"--container-image={env_config['container_image']}",
         f"--container-mounts={env_config['container_mount']}",
         f"--mpi=pmix --overlap -N 1 -n 1",
-        f"bash {env_config['work_dir']}/start_server.sh {os.path.join(log_dir, 'server_config.yaml')} \"{server_env_var}\"",
+        f"--export={server_env_var}",
+        f"bash {env_config['work_dir']}/start_server.sh {os.path.join(log_dir, 'server_config.yaml')}",
         f"&> {log_dir}/4_output_server.log &",
     ]
     start_server_cmds.append(" ".join(cmd))

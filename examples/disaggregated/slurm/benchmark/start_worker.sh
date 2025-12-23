@@ -11,16 +11,9 @@ numa_bind=${5}
 log_dir=${6}
 enable_nsys=${7}
 config_file=${8}
-worker_env_var=${9}
 
 unset UCX_TLS
 echo "SLURM_PROCID: ${SLURM_PROCID}, hostname: $(hostname), instance_id: ${instance_id}"
-
-# Export worker environment variables from config
-for env_var in ${worker_env_var}; do
-    export "${env_var}"
-    echo "Exported: ${env_var}"
-done
 
 if [ "${numa_bind}" = "true" ]; then
     numa_bind_cmd="numactl -m 0,1"
