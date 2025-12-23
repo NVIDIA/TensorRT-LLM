@@ -1585,7 +1585,7 @@ pipeline {
         }
         always {
             script {
-                if (!isReleaseCheckMode) {
+                if (!isReleaseCheckMode && !isRetagImageMode) {
                     collectTestResults(this, testFilter)
                 }
             }
