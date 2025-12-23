@@ -1177,11 +1177,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
             m, k = a.size(0), a.size(1) * 2
             l, n = b.size(0), b.size(1)
 
-            # TODO: Add full shmoo
-            mma_tiler_mn_candidates = [(self.tile_size, 128),
-                                       (self.tile_size, 256)]
-            cluster_shape_mn_candidates = [(self.tile_size // 128, 1),
-                                           (self.tile_size // 128, 2)]
+            if self.tile_size == 128:
+                mma_tiler_mn_candidates = [(128, 128), (128, 256)]
+                cluster_shape_mn_candidates = [(1, 1), (1, 2)]
+            elif self.tile_size == 256:
+                mma_tiler_mn_candidates = [(256, 128), (256, 256)]
+                cluster_shape_mn_candidates = [(2, 1), (2, 2)]
+            else:
+                raise ValueError(f"Tile size {self.tile_size} is not supported")
             raster_along_m_candidates = [True, False]
 
             valid_tactics = []
@@ -1557,9 +1560,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
             m, k = a.size(0), a.size(1) * 2
             l, n = b.size(0), b.size(1)
 
-            # TODO: Add full shmoo
-            mma_tiler_mn_candidates = [(128, 128), (128, 256)]
-            cluster_shape_mn_candidates = [(1, 1), (1, 2)]
+            if self.tile_size == 128:
+                mma_tiler_mn_candidates = [(128, 128), (128, 256)]
+                cluster_shape_mn_candidates = [(1, 1), (1, 2)]
+            elif self.tile_size == 256:
+                mma_tiler_mn_candidates = [(256, 128), (256, 256)]
+                cluster_shape_mn_candidates = [(2, 1), (2, 2)]
+            else:
+                raise ValueError(f"Tile size {self.tile_size} is not supported")
 
             valid_tactics = []
             for mma_tiler_mn, cluster_shape_mn in itertools.product(
@@ -1568,9 +1576,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         ab_dtype=cutlass.Float4E2M1FN,
                         sf_dtype=cutlass.Float8E4M3FN,
                         sf_vec_size=self.scaling_vector_size,
-                        acc_dtype=cutlass.Float32,
                         c_dtype=cutlass.Float4E2M1FN,
-                        use_2cta_instrs=False,
                         mma_tiler_mn=mma_tiler_mn,
                         cluster_shape_mn=cluster_shape_mn,
                         m=m,
@@ -1580,7 +1586,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         a_major="k",
                         b_major="k",
                         c_major="n",
-                        m_aligned=self.tile_size,
                 ):
                     valid_tactics.append((mma_tiler_mn, cluster_shape_mn))
 
@@ -1696,8 +1701,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
                     sf_vec_size=self.scaling_vector_size,
-                    acc_dtype=cutlass.Float32,
-                    use_2cta_instrs=False,
                     mma_tiler_mn=mma_tiler_mn,
                     cluster_shape_mn=cluster_shape_mn,
                     vectorized_f32=True,
@@ -1888,7 +1891,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         ab_dtype=cutlass.Float4E2M1FN,
                         sf_dtype=cutlass.Float8E4M3FN,
                         sf_vec_size=self.scaling_vector_size,
-                        acc_dtype=cutlass.Float32,
                         c_dtype=cutlass.Float4E2M1FN,
                         mma_tiler_mn=mma_tiler_mn,
                         cluster_shape_mn=cluster_shape_mn,
@@ -1899,7 +1901,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         a_major="k",
                         b_major="k",
                         c_major="n",
-                        m_aligned=self.tile_size,
                 ):
                     valid_tactics.append((mma_tiler_mn, cluster_shape_mn))
 
@@ -2043,7 +2044,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
                     sf_vec_size=self.scaling_vector_size,
-                    acc_dtype=cutlass.Float32,
                     mma_tiler_mn=mma_tiler_mn,
                     cluster_shape_mn=cluster_shape_mn,
                     vectorized_f32=True,

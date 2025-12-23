@@ -362,7 +362,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         """
 
         self.sf_vec_size = sf_vec_size
-        self.acc_dtype: Type[cutlass.Numeric] = cutlass.Float32
+        self.acc_dtype = cutlass.Float32
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
         self.raster_along_m = raster_along_m
@@ -2241,6 +2241,10 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             cluster_shape_mn[0] * cluster_shape_mn[1] > 16
             or cluster_shape_mn[0] <= 0
             or cluster_shape_mn[1] <= 0
+            # Special cluster shape check for scale factor multicasts.
+            # Due to limited size of scale factors, we can't multicast among more than 4 CTAs.
+            or cluster_shape_mn[0] > 4
+            or cluster_shape_mn[1] > 4
             or not is_power_of_2(cluster_shape_mn[0])
             or not is_power_of_2(cluster_shape_mn[1])
         ):
