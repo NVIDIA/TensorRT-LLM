@@ -56,7 +56,7 @@ If an unsupported backend is specified, NIXL will automatically fall back to UCX
 
 ### LIBFABRIC Backend Setup
 
-**Important Note:** The TensorRT-LLM container does not include libfabric or the NIXL-LIBFABRIC plugin by default. You must either rebuild NIXL with libfabric support or provide a pre-compiled plugin.
+**Important Note:** The TensorRT LLM container does not include libfabric or the NIXL-LIBFABRIC plugin by default. You must either rebuild NIXL with libfabric support or provide a pre-compiled plugin.
 
 #### Prerequisites
 
@@ -92,7 +92,7 @@ UCX is typically pre-installed in NVIDIA GPU containers. No additional installat
 
 3. **Reinstall NIXL after installing libfabric:**
    - After installing libfabric and hwloc, you must rebuild NIXL to generate the LIBFABRIC plugin
-   - You can base your installation on the TensorRT-LLM's NIXL installation script located at `docker/common/install_nixl.sh`
+   - You can base your installation on the TensorRT LLM NIXL installation script located at `docker/common/install_nixl.sh`
    - Modify the meson setup command in the script to include the libfabric path:
      ```bash
      meson setup builddir \
@@ -385,7 +385,7 @@ LIBFABRIC backend is particularly useful for Kubernetes deployments on AWS with 
 
 #### Deployment Steps
 
-**1.Configure Pod Resources**
+##### 1. Configure Pod Resources
 
 When deploying on Kubernetes with EFA, ensure proper resource allocation in your pod specification:
 
