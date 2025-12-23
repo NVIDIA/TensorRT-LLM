@@ -499,3 +499,5 @@ full:RTXPro6000D/accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp
 examples/test_ray.py::test_ray_disaggregated_serving[tp2] SKIP (https://nvbugs/5612502)
 disaggregated/test_disaggregated.py::test_disaggregated_benchmark_on_diff_backends[llama-v3-8b-hf] SKIP (https://nvbugs/5748683)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[latency_trtllmgen] SKIP (https://nvbugs/5715568)
+unittest/executor/test_rpc_proxy.py SKIP (https://nvbugs/5605741)
+unittest/executor/test_rpc_worker.py SKIP (https://nvbugs/5605741)
