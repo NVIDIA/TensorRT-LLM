@@ -1,7 +1,6 @@
 """Disaggregated Benchmark Configuration."""
 
 import os
-from datetime import datetime
 
 SESSION_COLLECT_CMD_TYPE = "session_collect"
 
@@ -191,15 +190,6 @@ def extract_config_fields(config_data: dict) -> dict:
     if "speculative_config" in gen_config:
         mtp_size = gen_config["speculative_config"].get("num_nextn_predict_layers", 0)
 
-    # Generate derived fields
-    dep_flag = "dep" if gen_enable_dp else "tep"
-    date_prefix = datetime.now().strftime("%Y%m%d")
-    log_base = f"{date_prefix}/{isl}-{osl}"
-    context_dir = (
-        f"disagg_ctx{ctx_num}_gen{gen_num}_{dep_flag}{gen_tp_size}_"
-        f"batch{gen_batch_size}_eplb{eplb_slots}_mtp{mtp_size}"
-    )
-
     return {
         "isl": isl,
         "osl": osl,
@@ -210,10 +200,7 @@ def extract_config_fields(config_data: dict) -> dict:
         "gen_enable_dp": gen_enable_dp,
         "eplb_slots": eplb_slots,
         "mtp_size": mtp_size,
-        "dep_flag": dep_flag,
         "cache_transceiver_backend": cache_transceiver_backend,
-        "log_base": log_base,
-        "context_dir": context_dir,
         "gen_max_tokens": gen_max_tokens,
         "gen_max_batch_size": gen_max_batch_size,
         "streaming": streaming,
