@@ -7,14 +7,12 @@ role=${1}
 instance_id=${2}
 model_path=${3}
 port=${4}
-benchmark_mode=${5}
-concurrency=${6}
-numa_bind=${7}
-log_dir=${8}
-enable_nsys=${9}
-profile_range=${10}
-config_file=${11}
-worker_env_var=${12}
+numa_bind=${5}
+log_dir=${6}
+enable_nsys=${7}
+profile_range=${8}
+config_file=${9}
+worker_env_var=${10}
 
 unset UCX_TLS
 echo "SLURM_PROCID: ${SLURM_PROCID}, hostname: $(hostname), instance_id: ${instance_id}"
@@ -31,11 +29,6 @@ if [ "${numa_bind}" = "true" ]; then
 else
     numa_bind_cmd=""
     echo "Not binding memory. If on GB200/GB300 NVL72, use \"numactl -m 0,1\" to only allocate memory from nodes."
-fi
-
-if [ "${benchmark_mode}" = "gen_only" ]; then
-    export TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1
-    export TLLM_BENCHMARK_REQ_QUEUES_SIZE=${concurrency}
 fi
 
 echo "config_file: ${config_file}"

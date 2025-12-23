@@ -172,6 +172,9 @@ def submit_job(config, log_dir, dry_run):
 
     worker_env_var = env_config.get('worker_env_var')
     server_env_var = env_config.get('server_env_var')
+    if benchmark_config['mode'] == "gen_only":
+        worker_env_var += " TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1"
+        worker_env_var += f" TLLM_BENCHMARK_REQ_QUEUES_SIZE=${benchmark_config['concurrency_list']}"
     if benchmark_config['mode'] == "gen_only_no_context":
         worker_env_var += " TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1"
         server_env_var += " TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1"
@@ -293,8 +296,6 @@ def submit_job(config, log_dir, dry_run):
                 str(server_id),
                 env_config['model_path'],
                 str(allocation["port"]),
-                benchmark_config['mode'],
-                f"'{benchmark_config['concurrency_list']}'",
                 str(slurm_config['numa_bind']).lower(),
                 log_dir,
                 str(profiling_config['nsys_on']).lower(),
