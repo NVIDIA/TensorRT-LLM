@@ -9,6 +9,7 @@ except ImportError:
 import pytest
 from defs.common import venv_check_call, wait_for_server
 from defs.conftest import get_device_count, llm_models_root
+from defs.trt_test_alternative import popen
 
 
 @pytest.fixture(scope="module")
@@ -89,18 +90,17 @@ def test_ray_disaggregated_serving(ray_example_root, llm_venv, tp_size):
             "RAY_ADDRESS": f"localhost:{ray_port}",
             "TLLM_RAY_FORCE_LOCAL_CLUSTER": "0"
         })
-        proc = subprocess.Popen(
+        with popen(
             [
                 "bash", script_path, "--executor", "ray", "--attach", "--model",
                 model_dir, "--tp_size",
                 str(tp_size)
             ],
-            cwd=disagg_dir,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env_copy,
-        )
-        try:
+                cwd=disagg_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env_copy,
+        ):
             assert wait_for_server("localhost", 8000, timeout_seconds=180), \
                 "Disaggregated server failed to start within 3 minutes"
 
@@ -123,14 +123,5 @@ def test_ray_disaggregated_serving(ray_example_root, llm_venv, tp_size):
 
             assert result.returncode == 0, f"curl exit {result.returncode}"
             assert status == 200, f"Expected 200, got {status}"
-
-        finally:
-            proc.terminate()
-            try:
-                proc.wait(timeout=10)
-            except Exception:
-                proc.kill()
-
-            subprocess.run("pkill -9 -f trtllm-serve", shell=True, check=False)
     finally:
         ray.shutdown()
