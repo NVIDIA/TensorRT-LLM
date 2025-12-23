@@ -2,7 +2,7 @@
 
 aiperf profile \
     -m TinyLlama-1.1B-Chat-v1.0 \
-    --tokenizer TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+    --tokenizer ${TOKENIZER_PATH:-TinyLlama/TinyLlama-1.1B-Chat-v1.0} \
     --endpoint-type chat \
     --random-seed 123 \
     --synthetic-input-tokens-mean 128 \

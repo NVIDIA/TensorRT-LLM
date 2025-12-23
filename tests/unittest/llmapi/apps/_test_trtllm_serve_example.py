@@ -1,16 +1,13 @@
 import json
 import os
 import subprocess
-import sys
 import tempfile
 
 import pytest
 import yaml
 
+from ..test_llm import get_model_path
 from .openai_server import RemoteOpenAIServer
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from test_llm import get_model_path
 
 
 @pytest.fixture(scope="module", ids=["TinyLlama-1.1B-Chat"])
@@ -36,6 +33,7 @@ def temp_extra_llm_api_options_file():
 @pytest.fixture(scope="module")
 def server(model_name: str, temp_extra_llm_api_options_file: str):
     model_path = get_model_path(model_name)
+    os.environ["TOKENIZER_PATH"] = model_path
     # fix port to facilitate concise trtllm-serve examples
     args = ["--extra_llm_api_options", temp_extra_llm_api_options_file]
     with RemoteOpenAIServer(model_path, args, port=8000) as remote_server:
