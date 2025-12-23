@@ -839,9 +839,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     f"{self.__class__.kernel_class.__name__} supports SM 100 (B200) and SM 103 (B300) only, but got SM {sm_version}"
                 )
 
-            if self.tile_size not in (128, ):
+            if self.tile_size not in (128, 256):
                 raise ValueError(
-                    f"{self.__class__.kernel_class.__name__} supports tile_size (MMA tile M dimension) 128 only, but got {self.tile_size}"
+                    f"{self.__class__.kernel_class.__name__} supports tile_size (MMA tile M dimension) 128 and 256 only, but got {self.tile_size}"
                 )
 
         def unique_id(self):
