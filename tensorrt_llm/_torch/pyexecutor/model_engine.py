@@ -2700,7 +2700,7 @@ class PyTorchModelEngine(ModelEngine):
 
         attn_metadata.prepare()
 
-        peft_cache_manager = resource_manager.get_resource_manager(
+        peft_cache_manager = resource_manager and resource_manager.get_resource_manager(
             ResourceManagerType.PEFT_CACHE_MANAGER)
         lora_params = self._get_lora_params_from_requests(
             scheduled_requests, attn_metadata, peft_cache_manager, maybe_graph)
@@ -3340,8 +3340,6 @@ class PyTorchModelEngine(ModelEngine):
                 req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None):
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
-        peft_cache_manager = resource_manager.get_resource_manager(
-            ResourceManagerType.PEFT_CACHE_MANAGER)
 
         attn_metadata = self._set_up_attn_metadata(kv_cache_manager)
         if self.enable_spec_decode:
