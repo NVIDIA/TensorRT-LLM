@@ -356,6 +356,19 @@ def dump_graphmodules(mod: nn.Module, fname_prefix: str):
       - "<fname_prefix>_<name>_graphmodule_code.txt" contains the source code for the GraphModule.
       - "<fname_prefix>_<name>_graphmodule_graph.txt" contains the string representation of its IR/graph.
 
+    Example usage:
+    This function can be used in-between optimizer stages/transforms to inspect the code and IR of all GraphModules in
+    the model before and after the given optimizer or transform step.
+
+            from tensorrt_llm._torch.auto_deploy.utils._graph import dump_graphmodules
+            dump_graphmodules(model, "before_opt")
+            # ... optimizer/transform step ...
+            dump_graphmodules(model, "after_opt")
+
+    This will generate files in the current working directory, allowing you to
+    inspect the code and IR of all GraphModules in the model before and after
+    the given optimizer or transform step.
+
     Args:
         mod (nn.Module): The root module containing GraphModules.
         fname_prefix (str): Prefix to use for the generated filenames.
