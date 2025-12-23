@@ -26,15 +26,15 @@ from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.utils import ActivationType, relu2
 
 from ..attention_backend import AttentionMetadata
-from ..distributed import AllReduce
+from ..distributed import AllReduce, allgather
 from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import MoEWeightLoadingMode, create_moe
-from ..modules.linear import Linear
+from ..modules.fused_moe import (MoEWeightLoadingMode, TRTLLMGenFusedMoE,
+                                 create_moe)
+from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mamba.mamba2_mixer import Mamba2Mixer
-from ..modules.mlp import MLP
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..utils import AuxStreamType, EventType
@@ -46,13 +46,21 @@ class NemotronHConfig(PretrainedConfig):
     model_type = "nemotron_h"
 
 
-class MLPLayer(MLP):
+class MLPLayer(nn.Module):
+    """MLP layer for NemotronH with attention_dp support.
+
+    When attention_dp is enabled, uses tp_size=1 to ensure each rank computes
+    full output for its tokens (required because different ranks have different
+    problem sizes).
+    """
 
     def __init__(
         self,
         model_config: ModelConfig[NemotronHConfig],
         layer_idx: int,
     ):
+        super().__init__()
+
         config = model_config.pretrained_config
         if isinstance(config.intermediate_size, list):
             if len(config.intermediate_size) == 1:
@@ -62,13 +70,54 @@ class MLPLayer(MLP):
         else:
             intermediate_size = config.intermediate_size
 
-        super().__init__(hidden_size=config.hidden_size,
-                         intermediate_size=intermediate_size,
-                         bias=False,
-                         activation=relu2,
-                         dtype=config.torch_dtype,
-                         config=model_config)
         self.layer_idx = layer_idx
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = intermediate_size
+        self.activation = relu2
+        self.enable_attention_dp = model_config.mapping.enable_attention_dp
+
+        # When attention_dp is enabled, use tp_size=1 mapping so each rank
+        # computes full output (not partial results).
+        # When disabled, use original mapping for normal TP behavior.
+        if self.enable_attention_dp:
+            from tensorrt_llm.mapping import Mapping
+            mapping = Mapping(
+                world_size=model_config.mapping.pp_size,
+                tp_size=1,
+                pp_size=model_config.mapping.pp_size,
+                rank=model_config.mapping.rank,
+                gpus_per_node=model_config.mapping.gpus_per_node,
+                enable_attention_dp=True,
+            )
+            reduce_output = False
+        else:
+            mapping = model_config.mapping
+            reduce_output = model_config.mapping.tp_size > 1
+
+        self.up_proj = Linear(
+            self.hidden_size,
+            self.intermediate_size,
+            bias=False,
+            dtype=config.torch_dtype,
+            mapping=mapping,
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
+            quant_config=model_config.get_quant_config(),
+            skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+            allreduce_strategy=model_config.allreduce_strategy,
+            force_dynamic_quantization=model_config.force_dynamic_quantization)
+
+        self.down_proj = Linear(
+            self.intermediate_size,
+            self.hidden_size,
+            bias=False,
+            dtype=config.torch_dtype,
+            mapping=mapping,
+            tensor_parallel_mode=TensorParallelMode.ROW,
+            quant_config=model_config.get_quant_config(),
+            skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+            allreduce_strategy=model_config.allreduce_strategy,
+            force_dynamic_quantization=model_config.force_dynamic_quantization,
+            reduce_output=reduce_output)
 
     def forward(
         self,
@@ -76,7 +125,10 @@ class MLPLayer(MLP):
         attn_metadata: AttentionMetadata,
         **kwargs,
     ) -> torch.Tensor:
-        return super().forward(hidden_states)
+        x_up = self.up_proj(hidden_states)
+        x_act = self.activation(x_up)
+        x_down = self.down_proj(x_act)
+        return x_down
 
 
 class TransformerLayer(Attention):
@@ -148,21 +200,54 @@ class NemotronHMOE(nn.Module):
         self.mapping = model_config.mapping
 
         # Setup shared expert MLP.
-        if config.n_shared_experts is None or config.n_shared_experts == 0:
-            self.shared_experts = None
+        # When attention_dp is enabled, use tp_size=1 so each rank computes
+        # full output for its tokens. When disabled, use original mapping.
+        self._has_shared_experts = config.n_shared_experts is not None and config.n_shared_experts > 0
+        if not self._has_shared_experts:
+            self.shared_expert_up_proj = None
+            self.shared_expert_down_proj = None
         else:
             shared_expert_intermediate_size = (
                 config.moe_shared_expert_intermediate_size *
                 config.n_shared_experts)
-            self.shared_experts = MLP(
-                hidden_size=config.hidden_size,
-                intermediate_size=shared_expert_intermediate_size,
+
+            if self.enable_attention_dp:
+                from tensorrt_llm.mapping import Mapping
+                shared_mapping = Mapping(
+                    world_size=model_config.mapping.pp_size,
+                    tp_size=1,
+                    pp_size=model_config.mapping.pp_size,
+                    rank=model_config.mapping.rank,
+                    gpus_per_node=model_config.mapping.gpus_per_node,
+                    enable_attention_dp=True,
+                )
+                reduce_output = False
+            else:
+                shared_mapping = model_config.mapping
+                reduce_output = self.reduce_results
+
+            self.shared_expert_up_proj = Linear(
+                config.hidden_size,
+                shared_expert_intermediate_size,
                 bias=self.mlp_bias,
-                activation=relu2,
                 dtype=config.torch_dtype,
-                config=model_config,
-                layer_idx=self.layer_idx,
-                reduce_output=self.reduce_results,
+                mapping=shared_mapping,
+                tensor_parallel_mode=TensorParallelMode.COLUMN,
+                quant_config=model_config.get_quant_config(),
+                skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+                allreduce_strategy=model_config.allreduce_strategy,
+            )
+            self.shared_expert_down_proj = Linear(
+                shared_expert_intermediate_size,
+                config.hidden_size,
+                bias=self.mlp_bias,
+                dtype=config.torch_dtype,
+                mapping=shared_mapping,
+                tensor_parallel_mode=TensorParallelMode.ROW,
+                quant_config=model_config.get_quant_config(),
+                skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+                allreduce_strategy=model_config.allreduce_strategy,
+                reduce_output=reduce_output,
             )
         # Setup MoE gate.
         self.gate = DeepseekV3Gate(
@@ -234,9 +319,20 @@ class NemotronHMOE(nn.Module):
         hidden_states = hidden_states.view(-1, self.hidden_dim)
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
 
+        # When attention_dp is enabled and using TRTLLMGenFusedMoE,
+        # we need to allgather hidden states before MoE computation.
+        if self.enable_attention_dp and self.mapping.tp_size > 1:
+            if isinstance(self.experts, TRTLLMGenFusedMoE):
+                hidden_states = allgather(hidden_states,
+                                          self.mapping,
+                                          dim=0,
+                                          sizes=all_rank_num_tokens)
+
         def _compute_shared_output():
-            if self.shared_experts is not None:
-                shared_expert_output = self.shared_experts(hidden_states)
+            if self._has_shared_experts:
+                x_up = self.shared_expert_up_proj(hidden_states)
+                x_act = relu2(x_up)
+                shared_expert_output = self.shared_expert_down_proj(x_act)
             else:
                 shared_expert_output = 0
             return shared_expert_output
@@ -358,11 +454,24 @@ class NemotronHModel(DecoderModel):
         }
 
         # calculate embeddings
-        self.embed_tokens = Embedding(
-            config.vocab_size,
-            config.hidden_size,
-            dtype=config.torch_dtype,
-        )
+        if model_config.mapping.enable_attention_dp:
+            # When attention_dp is enabled, we cannot do all_reduce since
+            # the problem size of different ranks are different.
+            # So, we don't do parallelism here.
+            self.embed_tokens = Embedding(
+                config.vocab_size,
+                config.hidden_size,
+                dtype=config.torch_dtype,
+            )
+        else:
+            self.embed_tokens = Embedding(
+                config.vocab_size,
+                config.hidden_size,
+                dtype=config.torch_dtype,
+                mapping=model_config.mapping,
+                tensor_parallel_mode=TensorParallelMode.COLUMN,
+                gather_output=True,
+            )
 
         # create layers
         layers = []

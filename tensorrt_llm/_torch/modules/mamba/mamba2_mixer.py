@@ -56,15 +56,33 @@ class Mamba2Mixer(nn.Module):
         super().__init__()
 
         config = config or ModelConfig()
-        self.mapping = config.mapping
-        tp_rank = config.mapping.tp_rank
-        tp_size = config.mapping.tp_size
+
+        # When attention_dp is enabled, use tp_size=1 to match the SSM state cache
+        # allocation in MambaCacheManager (which also uses tp_size=1 for attention_dp).
+        # Otherwise, use the original mapping to preserve all parameters.
+        self.enable_attention_dp = config.mapping.enable_attention_dp
+        if self.enable_attention_dp:
+            from tensorrt_llm.mapping import Mapping
+            self.mapping = Mapping(
+                world_size=config.mapping.pp_size,
+                tp_size=1,
+                pp_size=config.mapping.pp_size,
+                rank=config.mapping.rank,
+                gpus_per_node=config.mapping.gpus_per_node,
+                enable_attention_dp=True,
+            )
+            tp_size = 1
+            tp_rank = 0
+        else:
+            self.mapping = config.mapping
+            tp_size = config.mapping.tp_size
+            tp_rank = config.mapping.tp_rank
 
         d_inner = head_dim * nheads
         d_in_proj = 2 * d_inner + 2 * n_groups * d_state + nheads
         conv_dim = d_inner + 2 * n_groups * d_state
 
-        # TP
+        # TP dimensions (tp_size=1 when attention_dp is enabled)
         self.tp_conv_dim = conv_dim // tp_size
         self.tp_d_inner = d_inner // tp_size
         self.tp_nheads = nheads // tp_size
@@ -140,6 +158,8 @@ class Mamba2Mixer(nn.Module):
         )
 
         # out_proj
+        # When attention_dp is enabled, we skip all-reduce since different ranks
+        # have different problem sizes. The all-reduce will be handled externally.
         self.out_proj = Linear(
             d_inner,
             d_model,
@@ -149,7 +169,8 @@ class Mamba2Mixer(nn.Module):
             tensor_parallel_mode=TensorParallelMode.ROW,
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
-            allreduce_strategy=config.allreduce_strategy)
+            allreduce_strategy=config.allreduce_strategy,
+            reduce_output=not self.enable_attention_dp)
 
         self._mamba_ssm_cache_dtype = config.quant_config.mamba_ssm_cache_dtype
 

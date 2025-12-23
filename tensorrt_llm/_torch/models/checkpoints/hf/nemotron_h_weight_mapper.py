@@ -11,8 +11,12 @@ class NemotronHHfWeightMapper(HfWeightMapper):
 
     def preprocess_weights(self, weights: dict) -> dict:
         config = self.config.pretrained_config
-        tp_size = self.config.mapping.tp_size
-        tp_rank = self.config.mapping.tp_rank
+        # When attention_dp is enabled, Mamba2Mixer uses tp_size=1 internally
+        # (to match SSM state cache allocation in MambaCacheManager).
+        # So we should not shard the Mamba weights in this case.
+        enable_attention_dp = self.config.mapping.enable_attention_dp
+        tp_size = 1 if enable_attention_dp else self.config.mapping.tp_size
+        tp_rank = 0 if enable_attention_dp else self.config.mapping.tp_rank
         d_inner = config.mamba_head_dim * config.mamba_num_heads
 
         def _split_mamba2_mixer_in_proj(w: torch.Tensor) -> torch.Tensor:
@@ -102,6 +106,15 @@ class NemotronHHfWeightMapper(HfWeightMapper):
             elif "mixer.norm.weight" in key:
                 w = split(weights[name], tp_size, tp_rank)
                 new_weights[key] = w
+            # Remap shared_experts to shared_expert_* (model uses custom Linear layers).
+            elif "shared_experts.up_proj" in key:
+                key = key.replace("shared_experts.up_proj",
+                                  "shared_expert_up_proj")
+                new_weights[key] = weights[name]
+            elif "shared_experts.down_proj" in key:
+                key = key.replace("shared_experts.down_proj",
+                                  "shared_expert_down_proj")
+                new_weights[key] = weights[name]
             # Remap MoE expert weights.
             elif "mixer.experts." in key:
                 if self.config.moe_backend == 'VANILLA':

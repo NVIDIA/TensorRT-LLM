@@ -45,7 +45,11 @@ class MambaCacheManager(BaseResourceManager):
         self.mamba_ssm_cache_dtype = ssm_cache_dtype
 
         # get tp size
+        # When attention_dp is enabled, Mamba2Mixer uses tp_size=1 internally,
+        # so the cache should also use tp_size=1 for dimensions.
         tp_size = mapping.tp_size
+        if mapping.enable_attention_dp:
+            tp_size = 1
 
         # derive mamba parameters for conv and ssm states
         d_inner = head_dim * num_heads
