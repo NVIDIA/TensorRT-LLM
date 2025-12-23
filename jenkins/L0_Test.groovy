@@ -97,10 +97,10 @@ CCACHE_DIR="/mnt/sw-tensorrt-pvc/scratch.trt_ccache/llm_ccache"
 MODEL_CACHE_DIR="/scratch.trt_llm_data/llm-models"
 
 // GPU types that require open driver
-REQUIRED_OPEN_DRIVER_TYPES = ["b100-ts2", "rtx-5080", "rtx-5090", "rtx-pro-6000", "rtx-pro-6000d", "gb10x"]
+REQUIRED_OPEN_DRIVER_TYPES = ["b100-ts2", "rtx-5080", "rtx-5090", "rtx-pro-6000", "rtx-pro-6000d"]
 
 // GPU types that don't support dynamic driver flashing
-REQUIRED_NO_DRIVER_TYPES = ["dgx-h100", "dgx-h200", "gh200"]
+REQUIRED_NO_DRIVER_TYPES = ["dgx-h100", "dgx-h200", "gh200", "gb10x"]
 
 // ENABLE_NGC_DEVEL_IMAGE_TEST is currently disabled in the Jenkins BuildDockerImageSanityTest job config
 ENABLE_NGC_DEVEL_IMAGE_TEST = params.enableNgcDevelImageTest ?: false
@@ -1485,10 +1485,18 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
 
         // The following GPU types doesn't support dynamic driver flashing.
         if (REQUIRED_NO_DRIVER_TYPES.any { type.contains(it) }) {
-            selectors = """
+            if (type == "gb10x") {
+                selectors = """
+                    kubernetes.io/arch: ${arch}
+                    kubernetes.io/os: linux
+                    nvidia.com/gpu.machine: NVIDIA_DGX_Spark
+                    nvidia.com/tenant: blossom_trt"""
+            } else {
+                selectors = """
                     kubernetes.io/arch: ${arch}
                     kubernetes.io/os: linux
                     nvidia.com/gpu_type: ${gpuType}"""
+            }
         } else if (perfMode && !hasMultipleGPUs) {
         // Use single GPU machine with "tensorrt/test_type: perf" for stable perf testing.
         // H100 / A100 single GPU machine has this unique label in TensorRT Blossom pool.
@@ -1501,20 +1509,11 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         }
         else
         {
-            if (type == "gb10x") {
-                selectors = """
-                    kubernetes.io/arch: ${arch}
-                    kubernetes.io/os: linux
-                    nvidia.com/gpu.machine: NVIDIA_DGX_Spark
-                    nvidia.com/tenant: blossom_trt
-                    nvidia.com/driver_version: '${driverVersion}'"""
-            } else {
-                selectors = """
+            selectors = """
                     kubernetes.io/arch: ${arch}
                     kubernetes.io/os: linux
                     nvidia.com/gpu_type: ${gpuType}
                     nvidia.com/driver_version: '${driverVersion}'"""
-            }
         }
 
         containerConfig = """
