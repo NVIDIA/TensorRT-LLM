@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 from torch.fx import GraphModule
 
+import tensorrt_llm
 from tensorrt_llm import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -58,10 +59,11 @@ def apply_nccl_symmetric_patterns_to_model(model: nn.Module, mapping: Mapping) -
             This reuses the exact same pattern application code that Backend uses,
             ensuring consistency with the rest of TRT-LLM.
             """
-            # Debug: Print graph structure to understand why patterns aren't matching
-            logger.debug(
-                f"[NCCL_SYMMETRIC] PatternOnlyBackend: Graph has {len(list(gm.graph.nodes))} nodes"
-            )
+            # Debug: Print graph structure to understand why patterns aren't matching (rank 0 only)
+            if tensorrt_llm.mpi_rank() == 0:
+                logger.debug(
+                    f"[NCCL_SYMMETRIC] PatternOnlyBackend: Graph has {len(list(gm.graph.nodes))} nodes"
+                )
             # Log all allreduce calls in the graph
             allreduce_nodes = []
             for n in gm.graph.nodes:
@@ -70,9 +72,10 @@ def apply_nccl_symmetric_patterns_to_model(model: nn.Module, mapping: Mapping) -
                     if "allreduce" in target_str.lower():
                         allreduce_nodes.append(n)
 
-            logger.debug(
-                f"[NCCL_SYMMETRIC] PatternOnlyBackend: Found {len(allreduce_nodes)} allreduce nodes in graph"
-            )
+            if tensorrt_llm.mpi_rank() == 0:
+                logger.debug(
+                    f"[NCCL_SYMMETRIC] PatternOnlyBackend: Found {len(allreduce_nodes)} allreduce nodes in graph"
+                )
             for i, node in enumerate(allreduce_nodes):
                 # Extract strategy from args (it's typically the 7th positional arg)
                 strategy_val = None
@@ -102,26 +105,28 @@ def apply_nccl_symmetric_patterns_to_model(model: nn.Module, mapping: Mapping) -
                 except Exception:
                     pass
 
-                logger.debug(
-                    f"[NCCL_SYMMETRIC] PatternOnlyBackend: AllReduce node {i}: "
-                    f"target={node.target}, args={len(node.args)}, "
-                    f"strategy={strategy_val} (type={type(strategy_val)}), "
-                    f"fusion_op={fusion_val} (type={type(fusion_val)}), "
-                    f"kwargs={node.kwargs}, {schema_info}"
-                )
-                # Log first few args to understand structure
-                if len(node.args) > 0:
-                    args_slice = node.args[0:5] if len(node.args) >= 5 else node.args
+                if tensorrt_llm.mpi_rank() == 0:
                     logger.debug(
-                        f"[NCCL_SYMMETRIC] PatternOnlyBackend: AllReduce node {i} "
-                        f"args[0:5]={args_slice}"
+                        f"[NCCL_SYMMETRIC] PatternOnlyBackend: AllReduce node {i}: "
+                        f"target={node.target}, args={len(node.args)}, "
+                        f"strategy={strategy_val} (type={type(strategy_val)}), "
+                        f"fusion_op={fusion_val} (type={type(fusion_val)}), "
+                        f"kwargs={node.kwargs}, {schema_info}"
                     )
-                elif node.kwargs:
-                    kwarg_keys = list(node.kwargs.keys())
-                    logger.debug(
-                        f"[NCCL_SYMMETRIC] PatternOnlyBackend: AllReduce node {i} "
-                        f"using keyword args: {kwarg_keys}"
-                    )
+                # Log first few args to understand structure (rank 0 only)
+                if tensorrt_llm.mpi_rank() == 0:
+                    if len(node.args) > 0:
+                        args_slice = node.args[0:5] if len(node.args) >= 5 else node.args
+                        logger.debug(
+                            f"[NCCL_SYMMETRIC] PatternOnlyBackend: AllReduce node {i} "
+                            f"args[0:5]={args_slice}"
+                        )
+                    elif node.kwargs:
+                        kwarg_keys = list(node.kwargs.keys())
+                        logger.debug(
+                            f"[NCCL_SYMMETRIC] PatternOnlyBackend: AllReduce node {i} "
+                            f"using keyword args: {kwarg_keys}"
+                        )
 
             # Use the existing optimize() method which already handles:
             # - recover_pass()

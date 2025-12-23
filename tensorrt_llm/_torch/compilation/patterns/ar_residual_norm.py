@@ -11,12 +11,18 @@ from torch._inductor.pattern_matcher import (MULTIPLE, CallFunction, Ignored,
 from ...distributed import AllReduceFusionOp, AllReduceStrategy
 
 aten = torch.ops.aten
+import tensorrt_llm
 from tensorrt_llm import logger
 from tensorrt_llm.mapping import Mapping
 
 
 def register_ar_residual_norm(custom_pass: PatternMatcherPass,
                               mapping: Mapping):
+    if tensorrt_llm.mpi_rank() == 0:
+        logger.debug(
+            "[AR_RESIDUAL_NORM] Pattern: Registering pattern with "
+            f"group={mapping.tp_group}, fusion_op={int(AllReduceFusionOp.NONE)}"
+        )
     residual_key = KeywordArg("residual")
     trtllm_allreduce_default = CallFunction(
         torch.ops.trtllm.allreduce.default, KeywordArg("input"), None, None,
@@ -65,22 +71,46 @@ def register_ar_residual_norm(custom_pass: PatternMatcherPass,
         return all_reduce_output[0], all_reduce_output[1]
 
     def extra_check(match: Match) -> bool:
+        if tensorrt_llm.mpi_rank() == 0:
+            logger.debug(
+                "[AR_RESIDUAL_NORM] Pattern: extra_check called - pattern matched! "
+                f"pattern_to_node keys: {list(match.ctx.pattern_to_node.keys())}"
+            )
         # Residual should be a tensor
         residual_node = match.ctx.pattern_to_node[residual_key]
         if not isinstance(residual_node, torch.fx.graph.Node):
+            if tensorrt_llm.mpi_rank() == 0:
+                logger.debug(
+                    "[AR_RESIDUAL_NORM] Pattern: extra_check failed: residual_node is not a Node"
+                )
             return False
         getitem_node = match.ctx.pattern_to_node[getitem_x]
         if not isinstance(getitem_node, torch.fx.graph.Node):
+            if tensorrt_llm.mpi_rank() == 0:
+                logger.debug(
+                    "[AR_RESIDUAL_NORM] Pattern: extra_check failed: getitem_node is not a Node"
+                )
             return False
 
         getitem_node_shape = getitem_node.meta["tensor_meta"].shape
         residual_node_shape = residual_node.meta["tensor_meta"].shape
 
         if getitem_node_shape != residual_node_shape:
+            if tensorrt_llm.mpi_rank() == 0:
+                logger.debug(
+                    f"[AR_RESIDUAL_NORM] Pattern: extra_check failed: shape mismatch "
+                    f"getitem={getitem_node_shape}, residual={residual_node_shape}"
+                )
             return False
 
+        if tensorrt_llm.mpi_rank() == 0:
+            logger.debug("[AR_RESIDUAL_NORM] Pattern: extra_check passed")
         return True
 
+    if tensorrt_llm.mpi_rank() == 0:
+        logger.debug(
+            "[AR_RESIDUAL_NORM] Pattern: Registering replacement for ar_residual_norm"
+        )
     register_replacement(
         empty_pattern,
         target_pattern,
@@ -722,20 +752,21 @@ def register_nccl_symmetric_patterns(custom_passes: List[PatternMatcherPass],
 
     def register_convert_supported_ar_to_nccl_symmetric(
             custom_pass: PatternMatcherPass):
-        # Use KeywordArg for all arguments since the actual call uses keyword arguments
+        # FX normalizes keyword arguments to positional arguments based on schema
+        # Pattern should match positional arguments in schema order:
+        # input, residual, norm_weight, scale, bias, workspace, group, strategy, op, eps, trigger_completion_at_end
+        strategy = int(AllReduceStrategy.NCCL_SYMMETRIC)
         input_node = KeywordArg('input')
-        # Use actual schema parameter names for matching: 'residual', 'norm_weight', 'op', 'group', 'strategy'
-        # But keep 'residual_in', 'gamma', 'fusion_op' in function signatures for clarity
         fusion = KeywordArg('op')  # Schema uses 'op', not 'fusion_op'
-        group_arg = KeywordArg(
-            'group')  # Use KeywordArg to match keyword arguments
-        strategy_arg = KeywordArg(
-            'strategy')  # Use KeywordArg to match keyword arguments
         trtllm_allreduce_default = CallFunction(
             torch.ops.trtllm.allreduce.default, input_node,
             KeywordArg('residual'), KeywordArg('norm_weight'),
-            KeywordArg('scale'), None, Ignored(), group_arg, strategy_arg,
+            KeywordArg('scale'), None, Ignored(), mapping.tp_group, strategy,
             fusion, KeywordArg('eps'), Ignored())
+
+        if tensorrt_llm.mpi_rank() == 0:
+            logger.debug("[NCCL_SYMMETRIC] Pattern: Registering pattern with "
+                         f"strategy={strategy}, group={mapping.tp_group}")
 
         def empty_convert_supported_ar_to_nccl_symmetric(
             input: torch.Tensor,
@@ -755,10 +786,6 @@ def register_nccl_symmetric_patterns(custom_passes: List[PatternMatcherPass],
             fusion_op: int,
             eps: float,
         ):
-            logger.debug(
-                "[NCCL_SYMMETRIC] Pattern: Initial pattern matched: inserting copy_to_nccl_window "
-                f"before allreduce (fusion_op={fusion_op}, input_shape={input.shape}, "
-                f"input_dtype={input.dtype})")
             input = torch.ops.trtllm.copy_to_nccl_window(
                 input, mapping.tp_group)
             all_reduce_output = torch.ops.trtllm.allreduce(
@@ -771,56 +798,31 @@ def register_nccl_symmetric_patterns(custom_passes: List[PatternMatcherPass],
             # No dtype restriction for NCCL_SYMMETRIC - it supports all dtypes (f32, f16, bf16, etc.)
             # The dtype check is only needed for UB patterns, not NCCL_SYMMETRIC
 
-            logger.debug(
-                "[NCCL_SYMMETRIC] Pattern: extra_check called - pattern matched! "
-                f"pattern_to_node keys: {list(match.ctx.pattern_to_node.keys())}"
-            )
-
-            # Verify strategy is NCCL_SYMMETRIC
-            try:
-                strategy_value = match.ctx.pattern_to_node[strategy_arg]
-                if strategy_value != int(AllReduceStrategy.NCCL_SYMMETRIC):
-                    logger.debug(
-                        f"[NCCL_SYMMETRIC] Pattern: extra_check failed: strategy={strategy_value} "
-                        f"is not NCCL_SYMMETRIC ({int(AllReduceStrategy.NCCL_SYMMETRIC)})"
-                    )
-                    return False
-            except KeyError as e:
+            if tensorrt_llm.mpi_rank() == 0:
                 logger.debug(
-                    f"[NCCL_SYMMETRIC] Pattern: extra_check failed: strategy not found: {e}"
+                    "[NCCL_SYMMETRIC] Pattern: extra_check called - pattern matched! "
+                    f"pattern_to_node keys: {list(match.ctx.pattern_to_node.keys())}"
                 )
-                return False
-
-            # Verify group matches mapping.tp_group
-            try:
-                group_value = match.ctx.pattern_to_node[group_arg]
-                if group_value != mapping.tp_group:
-                    logger.debug(
-                        f"[NCCL_SYMMETRIC] Pattern: extra_check failed: group={group_value} "
-                        f"does not match mapping.tp_group={mapping.tp_group}")
-                    return False
-            except KeyError as e:
-                logger.debug(
-                    f"[NCCL_SYMMETRIC] Pattern: extra_check failed: group not found: {e}"
-                )
-                return False
 
             try:
                 fusion_value = match.ctx.pattern_to_node[fusion]
-                logger.debug(
-                    f"[NCCL_SYMMETRIC] Pattern: extra_check extracted fusion_value={fusion_value} (type={type(fusion_value)})"
-                )
+                if tensorrt_llm.mpi_rank() == 0:
+                    logger.debug(
+                        f"[NCCL_SYMMETRIC] Pattern: extra_check extracted fusion_value={fusion_value} (type={type(fusion_value)})"
+                    )
             except KeyError as e:
-                logger.debug(
-                    f"[NCCL_SYMMETRIC] Pattern: extra_check failed: fusion (op) not found in pattern_to_node: {e}, "
-                    f"pattern_to_node keys: {list(match.ctx.pattern_to_node.keys())}"
-                )
+                if tensorrt_llm.mpi_rank() == 0:
+                    logger.debug(
+                        f"[NCCL_SYMMETRIC] Pattern: extra_check failed: fusion (op) not found: {e}, "
+                        f"pattern_to_node keys: {list(match.ctx.pattern_to_node.keys())}"
+                    )
                 return False
 
             if not isinstance(fusion_value, int):
-                logger.debug(
-                    f"[NCCL_SYMMETRIC] Pattern: extra_check failed: fusion_value is not int, got {type(fusion_value)}"
-                )
+                if tensorrt_llm.mpi_rank() == 0:
+                    logger.debug(
+                        f"[NCCL_SYMMETRIC] Pattern: extra_check failed: fusion_value is not int, got {type(fusion_value)}"
+                    )
                 return False
             # NCCL_SYMMETRIC supports: RESIDUAL_RMS_NORM and RESIDUAL_RMS_NORM_QUANT_FP8
             # FP4 (RESIDUAL_RMS_NORM_QUANT_NVFP4) is NOT supported for NCCL_SYMMETRIC
@@ -828,19 +830,24 @@ def register_nccl_symmetric_patterns(custom_passes: List[PatternMatcherPass],
                     AllReduceFusionOp.RESIDUAL_RMS_NORM
             ) and fusion_value != int(
                     AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8):
-                logger.debug(
-                    f"[NCCL_SYMMETRIC] Pattern: extra_check failed: fusion_value={fusion_value} not in supported list (FP4 not supported)"
-                )
+                if tensorrt_llm.mpi_rank() == 0:
+                    logger.debug(
+                        f"[NCCL_SYMMETRIC] Pattern: extra_check failed: fusion_value={fusion_value} not in supported list "
+                        f"(RESIDUAL_RMS_NORM={int(AllReduceFusionOp.RESIDUAL_RMS_NORM)}, "
+                        f"RESIDUAL_RMS_NORM_QUANT_FP8={int(AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8)})"
+                    )
                 return False
 
-            logger.debug(
-                f"[NCCL_SYMMETRIC] Pattern: extra_check passed: fusion_value={fusion_value}, "
-                f"strategy={strategy_value}, group={group_value}")
+            if tensorrt_llm.mpi_rank() == 0:
+                logger.debug(
+                    f"[NCCL_SYMMETRIC] Pattern: extra_check passed: fusion_value={fusion_value}"
+                )
             return True
 
-        logger.debug(
-            "[NCCL_SYMMETRIC] Pattern: Registering replacement for convert_supported_ar_to_nccl_symmetric"
-        )
+        if tensorrt_llm.mpi_rank() == 0:
+            logger.debug(
+                "[NCCL_SYMMETRIC] Pattern: Registering replacement for convert_supported_ar_to_nccl_symmetric"
+            )
         register_replacement(
             empty_convert_supported_ar_to_nccl_symmetric,
             target_convert_supported_ar_to_nccl_symmetric,
@@ -882,10 +889,6 @@ def register_nccl_symmetric_patterns(custom_passes: List[PatternMatcherPass],
                 mm0_bias: Optional[torch.Tensor],
                 mm_dtype: torch.dtype,
             ):
-                logger.debug(
-                    "[NCCL_SYMMETRIC] Pattern: Prologue pattern matched: replacing "
-                    "copy_to_nccl_window(cublas_scaled_mm(...)) with direct allocation"
-                )
                 # TODO: When GEMM refactoring is done, use allocator parameter
                 # For now, create window tensor and use it as output
                 scaled_mm_output = torch.ops.trtllm.cublas_scaled_mm(
@@ -948,10 +951,6 @@ def register_nccl_symmetric_patterns(custom_passes: List[PatternMatcherPass],
                 to_userbuffers: bool,
                 allowed_backends: str,
             ):
-                logger.debug(
-                    "[NCCL_SYMMETRIC] Pattern: Prologue pattern matched: replacing "
-                    "copy_to_nccl_window(nvfp4_gemm(...)) with direct allocation"
-                )
                 # TODO: When GEMM refactoring is done, use allocator parameter
                 # For now, create window tensor and use it as output
                 nvfp4_gemm_output = torch.ops.trtllm.nvfp4_gemm(
@@ -1006,10 +1005,6 @@ def register_nccl_symmetric_patterns(custom_passes: List[PatternMatcherPass],
                 mm0_a: torch.Tensor,
                 mm0_b: torch.Tensor,
             ):
-                logger.debug(
-                    "[NCCL_SYMMETRIC] Pattern: Prologue pattern matched: replacing "
-                    "copy_to_nccl_window(aten.mm(...)) with matmul_to_nccl_window"
-                )
                 mm_output = torch.ops.trtllm.matmul_to_nccl_window(
                     mm0_a, mm0_b, mapping.tp_group)
                 return mm_output
@@ -1040,10 +1035,6 @@ def register_nccl_symmetric_patterns(custom_passes: List[PatternMatcherPass],
                 add_a: torch.Tensor,
                 add_b: torch.Tensor,
             ):
-                logger.debug(
-                    "[NCCL_SYMMETRIC] Pattern: Prologue pattern matched: replacing "
-                    "copy_to_nccl_window(aten.add(...)) with add_to_nccl_window"
-                )
                 add_output = torch.ops.trtllm.add_to_nccl_window(
                     add_a, add_b, mapping.tp_group)
                 return add_output
@@ -1063,17 +1054,20 @@ def register_nccl_symmetric_patterns(custom_passes: List[PatternMatcherPass],
         register_mm_prologue(custom_pass)
         register_add_prologue(custom_pass)
 
-    logger.debug(
-        "[NCCL_SYMMETRIC] Pattern: Registering NCCL_SYMMETRIC patterns")
+    if tensorrt_llm.mpi_rank() == 0:
+        logger.debug(
+            "[NCCL_SYMMETRIC] Pattern: Registering NCCL_SYMMETRIC patterns")
     custom_passes.append(PatternMatcherPass())
     register_convert_supported_ar_to_nccl_symmetric(custom_passes[-1])
-    logger.debug(
-        "[NCCL_SYMMETRIC] Pattern: Registered initial pattern (convert_supported_ar_to_nccl_symmetric)"
-    )
+    if tensorrt_llm.mpi_rank() == 0:
+        logger.debug(
+            "[NCCL_SYMMETRIC] Pattern: Registered initial pattern (convert_supported_ar_to_nccl_symmetric)"
+        )
 
     custom_passes.append(PatternMatcherPass())
     register_nccl_symmetric_prologue_patterns(custom_passes[-1])
-    logger.debug("[NCCL_SYMMETRIC] Pattern: Registered prologue patterns")
+    if tensorrt_llm.mpi_rank() == 0:
+        logger.debug("[NCCL_SYMMETRIC] Pattern: Registered prologue patterns")
 
 
 def register_ar_fusions(custom_passes: List[PatternMatcherPass],
