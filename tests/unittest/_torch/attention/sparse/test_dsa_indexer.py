@@ -518,7 +518,7 @@ def _create_mock_metadata(request_ids,
 
             # Add expanded buffers for MTP support
             self.use_expanded_buffers_for_mtp = (
-                (self.max_draft_tokens > 1 and get_sm_version()) == 90
+                (self.max_draft_tokens > 1 and get_sm_version() == 90)
                 or ((self.max_draft_tokens == 2 or self.max_draft_tokens > 3)
                     and get_sm_version() >= 100))
             self.kv_lens_expanded_cuda = torch.zeros(
@@ -541,7 +541,7 @@ def _create_mock_metadata(request_ids,
                     (self.num_sms // 2 + 1, 2),
                     device='cuda',
                     dtype=torch.int32)
-            if self.use_expanded_buffers_for_mtp > 1:
+            if self.use_expanded_buffers_for_mtp:
                 gen_kv_lens = kv_lens[num_contexts:self.num_seqs]
                 gen_kv_lens_expanded = torch.stack([gen_kv_lens] *
                                                    (1 + self.max_draft_tokens),
@@ -895,7 +895,7 @@ def test_fp8_k_cache_roundtrip():
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
 @skip_pre_hopper
-@pytest.mark.parametrize("batch_size,next_n", [(4, 1), (2, 2), (4, 4)])
+@pytest.mark.parametrize("batch_size,next_n", [(4, 1), (2, 2), (4, 3), (4, 4)])
 def test_indexer_decode_with_paged_kv_cache(batch_size, next_n):
     """
     Test FP8 paged KV cache with two-phase workflow and variable context lengths.

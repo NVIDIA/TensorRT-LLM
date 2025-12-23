@@ -742,7 +742,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # expand the kv_lens and block_table for MTP support.
         # TODO: remove this once fp8_paged_mqa_logits supports an arbitrary number of MTP draft tokens.
         self.use_expanded_buffers_for_mtp = (
-            (self.max_draft_tokens > 1 and get_sm_version()) == 90
+            (self.max_draft_tokens > 1 and get_sm_version() == 90)
             or ((self.max_draft_tokens == 2 or self.max_draft_tokens > 3)
                 and get_sm_version() >= 100))
         if self.use_expanded_buffers_for_mtp:
@@ -801,7 +801,21 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 tokens_per_block, self.num_sms)
             self.scheduler_metadata_buffer.copy_(scheduler_metadata_buffer,
                                                  non_blocking=True)
-            if self.max_draft_tokens == 3:
+            if self.use_expanded_buffers_for_mtp:
+                num_draft_tokens = 1 + self.max_draft_tokens
+                num_tokens = self.num_generations * num_draft_tokens
+                gen_kv_lens = self.kv_lens_cuda[self.num_contexts:self.num_seqs]
+                kv_lens_expanded = torch.stack([gen_kv_lens] * num_draft_tokens,
+                                               dim=0)
+                self.kv_lens_expanded_cuda[:num_tokens] = \
+                    kv_lens_expanded.transpose(0, 1).contiguous().flatten()
+                # Expand schedule metadata buffer (only generation)
+                kv_lens_expanded = self.kv_lens_expanded_cuda[:num_tokens]
+                scheduler_metadata_buffer_expanded = get_paged_mqa_logits_metadata(
+                    kv_lens_expanded, tokens_per_block, self.num_sms)
+                self.scheduler_metadata_buffer_expanded.copy_(
+                    scheduler_metadata_buffer_expanded, non_blocking=True)
+            elif self.max_draft_tokens == 3:
                 scheduler_metadata_buffer_mtp3 = get_paged_mqa_logits_metadata(
                     self.kv_lens_cuda[self.num_contexts:self.num_seqs],
                     tokens_per_block, self.num_sms // 2)
@@ -1428,7 +1442,7 @@ class Indexer(nn.Module):
             # Because fp8_paged_mqa_logits can only support next_n == 1/2/4 on sm100, and
             # next_n == 1/2 on sm90, for other next_n, we need to flatten the q_decode tensor
             # and expand the corresponding metadata.
-            if not metadata.use_expanded_buffers_for_mtp:
+            if not metadata.use_expanded_buffers_for_mtp or next_n == 1:
                 q_decode = q_decode.view(num_generations, -1, *q_fp8.shape[1:])
                 context_lens = metadata.kv_lens_cuda_runtime[
                     num_contexts:num_contexts + num_generations]
@@ -1440,7 +1454,7 @@ class Indexer(nn.Module):
                     scheduler_metadata_buffer = metadata.scheduler_metadata_buffer
             else:
                 q_decode = q_decode.view(-1, 1, *q_fp8.shape[1:])
-                num_tokens = num_generations * (1 + metadata.max_draft_tokens)
+                num_tokens = q_decode.shape[0]
                 context_lens = metadata.kv_lens_expanded_cuda[:num_tokens]
                 block_table = metadata.block_table_expanded[:num_tokens]
                 scheduler_metadata_buffer = metadata.scheduler_metadata_buffer_expanded
