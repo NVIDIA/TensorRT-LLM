@@ -566,6 +566,7 @@ class TestMoEAlltoAll:
             (4, [32, 32, 32, 32], 4),
             (4, [1, 1, 1, 1], 2),
             (8, [640, 640, 640, 640, 640, 640, 640, 640], 4),
+            (4, [32, 0, 16, 0], 2),
         ],
         indirect=["mpi_pool_executor"])
     def test_combine(self, mpi_pool_executor, all_num_tokens, top_k):
