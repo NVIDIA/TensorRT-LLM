@@ -1,5 +1,4 @@
 import logging
-import os
 import threading
 import time
 import uuid
@@ -339,10 +338,6 @@ def parse_metadata_server_config_file(
         return MetadataServerConfig(**config)
 
 
-def get_enable_prealloc_disagg():
-    return os.environ.get("TLLM_ENABLE_PREALLOC_DISAGG", "0") == "1"
-
-
 MIN_GLOBAL_ID = 1 << 42
 
 # Consider GIL being removed in the future, use a lock to protect the counter
@@ -365,13 +360,18 @@ def get_global_disagg_request_id(machine_id: int,
     global _global_disagg_request_id_counter
     global _last_timestamp_ms_in_request_id
 
-    if machine_id not in range(0, 1 << 10):
-        raise ValueError(f"machine_id must be in range [0, {1<<10})")
+    COUNTER_BITS = 12
+    MACHINE_ID_BITS = 10
+    COUNTER_MASK = (1 << COUNTER_BITS) - 1
+
+    if machine_id not in range(0, (1 << MACHINE_ID_BITS) - 1):
+        raise ValueError(
+            f"machine_id must be in range [0, {(1 << MACHINE_ID_BITS) - 1})")
 
     timestamp_ms = int(time.time() * 1000)
     with _global_disagg_request_id_lock:
-        last_counter = _global_disagg_request_id_counter & 0xFFF
-        counter = (_global_disagg_request_id_counter + 1) & 0xFFF
+        last_counter = _global_disagg_request_id_counter & COUNTER_MASK
+        counter = (_global_disagg_request_id_counter + 1) & COUNTER_MASK
         _global_disagg_request_id_counter += 1
         if monotonic and timestamp_ms == _last_timestamp_ms_in_request_id and counter < last_counter:
             # sleep 1ms and update timestamp_ms when the counter rotates and timestamp_ms remains the same
@@ -381,7 +381,8 @@ def get_global_disagg_request_id(machine_id: int,
 
     # keep the first bit 0 to get positive integer
     # [0, MIN_GLOBAL_ID] range is reserved for local ids
-    global_id = (timestamp_ms << 22 | machine_id << 12
+    global_id = (timestamp_ms <<
+                 (MACHINE_ID_BITS + COUNTER_BITS) | machine_id << COUNTER_BITS
                  | counter) + MIN_GLOBAL_ID
     global_id_int64 = global_id & ((1 << 63) - 1)
     return global_id_int64

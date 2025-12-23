@@ -209,16 +209,9 @@ class ExecutorRequestQueue:
         return False
 
     def _get_request_id(self, request: Optional[ExecutorRequest] = None):
-        try:
-            # if client id is a global disagg request id, use it
-            if request and request.client_id is not None and request.client_id >= MIN_GLOBAL_ID:
-                return request.client_id
-        except:
-            print(
-                f"Failed to get request id for request: {request}, {list(request.__dict__.keys())}"
-            )
-            raise
-        # (next_request_id + 1) % (MIN_GLOBAL_ID - 1)
+        # if client id is a global disagg request id, use it
+        if request and request.client_id is not None and request.client_id >= MIN_GLOBAL_ID:
+            return request.client_id
         current_id = self.next_request_id
         self.next_request_id = get_local_request_id(current_id)
         return current_id
