@@ -8,6 +8,7 @@ from typing import List
 
 import torch
 import torch.nn as nn
+from torch._inductor.pattern_matcher import PatternMatcherPass
 from torch.fx import GraphModule
 
 import tensorrt_llm
@@ -15,6 +16,7 @@ from tensorrt_llm import logger
 from tensorrt_llm.mapping import Mapping
 
 from .backend import Backend
+from .patterns.ar_residual_norm import register_nccl_symmetric_patterns
 
 
 def apply_nccl_symmetric_patterns_to_model(model: nn.Module, mapping: Mapping) -> nn.Module:
@@ -51,6 +53,10 @@ def apply_nccl_symmetric_patterns_to_model(model: nn.Module, mapping: Mapping) -
                 max_num_streams=1,
                 mapping=mapping,
             )
+            # Override custom_passes to register NCCL_SYMMETRIC patterns with match_auto_strategy=True
+            # This ensures we match AUTO strategy nodes (which is what's in the graph) and convert to NCCL_SYMMETRIC
+            self.custom_passes = [PatternMatcherPass()]
+            register_nccl_symmetric_patterns(self.custom_passes, mapping, match_auto_strategy=True)
 
         def __call__(self, gm: GraphModule, example_inputs: List[torch.Tensor]) -> callable:
             """

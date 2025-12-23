@@ -748,14 +748,29 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
 
 
 def register_nccl_symmetric_patterns(custom_passes: List[PatternMatcherPass],
-                                     mapping: Mapping):
+                                     mapping: Mapping,
+                                     match_auto_strategy: bool = False):
+    """
+    Register NCCL_SYMMETRIC patterns.
+
+    Args:
+        custom_passes: List of pattern matcher passes to register patterns in
+        mapping: Mapping configuration for TP group
+        match_auto_strategy: If True, match AUTO strategy nodes (strategy=3) and convert to NCCL_SYMMETRIC.
+                           If False, match NCCL_SYMMETRIC strategy nodes (strategy=8) directly.
+                           Should be True when NCCL_SYMMETRIC is requested but graph nodes have AUTO.
+    """
 
     def register_convert_supported_ar_to_nccl_symmetric(
             custom_pass: PatternMatcherPass):
         # FX normalizes keyword arguments to positional arguments based on schema
         # Pattern should match positional arguments in schema order:
         # input, residual, norm_weight, scale, bias, workspace, group, strategy, op, eps, trigger_completion_at_end
-        strategy = int(AllReduceStrategy.NCCL_SYMMETRIC)
+        # When match_auto_strategy=True, match AUTO strategy nodes (strategy=3) since graph nodes
+        # typically have AUTO even when NCCL_SYMMETRIC is requested in config. The pattern will convert them to NCCL_SYMMETRIC.
+        # When match_auto_strategy=False, match NCCL_SYMMETRIC strategy nodes (strategy=8) directly.
+        strategy = int(AllReduceStrategy.AUTO) if match_auto_strategy else int(
+            AllReduceStrategy.NCCL_SYMMETRIC)
         input_node = KeywordArg('input')
         fusion = KeywordArg('op')  # Schema uses 'op', not 'fusion_op'
         trtllm_allreduce_default = CallFunction(
@@ -765,8 +780,15 @@ def register_nccl_symmetric_patterns(custom_passes: List[PatternMatcherPass],
             fusion, KeywordArg('eps'), Ignored())
 
         if tensorrt_llm.mpi_rank() == 0:
-            logger.debug("[NCCL_SYMMETRIC] Pattern: Registering pattern with "
-                         f"strategy={strategy}, group={mapping.tp_group}")
+            if match_auto_strategy:
+                logger.debug(
+                    "[NCCL_SYMMETRIC] Pattern: Registering pattern to match AUTO strategy "
+                    f"(strategy={strategy}) and convert to NCCL_SYMMETRIC, group={mapping.tp_group}"
+                )
+            else:
+                logger.debug(
+                    "[NCCL_SYMMETRIC] Pattern: Registering pattern to match NCCL_SYMMETRIC strategy "
+                    f"(strategy={strategy}), group={mapping.tp_group}")
 
         def empty_convert_supported_ar_to_nccl_symmetric(
             input: torch.Tensor,
@@ -1085,5 +1107,8 @@ def register_ar_fusions(custom_passes: List[PatternMatcherPass],
     if enable_ub:
         register_ub_patterns(custom_passes, mapping)
 
-    # Always register NCCL_SYMMETRIC patterns (they only match when strategy is explicitly NCCL_SYMMETRIC)
-    register_nccl_symmetric_patterns(custom_passes, mapping)
+    # Register NCCL_SYMMETRIC patterns - by default match NCCL_SYMMETRIC strategy nodes directly
+    # Set match_auto_strategy=True only when NCCL_SYMMETRIC is requested but graph has AUTO nodes
+    register_nccl_symmetric_patterns(custom_passes,
+                                     mapping,
+                                     match_auto_strategy=False)
