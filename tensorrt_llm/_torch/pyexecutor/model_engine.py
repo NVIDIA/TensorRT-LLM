@@ -1000,7 +1000,18 @@ class PyTorchModelEngine(ModelEngine):
         num_key_value_heads = getattr(config, 'num_key_value_heads', None)
 
         if num_attention_heads is not None and num_key_value_heads is not None:
-            num_heads_per_kv = num_attention_heads // num_key_value_heads
+            # Handle case where num_key_value_heads is a list (per-layer KV heads)
+            if isinstance(num_key_value_heads, list):
+                logger.warning(
+                    f"num_heads_per_kv is used for kv cache reallocation, and it doesn't support per-layer KV heads currently, so we use the first non-zero value from the list"
+                )
+                # Use the first non-zero value from the list
+                kv_heads = next(
+                    (x for x in num_key_value_heads if x != 0),
+                    num_key_value_heads[0] if num_key_value_heads else 1)
+                num_heads_per_kv = num_attention_heads // kv_heads if kv_heads != 0 else 1
+            else:
+                num_heads_per_kv = num_attention_heads // num_key_value_heads
         else:
             num_heads_per_kv = 1
 
