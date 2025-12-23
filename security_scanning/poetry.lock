@@ -3215,19 +3215,19 @@ files = [
 
 [[package]]
 name = "nvidia-cutlass-dsl"
-version = "4.3.1"
+version = "4.3.4"
 description = "NVIDIA CUTLASS Python DSL"
 optional = false
 python-versions = ">=3.10"
 files = [
-    {file = "nvidia_cutlass_dsl-4.3.1-cp310-cp310-manylinux_2_28_aarch64.whl", hash = "sha256:29d6ccb56955e6528c818591fe752a820305951a73fbb69f9a816b3e228d57f8"},
-    {file = "nvidia_cutlass_dsl-4.3.1-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:f54d98339d4fca37d39390933186c4a7987291b57129da9bf45c7746d47786af"},
-    {file = "nvidia_cutlass_dsl-4.3.1-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:c7b27b3faf2d3cb4e9504ad55129ac58c09aa59f3af6eaabb88f4bda010a2792"},
-    {file = "nvidia_cutlass_dsl-4.3.1-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:24cfbf55aad55b3dd06ddaa340d13028b4e49b15e0e557105187a9d0bbc260db"},
-    {file = "nvidia_cutlass_dsl-4.3.1-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:025a8c7a0fb80626e2a893954ea19b2e1ece8d131078c7da12b7fabc2634d04d"},
-    {file = "nvidia_cutlass_dsl-4.3.1-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:b95ce5633e09f12c8d1fcd30c5db06b8325d41b3da0875d3e8a4c110ed5b5cdf"},
-    {file = "nvidia_cutlass_dsl-4.3.1-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:c8e816cc061b34e016906fa87948f2b0fa836a95f27732c14097f3ddda8286e2"},
-    {file = "nvidia_cutlass_dsl-4.3.1-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:f71adcfb56607fc86ea621edcf9503eaa31f66f70efd7ab719c33683db082183"},
+    {file = "nvidia_cutlass_dsl-4.3.4-cp310-cp310-manylinux_2_28_aarch64.whl", hash = "sha256:118508bc84f2a55ec7af3affd379bb713edf837d593218329909db67b518e700"},
+    {file = "nvidia_cutlass_dsl-4.3.4-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:3fdf0603ab7ec1bf6a499fbf72cff65e73b597d6e1359286808317c69aeb7c3d"},
+    {file = "nvidia_cutlass_dsl-4.3.4-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:c5bd21ed877da171f115123a12aae4a920035fc47eb57c807f9fba9f3df97cf4"},
+    {file = "nvidia_cutlass_dsl-4.3.4-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:671936f1df909e7de377d0cc00cb4287a3458c013d34947600423e9deb827e41"},
+    {file = "nvidia_cutlass_dsl-4.3.4-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:57693d87677919572ab9eefa386b3f39e8e888bc4a9db7ab8730a97e8dbe06b4"},
+    {file = "nvidia_cutlass_dsl-4.3.4-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:a48fbff859e44dd548f8f26819d97d0595acea70e3b057c91dfdb47929015c72"},
+    {file = "nvidia_cutlass_dsl-4.3.4-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:36bde25160f461f393beba81868ef9e54d5ba2e0e7666ed3e44b6dbf788af493"},
+    {file = "nvidia_cutlass_dsl-4.3.4-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:be127f0f087028fa498f50a994c49f95b2c6a518e11e2567bc3d71528bf0a504"},
 ]
 
 [package.dependencies]
@@ -4483,13 +4483,13 @@ test = ["pytest (>=3.6)", "pytest-cov", "pytest-runner"]
 
 [[package]]
 name = "pyparsing"
-version = "3.2.5"
+version = "3.3.0"
 description = "pyparsing - Classes and methods to define and execute parsing grammars"
 optional = false
 python-versions = ">=3.9"
 files = [
-    {file = "pyparsing-3.2.5-py3-none-any.whl", hash = "sha256:e38a4f02064cf41fe6593d328d0512495ad1f3d8a91c4f73fc401b3079a59a5e"},
-    {file = "pyparsing-3.2.5.tar.gz", hash = "sha256:2df8d5b7b2802ef88e8d016a2eb9c7aeaa923529cd251ed0fe4608275d4105b6"},
+    {file = "pyparsing-3.3.0-py3-none-any.whl", hash = "sha256:d15038408e0097d3a01e7e0846731f7f2450c5b6e4a75a52baabd6bbf24585be"},
+    {file = "pyparsing-3.3.0.tar.gz", hash = "sha256:0de16f2661afbab11fe6645d9472c3b96968d2fffea5b0cc9da88f5be286f039"},
 ]
 
 [package.extras]
@@ -6328,4 +6328,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.0"
 python-versions = ">=3.10,<3.13"
-content-hash = "6dd0726d69be11161ebbf3fea63d14e0ece7a14988e439e67539bc84dea75972"
+content-hash = "0044fcb43fce19eaa4c0704365e0526602ef9d54333de9f4ef964699ce962c29"

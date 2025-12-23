@@ -86,7 +86,7 @@ worker_config:
         layer_updates_per_iter: 1
     cache_transceiver_config:
       max_tokens_in_buffer: 8448
-      backend: UCX
+      backend: NIXL
     stream_interval: 100
     num_postprocess_workers: 4
     trust_remote_code: true
@@ -108,5 +108,5 @@ worker_config:
       dtype: fp8
     cache_transceiver_config:
       max_tokens_in_buffer: 8448
-      backend: UCX
+      backend: NIXL
     trust_remote_code: true
