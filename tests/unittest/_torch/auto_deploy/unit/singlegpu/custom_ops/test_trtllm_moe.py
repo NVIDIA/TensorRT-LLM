@@ -411,9 +411,7 @@ def test_trtllm_fused_moe_fp8(
         x,  # Note! unquantized input is expected
         selected_experts.to(torch.int),
         routing_weights,
-        fc1_expert_weights=w31_weight.contiguous()
-        if is_gated_mlp
-        else w1_weight.contiguous(),
+        fc1_expert_weights=w31_weight.contiguous() if is_gated_mlp else w1_weight.contiguous(),
         fc2_expert_weights=w2_weight.contiguous(),
         fc1_act_scale=hidden_states_scale.unsqueeze(0),
         fc1_dequant_scale=gemm1_dequant,
