@@ -176,8 +176,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
     :param sf_vec_size: Scalefactor vector size (16 for NVF4, 32 for MXF4/MXF8).
     :type sf_vec_size: int
-    :param acc_dtype: Data type of the accumulator (e.g., cutlass.Float32).
-    :type acc_dtype: Type[cutlass.Numeric]
     :param mma_tiler_mn: Shape of the Matrix Multiply-Accumulate (MMA) tile (M,N).
         Note: use_2cta_instrs is automatically inferred from mma_tiler_mn[0]
         (True when M=256, False when M=128).
@@ -217,7 +215,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         >>> # (True when M=256, False when M=128)
         >>> gemm = BlockScaledContiguousGatherGroupedGemmKernel(
         ...     sf_vec_size=16,
-        ...     acc_dtype=cutlass.Float32,
         ...     mma_tiler_mn=(256, 128),  # use_2cta_instrs=True since M=256
         ...     cluster_shape_mn=(2, 1),
         ...     vectorized_f32=True,
@@ -243,7 +240,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
     def __init__(
         self,
         sf_vec_size: int,
-        acc_dtype: Type[cutlass.Numeric],
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
         vectorized_f32: bool,
@@ -274,8 +270,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
         :param sf_vec_size: Vector size for scale factors (16 for NVF4, 32 for MXF4/MXF8).
         :type sf_vec_size: int
-        :param acc_dtype: Data type of the accumulator.
-        :type acc_dtype: type[cutlass.Numeric]
         :param mma_tiler_mn: Tuple (M, N) shape of the MMA instruction.
             use_2cta_instrs is automatically set based on M (True if M=256, False if M=128).
         :type mma_tiler_mn: Tuple[int, int]
@@ -289,7 +283,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
         self.sf_vec_size = sf_vec_size
         self.topk = topk
-        self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
+        self.acc_dtype: Type[cutlass.Numeric] = cutlass.Float32
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
         # K dimension is deferred in _setup_attributes
@@ -2620,7 +2614,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         ab_dtype: Type[cutlass.Numeric],
         sf_dtype: Type[cutlass.Numeric],
         sf_vec_size: int,
-        acc_dtype: Type[cutlass.Numeric],
         c_dtype: Type[cutlass.Numeric],
     ) -> bool:
         """
@@ -2632,8 +2625,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :type sf_dtype: Type[cutlass.Numeric]
         :param sf_vec_size: The vector size of the scale factor
         :type sf_vec_size: int
-        :param acc_dtype: The data type of the accumulator
-        :type acc_dtype: Type[cutlass.Numeric]
         :param c_dtype: The data type of the output tensor
         :type c_dtype: Type[cutlass.Numeric]
 
@@ -2662,8 +2653,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         if ab_dtype in {cutlass.Float8E5M2, cutlass.Float8E4M3FN} and sf_vec_size == 16:
             is_valid = False
 
-        if acc_dtype not in {cutlass.Float32}:
-            is_valid = False
         # Check valid c_dtype
         if c_dtype not in {
             cutlass.Float32,
@@ -2828,7 +2817,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         ab_dtype: Type[cutlass.Numeric],
         sf_dtype: Type[cutlass.Numeric],
         sf_vec_size: int,
-        acc_dtype: Type[cutlass.Numeric],
         c_dtype: Type[cutlass.Numeric],
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
@@ -2849,8 +2837,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :type sf_dtype: Type[cutlass.Numeric]
         :param sf_vec_size: The vector size of the scale factor
         :type sf_vec_size: int
-        :param acc_dtype: The data type of the accumulator
-        :type acc_dtype: Type[cutlass.Numeric]
         :param c_dtype: The data type of the output tensor
         :type c_dtype: Type[cutlass.Numeric]
         :param use_2cta_instrs: Whether to use 2 CTA groups
@@ -2880,7 +2866,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         can_implement = True
         # Skip unsupported types
         if not BlockScaledContiguousGatherGroupedGemmKernel.is_valid_dtypes_and_scale_factor_vec_size(
-            ab_dtype, sf_dtype, sf_vec_size, acc_dtype, c_dtype
+            ab_dtype, sf_dtype, sf_vec_size, c_dtype
         ):
             can_implement = False
 
