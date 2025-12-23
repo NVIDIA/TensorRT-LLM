@@ -3,7 +3,7 @@
 set -euo pipefail
 
 # Clear slurm envs
-unset $(env | awk -F'=' '{print $1}' | grep -E "SLURM_|SLURMD_|slurm_|MPI_|PMIX_")
+unset $(env | awk -F'=' '{print $1}' | (grep -E "SLURM_|SLURMD_|slurm_|MPI_|PMIX_" || true))
 
 extra_args=
 if [ -v TLLM_AUTOTUNER_CACHE_PATH ]; then

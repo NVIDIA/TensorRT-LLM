@@ -95,10 +95,11 @@ def shortest_common_supersequence(a, b):
 
 if args.file_path is not None:
     nsys_rep_file_path = Path(args.file_path)
+    if not nsys_rep_file_path.name.endswith(".nsys-rep"):
+        raise ValueError("Expect a .nsys-rep file")
 else:
     profile_dir = Path(args.profile_dir)
     nsys_rep_file_path = profile_dir / f"report_np{args.world_size}_rank{args.rank}.nsys-rep"
-assert nsys_rep_file_path.name.endswith(".nsys-rep")
 sqlite_file_path = nsys_rep_file_path.parent / (
     nsys_rep_file_path.name[: -len(".nsys-rep")] + ".sqlite"
 )
