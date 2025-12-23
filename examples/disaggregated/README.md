@@ -44,6 +44,175 @@ cache_transceiver_config:
   max_tokens_in_buffer: 2048
 ```
 
+## NIXL Backend Configuration
+
+NIXL supports multiple underlying communication backends for KV cache exchange. The backend can be configured using the `TRTLLM_NIXL_KVCACHE_BACKEND` environment variable.
+
+**Supported NIXL backends:**
+- **UCX** (default)
+- **LIBFABRIC** (available from v0.16.0)
+
+If an unsupported backend is specified, NIXL will automatically fall back to UCX.
+
+### LIBFABRIC Backend Setup
+
+**Important Note:** The TensorRT-LLM container does not include libfabric or the NIXL-LIBFABRIC plugin by default. You must either rebuild NIXL with libfabric support or provide a pre-compiled plugin.
+
+#### Prerequisites
+
+##### For LIBFABRIC Backend
+
+**Required Dependencies:**
+
+**Libfabric**
+- Custom libfabric installation is available via [https://ofiwg.github.io/libfabric/](https://ofiwg.github.io/libfabric/)
+- **Minimum required version:** v1.21.0
+- For EFA-enabled AWS instances, install through the [AWS EFA installer](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/efa-start.html) (recommend using the latest version)
+
+**hwloc**
+- hwloc is used to understand the underlying architecture to optimize application performance
+- **Suggested version:** 2.10.0 or newer
+
+**Network Hardware Requirements:**
+- Validated compatibility with AWS EFA (Elastic Fabric Adapter)
+
+##### For UCX Backend
+
+UCX is typically pre-installed in NVIDIA GPU containers. No additional installation is usually required.
+
+#### Installation Options
+
+##### Option 1: Rebuild NIXL with LIBFABRIC Support (Recommended)
+
+1. **Install libfabric dependencies:**
+   - Follow the installation instructions from the links above based on your system
+
+2. **Install hwloc:**
+   - Use your package manager or build from source
+
+3. **Reinstall NIXL after installing libfabric:**
+   - After installing libfabric and hwloc, you must rebuild NIXL to generate the LIBFABRIC plugin
+   - You can base your installation on the TensorRT-LLM's NIXL installation script located at `docker/common/install_nixl.sh`
+   - Modify the meson setup command in the script to include the libfabric path:
+     ```bash
+     meson setup builddir \
+         ...
+         -Dlibfabric_path=/path/to/libfabric \  # Add this line
+         --buildtype=release
+     ```
+   - For more details, see the [NIXL LIBFABRIC Plugin documentation](https://github.com/ai-dynamo/nixl/tree/6ee64753605b3110f8ef96c7cfc2f1315675c9c7/src/plugins/libfabric#nixl-libfabric-plugin)
+
+##### Option 2: Use Pre-compiled LIBFABRIC Plugin
+
+If you have a pre-compiled `libplugin_LIBFABRIC.so` that matches your NIXL version:
+
+1. Place the plugin file in a directory of your choice
+2. Set the environment variable to point to the plugin directory:
+   ```bash
+   export NIXL_PLUGINS_DIR=/path/to/plugin/directory
+   export TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC
+   ```
+3. Ensure the plugin was built with the same NIXL version as in your container
+
+### NIXL Configuration Examples
+
+To use NIXL for KV cache exchange, configure the `cache_transceiver_config` with `backend: NIXL`. The underlying NIXL backend (UCX or LIBFABRIC) is selected via the `TRTLLM_NIXL_KVCACHE_BACKEND` environment variable.
+
+**Context server configuration:**
+```yaml
+# context_config_nixl.yml
+disable_overlap_scheduler: True
+cache_transceiver_config:
+  backend: NIXL
+  max_tokens_in_buffer: 2048
+```
+
+**Generation server configuration:**
+```yaml
+# gen_config_nixl.yml
+cache_transceiver_config:
+  backend: NIXL
+  max_tokens_in_buffer: 2048
+```
+
+#### Example 1: Using NIXL with UCX backend (default)
+
+```bash
+# UCX is the default, but can be explicitly set
+export TRTLLM_NIXL_KVCACHE_BACKEND=UCX  # Optional, UCX is default
+
+# Start Context servers with NIXL using UCX
+CUDA_VISIBLE_DEVICES=0 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+  --host localhost --port 8001 --backend pytorch \
+  --config ./context_config_nixl.yml &> log_ctx_0 &
+
+CUDA_VISIBLE_DEVICES=1 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+  --host localhost --port 8002 --backend pytorch \
+  --config ./context_config_nixl.yml &> log_ctx_1 &
+
+# Start Generation server with NIXL using UCX
+CUDA_VISIBLE_DEVICES=2 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+  --host localhost --port 8003 --backend pytorch \
+  --config ./gen_config_nixl.yml &> log_gen_0 &
+```
+
+#### Example 2: Using NIXL with LIBFABRIC backend
+
+```bash
+# Configure NIXL to use LIBFABRIC backend
+export TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC
+
+# If using pre-compiled plugin:
+# export NIXL_PLUGINS_DIR=/path/to/plugin/directory
+
+# For AWS EFA (optional):
+# export FI_PROVIDER=efa
+# export FI_EFA_USE_DEVICE_RDMA=1
+# export FI_LOG_LEVEL=warn
+
+# Start Context servers with NIXL using LIBFABRIC
+CUDA_VISIBLE_DEVICES=0 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+  --host localhost --port 8001 --backend pytorch \
+  --config ./context_config_nixl.yml &> log_ctx_0 &
+
+CUDA_VISIBLE_DEVICES=1 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+  --host localhost --port 8002 --backend pytorch \
+  --config ./context_config_nixl.yml &> log_ctx_1 &
+
+# Start Generation server with NIXL using LIBFABRIC
+CUDA_VISIBLE_DEVICES=2 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+  --host localhost --port 8003 --backend pytorch \
+  --config ./gen_config_nixl.yml &> log_gen_0 &
+```
+
+### Environment Variables for NIXL Backends
+
+**NIXL Backend Selection:**
+- `TRTLLM_NIXL_KVCACHE_BACKEND`: Selects the underlying backend for NIXL. Valid options:
+  - `UCX` (default)
+  - `LIBFABRIC` (available from v0.16.0)
+  - If an unsupported value is provided, NIXL automatically falls back to UCX
+
+**Additional Environment Variables by Backend:**
+
+**For UCX backend:**
+- `UCX_MAX_RNDV_RAILS`: Maximum number of InfiniBand NIC devices per GPU. Setting to 1 can reduce contention in multi-GPU scenarios
+- Standard UCX environment variables apply
+
+**For LIBFABRIC backend:**
+- `NIXL_PLUGINS_DIR`: Directory containing the NIXL LIBFABRIC plugin (`libplugin_LIBFABRIC.so`) if using pre-compiled plugin
+- `FI_PROVIDER`: Specifies the libfabric provider to use (e.g., `efa` for AWS EFA)
+- `FI_EFA_USE_DEVICE_RDMA`: Set to `1` to enable GPU Direct RDMA on AWS EFA (if supported)
+- `FI_LOG_LEVEL`: Controls libfabric logging verbosity (e.g., `warn`, `info`, `debug`)
+
+**Example configuration for AWS EFA with LIBFABRIC:**
+```bash
+export TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC
+export FI_PROVIDER=efa
+export FI_EFA_USE_DEVICE_RDMA=1
+export FI_LOG_LEVEL=warn
+```
+
 ### Basic Usage
 
 For non-SLURM clusters - particularly in single-node, multi-GPU setups, it is recommended to use standard mode. In such cases, the system does not enforce limits on process creation or termination.
@@ -395,3 +564,14 @@ trtllm-serve disaggregated -c disagg_config.yaml
 ```
 
 The MPI communication backend for KV cache transfer has been deprecated and may not be supported in the future. When using the MPI backend, the environment variable `TRTLLM_USE_MPI_KVCACHE=1` should be set to avoid conflicts between mpi4py and KV cache transfer.
+
+## Troubleshooting
+
+### NIXL LIBFABRIC Backend Issues
+
+**Q: Why does NIXL fail to use LIBFABRIC backend even when `TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC` is set?**
+
+A: The TensorRT-LLM container doesn't include the NIXL LIBFABRIC plugin by default. You need to either:
+
+1. **Rebuild NIXL**: Install libfabric and hwloc first, then rebuild NIXL following the installation instructions above
+2. **Use a pre-compiled plugin**: If you have a compatible `libplugin_LIBFABRIC.so`, set `NIXL_PLUGINS_DIR` to point to its directory
