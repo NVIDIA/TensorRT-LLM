@@ -1390,7 +1390,10 @@ def getImageTags(pipeline, globalVars) {
     }
     def oldTagToNewTagMap = [:]
     oldImageTags.each { key, value ->
-        oldTagToNewTagMap[value] = newImageTags[key]
+        // Only include mappings where the key exists in newImageTags
+        if (newImageTags.containsKey(key)) {
+            oldTagToNewTagMap[value] = newImageTags[key]
+        }
     }
     pipeline.echo("Old to new image tag map:\n" + oldTagToNewTagMap.collect { k, v -> "${k} => ${v}" }.join('\n'))
     return oldTagToNewTagMap
