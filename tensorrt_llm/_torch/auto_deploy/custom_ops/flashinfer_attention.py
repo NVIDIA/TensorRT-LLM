@@ -51,9 +51,6 @@ class _FlashInferPlanner:
     """A class interface to handle flashinfer-related planning/wrapping operations."""
 
     workspace_buffer: Optional[torch.Tensor]
-    paged_kv_indptr_buffer: Optional[torch.Tensor]
-    paged_kv_indices_buffer: Optional[torch.Tensor]
-    paged_kv_last_page_len_buffer: Optional[torch.Tensor]
     prefill_wrapper: Optional[flashinfer.BatchPrefillWithPagedKVCacheWrapper]
     decode_wrapper: Optional[flashinfer.BatchDecodeWithPagedKVCacheWrapper]
     cached_cuda_graph_decode_wrappers: Dict[
@@ -63,9 +60,6 @@ class _FlashInferPlanner:
 
     def __init__(self):
         self.workspace_buffer = None
-        self.paged_kv_indptr_buffer = None
-        self.paged_kv_indices_buffer = None
-        self.paged_kv_last_page_len_buffer = None
         self.prefill_wrapper = None
         self.decode_wrapper = None
         self.cached_cuda_graph_decode_wrappers = {}
@@ -106,15 +100,6 @@ class _FlashInferPlanner:
             self.workspace_buffer,
             "NHD",
             backend="fa2",
-        )
-        self.paged_kv_indptr_buffer = torch.empty(
-            max_batch_size + 1, dtype=torch.int, device=workspace_buffer.device
-        )
-        self.paged_kv_indices_buffer = torch.empty(
-            num_pages, dtype=torch.int, device=workspace_buffer.device
-        )
-        self.paged_kv_last_page_len_buffer = torch.empty(
-            max_batch_size, dtype=torch.int, device=workspace_buffer.device
         )
         self.decode_wrapper = self._init_decode_wrapper()
 
@@ -468,7 +453,6 @@ class FlashInferAttention(AttentionDescriptor):
 
     @classmethod
     def host_prepare_for_forward(cls, sequence_info: SequenceInfo):
-        print("DEBUG: host_prepare_for_forward called for flashinfer attention")
         batch_info = sequence_info._input_buffer.get_host_view("batch_info")
         num_prefill, num_prefill_tokens, num_decode = batch_info.tolist()
         # Call plan for generate-only batches.
