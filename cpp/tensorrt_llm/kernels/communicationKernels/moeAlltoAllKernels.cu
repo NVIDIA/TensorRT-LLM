@@ -653,6 +653,7 @@ __device__ void vectorized_combine_impl(
             // Load directly into the per-k accumulator; reduce across k below
             acc[k].load(recv_buffer + base_token + offset);
         }
+        // Reduce acc[TOP_K] into acc[0]
         if constexpr (TOP_K == 16)
         {
             T* a0 = reinterpret_cast<T*>(&acc[0]);
@@ -737,9 +738,7 @@ __device__ void vectorized_combine_impl(
                 a0[j] += a8[j];
             }
         }
-
-        // Reduce acc[TOP_K] into acc[0]
-        if constexpr (TOP_K == 8)
+        else if constexpr (TOP_K == 8)
         {
             T* a0 = reinterpret_cast<T*>(&acc[0]);
             T* a1 = reinterpret_cast<T*>(&acc[1]);
