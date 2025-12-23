@@ -100,10 +100,21 @@ class Backend:
         example_inputs: List[torch.Tensor],
     ):
         graph = gm.graph
-        for custom_pass in self.custom_passes:
-            self.match_count.append(custom_pass.apply(graph))
+        logger.debug(
+            f"[NCCL_SYMMETRIC] Pattern: optimize() called with {len(self.custom_passes)} custom passes"
+        )
+        for i, custom_pass in enumerate(self.custom_passes):
+            match_count = custom_pass.apply(graph)
+            self.match_count.append(match_count)
+            logger.debug(
+                f"[NCCL_SYMMETRIC] Pattern: Pass {i} applied, matched {match_count} patterns"
+            )
             while self.match_count[-1]:
-                self.match_count.append(custom_pass.apply(graph))
+                match_count = custom_pass.apply(graph)
+                self.match_count.append(match_count)
+                logger.debug(
+                    f"[NCCL_SYMMETRIC] Pattern: Pass {i} re-applied, matched {match_count} more patterns"
+                )
         graph.eliminate_dead_code()
         # After this pass, cannot run any dce!!!
         remove_copy_for_mutates_args(graph)

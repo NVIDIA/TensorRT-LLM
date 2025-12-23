@@ -13,6 +13,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 import torch._dynamo.config
 
+import tensorrt_llm
 import tensorrt_llm.bindings.internal.userbuffers as ub
 from tensorrt_llm._utils import (is_trace_enabled, nvtx_range, release_gc,
                                  torch_dtype_to_str, trace_func)
@@ -34,6 +35,7 @@ from ..attention_backend.utils import get_attention_backend
 from ..attention_backend.vanilla import VanillaAttentionMetadata
 from ..autotuner import AutoTuner, autotune
 from ..compilation.backend import Backend
+from ..compilation.pattern_applier import apply_nccl_symmetric_patterns_to_model
 from ..compilation.utils import capture_piecewise_cuda_graph
 from ..distributed import MPIDist
 from ..distributed.communicator import init_pp_comm
@@ -299,6 +301,28 @@ class PyTorchModelEngine(ModelEngine):
                 torch._dynamo.config.cache_size_limit = 16
             else:
                 set_torch_compiling(False)
+                # Apply NCCL_SYMMETRIC patterns even when torch.compile is disabled
+                # This allows pattern matching to work in the default path
+                if (self.llm_args.allreduce_strategy == "NCCL_SYMMETRIC"
+                        and self.mapping is not None
+                        and tensorrt_llm.mpi_world_size() > 1):
+                    logger.info(
+                        "[NCCL_SYMMETRIC] Applying pattern matching without torch.compile"
+                    )
+                    try:
+                        if isinstance(self.model, DecoderModelForCausalLM):
+                            self.model.model = apply_nccl_symmetric_patterns_to_model(
+                                self.model.model, self.mapping)
+                        else:
+                            self.model = apply_nccl_symmetric_patterns_to_model(
+                                self.model, self.mapping)
+                    except Exception as e:
+                        logger.warning(
+                            f"[NCCL_SYMMETRIC] Failed to apply patterns without torch.compile: {e}. "
+                            "Patterns will not be applied, but model will still work."
+                        )
+                        import traceback
+                        traceback.print_exc()
         except Exception as e:
             import traceback
             traceback.print_exception(Exception, e, e.__traceback__)

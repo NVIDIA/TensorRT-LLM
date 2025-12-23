@@ -762,22 +762,34 @@ def register_nccl_symmetric_patterns(custom_passes: List[PatternMatcherPass],
 
         def extra_check_convert_supported_ar_to_nccl_symmetric(
                 match: Match) -> bool:
-            if not check_f16_bf16_input(match, input_node):
-                return False
+            # No dtype restriction for NCCL_SYMMETRIC - it supports all dtypes (f32, f16, bf16, etc.)
+            # The dtype check is only needed for UB patterns, not NCCL_SYMMETRIC
 
             fusion_value = match.ctx.pattern_to_node[fusion]
             if not isinstance(fusion_value, int):
+                logger.debug(
+                    f"[NCCL_SYMMETRIC] Pattern: extra_check failed: fusion_value is not int, got {type(fusion_value)}"
+                )
                 return False
+            # NCCL_SYMMETRIC supports: RESIDUAL_RMS_NORM and RESIDUAL_RMS_NORM_QUANT_FP8
+            # FP4 (RESIDUAL_RMS_NORM_QUANT_NVFP4) is NOT supported for NCCL_SYMMETRIC
             if fusion_value != int(
                     AllReduceFusionOp.RESIDUAL_RMS_NORM
             ) and fusion_value != int(
-                    AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8
-            ) and fusion_value != int(
-                    AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4):
+                    AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8):
+                logger.debug(
+                    f"[NCCL_SYMMETRIC] Pattern: extra_check failed: fusion_value={fusion_value} not in supported list (FP4 not supported)"
+                )
                 return False
 
+            logger.debug(
+                f"[NCCL_SYMMETRIC] Pattern: extra_check passed: fusion_value={fusion_value}"
+            )
             return True
 
+        logger.debug(
+            "[NCCL_SYMMETRIC] Pattern: Registering replacement for convert_supported_ar_to_nccl_symmetric"
+        )
         register_replacement(
             empty_convert_supported_ar_to_nccl_symmetric,
             target_convert_supported_ar_to_nccl_symmetric,
@@ -995,15 +1007,22 @@ def register_nccl_symmetric_patterns(custom_passes: List[PatternMatcherPass],
             )
 
         register_scaled_mm_prologue(custom_pass)
-        register_nvfp4_gemm_prologue(custom_pass)
+        # FP4 GEMM prologue not supported for NCCL_SYMMETRIC
+        # register_nvfp4_gemm_prologue(custom_pass)
         register_mm_prologue(custom_pass)
         register_add_prologue(custom_pass)
 
+    logger.debug(
+        "[NCCL_SYMMETRIC] Pattern: Registering NCCL_SYMMETRIC patterns")
     custom_passes.append(PatternMatcherPass())
     register_convert_supported_ar_to_nccl_symmetric(custom_passes[-1])
+    logger.debug(
+        "[NCCL_SYMMETRIC] Pattern: Registered initial pattern (convert_supported_ar_to_nccl_symmetric)"
+    )
 
     custom_passes.append(PatternMatcherPass())
     register_nccl_symmetric_prologue_patterns(custom_passes[-1])
+    logger.debug("[NCCL_SYMMETRIC] Pattern: Registered prologue patterns")
 
 
 def register_ar_fusions(custom_passes: List[PatternMatcherPass],
