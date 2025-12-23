@@ -1435,7 +1435,7 @@ def renameDockerImages(oldTagToNewTagMap) {
     }
 }
 
-def updateImageTag(oldTagToNewTagMap) {
+def updateImageTag(oldTagToNewTagMap, globalVars) {
     withCredentials([usernamePassword(credentialsId: GITHUB_CREDENTIALS_ID, usernameVariable: 'GITHUB_USERNAME', passwordVariable: 'GITHUB_PASSWORD')]) {
         // 1. Validate and parse source repo and branch
         def srcRepoAndBranch = globalVars[GITHUB_SOURCE_REPO_AND_BRANCH]
@@ -1550,7 +1550,7 @@ def runRetagImage(pipeline, globalVars)
         }
         oldTagToNewTagMap = getImageTags(pipeline, globalVars)
         renameDockerImages(oldTagToNewTagMap)
-        updateImageTag(oldTagToNewTagMap)
+        updateImageTag(oldTagToNewTagMap, globalVars)
     })
 }
 
