@@ -1397,10 +1397,10 @@ def getImageTags(pipeline, globalVars) {
         error "No GitHub PR API URL found"
     }
     newImageTags = [
-        "LLM_DOCKER_IMAGE" : "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-${pytorch_version}-py3-x86_64-ubuntu24.04-trt${trt_version}-skip-tritondevel-${timestamp}-${pr_id}",
-        "LLM_SBSA_DOCKER_IMAGE" : "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-${pytorch_version}-py3-aarch64-ubuntu24.04-trt${trt_version}-skip-tritondevel-${timestamp}-${pr_id}",
-        "LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE" : "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-${cuda_version}-devel-rocky8-x86_64-rocky8-py310-trt${trt_version}-skip-tritondevel-${timestamp}-${pr_id}",
-        "LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE" : "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-${cuda_version}-devel-rocky8-x86_64-rocky8-py312-trt${trt_version}-skip-tritondevel-${timestamp}-${pr_id}",
+        "LLM_DOCKER_IMAGE" : "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging:pytorch-${pytorch_version}-py3-x86_64-ubuntu24.04-trt${trt_version}-skip-tritondevel-${timestamp}-${pr_id}",
+        "LLM_SBSA_DOCKER_IMAGE" : "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging:pytorch-${pytorch_version}-py3-aarch64-ubuntu24.04-trt${trt_version}-skip-tritondevel-${timestamp}-${pr_id}",
+        "LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE" : "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging:cuda-${cuda_version}-devel-rocky8-x86_64-rocky8-py310-trt${trt_version}-skip-tritondevel-${timestamp}-${pr_id}",
+        "LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE" : "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging:cuda-${cuda_version}-devel-rocky8-x86_64-rocky8-py312-trt${trt_version}-skip-tritondevel-${timestamp}-${pr_id}",
     ]
     pipeline.echo("Generated new image tags:\n" + newImageTags.collect { key, value -> "${key} = ${value}" }.join('\n'))
 
