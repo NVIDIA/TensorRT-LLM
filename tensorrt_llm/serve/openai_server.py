@@ -157,6 +157,8 @@ class OpenAIServer:
         self.tool_call_id_type = "random" # default tool call id type is random
         if self.model_config.model_type == "kimi_k2":
             self.tool_call_id_type = "kimi_k2"
+        elif self.model_config.model_type == "deepseek_v32":
+            self.tool_call_id_type = "deepseek_v32"
 
         # as disagg-worker
         self.disagg_cluster_storage = None
