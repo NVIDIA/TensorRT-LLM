@@ -82,7 +82,7 @@ __global__ void llama4_moe_fc13_swiglu_fp8_kernel(int num_tokens,
 
     // Logits depends on the previous kernel, so we cannot prefetch anything.
 #if ENABLE_ACQBULK
-    asm volatile("griddepcontrol.wait;" ::: "memory");
+    cudaGridDependencySynchronize();
 #endif
 
     // Perform top1 within the current thread, which processes 4 experts.
@@ -242,7 +242,7 @@ __global__ void llama4_moe_fc2_fp8_kernel(int num_tokens,
     scaling_factors_shared[tid] = scaling_factors[tid];
 
 #if ENABLE_ACQBULK
-    asm volatile("griddepcontrol.wait;" ::: "memory");
+    cudaGridDependencySynchronize();
 #endif
 
     // Select the corresponding expert weight.
