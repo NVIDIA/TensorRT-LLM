@@ -219,7 +219,10 @@ class JobManager:
 
             # Call submit.py with the temporary config file
             submit_script = os.path.join(EnvManager.get_script_dir(), "submit.py")
-            cmd = ["python3", submit_script, "-c", temp_config_path]
+           
+            case_log_dir = JobManager.get_result_dir(test_config)
+
+            cmd = ["python3", submit_script, "-c", temp_config_path, "--log-dir", case_log_dir]
 
             logger.info(f"Command: {' '.join(cmd)}")
 
@@ -265,55 +268,49 @@ class JobManager:
         Args:
             job_id: SLURM job ID
             test_config: TestConfig object
-            result_dir: Result directory path
+            result_dir: Result directory path (already named as test_id)
             is_passed: Whether the job passed
         Returns:
-            backup_dir path if successful, None otherwise
+            Final directory path if successful, None otherwise
         """
         if not os.path.exists(result_dir):
             logger.warning(f"Result directory does not exist yet: {result_dir}")
             return None
 
-        # Replace colons with hyphens for safe directory naming
-        dst_dir_name = test_config.test_id.replace(":", "-")
-        # Add ERROR suffix if the job failed
-        if not is_passed:
-            dst_dir_name = f"{dst_dir_name}_ERROR"
-        backup_dir = os.path.join(os.path.dirname(result_dir), dst_dir_name)
-
         try:
-            logger.info("Copying result directory to backup...")
-            logger.info(f"Source: {result_dir}")
-            logger.info(f"Destination: {backup_dir}")
-
-            # Remove old backup if it exists
-            if os.path.exists(backup_dir):
-                logger.warning("Backup directory already exists, removing old backup")
-                shutil.rmtree(backup_dir)
-
-            # Copy result directory
-            shutil.copytree(result_dir, backup_dir)
-            logger.success(f"Backup created successfully: {backup_dir}")
-
-            # Move temporary config file to backup directory (not copy)
+            final_dir = result_dir
+            
+            # For FAILED cases, rename directory to add _ERROR suffix
+            if not is_passed:
+                error_dir = f"{result_dir}_ERROR"
+                logger.info(f"Renaming failed case directory: {result_dir} -> {error_dir}")
+                
+                # Remove old error directory if exists
+                if os.path.exists(error_dir):
+                    logger.warning(f"Removing existing error directory: {error_dir}")
+                    shutil.rmtree(error_dir)
+                
+                # Rename to add _ERROR suffix
+                shutil.move(result_dir, error_dir)
+                final_dir = error_dir
+                logger.success(f"Directory renamed to: {final_dir}")
+            
+            # Copy temporary config file to the directory
             temp_config_path = test_config.temp_config_path
             if os.path.exists(temp_config_path):
-                dest_path = os.path.join(backup_dir, os.path.basename(temp_config_path))
-                shutil.move(temp_config_path, dest_path)
-                logger.success(f"Temporary config moved to backup: {dest_path}")
+                dest_path = os.path.join(final_dir, os.path.basename(temp_config_path))
+                shutil.copy(temp_config_path, dest_path)
+                logger.success(f"Temporary config copied to: {dest_path}")
+                # Clean up the original temp config file
+                os.remove(temp_config_path)
+                logger.info(f"Cleaned up temporary config: {temp_config_path}")
             else:
-                # Fallback: copy original config if no temp file (backward compatibility)
-                case_config_path = test_config.config_path
-                if os.path.exists(case_config_path):
-                    shutil.copy(case_config_path, backup_dir)
-                    logger.success(f"Case config copied successfully: {case_config_path}")
-                else:
-                    logger.warning(f"Case config not found: {case_config_path}")
+                logger.warning(f"Temporary config not found: {temp_config_path}")
 
-            return backup_dir
+            return final_dir
 
         except Exception as e:
-            logger.warning(f"Failed to create backup copy: {e}")
+            logger.warning(f"Failed to backup logs: {e}")
             # Try to clean up temporary file on backup failure
             temp_config_path = test_config.temp_config_path
             if os.path.exists(temp_config_path):
@@ -325,26 +322,6 @@ class JobManager:
             return None
 
     @staticmethod
-    def cleanup_result_dir(result_dir: str) -> bool:
-        """Clean up result directory.
-
-        Args:
-            result_dir: Result directory path
-
-        Returns:
-            True if successful, False otherwise
-        """
-        if os.path.exists(result_dir):
-            try:
-                shutil.rmtree(result_dir)
-                logger.success(f"Result directory removed: {result_dir}")
-                return True
-            except Exception as e:
-                logger.warning(f"Failed to remove result directory: {e}")
-                return False
-        return True
-
-    @staticmethod
     def get_result_dir(test_config) -> str:
         """Get result directory.
 
@@ -354,16 +331,10 @@ class JobManager:
         Returns:
             Result directory path
         """
-        config_data = test_config.config_data
-        fields = extract_config_fields(config_data)
-
-        # Extract fields for logging and result directory
-        log_base = fields["log_base"]
-        context_dir = fields["context_dir"]
-        log_dir_name = log_base
-
-        result_dir = os.path.join(EnvManager.get_script_dir(), log_dir_name, context_dir)
-        return result_dir
+        # Use the same path as in submit_job: {output_path}/slurm_logs/{test_id}
+        log_dir = os.path.join(EnvManager.get_output_path(), "slurm_logs")
+        case_log_dir = os.path.join(log_dir, test_config.test_id.replace(":", "-"))
+        return case_log_dir
 
     @staticmethod
     def check_result(
@@ -413,16 +384,6 @@ class JobManager:
         except Exception as e:
             logger.error(f"Exception during result checking: {e}")
             check_result["error"] = f"Exception during result checking: {str(e)}"
-
-        # Clean up result directory
-        if EnvManager.get_debug_mode():
-            logger.debug(f"Debug mode: Skipping result directory cleanup: {result_dir}")
-        else:
-            try:
-                JobManager.cleanup_result_dir(result_dir)
-            except Exception as e:
-                logger.warning(f"Failed to cleanup result directory: {e}")
-
         return check_result
 
     @staticmethod
