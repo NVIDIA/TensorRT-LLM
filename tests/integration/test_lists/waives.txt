@@ -485,3 +485,5 @@ triton_server/test_triton.py::test_gpt_speculative_decoding[gpt-speculative-deco
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B_Instruct_RocketKV::test_auto_dtype SKIP (https://nvbugs/5762822)
 accuracy/test_llm_api_pytorch.py::TestMistralLarge3_675B::test_nvfp4_4gpus[latency_moe_trtllm] SKIP (https://nvbugs/5762852)
 accuracy/test_llm_api_pytorch.py::TestMistralLarge3_675B::test_nvfp4_4gpus[latency_moe_trtllm_eagle] SKIP (https://nvbugs/5762852)
+unittest/executor/test_rpc_proxy.py SKIP (https://nvbugs/5605741)
+unittest/executor/test_rpc_worker.py SKIP (https://nvbugs/5605741)
