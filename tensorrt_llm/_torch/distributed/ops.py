@@ -370,7 +370,7 @@ class HelixAllToAllNative:
     Manager for Helix All-to-All operations with MNNVL workspace management.
 
     Exchanges data along the cp_size dimension:
-    - partial_0: [..., cp_size, kv_lora_rank] half-precision
+    - partial_o: [..., cp_size, kv_lora_rank] half-precision
     - softmax_stats: [..., cp_size, 2] float32
     """
 
@@ -420,27 +420,27 @@ class HelixAllToAllNative:
 
         return HelixAllToAllNative._cache[mapping]
 
-    def alltoall_native(self, partial_0: torch.Tensor,
+    def alltoall_native(self, partial_o: torch.Tensor,
                         softmax_stats: torch.Tensor):
         """
         Perform all-to-all data exchange.
 
         Args:
-            partial_0: Tensor with shape [..., cp_size, kv_lora_rank], dtype half.
+            partial_o: Tensor with shape [..., cp_size, kv_lora_rank], dtype half.
             softmax_stats: Tensor with shape [..., cp_size, 2], dtype float32.
 
         Returns:
-            Tuple of (partial_0_out, softmax_stats_out) with same shapes as inputs.
+            Tuple of (partial_o_out, softmax_stats_out) with same shapes as inputs.
         """
-        partial_0_out, softmax_stats_out = torch.ops.trtllm.alltoall_helix_native(
-            partial_0,
+        partial_o_out, softmax_stats_out = torch.ops.trtllm.alltoall_helix_native(
+            partial_o,
             softmax_stats,
             self.workspace_tensor,
             self.mapping.cp_rank,
             self.mapping.cp_size,
         )
 
-        return partial_0_out, softmax_stats_out
+        return partial_o_out, softmax_stats_out
 
 
 def reducescatter(
