@@ -235,6 +235,27 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
                     imagePullPolicy: Always"""
         nodeLabelPrefix = "cpu"
         break
+    case "build":
+        // Use a customized docker:dind image with essential dependencies
+        containerConfig = """
+                  - name: docker
+                    image: urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:202505221445_docker_dind_withbash
+                    tty: true
+                    resources:
+                      requests:
+                        cpu: 16
+                        memory: 72Gi
+                        ephemeral-storage: 200Gi
+                      limits:
+                        cpu: 16
+                        memory: 256Gi
+                        ephemeral-storage: 200Gi
+                    imagePullPolicy: Always
+                    securityContext:
+                      privileged: true
+                      capabilities:
+                        add:
+                        - SYS_ADMIN"""
     case "package":
         containerConfig = """
                   - name: trt-llm
@@ -1517,7 +1538,7 @@ def updateImageTag(oldTagToNewTagMap) {
 
 def runRetagImage(pipeline, globalVars)
 {
-    collectResultPodSpec = createKubernetesPodConfig("", "agent")
+    collectResultPodSpec = createKubernetesPodConfig("", "build")
     trtllm_utils.launchKubernetesPod(pipeline, collectResultPodSpec, "alpine", {
         oldTagToNewTagMap = getImageTags(pipeline, globalVars)
         renameDockerImages(oldTagToNewTagMap)
