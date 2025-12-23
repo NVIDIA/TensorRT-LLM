@@ -1058,12 +1058,31 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     """.replaceAll("(?m)^\\s*", "")
                 }
 
+                // Define environment variables to export
+                def envVarNames = [
+                    'OPEN_SEARCH_DB_BASE_URL',
+                    'OPEN_SEARCH_DB_CREDENTIALS',
+                    'BUILD_ID',
+                    'BUILD_URL',
+                    'JOB_NAME',
+                    'globalVars',
+                    'gitlabCommit'
+                ]
+                def envVarsToExport = [:]
+                envVarNames.each { varName ->
+                    envVarsToExport[varName] = env."${varName}"
+                }
+
                 srunArgs = [
+                    "--container-name=multi_node_test-\${SLURM_JOB_ID}",
                     "--container-image=$containerImageArg",
                     "--container-workdir=/home/svc_tensorrt/bloom/scripts",
                     "--container-mounts=$mounts",
                     "--container-env=NVIDIA_IMEX_CHANNELS"
                 ]
+                envVarsToExport.each { varName, varValue ->
+                    srunArgs.add("--container-env=${varName}")
+                }
                 if(nodeCount > 1) {
                     srunArgs.add("--mpi=pmi2")
                 }
@@ -1072,6 +1091,17 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 if (cluster.host.contains("oci-nrt") || cluster.host.contains("oci-hsg") || cluster.host.contains("lbd-lax")) {
                     exemptionComment = """--comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"90","reason":"other","description":"Long data and model loading time and disaggregated serving tests"}}'"""
                 }
+
+                def envExportStatements = envVarsToExport.collect { varName, varValue ->
+                    def escapedValue = varValue?.toString() ?: ''
+                    escapedValue = escapedValue
+                        .replace('\\', '\\\\')    // Backslash
+                        .replace('"', '\\"')      // Double quote
+                        .replace('$', '\\$')      // Dollar sign (prevent variable expansion)
+                        .replace('`', '\\`')      // Backtick (prevent command substitution)
+                    "export ${varName}=\"${escapedValue}\""
+                }.join('\n')
+
                 def scriptContent = """#!/bin/bash
                     #SBATCH ${exemptionComment} --output=${outputPath}
                     ${taskArgs.collect { "#SBATCH $it" }.join('\n')}
@@ -1092,6 +1122,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export coverageConfigFile="$coverageConfigFile"
                     export NVIDIA_IMEX_CHANNELS=\${NVIDIA_IMEX_CHANNELS:-0}
                     export NVIDIA_VISIBLE_DEVICES=\${NVIDIA_VISIBLE_DEVICES:-\$(seq -s, 0 \$((\$(nvidia-smi --query-gpu=count -i 0 --format=noheader)-1)))}
+                    ${envExportStatements}
 
                     echo "Env NVIDIA_IMEX_CHANNELS: \$NVIDIA_IMEX_CHANNELS"
                     echo "Env NVIDIA_VISIBLE_DEVICES: \$NVIDIA_VISIBLE_DEVICES"

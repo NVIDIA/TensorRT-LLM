@@ -54,7 +54,7 @@ class WatchEventQueue:
         loop = asyncio.get_event_loop()
         for event in events:
             self.events.put_nowait(event)
-        loop._write_to_self()
+        loop.call_soon_threadsafe(lambda: None)
 
 
 class ClusterStorage(abc.ABC):
@@ -268,7 +268,7 @@ class HttpClusterStorageServer(ClusterStorage):
                 logger.info(
                     f"Notifying watch event for watch key {watch_key} with type {event_type}"
                 )
-            loop._write_to_self()
+            loop.call_soon_threadsafe(lambda: None)
         logger.info(
             f"Notified watch event for key {key} with type {event_type}")
 
@@ -426,7 +426,7 @@ class Etcd3WatchEventQueue(WatchEventQueue):
                         event_type=event_type,
                     ))
             if self.events._loop:
-                self.events._loop._write_to_self()
+                self.events._loop.call_soon_threadsafe(lambda: None)
         except Exception as e:
             logger.error(f"Error adding event: {e}")
             self.cancel_event()
