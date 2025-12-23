@@ -275,12 +275,24 @@ def submit_job(config, log_dir, dry_run):
     start_server_cmds = []
     # Generate start worker commands with placeholder hostnames
     for server_type in allocations.keys():
+        if server_type == "GEN":
+            profile_range = profiling_config['gen_profile_range']
+            config_path = gen_config_path
+        if server_type == "CTX":
+            profile_range = profiling_config['ctx_profile_range']
+            config_path = ctx_config_path
         for server_id in allocations[server_type].keys():
             allocation = allocations[server_type][server_id]
+            cur_worker_env_var = worker_env_var
+            if profiling_config['nsys_on']:
+                cur_worker_env_var += " TLLM_PROFILE_RECORD_GC=1"
+                cur_worker_env_var += " TLLM_NVTX_DEBUG=1"
+                cur_worker_env_var += " NSYS_MPI_STORE_TEAMS_PER_RANK=1"
+                cur_worker_env_var += f" TLLM_PROFILE_START_STOP={profile_range}"
             cuda_devices = ",".join([
                 str(device) for device in list(allocation["nodes"].values())[0]
             ])
-            cur_worker_env_var = worker_env_var + f" CUDA_VISIBLE_DEVICES={cuda_devices}"
+            cur_worker_env_var += f" CUDA_VISIBLE_DEVICES={cuda_devices}"
             cmd = [
                 "srun -l",
                 f"--nodelist {','.join(allocation['nodes'].keys())}",
@@ -299,9 +311,7 @@ def submit_job(config, log_dir, dry_run):
                 str(slurm_config['numa_bind']).lower(),
                 log_dir,
                 str(profiling_config['nsys_on']).lower(),
-                f"'{profiling_config['gen_profile_range']}'" if server_type
-                == "GEN" else f"'{profiling_config['ctx_profile_range']}'",
-                gen_config_path if server_type == "GEN" else ctx_config_path,
+                config_path,
                 f"'{cur_worker_env_var}'",
                 f"&> {log_dir}/3_output_{server_type}_{server_id}.log &",
             ]
