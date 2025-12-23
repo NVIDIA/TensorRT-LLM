@@ -76,16 +76,52 @@ def apply_nccl_symmetric_patterns_to_model(model: nn.Module, mapping: Mapping) -
             for i, node in enumerate(allreduce_nodes):
                 # Extract strategy from args (it's typically the 7th positional arg)
                 strategy_val = None
+                fusion_val = None
                 if len(node.args) > 7:
                     strategy_val = node.args[7]
                 elif "strategy" in node.kwargs:
                     strategy_val = node.kwargs["strategy"]
 
+                if len(node.args) > 8:
+                    fusion_val = node.args[8]
+                elif "op" in node.kwargs:
+                    fusion_val = node.kwargs["op"]
+                elif "fusion_op" in node.kwargs:
+                    fusion_val = node.kwargs["fusion_op"]
+
+                # Try to get schema to understand parameter names
+                schema_info = "N/A"
+                try:
+                    if hasattr(node.target, "_schemas") and node.target._schemas:
+                        schema = next(iter(node.target._schemas.values()))
+                        schema_info = f"schema_args={[arg.name for arg in schema.arguments]}"
+                    elif hasattr(node.target, "_schema"):
+                        schema_info = (
+                            f"schema_args={[arg.name for arg in node.target._schema.arguments]}"
+                        )
+                except Exception:
+                    pass
+
                 logger.debug(
                     f"[NCCL_SYMMETRIC] PatternOnlyBackend: AllReduce node {i}: "
                     f"target={node.target}, args={len(node.args)}, "
-                    f"strategy={strategy_val} (type={type(strategy_val)})"
+                    f"strategy={strategy_val} (type={type(strategy_val)}), "
+                    f"fusion_op={fusion_val} (type={type(fusion_val)}), "
+                    f"kwargs={node.kwargs}, {schema_info}"
                 )
+                # Log first few args to understand structure
+                if len(node.args) > 0:
+                    args_slice = node.args[0:5] if len(node.args) >= 5 else node.args
+                    logger.debug(
+                        f"[NCCL_SYMMETRIC] PatternOnlyBackend: AllReduce node {i} "
+                        f"args[0:5]={args_slice}"
+                    )
+                elif node.kwargs:
+                    kwarg_keys = list(node.kwargs.keys())
+                    logger.debug(
+                        f"[NCCL_SYMMETRIC] PatternOnlyBackend: AllReduce node {i} "
+                        f"using keyword args: {kwarg_keys}"
+                    )
 
             # Use the existing optimize() method which already handles:
             # - recover_pass()

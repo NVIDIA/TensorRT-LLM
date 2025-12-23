@@ -724,12 +724,14 @@ def register_nccl_symmetric_patterns(custom_passes: List[PatternMatcherPass],
             custom_pass: PatternMatcherPass):
         strategy = int(AllReduceStrategy.NCCL_SYMMETRIC)
         input_node = KeywordArg('input')
-        fusion = KeywordArg('fusion_op')
+        # Use actual schema parameter names for matching: 'residual', 'norm_weight', 'op'
+        # But keep 'residual_in', 'gamma', 'fusion_op' in function signatures for clarity
+        fusion = KeywordArg('op')  # Schema uses 'op', not 'fusion_op'
         trtllm_allreduce_default = CallFunction(
             torch.ops.trtllm.allreduce.default, input_node,
-            KeywordArg('residual_in'), KeywordArg('gamma'), KeywordArg('scale'),
-            None, Ignored(), mapping.tp_group, strategy, fusion,
-            KeywordArg('eps'), Ignored())
+            KeywordArg('residual'), KeywordArg('norm_weight'),
+            KeywordArg('scale'), None, Ignored(), mapping.tp_group, strategy,
+            fusion, KeywordArg('eps'), Ignored())
 
         def empty_convert_supported_ar_to_nccl_symmetric(
             input: torch.Tensor,
@@ -765,7 +767,23 @@ def register_nccl_symmetric_patterns(custom_passes: List[PatternMatcherPass],
             # No dtype restriction for NCCL_SYMMETRIC - it supports all dtypes (f32, f16, bf16, etc.)
             # The dtype check is only needed for UB patterns, not NCCL_SYMMETRIC
 
-            fusion_value = match.ctx.pattern_to_node[fusion]
+            logger.debug(
+                "[NCCL_SYMMETRIC] Pattern: extra_check called - pattern matched! "
+                f"pattern_to_node keys: {list(match.ctx.pattern_to_node.keys())}"
+            )
+
+            try:
+                fusion_value = match.ctx.pattern_to_node[fusion]
+                logger.debug(
+                    f"[NCCL_SYMMETRIC] Pattern: extra_check extracted fusion_value={fusion_value} (type={type(fusion_value)})"
+                )
+            except KeyError as e:
+                logger.debug(
+                    f"[NCCL_SYMMETRIC] Pattern: extra_check failed: fusion (op) not found in pattern_to_node: {e}, "
+                    f"pattern_to_node keys: {list(match.ctx.pattern_to_node.keys())}"
+                )
+                return False
+
             if not isinstance(fusion_value, int):
                 logger.debug(
                     f"[NCCL_SYMMETRIC] Pattern: extra_check failed: fusion_value is not int, got {type(fusion_value)}"
