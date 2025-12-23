@@ -595,7 +595,7 @@ class FlashInferAttention(AttentionDescriptor):
             # NOTE (lucaslie): avoid OOM for many cudagraphs,
             # see https://github.com/NVIDIA/TensorRT-LLM/pull/3686
             buffer = torch.empty(320 * 1024 * 1024, dtype=torch.uint8, device=si.device)
-            cls._get_planner().init_workspace(buffer, si.max_batch_size, si.num_pages)
+            cls._get_planner().init_workspace(buffer)
             return buffer
 
         return {"workspace_buffer": _init_workspace}
