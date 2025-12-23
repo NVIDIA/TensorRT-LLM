@@ -1513,16 +1513,7 @@ class PyExecutor:
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
 
-                while self.control_queue.qsize() > 0:
-                    request = self.control_queue.get_nowait()
-                    if request is not None:
-                        if isinstance(request, TruncateKVCacheRequest):
-                            self.kv_cache_manager.truncate_blocks(
-                                request.messages,
-                                len(request.messages_to_retain))
-                        else:
-                            raise ValueError(
-                                f"Invalid request type: {type(request)}.")
+                self._sync_and_process_control_queue()
 
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
                 self._handle_control_request()
@@ -1671,6 +1662,35 @@ class PyExecutor:
             self.control_action_done.wait()
             self.control_action_done.clear()
 
+    def _sync_and_process_control_queue(self):
+        """
+        Synchronizes and processes control queue items across all ranks.
+
+        This method ensures that control queue items (like TruncateKVCacheRequest)
+        are broadcast from rank 0 to all other ranks, so that all ranks execute
+        the same control operations for consistency (e.g., KV cache truncation).
+        """
+        # Rank 0 collects items from the control queue
+        if self.dist.rank == 0:
+            control_requests = []
+            while self.control_queue.qsize() > 0:
+                request = self.control_queue.get_nowait()
+                if request is not None:
+                    control_requests.append(request)
+        else:
+            control_requests = None
+
+        # Broadcast control requests to all ranks
+        control_requests = self.dist.broadcast(control_requests, root=0)
+
+        # All ranks process the control requests
+        for request in control_requests:
+            if isinstance(request, TruncateKVCacheRequest):
+                self.kv_cache_manager.truncate_blocks(
+                    request.messages, len(request.messages_to_retain))
+            else:
+                raise ValueError(f"Invalid request type: {type(request)}.")
+
     @contextmanager
     def control_action(self):
         """
@@ -1714,16 +1734,7 @@ class PyExecutor:
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
 
-                while self.control_queue.qsize() > 0:
-                    request = self.control_queue.get_nowait()
-                    if request is not None:
-                        if isinstance(request, TruncateKVCacheRequest):
-                            self.kv_cache_manager.truncate_blocks(
-                                request.messages,
-                                len(request.messages_to_retain))
-                        else:
-                            raise ValueError(
-                                f"Invalid request type: {type(request)}.")
+                self._sync_and_process_control_queue()
 
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
                 self._handle_control_request()
