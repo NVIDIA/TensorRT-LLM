@@ -202,7 +202,7 @@ TEST_P(AgentCommTest, AgentConnectionManagerConnect)
     agentConnection0->sendRequestAndBufferInfo(sendRequestInfo, cacheBufferIds, validConnectionIdx);
 
     tensorrt_llm::batch_manager::RequestInfo recvRequestInfo;
-    auto connection1 = connectionManager1->recvConnectionAndRequestInfo(recvRequestInfo);
+    auto connection1 = connectionManager1->recvConnectionAndRequestInfo(recvRequestInfo, std::atomic<bool>(false));
     ASSERT_EQ(recvRequestInfo.getRequestId(), requestId);
 
     auto sendBuffer = mTransBufferManager->getSendBuffer(cacheBufferIds[0].value());
