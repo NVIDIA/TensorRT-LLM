@@ -1,3 +1,5 @@
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 import yaml
 
@@ -158,22 +160,27 @@ def test_get_server_configs_dict():
 
 
 # test get_global_disagg_request_id
-@pytest.mark.parametrize("monotonic", [True, False])
-def test_get_global_disagg_request_id(monotonic):
-    node_ids = [0, 1, 2]
-    all_node_ids = [[] for _ in range(len(node_ids))]
+@pytest.mark.parametrize("multithread", [True, False],
+                         ids=["multithread", "singlethread"])
+def test_get_global_disagg_request_id(multithread):
     iter = 10000
-    for i in range(iter):
-        for node_id in node_ids:
-            all_node_ids[node_id].append(
-                get_global_disagg_request_id(node_id, monotonic=monotonic))
 
-    def issorted(l):
-        return all(l[i] < l[i + 1] for i in range(len(l) - 1))
+    def get_ids(node_ids):
+        all_node_ids = [[] for _ in range(len(node_ids))]
+        for i in range(iter):
+            for i, node_id in enumerate(node_ids):
+                all_node_ids[i].append(get_global_disagg_request_id(node_id))
+        return all_node_ids
 
-    for node_id in node_ids:
-        ids = all_node_ids[node_id]
-        assert not monotonic or issorted(ids)
+    node_ids = list(range(10))
+    if multithread:
+        with ThreadPoolExecutor(max_workers=len(node_ids)) as executor:
+            all_node_ids = [
+                ids[0] for ids in executor.map(get_ids, [[i] for i in node_ids])
+            ]
+    else:
+        all_node_ids = get_ids(node_ids)
+
     all_ids = set(i for ids in all_node_ids for i in ids)
     assert len(all_ids) == iter * len(node_ids)
     assert all(id >= MIN_GLOBAL_ID and id < ((1 << 63) - 1) for id in all_ids)
