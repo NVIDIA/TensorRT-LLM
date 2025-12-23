@@ -224,6 +224,7 @@ def flashinfer_mha_with_cache(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    custom_mask: Optional[torch.Tensor],
     # STANDARD METADATA
     batch_info: torch.Tensor,
     cu_seqlen: torch.Tensor,
@@ -244,10 +245,6 @@ def flashinfer_mha_with_cache(
     v_scale: float,
     window_left: int,  # FlashInfer inclusive sliding window (use -1 to disable)
     logits_soft_cap: float,  # FlashInfer logits softcap (use 0.0 to disable)
-    # VLM CUSTOM MASK (optional, for Gemma3 etc.)
-    # Contains bidirectional attention for image tokens. Sliding window is
-    # handled separately by the window_left parameter.
-    custom_mask: Optional[torch.Tensor],
 ) -> torch.Tensor:
     # reshape to standard [b*s, n_heads, head_dim] layout
     head_dim = k_cache.shape[-1]

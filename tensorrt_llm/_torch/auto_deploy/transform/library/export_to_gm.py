@@ -192,6 +192,11 @@ class ExportToGM(BaseTransform):
             # torch.export can get confused by keyword arguments that are not explicitly defined in
             # the signature but are captured through generic **kwargs. By overwriting the signature,
             # we ensure each argument is explicitly defined in the signature.
+
+            # Create callback to call post_export while patches are still active
+            def _post_export_cb(exported_gm):
+                e_info.post_export(sub_mod, exported_gm)
+
             with set_exact_signature(sub_mod, captured_kwargs):
                 sub_gm = torch_export_to_gm(
                     sub_mod,
@@ -201,6 +206,7 @@ class ExportToGM(BaseTransform):
                     clone=self.config.clone_state_dict,
                     strict=self.config.strict,
                     patch_list=self.config.patch_list,
+                    post_export_callback=_post_export_cb,
                 )
 
             # Ensure runtime calls from HF into this exported GraphModule do not fail due to

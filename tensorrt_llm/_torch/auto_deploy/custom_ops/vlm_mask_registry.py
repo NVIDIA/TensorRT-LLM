@@ -128,3 +128,8 @@ class VlmMaskGeneratorRegistry:
             True if a generator is registered, False otherwise.
         """
         return model_type in cls._registry
+
+    @classmethod
+    def registered_model_types(cls) -> list:
+        """Return a list of all registered model types."""
+        return list(cls._registry.keys())

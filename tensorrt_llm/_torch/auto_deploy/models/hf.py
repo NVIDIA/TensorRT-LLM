@@ -560,6 +560,14 @@ class _StateDictParamNameConverter:
 class TextModelExportInfo(SubModuleExportInfo):
     """An export configuration for the text model portion of a VLM."""
 
+    def post_export(self, sub_mod: nn.Module, sub_gm: GraphModule):
+        """Called after export but BEFORE patches are reverted.
+
+        Sets VLM metadata on the GraphModule while patches are still active,
+        so we can read _vlm_input_names from the module class.
+        """
+        self._set_vlm_metadata(sub_mod, sub_gm)
+
     def post_process(self, sub_mod: nn.Module, sub_gm: GraphModule):
         """Post-process the subgraph module and make sure the embedding remains available."""
         # make sure get_input_embeddings function is available in the graph module
@@ -587,10 +595,6 @@ class TextModelExportInfo(SubModuleExportInfo):
         sub_gm.graph.call_function(
             torch._assert, args=(n_embed_tokens, "Avoid embedding getting deleted from graph.")
         )
-
-        # Set VLM metadata on the GraphModule for runtime use.
-        # This is read by ADExecutor to determine which inputs to inject from multimodal_data.
-        self._set_vlm_metadata(sub_mod, sub_gm)
 
     def _set_vlm_metadata(self, sub_mod: nn.Module, sub_gm: GraphModule):
         """Set VLM-related metadata on the GraphModule.

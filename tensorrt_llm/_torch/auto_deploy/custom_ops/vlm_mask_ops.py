@@ -57,8 +57,10 @@ def create_attention_mask(
     # Dispatch to model-specific generator
     generator = VlmMaskGeneratorRegistry.get(model_type)
     if generator is None:
-        # No model-specific generator - return empty mask (no custom masking)
-        return torch.empty(0, dtype=torch.bool, device=token_info.device)
+        raise ValueError(
+            f"No model-specific generator found for model type: {model_type}. \
+        Registered model types: {VlmMaskGeneratorRegistry.registered_model_types()}."
+        )
 
     return generator(token_info, qo_indptr, seq_len, sliding_window)
 
@@ -163,7 +165,7 @@ def _gemma3_mask_impl(
     return torch.cat(masks).contiguous()
 
 
-@VlmMaskGeneratorRegistry.register("gemma3")
+@VlmMaskGeneratorRegistry.register("gemma3_text")
 def generate_gemma3_vlm_mask(
     image_token_mask: Tensor,
     qo_indptr: Tensor,

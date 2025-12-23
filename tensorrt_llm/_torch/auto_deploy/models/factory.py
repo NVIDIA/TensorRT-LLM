@@ -67,9 +67,24 @@ class SubModuleExportInfo:
         """Initialize the lookup for the dynamic shapes of keyword arguments."""
         raise NotImplementedError("Subclasses must implement this method.")
 
+    def post_export(self, sub_mod: nn.Module, sub_gm: GraphModule):
+        """Called after export but BEFORE patches are reverted.
+
+        Args:
+            sub_mod: The submodule from which the graph was captured+exported.
+            sub_gm: The graph module that was exported.
+
+        This method is called while export patches are still active, allowing access to
+        patch-set metadata on the module (e.g., _vlm_input_names). Override this method
+        to set metadata on the GraphModule that depends on patch state.
+
+        Default implementation does nothing.
+        """
+        pass
+
     @abstractmethod
     def post_process(self, sub_mod: nn.Module, sub_gm: GraphModule):
-        """Post-process the subgraph module.
+        """Post-process the subgraph module AFTER patches are reverted.
 
         Args:
             sub_mod: The submodule from which the graph was captured+exported.

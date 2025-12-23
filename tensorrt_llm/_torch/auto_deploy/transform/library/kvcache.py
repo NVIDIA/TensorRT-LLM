@@ -171,18 +171,18 @@ class InsertCachedAttention(BaseTransform):
 
         self._vlm_custom_mask_node = custom_mask_node
 
-    def _maybe_append_flashinfer_vlm_custom_mask(self, cached_attn_op, args: Tuple) -> Tuple:
-        """Append FlashInfer VLM custom mask arg (or None) to `args`.
+    def _get_vlm_custom_mask_node(self, cached_attn_op) -> Optional[Node]:
+        """Get the VLM custom mask node for FlashInfer attention ops.
 
         All layers receive the same mask - it provides bidirectional attention
         for image tokens. Sliding window is handled separately by window_left.
+
+        Returns:
+            The custom mask node, or None if not a FlashInfer op or no VLM.
         """
         if not self._is_flashinfer_cached_attn_op(cached_attn_op):
-            return args
-
-        # Append the custom mask node (or None if no VLM)
-        custom_mask = getattr(self, "_vlm_custom_mask_node", None)
-        return (*args, custom_mask)
+            return None
+        return getattr(self, "_vlm_custom_mask_node", None)
 
     def _process_metadata_extra(
         self, gm: GraphModule, cm: CachedSequenceInterface, any_source_attn_node: Node
@@ -226,18 +226,16 @@ class InsertCachedAttention(BaseTransform):
         """Insert a cached attention node into the graph."""
         with gm.graph.inserting_before(attn_node):
             cached_attn_op = self.attn_descriptor.get_cached_attention_op()
+            custom_mask_node = self._get_vlm_custom_mask_node(cached_attn_op)
             args = (
                 *qkv_nodes,
+                custom_mask_node,
                 *meta_nodes_std,
                 *meta_nodes_extra,
                 *cache_nodes,
                 *buffer_nodes,
                 *constants,
             )
-            # FlashInfer cached attention op optionally accepts a custom mask arg for VLM.
-            # The mask provides bidirectional attention for image tokens. Sliding window
-            # is handled separately by FlashInfer's window_left parameter.
-            args = self._maybe_append_flashinfer_vlm_custom_mask(cached_attn_op, args)
             cached_attn_node = gm.graph.call_function(
                 cached_attn_op,
                 args=args,

@@ -773,7 +773,6 @@ def _configure_vlm_mask_settings(engine: ADEngine, ad_config: LlmArgs) -> None:
     # Store on engine for external access
     engine._vlm_inputs = vlm_inputs
     engine._vlm_model_type = vlm_model_type
-
     # Detect if the model is a VLM that expects custom masks
     # This is relevant for FlashInfer backend with VLM models
     engine._expects_vlm_custom_masks = (
