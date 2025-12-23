@@ -3295,6 +3295,37 @@ class TestQwen2_7BInstruct(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
 
+class TestQwen3_4B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "Qwen3/Qwen3-4B"
+
+    def test_eagle3(self):
+        "RCCA: https://nvbugspro.nvidia.com/bug/5698434"
+        pytorch_config = dict(
+            disable_overlap_scheduler=True,
+            cuda_graph_config=CudaGraphConfig(),
+        )
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=False,
+            free_gpu_memory_fraction=0.6,
+        )
+
+        eagle_model_dir = f"{llm_models_root()}/Qwen3/Qwen3-4B_eagle3/"
+        target_model_dir = f"{llm_models_root()}/Qwen3/Qwen3-4B"
+
+        draft_len = 3
+        spec_config = EagleDecodingConfig(max_draft_len=draft_len,
+                                          speculative_model_dir=eagle_model_dir)
+
+        llm = LLM(model=target_model_dir,
+                  **pytorch_config,
+                  kv_cache_config=kv_cache_config,
+                  speculative_config=spec_config)
+
+        with llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
 class TestQwen3_8B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen3/Qwen3-8B"
 
