@@ -58,6 +58,35 @@ def apply_nccl_symmetric_patterns_to_model(model: nn.Module, mapping: Mapping) -
             This reuses the exact same pattern application code that Backend uses,
             ensuring consistency with the rest of TRT-LLM.
             """
+            # Debug: Print graph structure to understand why patterns aren't matching
+            logger.debug(
+                f"[NCCL_SYMMETRIC] PatternOnlyBackend: Graph has {len(list(gm.graph.nodes))} nodes"
+            )
+            # Log all allreduce calls in the graph
+            allreduce_nodes = []
+            for n in gm.graph.nodes:
+                if n.op == "call_function":
+                    target_str = str(n.target)
+                    if "allreduce" in target_str.lower():
+                        allreduce_nodes.append(n)
+
+            logger.debug(
+                f"[NCCL_SYMMETRIC] PatternOnlyBackend: Found {len(allreduce_nodes)} allreduce nodes in graph"
+            )
+            for i, node in enumerate(allreduce_nodes):
+                # Extract strategy from args (it's typically the 7th positional arg)
+                strategy_val = None
+                if len(node.args) > 7:
+                    strategy_val = node.args[7]
+                elif "strategy" in node.kwargs:
+                    strategy_val = node.kwargs["strategy"]
+
+                logger.debug(
+                    f"[NCCL_SYMMETRIC] PatternOnlyBackend: AllReduce node {i}: "
+                    f"target={node.target}, args={len(node.args)}, "
+                    f"strategy={strategy_val} (type={type(strategy_val)})"
+                )
+
             # Use the existing optimize() method which already handles:
             # - recover_pass()
             # - Pattern application via custom_passes
