@@ -752,15 +752,13 @@ def _register_fake():
             for i in range(0, len(input_list), num_ranks)
         ]
 
-    @torch.library.register_fake("trtllm::alltoall_helix_native",
-                                 mutates_args=("workspace", ))
+    @torch.library.register_fake("trtllm::alltoall_helix_native")
     def _(partial_o, softmax_stats, workspace, cp_rank, cp_size):
         # Returns outputs with same shapes as inputs
         return partial_o.new_empty(partial_o.shape), softmax_stats.new_empty(
             softmax_stats.shape)
 
-    @torch.library.register_fake("trtllm::initialize_helix_workspace",
-                                 mutates_args=("workspace", ))
+    @torch.library.register_fake("trtllm::initialize_helix_workspace")
     def _(workspace, cp_rank, cp_size):
         # This op initializes workspace in-place and returns nothing
         return None
