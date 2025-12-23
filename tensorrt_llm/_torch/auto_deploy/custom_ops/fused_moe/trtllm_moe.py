@@ -221,11 +221,11 @@ def trtllm_quant_fp8_moe_fused_fake(
     fc1_expert_weights: torch.Tensor,
     fc2_expert_weights: torch.Tensor,
     fc1_act_scale: torch.Tensor,
-    gemm1_dequant: torch.Tensor,
-    gemm2_act_quant: torch.Tensor,
-    gemm2_dequant: torch.Tensor,
-    is_gated_mlp: bool,
-    act_fn: int,
+    fc1_dequant_scale: torch.Tensor,
+    fc2_act_scale_reciprocal: torch.Tensor,
+    fc2_dequant_scale: torch.Tensor,
+    is_gated_mlp: bool = True,
+    act_fn: int = int(ActivationType.Silu),
 ) -> torch.Tensor:
     _validate_mlp_style_and_act_fn(is_gated_mlp, act_fn)
     return torch.empty_like(x)
