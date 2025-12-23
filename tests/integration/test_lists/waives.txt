@@ -495,5 +495,5 @@ accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B_Instruct_RocketKV::test_auto_d
 accuracy/test_llm_api_pytorch.py::TestMistralLarge3_675B::test_nvfp4_4gpus[latency_moe_trtllm] SKIP (https://nvbugs/5762852)
 accuracy/test_llm_api_pytorch.py::TestMistralLarge3_675B::test_nvfp4_4gpus[latency_moe_trtllm_eagle] SKIP (https://nvbugs/5762852)
 unittest/_torch/sampler/test_return_logits.py SKIP (https://nvbugs/5764627)
-accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype_with_helix SKIP (https://nvbugs/5744328)
+accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype_with_helix SKIP (https://nvbugs/5741331)
 examples/serve/test_serve.py::test_config_file_loading[--config] SKIP (https://nvbugs/5754977)
