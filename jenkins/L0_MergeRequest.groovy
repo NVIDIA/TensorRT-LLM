@@ -25,6 +25,9 @@ SCAN_ROOT = "scan"
 ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 
+// GitHub credentials configuration
+GITHUB_CREDENTIALS_ID = env.GithubCredencialId ?: 'github-cred-trtllm-ci'
+
 // Container configuration
 def getContainerURIs()
 {
