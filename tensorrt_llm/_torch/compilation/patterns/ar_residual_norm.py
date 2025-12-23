@@ -722,18 +722,20 @@ def register_nccl_symmetric_patterns(custom_passes: List[PatternMatcherPass],
 
     def register_convert_supported_ar_to_nccl_symmetric(
             custom_pass: PatternMatcherPass):
-        strategy = int(AllReduceStrategy.NCCL_SYMMETRIC)
+        # Use KeywordArg for all arguments since the actual call uses keyword arguments
         input_node = KeywordArg('input')
-        # Use actual schema parameter names for matching: 'residual', 'norm_weight', 'op', 'group'
+        # Use actual schema parameter names for matching: 'residual', 'norm_weight', 'op', 'group', 'strategy'
         # But keep 'residual_in', 'gamma', 'fusion_op' in function signatures for clarity
         fusion = KeywordArg('op')  # Schema uses 'op', not 'fusion_op'
         group_arg = KeywordArg(
             'group')  # Use KeywordArg to match keyword arguments
+        strategy_arg = KeywordArg(
+            'strategy')  # Use KeywordArg to match keyword arguments
         trtllm_allreduce_default = CallFunction(
             torch.ops.trtllm.allreduce.default, input_node,
             KeywordArg('residual'), KeywordArg('norm_weight'),
-            KeywordArg('scale'), None, Ignored(), group_arg, strategy, fusion,
-            KeywordArg('eps'), Ignored())
+            KeywordArg('scale'), None, Ignored(), group_arg, strategy_arg,
+            fusion, KeywordArg('eps'), Ignored())
 
         def empty_convert_supported_ar_to_nccl_symmetric(
             input: torch.Tensor,
@@ -773,6 +775,21 @@ def register_nccl_symmetric_patterns(custom_passes: List[PatternMatcherPass],
                 "[NCCL_SYMMETRIC] Pattern: extra_check called - pattern matched! "
                 f"pattern_to_node keys: {list(match.ctx.pattern_to_node.keys())}"
             )
+
+            # Verify strategy is NCCL_SYMMETRIC
+            try:
+                strategy_value = match.ctx.pattern_to_node[strategy_arg]
+                if strategy_value != int(AllReduceStrategy.NCCL_SYMMETRIC):
+                    logger.debug(
+                        f"[NCCL_SYMMETRIC] Pattern: extra_check failed: strategy={strategy_value} "
+                        f"is not NCCL_SYMMETRIC ({int(AllReduceStrategy.NCCL_SYMMETRIC)})"
+                    )
+                    return False
+            except KeyError as e:
+                logger.debug(
+                    f"[NCCL_SYMMETRIC] Pattern: extra_check failed: strategy not found: {e}"
+                )
+                return False
 
             # Verify group matches mapping.tp_group
             try:
@@ -817,8 +834,8 @@ def register_nccl_symmetric_patterns(custom_passes: List[PatternMatcherPass],
                 return False
 
             logger.debug(
-                f"[NCCL_SYMMETRIC] Pattern: extra_check passed: fusion_value={fusion_value}, group={group_value}"
-            )
+                f"[NCCL_SYMMETRIC] Pattern: extra_check passed: fusion_value={fusion_value}, "
+                f"strategy={strategy_value}, group={group_value}")
             return True
 
         logger.debug(
