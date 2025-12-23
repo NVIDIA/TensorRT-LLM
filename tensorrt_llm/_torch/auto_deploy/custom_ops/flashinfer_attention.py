@@ -333,6 +333,7 @@ def flashinfer_mha_with_cache_fake(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    custom_mask: Optional[torch.Tensor],
     # STANDARD METADATA
     batch_info: torch.Tensor,
     cu_seqlen: torch.Tensor,
@@ -353,8 +354,6 @@ def flashinfer_mha_with_cache_fake(
     v_scale: float,
     window_left: int,
     logits_soft_cap: float,
-    # VLM CUSTOM MASK
-    custom_mask: Optional[torch.Tensor],
 ) -> torch.Tensor:
     return torch.empty_like(q.contiguous())
 

@@ -348,6 +348,19 @@ def placeholders_on_meta(mod: nn.Module) -> bool:
 
 
 def dump_graphmodules(mod: nn.Module, fname_prefix: str):
+    """
+    Dump the code and IR/graph of all GraphModules in the given module to text files for debugging.
+
+    For each named GraphModule in `mod`, this function creates two files in the current
+    working directory with the given `fname_prefix`:
+      - "<fname_prefix>_<name>_graphmodule_code.txt" contains the source code for the GraphModule.
+      - "<fname_prefix>_<name>_graphmodule_graph.txt" contains the string representation of its IR/graph.
+
+    Args:
+        mod (nn.Module): The root module containing GraphModules.
+        fname_prefix (str): Prefix to use for the generated filenames.
+
+    """
     for name, gm in named_graphmodules(mod):
         # Dump module code
         code_path = os.path.join(os.getcwd(), f"{fname_prefix}_{name}_graphmodule_code.txt")
