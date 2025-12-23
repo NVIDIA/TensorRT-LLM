@@ -2185,7 +2185,8 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
                                             module.tp_rank,
                                             TensorParallelMode.ROW,
                                             device=device)
-        cast_w2_weight_shard = w2_weight_shard.view(dst_w2_weight.dtype)
+        cast_w2_weight_shard = w2_weight_shard.contiguous().view(
+            dst_w2_weight.dtype)
         cast_w2_weight_shard = self._maybe_padding_shape(
             cast_w2_weight_shard, dst_w2_weight)
         dst_w2_weight.copy_(cast_w2_weight_shard, non_blocking=True)
