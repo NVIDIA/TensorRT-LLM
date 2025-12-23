@@ -256,6 +256,8 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
                       capabilities:
                         add:
                         - SYS_ADMIN"""
+        nodeLabelPrefix = "cpu"
+        break
     case "package":
         containerConfig = """
                   - name: trt-llm
