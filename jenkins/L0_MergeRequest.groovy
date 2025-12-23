@@ -1539,7 +1539,10 @@ def updateImageTag(oldTagToNewTagMap) {
 def runRetagImage(pipeline, globalVars)
 {
     collectResultPodSpec = createKubernetesPodConfig("", "build")
-    trtllm_utils.launchKubernetesPod(pipeline, collectResultPodSpec, "alpine", {
+    trtllm_utils.launchKubernetesPod(pipeline, collectResultPodSpec, "docker", {
+        withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "docker login urm.nvidia.com -u ${USERNAME} -p ${PASSWORD}")
+        }
         oldTagToNewTagMap = getImageTags(pipeline, globalVars)
         renameDockerImages(oldTagToNewTagMap)
         updateImageTag(oldTagToNewTagMap)
