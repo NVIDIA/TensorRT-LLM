@@ -1,6 +1,6 @@
 Run LLM-API with pytorch backend on Slurm
 =========================================
-Source https://github.com/NVIDIA/TensorRT-LLM/blob/e4c707845ff58fcc0b1d87afb4dd0e64885c780a/examples/llm-api/llm_mgmn_llm_distributed.sh.
+Source https://github.com/NVIDIA/TensorRT-LLM/blob/9ba14263db0045ed3fa0860f949b5ce320107eb3/examples/llm-api/llm_mgmn_llm_distributed.sh.
 
 .. literalinclude:: ../../../examples/llm-api/llm_mgmn_llm_distributed.sh
     :lines: 1-48,52-94

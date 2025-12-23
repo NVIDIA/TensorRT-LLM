@@ -60,7 +60,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc5';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc6';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -73,7 +73,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc5" />
+  <meta name="docsearch:version" content="1.2.0rc6" />
 
 
   </head>
@@ -353,6 +353,7 @@
 <li class="toctree-l2"><a class="reference internal" href="examples/curl_chat_client.html">Curl Chat Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="examples/curl_responses_client.html">Curl Responses Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/genai_perf_client.html">Genai Perf Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/genai_perf_client_for_multimodal.html">Genai Perf Client For Multimodal</a></li>
@@ -361,6 +362,7 @@
 <li class="toctree-l2"><a class="reference internal" href="examples/openai_completion_client.html">OpenAI Completion Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+<li class="toctree-l2"><a class="reference internal" href="examples/openai_responses_client.html">OpenAI Responses Client</a></li>
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
@@ -1559,9 +1561,11 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheRetentionConfig.TokenRangeRetentionConfig.__init__">(tensorrt_llm.llmapi.KvCacheRetentionConfig.TokenRangeRetentionConfig attribute)</a>
 </li>
       </ul></li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.__init__">__init__() (tensorrt_llm.llmapi.AttentionDpConfig method)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AsyncLLM.__init__">__init__() (tensorrt_llm.llmapi.AsyncLLM method)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.__init__">(tensorrt_llm.llmapi.AttentionDpConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.__init__">(tensorrt_llm.llmapi.AutoDecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BatchingType.__init__">(tensorrt_llm.llmapi.BatchingType method)</a>
@@ -1735,8 +1739,6 @@
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.additional_model_outputs">additional_model_outputs (tensorrt_llm.llmapi.SamplingParams attribute)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.algorithm">algorithm (tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig attribute)</a>
 
       <ul>
@@ -1749,6 +1751,28 @@
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.allgather">allgather() (in module tensorrt_llm.functional)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.allow_advanced_sampling">allow_advanced_sampling (tensorrt_llm.llmapi.AutoDecodingConfig attribute)</a>
+
+      <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.allow_advanced_sampling">(tensorrt_llm.llmapi.DraftTargetDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.allow_advanced_sampling">(tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.allow_advanced_sampling">(tensorrt_llm.llmapi.LookaheadDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.allow_advanced_sampling">(tensorrt_llm.llmapi.MedusaDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.allow_advanced_sampling">(tensorrt_llm.llmapi.MTPDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.allow_advanced_sampling">(tensorrt_llm.llmapi.NGramDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.allow_advanced_sampling">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.allow_advanced_sampling">(tensorrt_llm.llmapi.UserProvidedDecodingConfig attribute)</a>
+</li>
+      </ul></li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.allreduce">allreduce() (in module tensorrt_llm.functional)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.allreduce_strategy">allreduce_strategy (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
@@ -1780,6 +1804,8 @@
       <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.GemmaForCausalLM.assert_valid_quant_algo">assert_valid_quant_algo() (tensorrt_llm.models.GemmaForCausalLM class method)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.assertion">assertion() (in module tensorrt_llm.functional)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AsyncLLM">AsyncLLM (class in tensorrt_llm.llmapi)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.Attention">Attention (class in tensorrt_llm.layers.attention)</a>
 </li>
@@ -2051,6 +2077,12 @@
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.CLIPVisionTransformer">CLIPVisionTransformer (class in tensorrt_llm.models)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.coerce_env_overrides_to_str">coerce_env_overrides_to_str() (tensorrt_llm.llmapi.TorchLlmArgs class method)</a>
+
+      <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.coerce_env_overrides_to_str">(tensorrt_llm.llmapi.TrtLlmArgs class method)</a>
+</li>
+      </ul></li>
       <li><a href="legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.CogVLMAttention">CogVLMAttention (class in tensorrt_llm.layers.attention)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.CogVLMConfig">CogVLMConfig (class in tensorrt_llm.models)</a>
@@ -2067,6 +2099,8 @@
         <li><a href="legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.linear.RowLinear.collect_and_bias">(tensorrt_llm.layers.linear.RowLinear method)</a>
 </li>
       </ul></li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AsyncLLM.collective_rpc">collective_rpc() (tensorrt_llm.llmapi.AsyncLLM method)</a>
+</li>
       <li><a href="legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.linear.ColumnLinear">ColumnLinear (in module tensorrt_llm.layers.linear)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.CombinedTimestepLabelEmbeddings">CombinedTimestepLabelEmbeddings (class in tensorrt_llm.layers.embedding)</a>
@@ -3421,9 +3455,11 @@
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.GemmaForCausalLM">GemmaForCausalLM (class in tensorrt_llm.models)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LLM.generate">generate() (tensorrt_llm.llmapi.LLM method)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AsyncLLM.generate">generate() (tensorrt_llm.llmapi.AsyncLLM method)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LLM.generate">(tensorrt_llm.llmapi.LLM method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalEncoder.generate">(tensorrt_llm.llmapi.MultimodalEncoder method)</a>
 </li>
         <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.EncDecModelRunner.generate">(tensorrt_llm.runtime.EncDecModelRunner method)</a>
@@ -3441,9 +3477,11 @@
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.generate_alibi_slopes">generate_alibi_slopes() (in module tensorrt_llm.functional)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LLM.generate_async">generate_async() (tensorrt_llm.llmapi.LLM method)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AsyncLLM.generate_async">generate_async() (tensorrt_llm.llmapi.AsyncLLM method)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LLM.generate_async">(tensorrt_llm.llmapi.LLM method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalEncoder.generate_async">(tensorrt_llm.llmapi.MultimodalEncoder method)</a>
 </li>
       </ul></li>
@@ -3477,25 +3515,29 @@
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.KeyValueCacheParams.get_first_past_key_value">get_first_past_key_value() (tensorrt_llm.layers.attention.KeyValueCacheParams method)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.GemmaConfig.get_hf_config">get_hf_config() (tensorrt_llm.models.GemmaConfig static method)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.get_indices_block_size">get_indices_block_size() (tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig method)</a>
 
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.get_indices_block_size">(tensorrt_llm.llmapi.RocketSparseAttentionConfig method)</a>
 </li>
       </ul></li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LLM.get_kv_cache_events">get_kv_cache_events() (tensorrt_llm.llmapi.LLM method)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AsyncLLM.get_kv_cache_events">get_kv_cache_events() (tensorrt_llm.llmapi.AsyncLLM method)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LLM.get_kv_cache_events">(tensorrt_llm.llmapi.LLM method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalEncoder.get_kv_cache_events">(tensorrt_llm.llmapi.MultimodalEncoder method)</a>
 </li>
       </ul></li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LLM.get_kv_cache_events_async">get_kv_cache_events_async() (tensorrt_llm.llmapi.LLM method)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AsyncLLM.get_kv_cache_events_async">get_kv_cache_events_async() (tensorrt_llm.llmapi.AsyncLLM method)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LLM.get_kv_cache_events_async">(tensorrt_llm.llmapi.LLM method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalEncoder.get_kv_cache_events_async">(tensorrt_llm.llmapi.MultimodalEncoder method)</a>
 </li>
       </ul></li>
@@ -3545,15 +3587,19 @@
       </ul></li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSequence.get_seq_idx">get_seq_idx() (tensorrt_llm.runtime.GenerationSequence method)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LLM.get_stats">get_stats() (tensorrt_llm.llmapi.LLM method)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AsyncLLM.get_stats">get_stats() (tensorrt_llm.llmapi.AsyncLLM method)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LLM.get_stats">(tensorrt_llm.llmapi.LLM method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalEncoder.get_stats">(tensorrt_llm.llmapi.MultimodalEncoder method)</a>
 </li>
       </ul></li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LLM.get_stats_async">get_stats_async() (tensorrt_llm.llmapi.LLM method)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AsyncLLM.get_stats_async">get_stats_async() (tensorrt_llm.llmapi.AsyncLLM method)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LLM.get_stats_async">(tensorrt_llm.llmapi.LLM method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalEncoder.get_stats_async">(tensorrt_llm.llmapi.MultimodalEncoder method)</a>
 </li>
       </ul></li>
@@ -4141,9 +4187,11 @@
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.llm_engine_dir">llm_engine_dir (tensorrt_llm.runtime.MultimodalModelRunner property)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LLM.llm_id">llm_id (tensorrt_llm.llmapi.LLM attribute)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AsyncLLM.llm_id">llm_id (tensorrt_llm.llmapi.AsyncLLM property)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LLM.llm_id">(tensorrt_llm.llmapi.LLM attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#id0">(tensorrt_llm.llmapi.LLM property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalEncoder.llm_id">(tensorrt_llm.llmapi.MultimodalEncoder property)</a>
@@ -5565,6 +5613,12 @@
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.Tensor.ndim">ndim() (tensorrt_llm.functional.Tensor method)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.needs_separate_short_long_cuda_graphs">needs_separate_short_long_cuda_graphs() (tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig method)</a>
+
+      <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.needs_separate_short_long_cuda_graphs">(tensorrt_llm.llmapi.RocketSparseAttentionConfig method)</a>
+</li>
+      </ul></li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.Tensor.network">network (tensorrt_llm.functional.Tensor property)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.next_medusa_input_ids">next_medusa_input_ids() (tensorrt_llm.runtime.GenerationSession method)</a>
@@ -5601,6 +5655,8 @@
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.SamplingConfig.num_beams">num_beams (tensorrt_llm.runtime.SamplingConfig attribute)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.num_capture_layers">num_capture_layers (tensorrt_llm.llmapi.EagleDecodingConfig property)</a>
 
       <ul>
@@ -5609,8 +5665,6 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.num_capture_layers">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig property)</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.num_draft_tokens">num_draft_tokens (tensorrt_llm.runtime.GenerationSession attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.num_eagle_layers">num_eagle_layers (tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
@@ -6197,6 +6251,8 @@
       </ul></li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.Tensor.rank">rank() (tensorrt_llm.functional.Tensor method)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.ray_placement_config">ray_placement_config (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.ray_worker_extension_cls">ray_worker_extension_cls (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.rearrange">rearrange() (in module tensorrt_llm.functional)</a>
@@ -6235,8 +6291,12 @@
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.relaxed_topk">relaxed_topk (tensorrt_llm.llmapi.MTPDecodingConfig attribute)</a>
 </li>
-      <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.PretrainedModel.release">release() (tensorrt_llm.models.PretrainedModel method)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AsyncLLM.release">release() (tensorrt_llm.llmapi.AsyncLLM method)</a>
+
+      <ul>
+        <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.PretrainedModel.release">(tensorrt_llm.models.PretrainedModel method)</a>
 </li>
+      </ul></li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.relu">relu() (in module tensorrt_llm.functional)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.plugin.html#tensorrt_llm.plugin.PluginConfig.remove_input_padding">remove_input_padding (tensorrt_llm.plugin.PluginConfig attribute)</a>
@@ -6348,6 +6408,8 @@
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.resource_manager">resource_manager (tensorrt_llm.llmapi.UserProvidedDecodingConfig attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RequestOutput.result">result() (tensorrt_llm.llmapi.RequestOutput method)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AsyncLLM.resume">resume() (tensorrt_llm.llmapi.AsyncLLM method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.return_context_logits">return_context_logits (tensorrt_llm.llmapi.SamplingParams attribute)</a>
 </li>
@@ -6507,6 +6569,8 @@
 <h2 id="S">S</h2>
 <table style="width: 100%" class="indextable genindextable"><tr>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.sampler_force_async_worker">sampler_force_async_worker (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.sampler_type">sampler_type (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RequestOutput.PostprocWorker.Input.sampling_params">sampling_params (tensorrt_llm.llmapi.RequestOutput.PostprocWorker.Input attribute)</a>
@@ -6653,6 +6717,12 @@
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.send">send() (in module tensorrt_llm.functional)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.seq_len_threshold">seq_len_threshold (tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig attribute)</a>
+
+      <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.seq_len_threshold">(tensorrt_llm.llmapi.RocketSparseAttentionConfig attribute)</a>
+</li>
+      </ul></li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.ModelRunner.serialize_engine">serialize_engine() (tensorrt_llm.runtime.ModelRunner method)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.Session">Session (class in tensorrt_llm.runtime)</a>
@@ -6691,6 +6761,8 @@
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.setup">setup() (tensorrt_llm.runtime.GenerationSession method)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AsyncLLM.setup_async">setup_async() (tensorrt_llm.llmapi.AsyncLLM method)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.setup_embedding_parallel_mode">setup_embedding_parallel_mode() (tensorrt_llm.llmapi.TrtLlmArgs method)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.setup_fake_prompts">setup_fake_prompts() (tensorrt_llm.runtime.MultimodalModelRunner method)</a>
@@ -6709,9 +6781,11 @@
       </ul></li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.shape">shape() (in module tensorrt_llm.functional)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LLM.shutdown">shutdown() (tensorrt_llm.llmapi.LLM method)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AsyncLLM.shutdown">shutdown() (tensorrt_llm.llmapi.AsyncLLM method)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LLM.shutdown">(tensorrt_llm.llmapi.LLM method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MpiCommSession.shutdown">(tensorrt_llm.llmapi.MpiCommSession method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalEncoder.shutdown">(tensorrt_llm.llmapi.MultimodalEncoder method)</a>
@@ -6739,10 +6813,12 @@
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.ModelConfig.skip_cross_attn_blocks">skip_cross_attn_blocks (tensorrt_llm.runtime.ModelConfig attribute)</a>
 </li>
-      <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.ModelConfig.skip_cross_kv">skip_cross_kv (tensorrt_llm.runtime.ModelConfig attribute)</a>
-</li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.ModelConfig.skip_cross_kv">skip_cross_kv (tensorrt_llm.runtime.ModelConfig attribute)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.skip_indexer_for_short_seqs">skip_indexer_for_short_seqs (tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.skip_special_tokens">skip_special_tokens (tensorrt_llm.llmapi.SamplingParams attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.skip_tokenizer_init">skip_tokenizer_init (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
@@ -6990,6 +7066,8 @@
 </li>
       </ul></li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.swiglu">swiglu() (in module tensorrt_llm.functional)</a>
+</li>
+      <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.AllReduceStrategy.SYMM_MEM">SYMM_MEM (tensorrt_llm.functional.AllReduceStrategy attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.sync_quant_config_with_kv_cache_config_dtype">sync_quant_config_with_kv_cache_config_dtype() (tensorrt_llm.llmapi.TorchLlmArgs method)</a>
 </li>
@@ -8274,6 +8352,8 @@
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache17ConnectionManager14getConnectionsERK9CommState">tensorrt_llm::executor::kv_cache::ConnectionManager::getConnections (C++ function)</a>
 </li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor8kv_cache17ConnectionManager9isRunningEv">tensorrt_llm::executor::kv_cache::ConnectionManager::isRunning (C++ function)</a>
+</li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache17ConnectionManager11recvConnectERK11DataContextPv6size_t">tensorrt_llm::executor::kv_cache::ConnectionManager::recvConnect (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache17ConnectionManagerD0Ev">tensorrt_llm::executor::kv_cache::ConnectionManager::~ConnectionManager (C++ function)</a>
@@ -8650,9 +8730,11 @@
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor22KVCacheStoredBlockData10cacheLevelE">tensorrt_llm::executor::KVCacheStoredBlockData::cacheLevel (C++ member)</a>
 </li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor22KVCacheStoredBlockData22KVCacheStoredBlockDataE6IdTypeN12tensorrt_llm7runtime15VecUniqueTokensENSt8optionalIN12tensorrt_llm7runtime14LoraTaskIdTypeEEE10SizeType3210SizeType32">tensorrt_llm::executor::KVCacheStoredBlockData::KVCacheStoredBlockData (C++ function)</a>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor22KVCacheStoredBlockData22KVCacheStoredBlockDataE6IdTypeN12tensorrt_llm7runtime15VecUniqueTokensENSt8optionalIN12tensorrt_llm7runtime14LoraTaskIdTypeEEE10SizeType3210SizeType32NSt6vectorI5MmKeyEE">tensorrt_llm::executor::KVCacheStoredBlockData::KVCacheStoredBlockData (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor22KVCacheStoredBlockData6loraIdE">tensorrt_llm::executor::KVCacheStoredBlockData::loraId (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor22KVCacheStoredBlockData6mmKeysE">tensorrt_llm::executor::KVCacheStoredBlockData::mmKeys (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor22KVCacheStoredBlockData8priorityE">tensorrt_llm::executor::KVCacheStoredBlockData::priority (C++ member)</a>
 </li>
@@ -8781,6 +8863,8 @@
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor10MemoryType4kUVME">tensorrt_llm::executor::MemoryType::kUVM (C++ enumerator)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor16MillisecondsTypeE">tensorrt_llm::executor::MillisecondsType (C++ type)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor5MmKeyE">tensorrt_llm::executor::MmKey (C++ type)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor9ModelTypeE">tensorrt_llm::executor::ModelType (C++ enum)</a>
 </li>
@@ -10168,10 +10252,10 @@
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4IEN12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kINT32EEE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT32&gt; (C++ struct)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kINT32EE4nameE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT32&gt;::name (C++ member)</a>
-</li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kINT32EE4nameE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT32&gt;::name (C++ member)</a>
+</li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kINT32EE4sizeE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT32&gt;::size (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kINT32EE4typeE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT32&gt;::type (C++ type)</a>
@@ -12688,9 +12772,11 @@
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheRetentionConfig.TokenRangeRetentionConfig.token_start">token_start (tensorrt_llm.llmapi.KvCacheRetentionConfig.TokenRangeRetentionConfig property)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LLM.tokenizer">tokenizer (tensorrt_llm.llmapi.LLM attribute)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AsyncLLM.tokenizer">tokenizer (tensorrt_llm.llmapi.AsyncLLM property)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LLM.tokenizer">(tensorrt_llm.llmapi.LLM attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#id1">(tensorrt_llm.llmapi.LLM property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalEncoder.tokenizer">(tensorrt_llm.llmapi.MultimodalEncoder property)</a>
@@ -13464,6 +13550,8 @@
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.AllReduceParams.update_strategy">update_strategy() (tensorrt_llm.functional.AllReduceParams method)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AsyncLLM.update_weights">update_weights() (tensorrt_llm.llmapi.AsyncLLM method)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BatchingType.upper">upper() (tensorrt_llm.llmapi.BatchingType method)</a>
 
       <ul>
@@ -13646,14 +13734,14 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.validate_draft_len_schedule_and_sort">(tensorrt_llm.llmapi.UserProvidedDecodingConfig class method)</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_dtype">validate_dtype() (tensorrt_llm.llmapi.TorchLlmArgs class method)</a>
 
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.validate_dtype">(tensorrt_llm.llmapi.TrtLlmArgs class method)</a>
 </li>
       </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="legacy/python-api/tensorrt_llm.plugin.html#tensorrt_llm.plugin.PluginConfig.validate_dtype_not_auto">validate_dtype_not_auto() (tensorrt_llm.plugin.PluginConfig class method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.validate_enable_build_cache">validate_enable_build_cache() (tensorrt_llm.llmapi.TrtLlmArgs method)</a>
@@ -13666,6 +13754,8 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.validate_gpus_per_node">(tensorrt_llm.llmapi.TrtLlmArgs class method)</a>
 </li>
       </ul></li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_helix_tokens_per_block">validate_helix_tokens_per_block() (tensorrt_llm.llmapi.TorchLlmArgs method)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.validate_kv_cache_dtype">validate_kv_cache_dtype() (tensorrt_llm.llmapi.TrtLlmArgs method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_load_balancer">validate_load_balancer() (tensorrt_llm.llmapi.TorchLlmArgs method)</a>
@@ -13705,6 +13795,8 @@
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.validate_positive_values">validate_positive_values() (tensorrt_llm.llmapi.LookaheadDecodingConfig class method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.validate_quant_config">validate_quant_config() (tensorrt_llm.llmapi.TrtLlmArgs class method)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_ray_placement_config">validate_ray_placement_config() (tensorrt_llm.llmapi.TorchLlmArgs method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_ray_worker_extension_cls">validate_ray_worker_extension_cls() (tensorrt_llm.llmapi.TorchLlmArgs method)</a>
 </li>
@@ -13975,9 +14067,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on December 07, 2025.</p>
+  <p>Last updated on December 15, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/e4c7078">e4c7078</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9ba1426">9ba1426</a>.</p>
   
 </div></div>
       

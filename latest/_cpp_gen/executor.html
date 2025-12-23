@@ -61,7 +61,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc5';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc6';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -74,7 +74,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc5" />
+  <meta name="docsearch:version" content="1.2.0rc6" />
 
 
   </head>
@@ -358,6 +358,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client.html">Curl Chat Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_responses_client.html">Curl Responses Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client.html">Genai Perf Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client_for_multimodal.html">Genai Perf Client For Multimodal</a></li>
@@ -366,6 +367,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_responses_client.html">OpenAI Responses Client</a></li>
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
@@ -1308,11 +1310,6 @@
 <dl class="cpp type">
 <dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm8executor9TensorPtrE">
 <span id="_CPPv3N12tensorrt_llm8executor9TensorPtrE"></span><span id="_CPPv2N12tensorrt_llm8executor9TensorPtrE"></span><span class="target" id="types_8h_1a32a3846eb7d506ec2f4699f052f54dda"></span><span class="k"><span class="pre">using</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">TensorPtr</span></span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">shared_ptr</span></span><span class="p"><span class="pre">&lt;</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm8executor6TensorE" title="tensorrt_llm::executor::Tensor"><span class="n"><span class="pre">Tensor</span></span></a><span class="p"><span class="pre">&gt;</span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm8executor9TensorPtrE" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp type">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm8executor10SizeType32E">
-<span id="_CPPv3N12tensorrt_llm8executor10SizeType32E"></span><span id="_CPPv2N12tensorrt_llm8executor10SizeType32E"></span><span class="target" id="types_8h_1ad818c2e487265ea3ec0ddd760b768085"></span><span class="k"><span class="pre">using</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">SizeType32</span></span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">int32_t</span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm8executor10SizeType32E" title="Link to this definition">#</a><br /></dt>
 <dd></dd></dl>
 
 <dl class="cpp type">
@@ -3144,6 +3141,11 @@
 <span id="_CPPv3NK12tensorrt_llm8executor8kv_cache17ConnectionManager12getCommStateEv"></span><span id="_CPPv2NK12tensorrt_llm8executor8kv_cache17ConnectionManager12getCommStateEv"></span><span id="tensorrt_llm::executor::kv_cache::ConnectionManager::getCommStateC"></span><span class="target" id="classtensorrt__llm_1_1executor_1_1kv__cache_1_1ConnectionManager_1a1891e3f7d95d10d503768aa993b6debf"></span><span class="k"><span class="pre">virtual</span></span><span class="w"> </span><a class="reference internal" href="#_CPPv4N12tensorrt_llm8executor8kv_cache9CommStateE" title="tensorrt_llm::executor::kv_cache::CommState"><span class="n"><span class="pre">CommState</span></span></a><span class="w"> </span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="p"><span class="pre">&amp;</span></span><span class="sig-name descname"><span class="n"><span class="pre">getCommState</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="m"><span class="pre">0</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm8executor8kv_cache17ConnectionManager12getCommStateEv" title="Link to this definition">#</a><br /></dt>
 <dd></dd></dl>
 
+<dl class="cpp function">
+<dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm8executor8kv_cache17ConnectionManager9isRunningEv">
+<span id="_CPPv3NK12tensorrt_llm8executor8kv_cache17ConnectionManager9isRunningEv"></span><span id="_CPPv2NK12tensorrt_llm8executor8kv_cache17ConnectionManager9isRunningEv"></span><span id="tensorrt_llm::executor::kv_cache::ConnectionManager::isRunningC"></span><span class="target" id="classtensorrt__llm_1_1executor_1_1kv__cache_1_1ConnectionManager_1ab3ba71ff7909d1460d7086ac34e2064e"></span><span class="k"><span class="pre">virtual</span></span><span class="w"> </span><span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">isRunning</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="m"><span class="pre">0</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm8executor8kv_cache17ConnectionManager9isRunningEv" title="Link to this definition">#</a><br /></dt>
+<dd></dd></dl>
+
 </div>
 </dd></dl>
 
@@ -3943,6 +3945,16 @@
 <span class="target" id="namespacetensorrt__llm_1_1executor"></span><span class="k"><span class="pre">namespace</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">executor</span></span></span><br /></dt>
 <dd><div class="breathe-sectiondef docutils container">
 <p class="breathe-sectiondef-title rubric" id="breathe-section-title-typedefs">Typedefs</p>
+<dl class="cpp type">
+<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm8executor10SizeType32E">
+<span id="_CPPv3N12tensorrt_llm8executor10SizeType32E"></span><span id="_CPPv2N12tensorrt_llm8executor10SizeType32E"></span><span id="tensorrt_llm::executor::SizeType32"></span><span class="target" id="executor_8h_1ac776d7ebaecdc4148fadc5c154f15901"></span><span class="k"><span class="pre">typedef</span></span><span class="w"> </span><a class="reference internal" href="#_CPPv412tensorrt_llm" title="tensorrt_llm"><span class="n"><span class="pre">tensorrt_llm</span></span></a><span class="p"><span class="pre">::</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtimeE" title="tensorrt_llm::runtime"><span class="n"><span class="pre">runtime</span></span></a><span class="p"><span class="pre">::</span></span><a class="reference internal" href="runtime.html#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">SizeType32</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm8executor10SizeType32E" title="Link to this definition">#</a><br /></dt>
+<dd></dd></dl>
+
+<dl class="cpp type">
+<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm8executor5MmKeyE">
+<span id="_CPPv3N12tensorrt_llm8executor5MmKeyE"></span><span id="_CPPv2N12tensorrt_llm8executor5MmKeyE"></span><span class="target" id="executor_8h_1a7ae0b1ae480fc64635877ec4a3477e61"></span><span class="k"><span class="pre">using</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">MmKey</span></span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">pair</span></span><span class="p"><span class="pre">&lt;</span></span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">array</span></span><span class="p"><span class="pre">&lt;</span></span><span class="n"><span class="pre">uint8_t</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="m"><span class="pre">32</span></span><span class="p"><span class="pre">&gt;</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference internal" href="#_CPPv4N12tensorrt_llm8executor10SizeType32E" title="tensorrt_llm::executor::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="p"><span class="pre">&gt;</span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm8executor5MmKeyE" title="Link to this definition">#</a><br /></dt>
+<dd></dd></dl>
+
 <dl class="cpp type">
 <dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm8executor17RetentionPriorityE">
 <span id="_CPPv3N12tensorrt_llm8executor17RetentionPriorityE"></span><span id="_CPPv2N12tensorrt_llm8executor17RetentionPriorityE"></span><span class="target" id="executor_8h_1a7d47a118ea2835238c34ba65f7ac692e"></span><span class="k"><span class="pre">using</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">RetentionPriority</span></span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><a class="reference internal" href="#_CPPv4N12tensorrt_llm8executor10SizeType32E" title="tensorrt_llm::executor::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><a class="headerlink" href="#_CPPv4N12tensorrt_llm8executor17RetentionPriorityE" title="Link to this definition">#</a><br /></dt>
@@ -6921,8 +6933,8 @@
 <div class="breathe-sectiondef docutils container">
 <p class="breathe-sectiondef-title rubric" id="breathe-section-title-public-functions">Public Functions</p>
 <dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm8executor22KVCacheStoredBlockData22KVCacheStoredBlockDataE6IdTypeN12tensorrt_llm7runtime15VecUniqueTokensENSt8optionalIN12tensorrt_llm7runtime14LoraTaskIdTypeEEE10SizeType3210SizeType32">
-<span id="_CPPv3N12tensorrt_llm8executor22KVCacheStoredBlockData22KVCacheStoredBlockDataE6IdTypeN12tensorrt_llm7runtime15VecUniqueTokensENSt8optionalIN12tensorrt_llm7runtime14LoraTaskIdTypeEEE10SizeType3210SizeType32"></span><span id="_CPPv2N12tensorrt_llm8executor22KVCacheStoredBlockData22KVCacheStoredBlockDataE6IdTypeN12tensorrt_llm7runtime15VecUniqueTokensENSt8optionalIN12tensorrt_llm7runtime14LoraTaskIdTypeEEE10SizeType3210SizeType32"></span><span id="tensorrt_llm::executor::KVCacheStoredBlockData::KVCacheStoredBlockData__IdType.tensorrt_llm::runtime::VecUniqueTokens.std::optional:tensorrt_llm::runtime::LoraTaskIdType:.SizeType32.SizeType32"></span><span class="target" id="structtensorrt__llm_1_1executor_1_1KVCacheStoredBlockData_1af6cc9927cdb952318da4d2eb2cf6eb31"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">KVCacheStoredBlockData</span></span></span><span class="sig-paren">(</span>
+<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm8executor22KVCacheStoredBlockData22KVCacheStoredBlockDataE6IdTypeN12tensorrt_llm7runtime15VecUniqueTokensENSt8optionalIN12tensorrt_llm7runtime14LoraTaskIdTypeEEE10SizeType3210SizeType32NSt6vectorI5MmKeyEE">
+<span id="_CPPv3N12tensorrt_llm8executor22KVCacheStoredBlockData22KVCacheStoredBlockDataE6IdTypeN12tensorrt_llm7runtime15VecUniqueTokensENSt8optionalIN12tensorrt_llm7runtime14LoraTaskIdTypeEEE10SizeType3210SizeType32NSt6vectorI5MmKeyEE"></span><span id="_CPPv2N12tensorrt_llm8executor22KVCacheStoredBlockData22KVCacheStoredBlockDataE6IdTypeN12tensorrt_llm7runtime15VecUniqueTokensENSt8optionalIN12tensorrt_llm7runtime14LoraTaskIdTypeEEE10SizeType3210SizeType32NSt6vectorI5MmKeyEE"></span><span id="tensorrt_llm::executor::KVCacheStoredBlockData::KVCacheStoredBlockData__IdType.tensorrt_llm::runtime::VecUniqueTokens.std::optional:tensorrt_llm::runtime::LoraTaskIdType:.SizeType32.SizeType32.std::vector:MmKey:"></span><span class="target" id="structtensorrt__llm_1_1executor_1_1KVCacheStoredBlockData_1a4397fd1bbe33809586fc5da7df6c9402"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">KVCacheStoredBlockData</span></span></span><span class="sig-paren">(</span>
 
 <dl>
 <dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm8executor6IdTypeE" title="tensorrt_llm::executor::IdType"><span class="n"><span class="pre">IdType</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">blockHash</span></span></em>,</dd>
@@ -6930,9 +6942,10 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">optional</span></span><span class="p"><span class="pre">&lt;</span></span><a class="reference internal" href="#_CPPv412tensorrt_llm" title="tensorrt_llm"><span class="n"><span class="pre">tensorrt_llm</span></span></a><span class="p"><span class="pre">::</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtimeE" title="tensorrt_llm::runtime"><span class="n"><span class="pre">runtime</span></span></a><span class="p"><span class="pre">::</span></span><a class="reference internal" href="runtime.html#_CPPv4N12tensorrt_llm7runtime14LoraTaskIdTypeE" title="tensorrt_llm::runtime::LoraTaskIdType"><span class="n"><span class="pre">LoraTaskIdType</span></span></a><span class="p"><span class="pre">&gt;</span></span><span class="w"> </span><span class="n sig-param"><span class="pre">loraId</span></span></em>,</dd>
 <dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm8executor10SizeType32E" title="tensorrt_llm::executor::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">cacheLevel</span></span></em>,</dd>
 <dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm8executor10SizeType32E" title="tensorrt_llm::executor::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">priority</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">vector</span></span><span class="p"><span class="pre">&lt;</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm8executor5MmKeyE" title="tensorrt_llm::executor::MmKey"><span class="n"><span class="pre">MmKey</span></span></a><span class="p"><span class="pre">&gt;</span></span><span class="w"> </span><span class="n sig-param"><span class="pre">mmKeys</span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="p"><span class="pre">{</span></span><span class="p"><span class="pre">}</span></span></em>,</dd>
 </dl>
 
-<span class="sig-paren">)</span><a class="headerlink" href="#_CPPv4N12tensorrt_llm8executor22KVCacheStoredBlockData22KVCacheStoredBlockDataE6IdTypeN12tensorrt_llm7runtime15VecUniqueTokensENSt8optionalIN12tensorrt_llm7runtime14LoraTaskIdTypeEEE10SizeType3210SizeType32" title="Link to this definition">#</a><br /></dt>
+<span class="sig-paren">)</span><a class="headerlink" href="#_CPPv4N12tensorrt_llm8executor22KVCacheStoredBlockData22KVCacheStoredBlockDataE6IdTypeN12tensorrt_llm7runtime15VecUniqueTokensENSt8optionalIN12tensorrt_llm7runtime14LoraTaskIdTypeEEE10SizeType3210SizeType32NSt6vectorI5MmKeyEE" title="Link to this definition">#</a><br /></dt>
 <dd></dd></dl>
 
 </div>
@@ -6966,6 +6979,12 @@
 <dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm8executor22KVCacheStoredBlockData8priorityE">
 <span id="_CPPv3N12tensorrt_llm8executor22KVCacheStoredBlockData8priorityE"></span><span id="_CPPv2N12tensorrt_llm8executor22KVCacheStoredBlockData8priorityE"></span><span id="tensorrt_llm::executor::KVCacheStoredBlockData::priority__SizeType32"></span><span class="target" id="structtensorrt__llm_1_1executor_1_1KVCacheStoredBlockData_1a8e2093038716a967af544a3c5e319629"></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm8executor10SizeType32E" title="tensorrt_llm::executor::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">priority</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm8executor22KVCacheStoredBlockData8priorityE" title="Link to this definition">#</a><br /></dt>
 <dd><p>The priority of the block. </p>
+</dd></dl>
+
+<dl class="cpp var">
+<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm8executor22KVCacheStoredBlockData6mmKeysE">
+<span id="_CPPv3N12tensorrt_llm8executor22KVCacheStoredBlockData6mmKeysE"></span><span id="_CPPv2N12tensorrt_llm8executor22KVCacheStoredBlockData6mmKeysE"></span><span id="tensorrt_llm::executor::KVCacheStoredBlockData::mmKeys__std::vector:MmKey:"></span><span class="target" id="structtensorrt__llm_1_1executor_1_1KVCacheStoredBlockData_1a51df5f1ec916092eded38a2e0202f717"></span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">vector</span></span><span class="p"><span class="pre">&lt;</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm8executor5MmKeyE" title="tensorrt_llm::executor::MmKey"><span class="n"><span class="pre">MmKey</span></span></a><span class="p"><span class="pre">&gt;</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">mmKeys</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm8executor22KVCacheStoredBlockData6mmKeysE" title="Link to this definition">#</a><br /></dt>
+<dd><p>The multimodal keys of the block. </p>
 </dd></dl>
 
 </div>
@@ -12245,7 +12264,6 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#types-h">types.h</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor9TensorPtrE"><code class="docutils literal notranslate"><span class="pre">TensorPtr</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor10SizeType32E"><code class="docutils literal notranslate"><span class="pre">SizeType32</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor10SizeType64E"><code class="docutils literal notranslate"><span class="pre">SizeType64</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor9FloatTypeE"><code class="docutils literal notranslate"><span class="pre">FloatType</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor11TokenIdTypeE"><code class="docutils literal notranslate"><span class="pre">TokenIdType</span></code></a></li>
@@ -12619,6 +12637,7 @@
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor8kv_cache17ConnectionManager11recvConnectERK11DataContextPv6size_t"><code class="docutils literal notranslate"><span class="pre">recvConnect()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor8kv_cache17ConnectionManager14getConnectionsERK9CommState"><code class="docutils literal notranslate"><span class="pre">getConnections()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm8executor8kv_cache17ConnectionManager12getCommStateEv"><code class="docutils literal notranslate"><span class="pre">getCommState()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm8executor8kv_cache17ConnectionManager9isRunningEv"><code class="docutils literal notranslate"><span class="pre">isRunning()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor8kv_cache11DataContextE"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm::executor::kv_cache::DataContext</span></code></a><ul class="nav section-nav flex-column">
@@ -12729,6 +12748,8 @@
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm13batch_manager16kv_cache_managerE"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm::batch_manager::kv_cache_manager</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor10SizeType32E"><code class="docutils literal notranslate"><span class="pre">SizeType32</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor5MmKeyE"><code class="docutils literal notranslate"><span class="pre">MmKey</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor17RetentionPriorityE"><code class="docutils literal notranslate"><span class="pre">RetentionPriority</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor16KVCacheEventDataE"><code class="docutils literal notranslate"><span class="pre">KVCacheEventData</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor7versionEv"><code class="docutils literal notranslate"><span class="pre">version()</span></code></a></li>
@@ -13177,12 +13198,13 @@
 </ul>
 </li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor22KVCacheStoredBlockDataE"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm::executor::KVCacheStoredBlockData</span></code></a><ul class="nav section-nav flex-column">
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor22KVCacheStoredBlockData22KVCacheStoredBlockDataE6IdTypeN12tensorrt_llm7runtime15VecUniqueTokensENSt8optionalIN12tensorrt_llm7runtime14LoraTaskIdTypeEEE10SizeType3210SizeType32"><code class="docutils literal notranslate"><span class="pre">KVCacheStoredBlockData()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor22KVCacheStoredBlockData22KVCacheStoredBlockDataE6IdTypeN12tensorrt_llm7runtime15VecUniqueTokensENSt8optionalIN12tensorrt_llm7runtime14LoraTaskIdTypeEEE10SizeType3210SizeType32NSt6vectorI5MmKeyEE"><code class="docutils literal notranslate"><span class="pre">KVCacheStoredBlockData()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor22KVCacheStoredBlockData9blockHashE"><code class="docutils literal notranslate"><span class="pre">blockHash</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor22KVCacheStoredBlockData6tokensE"><code class="docutils literal notranslate"><span class="pre">tokens</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor22KVCacheStoredBlockData6loraIdE"><code class="docutils literal notranslate"><span class="pre">loraId</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor22KVCacheStoredBlockData10cacheLevelE"><code class="docutils literal notranslate"><span class="pre">cacheLevel</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor22KVCacheStoredBlockData8priorityE"><code class="docutils literal notranslate"><span class="pre">priority</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor22KVCacheStoredBlockData6mmKeysE"><code class="docutils literal notranslate"><span class="pre">mmKeys</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor17KVCacheStoredDataE"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm::executor::KVCacheStoredData</span></code></a><ul class="nav section-nav flex-column">
@@ -13989,9 +14011,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on December 07, 2025.</p>
+  <p>Last updated on December 15, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/e4c7078">e4c7078</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9ba1426">9ba1426</a>.</p>
   
 </div></div>
       

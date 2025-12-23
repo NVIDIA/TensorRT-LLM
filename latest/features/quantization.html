@@ -61,7 +61,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc5';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc6';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -76,7 +76,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc5" />
+  <meta name="docsearch:version" content="1.2.0rc6" />
 
 
   </head>
@@ -360,6 +360,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client.html">Curl Chat Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_responses_client.html">Curl Responses Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client.html">Genai Perf Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client_for_multimodal.html">Genai Perf Client For Multimodal</a></li>
@@ -368,6 +369,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_responses_client.html">OpenAI Responses Client</a></li>
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
@@ -531,6 +533,7 @@
 <li><p>FP8 Block Scaling</p></li>
 <li><p>FP8 Rowwise</p></li>
 <li><p>FP8 KV Cache</p></li>
+<li><p>NVFP4 KV Cache</p></li>
 <li><p>W4A16 GPTQ</p></li>
 <li><p>W4A8 GPTQ</p></li>
 <li><p>W4A16 AWQ</p></li>
@@ -542,7 +545,7 @@
 <p>The default PyTorch backend supports FP4 and FP8 quantization on the latest Blackwell and Hopper GPUs.</p>
 <section id="running-pre-quantized-models">
 <h3>Running Pre-quantized Models<a class="headerlink" href="#running-pre-quantized-models" title="Link to this heading">#</a></h3>
-<p>TensorRT LLM can directly run <a class="reference external" href="https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4">pre-quantized models</a> generated with the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-Model-Optimizer">NVIDIA TensorRT Model Optimizer</a>.</p>
+<p>TensorRT LLM can directly run <a class="reference external" href="https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4">pre-quantized models</a> generated with the <a class="reference external" href="https://github.com/NVIDIA/Model-Optimizer">NVIDIA Model Optimizer</a>.</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span>
 <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s1">&#39;nvidia/Llama-3.1-8B-Instruct-FP8&#39;</span><span class="p">)</span>
 <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="s2">&quot;Hello, my name is&quot;</span><span class="p">)</span>
@@ -563,16 +566,38 @@
 </pre></div>
 </div>
 </section>
+<section id="nvfp4-kv-cache">
+<h4>NVFP4 KV Cache<a class="headerlink" href="#nvfp4-kv-cache" title="Link to this heading">#</a></h4>
+<p>To enable NVFP4 KV cache, offline quantization with ModelOpt is required. Please follow the below section for instructions.
+After the quantization is done, the NVFP4 KV cache option can be set by:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">KvCacheConfig</span>
+<span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s1">&#39;/path/to/model&#39;</span><span class="p">,</span>
+          <span class="n">kv_cache_config</span><span class="o">=</span><span class="n">KvCacheConfig</span><span class="p">(</span><span class="n">dtype</span><span class="o">=</span><span class="s1">&#39;nvfp4&#39;</span><span class="p">))</span>
+<span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="s2">&quot;Hello, my name is&quot;</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
 </section>
 <section id="offline-quantization-with-modelopt">
 <h3>Offline Quantization with ModelOpt<a class="headerlink" href="#offline-quantization-with-modelopt" title="Link to this heading">#</a></h3>
 <p>If a pre-quantized model is not available on the <a class="reference external" href="https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4">Hugging Face Hub</a>, you can quantize it offline using ModelOpt.</p>
 <p>Follow this step-by-step guide to quantize a model:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>git<span class="w"> </span>clone<span class="w"> </span>https://github.com/NVIDIA/TensorRT-Model-Optimizer.git
-<span class="nb">cd</span><span class="w"> </span>TensorRT-Model-Optimizer/examples/llm_ptq
-scripts/huggingface_example.sh<span class="w"> </span>--model<span class="w"> </span>&lt;huggingface_model_card&gt;<span class="w"> </span>--quant<span class="w"> </span>fp8<span class="w"> </span>--export_fmt<span class="w"> </span>hf
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>git<span class="w"> </span>clone<span class="w"> </span>https://github.com/NVIDIA/Model-Optimizer.git
+<span class="nb">cd</span><span class="w"> </span>Model-Optimizer/examples/llm_ptq
+scripts/huggingface_example.sh<span class="w"> </span>--model<span class="w"> </span>&lt;huggingface_model_card&gt;<span class="w"> </span>--quant<span class="w"> </span>fp8
 </pre></div>
 </div>
+<section id="id1">
+<h4>NVFP4 KV Cache<a class="headerlink" href="#id1" title="Link to this heading">#</a></h4>
+<p>To generate the checkpoint for NVFP4 KV cache:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>git<span class="w"> </span>clone<span class="w"> </span>https://github.com/NVIDIA/Model-Optimizer.git
+<span class="nb">cd</span><span class="w"> </span>TensorRT-Model-Optimizer/examples/llm_ptq
+scripts/huggingface_example.sh<span class="w"> </span>--model<span class="w"> </span>&lt;huggingface_model_card&gt;<span class="w"> </span>--quant<span class="w"> </span>fp8<span class="w"> </span>--kv_cache_quant<span class="w"> </span>nvfp4
+</pre></div>
+</div>
+<p>Note that currently TRT-LLM only supports FP8 weight/activation quantization when NVFP4 KV cache is enabled. Therefore, <code class="docutils literal notranslate"><span class="pre">--quant</span> <span class="pre">fp8</span></code> is required here.</p>
+</section>
 </section>
 </section>
 <section id="model-supported-matrix">
@@ -586,6 +611,7 @@ scripts/huggingface_example.sh<span class="w"> </span>--model<span class="w"> </
 <th class="head text-center"><p>FP8(block scaling)</p></th>
 <th class="head text-center"><p>FP8(rowwise)</p></th>
 <th class="head text-center"><p>FP8 KV Cache</p></th>
+<th class="head text-center"><p>NVFP4 KV Cache</p></th>
 <th class="head text-center"><p>W4A8 AWQ</p></th>
 <th class="head text-center"><p>W4A16 AWQ</p></th>
 <th class="head text-center"><p>W4A8 GPTQ</p></th>
@@ -604,6 +630,7 @@ scripts/huggingface_example.sh<span class="w"> </span>--model<span class="w"> </
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>DeepSeek-R1</p></td>
 <td class="text-center"><p>Y</p></td>
@@ -616,6 +643,7 @@ scripts/huggingface_example.sh<span class="w"> </span>--model<span class="w"> </
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p>EXAONE</p></td>
 <td class="text-center"><p>.</p></td>
@@ -624,6 +652,7 @@ scripts/huggingface_example.sh<span class="w"> </span>--model<span class="w"> </
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>.</p></td>
@@ -636,6 +665,7 @@ scripts/huggingface_example.sh<span class="w"> </span>--model<span class="w"> </
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>.</p></td>
@@ -652,6 +682,7 @@ scripts/huggingface_example.sh<span class="w"> </span>--model<span class="w"> </
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>LLaMA</p></td>
 <td class="text-center"><p>Y</p></td>
@@ -660,6 +691,7 @@ scripts/huggingface_example.sh<span class="w"> </span>--model<span class="w"> </
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>.</p></td>
@@ -674,6 +706,7 @@ scripts/huggingface_example.sh<span class="w"> </span>--model<span class="w"> </
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
 </tr>
@@ -682,6 +715,7 @@ scripts/huggingface_example.sh<span class="w"> </span>--model<span class="w"> </
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
+<td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
@@ -700,6 +734,7 @@ scripts/huggingface_example.sh<span class="w"> </span>--model<span class="w"> </
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>Mistral</p></td>
 <td class="text-center"><p>.</p></td>
@@ -708,6 +743,7 @@ scripts/huggingface_example.sh<span class="w"> </span>--model<span class="w"> </
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>.</p></td>
@@ -724,6 +760,7 @@ scripts/huggingface_example.sh<span class="w"> </span>--model<span class="w"> </
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>Phi</p></td>
 <td class="text-center"><p>.</p></td>
@@ -732,6 +769,7 @@ scripts/huggingface_example.sh<span class="w"> </span>--model<span class="w"> </
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
@@ -744,6 +782,7 @@ scripts/huggingface_example.sh<span class="w"> </span>--model<span class="w"> </
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>.</p></td>
@@ -756,6 +795,7 @@ scripts/huggingface_example.sh<span class="w"> </span>--model<span class="w"> </
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>.</p></td>
@@ -767,6 +807,7 @@ scripts/huggingface_example.sh<span class="w"> </span>--model<span class="w"> </
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
+<td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
@@ -784,6 +825,7 @@ scripts/huggingface_example.sh<span class="w"> </span>--model<span class="w"> </
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p>BLIP2-T5</p></td>
 <td class="text-center"><p>.</p></td>
@@ -792,6 +834,7 @@ scripts/huggingface_example.sh<span class="w"> </span>--model<span class="w"> </
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
@@ -805,6 +848,7 @@ scripts/huggingface_example.sh<span class="w"> </span>--model<span class="w"> </
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
@@ -817,6 +861,7 @@ scripts/huggingface_example.sh<span class="w"> </span>--model<span class="w"> </
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
@@ -828,6 +873,7 @@ scripts/huggingface_example.sh<span class="w"> </span>--model<span class="w"> </
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
@@ -853,6 +899,7 @@ The language component decides which quantization methods are supported by a giv
 <th class="head text-center"><p>FP8(block scaling)</p></th>
 <th class="head text-center"><p>FP8(rowwise)</p></th>
 <th class="head text-center"><p>FP8 KV Cache</p></th>
+<th class="head text-center"><p>NVFP4 KV Cache</p></th>
 <th class="head text-center"><p>W4A8 AWQ</p></th>
 <th class="head text-center"><p>W4A16 AWQ</p></th>
 <th class="head text-center"><p>W4A8 GPTQ</p></th>
@@ -871,6 +918,7 @@ The language component decides which quantization methods are supported by a giv
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>Blackwell(sm100)</p></td>
 <td class="text-center"><p>Y</p></td>
@@ -878,6 +926,7 @@ The language component decides which quantization methods are supported by a giv
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>.</p></td>
+<td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
@@ -891,6 +940,7 @@ The language component decides which quantization methods are supported by a giv
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
@@ -903,6 +953,7 @@ The language component decides which quantization methods are supported by a giv
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
@@ -915,6 +966,7 @@ The language component decides which quantization methods are supported by a giv
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>.</p></td>
@@ -932,7 +984,7 @@ The language component decides which quantization methods are supported by a giv
 <h2>Quick Links<a class="headerlink" href="#quick-links" title="Link to this heading">#</a></h2>
 <ul class="simple">
 <li><p><a class="reference external" href="https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4">Pre-quantized Models by ModelOpt</a></p></li>
-<li><p><a class="reference external" href="https://nvidia.github.io/TensorRT-Model-Optimizer/guides/0_support_matrix.html">ModelOpt Support Matrix</a></p></li>
+<li><p><a class="reference external" href="https://nvidia.github.io/Model-Optimizer/guides/0_support_matrix.html">ModelOpt Support Matrix</a></p></li>
 </ul>
 </section>
 </section>
@@ -990,9 +1042,13 @@ The language component decides which quantization methods are supported by a giv
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#usage">Usage</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#running-pre-quantized-models">Running Pre-quantized Models</a><ul class="nav section-nav flex-column">
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#fp8-kv-cache">FP8 KV Cache</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#nvfp4-kv-cache">NVFP4 KV Cache</a></li>
 </ul>
 </li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#offline-quantization-with-modelopt">Offline Quantization with ModelOpt</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#offline-quantization-with-modelopt">Offline Quantization with ModelOpt</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id1">NVFP4 KV Cache</a></li>
+</ul>
+</li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#model-supported-matrix">Model Supported Matrix</a></li>
@@ -1089,9 +1145,9 @@ The language component decides which quantization methods are supported by a giv
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on December 07, 2025.</p>
+  <p>Last updated on December 15, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/e4c7078">e4c7078</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9ba1426">9ba1426</a>.</p>
   
 </div></div>
       
