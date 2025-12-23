@@ -338,3 +338,85 @@ P99 ITL (ms):                            6.14
 - Control the number of images per request with `--random-num-images`
 - Use `--random-image-width` and `--random-image-height` to specify image dimensions or `--random-image-size` for squared image dimensions.
 - The `random_image` dataset generates synthetic images for benchmarking
+
+
+## Benchmark using AIPerf
+
+TensorRT-LLM also supports benchmarking `trtllm-serve` using [**AIPerf**](https://github.com/ai-dynamo/aiperf), NVIDIA’s
+comprehensive benchmarking tool for LLMs.  
+AIPerf provides throughput, latency, TTFT, and concurrency measurements for both
+text and multimodal workloads.
+
+AIPerf integrates directly with the OpenAI-compatible endpoints exposed by
+`trtllm-serve`.
+
+### Installation
+
+AIPerf is installed with TensorRT-LLM by default.  
+
+
+### Running AIPerf with trtllm-serve
+TensorRT-LLM provides example scripts under:
+
+- `examples/serve/aiperf_client.sh`
+- `examples/serve/aiperf_client_for_multimodal.sh`
+
+These scripts demonstrate how to benchmark a running trtllm-serve instance using
+the profile command in AIPerf.
+
+### Example: Benchmark a text model
+
+Once trtllm-serve is running on localhost:8000, run:
+
+```bash
+bash examples/serve/aiperf_client.sh
+```
+
+The script issues a profiling run:
+
+```bash
+aiperf profile \
+    -m TinyLlama-1.1B-Chat-v1.0 \
+    --tokenizer TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+    --endpoint-type chat \
+    --random-seed 123 \
+    --synthetic-input-tokens-mean 128 \
+    --synthetic-input-tokens-stddev 0 \
+    --output-tokens-mean 128 \
+    --output-tokens-stddev 0 \
+    --request-count 100 \
+    --request-rate 10 \
+    --profile-export-file my_profile_export.json \
+    --url localhost:8000 \
+    --streaming
+```
+
+### Example: Benchmark a multimodal model
+
+Benchmark multimodal inference using:
+
+```bash
+bash examples/serve/aiperf_client_for_multimodal.sh
+```
+
+This runs:
+
+```bash
+aiperf profile \
+    -m Qwen2.5-VL-3B-Instruct \
+    --tokenizer Qwen/Qwen2.5-VL-3B-Instruct \
+    --endpoint-type chat \
+    --random-seed 123 \
+    --image-width-mean 64 \
+    --image-height-mean 64 \
+    --image-format png \
+    --synthetic-input-tokens-mean 128 \
+    --synthetic-input-tokens-stddev 0 \
+    --output-tokens-mean 128 \
+    --output-tokens-stddev 0 \
+    --request-count 5 \
+    --request-rate 1 \
+    --profile-export-file my_profile_export.json \
+    --url localhost:8000 \
+    --streaming
+```
