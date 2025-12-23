@@ -39,7 +39,7 @@ FetchContent_Declare(
 FetchContent_Declare(
   deepgemm
   GIT_REPOSITORY https://github.com/deepseek-ai/DeepGEMM
-  GIT_TAG 2ce865de3ec8f11a80e0da786ab1e52f3482a0f9 # nv_dev branch
+  GIT_TAG 4ff3f54d9b7ed3129e4f36f9871232ea7ecab86b # nv_dev branch
   GIT_SUBMODULES_RECURSE
   ON
   SOURCE_SUBDIR
