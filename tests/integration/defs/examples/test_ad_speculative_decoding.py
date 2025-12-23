@@ -86,6 +86,7 @@ def run_with_autodeploy(model, speculative_model_dir, batch_size):
     llm_args = {
         "model": model,
         "skip_loading_weights": False,
+        "speculative_config": spec_config,
         "runtime": "trtllm",
         "world_size": 1,
         "kv_cache_config": kv_cache_config,
@@ -105,10 +106,6 @@ def run_with_autodeploy(model, speculative_model_dir, batch_size):
 
     # Create ExperimentConfig
     cfg = ExperimentConfig(**experiment_config)
-
-    cfg.args.speculative_config = (
-        spec_config  # Add here to avoid Pydantic validation error for eagle3_layers_to_capture
-    )
 
     # Add sampling parameters (deterministic with temperature=0.0 and fixed seed)
     cfg.prompt.sp_kwargs = {
@@ -133,21 +130,20 @@ def test_autodeploy_spec_dec(batch_size):
     Runs with and without speculative decoding and verifies outputs are identical.
     """
     print("\n" + "=" * 80)
-    print(f"Testing AutoDeploy Speculative Decoding - Batch Size {batch_size}")
+    print(f"Testing AutoDeploy Speculative Decoding (Draft Target) - Batch Size {batch_size}")
     print("=" * 80)
 
     base_model, draft_target_model, _ = get_model_paths()
 
     print(f"\nBase Model: {base_model}")
-    spec_model_path = draft_target_model
-    print(f"Speculative Model: {spec_model_path}")
+    print(f"Speculative Model: {draft_target_model}")
     print(f"Batch Size: {batch_size}")
 
     # Run with speculative decoding
     print("\n[1/2] Running with speculative decoding enabled...")
     spec_outputs = run_with_autodeploy(
         model=base_model,
-        speculative_model_dir=spec_model_path,
+        speculative_model_dir=draft_target_model,
         batch_size=batch_size,
     )
     print(f"Generated {len(spec_outputs)} outputs with speculative decoding")
