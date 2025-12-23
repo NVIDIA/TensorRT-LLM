@@ -140,7 +140,12 @@ async def test_chat(client: openai.AsyncOpenAI, model: str):
 
 
 @pytest.mark.asyncio(loop_scope="module")
-async def test_multi_turn_chat(client: openai.AsyncOpenAI, model: str):
+async def test_multi_turn_chat(client: openai.AsyncOpenAI, model: str,
+                               num_postprocess_workers: int):
+    if num_postprocess_workers > 0:
+        pytest.skip(
+            "Response store is disabled when num_postprocess_workers > 0")
+
     response = await client.responses.create(
         model=model,
         input=_get_qwen3_nothink_input(model, "What is the answer of 1+1?"),
