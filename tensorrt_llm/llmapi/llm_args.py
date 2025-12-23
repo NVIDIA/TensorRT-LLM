@@ -13,7 +13,7 @@ from typing import (Any, ClassVar, Dict, List, Literal, Optional, Set, Tuple,
 
 import torch
 import yaml
-from pydantic import BaseModel
+from pydantic import AliasChoices, BaseModel
 from pydantic import Field as PydanticField
 from pydantic import PrivateAttr, field_validator, model_validator
 from strenum import StrEnum
@@ -656,7 +656,9 @@ class DecodingBaseConfig(StrictBaseModel):
     #   which will be automatically downloaded.
     # - A local filesystem path to a downloaded model directory.
     speculative_model: Optional[Union[str, Path]] = Field(
-        default=None, validation_alias="speculative_model_dir")
+        default=None,
+        validation_alias=AliasChoices("speculative_model",
+                                      "speculative_model_dir"))
 
     # PyTorch only.
     # When specified, speculation will be disabled at batch sizes above
