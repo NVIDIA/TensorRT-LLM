@@ -1018,6 +1018,16 @@ class SequenceInfo:
         # The copy is truncated at the end of cache_loc to minimize transfer size
         self._input_buffer.copy_to_device()
 
+        from .flashinfer_attention import _GlobalFlashInferPlanner
+
+        if num_prefill == 0:
+            _GlobalFlashInferPlanner.plan_generate_only(
+                len(seq_len),
+                self._input_buffer.get_host_view("cu_num_pages")[: len(seq_len) + 1],
+                self._input_buffer.get_host_view("cache_loc"),
+                self._input_buffer.get_host_view("last_page_len")[: len(seq_len)],
+            )
+
     @nvtx_range("ad_rescatter_input_ids")
     def rescatter_input_ids(self, ungathered_input_ids: torch.Tensor):
         """Re-scatter the provided ungathered input ids into the input_ids tensor.
