@@ -261,6 +261,7 @@ class PyExecutor:
         # KVCacheTransferManager's onboard/offload operations.
         self.is_warmup = True
 
+        self.execution_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.execution_stream):
             self.model_engine.warmup(self.resource_manager)
             if self.draft_model_engine is not None:
@@ -2256,6 +2257,7 @@ class PyExecutor:
 
             # Run model forward on the execution stream for proper synchronization
             # with KVCacheTransferManager's onboard/offload operations.
+            self.execution_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self.execution_stream):
                 outputs = forward(scheduled_requests, self.resource_manager,
                                   new_tensors_device, gather_context_logits,
