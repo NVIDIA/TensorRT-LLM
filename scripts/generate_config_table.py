@@ -112,9 +112,7 @@ def build_rows(yaml_path) -> list[RecipeRow]:
 
                 profile = assign_profile(len(entries), idx, conc)
 
-                command = (
-                    f"trtllm-serve {model} --config ${{TRTLLM_DIR}}/{config_path}"
-                )
+                command = f"trtllm-serve {model} --config ${{TRTLLM_DIR}}/{config_path}"
 
                 config_filename = os.path.basename(config_path)
                 config_github_url = (
