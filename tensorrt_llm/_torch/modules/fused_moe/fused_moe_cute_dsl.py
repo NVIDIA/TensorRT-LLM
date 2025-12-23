@@ -1,5 +1,5 @@
 import math
-from typing import Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -8,7 +8,12 @@ from tensorrt_llm._utils import is_sm_100f
 
 from ...autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                           OptimizationProfile, TunableRunner, TuningConfig)
-from ...custom_ops.cute_dsl_custom_ops import GroupedGemmInputsHelper
+from ...custom_ops.cute_dsl_custom_ops import (
+    GroupedGemmInputsHelper,
+    Sm100BlockScaledContiguousGatherGroupedGemmSwigluFusionRunner,
+    Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
+    Sm100BlockScaledContiguousGroupedGemmRunner,
+    Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner)
 from ...distributed import allgather
 from ...model_config import ModelConfig
 from ...utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
@@ -265,6 +270,30 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         return self.forward_impl(*inputs,
                                  enable_alltoall=self.enable_alltoall,
                                  tile_size=tile_size)
+
+    @AutoTuner.TacticsCapture.register_runner_tactic_comb_checker
+    @staticmethod
+    def runner_tactic_comb_checker(
+            comb: List[Tuple[TunableRunner, Any]]) -> bool:
+        tile_size = None
+        for runner, tactic in comb:
+            if isinstance(runner, CuteDslFusedMoENvfp4Runner):
+                tile_size = tactic
+        if tile_size is None:
+            return True
+
+        for runner, tactic in comb:
+            if isinstance(
+                    runner,
+                (Sm100BlockScaledContiguousGroupedGemmRunner,
+                 Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
+                 Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner,
+                 Sm100BlockScaledContiguousGatherGroupedGemmSwigluFusionRunner
+                 )):
+                mma_tiler_mn, *_ = tactic
+                if mma_tiler_mn[0] != tile_size:
+                    return False
+        return True
 
 
 class CuteDslFusedMoE(CutlassFusedMoE):

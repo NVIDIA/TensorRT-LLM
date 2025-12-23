@@ -639,10 +639,13 @@ class AutoTuner:
         - Current replay state (which config and call index)
         """
 
+        runner_tactic_comb_checkers: List[Callable] = []
+
         def __init__(self, autotuner):
             # State for captured contexts
             self._captured_contexts: List[Dict[str, Any]] = []
-            self._configurations = None
+            self._context_tactics_lists: Optional[List[List[Tuple[int,
+                                                                  Any]]]] = None
             # State for replay mode
             self._replay_runner_tactic_list: Optional[List[Tuple[int,
                                                                  int]]] = None
@@ -654,10 +657,13 @@ class AutoTuner:
             For single context: yields (runner, tactic)
             For multiple contexts: yields ((runner_ctx0, tactic_ctx0), (runner_ctx1, tactic_ctx1), ...)
             """
-            if self._configurations is None:
-                self._configurations = self._generate_configurations()
+            if self._context_tactics_lists is None:
+                self._context_tactics_lists = self._generate_context_tactics_lists(
+                )
 
-            for config in self._configurations:
+            # Generate cartesian product from context and tactics where all_configrations[i][ctx] = (runner, tactic)
+            # Such that each element in all_configrations is a replay of multiple contexts of all possible replays
+            for config in itertools.product(*self._context_tactics_lists):
                 # config is a tuple of (runner_idx, tactic) for each context
                 # Convert to (runner, tactic) format for user
                 runner_tactic_pairs = []
@@ -666,9 +672,17 @@ class AutoTuner:
                     runner = runners[runner_idx]
                     runner_tactic_pairs.append((runner, tactic))
 
+                valid_comb = True
+                for checker in self.__class__.runner_tactic_comb_checkers:
+                    if not checker(runner_tactic_pairs):
+                        valid_comb = False
+                        break
+                if not valid_comb:
+                    continue
+
                 yield tuple(runner_tactic_pairs)
 
-        def _generate_configurations(self):
+        def _generate_context_tactics_lists(self):
             """Generate all valid tactic combinations."""
             if not self._captured_contexts:
                 raise RuntimeError(
@@ -694,14 +708,16 @@ class AutoTuner:
                         tactics_lists.append((runner_idx, tactic))
                 context_tactics_lists.append(tactics_lists)
 
-            # Generate cartesian product from context and tactics where all_configrations[i][ctx] = (runner, tactic)
-            # Such that each element in all_configrations is a replay of multiple contexts of all possible replays
-            all_configurations = list(itertools.product(*context_tactics_lists))
-            return all_configurations
+            return context_tactics_lists
 
         def is_replaying(self) -> bool:
             """Check if this TacticsCapture is currently in replay mode."""
             return self._replay_runner_tactic_list is not None
+
+        @classmethod
+        def register_runner_tactic_comb_checker(cls, checker: Callable):
+            cls.runner_tactic_comb_checkers.append(checker)
+            return checker
 
     def choose_one(
         self,

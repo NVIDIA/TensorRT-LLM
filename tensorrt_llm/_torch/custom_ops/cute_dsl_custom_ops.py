@@ -983,6 +983,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             else:
                 mma_tiler_mn = (self.tile_size, 128)
                 cluster_shape_mn = (self.tile_size // 128, 1)
+            assert mma_tiler_mn[
+                0] == self.tile_size, f"Tactic ({tactic}) is incompatible with tile size ({self.tile_size})"
 
             cache_key = (self.scaling_vector_size, self.tile_size, mma_tiler_mn,
                          cluster_shape_mn)
@@ -1294,8 +1296,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if isinstance(tactic, tuple):
                 mma_tiler_mn, cluster_shape_mn, raster_along_m = tactic
             else:
-                mma_tiler_mn, cluster_shape_mn, raster_along_m = (
-                    self.tile_size, 128), (self.tile_size // 128, 1), False
+                mma_tiler_mn = (self.tile_size, 128)
+                cluster_shape_mn = (self.tile_size // 128, 1)
+                raster_along_m = False
+            assert mma_tiler_mn[
+                0] == self.tile_size, f"Tactic ({tactic}) is incompatible with tile size ({self.tile_size})"
 
             cache_key = (self.scaling_vector_size, self.tile_size, mma_tiler_mn,
                          cluster_shape_mn)
@@ -1668,6 +1673,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             else:
                 mma_tiler_mn = (self.tile_size, 128)
                 cluster_shape_mn = (self.tile_size // 128, 1)
+            assert mma_tiler_mn[
+                0] == self.tile_size, f"Tactic ({tactic}) is incompatible with tile size ({self.tile_size})"
 
             cache_key = (self.scaling_vector_size, self.tile_size, mma_tiler_mn,
                          cluster_shape_mn)
@@ -2011,6 +2018,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             else:
                 mma_tiler_mn = (self.tile_size, 128)
                 cluster_shape_mn = (self.tile_size // 128, 1)
+            assert mma_tiler_mn[
+                0] == self.tile_size, f"Tactic ({tactic}) is incompatible with tile size ({self.tile_size})"
 
             cache_key = (self.scaling_vector_size, self.tile_size, self.top_k,
                          mma_tiler_mn, cluster_shape_mn)
