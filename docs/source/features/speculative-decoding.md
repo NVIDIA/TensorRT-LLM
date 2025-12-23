@@ -141,7 +141,7 @@ llm = LLM("/path/to/target_model", speculative_config=speculative_config)
 Speculative decoding options must be specified via `--config config.yaml` for both `trtllm-bench` and `trtllm-serve`. All speculative decoding options can be specified in this YAML file. An additional `decoding_type` option is used to specify the type of speculation to use. The available options are:
 
 * `MTP`
-* `Eagle3` (EAGLE 3)
+* `Eagle3`
 * `NGram`
 * `DraftTarget`
 
