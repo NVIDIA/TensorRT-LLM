@@ -38,6 +38,7 @@ from ..custom_ops.attention_interface import CacheConfig
 from ..utils._config import deep_merge_dicts
 from ..utils.logger import ad_logger
 from .factory import (
+    DROP_MODEL_INPUT_KWARGS,
     DynamicShape,
     FullModelExportInfo,
     ModelFactory,
@@ -593,7 +594,7 @@ class TextModelExportInfo(SubModuleExportInfo):
             "input_ids": {0: batch_size_dynamic, 1: seq_len_dynamic},
             "inputs_embeds": {0: batch_size_dynamic, 1: seq_len_dynamic},
             "position_ids": {0: batch_size_dynamic, 1: seq_len_dynamic},
-            "cache_position": {0: seq_len_dynamic},
+            # used for mask generation in VLM modules (specifies whether token is image or text)
             "token_type_ids": {0: batch_size_dynamic, 1: seq_len_dynamic},
         }
 
@@ -712,9 +713,9 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
             return_attention_mask=False,
         )
 
-        # We should have no need for the attention mask, and it can actually cause issues in
-        # downstream code.
-        inputs.pop("attention_mask", None)
+        # Drop known HF-only kwargs that may cause issues in downstream code.
+        for k in DROP_MODEL_INPUT_KWARGS:
+            inputs.pop(k, None)
 
         # NOTES:
         # 1. `inputs` is dict-like, but not a dict (hence the dict unpacking below).

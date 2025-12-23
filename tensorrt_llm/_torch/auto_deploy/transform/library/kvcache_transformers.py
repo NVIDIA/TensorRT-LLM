@@ -210,7 +210,7 @@ def forward_with_prepare_metadata(mod: nn.Module, **cm_kwargs):
         # Look up the mask generator for this model type from the registry
         mask_generator = VlmMaskGeneratorRegistry.get(model_type)
         if mask_generator is not None:
-            image_token_mask = get_image_token_mask(model_type, cm_kwargs)
+            image_token_mask = get_image_token_mask(cm_kwargs)
             if image_token_mask is not None and image_token_mask.any():
                 # Generate custom mask for FlashInfer - bidirectional for image tokens.
                 # Sliding window is handled separately by FlashInfer's window_left.

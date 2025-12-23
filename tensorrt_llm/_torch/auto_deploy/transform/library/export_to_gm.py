@@ -10,7 +10,7 @@ import torch.nn as nn
 from pydantic import Field
 
 from ...export import run_forward_for_capture, torch_export_to_gm
-from ...models.factory import ModelFactory
+from ...models.factory import DROP_MODEL_INPUT_KWARGS, ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ..interface import (
     BaseTransform,
@@ -19,16 +19,6 @@ from ..interface import (
     TransformInfo,
     TransformRegistry,
 )
-
-_DROP_GM_KWARGS = {
-    # HF often passes these, but we don't want them to participate in torch.export in_spec matching.
-    "attention_mask",
-    "output_attentions",
-    "output_hidden_states",
-    "return_dict",
-    # NOTE: token_type_ids and mm_token_type_ids are now included in the export so that
-    # VLM custom mask generation can happen inside the exported GraphModule.
-}
 
 
 def _ad_sanitize_gm_kwargs(mod: nn.Module, args, kwargs: Dict[str, Any]) -> None:
@@ -39,7 +29,7 @@ def _ad_sanitize_gm_kwargs(mod: nn.Module, args, kwargs: Dict[str, Any]) -> None
     pass extra kwargs that we do not want to treat as GraphModule inputs.
     """
     # Drop known HF-only kwargs that may be passed at runtime.
-    for k in _DROP_GM_KWARGS:
+    for k in DROP_MODEL_INPUT_KWARGS:
         kwargs.pop(k, None)
 
 
@@ -186,7 +176,7 @@ class ExportToGM(BaseTransform):
             # We intentionally do not export certain HF-only kwargs as GraphModule inputs.
             # Some HF call sites will still pass these at runtime; we will drop them before
             # calling the exported GraphModule to avoid torch.export strict in_spec matching.
-            for k in _DROP_GM_KWARGS:
+            for k in DROP_MODEL_INPUT_KWARGS:
                 captured_kwargs.pop(k, None)
 
             # construct dynamic shapes based on the captured kwargs and the dynamic shape lookup
@@ -215,7 +205,6 @@ class ExportToGM(BaseTransform):
             # Ensure runtime calls from HF into this exported GraphModule do not fail due to
             # torch.export's strict input spec checks (e.g., HF passing attention_mask).
             sub_gm.register_forward_pre_hook(_ad_sanitize_gm_kwargs, prepend=True, with_kwargs=True)
-
             # post process the sub graph module
             e_info.post_process(sub_mod, sub_gm)
 
