@@ -51,6 +51,7 @@ def get_disagg_server_url_from_cfg(config_file: str) -> tuple[str, int]:
     return server_host, server_port
 
 
+# {$nv-internal-release begin}
 def get_test_config(test_desc, example_dir, test_root):
     """Get test configuration based on test description WLAMM."""
     test_configs_root = f"{test_root}/test_configs"
@@ -195,6 +196,9 @@ def get_extra_llm_config(config, suffix, cwd):
         yaml.dump(extra_llm_config, f)
 
     return extra_config_file
+
+
+# {$nv-internal-release begin}
 
 
 def generate_worker_commands(model_path, config, server_config,
