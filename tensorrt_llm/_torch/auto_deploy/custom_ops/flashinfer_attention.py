@@ -143,9 +143,6 @@ class _FlashInferPlanner:
                 _plan_decode(self.decode_wrapper)
             else:
                 # plan prefill with optional custom_mask for VLM support
-                # NOTE: when using a custom mask, set window_left=-1 to avoid FlashInfer applying
-                # sliding-window attention on top of the custom mask.
-                window_left = -1 if custom_mask is not None else plan_params.window_left
                 self.prefill_wrapper.plan(
                     qo_indptr,
                     kv_page_indptr,
@@ -159,7 +156,7 @@ class _FlashInferPlanner:
                     q_data_type=plan_params.q_dtype,
                     kv_data_type=plan_params.kv_dtype,
                     sm_scale=plan_params.sm_scale,
-                    window_left=window_left,
+                    window_left=plan_params.window_left,
                     logits_soft_cap=plan_params.logits_soft_cap,
                     custom_mask=custom_mask,  # VLM custom mask (None for standard causal)
                 )
