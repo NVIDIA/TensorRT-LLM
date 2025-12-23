@@ -79,6 +79,38 @@ def _signal_handler_cleanup_child(signum, frame):
     sys.exit(128 + signum)
 
 
+def _append_extra_error_message_for_port_conflict(error_msg: str, port: int):
+    extra_error_msg = ""
+    try:
+        from datetime import datetime
+
+        import psutil
+
+        conns = psutil.net_connections()
+        bound_to_pid = None
+        for conn in conns:
+            if conn.laddr and conn.laddr.port == port:
+                bound_to_pid = conn.pid
+                break
+            if conn.raddr and conn.raddr.port == port:
+                bound_to_pid = conn.pid
+                break
+
+        if bound_to_pid:
+            bound_proc = psutil.Process(bound_to_pid)
+            extra_error_msg = (
+                f", Bound to PID: {bound_to_pid}, "
+                f"Process: {bound_proc.name()}, "
+                f"Started at: {datetime.fromtimestamp(bound_proc.create_time()).strftime('%Y-%m-%d %H:%M:%S')}, "
+                f"Command: {bound_proc.cmdline()}")
+
+    except Exception as e:
+        logger.warning(
+            f"Error appending extra error message for port conflict: {e}")
+
+    return error_msg + extra_error_msg
+
+
 def get_llm_args(
         model: str,
         tokenizer: Optional[str] = None,
@@ -183,7 +215,10 @@ def launch_server(
         try:
             s.bind((host, port))
         except OSError as e:
-            raise RuntimeError(f"Failed to bind socket to {host}:{port}: {e}")
+            error_msg = f"Failed to bind socket to {host}:{port}: {e}"
+            error_msg = _append_extra_error_message_for_port_conflict(
+                error_msg, port)
+            raise RuntimeError(error_msg)
 
         if backend == 'pytorch':
             llm_args.pop("build_config", None)
@@ -650,9 +685,10 @@ def disaggregated(
         try:
             s.bind((disagg_cfg.hostname, disagg_cfg.port))
         except OSError as e:
-            raise RuntimeError(
-                f"Failed to bind socket to {disagg_cfg.hostname}:{disagg_cfg.port}: {e}"
-            )
+            error_msg = f"Failed to bind socket to {disagg_cfg.hostname}:{disagg_cfg.port}: {e}"
+            error_msg = _append_extra_error_message_for_port_conflict(
+                error_msg, disagg_cfg.port)
+            raise RuntimeError(error_msg)
 
         metadata_server_cfg = parse_metadata_server_config_file(
             metadata_server_config_file)
