@@ -334,8 +334,8 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
             trust_remote_code=trust_remote_code)
         self._model_path = model_path
         if model_type == "mistral_large_3":
-            self._processor = MistralCommonImageProcessor(tokenizer=self._tokenizer,
-                                                        dtype=self.dtype)
+            self._processor = MistralCommonImageProcessor(
+                tokenizer=self._tokenizer, dtype=self.dtype)
             self.text_processor = AutoProcessor.from_pretrained(
                 model_path,
                 use_fast=self.use_fast,

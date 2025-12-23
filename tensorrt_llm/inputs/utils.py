@@ -375,7 +375,9 @@ NOTE:
 """
 
 HF_CHAT_TEMPLATE_EXCEPTIONS = ["llava_llama", "mistral_large_3"]
-PLACEHOLDER_EXCEPTIONS = ["llava_next", "NemotronH_Nano_VL_V2", "mistral_large_3"]
+PLACEHOLDER_EXCEPTIONS = [
+    "llava_next", "NemotronH_Nano_VL_V2", "mistral_large_3"
+]
 
 
 # Helpers to always get the latest supported multimodal model types from the registry
