@@ -1081,7 +1081,7 @@ CUBIN_EXPORT __global__
             unused(xBar.produced.arrive());
         }
 #if SKIP_SOFTMAX_ATTN && SKIP_SOFTMAX_ATTN_BLOCK_STATS
-        if (threadIdx.x == 0)
+        if (threadIdx.x == 0 && skipped_block_count != nullptr && total_block_count != nullptr)
         {
             atomicAdd(skipped_block_count, local_skipped_block_count);
             atomicAdd(total_block_count, nbIters);
