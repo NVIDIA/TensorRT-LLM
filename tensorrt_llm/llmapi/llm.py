@@ -265,44 +265,61 @@ class BaseLLM:
             return
         arch = archs[0]
 
+        def _disable_if_unsupported(
+            feature: SupportFeature,
+            *,
+            enabled: bool,
+            arg_path: str,
+            disable,
+        ) -> None:
+            # Preserve behavior: only override when user explicitly enabled it.
+            if not enabled:
+                return
+            status = get_support_status(arch, feature)
+            # Preserve behavior: unknown/untested/missing status must not disable anything.
+            if status not in (SupportStatus.NO, SupportStatus.NA):
+                return
+            logger.warning(
+                f"{arch}: {feature.value} unsupported; disabling {arg_path}")
+            disable()
+
         kv_cfg = getattr(self.args, "kv_cache_config", None)
-        if kv_cfg is not None and getattr(kv_cfg, "enable_block_reuse", False):
-            if get_support_status(
-                    arch, SupportFeature.KV_CACHE_REUSE) in (SupportStatus.NO,
-                                                             SupportStatus.NA):
-                logger.warning(
-                    f"{arch}: KV cache reuse unsupported; setting kv_cache_config.enable_block_reuse=False"
-                )
+
+        def _disable_kv_cache_reuse() -> None:
+            if kv_cfg is not None:
                 kv_cfg.enable_block_reuse = False
 
-        if getattr(self.args, "enable_chunked_prefill", False):
-            if get_support_status(
-                    arch, SupportFeature.CHUNKED_PREFILL) in (SupportStatus.NO,
-                                                              SupportStatus.NA):
-                logger.warning(
-                    f"{arch}: Chunked prefill unsupported; setting enable_chunked_prefill=False"
-                )
-                self.args.enable_chunked_prefill = False
+        _disable_if_unsupported(
+            SupportFeature.KV_CACHE_REUSE,
+            enabled=kv_cfg is not None
+            and getattr(kv_cfg, "enable_block_reuse", False),
+            arg_path="kv_cache_config.enable_block_reuse",
+            disable=_disable_kv_cache_reuse,
+        )
 
-        if getattr(self.args, "enable_attention_dp", False):
-            if get_support_status(
-                    arch, SupportFeature.ATTENTION_DP) in (SupportStatus.NO,
-                                                           SupportStatus.NA):
-                logger.warning(
-                    f"{arch}: Attention DP unsupported; setting enable_attention_dp=False"
-                )
-                self.args.enable_attention_dp = False
+        _disable_if_unsupported(
+            SupportFeature.CHUNKED_PREFILL,
+            enabled=getattr(self.args, "enable_chunked_prefill", False),
+            arg_path="enable_chunked_prefill",
+            disable=lambda: setattr(self.args, "enable_chunked_prefill", False),
+        )
 
-        if hasattr(self.args, "disable_overlap_scheduler") and getattr(
-                self.args, "disable_overlap_scheduler") is False:
-            if get_support_status(
-                    arch,
-                    SupportFeature.OVERLAP_SCHEDULER) in (SupportStatus.NO,
-                                                          SupportStatus.NA):
-                logger.warning(
-                    f"{arch}: Overlap scheduler unsupported; setting disable_overlap_scheduler=True"
-                )
-                self.args.disable_overlap_scheduler = True
+        _disable_if_unsupported(
+            SupportFeature.ATTENTION_DP,
+            enabled=getattr(self.args, "enable_attention_dp", False),
+            arg_path="enable_attention_dp",
+            disable=lambda: setattr(self.args, "enable_attention_dp", False),
+        )
+
+        # disable_overlap_scheduler is inverted: we only flip it when currently False.
+        _disable_if_unsupported(
+            SupportFeature.OVERLAP_SCHEDULER,
+            enabled=hasattr(self.args, "disable_overlap_scheduler")
+            and getattr(self.args, "disable_overlap_scheduler") is False,
+            arg_path="disable_overlap_scheduler",
+            disable=lambda: setattr(self.args, "disable_overlap_scheduler", True
+                                    ),
+        )
 
     @property
     @set_api_status("beta")
