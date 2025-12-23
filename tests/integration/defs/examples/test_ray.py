@@ -2,10 +2,8 @@ import os
 import subprocess
 
 import pytest
-from defs.common import venv_check_call, wait_for_server
+from defs.common import get_free_port_in_ci, venv_check_call, wait_for_server
 from defs.conftest import get_device_count, llm_models_root
-
-from tensorrt_llm._utils import get_free_port
 
 
 @pytest.fixture(scope="module")
@@ -68,7 +66,7 @@ def test_ray_disaggregated_serving(ray_example_root, llm_venv, tp_size):
     script_path = os.path.join(disagg_dir, "disagg_serving_local.sh")
     model_dir = f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
     subprocess.run("ray stop --force", shell=True, check=False)
-    ray_port = get_free_port()
+    ray_port = get_free_port_in_ci()
     subprocess.run(f"ray start --head --port {ray_port} --disable-usage-stats",
                    shell=True,
                    check=False)

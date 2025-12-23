@@ -22,7 +22,8 @@ from typing import Callable
 
 import pytest
 import yaml
-from defs.common import (revise_disagg_config_file_with_free_ports,
+from defs.common import (get_free_port_in_ci,
+                         revise_disagg_config_file_with_free_ports,
                          wait_for_server)
 from defs.conftest import (get_sm_version, llm_models_root, skip_arm,
                            skip_no_hopper)
@@ -30,7 +31,7 @@ from defs.trt_test_alternative import check_call, check_output, popen
 from test_common.perf_metrics_utils import (get_timing_metrics,
                                             validate_timing_metrics)
 
-from tensorrt_llm._utils import get_free_port, mpi_disabled
+from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.logger import logger
 
 
@@ -357,7 +358,7 @@ def run_disaggregated_test(example_dir,
 
         extra_config_files = []
         workers_cmds = []
-        ray_port = get_free_port()
+        ray_port = get_free_port_in_ci()
         subprocess.run([
             'ray', 'start', '--head', '--port',
             str(ray_port), '--disable-usage-stats'
