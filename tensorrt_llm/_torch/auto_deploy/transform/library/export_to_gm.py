@@ -10,6 +10,7 @@ import torch.nn as nn
 from pydantic import Field
 
 from ...export import run_forward_for_capture, torch_export_to_gm
+from ...export.tied_weights import add_load_hook_for_cross_boundary_tied_weights
 from ...models.factory import DROP_MODEL_INPUT_KWARGS, ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ..interface import (
@@ -213,6 +214,11 @@ class ExportToGM(BaseTransform):
                 mod = sub_gm
             else:
                 mod.set_submodule(e_info.submodule_name, sub_gm)
+
+        # Register hook for cross-boundary tied weights (VLM models like Gemma3)
+        # Only needed when submodules are exported (not full model export where submodule_name == "")
+        if sub_keys and not any(k == "" for k in sub_keys):
+            add_load_hook_for_cross_boundary_tied_weights(mod, sub_keys)
 
         # this is a clean graph by definition since it was just exported
         info = TransformInfo(
