@@ -60,7 +60,7 @@ def example_root():
 
 @pytest.mark.parametrize("exe, script",
                          [("python3", "openai_chat_client_for_multimodal.py"),
-                          ("bash", "genai_perf_client_for_multimodal.sh")])
+                          ("bash", "aiperf_client_for_multimodal.sh")])
 def test_trtllm_serve_examples(exe: str, script: str,
                                server: RemoteOpenAIServer, example_root: str):
     client_script = os.path.join(example_root, script)
