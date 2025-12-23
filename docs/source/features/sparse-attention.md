@@ -158,11 +158,13 @@ The key files located in `tensorrt_llm/_torch/attention_backend/sparse/` are:
 
 In `AttentionOp`, currently, the MQA/GQA sparse attention only supports sparse computation at block granularity in the generation phase, where the block size equals to the page size of the KV cache. It means that we can skip the attention computation of those unimportant pages. In addition, we provide a sparse MLA kernel that supports token-level sparse computation in both the context and generation phases.
 
-To support those features, as illustrated in Figure 2, for the MQA/GQA path we have implemented two kernels, `updateSparseKvCacheAfterFmha` and `gatherKvPageOffsetsKernel`, applied in the context and generation phases respectively:
+To support those features, as illustrated in Figure 2, we have implemented two kernels for the MQA/GQA path, `updateSparseKvCacheAfterFmha` and `gatherKvPageOffsetsKernel`, applied in the context and generation phases respectively:
 
 *   **`updateSparseKvCacheAfterFmha`**: Invoked in the post-processing stage after the context attention computation. It selects the important KV tokens and write those K/V vectors to the KV cache to reduce the KV cache size.
 
 *   **`gatherKvPageOffsetsKernel`**: Executed before the attention computation in the generation phase. It converts the input sparse indices (which can be of arbitrary granularity) into page-aligned indices. This means that if a single token is selected, the entire page it is included in the attention computation. After this conversion, we will get a new `kv_page_offsets` and also an updated `kv_len` that is the number of those selected KV tokens. Then these new metadata are fed into the subsequent attention kernel for computation.
+
+For sparse MLA, the kernel supports token sparsity directly, eliminating the need for gatherKvPageOffsetsKernel. However, please note that sparse KV cache support is not yet available.
 
 Many sparse attention algorithms also require additional auxiliary memory. In the current system, there are two paths to support this feature:
 
@@ -192,15 +194,15 @@ Create a new class inheriting from `TrtllmAttention` (in `tensorrt_llm/_torch/at
 **`sparse_kv_predict(self, q, k, metadata, **kwargs)`**
 *   **Behavior**: This function performs prediction to return the indices of tokens to be preserved in the KV cache.
 *   **Output**: 
-    - `sparse_kv_indices`: TODO
-    - `sparse_kv_offsets`: TODO
+    - `sparse_kv_indices`: The token indices of the important tokens on sequence dimension, shape `(nHeads, nTokens)`, where `nHeads` is the number of KV heads and `nTokens` is the total number of selected tokens across all samples in the batch.
+    - `sparse_kv_offsets`: The offset for the `sparse_kv_indices`, shape `(nBatch + 1)`, where `nBatch` is the number of the batch size. The index for head `h` and sample `n` can be obtained via `sparse_kv_indices[h, sparse_kv_offsets[n]]`.
 *   **Constraint**: Returned indices must be **sorted** to ensure safe in-place gathering in memory. Note that this post-processing "gather" step introduces some overhead, but significantly improves flexibility, allowing compatibility with features in context like chunked prefill.
 
 **`sparse_attn_predict(self, q, k, metadata, **kwargs)`**
 *   **Behavior**: For the current query tokens, predict and return the sparse indices for **sparse computation**.
 *   **Output**: 
-    - `sparse_attn_indices`: TODO
-    - `sparse_attn_offsets`: TODO
+    - `sparse_attn_indices`: The block indices of the block sparse attention on the KV sequence dimension, shape `(nHeads, nBlocks)`, where `nHeads` is the number of KV heads and `nBlocks` is the total number of selected blocks across all samples in the batch. For block sparse attention, the block size is defined by `sparse_attn_indices_block_size`, which supports arbitrary values.
+    - `sparse_attn_offsets`: The offset for the `sparse_attn_indices`, shape `(nBatch + 1)`, where `nBatch` is the number of the batch size. The index for head `h` and sample `n` can be obtained via `sparse_attn_indices[h, sparse_kv_offsets[n]]`.
 *   **Constraint**: The generation phase sparse computation is supported for NVIDIA Blackwell GPUs and newer (SM 100+) using TRTLLM-GEN kernels. However, it is flexible enough to extend to different architectures. Currently, only KV cache's **page-level** granularity is supported for sparse computation.
 
 **Note**: The prediction process can be time-consuming, especially in low-latency scenarios where it might account for a significant portion of the attention time. It is highly recommended to optimize this step using custom kernels.
