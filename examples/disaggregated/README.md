@@ -374,6 +374,92 @@ srun -A <account> -p <partition> -t <time> \
 
 Additionally, we offer a fully executable script—please refer to [Disaggregated SLURM Scripts](./slurm/simple_example/).
 
+### Kubernetes Deployment with AWS EFA
+
+LIBFABRIC backend is particularly useful for Kubernetes deployments on AWS with EFA (Elastic Fabric Adapter) for high-performance networking between pods in disaggregated serving.
+
+#### Prerequisites
+
+- Kubernetes cluster with GPU nodes and EFA support
+- TensorRT-LLM container with wheel package pre-installed
+
+#### Deployment Steps
+
+**1.Configure Pod Resources**
+
+When deploying on Kubernetes with EFA, ensure proper resource allocation in your pod specification:
+
+```yaml
+resources:
+  limits:
+    nvidia.com/gpu: 2           # Number of GPUs for this pod
+    vpc.amazonaws.com/efa: 4    # Number of EFA network interfaces
+```
+
+##### 2. Install EFA Libraries in Container
+
+AWS EFA library must be installed in the container for LIBFABRIC to work:
+
+```bash
+# Install AWS EFA library (required for LIBFABRIC with EFA)
+curl -O https://efa-installer.amazonaws.com/aws-efa-installer-latest.tar.gz
+tar -xf aws-efa-installer-latest.tar.gz
+cd aws-efa-installer && ./efa_installer.sh --yes --skip-kmod
+```
+
+##### 3. Rebuild NIXL with EFA Support
+
+Follow the NIXL rebuild instructions from the LIBFABRIC Backend Setup section, ensuring the libfabric path points to the EFA installation:
+
+```bash
+meson setup builddir \
+    -Ducx_path=/usr/local/ucx \
+    -Dlibfabric_path=/opt/amazon/efa \  # EFA libfabric installation path
+    -Dcudapath_lib=/usr/local/cuda/lib64 \
+    -Dcudapath_inc=/usr/local/cuda/include \
+    --buildtype=release
+```
+
+##### 4. Configure and Launch Services
+
+Use ConfigMaps to manage configurations for disaggregated serving:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: disagg-config
+data:
+  context.yaml: |
+    disable_overlap_scheduler: true
+    cache_transceiver_config:
+      backend: NIXL
+      max_tokens_in_buffer: 2048
+  generation.yaml: |
+    cache_transceiver_config:
+      backend: NIXL
+      max_tokens_in_buffer: 2048
+```
+
+Launch services:
+
+```bash
+# For context servers
+TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC \
+trtllm-serve <model> \
+    --host localhost --port 8001 \
+    --config /configs/context.yaml
+
+# For generation servers
+TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC \
+trtllm-serve <model> \
+    --host localhost --port 8002 \
+    --config /configs/generation.yaml
+
+# For disaggregated proxy server
+trtllm-serve disaggregated -c disagg_config.yaml
+```
+
 ## Mixed Precision Context and Generation
 
 In disaggregated serving, the context workers and generation workers have different performance characteristics: context workers are compute-bound while generation workers are memory-bound. Therefore, it may be beneficial to run context workers and generation workers in different precisions.
