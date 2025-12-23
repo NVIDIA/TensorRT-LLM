@@ -448,7 +448,7 @@ __device__ void warpGrpApplyMask(Gemm0Acc& acc, SpecDec const& specDec,
 #if SWAP_AB
 #if SKIP_SOFTMAX_ATTN
 __device__ RegColWiseVec computeWarpGrpColMax_sync(CtaBarrier& warpGrpBar, ShmQWiseVec& smemColMax, Gemm0Acc const& src,
-    float skipSoftmaxThreshold, uint32_t* smemSkipVote);
+    float skipSoftmaxThreshold, uint32_t* smemSkipVote, bool maybeSkip);
 #else
 __device__ RegColWiseVec computeWarpGrpColMax_sync(
     CtaBarrier& warpGrpBar, ShmQWiseVec& smemColMax, Gemm0Acc const& src);
@@ -1001,12 +1001,13 @@ CUBIN_EXPORT __global__
             auto& skipSoftmaxXBar = smem.skipSoftmaxXBar[idxXBuf];
             skipSoftmaxXBar.consumed.arrive_and_wait();
 
+            bool const maybeSkip = idxIter != 0;
             RegColWiseVec const colMax = computeWarpGrpColMax_sync(smem.gemm0WarpGrpBar, smem.gemm0CurrentSeqMax, acc,
-                idxIter == nbIters - 1 ? 0.0f : skipSoftmaxThreshold, &smem.skipSoftmaxVotesGemm0ToV[idxXBuf]);
+                skipSoftmaxThreshold, &smem.skipSoftmaxVotesGemm0ToV[idxXBuf], maybeSkip);
             bool const shouldSkipSoftmaxAttn = static_cast<bool>(smem.skipSoftmaxVotesGemm0ToV[idxXBuf]);
             unused(skipSoftmaxXBar.produced.arrive());
             warpGrpOnlineSoftmax(acc, colMax);
-            if (idxIter != nbIters - 1 && shouldSkipSoftmaxAttn)
+            if (shouldSkipSoftmaxAttn)
             {
                 xBar.consumed.arrive_and_wait();
                 if (threadIdx.x == 0)
@@ -1135,228 +1136,229 @@ CUBIN_EXPORT __global__
             auto const idxXBuf = idxVBuf;
             auto& xBar = smem.xBar[idxXBuf];
             auto& vBar = smem.vBar[idxVBuf];
+            auto const& vBuf = smem.vBuf(idxVBuf);
             xBar.produced.arrive_and_wait();
 #if SKIP_SOFTMAX_ATTN
             bool shouldSkipSoftmaxAttn = smem.skipSoftmaxVotesGemm0ToGemm1[idxXBuf]; // guarded by xBar
-            if (idxIter != nbIters - 1 && shouldSkipSoftmaxAttn)
+            if (shouldSkipSoftmaxAttn)
             {
                 vBar.produced.arrive_and_wait();
-                unused(xBar.consumed.arrive());
-#if SWAP_AB
-                unused(vBar.consumed.arrive());
-#else
-                static_assert(false, "not implemented");
-#endif
-                continue;
             }
 #endif
-            arrive_tx_and_wait(vBar.produced, exactDiv(sizeof(SharedMem::VBuffer), gemm1NbThrds));
-            auto const& vBuf = smem.vBuf(idxVBuf);
+
+#if SKIP_SOFTMAX_ATTN
+            if (!shouldSkipSoftmaxAttn) // skip XVGemm
+#endif
+            {
+                arrive_tx_and_wait(vBar.produced, exactDiv(sizeof(SharedMem::VBuffer), gemm1NbThrds));
 #if !SWAP_AB
-            CtaBarrierPair& vtBar = smem.vtBar[idxVBuf];
-            auto& vtBuf = smem.vtBuf(idxVBuf);
-            vtBar.consumed.arrive_and_wait();
-            transposeVTile(warpRank, laneId(), vtBuf, vBuf);
-            vBar.consumed.arrive();
-            vtBar.produced.arrive();
+                CtaBarrierPair& vtBar = smem.vtBar[idxVBuf];
+                auto& vtBuf = smem.vtBuf(idxVBuf);
+                vtBar.consumed.arrive_and_wait();
+                transposeVTile(warpRank, laneId(), vtBuf, vBuf);
+                vBar.consumed.arrive();
+                vtBar.produced.arrive();
 #endif
 #if !defined(NDEBUG) && DBG_PRINT
 #if SWAP_AB
-            if (threadIdx.x == 0)
-            {
-                printf("colMax:\n");
-                for (int i = 0; i < ctaNbQHeads; i++)
+                if (threadIdx.x == 0)
                 {
-                    printf("%f, ", smem.xColMax[idxXBuf][i]);
-                }
-                printf("\n");
-                printf("colSum:\n");
-                for (int n = 0; n < 4; n++)
-                {
+                    printf("colMax:\n");
                     for (int i = 0; i < ctaNbQHeads; i++)
                     {
-                        printf("%f, ", smem.xColSum[idxXBuf][n][i]);
+                        printf("%f, ", smem.xColMax[idxXBuf][i]);
+                    }
+                    printf("\n");
+                    printf("colSum:\n");
+                    for (int n = 0; n < 4; n++)
+                    {
+                        for (int i = 0; i < ctaNbQHeads; i++)
+                        {
+                            printf("%f, ", smem.xColSum[idxXBuf][n][i]);
+                        }
+                        printf("\n");
+                    }
+                    printf("\n");
+                    printf("X:\n");
+                    for (int i = 0; i < ctaNbQHeads; i++)
+                    {
+                        for (int j = 0; j < gemm0CtaTileNbTokens; j++)
+                        {
+                            auto const& elemsPerXPart = (cacheElemsPerGrain * grainsPerXPart);
+                            auto const e = reinterpret_cast<Vec<__nv_fp8_e4m3, 16>&>(
+                                smem.xBuf(idxXBuf)[j / elemsPerXPart].template at<true>(
+                                    i, j % elemsPerXPart / cacheElemsPerGrain))[j % cacheElemsPerGrain];
+                            printf("%.2f, ", float(e));
+                            if (j % 16 == 15)
+                            {
+                                printf("| ");
+                            }
+                        }
+                        printf("\n\n");
+                    }
+                }
+                smem.gemm1WarpGrpBar.arrive_and_wait();
+#else
+                if (blockIdx.y == 1 && threadIdx.x == 0)
+                {
+                    printf("rowMax:\n");
+                    for (int i = 0; i < ctaNbQHeads; i++)
+                    {
+                        printf("%f, ", smem.xRowMax[idxXBuf][i]);
+                    }
+                    printf("\n");
+                    printf("rowSum:\n");
+                    for (int i = 0; i < ctaNbQHeads; i++)
+                    {
+                        printf("%f, ", smem.xRowSum[idxXBuf][i]);
                     }
                     printf("\n");
                 }
-                printf("\n");
-                printf("X:\n");
-                for (int i = 0; i < ctaNbQHeads; i++)
-                {
-                    for (int j = 0; j < gemm0CtaTileNbTokens; j++)
-                    {
-                        auto const& elemsPerXPart = (cacheElemsPerGrain * grainsPerXPart);
-                        auto const e = reinterpret_cast<Vec<__nv_fp8_e4m3, 16>&>(
-                            smem.xBuf(idxXBuf)[j / elemsPerXPart].template at<true>(
-                                i, j % elemsPerXPart / cacheElemsPerGrain))[j % cacheElemsPerGrain];
-                        printf("%.2f, ", float(e));
-                        if (j % 16 == 15)
-                        {
-                            printf("| ");
-                        }
-                    }
-                    printf("\n\n");
-                }
-            }
-            smem.gemm1WarpGrpBar.arrive_and_wait();
-#else
-            if (blockIdx.y == 1 && threadIdx.x == 0)
-            {
-                printf("rowMax:\n");
-                for (int i = 0; i < ctaNbQHeads; i++)
-                {
-                    printf("%f, ", smem.xRowMax[idxXBuf][i]);
-                }
-                printf("\n");
-                printf("rowSum:\n");
-                for (int i = 0; i < ctaNbQHeads; i++)
-                {
-                    printf("%f, ", smem.xRowSum[idxXBuf][i]);
-                }
-                printf("\n");
-            }
-            smem.gemm1WarpGrpBar.arrive_and_wait();
+                smem.gemm1WarpGrpBar.arrive_and_wait();
 #endif
 #endif
 
 #if SWAP_AB
-            // @fixme: if first tile, no need to rescale acc. For persistent CTA, just re-initialize acc instead.
-            rescaleGemm1AccForNewColMax_sync(warpRank, smem.xColMax[idxXBuf], smem.xColSum[idxXBuf],
-                smem.gemm1AccColMax, acc, smem.gemm1AccColSum, smem.gemm1WarpGrpBar);
+                // @fixme: if first tile, no need to rescale acc. For persistent CTA, just re-initialize acc instead.
+                rescaleGemm1AccForNewColMax_sync(warpRank, smem.xColMax[idxXBuf], smem.xColSum[idxXBuf],
+                    smem.gemm1AccColMax, acc, smem.gemm1AccColSum, smem.gemm1WarpGrpBar);
 #else
-            rescaleGemm1AccForNewRowMax_sync(
-                warpRank, smem.xRowMax[idxXBuf], smem.xRowSum[idxXBuf], smem.gemm1AccColMax, acc, smem.gemm1AccColSum);
+                rescaleGemm1AccForNewRowMax_sync(warpRank, smem.xRowMax[idxXBuf], smem.xRowSum[idxXBuf],
+                    smem.gemm1AccColMax, acc, smem.gemm1AccColSum);
 #endif
-            auto& xBuf = smem.xBuf(idxXBuf);
+                auto& xBuf = smem.xBuf(idxXBuf);
 
-            auto const descXBase = gmma::makeMatDesc(nullptr, 0, SharedMem::XBuffer::Elem::rowBytes * 8,
-                gmma::getSwizzleMode<true>(SharedMem::XBuffer::Elem{}))
-                                       .raw();
+                auto const descXBase = gmma::makeMatDesc(nullptr, 0, SharedMem::XBuffer::Elem::rowBytes * 8,
+                    gmma::getSwizzleMode<true>(SharedMem::XBuffer::Elem{}))
+                                           .raw();
 #if CACHE_ELEM_ENUM == 0
-            auto const descVBase = gmma::makeMatDesc(nullptr, 0, SharedMem::VBuffer::Elem::rowBytes * 8,
-                gmma::getSwizzleMode<true>(SharedMem::VBuffer::Elem{}))
-                                       .raw();
+                auto const descVBase = gmma::makeMatDesc(nullptr, 0, SharedMem::VBuffer::Elem::rowBytes * 8,
+                    gmma::getSwizzleMode<true>(SharedMem::VBuffer::Elem{}))
+                                           .raw();
 #endif
 #if SWAP_AB
 //@fixme: to reduce code size, we can disable unroll and use double-buffer for LDSM in loadVTileTransposed.
 #pragma unroll
-            for (uint32_t idxInstK = 0; idxInstK < gemm1NbGmmaInstK; idxInstK++)
-            {
+                for (uint32_t idxInstK = 0; idxInstK < gemm1NbGmmaInstK; idxInstK++)
+                {
 #if CACHE_ELEM_ENUM == 2
-                Vec<RegMatAFrag, gemm1NbGmmaInstM> const fragA
-                    = loadVTileTransposed(warpRank, laneId(), vBuf, idxInstK);
+                    Vec<RegMatAFrag, gemm1NbGmmaInstM> const fragA
+                        = loadVTileTransposed(warpRank, laneId(), vBuf, idxInstK);
 #if !defined(NDEBUG) && DBG_PRINT
-                if (threadIdx.x == 0)
-                {
-                    printf("fragA:\nidxInstK == %u\n", idxInstK);
-                }
-                smem.gemm1WarpGrpBar.arrive_and_wait();
-                for (int m = 0; m < 2; m++)
-                {
-                    for (int w = 0; w < 4; w++)
+                    if (threadIdx.x == 0)
                     {
-                        if (warpRank == w)
+                        printf("fragA:\nidxInstK == %u\n", idxInstK);
+                    }
+                    smem.gemm1WarpGrpBar.arrive_and_wait();
+                    for (int m = 0; m < 2; m++)
+                    {
+                        for (int w = 0; w < 4; w++)
                         {
-                            if (laneId() == 0)
+                            if (warpRank == w)
                             {
-                                printf("    warpRank = %u\n", warpRank);
-                            }
-                            __syncwarp();
-                            for (int a = 0; a < 2; a++)
-                            {
-                                for (int b = 0; b < 8; b++)
+                                if (laneId() == 0)
                                 {
-                                    for (int c = 0; c < 2; c++)
+                                    printf("    warpRank = %u\n", warpRank);
+                                }
+                                __syncwarp();
+                                for (int a = 0; a < 2; a++)
+                                {
+                                    for (int b = 0; b < 8; b++)
                                     {
-                                        for (int d = 0; d < 4; d++)
+                                        for (int c = 0; c < 2; c++)
                                         {
-                                            if (laneId() == b * 4 + d)
+                                            for (int d = 0; d < 4; d++)
                                             {
-                                                for (int e = 0; e < 4; e++)
+                                                if (laneId() == b * 4 + d)
                                                 {
-                                                    auto const& elem4 = reinterpret_cast<__nv_fp8_e4m3 const(&)[4]>(
-                                                        fragA[m](0, c)(a, 0));
-                                                    printf("%.2f, ", float(elem4[e]));
+                                                    for (int e = 0; e < 4; e++)
+                                                    {
+                                                        auto const& elem4 = reinterpret_cast<__nv_fp8_e4m3 const(&)[4]>(
+                                                            fragA[m](0, c)(a, 0));
+                                                        printf("%.2f, ", float(elem4[e]));
+                                                    }
                                                 }
+                                                __syncwarp();
                                             }
-                                            __syncwarp();
                                         }
+                                        if (laneId() == 0)
+                                        {
+                                            printf("\n");
+                                        }
+                                        __syncwarp();
                                     }
-                                    if (laneId() == 0)
+                                    if (laneId() == 0 && a == 0)
                                     {
-                                        printf("\n");
+                                        printf("----------------------\n");
                                     }
                                     __syncwarp();
                                 }
-                                if (laneId() == 0 && a == 0)
-                                {
-                                    printf("----------------------\n");
-                                }
-                                __syncwarp();
                             }
+                            smem.gemm1WarpGrpBar.arrive_and_wait();
                         }
-                        smem.gemm1WarpGrpBar.arrive_and_wait();
                     }
-                }
 #endif
 #endif
-                BoundedVal<grainsPerInstK * gemm1NbGmmaInstK> const kOffsetInGrains{grainsPerInstK * idxInstK};
-                auto const descX = addAddr(descXBase,
-                    &xBuf[kOffsetInGrains.template divBy<SharedMem::XBuffer::Elem::cols>().get()](
-                        0, kOffsetInGrains.template mod<SharedMem::XBuffer::Elem::cols>().get()));
+                    BoundedVal<grainsPerInstK * gemm1NbGmmaInstK> const kOffsetInGrains{grainsPerInstK * idxInstK};
+                    auto const descX = addAddr(descXBase,
+                        &xBuf[kOffsetInGrains.template divBy<SharedMem::XBuffer::Elem::cols>().get()](
+                            0, kOffsetInGrains.template mod<SharedMem::XBuffer::Elem::cols>().get()));
 #if CACHE_ELEM_ENUM == 2
-                gmma::fence();
+                    gmma::fence();
 #endif
 #pragma unroll
-                for (uint32_t idxInstM = 0; idxInstM < gemm1NbGmmaInstM; idxInstM++)
-                {
+                    for (uint32_t idxInstM = 0; idxInstM < gemm1NbGmmaInstM; idxInstM++)
+                    {
 #if CACHE_ELEM_ENUM == 0
-                    auto const descV
-                        = addAddr(descVBase, &vBuf[idxInstM](kOffsetInGrains.get() * cacheElemsPerGrain, 0));
-                    gmma::mma_async_shmA<MathElem, ctaNbQHeads, true, false>(
-                        reinterpret_cast<float(&)[exactDiv(ctaNbQHeads, gmma::instNBase)][2][2]>(acc(idxInstM, 0)),
-                        descV, descX, true);
+                        auto const descV
+                            = addAddr(descVBase, &vBuf[idxInstM](kOffsetInGrains.get() * cacheElemsPerGrain, 0));
+                        gmma::mma_async_shmA<MathElem, ctaNbQHeads, true, false>(
+                            reinterpret_cast<float(&)[exactDiv(ctaNbQHeads, gmma::instNBase)][2][2]>(acc(idxInstM, 0)),
+                            descV, descX, true);
 #elif CACHE_ELEM_ENUM == 2
-                    gmma::mma_async_regA<MathElem, ctaNbQHeads>(
-                        reinterpret_cast<float(&)[exactDiv(ctaNbQHeads, gmma::instNBase)][2][2]>(acc(idxInstM, 0)),
-                        reinterpret_cast<uint32_t const(&)[2][2][1]>(fragA[idxInstM]), descX, true);
+                        gmma::mma_async_regA<MathElem, ctaNbQHeads>(
+                            reinterpret_cast<float(&)[exactDiv(ctaNbQHeads, gmma::instNBase)][2][2]>(acc(idxInstM, 0)),
+                            reinterpret_cast<uint32_t const(&)[2][2][1]>(fragA[idxInstM]), descX, true);
 #endif
+                    }
+                    gmma::commit_group();
+                    //@fixme: delay wait and consumption to next tile. Note that fragA must also persist until finish of
+                    // gmma.
+                    gmma::wait_group<0>();
                 }
-                gmma::commit_group();
-                //@fixme: delay wait and consumption to next tile. Note that fragA must also persist until finish of
-                // gmma.
-                gmma::wait_group<0>();
-            }
 #else
-            auto const descVTBase = gmma::makeMatDesc(
-                nullptr, 0, SharedMem::VTBuffer::rowBytes * 8, gmma::getSwizzleMode<true>(SharedMem::VTBuffer{}))
-                                        .raw();
-            vtBar.produced.arrive_and_wait();
+                auto const descVTBase = gmma::makeMatDesc(
+                    nullptr, 0, SharedMem::VTBuffer::rowBytes * 8, gmma::getSwizzleMode<true>(SharedMem::VTBuffer{}))
+                                            .raw();
+                vtBar.produced.arrive_and_wait();
 // if (idxIter == 1 && threadIdx.x == 0) {
 //     printf("vtBuf:\n");
 //     dbg::printArray2D<__nv_fp8_e4m3, true>(vtBuf);
 // }
 #pragma unroll
-            for (uint32_t m = 0; m < Gemm1Acc::rows; m++)
-            {
-#pragma unroll
-                for (uint32_t k = 0; k < gemm1NbGmmaInstK; k++)
+                for (uint32_t m = 0; m < Gemm1Acc::rows; m++)
                 {
-                    BoundedVal<grainsPerInstK * gemm1NbGmmaInstK> const kOffsetInGrains{grainsPerInstK * k};
-                    auto const descX = addAddr(descXBase,
-                        &xBuf[kOffsetInGrains.template divBy<SharedMem::XBuffer::Elem::cols>().get()](
-                            gmma::instM * m, kOffsetInGrains.template mod<SharedMem::XBuffer::Elem::cols>().get()));
-                    auto const descVT = addAddr(
-                        descVTBase, &vtBuf(0, kOffsetInGrains.template mod<SharedMem::VTBuffer::cols>().get()));
-                    gmma::mma_async_shmA<MathElem, headElems>(
-                        reinterpret_cast<float(&)[exactDiv(headElems, gmma::instNBase)][2][2]>(acc(m, 0)), descX,
-                        descVT, true);
+#pragma unroll
+                    for (uint32_t k = 0; k < gemm1NbGmmaInstK; k++)
+                    {
+                        BoundedVal<grainsPerInstK * gemm1NbGmmaInstK> const kOffsetInGrains{grainsPerInstK * k};
+                        auto const descX = addAddr(descXBase,
+                            &xBuf[kOffsetInGrains.template divBy<SharedMem::XBuffer::Elem::cols>().get()](
+                                gmma::instM * m, kOffsetInGrains.template mod<SharedMem::XBuffer::Elem::cols>().get()));
+                        auto const descVT = addAddr(
+                            descVTBase, &vtBuf(0, kOffsetInGrains.template mod<SharedMem::VTBuffer::cols>().get()));
+                        gmma::mma_async_shmA<MathElem, headElems>(
+                            reinterpret_cast<float(&)[exactDiv(headElems, gmma::instNBase)][2][2]>(acc(m, 0)), descX,
+                            descVT, true);
+                    }
                 }
-            }
-            gmma::commit_group();
-            //@fixme: delay wait and consumption to next tile. Note that fragA must also persist until finish of gmma.
-            gmma::wait_group<0>();
+                gmma::commit_group();
+                //@fixme: delay wait and consumption to next tile. Note that fragA must also persist until finish of
+                // gmma.
+                gmma::wait_group<0>();
 #endif
+            }
+
             if (idxIter == nbIters - 1)
             {
                 // gmma::wait_group should have already synchronized threads, so this may be unnecessary.
@@ -1627,7 +1629,7 @@ CUBIN_EXPORT __global__
 #endif
 
 #if SKIP_SOFTMAX_ATTN
-                if (idxIter != nbIters - 1 && shouldSkipSoftmaxAttn)
+                if (shouldSkipSoftmaxAttn)
                 {
                     vBar.consumed.arrive_and_wait();
                     // compared to non-skip softmax attn, we need to increase vBar.produced count to avoid race
@@ -2130,7 +2132,7 @@ __device__ inline void warpGrpApplyMask(Gemm0Acc& acc, SpecDec const& specDec,
 // smemColMax is persistent across multiple iterations
 #if SKIP_SOFTMAX_ATTN
 __device__ inline RegColWiseVec computeWarpGrpColMax_sync(CtaBarrier& warpGrpBar, ShmQWiseVec& smemColMax,
-    Gemm0Acc const& src, float skipSoftmaxThreshold, uint32_t* smemSkipVote)
+    Gemm0Acc const& src, float skipSoftmaxThreshold, uint32_t* smemSkipVote, bool maybeSkip)
 #else
 __device__ inline RegColWiseVec computeWarpGrpColMax_sync(
     CtaBarrier& warpGrpBar, ShmQWiseVec& smemColMax, Gemm0Acc const& src)
@@ -2139,7 +2141,7 @@ __device__ inline RegColWiseVec computeWarpGrpColMax_sync(
 #if SKIP_SOFTMAX_ATTN
     if (threadIdx.x == 0)
     {
-        *smemSkipVote = 1U; // will sync before vote
+        *smemSkipVote = maybeSkip ? 1U : 0U; // will sync before vote
     }
     float const lnThreshold = log(skipSoftmaxThreshold);
 #endif
@@ -2194,7 +2196,7 @@ __device__ inline RegColWiseVec computeWarpGrpColMax_sync(
                 // smemColMax(Prev), the smemColMax value *before* this tile is computed.
                 // When determine whether to skip, it is safe to use prevOrCurrentMax: 1) all 4 warps' localmax <
                 // smemColMax(Prev), then prevOrCurrentMax == smemColMax(Prev), result not affected; 2) if some localmax
-                // > smemColMax(Prev), prevOrCurrentMax < actual smemColMax, some warps may incorrectly vote skip, but
+                // > smemColMax(Prev), prevOrCurrentMax > smemColMax(Prev), some warps may incorrectly vote skip, but
                 // at least one warp whose localColMax is larger will not skip, then the tile is not skipped
                 prevOrCurrentMax[n][j] = atomicMax(&smemColMax[8 * n + 2 * lane + j], colMax[n][j]);
 #else

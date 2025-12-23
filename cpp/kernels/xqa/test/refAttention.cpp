@@ -111,7 +111,7 @@ Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refFlashAt
             *total_block_count += 1;
             auto const skip_softmax_mask
                 = ((localRowMax - skipRowMaxs[idxTile % nbSubSeq]).array() < std::log(skip_softmax_threshold));
-            bool const skip_block = skip_softmax_mask.all() && (idxTile != nbTiles - 1);
+            bool const skip_block = skip_softmax_mask.all() && (idxTile != idxTileBeg);
             if (skip_block)
             {
                 *skipped_block_count += 1;
