@@ -18,7 +18,7 @@ from tensorrt_llm._torch.modules.multi_stream_utils import \
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.utils import maybe_compile
-from tensorrt_llm._utils import get_size_in_bytes
+from tensorrt_llm._utils import get_size_in_bytes, get_sm_version
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.bindings.internal.batch_manager import \
@@ -312,6 +312,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     skip_indexer_for_ctx_reqs: bool = False
     # Whether skip the indexer for generation requests
     skip_indexer_for_gen_reqs: bool = False
+    # Whether to use the expanded buffers for MTP support
+    use_expanded_buffers_for_mtp: bool = False
 
     def __init__(self, *args, **kwargs):
         self.num_sms = tensorrt_llm.deep_gemm.get_num_sms()
@@ -475,10 +477,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 device='cpu',
                 pin_memory=True,
             )
-        # Create expanded buffers for MTP>1 support
+        # Create expanded buffers for MTP support
         self.create_expanded_buffers(capture_graph=capture_graph)
 
-    # TODO: remove these expanded buffers when fp8_paged_mqa_logits supports MTP > 1.
+    # TODO: remove these expanded buffers when fp8_paged_mqa_logits supports an arbitrary number of MTP draft tokens.
     def create_expanded_buffers(self, capture_graph=False):
         self.kv_lens_expanded_cuda = self.get_empty(
             self.cuda_graph_buffers,
@@ -514,9 +516,18 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
+        # The fp8_paged_mqa_logits kernel needs different layout of the metadata buffer for MTP=3.
+        if self.max_draft_tokens == 3:
+            self.scheduler_metadata_buffer_mtp3 = self.get_empty(
+                self.cuda_graph_buffers,
+                (self.num_sms // 2 + 1, 2),
+                cache_name="scheduler_metadata_buffer_mtp3",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
 
     # This function is only used to create the expanded buffers when the max_draft_tokens is changed.
-    # TODO: remove this function when fp8_paged_mqa_logits can support MTP > 1.
+    # TODO: remove this function once fp8_paged_mqa_logits supports an arbitrary number of MTP draft tokens.
     def update_spec_dec_param(
         self,
         batch_size,
@@ -726,11 +737,15 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         else:
             self.max_gen_seq_len = 0
 
-        # Because the fp8_paged_mqa_logits only supports seq_len == 1 or 2, so it cannot support
-        # MTP > 1. To handle this, when MTP > 1, we flatten the q tensor and expand the kv_lens and
-        # block_table for to use the fp8_paged_mqa_logits.
-        # TODO: remove this when fp8_paged_mqa_logits supports MTP > 1.
-        if self.max_draft_tokens > 1:
+        # Because the fp8_paged_mqa_logits only supports seq_len == 1/2/4 on sm100, and
+        # seq_len == 1/2 on sm90, for other cases, we need to flatten the q tensor and
+        # expand the kv_lens and block_table for MTP support.
+        # TODO: remove this once fp8_paged_mqa_logits supports an arbitrary number of MTP draft tokens.
+        self.use_expanded_buffers_for_mtp = (
+            (self.max_draft_tokens > 1 and get_sm_version()) == 90
+            or ((self.max_draft_tokens == 2 or self.max_draft_tokens > 3)
+                and get_sm_version() >= 100))
+        if self.use_expanded_buffers_for_mtp:
             # Expand kv_lens_cuda (only generation)
             num_tokens = self.num_generations * (1 + self.max_draft_tokens)
             gen_kv_lens = kv_lens[self.num_contexts:self.num_seqs]
@@ -786,6 +801,12 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 tokens_per_block, self.num_sms)
             self.scheduler_metadata_buffer.copy_(scheduler_metadata_buffer,
                                                  non_blocking=True)
+            if self.max_draft_tokens == 3:
+                scheduler_metadata_buffer_mtp3 = get_paged_mqa_logits_metadata(
+                    self.kv_lens_cuda[self.num_contexts:self.num_seqs],
+                    tokens_per_block, self.num_sms // 2)
+                self.scheduler_metadata_buffer_mtp3.copy_(
+                    scheduler_metadata_buffer_mtp3, non_blocking=True)
         self.prepare_dense_topk_indices(self.kv_lens_cuda, device=True)
 
     def update_for_spec_dec(self):
@@ -1058,13 +1079,18 @@ class Indexer(nn.Module):
         if num_generations > 0:
             # Prepare schedule metadata for fp8_paged_mqa_logits
             # This is a preprocessing step that computes scheduling information for the kernel
-            if metadata.max_draft_tokens <= 1:
+            if not metadata.use_expanded_buffers_for_mtp:
                 gen_seq_lens = metadata.kv_lens_cuda_runtime[
                     num_contexts:num_contexts + num_generations]
                 scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
                     gen_seq_lens, tokens_per_block, metadata.num_sms)
                 metadata.scheduler_metadata_buffer.copy_(
                     scheduler_metadata_buffer, non_blocking=True)
+                if metadata.max_draft_tokens == 3:
+                    scheduler_metadata_buffer_mtp3 = get_paged_mqa_logits_metadata(
+                        gen_seq_lens, tokens_per_block, metadata.num_sms // 2)
+                    metadata.scheduler_metadata_buffer_mtp3.copy_(
+                        scheduler_metadata_buffer_mtp3, non_blocking=True)
             else:
                 # Expand schedule metadata buffer (only generation)
                 num_tokens = metadata.num_generations * (
@@ -1399,15 +1425,19 @@ class Indexer(nn.Module):
                              ...]
             batch_size = num_generations
             next_n = num_gen_tokens // num_generations
-            # Because fp8_paged_mqa_logits cannot support next_n > 2, we need to flatten the q_decode tensor
+            # Because fp8_paged_mqa_logits can only support next_n == 1/2/4 on sm100, and
+            # next_n == 1/2 on sm90, for other next_n, we need to flatten the q_decode tensor
             # and expand the corresponding metadata.
-            if next_n <= 2:
+            if not metadata.use_expanded_buffers_for_mtp:
                 q_decode = q_decode.view(num_generations, -1, *q_fp8.shape[1:])
                 context_lens = metadata.kv_lens_cuda_runtime[
                     num_contexts:num_contexts + num_generations]
                 block_table = metadata.indexer_k_cache_block_offsets[
                     num_contexts:num_contexts + num_generations]
-                scheduler_metadata_buffer = metadata.scheduler_metadata_buffer
+                if q_decode.shape[1] == 4:
+                    scheduler_metadata_buffer = metadata.scheduler_metadata_buffer_mtp3
+                else:
+                    scheduler_metadata_buffer = metadata.scheduler_metadata_buffer
             else:
                 q_decode = q_decode.view(-1, 1, *q_fp8.shape[1:])
                 num_tokens = num_generations * (1 + metadata.max_draft_tokens)
