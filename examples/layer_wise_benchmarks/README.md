@@ -153,9 +153,11 @@ NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --scaled-from 16 --moe-backend WID
 Run the following command in the container:
 
 ```bash
+# Parse the profile at the default directory
 python3 parse.py --world-size 4
 
-# Specify the location of the .nsys-rep file
+# Specify the file path
+python3 parse.py --file-path profiles/report_np4_rank0.nsys-rep
 python3 parse.py --profile-dir ./profiles --world-size 4 --rank 0
 
 # Parse a specific module. The module must appear exactly once in each run.

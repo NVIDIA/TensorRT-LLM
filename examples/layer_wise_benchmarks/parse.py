@@ -15,8 +15,9 @@ import pandas as pd
 
 # Parse cmdline
 parser = argparse.ArgumentParser()
+parser.add_argument("--file-path", type=str)
 parser.add_argument("--profile-dir", type=str, default="profiles")
-parser.add_argument("--world-size", "--np", type=int, required=True)
+parser.add_argument("--world-size", "--np", type=int)
 parser.add_argument("--rank", type=int, default=0)
 parser.add_argument("--warmup-times", type=int)
 parser.add_argument("--module", type=str)
@@ -28,6 +29,8 @@ group.add_argument(
 )
 parser.set_defaults(error_on_unknown_kernel=False)
 args = parser.parse_args()
+if (args.file_path is None) == (args.world_size is None):
+    parser.error("Please specify exactly one of --file-path and --world-size.")
 print(args)
 
 
@@ -90,11 +93,19 @@ def shortest_common_supersequence(a, b):
     return res
 
 
-profile_dir = Path(args.profile_dir)
-nsys_rep_file_path = profile_dir / f"report_np{args.world_size}_rank{args.rank}.nsys-rep"
-sqlite_file_path = profile_dir / f"report_np{args.world_size}_rank{args.rank}.sqlite"
-csv_file_path = profile_dir / f"report_np{args.world_size}_rank{args.rank}.csv"
-html_file_path = profile_dir / f"report_np{args.world_size}_rank{args.rank}.html"
+if args.file_path is not None:
+    nsys_rep_file_path = Path(args.file_path)
+else:
+    profile_dir = Path(args.profile_dir)
+    nsys_rep_file_path = profile_dir / f"report_np{args.world_size}_rank{args.rank}.nsys-rep"
+assert nsys_rep_file_path.name.endswith(".nsys-rep")
+sqlite_file_path = nsys_rep_file_path.parent / (
+    nsys_rep_file_path.name[: -len(".nsys-rep")] + ".sqlite"
+)
+csv_file_path = nsys_rep_file_path.parent / (nsys_rep_file_path.name[: -len(".nsys-rep")] + ".csv")
+html_file_path = nsys_rep_file_path.parent / (
+    nsys_rep_file_path.name[: -len(".nsys-rep")] + ".html"
+)
 lazy_convert_sqlite(nsys_rep_file_path, sqlite_file_path)
 
 conn = sqlite3.connect(f"file:{sqlite_file_path}?mode=ro", uri=True)
@@ -197,7 +208,8 @@ if "CUDA_GRAPH_NODE_EVENTS" in tables:
            R.start AS runtime_start, R.end AS runtime_end,
            CGE2.start AS capture_start, CGE2.end AS capture_end
     FROM ({unified_subquery}) AS unified
-    JOIN CUPTI_ACTIVITY_KIND_RUNTIME AS R ON unified.correlationId = R.correlationId
+    JOIN CUPTI_ACTIVITY_KIND_RUNTIME AS R ON unified.graphNodeId IS NOT NULL AND
+                                             unified.correlationId = R.correlationId
     LEFT JOIN CUDA_GRAPH_NODE_EVENTS AS CGE1 ON unified.graphNodeId = CGE1.graphNodeId AND
                                                 CGE1.originalGraphNodeId IS NOT NULL
     LEFT JOIN CUDA_GRAPH_NODE_EVENTS AS CGE2 ON CGE1.originalGraphNodeId = CGE2.graphNodeId"""
