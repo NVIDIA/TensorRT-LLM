@@ -61,7 +61,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc5';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc6';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -76,7 +76,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc5" />
+  <meta name="docsearch:version" content="1.2.0rc6" />
 
 
   </head>
@@ -360,6 +360,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client.html">Curl Chat Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_responses_client.html">Curl Responses Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client.html">Genai Perf Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client_for_multimodal.html">Genai Perf Client For Multimodal</a></li>
@@ -368,6 +369,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_responses_client.html">OpenAI Responses Client</a></li>
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
@@ -691,7 +693,7 @@ JSON entry is on every line.</p>
 <p>In order to prepare a synthetic dataset, you can use the provided script in the <code class="docutils literal notranslate"><span class="pre">benchmarks/cpp</span></code>
 directory. For example, to generate a synthetic dataset of 1000 requests with a uniform ISL/OSL of
 128/128 for <a class="reference external" href="https://huggingface.co/meta-llama/Llama-3.1-8B">meta-llama/Llama-3.1-8B</a>, run:</p>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>benchmarks/cpp/prepare_dataset.py<span class="w"> </span>--stdout<span class="w"> </span>--tokenizer<span class="w"> </span>meta-llama/Llama-3.1-8B<span class="w"> </span>token-norm-dist<span class="w"> </span>--input-mean<span class="w"> </span><span class="m">128</span><span class="w"> </span>--output-mean<span class="w"> </span><span class="m">128</span><span class="w"> </span>--input-stdev<span class="w"> </span><span class="m">0</span><span class="w"> </span>--output-stdev<span class="w"> </span><span class="m">0</span><span class="w"> </span>--num-requests<span class="w"> </span><span class="m">1000</span><span class="w"> </span>&gt;<span class="w"> </span>/tmp/synthetic_128_128.txt
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--model<span class="w"> </span>meta-llama/Llama-3.1-8B<span class="w"> </span>prepare-dataset<span class="w"> </span>--output<span class="w"> </span>/tmp/synthetic_128_128.txt<span class="w"> </span>token-norm-dist<span class="w"> </span>--input-mean<span class="w"> </span><span class="m">128</span><span class="w"> </span>--output-mean<span class="w"> </span><span class="m">128</span><span class="w"> </span>--input-stdev<span class="w"> </span><span class="m">0</span><span class="w"> </span>--output-stdev<span class="w"> </span><span class="m">0</span><span class="w"> </span>--num-requests<span class="w"> </span><span class="m">1000</span>
 </pre></div>
 </div>
 </section>
@@ -765,11 +767,11 @@ Total<span class="w"> </span>Latency<span class="w"> </span><span class="o">(</s
 <h4>Benchmarking with LoRA Adapters in PyTorch workflow<a class="headerlink" href="#benchmarking-with-lora-adapters-in-pytorch-workflow" title="Link to this heading">#</a></h4>
 <p>The PyTorch workflow supports benchmarking with LoRA (Low-Rank Adaptation) adapters. This requires preparing a dataset with LoRA metadata and configuring the LoRA settings.</p>
 <p><strong>Preparing LoRA Dataset</strong></p>
-<p>Use <code class="docutils literal notranslate"><span class="pre">prepare_dataset.py</span></code> with LoRA-specific options to generate requests with LoRA metadata:</p>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span>benchmarks/cpp/prepare_dataset.py<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--stdout<span class="w"> </span><span class="se">\</span>
+<p>Use <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">prepare-dataset</span></code> with LoRA-specific options to generate requests with LoRA metadata:</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--model<span class="w"> </span>/path/to/tokenizer<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>prepare-dataset<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--rand-task-id<span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--tokenizer<span class="w"> </span>/path/to/tokenizer<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--lora-dir<span class="w"> </span>/path/to/loras<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>token-norm-dist<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--num-requests<span class="w"> </span><span class="m">100</span><span class="w"> </span><span class="se">\</span>
@@ -834,16 +836,17 @@ Each subdirectory should contain the LoRA adapter files for that specific task.<
 <h4>Running multi-modal models in the PyTorch Workflow<a class="headerlink" href="#running-multi-modal-models-in-the-pytorch-workflow" title="Link to this heading">#</a></h4>
 <p>To benchmark multi-modal models with PyTorch workflow, you can follow the similar approach as above.</p>
 <p>First, prepare the dataset:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">python</span> <span class="o">./</span><span class="n">benchmarks</span><span class="o">/</span><span class="n">cpp</span><span class="o">/</span><span class="n">prepare_dataset</span><span class="o">.</span><span class="n">py</span> \
-  <span class="o">--</span><span class="n">tokenizer</span> <span class="n">Qwen</span><span class="o">/</span><span class="n">Qwen2</span><span class="o">-</span><span class="n">VL</span><span class="o">-</span><span class="mi">2</span><span class="n">B</span><span class="o">-</span><span class="n">Instruct</span> \
-  <span class="o">--</span><span class="n">stdout</span> \
-  <span class="n">dataset</span> \
-  <span class="o">--</span><span class="n">dataset</span><span class="o">-</span><span class="n">name</span> <span class="n">lmms</span><span class="o">-</span><span class="n">lab</span><span class="o">/</span><span class="n">MMMU</span> \
-  <span class="o">--</span><span class="n">dataset</span><span class="o">-</span><span class="n">split</span> <span class="n">test</span> \
-  <span class="o">--</span><span class="n">dataset</span><span class="o">-</span><span class="n">image</span><span class="o">-</span><span class="n">key</span> <span class="n">image</span> \
-  <span class="o">--</span><span class="n">dataset</span><span class="o">-</span><span class="n">prompt</span><span class="o">-</span><span class="n">key</span> <span class="n">question</span> \
-  <span class="o">--</span><span class="n">num</span><span class="o">-</span><span class="n">requests</span> <span class="mi">10</span> \
-  <span class="o">--</span><span class="n">output</span><span class="o">-</span><span class="nb">len</span><span class="o">-</span><span class="n">dist</span> <span class="mi">128</span><span class="p">,</span><span class="mi">5</span> <span class="o">&gt;</span> <span class="n">mm_data</span><span class="o">.</span><span class="n">jsonl</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--model<span class="w"> </span>Qwen/Qwen2-VL-2B-Instruct<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>prepare-dataset<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--output<span class="w"> </span>mm_data.jsonl
+<span class="w">  </span>real-dataset
+<span class="w">  </span>--dataset-name<span class="w"> </span>lmms-lab/MMMU<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--dataset-split<span class="w"> </span><span class="nb">test</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--dataset-image-key<span class="w"> </span>image<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--dataset-prompt-key<span class="w"> </span>question<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--num-requests<span class="w"> </span><span class="m">10</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--output-len-dist<span class="w"> </span><span class="m">128</span>,5
 </pre></div>
 </div>
 <p>It will download the media files to <code class="docutils literal notranslate"><span class="pre">/tmp</span></code> directory and prepare the dataset with their paths. Note that the <code class="docutils literal notranslate"><span class="pre">prompt</span></code> fields are texts and not tokenized ids. This is due to the fact that
@@ -944,9 +947,9 @@ checkpoint. For the Llama-3.1 models, TensorRT LLM provides the following checkp
 <li><p><a class="reference external" href="https://huggingface.co/nvidia/Llama-3.1-70B-Instruct-FP8"><code class="docutils literal notranslate"><span class="pre">nvidia/Llama-3.1-70B-Instruct-FP8</span></code></a></p></li>
 <li><p><a class="reference external" href="https://huggingface.co/nvidia/Llama-3.1-405B-Instruct-FP8"><code class="docutils literal notranslate"><span class="pre">nvidia/Llama-3.1-405B-Instruct-FP8</span></code></a></p></li>
 </ul>
-<p>To understand more about how to quantize your own checkpoints, refer to ModelOpt <a class="reference external" href="https://nvidia.github.io/TensorRT-Model-Optimizer/deployment/1_tensorrt_llm.html">documentation</a>.</p>
+<p>To understand more about how to quantize your own checkpoints, refer to ModelOpt <a class="reference external" href="https://nvidia.github.io/Model-Optimizer/deployment/1_tensorrt_llm.html">documentation</a>.</p>
 <p><code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> utilizes the <code class="docutils literal notranslate"><span class="pre">hf_quant_config.json</span></code> file present in the pre-quantized checkpoints above. The configuration
-file is present in checkpoints quantized with <a class="reference external" href="https://github.com/NVIDIA/TensorRT-Model-Optimizer">TensorRT Model Optimizer</a>
+file is present in checkpoints quantized with <a class="reference external" href="https://github.com/NVIDIA/Model-Optimizer">Model Optimizer</a>
 and describes the compute and KV cache quantization that checkpoint was compiled with. For example, from the checkpoints
 above:</p>
 <div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
@@ -1175,9 +1178,9 @@ when the checkpoint precision is <code class="docutils literal notranslate"><spa
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on December 07, 2025.</p>
+  <p>Last updated on December 15, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/e4c7078">e4c7078</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9ba1426">9ba1426</a>.</p>
   
 </div></div>
       

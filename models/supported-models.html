@@ -61,7 +61,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc5';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc6';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -76,7 +76,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc5" />
+  <meta name="docsearch:version" content="1.2.0rc6" />
 
 
   </head>
@@ -360,6 +360,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client.html">Curl Chat Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_responses_client.html">Curl Responses Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client.html">Genai Perf Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client_for_multimodal.html">Genai Perf Client For Multimodal</a></li>
@@ -368,6 +369,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_responses_client.html">OpenAI Responses Client</a></li>
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
@@ -542,71 +544,75 @@
 <td><p>DeepSeek-V3</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">deepseek-ai/DeepSeek-V3</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Exaone4ForCausalLM</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">DeepseekV32ForCausalLM</span></code></p></td>
+<td><p>DeepSeek-V3.2</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">deepseek-ai/DeepSeek-V3.2</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Exaone4ForCausalLM</span></code></p></td>
 <td><p>EXAONE 4.0</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">LGAI-EXAONE/EXAONE-4.0-32B</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Gemma3ForCausalLM</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Gemma3ForCausalLM</span></code></p></td>
 <td><p>Gemma 3</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">google/gemma-3-1b-it</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">GptOssForCausalLM</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">GptOssForCausalLM</span></code></p></td>
 <td><p>GPT-OSS</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">openai/gpt-oss-120b</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">LlamaForCausalLM</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">LlamaForCausalLM</span></code></p></td>
 <td><p>Llama 3.1, Llama 3, Llama 2, LLaMA</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">meta-llama/Meta-Llama-3.1-70B</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Llama4ForConditionalGeneration</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Llama4ForConditionalGeneration</span></code></p></td>
 <td><p>Llama 4</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">meta-llama/Llama-4-Scout-17B-16E-Instruct</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MistralForCausalLM</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MistralForCausalLM</span></code></p></td>
 <td><p>Mistral</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">mistralai/Mistral-7B-v0.1</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MixtralForCausalLM</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MixtralForCausalLM</span></code></p></td>
 <td><p>Mixtral</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">mistralai/Mixtral-8x7B-v0.1</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MllamaForConditionalGeneration</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MllamaForConditionalGeneration</span></code></p></td>
 <td><p>Llama 3.2</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">meta-llama/Llama-3.2-11B-Vision</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">NemotronForCausalLM</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">NemotronForCausalLM</span></code></p></td>
 <td><p>Nemotron-3, Nemotron-4, Minitron</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">nvidia/Minitron-8B-Base</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">NemotronNASForCausalLM</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">NemotronNASForCausalLM</span></code></p></td>
 <td><p>NemotronNAS</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">nvidia/Llama-3_3-Nemotron-Super-49B-v1</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Phi3ForCausalLM</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Phi3ForCausalLM</span></code></p></td>
 <td><p>Phi-4</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">microsoft/Phi-4</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen2ForCausalLM</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen2ForCausalLM</span></code></p></td>
 <td><p>QwQ, Qwen2</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen2-7B-Instruct</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen2ForProcessRewardModel</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen2ForProcessRewardModel</span></code></p></td>
 <td><p>Qwen2-based</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen2.5-Math-PRM-7B</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen2ForRewardModel</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen2ForRewardModel</span></code></p></td>
 <td><p>Qwen2-based</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen2.5-Math-RM-72B</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3ForCausalLM</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3ForCausalLM</span></code></p></td>
 <td><p>Qwen3</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-8B</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3MoeForCausalLM</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3MoeForCausalLM</span></code></p></td>
 <td><p>Qwen3MoE</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-30B-A3B</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3NextForCausalLM</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3NextForCausalLM</span></code></p></td>
 <td><p>Qwen3Next</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-Next-80B-A3B-Thinking</span></code></p></td>
 </tr>
@@ -652,7 +658,23 @@
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3MoeForCausalLM</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">DeepseekV32ForCausalLM</span></code></p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>No</p></td>
+<td><p>No</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>N/A</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3MoeForCausalLM</span></code></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -668,7 +690,7 @@
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3NextForCausalLM</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3NextForCausalLM</span></code></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>No</p></td>
@@ -684,7 +706,7 @@
 <td><p>Untested</p></td>
 <td><p>Untested</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Llama4ForConditionalGeneration</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Llama4ForConditionalGeneration</span></code></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -700,7 +722,7 @@
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">GptOssForCausalLM</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">GptOssForCausalLM</span></code></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -1017,9 +1039,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on December 07, 2025.</p>
+  <p>Last updated on December 15, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/e4c7078">e4c7078</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9ba1426">9ba1426</a>.</p>
   
 </div></div>
       

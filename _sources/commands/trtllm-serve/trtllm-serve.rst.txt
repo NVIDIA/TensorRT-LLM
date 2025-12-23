@@ -34,7 +34,7 @@ For the full syntax and argument descriptions, refer to :ref:`syntax`.
 Inference Endpoints
 -------------------
 
-After you start the server, you can send inference requests through completions API and Chat API, which are compatible with corresponding OpenAI APIs. We use `TinyLlama-1.1B-Chat-v1.0 <https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0>`_ for examples in the following sections.
+After you start the server, you can send inference requests through completions API, Chat API and Responses API, which are compatible with corresponding OpenAI APIs. We use `TinyLlama-1.1B-Chat-v1.0 <https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0>`_ for examples in the following sections.
 
 Chat API
 ~~~~~~~~
@@ -65,6 +65,24 @@ Another example uses ``curl``:
 .. literalinclude:: ../../../../examples/serve/curl_completion_client.sh
     :language: bash
     :linenos:
+
+Responses API
+~~~~~~~~~~~~~~~
+
+You can query Responses API with any http clients, a typical example is OpenAI Python client:
+
+.. literalinclude:: ../../../../examples/serve/openai_responses_client.py
+    :language: python
+    :linenos:
+
+Another example uses ``curl``:
+
+.. literalinclude:: ../../../../examples/serve/curl_responses_client.sh
+    :language: bash
+    :linenos:
+
+
+More openai compatible examples can be found in the `compatibility examples <https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/serve/compatibility>`_ directory.
 
 Multimodal Serving
 ~~~~~~~~~~~~~~~~~~

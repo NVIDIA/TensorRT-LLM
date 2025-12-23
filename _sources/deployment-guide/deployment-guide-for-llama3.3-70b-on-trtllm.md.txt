@@ -39,7 +39,7 @@ docker run --rm -it \
 -p 8000:8000 \
 -v ~/.cache:/root/.cache:rw \
 --name tensorrt_llm \
-nvcr.io/nvidia/tensorrt-llm/release:1.2.0rc5 \
+nvcr.io/nvidia/tensorrt-llm/release:1.2.0rc6 \
 /bin/bash
 ```
 
@@ -58,7 +58,7 @@ We maintain YAML configuration files with recommended performance settings in th
 
 ```shell
 TRTLLM_DIR=/app/tensorrt_llm # change as needed to match your environment
-EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/llama-3.3-70b.yaml
+EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/curated/llama-3.3-70b.yaml
 ```
 
 Note: if you don't have access to the source code locally, you can manually create the YAML config file using the code in the dropdown below.
@@ -66,7 +66,7 @@ Note: if you don't have access to the source code locally, you can manually crea
 ````{admonition} Show code
 :class: dropdown
 
-```{literalinclude} ../../../examples/configs/llama-3.3-70b.yaml
+```{literalinclude} ../../../examples/configs/curated/llama-3.3-70b.yaml
 ---
 language: shell
 prepend: |

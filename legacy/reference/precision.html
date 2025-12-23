@@ -61,7 +61,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc5';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc6';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -74,7 +74,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc5" />
+  <meta name="docsearch:version" content="1.2.0rc6" />
 
 
   </head>
@@ -358,6 +358,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client.html">Curl Chat Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_responses_client.html">Curl Responses Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/genai_perf_client.html">Genai Perf Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/genai_perf_client_for_multimodal.html">Genai Perf Client For Multimodal</a></li>
@@ -366,6 +367,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_responses_client.html">OpenAI Responses Client</a></li>
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
@@ -582,7 +584,7 @@ maintaining the accuracy of the network (on downstream tasks).</p>
 weights of the model. TensorRT-LLM includes scripts to prepare the model to
 run using the SmoothQuant method.</p>
 <p>Examples of how to enable SmoothQuant for GPT, GPT-J and LLaMA can be found in
-the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/e4c7078/examples/quantization">examples/quantization</a> folder of that release.</p>
+the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/9ba1426/examples/quantization">examples/quantization</a> folder of that release.</p>
 </section>
 <section id="int4-and-int8-weight-only-w4a16-and-w8a16">
 <h2>INT4 and INT8 Weight-Only (W4A16 and W8A16)<a class="headerlink" href="#int4-and-int8-weight-only-w4a16-and-w8a16" title="Link to this heading">#</a></h2>
@@ -591,8 +593,8 @@ a model and dequantizing those weights on-the-fly in linear layers (Matmuls).
 The activations are encoded using floating-point values (FP16 or BF16).</p>
 <p>To use INT4/INT8 Weight-Only methods, the user must determine the scaling
 factors to use to quantize and dequantize the weights of the model.</p>
-<p>This release includes examples for <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/e4c7078/examples/models/core/gpt">GPT</a> and
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/e4c7078/examples/models/core/llama">LLaMA</a>.</p>
+<p>This release includes examples for <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/9ba1426/examples/models/core/gpt">GPT</a> and
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/9ba1426/examples/models/core/llama">LLaMA</a>.</p>
 </section>
 <section id="gptq-and-awq-w4a16">
 <h2>GPTQ and AWQ (W4A16)<a class="headerlink" href="#gptq-and-awq-w4a16" title="Link to this heading">#</a></h2>
@@ -602,19 +604,19 @@ and
 <a class="reference external" href="https://arxiv.org/abs/2306.00978">https://arxiv.org/abs/2306.00978</a>,
 respectively. TensorRT-LLM supports per-group scaling factors and
 zero-offsetting in linear layers to implement GPTQ and AWQ methods. See the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/e4c7078/cpp/tensorrt_llm/plugins/weightOnlyGroupwiseQuantMatmulPlugin">WeightOnlyGroupwiseQuantMatmulPlugin</a>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/9ba1426/cpp/tensorrt_llm/plugins/weightOnlyGroupwiseQuantMatmulPlugin">WeightOnlyGroupwiseQuantMatmulPlugin</a>
 plugin and the corresponding
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/e4c7078/tensorrt_llm/quantization/functional.py"><code class="docutils literal notranslate"><span class="pre">weight_only_groupwise_quant_matmul</span></code></a>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/9ba1426/tensorrt_llm/quantization/functional.py"><code class="docutils literal notranslate"><span class="pre">weight_only_groupwise_quant_matmul</span></code></a>
 Python function, for details.</p>
-<p>This release includes examples of applying GPTQ to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/e4c7078/examples/models/core/gpt">GPT-NeoX</a>
-and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/e4c7078/examples/models/core/llama">LLaMA-v2</a>, as well as an example of using AWQ with
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/e4c7078/examples/models/contrib/gptj">GPT-J</a>.</p>
+<p>This release includes examples of applying GPTQ to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/9ba1426/examples/models/core/gpt">GPT-NeoX</a>
+and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/9ba1426/examples/models/core/llama">LLaMA-v2</a>, as well as an example of using AWQ with
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/9ba1426/examples/models/contrib/gptj">GPT-J</a>.</p>
 </section>
 <section id="fp8-hopper">
 <h2>FP8 (Hopper)<a class="headerlink" href="#fp8-hopper" title="Link to this heading">#</a></h2>
 <p>This release of TensorRT-LLM contains implementations of FP8 for GPT-NeMo,
 GPT-J and LLaMA. Those examples can be found in
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/e4c7078/examples/quantization">examples/quantization</a>.</p>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/9ba1426/examples/quantization">examples/quantization</a>.</p>
 </section>
 <section id="nvfp4-blackwell">
 <h2>NVFP4 (Blackwell)<a class="headerlink" href="#nvfp4-blackwell" title="Link to this heading">#</a></h2>
@@ -1116,7 +1118,7 @@ The language component decides which quantization methods are supported by a giv
 <section id="technical-detail-the-quantmode-flags">
 <h2>Technical Detail: The <code class="docutils literal notranslate"><span class="pre">QuantMode</span></code> Flags<a class="headerlink" href="#technical-detail-the-quantmode-flags" title="Link to this heading">#</a></h2>
 <p>The quantization method is controlled by the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/e4c7078/tensorrt_llm/quantization/mode.py"><code class="docutils literal notranslate"><span class="pre">QuantMode</span></code></a> flags. The different fields
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/9ba1426/tensorrt_llm/quantization/mode.py"><code class="docutils literal notranslate"><span class="pre">QuantMode</span></code></a> flags. The different fields
 are:</p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">INT4_WEIGHTS</span></code>, the weights are quantized to 4 bits (W4A*),</p></li>
@@ -1266,9 +1268,9 @@ are:</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on December 07, 2025.</p>
+  <p>Last updated on December 15, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/e4c7078">e4c7078</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9ba1426">9ba1426</a>.</p>
   
 </div></div>
       

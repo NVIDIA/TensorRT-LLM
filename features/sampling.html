@@ -61,7 +61,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc5';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc6';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -76,7 +76,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc5" />
+  <meta name="docsearch:version" content="1.2.0rc6" />
 
 
   </head>
@@ -360,6 +360,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client.html">Curl Chat Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_responses_client.html">Curl Responses Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client.html">Genai Perf Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client_for_multimodal.html">Genai Perf Client For Multimodal</a></li>
@@ -368,6 +369,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_responses_client.html">OpenAI Responses Client</a></li>
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
@@ -527,7 +529,7 @@
 <p>To use the feature:</p>
 <ol class="arabic simple">
 <li><p>Enable the <code class="docutils literal notranslate"><span class="pre">enable_trtllm_sampler</span></code> option in the <code class="docutils literal notranslate"><span class="pre">LLM</span></code> class</p></li>
-<li><p>Pass a <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/e4c7078/tensorrt_llm/sampling_params.py"><code class="docutils literal notranslate"><span class="pre">SamplingParams</span></code></a> object with the desired options to the <code class="docutils literal notranslate"><span class="pre">generate()</span></code> function</p></li>
+<li><p>Pass a <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/9ba1426/tensorrt_llm/sampling_params.py"><code class="docutils literal notranslate"><span class="pre">SamplingParams</span></code></a> object with the desired options to the <code class="docutils literal notranslate"><span class="pre">generate()</span></code> function</p></li>
 </ol>
 <p>The following example prepares two identical prompts which will give different results due to the sampling parameters chosen:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span>
@@ -583,7 +585,7 @@
 <p>Logits processors allow you to modify the logits produced by the network before sampling, enabling custom generation behavior and constraints.</p>
 <p>To use a custom logits processor:</p>
 <ol class="arabic simple">
-<li><p>Create a custom class that inherits from <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/e4c7078/tensorrt_llm/sampling_params.py"><code class="docutils literal notranslate"><span class="pre">LogitsProcessor</span></code></a> and implements the <code class="docutils literal notranslate"><span class="pre">__call__</span></code> method</p></li>
+<li><p>Create a custom class that inherits from <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/9ba1426/tensorrt_llm/sampling_params.py"><code class="docutils literal notranslate"><span class="pre">LogitsProcessor</span></code></a> and implements the <code class="docutils literal notranslate"><span class="pre">__call__</span></code> method</p></li>
 <li><p>Pass an instance of this class to the <code class="docutils literal notranslate"><span class="pre">logits_processor</span></code> parameter of <code class="docutils literal notranslate"><span class="pre">SamplingParams</span></code></p></li>
 </ol>
 <p>The following example demonstrates logits processing:</p>
@@ -611,7 +613,7 @@
 <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">([</span><span class="s2">&quot;Hello, my name is&quot;</span><span class="p">],</span> <span class="n">sampling_params</span><span class="p">)</span>
 </pre></div>
 </div>
-<p>You can find a more detailed example on logits processors <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/e4c7078/examples/llm-api/llm_logits_processor.py">here</a>.</p>
+<p>You can find a more detailed example on logits processors <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/9ba1426/examples/llm-api/llm_logits_processor.py">here</a>.</p>
 </section>
 </section>
 
@@ -758,9 +760,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on December 07, 2025.</p>
+  <p>Last updated on December 15, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/e4c7078">e4c7078</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9ba1426">9ba1426</a>.</p>
   
 </div></div>
       

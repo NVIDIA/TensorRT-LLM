@@ -61,7 +61,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc5';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc6';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -74,7 +74,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc5" />
+  <meta name="docsearch:version" content="1.2.0rc6" />
 
 
   </head>
@@ -358,6 +358,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client.html">Curl Chat Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_responses_client.html">Curl Responses Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/genai_perf_client.html">Genai Perf Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/genai_perf_client_for_multimodal.html">Genai Perf Client For Multimodal</a></li>
@@ -366,6 +367,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_responses_client.html">OpenAI Responses Client</a></li>
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
@@ -629,7 +631,7 @@ a smaller subset.</p>
 <code class="docutils literal notranslate"><span class="pre">meta-llama/Llama-3.1-8B</span></code> on a synthetic dataset with a uniform distribution of prompts with ISL:OSL
 of 128:128.
 To run the benchmark from start to finish, run the following commands:</p>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>benchmarks/cpp/prepare_dataset.py<span class="w"> </span>--stdout<span class="w"> </span>--tokenizer<span class="w"> </span>meta-llama/Llama-3.1-8B<span class="w"> </span>token-norm-dist<span class="w"> </span>--input-mean<span class="w"> </span><span class="m">128</span><span class="w"> </span>--output-mean<span class="w"> </span><span class="m">128</span><span class="w"> </span>--input-stdev<span class="w"> </span><span class="m">0</span><span class="w"> </span>--output-stdev<span class="w"> </span><span class="m">0</span><span class="w"> </span>--num-requests<span class="w"> </span><span class="m">3000</span><span class="w"> </span>&gt;<span class="w"> </span>/tmp/synthetic_128_128.txt
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--tokenizer<span class="w"> </span>meta-llama/Llama-3.1-8B<span class="w"> </span>prepare-dataset<span class="w"> </span>--output<span class="w"> </span>/tmp/synthetic_128_128.txt<span class="w"> </span>token-norm-dist<span class="w"> </span>--input-mean<span class="w"> </span><span class="m">128</span><span class="w"> </span>--output-mean<span class="w"> </span><span class="m">128</span><span class="w"> </span>--input-stdev<span class="w"> </span><span class="m">0</span><span class="w"> </span>--output-stdev<span class="w"> </span><span class="m">0</span><span class="w"> </span>--num-requests<span class="w"> </span><span class="m">3000</span>
 trtllm-bench<span class="w"> </span>--model<span class="w"> </span>meta-llama/Llama-3.1-8B<span class="w"> </span>build<span class="w"> </span>--dataset<span class="w"> </span>/tmp/synthetic_128_128.txt<span class="w"> </span>--quantization<span class="w"> </span>FP8
 trtllm-bench<span class="w"> </span>--model<span class="w"> </span>meta-llama/Llama-3.1-8B<span class="w"> </span>throughput<span class="w"> </span>--dataset<span class="w"> </span>/tmp/synthetic_128_128.txt<span class="w"> </span>--engine_dir<span class="w"> </span>/tmp/meta-llama/Llama-3.1-8B/tp_1_pp_1
 </pre></div>
@@ -745,7 +747,7 @@ JSON entry is on every line.</p>
 <p>In order to prepare a synthetic dataset, you can use the provided script in the <code class="docutils literal notranslate"><span class="pre">benchmarks/cpp</span></code>
 directory. For example, to generate a synthetic dataset of 1000 requests with a uniform ISL/OSL of
 128/128 for <a class="reference external" href="https://huggingface.co/meta-llama/Llama-3.1-8B">meta-llama/Llama-3.1-8B</a>, run:</p>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>benchmarks/cpp/prepare_dataset.py<span class="w"> </span>--stdout<span class="w"> </span>--tokenizer<span class="w"> </span>meta-llama/Llama-3.1-8B<span class="w"> </span>token-norm-dist<span class="w"> </span>--input-mean<span class="w"> </span><span class="m">128</span><span class="w"> </span>--output-mean<span class="w"> </span><span class="m">128</span><span class="w"> </span>--input-stdev<span class="w"> </span><span class="m">0</span><span class="w"> </span>--output-stdev<span class="w"> </span><span class="m">0</span><span class="w"> </span>--num-requests<span class="w"> </span><span class="m">1000</span><span class="w"> </span>&gt;<span class="w"> </span>/tmp/synthetic_128_128.txt
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--tokenizer<span class="w"> </span>meta-llama/Llama-3.1-8B<span class="w"> </span>prepare-dataset<span class="w"> </span>--output<span class="w"> </span>/tmp/synthetic_128_128.txt<span class="w"> </span>token-norm-dist<span class="w"> </span>--input-mean<span class="w"> </span><span class="m">128</span><span class="w"> </span>--output-mean<span class="w"> </span><span class="m">128</span><span class="w"> </span>--input-stdev<span class="w"> </span><span class="m">0</span><span class="w"> </span>--output-stdev<span class="w"> </span><span class="m">0</span><span class="w"> </span>--num-requests<span class="w"> </span><span class="m">3000</span>
 </pre></div>
 </div>
 </section>
@@ -1182,7 +1184,7 @@ checkpoint. For the Llama-3.1 models, TensorRT-LLM provides the following checkp
 <li><p><a class="reference external" href="https://huggingface.co/nvidia/Llama-3.1-405B-Instruct-FP8"><code class="docutils literal notranslate"><span class="pre">nvidia/Llama-3.1-405B-Instruct-FP8</span></code></a></p></li>
 </ul>
 <p><code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> utilizes the <code class="docutils literal notranslate"><span class="pre">hf_quant_config.json</span></code> file present in the pre-quantized checkpoints above. The configuration
-file is present in checkpoints quantized with <a class="reference external" href="https://github.com/NVIDIA/TensorRT-Model-Optimizer">TensorRT Model Optimizer</a>
+file is present in checkpoints quantized with <a class="reference external" href="https://github.com/NVIDIA/Model-Optimizer">Model Optimizer</a>
 and describes the compute and KV cache quantization that checkpoint was compiled with. For example, from the checkpoints
 above:</p>
 <div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
@@ -1589,9 +1591,9 @@ The choices are specified with a YAML file like the following example (<code cla
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on December 07, 2025.</p>
+  <p>Last updated on December 15, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/e4c7078">e4c7078</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9ba1426">9ba1426</a>.</p>
   
 </div></div>
       

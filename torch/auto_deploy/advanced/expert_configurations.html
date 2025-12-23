@@ -61,7 +61,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc5';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc6';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -74,7 +74,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc5" />
+  <meta name="docsearch:version" content="1.2.0rc6" />
 
 
   </head>
@@ -358,6 +358,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/curl_chat_client.html">Curl Chat Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/curl_responses_client.html">Curl Responses Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/genai_perf_client.html">Genai Perf Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/genai_perf_client_for_multimodal.html">Genai Perf Client For Multimodal</a></li>
@@ -366,6 +367,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/openai_responses_client.html">OpenAI Responses Client</a></li>
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
@@ -696,6 +698,23 @@ python<span class="w"> </span>build_and_run_ad.py<span class="w"> </span><span c
 </ul>
 <p>You can enable multiple dimensions simultaneously. For example, <code class="docutils literal notranslate"><span class="pre">['tp',</span> <span class="pre">'ep']</span></code> will apply both tensor parallelism and expert parallelism.</p>
 </section>
+<section id="process-grid-dict-default-none">
+<h4><code class="docutils literal notranslate"><span class="pre">process_grid</span></code> (dict, default: <code class="docutils literal notranslate"><span class="pre">None</span></code>)<a class="headerlink" href="#process-grid-dict-default-none" title="Link to this heading">#</a></h4>
+<p>Specifies a 2D device mesh for hybrid EP+TP parallelism.</p>
+<ul class="simple">
+<li><p>NOTE 1: This grid applies only to the MoE layers. Attention, Mamba, and MLP layers are unaffected.</p></li>
+<li><p>NOTE 2: The order of the keys matters. Process grid’s layout is in the generalized column-major order,
+that is, the last dimension is stride-one.</p></li>
+<li><p>NOTE 3: <code class="docutils literal notranslate"><span class="pre">ep</span> <span class="pre">*</span> <span class="pre">tp</span></code> must be equal to the provided world size. Otherwise, the mesh will be considered invalid,
+and 1D ep-only parallelism will be applied.</p></li>
+</ul>
+<p>Example:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>    <span class="n">process_grid</span><span class="p">:</span> <span class="p">{</span><span class="s1">&#39;ep&#39;</span><span class="p">:</span> <span class="mi">2</span><span class="p">,</span> <span class="s1">&#39;tp&#39;</span><span class="p">:</span> <span class="mi">2</span><span class="p">}</span>
+</pre></div>
+</div>
+<p>If <code class="docutils literal notranslate"><span class="pre">world_size</span> <span class="pre">==</span> <span class="pre">4</span></code>, ranks [0,1] and [2,3] will create two EP groups. Experts will be distributed across these two
+groups, and internally, TP=2 column-row sharding will be applied.</p>
+</section>
 <section id="requires-shape-prop-bool-default-true">
 <h4><code class="docutils literal notranslate"><span class="pre">requires_shape_prop</span></code> (bool, default: <code class="docutils literal notranslate"><span class="pre">true</span></code>)<a class="headerlink" href="#requires-shape-prop-bool-default-true" title="Link to this heading">#</a></h4>
 <p>Whether shape propagation is required before applying this transform. Shape propagation enables the transform to make informed decisions about sharding strategies based on tensor dimensions.</p>
@@ -797,6 +816,7 @@ python<span class="w"> </span>build_and_run_ad.py<span class="w"> </span><span c
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#sharding-source-list-default-manual-factory-heuristic"><code class="docutils literal notranslate"><span class="pre">sharding_source</span></code> (list, default: <code class="docutils literal notranslate"><span class="pre">['manual',</span> <span class="pre">'factory',</span> <span class="pre">'heuristic']</span></code>)</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#support-partial-config-bool-default-true"><code class="docutils literal notranslate"><span class="pre">support_partial_config</span></code> (bool, default: <code class="docutils literal notranslate"><span class="pre">true</span></code>)</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#sharding-dims-list-default-tp-ep-bmm"><code class="docutils literal notranslate"><span class="pre">sharding_dims</span></code> (list, default: <code class="docutils literal notranslate"><span class="pre">['tp',</span> <span class="pre">'ep',</span> <span class="pre">'bmm']</span></code>)</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#process-grid-dict-default-none"><code class="docutils literal notranslate"><span class="pre">process_grid</span></code> (dict, default: <code class="docutils literal notranslate"><span class="pre">None</span></code>)</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#requires-shape-prop-bool-default-true"><code class="docutils literal notranslate"><span class="pre">requires_shape_prop</span></code> (bool, default: <code class="docutils literal notranslate"><span class="pre">true</span></code>)</a></li>
 </ul>
 </li>
@@ -898,9 +918,9 @@ python<span class="w"> </span>build_and_run_ad.py<span class="w"> </span><span c
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on December 07, 2025.</p>
+  <p>Last updated on December 15, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/e4c7078">e4c7078</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9ba1426">9ba1426</a>.</p>
   
 </div></div>
       
