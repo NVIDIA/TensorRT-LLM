@@ -410,9 +410,9 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
                 )
                 return pg, bundle_indices
             else:
-                raise ValueError(f"No global placement group is found.")
+                raise ValueError("No global placement group is found.")
 
-        def _get_from_default(tp_size):
+        def _get_default(tp_size):
             head_tag = f"node:{self.master_address}"
             nodes = ray.nodes()
             gpus_per_node = int(nodes[0]["Resources"].get(
@@ -453,7 +453,7 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
         if bundle_indices := os.getenv("TRTLLM_RAY_BUNDLE_INDICES", None):
             return _get_from_env(bundle_indices)
         # path 2
-        return _get_from_default(tp_size)
+        return _get_default(tp_size)
 
     @property
     def enable_postprocess_parallel(self) -> bool:
