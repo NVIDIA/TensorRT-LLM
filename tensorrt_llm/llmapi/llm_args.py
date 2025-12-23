@@ -656,7 +656,7 @@ class DecodingBaseConfig(StrictBaseModel):
     #   which will be automatically downloaded.
     # - A local filesystem path to a downloaded model directory.
     speculative_model: Optional[Union[str, Path]] = Field(
-        default=None, alias="speculative_model_dir")
+        default=None, validation_alias="speculative_model_dir")
 
     # PyTorch only.
     # When specified, speculation will be disabled at batch sizes above

@@ -125,7 +125,7 @@ class ModelLoader:
             Path] = self.model_obj.model_dir if self.model_obj.is_local_model else None
 
         self._speculative_model_dir: Optional[
-            Path] = self.speculative_model_obj.model_dir if self.speculative_model_obj is not None and self.model_obj.is_local_model else None
+            Path] = self.speculative_model_obj.model_dir if self.speculative_model_obj is not None and self.speculative_model_obj.is_local_model else None
         self._model_info: Optional[_ModelInfo] = None
         self._model_format = self.llm_args.model_format
 
@@ -660,20 +660,21 @@ class CachedModelLoader:
         if self.llm_args.model_format is _ModelFormatKind.TLLM_ENGINE:
             return Path(self.llm_args.model), None
 
+        # Download speculative model from HuggingFace if needed (all backends)
+        if (self.llm_args.speculative_config is not None and
+                self.llm_args.speculative_config.speculative_model is not None):
+            spec_model_obj = _ModelWrapper(
+                self.llm_args.speculative_config.speculative_model)
+            spec_model_dir = self._download_hf_model_if_needed(spec_model_obj)
+            self.llm_args.speculative_config.speculative_model = spec_model_dir
+
+        # AutoDeploy doesn't use ModelLoader
+        if self.llm_args.backend == "_autodeploy":
+            return None, ""
+
         self.engine_cache_stage: Optional[CachedStage] = None
         self._hf_model_dir = None
         self.model_loader = ModelLoader(self.llm_args)
-
-        # Download speculative model from HuggingFace if needed
-        if self.model_loader.speculative_model_obj is not None:
-            spec_model_dir = self._download_hf_model_if_needed(
-                self.model_loader.speculative_model_obj)
-            # Update llm_args so PyTorch/AutoDeploy executor gets the local path
-            if self.llm_args.speculative_config is not None:
-                self.llm_args.speculative_config.speculative_model = spec_model_dir
-
-        if self.llm_args.backend == "_autodeploy":
-            return None, ""
 
         if self.llm_args.backend is not None:
             if self.llm_args.backend not in ["pytorch", "_autodeploy"]:
