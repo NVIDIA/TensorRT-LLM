@@ -131,6 +131,8 @@ def get_quantization_params_from_linear_node(linear_op: torch.fx.node.Node):
 
 def extract_weight_node(node: Node) -> int:
     """Extracts the weight node from the given parametrized node"""
+    gm = node.graph.owning_module
+    param_names = {name for name, _ in gm.named_parameters()}
 
     def find_get_attr_node(weight_node: Node) -> Node:
         """Recursively traverse inputs of allowed nodes to find a node with 'get_attr' op."""
@@ -141,7 +143,7 @@ def extract_weight_node(node: Node) -> int:
             torch.ops.aten.view.default,
         }
 
-        if weight_node.op == "get_attr":
+        if weight_node.op == "get_attr" and weight_node.target in param_names:
             return weight_node
 
         # If node is not in the list of allowable ops then return None
@@ -331,6 +333,15 @@ def is_any_ssm_op(node: Node) -> bool:
         node,
         ops=[
             torch.ops.auto_deploy.torch_ssm,
+        ],
+    )
+
+
+def is_any_conv_op(node: Node) -> bool:
+    return is_op(
+        node,
+        ops=[
+            torch.ops.auto_deploy.torch_causal_conv1d,
         ],
     )
 

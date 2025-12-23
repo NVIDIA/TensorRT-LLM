@@ -1258,6 +1258,7 @@ def _shard_parameter_node(
 
     # Shard weight using the unified function (also updates the parameter)
     original_weight = gm.get_parameter(weight_key)
+
     _, weight_new_shape = shard_weight_tensor(
         gm=gm,
         weight_tensor=original_weight,
@@ -1691,6 +1692,8 @@ def _process_ssm_sharding(
         if "out_proj" not in str(n)
     ]
     for weight_node in weight_nodes:
+        # if is_any_ssm_op(list(weight_node.users)[0]):
+        #     continue
         weight_key = weight_node.target
         # Get the weight parameter
         try:
