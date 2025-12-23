@@ -257,22 +257,21 @@ class Deepseekv3RoutingImpl:
         if self.n_group > 1:
             if self.top_k > 8 or (num_experts / n_group) > 32 or (
                     num_experts / n_group) * self.topk_group > 128:
-                if (self.is_fused):
+                if self.is_fused:
                     warnings.warn(
                         "The configuration is not supported by the fused routing kernel. We have to use the original pytorch implementation."
                     )
                 self.is_fused = False
-        else:
+        elif (num_experts > 512 or (self.top_k > 8 and self.top_k != 22)
+              or self.topk_group == 1):
             # We have special implementation for n_group == 1, top_k == 22 and num_experts == 512 for Nemotron Super v3.
-            if num_experts > 512 or (self.top_k > 8 and self.top_k != 22):
-                if (self.is_fused):
-                    warnings.warn(
-                        "The configuration is not supported by the fused routing kernel. We have to use the original pytorch implementation."
-                    )
-                self.is_fused = False
+            if self.is_fused:
+                warnings.warn(
+                    "The configuration is not supported by the fused routing kernel. We have to use the original pytorch implementation."
+                )
+            self.is_fused = False
 
-        if self.n_group == 1 and self.n_group == 1:
-            # Edge case to reduce the computation.
+        if self.n_group == 1 and self.topk_group == 1:
             scores, scores_with_bias = self.get_scores(logits,
                                                        e_score_correction_bias)
             _, topk_indices = torch.topk(scores_with_bias, k=self.top_k, dim=1)
