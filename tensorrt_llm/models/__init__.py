@@ -62,6 +62,9 @@ from .qwen.model import QWenForCausalLM
 from .recurrentgemma.model import RecurrentGemmaForCausalLM
 from .redrafter.model import ReDrafterForLLaMALM, ReDrafterForQWenLM
 from .stdit.model import STDiT3Model
+# VoRA model is in _torch.models
+# from .vora.config import VoRAConfig  
+# from .vora.model import VoRAForCausalLM
 
 __all__ = [
     'BertModel',
@@ -134,6 +137,8 @@ __all__ = [
     'SpeculativeDecodingMode',
     'CohereForCausalLM',
     'MLLaMAForCausalLM',
+    # 'VoRAConfig',
+    # 'VoRAForCausalLM',
 ]
 
 MODEL_MAP = {
@@ -220,4 +225,5 @@ MODEL_MAP = {
     'RobertaModel': RobertaModel,
     'RobertaForQuestionAnswering': RobertaForQuestionAnswering,
     'RobertaForSequenceClassification': RobertaForSequenceClassification,
+    # 'VoRAForCausalLM': VoRAForCausalLM,
 }
