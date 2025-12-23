@@ -118,7 +118,7 @@ class MistralTokenizer(TransformersTokenizer):
 
     @property
     def name_or_path(self) -> str:
-        raise NotImplementedError
+        return self.transformers_tokenizer.name_or_path
 
     def batch_encode_plus(self, texts: list[str], *args, **kwargs) -> dict:
         raise NotImplementedError
