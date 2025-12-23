@@ -1,0 +1,4 @@
+# Default configuration for all AutoDeploy dashboard tests
+# These are baseline settings that apply to all models unless overridden
+
+compile_backend: torch-cudagraph
