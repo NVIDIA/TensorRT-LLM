@@ -232,6 +232,7 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
     jit::CubinObj const* const cubinObj = mResource->getCubinObjRegistry()->getCubin(key);
     TLLM_CHECK(cubinObj != nullptr && cubinObj->isInitialized());
     bool const isSpecDec = xqaParams.multi_query_tokens;
+    bool const isSkipSoftmax = xqaParams.skip_softmax_threshold_scale_factor != 0;
     bool const isHMMAKernel = (cubinObj->getKernelType() == XQAKernelType::kAMPERE_WARP_SPECIALIZED);
     bool const isGMMAKernel = (cubinObj->getKernelType() == XQAKernelType::kHOPPER_WARP_SPECIALIZED);
     bool const isMLAKernel = (cubinObj->getKernelType() == XQAKernelType::kSM120_MLA);
@@ -513,6 +514,15 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
             specDecParams = makeSpecDecParams();
             appendParam(&specDecParams);
             specDecBlocks = divUp(specDecParams.qSeqLen, 64 / num_q_heads_over_kv);
+        }
+        if (isSkipSoftmax)
+        {
+            TLLM_CHECK_WITH_INFO(isGMMAKernel, "skip softmax is only supported for GMMA kernel in JIT path for now.");
+            appendParam(&xqaParams.skip_softmax_threshold_scale_factor);
+#ifdef SKIP_SOFTMAX_STAT
+            appendParam(&xqaParams.skip_softmax_total_blocks);
+            appendParam(&xqaParams.skip_softmax_skipped_blocks);
+#endif
         }
         appendParam(&launchParams.semaphores);
         appendParam(&launchParams.scratch);
