@@ -3,7 +3,7 @@ metadata:
   precision: fp4
   model_dir_name: DeepSeek-R1-0528-FP4-v2
   supported_gpus:
-  - GB300
+  - GB200
   script_file: disaggr_torch.slurm
   benchmark_type: 128k8k
 slurm:
@@ -27,7 +27,7 @@ benchmark:
 hardware:
   gpus_per_node: 4
   num_ctx_servers: 1
-  num_gen_servers: 8
+  num_gen_servers: 7
 environment:
   container_mount: <container_mount>
   container_image: <container_image>
@@ -84,7 +84,7 @@ worker_config:
     tensor_parallel_size: 1
     moe_expert_parallel_size: 1
     enable_attention_dp: true
-    pipeline_parallel_size: 4
+    pipeline_parallel_size: 8
     print_iter_log: true
     cuda_graph_config: null
     disable_overlap_scheduler: true

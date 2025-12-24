@@ -79,7 +79,7 @@ worker_config:
     allreduce_strategy: MNNVL
   ctx:
     max_batch_size: 2
-    max_num_tokens: 150000
+    max_num_tokens: 131104
     max_seq_len: 131104
     tensor_parallel_size: 1
     moe_expert_parallel_size: 1
@@ -95,3 +95,5 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 131104
       backend: DEFAULT
+    moe_config:
+      backend: TRTLLM

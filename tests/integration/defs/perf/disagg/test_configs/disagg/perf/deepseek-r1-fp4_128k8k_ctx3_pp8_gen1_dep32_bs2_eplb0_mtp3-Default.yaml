@@ -3,7 +3,7 @@ metadata:
   precision: fp4
   model_dir_name: DeepSeek-R1-0528-FP4-v2
   supported_gpus:
-  - GB300
+  - GB200
   script_file: disaggr_torch.slurm
   benchmark_type: 128k8k
 slurm:
@@ -20,14 +20,14 @@ benchmark:
   multi_round: 1
   benchmark_ratio: 0.8
   streaming: true
-  concurrency_list: '1'
+  concurrency_list: '2'
   input_length: 131072
   output_length: 8192
   dataset_file: <dataset_file>
 hardware:
   gpus_per_node: 4
-  num_ctx_servers: 1
-  num_gen_servers: 8
+  num_ctx_servers: 3
+  num_gen_servers: 1
 environment:
   container_mount: <container_mount>
   container_image: <container_image>
@@ -44,11 +44,11 @@ accuracy:
   enable_accuracy_test: false
 worker_config:
   gen:
-    tensor_parallel_size: 8
-    moe_expert_parallel_size: 8
-    enable_attention_dp: false
+    tensor_parallel_size: 32
+    moe_expert_parallel_size: 32
+    enable_attention_dp: true
     pipeline_parallel_size: 1
-    max_batch_size: 1
+    max_batch_size: 2
     max_num_tokens: 128
     max_seq_len: 139296
     cuda_graph_config:
@@ -76,15 +76,17 @@ worker_config:
       backend: DEFAULT
     stream_interval: 20
     num_postprocess_workers: 4
-    allreduce_strategy: MNNVL
+    speculative_config: &id001
+      decoding_type: MTP
+      num_nextn_predict_layers: 3
   ctx:
-    max_batch_size: 1
+    max_batch_size: 2
     max_num_tokens: 131104
     max_seq_len: 131104
     tensor_parallel_size: 1
     moe_expert_parallel_size: 1
     enable_attention_dp: true
-    pipeline_parallel_size: 4
+    pipeline_parallel_size: 8
     print_iter_log: true
     cuda_graph_config: null
     disable_overlap_scheduler: true
@@ -95,5 +97,6 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 131104
       backend: DEFAULT
+    speculative_config: *id001
     moe_config:
       backend: TRTLLM
