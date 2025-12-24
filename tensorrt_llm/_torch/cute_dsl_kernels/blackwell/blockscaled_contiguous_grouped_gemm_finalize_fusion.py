@@ -806,7 +806,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         class SharedStorage:
             # (bidx, bidy, bidz, valid)
             sInfo: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Int32, 4 * self.num_tile_stage],
+                cute.struct.MemRange[cutlass.Int32, 5 * self.num_tile_stage],
                 # 1 byte alignment
                 1,
             ]
@@ -1061,7 +1061,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         # (granularity_n, repeat_n), (granularity_k, repeat_k), num_scale_stage)
         sSFB = storage.sSFB.get_tensor(sfb_smem_layout_staged)
         # (bidx, bidy, bidz, valid)
-        info_layout = cute.make_layout((4, self.num_tile_stage), stride=(1, 4))
+        info_layout = cute.make_layout((5, self.num_tile_stage), stride=(1, 5))
         sInfo = storage.sInfo.get_tensor(info_layout)
 
         #
@@ -1260,6 +1260,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     tile_idx = mma_tile_coord_m
                     if tile_idx < num_valid_tiles:
                         tile_info_pipeline.producer_acquire(tile_info_producer_state)
+                        mn_limit = tile_idx_to_mn_limit[tile_idx]
                         with cute.arch.elect_one():
                             sInfo[(0, tile_info_producer_state.index)] = cur_tile_coord[0]
                             sInfo[(1, tile_info_producer_state.index)] = cur_tile_coord[1]
@@ -1267,6 +1268,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                             sInfo[(3, tile_info_producer_state.index)] = cutlass.Int32(
                                 work_tile.is_valid_tile
                             )
+                            sInfo[(4, tile_info_producer_state.index)] = mn_limit
                             # fence view async shared
                         cute.arch.fence_proxy(
                             cute.arch.ProxyKind.async_shared,
@@ -1295,6 +1297,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                             sInfo[(3, tile_info_producer_state.index)] = cutlass.Int32(
                                 work_tile.is_valid_tile
                             )
+                            sInfo[(4, tile_info_producer_state.index)] = mn_limit
                             # fence view async shared
                         cute.arch.fence_proxy(
                             cute.arch.ProxyKind.async_shared,
@@ -1317,6 +1320,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 sInfo[(1, tile_info_producer_state.index)] = work_tile.tile_idx[1]
                 sInfo[(2, tile_info_producer_state.index)] = -1
                 sInfo[(3, tile_info_producer_state.index)] = cutlass.Int32(0)
+                sInfo[(4, tile_info_producer_state.index)] = cutlass.Int32(0)
             cute.arch.fence_proxy(
                 cute.arch.ProxyKind.async_shared,
                 space=cute.arch.SharedSpace.shared_cta,
@@ -1341,9 +1345,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             )
 
             # Get the first tile info from pipeline (scheduler has filtered out tiles >= num_non_exiting_tiles)
-            tile_info = cute.make_rmem_tensor((4,), cutlass.Int32)
+            tile_info = cute.make_rmem_tensor((5,), cutlass.Int32)
             tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-            for idx in cutlass.range(4, unroll_full=True):
+            for idx in cutlass.range(5, unroll_full=True):
                 tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[3] == 1
             cute.arch.fence_proxy(
@@ -1525,9 +1529,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             )
 
             # Get the first tile info from pipeline (scheduler has filtered out tiles >= num_non_exiting_tiles)
-            tile_info = cute.make_rmem_tensor((4,), cutlass.Int32)
+            tile_info = cute.make_rmem_tensor((5,), cutlass.Int32)
             tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-            for idx in cutlass.range(4, unroll_full=True):
+            for idx in cutlass.range(5, unroll_full=True):
                 tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[3] == 1
             cute.arch.fence_proxy(
@@ -1735,11 +1739,14 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 pipeline.PipelineUserType.Consumer, self.num_tile_stage
             )
 
+            token_idx = cutlass.Int32(0)
+            token_scale = self.final_scale_dtype(0.0)
+
             # Get the first tile info
-            tile_info = cute.make_rmem_tensor((4,), cutlass.Int32)
+            tile_info = cute.make_rmem_tensor((5,), cutlass.Int32)
 
             tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-            for idx in cutlass.range(4, unroll_full=True):
+            for idx in cutlass.range(5, unroll_full=True):
                 tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[3] == 1
             cute.arch.fence_proxy(
@@ -1761,6 +1768,11 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
 
                 expert_idx = mma_tile_coord_mnl[2]
                 alpha_val = alpha[expert_idx]
+
+                tile_m_start = tile_info[0] * self.cta_tile_shape_mnk[0]
+                permuted_row = tile_m_start + epi_tidx
+                expanded_idx = permuted_idx_to_expanded_idx[permuted_row]
+                is_valid_row = permuted_row < tile_info[4]
 
                 # Get accumulator stage index
                 if cutlass.const_expr(self.overlapping_accum):
@@ -1786,16 +1798,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 # Following TensorRT-LLM's direct G2R (global to register) approach
                 #
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
-
-                tile_m_start = tile_info[0] * self.cta_tile_shape_mnk[0]
-
-                permuted_row = tile_m_start + epi_tidx
-                expanded_idx = permuted_idx_to_expanded_idx[permuted_row]
-
-                token_idx = cutlass.Int32(0)
-                token_scale = self.final_scale_dtype(0.0)
-                tile_mn_limit = tile_idx_to_mn_limit[mma_tile_coord_mnl[0]]
-                is_valid_row = permuted_row < tile_mn_limit
 
                 if is_valid_row:
                     topK = token_final_scales.shape[1]
