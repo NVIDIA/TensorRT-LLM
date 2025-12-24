@@ -756,11 +756,11 @@ class JobManager:
 
         Args:
             job_id: SLURM job ID
-            test_category: Test category ("perf" or "accuracy")
+            test_category: Test category ("perf", "accuracy", or "stress")
             benchmark_type: Benchmark type (1k1k, 8k1k, etc.)
             config: Configuration dict (YAML data)
             metrics_config: MetricsConfig object (default or custom)
-            accuracy_config: AccuracyConfig object (required for accuracy tests)
+            accuracy_config: AccuracyConfig object (required for accuracy and stress tests)
             model_name: Model name
             result_dir: Result directory
             timestamps: Optional timestamps dict
@@ -768,6 +768,7 @@ class JobManager:
 
         Returns:
             Dict with success status and details
+            For stress tests, includes both perf and accuracy results
         """
         logger.info(f"Checking result directory: {result_dir}")
 
@@ -776,12 +777,63 @@ class JobManager:
 
         # Route based on test_category
         if test_category == "accuracy":
+            # Use metrics config from accuracy_config (defaults to _COMMON_ACCURACY_METRICS)
+            accuracy_metrics = accuracy_config.get_metrics_config()
             return JobManager._check_accuracy_result(
                 job_id=job_id,
-                metrics_config=metrics_config,
+                metrics_config=accuracy_metrics,
                 accuracy_config=accuracy_config,
                 result_dir=result_dir,
             )
+        elif test_category == "stress":
+            # Stress tests combine both perf and accuracy validation
+            # First check performance and write CSV
+            perf_result = JobManager._check_perf_result(
+                job_id=job_id,
+                benchmark_type=benchmark_type,
+                config=config,
+                metrics_config=metrics_config,
+                model_name=model_name,
+                result_dir=result_dir,
+                timestamps=timestamps,
+                test_name=test_name,
+            )
+            
+            # If perf check failed, return immediately
+            if not perf_result.get("success", False):
+                return perf_result
+            
+            # Then check accuracy if accuracy_config is provided
+            if accuracy_config:
+                # Use metrics config from accuracy_config (defaults to _COMMON_ACCURACY_METRICS)
+                accuracy_metrics = accuracy_config.get_metrics_config()
+                
+                accuracy_result = JobManager._check_accuracy_result(
+                    job_id=job_id,
+                    metrics_config=accuracy_metrics,
+                    accuracy_config=accuracy_config,
+                    result_dir=result_dir,
+                )
+                
+                # If accuracy check failed, merge results and return
+                if not accuracy_result.get("success", False):
+                    return {
+                        **perf_result,
+                        "success": False,
+                        "accuracy_result": accuracy_result,
+                        "error": f"Perf passed but accuracy failed: {accuracy_result.get('error', 'Unknown')}",
+                    }
+                
+                # Both passed, merge results
+                return {
+                    **perf_result,
+                    "accuracy_result": accuracy_result,
+                    "success": True,
+                }
+            else:
+                # No accuracy config, just return perf result
+                logger.warning("Stress test has no accuracy_config, only perf validation performed")
+                return perf_result
         else:  # perf
             return JobManager._check_perf_result(
                 job_id=job_id,
