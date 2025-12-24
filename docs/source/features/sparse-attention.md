@@ -13,7 +13,7 @@
     - [3. Manage Auxiliary Memory Pool](#3-manage-auxiliary-memory-pool)
     - [4. Registration and Dispatch](#4-registration-and-dispatch)
 - [Summary and Future Work](#summary-and-future-work)
-    - [Current State](#current-state)
+    - [Current Status](#current-status)
     - [Future Work](#future-work)
 
 ## Background and Motivation
