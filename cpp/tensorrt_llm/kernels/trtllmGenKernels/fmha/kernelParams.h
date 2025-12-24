@@ -71,7 +71,7 @@ private:
 private:
     int32_t mDivisor = 1;
     uint32_t mMultiplier = 0;
-    [[maybe_unused]] uint32_t mAdd = 0;
+    __attribute__((unused)) uint32_t mAdd = 0;
     int32_t mShift = 0;
 };
 
