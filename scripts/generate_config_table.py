@@ -19,10 +19,19 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-from examples.configs.database.database import DATABASE_LIST_PATH, RecipeList
-
 SCRIPT_DIR = Path(__file__).parent.resolve()
 REPO_ROOT = SCRIPT_DIR.parent
+
+# Add repo root to path for examples.configs.database import
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from examples.configs.database.database import (  # noqa: E402
+    DATABASE_LIST_PATH,
+    RecipeList,
+    assign_profile,
+)
+
 MODEL_INFO = {
     "deepseek-ai/DeepSeek-R1-0528": {
         "display_name": "DeepSeek-R1",
@@ -38,9 +47,6 @@ MODEL_INFO = {
     },
 }
 
-LOW_LATENCY_CONCURRENCY_THRESHOLD = 8
-HIGH_THROUGHPUT_CONCURRENCY_THRESHOLD = 32
-
 
 def generate_rst(yaml_path, output_file=None):
     """Generate RST table from YAML config database.
@@ -51,16 +57,16 @@ def generate_rst(yaml_path, output_file=None):
     """
     recipe_list = RecipeList.from_yaml(Path(yaml_path))
 
-    # Group by model -> (gpu, isl, osl) -> list of recipes
+    # Group by model -> (gpu, num_gpus, isl, osl) -> list of recipes
     model_groups = defaultdict(lambda: defaultdict(list))
     for recipe in recipe_list:
-        key = (recipe.gpu, recipe.isl, recipe.osl)
+        key = (recipe.gpu, recipe.num_gpus, recipe.isl, recipe.osl)
         model_groups[recipe.model][key].append(recipe)
 
     lines = []
 
     # Include note_sections.rst at the top (relative include for Sphinx)
-    lines.append(".. include:: note_sections.rst")
+    lines.append(".. include:: ../_includes/note_sections.rst")
     lines.append("   :start-after: .. start-note-traffic-patterns")
     lines.append("   :end-before: .. end-note-traffic-patterns")
     lines.append("")
@@ -97,7 +103,8 @@ def generate_rst(yaml_path, output_file=None):
 
         subgroups = model_groups[model]
         sorted_keys = sorted(
-            subgroups.keys(), key=lambda k: (str(k[0]), int(k[1] or 0), int(k[2] or 0))
+            subgroups.keys(),
+            key=lambda k: (str(k[0]), int(k[1] or 0), int(k[2] or 0), int(k[3] or 0)),
         )
 
         for key in sorted_keys:
@@ -114,26 +121,10 @@ def generate_rst(yaml_path, output_file=None):
                 conc = entry.concurrency
                 config_path = entry.config_path
 
-                if n == 1:
-                    if conc <= LOW_LATENCY_CONCURRENCY_THRESHOLD:
-                        profile = "Low Latency"
-                    elif conc >= HIGH_THROUGHPUT_CONCURRENCY_THRESHOLD:
-                        profile = "High Throughput"
-                    else:
-                        profile = "Balanced"
-                elif idx == 0:
-                    profile = "Min Latency"
-                elif idx == n - 1:
-                    profile = "Max Throughput"
-                elif idx in ((n - 1) // 2, n // 2):
-                    profile = "Balanced"
-                elif idx < n // 2:
-                    profile = "Low Latency"
-                else:
-                    profile = "High Throughput"
+                profile = assign_profile(n, idx, conc)
 
                 full_config_path = config_path
-                command = f"trtllm-serve {model} --extra_llm_api_options ${{TRTLLM_DIR}}/{full_config_path}"
+                command = f"trtllm-serve {model} --config ${{TRTLLM_DIR}}/{full_config_path}"
 
                 config_filename = os.path.basename(full_config_path)
 

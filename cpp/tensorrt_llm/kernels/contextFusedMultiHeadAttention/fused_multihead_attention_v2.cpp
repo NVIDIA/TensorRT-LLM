@@ -195,8 +195,8 @@ FusedMultiHeadAttentionXMMAKernelV2::FusedMultiHeadAttentionXMMAKernelV2(
 uint64_t FusedMultiHeadAttentionXMMAKernelV2::hashID(unsigned int s, unsigned int d, unsigned int dv, bool interleaved,
     bool unroll, bool force_fp32_acc, bool flash_attention, bool warp_specialization, bool is_alibi_supported,
     int attention_mask_type, int input_layout, bool tiled, bool enable_attn_logit_softcapping,
-    unsigned int sage_block_size_q, unsigned int sage_block_size_k, unsigned int sage_block_size_v,
-    bool return_softmax) const
+    unsigned int sage_block_size_q, unsigned int sage_block_size_k, unsigned int sage_block_size_v, bool return_softmax,
+    bool enable_skip_softmax) const
 {
     unsigned int log_block_size_q = (unsigned int) std::log2(sage_block_size_q);
     unsigned int log_block_size_k = (unsigned int) std::log2(sage_block_size_k);
@@ -204,17 +204,20 @@ uint64_t FusedMultiHeadAttentionXMMAKernelV2::hashID(unsigned int s, unsigned in
     unsigned int hash = 0;
     if (flash_attention)
     {
-        hash = (uint64_t(log_block_size_q) << 12) | (uint64_t(log_block_size_k) << 6) | uint64_t(log_block_size_v);
+        hash = (static_cast<uint64_t>(log_block_size_q) << 12) | (static_cast<uint64_t>(log_block_size_k) << 6)
+            | static_cast<uint64_t>(log_block_size_v);
     }
     else
     {
         hash = s;
     }
-    return (uint64_t(hash) << 37) | (uint64_t(d) << 27) | (dv << 17) | (attention_mask_type << 11) | (input_layout << 9)
-        | (return_softmax ? 256ull : 0ull) | (enable_attn_logit_softcapping ? 128ull : 0ull)
-        | (is_alibi_supported ? 64ull : 0ull) | (warp_specialization ? 32ull : 0ull) | (tiled ? 16ull : 0ull)
-        | (force_fp32_acc ? 8ull : 0ull) | (flash_attention ? 4ull : 0ull) | (interleaved ? 2ull : 0ull)
-        | (unroll ? 1ull : 0ull);
+    return (static_cast<uint64_t>(hash) << 37) | (static_cast<uint64_t>(d) << 27) | (static_cast<uint64_t>(dv) << 17)
+        | (static_cast<uint64_t>(enable_skip_softmax) << 13) | (static_cast<uint64_t>(attention_mask_type) << 11)
+        | (static_cast<uint64_t>(input_layout) << 9) | (static_cast<uint64_t>(return_softmax) << 8)
+        | (static_cast<uint64_t>(enable_attn_logit_softcapping) << 7) | (static_cast<uint64_t>(is_alibi_supported) << 6)
+        | (static_cast<uint64_t>(warp_specialization) << 5) | (static_cast<uint64_t>(tiled) << 4)
+        | (static_cast<uint64_t>(force_fp32_acc) << 3) | (static_cast<uint64_t>(flash_attention) << 2)
+        | (static_cast<uint64_t>(interleaved) << 1) | (static_cast<uint64_t>(unroll) << 0);
 }
 
 uint64_t FusedMultiHeadAttentionXMMAKernelV2::hashID(KernelMeta const& kernelMeta) const
@@ -223,7 +226,7 @@ uint64_t FusedMultiHeadAttentionXMMAKernelV2::hashID(KernelMeta const& kernelMet
         kernelMeta.mFP32Accumulation, kernelMeta.mFlashAttention, kernelMeta.mWarpSpecialization,
         kernelMeta.mAlibiSupported, kernelMeta.mAttentionMaskType, kernelMeta.mAttentionInputLayout, kernelMeta.mTiled,
         kernelMeta.mEnableAttnLogitSoftcapping, kernelMeta.mSageBlockSizeQ, kernelMeta.mSageBlockSizeK,
-        kernelMeta.mSageBlockSizeV, kernelMeta.mReturnSoftmaxStats);
+        kernelMeta.mSageBlockSizeV, kernelMeta.mReturnSoftmaxStats, kernelMeta.mEnableSkipSoftmax);
 }
 
 void FusedMultiHeadAttentionXMMAKernelV2::run(
@@ -251,6 +254,7 @@ void FusedMultiHeadAttentionXMMAKernelV2::run(
            << "  FlashAttention        : " << (launch_params.flash_attention ? 1 : 0) << "\n"
            << "  Interleaved           : " << (launch_params.interleaved ? 1 : 0) << "\n"
            << "  ReturnSoftmaxStats    : " << (launch_params.supportReturnSoftmaxStats ? 1 : 0) << "\n"
+           << "  EnableSkipSoftmax    : " << (launch_params.enableSkipSoftmax ? 1 : 0) << "\n"
            << "  Unroll                : " << (forceUnroll ? 1 : 0) << "\n"
            << "  Hash                  : 0x" << std::hex << std::setfill('0') << std::setw(16) << hash << std::dec
            << "\n\n"
@@ -273,6 +277,7 @@ void FusedMultiHeadAttentionXMMAKernelV2::run(
                << "    FlashAttention        : " << meta.mFlashAttention << "\n"
                << "    Interleaved           : " << meta.mInterleaved << "\n"
                << "    ReturnSoftmaxStats    : " << meta.mReturnSoftmaxStats << "\n"
+               << "    EnableSkipSoftmax     : " << meta.mEnableSkipSoftmax << "\n"
                << "    Unroll                : " << (meta.mUnrollStep == 0 ? 0 : 1) << "\n"
                << "    Hash                  : 0x" << std::hex << std::setfill('0') << std::setw(16) << func.first
                << std::dec << "\n\n";
@@ -391,7 +396,7 @@ bool FusedMultiHeadAttentionXMMAKernelV2::checkIfKernelExist(MHARunnerFixedParam
     uint64_t id = hashID(0, params.headSize, params.headSizeV, 0, 0, params.forceFp32Acc, false, false, false,
         static_cast<int>(params.attentionMaskType), static_cast<int>(params.attentionInputLayout), false,
         params.attnLogitSoftcappingScale != 0.f, params.sageBlockSizeQ, params.sageBlockSizeK, params.sageBlockSizeV,
-        false);
+        false, /*We do not support enable_skip_softmax with the legacy TRT path.*/ false);
     auto const findIter = std::find_if(mFunctions.begin(), mFunctions.end(), KernelExistPredicate(id));
     bool found = findIter != mFunctions.end();
     if (!found)
@@ -551,7 +556,7 @@ uint64_t FusedMultiHeadAttentionXMMAKernelV2::hashFromParams(
         !launch_params.useKernelWithoutAlibi, static_cast<int>(launch_params.attention_mask_type),
         static_cast<int>(launch_params.attention_input_layout), launch_params.granular_tiling,
         launch_params.enableAttnLogitSoftcapping, launch_params.sage_block_size_q, launch_params.sage_block_size_k,
-        launch_params.sage_block_size_v, launch_params.supportReturnSoftmaxStats);
+        launch_params.sage_block_size_v, launch_params.supportReturnSoftmaxStats, launch_params.enableSkipSoftmax);
 }
 
 FusedMultiHeadAttentionXMMAKernelV2 const* getXMMAKernelsV2(Data_type inputType, Data_type outputType, unsigned int sm)

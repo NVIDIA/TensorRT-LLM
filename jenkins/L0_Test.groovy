@@ -775,7 +775,9 @@ def getPytestBaseCommandLine(
     String trtllmWheelPath,
     String coverageConfigFile,
     String pytestUtil = "",
-    List<String> extraArgs = []
+    List<String> extraArgs = [],
+    int containerPortStart = 0,
+    int containerPortNum = 0
 ) {
     def extraInternalEnv = ""
     def pytestTestTimeout = "3600"
@@ -787,6 +789,12 @@ def getPytestBaseCommandLine(
     // Enable NCCL debug information for multi-GPU tests
     extraInternalEnv += " NCCL_DEBUG=INFO"
 
+    // Container port allocation environment variables for avoiding port conflicts
+    def portEnvVars = ""
+    if (containerPortStart > 0 && containerPortNum > 0) {
+        portEnvVars = "CONTAINER_PORT_START=${containerPortStart} CONTAINER_PORT_NUM=${containerPortNum}"
+    }
+
     def testCmdLine = [
         "LLM_ROOT=${llmSrc}",
         "LLM_BACKEND_ROOT=${llmSrc}/triton_backend",
@@ -794,6 +802,7 @@ def getPytestBaseCommandLine(
         "MODEL_CACHE_DIR=${MODEL_CACHE_DIR}",
         "COLUMNS=200",
         extraInternalEnv,
+        portEnvVars,
         pytestUtil,
         "pytest",
         "-v",
@@ -1054,12 +1063,31 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     """.replaceAll("(?m)^\\s*", "")
                 }
 
+                // Define environment variables to export
+                def envVarNames = [
+                    'OPEN_SEARCH_DB_BASE_URL',
+                    'OPEN_SEARCH_DB_CREDENTIALS',
+                    'BUILD_ID',
+                    'BUILD_URL',
+                    'JOB_NAME',
+                    'globalVars',
+                    'gitlabCommit'
+                ]
+                def envVarsToExport = [:]
+                envVarNames.each { varName ->
+                    envVarsToExport[varName] = env."${varName}"
+                }
+
                 srunArgs = [
+                    "--container-name=multi_node_test-\${SLURM_JOB_ID}",
                     "--container-image=$containerImageArg",
                     "--container-workdir=/home/svc_tensorrt/bloom/scripts",
                     "--container-mounts=$mounts",
                     "--container-env=NVIDIA_IMEX_CHANNELS"
                 ]
+                envVarsToExport.each { varName, varValue ->
+                    srunArgs.add("--container-env=${varName}")
+                }
                 if(nodeCount > 1) {
                     srunArgs.add("--mpi=pmi2")
                 }
@@ -1068,6 +1096,17 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 if (cluster.host.contains("oci-nrt") || cluster.host.contains("oci-hsg") || cluster.host.contains("lbd-lax")) {
                     exemptionComment = """--comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"90","reason":"other","description":"Long data and model loading time and disaggregated serving tests"}}'"""
                 }
+
+                def envExportStatements = envVarsToExport.collect { varName, varValue ->
+                    def escapedValue = varValue?.toString() ?: ''
+                    escapedValue = escapedValue
+                        .replace('\\', '\\\\')    // Backslash
+                        .replace('"', '\\"')      // Double quote
+                        .replace('$', '\\$')      // Dollar sign (prevent variable expansion)
+                        .replace('`', '\\`')      // Backtick (prevent command substitution)
+                    "export ${varName}=\"${escapedValue}\""
+                }.join('\n')
+
                 def scriptContent = """#!/bin/bash
                     #SBATCH ${exemptionComment} --output=${outputPath}
                     ${taskArgs.collect { "#SBATCH $it" }.join('\n')}
@@ -1088,6 +1127,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export coverageConfigFile="$coverageConfigFile"
                     export NVIDIA_IMEX_CHANNELS=\${NVIDIA_IMEX_CHANNELS:-0}
                     export NVIDIA_VISIBLE_DEVICES=\${NVIDIA_VISIBLE_DEVICES:-\$(seq -s, 0 \$((\$(nvidia-smi --query-gpu=count -i 0 --format=noheader)-1)))}
+                    ${envExportStatements}
 
                     echo "Env NVIDIA_IMEX_CHANNELS: \$NVIDIA_IMEX_CHANNELS"
                     echo "Env NVIDIA_VISIBLE_DEVICES: \$NVIDIA_VISIBLE_DEVICES"
@@ -1125,10 +1165,17 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     # Kill tail -f process
                     kill \$tailPid
                     # Check if the job failed or not
+                    sleep 5
+                    STATUS=\$(sacct -j \$jobId --format=State --noheader | head -n 1 | awk '{print \$1}')
                     EXIT_CODE=\$(sacct -j \$jobId --format=ExitCode -Pn --allocations | awk -F: '{print \$1}')
-                    if [ "\$EXIT_CODE" -ne 0 ]; then
-                        echo "Pytest failed in Slurm job \$jobId with exit code \$EXIT_CODE"
-                        exit \$EXIT_CODE
+                    if [[ "\$STATUS" == "COMPLETED" && \$EXIT_CODE -eq 0 ]]; then
+                        echo "Pytest succeed in Slurm job \$jobId"
+                        echo "Status: \$STATUS | Exit_code \$EXIT_CODE"
+                        exit 0
+                    else
+                        echo "Pytest failed in Slurm job \$jobId"
+                        echo "Status: \$STATUS | Exit_code \$EXIT_CODE"
+                        exit 1
                     fi
                 """.replaceAll("(?m)^\\s*", "").trim()
                 pipeline.writeFile(file: scriptExecPathLocal, text: scriptExec)
@@ -1262,6 +1309,61 @@ def globalVars = [
 
 class GlobalState {
     static def uploadResultStageNames = []
+
+    // HOST_NODE_NAME to starting port section map
+    // This map maintains the next available starting port for each host node
+    // to avoid port conflicts when running parallel tests on the same node.
+    // Key: HOST_NODE_NAME (e.g., "node-01.cluster.local")
+    // Value: Next available starting port number for that node
+    static def hostNodePortMap = [:]
+
+    // Port allocation configuration
+    static final int BASE_PORT = 10000           // Base starting port
+    static final int PORT_SECTION_SIZE = 1000    // Number of ports per section/stage
+    static final int MAX_PORT = 32000            // Maximum port number to avoid system ports
+}
+
+/**
+ * Allocates and returns a starting port section for the given host node.
+ * This function is thread-safe and ensures each stage running on the same
+ * host node gets a unique port range to avoid conflicts.
+ *
+ * @param hostNodeName The HOST_NODE_NAME of the node running the stage
+ * @param stageName Optional stage name for logging purposes
+ * @return The starting port number for this stage's port section
+ */
+def getStartingPortForHost(String hostNodeName, String stageName = "") {
+    lock(resource: 'globalstate-hostNodePortMap') {
+        def startingPort = GlobalState.hostNodePortMap.get(hostNodeName, GlobalState.BASE_PORT)
+
+        // Store the next available starting port for this host
+        def nextPort = startingPort + GlobalState.PORT_SECTION_SIZE
+
+        // Wrap around if we exceed MAX_PORT
+        if (nextPort > GlobalState.MAX_PORT) {
+            nextPort = GlobalState.BASE_PORT
+        }
+
+        GlobalState.hostNodePortMap[hostNodeName] = nextPort
+
+        return startingPort
+    }
+}
+
+/**
+ * Gets the HOST_NODE_NAME from the current environment.
+ * Falls back to hostname if HOST_NODE_NAME is not set.
+ *
+ * @return The host node name
+ */
+def getHostNodeName() {
+    return sh(script: '''
+        if [ -n "$HOST_NODE_NAME" ]; then
+            echo "$HOST_NODE_NAME"
+        else
+            hostname -f || hostname
+        fi
+    ''', returnStdout: true).trim()
 }
 
 String getShortenedJobName(String path)
@@ -2447,6 +2549,12 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             cat ${coverageConfigFile}
         """
         echoNodeAndGpuInfo(pipeline, stageName)
+
+        // Allocate a unique port section for this container to avoid port conflicts
+        def hostNodeName = getHostNodeName()
+        def containerPortStart = getStartingPortForHost(hostNodeName, stageName)
+        def containerPortNum = GlobalState.PORT_SECTION_SIZE
+
         // Some clusters do not allow dmesg -C so we add || true
         sh 'if [ "$(id -u)" -eq 0 ]; then dmesg -C || true; fi'
         def pytestCommand = getPytestBaseCommandLine(
@@ -2456,7 +2564,11 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             perfMode,
             "${WORKSPACE}/${stageName}",
             TRTLLM_WHL_PATH,
-            coverageConfigFile
+            coverageConfigFile,
+            "",  // pytestUtil
+            [],  // extraArgs
+            containerPortStart,
+            containerPortNum
         )
 
         // Only add --test-list if there are regular tests to run

@@ -81,6 +81,7 @@ transforms:
     sharding_source: ['manual', 'factory', 'heuristic']
     support_partial_config: true
     sharding_dims: ['tp', 'ep', 'bmm']
+    shard_all_unprocessed: true
     allreduce_strategy: 'NCCL'
     dist_backend: auto
     requires_shape_prop: true
@@ -134,6 +135,10 @@ transforms:
   fuse_add_rms_norm:
     stage: post_load_fusion
     enabled: true
+  gather_logits_before_lm_head:
+    stage: post_load_fusion
+    # TODO: fix https://github.com/NVIDIA/TensorRT-LLM/issues/9878 to enable by default
+    enabled: false
   ############################################################################################
   # VISUALIZE GRAPH
   ############################################################################################

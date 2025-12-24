@@ -3,12 +3,11 @@
 TensorRT LLM provides the OpenAI-compatible API via `trtllm-serve` command.
 A complete reference for the API is available in the [OpenAI API Reference](https://platform.openai.com/docs/api-reference).
 
-This step-by-step tutorial covers the following topics for running online serving benchmarking with Llama 3.1 70B and Qwen2.5-VL-7B for multimodal models:
- * Methodology Introduction
- * Launch the OpenAI-Compatible Server with NGC container
- * Run the performance benchmark
- * Using `extra_llm_api_options`
- * Multimodal Serving and Benchmarking
+```{contents}
+:Contents
+:local:
+:depth: 3
+```
 
 
 ## Methodology Introduction
@@ -17,8 +16,9 @@ The overall performance benchmarking involves:
    1. Launch the OpenAI-compatible service with `trtllm-serve`
    2. Run the benchmark with [benchmark_serving.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/serve/scripts/benchmark_serving.py)
 
+## Preparation
 
-## Launch the NGC container
+### Launch the NGC container
 
 TensorRT LLM distributes the pre-built container on [NGC Catalog](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags).
 
@@ -29,7 +29,7 @@ docker run --rm -it --ipc host -p 8000:8000 --gpus all --ulimit memlock=-1 --uli
 ```
 
 
-## Start the trtllm-serve service
+### Start the trtllm-serve service
 > [!WARNING]
 > The commands and configurations presented in this document are for illustrative purposes only.
 > They serve as examples and may not deliver the optimal performance for your specific use case.
@@ -38,9 +38,9 @@ For benchmarking purposes, first create a bash script using the following code a
 ```bash
 #! /bin/bash
 model_path=/path/to/llama3.1_70B
-extra_llm_api_file=/tmp/extra-llm-api-config.yml
+config_file=/tmp/config.yml
 
-cat << EOF > ${extra_llm_api_file}
+cat << EOF > ${config_file}
 enable_attention_dp: false
 print_iter_log: true
 cuda_graph_config:
@@ -58,7 +58,7 @@ trtllm-serve ${model_path} \
     --tp_size 1 \
     --ep_size 1 \
     --trust_remote_code \
-    --extra_llm_api_options ${extra_llm_api_file}
+    --config ${config_file}
 ```
 > [!NOTE]
 > The trtllm-llmapi-launch is a script that launches the LLM-API code on
@@ -79,9 +79,9 @@ INFO:     Application startup complete.
 INFO:     Uvicorn running on http://localhost:8000 (Press CTRL+C to quit)
 ```
 
-## Run the benchmark
+## Benchmark using `tensorrt_llm.serve.scripts.benchmark_serving`
 
-Similar to starting trtllm-serve, create a script to execute the benchmark using the following code and name it bench.sh.
+Similar to starting `trtllm-serve`, create a script to execute the benchmark using the following code and name it bench.sh.
 
 ```bash
 concurrency_list="1 2 4 8 16 32 64 128 256"
@@ -196,17 +196,24 @@ $$
 
 To get more detailed metrics besides the key metrics above, there is an [experimental tool](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/serve/scripts/time_breakdown) for request time breakdown.
 
-## About `extra_llm_api_options`
-   trtllm-serve provides `extra_llm_api_options` knob to **overwrite** the parameters specified by trtllm-serve.
-   Generally, We create a YAML file that contains various performance switches.
-   e.g
-   ```yaml
-     cuda_graph_config:
-      padding_enabled: true
-     print_iter_log: true
-     kv_cache_dtype: fp8
-     enable_attention_dp: true
-   ```
+## About `--config`
+
+```{eval-rst}
+.. include:: ../../_includes/note_sections.rst
+   :start-after: .. start-note-config-flag-alias
+   :end-before: .. end-note-config-flag-alias
+```
+
+`trtllm-serve` provides `--config` to **overwrite** the parameters specified by `trtllm-serve`.
+Generally, we create a YAML file that contains various performance switches. For example:
+
+```yaml
+cuda_graph_config:
+  padding_enabled: true
+print_iter_log: true
+kv_cache_dtype: fp8
+enable_attention_dp: true
+```
 
 The following is a list of common performance switches.
 #### `kv_cache_config`
@@ -255,7 +262,7 @@ The following is a list of common performance switches.
 
 &emsp;**Default**: TRTLLM
 
-See the [TorchLlmArgs class](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs) for the full list of options which can be used in the extra\_llm\_api\_options`.`
+See the [TorchLlmArgs class](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs) for the full list of options which can be used in the `--config`.
 
 ## Multimodal Serving and Benchmarking
 
@@ -331,3 +338,85 @@ P99 ITL (ms):                            6.14
 - Control the number of images per request with `--random-num-images`
 - Use `--random-image-width` and `--random-image-height` to specify image dimensions or `--random-image-size` for squared image dimensions.
 - The `random_image` dataset generates synthetic images for benchmarking
+
+
+## Benchmark using AIPerf
+
+TensorRT-LLM also supports benchmarking `trtllm-serve` using [**AIPerf**](https://github.com/ai-dynamo/aiperf), NVIDIA’s
+comprehensive benchmarking tool for LLMs.  
+AIPerf provides throughput, latency, TTFT, and concurrency measurements for both
+text and multimodal workloads.
+
+AIPerf integrates directly with the OpenAI-compatible endpoints exposed by
+`trtllm-serve`.
+
+### Installation
+
+AIPerf is installed with TensorRT-LLM by default.  
+
+
+### Running AIPerf with trtllm-serve
+TensorRT-LLM provides example scripts under:
+
+- `examples/serve/aiperf_client.sh`
+- `examples/serve/aiperf_client_for_multimodal.sh`
+
+These scripts demonstrate how to benchmark a running trtllm-serve instance using
+the profile command in AIPerf.
+
+### Example: Benchmark a text model
+
+Once trtllm-serve is running on localhost:8000, run:
+
+```bash
+bash examples/serve/aiperf_client.sh
+```
+
+The script issues a profiling run:
+
+```bash
+aiperf profile \
+    -m TinyLlama-1.1B-Chat-v1.0 \
+    --tokenizer TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+    --endpoint-type chat \
+    --random-seed 123 \
+    --synthetic-input-tokens-mean 128 \
+    --synthetic-input-tokens-stddev 0 \
+    --output-tokens-mean 128 \
+    --output-tokens-stddev 0 \
+    --request-count 100 \
+    --request-rate 10 \
+    --profile-export-file my_profile_export.json \
+    --url localhost:8000 \
+    --streaming
+```
+
+### Example: Benchmark a multimodal model
+
+Benchmark multimodal inference using:
+
+```bash
+bash examples/serve/aiperf_client_for_multimodal.sh
+```
+
+This runs:
+
+```bash
+aiperf profile \
+    -m Qwen2.5-VL-3B-Instruct \
+    --tokenizer Qwen/Qwen2.5-VL-3B-Instruct \
+    --endpoint-type chat \
+    --random-seed 123 \
+    --image-width-mean 64 \
+    --image-height-mean 64 \
+    --image-format png \
+    --synthetic-input-tokens-mean 128 \
+    --synthetic-input-tokens-stddev 0 \
+    --output-tokens-mean 128 \
+    --output-tokens-stddev 0 \
+    --request-count 5 \
+    --request-rate 1 \
+    --profile-export-file my_profile_export.json \
+    --url localhost:8000 \
+    --streaming
+```

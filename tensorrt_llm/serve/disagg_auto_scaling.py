@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import random
+import socket
 import time
 from dataclasses import asdict, dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
@@ -27,6 +28,18 @@ def get_worker_key_prefix(cluster_name: str) -> str:
 
 def get_worker_key(name: str, role: ServerRole, worker_id: str = "") -> str:
     return f"{get_worker_key_prefix(name)}/{worker_id}"
+
+
+def get_host_from_uri(uri: str) -> str:
+    return uri.split("://")[1].split(":")[0]
+
+
+# Get the local ip address from a remote host,
+# if remote host is not provided, use Google's public DNS server "8.8.8.8"
+def get_local_ip(remote_host: str = "8.8.8.8") -> str:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.connect((remote_host, 80))
+        return s.getsockname()[0]
 
 
 class DisaggClusterManager:
@@ -104,6 +117,9 @@ class DisaggClusterManager:
         workers = []
         self._watch_handle = await self._cluster_storage.watch(
             self.worker_key_prefix)
+
+        assert self._watch_handle is not None, "failed to watch workers"
+
         if get_existing_first:
             # There is a tiny gap between getting existing workers and watching the key,
             # which may cause we missing some workers registered in between.
@@ -238,18 +254,25 @@ class DisaggClusterWorker:
     It will send heartbeat to the cluster storage every heartbeat_interval_sec seconds.
     If the worker heartbeat fails, it will re-register itself.
     """
+    LOCALHOST_IPS = ["localhost", "127.0.0.1", "0.0.0.0", "::1",
+                     "::"]  # nosec B104
 
     def __init__(self, role: ServerRole, host: str, port: int,
                  config: DisaggClusterConfig, storage: ClusterStorage):
         self._role = role
-        self._host = host
         self._port = port
         self._config = config
         self._cluster_storage = storage
         self._stop = False
         self._heartbeat_task = None
         self._last_heartbeat = 0
-        self._worker_id = f"{role.name}-{host}:{port}-{int(time.time()*1000)}-{os.getpid()}-{random.randint(0, 1000):03}"
+        register_host = host
+        # if the host is localhost and the cluster uri is not localhost, use the hostname to register the worker
+        disagg_host = get_host_from_uri(self._config.cluster_uri)
+        if host in self.LOCALHOST_IPS and disagg_host not in self.LOCALHOST_IPS:
+            register_host = get_local_ip(disagg_host)
+        self._host = register_host
+        self._worker_id = f"{role.name}-{register_host}:{port}-{int(time.time()*1000)}-{os.getpid()}-{random.randint(0, 1000):03}"
 
     def __del__(self):
         try:
