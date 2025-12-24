@@ -858,6 +858,8 @@ class EagleDecodingConfig(DecodingBaseConfig):
     # The model architecture of the eagle3 model.
     # choices: llama3, mistral_large3
     eagle3_model_arch: str = "llama3"
+    # Whether if draft is captured in cuda graph
+    enable_cuda_graph_for_draft_model: Optional[bool] = True
 
     def __init__(self, **kwargs):
         super().__init__()
@@ -911,6 +913,11 @@ class EagleDecodingConfig(DecodingBaseConfig):
             assert self.max_draft_len is not None and self.max_draft_len > 0, "max_draft_len should be provided, which indicates the number of drafter layers"
             assert self.dynamic_tree_max_topK is not None and self.dynamic_tree_max_topK > 0, "dynamic_tree_max_topK should be provided, which indicates the number of nodes to expand each time"
             assert self.max_total_draft_tokens is not None and self.max_total_draft_tokens > 0, "max_total_draft_tokens should be provided, which indicates the total nodes of the final draft tree. (exclude the root node)"
+
+        if self.enable_cuda_graph_for_draft_model == False and self.eagle3_one_model == False:
+            raise ValueError(
+                "enable_cuda_graph_for_draft_model can be false only when eagle3_one_model is True"
+            )
 
     @classmethod
     def from_dict(cls, data: dict):

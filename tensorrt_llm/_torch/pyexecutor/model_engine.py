@@ -338,6 +338,7 @@ class PyTorchModelEngine(ModelEngine):
             ) or self.model_is_wrapped
             self.max_draft_len = spec_config.max_draft_len
             self.max_total_draft_tokens = spec_config.max_total_draft_tokens
+            self.enable_cuda_graph_for_draft_model = spec_config.enable_cuda_graph_for_draft_model
         else:
             self.without_logits = False
             self.max_draft_len = 0
@@ -3265,6 +3266,12 @@ class PyTorchModelEngine(ModelEngine):
                     else:
                         with MoeLoadBalancerIterContext(moe_load_balancer):
                             outputs = self.cuda_graph_runner.replay(key, inputs)
+                            if not self.enable_cuda_graph_for_draft_model:
+                                outputs = self.model.forward_draft(
+                                    outputs, inputs['input_ids'],
+                                    inputs['position_ids'],
+                                    inputs['attn_metadata'],
+                                    inputs['spec_metadata'])
 
             if self.forward_pass_callable is not None:
                 self.forward_pass_callable()

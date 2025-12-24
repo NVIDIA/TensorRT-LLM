@@ -796,6 +796,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                     assert key in model_config.extra_attrs
                     model_config.extra_attrs[key].update(value)
         self.layer_idx = -1
+        self.enable_cuda_graph_for_draft_model = spec_config.enable_cuda_graph_for_draft_model
 
     def forward(
         self,
@@ -823,33 +824,15 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         if attn_metadata.padded_num_tokens is not None:
             hidden_states = hidden_states[:attn_metadata.num_tokens]
 
-        if self.draft_model is not None:
-            # get logits
-            logits = self.logits_processor.forward(
-                hidden_states[spec_metadata.gather_ids],
-                self.lm_head,
-                attn_metadata,
-                True,
-            )
-            mtp_input_ids = input_ids
-            mtp_position_ids = position_ids
-            if attn_metadata.padded_num_tokens is not None:
-                if input_ids is not None:
-                    # Slice along the first dimension
-                    mtp_input_ids = input_ids[:attn_metadata.num_tokens]
-                if position_ids is not None:
-                    # Slice along the last dimension
-                    mtp_position_ids = position_ids[:, :attn_metadata.
-                                                    num_tokens]
+        is_capturing = torch.cuda.is_current_stream_capturing()
 
-            # get accepted tokens and next draft tokens
-            return self.spec_worker(input_ids=mtp_input_ids,
-                                    position_ids=mtp_position_ids,
-                                    hidden_states=hidden_states,
-                                    logits=logits,
-                                    attn_metadata=attn_metadata,
-                                    spec_metadata=spec_metadata,
-                                    draft_model=self.draft_model)
+        if self.draft_model is not None:
+            if is_capturing and not self.enable_cuda_graph_for_draft_model:
+                return hidden_states
+            else:
+                return self.forward_draft(hidden_states, input_ids,
+                                          position_ids, attn_metadata,
+                                          spec_metadata)
         else:
             logits = self.logits_processor.forward(
                 hidden_states,
@@ -859,6 +842,34 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             )
 
         return logits
+
+    def forward_draft(self, hidden_states, input_ids, position_ids,
+                      attn_metadata, spec_metadata):
+        # get logits
+        logits = self.logits_processor.forward(
+            hidden_states[spec_metadata.gather_ids],
+            self.lm_head,
+            attn_metadata,
+            True,
+        )
+        mtp_input_ids = input_ids
+        mtp_position_ids = position_ids
+        if attn_metadata.padded_num_tokens is not None:
+            if input_ids is not None:
+                # Slice along the first dimension
+                mtp_input_ids = input_ids[:attn_metadata.num_tokens]
+            if position_ids is not None:
+                # Slice along the last dimension
+                mtp_position_ids = position_ids[:, :attn_metadata.num_tokens]
+
+        # get accepted tokens and next draft tokens
+        return self.spec_worker(input_ids=mtp_input_ids,
+                                position_ids=mtp_position_ids,
+                                hidden_states=hidden_states,
+                                logits=logits,
+                                attn_metadata=attn_metadata,
+                                spec_metadata=spec_metadata,
+                                draft_model=self.draft_model)
 
     def load_weights(self,
                      weights: Dict,

@@ -266,8 +266,13 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("overlap_scheduler", [True, False])
     @parametrize_with_ids("eagle3_one_model", [True, False])
     @parametrize_with_ids("sampler_async_worker", [True, False])
+    @parametrize_with_ids("enable_cuda_graph_for_draft_model", [True, False])
     def test_eagle3(self, overlap_scheduler, eagle3_one_model,
-                    sampler_async_worker):
+                    sampler_async_worker, enable_cuda_graph_for_draft_model):
+        if enable_cuda_graph_for_draft_model == False and eagle3_one_model == False:
+            pytest.skip(
+                "enable_cuda_graph_for_draft_model can be false only when eagle3_one_model is True"
+            )
         pytorch_config = dict(
             max_batch_size=
             1,  # add max_batch_size to avoid error in overlap scheduler
@@ -284,9 +289,11 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         target_model_dir = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
 
         draft_len = 4
-        spec_config = EagleDecodingConfig(max_draft_len=draft_len,
-                                          speculative_model_dir=eagle_model_dir,
-                                          eagle3_one_model=eagle3_one_model)
+        spec_config = EagleDecodingConfig(
+            max_draft_len=draft_len,
+            speculative_model_dir=eagle_model_dir,
+            eagle3_one_model=eagle3_one_model,
+            enable_cuda_graph_for_draft_model=enable_cuda_graph_for_draft_model)
 
         with LLM(model=target_model_dir,
                  **pytorch_config,
