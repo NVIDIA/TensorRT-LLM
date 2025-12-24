@@ -227,6 +227,7 @@ if args.run_type == "GEN":
     logger.info("Layer-wise benchmarks: Prefill KV cache  ... Done")
 
 # Warm up
+logger.info("Layer-wise benchmarks: Warmup")
 for batch_size, seq_len_q, seq_len_kv_cache, balance_ratio in [
     *itertools.product(
         args.batch_size_list,
@@ -255,6 +256,7 @@ for batch_size, seq_len_q, seq_len_kv_cache, balance_ratio in [
             run_pack(check=True)
         torch.cuda.current_stream().wait_stream(capture_stream)
 torch.cuda.synchronize()
+logger.info("Layer-wise benchmarks: Warmup  ... Done")
 
 events = [
     torch.cuda.Event(enable_timing=True) for _ in range(args.warmup_times + args.run_times + 1)

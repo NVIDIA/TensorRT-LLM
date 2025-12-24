@@ -106,7 +106,7 @@ You may compile C++ extensions in the interactive shell:
 ```bash
 cd ../..
 export CCACHE_DIR=$(realpath cpp/.ccache)
-python3 scripts/build_wheel.py --cuda_architectures "100-real" --no-venv --skip_building_wheel --use_ccache --clean
+python3 scripts/build_wheel.py --cuda_architectures native --no-venv --skip_building_wheel -G Ninja --use_ccache --clean
 ```
 
 **Step 3:** Run benchmarks to generate profiles. Run the following command on the controller node, where `NODES` &le; the number of allocated nodes:
