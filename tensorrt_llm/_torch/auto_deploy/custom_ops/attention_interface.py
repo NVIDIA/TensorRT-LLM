@@ -10,7 +10,19 @@ and operates on a purely functional paradigm that is compatible with the torch c
 """
 
 from abc import ABC, abstractmethod
-from typing import Dict, List, Literal, Optional, Protocol, Sequence, Set, Tuple, Type, Union
+from typing import (
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Protocol,
+    Sequence,
+    Set,
+    Tuple,
+    Type,
+    Union,
+)
 
 import torch
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -511,6 +523,9 @@ class SequenceInfo:
         # EXTRA TENSOR FIELDS ######################################################################
         self._extra_args: Dict[str, Optional[torch.Tensor]] = {}
         ############################################################################################
+
+        # HOST PREPARE FOR ATTENTION FORWARD #######################################################
+        self._host_prepare_functions: set[Callable[[SequenceInfo], None]] = set()
 
         # call reset once to set a consistent initial state
         self.reset()
@@ -1089,6 +1104,15 @@ class SequenceInfo:
         t_squeezed = t_nested.squeeze(int(self.is_generate))
         return list(torch.split(t_squeezed, self.seq_len))
 
+    def register_host_prepare_for_attention_forward(
+        self, host_function: Callable[["SequenceInfo"], None]
+    ):
+        self._host_prepare_functions.add(host_function)
+
+    def run_host_prepare_for_attention_forward(self) -> None:
+        for host_function in self._host_prepare_functions:
+            host_function(self)
+
 
 class MHACallable(Protocol):
     def __call__(
@@ -1265,6 +1289,15 @@ class AttentionDescriptor(ABC):
         caches and buffers. The constants are expected to be of type int, float, str, or None.
         """
         return []
+
+    @classmethod
+    def host_prepare_for_forward(cls, sequence_info: SequenceInfo):
+        """Perform host-side preparation for the forward pass for the attention op.
+
+        This method is responsible for preparing the attention op for the forward pass.
+        This function is not expected to be graph capturable or compatible with cuda graphs.
+        """
+        return
 
 
 class AttentionRegistry:

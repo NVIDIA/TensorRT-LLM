@@ -36,3 +36,4 @@ opentelemetry-api>=1.26.0
 opentelemetry-exporter-otlp>=1.26.0
 opentelemetry-semantic-conventions-ai>=0.4.1
 fuzzywuzzy==0.18.0
+aiperf==0.3.0

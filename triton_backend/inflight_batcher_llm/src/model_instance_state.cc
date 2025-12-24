@@ -491,10 +491,10 @@ executor::ExecutorConfig ModelInstanceState::getExecutorConfigFromParams()
             + std::to_string(requestStatsMaxIterations));
     }
 
+    bool enableTrtOverlap = false;
     try
     {
-        model_state_->GetParameter<bool>("enable_trt_overlap");
-        TLLM_LOG_WARNING("enable_trt_overlap is deprecated and will be ignored");
+        enableTrtOverlap = model_state_->GetParameter<bool>("enable_trt_overlap");
     }
     catch (std::exception const& e)
     {
@@ -698,6 +698,7 @@ executor::ExecutorConfig ModelInstanceState::getExecutorConfigFromParams()
         maxQueueSize, extendedRuntimePerfKnobConfig,
         /*DebugConfig*/ std::nullopt, recvPollPeriodMs};
     execConfig.setSpecDecConfig(specDecConfig);
+    execConfig.setEnableTrtOverlap(enableTrtOverlap);
     execConfig.setCacheTransceiverConfig(tle::CacheTransceiverConfig(tle::CacheTransceiverConfig::BackendType::MPI));
     if (guidedConfig.has_value())
     {

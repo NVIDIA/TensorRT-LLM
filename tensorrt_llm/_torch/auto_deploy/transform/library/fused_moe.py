@@ -5,6 +5,8 @@ import torch
 from pydantic import Field
 from torch.fx import GraphModule, Node
 
+from tensorrt_llm._torch.utils import ActivationType
+
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.cuda_mem_tracker import cuda_memory_tracker
@@ -70,20 +72,20 @@ def _insert_fused_moe_ops(gm: GraphModule, backend: Literal["auto", "trtllm", "t
                     except (AttributeError, KeyError):
                         pass
 
+        (is_gated_mlp, act_fn) = extract_op_args(node, "is_gated_mlp", "act_fn")
+
         if is_stacked_moe:
             # Stacked MoE (Llama4 pattern): only supports gated MLP
-            (act_fn_val,) = extract_op_args(node, "act_fn")
             _process_llama4_stacked_moe_node(
-                gm, graph, node, replacement_op, act_fn_val, fused_key_counter
+                gm, graph, node, replacement_op, act_fn, fused_key_counter
             )
         else:
             # Standard MoE with per-expert weight lists
-            (mlp_style_val, act_fn_val) = extract_op_args(node, "mlp_style", "act_fn")
-            assert backend != "triton" or mlp_style_val == "mlp", (
+            assert backend != "triton" or not is_gated_mlp, (
                 "Triton backend only supports mlp style."
             )
             _process_regular_moe_node(
-                gm, graph, node, replacement_op, mlp_style_val, act_fn_val, fused_key_counter
+                gm, graph, node, replacement_op, is_gated_mlp, act_fn, fused_key_counter
             )
 
         fused_key_counter += 1
@@ -102,8 +104,8 @@ def _process_regular_moe_node(
     graph: torch.fx.Graph,
     node: Node,
     replacement_op,
-    mlp_style_val: str,
-    act_fn_val: str,
+    is_gated_mlp: bool,
+    act_fn: ActivationType,
     fused_key_counter: int,
 ) -> None:
     """Process a single torch_moe node with per-expert weight lists.
@@ -122,7 +124,7 @@ def _process_regular_moe_node(
     )
 
     # Stack weights based on MLP style
-    if mlp_style_val == "gated_mlp":
+    if is_gated_mlp:
         # For gated MLP, concatenate w3 and w1 then stack across experts
         fused_w_up_experts = torch.stack(
             [
@@ -135,12 +137,10 @@ def _process_regular_moe_node(
             dim=0,
         )
         new_key_w_up = f"fused_moe_w3_w1_stacked_{fused_key_counter}"
-    elif mlp_style_val == "mlp":
+    else:
         # For regular MLP, just stack w1
         fused_w_up_experts = torch.stack([gm.get_parameter(n.target) for n in w1_list], dim=0)
         new_key_w_up = f"fused_moe_w1_stacked_{fused_key_counter}"
-    else:
-        raise ValueError(f"Unknown mlp_style: {mlp_style_val}")
 
     # Stack w2/down weights
     fused_w_down_experts = torch.stack([gm.get_parameter(n.target) for n in w2_list], dim=0)
@@ -162,8 +162,8 @@ def _process_regular_moe_node(
             replacement_op,
             args=(hidden_states, selected_experts, routing_weights, w_up_arg, w_down_arg),
             kwargs={
-                "mlp_style": mlp_style_val,
-                "act_fn": act_fn_val,
+                "is_gated_mlp": is_gated_mlp,
+                "act_fn": act_fn,
             },
         )
 
@@ -176,7 +176,7 @@ def _process_llama4_stacked_moe_node(
     graph: torch.fx.Graph,
     node: Node,
     replacement_op,
-    act_fn_val: str,
+    act_fn: ActivationType,
     fused_key_counter: int,
 ) -> None:
     """Process a single Llama4 MoE node with pre-stacked weight tensors.
@@ -301,7 +301,8 @@ def _process_llama4_stacked_moe_node(
             replacement_op,
             args=(scaled_input, selected_experts, ones_node, w_up_arg, w_down_arg),
             kwargs={
-                "act_fn": act_fn_val,
+                "act_fn": act_fn,
+                "is_gated_mlp": True,
             },
         )
 
@@ -602,12 +603,11 @@ def _remove_dead_inplace_nodes_in_region(
     def target(n: torch.fx.Node) -> bool:
         return is_op(n, {torch.ops.aten.index_add_}) and len(n.users) == 0
 
-    try:
-        node_to_remove, _ = bfs(start_boundary, target, attr_next="users", boundary=end_boundary)
+    node_to_remove, _ = bfs(start_boundary, target, attr_next="users", boundary=end_boundary)
+    if node_to_remove:
         graph.erase_node(node_to_remove)
         return True
-    except RuntimeError:
-        return False
+    return False
 
 
 class MatchMoePattern(BaseTransform):
@@ -920,12 +920,12 @@ class MatchBmmMoePattern(BaseTransform):
         input_hidden_states = repeat_node.args[0]
 
         # Trace back from routing_weight to find topk
-        try:
-            topk_node, _ = bfs(
-                routing_weight_node,
-                lambda n: is_op(n, torch.ops.aten.topk),
-                attr_next="all_input_nodes",
-            )
+        topk_node, _ = bfs(
+            routing_weight_node,
+            lambda n: is_op(n, torch.ops.aten.topk),
+            attr_next="all_input_nodes",
+        )
+        if topk_node:
             router_logits = topk_node.args[0] if topk_node.args else None
             if not router_logits:
                 return None
@@ -936,8 +936,7 @@ class MatchBmmMoePattern(BaseTransform):
             k_value = topk_node.args[1]
             if k_value != 1:
                 return None
-
-        except RuntimeError:
+        else:
             return None
 
         return (input_hidden_states, topk_node)
@@ -1240,7 +1239,7 @@ class MatchBmmMoePattern(BaseTransform):
                             w3_list_node,
                         ),
                         kwargs={
-                            "mlp_style": "gated_mlp",
+                            "is_gated_mlp": True,
                             "apply_routing_on_input": apply_routing_on_input,
                         },
                     )

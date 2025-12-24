@@ -77,6 +77,11 @@ def add_llm_args(parser):
                         choices=["auto", "TorchSampler", "TRTLLMSampler"])
     parser.add_argument('--tp_size', type=int, default=1)
     parser.add_argument('--pp_size', type=int, default=1)
+    parser.add_argument('--orchestrator_type',
+                        type=str,
+                        default=None,
+                        choices=[None, 'rpc', 'ray'],
+                        help='Orchestrator type for multi-GPU execution')
     parser.add_argument('--moe_ep_size', type=int, default=-1)
     parser.add_argument('--moe_tp_size', type=int, default=-1)
     parser.add_argument('--moe_cluster_size', type=int, default=-1)
@@ -288,6 +293,7 @@ def setup_llm(args, **kwargs):
         trust_remote_code=args.trust_remote_code,
         gather_generation_logits=args.return_generation_logits,
         max_beam_width=args.max_beam_width,
+        orchestrator_type=args.orchestrator_type,
         **kwargs)
 
     use_beam_search = args.max_beam_width > 1
