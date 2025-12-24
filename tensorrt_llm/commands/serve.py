@@ -103,6 +103,19 @@ def _append_extra_error_message_for_port_conflict(error_msg: str, port: int):
                 f"Process: {bound_proc.name()}, "
                 f"Started at: {datetime.fromtimestamp(bound_proc.create_time()).strftime('%Y-%m-%d %H:%M:%S')}, "
                 f"Command: {bound_proc.cmdline()}")
+        else:
+            logger.warning(f"Could not find a process listening on port {port}")
+
+        used_ports = list()
+        for p in range(10000, 14000):
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.bind(("localhost", p))
+            except OSError:
+                used_ports.append(p)
+
+        if len(used_ports) > 0:
+            extra_error_msg += f", Used ports in range 10000-14000: {used_ports}"
 
     except Exception as e:
         logger.warning(
