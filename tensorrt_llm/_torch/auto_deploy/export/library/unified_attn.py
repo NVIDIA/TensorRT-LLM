@@ -4,7 +4,6 @@ from typing import Optional
 
 import torch
 import torch.export as te
-
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from ..interface import BaseExportPatch, ExportPatchRegistry
