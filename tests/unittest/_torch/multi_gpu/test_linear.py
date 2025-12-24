@@ -420,8 +420,8 @@ def fp4_row_linear_allreduce_run_single_rank(func, tp_size, seq_len,
         func(tp_size, local_rank, seq_len, output_size, hidden_size, dtype,
              output_ref, x_sf_global, w_sf_global, x_fp4s, w_fp4, x_sf_blocks,
              w_sf_block_unswizzled)
-    except Exception:
-        traceback.print_exc()
+    except Exception as e:
+        print(f"Error: {e}")
         raise
     return True
 
@@ -429,7 +429,7 @@ def fp4_row_linear_allreduce_run_single_rank(func, tp_size, seq_len,
 @skip_pre_blackwell
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason='needs 2 GPUs to run this test')
-@pytest.mark.parametrize("seq_len", [256], ids=lambda x: f"seqlen:{x}")
+@pytest.mark.parametrize("seq_len", [256, 400], ids=lambda x: f"seqlen:{x}")
 @pytest.mark.parametrize("output_size", [32, 64], ids=lambda x: f"output:{x}")
 @pytest.mark.parametrize("hidden_size", [128, 256], ids=lambda x: f"hidden:{x}")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16],

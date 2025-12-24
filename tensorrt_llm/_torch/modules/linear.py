@@ -2156,19 +2156,17 @@ class Linear(nn.Module):
         self.use_custom_cublas_mm = use_custom_cublas_mm
         self.lora = lora
 
-        use_fused_gemm_allreduce = True
-        use_fused_gemm_allreduce &= (not mpi_disabled())
-        use_fused_gemm_allreduce &= self.dtype in (torch.float16,
-                                                   torch.bfloat16)
-        use_fused_gemm_allreduce &= (self.in_features % 128 == 0)
-        use_fused_gemm_allreduce &= (self.tp_mode is not None
-                                     and self.tp_mode == TensorParallelMode.ROW)
-        use_fused_gemm_allreduce &= (self.tp_size > 1 and self.reduce_output)
-        use_fused_gemm_allreduce &= (self.out_features % 64 == 0)
-        use_fused_gemm_allreduce &= (
-            self.quant_config is not None
-            and self.quant_config.layer_quant_mode.has_nvfp4())
-        self.use_fused_gemm_allreduce = use_fused_gemm_allreduce
+        mpi_enabled = not mpi_disabled()
+        dtype_supported = self.dtype in (torch.float16, torch.bfloat16)
+        in_features_aligned = self.in_features % 128 == 0
+        out_features_aligned = self.out_features % 64 == 0
+        tp_valid = self.tp_mode is not None and self.tp_mode == TensorParallelMode.ROW and self.tp_size > 1
+        quant_valid = self.quant_config is not None and self.quant_config.layer_quant_mode.has_nvfp4(
+        )
+        self.use_fused_gemm_allreduce = all([
+            self.reduce_output, mpi_enabled, dtype_supported,
+            in_features_aligned, out_features_aligned, tp_valid, quant_valid
+        ])
 
         self.enable_cuda_core = False
         if torch.cuda.is_available():
