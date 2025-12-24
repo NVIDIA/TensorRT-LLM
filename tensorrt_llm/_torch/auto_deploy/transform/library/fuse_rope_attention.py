@@ -18,6 +18,7 @@ from typing import List, Tuple
 import torch
 from torch.fx import GraphModule, Node
 
+from ...models import hf
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils._graph import add_graph_input, add_graph_output, remove_graph_input, run_shape_prop
@@ -290,7 +291,7 @@ class FuseRopeAttention(BaseTransform):
 
         return matches
 
-    def _add_global_placeholders(self, gm: GraphModule, cm: "CachedSequenceInterface") -> tuple:
+    def _add_global_placeholders(self, gm: GraphModule, factory: ModelFactory) -> tuple:
         """Add global input placeholders required by the fused AttentionPlugin.
 
         Creates three new graph inputs that are shared across all attention layers:
@@ -336,26 +337,25 @@ class FuseRopeAttention(BaseTransform):
         # 1. Add context_lengths placeholder: int32[batch_size]
         context_lengths_example = torch.zeros(batch_size_dim, dtype=torch.int32, device="meta")
         context_lengths_node = add_graph_input(
-            gm, name="context_lengths", val=context_lengths_example, name_prefix=""
+            gm, name="context_lengths", val=context_lengths_example
         )
         ad_logger.debug(f"Added context_lengths placeholder: {context_lengths_node.name}")
 
         # 2. Add rope_rotary_cos_sin placeholder: float32[rope_batch_size, rope_max_position_length, 64]
         # Create with concrete example tensor
-        model_config = gm.config
+        assert isinstance(factory, hf.AutoModelFactory)
+        model_config, _ = factory._get_model_config()
         head_dim = model_config.hidden_size // model_config.num_attention_heads
         rope_example = torch.zeros(
             batch_size_dim, max_seq_len_dim, head_dim, dtype=torch.float32, device="meta"
         )
-        rope_rotary_cos_sin_node = add_graph_input(
-            gm, name="rope_rotary_cos_sin", val=rope_example, name_prefix=""
-        )
+        rope_rotary_cos_sin_node = add_graph_input(gm, name="rope_rotary_cos_sin", val=rope_example)
         ad_logger.debug(f"Added rope_rotary_cos_sin placeholder: {rope_rotary_cos_sin_node.name}")
 
         # 3. Add kvcache_start_index placeholder: int32[batch_size]
         kvcache_start_index_example = torch.zeros(batch_size_dim, dtype=torch.int32, device="meta")
         kvcache_start_index_node = add_graph_input(
-            gm, name="kvcache_start_index", val=kvcache_start_index_example, name_prefix=""
+            gm, name="kvcache_start_index", val=kvcache_start_index_example
         )
         ad_logger.debug(f"Added kvcache_start_index placeholder: {kvcache_start_index_node.name}")
 
@@ -406,7 +406,7 @@ class FuseRopeAttention(BaseTransform):
                 batch_size_dim, 2, 2, past_len, match.head_dim, dtype=torch.float16, device="meta"
             )
             past_key_values_node = add_graph_input(
-                gm, name=f"past_key_values_{match_id}", val=past_key_values_example, name_prefix=""
+                gm, name=f"past_key_values_{match_id}", val=past_key_values_example
             )
 
             ad_logger.debug(f"Added past_key_values_{match_id} placeholder")
@@ -526,7 +526,7 @@ class FuseRopeAttention(BaseTransform):
 
         # Add global placeholders
         context_lengths_node, rope_rotary_cos_sin_node, kvcache_start_index_node = (
-            self._add_global_placeholders(gm, cm)
+            self._add_global_placeholders(gm, factory)
         )
 
         # Perform replacement for all matches
