@@ -430,7 +430,7 @@ void XqaDispatcher::runImpl(
             tllmRunnerParams.mNumTokensPerPage = kv_cache_buffer.mTokensPerBlock;
 
             // Gather kv page offsets for sparse attention.
-            if (params.use_sparse_attention)
+            if (params.use_sparse_attention_gen_paged)
             {
                 invokeGatherKvPageOffsets(reinterpret_cast<int32_t*>(launchParams.sparse_kv_block_offsets),
                     launchParams.sparse_seq_lengths, reinterpret_cast<int32_t const*>(kv_cache_buffer.data),
@@ -445,7 +445,8 @@ void XqaDispatcher::runImpl(
         }
         else
         {
-            TLLM_CHECK_WITH_INFO(!params.use_sparse_attention, "Sparse attention is not supported for KVLinearBuffer.");
+            TLLM_CHECK_WITH_INFO(
+                !(params.use_sparse_attention_gen_paged), "Sparse attention is not supported for KVLinearBuffer.");
             static_assert(std::is_same_v<KVCacheBuffer, KVLinearBuffer>);
             // Contiguous KV
             tllmRunnerParams.mQkvLayout = QkvLayout::ContiguousKv;

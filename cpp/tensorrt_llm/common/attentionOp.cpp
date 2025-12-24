@@ -295,7 +295,7 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     xqaParams.start_token_idx_sf = generationsParams.start_token_idx_sf;
     // Parameters for sparse attention
     xqaParams.sparse_params = mRuntimeSparseAttentionParams;
-    xqaParams.use_sparse_attention = useTllmGenSparseAttention();
+    xqaParams.use_sparse_attention_gen_paged = useTllmGenSparseAttentionPaged();
     // Skip softmax threshold.
     xqaParams.skip_softmax_threshold_scale_factor = mSkipSoftmaxThresholdScaleFactorDecode;
     // Cross attention parameters.
@@ -939,7 +939,7 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
         size_t const cu_kv_seqlens_size = sizeof(int) * (batch_beam + 1);
         size_t const rotary_inv_freq_size = sizeof(float) * batch_beam * mRotaryEmbeddingDim / 2;
         // Two workspaces for sparse attention. One for the sequence lengths, and one for kv block offsets.
-        size_t const sparse_attn_cache_size = useTllmGenSparseAttention()
+        size_t const sparse_attn_cache_size = useTllmGenSparseAttentionPaged()
             ? sizeof(int) * (batch_beam + batch_beam * 2 * max_blocks_per_sequence) * mNumKVHeads
             : 0;
         xqa_workspaces[0] = cu_seqlens_size;
@@ -1111,14 +1111,14 @@ int AttentionOp::mlaGeneration(
                 = reinterpret_cast<float const*>(params.bmm1_scale) + bmm1_scale_offset;
         }
 
-        // Set the following parameters if sparseMLA is used.
+        // Set the following parameters if sparseAttention is used.
         if (useSparseMLA())
         {
-            tllmRunnerParams.mSparseMla = true;
-            tllmRunnerParams.mSparseMlaTopK = mRuntimeSparseAttentionParams.sparse_mla_topk;
+            tllmRunnerParams.mSparseAttention = true;
+            tllmRunnerParams.mSparseTopK = mRuntimeSparseAttentionParams.sparse_topk;
             tllmRunnerParams.kvPageIdxPtr = reinterpret_cast<KVCacheIndex::UnderlyingType const*>(
                 mRuntimeSparseAttentionParams.sparse_attn_indices);
-            tllmRunnerParams.kvPtr = mRuntimeSparseAttentionParams.sparse_mla_kv_cache_pool;
+            tllmRunnerParams.kvPtr = mRuntimeSparseAttentionParams.sparse_kv_cache_pool;
         }
 
         mTllmGenFMHARunner->run(tllmRunnerParams);
@@ -1883,7 +1883,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         fmhaParams.softmaxStatsPtr = params.softmax_stats;
 
         // Sparse attention parameters
-        if (useSparseMLA())
+        if (useTllmGenSparseAttention())
         {
             fmhaParams.sparse_params = mRuntimeSparseAttentionParams;
         }
@@ -2799,6 +2799,7 @@ int AttentionOp::initialize() noexcept
         fmhaParams.hasAlibi = isALiBi();
         fmhaParams.scaleAlibi = isAliBiWithScale();
         fmhaParams.useSparseMLA = useSparseMLA();
+        fmhaParams.useTllmGenSparseAttention = useTllmGenSparseAttention();
 
         // Load kernels from the pre-compiled cubins.
         mFmhaDispatcher.reset(new FmhaDispatcher(fmhaParams));

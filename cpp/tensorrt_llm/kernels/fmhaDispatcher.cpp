@@ -123,7 +123,7 @@ bool FmhaDispatcher::isSupported()
         // Set the kernel type and mask type if sparseMLA is used.
         if (mFixedParams.useSparseMLA)
         {
-            tllmRunnerParams.mSparseMla = true;
+            tllmRunnerParams.mSparseAttention = true;
             tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
             tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
         }
@@ -231,16 +231,24 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         // For skip softmax
         tllmRunnerParams.mSkipSoftmaxThresholdScaleFactor = runnerParams.skipSoftmaxThresholdScaleFactor;
         tllmRunnerParams.stream = runnerParams.stream;
-        // Set the sparse attention parameters if sparseMLA is used.
-        if (mFixedParams.useSparseMLA)
+        // Set the sparse attention parameters if trtllm-gen sparse attention is used.
+        if (mFixedParams.useTllmGenSparseAttention)
         {
-            tllmRunnerParams.mSparseMla = true;
-            tllmRunnerParams.mSparseMlaTopK = runnerParams.sparse_params.sparse_mla_topk;
+            tllmRunnerParams.mSparseAttention = true;
+            tllmRunnerParams.mSparseTopK = runnerParams.sparse_params.sparse_topk;
             tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
             tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
-            tllmRunnerParams.kvPageIdxPtr
-                = reinterpret_cast<int const*>(runnerParams.sparse_params.sparse_attn_indices);
-            tllmRunnerParams.kvPtr = runnerParams.sparse_params.sparse_mla_kv_cache_pool;
+            if (mFixedParams.useSparseMLA)
+            {
+                tllmRunnerParams.kvPageIdxPtr
+                    = reinterpret_cast<int const*>(runnerParams.sparse_params.sparse_attn_indices);
+            }
+            else
+            {
+                tllmRunnerParams.kvPageIdxPtr
+                    = reinterpret_cast<int const*>(runnerParams.sparse_params.sparse_attn_ctx_indices);
+            }
+            tllmRunnerParams.kvPtr = runnerParams.sparse_params.sparse_kv_cache_pool;
         }
 
         mTllmGenFMHARunner->run(tllmRunnerParams);

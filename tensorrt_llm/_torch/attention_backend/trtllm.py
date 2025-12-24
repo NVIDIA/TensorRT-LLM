@@ -213,6 +213,7 @@ class TrtllmAttentionWrapper:
         sparse_kv_offsets: Optional[torch.Tensor] = None,
         sparse_attn_indices: Optional[torch.Tensor] = None,
         sparse_attn_offsets: Optional[torch.Tensor] = None,
+        sparse_attn_ctx_indices: Optional[torch.Tensor] = None,
         sparse_attn_indices_block_size: int = 1,
         sparse_mla_topk: int = 0,
         skip_softmax_threshold_scale_factor_prefill: Optional[float] = None,
@@ -261,6 +262,7 @@ class TrtllmAttentionWrapper:
             sparse_kv_offsets (torch.Tensor): The batch offsets for the sparse KV indices, with shape of (num_contexts + 1) on GPU.
             sparse_attn_indices (torch.Tensor): The sparse indices for the attention layer, with shape of (num_heads_kv, num_sparse_tokens) on GPU.
             sparse_attn_offsets (torch.Tensor): The batch offsets for the sparse attention indices, with shape of (num_generations + 1) on GPU.
+            sparse_attn_ctx_indices (torch.Tensor): The sparse indices for the context attention layer, with shape of (num_heads_kv, num_ctx_tokens, num_sparse_tokens) on GPU.
             sparse_attn_indices_block_size (int): The granularity of the sparse attention indices, used by block sparse attention.
             sparse_mla_topk (int): The topk for the sparse MLA, used by DSA attention.
             skip_softmax_threshold_scale_factor_prefill (float): The scale factor for the skip softmax threshold in prefill phase.
@@ -307,6 +309,7 @@ class TrtllmAttentionWrapper:
         self.sparse_kv_offsets = sparse_kv_offsets
         self.sparse_attn_indices = sparse_attn_indices
         self.sparse_attn_offsets = sparse_attn_offsets
+        self.sparse_attn_ctx_indices = sparse_attn_ctx_indices
         self.sparse_attn_indices_block_size = sparse_attn_indices_block_size
         self.sparse_mla_topk = sparse_mla_topk
         self.helix_position_offsets = helix_position_offsets
@@ -569,6 +572,7 @@ class TrtllmAttentionWrapper:
             self.sparse_kv_offsets,
             self.sparse_attn_indices,
             self.sparse_attn_offsets,
+            self.sparse_attn_ctx_indices,
             self.sparse_attn_indices_block_size,
             self.sparse_mla_topk,
             self.skip_softmax_threshold_scale_factor_prefill,
@@ -1625,6 +1629,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                     q, k, metadata, **kwargs)
                 sparse_attn_indices, sparse_attn_offsets = self.sparse_attn_predict(
                     q, k, metadata, **kwargs)
+                sparse_attn_ctx_indices = self.sparse_attn_ctx_predict(
+                    q, k, metadata, **kwargs)
                 sparse_attn_indices_block_size = self.sparse_attention_config.get_indices_block_size(
                 )
 
@@ -1685,6 +1691,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             sparse_kv_offsets=sparse_kv_offsets,
             sparse_attn_indices=sparse_attn_indices,
             sparse_attn_offsets=sparse_attn_offsets,
+            sparse_attn_ctx_indices=sparse_attn_ctx_indices,
             sparse_attn_indices_block_size=sparse_attn_indices_block_size,
             sparse_mla_topk=metadata.sparse_mla_topk if hasattr(
                 metadata, 'sparse_mla_topk') else 0,
@@ -1939,6 +1946,19 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             Predict sparse attn indices. It's implemented in the derived class.
         """
         raise NotImplementedError
+
+    def sparse_attn_ctx_predict(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        metadata: TrtllmAttentionMetadata,
+        **kwargs,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+            Predict sparse attn ctx indices. It's implemented in the derived class.
+        """
+        # TODO(yuhangh): complete this part logic
+        return None
 
     def mla_rope_generation(
         self,

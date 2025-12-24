@@ -88,11 +88,11 @@ public:
         c10::ArrayRef<std::optional<torch::Tensor>> spec_decoding_tensor_params,
         torch::optional<torch::Tensor> attention_sinks, torch::optional<torch::Tensor> sparse_kv_indices,
         torch::optional<torch::Tensor> sparse_kv_offsets, torch::optional<torch::Tensor> sparse_attn_indices,
-        torch::optional<torch::Tensor> sparse_attn_offsets, int64_t const sparse_attn_indices_block_size,
-        int32_t const sparse_mla_topk, std::optional<torch::Tensor> cu_q_seqlens,
-        std::optional<torch::Tensor> cu_kv_seqlens, std::optional<torch::Tensor> fmha_scheduler_counter,
-        std::optional<torch::Tensor> mla_bmm1_scale, std::optional<torch::Tensor> mla_bmm2_scale,
-        std::optional<torch::Tensor> quant_q_buffer) const
+        torch::optional<torch::Tensor> sparse_attn_offsets, torch::optional<torch::Tensor> sparse_attn_ctx_indices,
+        int64_t const sparse_attn_indices_block_size, int32_t const sparse_mla_topk,
+        std::optional<torch::Tensor> cu_q_seqlens, std::optional<torch::Tensor> cu_kv_seqlens,
+        std::optional<torch::Tensor> fmha_scheduler_counter, std::optional<torch::Tensor> mla_bmm1_scale,
+        std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer) const
         = 0;
 };
 
@@ -149,11 +149,11 @@ public:
         c10::ArrayRef<std::optional<torch::Tensor>> spec_decoding_tensor_params,
         torch::optional<torch::Tensor> attention_sinks, torch::optional<torch::Tensor> sparse_kv_indices,
         torch::optional<torch::Tensor> sparse_kv_offsets, torch::optional<torch::Tensor> sparse_attn_indices,
-        torch::optional<torch::Tensor> sparse_attn_offsets, int64_t const sparse_attn_indices_block_size,
-        int32_t const sparse_mla_topk, std::optional<torch::Tensor> cu_q_seqlens,
-        std::optional<torch::Tensor> cu_kv_seqlens, std::optional<torch::Tensor> fmha_scheduler_counter,
-        std::optional<torch::Tensor> mla_bmm1_scale, std::optional<torch::Tensor> mla_bmm2_scale,
-        std::optional<torch::Tensor> quant_q_buffer) const override
+        torch::optional<torch::Tensor> sparse_attn_offsets, torch::optional<torch::Tensor> sparse_attn_ctx_indices,
+        int64_t const sparse_attn_indices_block_size, int32_t const sparse_mla_topk,
+        std::optional<torch::Tensor> cu_q_seqlens, std::optional<torch::Tensor> cu_kv_seqlens,
+        std::optional<torch::Tensor> fmha_scheduler_counter, std::optional<torch::Tensor> mla_bmm1_scale,
+        std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer) const override
     {
         auto stream = at::cuda::getCurrentCUDAStream(qkv_or_q.get_device());
         T* attention_input = static_cast<T*>(qkv_or_q.slice(0, token_offset).data_ptr());
@@ -404,15 +404,24 @@ public:
             = sparse_attn_indices.has_value() ? sparse_attn_indices.value().data_ptr<int32_t>() : nullptr;
         op.mRuntimeSparseAttentionParams.sparse_attn_offsets
             = sparse_attn_offsets.has_value() ? sparse_attn_offsets.value().data_ptr<int32_t>() : nullptr;
+        op.mRuntimeSparseAttentionParams.sparse_attn_ctx_indices
+            = sparse_attn_ctx_indices.has_value() ? sparse_attn_ctx_indices.value().data_ptr<int32_t>() : nullptr;
         op.mRuntimeSparseAttentionParams.sparse_attn_indices_block_size = sparse_attn_indices_block_size;
         op.mRuntimeSparseAttentionParams.sparse_attn_indices_stride
             = sparse_attn_indices.has_value() ? sparse_attn_indices.value().size(-1) : 0;
-        if (op.isMLAEnabled() && op.mUseSparseAttention)
+        if (op.useTllmGenSparseAttention())
         {
-            op.mRuntimeSparseAttentionParams.sparse_mla_topk = sparse_mla_topk;
+            if (op.isMLAEnabled())
+            {
+                op.mRuntimeSparseAttentionParams.sparse_topk = sparse_mla_topk;
+            }
+            else
+            {
+                op.mRuntimeSparseAttentionParams.sparse_topk = sparse_attn_ctx_indices.value().size(-1);
+            }
             if (op.useKVCache() && host_kv_cache_pool_pointers.has_value())
             {
-                op.mRuntimeSparseAttentionParams.sparse_mla_kv_cache_pool = reinterpret_cast<char*>(
+                op.mRuntimeSparseAttentionParams.sparse_kv_cache_pool = reinterpret_cast<char*>(
                     host_kv_cache_pool_pointers.value().index({pool_index, 0}).item<int64_t>());
             }
         }
@@ -631,8 +640,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::vector<std::optional<torch::Tensor>> spec_decoding_tensor_params,
     std::optional<torch::Tensor> sparse_kv_indices, std::optional<torch::Tensor> sparse_kv_offsets,
     std::optional<torch::Tensor> sparse_attn_indices, std::optional<torch::Tensor> sparse_attn_offsets,
-    int64_t const sparse_attn_indices_block_size, std::optional<int64_t> sparse_mla_topk,
-    std::optional<double> skip_softmax_threshold_scale_factor_prefill,
+    std::optional<torch::Tensor> sparse_attn_ctx_indices, int64_t const sparse_attn_indices_block_size,
+    std::optional<int64_t> sparse_mla_topk, std::optional<double> skip_softmax_threshold_scale_factor_prefill,
     std::optional<double> skip_softmax_threshold_scale_factor_decode, std::optional<torch::Tensor> skip_softmax_stat,
     std::optional<torch::Tensor> cu_q_seqlens, std::optional<torch::Tensor> cu_kv_seqlens,
     std::optional<torch::Tensor> fmha_scheduler_counter, std::optional<torch::Tensor> mla_bmm1_scale,
@@ -759,12 +768,18 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     op->mIsSpecDecTree = spec_decoding_bool_params[2];         // is_spec_dec_tree
 
     op->mUseSparseAttention = false;
+    op->mUseTllmGenSparseAttentionPaged = false;
     op->mUseTllmGenSparseAttention = false;
     if ((sparse_kv_indices.has_value() && sparse_kv_indices.value().numel() > 0)
-        || (sparse_attn_indices.has_value() && sparse_attn_indices.value().numel() > 0))
+        || (sparse_attn_indices.has_value() && sparse_attn_indices.value().numel() > 0)
+        || (sparse_attn_ctx_indices.has_value() && sparse_attn_ctx_indices.value().numel() > 0))
     {
         op->mUseSparseAttention = true;
         if (sparse_attn_indices.has_value() && sparse_attn_indices.value().numel() > 0)
+        {
+            op->mUseTllmGenSparseAttentionPaged = true;
+        }
+        if (sparse_attn_ctx_indices.has_value() && sparse_attn_ctx_indices.value().numel() > 0)
         {
             op->mUseTllmGenSparseAttention = true;
         }
@@ -898,8 +913,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe, block_ids_per_seq, mrope_rotary_cos_sin,
             mrope_position_deltas, mla_tensor_params, softmax_stats_tensor, spec_decoding_tensor_params,
             attention_sinks, sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets,
-            sparse_attn_indices_block_size, sparse_mla_topk_value, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter,
-            mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer);
+            sparse_attn_ctx_indices, sparse_attn_indices_block_size, sparse_mla_topk_value, cu_q_seqlens, cu_kv_seqlens,
+            fmha_scheduler_counter, mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
@@ -917,8 +932,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe, block_ids_per_seq, mrope_rotary_cos_sin,
             mrope_position_deltas, mla_tensor_params, softmax_stats_tensor, spec_decoding_tensor_params,
             attention_sinks, sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets,
-            sparse_attn_indices_block_size, sparse_mla_topk_value, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter,
-            mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer);
+            sparse_attn_ctx_indices, sparse_attn_indices_block_size, sparse_mla_topk_value, cu_q_seqlens, cu_kv_seqlens,
+            fmha_scheduler_counter, mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", layer_idx);

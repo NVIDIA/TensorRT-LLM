@@ -715,7 +715,7 @@ struct KernelParams
 
         // If sparse MLA is enabled, the shape and stride for K need to be updated for 2D layout (numTokensKvInPagedKv,
         // headDimQk).
-        if (options.mSparseMla)
+        if (options.mSparseAttention)
         {
             shapeK = std::vector<uint64_t>{static_cast<uint64_t>(options.mHeadDimQk), static_cast<uint64_t>(INT_MAX)};
             strideK = std::vector<uint64_t>{1, static_cast<uint64_t>(options.mHeadDimQk)};
@@ -844,8 +844,8 @@ struct KernelParams
         params.mStartTokenIdx = options.mSfStartTokenIdx;
         // The sparseMlaTopK needs to be a multiple of 4 as we use 16B cpAsync instructions for the indices.
         TLLM_CHECK_WITH_INFO(
-            !options.mSparseMla || (options.mSparseMlaTopK % 4) == 0, "SparseMlaTopK must be a multiple of 4");
-        params.mSparseMlaTopK = options.mSparseMlaTopK;
+            !options.mSparseAttention || (options.mSparseTopK % 4) == 0, "SparseTopK must be a multiple of 4");
+        params.mSparseMlaTopK = options.mSparseTopK;
         params.mUseBlockSparseAttention = options.mUseBlockSparseAttention;
         params.mSkipSoftmaxThresholdScaleFactor = options.mSkipSoftmaxThresholdScaleFactor;
         return params;

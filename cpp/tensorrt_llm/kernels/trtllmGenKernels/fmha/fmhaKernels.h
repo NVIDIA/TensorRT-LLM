@@ -116,7 +116,8 @@ public:
 
     inline uint64_t hashID(int qkvLayout, int maskType, int kernelType, int scheduler, int multiCtasKvMode,
         int headDimPerCtaV, int headDimQk, int headDimV, int tileSizeKv, int numTokensPerPage,
-        int maxNumHeadsQPerKvInCta, bool reuseSmemKForV, bool uses2CtaMma, bool sparseMla, bool skipsSoftmax) const
+        int maxNumHeadsQPerKvInCta, bool reuseSmemKForV, bool uses2CtaMma, bool sparseAttention,
+        bool skipsSoftmax) const
     {
         TLLM_CHECK_WITH_INFO((headDimPerCtaV >= 32) && (headDimQk >= 32) && (headDimV >= 32) && (headDimPerCtaV <= 1024)
                 && (headDimQk <= 1024) && (headDimV <= 1024),
@@ -142,7 +143,7 @@ public:
         // Bit 49 - 56: maxNumHeadsQPerKvInCta.
         // Bit 57 - 57: reuseSmemKForV.
         // Bit 58 - 58: uses2CtaMma.
-        // Bit 59 - 59: sparseMla.
+        // Bit 59 - 59: sparseAttention.
         // Bit 60 - 60: skipsSoftmax.
         return (static_cast<uint64_t>(qkvLayout) << 0) | (static_cast<uint64_t>(maskType) << 4)
             | (static_cast<uint64_t>(kernelType) << 8) | (static_cast<uint64_t>(scheduler) << 12)
@@ -150,7 +151,7 @@ public:
             | (static_cast<uint64_t>(headDimQk >> 3) << 26) | (static_cast<uint64_t>(headDimV >> 3) << 34)
             | (static_cast<uint64_t>(tileSizeKv >> 6) << 42) | (static_cast<uint64_t>(log2(numTokensPerPage)) << 44)
             | (static_cast<uint64_t>(maxNumHeadsQPerKvInCta) << 49) | (static_cast<uint64_t>(reuseSmemKForV) << 57)
-            | (static_cast<uint64_t>(uses2CtaMma) << 58) | (static_cast<uint64_t>(sparseMla) << 59)
+            | (static_cast<uint64_t>(uses2CtaMma) << 58) | (static_cast<uint64_t>(sparseAttention) << 59)
             | (static_cast<uint64_t>(skipsSoftmax) << 60);
     }
 
@@ -354,10 +355,10 @@ private:
         {
             // The maximum attention window (the maximum number of tokensKv that will be attended to).
             int maxAttentionWindow{params.mMaxSeqLenKv};
-            // The sparseMla only selects topK tokensKv.
-            if (params.mSparseMla)
+            // The sparseAttention only selects topK tokensKv.
+            if (params.mSparseAttention)
             {
-                maxAttentionWindow = std::min(params.mMaxSeqLenKv, params.mSparseMlaTopK);
+                maxAttentionWindow = std::min(params.mMaxSeqLenKv, params.mSparseTopK);
             }
             // Some of the tilesKv will be skipped if the sliding window attention or chunked attention is used.
             if (isSlidingOrChunkedCausalMask(selectKernelParams.mMaskType))
@@ -392,7 +393,7 @@ private:
                 // Need to select a different kernel.
                 selectKernelParams.mSelectNewKernel = true;
             }
-            else if (totalNumCtas < params.mMultiProcessorCount && isMlaGenKernel(params) && !params.mSparseMla
+            else if (totalNumCtas < params.mMultiProcessorCount && isMlaGenKernel(params) && !params.mSparseAttention
                 && selectKernelParams.mTileSizeKv == 128 && tensorrt_llm::common::getEnvUseTileSizeKv64ForTrtllmGen())
             {
                 // Use smaller tileSizeKv to fully utilize the SMs.
@@ -515,7 +516,7 @@ private:
             // The sparseMla kernel will always use the 2CTA high-throughput kernel.
 
             // Check the conditions.
-            if (params.mNumHeadsQPerKv <= 32 || (params.mSparseMla && params.mNumHeadsQPerKv < 128)
+            if (params.mNumHeadsQPerKv <= 32 || (params.mSparseAttention && params.mNumHeadsQPerKv < 128)
                 || useSwapsMmaAbMlaGenKernel(params))
             {
                 kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
@@ -530,7 +531,7 @@ private:
                     selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::GmemReductionWithSeparateKernel;
                 }
                 // The keepsMmaAbForGeneration sparseMla kernels only support numHeadsQPerKv = 128.
-                TLLM_CHECK_WITH_INFO(!params.mSparseMla || params.mNumHeadsQPerKv == 128,
+                TLLM_CHECK_WITH_INFO(!params.mSparseAttention || params.mNumHeadsQPerKv == 128,
                     "The keepsMmaAbForGeneration sparseMla kernels only support numHeadsQPerKv = 128, got %d",
                     params.mNumHeadsQPerKv);
                 // The 2CTA keepsMmaAbForGeneration kernel is used when the numHeadsQPerKv is 128.
@@ -614,7 +615,7 @@ private:
         // The number of tokens per page.
         int numTokensPerPage = params.mNumTokensPerPage;
         // SparseMla kernels use a fixed numTokensPerPage = 1.
-        if (params.mSparseMla)
+        if (params.mSparseAttention)
         {
             numTokensPerPage = 1;
         }
@@ -639,8 +640,9 @@ private:
             + ", headDimQk=" + std::to_string(params.mHeadDimQk) + ", headDimV=" + std::to_string(params.mHeadDimV)
             + ", tileSizeKv=" + std::to_string(selectKernelParams.mTileSizeKv) + ", numTokensPerPage="
             + std::to_string(numTokensPerPage) + ", maxNumHeadsQPerKvInCta=" + std::to_string(maxNumHeadsQPerKvInCta)
-            + ", reuseSmemKForV=" + std::to_string(selectKernelParams.mReuseSmemKForV) + ", uses2CtaMma="
-            + std::to_string(selectKernelParams.mUses2CtaMma) + ", sparseMla=" + std::to_string(params.mSparseMla)
+            + ", reuseSmemKForV=" + std::to_string(selectKernelParams.mReuseSmemKForV)
+            + ", uses2CtaMma=" + std::to_string(selectKernelParams.mUses2CtaMma)
+            + ", sparseAttention=" + std::to_string(params.mSparseAttention)
             + ", skipsSoftmax=" + std::to_string(selectKernelParams.mSkipsSoftmaxWhenPossible);
 
         TLLM_LOG_DEBUG("Searching for kernel traits: " + info);
@@ -651,7 +653,7 @@ private:
                 static_cast<int>(selectKernelParams.mMultiCtasKvMode), selectKernelParams.mHeadDimPerCtaV,
                 params.mHeadDimQk, params.mHeadDimV, selectKernelParams.mTileSizeKv, numTokensPerPage,
                 maxNumHeadsQPerKvInCta, selectKernelParams.mReuseSmemKForV, selectKernelParams.mUses2CtaMma,
-                params.mSparseMla, selectKernelParams.mSkipsSoftmaxWhenPossible),
+                params.mSparseAttention, selectKernelParams.mSkipsSoftmaxWhenPossible),
             info);
     }
 

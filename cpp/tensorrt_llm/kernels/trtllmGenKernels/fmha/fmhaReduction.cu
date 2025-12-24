@@ -32,8 +32,8 @@ namespace kernels
 
 template <int32_t TileSizePerCtaQ, int32_t HeadDim, int32_t HeadDimPerCta, bool IsE4m3Bmm, typename DtypeO,
     typename DtypePartialO>
-__global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(KernelParams const params, bool sparseMla,
-    int32_t numCtasForReduction, int32_t numCtasForAllHeads, int32_t numHeadDimCtasV)
+__global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(KernelParams const params,
+    bool sparseAttention, int32_t numCtasForReduction, int32_t numCtasForAllHeads, int32_t numHeadDimCtasV)
 {
 
     // clang-format off
@@ -80,9 +80,10 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(Kerne
     int32_t seqLenKv{params.ptrSeqLensKv[batchIdx]};
     // Consider the causal-mask speculative decoding.
     seqLenKv = seqLenKv - ((params.mMaxSeqLenQ - 1) - ctaIdxQ);
-    // Consider sparseMlaTopK.
-    if (sparseMla)
+    // Consider sparseTopK.
+    if (sparseAttention)
     {
+        // TODO(yuhangh): replace with params.mSparseTopK
         seqLenKv = min(seqLenKv, params.mSparseMlaTopK);
     }
     // The actual number of CtasKv (TileSizeKv is always 128 for now).

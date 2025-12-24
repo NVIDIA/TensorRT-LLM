@@ -288,7 +288,7 @@ void buildXQALaunchParams(XQALaunchParam<KVCacheBuffer>& launchParams, void*& in
     launchParams.bmm2_scale_ptr = reinterpret_cast<float*>(workspace);
     workspace = tensorrt_llm::common::nextWorkspacePtrWithAlignment(workspace, bmm2_scale_size);
     // Used for block sparse attention
-    if (params.use_sparse_attention)
+    if (params.use_sparse_attention_gen_paged)
     {
         launchParams.sparse_kv_block_offsets = reinterpret_cast<void*>(workspace);
         workspace = tensorrt_llm::common::nextWorkspacePtrWithAlignment(workspace, kv_block_offsets_size);

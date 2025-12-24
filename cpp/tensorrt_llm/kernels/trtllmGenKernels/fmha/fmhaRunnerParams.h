@@ -286,9 +286,9 @@ struct TllmGenFmhaRunnerParams
     // Skip softmax threshold scale factor.
     float mSkipSoftmaxThresholdScaleFactor;
     // Whether to use sparse MLA.
-    bool mSparseMla;
+    bool mSparseAttention;
     // The top k value for sparse MLA.
-    int mSparseMlaTopK;
+    int mSparseTopK;
     // The cuda stream.
     cudaStream_t stream;
     // The layer index.

@@ -29,12 +29,13 @@ namespace kernels
 
 struct SparseAttentionParams
 {
-    int32_t* sparse_kv_indices{nullptr};     // [num_kv_heads, num_sparse_kv_indices]
-    int32_t* sparse_attn_indices{nullptr};   // [num_kv_heads, num_sparse_attn_indices]
-    int32_t* sparse_kv_offsets{nullptr};     // [num_contexts + 1]
-    int32_t* sparse_attn_offsets{nullptr};   // [num_generations + 1]
-    int32_t sparse_mla_topk{0};              // for DSA attention
-    void* sparse_mla_kv_cache_pool{nullptr}; // for DSA attention
+    int32_t* sparse_kv_indices{nullptr};       // [num_kv_heads, num_sparse_kv_indices]
+    int32_t* sparse_attn_indices{nullptr};     // [num_kv_heads, num_sparse_attn_indices]
+    int32_t* sparse_kv_offsets{nullptr};       // [num_contexts + 1]
+    int32_t* sparse_attn_offsets{nullptr};     // [num_generations + 1]
+    int32_t* sparse_attn_ctx_indices{nullptr}; // [num_kv_heads, num_tokens, sparse_topk]
+    int32_t sparse_topk{0};
+    void* sparse_kv_cache_pool{nullptr};
 
     int32_t sparse_attn_indices_block_size{1};
     int32_t sparse_attn_indices_stride{0};
@@ -46,8 +47,9 @@ struct SparseAttentionParams
            << "sparse_attn_indices: " << this->sparse_attn_indices << std::endl
            << "sparse_kv_offsets: " << this->sparse_kv_offsets << std::endl
            << "sparse_attn_offsets: " << this->sparse_attn_offsets << std::endl
-           << "sparse_mla_topk: " << this->sparse_mla_topk << std::endl
-           << "sparse_mla_kv_cache_pool: " << this->sparse_mla_kv_cache_pool << std::endl
+           << "sparse_attn_ctx_indices: " << this->sparse_attn_ctx_indices << std::endl
+           << "sparse_topk: " << this->sparse_topk << std::endl
+           << "sparse_kv_cache_pool: " << this->sparse_kv_cache_pool << std::endl
            << "sparse_attn_indices_block_size: " << this->sparse_attn_indices_block_size << std::endl
            << "sparse_attn_indices_stride: " << this->sparse_attn_indices_stride << std::endl;
         return ss.str();

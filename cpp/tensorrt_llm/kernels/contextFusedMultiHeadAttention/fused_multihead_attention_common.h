@@ -143,6 +143,8 @@ struct MHARunnerFixedParams
     int sageBlockSizeV = 0;
     // Use sparse MLA ?
     bool useSparseMLA = false;
+    // Use sparse attention in trtllm-gen ?
+    bool useTllmGenSparseAttention = false;
 
     // Convert to string for debug.
     std::string convertToStrOutput()
@@ -193,6 +195,8 @@ struct MHARunnerFixedParams
         output += ", sageBlockSizeQ = " + std::to_string(sageBlockSizeQ);
         output += ", sageBlockSizeK = " + std::to_string(sageBlockSizeK);
         output += ", sageBlockSizeV = " + std::to_string(sageBlockSizeV);
+        output += ", useSparseMLA = " + std::string(useSparseMLA ? "true" : "false");
+        output += ", useTllmGenSparseAttention = " + std::string(useTllmGenSparseAttention ? "true" : "false");
 
         return output;
     }
