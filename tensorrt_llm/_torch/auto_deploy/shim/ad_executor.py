@@ -668,6 +668,8 @@ class ADEngine(ModelEngine):
         if new_tokens is not None:
             self.cache_seq_interface.info.rescatter_input_ids(new_tokens.flatten())
 
+        self.cache_seq_interface.info.run_host_prepare_for_attention_forward()
+
         self.iter_states["num_ctx_requests"] = num_ctx_requests
         self.iter_states["num_ctx_tokens"] = num_ctx_tokens
         # TODO: handle extend requests and draft requests for specdec
