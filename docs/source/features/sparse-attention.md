@@ -105,7 +105,7 @@ This section describes the sparse attention framework architecture and guides de
 
 <div align="center">
 <figure>
-  <img src="https://github.com/heyuhhh/TensorRT-LLM/blob/user/yuhangh/add_sparse_attention_doc/docs/source/media/sparse_attention_framework.png" width="800">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/media/sparse_attention_framework.png" width="800">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 1: The sparse attention framework in TensorRT LLM.</em></sub></p>
@@ -152,14 +152,14 @@ The key files located in `tensorrt_llm/_torch/attention_backend/sparse/` are:
 
 <div align="center">
 <figure>
-  <img src="https://github.com/heyuhhh/TensorRT-LLM/blob/user/yuhangh/add_sparse_attention_doc/docs/source/media/sparse_attention_op.png" width="800">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/media/sparse_attention_op.png" width="800">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 2: Sparse attention operator workflow in TensorRT LLM.</em></sub></p>
 
 In `AttentionOp`, currently, the MQA/GQA sparse attention only supports sparse computation at block granularity in the generation phase, where the block size equals to the page size of the KV cache. It means that we can skip the attention computation of those unimportant pages. In addition, we provide a sparse MLA kernel that supports token-level sparse computation in both the context and generation phases.
 
-To support those features, as illustrated in Figure 2, we have implemented two kernels for the MQA/GQA path, `updateSparseKvCacheAfterFmha` and `gatherKvPageOffsetsKernel`, applied in the context and generation phases respectively:
+To support those features, as illustrated in figure 2, we have implemented two kernels for the MQA/GQA path, `updateSparseKvCacheAfterFmha` and `gatherKvPageOffsetsKernel`, applied in the context and generation phases respectively:
 
 *   **`updateSparseKvCacheAfterFmha`**: Invoked in the post-processing stage after the context attention computation. It selects the important KV tokens and write those K/V vectors to the KV cache to reduce the KV cache size.
 
