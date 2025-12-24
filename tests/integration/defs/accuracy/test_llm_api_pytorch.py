@@ -3871,7 +3871,7 @@ class TestQwen3_30B_A3B_Instruct_2507(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/{MODEL_NAME}"
 
     @skip_pre_hopper
-    @pytest.mark.skip_less_device_memory(140000)  # Only test for H200, B200
+    # @pytest.mark.skip_less_device_memory(140000)  # Only test for H200, B200
     @pytest.mark.parametrize(
         "target_sparsity,thr_prefill,thr_decode",
         [
