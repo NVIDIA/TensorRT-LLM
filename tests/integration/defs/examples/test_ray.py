@@ -1,9 +1,15 @@
 import os
 import subprocess
 
+try:
+    import ray
+except ImportError:
+    import tensorrt_llm.ray_stub as ray
+
 import pytest
 from defs.common import venv_check_call, wait_for_server
 from defs.conftest import get_device_count, llm_models_root
+from defs.trt_test_alternative import popen
 
 
 @pytest.fixture(scope="module")
@@ -65,48 +71,57 @@ def test_ray_disaggregated_serving(ray_example_root, llm_venv, tp_size):
     disagg_dir = os.path.join(ray_example_root, "disaggregated")
     script_path = os.path.join(disagg_dir, "disagg_serving_local.sh")
     model_dir = f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
-    subprocess.run("ray stop --force", shell=True, check=False)
 
-    proc = subprocess.Popen(
-        [
-            "bash", script_path, "--executor", "ray", "--model", model_dir,
-            "--tp_size",
-            str(tp_size)
-        ],
-        cwd=disagg_dir,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
     try:
-        assert wait_for_server("localhost", 8000, timeout_seconds=180), \
-            "Disaggregated server failed to start within 3 minutes"
+        runtime_env = {
+            "env_vars": {
+                "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"
+            }
+        }
+        ray.init(address="local",
+                 include_dashboard=False,
+                 ignore_reinit_error=True,
+                 runtime_env=runtime_env)
+        gcs_addr = ray.get_runtime_context().gcs_address
+        ray_port = str(gcs_addr.split(":")[1])
 
-        result = subprocess.run([
-            "curl", "-sS", "-w", "\n%{http_code}",
-            "http://localhost:8000/v1/completions", "-H",
-            "Content-Type: application/json", "-d",
-            '{"model":"TinyLlama-1.1B-Chat-v1.0","prompt":"NVIDIA is a great company because","max_tokens":16,"temperature":0}'
-        ],
-                                capture_output=True,
-                                text=True,
-                                timeout=30)
+        env_copy = os.environ.copy()
+        env_copy.update({
+            "RAY_ADDRESS": f"localhost:{ray_port}",
+            "TLLM_RAY_FORCE_LOCAL_CLUSTER": "0"
+        })
+        with popen(
+            [
+                "bash", script_path, "--executor", "ray", "--attach", "--model",
+                model_dir, "--tp_size",
+                str(tp_size)
+            ],
+                cwd=disagg_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env_copy,
+        ):
+            assert wait_for_server("localhost", 8000, timeout_seconds=180), \
+                "Disaggregated server failed to start within 3 minutes"
 
-        *body_lines, status_line = result.stdout.strip().splitlines()
-        body = "\n".join(body_lines)
-        status = int(status_line)
+            result = subprocess.run([
+                "curl", "-sS", "-w", "\n%{http_code}",
+                "http://localhost:8000/v1/completions", "-H",
+                "Content-Type: application/json", "-d",
+                '{"model":"TinyLlama-1.1B-Chat-v1.0","prompt":"NVIDIA is a great company because","max_tokens":16,"temperature":0}'
+            ],
+                                    capture_output=True,
+                                    text=True,
+                                    timeout=30)
 
-        print("HTTP status:", status)
-        print("Response body:", body)
+            *body_lines, status_line = result.stdout.strip().splitlines()
+            body = "\n".join(body_lines)
+            status = int(status_line)
 
-        assert result.returncode == 0, f"curl exit {result.returncode}"
-        assert status == 200, f"Expected 200, got {status}"
+            print("HTTP status:", status)
+            print("Response body:", body)
 
+            assert result.returncode == 0, f"curl exit {result.returncode}"
+            assert status == 200, f"Expected 200, got {status}"
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=10)
-        except Exception:
-            proc.kill()
-
-        subprocess.run("ray stop --force", shell=True, check=False)
-        subprocess.run("pkill -9 -f trtllm-serve", shell=True, check=False)
+        ray.shutdown()
