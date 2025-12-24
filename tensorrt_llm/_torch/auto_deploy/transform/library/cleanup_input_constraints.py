@@ -21,6 +21,9 @@ class CleanupInputConstraints(BaseTransform):
     flattened sequence length.
     """
 
+    # Sequence input names to look for (in order of preference)
+    _SEQUENCE_INPUT_NAMES = ("input_ids", "inputs_embeds")
+
     def _apply(
         self,
         gm: GraphModule,
@@ -29,8 +32,36 @@ class CleanupInputConstraints(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         graph: Graph = gm.graph
-        input_node = graph.find_nodes(op="placeholder")[1]
-        sym_shape: torch.Size = input_node.meta["val"].shape
+        placeholder_nodes = graph.find_nodes(op="placeholder")
+
+        # Find sequence input node by name instead of hardcoded index
+        input_node = None
+        for node in placeholder_nodes:
+            if node.target in self._SEQUENCE_INPUT_NAMES:
+                input_node = node
+                break
+
+        # Skip if no sequence input node found or if it has no meta value
+        if input_node is None:
+            info = TransformInfo(
+                skipped=True,
+                num_matches=0,
+                is_clean=True,
+                has_valid_shapes=True,
+            )
+            return gm, info
+
+        input_val = input_node.meta.get("val", None)
+        if input_val is None:
+            info = TransformInfo(
+                skipped=True,
+                num_matches=0,
+                is_clean=True,
+                has_valid_shapes=True,
+            )
+            return gm, info
+
+        sym_shape: torch.Size = input_val.shape
 
         # get expressions in the symbolic shape
         vrs: List[ValueRanges] = []

@@ -190,6 +190,11 @@ class PlanParams:
     sm_scale: Optional[float] = None
 
     causal: bool = True
+    has_custom_mask: bool = False  # Affects cache key when using VLM custom masks
+    # Sliding window attention: FlashInfer uses inclusive `window_left` (<=0 disables, use -1).
+    window_left: int = -1
+    # Logits softcapping: FlashInfer uses `logits_soft_cap` (<=0 disables, use 0.0).
+    logits_soft_cap: float = 0.0
 
     def __hash__(self):
         """Convert all fields to a string representation and concatenate them."""
@@ -286,6 +291,7 @@ class _FlashInferPlanner:
         kv_page_indices: torch.Tensor,
         kv_last_page_len: torch.Tensor,
         plan_params: PlanParams,
+        custom_mask: Optional[torch.Tensor] = None,
     ) -> Union[
         flashinfer.BatchPrefillWithPagedKVCacheWrapper,
         flashinfer.BatchDecodeWithPagedKVCacheWrapper,
@@ -305,6 +311,8 @@ class _FlashInferPlanner:
                 q_data_type=plan_params.q_dtype,
                 kv_data_type=plan_params.kv_dtype,
                 sm_scale=plan_params.sm_scale,
+                window_left=plan_params.window_left,
+                logits_soft_cap=plan_params.logits_soft_cap,
             )
 
         # we want to plan during warm-up of cuda graph capture to ensure we have the plan cached
@@ -328,11 +336,15 @@ class _FlashInferPlanner:
             return wrapper
 
         # check for re-planning
-        if plan_params != self.plan_params:
+        # NOTE: When using custom_mask, we always re-plan prefill since the mask changes per batch
+        needs_replan = (plan_params != self.plan_params) or (
+            custom_mask is not None and not plan_params.is_generate
+        )
+        if needs_replan:
             if plan_params.is_generate:
                 _plan_decode(self.decode_wrapper)
             else:
-                # plan prefill
+                # plan prefill with optional custom_mask for VLM support
                 self.prefill_wrapper.plan(
                     qo_indptr,
                     kv_page_indptr,
@@ -342,10 +354,13 @@ class _FlashInferPlanner:
                     plan_params.n_kv_heads,  # KV heads
                     plan_params.head_dim,
                     plan_params.page_size,
-                    causal=plan_params.causal,
+                    causal=plan_params.causal if custom_mask is None else False,
                     q_data_type=plan_params.q_dtype,
                     kv_data_type=plan_params.kv_dtype,
                     sm_scale=plan_params.sm_scale,
+                    window_left=plan_params.window_left,
+                    logits_soft_cap=plan_params.logits_soft_cap,
+                    custom_mask=custom_mask,  # VLM custom mask (None for standard causal)
                 )
             self.plan_params = plan_params
 
@@ -410,6 +425,7 @@ def flashinfer_mha_with_cache(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    custom_mask: Optional[torch.Tensor],
     # STANDARD METADATA
     batch_info: torch.Tensor,
     cu_seqlen: torch.Tensor,
@@ -428,6 +444,8 @@ def flashinfer_mha_with_cache(
     scale: Optional[float],
     k_scale: float,
     v_scale: float,
+    window_left: int,  # FlashInfer inclusive sliding window (use -1 to disable)
+    logits_soft_cap: float,  # FlashInfer logits softcap (use 0.0 to disable)
 ) -> torch.Tensor:
     # reshape to standard [b*s, n_heads, head_dim] layout
     head_dim = k_cache.shape[-1]
@@ -453,16 +471,23 @@ def flashinfer_mha_with_cache(
     n_heads = q.shape[1]
     n_kv_heads = k.shape[1]
 
+    is_generate = s == 1
+    # Custom mask only applies during prefill, not generation
+    effective_mask = None if is_generate else custom_mask
+
     pp = PlanParams(
         n_heads=n_heads,
         n_kv_heads=n_kv_heads,
         head_dim=head_dim,
         num_seq=len(qo_indptr) - 1,
-        is_generate=(s == 1),
+        is_generate=is_generate,
         page_size=k_cache.shape[1],
         q_dtype=q.dtype,
         kv_dtype=k_cache.dtype,
         sm_scale=scale,
+        has_custom_mask=(effective_mask is not None),
+        window_left=window_left,
+        logits_soft_cap=float(logits_soft_cap or 0.0),
     )
 
     # Assuming k_scale = v_scale = 1.0
@@ -490,6 +515,7 @@ def flashinfer_mha_with_cache(
         paged_kv_indices,
         paged_kv_last_page_len,
         pp,
+        custom_mask=effective_mask,
     )
 
     y = wrapper.run(
@@ -505,6 +531,7 @@ def flashinfer_mha_with_cache_fake(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    custom_mask: Optional[torch.Tensor],
     # STANDARD METADATA
     batch_info: torch.Tensor,
     cu_seqlen: torch.Tensor,
@@ -523,6 +550,8 @@ def flashinfer_mha_with_cache_fake(
     scale: Optional[float],
     k_scale: float,
     v_scale: float,
+    window_left: int,
+    logits_soft_cap: float,
 ) -> torch.Tensor:
     return torch.empty_like(q.contiguous())
 
@@ -650,8 +679,34 @@ class FlashInferAttention(AttentionDescriptor):
             ad_logger.warning(f"Provided {scale=}, is not a float. Using default scale instead.")
             scale = None
 
+        # Get sliding_window and logit_cap from args or kwargs and convert to FlashInfer conventions.
+        sliding_window = extract_op_args(source_attn_node, "sliding_window")[0]
+        if sliding_window is None:
+            window_left = -1
+        elif isinstance(sliding_window, int):
+            # HF sliding_window is an exclusive window size; FlashInfer is inclusive window_left.
+            window_left = sliding_window - 1 if sliding_window > 0 else -1
+        else:
+            ad_logger.warning(
+                f"Provided sliding_window={sliding_window!r} is not an int. Disabling sliding window."
+            )
+            window_left = -1
+
+        logit_cap = extract_op_args(source_attn_node, "logit_cap")[0]
+        if logit_cap is None:
+            logits_soft_cap = 0.0
+        elif isinstance(logit_cap, (float, int)):
+            logits_soft_cap = float(logit_cap) if float(logit_cap) > 0.0 else 0.0
+        else:
+            ad_logger.warning(
+                f"Provided logit_cap={logit_cap!r} is not a number. Disabling logits softcapping."
+            )
+            logits_soft_cap = 0.0
+
         return [
             scale,  # softmax scale
             1.0,  # k_scale
             1.0,  # v_scale
+            window_left,  # FlashInfer inclusive sliding window size (-1 disables)
+            logits_soft_cap,  # FlashInfer logits softcap (0 disables)
         ]

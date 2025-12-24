@@ -10,7 +10,8 @@ import torch.nn as nn
 from pydantic import Field
 
 from ...export import run_forward_for_capture, torch_export_to_gm
-from ...models.factory import ModelFactory
+from ...export.tied_weights import add_load_hook_for_cross_boundary_tied_weights
+from ...models.factory import DROP_MODEL_INPUT_KWARGS, ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ..interface import (
     BaseTransform,
@@ -19,6 +20,18 @@ from ..interface import (
     TransformInfo,
     TransformRegistry,
 )
+
+
+def _ad_sanitize_gm_kwargs(mod: nn.Module, args, kwargs: Dict[str, Any]) -> None:
+    """Sanitize kwargs before calling an exported GraphModule.
+
+    Exported GraphModules created via torch.export attach an input-constraint pre-hook that
+    enforces an exact match between runtime kwargs and the exported input spec. Some HF call sites
+    pass extra kwargs that we do not want to treat as GraphModule inputs.
+    """
+    # Drop known HF-only kwargs that may be passed at runtime.
+    for k in DROP_MODEL_INPUT_KWARGS:
+        kwargs.pop(k, None)
 
 
 class ExportToGMConfig(TransformConfig):
@@ -161,6 +174,11 @@ class ExportToGM(BaseTransform):
                     clone=self.config.clone_state_dict,
                     patch_list=self.config.patch_list,
                 )
+            # We intentionally do not export certain HF-only kwargs as GraphModule inputs.
+            # Some HF call sites will still pass these at runtime; we will drop them before
+            # calling the exported GraphModule to avoid torch.export strict in_spec matching.
+            for k in DROP_MODEL_INPUT_KWARGS:
+                captured_kwargs.pop(k, None)
 
             # construct dynamic shapes based on the captured kwargs and the dynamic shape lookup
             dynamic_shapes = {
@@ -174,6 +192,11 @@ class ExportToGM(BaseTransform):
             # torch.export can get confused by keyword arguments that are not explicitly defined in
             # the signature but are captured through generic **kwargs. By overwriting the signature,
             # we ensure each argument is explicitly defined in the signature.
+
+            # Create callback to call post_export while patches are still active
+            def _post_export_cb(exported_gm):
+                e_info.post_export(sub_mod, exported_gm)
+
             with set_exact_signature(sub_mod, captured_kwargs):
                 sub_gm = torch_export_to_gm(
                     sub_mod,
@@ -183,8 +206,12 @@ class ExportToGM(BaseTransform):
                     clone=self.config.clone_state_dict,
                     strict=self.config.strict,
                     patch_list=self.config.patch_list,
+                    post_export_callback=_post_export_cb,
                 )
 
+            # Ensure runtime calls from HF into this exported GraphModule do not fail due to
+            # torch.export's strict input spec checks (e.g., HF passing attention_mask).
+            sub_gm.register_forward_pre_hook(_ad_sanitize_gm_kwargs, prepend=True, with_kwargs=True)
             # post process the sub graph module
             e_info.post_process(sub_mod, sub_gm)
 
@@ -193,6 +220,11 @@ class ExportToGM(BaseTransform):
                 mod = sub_gm
             else:
                 mod.set_submodule(e_info.submodule_name, sub_gm)
+
+        # Register hook for cross-boundary tied weights (VLM models like Gemma3)
+        # Only needed when submodules are exported (not full model export where submodule_name == "")
+        if sub_keys and not any(k == "" for k in sub_keys):
+            add_load_hook_for_cross_boundary_tied_weights(mod, sub_keys)
 
         # this is a clean graph by definition since it was just exported
         info = TransformInfo(

@@ -227,6 +227,7 @@ def run_forward_for_capture(
     *,
     patch_configs: Optional[Dict[str, Union[dict, Any]]] = None,
     patch_list: Optional[List[str]] = None,
+    post_export_callback: Optional[Callable[[nn.Module], None]] = None,
 ) -> nn.Module:
     """A wrapper to run the provided closure over the model on the meta device with patches.
 
@@ -244,6 +245,8 @@ def run_forward_for_capture(
         patch_configs: Optional patch configurations. If None, all registered patches
                       will be applied with default settings.
         patch_list: Optional list of patch names to apply with default settings.
+        post_export_callback: Optional callback called after capture but before patches are reverted.
+                             Receives the captured module as argument.
     """
     # run capture with patches and lifted to meta
     with apply_export_patches(patch_configs, patch_list), lift_to_meta(model) as state_dict:
@@ -258,6 +261,10 @@ def run_forward_for_capture(
                 mod_after_capture = model
             else:
                 mod_after_capture = capture_fn(model, args, kwargs)
+
+        # Call post_export_callback while patches are still active
+        if post_export_callback is not None:
+            post_export_callback(mod_after_capture)
 
         # load state_dict into egm
         # NOTE: export might have removed unused params/buffers (hence we allow unexpected keys)
@@ -283,6 +290,7 @@ def torch_export_to_gm(
     strict: bool = False,
     patch_configs: Optional[Dict[str, Union[dict, Any]]] = None,
     patch_list: Optional[List[str]] = None,
+    post_export_callback: Optional[Callable[[nn.Module], None]] = None,
 ) -> fx.GraphModule:
     """torch's export with wrapping into GraphModule + useful additions to the resulting module.
 
@@ -306,6 +314,8 @@ def torch_export_to_gm(
                       will be applied with default settings.
         patch_list: Optional list of patch names to apply with default settings.
                    Cannot be used together with patch_configs.
+        post_export_callback: Optional callback called after export but before patches are reverted.
+                             Receives the exported GraphModule as argument.
     """
 
     def _capture_fn(model, args, kwargs):
@@ -316,7 +326,14 @@ def torch_export_to_gm(
 
     # run capture with export
     egm = run_forward_for_capture(
-        model, _capture_fn, args, kwargs, clone, patch_list=patch_list, patch_configs=patch_configs
+        model,
+        _capture_fn,
+        args,
+        kwargs,
+        clone,
+        patch_list=patch_list,
+        patch_configs=patch_configs,
+        post_export_callback=post_export_callback,
     )
 
     # Export strips away all methods not traced during forward. The model could have

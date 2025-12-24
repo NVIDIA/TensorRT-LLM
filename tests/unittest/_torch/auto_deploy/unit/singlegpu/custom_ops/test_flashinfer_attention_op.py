@@ -97,6 +97,8 @@ def test_flashinfer_attention_op_context(seq_length, n_heads, batch_size, dtype,
         q,
         k,
         v,
+        # VLM CUSTOM MASK
+        None,  # custom_mask
         # STANDARD METADATA
         batch_info,
         qo_indptr,
@@ -115,6 +117,8 @@ def test_flashinfer_attention_op_context(seq_length, n_heads, batch_size, dtype,
         None,
         1.0,
         1.0,
+        -1,  # window_left (disabled)
+        0.0,  # logits_soft_cap (disabled)
     )
 
     # Use torch backend as clean reference
@@ -232,6 +236,8 @@ def test_flashinfer_attention_op_decode(
         q,
         k,
         v,
+        # VLM CUSTOM MASK
+        None,  # custom_mask
         # STANDARD METADATA
         batch_info,
         qo_indptr,
@@ -250,6 +256,8 @@ def test_flashinfer_attention_op_decode(
         None,
         1.0,
         1.0,
+        -1,  # window_left (disabled)
+        0.0,  # logits_soft_cap (disabled)
     )
 
     assert torch.allclose(
@@ -356,6 +364,8 @@ def test_flashinfer_attention_context_and_generate(
         q_1,
         k_1,
         v_1,
+        # VLM CUSTOM MASK
+        None,  # custom_mask
         # STANDARD METADATA
         batch_info,
         qo_indptr,
@@ -374,6 +384,8 @@ def test_flashinfer_attention_context_and_generate(
         None,
         1.0,
         1.0,
+        -1,  # window_left (disabled)
+        0.0,  # logits_soft_cap (disabled)
     )
 
     # Generate reference outputs
@@ -437,6 +449,8 @@ def test_flashinfer_attention_context_and_generate(
         q_3,
         k_3,
         v_3,
+        # VLM CUSTOM MASK
+        None,  # custom_mask
         # STANDARD METADATA
         batch_info,
         qo_indptr,
@@ -455,6 +469,8 @@ def test_flashinfer_attention_context_and_generate(
         None,
         1.0,
         1.0,
+        -1,  # window_left (disabled)
+        0.0,  # logits_soft_cap (disabled)
     )
 
     # Generate reference outputs
@@ -552,6 +568,8 @@ def test_flashinfer_attention_op_context_input_pos(seq, batch_size, n_heads, dty
         q,
         k,
         v,
+        # VLM CUSTOM MASK
+        None,  # custom_mask
         # STANDARD METADATA
         batch_info,
         qo_indptr,
@@ -570,6 +588,8 @@ def test_flashinfer_attention_op_context_input_pos(seq, batch_size, n_heads, dty
         None,
         1.0,
         1.0,
+        -1,  # window_left (disabled)
+        0.0,  # logits_soft_cap (disabled)
     )
 
     # Generate ref
@@ -705,6 +725,8 @@ def test_flashinfer_attention_with_fp8_cache(
         q,
         k,
         v,
+        # VLM CUSTOM MASK
+        None,  # custom_mask
         # STANDARD METADATA
         batch_info,
         qo_indptr,
@@ -723,6 +745,8 @@ def test_flashinfer_attention_with_fp8_cache(
         None,
         K_SCALE,
         V_SCALE,
+        -1,  # window_left (disabled)
+        0.0,  # logits_soft_cap (disabled)
     )
 
     y = flashinfer_output.view(BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD)
@@ -805,6 +829,8 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
         q,
         k,
         v,
+        # VLM CUSTOM MASK
+        None,  # custom_mask
         # STANDARD METADATA
         batch_info,
         qo_indptr,
@@ -823,6 +849,8 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
         None,
         1.0,
         1.0,
+        -1,  # window_left (disabled)
+        0.0,  # logits_soft_cap (disabled)
     )
 
     # Compute reference
@@ -892,6 +920,8 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
         q_gen,
         k_gen,
         v_gen,
+        # VLM CUSTOM MASK
+        None,  # custom_mask
         # STANDARD METADATA
         batch_info,
         qo_indptr2,
@@ -910,6 +940,8 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
         None,
         1.0,
         1.0,
+        -1,  # window_left (disabled)
+        0.0,  # logits_soft_cap (disabled)
     )
 
     # Compute reference

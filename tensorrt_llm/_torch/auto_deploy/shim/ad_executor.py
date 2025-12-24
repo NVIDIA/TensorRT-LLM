@@ -61,6 +61,7 @@ from ...pyexecutor.scheduler import (
     SimpleScheduler,
 )
 from ..custom_ops.attention_interface import SequenceInfo
+from ..custom_ops.vlm_mask_registry import VlmMetadataKeys
 from ..distributed import common as dist
 from ..llm_args import LlmArgs
 from ..transform.optimizer import InferenceOptimizer
@@ -356,7 +357,7 @@ class ADEngine(ModelEngine):
         build_and_optimize = InferenceOptimizer(factory=factory, config=ad_config.transforms)
 
         # construct engine
-        return cls(
+        engine = cls(
             build_and_optimize,
             seq_info,
             device,
@@ -364,6 +365,9 @@ class ADEngine(ModelEngine):
             mapping=mapping,
             reporting_info=reporting_info,
         )
+        _configure_vlm_mask_settings(engine, ad_config)
+
+        return engine
 
     @torch.inference_mode()
     def __init__(
@@ -626,6 +630,12 @@ class ADEngine(ModelEngine):
             if use_overlap:
                 mask_scatter_indices.extend(list(range(cu_seqlen[-2], cu_seqlen[-1])))
 
+            seq_len.append(len(input_ids[-1]))
+            cu_seqlen.append(cu_seqlen[-1] + seq_len[-1])
+
+            if use_overlap:
+                mask_scatter_indices.extend(list(range(cu_seqlen[-2], cu_seqlen[-1])))
+
             # get cache indices
             cache_indices = kv_cache_manager.get_cache_indices(request)
             cache_loc.extend(cache_indices)
@@ -688,6 +698,18 @@ class ADEngine(ModelEngine):
         """Maximum number of sequences supported by the engine."""
         return self.cache_seq_interface.info.max_batch_size
 
+    def get_vlm_input_names(self) -> List[str]:
+        """Return VLM-specific input names this model expects.
+
+        These are inputs that should be provided in the request's multimodal_data.
+        Returns an empty list for non-VLM models.
+
+        Example:
+            vlm_inputs = engine.get_vlm_input_names()  # e.g., ["token_type_ids"]
+            # Client should populate multimodal_data with these keys
+        """
+        return getattr(self, "_vlm_inputs", [])
+
     @torch.inference_mode()
     @maybe_pad_for_cuda_graph
     def forward(
@@ -714,6 +736,89 @@ class ADEngine(ModelEngine):
             self._execute_logit_post_processors(scheduled_requests, outputs)
 
         return outputs
+
+
+def _configure_vlm_mask_settings(engine: ADEngine, ad_config: LlmArgs) -> None:
+    """Configure VLM custom mask settings on the engine.
+
+    This is model-agnostic: it reads VLM metadata (_vlm_inputs, _vlm_model_type)
+    from the GraphModule that was set during export post-processing.
+
+    For VLM models, this function registers a forward pre-hook on the inner
+    GraphModule to inject VLM inputs from _extra_args (populated from multimodal_data).
+    """
+    engine._ad_config = ad_config  # so _prepare_inputs() constraint checks actually run
+
+    def _find_vlm_graphmodule(mod: torch.nn.Module) -> Optional[torch.nn.Module]:
+        """Find the nested GraphModule with VLM metadata."""
+        try:
+            import torch.fx  # local import to keep module import surface small
+
+            for m in mod.modules():
+                if isinstance(m, torch.fx.GraphModule):
+                    # Check for VLM metadata set by TextModelExportInfo.post_process
+                    if hasattr(m, VlmMetadataKeys.GRAPH_INPUTS) and getattr(
+                        m, VlmMetadataKeys.GRAPH_INPUTS, []
+                    ):
+                        return m
+        except Exception:
+            pass
+        return None
+
+    # Find the inner GraphModule with VLM metadata
+    inner_gm = _find_vlm_graphmodule(engine.model)
+
+    # Read VLM metadata from the GraphModule
+    vlm_inputs = getattr(inner_gm, VlmMetadataKeys.GRAPH_INPUTS, []) if inner_gm else []
+    vlm_model_type = getattr(inner_gm, VlmMetadataKeys.GRAPH_MODEL_TYPE, None) if inner_gm else None
+
+    # Store on engine for external access
+    engine._vlm_inputs = vlm_inputs
+    engine._vlm_model_type = vlm_model_type
+    # Detect if the model is a VLM that expects custom masks
+    # This is relevant for FlashInfer backend with VLM models
+    engine._expects_vlm_custom_masks = (
+        ad_config.attn_backend == "flashinfer" and len(vlm_inputs) > 0
+    )
+
+    # If the model expects VLM inputs, register a forward pre-hook to inject them
+    # This is needed because the outer VLM model may not forward these inputs
+    # to the inner GraphModule
+    if engine._expects_vlm_custom_masks and inner_gm is not None:
+
+        def _inject_vlm_inputs_hook(module, args, kwargs):
+            """Forward pre-hook to inject VLM inputs into the GraphModule kwargs.
+
+            This hook runs BEFORE the GraphModule's input validation hook, ensuring
+            VLM inputs are present in kwargs when the GraphModule is called.
+            """
+            extra_args = engine.cache_seq_interface.info._extra_args
+            kwargs_modified = False
+
+            for input_name in vlm_inputs:
+                # Skip if already present and not None
+                if input_name in kwargs and kwargs[input_name] is not None:
+                    continue
+
+                # Try to get from _extra_args (populated from multimodal_data)
+                value = extra_args.get(input_name)
+
+                # If not available, create a default (zeros based on position_ids shape)
+                if value is None:
+                    position_ids = kwargs.get("position_ids")
+                    if position_ids is not None:
+                        value = torch.zeros_like(position_ids, dtype=torch.long)
+
+                if value is not None:
+                    if not kwargs_modified:
+                        kwargs = dict(kwargs)  # Make a mutable copy on first modification
+                        kwargs_modified = True
+                    kwargs[input_name] = value
+
+            return args, kwargs
+
+        # Register the hook with prepend=True to run before other hooks (like input validation)
+        inner_gm.register_forward_pre_hook(_inject_vlm_inputs_hook, with_kwargs=True, prepend=True)
 
 
 def create_draft_model_engine_maybe(

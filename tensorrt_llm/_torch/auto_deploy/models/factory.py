@@ -16,6 +16,18 @@ from ..utils.logger import ad_logger
 
 DynamicShape = Dict[int, Dim]  # indicating the dynamic shape in tensor dimension
 
+# Kwargs that should be dropped from model inputs during export and at runtime.
+# HF often passes these, but we don't want them to participate in torch.export in_spec matching.
+# NOTE: token_type_ids will be included in the export so that
+# VLM custom mask generation can happen inside the exported GraphModule.
+DROP_MODEL_INPUT_KWARGS = {
+    "attention_mask",
+    "cache_position",
+    "output_attentions",
+    "output_hidden_states",
+    "return_dict",
+}
+
 
 class ShardingConfigSource(Enum):
     """Enum for factory source."""
@@ -55,9 +67,24 @@ class SubModuleExportInfo:
         """Initialize the lookup for the dynamic shapes of keyword arguments."""
         raise NotImplementedError("Subclasses must implement this method.")
 
+    def post_export(self, sub_mod: nn.Module, sub_gm: GraphModule):
+        """Called after export but BEFORE patches are reverted.
+
+        Args:
+            sub_mod: The submodule from which the graph was captured+exported.
+            sub_gm: The graph module that was exported.
+
+        This method is called while export patches are still active, allowing access to
+        patch-set metadata on the module (e.g., _vlm_input_names). Override this method
+        to set metadata on the GraphModule that depends on patch state.
+
+        Default implementation does nothing.
+        """
+        pass
+
     @abstractmethod
     def post_process(self, sub_mod: nn.Module, sub_gm: GraphModule):
-        """Post-process the subgraph module.
+        """Post-process the subgraph module AFTER patches are reverted.
 
         Args:
             sub_mod: The submodule from which the graph was captured+exported.

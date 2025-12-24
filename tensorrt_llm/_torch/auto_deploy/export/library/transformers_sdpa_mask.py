@@ -12,6 +12,11 @@ def _transformers_version() -> str:
     return version.parse(importlib.metadata.version("transformers")).base_version
 
 
+def _noop_mask_function(**kwargs):
+    """Return None to skip vmap-based mask creation during export."""
+    return None
+
+
 @ExportPatchRegistry.register("transformers_sdpa_mask")
 class TransformersSdpaMaskPatch(BaseExportPatch):
     """Patch transformers.masking_utils.sdpa_mask to be export-compatible.
@@ -34,8 +39,17 @@ class TransformersSdpaMaskPatch(BaseExportPatch):
             # recall original implementation
             self.original_values["masking_utils.sdpa_mask"] = masking_utils.sdpa_mask
 
+            self.original_values["masking_utils.create_causal_mask"] = (
+                masking_utils.create_causal_mask
+            )
+            self.original_values["masking_utils.create_sliding_window_causal_mask"] = (
+                masking_utils.create_sliding_window_causal_mask
+            )
             # patch function and mask attention interface
             masking_utils.sdpa_mask = sdpa_mask_without_vmap
+
+            masking_utils.create_causal_mask = _noop_mask_function
+            masking_utils.create_sliding_window_causal_mask = _noop_mask_function
 
             if "sdpa" in masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._local_mapping:
                 self.original_values["sdpa_local_original"] = (
@@ -63,6 +77,16 @@ class TransformersSdpaMaskPatch(BaseExportPatch):
             # revert patches
             if "masking_utils.sdpa_mask" in self.original_values:
                 masking_utils.sdpa_mask = self.original_values["masking_utils.sdpa_mask"]
+
+            if "masking_utils.create_causal_mask" in self.original_values:
+                masking_utils.create_causal_mask = self.original_values[
+                    "masking_utils.create_causal_mask"
+                ]
+
+            if "masking_utils.create_sliding_window_causal_mask" in self.original_values:
+                masking_utils.create_sliding_window_causal_mask = self.original_values[
+                    "masking_utils.create_sliding_window_causal_mask"
+                ]
 
             if "sdpa_local_original" in self.original_values:
                 if self.original_values["sdpa_local_original"] is None:

@@ -34,9 +34,11 @@ from transformers.utils import (
 )
 
 from ..custom_ops.attention_interface import CacheConfig
+from ..custom_ops.vlm_mask_registry import VlmMetadataKeys
 from ..utils._config import deep_merge_dicts
 from ..utils.logger import ad_logger
 from .factory import (
+    DROP_MODEL_INPUT_KWARGS,
     DynamicShape,
     FullModelExportInfo,
     ModelFactory,
@@ -548,6 +550,14 @@ class _StateDictParamNameConverter:
 class TextModelExportInfo(SubModuleExportInfo):
     """An export configuration for the text model portion of a VLM."""
 
+    def post_export(self, sub_mod: nn.Module, sub_gm: GraphModule):
+        """Called after export but BEFORE patches are reverted.
+
+        Sets VLM metadata on the GraphModule while patches are still active,
+        so we can read _vlm_input_names from the module class.
+        """
+        self._set_vlm_metadata(sub_mod, sub_gm)
+
     def post_process(self, sub_mod: nn.Module, sub_gm: GraphModule):
         """Post-process the subgraph module and make sure the embedding remains available."""
         # make sure get_input_embeddings function is available in the graph module
@@ -576,6 +586,37 @@ class TextModelExportInfo(SubModuleExportInfo):
             torch._assert, args=(n_embed_tokens, "Avoid embedding getting deleted from graph.")
         )
 
+    def _set_vlm_metadata(self, sub_mod: nn.Module, sub_gm: GraphModule):
+        """Set VLM-related metadata on the GraphModule.
+
+        This metadata is used by:
+        - ADExecutor to know which inputs to inject from multimodal_data
+        - Mask generation ops to dispatch to model-specific generators
+
+        VLM input names are read from the module's _vlm_input_names attribute,
+        which is set by model-specific patches (e.g., Gemma3ModelPatch).
+        """
+        # Determine model_type from config
+        model_type = None
+        if hasattr(sub_mod, "config") and hasattr(sub_mod.config, "model_type"):
+            model_type = sub_mod.config.model_type
+
+        # Get VLM input candidates from module metadata (set by model patches)
+        # This avoids hardcoding input names - patches specify what they inject
+        vlm_input_candidates = (
+            getattr(type(sub_mod), VlmMetadataKeys.MODULE_INPUT_NAMES, None) or []
+        )
+
+        # Determine which VLM inputs are actually present in the graph
+        vlm_inputs = []
+        for node in sub_gm.graph.nodes:
+            if node.op == "placeholder" and node.target in vlm_input_candidates:
+                vlm_inputs.append(node.target)
+
+        # Set metadata on the GraphModule
+        setattr(sub_gm, VlmMetadataKeys.GRAPH_INPUTS, vlm_inputs)
+        setattr(sub_gm, VlmMetadataKeys.GRAPH_MODEL_TYPE, model_type)
+
     def _init_dynamic_shape_lookup(self) -> Dict[str, DynamicShape]:
         batch_size_dynamic = Dim.DYNAMIC
         seq_len_dynamic = Dim.DYNAMIC
@@ -583,6 +624,8 @@ class TextModelExportInfo(SubModuleExportInfo):
             "input_ids": {0: batch_size_dynamic, 1: seq_len_dynamic},
             "inputs_embeds": {0: batch_size_dynamic, 1: seq_len_dynamic},
             "position_ids": {0: batch_size_dynamic, 1: seq_len_dynamic},
+            # used for mask generation in VLM modules (specifies whether token is image or text)
+            "token_type_ids": {0: batch_size_dynamic, 1: seq_len_dynamic},
         }
 
     @classmethod
@@ -696,9 +739,9 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
             return_attention_mask=False,
         )
 
-        # We should have no need for the attention mask, and it can actually cause issues in
-        # downstream code.
-        inputs.pop("attention_mask", None)
+        # Drop known HF-only kwargs that may cause issues in downstream code.
+        for k in DROP_MODEL_INPUT_KWARGS:
+            inputs.pop(k, None)
 
         # NOTES:
         # 1. `inputs` is dict-like, but not a dict (hence the dict unpacking below).
