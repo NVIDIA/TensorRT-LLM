@@ -108,7 +108,7 @@ eval $pytestCommand
 pytest_exit_code=$?
 echo "Rank${SLURM_PROCID} Pytest finished execution with exit code $pytest_exit_code"
 
-if [ $SLURM_PROCID -eq 0 ] && [ "$perfMode" = "true" ] && [[ "$stageName" != *Perf-Sanity* ]]; then
+if [ $SLURM_PROCID -eq 0 ] && [ "$perfMode" = "true" ]; then
     if [[ "$stageName" == *PyTorch* ]]; then
         basePerfFilename="base_perf_pytorch.csv"
     else
@@ -133,14 +133,6 @@ if [ $SLURM_PROCID -eq 0 ] && [ "$perfMode" = "true" ] && [[ "$stageName" != *Pe
         perf_check_exit_code=$perf_report_exit_code
     fi
     echo "Rank${SLURM_PROCID} Perf check finished execution with exit code $perf_check_exit_code"
-fi
-
-if [ $SLURM_PROCID -eq 0 ] && [ "$perfMode" = "true" ] && [[ "$stageName" == *Perf-Sanity* ]]; then
-    echo "Check Perf-Sanity Result"
-    python3 $llmSrcNode/tests/integration/defs/perf/perf_regression_check.py \
-        $jobWorkspace
-    perf_sanity_check_exit_code=$?
-    echo "Rank${SLURM_PROCID} Perf-Sanity check finished execution with exit code $perf_sanity_check_exit_code"
 fi
 
 if [ "$pytest_exit_code" -ne 0 ]; then
