@@ -1,15 +1,15 @@
 # nvbugs: 5422621
 metadata:
-  model_name: deepseek-r1-fp4
+  model_name: deepseek-v32-fp4
   precision: fp4
-  model_dir_name: DeepSeek-R1-0528-FP4-v2
+  model_dir_name: DeepSeek-V3.2-FP4-v2
   supported_gpus:
   - GB200
   - GB300
   script_file: disaggr_torch.slurm
   benchmark_type: 1k1k
   config_index: 7
-  dataset_file: disagg_datasets/deepseek-r1-1024-1024-100000-ratio-1_for_serve.json
+  dataset_file: disagg_datasets/deepseek-v32-1024-1024-200000-ratio-1_for_serve.json
 slurm:
   script_file: disaggr_torch.slurm
   partition: <partition>

@@ -1,15 +1,14 @@
-# nvbugs: 5422621
 metadata:
-  model_name: deepseek-r1-fp4
+  model_name: deepseek-v32-fp4
   precision: fp4
-  model_dir_name: DeepSeek-R1-0528-FP4-v2
+  model_dir_name: DeepSeek-V3.2-FP4-v2
   supported_gpus:
   - GB200
   - GB300
   script_file: disaggr_torch.slurm
-  benchmark_type: 1k1k
-  config_index: 7
-  dataset_file: disagg_datasets/deepseek-r1-1024-1024-100000-ratio-1_for_serve.json
+  benchmark_type: 8k1k
+  config_index: 4
+  dataset_file: disagg_datasets/deepseek-v32-8192-1024-200000-ratio-1_for_serve.json
 slurm:
   script_file: disaggr_torch.slurm
   partition: <partition>
@@ -24,13 +23,13 @@ benchmark:
   multi_round: 8
   benchmark_ratio: 0.8
   streaming: true
-  concurrency_list: '12288'
-  input_length: 1024
+  concurrency_list: '538'
+  input_length: 8192
   output_length: 1024
   dataset_file: <dataset_file>
 hardware:
   gpus_per_node: 4
-  num_ctx_servers: 2
+  num_ctx_servers: 8
   num_gen_servers: 1
 environment:
   container_mount: <container_mount>
@@ -51,14 +50,14 @@ accuracy:
 worker_config:
   gen:
     enable_layerwise_nvtx_marker: true
-    tensor_parallel_size: 48
-    moe_expert_parallel_size: 48
+    tensor_parallel_size: 32
+    moe_expert_parallel_size: 32
     enable_attention_dp: true
     enable_lm_head_tp_in_adp: true
     pipeline_parallel_size: 1
-    max_batch_size: 1024
-    max_num_tokens: 1024
-    max_seq_len: 2176
+    max_batch_size: 16
+    max_num_tokens: 64
+    max_seq_len: 9419
     cuda_graph_config:
       enable_padding: true
       batch_sizes:
@@ -86,14 +85,18 @@ worker_config:
         num_slots: 288
         layer_updates_per_iter: 1
     cache_transceiver_config:
-      max_tokens_in_buffer: 8320
-      backend: DEFAULT
+      max_tokens_in_buffer: 8448
+      backend: NIXL
     stream_interval: 20
+    num_postprocess_workers: 4
+    speculative_config:
+      decoding_type: MTP
+      num_nextn_predict_layers: 3
   ctx:
     enable_layerwise_nvtx_marker: true
-    max_batch_size: 4
-    max_num_tokens: 4480
-    max_seq_len: 2176
+    max_batch_size: 1
+    max_num_tokens: 8448
+    max_seq_len: 9419
     tensor_parallel_size: 4
     moe_expert_parallel_size: 4
     enable_attention_dp: true
@@ -103,8 +106,11 @@ worker_config:
     disable_overlap_scheduler: true
     kv_cache_config:
       enable_block_reuse: false
-      free_gpu_memory_fraction: 0.85
+      free_gpu_memory_fraction: 0.75
       dtype: fp8
     cache_transceiver_config:
-      max_tokens_in_buffer: 8320
-      backend: DEFAULT
+      max_tokens_in_buffer: 8448
+      backend: NIXL
+    speculative_config:
+      decoding_type: MTP
+      num_nextn_predict_layers: 3
