@@ -4,7 +4,6 @@ import torch
 from torch import nn
 from transformers import LlamaConfig, PretrainedConfig
 
-from tensorrt_llm.logger import logger
 
 from ...functional import PositionEmbeddingType
 from ..attention_backend import AttentionMetadata

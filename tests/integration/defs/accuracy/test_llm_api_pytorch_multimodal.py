@@ -6,6 +6,7 @@ from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MoeConfig, Sampl
 from ..conftest import llm_models_root, skip_pre_blackwell
 from .accuracy_core import MMMU, LlmapiAccuracyTestHarness
 
+
 class TestQwen2_VL_7B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen/Qwen2-VL-7B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/Qwen2-VL-7B-Instruct"
@@ -285,13 +286,14 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
             "latency_moe_trtllm",
         ],
     )
-    def test_nvfp4_4gpus(self, tp_size, pp_size, ep_size, attention_dp,
-                         cuda_graph, overlap_scheduler, moe_backend):
-
+    def test_nvfp4_4gpus(
+        self, tp_size, pp_size, ep_size, attention_dp, cuda_graph, overlap_scheduler, moe_backend
+    ):
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
-            moe_config=MoeConfig(backend=moe_backend))
+            moe_config=MoeConfig(backend=moe_backend),
+        )
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
 
