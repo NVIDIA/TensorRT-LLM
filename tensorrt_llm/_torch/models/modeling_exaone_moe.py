@@ -12,6 +12,7 @@ from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
+from ...logger import logger
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import (
     PositionalEmbeddingParams,
@@ -47,25 +48,14 @@ from transformers import AutoConfig, PretrainedConfig  # isort: skip
 class ExaoneMoEConfig(PretrainedConfig):
     model_type = "exaone_moe"
 
-print(
+logger.warning_once(
     "transformers does not support 'ExaoneMoEConfig'. "
-    "Register ExaoneMoEConfig to mimic the ExaoneMoE model."
+    "Register ExaoneMoEConfig to mimic the ExaoneMoE model.",
+    key="EXAONE_MOE_REGISTER_WARNING"
 )
 AutoConfig.register(ExaoneMoEConfig.model_type, ExaoneMoEConfig)
 # End of the config register.
 # fmt: on
-
-
-PRINT_DEBUG = False
-
-
-def debug_print(tag: str, x: torch.Tensor, layer_idx: Optional[int] = None):
-    if PRINT_DEBUG and not torch.cuda.is_current_stream_capturing():
-        tag = tag if layer_idx is None else f"layer.{layer_idx}.{tag}"
-        x = x.float()
-        print(
-            f"[DEBUG_PRINT] TR | {tag:20s} | l1_norm {x.abs().mean():10.4f} | mean {x.mean():10.4f}"
-        )
 
 
 def check_is_sliding(config: ExaoneMoEConfig, layer_idx: int) -> bool:
@@ -185,7 +175,9 @@ class ExaoneMoeDecoderLayer(DecoderLayer):
         self.is_p2p_supported = can_access_peer(mapping)
 
         self.fusion_config = EagerFusionConfig()
-        self.enable_fusion = os.environ.get("TRTLLM_EXAONE_EAGER_FUSION_DISABLED", "0") == "0"
+        # MoE fusions are disabled by default in K-EXAONE since
+        # it may cause a slight accuracy drop due to numerical gap.
+        self.enable_fusion = os.environ.get("TRTLLM_EXAONE_EAGER_FUSION_ENABLED", "0") == "1"
         self.enable_fusion &= not self.enable_attention_dp
 
         # FIXME: incompatible with mixed quantization mode
@@ -205,30 +197,15 @@ class ExaoneMoeDecoderLayer(DecoderLayer):
             )
             self.moe_allreduce = MoEAllReduce(self.mapping)
 
-        # TODO(jaedeokk): Finalize parallelism and fusion configuration.
         has_tp = mapping.has_tp()
         has_pp = mapping.has_pp()
-
-        # K-EXAONE uses per-tensor scale.
-        self.disable_deep_gemm = False
-        # quant_config = getattr(model_config, "quant_config", None)
-        # if quant_config is not None:
-        #     # TODO(jaedeokk): Check if
-        #     # ExaoneMoe fp8 has an illegal memory access issue with deep_gemm.
-        #     self.disable_deep_gemm = (
-        #         getattr(quant_config, "quant_algo", None) == QuantAlgo.FP8_BLOCK_SCALES
-        #     )
 
         # Submodule definitions
         self.input_layernorm = RMSNorm(
             hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=config.torch_dtype
         )
 
-        self.self_attn = ExaoneMoeAttention(
-            model_config,
-            layer_idx=layer_idx,
-            disable_deep_gemm=self.disable_deep_gemm,
-        )
+        self.self_attn = ExaoneMoeAttention(model_config, layer_idx=layer_idx)
 
         # MoE or Dense layer
         self.is_moe_layer = check_is_moe(config, layer_idx)
@@ -254,7 +231,7 @@ class ExaoneMoeDecoderLayer(DecoderLayer):
                 block_size = quant_config.group_size
             self.mlp_tp_size = self._compute_mlp_tp_size(config.intermediate_size, block_size)
             has_mlp_tp = self.mlp_tp_size > 1
-            # TODO(jaedeokk): Enable when FP4 is available.
+
             self.fusion_config.PRE_MLP_FUSION = self.enable_fusion and has_mlp_tp and self.is_nvfp4
             self.fusion_config.POST_MLP_FUSION = self.enable_fusion and has_mlp_tp
 
@@ -268,7 +245,6 @@ class ExaoneMoeDecoderLayer(DecoderLayer):
                 # In attention-DP, mlp_tp_size==1 -> disable TP sharding here.
                 overridden_tp_size=self.mlp_tp_size,
                 layer_idx=layer_idx,
-                disable_deep_gemm=self.disable_deep_gemm,
                 reduce_output=has_mlp_tp,
             )
 
@@ -285,7 +261,7 @@ class ExaoneMoeDecoderLayer(DecoderLayer):
         self.next_layer_layernorm: RMSNorm = None
 
     def _get_decoder_layer_quant_config(
-        self, model_config: ModelConfig[PretrainedConfig], layer_idx: int
+        self, model_config: ModelConfig[ExaoneMoEConfig], layer_idx: int
     ):
         """
         The MTP layer in the nvfp4 checkpoint is unquantized. Because the TRTLLM
@@ -306,7 +282,7 @@ class ExaoneMoeDecoderLayer(DecoderLayer):
     def _compute_mlp_tp_size(self, intermediate_size: int, block_size: int) -> int:
         """Adopted from DeepseekV3DecoderLayer._compute_mlp_tp_size."""
         assert intermediate_size % block_size == 0, (
-            "intermediate_size must be divisible by block_size."
+            f"intermediate_size {intermediate_size} must be divisible by block_size {block_size}."
         )
         if self.enable_attention_dp:
             # If using attention DP, the MLP also uses DP instead of TP.
@@ -339,8 +315,6 @@ class ExaoneMoeDecoderLayer(DecoderLayer):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
-        debug_print("ln_out", hidden_states, self.layer_idx)
-        debug_print("residual", residual, self.layer_idx)
 
         hidden_states = self.self_attn(
             position_ids=position_ids,
@@ -350,33 +324,17 @@ class ExaoneMoeDecoderLayer(DecoderLayer):
             **kwargs,
         )
 
-        debug_print("attn_out", hidden_states, self.layer_idx)
-
-        if self.mapping.tp_size == 1:
-            # TODO(jaedeokk): This is for debugging. Will remove this path.
-            hidden_states, residual = self.post_attention_layernorm(
-                hidden_states, residual=residual
+        if self.is_moe_layer:
+            hidden_states, residual = self.forward_moe(
+                hidden_states=hidden_states,
+                attn_metadata=attn_metadata,
+                residual=residual,
             )
-
-            debug_print("post_ln_out", hidden_states, self.layer_idx)
-            debug_print("post_ln_res", residual, self.layer_idx)
-            hidden_states = self.mlp(hidden_states)
-            debug_print("mlp_out", hidden_states, self.layer_idx)
-            debug_print("layer_out", hidden_states + residual, self.layer_idx)
-            if self.next_layer_layernorm is not None:
-                hidden_states, residual = self.next_layer_layernorm(hidden_states, residual)
         else:
-            if self.is_moe_layer:
-                hidden_states, residual = self.forward_moe(
-                    hidden_states=hidden_states,
-                    attn_metadata=attn_metadata,
-                    residual=residual,
-                )
-            else:
-                hidden_states, residual = self.forward_mlp(
-                    hidden_states=hidden_states,
-                    residual=residual,
-                )
+            hidden_states, residual = self.forward_mlp(
+                hidden_states=hidden_states,
+                residual=residual,
+            )
 
         return hidden_states, residual
 
@@ -401,7 +359,6 @@ class ExaoneMoeDecoderLayer(DecoderLayer):
 
         if self.fusion_config.PRE_MOE_FUSION:
             # moe_backend can be either CUTLASS or TRTLLM here
-            # TODO: unify the two min-latency MoE backends by enabling quant fusion
             hidden_states, residual = self.allreduce(
                 hidden_states,
                 all_reduce_params=AllReduceParams(
@@ -488,7 +445,6 @@ class ExaoneMoeDecoderLayer(DecoderLayer):
 
         hidden_states = self.mlp(
             hidden_states,
-            # TODO(jaedeokk): Should we move to the constructor?
             final_all_reduce_params=AllReduceParams(
                 enable_allreduce=not (self.fusion_config.POST_MLP_FUSION or self.mlp_tp_size == 1)
             ),
@@ -565,8 +521,6 @@ class ExaoneMoeModel(DecoderModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         hidden_states = inputs_embeds.to(self.dtype)
-
-        debug_print("inputs_embeds", inputs_embeds)
         residual = None
 
         for decoder_layer in self.layers[: self.num_hidden_layers]:
@@ -627,9 +581,12 @@ class ExaoneMoeForCausalLM(DecoderModelForCausalLM[ExaoneMoeModel, ExaoneMoEConf
             if new_name != name:
                 weights[new_name] = weights.pop(name)
 
-        # TODO(jaedeokk): Attention DP requires exceptional handling in weight loading.
-        skip_modules = skip_modules or []
-        super().load_weights(weights, weight_mapper, skip_modules, allow_partial_loading)
+        super().load_weights(
+            weights=weights,
+            weight_mapper=weight_mapper,
+            skip_modules=skip_modules or [],
+            allow_partial_loading=allow_partial_loading,
+        )
 
     def post_load_weights(self):
         # For the cross-layer residual+LN fusion.
