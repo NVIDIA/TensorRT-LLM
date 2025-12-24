@@ -868,7 +868,7 @@ CUBIN_EXPORT __global__
 #endif
 
 #if SKIP_SOFTMAX_ATTN_BLOCK_STATS
-        uint32_t local_skipped_block_count = 0;
+        uint32_t localSkippedBlockCount = 0;
 #endif
 
         // QK gemm
@@ -1014,7 +1014,7 @@ CUBIN_EXPORT __global__
                 {
                     smem.skipSoftmaxVotesGemm0ToGemm1[idxXBuf] = 1U;
 #if SKIP_SOFTMAX_ATTN_BLOCK_STATS
-                    local_skipped_block_count++;
+                    localSkippedBlockCount++;
 #endif
                 }
                 asm volatile("fence.proxy.async.shared::cta;\n"); // maybe not used
@@ -1081,9 +1081,9 @@ CUBIN_EXPORT __global__
             unused(xBar.produced.arrive());
         }
 #if SKIP_SOFTMAX_ATTN && SKIP_SOFTMAX_ATTN_BLOCK_STATS
-        if (threadIdx.x == 0 && skipped_block_count != nullptr && total_block_count != nullptr)
+        if (threadIdx.x == 0 && skippedBlockCount != nullptr && totalBlockCount != nullptr)
         {
-            atomicAdd(skippedBlockCount, local_skipped_block_count);
+            atomicAdd(skippedBlockCount, localSkippedBlockCount);
             atomicAdd(totalBlockCount, nbIters);
         }
 #endif
@@ -1670,7 +1670,6 @@ CUBIN_EXPORT __global__
     {
         return;
     }
-    // todo: skip_softmax_attn: fix multiblockmode
     bool& smemIsLastCta = smem.isLastCta;
     if (threadIdx.x == gemm1NbThrds - 1U && threadIdx.z == 0)
     {
@@ -3486,7 +3485,7 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #if SKIP_SOFTMAX_ATTN
     float const skipSoftmaxThresholdScaleFactor,
 #if SKIP_SOFTMAX_ATTN_BLOCK_STATS
-    uint32_t* __restrict__ skipped_block_count, uint32_t* __restrict__ total_block_count,
+    uint32_t* __restrict__ skippedBlockCount, uint32_t* __restrict__ totalBlockCount,
 #endif
 #endif
     uint32_t* semaphores, void* scratch, cudaStream_t stream)
@@ -3515,8 +3514,6 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
     // gridDim.z == nbKHeads * batchSize && gridDim.y == nbSubSeqPerSeq && gridDim.x == nbInputSeqSplit
     dim3 const dimGrid{divUp(qSeqLen, inputTokensPerCta), nbSubSeqPerSeq, nbKHeads * batchSize};
     dim3 const dimCta{warp_size * gmmaWarpsPerGrp, 1, 3};
-    // printf("dimGrid: %d, %d, %d\n", dimGrid.x, dimGrid.y, dimGrid.z);
-    // printf("dimCta: %d, %d, %d\n", dimCta.x, dimCta.y, dimCta.z);
     auto const launchCfg = makeLaunchConfig(dimGrid, dimCta, hostSmemSize, stream, ENABLE_PDL != 0);
 #if USE_PAGED_KV_CACHE
     uint32_t const maxNbPagesPerSeq = exactDiv(maxSeqLen, tokensPerPage);
@@ -3582,7 +3579,7 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #if SKIP_SOFTMAX_ATTN
         skipSoftmaxThresholdScaleFactor,
 #if SKIP_SOFTMAX_ATTN_BLOCK_STATS
-        skipped_block_count, total_block_count,
+        skippedBlockCount, totalBlockCount,
 #endif
 #endif
         semaphores, scratch);

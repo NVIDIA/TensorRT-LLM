@@ -17,7 +17,6 @@
 
 #include "refAttention.h"
 #include <cstdint>
-#include <cstdio>
 
 template <typename T>
 Vec<float, validElemsPerHead> toF32Head(Vec<T, validElemsPerHead> const& src)
@@ -65,7 +64,6 @@ Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refFlashAt
     uint32_t const idxTileBeg = seqBeg / tileSize;
 
     uint32_t const nbSubSeq = (multiBlockNum > 0 && nbTiles >= 2) ? mha::min(nbTiles, multiBlockNum) : 1;
-    // uint32_t const nbSubSeq = 1;
     std::vector<Eigen::Vector<float, headGrpSize>> skipRowMaxs(nbSubSeq);
     for (uint32_t i = 0; i < nbSubSeq; i++)
     {
