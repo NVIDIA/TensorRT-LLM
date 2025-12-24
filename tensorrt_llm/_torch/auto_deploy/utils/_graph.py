@@ -342,7 +342,6 @@ def add_graph_input(
     add_kwargs: bool = True,
     val: Union[Optional[torch.Tensor], _NoValType] = _NO_VAL,
     dynamic_shape=None,
-    name_prefix: str = "arg_",
 ) -> Node:
     """Add a graph input to the given GraphModule and return the newly created node.
 
@@ -374,12 +373,12 @@ def add_graph_input(
     # insert input node after currently last input node
     node_last_input = graph.find_nodes(op="placeholder", sort=True)[-1]
     with graph.inserting_after(node_last_input):
-        in_node = graph.placeholder(name_prefix + name)
+        in_node = graph.placeholder(name)
         in_spec_for_args.children_specs.append(_LEAF_SPEC)
-        orig_args.append(name_prefix + name)
+        orig_args.append(name)
 
         if add_kwargs:
-            in_spec_for_args.context.append(name_prefix + name)
+            in_spec_for_args.context.append(name)
 
     # update pytree info recursively with __post_init__ starting at leaves
     _call_post_init_recursive(in_spec)
