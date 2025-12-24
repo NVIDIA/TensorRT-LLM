@@ -9,6 +9,7 @@ from strenum import StrEnum
 
 from tensorrt_llm.bindings import internal as tb_internal
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
+from tensorrt_llm.logger import logger
 
 # Assuming these imports exist in your environment
 from .llm_request import LlmRequest, LlmRequestState
@@ -259,12 +260,35 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
         max_batch_size: int,
         max_num_tokens: Optional[int] = None,
         ctx_chunk_config: Optional[ContextChunkingConfig] = None,
+        no_schedule_until_state: LlmRequestState = LlmRequestState.CONTEXT_INIT,
+        no_schedule_after_state: LlmRequestState = LlmRequestState.
+        GENERATION_TO_COMPLETE,
     ):
         super().__init__()
         self.max_batch_size = max_batch_size
         self.max_num_tokens = max_num_tokens
         self.ctx_chunk_config = ctx_chunk_config
         self.max_context_length = max_num_tokens
+        # Match C++ MicroBatchScheduler defaults (see algorithms.cpp line 68-70)
+        self.no_schedule_until_state = no_schedule_until_state
+        self.no_schedule_after_state = no_schedule_after_state
+
+    def _has_reached_state(self, req: LlmRequest,
+                           target_state: LlmRequestState) -> bool:
+        """Check if request has reached the target state."""
+        # C++ equivalent: req->hasReachedState(state)
+        return req.state.value >= target_state.value
+
+    def _can_be_scheduled(self, req: LlmRequest) -> bool:
+        """
+        Check if request is within the schedulable state range.
+        C++ reference: microBatchScheduler.cpp line 192-195
+        """
+        if not self._has_reached_state(req, self.no_schedule_until_state):
+            return False
+        if self._has_reached_state(req, self.no_schedule_after_state):
+            return False
+        return True
 
     def schedule(
             self, active_requests: RequestList,
@@ -289,23 +313,26 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
             if req.request_id in inflight_request_ids:
                 continue
 
+            # Skip if request cannot be scheduled yet or should no longer be scheduled
+            # C++ reference: microBatchScheduler.cpp line 192-195
+            if not self._can_be_scheduled(req):
+                continue
+
             req_num_tokens = 0
 
-            # --- A. Encoder Request Handling (Previously Missing) ---
+            # --- A. Encoder Request Handling ---
             if req.state == LlmRequestState.ENCODER_INIT:
-                # C++: reqNumTokens = llmReq->getEncoderOutputLen();
                 req_num_tokens = req.encoder_output_len
 
-                if self.max_context_length is not None and req_num_tokens > self.max_context_length:
-                    # C++ does TLLM_CHECK here. We skip or log.
-                    continue
+                assert self.max_context_length is None or req_num_tokens <= self.max_context_length, \
+                    f"The number of encoder tokens ({req_num_tokens}) exceeds the limit value ({self.max_context_length})"
 
-                # Check Batch Token Budget
                 if self.max_num_tokens is not None and (batch_num_tokens +
                                                         req_num_tokens
                                                         > self.max_num_tokens):
                     break
 
+                logger.debug(f"encoder request scheduled: ID {req.request_id}")
                 context_requests.append(req)
                 batch_num_tokens += req_num_tokens
 
@@ -313,24 +340,25 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
             elif req.state == LlmRequestState.CONTEXT_INIT:
                 if not self.ctx_chunk_config:
                     # No Chunking: Schedule full context
-                    # C++: getNumTokens(beam) + (hasDraft ? getNumDraftTokens : 0)
-                    base_tokens = req.context_remaining_length  # effectively getNumTokens(0)
+                    # C++ uses getNumTokens(beam=0) which is tokens.size() - numPreDecodedTokens
+                    base_tokens = req.get_num_tokens(0)
                     draft_tokens = req.num_draft_tokens if req.has_draft_tokens else 0
                     req_num_tokens = base_tokens + draft_tokens
 
-                    if self.max_context_length is not None and req_num_tokens > self.max_context_length:
-                        continue
+                    assert self.max_context_length is None or req_num_tokens <= self.max_context_length, \
+                        f"The number of context tokens ({req_num_tokens}) exceeds the limit value ({self.max_context_length})"
 
                     if self.max_num_tokens is not None and (
                             batch_num_tokens + req_num_tokens
                             > self.max_num_tokens):
                         break
 
+                    logger.debug(
+                        f"context request scheduled: ID {req.request_id}")
                     context_requests.append(req)
                     batch_num_tokens += req_num_tokens
                 else:
                     # Chunking Enabled: Tentative schedule
-                    # C++: setContextChunkSize(remaining); reqNumTokens = size + draft
                     req.context_chunk_size = req.context_remaining_length
 
                     draft_tokens = req.num_draft_tokens if (
@@ -338,18 +366,23 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
                         and req.has_draft_tokens) else 0
                     req_num_tokens = req.context_chunk_size + draft_tokens
 
-                    # C++: Check maxContextLength constraints
                     if self.max_context_length is not None:
                         if self.max_context_length < req_num_tokens:
                             req_num_tokens = self.max_context_length
                             all_context_requests_fit = False
 
+                    logger.debug(
+                        f"contexts-to-be-chunked request scheduled: ID {req.request_id}"
+                    )
                     contexts_to_be_chunked.append(req)
                     num_chunked_tokens += req_num_tokens
 
             # --- C. Generation Request Handling ---
             else:
-                beam_width = req.sampling_config.beam_width
+                # C++ uses getBeamWidthByIter() which returns dynamic beam width
+                # during beam search (1->2->3->...->beamWidth)
+                beam_width = req.get_beam_width_by_iter(
+                    for_next_iteration=False)
                 req_num_tokens = beam_width + req.num_draft_tokens
 
                 if self.max_num_tokens is not None and (batch_num_tokens +
@@ -357,13 +390,19 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
                                                         > self.max_num_tokens):
                     break
 
-                # Beam Width Consistency Check (C++ Logic)
+                # Beam Width Consistency Check
                 if scheduled_beam_width == 0:
                     scheduled_beam_width = beam_width
                 elif scheduled_beam_width != beam_width:
-                    # Skip requests with different beam width in this batch
+                    logger.debug(
+                        f"generation request skipped: ID {req.request_id} since its "
+                        f"beam width ({beam_width}) is different from scheduled ones "
+                        f"({scheduled_beam_width})")
                     continue
 
+                logger.debug(
+                    f"generation request scheduled: ID {req.request_id} "
+                    f"with beam width {beam_width}")
                 generation_requests.append(req)
                 batch_num_tokens += req_num_tokens
 
@@ -379,27 +418,79 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
 
         # 3. Apply Chunking Strategy if needed
         if not all_context_requests_fit and contexts_to_be_chunked:
-            if not self.ctx_chunk_config:
-                pass  # Error in C++: "If chunking not enabled..."
-            else:
-                remaining_capacity = (
-                    self.max_num_tokens - batch_num_tokens
-                ) if self.max_num_tokens is not None else None
+            assert self.ctx_chunk_config is not None, \
+                "If chunking is not enabled, context scheduling should be completed."
+            remaining_capacity = (
+                self.max_num_tokens -
+                batch_num_tokens) if self.max_num_tokens is not None else None
 
-                self._set_ctx_requests_chunk_size(contexts_to_be_chunked,
-                                                  remaining_capacity)
+            self._set_ctx_requests_chunk_size(contexts_to_be_chunked,
+                                              remaining_capacity)
 
         # 4. Finalize Chunked Requests
         for req in contexts_to_be_chunked:
             if req.context_chunk_size > 0:
                 context_requests.append(req)
-                # C++: batchNumTokens += chunk size
                 batch_num_tokens += req.context_chunk_size
+                logger.debug(f"context request scheduled: ID {req.request_id}, "
+                             f"chunk size {req.context_chunk_size}")
 
-        # Note: C++ calls utils::sortRequests here. Python lists preserve order,
-        # usually acceptable unless specific downstream kernel requirements exist.
+        # Sort requests for consistency with C++
+        # C++ reference: utils::sortRequests in inflightBatchingUtils.cpp
+        self._sort_requests(context_requests, generation_requests,
+                            not all_context_requests_fit)
+
+        # Summary logs
+        logger.debug(f"batchSize (num ctx/enc requests + num gen requests): "
+                     f"{len(context_requests) + len(generation_requests)}")
+        logger.debug(f"batchNumTokens / maxNumTokens: {batch_num_tokens} / "
+                     f"{self.max_num_tokens or 0}")
+        logger.debug(
+            f"[Summary] Micro Batch scheduler schedules {len(context_requests)} "
+            f"context/encoder requests, {len(generation_requests)} generation requests. "
+            f"{len(inflight_request_ids)} requests inflight with the model already"
+        )
 
         return context_requests, generation_requests
+
+    def _sort_requests(self, context_requests: RequestList,
+                       generation_requests: RequestList,
+                       chunks_present: bool) -> None:
+        """
+        Sort requests for consistency with C++.
+        C++ reference: utils::sortRequests in inflightBatchingUtils.cpp
+
+        1. If chunks are present, move context requests that reached the last
+           context chunk to the end of the vector.
+        2. Sort all requests by lora task id for performance.
+        """
+
+        def get_lora_task_id(req: LlmRequest) -> int:
+            # Return lora_task_id or a large value if not set
+            lora_id = getattr(req, 'lora_task_id', None)
+            if lora_id is None:
+                return float('inf')
+            return lora_id
+
+        if chunks_present:
+            # Partition: non-last-chunk first, last-chunk at end
+            not_last_chunk = [
+                r for r in context_requests if not r.is_last_context_chunk
+            ]
+            last_chunk = [
+                r for r in context_requests if r.is_last_context_chunk
+            ]
+            # Sort each group by lora_task_id
+            not_last_chunk.sort(key=get_lora_task_id)
+            last_chunk.sort(key=get_lora_task_id)
+            # Rebuild the list in-place
+            context_requests.clear()
+            context_requests.extend(not_last_chunk)
+            context_requests.extend(last_chunk)
+        else:
+            context_requests.sort(key=get_lora_task_id)
+
+        generation_requests.sort(key=get_lora_task_id)
 
     def _set_ctx_requests_chunk_size(self, requests: RequestList,
                                      capacity: Optional[int]):
@@ -414,6 +505,8 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
             self._chunk_equal_progress(requests, capacity, unit_size)
         elif policy == ChunkingPolicy.FIRST_COME_FIRST_SERVED:
             self._chunk_fcfs(requests, capacity, unit_size)
+        else:
+            raise ValueError(f"Invalid chunking policy: {policy}")
 
         self._fit_draft_tokens(requests, capacity, unit_size)
 
@@ -502,347 +595,642 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
 
                 draft_discard = req.num_draft_tokens - remaining_space
                 if draft_discard > 0:
+                    logger.debug(f"Discarding {draft_discard} draft tokens")
                     if hasattr(req, "discard_draft_tokens"):
                         req.discard_draft_tokens(draft_discard)
+
+
+class SchedulerPolicyBase(ABC):
+    """
+    Abstract base class for capacity scheduler policies.
+    Each policy implements its own scheduling logic.
+    """
+
+    @abstractmethod
+    def schedule(
+            self, scheduler: 'PyCapacityScheduler',
+            active_requests: RequestList) -> Tuple[RequestList, RequestList]:
+        """
+        Schedule requests according to the policy.
+
+        Args:
+            scheduler: The capacity scheduler instance (for accessing shared state)
+            active_requests: List of active requests to schedule
+
+        Returns:
+            Tuple of (scheduled_requests, paused_requests)
+        """
+        raise NotImplementedError
+
+
+class MaxRequestsPolicy(SchedulerPolicyBase):
+    """
+    MaxRequestsScheduler: Simple request count limiting without KV cache checks.
+    C++ reference: capacityScheduler.cpp:154-176
+    """
+
+    def schedule(
+            self, scheduler: 'PyCapacityScheduler',
+            active_requests: RequestList) -> Tuple[RequestList, RequestList]:
+        scheduled_requests: RequestList = []
+
+        for req in active_requests:
+            if not scheduler._can_be_scheduled(req):
+                continue
+
+            if len(scheduled_requests) >= scheduler.max_num_requests:
+                break
+
+            if (req.is_encoder_init_state or req.is_context_init_state
+                    or req.is_generation_in_progress_state):
+                scheduled_requests.append(req)
+
+        return scheduled_requests, []
+
+
+class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
+    """
+    GuaranteedNoEvictScheduler: Reserve blocks for requests to complete without eviction.
+    C++ reference: capacityScheduler.cpp:194-331
+    """
+
+    def __init__(self, static_batch: bool = False):
+        self.static_batch = static_batch
+
+    def schedule(
+            self, scheduler: 'PyCapacityScheduler',
+            active_requests: RequestList) -> Tuple[RequestList, RequestList]:
+        scheduled_requests: RequestList = []
+        max_peft_pages = scheduler._get_max_peft_pages()
+
+        skipping_is_relevant = scheduler._is_skipping_relevant()
+
+        newly_contributed_context_blocks: Set = set()
+        newly_contributed_cross_context_blocks: Set = set()
+        if not self.static_batch and skipping_is_relevant:
+            newly_contributed_context_blocks, newly_contributed_cross_context_blocks = \
+                scheduler._prefill_contributed_blocks(active_requests)
+
+        reserved_blocks = NoEvictScheduledBlocksManager(
+            scheduler.kv_cache_manager)
+        reserved_cross_blocks: Optional[NoEvictScheduledBlocksManager] = None
+        if scheduler.cross_kv_cache_manager is not None:
+            reserved_cross_blocks = NoEvictScheduledBlocksManager(
+                scheduler.cross_kv_cache_manager)
+
+        claimed_peft_pages = 0
+        uniq_task_ids: Set[int] = set()
+
+        pending_requests: RequestList = []
+        pending_dis_gen_init_requests: RequestList = []
+
+        # First pass: process in-progress generation and classify requests
+        for req in active_requests:
+            if not scheduler._can_be_scheduled_with_disagg_exception(req):
+                continue
+
+            if len(scheduled_requests) >= scheduler.max_num_requests:
+                break
+
+            if req.is_generation_in_progress_state:
+                scheduled_requests.append(req)
+                reserved_blocks.decrement_reserved_blocks(req)
+                if reserved_cross_blocks is not None:
+                    reserved_cross_blocks.decrement_reserved_blocks(req)
+
+                lora_task_id, is_new_task, peft_pages = scheduler._get_peft_task_info(
+                    req, uniq_task_ids)
+                if is_new_task:
+                    claimed_peft_pages += peft_pages
+                    uniq_task_ids.add(lora_task_id)
+
+            elif req.is_disagg_generation_init_state:
+                pending_dis_gen_init_requests.append(req)
+            else:
+                pending_requests.append(req)
+
+        # Second pass: process pending requests
+        if not self.static_batch or len(scheduled_requests) == 0:
+            available_peft_pages = max_peft_pages - claimed_peft_pages
+
+            for requests in [pending_dis_gen_init_requests, pending_requests]:
+                for req in requests:
+                    if (not self.static_batch and skipping_is_relevant
+                            and not req.is_disagg_generation_init_state
+                            and scheduler._beneficial_to_skip(
+                                req, newly_contributed_context_blocks,
+                                newly_contributed_cross_context_blocks)):
+                        continue
+
+                    if len(scheduled_requests) >= scheduler.max_num_requests:
+                        break
+
+                    if req.is_context_init_state or req.is_disagg_generation_init_state:
+                        enough_blocks = reserved_blocks.enough_available_blocks(
+                            req)
+                        enough_cross_blocks = True
+                        if reserved_cross_blocks is not None:
+                            enough_cross_blocks = reserved_cross_blocks.enough_available_blocks(
+                                req)
+
+                        lora_task_id, is_new_task, needed_peft_pages = scheduler._get_peft_task_info(
+                            req, uniq_task_ids)
+
+                        if (enough_blocks and enough_cross_blocks
+                                and needed_peft_pages <= available_peft_pages):
+                            scheduled_requests.append(req)
+                            reserved_blocks.decrement_reserved_blocks(req)
+                            if reserved_cross_blocks is not None:
+                                reserved_cross_blocks.decrement_reserved_blocks(
+                                    req)
+                            available_peft_pages -= needed_peft_pages
+                            if is_new_task:
+                                uniq_task_ids.add(lora_task_id)
+                        elif not enough_blocks or not enough_cross_blocks:
+                            break
+
+        return scheduled_requests, []
+
+
+class MaxUtilizationPolicy(SchedulerPolicyBase):
+    """
+    MaxUtilizationScheduler: Maximize utilization, may pause started requests.
+    C++ reference: capacityScheduler.cpp:341-425
+    """
+
+    def schedule(
+            self, scheduler: 'PyCapacityScheduler',
+            active_requests: RequestList) -> Tuple[RequestList, RequestList]:
+        scheduler.kv_cache_manager.impl.start_scheduling()
+
+        skipping_is_relevant = scheduler._is_skipping_relevant()
+
+        scheduled_blocks_manager = MaxUtilizationScheduledBlocksManager(
+            scheduler.kv_cache_manager, scheduler.two_step_lookahead)
+
+        num_scheduled_peft_pages = 0
+        seen_task_ids: Set[int] = set()
+
+        newly_contributed_context_blocks, _ = scheduler._prefill_contributed_blocks(
+            active_requests)
+
+        def is_started_request(req: LlmRequest) -> bool:
+            if not scheduler._can_be_scheduled(req):
+                return False
+            return ((req.is_context_init_state
+                     and not req.is_first_context_chunk)
+                    or req.is_generation_in_progress_state)
+
+        scheduled_requests: RequestList = []
+        paused_requests: RequestList = []
+
+        requests_list = list(active_requests)
+        req_it_end = len(requests_list)
+        req_it = 0
+
+        while req_it < req_it_end:
+            req = requests_list[req_it]
+            logger.debug(
+                f"MaxUtilizationScheduler: scheduling request ID {req.request_id}"
+            )
+
+            if not scheduler._can_be_scheduled_with_disagg_exception(req):
+                logger.debug(
+                    f"MaxUtilizationScheduler: request ID {req.request_id} "
+                    "cannot / should not be scheduled")
+                req_it += 1
+                continue
+
+            if (skipping_is_relevant and scheduler._beneficial_to_skip(
+                    req, newly_contributed_context_blocks, set())):
+                req_it += 1
+                continue
+
+            was_scheduled = self._try_scheduling_request(
+                scheduler, req, scheduled_requests, scheduled_blocks_manager,
+                num_scheduled_peft_pages, seen_task_ids)
+
+            if was_scheduled:
+                logger.debug(
+                    f"MaxUtilizationScheduler: request ID {req.request_id} -> start"
+                )
+                req_it += 1
+            else:
+                last_started_idx = None
+                for i in range(req_it_end - 1, req_it - 1, -1):
+                    if is_started_request(requests_list[i]):
+                        last_started_idx = i
+                        break
+
+                if last_started_idx is not None:
+                    paused_req = requests_list[last_started_idx]
+                    scheduler.kv_cache_manager.impl.scheduling_remove_sequence(
+                        paused_req.py_request_id)
+                    paused_requests.append(paused_req)
+                    logger.debug(
+                        f"MaxUtilizationScheduler: request ID {paused_req.request_id} -> pause"
+                    )
+                    req_it_end = last_started_idx
+                else:
+                    break
+
+        return scheduled_requests, paused_requests
+
+    def _try_scheduling_request(
+            self, scheduler: 'PyCapacityScheduler', req: LlmRequest,
+            scheduled_requests: RequestList,
+            scheduled_blocks_manager: 'MaxUtilizationScheduledBlocksManager',
+            num_scheduled_peft_pages: int, seen_task_ids: Set[int]) -> bool:
+        if len(scheduled_requests) >= scheduler.max_num_requests:
+            return False
+
+        lora_task_id, is_new_task, num_required_peft_pages = scheduler._get_peft_task_info(
+            req, seen_task_ids)
+        logger.debug(f"MaxUtilizationScheduler: request ID {req.request_id} "
+                     f"required peft pages: {num_required_peft_pages}")
+
+        blocks_if_scheduled = scheduled_blocks_manager.prepare_blocks_if_schedulable(
+            req)
+        fits_kv_cache = blocks_if_scheduled is not None
+
+        fits_peft = True
+        if scheduler.peft_cache_manager is not None:
+            max_peft_pages = scheduler._get_max_peft_pages()
+            fits_peft = (num_required_peft_pages + num_scheduled_peft_pages
+                         <= max_peft_pages)
+
+        if fits_kv_cache and fits_peft:
+            scheduled_blocks_manager.update_scheduled_blocks(
+                blocks_if_scheduled)
+            logger.debug(
+                f"MaxUtilizationScheduler: scheduled peft pages: {num_required_peft_pages}"
+            )
+            scheduled_requests.append(req)
+            if is_new_task:
+                seen_task_ids.add(lora_task_id)
+            return True
+
+        return False
+
+
+class NoEvictScheduledBlocksManager:
+    """
+    Python equivalent of C++ kv_cache_manager::NoEvictScheduledBlocksManager.
+    Tracks available blocks per window size for GUARANTEED_NO_EVICT scheduling.
+
+    Reference: cpp/tensorrt_llm/batch_manager/scheduledBlocksManager.h:29-62
+    """
+
+    def __init__(self, kv_cache_manager):
+        """
+        Initialize with free blocks from KVCacheManager.
+        C++ equivalent: mAvailableBlocks = mKvCacheManager.getBlockManager().getNumFreeBlocksPerWindowSize()
+        """
+        self.kv_cache_manager = kv_cache_manager
+        stats = kv_cache_manager.impl.get_kv_cache_stats()
+        self.available_blocks: Dict[int, int] = dict(
+            stats.num_free_blocks_per_window_size)
+
+    def decrement_reserved_blocks(self, req: LlmRequest) -> None:
+        """
+        Decrement available blocks by the blocks needed to complete this request.
+        C++ reference: scheduledBlocksManager.h:40-46
+        """
+        for window_size in self.available_blocks:
+            needed = self.kv_cache_manager.impl.get_remaining_blocks_to_completion(
+                req, window_size)
+            self.available_blocks[window_size] -= needed
+
+    def enough_available_blocks(self, req: LlmRequest) -> bool:
+        """
+        Check if there are enough available blocks for this request across all window sizes.
+        C++ reference: scheduledBlocksManager.h:48-57
+        """
+        return all(
+            self.kv_cache_manager.impl.get_remaining_blocks_to_completion(
+                req, ws) <= avail
+            for ws, avail in self.available_blocks.items())
+
+
+class MaxUtilizationScheduledBlocksManager:
+    """
+    Python equivalent of C++ kv_cache_manager::MaxUtilizationScheduledBlocksManager.
+    Tracks scheduled blocks per window size for MAX_UTILIZATION scheduling.
+
+    Reference: cpp/tensorrt_llm/batch_manager/scheduledBlocksManager.h:64-117
+    """
+
+    def __init__(self, kv_cache_manager, two_steps_look_ahead: bool):
+        """
+        Initialize scheduled blocks count per window size.
+        C++ equivalent: iterate windowSizes and set mNumScheduledBlocks[windowSize] = 0
+        """
+        self.kv_cache_manager = kv_cache_manager
+        self.two_steps_look_ahead = two_steps_look_ahead
+        window_sizes = set(kv_cache_manager.max_attention_window_vec)
+        self.num_scheduled_blocks: Dict[int, int] = {
+            ws: 0
+            for ws in window_sizes
+        }
+
+    def prepare_blocks_if_schedulable(
+            self, req: LlmRequest) -> Optional[Dict[int, int]]:
+        """
+        Check if request can be scheduled and return new block counts if so.
+        Returns None if request cannot fit.
+        C++ reference: scheduledBlocksManager.h:80-100
+        """
+        blocks_if_scheduled = {}
+        for window_size, num_scheduled in self.num_scheduled_blocks.items():
+            required = self.kv_cache_manager.impl.get_needed_blocks_one_step(
+                req, self.two_steps_look_ahead, window_size)
+            logger.debug(
+                f"MaxUtilizationScheduler: request ID {req.request_id} "
+                f"required blocks {required} for {window_size} window size")
+            scheduled_total = num_scheduled + required
+            has_free = self.kv_cache_manager.impl.scheduling_has_free_blocks(
+                scheduled_total, window_size)
+            if not has_free:
+                return None
+            blocks_if_scheduled[window_size] = scheduled_total
+        return blocks_if_scheduled
+
+    def update_scheduled_blocks(self, blocks: Dict[int, int]) -> None:
+        """
+        Update the scheduled blocks after successfully scheduling a request.
+        C++ reference: scheduledBlocksManager.h:102-110
+        """
+        assert len(blocks) == len(self.num_scheduled_blocks), \
+            f"Block count mismatch: {len(blocks)} vs {len(self.num_scheduled_blocks)}"
+        for window_size, blocks_if_scheduled in blocks.items():
+            logger.debug(
+                f"MaxUtilizationScheduler: scheduled blocks {blocks_if_scheduled} "
+                f"for window size {window_size}")
+            self.num_scheduled_blocks[window_size] = blocks_if_scheduled
 
 
 class PyCapacityScheduler:
     """
     Python implementation of the C++ CapacityScheduler.
-    Aligned with C++ logic to support Multiple Window Sizes (VSWA).
+    Aligned 1:1 with C++ logic in cpp/tensorrt_llm/batch_manager/capacityScheduler.cpp.
+    Supports Multiple Window Sizes (VSWA), block reuse optimization, and all policies.
+
+    Policies:
+    - MaxRequestsScheduler: No KV cache manager, simple request count limit
+    - GuaranteedNoEvictScheduler: Reserve blocks for completion, no eviction
+    - StaticBatchScheduler: Only schedule when no requests are active
+    - MaxUtilizationScheduler: Maximize utilization, may pause requests
+
+    Reference: cpp/include/tensorrt_llm/batch_manager/capacityScheduler.h
     """
 
     def __init__(
         self,
         max_num_requests: int,
-        kv_cache_manager,
+        kv_cache_manager=None,
         peft_cache_manager=None,
         scheduler_policy: CapacitySchedulerPolicy = CapacitySchedulerPolicy.
-        MAX_UTILIZATION,
-        no_schedule_until_state=LlmRequestState.CONTEXT_INIT,
-        no_schedule_after_state=LlmRequestState.GENERATION_COMPLETE,
+        GUARANTEED_NO_EVICT,
+        cross_kv_cache_manager=None,
+        two_step_lookahead: bool = False,
+        no_schedule_until_state: LlmRequestState = LlmRequestState.CONTEXT_INIT,
+        no_schedule_after_state: LlmRequestState = LlmRequestState.
+        GENERATION_COMPLETE,
     ):
+        """
+        Initialize the capacity scheduler.
+
+        Args:
+            max_num_requests: Maximum number of requests to schedule
+            kv_cache_manager: KV cache manager (None for MaxRequestsScheduler)
+            peft_cache_manager: PEFT/LoRA cache manager (optional)
+            scheduler_policy: Scheduling policy
+            cross_kv_cache_manager: Cross-attention KV cache manager for encoder-decoder
+            two_step_lookahead: Enable two-step lookahead for MAX_UTILIZATION
+            no_schedule_until_state: Don't schedule until this state is reached
+            no_schedule_after_state: Don't schedule after this state is reached
+        """
         self.max_num_requests = max_num_requests
         self.kv_cache_manager = kv_cache_manager
         self.peft_cache_manager = peft_cache_manager
-        self.policy = scheduler_policy
+        self.cross_kv_cache_manager = cross_kv_cache_manager
+        self.scheduler_policy = scheduler_policy
+        self.two_step_lookahead = two_step_lookahead
         self.no_schedule_until_state = no_schedule_until_state
         self.no_schedule_after_state = no_schedule_after_state
 
-        if self.kv_cache_manager is not None:
-            self.kv_cache_manager_cpp = kv_cache_manager.impl
-            self.default_window_size = self.kv_cache_manager.max_seq_len
+        # Initialize the appropriate policy
+        self._policy = self._create_policy()
 
-        if self.peft_cache_manager:
-            self.peft_cache_manager_cpp = self.peft_cache_manager.impl
-            self.max_peft_pages = self.peft_cache_manager_cpp.max_device_pages
+    def _create_policy(self) -> SchedulerPolicyBase:
+        """Create the appropriate policy based on configuration."""
+        if self.kv_cache_manager is None:
+            return MaxRequestsPolicy()
+        elif self.scheduler_policy == CapacitySchedulerPolicy.MAX_UTILIZATION:
+            return MaxUtilizationPolicy()
+        elif self.scheduler_policy == CapacitySchedulerPolicy.GUARANTEED_NO_EVICT:
+            return GuaranteedNoEvictPolicy(static_batch=False)
+        elif self.scheduler_policy == CapacitySchedulerPolicy.STATIC_BATCH:
+            return GuaranteedNoEvictPolicy(static_batch=True)
         else:
-            self.max_peft_pages = float('inf')  # Effectively infinite
+            raise ValueError(
+                f"Unsupported scheduler policy: {self.scheduler_policy}")
+
+    def _has_reached_state(self, req: LlmRequest,
+                           target_state: LlmRequestState) -> bool:
+        """Check if request has reached the target state."""
+        # C++ equivalent: req->hasReachedState(state)
+        # States are ordered: ENCODER_INIT(1) < CONTEXT_INIT(2) < GENERATION_IN_PROGRESS(3) < ...
+        return req.state.value >= target_state.value
+
+    def _can_be_scheduled(self, req: LlmRequest) -> bool:
+        """
+        Check if request is within the schedulable state range.
+        Returns True if request has reached no_schedule_until_state
+        but has not yet reached no_schedule_after_state.
+        """
+        if not self._has_reached_state(req, self.no_schedule_until_state):
+            return False
+        if self._has_reached_state(req, self.no_schedule_after_state):
+            return False
+        return True
+
+    def _is_skipping_relevant(self) -> bool:
+        """
+        Check if block reuse skip optimization is relevant.
+        Disabled for VSWA (Variable Sliding Window Attention).
+        C++ reference: capacityScheduler.cpp:207-208, 348
+        """
+        if self.kv_cache_manager is None:
+            return False
+        if self.kv_cache_manager.is_vswa:
+            return False
+        if (self.cross_kv_cache_manager is not None
+                and self.cross_kv_cache_manager.is_vswa):
+            return False
+        return True
+
+    def _prefill_contributed_blocks(
+            self, active_requests: RequestList) -> Tuple[Set, Set]:
+        """
+        Collect blocks contributed by chunked context requests already executing.
+        These blocks can be reused by later requests.
+
+        C++ reference: capacityScheduler.cpp:34-68 (prefillWithChunkedContextsAlreadyExecuting)
+        """
+        newly_contributed_context_blocks: Set = set()
+        newly_contributed_cross_context_blocks: Set = set()
+
+        if self.kv_cache_manager is None:
+            return newly_contributed_context_blocks, newly_contributed_cross_context_blocks
+
+        enable_block_reuse = self.kv_cache_manager.enable_block_reuse
+        cross_enable_reuse = (self.cross_kv_cache_manager is not None and
+                              self.cross_kv_cache_manager.enable_block_reuse)
+
+        for req in active_requests:
+            # Check: isContextInitState() && !isFirstContextChunk()
+            if req.is_context_init_state and not req.is_first_context_chunk:
+                # Chunked context request already executing
+                if enable_block_reuse:
+                    unique_tokens = req.get_unique_tokens(0)
+                    block_key = self.kv_cache_manager.impl.find_new_context_block(
+                        unique_tokens, req)
+                    if block_key is not None:
+                        newly_contributed_context_blocks.add(block_key)
+
+                if cross_enable_reuse:
+                    encoder_unique_tokens = req.get_encoder_unique_tokens()
+                    if encoder_unique_tokens is not None:
+                        block_key = self.cross_kv_cache_manager.impl.find_new_context_block(
+                            encoder_unique_tokens, req)
+                        if block_key is not None:
+                            newly_contributed_cross_context_blocks.add(
+                                block_key)
+
+        return newly_contributed_context_blocks, newly_contributed_cross_context_blocks
+
+    def _one_manager_beneficial_to_skip(self, kv_cache_manager, unique_tokens,
+                                        req: LlmRequest,
+                                        newly_contributed_blocks: Set) -> bool:
+        """
+        Check if skipping is beneficial for one KV cache manager.
+        C++ reference: capacityScheduler.cpp:70-92 (oneManagerBeneficialToSkip)
+        """
+        new_context_block = kv_cache_manager.impl.find_new_context_block(
+            unique_tokens, req)
+        if new_context_block is not None:
+            if new_context_block in newly_contributed_blocks:
+                return True
+            newly_contributed_blocks.add(new_context_block)
+        return False
+
+    def _beneficial_to_skip(
+            self, req: LlmRequest, newly_contributed_context_blocks: Set,
+            newly_contributed_cross_context_blocks: Set) -> bool:
+        """
+        Check if it's beneficial to skip this request.
+        A request should be skipped if it can reuse blocks contributed by
+        already scheduled context requests.
+
+        C++ reference: capacityScheduler.cpp:97-123 (beneficialToSkip)
+        """
+        if not (req.is_context_init_state and req.is_first_context_chunk):
+            return False
+
+        if (self.kv_cache_manager is not None
+                and self.kv_cache_manager.enable_block_reuse):
+            unique_tokens = req.get_unique_tokens(0)
+            if self._one_manager_beneficial_to_skip(
+                    self.kv_cache_manager, unique_tokens, req,
+                    newly_contributed_context_blocks):
+                return True
+
+        if (self.cross_kv_cache_manager is not None
+                and self.cross_kv_cache_manager.enable_block_reuse):
+            encoder_unique_tokens = req.get_encoder_unique_tokens()
+            if encoder_unique_tokens is not None:
+                if self._one_manager_beneficial_to_skip(
+                        self.cross_kv_cache_manager, encoder_unique_tokens, req,
+                        newly_contributed_cross_context_blocks):
+                    return True
+
+        return False
+
+    def _get_max_peft_pages(self) -> int:
+        """Get maximum PEFT cache pages."""
+        if self.peft_cache_manager is None:
+            return 2**31 - 1  # INT_MAX equivalent
+        return self.peft_cache_manager.get_max_device_pages()
+
+    def _get_peft_pages_for_request(self, req: LlmRequest) -> int:
+        """Get PEFT pages needed for a request."""
+        if self.peft_cache_manager is None:
+            return 0
+        return self.peft_cache_manager.determine_num_pages(req)
+
+    def _get_peft_task_info(
+            self, req: LlmRequest,
+            seen_task_ids: Set[int]) -> Tuple[Optional[int], bool, int]:
+        """
+        Get PEFT task information for a request.
+        Returns (lora_task_id, is_new_task, required_pages).
+        """
+        lora_task_id = getattr(req, 'lora_task_id', None)
+        is_new_task = lora_task_id is not None and lora_task_id not in seen_task_ids
+        required_pages = self._get_peft_pages_for_request(
+            req) if is_new_task else 0
+        return lora_task_id, is_new_task, required_pages
+
+    def _can_be_scheduled_with_disagg_exception(self, req: LlmRequest) -> bool:
+        """
+        Check if request can be scheduled, with exception for disagg generation init state.
+        Disagg generation init requests bypass the normal state gating.
+        """
+        if req.is_disagg_generation_init_state:
+            return True
+        return self._can_be_scheduled(req)
 
     def schedule_request(
         self, active_requests: RequestList
     ) -> Tuple[RequestList, RequestList, RequestList]:
-
-        if self.kv_cache_manager is None:
-            return self._schedule_max_requests(active_requests)
-
-        if self.policy == CapacitySchedulerPolicy.MAX_UTILIZATION:
-            return self._schedule_max_utilization(active_requests)
-        elif self.policy == CapacitySchedulerPolicy.GUARANTEED_NO_EVICT:
-            return self._schedule_guaranteed_no_evict(active_requests)
-        else:
-            raise NotImplementedError(
-                f"Policy {self.policy} not implemented in PyCapacityScheduler")
-
-    def _get_initial_available_blocks_map(self) -> Dict[int, int]:
         """
-        Mimics C++: mKvCacheManager.getBlockManager().getNumFreeBlocksPerWindowSize()
-        Returns a dict {window_size: free_blocks}.
+        Schedule requests based on the configured policy.
+
+        Args:
+            active_requests: List of active requests to consider
+
+        Returns:
+            Tuple of (fitting_requests, fitting_disagg_gen_init_requests, paused_requests)
+
+        C++ reference: capacityScheduler.cpp:488-539 (CapacityScheduler::operator())
         """
-        stats = self.kv_cache_manager_cpp.get_kv_cache_stats()
+        scheduled, paused = self._policy.schedule(self, active_requests)
 
-        # Nanobind binds std::map to python dict
-        # Property name from binding: .def_rw("num_free_blocks_per_window_size", ...)
-        free_map = stats.num_free_blocks_per_window_size
+        fitting_requests, fitting_disagg_gen_init_requests = self._classify_output(
+            scheduled)
 
-        if not free_map:
-            # Fallback for simple cases or if map is empty (though unlikely in C++)
-            # Calculate scalar free blocks
-            free_scalar = stats.max_num_blocks - stats.used_num_blocks
-            return {self.default_window_size: free_scalar}
+        logger.debug(
+            f"[Summary] Capacity scheduler allows {len(fitting_requests)} requests, "
+            f"pauses {len(paused)} requests")
 
-        # Ensure we return a copy so we can modify it during scheduling
-        return dict(free_map)
+        return fitting_requests, fitting_disagg_gen_init_requests, paused
 
-    def _req_check_and_update_map(self, req: LlmRequest,
-                                  available_map: Dict[int, int],
-                                  is_guaranteed_no_evict: bool) -> bool:
+    def _classify_output(
+            self,
+            scheduled_requests: RequestList) -> Tuple[RequestList, RequestList]:
         """
-        Checks if a request fits in ALL window sizes tracked in available_map.
-        If it fits, decrements the map and returns True.
-        If it doesn't fit, leaves map untouched and returns False.
+        Separate scheduled requests into normal requests and disagg gen init requests.
+        C++ reference: capacityScheduler.cpp:522-534
         """
-        # 1. Calculate needed blocks for all window sizes
-        needed_per_window = {}
-        for window_size in available_map.keys():
-            if is_guaranteed_no_evict:
-                # C++: getRemainingBlocksToCompletion(req, windowSize)
-                needed = self.kv_cache_manager_cpp.get_remaining_blocks_to_completion(
-                    req, window_size)
-            else:
-                # C++: getNeededBlocksOneStep(req, twoStepsLookAhead, windowSize)
-                needed = self.kv_cache_manager_cpp.get_needed_blocks_one_step(
-                    req, False, window_size)
-            needed_per_window[window_size] = needed
-
-        # 2. Check if fits (All or Nothing)
-        for window_size, available in available_map.items():
-            if needed_per_window[window_size] > available:
-                return False
-
-        # 3. Commit update
-        for window_size in available_map.keys():
-            available_map[window_size] -= needed_per_window[window_size]
-
-        return True
-
-    def _req_force_update_map(self, req: LlmRequest, available_map: Dict[int,
-                                                                         int],
-                              is_guaranteed_no_evict: bool):
-        """
-        Unconditionally decrements the available blocks (used for Running requests in NoEvict).
-        Allowed to go negative.
-        """
-        for window_size in available_map.keys():
-            if is_guaranteed_no_evict:
-                needed = self.kv_cache_manager_cpp.get_remaining_blocks_to_completion(
-                    req, window_size)
-            else:
-                needed = self.kv_cache_manager_cpp.get_needed_blocks_one_step(
-                    req, False, window_size)
-
-            available_map[window_size] -= needed
-
-    def _req_revert_map(self, req: LlmRequest, available_map: Dict[int, int],
-                        is_guaranteed_no_evict: bool):
-        """
-        Reverts a decrement (used for Backtracking in MaxUtilization).
-        """
-        for window_size in available_map.keys():
-            if is_guaranteed_no_evict:
-                needed = self.kv_cache_manager_cpp.get_remaining_blocks_to_completion(
-                    req, window_size)
-            else:
-                needed = self.kv_cache_manager_cpp.get_needed_blocks_one_step(
-                    req, False, window_size)
-
-            available_map[window_size] += needed
-
-    def _schedule_max_requests(self, active_requests: RequestList):
-        scheduled_requests: RequestList = []
-        paused_requests: RequestList = []
-
-        for req in active_requests:
-            is_disagg_init = (
-                req.state == LlmRequestState.DISAGG_GENERATION_INIT)
-
-            if not is_disagg_init and (
-                    req.state.value < self.no_schedule_until_state.value
-                    or req.state.value >= self.no_schedule_after_state.value):
-                continue
-
-            if len(scheduled_requests) >= self.max_num_requests:
-                break
-
-            if (req.state == LlmRequestState.ENCODER_INIT
-                    or req.state == LlmRequestState.CONTEXT_INIT
-                    or req.state == LlmRequestState.GENERATION_IN_PROGRESS
-                    or is_disagg_init):
-                scheduled_requests.append(req)
-
-        return self._classify_output(active_requests, scheduled_requests,
-                                     paused_requests)
-
-    def _schedule_max_utilization(self, active_requests: RequestList):
-        scheduled_requests: RequestList = []
-        paused_requests: RequestList = []
-
-        self.kv_cache_manager_cpp.start_scheduling()
-
-        # [FIX] Use Map tracking for multiple window sizes
-        current_free_blocks_map = self._get_initial_available_blocks_map()
-
-        cached_active_list = list(active_requests)
-        idx = 0
-
-        while idx < len(cached_active_list):
-            req = cached_active_list[idx]
-
-            is_disagg_init = (
-                req.state == LlmRequestState.DISAGG_GENERATION_INIT)
-
-            if not is_disagg_init and (
-                    req.state.value < self.no_schedule_until_state.value
-                    or req.state.value >= self.no_schedule_after_state.value):
-                idx += 1
-                continue
-
-            if len(scheduled_requests) >= self.max_num_requests:
-                break
-
-            # 3. Try Allocation
-            # C++ Logic: Checks if it fits in *all* window sizes
-            if self._req_check_and_update_map(req,
-                                              current_free_blocks_map,
-                                              is_guaranteed_no_evict=False):
-                scheduled_requests.append(req)
-                idx += 1
-                continue
-
-            # 4. Backtracking (Evict Generation requests only)
-            victim_idx = -1
-            for i in range(len(scheduled_requests) - 1, -1, -1):
-                r = scheduled_requests[i]
-                if r.state == LlmRequestState.GENERATION_IN_PROGRESS:
-                    victim_idx = i
-                    break
-
-            if victim_idx != -1:
-                # Found a victim. Evict it.
-                victim_req = scheduled_requests.pop(victim_idx)
-                paused_requests.append(victim_req)
-
-                # Revert victim's usage in the map
-                self._req_revert_map(victim_req,
-                                     current_free_blocks_map,
-                                     is_guaranteed_no_evict=False)
-
-                # Retry current req (do NOT increment idx)
-                continue
-            else:
-                # No victim found, and current request doesn't fit. Stop.
-                break
-
-        return self._classify_output(active_requests, scheduled_requests,
-                                     paused_requests)
-
-    def _schedule_guaranteed_no_evict(self, active_requests: RequestList):
-        scheduled_requests: RequestList = []
-        pending_disagg_requests: RequestList = []
-        pending_context_requests: RequestList = []
-
-        # KV Cache Resource Tracking
-        available_blocks_map = self._get_initial_available_blocks_map()
-
-        # PEFT Resource Tracking
-        claimed_peft_pages = 0
-        uniq_task_ids: Set[int] = set()
-
-        # --- Pass 1: Running Requests ---
-        for request in active_requests:
-            req_state = request.state
-            is_disagg_init = (
-                req_state == LlmRequestState.DISAGG_GENERATION_INIT)
-
-            if not is_disagg_init and (
-                    req_state.value < self.no_schedule_until_state.value
-                    or req_state.value >= self.no_schedule_after_state.value):
-                continue
-
-            if len(scheduled_requests) >= self.max_num_requests:
-                if is_disagg_init:
-                    pending_disagg_requests.append(request)
-                else:
-                    pending_context_requests.append(request)
-                continue
-
-            if (req_state == LlmRequestState.GENERATION_IN_PROGRESS
-                    or req_state == LlmRequestState.GENERATION_TO_COMPLETE):
-
-                # 1. Update KV Cache Map (Unconditional)
-                self._req_force_update_map(request,
-                                           available_blocks_map,
-                                           is_guaranteed_no_evict=True)
-
-                # 2. Update PEFT Usage
-                # C++: if (isNewTask) claimedPeftPages += determineNumPages(req);
-                if self.peft_cache_manager and request.lora_task_id is not None:
-                    task_id = request.lora_task_id
-                    if task_id not in uniq_task_ids:
-                        # Binding check: determine_num_pages
-                        pages = self.peft_cache_manager_cpp.determine_num_pages(
-                            request)
-                        claimed_peft_pages += pages
-                        uniq_task_ids.add(task_id)
-
-                scheduled_requests.append(request)
-            else:
-                if is_disagg_init:
-                    pending_disagg_requests.append(request)
-                else:
-                    pending_context_requests.append(request)
-
-        # --- Pass 2: New / Context Requests ---
-        available_peft_pages = self.max_peft_pages - claimed_peft_pages
-        all_pending = pending_disagg_requests + pending_context_requests
-
-        for request in all_pending:
-            if len(scheduled_requests) >= self.max_num_requests:
-                break
-
-            # 1. Check PEFT Capacity
-            needed_peft_pages = 0
-            is_new_task = False
-            task_id = None
-
-            if self.peft_cache_manager and request.lora_task_id is not None:
-                task_id = request.lora_task_id
-                is_new_task = (task_id not in uniq_task_ids)
-                if is_new_task:
-                    needed_peft_pages = self.peft_cache_manager_cpp.determine_num_pages(
-                        request)
-                    if needed_peft_pages > available_peft_pages:
-                        # Not enough PEFT memory
-                        break  # Head-of-line blocking
-
-            # 2. Check KV Cache Capacity
-            if not self._req_check_and_update_map(
-                    request, available_blocks_map, is_guaranteed_no_evict=True):
-                # Not enough KV blocks
-                break
-
-            # 3. Commit Schedule
-            scheduled_requests.append(request)
-
-            # Commit PEFT usage
-            if is_new_task:
-                available_peft_pages -= needed_peft_pages
-                uniq_task_ids.add(task_id)
-
-        return self._classify_output(active_requests, scheduled_requests, [])
-
-    def _classify_output(self, active_requests, scheduled_requests,
-                         explicit_paused_requests):
-        fitting_requests = []
-        fitting_disagg_gen_init = []
-        paused_requests = list(explicit_paused_requests)
-
-        scheduled_ids = set(r.request_id for r in scheduled_requests)
-        paused_ids = set(r.request_id for r in paused_requests)
-
-        for req in active_requests:
-            if (req.request_id not in scheduled_ids
-                    and req.request_id not in paused_ids
-                    and req.state == LlmRequestState.GENERATION_IN_PROGRESS):
-                paused_requests.append(req)
-
+        fitting_requests: RequestList = []
+        fitting_disagg_gen_init_requests: RequestList = []
         for req in scheduled_requests:
-            if req.state == LlmRequestState.DISAGG_GENERATION_INIT:
-                fitting_disagg_gen_init.append(req)
+            if req.is_disagg_generation_init_state:
+                fitting_disagg_gen_init_requests.append(req)
             else:
                 fitting_requests.append(req)
-
-        return fitting_requests, fitting_disagg_gen_init, paused_requests
+        return fitting_requests, fitting_disagg_gen_init_requests
 
 
 class SimpleUnifiedScheduler(RequestScheduler):
@@ -855,13 +1243,18 @@ class SimpleUnifiedScheduler(RequestScheduler):
         peft_cache_manager,
         scheduler_policy: CapacitySchedulerPolicy,
         ctx_chunk_config: Optional[Tuple[StrEnum, int]] = None,
+        cross_kv_cache_manager=None,
+        two_step_lookahead: bool = False,
     ):
         # 1. Initialize Python Capacity Scheduler
+        # Now fully aligned with C++ CapacityScheduler
         self.capacity_scheduler = PyCapacityScheduler(
             max_num_requests=max_batch_size,
             kv_cache_manager=kv_cache_manager,
             peft_cache_manager=peft_cache_manager,
-            scheduler_policy=scheduler_policy)
+            scheduler_policy=scheduler_policy,
+            cross_kv_cache_manager=cross_kv_cache_manager,
+            two_step_lookahead=two_step_lookahead)
 
         # 2. Initialize Python MicroBatch Scheduler
         py_chunk_config = None

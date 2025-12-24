@@ -258,7 +258,20 @@ void initBindings(pybind11::module_& m)
             })
         .def_property("is_dummy_request", &GenLlmReq::isDummyRequest, &GenLlmReq::setIsDummyRequest)
         .def_property_readonly("return_perf_metrics", &GenLlmReq::getReturnPerfMetrics)
-        .def_property("use_draft_model", &GenLlmReq::useDraftModel, &GenLlmReq::setUseDraftModel);
+        .def_property("use_draft_model", &GenLlmReq::useDraftModel, &GenLlmReq::setUseDraftModel)
+        .def("get_unique_tokens", py::overload_cast<GenLlmReq::SizeType32>(&GenLlmReq::getUniqueTokens, py::const_),
+            py::arg("beam"))
+        .def("get_unique_tokens", py::overload_cast<>(&GenLlmReq::getUniqueTokens, py::const_))
+        .def("get_encoder_unique_tokens",
+            [](GenLlmReq& self)
+            {
+                auto const& encoderUniqueTokens = self.getEncoderUniqueTokens();
+                if (encoderUniqueTokens.has_value() && encoderUniqueTokens.value())
+                {
+                    return std::optional<GenLlmReq::VecUniqueTokens>(*encoderUniqueTokens.value());
+                }
+                return std::optional<GenLlmReq::VecUniqueTokens>(std::nullopt);
+            });
 
     py::classh<tb::LlmRequest, GenLlmReq>(m, "LlmRequest", pybind11::dynamic_attr())
         .def(py::init<>(

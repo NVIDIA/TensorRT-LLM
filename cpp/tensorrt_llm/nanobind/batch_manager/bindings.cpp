@@ -252,7 +252,20 @@ void initBindings(nb::module_& m)
             })
         .def_prop_rw("is_dummy_request", &GenLlmReq::isDummyRequest, &GenLlmReq::setIsDummyRequest)
         .def_prop_ro("return_perf_metrics", &GenLlmReq::getReturnPerfMetrics)
-        .def_prop_rw("use_draft_model", &GenLlmReq::useDraftModel, &GenLlmReq::setUseDraftModel);
+        .def_prop_rw("use_draft_model", &GenLlmReq::useDraftModel, &GenLlmReq::setUseDraftModel)
+        .def("get_unique_tokens", nb::overload_cast<GenLlmReq::SizeType32>(&GenLlmReq::getUniqueTokens, nb::const_),
+            nb::arg("beam"))
+        .def("get_unique_tokens", nb::overload_cast<>(&GenLlmReq::getUniqueTokens, nb::const_))
+        .def("get_encoder_unique_tokens",
+            [](GenLlmReq& self)
+            {
+                auto const& encoderUniqueTokens = self.getEncoderUniqueTokens();
+                if (encoderUniqueTokens.has_value() && encoderUniqueTokens.value())
+                {
+                    return std::optional<GenLlmReq::VecUniqueTokens>(*encoderUniqueTokens.value());
+                }
+                return std::optional<GenLlmReq::VecUniqueTokens>(std::nullopt);
+            });
 
     nb::class_<tb::LlmRequest, GenLlmReq>(m, "LlmRequest", nb::dynamic_attr())
         .def(
