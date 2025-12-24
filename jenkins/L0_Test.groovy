@@ -3131,7 +3131,7 @@ def launchTestJobs(pipeline, testFilter)
         "GB200-4_GPUs-PyTorch-1": ["gb200-x4-oci", "l0_gb200_multi_gpus", 1, 2, 4],
         "GB200-4_GPUs-PyTorch-2": ["gb200-x4-oci", "l0_gb200_multi_gpus", 2, 2, 4],
         "GB200-4_GPUs-PyTorch-Post-Merge-1": ["gb200-x4-oci", "l0_gb200_multi_gpus", 1, 1, 4],
-        "GB10-PyTorch-Post-Merge-1": ["gb10x", "l0_gb10", 1, 1],
+        "GB10-PyTorch-Post-Merge-1": ["gb10x-single", "l0_gb10", 1, 1],
         // Perf sanity post merge test
         "GB200-4_GPUs-PyTorch-Perf-Sanity-Post-Merge-1": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 1, 1, 4],
         // Disable GB300 stages due to nodes will be offline temporarily.
