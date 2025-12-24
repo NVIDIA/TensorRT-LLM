@@ -826,6 +826,22 @@ disaggregated/test_workers.py::test_workers_conditional_disaggregation[TinyLlama
 disaggregated/test_workers.py::test_workers_kv_cache_events[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_workers.py::test_workers_kv_cache_aware_router[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_workers.py::test_workers_kv_cache_aware_router_eviction[TinyLlama-1.1B-Chat-v1.0]
+disaggregated/test_auto_scaling.py::test_service_discovery[etcd-round_robin]
+disaggregated/test_auto_scaling.py::test_service_discovery[etcd-load_balancing]
+disaggregated/test_auto_scaling.py::test_service_discovery[etcd-kv_cache_aware]
+disaggregated/test_auto_scaling.py::test_service_discovery[http-round_robin]
+disaggregated/test_auto_scaling.py::test_service_discovery[http-load_balancing]
+disaggregated/test_auto_scaling.py::test_service_discovery[http-kv_cache_aware]
+disaggregated/test_auto_scaling.py::test_minimal_instances[etcd-round_robin]
+disaggregated/test_auto_scaling.py::test_minimal_instances[http-round_robin]
+disaggregated/test_auto_scaling.py::test_worker_restart[etcd-round_robin]
+disaggregated/test_auto_scaling.py::test_worker_restart[etcd-load_balancing]
+disaggregated/test_auto_scaling.py::test_worker_restart[etcd-kv_cache_aware]
+disaggregated/test_auto_scaling.py::test_worker_restart[http-round_robin]
+disaggregated/test_auto_scaling.py::test_worker_restart[http-load_balancing]
+disaggregated/test_auto_scaling.py::test_worker_restart[http-kv_cache_aware]
+disaggregated/test_auto_scaling.py::test_disagg_server_restart[etcd-round_robin]
+disaggregated/test_auto_scaling.py::test_disagg_server_restart[http-round_robin]
 
 # llm-api promote pytorch to default
 llmapi/test_llm_api_qa.py::TestLlmDefaultBackend::test_llm_args_logging
