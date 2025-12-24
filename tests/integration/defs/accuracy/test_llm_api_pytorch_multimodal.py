@@ -267,7 +267,9 @@ class TestQwen3VL_MOE(LlmapiAccuracyTestHarness):
 
 class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "mistral/Mistral-Large-3-675B"
-    MODEL_PATH = f"{llm_models_root()}/Mistral-Large-3-675B/Mistral-Large-3-675B-Instruct-2512-NVFP4/"
+    MODEL_PATH = (
+        f"{llm_models_root()}/Mistral-Large-3-675B/Mistral-Large-3-675B-Instruct-2512-NVFP4/"
+    )
     MAX_NUM_TOKENS = 16384
 
     sampling_params = SamplingParams(
