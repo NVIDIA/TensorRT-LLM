@@ -14,6 +14,7 @@ triton_server/test_triton_llm.py::test_llama_v2_7b_ifb[test_basic-False-1---Fals
 triton_server/test_triton_llm.py::test_llama_v2_7b_ifb[test_basic-False-1---False-True-False-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap--guaranteed_no_evict---1-1-1-True-tensorrt_llm_bls]
 triton_server/test_triton_llm.py::test_llama_v2_7b_ifb[test_basic-False-1---False-True-False-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap--guaranteed_no_evict---1-1-1-False-ensemble]
 triton_server/test_triton_llm.py::test_llama_v2_7b_ifb[test_basic-False-1---False-True-False-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap--guaranteed_no_evict---1-1-1-False-tensorrt_llm_bls]
+triton_server/test_triton_llm.py::test_llama_v2_7b_ifb[test_basic-False-1---False-True-False-0-128-disableDecoupleMode-inflight_fused_batching-enableTrtOverlap--guaranteed_no_evict---1-1-1-True-ensemble]
 triton_server/test_triton_llm.py::test_llama_v2_7b_ifb[batched_inputs-False-1---False-True-False-0-128-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap--max_utilization---1-1-1-True-ensemble]
 triton_server/test_triton_llm.py::test_llama_v2_7b_ifb[batched_inputs-False-1---False-True-False-0-128-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap--max_utilization---1-1-1-True-tensorrt_llm_bls]
 triton_server/test_triton_llm.py::test_llama_v2_7b_ifb[batched_inputs-False-1---False-True-False-0-128-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap--max_utilization---1-1-1-False-ensemble]
