@@ -357,7 +357,7 @@ class PyExecutor:
                         self.kv_connector_manager.layer_pre_hook)
                     module.register_forward_hook(
                         self.kv_connector_manager.layer_post_hook)
-            
+
             self.kv_connector_manager.wait_for_initialization()
 
     def _event_loop_wrapper(self):
@@ -1349,10 +1349,10 @@ class PyExecutor:
                 finished_requests = []
 
                 can_queue = self._can_queue(scheduled_batch)
-                
+
                 if self.kv_connector_manager:
                     self.kv_connector_manager.handle_metadata()
-                
+
                 if can_queue:
                     if self.kv_cache_transceiver:
                         # For generation requests which have completed KV cache transfer
@@ -1585,7 +1585,7 @@ class PyExecutor:
 
                 if self.kv_connector_manager:
                     self.kv_connector_manager.handle_metadata()
-                    
+
                 can_queue = self._can_queue(scheduled_batch)
                 if can_queue:
                     if self.kv_cache_transceiver:
@@ -2642,7 +2642,7 @@ class PyExecutor:
                                  self.ctx_in_transmission_counter))
                     else:
                         requests_to_terminate.append(request)
-                
+
                 if self.kv_connector_manager is not None:
                     self.resource_manager.free_slot_only(request)
             else:
