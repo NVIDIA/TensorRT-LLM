@@ -250,7 +250,7 @@ class RequestGroupKey(Generic[GenericStrategyKeyType]):
         return iter((self.strategy_key, self.needs_probs))
 
     def __len__(self):
-        return 3
+        return 2
 
 
 @dataclass(kw_only=True, frozen=True)
