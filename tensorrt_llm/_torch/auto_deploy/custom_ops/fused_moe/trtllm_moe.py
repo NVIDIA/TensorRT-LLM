@@ -107,47 +107,42 @@ def trtllm_quant_fp8_moe_fused(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
-    w1_weight: torch.Tensor,  # [E, I, H] stacked FP8 weights
-    w2_weight: torch.Tensor,  # [E, H, I] stacked FP8 weights
-    w3_weight: torch.Tensor,  # [E, I, H] for gated_mlp, unused for mlp
-    w1_input_scale: torch.Tensor,  # [E] stacked input scales
-    w2_input_scale: torch.Tensor,  # [E] stacked input scales
-    w3_input_scale: torch.Tensor,  # [E] or unused
-    w1_weight_scale: torch.Tensor,  # [E] stacked weight scales
-    w2_weight_scale: torch.Tensor,  # [E] stacked weight scales
-    w3_weight_scale: torch.Tensor,  # [E] or unused
-    gemm1_dequant: torch.Tensor,  # [E]
-    gemm2_act_quant: torch.Tensor,  # [E]
-    gemm2_dequant: torch.Tensor,  # [E]
+    fc1_expert_weights: torch.Tensor,
+    fc2_expert_weights: torch.Tensor,
+    fc1_act_scale: torch.Tensor,
+    fc1_dequant_scale: torch.Tensor,
+    fc2_act_scale_reciprocal: torch.Tensor,
+    fc2_dequant_scale: torch.Tensor,
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
 ) -> torch.Tensor:
-    """
-    TensorRT-LLM Cutlass FP8 W8A8 MoE for gated and non-gated MLP.
+    """TensorRT-LLM Cutlass FP8 (W8A8) MoE for gated and non-gated MLP.
+
+    Computes (per expert):
+        For gated_mlp:
+            y = (act(x @ w1.T) * (x @ w3.T)) @ w2.T  # act := SiLU
+        For mlp:
+            y = act(x @ w1.T) @ w2.T                 # act := ReLU^2
+    Notes:
+        - FC1 implements: fc1_output = (act(x @ w1.T) * (x @ w3.T)) or fc1_output = act(x @ w1.T)
+        - FC2 implements: fc2_output = fc1_output @ w2.T
+        - FC1 weights are concatenated w3 and w1 if gated_mlp, otherwise w1
+
     Parameters:
         x: BF16/FP16 input tensor of shape (B, H) or (B, S, H)
         selected_experts: Expert indices (B*S, TOP_K)
         routing_weights: Routing weights (B*S, TOP_K)
-        w1_weight: FP8 w1 weights [E, I, H]
-        w2_weight: FP8 w2 weights [E, H, I]
-        w3_weight: FP8 w3 weights [E, I, H] (for gated_mlp)
-        w1_input_scale: Input scales for w1 [E]
-        w2_input_scale: Input scales for w2 [E]
-        w3_input_scale: Input scales for w3 [E]
-        w1_weight_scale: Weight scales for w1 [E]
-        w2_weight_scale: Weight scales for w2 [E]
-        w3_weight_scale: Weight scales for w3 [E]
-        gemm1_dequant: Precomputed gemm1 dequant scale [E]
-        gemm2_act_quant: Precomputed gemm2 act quant scale [1]
-        gemm2_dequant: Precomputed gemm2 dequant scale [E]
+        fc1_expert_weights: FC1 weights [E, 2*I, H] for gated_mlp, [E, I, H] for mlp
+        fc2_expert_weights: FC2 weights [E, H, I]
+        fc1_act_scale: FC1 activation scale [E]
+        fc1_dequant_scale: FC1 dequant scale [E]
+        fc2_act_scale_reciprocal: FC2 activation scale reciprocal [E]
+        fc2_dequant_scale: FC2 dequant scale [E]
         is_gated_mlp: True for gated_mlp, False for mlp
         act_fn: ActivationType.Silu for gated_mlp, ActivationType.Relu2 for mlp
 
-    Non-Gated MLP:
-        activation_fn(expert_inputs @ w1_expert.t())@ w2_expert.t()
-
-    Gated MLP:
-        activation_fn(expert_inputs @ w1_expert.t()) * (expert_inputs @ w3_expert.t()) @ w2_expert.t()
+    Returns:
+        Output tensor of shape (B, H) or (B, S, H)
     """
 
     _validate_mlp_style_and_act_fn(is_gated_mlp, act_fn)
@@ -155,24 +150,24 @@ def trtllm_quant_fp8_moe_fused(
     # Store original shape and flatten to 2D
     x_shape = x.shape
     x2d = x.view(-1, x_shape[-1])
-    # Quantize input
-    x_q_fp8 = _quantize_fp8(x2d, w1_input_scale[0])
+    # Quantize the input
+    x_q_fp8 = _quantize_fp8(x2d, fc1_act_scale[0])
 
     # Scales are stored in float32
-    w1_input_scale = w1_input_scale[0]
+    w1_input_scale = fc1_act_scale[0]
 
-    # Prepare quant_scales for TensorRT-LLM FP8 format:
-    # [gemm1_dequant_scale, gemm2_act_quant_scale, gemm2_dequant_scale, gemm1_input_dequant_scale]
+    # Prepare quant_scales for TensorRT-LLM (Cutlass) FP8 format:
+    # [fc1_dequant_scale, fc2_act_scale_reciprocal, fc2_dequant_scale, gemm1_input_dequant_scale]
     # For gated MLP:
     # These are precomputed in `fused_moe` transform
-    # - gemm1_dequant_scale: w1_weight_scale * w1_input_scale (combined for w1 and w3)
-    # - gemm2_act_quant_scale: 1 / w2_input_scale
-    # - gemm2_dequant_scale: w2_weight_scale * w2_input_scale
-    # - gemm1_input_dequant_scale: w1_input_scale
+    # - fc1_dequant_scale: w1_weight_scale * w1_input_scale (combined for w1 and w3)
+    # - fc2_act_scale_reciprocal: 1 / w2_input_scale
+    # - fc1_dequant_scale: w2_weight_scale * w2_input_scale
+    # - fc1_act_scale: w1_input_scale
 
-    assert gemm1_dequant.ndim == 1, "gemm1_dequant must be 1D"
-    assert gemm2_dequant.ndim == 1, "gemm2_dequant must be 1D"
-    quant_scales = [gemm1_dequant, gemm2_act_quant, gemm2_dequant, w1_input_scale]
+    assert fc1_dequant_scale.ndim == 1, "fc1_dequant_scale must be 1D"
+    assert fc2_dequant_scale.ndim == 1, "fc2_dequant_scale must be 1D"
+    quant_scales = [fc1_dequant_scale, fc2_act_scale_reciprocal, fc2_dequant_scale, w1_input_scale]
 
     # Ensure contiguous tensors
     selected_experts = selected_experts.int().contiguous()
@@ -182,11 +177,9 @@ def trtllm_quant_fp8_moe_fused(
 
     # Determine activation type
     activation_type = ActivationType.Swiglu
+
     if is_gated_mlp:
         # Gated MLP uses Silu: silu(x @ w1.T) * (x @ w3.T)
-        # For gated MLP, concatenate w1 and w3 as [w3, w1]
-        w3_w1_stacked = torch.cat([w3_weight, w1_weight], dim=1).contiguous()  # [E, 2*I, H]
-        fc1_expert_weights = w3_w1_stacked
         if act_fn in [ActivationType.Silu, ActivationType.Swiglu]:
             activation_type = ActivationType.Swiglu
         else:
@@ -195,7 +188,6 @@ def trtllm_quant_fp8_moe_fused(
             )
     else:
         # For non-gated MLP with ReLU^2
-        fc1_expert_weights = w1_weight.contiguous()
         if act_fn == ActivationType.Relu2:
             activation_type = ActivationType.Relu2
         else:
@@ -210,7 +202,7 @@ def trtllm_quant_fp8_moe_fused(
         routing_weights,
         fc1_expert_weights=fc1_expert_weights,
         fc1_expert_biases=None,
-        fc2_expert_weights=w2_weight.contiguous(),
+        fc2_expert_weights=fc2_expert_weights.contiguous(),
         fc2_expert_biases=None,
         output_dtype=x.dtype,
         quant_scales=quant_scales,
@@ -226,20 +218,14 @@ def trtllm_quant_fp8_moe_fused_fake(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
-    w1_weight: torch.Tensor,
-    w2_weight: torch.Tensor,
-    w3_weight: torch.Tensor,
-    w1_input_scale: torch.Tensor,
-    w2_input_scale: torch.Tensor,
-    w3_input_scale: torch.Tensor,
-    w1_weight_scale: torch.Tensor,
-    w2_weight_scale: torch.Tensor,
-    w3_weight_scale: torch.Tensor,
-    gemm1_dequant: torch.Tensor,
-    gemm2_act_quant: torch.Tensor,
-    gemm2_dequant: torch.Tensor,
-    is_gated_mlp: bool,
-    act_fn: int,
+    fc1_expert_weights: torch.Tensor,
+    fc2_expert_weights: torch.Tensor,
+    fc1_act_scale: torch.Tensor,
+    fc1_dequant_scale: torch.Tensor,
+    fc2_act_scale_reciprocal: torch.Tensor,
+    fc2_dequant_scale: torch.Tensor,
+    is_gated_mlp: bool = True,
+    act_fn: int = int(ActivationType.Silu),
 ) -> torch.Tensor:
     _validate_mlp_style_and_act_fn(is_gated_mlp, act_fn)
     return torch.empty_like(x)
