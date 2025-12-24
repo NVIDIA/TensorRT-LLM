@@ -737,10 +737,12 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         else:
             self.max_gen_seq_len = 0
 
-        # Because the fp8_paged_mqa_logits only supports seq_len == 1/2/4 on sm100, and
-        # seq_len == 1/2 on sm90, for other cases, we need to flatten the q tensor and
+        # Because the fp8_paged_mqa_logits only supports seq_len == 1/2/4 (i.e., max_draft_tokens == 0/1/3) on sm100, and
+        # seq_len == 1/2 (i.e., max_draft_tokens == 0/1) on sm90, for other cases, we need to flatten the q tensor and
         # expand the kv_lens and block_table for MTP support.
-        # TODO: remove this once fp8_paged_mqa_logits supports an arbitrary number of MTP draft tokens.
+        # TODO:
+        # - No distinction between sm90 and sm100 is needed once MTP3 is supported on sm90.
+        # - Remove this once fp8_paged_mqa_logits supports an arbitrary number of MTP draft tokens.
         self.use_expanded_buffers_for_mtp = (
             (self.max_draft_tokens > 1 and get_sm_version() == 90)
             or ((self.max_draft_tokens == 2 or self.max_draft_tokens > 3)
