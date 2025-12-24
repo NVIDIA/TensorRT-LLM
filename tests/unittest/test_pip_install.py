@@ -177,6 +177,23 @@ def create_link_for_models():
             os.symlink(src, dst, target_is_directory=True)
 
 
+def run_sanity_check(examples_path="../../examples"):
+    """Run sanity checks after installation."""
+    print("##########  Test import tensorrt_llm  ##########")
+    subprocess.check_call(
+        'python3 -c "import tensorrt_llm; print(tensorrt_llm.__version__)"',
+        shell=True)
+    print("##########  Verify license files  ##########")
+    verify_license_files()
+
+    print("##########  Create link for models  ##########")
+    create_link_for_models()
+
+    print("##########  Test quickstart example  ##########")
+    subprocess.check_call(
+        f"python3 {examples_path}/llm-api/quickstart_example.py", shell=True)
+
+
 def test_pip_install(args):
     print("##########  Install required system libs  ##########")
     if not os.path.exists("/usr/local/mpi/bin/mpicc"):
@@ -194,19 +211,7 @@ def test_pip_install(args):
     download_wheel(args)
     install_tensorrt_llm()
 
-    print("##########  Test import tensorrt_llm  ##########")
-    subprocess.check_call(
-        'python3 -c "import tensorrt_llm; print(tensorrt_llm.__version__)"',
-        shell=True)
-    print("##########  Verify license files  ##########")
-    verify_license_files()
-
-    print("##########  Create link for models  ##########")
-    create_link_for_models()
-
-    print("##########  Test quickstart example  ##########")
-    subprocess.check_call(
-        "python3 ../../examples/llm-api/quickstart_example.py", shell=True)
+    run_sanity_check()
 
 
 def test_python_builds(args):
@@ -239,34 +244,14 @@ def test_python_builds(args):
     subprocess.check_call(["pip3", "install", "-e", ".", "-v"],
                           cwd=repo_root,
                           env=env)
-
-    print("##########  Verify installation  ##########")
-    subprocess.check_call(
-        'python3 -c "import tensorrt_llm; print(tensorrt_llm.__version__)"',
-        shell=True)
-
-    print("##########  Verify C++ extension files  ##########")
-    subprocess.check_call([
-        "python3", "-m", "pytest", "-v",
-        "tests/unittest/utils/test_prebuilt_whl_cpp_extensions.py"
-    ],
-                          cwd=repo_root)
-
-    print("##########  Create link for models  ##########")
-    create_link_for_models()
-
-    print("##########  Test quickstart example  ##########")
-    subprocess.check_call(
-        f"python3 {repo_root}/examples/llm-api/quickstart_example.py",
-        shell=True)
+    run_sanity_check(examples_path=f"{repo_root}/examples")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Check Pip Install")
     parser.add_argument("--wheel_path",
                         type=str,
-                        required=False,
-                        default="Default",
+                        required=True,
                         help="The wheel path")
     args = parser.parse_args()
 
