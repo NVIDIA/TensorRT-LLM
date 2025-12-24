@@ -42,6 +42,18 @@ namespace kernels
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Check if two SM values are family/specific versions of the same architecture
+// Returns true only if one is a family version and the other is a compatible specific version
+constexpr bool isFamilySpecificSMPair(int sm1, int sm2)
+{
+    if ((sm1 == kSM_100f && (sm2 == kSM_100 || sm2 == kSM_103))
+        || (sm2 == kSM_100f && (sm1 == kSM_100 || sm1 == kSM_103)))
+    {
+        return true;
+    }
+    return false;
+}
+
 constexpr bool isSMCompatible(int gpuSM, int kernelSM)
 {
     if (gpuSM == kSM_103)
@@ -107,16 +119,31 @@ public:
                         CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, kernelMeta.mSharedMemBytes));
                 }
                 // Make sure the hashIds are not duplicated.
-                TLLM_CHECK_WITH_INFO(mFunctions.find(hashID(kernelMeta)) == mFunctions.end(),
-                    "The kernel's hashId has conflicts with others.");
-                mFunctions.insert(std::make_pair(hashID(kernelMeta), funcInfo));
+                // Except for the case where we have both family version and specific version of the same config.
+                auto const hash = hashID(kernelMeta);
+                auto it = mFunctions.find(hash);
+                if (it != mFunctions.end())
+                {
+                    auto const& existingKernelMeta = mKernelMeta[it->second.mMetaInfoIndex];
+                    TLLM_CHECK_WITH_INFO(isFamilySpecificSMPair(existingKernelMeta.mSM, kernelMeta.mSM),
+                        "The kernel's hashId has conflicts with others.");
+                    // Prefer specific SM version over family version
+                    if (existingKernelMeta.mSM == kSM_100f)
+                    {
+                        it->second = funcInfo;
+                    }
+                }
+                else
+                {
+                    mFunctions[hash] = funcInfo;
+                }
             }
         }
     }
 
     inline uint64_t hashID(int qkvLayout, int maskType, int kernelType, int scheduler, int multiCtasKvMode,
         int headDimPerCtaV, int headDimQk, int headDimV, int tileSizeKv, int numTokensPerPage,
-        int maxNumHeadsQPerKvInCta, bool reuseSmemKForV, bool uses2CtaMma, bool sparseMla) const
+        int maxNumHeadsQPerKvInCta, bool reuseSmemKForV, bool uses2CtaMma, bool sparseMla, bool skipsSoftmax) const
     {
         TLLM_CHECK_WITH_INFO((headDimPerCtaV >= 32) && (headDimQk >= 32) && (headDimV >= 32) && (headDimPerCtaV <= 1024)
                 && (headDimQk <= 1024) && (headDimV <= 1024),
@@ -143,13 +170,15 @@ public:
         // Bit 57 - 57: reuseSmemKForV.
         // Bit 58 - 58: uses2CtaMma.
         // Bit 59 - 59: sparseMla.
+        // Bit 60 - 60: skipsSoftmax.
         return (static_cast<uint64_t>(qkvLayout) << 0) | (static_cast<uint64_t>(maskType) << 4)
             | (static_cast<uint64_t>(kernelType) << 8) | (static_cast<uint64_t>(scheduler) << 12)
             | (static_cast<uint64_t>(multiCtasKvMode) << 16) | (static_cast<uint64_t>(headDimPerCtaV >> 3) << 18)
             | (static_cast<uint64_t>(headDimQk >> 3) << 26) | (static_cast<uint64_t>(headDimV >> 3) << 34)
             | (static_cast<uint64_t>(tileSizeKv >> 6) << 42) | (static_cast<uint64_t>(log2(numTokensPerPage)) << 44)
             | (static_cast<uint64_t>(maxNumHeadsQPerKvInCta) << 49) | (static_cast<uint64_t>(reuseSmemKForV) << 57)
-            | (static_cast<uint64_t>(uses2CtaMma) << 58) | (static_cast<uint64_t>(sparseMla) << 59);
+            | (static_cast<uint64_t>(uses2CtaMma) << 58) | (static_cast<uint64_t>(sparseMla) << 59)
+            | (static_cast<uint64_t>(skipsSoftmax) << 60);
     }
 
     uint64_t hashID(KernelMeta const& kernelMeta) const
@@ -157,7 +186,8 @@ public:
         return hashID(kernelMeta.mQkvLayout, kernelMeta.mMaskType, kernelMeta.mKernelType, kernelMeta.mTileScheduler,
             kernelMeta.mMultiCtasKvMode, kernelMeta.mHeadDimPerCtaV, kernelMeta.mHeadDimQk, kernelMeta.mHeadDimV,
             kernelMeta.mTileSizeKv, kernelMeta.mNumTokensPerPage, kernelMeta.mMaxNumHeadsQPerKvInCta,
-            kernelMeta.mReuseSmemKForV, kernelMeta.m2CtaMma, kernelMeta.mSparseMla);
+            kernelMeta.mReuseSmemKForV, kernelMeta.m2CtaMma, kernelMeta.mSparseMla,
+            kernelMeta.mSkipsSoftmaxWhenPossible);
     }
 
     std::pair<bool, std::string> checkIfKernelExist(RunnerParams const& params) const
@@ -409,6 +439,21 @@ private:
                 selectKernelParams.mSelectNewKernel = true;
             }
 
+            // Disable skipsSoftmax when the sequence length per CTA is less than 1K or the data type is E4M3.
+            if (selectKernelParams.mSkipsSoftmaxWhenPossible && !isContextKernel(selectKernelParams.mKernelType))
+            {
+                // Compute the sequence length per CTA.
+                int const seqLenPerCta = (params.mMaxSeqLenKv + numCtasPerSeqKv - 1) / numCtasPerSeqKv;
+
+                if (seqLenPerCta < 1024)
+                {
+                    // Disable skipsSoftmax.
+                    selectKernelParams.mSkipsSoftmaxWhenPossible = false;
+                    // Need to select a different kernel.
+                    selectKernelParams.mSelectNewKernel = true;
+                }
+            }
+
             // Add the debug info when multiCtasKvMode is enabled.
             if (numCtasPerSeqKv > 1)
             {
@@ -606,6 +651,9 @@ private:
             numTokensPerPage = 0;
         }
 
+        // The skip softmax.
+        selectKernelParams.mSkipsSoftmaxWhenPossible = params.mSkipSoftmaxThresholdScaleFactor != 0.0f;
+
         // Debug info.
         std::string info = "dtypeQ=" + std::to_string(static_cast<int>(mDtypeQ)) + ", dtypeKv="
             + std::to_string(static_cast<int>(mDtypeKv)) + ", dtypeOut=" + std::to_string(static_cast<int>(mDtypeOut))
@@ -619,7 +667,9 @@ private:
             + ", tileSizeKv=" + std::to_string(selectKernelParams.mTileSizeKv) + ", numTokensPerPage="
             + std::to_string(numTokensPerPage) + ", maxNumHeadsQPerKvInCta=" + std::to_string(maxNumHeadsQPerKvInCta)
             + ", reuseSmemKForV=" + std::to_string(selectKernelParams.mReuseSmemKForV) + ", uses2CtaMma="
-            + std::to_string(selectKernelParams.mUses2CtaMma) + ", sparseMla=" + std::to_string(params.mSparseMla);
+            + std::to_string(selectKernelParams.mUses2CtaMma) + ", sparseMla=" + std::to_string(params.mSparseMla)
+            + ", skipsSoftmax=" + std::to_string(selectKernelParams.mSkipsSoftmaxWhenPossible);
+
         TLLM_LOG_DEBUG("Searching for kernel traits: " + info);
 
         return std::make_pair(
@@ -628,7 +678,7 @@ private:
                 static_cast<int>(selectKernelParams.mMultiCtasKvMode), selectKernelParams.mHeadDimPerCtaV,
                 params.mHeadDimQk, params.mHeadDimV, selectKernelParams.mTileSizeKv, numTokensPerPage,
                 maxNumHeadsQPerKvInCta, selectKernelParams.mReuseSmemKForV, selectKernelParams.mUses2CtaMma,
-                params.mSparseMla),
+                params.mSparseMla, selectKernelParams.mSkipsSoftmaxWhenPossible),
             info);
     }
 
@@ -703,8 +753,8 @@ inline TllmGenFmhaKernel const* getTllmFmhaKernels(
 {
 
 #if !defined(EXCLUDE_SM_100) || !defined(EXCLUDE_SM_103)
-    return TllmFmhaKernelFactory::Get().getKernels(
-        sTllmGenFmhaKernelMetaInfos, sTllmGenFmhaKernelMetaInfosSize, dtypeQ, dtypeKv, dtypeOut, sm);
+    return TllmFmhaKernelFactory::Get().getKernels(sTllmGenFmhaKernelMetaInfos,
+        sizeof(sTllmGenFmhaKernelMetaInfos) / sizeof(sTllmGenFmhaKernelMetaInfos[0]), dtypeQ, dtypeKv, dtypeOut, sm);
 #else
     return nullptr;
 #endif // EXCLUDE_SM_100

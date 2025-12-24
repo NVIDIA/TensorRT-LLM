@@ -1,6 +1,5 @@
 import copy
 import dataclasses
-import os
 from typing import Any, Dict, List, Tuple
 
 import torch
@@ -20,7 +19,8 @@ from tensorrt_llm._torch.models.checkpoints.mistral.weight_mapper import \
 from tensorrt_llm._torch.models.modeling_mistral_large3 import (
     Mistral3Gate, MistralLarge3ForCausalLM)
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (
-    find_input_mm_embeds, fuse_input_embeds, get_multimodal_embeddings)
+    _MULTIMODAL_ENV_NAME, _is_disagg, find_input_mm_embeds, fuse_input_embeds,
+    get_multimodal_embeddings)
 from tensorrt_llm._torch.models.modeling_utils import (DecoderModel,
                                                        DecoderModelForCausalLM,
                                                        _load_weights_impl,
@@ -44,13 +44,6 @@ from tensorrt_llm.inputs import (BaseMultimodalDummyInputsBuilder,
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.logger import logger
-
-_MULTIMODAL_ENV_NAME = "TLLM_MULTIMODAL_DISAGGREGATED"
-
-
-# Make this a runtime lookup rather than a module-wide constant for easier unit testing.
-def _is_disagg() -> bool:
-    return os.getenv(_MULTIMODAL_ENV_NAME, "0") == "1"
 
 
 class MistralAttention(Attention):
@@ -373,6 +366,7 @@ class Mistral3VLM(PreTrainedModel):
             )
 
         config = model_config.pretrained_config
+        self._supports_sdpa = True
         super().__init__(config)
 
         vision_feature_layer = getattr(config, "vision_feature_layer", -1)
@@ -457,6 +451,18 @@ class Mistral3VLM(PreTrainedModel):
         logger.debug(
             f"Successfully loaded weights for {type(self._multi_modal_projector)}"
         )
+
+    @property
+    def draft_config(self):
+        return self.llm.draft_config
+
+    @property
+    def draft_model(self):
+        return self.llm.draft_model
+
+    @property
+    def load_draft_weights(self):
+        return self.llm.load_draft_weights
 
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()

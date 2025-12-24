@@ -42,6 +42,7 @@ l0_dgx_h100:
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[True-False-True]
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[True-True-False]
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[True-True-True]
+  - unittest/llmapi/apps/test_disagg_serving_perf_metrics.py
   # ------------- AutoDeploy tests ---------------
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[False-2]
   # llmapi
@@ -230,6 +231,7 @@ l0_dgx_h100:
   - cpp/test_multi_gpu.py::test_cache_transceiver[2proc-ucx_kvcache-90] ISOLATION
   - cpp/test_multi_gpu.py::test_cache_transceiver[8proc-nixl_kvcache-90] ISOLATION
   - cpp/test_multi_gpu.py::test_cache_transceiver[8proc-ucx_kvcache-90] ISOLATION
+  - cpp/test_multi_gpu.py::test_cache_transceiver[8proc-mooncake_kvcache-90] ISOLATION
   - cpp/test_multi_gpu.py::test_user_buffer[2proc-90]
   - cpp/test_multi_gpu.py::test_enc_dec[t5-90]
   - cpp/test_multi_gpu.py::test_llama_executor[llama-orchestrator-90]
