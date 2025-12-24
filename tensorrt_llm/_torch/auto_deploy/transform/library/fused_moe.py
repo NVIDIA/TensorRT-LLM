@@ -1305,7 +1305,7 @@ def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "
             "w1_weight_scale",
             "w2_weight_scale",
             "w3_weight_scale",
-            "mlp_style",
+            "is_gated_mlp",
         )
 
     def _stack(param_list, dim=0):
@@ -1314,7 +1314,7 @@ def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "
         ).contiguous()
 
     def _prepare_args_cutlass_format():
-        if mlp_style == "gated_mlp":
+        if is_gated_mlp:
             # For gated MLP, concatenate w1 and w3 as [w3, w1]
             fc1_expert_weights = torch.cat(
                 [w3_stacked, w1_stacked], dim=1
@@ -1322,11 +1322,9 @@ def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "
             fc1_act_scale = torch.cat(
                 [w3_input_scale_stacked, w1_input_scale_stacked], dim=1
             ).contiguous()
-        elif mlp_style == "mlp":
+        else:
             fc1_expert_weights = w1_stacked
             fc1_act_scale = w1_input_scale_stacked
-        else:
-            raise ValueError(f"Unknown mlp_style '{mlp_style}'. Use 'gated_mlp' or 'mlp'.")
 
         fc2_expert_weights = w2_stacked
 
@@ -1432,7 +1430,7 @@ def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "
             w1_weight_scale,
             w2_weight_scale,
             w3_weight_scale,
-            mlp_style,
+            is_gated_mlp,
         ) = _extract_op_args(node)
 
         # Stack the actual tensor values (fast, like in quantize_moe.py)
