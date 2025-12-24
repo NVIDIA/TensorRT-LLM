@@ -1159,7 +1159,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                        (self.tile_size, 256)]
             cluster_shape_mn_candidates = [(self.tile_size // 128, 1),
                                            (self.tile_size // 128, 2)]
-            raster_along_m_candidates = [True, False]
+            # raster_along_m=False should be theoretically more performant.
+            # TODO: Investigate why sometimes autotuner selects raster_along_m=True.
+            raster_along_m_candidates = [False]
 
             valid_tactics = []
             for mma_tiler_mn, cluster_shape_mn, raster_along_m in itertools.product(
