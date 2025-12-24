@@ -52,6 +52,8 @@ public:
     FastModDivInt32(int32_t divisor)
         : mDivisor(divisor)
     {
+        // Explicitly initialize the unused member variable to avoid compiler warnings.
+        mAdd = 0;
         mShift = ceilLog2(mDivisor) - 1;
         mMultiplier = static_cast<uint32_t>(ceilDiv(uint64_t(1) << (32 + mShift), static_cast<uint64_t>(mDivisor)));
     }
@@ -71,7 +73,7 @@ private:
 private:
     int32_t mDivisor = 1;
     uint32_t mMultiplier = 0;
-    __attribute__((unused)) uint32_t mAdd = 0;
+    uint32_t mAdd = 0;
     int32_t mShift = 0;
 };
 
