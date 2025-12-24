@@ -579,6 +579,7 @@ private:
         return seqLenPerCtaKv <= 1024 && numCtas <= params.mMultiProcessorCount;
     }
 
+    // Selects a heuristic kernel for MLA generation.
     void selectMlaGenerationKernel(RunnerParams const& params, SelectKernelParams& selectKernelParams) const
     {
         // We use the low-latency kernel (SwapsMmaAbForGeneration with tileSizeQ = 16) when any of the following
@@ -730,6 +731,7 @@ private:
         }
     }
 
+    // Selects a heuristic kernel for GQA generation.
     void selectGqGenerationKernel(RunnerParams const& params, SelectKernelParams& selectKernelParams) const
     {
 
@@ -806,6 +808,7 @@ private:
         }
     }
 
+    // Select a kernel based on the heuristic.
     void selectKernel(RunnerParams const& params, SelectKernelParams& selectKernelParams) const
     {
 
