@@ -18,6 +18,7 @@
 #include <pybind11/functional.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <tensorrt_llm/kernels/helixAllToAll.h>
 #include <tensorrt_llm/thop/attentionOp.h>
 #include <tensorrt_llm/thop/moeAlltoAllMeta.h>
 #include <torch/extension.h>
@@ -73,5 +74,10 @@ void initBindings(pybind11::module_& m)
         py::arg("mla_bmm1_scale") = std::nullopt, py::arg("mla_bmm2_scale") = std::nullopt,
         py::arg("quant_q_buffer") = std::nullopt, "Multi-head attention operation",
         py::call_guard<py::gil_scoped_release>());
+
+    m.def(
+        "get_helix_workspace_size_per_rank",
+        [](int cp_size) { return tensorrt_llm::kernels::computeHelixWorkspaceSizePerRank(cp_size); },
+        py::arg("cp_size"), "Get helix all-to-all workspace size per rank in bytes");
 }
 } // namespace tensorrt_llm::pybind::thop
