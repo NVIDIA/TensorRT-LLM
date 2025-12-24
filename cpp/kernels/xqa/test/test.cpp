@@ -225,10 +225,9 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
         seqLen = (16U << 20) / gmemCacheHeadBytes; // 32MB per K+V head.
     }
     ctxLen = std::min(ctxLen, seqLen);
-    float skip_softmax_threshold_scale_factor = skipSoftmaxThresholdScaleFactor;
-    uint32_t skipped_block_count = 0;
-    uint32_t total_block_count = 0;
-    if (skip_softmax_threshold_scale_factor > 0)
+    uint32_t skippedBlockCount = 0;
+    uint32_t totalBlockCount = 0;
+    if (skipSoftmaxThresholdScaleFactor > 0)
     {
         assert(useQGMMA);
     }
@@ -339,10 +338,10 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
     auto const ctxLenList = ManagedMemBuf<uint32_t[beamWidth]>(batchSize);
 #if SKIP_SOFTMAX_ATTN
 #ifdef SKIP_SOFTMAX_ATTN_BLOCK_STATS
-    auto const kernel_skipped_block_count = ManagedMemBuf<uint32_t>(1);
-    auto const kernel_total_block_count = ManagedMemBuf<uint32_t>(1);
-    kernel_skipped_block_count[0] = 0;
-    kernel_total_block_count[0] = 0;
+    auto const kernelSkippedBlockCount = ManagedMemBuf<uint32_t>(1);
+    auto const kernelTotalBlockCount = ManagedMemBuf<uint32_t>(1);
+    kernelSkippedBlockCount[0] = 0;
+    kernelTotalBlockCount[0] = 0;
 #endif
 #else
     EXPECT_EQ(skipSoftmaxThresholdScaleFactor, 0.0f)
@@ -804,7 +803,7 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
 #if SKIP_SOFTMAX_ATTN
             skipSoftmaxThresholdScaleFactor,
 #if SKIP_SOFTMAX_ATTN_BLOCK_STATS
-            kernel_skipped_block_count.get(), kernel_total_block_count.get(),
+            kernelSkippedBlockCount.get(), kernelTotalBlockCount.get(),
 #endif
 #endif
             semaphores.get(), scratch, stream);
@@ -844,8 +843,8 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
     prefetchToDevice(cudaCpuDeviceId);
     checkCuda(cudaStreamSynchronize(stream));
 #if SKIP_SOFTMAX_ATTN && SKIP_SOFTMAX_ATTN_BLOCK_STATS
-    kernel_skipped_block_count[0] /= nbIters;
-    kernel_total_block_count[0] /= nbIters;
+    kernelSkippedBlockCount[0] /= nbIters;
+    kernelTotalBlockCount[0] /= nbIters;
 #endif
     if (testPerf)
     {
@@ -885,7 +884,7 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
         float const dramSolRatio = dramSolTime / ms;
 #if SKIP_SOFTMAX_ATTN && SKIP_SOFTMAX_ATTN_BLOCK_STATS
         size_t const totalNbCacheLoadWithSkip = gmemCacheHeadBytes
-            * (nbKHeads + nbVHeads * (1 - 1.0f * kernel_skipped_block_count[0] / kernel_total_block_count[0]))
+            * (nbKHeads + nbVHeads * (1 - 1.0f * kernelSkippedBlockCount[0] / kernelTotalBlockCount[0]))
             * nbLoadedCacheTokens;
         float const totalTrafficWithSkip
             = totalNbCacheLoadWithSkip + inputBytes + outputBytes; // we ignore page indices and beam search indices.
@@ -907,13 +906,9 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
         float const tops = headGrpSize * qSeqLen * float(seqLen) * (validElemsPerKHead + validElemsPerVHead) * 2
             * nbKHeads * batchSize / (ms * 1E-3F) * 1E-12F;
 #if SKIP_SOFTMAX_ATTN && SKIP_SOFTMAX_ATTN_BLOCK_STATS
-        float const topsWithSkip = headGrpSize * qSeqLen * float(seqLen) * (validElemsPerKHead + validElemsPerVHead) * 2
-            * nbKHeads * batchSize / (ms * 1E-3F) * 1E-12F;
-        printf("kernel skipped_block_count: %d/%d (%.2f%%)\n", kernel_skipped_block_count[0],
-            kernel_total_block_count[0],
-            kernel_total_block_count[0] == 0 ? 0.0f
-                                             : 100.0f * kernel_skipped_block_count[0] / kernel_total_block_count[0]);
-        printf("dramSolRatioWithSkip: %f%% (%f ms, TOPS = %f)\n", dramSolRatioWithSkip * 100, ms, topsWithSkip);
+        printf("kernel skippedBlockCount: %d/%d (%.2f%%)\n", kernelSkippedBlockCount[0], kernelTotalBlockCount[0],
+            kernelTotalBlockCount[0] == 0 ? 0.0f : 100.0f * kernelSkippedBlockCount[0] / kernelTotalBlockCount[0]);
+        printf("dramSolRatioWithSkip: %f%% (%f ms, TOPS = %f)\n", dramSolRatioWithSkip * 100, ms, tops);
 #else
         printf("dramSolRatio: %f%% (%f ms, TOPS = %f)\n", dramSolRatio * 100, ms, tops);
 #endif
@@ -1138,8 +1133,7 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
                     {
                         refOutput = refFlashAttention<CacheElem, 64>(&qHeads[req][b][headGrpSize * idxKHead], kCacheSeq,
                             vCacheSeq, seqLen, qScaleForRef, kvCacheScale[0], xScale, slidingWinSize, refAttentionSinks,
-                            skip_softmax_threshold_scale_factor, &skipped_block_count, &total_block_count,
-                            multiBlockNum);
+                            skipSoftmaxThresholdScaleFactor, &skippedBlockCount, &totalBlockCount, multiBlockNum);
                         // refOutput = refAttention<CacheElem>(&qHeads[req][b][headGrpSize * idxKHead], kCacheSeq,
                         // vCacheSeq, seqLen, qScaleForRef, kvCacheScale[0], xScale, slidingWinSize);
                     }
@@ -1187,13 +1181,11 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
             }
         }
 #if SKIP_SOFTMAX_ATTN
-        printf("host skipped_block_count: %d/%d (%.2f%%)\n", skipped_block_count, total_block_count,
-            total_block_count == 0 ? 0.0f : 100.0f * skipped_block_count / total_block_count);
+        printf("host skippedBlockCount: %d/%d (%.2f%%)\n", skippedBlockCount, totalBlockCount,
+            totalBlockCount == 0 ? 0.0f : 100.0f * skippedBlockCount / totalBlockCount);
 #if SKIP_SOFTMAX_ATTN_BLOCK_STATS
-        printf("kernel skipped_block_count: %d/%d (%.2f%%)\n", kernel_skipped_block_count[0],
-            kernel_total_block_count[0],
-            kernel_total_block_count[0] == 0 ? 0.0f
-                                             : 100.0f * kernel_skipped_block_count[0] / kernel_total_block_count[0]);
+        printf("kernel skippedBlockCount: %d/%d (%.2f%%)\n", kernelSkippedBlockCount[0], kernelTotalBlockCount[0],
+            kernelTotalBlockCount[0] == 0 ? 0.0f : 100.0f * kernelSkippedBlockCount[0] / kernelTotalBlockCount[0]);
 #endif
 #endif
         if (saveData)

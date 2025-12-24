@@ -705,7 +705,7 @@ CUBIN_EXPORT __global__
 #if SKIP_SOFTMAX_ATTN
             float const skipSoftmaxThresholdScaleFactor,
 #if SKIP_SOFTMAX_ATTN_BLOCK_STATS
-            uint32_t* __restrict__ skipped_block_count, uint32_t* __restrict__ total_block_count,
+            uint32_t* __restrict__ skippedBlockCount, uint32_t* __restrict__ totalBlockCount,
 #endif
 #endif
             uint32_t* __restrict__ const semaphores
@@ -1083,8 +1083,8 @@ CUBIN_EXPORT __global__
 #if SKIP_SOFTMAX_ATTN && SKIP_SOFTMAX_ATTN_BLOCK_STATS
         if (threadIdx.x == 0 && skipped_block_count != nullptr && total_block_count != nullptr)
         {
-            atomicAdd(skipped_block_count, local_skipped_block_count);
-            atomicAdd(total_block_count, nbIters);
+            atomicAdd(skippedBlockCount, local_skipped_block_count);
+            atomicAdd(totalBlockCount, nbIters);
         }
 #endif
         unused(smem.qBar.consumed.arrive());
@@ -2395,7 +2395,7 @@ __device__ inline void storeGemm0AccToShm(
     uint32_t const idxOctInsideHalf = idxInHalf / 8;
     uint32_t const idxRowInsideOct = lane % 8;
     uint32_t const warpBaseC = 16 * warpRank;
-    auto const toAccCoords = [](uint32_t const idxAccCoreMat) -> std::pair<uint32_t, uint32_t>
+    auto const toAccCoords = [](uint32_t const idxAccCoreMat) -> mha::pair<uint32_t, uint32_t>
     {
         uint32_t const accR = idxAccCoreMat / Gemm0Acc::cols;
         uint32_t const accC = idxAccCoreMat % Gemm0Acc::cols;

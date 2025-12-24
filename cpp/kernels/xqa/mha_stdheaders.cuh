@@ -1272,6 +1272,19 @@ using is_void = is_same<remove_cv_t<T>, void>;
 template <typename T>
 inline constexpr bool is_void_v = is_void<T>::value;
 #endif
+
+#ifndef GENERATE_CUBIN
+template <typename T1, typename T2>
+using pair = std::pair<T1, T2>;
+#else
+template <typename T1, typename T2>
+struct pair
+{
+    T1 first;
+    T2 second;
+};
+#endif
+
 } // namespace mha
 
 #if GENERATE_CUBIN

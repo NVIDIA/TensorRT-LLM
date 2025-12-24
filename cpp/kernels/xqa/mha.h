@@ -134,7 +134,7 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t const nbKHeads,
 #if SKIP_SOFTMAX_ATTN
     float const skipSoftmaxThresholdScaleFactor,
 #if SKIP_SOFTMAX_ATTN_BLOCK_STATS
-    uint32_t* __restrict__ skipped_block_count, uint32_t* __restrict__ total_block_count,
+    uint32_t* __restrict__ skippedBlockCount, uint32_t* __restrict__ totalBlockCount,
 #endif
 #endif
     uint32_t* semaphores, void* scratch, cudaStream_t stream);
@@ -183,7 +183,7 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #if SKIP_SOFTMAX_ATTN
     float const skipSoftmaxThresholdScaleFactor,
 #if SKIP_SOFTMAX_ATTN_BLOCK_STATS
-    uint32_t* __restrict__ skipped_block_count, uint32_t* __restrict__ total_block_count,
+    uint32_t* __restrict__ skippedBlockCount, uint32_t* __restrict__ totalBlockCount,
 #endif
 #endif
     uint32_t* semaphores, void* scratch, cudaStream_t stream);
