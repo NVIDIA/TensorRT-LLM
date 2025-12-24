@@ -434,6 +434,12 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
+        self.host_req_idx_per_token = torch.zeros_like(
+            self.req_idx_per_token,
+            device='cpu',
+            pin_memory=True,
+        )
+
         # Block table for topk_indices conversion (shared for context and generation)
         self.block_table = self.get_empty(
             self.cuda_graph_buffers,
@@ -442,12 +448,22 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
+        self.host_block_table = torch.zeros_like(
+            self.block_table,
+            device='cpu',
+            pin_memory=True,
+        )
         self.scheduler_metadata_buffer = self.get_empty(
             self.cuda_graph_buffers,
             (self.num_sms + 1, 2),
             cache_name="scheduler_metadata_buffer",
             dtype=torch.int32,
             capture_graph=capture_graph,
+        )
+        self.host_scheduler_metadata_buffer = torch.zeros_like(
+            self.scheduler_metadata_buffer,
+            device='cpu',
+            pin_memory=True,
         )
         self.cu_seqlen_ks = self.get_empty(
             self.cuda_graph_buffers,
@@ -456,12 +472,22 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
+        self.host_cu_seqlen_ks = torch.zeros_like(
+            self.cu_seqlen_ks,
+            device='cpu',
+            pin_memory=True,
+        )
         self.cu_seqlen_ke = self.get_empty(
             self.cuda_graph_buffers,
             (self.max_num_tokens, ),
             cache_name="cu_seqlen_ke",
             dtype=torch.int32,
             capture_graph=capture_graph,
+        )
+        self.host_cu_seqlen_ke = torch.zeros_like(
+            self.cu_seqlen_ke,
+            device='cpu',
+            pin_memory=True,
         )
         # Topk indices buffer to support skip indexer for requests with short sequence lengths
         if self.enable_indexer_skip:
@@ -516,6 +542,11 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
+        self.host_scheduler_metadata_buffer_expanded = torch.zeros_like(
+            self.scheduler_metadata_buffer_expanded,
+            device='cpu',
+            pin_memory=True,
+        )
         # The fp8_paged_mqa_logits kernel needs different layout of the metadata buffer for MTP=3.
         if self.max_draft_tokens == 3:
             self.scheduler_metadata_buffer_mtp3 = self.get_empty(
@@ -524,6 +555,11 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 cache_name="scheduler_metadata_buffer_mtp3",
                 dtype=torch.int32,
                 capture_graph=capture_graph,
+            )
+            self.host_scheduler_metadata_buffer_mtp3 = torch.zeros_like(
+                self.scheduler_metadata_buffer_mtp3,
+                device='cpu',
+                pin_memory=True,
             )
 
     # This function is only used to create the expanded buffers when the max_draft_tokens is changed.
@@ -650,37 +686,34 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 self.request_ids)
             for i in range(len(block_ids)):
                 self.host_indexer_k_cache_block_offsets[
-                    i, :len(block_ids[i])].copy_(
-                        torch.tensor(block_ids[i],
-                                     dtype=torch.int32,
-                                     device='cpu'))
+                    i, :len(block_ids[i])] = torch.tensor(block_ids[i],
+                                                          dtype=torch.int32,
+                                                          device='cpu')
             self.indexer_k_cache_block_offsets[:self.num_seqs].copy_(
                 self.host_indexer_k_cache_block_offsets[:self.num_seqs],
                 non_blocking=True)
 
         # Build req_idx_per_token for topk_indices conversion
-        host_req_idx_per_token = torch.repeat_interleave(torch.arange(
-            self.num_seqs, dtype=torch.int32),
-                                                         self.seq_lens,
-                                                         dim=0)
-        self.req_idx_per_token[:self.num_tokens].copy_(host_req_idx_per_token,
-                                                       non_blocking=True)
+        self.host_req_idx_per_token[:self.num_tokens] = torch.repeat_interleave(
+            torch.arange(self.num_seqs, dtype=torch.int32),
+            self.seq_lens,
+            dim=0)
+        self.req_idx_per_token[:self.num_tokens].copy_(
+            self.host_req_idx_per_token[:self.num_tokens], non_blocking=True)
 
         # Build block_table for topk_indices conversion (actual block allocation)
         block_ids_all = self.kv_cache_manager.get_batch_cache_indices(
             self.request_ids[:self.num_seqs])
-        max_blocks_used = max(len(b)
-                              for b in block_ids_all) if block_ids_all else 1
-        host_block_table = torch.full((self.num_seqs, max_blocks_used),
-                                      -1,
-                                      dtype=torch.int32)
-        for i, blocks in enumerate(block_ids_all):
-            if len(blocks) > 0:
-                host_block_table[i, :len(blocks)] = torch.tensor(
-                    blocks, dtype=torch.int32)
+        block_ids_all_tensors = [
+            torch.tensor(sublist, dtype=torch.int) for sublist in block_ids_all
+        ]
+        block_ids_all_padded = torch.nn.utils.rnn.pad_sequence(
+            block_ids_all_tensors, batch_first=True,
+            padding_value=-1).pin_memory()
         # Copy to GPU
-        self.block_table[:self.num_seqs, :max_blocks_used].copy_(
-            host_block_table, non_blocking=True)
+        num_blocks = block_ids_all_padded.shape[1]
+        self.block_table[:self.num_seqs, :num_blocks].copy_(
+            block_ids_all_padded, non_blocking=True)
 
         # For mla_rope_append_paged_kv_assign_q
         if self.num_contexts > 0:
@@ -756,7 +789,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                                                dim=0)
             gen_kv_lens_expanded = gen_kv_lens_expanded.transpose(
                 0, 1).contiguous().flatten()
-            self.kv_lens_expanded_host[:num_tokens].copy_(gen_kv_lens_expanded)
+            self.kv_lens_expanded_host[:num_tokens] = gen_kv_lens_expanded
             self.kv_lens_expanded_cuda[:num_tokens].copy_(
                 self.kv_lens_expanded_host[:num_tokens], non_blocking=True)
 
@@ -772,8 +805,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                         self.num_contexts:self.num_seqs, :max_len]
                     expanded_blocks = gen_block_tensor.repeat_interleave(
                         1 + self.max_draft_tokens, dim=0)
-                    self.host_block_table_expanded[:num_tokens, :max_len].copy_(
-                        expanded_blocks, non_blocking=True)
+                    self.host_block_table_expanded[:num_tokens, :
+                                                   max_len] = expanded_blocks
                     self.block_table_expanded[:num_tokens].copy_(
                         self.host_block_table_expanded[:num_tokens],
                         non_blocking=True)
@@ -798,11 +831,11 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 dim=0,
                 dtype=torch.int64,
                 out=self.gen_cached_token_indptr[1:self.num_generations + 1])
-            scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
+            self.host_scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
                 self.kv_lens_cuda[self.num_contexts:self.num_seqs],
                 tokens_per_block, self.num_sms)
-            self.scheduler_metadata_buffer.copy_(scheduler_metadata_buffer,
-                                                 non_blocking=True)
+            self.scheduler_metadata_buffer.copy_(
+                self.host_scheduler_metadata_buffer, non_blocking=True)
             if self.use_expanded_buffers_for_mtp:
                 num_draft_tokens = 1 + self.max_draft_tokens
                 num_tokens = self.num_generations * num_draft_tokens
@@ -813,16 +846,17 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                     kv_lens_expanded.transpose(0, 1).contiguous().flatten()
                 # Expand schedule metadata buffer (only generation)
                 kv_lens_expanded = self.kv_lens_expanded_cuda[:num_tokens]
-                scheduler_metadata_buffer_expanded = get_paged_mqa_logits_metadata(
+                self.host_scheduler_metadata_buffer_expanded = get_paged_mqa_logits_metadata(
                     kv_lens_expanded, tokens_per_block, self.num_sms)
                 self.scheduler_metadata_buffer_expanded.copy_(
-                    scheduler_metadata_buffer_expanded, non_blocking=True)
+                    self.host_scheduler_metadata_buffer_expanded,
+                    non_blocking=True)
             elif self.max_draft_tokens == 3:
-                scheduler_metadata_buffer_mtp3 = get_paged_mqa_logits_metadata(
+                self.host_scheduler_metadata_buffer_mtp3 = get_paged_mqa_logits_metadata(
                     self.kv_lens_cuda[self.num_contexts:self.num_seqs],
                     tokens_per_block, self.num_sms // 2)
                 self.scheduler_metadata_buffer_mtp3.copy_(
-                    scheduler_metadata_buffer_mtp3, non_blocking=True)
+                    self.host_scheduler_metadata_buffer_mtp3, non_blocking=True)
         self.prepare_dense_topk_indices(self.kv_lens_cuda, device=True)
 
     def update_for_spec_dec(self):
@@ -1083,13 +1117,15 @@ class Indexer(nn.Module):
                 else:
                     metadata.indexer_prefill_chunks = None
 
-            host_cu_seqlen_ks, host_cu_seqlen_ke = compute_cu_seqlen_kv_bounds_with_cache(
-                host_seq_lens, num_contexts, num_ctx_tokens, host_cached_tokens)
+            metadata.host_cu_seqlen_ks[:
+                                       num_ctx_tokens], metadata.host_cu_seqlen_ke[:num_ctx_tokens] = compute_cu_seqlen_kv_bounds_with_cache(
+                                           host_seq_lens, num_contexts,
+                                           num_ctx_tokens, host_cached_tokens)
 
-            metadata.cu_seqlen_ks[:num_ctx_tokens].copy_(host_cu_seqlen_ks,
-                                                         non_blocking=True)
-            metadata.cu_seqlen_ke[:num_ctx_tokens].copy_(host_cu_seqlen_ke,
-                                                         non_blocking=True)
+            metadata.cu_seqlen_ks[:num_ctx_tokens].copy_(
+                metadata.host_cu_seqlen_ks[:num_ctx_tokens], non_blocking=True)
+            metadata.cu_seqlen_ke[:num_ctx_tokens].copy_(
+                metadata.host_cu_seqlen_ke[:num_ctx_tokens], non_blocking=True)
 
         # Prepare for decode phase if there are generation requests
         if num_generations > 0:
@@ -1098,24 +1134,26 @@ class Indexer(nn.Module):
             if not metadata.use_expanded_buffers_for_mtp:
                 gen_seq_lens = metadata.kv_lens_cuda_runtime[
                     num_contexts:num_contexts + num_generations]
-                scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
+                metadata.host_scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
                     gen_seq_lens, tokens_per_block, metadata.num_sms)
                 metadata.scheduler_metadata_buffer.copy_(
-                    scheduler_metadata_buffer, non_blocking=True)
+                    metadata.host_scheduler_metadata_buffer, non_blocking=True)
                 if metadata.max_draft_tokens == 3:
-                    scheduler_metadata_buffer_mtp3 = get_paged_mqa_logits_metadata(
+                    metadata.host_scheduler_metadata_buffer_mtp3 = get_paged_mqa_logits_metadata(
                         gen_seq_lens, tokens_per_block, metadata.num_sms // 2)
                     metadata.scheduler_metadata_buffer_mtp3.copy_(
-                        scheduler_metadata_buffer_mtp3, non_blocking=True)
+                        metadata.host_scheduler_metadata_buffer_mtp3,
+                        non_blocking=True)
             else:
                 # Expand schedule metadata buffer (only generation)
                 num_tokens = metadata.num_generations * (
                     1 + metadata.max_draft_tokens)
                 kv_lens_expanded = metadata.kv_lens_expanded_cuda[:num_tokens]
-                scheduler_metadata_buffer_expanded = get_paged_mqa_logits_metadata(
+                metadata.host_scheduler_metadata_buffer_expanded = get_paged_mqa_logits_metadata(
                     kv_lens_expanded, tokens_per_block, metadata.num_sms)
                 metadata.scheduler_metadata_buffer_expanded.copy_(
-                    scheduler_metadata_buffer_expanded, non_blocking=True)
+                    metadata.host_scheduler_metadata_buffer_expanded,
+                    non_blocking=True)
 
         # Compute slot_mapping for all requests (both context and generation)
         # This maps each token to its flat cache position for vectorized KV cache updates
