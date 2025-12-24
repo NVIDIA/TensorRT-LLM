@@ -499,3 +499,5 @@ disaggregated/test_disaggregated.py::test_disaggregated_benchmark_on_diff_backen
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[latency_trtllmgen] SKIP (https://nvbugs/5715568)
 unittest/executor/test_rpc_proxy.py SKIP (https://nvbugs/5605741)
 unittest/executor/test_rpc_worker.py SKIP (https://nvbugs/5605741)
+accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ngram SKIP (https://nvbugs/5744328)
+test_e2e.py::test_eagle3_output_consistency_4gpus[Qwen3/saved_models_Qwen3-235B-A22B_fp8_hf-Qwen3/qwen3-235B-eagle3] SKIP (https://nvbugs/5685010)
