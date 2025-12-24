@@ -171,7 +171,7 @@ class QwenDecoderLayer(DecoderLayer):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, **kwargs)
 
         if spec_metadata is not None:
             spec_metadata.maybe_capture_hidden_states(self.layer_idx,

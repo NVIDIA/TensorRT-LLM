@@ -152,6 +152,7 @@ class Qwen3DecoderLayer(DecoderLayer):
             final_all_reduce_params=AllReduceParams(
                 enable_allreduce=not self.disable_allreduce),
             cutlass_min_latency_mode=False,
+            **kwargs,
         )
         if deepstack_embeds is not None and self.layer_idx in range(
                 len(deepstack_embeds)):
