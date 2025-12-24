@@ -19,7 +19,7 @@ from torch.fx import GraphModule, Node
 
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
-from ...utils._graph import add_graph_input, run_shape_prop
+from ...utils._graph import add_graph_input
 from ...utils.logger import ad_logger
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
@@ -84,9 +84,7 @@ class GatherLastTokenIds(BaseTransform):
         num_selected_tokens = 2
         input_shape = (batch_size_dim, num_selected_tokens)
         last_token_ids_example = torch.zeros(input_shape, dtype=torch.int64, device="meta")
-        last_token_ids_node = add_graph_input(
-            gm, name="last_token_ids", val=last_token_ids_example, name_prefix=""
-        )
+        last_token_ids_node = add_graph_input(gm, name="last_token_ids", val=last_token_ids_example)
 
         ad_logger.info(f"Added last_token_ids placeholder: {last_token_ids_node.name}")
 
@@ -160,15 +158,5 @@ class GatherLastTokenIds(BaseTransform):
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
-
-        # Step 4: Clean up and recompile
-        gm.graph.eliminate_dead_code()
-        gm.graph.lint()
-        gm.recompile()
-
-        ad_logger.info("Successfully added last_token_ids gather operation")
-
-        # Run shape propagation to update metadata
-        run_shape_prop(gm)
 
         return gm, TransformInfo(skipped=False, num_matches=1, is_clean=True, has_valid_shapes=True)

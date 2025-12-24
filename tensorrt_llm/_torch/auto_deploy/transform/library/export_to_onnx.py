@@ -23,6 +23,7 @@ from pydantic import Field
 from torch.export import Dim
 from torch.fx import GraphModule
 
+from ...models import hf
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.logger import ad_logger
@@ -301,20 +302,24 @@ class ExportToONNX(BaseTransform):
         ad_logger.info(f"Successfully exported ONNX model to {output_path}")
         return True
 
-    def _export_config_json(self, gm: GraphModule, output_dir: str, is_eagle_base: bool) -> None:
+    def _export_config_json(
+        self, factory: ModelFactory, output_dir: str, is_eagle_base: bool
+    ) -> None:
         """Export model configuration to config.json.
 
         Generates a configuration file containing model architecture parameters
         such as hidden size, number of layers, attention heads, etc.
 
         Args:
-            gm: The GraphModule containing model configuration in gm.config.
+            factory: The ModelFactory containing model configuration.
             output_dir: Directory path where config.json will be saved.
             is_eagle_base: If True, exports as "eagle3_base" model type,
                 otherwise exports as "llm" model type.
         """
         model_type = "eagle3_base" if is_eagle_base else "llm"
-        model_config = export_llm_config(gm.config, model_type)
+        assert isinstance(factory, hf.AutoModelFactory)
+        model_config, _ = factory._get_model_config()
+        model_config = export_llm_config(model_config, model_type)
         # Add reduced_vocab_size to config if vocabulary reduction is used
         reduced_vocab_size = None  # TODO: Implement this
         if reduced_vocab_size is not None:
@@ -350,7 +355,7 @@ class ExportToONNX(BaseTransform):
         # Export model configuration (architecture params, layer counts, etc.)
         is_eagle_base = self.config.is_eagle_base
         output_dir = self.config.output_dir
-        self._export_config_json(gm, output_dir, is_eagle_base)
+        self._export_config_json(factory, output_dir, is_eagle_base)
 
         # Export tokenizer files for text processing during inference
         # Includes: added_tokens.json, special_tokens_map.json, tokenizer.json,

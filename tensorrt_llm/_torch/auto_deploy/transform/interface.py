@@ -3,20 +3,23 @@
 This module defines the base classes and interfaces for all transforms.
 """
 
+import os
 import time
 from abc import ABC
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import Enum
 from functools import total_ordering, wraps
-from typing import Any, Callable, Dict, Mapping, Tuple, Type, Union, final
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple, Type, Union, final
 
+import torch
 import torch.nn as nn
 from pydantic import BaseModel, Field
 from torch.fx import GraphModule, Node
 
 from ..models.factory import ModelFactory
 from ..shim.interface import CachedSequenceInterface
+from ..transform.graph_module_visualizer import to_dot
 from ..utils._graph import (
     add_graph_input,
     canonicalize_graph,
@@ -167,6 +170,10 @@ class TransformConfig(BaseModel):
         default=False,
         description="Whether this transform requires shape propagation before it is applied.",
     )
+    debug_visualize_dir: Optional[str] = Field(
+        default=None,
+        description="Enable debug visualization.",
+    )
 
     expect_mem_change: bool = Field(
         default=False,
@@ -258,6 +265,7 @@ def with_transform_logging(call_fn: Callable) -> Callable:
         cm: CachedSequenceInterface,
         factory: ModelFactory,
         shared_config: SharedConfig,
+        idx: int,
     ) -> nn.Module:
         prefix = f"[stage={self.config.stage.value}, transform={self.get_transform_key()}]"
         original_log = ad_logger.log
@@ -269,7 +277,7 @@ def with_transform_logging(call_fn: Callable) -> Callable:
 
         ad_logger.log = _patched_log  # type: ignore[assignment]
         try:
-            return call_fn(self, gm, cm, factory, shared_config)
+            return call_fn(self, gm, cm, factory, shared_config, idx)
         finally:
             ad_logger.log = original_log  # type: ignore[assignment]
 
@@ -347,6 +355,7 @@ class BaseTransform(ABC):
         cm: CachedSequenceInterface,
         factory: ModelFactory,
         shared_config: SharedConfig,
+        idx: int,
     ) -> nn.Module:
         """Apply the transform to the graph.
 
@@ -474,9 +483,25 @@ class BaseTransform(ABC):
         autodeploy_meta[self._mem_history_key] = mem_history
 
         self._set_autodeploy_meta(mod, autodeploy_meta)
+        self._visualize_graph(mod, idx)
 
         # return the graph module
         return mod
+
+    @final
+    def _visualize_graph(self, mod: nn.Module, idx: int) -> None:
+        """Visualize the graph if debug visualization is enabled."""
+        if not isinstance(mod, torch.fx.GraphModule):
+            return
+        visualize_dir = self.config.debug_visualize_dir
+        if not visualize_dir:
+            return
+        if not os.path.exists(visualize_dir):
+            os.makedirs(visualize_dir)
+        name_stem = f"gm_{idx + 1:02d}_{self.get_transform_key()}"
+        visualize_path = os.path.join(visualize_dir, f"{name_stem}")
+        to_dot(mod, name=name_stem, save_path=visualize_path, format="svg")
+        ad_logger.debug(f"[{idx + 1:02d}] Visualized {name_stem} to {visualize_path}")
 
     @final
     def _apply_per_gm_or_whole_model(

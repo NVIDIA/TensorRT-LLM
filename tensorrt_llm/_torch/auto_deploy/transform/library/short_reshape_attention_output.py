@@ -19,7 +19,6 @@ from torch.fx import GraphModule, Node
 
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
-from ...utils._graph import run_shape_prop
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
 
@@ -160,12 +159,7 @@ class ShortReshapeAttentionOutput(BaseTransform):
 
             num_matches += 1
 
-        run_shape_prop(gm)
-        gm.graph.eliminate_dead_code()
-        gm.graph.lint()
-        gm.recompile()
-
         info = TransformInfo(
-            skipped=False, num_matches=num_matches, is_clean=True, has_valid_shapes=True
+            skipped=False, num_matches=num_matches, is_clean=False, has_valid_shapes=False
         )
         return gm, info
