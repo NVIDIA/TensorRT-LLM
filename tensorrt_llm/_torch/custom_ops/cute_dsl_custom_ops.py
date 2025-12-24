@@ -1177,14 +1177,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             m, k = a.size(0), a.size(1) * 2
             l, n = b.size(0), b.size(1)
 
-            if self.tile_size == 128:
-                mma_tiler_mn_candidates = [(128, 128), (128, 256)]
-                cluster_shape_mn_candidates = [(1, 1), (1, 2)]
-            elif self.tile_size == 256:
-                mma_tiler_mn_candidates = [(256, 128), (256, 256)]
-                cluster_shape_mn_candidates = [(2, 1), (2, 2)]
-            else:
-                raise ValueError(f"Tile size {self.tile_size} is not supported")
+            # TODO: Add full shmoo
+            mma_tiler_mn_candidates = [(self.tile_size, 128),
+                                       (self.tile_size, 256)]
+            cluster_shape_mn_candidates = [(self.tile_size // 128, 1),
+                                           (self.tile_size // 128, 2)]
             raster_along_m_candidates = [True, False]
 
             valid_tactics = []
@@ -1560,14 +1557,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             m, k = a.size(0), a.size(1) * 2
             l, n = b.size(0), b.size(1)
 
-            if self.tile_size == 128:
-                mma_tiler_mn_candidates = [(128, 128), (128, 256)]
-                cluster_shape_mn_candidates = [(1, 1), (1, 2)]
-            elif self.tile_size == 256:
-                mma_tiler_mn_candidates = [(256, 128), (256, 256)]
-                cluster_shape_mn_candidates = [(2, 1), (2, 2)]
-            else:
-                raise ValueError(f"Tile size {self.tile_size} is not supported")
+            # TODO: Add full shmoo
+            mma_tiler_mn_candidates = [(128, 128), (128, 256)]
+            cluster_shape_mn_candidates = [(1, 1), (1, 2)]
 
             valid_tactics = []
             for mma_tiler_mn, cluster_shape_mn in itertools.product(

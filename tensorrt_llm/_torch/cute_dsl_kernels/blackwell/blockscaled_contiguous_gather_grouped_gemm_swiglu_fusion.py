@@ -3056,8 +3056,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             is_valid = False
         return is_valid
 
-    @staticmethod
+    @classmethod
     def can_implement(
+        cls,
         ab_dtype: Type[cutlass.Numeric],
         sf_dtype: Type[cutlass.Numeric],
         sf_vec_size: int,
@@ -3107,24 +3108,20 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         """
         can_implement = True
         # Skip unsupported types
-        if not BlockScaledContiguousGatherGroupedGemmKernel.is_valid_dtypes_and_scale_factor_vec_size(
+        if not cls.is_valid_dtypes_and_scale_factor_vec_size(
             ab_dtype, sf_dtype, sf_vec_size, c_dtype
         ):
             can_implement = False
 
         # Skip unsupported layouts
-        if not BlockScaledContiguousGatherGroupedGemmKernel.is_valid_layouts(
-            ab_dtype, c_dtype, a_major, b_major, c_major
-        ):
+        if not cls.is_valid_layouts(ab_dtype, c_dtype, a_major, b_major, c_major):
             can_implement = False
 
         # Skip invalid mma tile shape and cluster shape
-        if not BlockScaledContiguousGatherGroupedGemmKernel.is_valid_mma_tiler_and_cluster_shape(
-            mma_tiler_mn, cluster_shape_mn
-        ):
+        if not cls.is_valid_mma_tiler_and_cluster_shape(mma_tiler_mn, cluster_shape_mn):
             can_implement = False
         # Skip illegal problem shape for load/store alignment
-        if not BlockScaledContiguousGatherGroupedGemmKernel.is_valid_tensor_alignment(
+        if not cls.is_valid_tensor_alignment(
             m, n, k, l, ab_dtype, c_dtype, a_major, b_major, c_major
         ):
             can_implement = False
