@@ -1290,6 +1290,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     tile_idx = mma_tile_coord_m
                     if tile_idx < num_valid_tiles:
                         tile_info_pipeline.producer_acquire(tile_info_producer_state)
+                        mn_limit = tile_idx_to_mn_limit[tile_idx]
                         with cute.arch.elect_one():
                             sInfo[(0, tile_info_producer_state.index)] = cur_tile_coord[0]
                             sInfo[(1, tile_info_producer_state.index)] = cur_tile_coord[1]
