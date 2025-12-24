@@ -61,7 +61,7 @@ else
     done
 fi
 
-if [[ "$stageName" == *gb200* ]]; then
+if [[ "$stageName" == *GB200* ]]; then
     echo "Checking Coherent GPU mapping (for GB200)..."
     grep Coherent /proc/driver/nvidia/params || echo "Unable to grep Coherent from /proc/driver/nvidia/params"
 fi
