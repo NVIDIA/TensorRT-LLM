@@ -14,8 +14,11 @@
 # limitations under the License.
 
 
+import math
+
 import torch
 
+from tensorrt_llm._torch.auto_deploy.custom_ops.quant import TRTLLM_NVFP4_ROW_SIZE
 from tensorrt_llm._torch.utils import ActivationType
 
 
@@ -212,11 +215,11 @@ def trtllm_quant_fp8_moe_fused_fake(
 
 @torch.library.custom_op("auto_deploy::trtllm_quant_nvfp4_moe_fused", mutates_args=())
 def trtllm_quant_nvfp4_moe_fused(
-    x: torch.Tensor,  # [B, S, H] or [B*S, H], 16-bit float
+    x: torch.Tensor,
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
-    fc1_expert_weights_fp4: torch.Tensor,  # [E, 2*I, H] or [E, I, H]; uint8
-    fc2_expert_weights_fp4: torch.Tensor,  # [E, H, I]; uint8
+    fc1_expert_weights_fp4: torch.Tensor,
+    fc2_expert_weights_fp4: torch.Tensor,
     fc1_weight_blockscale_fp8: torch.Tensor,  # Global scale for fc1 (scalar)
     fc2_weight_blockscale_fp8: torch.Tensor,  # Global scale for w2 (scalar)
     fc1_act_global_scale: torch.Tensor,  # Global scale for FC1 activations
@@ -234,10 +237,26 @@ def trtllm_quant_nvfp4_moe_fused(
         For mlp:
             y = act(x @ w1.T) @ w2.T                 # act := ReLU^2
 
+    Notes:
+    - FC1 implements: fc1_output = (act(x @ w1.T) * (x @ w3.T)) or fc1_output = act(x @ w1.T)
+    - FC2 implements: fc2_output = fc1_output @ w2.T
+    - FC1 weights are concatenated w3 and w1 if gated_mlp, otherwise w1
+    - FP4 elements pairs are packed as a single uint8 element
 
-    FC1 implements: fc1_output = (act(x @ w1.T) * (x @ w3.T)) or fc1_output = act(x @ w1.T)
-    FC2 implements: fc2_output = fc1_output @ w2.T
-
+    Parameters:
+        x: BF16/FP16 input tensor of shape (B, H) or (B, S, H)
+        selected_experts: Expert indices (B*S, TOP_K)
+        routing_weights: Routing weights (B*S, TOP_K)
+        fc1_expert_weights_fp4: FP4 FC1 weights [E, 2*I, H/2] or [E, I, H/2]; packed uint8
+        fc2_expert_weights_fp4: FP4 FC2 weights [E, H, I/2]; packed uint8
+        fc1_weight_blockscale_fp8: Block scales for FC1 weights (w1 or cat(w3, w1))
+        fc2_weight_blockscale_fp8: Block scales for FC2 weights (w2)
+        fc1_act_global_scale: Global scale for FC1 activations (scalar)
+        fc2_act_global_scale: Global scale for FC2 activations (scalar)
+        fc1_alpha: FC1 dequant scales = 1.0 / (fc1_act_global_scale * fc1_weight_global_scale)
+        fc2_alpha: FC2 dequant scales = 1.0 / (fc2_act_global_scale * fc2_weight_global_scale)
+        mlp_style: "gated_mlp" or "mlp"
+        act_fn: "silu" for gated_mlp, "relu2" for mlp
     """
     NVFP4_BLOCK_SIZE = 16
 
@@ -257,19 +276,6 @@ def trtllm_quant_nvfp4_moe_fused(
                 f"Unsupported activation '{ActivationType(act_fn).name}' for mlp. Use 'relu2'."
             )
 
-    # quant_scales is described by this code:
-    # https://github.com/NVIDIA/TensorRT-LLM/blob/c9771ebb997683c08b26bbba796a7fc6aff09d93/cpp/tensorrt_llm/thop/moeOp.cpp#L1015
-    quant_scales = [
-        fc1_act_global_scale,  # torch.float32; [E] or scalar
-        fc1_weight_blockscale_fp8.view(
-            torch.int32
-        ),  # 4 FP8 as packed int32; [E, I*2, H / 16 / 4] or [E, I, H / 16 / 4]
-        fc1_alpha,  # torch.float32; [E]
-        fc2_act_global_scale,  # torch.float32; [E] or scalar
-        fc2_weight_blockscale_fp8.view(torch.int32),  # 4 FP8 as packed int32; [E, H, I / 16 / 4]
-        fc2_alpha,  # torch.float32; [E]
-    ]
-
     if x.dtype in (torch.float16, torch.bfloat16):
         x_q_fp4, input_blockscale = torch.ops.trtllm.fp4_quantize(
             x, fc1_act_global_scale, NVFP4_BLOCK_SIZE
@@ -279,6 +285,37 @@ def trtllm_quant_nvfp4_moe_fused(
         x_q_fp4 = x
         input_blockscale = None
         output_dtype = x.dtype
+
+    # Pad I to be divisible by 128
+    I_padded = math.ceil(inter_size / TRTLLM_NVFP4_ROW_SIZE) * TRTLLM_NVFP4_ROW_SIZE
+    if I_padded != inter_size:
+        # if False:
+        # fc1_expert_weights_fp4: [E, I, H]
+        fc1_padded = fc1_expert_weights_fp4.new_zeros(n_experts, I_padded, hidden_size // 2)
+        fc1_padded[:, :inter_size, :] = fc1_expert_weights_fp4
+        fc1_expert_weights_fp4 = fc1_padded
+
+        # fc2_expert_weights_fp4: [E, H, I]
+        fc2_padded = fc2_expert_weights_fp4.new_zeros(n_experts, hidden_size, I_padded // 2)
+        fc2_padded[:, :, : inter_size // 2] = fc2_expert_weights_fp4
+        fc2_expert_weights_fp4 = fc2_padded
+
+        fc2_blockscale_fp8_padded = fc2_weight_blockscale_fp8.new_zeros(
+            n_experts, hidden_size, I_padded // 16
+        )
+        fc2_blockscale_fp8_padded[:, :, : inter_size // 16] = fc2_weight_blockscale_fp8
+        fc2_weight_blockscale_fp8 = fc2_blockscale_fp8_padded
+
+    # quant_scales is described by this code:
+    # https://github.com/NVIDIA/TensorRT-LLM/blob/c9771ebb997683c08b26bbba796a7fc6aff09d93/cpp/tensorrt_llm/thop/moeOp.cpp#L1015
+    quant_scales = [
+        fc1_act_global_scale,  # torch.float32; [E] or scalar
+        fc1_weight_blockscale_fp8.view(torch.int32),
+        fc1_alpha,  # torch.float32; [E]
+        fc2_act_global_scale,  # torch.float32; [E] or scalar
+        fc2_weight_blockscale_fp8.view(torch.int32),
+        fc2_alpha,  # torch.float32; [E]
+    ]
 
     trtllm_output = torch.ops.trtllm.fused_moe(
         x_q_fp4,

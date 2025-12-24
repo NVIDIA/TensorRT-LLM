@@ -3,6 +3,7 @@ This file contains test functions copied from:
 https://github.com/flashinfer-ai/flashinfer/blob/main/tests/moe/test_trtllm_cutlass_fused_moe.py
 """
 
+import math
 from typing import Callable
 
 import pytest
@@ -12,12 +13,17 @@ from torch.nn import functional as F
 from utils.util import skip_pre_hopper
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
+from tensorrt_llm._torch.auto_deploy.custom_ops.quant import (
+    TRTLLM_NVFP4_COLUMN_SIZE,
+    TRTLLM_NVFP4_ROW_SIZE,
+    TRTLLM_NVFP4_SCALING_VECTOR_SIZE,
+)
 from tensorrt_llm._torch.utils import ActivationType
 
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 FLOAT4_E2M1_MAX = 6.0
 FP8_DTYPE = torch.float8_e4m3fn
-NVFP4_BLOCK_SIZE = 16
+NVFP4_BLOCK_SIZE = TRTLLM_NVFP4_SCALING_VECTOR_SIZE
 
 
 def dynamic_per_tensor_fp8_quant(x: torch.tensor) -> tuple[torch.tensor, torch.tensor]:
@@ -152,20 +158,13 @@ def _print_diff_if(
 
 
 # Test configurations
-BATCH_SIZES = [
-    1,
-]
-HIDDEN_SIZES = [
-    128,
-]
+BATCH_SIZES = [1]
+HIDDEN_SIZES = [128]
 NUM_EXPERTS = [2]
 TOP_K_VALUES = [2]
-INTERMEDIATE_SIZES = [
-    128,
-]
+INTERMEDIATE_SIZES = [128]
 EP_NUM_EXPERTS = [8]
 EP_TOP_K = [2]
-
 
 F16_TEST_DTYPES = [
     (torch.float16, torch.float16, torch.float16),
@@ -504,12 +503,12 @@ def dequantize_nvfp4_to_dtype(tensor_fp4, tensor_sf, global_scale, dtype, device
     """Dequantize the fp4 tensor back to high precision."""
 
     def convert_swizzled_to_linear(a_sf_swizzled: torch.Tensor, m, k, block_size):
-        m_tiles = (m + 128 - 1) // 128
+        m_tiles = (m + TRTLLM_NVFP4_ROW_SIZE - 1) // TRTLLM_NVFP4_ROW_SIZE
         f = block_size * 4
         k_tiles = (k + f - 1) // f
         tmp = torch.reshape(a_sf_swizzled, (1, m_tiles, k_tiles, 32, 4, 4))
         tmp = torch.permute(tmp, (0, 1, 4, 3, 2, 5))
-        out = tmp.reshape(m_tiles * 128, k_tiles * f // block_size)
+        out = tmp.reshape(m_tiles * TRTLLM_NVFP4_ROW_SIZE, k_tiles * f // block_size)
         return out[0:m, 0:k]
 
     # Originally from https://github.com/flashinfer-ai/flashinfer/blob/main/tests/moe/test_trtllm_cutlass_fused_moe.py
@@ -552,14 +551,20 @@ def dequantize_nvfp4_to_dtype(tensor_fp4, tensor_sf, global_scale, dtype, device
     return out.to(dtype=dtype)
 
 
-NVFP4_TEST_DTYPES = [
-    (torch.float16, torch.float8_e4m3fn),
-    (torch.bfloat16, torch.float8_e4m3fn),
+NVFP4_TEST_DTYPES = [torch.float16, torch.bfloat16]
+
+FP4_TEST_SHAPES = [
+    (128, 128),  # Trivial test case (no padding required)
+    (2688, 1856),  # Nemotron-Nano-3-30B-A3 sizes (padding required)
 ]
+
+# Scale the input and weights to prevent large absolute values.
+FP4_X_GEN_SCALE = 0.5
+FP4_W_GEN_SCALE = 0.1
 
 
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
-@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
+@pytest.mark.parametrize("hidden_size, intermediate_size", FP4_TEST_SHAPES)
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS)
 @pytest.mark.parametrize("top_k", TOP_K_VALUES)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
@@ -576,7 +581,6 @@ def test_trtllm_fused_moe_nvfp4(
     top_k,
     intermediate_size,
     otype,
-    wtype,
     activation_func,
 ):
     # In the code below:
@@ -596,29 +600,29 @@ def test_trtllm_fused_moe_nvfp4(
         num_experts,
         intermediate_size,
     ):
-        x = gen_tensor((batch_size, hidden_size), otype)
+        x = gen_tensor((batch_size, hidden_size), otype) * FP4_X_GEN_SCALE
         w1_shape = (num_experts, intermediate_size, hidden_size)
         w3_shape = w1_shape
-        w1 = gen_tensor(w1_shape, otype, scale=0.1)
-        w2 = gen_tensor((num_experts, hidden_size, intermediate_size), otype, scale=0.1)
-        w3 = gen_tensor(w3_shape, otype, scale=0.1)
+        w1 = gen_tensor(w1_shape, otype, scale=FP4_W_GEN_SCALE)
+        w2 = gen_tensor((num_experts, hidden_size, intermediate_size), otype, scale=FP4_W_GEN_SCALE)
+        w3 = gen_tensor(w3_shape, otype, scale=FP4_W_GEN_SCALE)
         router_logits = torch.randn(batch_size, num_experts, dtype=otype).cuda()
         return x, w1, w2, w3, router_logits
 
     def _quantize_weights(w1, w2, w3):
         def round_up(x, y):
-            return (x + y - 1) // y * y
+            return math.ceil(x / y) * y
 
         w1_n = w1.shape[1]
         w3_n = w3.shape[1]
-        sf_w1_n = round_up(w1_n, 128)
-        sf_w3_n = round_up(w3_n, 128)
-        sf_w1_k = round_up(hidden_size // NVFP4_BLOCK_SIZE, 4)
+        sf_w1_n = round_up(w1_n, TRTLLM_NVFP4_ROW_SIZE)
+        sf_w3_n = round_up(w3_n, TRTLLM_NVFP4_ROW_SIZE)
+        sf_w1_k = round_up(hidden_size // NVFP4_BLOCK_SIZE, TRTLLM_NVFP4_COLUMN_SIZE)
         w1_blockscale = torch.empty(
             (num_experts, sf_w1_n, sf_w1_k), device="cuda", dtype=torch.float8_e4m3fn
         )
-        sf_w2_k = round_up(hidden_size, 128)
-        sf_w2_n = round_up(intermediate_size // NVFP4_BLOCK_SIZE, 4)
+        sf_w2_k = round_up(hidden_size, TRTLLM_NVFP4_ROW_SIZE)
+        sf_w2_n = round_up(intermediate_size // NVFP4_BLOCK_SIZE, TRTLLM_NVFP4_COLUMN_SIZE)
         w2_blockscale = torch.empty(
             (num_experts, sf_w2_k, sf_w2_n), device="cuda", dtype=torch.float8_e4m3fn
         )
@@ -789,8 +793,9 @@ def test_trtllm_fused_moe_nvfp4(
         return ref_output
 
     ref_output = compute_ref_output(w1_gs, w3_gs)
-    print(f"max diff: {(ref_output - trtllm_output).abs().max()}")
-    print(f"diff = {ref_output - trtllm_output}")
-    print(f"ref_output = {ref_output}")
-    print(f"flash_output = {trtllm_output}")
+    diff = ref_output - trtllm_output
+    print(f"max diff: {diff.abs().max()}")
+    print(f"{diff=}")
+    print(f"{ref_output=}")
+    print(f"{trtllm_output=}")
     torch.testing.assert_close(ref_output, trtllm_output, rtol=2e-1, atol=2e-1)
