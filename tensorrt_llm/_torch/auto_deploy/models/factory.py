@@ -301,12 +301,53 @@ class ModelFactory(ABC):
         NOTE: this utility is written in such a fashion that not more memory than what the model
         shard needs is reserved and/or allocated.
         """
-        model._apply(
-            # NOTE (lucaslie): torch.normal is not supported for all dtypes
-            lambda t: torch.normal(0.0, 1.0, size=t.shape, device=device).to(t.dtype)
-            if t.device == torch.device("meta")
-            else t.to(device)
-        )
+        if False:
+            # Build id -> name mapping for logging
+            tensor_names: Dict[int, str] = {}
+            for name, param in model.named_parameters():
+                tensor_names[id(param)] = name
+            for name, buf in model.named_buffers():
+                if buf is not None:
+                    tensor_names[id(buf)] = name
+
+            # Build usage info if this is a GraphModule
+            # According to delete_all_unused_submodules doc, a Module is "used" if:
+            # 1. It has children that are used
+            # 2. Its forward is called directly via a call_module node
+            # 3. It has a non-Module attribute that is used from a get_attr node
+            get_attr_usage: Dict[str, List[str]] = {}  # attr_name -> list of user node names
+            call_module_targets: set = set()  # set of module paths called via call_module
+
+            if isinstance(model, GraphModule):
+                for node in model.graph.nodes:
+                    if node.op == "get_attr":
+                        user_names = [u.name for u in node.users]
+                        get_attr_usage[node.target] = user_names
+                    elif node.op == "call_module":
+                        call_module_targets.add(node.target)
+
+            def _init_param(t: torch.Tensor) -> torch.Tensor:
+                name = tensor_names.get(id(t), "unknown")
+                # reason = _get_usage_reason(name)
+                ad_logger.info(
+                    f"Initializing parameter {name} | shape={t.shape}, dtype={t.dtype}, "
+                    f"current_device={t.device}, target_device={device}, is_meta={t.device == torch.device('meta')}"
+                )
+
+                # Initialize used parameters or move to device
+                if t.device == torch.device("meta"):
+                    return torch.normal(0.0, 1.0, size=t.shape, device=device).to(t.dtype)
+                else:
+                    return t.to(device)
+
+            model._apply(_init_param)
+        else:
+            model._apply(
+                # NOTE (lucaslie): torch.normal is not supported for all dtypes
+                lambda t: torch.normal(0.0, 1.0, size=t.shape, device=device).to(t.dtype)
+                if t.device == torch.device("meta")
+                else t.to(device)
+            )
 
     @abstractmethod
     def _load_checkpoint(self, model: nn.Module, device: DeviceLikeType):

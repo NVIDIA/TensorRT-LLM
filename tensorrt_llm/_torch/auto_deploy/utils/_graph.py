@@ -171,6 +171,25 @@ def _canonicalize_single_gm(gm: GraphModule) -> None:
     # clean up graph module
     gm.delete_all_unused_submodules()
 
+    # delete_all_unused_submodules only deletes submodules, not direct parameters.
+    # We need to also delete parameters that have no get_attr node referencing them.
+    get_attr_targets: set = set()
+    for node in gm.graph.nodes:
+        if node.op == "get_attr":
+            get_attr_targets.add(node.target)
+
+    # Find and delete orphaned parameters (not referenced by any get_attr)
+    params_to_delete = []
+    for param_name, param in gm.named_parameters():
+        if param_name not in get_attr_targets:
+            # Check if it's a direct parameter (no dots = registered on gm itself)
+            if "." not in param_name:
+                params_to_delete.append(param_name)
+                ad_logger.debug(f"Deleting orphaned parameter: {param_name} | shape={param.shape}")
+
+    for param_name in params_to_delete:
+        delattr(gm, param_name)
+
     # lint the graph
     gm.graph.lint()
 

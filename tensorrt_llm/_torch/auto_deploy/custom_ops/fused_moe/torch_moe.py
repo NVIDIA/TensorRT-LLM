@@ -150,50 +150,16 @@ def torch_moe(
     """
     torch_act_fn = _resolve_torch_fn(act_fn)
 
-    # Detect if using stacked tensor format (Llama4) vs per-expert lists (standard)
-    is_stacked = len(w1_weight) == 1 and w1_weight[0].ndim == 3
-
-    # Todo: either change torch_moe to use a single condition, or refactor this code.
-    # it should be :
-    # is_gated_mlp:
-    #    stacked:
-    #        ...
-    #    not stacked:
-    #   .
-    # else:
-    #    assert (not stacked)
-    #    ...
-    #   .
-    if is_stacked:
-        # Llama4 stacked tensor format - only supports gated_mlp
-        if not is_gated_mlp:
-            raise ValueError("Stacked tensor format only supports gated MLP style")
-
-        w3_w1_stacked = w1_weight[0]  # (E, 2*I, H)
-        intermediate_size = w3_w1_stacked.shape[1] // 2
-        w2_stacked = w2_weight[0]  # (E, H, I)
-
-        def make_mlp(idx: int):
-            gate_up = w3_w1_stacked[idx]  # (2*I, H)
-            W3 = gate_up[:intermediate_size, :]  # (I, H)
-            W1 = gate_up[intermediate_size:, :]  # (I, H)
-            W2 = w2_stacked[idx]  # (H, I)
-            weight_dtype = W1.dtype
-            return lambda inp: F.linear(
-                torch_act_fn(F.linear(inp.to(weight_dtype), W1))
-                * F.linear(inp.to(weight_dtype), W3),
-                W2,
-            )
-
-        mlps = [make_mlp(idx) for idx in range(w3_w1_stacked.shape[0])]
-
-    elif is_gated_mlp:
+    mlps = []
+    if is_gated_mlp:
         # Standard per-expert list format with gated MLP
         def make_mlp(i: int):
             W1 = w1_weight[i]  # (I, H)
             W2 = w2_weight[i]  # (H, I)
             W3 = w3_weight[i]  # (I, H)
-            return lambda inp: F.linear(torch_act_fn(F.linear(inp, W1)) * F.linear(inp, W3), W2)
+            return lambda inp: F.linear(
+                torch_act_fn(F.linear(inp.to(W1.dtype), W1)) * F.linear(inp.to(W3.dtype), W3), W2
+            )
 
         mlps = [make_mlp(i) for i in range(len(w1_weight))]
 
