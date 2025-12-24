@@ -1032,7 +1032,7 @@ class PerfTestConfig:
         extra: bool = False,
         # _autodeploy backend specific parameters
         ad_compile_backend: str = "torch-opt",
-        free_mem_ratio: float = 0.9,
+        free_mem_ratio: float = 0.7,
         extra_runtime: str = "trtllm",
         skip_loading_weights: bool = False,
     ):
