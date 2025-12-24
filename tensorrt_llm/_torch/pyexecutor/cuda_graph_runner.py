@@ -17,8 +17,8 @@ from ..modules.multi_stream_utils import with_multi_stream
 from ..speculative.eagle3 import Eagle3ResourceManager
 from ..speculative.mtp import SampleStateTensorsMTP
 from ..utils import make_weak_ref, piecewise_cuda_graph
-from .mamba_cache_manager import MambaCacheManager, MambaHybridCacheManager
 from .llm_request import get_draft_token_length
+from .mamba_cache_manager import MambaCacheManager, MambaHybridCacheManager
 from .resource_manager import (BaseResourceManager, ResourceManager,
                                ResourceManagerType)
 from .sampler import SampleStateTensors
