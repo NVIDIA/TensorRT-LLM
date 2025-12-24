@@ -786,7 +786,8 @@ CUBIN_EXPORT __global__
     static_assert(multiBlockMinNbTiles >= multiBlockMinNbTilesPerCta * 2);
     assert(isMultiBlockMode == (nbSubSeq > 1));
 #if SKIP_SOFTMAX_ATTN
-    float const skipSoftmaxThreshold = skipSoftmaxThresholdScaleFactor / cacheSeqLen;
+    bool const disableSkipForShortSeq = (cacheSeqLen < skipSoftmaxThresholdScaleFactor);
+    float const skipSoftmaxThreshold = disableSkipForShortSeq ? 0.0f : skipSoftmaxThresholdScaleFactor / cacheSeqLen;
 #endif
     if (idxSubSeq >= nbSubSeq)
     {
@@ -1001,7 +1002,7 @@ CUBIN_EXPORT __global__
             auto& skipSoftmaxXBar = smem.skipSoftmaxXBar[idxXBuf];
             skipSoftmaxXBar.consumed.arrive_and_wait();
 
-            bool const maybeSkip = idxIter != 0;
+            bool const maybeSkip = !disableSkipForShortSeq && idxIter != 0;
             RegColWiseVec const colMax = computeWarpGrpColMax_sync(smem.gemm0WarpGrpBar, smem.gemm0CurrentSeqMax, acc,
                 skipSoftmaxThreshold, &smem.skipSoftmaxVotesGemm0ToV[idxXBuf], maybeSkip);
             bool const shouldSkipSoftmaxAttn = static_cast<bool>(smem.skipSoftmaxVotesGemm0ToV[idxXBuf]);
@@ -2142,7 +2143,8 @@ __device__ inline RegColWiseVec computeWarpGrpColMax_sync(
     {
         *smemSkipVote = maybeSkip ? 1U : 0U; // will sync before vote
     }
-    float const lnThreshold = log(skipSoftmaxThreshold);
+    float const lnThreshold
+        = log(skipSoftmaxThreshold); // this can be -inf, but should be safe as we only use it for comparison
 #endif
 
     auto colMax = RegColWiseVec::filled(Vec<float, 2>::filled(safeInitRowMax));

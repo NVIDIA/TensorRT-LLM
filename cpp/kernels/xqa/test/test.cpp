@@ -1312,10 +1312,11 @@ TEST(RefCheck, llama_V2_70b)
 #endif
 #if SKIP_SOFTMAX_ATTN
     runTest<1>(32, 2048, false, true, false, false, false, ~0U, 1U << 30, 0.f);
-    runTest<4>(32, 1538, false, true, false, false, false, ~0U, 1U << 30, 55.f);
+    runTest<4>(32, 1538, false, true, false, false, false, ~0U, 1U << 30, 1280.f);
     runTest<2>(32, 4096, false, true, false, false, false, ~0U, 1U << 30, 125.f);
     runTest<4>(32, 300, false, true, false, false, false, ~0U, 1U << 30, 80.f);
-    runTest<4>(32, 500, false, true, false, false, false, ~0U, 1U << 30, 455.f);
+    runTest<4>(32, 500, false, true, false, false, false, ~0U, 1U << 30, 501.0f);
+    runTest<4>(32, 500, false, true, false, false, false, ~0U, 1U << 30, 500.f);
 #endif
     runTest<8>(120, 367, false, true);
     runTest<8>(1792, 2048, false, true);

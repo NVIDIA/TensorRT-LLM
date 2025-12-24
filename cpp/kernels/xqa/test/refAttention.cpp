@@ -69,7 +69,8 @@ Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refFlashAt
     {
         skipRowMaxs[i].fill(-INFINITY);
     }
-    float skipSoftmaxThreshold = skipSoftmaxThresholdScaleFactor / seqLen;
+    bool const disableSkipForShortSeq = (seqLen < skipSoftmaxThresholdScaleFactor);
+    float const skipSoftmaxThreshold = disableSkipForShortSeq ? 0.0f : skipSoftmaxThresholdScaleFactor / seqLen;
 
     for (uint32_t idxTile = idxTileBeg; idxTile < nbTiles; idxTile++)
     {
@@ -103,7 +104,7 @@ Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refFlashAt
         auto const prevSkipRowMax = skipRowMaxs[idxTile % nbSubSeq];
         skipRowMaxs[idxTile % nbSubSeq] = localRowMax.cwiseMax(skipRowMaxs[idxTile % nbSubSeq]).eval();
 
-        if (skipSoftmaxThreshold > 0)
+        if (!disableSkipForShortSeq && skipSoftmaxThreshold > 0)
         {
             *totalBlockCount += 1;
             auto const skipSoftmaxMask = ((localRowMax - prevSkipRowMax).array() < std::log(skipSoftmaxThreshold));
