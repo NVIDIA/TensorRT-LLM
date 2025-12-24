@@ -118,7 +118,8 @@ class DetectHiddenStatesForCapture(BaseTransform):
         # from there we will find the residual add node for that layer
         layer_subgraphs, unprocessed_linear_nodes = get_all_layer_subgraphs(gm)
         residual_add_nodes: Dict[int, Node] = {}
-        for _, _, lin_node_closing in layer_subgraphs:
+        for layer_subgraph in layer_subgraphs:
+            lin_node_closing = layer_subgraph.terminating_node
             # need layer number to correctly identify the residual add node
             layer_number = _get_layer_number(lin_node_closing)
             if layer_number is None:
