@@ -60,7 +60,7 @@ def add_llm_args(parser):
                         default='CUTLASS',
                         choices=[
                             'CUTLASS', 'TRTLLM', 'VANILLA', 'WIDEEP',
-                            'DEEPGEMM', 'CUTEDSL', 'TRITON'
+                            'DEEPGEMM', 'DENSEGEMM', 'CUTEDSL', 'TRITON'
                         ])
     parser.add_argument('--enable_attention_dp',
                         default=False,
