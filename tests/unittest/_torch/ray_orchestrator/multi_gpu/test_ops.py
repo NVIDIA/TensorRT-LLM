@@ -1,5 +1,6 @@
 import os
 from operator import attrgetter
+from typing import Optional
 
 import pytest
 import torch
@@ -10,7 +11,6 @@ except ModuleNotFoundError:
     from tensorrt_llm import ray_stub as ray
 
 from tensorrt_llm._torch.distributed.communicator import TorchDist
-from tensorrt_llm._utils import get_free_port
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
 from tensorrt_llm.mapping import Mapping
 
@@ -22,7 +22,6 @@ class PgOpTest:
         self.rank = rank
         self.world_size = world_size
         self.master_address = os.environ["MASTER_ADDR"]
-        self.master_port = os.environ["MASTER_PORT"]
 
         assert len(ray.get_gpu_ids()) == 1
         self.gpu = int(ray.get_gpu_ids()[0])
@@ -30,12 +29,30 @@ class PgOpTest:
         local_gpu = RayWorkerWrapper.physical_to_local_id(self.gpu)
         torch.cuda.set_device(local_gpu)
 
-        torch.distributed.init_process_group(
-            backend="cuda:nccl,cpu:gloo",
-            init_method=f"tcp://{self.master_address}:{self.master_port}",
-            world_size=world_size,
-            rank=rank)
+    def _create_tcp_store(self,
+                          port: Optional[int] = None
+                          ) -> torch.distributed.TCPStore:
+        actual_port = port if port is not None else 0
+        return torch.distributed.TCPStore(host_name=self.master_address,
+                                          port=actual_port,
+                                          world_size=self.world_size,
+                                          is_master=(self.rank == 0),
+                                          wait_for_workers=False)
 
+    def setup_tcp_store(self):
+        if self.rank != 0:
+            raise RuntimeError("Only the master worker can setup TCP store")
+        self.store = self._create_tcp_store()
+        return self.store.port
+
+    def setup_distributed_env(self, port: int):
+        if self.rank != 0:
+            self.store = self._create_tcp_store(port)
+
+        torch.distributed.init_process_group(backend="cuda:nccl,cpu:gloo",
+                                             store=self.store,
+                                             world_size=self.world_size,
+                                             rank=self.rank)
         self.mapping = Mapping(world_size=self.world_size,
                                gpus_per_node=self.world_size,
                                tp_size=self.world_size,
@@ -91,13 +108,11 @@ def test_allgather_pg_op(setup_ray_cluster, seq_len, hidden_size, var_len):
         sizes = None
 
     remotePGTests = []
-    master_port = get_free_port()
     runtime_env = ray.runtime_env.RuntimeEnv()
     runtime_env["env_vars"] = os.environ.copy()
     runtime_env["env_vars"].update({
         "TLLM_DISABLE_MPI": "1",
         "MASTER_ADDR": "127.0.0.1",
-        "MASTER_PORT": str(master_port)
     })
 
     for rank in range(world_size):
@@ -106,6 +121,12 @@ def test_allgather_pg_op(setup_ray_cluster, seq_len, hidden_size, var_len):
 
     ray.get(
         [remotePGTest.__ray_ready__.remote() for remotePGTest in remotePGTests])
+
+    port = ray.get(remotePGTests[0].setup_tcp_store.remote())
+    ray.get([
+        remotePGTest.setup_distributed_env.remote(port)
+        for remotePGTest in remotePGTests
+    ])
 
     if var_len:
         results = ray.get([
@@ -155,13 +176,11 @@ def test_reducescatter_pg_op(setup_ray_cluster, seq_len, hidden_size, var_len):
         ]
         sizes = None
 
-    master_port = get_free_port()
     runtime_env = ray.runtime_env.RuntimeEnv()
     runtime_env["env_vars"] = os.environ.copy()
     runtime_env["env_vars"].update({
         "TLLM_DISABLE_MPI": "1",
         "MASTER_ADDR": "127.0.0.1",
-        "MASTER_PORT": str(master_port)
     })
 
     remotePGTests = []
@@ -171,6 +190,12 @@ def test_reducescatter_pg_op(setup_ray_cluster, seq_len, hidden_size, var_len):
 
     ray.get(
         [remotePGTest.__ray_ready__.remote() for remotePGTest in remotePGTests])
+
+    port = ray.get(remotePGTests[0].setup_tcp_store.remote())
+    ray.get([
+        remotePGTest.setup_distributed_env.remote(port)
+        for remotePGTest in remotePGTests
+    ])
 
     results = ray.get([
         remotePGTest.run.remote("reducescatter_pg",
@@ -194,13 +219,11 @@ def test_allreduce_pg_op(setup_ray_cluster, seq_len, hidden_size):
     test_tensor = torch.randn((seq_len, hidden_size), dtype=dtype)
     expected_result = test_tensor * world_size
 
-    master_port = get_free_port()
     runtime_env = ray.runtime_env.RuntimeEnv()
     runtime_env["env_vars"] = os.environ.copy()
     runtime_env["env_vars"].update({
         "TLLM_DISABLE_MPI": "1",
         "MASTER_ADDR": "127.0.0.1",
-        "MASTER_PORT": str(master_port)
     })
 
     remotePGTests = []
@@ -210,6 +233,12 @@ def test_allreduce_pg_op(setup_ray_cluster, seq_len, hidden_size):
 
     ray.get(
         [remotePGTest.__ray_ready__.remote() for remotePGTest in remotePGTests])
+
+    port = ray.get(remotePGTests[0].setup_tcp_store.remote())
+    ray.get([
+        remotePGTest.setup_distributed_env.remote(port)
+        for remotePGTest in remotePGTests
+    ])
 
     results = ray.get([
         remotePGTest.run.remote("allreduce_pg",
