@@ -1159,8 +1159,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                        (self.tile_size, 256)]
             cluster_shape_mn_candidates = [(self.tile_size // 128, 1),
                                            (self.tile_size // 128, 2)]
-            # raster_along_m=False should be theoretically more performant.
-            # TODO: Investigate why sometimes autotuner selects raster_along_m=True.
+            # raster_along_m=False should be theoretically more performant than raster_along_m=True.
+            # TODO: Add raster_along_m=True if we find it more performant in some cases.
             raster_along_m_candidates = [False]
 
             valid_tactics = []
@@ -1305,7 +1305,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 0] == self.tile_size, f"Tactic ({tactic}) is incompatible with tile size ({self.tile_size})"
 
             cache_key = (self.scaling_vector_size, self.tile_size, mma_tiler_mn,
-                         cluster_shape_mn)
+                         cluster_shape_mn, raster_along_m)
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
                     sf_vec_size=self.scaling_vector_size,
