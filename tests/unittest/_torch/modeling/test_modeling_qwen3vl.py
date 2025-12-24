@@ -65,7 +65,7 @@ QWEN3_VL_8B_CONFIG = {
     "vision_end_token_id": 151653,
     "vision_start_token_id": 151652,
     "_attn_implementation": "flash_attention_2",
-    "_name_or_path": str(os.path.join(llm_models_root(), "Qwen3-VL-8B-Instruct")),
+    "_name_or_path": str(os.path.join(llm_models_root(), "Qwen3", "Qwen3-VL-8B-Instruct")),
 }
 
 
@@ -215,13 +215,13 @@ class TestQwen3VL(TestModelingMultimodal):
                 chunked_prefill=False,
                 kv_cache_reuse=False,
             ),
-            # TestQwen3VLScenario(
-            #     modality="video",
-            #     use_cuda_graph=False,
-            #     disable_fuse_rope=False,
-            #     chunked_prefill=False,
-            #     kv_cache_reuse=False,
-            # ),
+            TestQwen3VLScenario(
+                modality="video",
+                use_cuda_graph=False,
+                disable_fuse_rope=False,
+                chunked_prefill=False,
+                kv_cache_reuse=False,
+            ),
             TestQwen3VLScenario(
                 modality="multiple_image",
                 use_cuda_graph=False,
