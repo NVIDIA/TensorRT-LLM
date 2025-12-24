@@ -96,6 +96,7 @@ def llm_models_root() -> str:
 
     return str(root)
 
+
 def tests_path() -> Path:
     return (Path(os.path.dirname(__file__)) / "../..").resolve()
 

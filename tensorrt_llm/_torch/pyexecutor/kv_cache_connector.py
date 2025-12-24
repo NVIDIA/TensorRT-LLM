@@ -234,7 +234,7 @@ class KvCacheConnectorScheduler(ABC):
             request: The request that was allocated resources.
             block_ids: The KV cacheblock IDs that were allocated.
         """
-    
+
     def wait_for_initialization(self):
         """
         Some connectors need to wait for some resources to be initialized.

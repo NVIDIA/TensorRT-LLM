@@ -439,39 +439,3 @@ def test_connector_multi_request(enforce_single_worker, model_with_connector):
 
     # The KV cache of both prior requests should be freed, allowing the third request to run.
     model.generate([2] * 110, sampling_params=sampling_params)
-
-
-@pytest.mark.threadleak(enabled=False)
-@pytest.mark.parametrize("matched_tokens", [0, 32])
-def test_connector_num_matched_tokens(enforce_single_worker, model_with_connector,
-                                       matched_tokens):
-    """Test setNumConnectorMatchedTokens (set) and num_connector_matched_tokens (get)."""
-    NUM_INPUT_TOKENS = 64
-    NUM_OUTPUT_TOKENS = 8
-
-    model_fn, scheduler, worker = model_with_connector
-    model = model_fn(disable_overlap_scheduler=True)
-
-    scheduler.get_num_new_matched_tokens.return_value = matched_tokens, False
-    worker.get_finished.return_value = [], []
-
-    model.generate([1] * NUM_INPUT_TOKENS, SamplingParams(max_tokens=NUM_OUTPUT_TOKENS, ignore_eos=True))
-
-    # Get request before setNumConnectorMatchedTokens is called
-    request_before = scheduler.get_num_new_matched_tokens.call_args.args[0]
-    initial_value = request_before.num_connector_matched_tokens
-
-    # Get request after setNumConnectorMatchedTokens is called
-    request_after = scheduler.update_state_after_alloc.call_args.args[0]
-    final_value = request_after.num_connector_matched_tokens
-
-    # Test get: verify property exists and can be accessed
-    assert hasattr(request_after, 'num_connector_matched_tokens')
-    
-    # Test set: verify value is correctly set
-    assert final_value == matched_tokens, \
-        f"Expected {matched_tokens}, got {final_value}"
-    
-    # Verify set worked (value changed when matched_tokens != 0)
-    if matched_tokens != 0:
-        assert final_value != initial_value

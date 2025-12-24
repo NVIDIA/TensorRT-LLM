@@ -526,7 +526,7 @@ class PyExecutor:
                         self.kv_connector_manager.layer_pre_hook)
                     module.register_forward_hook(
                         self.kv_connector_manager.layer_post_hook)
-            
+
             self.kv_connector_manager.wait_for_initialization()
 
     def _end_transfer_and_maybe_terminate(self, request: LlmRequest):
@@ -3012,7 +3012,7 @@ class PyExecutor:
                 else:
                     if not request.is_disagg_context_transmission_state:
                         requests_to_terminate.append(request)
-                
+
                 if self.kv_connector_manager is not None:
                     self.resource_manager.free_slot_only(request)
             else:

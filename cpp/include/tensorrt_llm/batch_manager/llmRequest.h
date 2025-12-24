@@ -1700,10 +1700,11 @@ public:
     [[nodiscard]] bool isFinishedNormal() const noexcept
     {
         return std::all_of(mFinishReasons.begin(), mFinishReasons.end(),
-            [](auto reason) { 
-                return  reason == executor::FinishReason::kEND_ID || \
-                        reason == executor::FinishReason::kSTOP_WORDS || \
-                        reason == executor::FinishReason::kLENGTH; });
+            [](auto reason)
+            {
+                return reason == executor::FinishReason::kEND_ID || reason == executor::FinishReason::kSTOP_WORDS
+                    || reason == executor::FinishReason::kLENGTH;
+            });
     }
 
     [[nodiscard]] bool isTimedOut() const
