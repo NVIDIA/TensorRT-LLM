@@ -91,6 +91,8 @@ class RayWorkerWrapper:
                                              store=self.store,
                                              world_size=self.world_size,
                                              rank=self.rank)
+        assert torch.distributed.get_world_size(
+        ) == self.world_size, "Process group world size must match the expected world size"
         logger.info(
             f"[Rank {self.rank}] Finished PG init. Global GPU ID: {self.gpu}, local GPU ID: {self.local_gpu}"
         )

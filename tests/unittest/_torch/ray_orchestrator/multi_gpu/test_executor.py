@@ -25,12 +25,12 @@ def test_worker_extension():
 
 
 @pytest.mark.gpu4
-def test_placement_env_vars(monkeypatch):
+def test_placement_env_vars(setup_ray_cluster, monkeypatch):
+    port = setup_ray_cluster
     monkeypatch.setenv("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", "1")
 
     pg = None
     try:
-        ray.init()
         pg = placement_group([{"GPU": 1, "CPU": 1}] * 4)
         ray.get(pg.ready())
         print(f"Placement group ready with bundles {pg.bundle_specs}")
@@ -39,7 +39,9 @@ def test_placement_env_vars(monkeypatch):
         runtime_env = {
             "env_vars": {
                 "TRTLLM_RAY_PER_WORKER_GPUS": "0.8",
-                "TRTLLM_RAY_BUNDLE_INDICES": ",".join(map(str, bundle_indices))
+                "TRTLLM_RAY_BUNDLE_INDICES": ",".join(map(str, bundle_indices)),
+                "RAY_ADDRESS": f"localhost:{port}",
+                "TLLM_RAY_FORCE_LOCAL_CLUSTER": "0"
             }
         }
 
@@ -70,7 +72,6 @@ def test_placement_env_vars(monkeypatch):
     finally:
         if pg is not None:
             remove_placement_group(pg)
-        ray.shutdown()
 
 
 @pytest.mark.gpu2
@@ -79,13 +80,14 @@ def test_placement_env_vars(monkeypatch):
     (2, [1]),
 ],
                          ids=["gpu2_tp1"])
-def test_placement_api(monkeypatch, n_gpus, bundle_indices):
-    monkeypatch.setenv("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", "1")
+def test_placement_api(setup_ray_cluster, monkeypatch, n_gpus, bundle_indices):
 
+    port = setup_ray_cluster
+    monkeypatch.setenv("RAY_ADDRESS", f"localhost:{port}")
+    monkeypatch.setenv("TLLM_RAY_FORCE_LOCAL_CLUSTER", "0")
     tp_size = n_gpus // 2
     pg = None
     try:
-        ray.init()
         pg = placement_group([{"GPU": 1, "CPU": 1}] * n_gpus)
         ray.get(pg.ready())
         print(f"Placement group ready with bundles {pg.bundle_specs}")
@@ -116,7 +118,6 @@ def test_placement_api(monkeypatch, n_gpus, bundle_indices):
     finally:
         if pg is not None:
             remove_placement_group(pg)
-        ray.shutdown()
 
 
 @pytest.mark.gpu2

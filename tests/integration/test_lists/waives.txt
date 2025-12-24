@@ -492,7 +492,6 @@ accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B_Instruct_RocketKV::test_auto_d
 accuracy/test_llm_api_pytorch.py::TestMistralLarge3_675B::test_nvfp4_4gpus[latency_moe_trtllm] SKIP (https://nvbugs/5762852)
 accuracy/test_llm_api_pytorch.py::TestMistralLarge3_675B::test_nvfp4_4gpus[latency_moe_trtllm_eagle] SKIP (https://nvbugs/5762852)
 unittest/_torch/sampler/test_return_logits.py SKIP (https://nvbugs/5764627)
-accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype_with_helix SKIP (https://nvbugs/5741331)
 examples/serve/test_serve.py::test_config_file_loading[--config] SKIP (https://nvbugs/5754977)
 full:RTXPro6000D/accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=CUTLASS-mtp_nextn=2-tp2pp2-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False] SKIP (https://nvbugs/5740075)
 examples/test_ray.py::test_ray_disaggregated_serving[tp2] SKIP (https://nvbugs/5612502)
@@ -513,3 +512,4 @@ unittest/_torch/auto_deploy/unit/multigpu/transformations/library/test_tp_shardi
 triton_server/test_triton.py::test_gpt_gather_logits[gpt-gather-logits] SKIP (https://nvbugs/5766960)
 stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-GUARANTEED_NO_EVICT-pytorch-stress-test] SKIP (https://nvbugs/5766952)
 accuracy/test_llm_api_pytorch.py::TestQwen3NextInstruct::test_bf16_4gpu[tp4ep4_cudagraph_overlap] SKIP (https://nvbugs/5722618)
+full:sm89/accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[MMLU-gen_tp=1-ctx_pp=2] SKIP (https://nvbugs/5596337)
