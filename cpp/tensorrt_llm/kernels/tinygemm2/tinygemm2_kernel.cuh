@@ -172,7 +172,7 @@ struct Profile
 };
 
 template <int WARP_TILE_M, int TILE_M, int TILE_N, int TILE_K, int STAGES, int STAGE_UNROLL, bool PROFILE>
-__global__ __launch_bounds__(384, 1) void kernel(__nv_bfloat16* output, __nv_bfloat16* weights,
+__global__ __launch_bounds__(384, 1) void tinygemm_kernel(__nv_bfloat16* output, __nv_bfloat16* weights,
     __nv_bfloat16* activations, __nv_bfloat16* bias, int M, int N, int K,
     const __grid_constant__ CUtensorMap weight_map, const __grid_constant__ CUtensorMap activation_map,
     Profile* profile = nullptr)
