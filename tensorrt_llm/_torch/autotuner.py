@@ -672,12 +672,9 @@ class AutoTuner:
                     runner = runners[runner_idx]
                     runner_tactic_pairs.append((runner, tactic))
 
-                valid_comb = True
-                for checker in self.__class__.runner_tactic_comb_checkers:
-                    if not checker(runner_tactic_pairs):
-                        valid_comb = False
-                        break
-                if not valid_comb:
+                if not all(
+                        checker(runner_tactic_pairs) for checker in
+                        self.__class__.runner_tactic_comb_checkers):
                     continue
 
                 yield tuple(runner_tactic_pairs)
