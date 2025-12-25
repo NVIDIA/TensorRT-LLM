@@ -16,6 +16,7 @@
 
 import datetime
 import gc
+import logging
 import os
 import platform
 import re
@@ -55,6 +56,9 @@ try:
     from llm import trt_environment
 except ImportError:
     trt_environment = None
+
+# Logger
+logger = logging.getLogger(__name__)
 
 # TODO: turn off this when the nightly storage issue is resolved.
 DEBUG_CI_STORAGE = os.environ.get("DEBUG_CI_STORAGE", False)
@@ -2684,7 +2688,7 @@ gpu_warning_threshold = 1024 * 1024 * 1024
 def get_gpu_memory_wo_pynvml():
     import psutil
 
-    print(
+    logger.warning(
         f"\nWarning: pynvml not available, using fallback commands for memory monitoring"
     )
 
@@ -2741,7 +2745,7 @@ def get_gpu_memory_wo_pynvml():
             except (ValueError, IndexError):
                 continue
     except Exception as gpu_err:
-        print(f"nvidia-smi pmon error: {gpu_err}")
+        logging.warning(f"nvidia-smi pmon error: {gpu_err}")
 
     # Create default entry for GPU 0 if no GPUs detected
     if not gpu_memory:
