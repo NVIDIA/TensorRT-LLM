@@ -1663,20 +1663,8 @@ class PyExecutor:
                         guided_decoder_failed_requests = self.guided_decoder.execute(
                             batch_outputs['logits'])
 
-                    # Wait for the previous sample to finish.
-                    self.finish_sample_event.wait()
-                    # Copy the batch outputs as sampler inputs
-                    # to avoid next forward step overwriting them.
-                    batch_outputs_copy = {
-                        name: tensor.clone()
-                        for name, tensor in batch_outputs.items()
-                    }
-                    self.start_sample_event.record()
-                    with torch.cuda.stream(self.sample_stream):
-                        self.start_sample_event.wait()
-                        sample_state = self._sample_async(
-                            scheduled_batch, batch_outputs_copy)
-                        self.finish_sample_event.record()
+                    sample_state = self._sample_async(scheduled_batch,
+                                                      batch_outputs)
                     assert sample_state is not None, "Sampling failed"
 
                     # Handle guided decoder errors after _sample_async to avoid state conflicts.
@@ -2783,8 +2771,6 @@ class PyExecutor:
             new_target_inputs = None
             num_accepted_tokens_device = None
             if has_draft_batch:
-                # Wait for the previous sampling to finish before using its outputs.
-                self.finish_sample_event.wait()
                 target_outputs = self.previous_batch.sample_state and self.previous_batch.sample_state.device
                 assert target_outputs is not None, "target_outputs should not be None"
                 new_target_inputs, num_accepted_tokens_device = self._accept_draft_tokens(
@@ -2792,6 +2778,7 @@ class PyExecutor:
                     target_inputs=target_inputs,
                     target_outputs=target_outputs)
 
+            if has_draft_batch:
                 self.drafter.generate_draft_tokens_with_overlap(
                     scheduled_batch, self.resource_manager,
                     previous_tensors.device if previous_tensors else None,
