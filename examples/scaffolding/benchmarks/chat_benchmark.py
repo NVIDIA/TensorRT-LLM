@@ -18,7 +18,7 @@ async def async_chat_benchmark(args):
         Tuple of (results, requests_start_time, requests_execution_time, total_time)
     """
     client = AsyncOpenAI(api_key=args.openai_api_key, base_url=args.base_url)
-    chat_worker = TRTOpenaiWorker(client, args.model, getattr(args, "kv_cache_hint_enabled", False))
+    chat_worker = TRTOpenaiWorker(client, args.model, getattr(args, "kv_cache_hint_chat", False))
 
     # Optionally wrap controller with task metrics collection
     controller_type = NativeChatController
