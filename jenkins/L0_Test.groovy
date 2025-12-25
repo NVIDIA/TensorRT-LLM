@@ -1557,7 +1557,8 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         nodeLabelPrefix = type
 
         targetCloud = "kubernetes"
-        // For spark settings
+        // DGX Spark requires a special setting for accessing the device.
+        // It has 128GB unified memory as per spec. Use half of the memory at the CPU side.
         if (type == "gb10x") {
             targetCloud = "nvks-sparks-cloud"
             memorySize = "64Gi"
