@@ -40,6 +40,6 @@
 
 .. note::
 
-   The configs here are specifically optimized for a target ISL/OSL (Input/Output Sequence Length) of 1024/1024. If your traffic pattern is different, refer to the :ref:`Comprehensive Configuration Database` section below which covers a larger set of traffic patterns and performance profiles.
+   The configs here are specifically optimized for a target ISL/OSL (Input/Output Sequence Length) of 1024/1024. If your traffic pattern is different, refer to the :ref:`Preconfigured Recipes` section below which covers a larger set of traffic patterns and performance profiles.
 
 .. end-note-quick-start-isl-osl
