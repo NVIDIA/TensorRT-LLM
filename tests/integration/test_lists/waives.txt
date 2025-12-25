@@ -519,3 +519,4 @@ disaggregated/test_disaggregated.py::test_disaggregated_benchmark_on_diff_backen
 accuracy/test_llm_api_pytorch_multimodal.py::TestMistralLarge3_675B::test_nvfp4_4gpus[latency_moe_trtllm] SKIP (TBD)
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[dp4-trtllm-fp8] SKIP (https://nvbugs/5772396)
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[dp4-trtllm-auto] SKIP (https://nvbugs/5772396)
+accuracy/test_llm_api_pytorch_multimodal.py::TestGemma3_27BInstruct::test_auto_dtype SKIP (https://nvbugs/5542138)
