@@ -18,7 +18,12 @@ import sys
 import traceback
 import warnings
 from functools import partial
-from typing import Any
+from typing import Any, Generator
+
+try:
+    import ray
+except ModuleNotFoundError:
+    from tensorrt_llm import ray_stub as ray
 
 import _pytest.outcomes
 import pytest
@@ -344,3 +349,26 @@ def process_gpu_memory_info_available():
         return False
 
     return True
+
+
+@pytest.fixture(scope="function")
+def setup_ray_cluster() -> Generator[int, None, None]:
+    runtime_env = {
+        "env_vars": {
+            "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"
+        }
+    }
+    ray_init_args = {
+        "include_dashboard": False,
+        "namespace": "test",
+        "ignore_reinit_error": True,
+        "runtime_env": runtime_env
+    }
+    try:
+        ray.init(address="local", **ray_init_args)
+        gcs_addr = ray.get_runtime_context().gcs_address
+        port = int(gcs_addr.split(":")[1])
+        yield port
+    finally:
+        if ray.is_initialized():
+            ray.shutdown()

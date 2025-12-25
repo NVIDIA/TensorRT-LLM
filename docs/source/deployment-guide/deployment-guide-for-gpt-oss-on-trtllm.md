@@ -380,13 +380,24 @@ $$
 
 ## Preconfigured Recipes
 
-The following table lists recommended configurations from the comprehensive database for different performance profiles.
+The following sections help you pick a known-good `trtllm-serve --config` for your target GPU and traffic pattern.
+
+### Recipe selector
+
+```{eval-rst}
+.. trtllm_config_selector::
+   :models: openai/gpt-oss-120b
+```
 
 ```{eval-rst}
 .. include:: ../_includes/note_sections.rst
    :start-after: .. start-note-traffic-patterns
    :end-before: .. end-note-traffic-patterns
+```
 
+### Recipe database
+
+```{eval-rst}
 .. include:: config_table.rst
    :start-after: .. start-openai/gpt-oss-120b
    :end-before: .. end-openai/gpt-oss-120b

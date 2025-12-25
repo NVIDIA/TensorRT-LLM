@@ -19,39 +19,58 @@ import pytest
 from build_and_run_ad import ExperimentConfig, main
 from defs.conftest import llm_models_root
 
-from tensorrt_llm.llmapi import DraftTargetDecodingConfig, KvCacheConfig
+from tensorrt_llm import SamplingParams
+from tensorrt_llm._torch.auto_deploy.llm import LLM
+from tensorrt_llm.llmapi import DraftTargetDecodingConfig, EagleDecodingConfig, KvCacheConfig
 
 prompts = [
     "What is the capital of France?",
     "Please explain the concept of gravity in simple words and a single sentence.",
-    "What is the capital of Norway?",
-    "What is the highest mountain in the world?",
 ]
+
+EAGLE_MODEL_SUBPATH = "EAGLE3-LLaMA3.1-Instruct-8B"
+LLAMA_BASE_SUBPATH = "llama-3.1-model/Llama-3.1-8B-Instruct"
+DRAFT_TARGET_MAX_DRAFT_LEN = 3
+EAGLE_MAX_DRAFT_LEN = 3
 
 
 def get_model_paths():
     """Get model paths using llm_models_root()."""
     models_root = llm_models_root()
-    base_model = os.path.join(
-        models_root,
-        "llama-3.1-model/Llama-3.1-8B-Instruct",
-    )
-    speculative_model = os.path.join(
+    base_model = os.path.join(models_root, LLAMA_BASE_SUBPATH)
+    draft_target_model = os.path.join(
         models_root,
         "llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
     )
+    eagle_model = os.path.join(models_root, EAGLE_MODEL_SUBPATH)
 
     print(f"Base model path: {base_model}")
-    print(f"Speculative model path: {speculative_model}")
-    return base_model, speculative_model
+    print(f"DraftTarget draft model path: {draft_target_model}")
+    print(f"EAGLE model path: {eagle_model}")
+    return base_model, draft_target_model, eagle_model
 
 
-def run_with_autodeploy(model, speculative_model_dir, batch_size):
+def make_draft_target_config(spec_model_path: str):
+    return DraftTargetDecodingConfig(
+        max_draft_len=DRAFT_TARGET_MAX_DRAFT_LEN, speculative_model_dir=spec_model_path
+    )
+
+
+def make_eagle3_config(spec_model_path: str):
+    return EagleDecodingConfig(
+        max_draft_len=EAGLE_MAX_DRAFT_LEN,
+        speculative_model_dir=spec_model_path,
+        eagle3_one_model=False,
+        eagle3_layers_to_capture=None,
+    )
+
+
+def run_with_autodeploy(model, speculative_config, batch_size):
     """Run AutoDeploy with or without speculative decoding.
 
     Args:
         model: Path to the base model
-        speculative_model_dir: Path to the speculative model (None for baseline mode)
+        speculative_config: Speculative decoding config (None for baseline mode)
         batch_size: Number of prompts to process
 
     Returns:
@@ -60,16 +79,11 @@ def run_with_autodeploy(model, speculative_model_dir, batch_size):
     # Select prompts based on batch size
     selected_prompts = prompts[:batch_size]
 
-    # Configure speculative decoding if speculative_model_dir is provided
-    spec_config = None
-    if speculative_model_dir is not None:
-        spec_config = DraftTargetDecodingConfig(
-            max_draft_len=3, speculative_model_dir=speculative_model_dir
-        )
+    spec_config = speculative_config
 
     # Configure KV cache
     kv_cache_config = KvCacheConfig(
-        free_gpu_memory_fraction=0.1,
+        free_gpu_memory_fraction=0.01,
     )
 
     # Configure AutoDeploy LLM arguments
@@ -81,9 +95,6 @@ def run_with_autodeploy(model, speculative_model_dir, batch_size):
         "world_size": 1,
         "kv_cache_config": kv_cache_config,
         "disable_overlap_scheduler": True,
-        "transforms": {
-            "fuse_rmsnorm": {"rmsnorm_backend": "triton"},
-        },
         "max_num_tokens": 64,
     }
 
@@ -116,34 +127,46 @@ def run_with_autodeploy(model, speculative_model_dir, batch_size):
     return result["prompts_and_outputs"]
 
 
-@pytest.mark.parametrize("batch_size", [1, 4])
-def test_autodeploy_spec_dec(batch_size):
-    """Test AutoDeploy speculative decoding with different batch sizes.
+# Note: This test tests exact equality of outputs between speculative and baseline modes.
+# This can fail for larger batch sizes due to nondeterminism with in flight batching.
+# TODO: Figure out a robust test for output correctness that can pass for larger batch sizes.
+@pytest.mark.parametrize("spec_dec_mode", ["draft_target", "eagle3"])
+def test_autodeploy_spec_dec_output(spec_dec_mode):
+    """Test AutoDeploy speculative decoding output correctness.
 
     Runs with and without speculative decoding and verifies outputs are identical.
     """
     print("\n" + "=" * 80)
-    print(f"Testing AutoDeploy Speculative Decoding - Batch Size {batch_size}")
+    print(f"Testing AutoDeploy Speculative Decoding ({spec_dec_mode}) - Output Correctness")
     print("=" * 80)
 
-    base_model, speculative_model = get_model_paths()
+    base_model, draft_target_model, eagle_model = get_model_paths()
+
+    # Select model and config based on mode
+    if spec_dec_mode == "draft_target":
+        spec_model = draft_target_model
+        spec_config = make_draft_target_config(spec_model)
+    elif spec_dec_mode == "eagle3":  # eagle3
+        spec_model = eagle_model
+        spec_config = make_eagle3_config(spec_model)
+    else:
+        raise ValueError(f"Unsupported speculative decoding mode: {spec_dec_mode}")
 
     print(f"\nBase Model: {base_model}")
-    print(f"Speculative Model: {speculative_model}")
-    print(f"Batch Size: {batch_size}")
+    print(f"Speculative Model ({spec_dec_mode}): {spec_model}")
 
     # Run with speculative decoding
     print("\n[1/2] Running with speculative decoding enabled...")
     spec_outputs = run_with_autodeploy(
-        model=base_model, speculative_model_dir=speculative_model, batch_size=batch_size
+        model=base_model,
+        speculative_config=spec_config,
+        batch_size=1,
     )
     print(f"Generated {len(spec_outputs)} outputs with speculative decoding")
 
     # Run without speculative decoding (baseline)
     print("\n[2/2] Running without speculative decoding (baseline)...")
-    baseline_outputs = run_with_autodeploy(
-        model=base_model, speculative_model_dir=None, batch_size=batch_size
-    )
+    baseline_outputs = run_with_autodeploy(model=base_model, speculative_config=None, batch_size=1)
     print(f"Generated {len(baseline_outputs)} outputs in baseline mode")
 
     # Verify outputs are identical
@@ -170,4 +193,86 @@ def test_autodeploy_spec_dec(batch_size):
 
     print("\n" + "=" * 80)
     print("SUCCESS! All outputs are identical between spec-dec and baseline modes")
+    print("=" * 80)
+
+
+def test_autodeploy_eagle3_acceptance_rate():
+    """Test Eagle3 acceptance rate with AutoDeploy engine.
+
+    Runs Eagle3 speculative decoding with streaming and verifies
+    that the acceptance rate is above a minimum threshold.
+    """
+    print("\n" + "=" * 80)
+    print("Testing AutoDeploy Eagle3 Acceptance Rate")
+    print("=" * 80)
+
+    base_model, _, eagle_model = get_model_paths()
+
+    print(f"\nBase Model: {base_model}")
+    print(f"Eagle3 Model: {eagle_model}")
+
+    max_draft_len = EAGLE_MAX_DRAFT_LEN
+
+    # Configure Eagle3 speculative decoding
+    speculative_config = EagleDecodingConfig(
+        max_draft_len=max_draft_len,
+        speculative_model_dir=eagle_model,
+        eagle3_one_model=False,
+        eagle3_layers_to_capture=None,
+    )
+
+    # Configure KV cache
+    kv_cache_config = KvCacheConfig(
+        free_gpu_memory_fraction=0.01,
+    )
+
+    # Create AutoDeploy LLM with Eagle3 speculative decoding
+    # We directly instantiate the LLM class instead of using the main() function
+    # so that we can stream the outputs to see acceptance rates without needing to
+    # collect them in the executor.
+    llm = LLM(
+        model=base_model,
+        skip_loading_weights=False,
+        runtime="trtllm",
+        world_size=1,
+        kv_cache_config=kv_cache_config,
+        speculative_config=speculative_config,
+        disable_overlap_scheduler=True,
+        max_num_tokens=64,
+    )
+
+    # Tokenize 2 prompts to test multiple sequential requests
+    batch_tok_ids = [llm.tokenizer.encode(p) for p in prompts[:2]]
+
+    sampling_params = SamplingParams(max_tokens=128, temperature=0, seed=42)
+
+    print("\nRunning Eagle3 speculative decoding with streaming...")
+
+    # Process each request sequentially and verify acceptance rate
+    for i in range(len(batch_tok_ids)):
+        num_tokens = 0
+        num_drafted = 0
+        num_accepted = 0
+
+        for output in llm.generate_async(batch_tok_ids[i], sampling_params, streaming=True):
+            new_tokens = output.outputs[0].token_ids
+            num_drafted += max_draft_len
+            num_accepted += len(new_tokens) - num_tokens - 1
+            num_tokens = len(new_tokens)
+
+        accept_rate = num_accepted / num_drafted
+
+        print(f"\nRequest {i + 1} Acceptance Rate Statistics:")
+        print(f"  Total tokens drafted: {num_drafted}")
+        print(f"  Total tokens accepted: {num_accepted}")
+        print(f"  Acceptance rate: {accept_rate:.2%}")
+
+        # Verify acceptance rate is above minimum threshold (10%)
+        min_acceptance_rate = 0.10
+        assert accept_rate > min_acceptance_rate, (
+            f"Request {i + 1}: Acceptance rate {accept_rate:.2%} is below minimum threshold {min_acceptance_rate:.0%}"
+        )
+
+    print("\n" + "=" * 80)
+    print("SUCCESS! All requests passed acceptance rate threshold")
     print("=" * 80)

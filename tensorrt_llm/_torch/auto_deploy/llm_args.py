@@ -8,7 +8,14 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from ...llmapi.llm_args import BaseLlmArgs, BuildConfig, KvCacheConfig, SamplerType, _ParallelConfig
+from ...llmapi.llm_args import (
+    BaseLlmArgs,
+    BuildConfig,
+    EagleDecodingConfig,
+    KvCacheConfig,
+    SamplerType,
+    _ParallelConfig,
+)
 from .models import ModelFactory, ModelFactoryRegistry
 from .utils._config import DynamicYamlMixInForSettings
 from .utils.logger import ad_logger
@@ -150,6 +157,11 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
 
     enable_chunked_prefill: bool = Field(default=False, description="Enable chunked prefill.")
 
+    draft_checkpoint_loader: Optional[object] = Field(
+        default=None,
+        description="The checkpoint loader to use for the draft model when using speculative decoding with two models.",
+    )
+
     ### INFERENCE OPTIMIZER CONFIG #################################################################
     mode: Literal["graph", "transformers"] = Field(
         default="graph",
@@ -188,11 +200,6 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
             " be used to determine the batch sizes.",
             "cuda_graph_batch_sizes",
         ),
-    )
-
-    draft_checkpoint_loader: Optional[object] = Field(
-        default=None,
-        description="The checkpoint loader to use for the draft model when using speculative decoding with two models.",
     )
 
     ### SEQUENCE INTERFACE CONFIG ##################################################################
@@ -419,6 +426,19 @@ class LlmArgs(AutoDeployConfig, BaseLlmArgs, BaseSettings):
     def ensure_no_custom_parallel_config(cls, value: Any, info: ValidationInfo) -> Any:
         msg = "AutoDeploy only supports parallelization via the `world_size` argument."
         return _check_for_default_value_only(cls, value, info, msg)
+
+    @model_validator(mode="after")
+    def setup_hidden_state_capture(self):
+        if self.speculative_config is None or not isinstance(
+            self.speculative_config, EagleDecodingConfig
+        ):
+            return self
+
+        self.transforms["detect_hidden_states_for_capture"]["capture_hidden_states"] = True
+        self.transforms["detect_hidden_states_for_capture"]["eagle3_layers_to_capture"] = (
+            self.speculative_config.eagle3_layers_to_capture
+        )
+        return self
 
     @model_validator(mode="after")
     def validate_parallel_config(self):

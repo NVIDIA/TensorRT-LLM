@@ -25,7 +25,9 @@ from typing import Tuple
 import torch
 from torch.fx import GraphModule
 
-from ...utils.node_utils import is_linear_op, is_op
+from tensorrt_llm._torch.auto_deploy.utils._graph import get_lm_head_node
+
+from ...utils.node_utils import is_linear_op
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
 
@@ -54,9 +56,7 @@ class GatherLogitsBeforeLmHeadTransform(BaseTransform):
         self._log_info("Applying GatherLogitsBeforeLmHead transform...")
 
         # assume lm head node is the input to the output node
-        lm_head_node = gm.graph.find_nodes(op="output")[0].all_input_nodes[0]
-        if is_op(lm_head_node, torch.ops.aten.to):
-            lm_head_node = lm_head_node.all_input_nodes[0]
+        lm_head_node = get_lm_head_node(gm)
 
         if is_linear_op(lm_head_node):
             node_to_gather = lm_head_node.all_input_nodes[0]

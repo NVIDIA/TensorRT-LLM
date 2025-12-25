@@ -96,9 +96,10 @@ async def test_async_llm_release_resume(process_gpu_memory_info_available, num_c
 @pytest.mark.ray
 @pytest.mark.gpu4
 @pytest.mark.asyncio
-@pytest.mark.threadleak(enabled=False)
-async def test_async_llm_placement_api(monkeypatch):
-    monkeypatch.setenv("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", "1")
+async def test_async_llm_placement_api(setup_ray_cluster, monkeypatch):
+    port = setup_ray_cluster
+    monkeypatch.setenv("RAY_ADDRESS", f"localhost:{port}")
+    monkeypatch.setenv("TLLM_RAY_FORCE_LOCAL_CLUSTER", "0")
 
     n_gpus = 4
     bundle_indices = [2, 3]
@@ -106,7 +107,6 @@ async def test_async_llm_placement_api(monkeypatch):
 
     pg = None
     try:
-        ray.init()
         pg = placement_group([{"GPU": 1, "CPU": 1}] * n_gpus)
         ray.get(pg.ready())
         print(f"Placement group ready with bundles {pg.bundle_specs}")
@@ -132,6 +132,6 @@ async def test_async_llm_placement_api(monkeypatch):
         )
 
     finally:
+        llm.shutdown()
         if pg is not None:
             remove_placement_group(pg)
-        ray.shutdown()

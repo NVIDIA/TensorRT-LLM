@@ -37,7 +37,6 @@ import tqdm
 import yaml
 from _pytest.mark import ParameterSet
 
-from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
 from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
 
@@ -2362,6 +2361,7 @@ def pytest_configure(config):
     tqdm.tqdm.monitor_interval = 0
     if config.getoption("--run-ray"):
         os.environ["TLLM_DISABLE_MPI"] = "1"
+        os.environ["TLLM_RAY_FORCE_LOCAL_CLUSTER"] = "1"
 
     # Initialize PeriodicJUnitXML reporter if enabled
     periodic = config.getoption("--periodic-junit", default=False)
@@ -2825,15 +2825,3 @@ def torch_empty_cache() -> None:
         gc.collect()
         torch.cuda.empty_cache()
         gc.collect()
-
-
-@pytest.fixture(autouse=True)
-def ray_cleanup(llm_venv) -> None:
-    yield
-
-    if mpi_disabled():
-        llm_venv.run_cmd([
-            "-m",
-            "ray.scripts.scripts",
-            "stop",
-        ])

@@ -21,6 +21,12 @@ import tempfile
 from typing import Callable
 
 import pytest
+
+try:
+    import ray
+except ImportError:
+    import tensorrt_llm.ray_stub as ray
+
 import yaml
 from defs.common import (revise_disagg_config_file_with_free_ports,
                          wait_for_server)
@@ -30,7 +36,7 @@ from defs.trt_test_alternative import check_call, check_output, popen
 from test_common.perf_metrics_utils import (get_timing_metrics,
                                             validate_timing_metrics)
 
-from tensorrt_llm._utils import get_free_port, mpi_disabled
+from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.logger import logger
 
 
@@ -357,8 +363,6 @@ def run_disaggregated_test(example_dir,
 
         extra_config_files = []
         workers_cmds = []
-        subprocess.run(['ray', 'start', '--head', '--disable-usage-stats'],
-                       check=True)
 
         # Generate ctx and gen server worker commands
         ctx_extra_config_file = get_extra_llm_config(config['context_servers'],
@@ -415,6 +419,21 @@ def run_disaggregated_test(example_dir,
                                  use_ray=False)
 
         else:
+            runtime_env = {
+                "env_vars": {
+                    "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"
+                }
+            }
+            ray.init(address="local",
+                     include_dashboard=False,
+                     ignore_reinit_error=True,
+                     runtime_env=runtime_env)
+            gcs_addr = ray.get_runtime_context().gcs_address
+            ray_port = str(gcs_addr.split(":")[1])
+            run_env.update({
+                "RAY_ADDRESS": f"localhost:{ray_port}",
+                "TLLM_RAY_FORCE_LOCAL_CLUSTER": "0"
+            })
             workers_proc = []
             with contextlib.ExitStack() as stack:
                 workers_log = stack.enter_context(
@@ -470,16 +489,16 @@ def run_disaggregated_test(example_dir,
             logger.error(f.read())
         raise
     finally:
-        if use_ray:
-            subprocess.run(['ray', 'stop', '--force'], check=False)
-            for extra_file in extra_config_files:
-                if os.path.exists(extra_file):
-                    os.remove(extra_file)
-        elif 'server_proc' in locals() and 'workers_proc' in locals():
+        if 'server_proc' in locals() and 'workers_proc' in locals():
             server_proc.terminate()
             workers_proc.terminate()
             server_proc.wait()
             workers_proc.wait()
+        if use_ray:
+            ray.shutdown()
+            for extra_file in extra_config_files:
+                if os.path.exists(extra_file):
+                    os.remove(extra_file)
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],

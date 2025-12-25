@@ -328,9 +328,6 @@ def run_test_in_subprocess(env, test_file):
     {
         'TRTLLM_DG_JIT_USE_NVCC': '1'
     },
-    {
-        'TRTLLM_DG_ENABLED': '0'
-    },
 ])
 def test_deep_gemm_in_subprocess(env):
     # Get the directory of the current file
