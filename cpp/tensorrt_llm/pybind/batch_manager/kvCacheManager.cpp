@@ -526,7 +526,9 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
             "scheduling_has_free_blocks",
             [](tbk::KVCacheManager& self, SizeType32 numRequired, SizeType32 windowSize)
             { return self.getBlockManager().schedulingHasFreeBlocks(numRequired, windowSize); },
-            py::arg("num_required"), py::arg("window_size"), py::call_guard<py::gil_scoped_release>());
+            py::arg("num_required"), py::arg("window_size"), py::call_guard<py::gil_scoped_release>())
+        .def_property_readonly(
+            "is_variable_window", [](tbk::KVCacheManager& self) { return self.getBlockManager().isVariableWindow(); });
 }
 
 void tb::BasePeftCacheManagerBindings::initBindings(py::module_& m)

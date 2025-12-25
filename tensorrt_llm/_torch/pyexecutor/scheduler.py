@@ -465,12 +465,13 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
         2. Sort all requests by lora task id for performance.
         """
 
-        def get_lora_task_id(req: LlmRequest) -> int:
-            # Return lora_task_id or a large value if not set
+        def get_lora_task_id(req: LlmRequest):
+            # C++ uses std::optional comparison where nullopt < any_value
+            # So requests without LoRA (nullopt) should come first
             lora_id = getattr(req, 'lora_task_id', None)
             if lora_id is None:
-                return float('inf')
-            return lora_id
+                return (0, 0)  # (has_value=False, value=0) - comes first
+            return (1, lora_id)  # (has_value=True, value) - sorted by value
 
         if chunks_present:
             # Partition: non-last-chunk first, last-chunk at end
@@ -761,7 +762,7 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
     def schedule(
             self, scheduler: 'PyCapacityScheduler',
             active_requests: RequestList) -> Tuple[RequestList, RequestList]:
-        scheduler.kv_cache_manager.impl.start_scheduling()
+        scheduler.kv_cache_manager.start_scheduling()
 
         skipping_is_relevant = scheduler._is_skipping_relevant()
 
@@ -824,7 +825,7 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
 
                 if last_started_idx is not None:
                     paused_req = requests_list[last_started_idx]
-                    scheduler.kv_cache_manager.impl.scheduling_remove_sequence(
+                    scheduler.kv_cache_manager.scheduling_remove_sequence(
                         paused_req.py_request_id)
                     paused_requests.append(paused_req)
                     logger.debug(
@@ -887,7 +888,7 @@ class NoEvictScheduledBlocksManager:
         C++ equivalent: mAvailableBlocks = mKvCacheManager.getBlockManager().getNumFreeBlocksPerWindowSize()
         """
         self.kv_cache_manager = kv_cache_manager
-        stats = kv_cache_manager.impl.get_kv_cache_stats()
+        stats = kv_cache_manager.get_kv_cache_stats()
         self.available_blocks: Dict[int, int] = dict(
             stats.num_free_blocks_per_window_size)
 
@@ -897,7 +898,7 @@ class NoEvictScheduledBlocksManager:
         C++ reference: scheduledBlocksManager.h:40-46
         """
         for window_size in self.available_blocks:
-            needed = self.kv_cache_manager.impl.get_remaining_blocks_to_completion(
+            needed = self.kv_cache_manager.get_remaining_blocks_to_completion(
                 req, window_size)
             self.available_blocks[window_size] -= needed
 
@@ -907,9 +908,8 @@ class NoEvictScheduledBlocksManager:
         C++ reference: scheduledBlocksManager.h:48-57
         """
         return all(
-            self.kv_cache_manager.impl.get_remaining_blocks_to_completion(
-                req, ws) <= avail
-            for ws, avail in self.available_blocks.items())
+            self.kv_cache_manager.get_remaining_blocks_to_completion(req, ws) <=
+            avail for ws, avail in self.available_blocks.items())
 
 
 class MaxUtilizationScheduledBlocksManager:
@@ -942,13 +942,13 @@ class MaxUtilizationScheduledBlocksManager:
         """
         blocks_if_scheduled = {}
         for window_size, num_scheduled in self.num_scheduled_blocks.items():
-            required = self.kv_cache_manager.impl.get_needed_blocks_one_step(
+            required = self.kv_cache_manager.get_needed_blocks_one_step(
                 req, self.two_steps_look_ahead, window_size)
             logger.debug(
                 f"MaxUtilizationScheduler: request ID {req.request_id} "
                 f"required blocks {required} for {window_size} window size")
             scheduled_total = num_scheduled + required
-            has_free = self.kv_cache_manager.impl.scheduling_has_free_blocks(
+            has_free = self.kv_cache_manager.scheduling_has_free_blocks(
                 scheduled_total, window_size)
             if not has_free:
                 return None
@@ -1063,10 +1063,10 @@ class PyCapacityScheduler:
         """
         if self.kv_cache_manager is None:
             return False
-        if self.kv_cache_manager.is_vswa:
+        if self.kv_cache_manager.is_variable_window:
             return False
         if (self.cross_kv_cache_manager is not None
-                and self.cross_kv_cache_manager.is_vswa):
+                and self.cross_kv_cache_manager.is_variable_window):
             return False
         return True
 
@@ -1094,7 +1094,7 @@ class PyCapacityScheduler:
                 # Chunked context request already executing
                 if enable_block_reuse:
                     unique_tokens = req.get_unique_tokens(0)
-                    block_key = self.kv_cache_manager.impl.find_new_context_block(
+                    block_key = self.kv_cache_manager.find_new_context_block(
                         unique_tokens, req)
                     if block_key is not None:
                         newly_contributed_context_blocks.add(block_key)
@@ -1102,7 +1102,7 @@ class PyCapacityScheduler:
                 if cross_enable_reuse:
                     encoder_unique_tokens = req.get_encoder_unique_tokens()
                     if encoder_unique_tokens is not None:
-                        block_key = self.cross_kv_cache_manager.impl.find_new_context_block(
+                        block_key = self.cross_kv_cache_manager.find_new_context_block(
                             encoder_unique_tokens, req)
                         if block_key is not None:
                             newly_contributed_cross_context_blocks.add(
@@ -1117,7 +1117,7 @@ class PyCapacityScheduler:
         Check if skipping is beneficial for one KV cache manager.
         C++ reference: capacityScheduler.cpp:70-92 (oneManagerBeneficialToSkip)
         """
-        new_context_block = kv_cache_manager.impl.find_new_context_block(
+        new_context_block = kv_cache_manager.find_new_context_block(
             unique_tokens, req)
         if new_context_block is not None:
             if new_context_block in newly_contributed_blocks:
@@ -1161,7 +1161,7 @@ class PyCapacityScheduler:
         """Get maximum PEFT cache pages."""
         if self.peft_cache_manager is None:
             return 2**31 - 1  # INT_MAX equivalent
-        return self.peft_cache_manager.get_max_device_pages()
+        return self.peft_cache_manager.max_device_pages
 
     def _get_peft_pages_for_request(self, req: LlmRequest) -> int:
         """Get PEFT pages needed for a request."""

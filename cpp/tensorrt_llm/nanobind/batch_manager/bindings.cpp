@@ -174,6 +174,7 @@ void initBindings(nb::module_& m)
         .def_prop_ro("is_disagg_generation_transmission_complete", &GenLlmReq::isDisaggGenerationTransmissionComplete)
         .def_prop_ro(
             "is_disagg_generation_transmission_in_progress", &GenLlmReq::isDisaggGenerationTransmissionInProgress)
+        .def_prop_ro("is_encoder_init_state", &GenLlmReq::isEncoderInitState)
         .def_prop_ro("is_context_init_state", &GenLlmReq::isContextInitState)
         .def_prop_ro("is_generation_in_progress_state", &GenLlmReq::isGenerationInProgressState)
         .def_prop_ro("is_disagg_context_transmission_state", &GenLlmReq::isDisaggContextTransmissionState)
