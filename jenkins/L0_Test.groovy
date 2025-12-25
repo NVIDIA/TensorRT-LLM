@@ -1,4 +1,4 @@
-@Library(['bloom-jenkins-shared-lib@emma/add_spark_for_slurm', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -1477,9 +1477,6 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
 
     def archSuffix = arch == "arm64" ? "arm" : "amd"
     def jnlpImage = "urm.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
-    if ( type == "gb10x" ) {
-        println "Using type: ${type} to create Kubernetes Pod config"
-    }
 
     switch(type)
     {
