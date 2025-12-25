@@ -194,7 +194,8 @@ def run_sanity_check(examples_path="../../examples"):
         f"python3 {examples_path}/llm-api/quickstart_example.py", shell=True)
 
 
-def test_pip_install(args):
+def install_system_libs():
+    """Install required system libraries for tensorrt_llm."""
     print("##########  Install required system libs  ##########")
     if not os.path.exists("/usr/local/mpi/bin/mpicc"):
         subprocess.check_call("apt-get -y install libopenmpi-dev", shell=True)
@@ -208,6 +209,10 @@ def test_pip_install(args):
     subprocess.check_call("pip3 install --ignore-installed wheel || true",
                           shell=True)
 
+
+def test_pip_install(args):
+    install_system_libs()
+
     download_wheel(args)
     install_tensorrt_llm()
 
@@ -215,15 +220,19 @@ def test_pip_install(args):
 
 
 def test_python_builds(args):
-    """Test Python builds using precompiled wheel.
+    """Test Python builds using precompiled wheel (sanity check only).
 
     This test verifies the TRTLLM_PRECOMPILED_LOCATION workflow:
-    1. Use precompiled wheel URL to extract C++ bindings
-    2. Build Python-only wheel (editable install)
-    3. Verify installation works correctly
-    4. Run quickstart example
+    1. Install required system libs
+    2. Use precompiled wheel URL to extract C++ bindings
+    3. Build Python-only wheel (editable install)
+    4. Verify installation works correctly
+    5. Run quickstart example
+    6. Clean up editable install to leave env in clean state
     """
     print("##########  Python Builds Test  ##########")
+
+    install_system_libs()
 
     wheel_url = get_wheel_url(args.wheel_path)
     print(f"Using precompiled wheel: {wheel_url}")
@@ -246,6 +255,12 @@ def test_python_builds(args):
                           env=env)
     run_sanity_check(examples_path=f"{repo_root}/examples")
 
+    # Clean up: uninstall editable install to leave env in clean state
+    print("##########  Clean up editable install  ##########")
+    subprocess.run("pip3 uninstall -y tensorrt_llm || true",
+                   shell=True,
+                   check=False)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Check Pip Install")
@@ -254,7 +269,5 @@ if __name__ == "__main__":
                         required=True,
                         help="The wheel path")
     args = parser.parse_args()
-
-    # Run python_builds first (sanity check), then pip_install last
     test_python_builds(args)
     test_pip_install(args)
