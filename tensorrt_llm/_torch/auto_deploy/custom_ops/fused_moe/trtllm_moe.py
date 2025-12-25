@@ -292,7 +292,7 @@ def trtllm_quant_nvfp4_moe_fused(
 
     # Pad I to be divisible by 128
     inter_size_padded = math.ceil(inter_size / TRTLLM_NVFP4_ROW_SIZE) * TRTLLM_NVFP4_ROW_SIZE
-    if inter_size_padded != inter_size:
+    if not is_gated_mlp and inter_size_padded != inter_size:
         # if False:
         # fc1_expert_weights_fp4: [E, I, H]
         fc1_padded = fc1_expert_weights_fp4.new_zeros(
