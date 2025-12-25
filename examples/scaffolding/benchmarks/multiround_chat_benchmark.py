@@ -267,6 +267,7 @@ class SyntheticDataConfig:
         default_factory=lambda: ["examples/scaffolding/benchmarks/pg1184.txt"]
     )
     print_stats: bool = False
+    seed: Optional[int] = None  # Random seed for reproducibility
 
     # num_turns distribution
     num_turns_distribution: str = "uniform"
@@ -715,6 +716,10 @@ def load_or_generate_conversations(
     """
     # Option 1: Synthetic generation
     if config.synthetic.enabled:
+        # Set random seed for reproducibility if specified
+        if config.synthetic.seed is not None:
+            np.random.seed(config.synthetic.seed)
+            print(f"Using random seed: {config.synthetic.seed}")
         print("Generating synthetic conversations...")
         gen_args = config.synthetic.to_gen_conv_args(config.num_conversations)
         return generate_conversations(gen_args, tokenizer)
@@ -754,6 +759,7 @@ async def async_multiround_chat_benchmark(args):
         enabled=args.multiround_synthetic,
         text_files=args.multiround_text_files,
         print_stats=args.multiround_print_stats,
+        seed=getattr(args, "multiround_seed", None),
         # num_turns distribution
         num_turns_distribution=args.multiround_num_turns_distribution,
         num_turns_min=args.multiround_num_turns_min,
@@ -811,7 +817,7 @@ async def async_multiround_chat_benchmark(args):
 
     # Initialize workers
     client = AsyncOpenAI(api_key=args.openai_api_key, base_url=args.base_url)
-    generation_worker = TRTOpenaiWorker(client, args.model, args.kv_cache_hint_enabled)
+    generation_worker = TRTOpenaiWorker(client, args.model, args.kv_cache_hint_multiround)
 
     multiround_worker = MultiroundChatWorker(
         model_dir=args.model_dir,

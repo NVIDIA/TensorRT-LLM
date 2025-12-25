@@ -187,6 +187,13 @@ def parse_arguments():
         action="store_true",
         help="[Multiround/Synthetic] Print conversation statistics after generation",
     )
+    parser.add_argument(
+        "--multiround_seed",
+        type=int,
+        default=None,
+        help="[Multiround/Synthetic] Random seed for reproducible synthetic data generation. "
+        "If not set, results will vary between runs.",
+    )
     # num_turns distribution
     parser.add_argument(
         "--multiround_num_turns_distribution",
@@ -354,10 +361,26 @@ def parse_arguments():
         default=10.0,
         help="[Multiround] Maximum cap for any delay in seconds (default: 10.0)",
     )
+    # KV cache hint settings (per-benchmark)
     parser.add_argument(
         "--kv_cache_hint_enabled",
         action="store_true",
-        help="[All benchmarks] Enable KV cache hint for better cache utilization",
+        help="[All benchmarks] Enable KV cache hint for all benchmarks (overrides individual settings)",
+    )
+    parser.add_argument(
+        "--kv_cache_hint_agent",
+        action="store_true",
+        help="[Agent only] Enable KV cache hint for agent benchmarks (normal and burst)",
+    )
+    parser.add_argument(
+        "--kv_cache_hint_chat",
+        action="store_true",
+        help="[Chat only] Enable KV cache hint for chat benchmark",
+    )
+    parser.add_argument(
+        "--kv_cache_hint_multiround",
+        action="store_true",
+        help="[Multiround only] Enable KV cache hint for multiround chat benchmark",
     )
     parser.add_argument(
         "--export_task_metrics_path",
@@ -383,6 +406,12 @@ def main():
 
     # Handle user delay enabled/disabled logic (enabled by default)
     args.multiround_user_delay_enabled = not args.multiround_user_delay_disabled
+
+    # Resolve KV cache hint settings: --kv_cache_hint_enabled overrides all individual settings
+    if args.kv_cache_hint_enabled:
+        args.kv_cache_hint_agent = True
+        args.kv_cache_hint_chat = True
+        args.kv_cache_hint_multiround = True
 
     # Validate multiround chat arguments
     if args.enable_multiround_chat:
