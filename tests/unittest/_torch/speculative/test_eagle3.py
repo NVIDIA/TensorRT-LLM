@@ -588,7 +588,7 @@ def test_eagle3_cuda_graph_padding(disable_overlap_scheduler: bool):
     max_batch_size = 4
     max_draft_len = 4
     kv_cache_config = KvCacheConfig(enable_block_reuse=enable_block_reuse,
-                                    max_tokens=8192)
+                                    max_tokens=4096)
     cuda_graph_config = CudaGraphConfig(batch_sizes=[1, 2, 4],
                                         enable_padding=True)
 
@@ -599,7 +599,7 @@ def test_eagle3_cuda_graph_padding(disable_overlap_scheduler: bool):
         cuda_graph_config=cuda_graph_config,
         max_batch_size=max_batch_size,
         kv_cache_config=kv_cache_config,
-        max_seq_len=8192,
+        max_seq_len=2048,
         enable_chunked_prefill=enable_chunked_prefill,
     )
 
@@ -617,7 +617,7 @@ def test_eagle3_cuda_graph_padding(disable_overlap_scheduler: bool):
         "The future of AI is"
     ]
 
-    sampling_params = SamplingParams(max_tokens=20, temperature=0)
+    sampling_params = SamplingParams(max_tokens=2048, temperature=0)
     llm_spec.generate(prompts, sampling_params)
     llm_spec.shutdown()
 

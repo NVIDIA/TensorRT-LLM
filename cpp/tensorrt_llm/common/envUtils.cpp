@@ -249,7 +249,7 @@ bool getEnvUseTileSizeKv64ForTrtllmGen()
 bool getEnvEnablePDL()
 {
     static std::once_flag flag;
-    static bool enablePDL = false;
+    static bool enablePDL = true;
 
     std::call_once(flag,
         [&]()
@@ -257,7 +257,18 @@ bool getEnvEnablePDL()
             if (getSMVersion() >= 90)
             {
                 // PDL will be enabled by setting the env variables `TRTLLM_ENABLE_PDL` to `1`
-                enablePDL = getBoolEnv("TRTLLM_ENABLE_PDL");
+                char const* env = std::getenv("TRTLLM_ENABLE_PDL");
+                if (env)
+                {
+                    if (env[0] == '1' && env[1] == '\0')
+                    {
+                        enablePDL = true;
+                    }
+                    else if (env[0] == '0' && env[1] == '\0')
+                    {
+                        enablePDL = false;
+                    }
+                };
             }
         });
     return enablePDL;
