@@ -18,7 +18,11 @@ import math
 
 import torch
 
-from tensorrt_llm._torch.auto_deploy.custom_ops.quant import TRTLLM_NVFP4_ROW_SIZE
+from tensorrt_llm._torch.auto_deploy.custom_ops.quant import (
+    TRTLLM_NVFP4_COLUMN_SIZE,
+    TRTLLM_NVFP4_ROW_SIZE,
+    TRTLLM_NVFP4_SCALING_VECTOR_SIZE,
+)
 from tensorrt_llm._torch.utils import ActivationType
 
 
@@ -220,12 +224,12 @@ def trtllm_quant_nvfp4_moe_fused(
     routing_weights: torch.Tensor,
     fc1_expert_weights_fp4: torch.Tensor,
     fc2_expert_weights_fp4: torch.Tensor,
-    fc1_weight_blockscale_fp8: torch.Tensor,  # Global scale for fc1 (scalar)
-    fc2_weight_blockscale_fp8: torch.Tensor,  # Global scale for w2 (scalar)
-    fc1_act_global_scale: torch.Tensor,  # Global scale for FC1 activations
-    fc2_act_global_scale: torch.Tensor,  # Global scale for FC2 activations
-    fc1_alpha: torch.Tensor,  # Precomputed FC1 alpha (1.0 / (fc1_act_global_scale * fc1_weight_blockscale_fp8))
-    fc2_alpha: torch.Tensor,  # Precomputed FC2 alpha (1.0 / (fc2_act_global_scale * fc2_weight_blockscale_fp8))
+    fc1_weight_blockscale_fp8: torch.Tensor,
+    fc2_weight_blockscale_fp8: torch.Tensor,
+    fc1_act_global_scale: torch.Tensor,
+    fc2_act_global_scale: torch.Tensor,
+    fc1_alpha: torch.Tensor,
+    fc2_alpha: torch.Tensor,
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
 ) -> torch.Tensor:
@@ -258,25 +262,23 @@ def trtllm_quant_nvfp4_moe_fused(
         mlp_style: "gated_mlp" or "mlp"
         act_fn: "silu" for gated_mlp, "relu2" for mlp
     """
-    NVFP4_BLOCK_SIZE = 16
-    n_experts, hidden_size, inter_size = fc2_expert_weights_fp4.shape
-    inter_size *= 2  # 2 FP4 elements are packed in each uint8 element.
+    NVFP4_BLOCK_SIZE = TRTLLM_NVFP4_SCALING_VECTOR_SIZE
+    TRTLLM_NVFP4_NUM_ELEMENTS_PER_UINT8 = 2
 
-    activation_type = ActivationType.Swiglu
-    if is_gated_mlp:
-        if act_fn in [ActivationType.Silu, ActivationType.Swiglu]:
-            activation_type = ActivationType.Swiglu
-        else:
-            raise ValueError(
-                f"Unsupported activation '{ActivationType(act_fn).name}' for gated_mlp. Use 'silu'."
-            )
-    else:
-        if act_fn == ActivationType.Relu2:
-            activation_type = ActivationType.Relu2
-        else:
-            raise ValueError(
-                f"Unsupported activation '{ActivationType(act_fn).name}' for mlp. Use 'relu2'."
-            )
+    n_experts, hidden_size, inter_size = fc2_expert_weights_fp4.shape
+    # Convert the inter_size from number of uint8 elements to number of FP4 elements.
+    inter_size *= TRTLLM_NVFP4_NUM_ELEMENTS_PER_UINT8
+
+    # Validate shapes and padding requirements as defined by the cutlass kernel.
+    assert fc1_weight_blockscale_fp8.ndim == 3, "fc1_weight_blockscale_fp8 must be 3D"
+    assert fc2_weight_blockscale_fp8.ndim == 3, "fc2_weight_blockscale_fp8 must be 3D"
+    assert fc1_weight_blockscale_fp8.size(1) % TRTLLM_NVFP4_ROW_SIZE == 0
+    assert fc2_weight_blockscale_fp8.size(1) % TRTLLM_NVFP4_ROW_SIZE == 0
+    assert fc1_weight_blockscale_fp8.size(2) % TRTLLM_NVFP4_COLUMN_SIZE == 0
+    assert fc2_weight_blockscale_fp8.size(2) % TRTLLM_NVFP4_COLUMN_SIZE == 0
+
+    _validate_mlp_style_and_act_fn(is_gated_mlp, act_fn)
+    act_fn = ActivationType.Swiglu if act_fn == ActivationType.Silu else act_fn
 
     if x.dtype in (torch.float16, torch.bfloat16):
         x_q_fp4, input_blockscale = torch.ops.trtllm.fp4_quantize(
@@ -289,21 +291,25 @@ def trtllm_quant_nvfp4_moe_fused(
         output_dtype = x.dtype
 
     # Pad I to be divisible by 128
-    I_padded = math.ceil(inter_size / TRTLLM_NVFP4_ROW_SIZE) * TRTLLM_NVFP4_ROW_SIZE
-    if I_padded != inter_size:
+    inter_size_padded = math.ceil(inter_size / TRTLLM_NVFP4_ROW_SIZE) * TRTLLM_NVFP4_ROW_SIZE
+    if inter_size_padded != inter_size:
         # if False:
         # fc1_expert_weights_fp4: [E, I, H]
-        fc1_padded = fc1_expert_weights_fp4.new_zeros(n_experts, I_padded, hidden_size // 2)
+        fc1_padded = fc1_expert_weights_fp4.new_zeros(
+            n_experts, inter_size_padded, hidden_size // 2
+        )
         fc1_padded[:, :inter_size, :] = fc1_expert_weights_fp4
         fc1_expert_weights_fp4 = fc1_padded
 
         # fc2_expert_weights_fp4: [E, H, I]
-        fc2_padded = fc2_expert_weights_fp4.new_zeros(n_experts, hidden_size, I_padded // 2)
+        fc2_padded = fc2_expert_weights_fp4.new_zeros(
+            n_experts, hidden_size, inter_size_padded // 2
+        )
         fc2_padded[:, :, : inter_size // 2] = fc2_expert_weights_fp4
         fc2_expert_weights_fp4 = fc2_padded
 
         fc2_blockscale_fp8_padded = fc2_weight_blockscale_fp8.new_zeros(
-            n_experts, hidden_size, I_padded // 16
+            n_experts, hidden_size, inter_size_padded // 16
         )
         fc2_blockscale_fp8_padded[:, :, : inter_size // 16] = fc2_weight_blockscale_fp8
         fc2_weight_blockscale_fp8 = fc2_blockscale_fp8_padded
@@ -330,7 +336,7 @@ def trtllm_quant_nvfp4_moe_fused(
         output_dtype=output_dtype,
         quant_scales=quant_scales,
         input_sf=input_blockscale,
-        activation_type=activation_type,
+        activation_type=act_fn,
     )[0].view(x.shape)
 
     return trtllm_output

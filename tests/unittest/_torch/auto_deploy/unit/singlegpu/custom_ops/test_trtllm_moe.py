@@ -584,7 +584,7 @@ def test_trtllm_fused_moe_nvfp4(
 ):
     # In the code below:
     #   sf := block scale factors for NVFP4
-    #   blockscale := block scale factor for NVFP4
+    #   blockscale := block scale factors for NVFP4
     #   gs := global scale for NVFP4
 
     # Skip invalid configurations
@@ -646,6 +646,11 @@ def test_trtllm_fused_moe_nvfp4(
             w2_gs[expert] = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w2_amax
             w3_gs[expert] = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w3_amax
 
+            # Quantize the weights to NVFP4 and ask for swizzled block scale factors because the
+            # MoE operator expects pre-swizzled block scale factors. Swizzling also flattens the
+            # block scale factors to a 1D tensor.
+            # Note that swizzling might create padded block scales
+            # because the block-scales are required to be padded to the nearest multiple of 128x4.
             nvfp4_vals, fp8_block_scales = torch.ops.trtllm.fp4_quantize(
                 w1[expert], w1_gs[expert], NVFP4_BLOCK_SIZE, isSfSwizzledLayout=True
             )
@@ -665,68 +670,6 @@ def test_trtllm_fused_moe_nvfp4(
             w3_blockscale[expert] = fp8_block_scales.reshape(w3_blockscale[expert].shape)
 
         return w1_q, w2_q, w3_q, w1_blockscale, w2_blockscale, w3_blockscale, w1_gs, w2_gs, w3_gs
-
-    x, w1, w2, w3, router_logits = _get_test_data(
-        otype, batch_size, hidden_size, num_experts, intermediate_size
-    )
-
-    (
-        w1_q_fp4,
-        w2_q_fp4,
-        w3_q_fp4,
-        w1_blockscale,
-        w2_blockscale,
-        w3_blockscale,
-        w1_gs,
-        w2_gs,
-        w3_gs,
-    ) = _quantize_weights(w1, w2, w3)
-
-    fc1_activation_gs = torch.tensor(1.0, device="cuda", dtype=torch.float32)
-    fc2_activation_gs = torch.tensor(1.0, device="cuda", dtype=torch.float32)
-
-    routing_weights, selected_experts = compute_routing(router_logits, top_k)
-
-    fc1_weight_gs = torch.max(w3_gs, w1_gs)
-    fc1_alpha = 1.0 / (fc1_activation_gs * fc1_weight_gs)
-    fc2_alpha = 1.0 / (fc2_activation_gs * w2_gs)
-
-    is_gated_mlp = False if activation_func == ActivationType.Relu2 else True
-    if is_gated_mlp:
-        # For gated MLP, concatenate w1 and w3 as [w3, w1]
-        fc1_expert_weights_fp4 = torch.cat([w3_q_fp4, w1_q_fp4], dim=1).contiguous()
-        fc1_weight_blockscale_fp8 = torch.cat([w3_blockscale, w1_blockscale], dim=1)
-        fc1_weight_gs = torch.max(w3_gs, w1_gs)
-        if activation_func != ActivationType.Silu:
-            raise ValueError(
-                f"Unsupported activation '{activation_func}' for gated_mlp. Use 'silu'."
-            )
-    else:
-        # For non-gated MLP with ReLU^2
-        fc1_expert_weights_fp4 = w1_q_fp4
-        fc1_weight_blockscale_fp8 = w1_blockscale.view(torch.long)
-        fc1_weight_gs = w1_gs
-        if activation_func != ActivationType.Relu2:
-            raise ValueError(f"Unsupported activation '{activation_func}' for mlp. Use 'relu2'.")
-
-    fc2_expert_weights_fp4 = w2_q_fp4
-    fc2_weight_blockscale_fp8 = w2_blockscale
-
-    trtllm_output = torch.ops.auto_deploy.trtllm_quant_nvfp4_moe_fused(
-        x,
-        selected_experts.to(torch.int),
-        routing_weights,
-        fc1_expert_weights_fp4,
-        fc2_expert_weights_fp4,
-        fc1_weight_blockscale_fp8,
-        fc2_weight_blockscale_fp8,
-        fc1_activation_gs,
-        fc2_activation_gs,
-        fc1_alpha,
-        fc2_alpha,
-        is_gated_mlp=is_gated_mlp,
-        act_fn=activation_func,
-    )
 
     def compute_ref_output(w1_gs, w3_gs):
         # Quantize then dequantize the input to emulate the precision loss.
@@ -791,10 +734,76 @@ def test_trtllm_fused_moe_nvfp4(
         )
         return ref_output
 
+    # Begin test
+
+    x, w1, w2, w3, router_logits = _get_test_data(
+        otype, batch_size, hidden_size, num_experts, intermediate_size
+    )
+
+    (
+        w1_q_fp4,
+        w2_q_fp4,
+        w3_q_fp4,
+        w1_blockscale,
+        w2_blockscale,
+        w3_blockscale,
+        w1_gs,
+        w2_gs,
+        w3_gs,
+    ) = _quantize_weights(w1, w2, w3)
+
+    fc1_activation_gs = torch.tensor(1.0, device="cuda", dtype=torch.float32)
+    fc2_activation_gs = torch.tensor(1.0, device="cuda", dtype=torch.float32)
+
+    routing_weights, selected_experts = compute_routing(router_logits, top_k)
+
+    fc1_weight_gs = torch.max(w3_gs, w1_gs)
+    fc1_alpha = 1.0 / (fc1_activation_gs * fc1_weight_gs)
+    fc2_alpha = 1.0 / (fc2_activation_gs * w2_gs)
+
+    is_gated_mlp = False if activation_func == ActivationType.Relu2 else True
+    if is_gated_mlp:
+        # For gated MLP, concatenate w1 and w3 as [w3, w1]
+        fc1_expert_weights_fp4 = torch.cat([w3_q_fp4, w1_q_fp4], dim=1).contiguous()
+        fc1_weight_blockscale_fp8 = torch.cat([w3_blockscale, w1_blockscale], dim=1)
+        fc1_weight_gs = torch.max(w3_gs, w1_gs)
+        if activation_func != ActivationType.Silu:
+            raise ValueError(
+                f"Unsupported activation '{activation_func}' for gated_mlp. Use 'silu'."
+            )
+    else:
+        # For non-gated MLP with ReLU^2
+        fc1_expert_weights_fp4 = w1_q_fp4
+        fc1_weight_blockscale_fp8 = w1_blockscale
+        fc1_weight_gs = w1_gs
+        if activation_func != ActivationType.Relu2:
+            raise ValueError(f"Unsupported activation '{activation_func}' for mlp. Use 'relu2'.")
+
+    fc2_expert_weights_fp4 = w2_q_fp4
+    fc2_weight_blockscale_fp8 = w2_blockscale
+
+    trtllm_output = torch.ops.auto_deploy.trtllm_quant_nvfp4_moe_fused(
+        x,
+        selected_experts.to(torch.int),
+        routing_weights,
+        fc1_expert_weights_fp4,
+        fc2_expert_weights_fp4,
+        fc1_weight_blockscale_fp8,
+        fc2_weight_blockscale_fp8,
+        fc1_activation_gs,
+        fc2_activation_gs,
+        fc1_alpha,
+        fc2_alpha,
+        is_gated_mlp=is_gated_mlp,
+        act_fn=activation_func,
+    )
+
     ref_output = compute_ref_output(w1_gs, w3_gs)
     diff = ref_output - trtllm_output
     print(f"max diff: {diff.abs().max()}")
+    # torch.set_printoptions(profile="full")
     print(f"{diff=}")
     print(f"{ref_output=}")
     print(f"{trtllm_output=}")
+    # print(f"{diff.abs()>=2e-1=}")
     torch.testing.assert_close(ref_output, trtllm_output, rtol=2e-1, atol=2e-1)
