@@ -3118,7 +3118,7 @@ def launchTestJobs(pipeline, testFilter)
     parallelJobs += parallelSlurmJobs
 
     // Try to match what are being tested on x86 H100_PCIe.
-    // The total machine time is scaled proportionally according to the number of each GPU.
+// SBSA machines from the Blossom machine pool
     SBSATestConfigs = [
         "GH200-TensorRT-Post-Merge-1": ["gh200", "l0_gh200", 1, 1],
         "GB10-PyTorch-1": ["gb10x", "l0_gb10", 1, 1],
