@@ -30,11 +30,11 @@
 
 """Example usage of the kernel.
 
-python run_blockscaled_contiguous_grouped_gemm_finalize_fusion.py \
-        --ab_dtype Float4E2M1FN --out_dtype Float32 \
+python run_blockscaled_contiguous_grouped_gemm.py \
+        --ab_dtype Float4E2M1FN --c_dtype BFloat16 \
         --sf_dtype Float8E4M3FN --sf_vec_size 16 \
-        --mma_tiler_mn 256,256 --cluster_shape_mn 1,1 --seq_len 4096 \
-        --benchmark 128x7168x2048x8 --iterations 1
+        --mma_tiler_mn 128,128 --cluster_shape_mn 1,1 \
+        --benchmark 128x128x256x1 --iterations 1
 """
 
 import argparse
@@ -42,7 +42,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import List, Tuple, Type
+from typing import Tuple, Type
 
 import cutlass
 import cutlass.cute as cute
@@ -52,14 +52,14 @@ from cutlass.cute.runtime import from_dlpack
 
 try:
     from tensorrt_llm._torch.cute_dsl_kernels.blackwell import (
-        blockscaled_contiguous_grouped_gemm_finalize_fusion as kernel_module,
+        blockscaled_contiguous_grouped_gemm as kernel_module,
     )
 except (ModuleNotFoundError, ImportError):
     sys.path.insert(0, str(Path(__file__).parents[3] / "tensorrt_llm/_torch/cute_dsl_kernels"))
-    from blackwell import blockscaled_contiguous_grouped_gemm_finalize_fusion as kernel_module
+    from blackwell import blockscaled_contiguous_grouped_gemm as kernel_module
 
-Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel = (
-    kernel_module.Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel
+Sm100BlockScaledContiguousGroupedGemmKernel = (
+    kernel_module.Sm100BlockScaledContiguousGroupedGemmKernel
 )
 cvt_sf_MKL_to_M32x4xrm_K4xrk_L = kernel_module.cvt_sf_MKL_to_M32x4xrm_K4xrk_L
 
@@ -69,11 +69,11 @@ except ImportError:
     from testing import benchmark
 
 
-def create_mask(group_m_list, cta_tile_mn, permuted_m=None):
+def create_mask(group_m_list, mma_tiler_mn, permuted_m=None, swap_ab=False):
     """Create mask and group mapping for contiguous grouped GEMM.
 
-    :param group_m_list: List of M values for each group (will be aligned to cta_tile_mn[0] dimension)
-    :param cta_tile_mn: CTA tile size tuple (M, N) - M dimension used for alignment
+    :param group_m_list: List of M values for each group
+    :param mma_tiler_mn: CTA tile size
     :param permuted_m: Optional padded M dimension for cuda_graph support. If provided,
                      tile_idx_to_expert_idx will be padded to this size.
                      When tile_idx >= num_non_exiting_tiles, the kernel exits.
@@ -84,32 +84,27 @@ def create_mask(group_m_list, cta_tile_mn, permuted_m=None):
           Only the actual valid rows (aligned_groupm[0]+aligned_groupm[1]+...) contain
           valid data. The kernel will exit when tile_idx >= num_non_exiting_tiles.
 
-    :return: Tuple of (valid_m, aligned_group_m_list, tile_idx_to_expert_idx,
-                num_non_exiting_tiles, tile_idx_to_mn_limit)
-         - valid_m: total valid M dimension
-         - aligned_group_m_list: aligned group M dimension list
-         - tile_idx_to_expert_idx: shape (permuted_m/cta_tile_m,) if permuted_m provided, else (valid_m/cta_tile_m,)
+    :return: Tuple of (valid_m, aligned_group_m_list, tile_idx_to_expert_idx, num_non_exiting_tiles)
+             - tile_idx_to_expert_idx: shape (permuted_m/cta_tile_m,) if permuted_m provided, else (valid_m/cta_tile_m,)
              - num_non_exiting_tiles: scalar value = valid_m/cta_tile_m
-             - tile_idx_to_mn_limit: M limit for each tile index
     """
-    m_aligned = cta_tile_mn[0]
+    m_aligned = mma_tiler_mn[0]
     valid_m = 0
     aligned_group_m_list = []
     tile_idx_to_expert_idx = []
-    tile_idx_to_mn_limit = []
 
     for i, group_m in enumerate(group_m_list):
         aligned_group_m = ((group_m + m_aligned - 1) // m_aligned) * m_aligned
+        valid_m += aligned_group_m
         aligned_group_m_list.append(aligned_group_m)
 
         # Calculate number of tiles for this group based on CTA tile M size
         # Each tile covers cta_tile_m rows in M dimension
-        num_tiles_in_group = aligned_group_m // cta_tile_mn[0]
+        num_tiles_in_group = (
+            aligned_group_m // mma_tiler_mn[1] if swap_ab else aligned_group_m // mma_tiler_mn[0]
+        )
         # Add expert_idx for each tile in this group
         tile_idx_to_expert_idx.extend([i] * num_tiles_in_group)
-
-        tile_idx_to_mn_limit.extend([group_m + valid_m] * num_tiles_in_group)
-        valid_m += aligned_group_m
 
     # Compute num_non_exiting_tiles (number of valid tiles in M dimension)
     num_non_exiting_tiles = len(tile_idx_to_expert_idx)
@@ -123,9 +118,11 @@ def create_mask(group_m_list, cta_tile_mn, permuted_m=None):
             )
         if permuted_m > valid_m:
             # Calculate how many padding tiles are needed based on CTA tile M size
-            num_padding_tiles = (permuted_m - valid_m) // cta_tile_mn[0]
+            num_padding_tiles = (
+                (permuted_m - valid_m) // mma_tiler_mn[1] if swap_ab else mma_tiler_mn[0]
+            )
             # Pad with 0 (these tiles won't be accessed due to num_non_exiting_tiles check)
-            tile_idx_to_expert_idx.extend([0] * num_padding_tiles)
+            tile_idx_to_expert_idx.extend([int(-2e9)] * num_padding_tiles)
 
     # Final shape of tile_idx_to_expert_idx: (permuted_m/cta_tile_m,) if permuted_m provided, else (valid_m/cta_tile_m,)
     tile_idx_to_expert_idx = torch.tensor(tile_idx_to_expert_idx, device="cuda", dtype=torch.int32)
@@ -133,69 +130,11 @@ def create_mask(group_m_list, cta_tile_mn, permuted_m=None):
         [num_non_exiting_tiles], device="cuda", dtype=torch.int32
     )
 
-    tile_idx_to_mn_limit_tensor = torch.tensor(
-        tile_idx_to_mn_limit, device="cuda", dtype=torch.int32
-    )
-
     return (
         valid_m,
         aligned_group_m_list,
         tile_idx_to_expert_idx,
         num_non_exiting_tiles_tensor,
-        tile_idx_to_mn_limit_tensor,
-    )
-
-
-def create_fused_finalize_tensors(
-    seq_len, topK, permuted_m, group_m_list, mma_tiler_mn, final_scale_dtype
-):
-    m_aligned = mma_tiler_mn[0]
-    permuted_idx_to_expanded_idx_tensor = torch.empty(
-        (permuted_m,), dtype=torch.int32, device="cuda"
-    ).fill_(-1)
-    # # normalized token final scales
-    token_final_scales = (
-        torch.rand(seq_len, topK).to(dtype=cutlass_torch.dtype(final_scale_dtype)).cuda()
-    )
-    token_final_scales = token_final_scales / token_final_scales.sum(dim=1, keepdim=True)
-
-    start_idx = 0
-    for group_idx in range(len(group_m_list)):
-        m_per_group = group_m_list[group_idx]
-
-        if m_per_group > 0:
-            # Sequential/Blocked assignment for better atomic add memory access (Friendly Layout)
-            # Experts are grouped into sets of size topK.
-            # Expert Set S (experts S*topK ... S*topK+topK-1) serves a contiguous block of tokens.
-            # This ensures that within an expert, we process tokens T, T+1, T+2... sequentially.
-
-            expert_set_idx = group_idx // topK
-            k_in_set = group_idx % topK
-
-            # Start token index for this expert set
-            start_token = expert_set_idx * m_per_group
-
-            # Generate sequential token indices for this expert
-            token_indices = torch.arange(
-                start_token, start_token + m_per_group, dtype=torch.int32, device="cuda"
-            )
-            token_indices = token_indices % seq_len
-
-            # expanded_idx = token_idx * topK + k
-            expanded_idx = token_indices * topK + k_in_set
-
-            permuted_idx_to_expanded_idx_tensor[start_idx : (start_idx + m_per_group)] = (
-                expanded_idx
-            )
-        # Move to next aligned group
-        m_aligned_per_group = ((m_per_group + m_aligned - 1) // m_aligned) * m_aligned
-        start_idx += m_aligned_per_group
-
-    return (
-        permuted_idx_to_expanded_idx_tensor,
-        token_final_scales,
-        from_dlpack(permuted_idx_to_expanded_idx_tensor).mark_layout_dynamic(),
-        from_dlpack(token_final_scales).mark_layout_dynamic(),
     )
 
 
@@ -278,7 +217,6 @@ def create_scale_factor_tensor(l, mn, k, sf_vec_size, dtype):  # noqa: E741
         dtype,
         is_dynamic_layout=True,
     )
-
     return ref_f32_torch_tensor_cpu, cute_tensor, cute_torch_tensor
 
 
@@ -291,64 +229,45 @@ def create_tensors(
     b_major,
     cd_major,
     ab_dtype,
-    out_dtype,
+    c_dtype,
     sf_dtype,
     sf_vec_size,
     mma_tiler_mn,
     permuted_m=None,
-    seq_len=None,
+    swap_ab=False,
 ):
     """Create tensors for contiguous grouped GEMM.
 
     :param permuted_m: Optional padded M dimension for cuda_graph support. If provided,
                      A matrix, C matrix, and scale factor A will be padded to this size.
                      The kernel exits when tile_idx >= num_non_exiting_tiles.
-    :param seq_len: Sequence length (number of output tokens for C tensor)
-    :return: Tuple of (a_tensor, b_tensor, out_tensor, sfa_tensor, sfb_tensor,
-                      tile_idx_to_expert_idx, num_non_exiting_tiles, alpha,
-                      a_torch_cpu, b_torch_cpu, out_torch_cpu, sfa_torch_cpu, sfb_torch_cpu,
-                      alpha_torch_cpu, a_torch_gpu, b_torch_gpu, sfa_torch_gpu, sfb_torch_gpu,
-                      out_torch_gpu, aligned_group_m_list, valid_m
-
-    Example with CUDA graph padding:
-        # For MoE: m=4096, topK=8, num_local_experts=256, experts_per_rank=8
-        permuted_m = 4096 * 8 + 8 * 255  # = 34808
-        tensors = create_tensors(
-            l=8,  # num_local_experts
-            group_m_list=[512, 1024, ...],  # actual group sizes
-            n=4096, k=7168,
-            a_major="k", b_major="k", cd_major="n",
-            ab_dtype=cutlass.Float4E2M1FN,
-            out_dtype=cutlass.BFloat16,
-            sf_dtype=cutlass.Float8E4M3FN,
-            sf_vec_size=16,
-            mma_tiler_mn=(128, 128),  # MMA tile shape
-            permuted_m=34808,  # Enable padding for cuda_graph
-        )
-        # Returns tensors with A, C, and SFA padded to permuted_m rows,
-        # kernel exits early when tile_idx >= num_non_exiting_tiles
-        # Also returns permuted_idx_to_expanded_idx and token_final_scales for fusion
     """
     torch.manual_seed(1111)
 
-    alpha_torch_cpu = torch.ones((l,), dtype=torch.float32) * 0.1
+    alpha_torch_cpu = torch.randn((l,), dtype=torch.float32)
 
-    (
-        valid_m,
-        aligned_group_m_list,
-        _tile_idx_to_expert_idx,
-        _num_non_exiting_tiles,
-        _tile_idx_to_mn_limit,
-    ) = create_mask(group_m_list, mma_tiler_mn, permuted_m)
+    valid_m, aligned_group_m_list, _tile_idx_to_expert_idx, _num_non_exiting_tiles = create_mask(
+        group_m_list, mma_tiler_mn, permuted_m, swap_ab
+    )
 
     # Use permuted_m for A/C tensors if provided (for cuda_graph support)
     tensor_m = permuted_m if permuted_m is not None else valid_m
 
+    # C tensor also uses tensor_m (permuted_m) for cuda_graph support
+    # A: (1, M, K), a_major is k
+    # B: (L, N, K), b_major is k
+    # C: (1, M, N), cd_major is n
     a_torch_cpu = cutlass_torch.matrix(1, tensor_m, k, a_major == "m", cutlass.Float32)
     b_torch_cpu = cutlass_torch.matrix(l, n, k, b_major == "n", cutlass.Float32)
-    out_torch_cpu = cutlass_torch.matrix(1, seq_len, n, cd_major == "m", cutlass.Float32)
+    c_torch_cpu = cutlass_torch.matrix(1, tensor_m, n, cd_major == "m", cutlass.Float32)
 
-    out_torch_cpu.fill_(0)
+    # Use tensor_m (permuted_m if provided) for scale factor A
+    sfa_torch_cpu, sfa_tensor, sfa_torch_gpu = create_scale_factor_tensor(
+        1, tensor_m, k, sf_vec_size, sf_dtype
+    )
+    sfb_torch_cpu, sfb_tensor, sfb_torch_gpu = create_scale_factor_tensor(
+        l, n, k, sf_vec_size, sf_dtype
+    )
 
     a_tensor, a_torch_gpu = cutlass_torch.cute_tensor_like(
         a_torch_cpu, ab_dtype, is_dynamic_layout=True, assumed_align=16
@@ -356,8 +275,8 @@ def create_tensors(
     b_tensor, b_torch_gpu = cutlass_torch.cute_tensor_like(
         b_torch_cpu, ab_dtype, is_dynamic_layout=True, assumed_align=16
     )
-    out_tensor, out_torch_gpu = cutlass_torch.cute_tensor_like(
-        out_torch_cpu, out_dtype, is_dynamic_layout=True, assumed_align=16
+    c_tensor, c_torch_gpu = cutlass_torch.cute_tensor_like(
+        c_torch_cpu, c_dtype, is_dynamic_layout=True, assumed_align=16
     )
 
     # Mark tensor with element divisibility for 16B alignment
@@ -371,42 +290,29 @@ def create_tensors(
         stride_order=(2, 0, 1) if b_major == "k" else (2, 1, 0),
         divisibility=32 if ab_dtype == cutlass.Float4E2M1FN else 16,
     )
-
-    out_tensor.mark_compact_shape_dynamic(
+    c_tensor.mark_compact_shape_dynamic(
         mode=1 if cd_major == "n" else 0,
         stride_order=(2, 0, 1) if cd_major == "n" else (2, 1, 0),
         divisibility=32 if ab_dtype == cutlass.Float4E2M1FN else 16,
     )
 
-    # Use tensor_m (permuted_m if provided) for scale factor A
-    sfa_torch_cpu, sfa_tensor, sfa_torch_gpu = create_scale_factor_tensor(
-        1, tensor_m, k, sf_vec_size, sf_dtype
-    )
-    sfb_torch_cpu, sfb_tensor, sfb_torch_gpu = create_scale_factor_tensor(
-        l, n, k, sf_vec_size, sf_dtype
-    )
-
     tile_idx_to_expert_idx = from_dlpack(_tile_idx_to_expert_idx).mark_layout_dynamic()
     num_non_exiting_tiles = from_dlpack(_num_non_exiting_tiles).mark_layout_dynamic()
-    tile_idx_to_mn_limit = from_dlpack(_tile_idx_to_mn_limit).mark_layout_dynamic()
 
     alpha = from_dlpack(alpha_torch_cpu.cuda()).mark_layout_dynamic()
-
-    out_torch_gpu.fill_(0)
 
     return (
         a_tensor,
         b_tensor,
-        out_tensor,
+        c_tensor,
         sfa_tensor,
         sfb_tensor,
         tile_idx_to_expert_idx,
         num_non_exiting_tiles,
-        tile_idx_to_mn_limit,
         alpha,
         a_torch_cpu,
         b_torch_cpu,
-        out_torch_cpu,
+        c_torch_cpu,
         sfa_torch_cpu,
         sfb_torch_cpu,
         alpha_torch_cpu,
@@ -414,81 +320,22 @@ def create_tensors(
         b_torch_gpu,
         sfa_torch_gpu,
         sfb_torch_gpu,
-        out_torch_gpu,
+        c_torch_gpu,
         aligned_group_m_list,
         valid_m,
     )
-
-
-def verify_reference_result(
-    a_torch_cpu: torch.Tensor,
-    b_torch_cpu: torch.Tensor,
-    sfa_torch_cpu: torch.Tensor,
-    sfb_torch_cpu: torch.Tensor,
-    alpha_torch_cpu: torch.Tensor,
-    permuted_idx_to_expanded_idx_torch: torch.Tensor,
-    token_final_scales_torch: torch.Tensor,
-    group_m_list: List[int],
-    aligned_group_m_list: List[int],
-    out_dtype: torch.dtype,
-    valid_m: int,
-    n: int,
-    topK: int,
-    seq_len: int,
-) -> torch.Tensor:
-    gemm_output = torch.empty((1, valid_m, n), dtype=torch.float32)
-    valid_mask = torch.zeros((valid_m,), dtype=torch.bool, device="cuda")
-    #########  gemm calculation #########
-    start = 0
-    for i, group_m in enumerate(aligned_group_m_list):
-        end = start + group_m
-        res_a = torch.einsum(
-            "mk,mk->mk",
-            a_torch_cpu[start:end, :, 0],
-            sfa_torch_cpu[start:end, :, 0],
-        )
-        res_b = torch.einsum("nk,nk->nk", b_torch_cpu[:, :, i], sfb_torch_cpu[:, :, i])
-        gemm_output[0, start:end, :] = torch.einsum("mk,nk->mn", res_a, res_b) * alpha_torch_cpu[i]
-        valid_mask[start : start + group_m_list[i]] = 1
-        start = end
-
-    #########  finalize calculation #########
-    # Considering BF16 accumulator gpu accuracy error, we used gpu to verify the result
-    gemm_output = gemm_output.permute((1, 2, 0)).cuda()
-
-    final_output = torch.zeros((seq_len, n), dtype=out_dtype).cuda()
-
-    gemm_output = gemm_output[:valid_m, :, 0].clone()  # (valid_m, n)
-    expanded_idx_all = permuted_idx_to_expanded_idx_torch[:valid_m]  # (valid_m,
-
-    # Step 3: Filter valid rows (expanded_idx >= 0)
-    expanded_idx_valid = expanded_idx_all[valid_mask]  # (num_valid,)
-    gemm_output_valid = gemm_output[valid_mask]  # (num_valid, n)
-
-    token_idx = expanded_idx_valid // topK  # (num_valid,)
-    topk_idx = expanded_idx_valid % topK  # (num_valid,)
-
-    scales = token_final_scales_torch[token_idx, topk_idx]  # (num_valid,)
-    scaled_output = gemm_output_valid * scales.unsqueeze(1)  # (num_valid, n)
-    scaled_output = scaled_output.to(out_dtype)
-
-    for i in range(len(token_idx)):
-        final_output[token_idx[i]] += scaled_output[i]
-
-    return final_output
 
 
 def run(
     nkl: Tuple[int, int, int],
     group_m_list: Tuple[int, ...],
     ab_dtype: Type[cutlass.Numeric],
-    out_dtype: Type[cutlass.Numeric],
+    c_dtype: Type[cutlass.Numeric],
     sf_dtype: Type[cutlass.Numeric],
     sf_vec_size: int,
-    final_scale_dtype: Type[cutlass.Numeric],
     a_major: str,
     b_major: str,
-    out_major: str,
+    c_major: str,
     mma_tiler_mn: Tuple[int, int],
     cluster_shape_mn: Tuple[int, int],
     tolerance: float,
@@ -497,40 +344,10 @@ def run(
     skip_ref_check: bool = False,
     use_cold_l2: bool = False,
     permuted_m: int = None,
-    topK: int = 8,
-    seq_len: int = 4096,
-    raster_along_m: bool = False,
     use_cupti: bool = False,
     **kwargs,
 ):
-    """Prepare A/B/C tensors, launch GPU kernel, and reference checking.
-
-    :param nkl: Tuple of (N, K, L) dimensions of the GEMM problem.
-    :param group_m_list: List of M values for each group.
-    :param ab_dtype: Data type for input tensors A and B.
-    :param out_dtype: Data type for the output tensor C.
-    :param sf_dtype: Data type for the scale factor tensors.
-    :param sf_vec_size: Vector size for the scale factor tensors.
-    :param final_scale_dtype: Data type for the final scale factor tensors.
-    :param a_major: The major axis of the A tensor.
-    :param b_major: The major axis of the B tensor.
-    :param out_major: The major axis of the C tensor.
-    :param mma_tiler_mn: The shape of the MMA tile.
-    :param cluster_shape_mn: The shape of the CTA cluster.
-    :param tolerance: Tolerance for result validation.
-    :param warmup_iterations: Number of warmup runs.
-    :param iterations: Number of benchmark iterations.
-    :param skip_ref_check: If True, skips reference checking.
-    :param use_cold_l2: If True, uses a circular buffer to ensure a cold L2 cache.
-    :param permuted_m: Optional padded M dimension for CUDA graph support. If provided,
-                    A/C matrices and scale factor A will be padded to this size.
-    :param topK: Number of experts per token (for MoE with fused finalize)
-    :param seq_len: Sequence length for MoE, used by fused finalize,
-            need to know the sequence length to do finalize correctly.
-    :param raster_along_m: If True, raster along M dimension for tile scheduler.
-    :param use_cupti (bool, optional): If True, uses CUPTI to measure execution time.
-            Defaults to False.
-    """
+    """Prepare A/B/C tensors, launch GPU kernel, and reference checking."""
     m_aligned = mma_tiler_mn[0]
     use_2cta_instrs = mma_tiler_mn[0] == 256 and cluster_shape_mn[0] % 2 == 0
 
@@ -538,14 +355,12 @@ def run(
     print(f"nkl: {nkl}")
     print(f"group_m_list: {group_m_list}")
     print(
-        f"AB dtype: {ab_dtype}, C dtype: {out_dtype}, Scale factor dtype: {sf_dtype}, SF Vec size: {sf_vec_size}"
+        f"AB dtype: {ab_dtype}, C dtype: {c_dtype}, Scale factor dtype: {sf_dtype}, SF Vec size: {sf_vec_size}"
     )
     print(f"Group M alignment: {m_aligned}")
     if permuted_m is not None:
         print(f"Padded M (CUDA graph support): {permuted_m}")
-    print(f"Fused finalize enabled with topK={topK}")
-    print(f"Sequence length: {seq_len}")
-    print(f"Matrix majors - A: {a_major}, B: {b_major}, Out: {out_major}")
+    print(f"Matrix majors - A: {a_major}, B: {b_major}, C: {c_major}")
     print(f"Mma Tiler (M, N): {mma_tiler_mn}, Cluster Shape (M, N): {cluster_shape_mn}")
     print(f"2CTA MMA instructions: {'True' if use_2cta_instrs else 'False'}")
     print(f"Use TMA Store: {'True'}")
@@ -553,8 +368,6 @@ def run(
     print(f"Warmup iterations: {warmup_iterations}")
     print(f"Iterations: {iterations}")
     print(f"Skip reference checking: {skip_ref_check}")
-    print(f"Use TMA prefetch: {'True'}")
-    print(f"Raster along M: {raster_along_m}")
     print(f"Use CUPTI: {'True' if use_cupti else 'False'}")
 
     # Unpack parameters
@@ -564,11 +377,11 @@ def run(
         raise RuntimeError("GPU is required to run this example!")
 
     # Skip unsupported testcase
-    if not Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel.can_implement(
+    if not Sm100BlockScaledContiguousGroupedGemmKernel.can_implement(
         ab_dtype,
         sf_dtype,
         sf_vec_size,
-        out_dtype,
+        c_dtype,
         mma_tiler_mn,
         cluster_shape_mn,
         m_aligned,
@@ -577,27 +390,26 @@ def run(
         l,
         a_major,
         b_major,
-        out_major,
+        c_major,
     ):
         raise TypeError(
-            f"Unsupported testcase {ab_dtype}, {sf_dtype}, {sf_vec_size}, {out_dtype}, "
-            f"{use_2cta_instrs}, {mma_tiler_mn}, {cluster_shape_mn}, {n}, {k}, {l}, "
-            f"{a_major}, {b_major}, {out_major}, {m_aligned}"
+            f"Unsupported testcase {ab_dtype}, {sf_dtype}, {sf_vec_size}, {c_dtype},"
+            f"{use_2cta_instrs},{mma_tiler_mn}, {cluster_shape_mn}, {n}, {k}, {l},"
+            f"{a_major}, {b_major}, {c_major}, {m_aligned}"
         )
 
     (
         a_tensor,
         b_tensor,
-        out_tensor,
+        c_tensor,
         sfa_tensor,
         sfb_tensor,
         tile_idx_to_expert_idx,
         num_non_exiting_tiles,
-        tile_idx_to_mn_limit,
         alpha,
         a_torch_cpu,
         b_torch_cpu,
-        out_torch_cpu,
+        c_torch_cpu,
         sfa_torch_cpu,
         sfb_torch_cpu,
         alpha_torch_cpu,
@@ -605,7 +417,7 @@ def run(
         b_torch_gpu,
         sfa_torch_gpu,
         sfb_torch_gpu,
-        out_torch_gpu,
+        c_torch_gpu,
         aligned_group_m_list,
         valid_m,
     ) = create_tensors(
@@ -615,39 +427,19 @@ def run(
         k,
         a_major,
         b_major,
-        out_major,
+        c_major,
         ab_dtype,
-        out_dtype,
+        c_dtype,
         sf_dtype,
         sf_vec_size,
-        mma_tiler_mn,  # cta_tile_m
-        permuted_m,
-        seq_len,  # Pass seq_len as num_tokens for C tensor shape
-    )
-
-    # Calculate actual tensor_m used (with padding if permuted_m provided)
-    tensor_m = permuted_m if permuted_m is not None else valid_m
-
-    (
-        permuted_idx_to_expanded_idx_torch,
-        token_final_scales_torch,
-        permuted_idx_to_expanded_idx,
-        token_final_scales,
-    ) = create_fused_finalize_tensors(
-        seq_len,
-        topK,
-        tensor_m,
-        group_m_list,
         mma_tiler_mn,
-        final_scale_dtype,
+        permuted_m,
     )
-
     # Configure gemm kernel
-    gemm = Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel(
+    gemm = Sm100BlockScaledContiguousGroupedGemmKernel(
         sf_vec_size,
         mma_tiler_mn,
         cluster_shape_mn,
-        raster_along_m,
     )
 
     # Compute max active clusters on current device
@@ -656,116 +448,110 @@ def run(
         cluster_shape_mn[0] * cluster_shape_mn[1]
     )
 
-    # Initialize Stream
     current_stream = cutlass_torch.default_stream()
-
     # Compile gemm kernel
     compiled_gemm = cute.compile(
         gemm,
         a_tensor,
         b_tensor,
-        out_tensor,
+        c_tensor,
         sfa_tensor,
         sfb_tensor,
         tile_idx_to_expert_idx,
         num_non_exiting_tiles,
-        tile_idx_to_mn_limit,
         alpha,
         max_active_clusters,
         current_stream,
-        permuted_idx_to_expanded_idx,
-        token_final_scales,
-        options="--opt-level 2",
     )
 
     # Compute reference result
     if not skip_ref_check:
-        print("Verifying results...")
         # Execution
         compiled_gemm(
             a_tensor,
             b_tensor,
-            out_tensor,
+            c_tensor,
             sfa_tensor,
             sfb_tensor,
             tile_idx_to_expert_idx,
             num_non_exiting_tiles,
-            tile_idx_to_mn_limit,
             alpha,
             current_stream,
-            permuted_idx_to_expanded_idx,
-            token_final_scales,
         )
-
         torch.cuda.synchronize()
-        ref_result = verify_reference_result(
-            a_torch_cpu,
-            b_torch_cpu,
-            sfa_torch_cpu,
-            sfb_torch_cpu,
-            alpha_torch_cpu,
-            permuted_idx_to_expanded_idx_torch,
-            token_final_scales_torch,
-            group_m_list,
-            aligned_group_m_list,
-            out_torch_gpu.dtype,
-            valid_m,
-            n,
-            topK,
-            seq_len,
-        )
+        print("Verifying results...")
+        ref = torch.empty((1, valid_m, n), dtype=torch.float32)
+        start = 0
+        for i, group_m in enumerate(aligned_group_m_list):
+            end = start + group_m
+            res_a = torch.einsum(
+                "mk,mk->mk",
+                a_torch_cpu[start:end, :, 0],
+                sfa_torch_cpu[start:end, :, 0],
+            )
+            res_b = torch.einsum("nk,nk->nk", b_torch_cpu[:, :, i], sfb_torch_cpu[:, :, i])
+            ref[0, start:end, :] = torch.einsum("mk,nk->mn", res_a, res_b) * alpha_torch_cpu[i]
+            start = end
+
+        ref = ref.permute((1, 2, 0))
 
         # Convert c back to f32 for comparison.
-        actual_result = out_torch_gpu[:, :, 0]
-        if out_dtype in (cutlass.Float32, cutlass.Float16, cutlass.BFloat16):
-            torch.testing.assert_close(actual_result, ref_result, atol=tolerance, rtol=1e-02)
-        elif out_dtype in (cutlass.Float8E5M2, cutlass.Float8E4M3FN):
+        res = c_torch_cpu.cuda()
+        cute.testing.convert(
+            c_tensor,
+            from_dlpack(res, assumed_align=16).mark_layout_dynamic(
+                leading_dim=(1 if c_major == "n" else 0)
+            ),
+        )
+
+        # Only compare valid rows (in case of padding for cuda_graph)
+        res = res[:valid_m]
+
+        if c_dtype in (cutlass.Float32, cutlass.Float16, cutlass.BFloat16):
+            torch.testing.assert_close(res.cpu(), ref, atol=tolerance, rtol=1e-02)
+        elif c_dtype in (cutlass.Float8E5M2, cutlass.Float8E4M3FN):
             # Convert ref : f32 -> f8 -> f32
             ref_f8_ = torch.empty(*(1, valid_m, n), dtype=torch.uint8, device="cuda").permute(
                 1, 2, 0
             )
             ref_f8 = from_dlpack(ref_f8_, assumed_align=16).mark_layout_dynamic(leading_dim=1)
-            ref_f8.element_type = out_dtype
-            ref_device = ref_result.cuda()
+            ref_f8.element_type = c_dtype
+            ref_device = ref.cuda()
             ref_tensor = from_dlpack(ref_device, assumed_align=16).mark_layout_dynamic(
                 leading_dim=1
             )
             cute.testing.convert(ref_tensor, ref_f8)
             cute.testing.convert(ref_f8, ref_tensor)
-            torch.testing.assert_close(
-                actual_result.cpu(), ref_device.cpu(), atol=tolerance, rtol=1e-02
-            )
-        elif out_dtype is cutlass.Float4E2M1FN:
+            torch.testing.assert_close(res.cpu(), ref_device.cpu(), atol=tolerance, rtol=1e-02)
+        elif c_dtype is cutlass.Float4E2M1FN:
             # Convert ref : f32 -> f4 -> f32
             ref_f4_ = torch.empty(*(1, valid_m, n), dtype=torch.uint8, device="cuda").permute(
                 1, 2, 0
             )
             ref_f4 = from_dlpack(ref_f4_, assumed_align=16).mark_layout_dynamic(leading_dim=1)
-            ref_f4.element_type = out_dtype
-            ref_device = ref_result.cuda()
+            ref_f4.element_type = c_dtype
+            ref_device = ref.cuda()
             ref_tensor = from_dlpack(ref_device, assumed_align=16).mark_layout_dynamic(
                 leading_dim=1
             )
             cute.testing.convert(ref_tensor, ref_f4)
             cute.testing.convert(ref_f4, ref_tensor)
-            torch.testing.assert_close(
-                actual_result.cpu(), ref_device.cpu(), atol=tolerance, rtol=1e-02
-            )
+            torch.testing.assert_close(res.cpu(), ref_device.cpu(), atol=tolerance, rtol=1e-02)
 
     def generate_tensors():
+        # Reuse existing CPU reference tensors and create new GPU tensors from them
         (
             a_tensor,
             b_tensor,
-            out_tensor,
+            c_tensor,
             sfa_tensor,
             sfb_tensor,
             tile_idx_to_expert_idx,
             num_non_exiting_tiles,
-            tile_idx_to_mn_limit,
             alpha,
             a_torch_cpu,
             b_torch_cpu,
-            out_torch_cpu,
+            c_torch_cpu,
             sfa_torch_cpu,
             sfb_torch_cpu,
             alpha_torch_cpu,
@@ -773,7 +559,7 @@ def run(
             b_torch_gpu,
             sfa_torch_gpu,
             sfb_torch_gpu,
-            out_torch_gpu,
+            c_torch_gpu,
             aligned_group_m_list,
             valid_m,
         ) = create_tensors(
@@ -783,51 +569,34 @@ def run(
             k,
             a_major,
             b_major,
-            out_major,
+            c_major,
             ab_dtype,
-            out_dtype,
+            c_dtype,
             sf_dtype,
             sf_vec_size,
             mma_tiler_mn,  # cta_tile_m
             permuted_m,
-            seq_len,  # Pass seq_len as num_tokens for C tensor shape
         )
-
-        (
-            permuted_idx_to_expanded_idx_torch,
-            token_final_scales_torch,
-            permuted_idx_to_expanded_idx,
-            token_final_scales,
-        ) = create_fused_finalize_tensors(
-            seq_len,
-            topK,
-            tensor_m,
-            group_m_list,
-            mma_tiler_mn,
-            final_scale_dtype,
-        )
-
         return cute.testing.JitArguments(
             a_tensor,
             b_tensor,
-            out_tensor,
+            c_tensor,
             sfa_tensor,
             sfb_tensor,
             tile_idx_to_expert_idx,
             num_non_exiting_tiles,
-            tile_idx_to_mn_limit,
             alpha,
             current_stream,
-            permuted_idx_to_expanded_idx,
-            token_final_scales,
         )
 
     workspace_count = 1
     if use_cold_l2:
+        # Calculate actual tensor_m used (with padding if permuted_m provided)
+        tensor_m = permuted_m if permuted_m is not None else valid_m
         one_workspace_bytes = (
             a_torch_gpu.numel() * a_torch_gpu.element_size()
             + b_torch_gpu.numel() * b_torch_gpu.element_size()
-            + out_torch_gpu.numel() * out_torch_gpu.element_size()
+            + c_torch_gpu.numel() * c_torch_gpu.element_size()
             + sfa_torch_gpu.numel() * sfa_torch_gpu.element_size()
             + sfb_torch_gpu.numel() * sfb_torch_gpu.element_size()
             + (tensor_m // mma_tiler_mn[0])
@@ -924,6 +693,7 @@ if __name__ == "__main__":
         Supported formats:
         1. 'MxNxKxL': 128x512x1024x4 -> n=512, k=1024, l=4, m_values=(128, 128, 128, 128)
         2. '[m0,m1,...]xNxK': [128,256]x512x1024 -> n=512, k=1024, l=2, m_values=(128, 256)
+
         """
         # Try matching [m0, m1, ...]xNxK format
         match_list = re.match(r"\[([\d,\s]+)\]\s*x\s*(\d+)\s*x\s*(\d+)", arg)
@@ -970,32 +740,17 @@ if __name__ == "__main__":
         "--benchmark",
         type=str,
         default=None,
-        help="Path to benchmark file with problem sizes (format: 'index MxNxK' per line),"
-        "or 'MxNxKxL' format or '[m0,m1,...]xNxK' format",
+        help="Path to benchmark file with problem sizes"
+        "(format: 'index MxNxK' per line) or 'MxNxKxL' or '[m0,m1,...]xNxK'.",
     )
 
     parser.add_argument(
         "--permuted_m",
         type=int,
         default=None,
-        help="Optional padded M dimension for CUDA graph support. If specified,"
-        "A/C matrices and scale factor A will be padded to this size."
+        help="Optional padded M dimension for CUDA graph support. If specified, A/C matrices and scale factor"
+        "A will be padded to this size. "
         "Example: For MoE with m=4096, topK=8, experts_per_rank=8: permuted_m = 4096*8 + 8*255 = 34808",
-    )
-
-    parser.add_argument(
-        "--seq_len",
-        type=int,
-        default=4096,
-        help="Sequence length for MoE, used by fused finalize, need to know"
-        "the sequence length to do finalize correctly",
-    )
-
-    parser.add_argument(
-        "--topk",
-        type=int,
-        default=8,
-        help="Top-K experts per token (used for fused finalize)",
     )
 
     parser.add_argument(
@@ -1010,14 +765,13 @@ if __name__ == "__main__":
         default=(1, 1),
         help="Cluster shape (comma-separated)",
     )
-    parser.add_argument("--ab_dtype", type=cutlass.dtype, default=cutlass.Float8E4M3FN)
-    parser.add_argument("--out_dtype", type=cutlass.dtype, default=cutlass.BFloat16)
-    parser.add_argument("--final_scale_dtype", type=cutlass.dtype, default=cutlass.Float32)
-    parser.add_argument("--sf_dtype", type=cutlass.dtype, default=cutlass.Float32)
+    parser.add_argument("--ab_dtype", type=cutlass.dtype, default=cutlass.Float4E2M1FN)
+    parser.add_argument("--c_dtype", type=cutlass.dtype, default=cutlass.BFloat16)
+    parser.add_argument("--sf_dtype", type=cutlass.dtype, default=cutlass.Float8E4M3FN)
     parser.add_argument("--sf_vec_size", type=int, default=16)
     parser.add_argument("--a_major", choices=["k"], type=str, default="k")
     parser.add_argument("--b_major", choices=["k"], type=str, default="k")
-    parser.add_argument("--out_major", choices=["n", "m"], type=str, default="n")
+    parser.add_argument("--c_major", choices=["n", "m"], type=str, default="n")
     parser.add_argument("--tolerance", type=float, default=1e-01, help="Tolerance for validation")
     parser.add_argument("--warmup_iterations", type=int, default=0, help="Warmup iterations")
     parser.add_argument(
@@ -1030,20 +784,11 @@ if __name__ == "__main__":
     parser.add_argument("--use_cold_l2", action="store_true", default=False, help="Use cold L2")
 
     parser.add_argument(
-        "--raster_along_m",
-        action="store_true",
-        dest="raster_along_m",
-        default=False,
-        help="Enable raster along M (default: False)",
-    )
-
-    parser.add_argument(
         "--use_cupti",
         action="store_true",
         default=False,
         help="Use CUPTI to measure execution time",
     )
-
     args = parser.parse_args()
 
     # Process arguments to generate nkl and group_m_list
@@ -1055,6 +800,7 @@ if __name__ == "__main__":
             nkl, group_m_list = parse_benchmark_arg(args.benchmark)
     else:
         parser.error("No benchmark file or benchmark argument provided")
+
     if len(args.mma_tiler_mn) != 2:
         parser.error("--mma_tiler_mn must contain exactly 2 values")
 
@@ -1065,13 +811,12 @@ if __name__ == "__main__":
         nkl,
         group_m_list,
         args.ab_dtype,
-        args.out_dtype,
+        args.c_dtype,
         args.sf_dtype,
         args.sf_vec_size,
-        args.final_scale_dtype,
         args.a_major,
         args.b_major,
-        args.out_major,
+        args.c_major,
         args.mma_tiler_mn,
         args.cluster_shape_mn,
         args.tolerance,
@@ -1080,9 +825,6 @@ if __name__ == "__main__":
         args.skip_ref_check,
         args.use_cold_l2,
         args.permuted_m,
-        args.topk,
-        args.seq_len,
-        args.raster_along_m,
         args.use_cupti,
     )
     print("exec_time: ", exec_time)
