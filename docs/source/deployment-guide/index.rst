@@ -100,9 +100,26 @@ The deployment guides below provide more detailed instructions for serving speci
    deployment-guide-for-qwen3-next-on-trtllm.md
    deployment-guide-for-kimi-k2-thinking-on-trtllm.md
 
-Comprehensive Configuration Database
-------------------------------------
+Preconfigured Recipes
+---------------------
+
+.. _recipe-selector:
+
+Recipe selector
+^^^^^^^^^^^^^^^
+
+.. trtllm_config_selector::
+
+.. include:: ../_includes/note_sections.rst
+   :start-after: .. start-note-traffic-patterns
+   :end-before: .. end-note-traffic-patterns
+
+.. _recipe-database:
+
+Recipe database
+^^^^^^^^^^^^^^^
 
 The table below lists all available pre-configured model scenarios in the TensorRT LLM configuration database. Each row represents a specific model, GPU, and performance profile combination with recommended request settings.
 
 .. include:: config_table.rst
+   :start-after: .. end-config-table-note
