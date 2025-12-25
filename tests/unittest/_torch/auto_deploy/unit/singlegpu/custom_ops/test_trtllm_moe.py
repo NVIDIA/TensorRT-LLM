@@ -307,7 +307,9 @@ FP8_TEST_DTYPES = [
 @pytest.mark.parametrize("top_k", TOP_K_VALUES)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
 @pytest.mark.parametrize("itype, otype, wtype", FP8_TEST_DTYPES)
-@pytest.mark.parametrize("activation_func", [ActivationType.Silu, ActivationType.Relu2])
+@pytest.mark.parametrize(
+    "activation_func", [ActivationType.Silu, ActivationType.Swiglu, ActivationType.Relu2]
+)
 @pytest.mark.skipif(
     not fp8_compatible() or not trtllm_ops_available(),
     reason="Requires fp8 and trtllm support",

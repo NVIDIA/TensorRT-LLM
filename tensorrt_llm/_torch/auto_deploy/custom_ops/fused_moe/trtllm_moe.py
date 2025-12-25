@@ -94,7 +94,7 @@ def _quantize_fp8(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 
 
 def _validate_mlp_style_and_act_fn(is_gated_mlp: bool, act_fn: int) -> None:
-    assert (is_gated_mlp and act_fn == ActivationType.Silu) or (
+    assert (is_gated_mlp and act_fn in [ActivationType.Silu, ActivationType.Swiglu]) or (
         not is_gated_mlp and act_fn == ActivationType.Relu2
     ), (
         f"Unsupported combination: is_gated_mlp='{is_gated_mlp}', act_fn='{act_fn}'. "
@@ -146,6 +146,7 @@ def trtllm_quant_fp8_moe_fused(
     """
 
     _validate_mlp_style_and_act_fn(is_gated_mlp, act_fn)
+    act_fn = ActivationType.Swiglu if act_fn == ActivationType.Silu else act_fn
 
     # Store original shape and flatten to 2D
     x_shape = x.shape
@@ -173,28 +174,6 @@ def trtllm_quant_fp8_moe_fused(
     selected_experts = selected_experts.int().contiguous()
     routing_weights = routing_weights.contiguous()
 
-    # Todo: refactor this repeating code block
-
-    # Determine activation type
-    activation_type = ActivationType.Swiglu
-
-    if is_gated_mlp:
-        # Gated MLP uses Silu: silu(x @ w1.T) * (x @ w3.T)
-        if act_fn in [ActivationType.Silu, ActivationType.Swiglu]:
-            activation_type = ActivationType.Swiglu
-        else:
-            raise ValueError(
-                f"Unsupported activation '{ActivationType(act_fn).name}' for gated_mlp. Use 'silu'."
-            )
-    else:
-        # For non-gated MLP with ReLU^2
-        if act_fn == ActivationType.Relu2:
-            activation_type = ActivationType.Relu2
-        else:
-            raise ValueError(
-                f"Unsupported activation '{ActivationType(act_fn).name}' for mlp. Use 'relu2'."
-            )
-
     # Note! Outputting Float8_e4m3fn directly is not currently supported
     output = torch.ops.trtllm.fused_moe(
         x_q_fp8,
@@ -206,7 +185,7 @@ def trtllm_quant_fp8_moe_fused(
         fc2_expert_biases=None,
         output_dtype=x.dtype,
         quant_scales=quant_scales,
-        activation_type=activation_type,
+        activation_type=act_fn,
     )
 
     # Restore original shape
