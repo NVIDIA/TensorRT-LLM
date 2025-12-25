@@ -34,7 +34,6 @@ def _bmm_moe_gate_up_split_hook(
 
     Args:
         source_key: Original stacked weight key (e.g., "gate_up_weight")
-        num_experts: Total number of experts
         intermediate_size: Intermediate dimension size
         w1_keys: List of target parameter keys for w1 weights
         w3_keys: List of target parameter keys for w3 weights
@@ -64,7 +63,6 @@ def _bmm_moe_down_split_hook(
 
     Args:
         source_key: Original stacked weight key (e.g., "down_weight")
-        num_experts: Total number of experts
         w2_keys: List of target parameter keys for w2 weights
     """
     source_full_key = prefix + source_key
@@ -1199,9 +1197,9 @@ class MatchBmmMoePattern(BaseTransform):
                     f"got {hidden_size} and {down_tensor.shape[2]}"
                 )
                 intermediate_size = gate_up_tensor.shape[2] // 2
-                assert intermediate_size == gate_up_tensor.shape[2] // 2, (
-                    f"Expected intermediate_size == gate_up_tensor.shape[2] // 2,"
-                    f"got {intermediate_size} and {gate_up_tensor.shape[2] // 2}"
+                assert intermediate_size == down_tensor.shape[1], (
+                    f"Expected intermediate_size == down_tensor.shape[1],"
+                    f"got {intermediate_size} and {down_tensor.shape[1]}"
                 )
 
                 # Store checkpoint keys for hooks
@@ -1242,7 +1240,6 @@ class MatchBmmMoePattern(BaseTransform):
                     partial(
                         _bmm_moe_gate_up_split_hook,
                         source_key=gate_up_checkpoint_key,
-                        num_experts=num_experts,
                         intermediate_size=intermediate_size,
                         w1_keys=w1_keys,
                         w3_keys=w3_keys,
@@ -1254,7 +1251,6 @@ class MatchBmmMoePattern(BaseTransform):
                     partial(
                         _bmm_moe_down_split_hook,
                         source_key=down_checkpoint_key,
-                        num_experts=num_experts,
                         w2_keys=w2_keys,
                     )
                 )
