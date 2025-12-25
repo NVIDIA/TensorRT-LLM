@@ -5,16 +5,33 @@ from openai import AsyncOpenAI
 from tensorrt_llm.scaffolding import NativeChatController, ScaffoldingLlm, TRTOpenaiWorker
 from tensorrt_llm.scaffolding.benchmark import ScaffoldingBenchRequest, async_scaffolding_benchmark
 from tensorrt_llm.scaffolding.load_generation_strategy import ConcurrentStrategy
+from tensorrt_llm.scaffolding.task import ChatTask
+from tensorrt_llm.scaffolding.task_collection import TaskMetricsCollector, with_task_collection
 
-from .benchmark_utils import load_prompts_from_json, print_benchmark_results
+from .benchmark_utils import load_prompts_from_json, print_benchmark_results, shutdown_llm
 
 
 async def async_chat_benchmark(args):
-    """Chat benchmark using simple generation without agent capabilities."""
-    client = AsyncOpenAI(api_key=args.openai_api_key, base_url=args.base_url)
-    chat_worker = TRTOpenaiWorker(client, args.model)
+    """Chat benchmark using simple generation without agent capabilities.
 
-    chat_controller = NativeChatController(
+    Returns:
+        Tuple of (results, requests_start_time, requests_execution_time, total_time)
+    """
+    client = AsyncOpenAI(api_key=args.openai_api_key, base_url=args.base_url)
+    chat_worker = TRTOpenaiWorker(client, args.model, getattr(args, "kv_cache_hint_enabled", False))
+
+    # Optionally wrap controller with task metrics collection
+    controller_type = NativeChatController
+    if getattr(args, "enable_statistics", False):
+        controller_type = with_task_collection(
+            "ChatTaskCollection",
+            TaskMetricsCollector,
+            controller_name="Chat",
+            task_types=[ChatTask],
+            enable_print=False,
+        )(NativeChatController)
+
+    chat_controller = controller_type(
         sampling_params={
             "temperature": 0.9,
             "max_tokens": args.max_tokens_chat,
@@ -46,12 +63,6 @@ async def async_chat_benchmark(args):
         "Chat", results, requests_start_time, requests_execution_time, total_time
     )
 
-    # Graceful shutdown
-    chat_llm.shutdown()
-    chat_worker.shutdown()
+    await shutdown_llm(chat_llm)
 
-    # Wait for LLM's internal event loop to fully stop
-    if not chat_llm.own_loop:
-        await chat_llm.main_loop_stop_event.wait()
-
-    return
+    return results, requests_start_time, requests_execution_time, total_time

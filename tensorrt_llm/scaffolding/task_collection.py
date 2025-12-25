@@ -198,7 +198,10 @@ class TaskMetricsCollector(TaskCollection):
     Records token usage, execution time, and perf_metrics for each task.
 
     Supports filtering by task types and captures additional fields for ChatTask
-    including perf_metrics, finish_reason, and unique_id.
+    including perf_metrics, finish_reason, unique_id, and optionally message content.
+
+    When capture_messages is enabled, also captures comprehensive trace information
+    including messages, new_messages added during the yield, and sub_request_markers.
     """
 
     # Global statistics: controller_name -> List[task_info_dict]
@@ -207,12 +210,15 @@ class TaskMetricsCollector(TaskCollection):
     def __init__(self,
                  controller_name: str,
                  task_types: List[Type[Task]] = None,
-                 enable_print: bool = True):
+                 enable_print: bool = True,
+                 capture_messages: bool = False):
         super().__init__()
         self.controller_name = controller_name
         self.task_types = task_types
         self.enable_print = enable_print
+        self.capture_messages = capture_messages
         self.start_time_map: Dict[int, float] = {}
+        self.pre_message_count_map: Dict[int, int] = {}
 
         if controller_name not in TaskMetricsCollector.statistics:
             TaskMetricsCollector.statistics[controller_name] = []
@@ -239,10 +245,13 @@ class TaskMetricsCollector(TaskCollection):
                 continue
 
             self._mark_task_profiling_start(task)
-            self.start_time_map[id(task)] = time.time()
+            task_id = id(task)
+            self.start_time_map[task_id] = time.time()
 
             if isinstance(task, ChatTask):
                 task.enable_token_counting = True
+                if self.capture_messages:
+                    self.pre_message_count_map[task_id] = len(task.messages)
 
     def after_yield(self, tasks: List[Task]):
         for task in tasks:
@@ -275,13 +284,53 @@ class TaskMetricsCollector(TaskCollection):
                 task_info['finish_reason'] = getattr(task, 'finish_reason',
                                                      None)
                 task_info['unique_id'] = getattr(task, 'unique_id', None)
+                task_info['sub_request_markers'] = getattr(
+                    task, 'sub_request_markers', [])
                 task_info['perf_metrics'] = getattr(task, 'perf_metrics', None)
+
+                # Capture messages if enabled
+                if self.capture_messages:
+                    pre_message_count = self.pre_message_count_map.get(
+                        task_id, 0)
+                    if task_id in self.pre_message_count_map:
+                        del self.pre_message_count_map[task_id]
+
+                    task_info['message_count_before'] = pre_message_count
+                    task_info['message_count_after'] = len(task.messages)
+                    task_info['messages'] = [
+                        self._serialize_message(msg) for msg in task.messages
+                    ]
+                    # Capture only the new messages added during this yield
+                    if len(task.messages) > pre_message_count:
+                        task_info['new_messages'] = [
+                            self._serialize_message(msg)
+                            for msg in task.messages[pre_message_count:]
+                        ]
+                    else:
+                        task_info['new_messages'] = []
 
             TaskMetricsCollector.statistics[self.controller_name].append(
                 task_info)
 
             if self.enable_print:
                 self._print_task_info(task_info)
+
+    def _serialize_message(self, message) -> Dict[str, Any]:
+        """Serialize a RoleMessage to a dictionary."""
+        result = {
+            "role": getattr(message, "role", None),
+            "content": getattr(message, "content", None),
+        }
+        # Capture additional fields for AssistantMessage
+        if hasattr(message, "reasoning") and message.reasoning is not None:
+            result["reasoning"] = message.reasoning
+        if hasattr(
+                message,
+                "reasoning_content") and message.reasoning_content is not None:
+            result["reasoning_content"] = message.reasoning_content
+        if hasattr(message, "tool_calls") and message.tool_calls is not None:
+            result["tool_calls"] = [str(tc) for tc in message.tool_calls]
+        return result
 
     def _print_task_info(self, task_info: Dict[str, Any]):
         log_parts = [
@@ -302,6 +351,20 @@ class TaskMetricsCollector(TaskCollection):
             log_parts.append(f"📊 {perf_str}")
 
         print(" | ".join(log_parts))
+
+        # Print message details if capture_messages is enabled
+        if 'new_messages' in task_info and task_info['new_messages']:
+            print(
+                f"    Messages: {task_info['message_count_before']} -> {task_info['message_count_after']}"
+            )
+            print("    New Messages:")
+            for msg in task_info['new_messages']:
+                role = msg.get("role", "unknown")
+                content = msg.get("content", "")
+                # Truncate long content for display
+                if content and len(content) > 200:
+                    content = content[:200] + "..."
+                print(f"      [{role}]: {content}")
 
     @staticmethod
     def _compute_stats(values: List[float]) -> Dict[str, float]:

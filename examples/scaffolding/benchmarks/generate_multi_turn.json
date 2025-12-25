@@ -1,6 +1,6 @@
 {
     "filetype": "generate_conversations",
-    "num_conversations": 24,
+    "num_conversations": 500,
     "text_files": ["examples/scaffolding/benchmarks/pg1184.txt"],
     "print_stats": false,
     "prompt_input": {
@@ -16,15 +16,15 @@
         },
         "num_tokens": {
             "distribution": "uniform",
-            "min": 120,
-            "max": 160
+            "min": 200,
+            "max": 400
         }
     },
     "prompt_output": {
         "num_tokens": {
             "distribution": "uniform",
-            "min": 80,
-            "max": 120
+            "min": 200,
+            "max": 400
         }
     }
 }
