@@ -6,6 +6,8 @@ from typing import Any, Callable, Dict, List, Tuple
 import torch
 from torch.fx import GraphModule
 
+from tensorrt_llm._torch.utils import ActivationType
+
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.logger import ad_logger
@@ -123,8 +125,8 @@ def trtllm_moe_fused_aux(
     routing_weights: torch.Tensor,
     w3_w1_stacked_weight: torch.Tensor,
     w2_stacked_weight: torch.Tensor,
-    mlp_style: str = "gated_mlp",
-    act_fn: str = "silu",
+    is_gated_mlp: bool = True,
+    act_fn: int = int(ActivationType.Silu),
 ) -> torch.Tensor:
     device = torch.cuda.current_device()
     with torch.cuda.stream(
@@ -137,7 +139,7 @@ def trtllm_moe_fused_aux(
             routing_weights,
             w3_w1_stacked_weight,
             w2_stacked_weight,
-            mlp_style,
+            is_gated_mlp,
             act_fn,
         )
         torch.ops.auto_deploy.record_event(device, cuda_stream_manager.AUX_STREAM_NAME)
@@ -152,8 +154,8 @@ def trtllm_moe_fused_aux_fake(
     routing_weights: torch.Tensor,
     w3_w1_stacked_weight: torch.Tensor,
     w2_stacked_weight: torch.Tensor,
-    mlp_style: str = "gated_mlp",
-    act_fn: str = "silu",
+    is_gated_mlp: bool = True,
+    act_fn: int = int(ActivationType.Silu),
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -213,8 +215,8 @@ def trtllm_quant_fp8_moe_fused_aux(
     gemm1_dequant: torch.Tensor,  # [E]
     gemm2_act_quant: torch.Tensor,  # [E]
     gemm2_dequant: torch.Tensor,  # [E]
-    mlp_style: str = "gated_mlp",
-    act_fn: str = "silu",
+    is_gated_mlp: bool = True,
+    act_fn: int = int(ActivationType.Silu),
 ) -> torch.Tensor:
     device = torch.cuda.current_device()
     with torch.cuda.stream(
@@ -237,7 +239,7 @@ def trtllm_quant_fp8_moe_fused_aux(
             gemm1_dequant,
             gemm2_act_quant,
             gemm2_dequant,
-            mlp_style,
+            is_gated_mlp,
             act_fn,
         )
         torch.ops.auto_deploy.record_event(device, cuda_stream_manager.AUX_STREAM_NAME)
@@ -262,8 +264,8 @@ def trtllm_quant_fp8_moe_fused_aux_fake(
     gemm1_dequant: torch.Tensor,
     gemm2_act_quant: torch.Tensor,
     gemm2_dequant: torch.Tensor,
-    mlp_style: str = "gated_mlp",
-    act_fn: str = "silu",
+    is_gated_mlp: bool = True,
+    act_fn: int = int(ActivationType.Silu),
 ) -> torch.Tensor:
     return torch.empty_like(x)
 

@@ -26,8 +26,8 @@ def trtllm_moe_fused(
     routing_weights: torch.Tensor,
     w3_w1_stacked_weight: torch.Tensor,
     w2_stacked_weight: torch.Tensor,
-    mlp_style: str = "gated_mlp",
-    act_fn: str = "silu",
+    is_gated_mlp: bool = True,
+    act_fn: int = int(ActivationType.Silu),
 ) -> torch.Tensor:
     x_shape = x.shape
     x = x.view(-1, x_shape[-1])
@@ -37,24 +37,24 @@ def trtllm_moe_fused(
     quant_scales = []
 
     # Determine activation type
-    mlp_style = mlp_style.lower()
-    act_fn = act_fn.lower()
 
     activation_type = ActivationType.Swiglu
-    if mlp_style == "gated_mlp":
+    if is_gated_mlp:
         # Gated MLP uses Silu: silu(x @ w1.T) * (x @ w3.T)
-        if act_fn == "silu":
+        if act_fn in [ActivationType.Silu, ActivationType.Swiglu]:
             activation_type = ActivationType.Swiglu
         else:
-            raise ValueError(f"Unsupported activation '{act_fn}' for gated_mlp. Use 'silu'.")
-    elif mlp_style == "mlp":
+            raise ValueError(
+                f"Unsupported activation '{ActivationType(act_fn).name}' for gated_mlp. Use 'silu'."
+            )
+    else:
         # For non-gated MLP with ReLU^2
-        if act_fn == "relu2":
+        if act_fn == ActivationType.Relu2:
             activation_type = ActivationType.Relu2
         else:
-            raise ValueError(f"Unsupported activation '{act_fn}' for mlp. Use 'relu2'.")
-    else:
-        raise ValueError(f"Unknown mlp_style '{mlp_style}'. Use 'gated_mlp' or 'mlp'.")
+            raise ValueError(
+                f"Unsupported activation '{ActivationType(act_fn).name}' for mlp. Use 'relu2'."
+            )
 
     return torch.ops.trtllm.fused_moe(
         x,
@@ -77,8 +77,8 @@ def trtllm_moe_fused_fake(
     routing_weights: torch.Tensor,
     w3_w1_stacked_weight: torch.Tensor,
     w2_stacked_weight: torch.Tensor,
-    mlp_style: str = "gated_mlp",
-    act_fn: str = "silu",
+    is_gated_mlp: bool = True,
+    act_fn: int = int(ActivationType.Silu),
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -93,21 +93,12 @@ def _quantize_fp8(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return (x / scale).clamp(FP8_MIN, FP8_MAX).to(torch.float8_e4m3fn)
 
 
-def _validate_mlp_style_and_act_fn(mlp_style: str, act_fn: str) -> None:
-    supported_combinations = {
-        "gated_mlp": ["silu"],
-        "mlp": ["relu2"],
-    }
-    supported_act_fns = [
-        act_fn for act_fn_list in supported_combinations.values() for act_fn in act_fn_list
-    ]
-    assert mlp_style in supported_combinations.keys(), (
-        f"Unknown mlp_style '{mlp_style}'. Use {supported_combinations.keys()}."
-    )
-    assert act_fn in supported_act_fns, f"Unknown act_fn '{act_fn}'. Use {supported_act_fns}."
-    assert act_fn in supported_combinations[mlp_style], (
-        f"Unsupported combination: mlp_style='{mlp_style}', act_fn='{act_fn}'. "
-        f"Supported combinations: {supported_combinations}"
+def _validate_mlp_style_and_act_fn(is_gated_mlp: bool, act_fn: int) -> None:
+    assert (is_gated_mlp and act_fn == ActivationType.Silu) or (
+        not is_gated_mlp and act_fn == ActivationType.Relu2
+    ), (
+        f"Unsupported combination: is_gated_mlp='{is_gated_mlp}', act_fn='{act_fn}'. "
+        f"Supported combinations: gated mlp with silu or mlp with relu2."
     )
 
 
@@ -128,8 +119,8 @@ def trtllm_quant_fp8_moe_fused(
     gemm1_dequant: torch.Tensor,  # [E]
     gemm2_act_quant: torch.Tensor,  # [E]
     gemm2_dequant: torch.Tensor,  # [E]
-    mlp_style: str = "gated_mlp",
-    act_fn: str = "silu",
+    is_gated_mlp: bool = True,
+    act_fn: int = int(ActivationType.Silu),
 ) -> torch.Tensor:
     """
     TensorRT-LLM Cutlass FP8 W8A8 MoE for gated and non-gated MLP.
@@ -149,8 +140,8 @@ def trtllm_quant_fp8_moe_fused(
         gemm1_dequant: Precomputed gemm1 dequant scale [E]
         gemm2_act_quant: Precomputed gemm2 act quant scale [1]
         gemm2_dequant: Precomputed gemm2 dequant scale [E]
-        mlp_style: "gated_mlp" or "mlp"
-        act_fn: "silu" for gated_mlp, "relu2" for mlp
+        is_gated_mlp: True for gated_mlp, False for mlp
+        act_fn: ActivationType.Silu for gated_mlp, ActivationType.Relu2 for mlp
 
     Non-Gated MLP:
         activation_fn(expert_inputs @ w1_expert.t())@ w2_expert.t()
@@ -159,7 +150,7 @@ def trtllm_quant_fp8_moe_fused(
         activation_fn(expert_inputs @ w1_expert.t()) * (expert_inputs @ w3_expert.t()) @ w2_expert.t()
     """
 
-    _validate_mlp_style_and_act_fn(mlp_style, act_fn)
+    _validate_mlp_style_and_act_fn(is_gated_mlp, act_fn)
 
     # Store original shape and flatten to 2D
     x_shape = x.shape
@@ -190,28 +181,27 @@ def trtllm_quant_fp8_moe_fused(
     # Todo: refactor this repeating code block
 
     # Determine activation type
-    mlp_style = mlp_style.lower()
-    act_fn = act_fn.lower()
-
     activation_type = ActivationType.Swiglu
-    if mlp_style == "gated_mlp":
+    if is_gated_mlp:
         # Gated MLP uses Silu: silu(x @ w1.T) * (x @ w3.T)
         # For gated MLP, concatenate w1 and w3 as [w3, w1]
         w3_w1_stacked = torch.cat([w3_weight, w1_weight], dim=1).contiguous()  # [E, 2*I, H]
         fc1_expert_weights = w3_w1_stacked
-        if act_fn == "silu":
+        if act_fn in [ActivationType.Silu, ActivationType.Swiglu]:
             activation_type = ActivationType.Swiglu
         else:
-            raise ValueError(f"Unsupported activation '{act_fn}' for gated_mlp. Use 'silu'.")
-    elif mlp_style == "mlp":
+            raise ValueError(
+                f"Unsupported activation '{ActivationType(act_fn).name}' for gated_mlp. Use 'silu'."
+            )
+    else:
         # For non-gated MLP with ReLU^2
         fc1_expert_weights = w1_weight.contiguous()
-        if act_fn == "relu2":
+        if act_fn == ActivationType.Relu2:
             activation_type = ActivationType.Relu2
         else:
-            raise ValueError(f"Unsupported activation '{act_fn}' for mlp. Use 'relu2'.")
-    else:
-        raise ValueError(f"Unknown mlp_style '{mlp_style}'. Use 'gated_mlp' or 'mlp'.")
+            raise ValueError(
+                f"Unsupported activation '{ActivationType(act_fn).name}' for mlp. Use 'relu2'."
+            )
 
     # Note! Outputting Float8_e4m3fn directly is not currently supported
     output = torch.ops.trtllm.fused_moe(
@@ -248,10 +238,10 @@ def trtllm_quant_fp8_moe_fused_fake(
     gemm1_dequant: torch.Tensor,
     gemm2_act_quant: torch.Tensor,
     gemm2_dequant: torch.Tensor,
-    mlp_style: str,
-    act_fn: str,
+    is_gated_mlp: bool,
+    act_fn: int,
 ) -> torch.Tensor:
-    _validate_mlp_style_and_act_fn(mlp_style, act_fn)
+    _validate_mlp_style_and_act_fn(is_gated_mlp, act_fn)
     return torch.empty_like(x)
 
 
@@ -268,8 +258,8 @@ def trtllm_quant_nvfp4_moe_fused(
     fc2_act_global_scale: torch.Tensor,  # Global scale for FC2 activations
     fc1_alpha: torch.Tensor,  # Precomputed FC1 alpha (1.0 / (fc1_act_global_scale * fc1_weight_blockscale_fp8))
     fc2_alpha: torch.Tensor,  # Precomputed FC2 alpha (1.0 / (fc2_act_global_scale * fc2_weight_blockscale_fp8))
-    mlp_style: str = "gated_mlp",
-    act_fn: str = "silu",
+    is_gated_mlp: bool = True,
+    act_fn: int = int(ActivationType.Silu),
 ) -> torch.Tensor:
     """TensorRT-LLM Cutlass NVFP4 W8A8 MoE for gated and non-gated MLP.
 
@@ -285,22 +275,22 @@ def trtllm_quant_nvfp4_moe_fused(
 
     """
     NVFP4_BLOCK_SIZE = 16
-    mlp_style = mlp_style.lower()
-    act_fn = act_fn.lower()
 
     activation_type = ActivationType.Swiglu
-    if mlp_style == "gated_mlp":
-        if act_fn == "silu":
+    if is_gated_mlp:
+        if act_fn in [ActivationType.Silu, ActivationType.Swiglu]:
             activation_type = ActivationType.Swiglu
         else:
-            raise ValueError(f"Unsupported activation '{act_fn}' for gated_mlp. Use 'silu'.")
-    elif mlp_style == "mlp":
-        if act_fn == "relu2":
+            raise ValueError(
+                f"Unsupported activation '{ActivationType(act_fn).name}' for gated_mlp. Use 'silu'."
+            )
+    else:
+        if act_fn == ActivationType.Relu2:
             activation_type = ActivationType.Relu2
         else:
-            raise ValueError(f"Unsupported activation '{act_fn}' for mlp. Use 'relu2'.")
-    else:
-        raise ValueError(f"Unknown mlp_style '{mlp_style}'. Use 'gated_mlp' or 'mlp'.")
+            raise ValueError(
+                f"Unsupported activation '{ActivationType(act_fn).name}' for mlp. Use 'relu2'."
+            )
 
     # quant_scales is described by this code:
     # https://github.com/NVIDIA/TensorRT-LLM/blob/c9771ebb997683c08b26bbba796a7fc6aff09d93/cpp/tensorrt_llm/thop/moeOp.cpp#L1015
@@ -353,7 +343,7 @@ def trtllm_quant_nvfp4_moe_fused_fake(
     fc2_act_global_scale: torch.Tensor,
     fc1_alpha: torch.Tensor,
     fc2_alpha: torch.Tensor,
-    mlp_style: str = "gated_mlp",
-    act_fn: str = "silu",
+    is_gated_mlp: bool = True,
+    act_fn: int = int(ActivationType.Silu),
 ) -> torch.Tensor:
     return torch.empty_like(x)

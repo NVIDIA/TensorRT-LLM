@@ -111,6 +111,7 @@ MODEL_PATH_DICT = {
     "deepseek_v3_lite_nvfp4": "DeepSeek-V3-Lite/nvfp4_moe_only",
     "qwen2_7b_instruct": "Qwen2-7B-Instruct",
     "qwen_14b_chat": "Qwen-14B-Chat",
+    "qwen3_0.6b": "Qwen3/Qwen3-0.6B",
     "qwen3_4b_eagle3": "Qwen3/Qwen3-4B",
     "qwen3_235b_a22b_fp8": "Qwen3/saved_models_Qwen3-235B-A22B_fp8_hf",
     "qwen3_235b_a22b_fp4": "Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",
@@ -625,8 +626,8 @@ class ServerConfig:
             numa_bind_cmd = ["numactl", "-m 0,1"]
 
         cmd = numa_bind_cmd + [
-            "trtllm-serve", self.model_path, "--backend", "pytorch",
-            "--extra_llm_api_options", config_path
+            "trtllm-serve", self.model_path, "--backend", "pytorch", "--config",
+            config_path
         ]
         return cmd
 
@@ -2040,9 +2041,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 print_info(f"pytorch/TRT model config: {config}")
                 with open(pytorch_config_path, 'w') as f:
                     yaml.dump(config, f, default_flow_style=False)
-                benchmark_cmd += [
-                    f"--extra_llm_api_options={pytorch_config_path}"
-                ]
+                benchmark_cmd += [f"--config={pytorch_config_path}"]
                 # If guided_decoding_backend is set, we need to initialize tokenizer
                 if config.get('guided_decoding_backend') is not None:
                     benchmark_cmd += ["--no_skip_tokenizer_init"]
@@ -2070,9 +2069,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             print_info(f"_autodeploy model config: {autodeploy_config}")
             with open(autodeploy_config_path, 'w') as f:
                 yaml.dump(autodeploy_config, f, default_flow_style=False)
-            benchmark_cmd += [
-                f"--extra_llm_api_options={autodeploy_config_path}"
-            ]
+            benchmark_cmd += [f"--config={autodeploy_config_path}"]
         # for sampler options
         sampler_options_path = os.path.join(engine_dir, "sampler_options.yml")
         if not os.path.exists(sampler_options_path):
@@ -2848,8 +2845,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 self._config.gen_server_workers)
         ])
 
-        ctx_cmd = f'CUDA_VISIBLE_DEVICES={ctx_gpu_list} trtllm-serve {model_dir} --host localhost --port 8001 --extra_llm_api_options {ctx_config_path}'
-        gen_cmd = f'CUDA_VISIBLE_DEVICES={gen_gpu_list} trtllm-serve {model_dir} --host localhost --port 8002 --extra_llm_api_options {gen_config_path}'
+        ctx_cmd = f'CUDA_VISIBLE_DEVICES={ctx_gpu_list} trtllm-serve {model_dir} --host localhost --port 8001 --config {ctx_config_path}'
+        gen_cmd = f'CUDA_VISIBLE_DEVICES={gen_gpu_list} trtllm-serve {model_dir} --host localhost --port 8002 --config {gen_config_path}'
         return ctx_cmd, gen_cmd
 
     def _get_disagg_server_deploy_command(self):

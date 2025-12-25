@@ -22,6 +22,8 @@ def test_fmha():
             "SCHEDULING_MODE": "1",
             "ENABLE_SM100": "1",
             "ENABLE_SM120": "1",
+            "DISABLE_SKIP_SOFTMAX":
+            "1",  # Do not run tests with skip-softmax feature.
         })
 
         build_run(

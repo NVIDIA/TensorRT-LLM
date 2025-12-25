@@ -559,7 +559,7 @@ class BenchRunner:
             benchmark_cmd += " --backend tensorrt"
 
         if self.extra_llm_api_options:
-            benchmark_cmd += f" --extra_llm_api_options {self.extra_llm_api_options}"
+            benchmark_cmd += f" --config {self.extra_llm_api_options}"
         if self.concurrency:
             benchmark_cmd += f" --concurrency {self.concurrency}"
         if self.num_requests:
@@ -723,7 +723,7 @@ def test_trtllm_bench_invalid_token_pytorch(llm_root, llm_venv, model_name,
                 f"--model_path {llama_model_root} " \
                 f"throughput " \
                 f"--dataset {str(dataset_path)} --backend pytorch " \
-                f"--extra_llm_api_options {extra_options_path} " \
+                f"--config {extra_options_path} " \
                 f"> {output_path} 2>&1"
         # Check clean shutdown (no hang)
         with pytest.raises(subprocess.CalledProcessError) as exc_info:
@@ -899,7 +899,7 @@ def test_trtllm_bench_sanity(llm_root, llm_venv, engine_dir, model_subdir,
 
     assert not pytorch_backend_config
     if use_extra_config:
-        benchmark_cmd += f" --extra_llm_api_options {temp_extra_llm_api_options_file}"
+        benchmark_cmd += f" --config {temp_extra_llm_api_options_file}"
     check_call(benchmark_cmd, shell=True)
 
 
@@ -950,7 +950,7 @@ def test_trtllm_bench_pytorch_backend_sanity(llm_root, llm_venv,
         "Meta-Llama-3.1-8B-NVFP4": 10.2
     }
     if use_extra_config:
-        benchmark_cmd += f" --extra_llm_api_options {temp_extra_llm_api_options_file}"
+        benchmark_cmd += f" --config {temp_extra_llm_api_options_file}"
 
     model_id = llama_model_root.split(r"/")[-1]
     if "nvfp4-quantized" in llama_model_root:
@@ -3369,3 +3369,15 @@ def test_eagle3_output_consistency_4gpus(model_dir: str, draft_model_dir: str):
         f"Eagle3 output contains repetitive characters: {output_spec[:500]}")
     assert not repetitive_pattern.search(output_ref), (
         f"Baseline output contains repetitive characters: {output_ref[:500]}")
+
+
+def test_get_ci_container_port():
+    container_port_start = os.environ.get("CONTAINER_PORT_START", None)
+    container_port_num = os.environ.get("CONTAINER_PORT_NUM", None)
+    assert container_port_start is not None
+    assert container_port_num is not None
+    container_port_start = int(container_port_start)
+    container_port_num = int(container_port_num)
+    assert container_port_start > 0
+    assert container_port_num > 0
+    assert container_port_start + container_port_num <= 60000

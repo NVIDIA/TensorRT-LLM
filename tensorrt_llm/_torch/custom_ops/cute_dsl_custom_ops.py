@@ -371,7 +371,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         def __init__(self,
                      output_dtype: torch.dtype,
                      to_userbuffers: bool = False,
-                     use_tvm_ffi: bool = False):
+                     use_tvm_ffi: bool = True):
             super().__init__()
 
             if output_dtype != torch.bfloat16:
@@ -775,7 +775,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         alpha: torch.Tensor,
         output_dtype: torch.dtype,
         to_userbuffers: bool = False,
-        use_tvm_ffi: bool = False,
+        use_tvm_ffi: bool = True,
     ) -> torch.Tensor:
         """CuteDSL-based NVFP4 GEMM optimized for Blackwell.
 
@@ -825,7 +825,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         alpha: torch.Tensor,  # Match custom op signature
         output_dtype: torch.dtype,
         to_userbuffers: bool = False,
-        use_tvm_ffi: bool = False,
+        use_tvm_ffi: bool = True,
     ):
         # [m, k]
         shape = list(mat_a.shape)
@@ -2177,32 +2177,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                    dtype=input_scale.dtype,
                                    device=input_scale.device)
         return output, output_scale
-
-    class FusedMoEInputsHelper:
-
-        def __init__(self, num_experts: int, top_k: int, num_local_experts: int,
-                     local_expert_offset: int):
-            self.num_experts = num_experts
-            self.top_k = top_k
-            self.num_local_experts = num_local_experts
-            self.local_expert_offset = local_expert_offset
-
-        def infer_shape_num_tokens(self, input_shapes: List[torch.Size]) -> int:
-            return input_shapes[0][0]
-
-        def inputs_pre_hook(self,
-                            inputs: List[torch.Tensor]) -> List[torch.Tensor]:
-            x, x_sf, token_selected_experts, token_final_scales, *others = inputs
-            num_tokens = token_selected_experts.size(0)
-            new_token_final_scales, new_token_selected_experts = torch.randn(
-                num_tokens,
-                self.num_experts,
-                device=token_selected_experts.device).topk(self.top_k, dim=-1)
-            new_token_selected_experts = new_token_selected_experts.to(
-                token_selected_experts.dtype)
-            new_token_final_scales = new_token_final_scales.softmax(dim=-1).to(
-                token_final_scales.dtype)
-            return x, x_sf, new_token_selected_experts, new_token_final_scales, *others
 
     class Sm100BlockScaledFusedMoERunner(TunableRunner):
         tuning_config_cache = dict()

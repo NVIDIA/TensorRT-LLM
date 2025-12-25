@@ -295,15 +295,6 @@ class JobManager:
             shutil.copytree(result_dir, backup_dir)
             logger.success(f"Backup created successfully: {backup_dir}")
 
-            # Copy SLURM log file
-            work_dir = EnvManager.get_work_dir()
-            slurm_out_file = os.path.join(work_dir, f"slurm-{job_id}.out")
-            if os.path.exists(slurm_out_file):
-                shutil.copy(slurm_out_file, backup_dir)
-                logger.success(f"SLURM log copied successfully: {slurm_out_file}")
-            else:
-                logger.warning(f"SLURM log not found: {slurm_out_file}")
-
             # Move temporary config file to backup directory (not copy)
             temp_config_path = test_config.temp_config_path
             if os.path.exists(temp_config_path):
@@ -386,6 +377,8 @@ class JobManager:
         High-level method that automatically extracts parameters from TestConfig,
         parses logs, generates performance reports, and saves results to CSV.
 
+        Note: backup_logs should be called separately by the caller (test_disagg.py).
+
         Args:
             job_id: SLURM job ID
             test_config: TestConfig object containing configuration
@@ -400,29 +393,35 @@ class JobManager:
         result_dir = JobManager.get_result_dir(test_config)
         logger.info(f"Result directory: {result_dir}")
 
-        # Call the internal implementation method
-        check_result = JobManager._check_job_result(
-            job_id=job_id,
-            test_category=test_config.test_category,  # Pass test category for routing
-            benchmark_type=test_config.benchmark_type,
-            config=config_data,
-            metrics_config=test_config.metrics_config,
-            accuracy_config=test_config.accuracy_config,  # Pass accuracy config
-            model_name=test_config.model_name,
-            result_dir=result_dir,
-            timestamps=timestamps,
-            test_name=test_name,
-        )
+        # Initialize default result in case of exception
+        check_result = {"job_id": job_id, "status": "ERROR", "success": False}
 
-        is_passed = check_result["success"]
-        # Backup logs and config files
-        JobManager.backup_logs(job_id, test_config, result_dir, is_passed)
+        try:
+            # Call the internal implementation method
+            check_result = JobManager._check_job_result(
+                job_id=job_id,
+                test_category=test_config.test_category,  # Pass test category for routing
+                benchmark_type=test_config.benchmark_type,
+                config=config_data,
+                metrics_config=test_config.metrics_config,
+                accuracy_config=test_config.accuracy_config,  # Pass accuracy config
+                model_name=test_config.model_name,
+                result_dir=result_dir,
+                timestamps=timestamps,
+                test_name=test_name,
+            )
+        except Exception as e:
+            logger.error(f"Exception during result checking: {e}")
+            check_result["error"] = f"Exception during result checking: {str(e)}"
 
         # Clean up result directory
         if EnvManager.get_debug_mode():
             logger.debug(f"Debug mode: Skipping result directory cleanup: {result_dir}")
         else:
-            JobManager.cleanup_result_dir(result_dir)
+            try:
+                JobManager.cleanup_result_dir(result_dir)
+            except Exception as e:
+                logger.warning(f"Failed to cleanup result directory: {e}")
 
         return check_result
 
@@ -483,43 +482,38 @@ class JobManager:
         return False, None
 
     @staticmethod
-    def check_job_status(job_id: str) -> str:
-        """Check job status using sacct (works for all job states)."""
+    def check_job_exists(job_id: str) -> bool:
+        """Check if job still exists in SLURM queue.
+
+        Returns:
+            True if job exists (running or pending), False if job is gone
+        """
         try:
-            # Use sacct to get job status - works for both running and completed jobs
-            sacct_output = exec_cmd_with_output(
-                ["sacct", "-j", job_id, "--noheader", "--format=State", "-X"], timeout=30
-            )
-            if sacct_output.strip():
-                return sacct_output.strip()
-            else:
-                # If sacct returns empty, job might be very new, wait a bit and try once more
-                time.sleep(3)
-                sacct_output = exec_cmd_with_output(
-                    ["sacct", "-j", job_id, "--noheader", "--format=State", "-X"], timeout=30
-                )
-                return sacct_output.strip() if sacct_output.strip() else "UNKNOWN"
+            # Use squeue to check if job exists in queue
+            squeue_output = exec_cmd_with_output(["squeue", "-j", job_id, "--noheader"], timeout=30)
+            # If output is not empty, job exists
+            return bool(squeue_output.strip())
         except Exception as e:
-            logger.error(f"Error checking job status with sacct: {e}")
-            return "ERROR"
+            # If command fails, assume job doesn't exist
+            logger.debug(f"squeue check failed (job likely finished): {e}")
+            return False
 
     @staticmethod
     def wait_for_completion(
         job_id: str, timeout: int = 3600, test_config=None, check_early_failure: bool = True
-    ) -> tuple[bool, Optional[str]]:
-        """Wait for job completion with optional early failure detection.
+    ) -> None:
+        """Wait for job to finish (disappear from queue).
+
+        Simplified logic: Just wait until job no longer exists in SLURM queue,
+        regardless of final status (COMPLETED, CANCELLED, FAILED, etc).
+        If timeout or early failure detected, cancel the job.
+        The actual success/failure will be determined by log file parsing.
 
         Args:
             job_id: SLURM job ID
             timeout: Maximum wait time in seconds
             test_config: TestConfig object (required for early failure detection)
             check_early_failure: Whether to check logs for early failures
-
-        Returns:
-            tuple: (completed_successfully, error_message)
-                - (True, None): Job completed normally
-                - (False, "timeout"): Job timed out
-                - (False, error_msg): Job failed early with specific error
         """
         start_time = time.time()
         check_interval = 180  # Check every 3 minutes
@@ -527,60 +521,44 @@ class JobManager:
         last_failure_check = start_time
 
         # Wait for job to appear in system (initial delay)
-        logger.info(f"Waiting for job {job_id} to appear in system...")
+        logger.info(f"Waiting for job {job_id} to start...")
         time.sleep(60)  # Initial wait for job to be scheduled
 
-        last_status = None  # Track status changes
+        logger.info(f"Waiting for job {job_id} to finish...")
+
         while time.time() - start_time < timeout:
-            status = JobManager.check_job_status(job_id)
+            # Simple check: does job still exist?
+            job_exists = JobManager.check_job_exists(job_id)
 
-            # Only log when status changes
-            if status != last_status:
-                logger.info(f"Job {job_id} status changed: {status}")
-                last_status = status
+            if not job_exists:
+                # Job has disappeared from queue - it's done (whatever the status was)
+                logger.success(f"Job {job_id} finished (no longer in queue)")
+                return
 
-            # Check for terminal states - all mean the job is done
-            if status in [
-                "COMPLETED",
-                "FAILED",
-                "CANCELLED",
-                "TIMEOUT",
-                "NODE_FAIL",
-                "OUT_OF_MEMORY",
-                "ERROR",
-                "CANCELLED+",
-            ] or ("error" in status.lower() and status != "ERROR"):
-                if status == "COMPLETED":
-                    logger.success(f"Job {job_id} completed successfully")
-                    return True, None
-                else:
-                    logger.error(f"Job {job_id} finished with status: {status}")
-                    return True, None  # Job finished (let check_result determine success)
-
-            # For running states, don't log repeatedly - status change already logged above
-            # Only log unexpected/unknown statuses
-            if status not in ["RUNNING", "PENDING", "CONFIGURING", "COMPLETING", "UNKNOWN"]:
-                logger.warning(f"Job {job_id} has unexpected status: {status}")
-
-            # Check for early failures (only when job is running and test_config is provided)
+            # Check for early failures (only if test_config is provided)
             current_time = time.time()
             if (
                 check_early_failure
                 and test_config
-                and status == "RUNNING"
                 and current_time - last_failure_check >= failure_check_interval
             ):
                 has_error, error_msg = JobManager.check_for_early_failure(job_id, test_config)
                 if has_error:
                     logger.error(f"Early failure detected: {error_msg}")
-                    logger.warning(f"Stopping wait for job {job_id}")
-                    return False, error_msg
+                    logger.warning(f"Cancelling job {job_id} due to early failure")
+                    JobManager.cancel_job(job_id)
+                    # Wait a bit for job to be cancelled, then return
+                    time.sleep(10)
+                    return
                 last_failure_check = current_time
 
             time.sleep(check_interval)
 
-        logger.warning(f"Job {job_id} timeout after {timeout} seconds")
-        return False, "timeout"
+        # Timeout - cancel the job
+        logger.warning(f"Job {job_id} timeout after {timeout} seconds, cancelling...")
+        JobManager.cancel_job(job_id)
+        # Wait a bit for job to be cancelled
+        time.sleep(10)
 
     @staticmethod
     def cancel_job(job_id: str) -> bool:
@@ -601,28 +579,34 @@ class JobManager:
             job_id: SLURM job ID for finding the slurm log file
             result_dir: Result directory containing log and config files
         """
-        # Print the slurm log to console
-        slurm_log_writer = LogWriter(EnvManager.get_work_dir())
-        slurm_log_writer.print_to_console(f"slurm-{job_id}.out")
+        # Print the slurm log to console (check if exists first)
+        slurm_log_path = os.path.join(EnvManager.get_work_dir(), f"slurm-{job_id}.out")
+        if os.path.exists(slurm_log_path):
+            slurm_log_writer = LogWriter(EnvManager.get_work_dir())
+            slurm_log_writer.print_to_console(f"slurm-{job_id}.out")
+        else:
+            logger.warning(f"SLURM log file not found: {slurm_log_path}")
 
         # Print all .log and .yaml files in result_dir (except output_server.log)
+        if not os.path.exists(result_dir):
+            logger.warning(f"Result directory not found: {result_dir}")
+            return
+
         log_writer = LogWriter(result_dir)
         files_to_print = []
-        if os.path.exists(result_dir):
-            for file in os.listdir(result_dir):
-                if (
-                    file.endswith(".log") or file.endswith(".yaml")
-                ) and file != "output_server.log":
-                    files_to_print.append(file)
+        for file in os.listdir(result_dir):
+            if (file.endswith(".log") or file.endswith(".yaml")) and file != "output_server.log":
+                files_to_print.append(file)
 
         # Sort files for consistent output order
         files_to_print.sort()
 
         for file in files_to_print:
-            if os.path.exists(os.path.join(result_dir, file)):
+            file_path = os.path.join(result_dir, file)
+            if os.path.exists(file_path):
                 log_writer.print_to_console(file)
             else:
-                logger.warning(f"{file} not found: {file}")
+                logger.warning(f"Log file not found: {file}")
 
     @staticmethod
     def _check_accuracy_result(
@@ -648,6 +632,21 @@ class JobManager:
         # Validate accuracy_config
         if not accuracy_config:
             result["error"] = "Accuracy config not found in test configuration"
+            return result
+
+        # Check if result_dir exists
+        if not os.path.exists(result_dir):
+            error_msg = f"Result directory not found: {result_dir}"
+            logger.error(error_msg)
+            result["error"] = error_msg
+            return result
+
+        # Check if required log file exists (7_accuracy_eval.log)
+        accuracy_log = os.path.join(result_dir, "7_accuracy_eval.log")
+        if not os.path.exists(accuracy_log):
+            error_msg = f"Accuracy evaluation log file not found: {accuracy_log}"
+            logger.error(error_msg)
+            result["error"] = error_msg
             return result
 
         # Import and use AccuracyParser
@@ -734,17 +733,34 @@ class JobManager:
         """
         result = {"job_id": job_id, "status": "UNKNOWN", "success": False}
 
+        # Check if result_dir exists
+        if not os.path.exists(result_dir):
+            error_msg = f"Result directory not found: {result_dir}"
+            logger.error(error_msg)
+            result["error"] = error_msg
+            return result
+
+        # Check if required log file exists (6_bench.log)
+        bench_log = os.path.join(result_dir, "6_bench.log")
+        if not os.path.exists(bench_log):
+            error_msg = f"Benchmark log file not found: {bench_log}"
+            logger.error(error_msg)
+            result["error"] = error_msg
+            return result
+
         # Parse metrics and save to CSV
         log_parser = LogParser(benchmark_type, config, metrics_config, result_dir)
         parse_result = log_parser.parse(model_name, timestamps=timestamps, test_name=test_name)
 
         if not parse_result["status"]:
+            result["error"] = "Failed to parse benchmark logs"
             return result
 
         # Check if df is None
         result_df = parse_result.get("df")
         if result_df is None:
             logger.error("Parse result contains None DataFrame")
+            result["error"] = "Parse result contains None DataFrame"
             return result
 
         # Save results to CSV

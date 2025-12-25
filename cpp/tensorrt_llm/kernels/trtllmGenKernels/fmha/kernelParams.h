@@ -158,8 +158,8 @@ struct KernelParams
     float mScaleSfKv;
     // The SF scale for O.
     float mScaleSfO;
-    // The reserved parameter.
-    float mReservedParam;
+    // Threshold to decide whether warp skips softmax ops
+    float mSkipSoftmaxThresholdScaleFactor;
     // The start token index in SF tensor. Used for FP4 SF offset calculation in generation phase
     // kernel when inflight batching is enabled in TRT-LLM.
     int32_t mStartTokenIdx;
@@ -847,7 +847,7 @@ struct KernelParams
             !options.mSparseMla || (options.mSparseMlaTopK % 4) == 0, "SparseMlaTopK must be a multiple of 4");
         params.mSparseMlaTopK = options.mSparseMlaTopK;
         params.mUseBlockSparseAttention = options.mUseBlockSparseAttention;
-
+        params.mSkipSoftmaxThresholdScaleFactor = options.mSkipSoftmaxThresholdScaleFactor;
         return params;
     }
 };

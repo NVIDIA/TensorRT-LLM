@@ -40,6 +40,14 @@ from ..logger import logger, severity_map
               help="Path | Name of the tokenizer."
               "Specify this value only if using TensorRT engine as model.")
 @click.option(
+    "--custom_tokenizer",
+    type=str,
+    default=None,
+    help=
+    "Custom tokenizer type: alias (e.g., 'deepseek_v32') or Python import path "
+    "(e.g., 'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer'). [Experimental]"
+)
+@click.option(
     "--backend",
     type=click.Choice(["pytorch", "tensorrt"]),
     default="pytorch",
@@ -109,13 +117,13 @@ from ..logger import logger, severity_map
               default=False,
               help="Flag for disabling KV cache reuse.")
 @click.pass_context
-def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
-         backend: str, max_beam_width: int, max_batch_size: int,
-         max_num_tokens: int, max_seq_len: int, tp_size: int, pp_size: int,
-         ep_size: Optional[int], gpus_per_node: Optional[int],
-         kv_cache_free_gpu_memory_fraction: float, trust_remote_code: bool,
-         revision: Optional[str], extra_llm_api_options: Optional[str],
-         disable_kv_cache_reuse: bool):
+def main(ctx, model: str, tokenizer: Optional[str],
+         custom_tokenizer: Optional[str], log_level: str, backend: str,
+         max_beam_width: int, max_batch_size: int, max_num_tokens: int,
+         max_seq_len: int, tp_size: int, pp_size: int, ep_size: Optional[int],
+         gpus_per_node: Optional[int], kv_cache_free_gpu_memory_fraction: float,
+         trust_remote_code: bool, revision: Optional[str],
+         extra_llm_api_options: Optional[str], disable_kv_cache_reuse: bool):
     logger.set_level(log_level)
 
     kv_cache_config = KvCacheConfig(
@@ -125,6 +133,7 @@ def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
     llm_args = {
         "model": model,
         "tokenizer": tokenizer,
+        "custom_tokenizer": custom_tokenizer,
         "tensor_parallel_size": tp_size,
         "pipeline_parallel_size": pp_size,
         "moe_expert_parallel_size": ep_size,
