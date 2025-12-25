@@ -2,8 +2,11 @@
 
 This benchmark simulates multi-turn conversations with realistic user behavior
 and conversation context management. It supports various distribution types for
-turns, tokens, prefixes, and user delays, as well as JSON config file support
-for complex workload specifications.
+turns, tokens, prefixes, and user delays.
+
+Data sources:
+- Synthetic: Generate synthetic conversations with configurable distributions via CLI args
+- ShareGPT: Load real conversations from ShareGPT format JSON files
 
 Adapted from: https://github.com/vllm-project/vllm/tree/main/benchmarks/multi_turn
 """
@@ -11,11 +14,10 @@ Adapted from: https://github.com/vllm-project/vllm/tree/main/benchmarks/multi_tu
 import asyncio
 import json
 import os
-import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 
 import numpy as np
 from openai import AsyncOpenAI
@@ -24,13 +26,15 @@ from transformers import AutoTokenizer
 from tensorrt_llm.scaffolding import Controller, ScaffoldingLlm, TRTOpenaiWorker, Worker
 from tensorrt_llm.scaffolding.benchmark import ScaffoldingBenchRequest, async_scaffolding_benchmark
 from tensorrt_llm.scaffolding.load_generation_strategy import ConcurrentStrategy
-from tensorrt_llm.scaffolding.task import ChatTask, SystemMessage, Task, TaskStatus, UserMessage
+from tensorrt_llm.scaffolding.task import ChatTask, SystemMessage, TaskStatus, UserMessage
 from tensorrt_llm.scaffolding.task_collection import (
     DropKVCacheWorkerTag,
-    TaskCollection,
+    TaskMetricsCollector,
     drop_kv_cache_scope,
     with_task_collection,
 )
+
+from .benchmark_utils import print_benchmark_results, shutdown_llm
 
 # =============================================================================
 # Type Aliases
@@ -232,7 +236,7 @@ class UserDelayConfig:
     """Configuration for user response delay distribution."""
 
     enabled: bool = True
-    distribution: str = "poisson"  # exponential, poisson, constant, uniform
+    distribution: str = "exponential"  # exponential, poisson, constant, uniform
     # Parameters based on distribution type
     lambda_param: float = 1.0  # For exponential/poisson (mean delay in seconds)
     constant_value: float = 1.0  # For constant
@@ -255,232 +259,131 @@ class UserDelayConfig:
 
 
 @dataclass
-class MultiroundDataConfig:
-    """Configuration for multiround chat data source."""
+class SyntheticDataConfig:
+    """Configuration for synthetic conversation generation."""
 
-    # Data source type: "sharegpt", "synthetic", or "json_config"
-    data_source: str = "synthetic"
+    enabled: bool = False
+    text_files: List[str] = field(
+        default_factory=lambda: ["examples/scaffolding/benchmarks/pg1184.txt"]
+    )
+    print_stats: bool = False
+
+    # num_turns distribution
+    num_turns_distribution: str = "uniform"
+    num_turns_min: int = 12
+    num_turns_max: int = 18
+    num_turns_value: int = 10
+
+    # prefix_num_tokens distribution
+    prefix_tokens_distribution: str = "lognormal"
+    prefix_tokens_average: int = 1000
+    prefix_tokens_max: int = 5000
+    prefix_tokens_min: int = 500
+    prefix_tokens_value: int = 1000
+
+    # input_num_tokens distribution
+    input_tokens_distribution: str = "uniform"
+    input_tokens_min: int = 200
+    input_tokens_max: int = 400
+    input_tokens_average: int = 300
+    input_tokens_value: int = 300
+
+    # output_num_tokens distribution
+    output_tokens_distribution: str = "uniform"
+    output_tokens_min: int = 200
+    output_tokens_max: int = 400
+    output_tokens_average: int = 300
+    output_tokens_value: int = 300
+
+    def get_num_turns_distribution(self) -> Distribution:
+        """Create distribution for number of turns."""
+        if self.num_turns_distribution == "constant":
+            return ConstantDistribution(self.num_turns_value)
+        elif self.num_turns_distribution == "uniform":
+            return UniformDistribution(self.num_turns_min, self.num_turns_max, is_integer=True)
+        elif self.num_turns_distribution == "zipf":
+            return ZipfDistribution(1.5, max_val=self.num_turns_max)
+        elif self.num_turns_distribution == "poisson":
+            return PoissonDistribution(self.num_turns_value, max_val=self.num_turns_max)
+        return UniformDistribution(self.num_turns_min, self.num_turns_max, is_integer=True)
+
+    def get_prefix_tokens_distribution(self) -> Distribution:
+        """Create distribution for prefix tokens."""
+        if self.prefix_tokens_distribution == "constant":
+            return ConstantDistribution(self.prefix_tokens_value)
+        elif self.prefix_tokens_distribution == "uniform":
+            return UniformDistribution(
+                self.prefix_tokens_min, self.prefix_tokens_max, is_integer=True
+            )
+        elif self.prefix_tokens_distribution == "lognormal":
+            return LognormalDistribution(
+                average=self.prefix_tokens_average, max_val=self.prefix_tokens_max
+            )
+        return LognormalDistribution(
+            average=self.prefix_tokens_average, max_val=self.prefix_tokens_max
+        )
+
+    def get_input_tokens_distribution(self) -> Distribution:
+        """Create distribution for input tokens."""
+        if self.input_tokens_distribution == "constant":
+            return ConstantDistribution(self.input_tokens_value)
+        elif self.input_tokens_distribution == "uniform":
+            return UniformDistribution(
+                self.input_tokens_min, self.input_tokens_max, is_integer=True
+            )
+        elif self.input_tokens_distribution == "lognormal":
+            return LognormalDistribution(
+                average=self.input_tokens_average, max_val=self.input_tokens_max
+            )
+        return UniformDistribution(self.input_tokens_min, self.input_tokens_max, is_integer=True)
+
+    def get_output_tokens_distribution(self) -> Distribution:
+        """Create distribution for output tokens."""
+        if self.output_tokens_distribution == "constant":
+            return ConstantDistribution(self.output_tokens_value)
+        elif self.output_tokens_distribution == "uniform":
+            return UniformDistribution(
+                self.output_tokens_min, self.output_tokens_max, is_integer=True
+            )
+        elif self.output_tokens_distribution == "lognormal":
+            return LognormalDistribution(
+                average=self.output_tokens_average, max_val=self.output_tokens_max
+            )
+        return UniformDistribution(self.output_tokens_min, self.output_tokens_max, is_integer=True)
+
+    def to_gen_conv_args(self, num_conversations: int) -> "GenConvArgs":
+        """Convert to GenConvArgs for synthetic generation."""
+        return GenConvArgs(
+            num_conversations=num_conversations,
+            text_files=self.text_files,
+            input_num_turns=self.get_num_turns_distribution(),
+            input_prefix_num_tokens=self.get_prefix_tokens_distribution(),
+            input_num_tokens=self.get_input_tokens_distribution(),
+            output_num_tokens=self.get_output_tokens_distribution(),
+            print_stats=self.print_stats,
+        )
+
+
+@dataclass
+class MultiroundDataConfig:
+    """Configuration for multiround chat data source.
+
+    Data source is determined by:
+    - If synthetic.enabled is True: generate synthetic conversations
+    - If sharegpt_file is set: load conversations from ShareGPT format
+    """
 
     # For ShareGPT: path to the JSON file
     sharegpt_file: Optional[str] = None
 
-    # For JSON config file (like generate_multi_turn.json)
-    json_config_file: Optional[str] = None
+    # Synthetic data configuration
+    synthetic: SyntheticDataConfig = field(default_factory=SyntheticDataConfig)
 
-    # For synthetic generation (used when no json_config_file)
+    # Max conversations to load/generate
     num_conversations: int = 24
-    text_files: List[str] = field(default_factory=list)
-
-    # Distribution configs for synthetic generation
-    # Turn distribution
-    num_turns_distribution: str = "zipfian"  # uniform, constant, zipf, poisson, lognormal
-    num_turns_min: int = 4
-    num_turns_max: int = 12
-    num_turns_alpha: float = 1.0  # For zipf/poisson
-    num_turns_average: int = 8  # For lognormal
-
-    # Input token distribution
-    input_tokens_distribution: str = "uniform"
-    input_tokens_min: int = 50
-    input_tokens_max: int = 200
-    input_tokens_alpha: float = 2.0
-    input_tokens_average: int = 100
-
-    # Output token distribution
-    output_tokens_distribution: str = "uniform"
-    output_tokens_min: int = 50
-    output_tokens_max: int = 200
-    output_tokens_alpha: float = 2.0
-    output_tokens_average: int = 100
-
-    # Prefix token distribution
-    prefix_tokens_distribution: str = "lognormal"
-    prefix_tokens_min: int = 100
-    prefix_tokens_max: int = 5000
-    prefix_tokens_alpha: float = 2.0
-    prefix_tokens_average: int = 1000
-
-    # Print statistics
-    print_stats: bool = False
 
     # User delay configuration
     user_delay: UserDelayConfig = field(default_factory=UserDelayConfig)
-
-
-# =============================================================================
-# Distribution Factory
-# =============================================================================
-def create_distribution(
-    dist_type: str,
-    min_val: Optional[Union[int, float]] = None,
-    max_val: Optional[Union[int, float]] = None,
-    alpha: Optional[float] = None,
-    average: Optional[int] = None,
-    value: Optional[Union[int, float]] = None,
-    median_ratio: Optional[float] = None,
-    is_integer: bool = True,
-) -> Distribution:
-    """Factory function to create distribution objects."""
-    if dist_type == "constant":
-        if value is None:
-            raise ValueError("Constant distribution requires 'value'")
-        return ConstantDistribution(value)
-
-    elif dist_type == "uniform":
-        if min_val is None or max_val is None:
-            raise ValueError("Uniform distribution requires 'min_val' and 'max_val'")
-        return UniformDistribution(min_val, max_val, is_integer)
-
-    elif dist_type == "zipf":
-        if alpha is None:
-            raise ValueError("Zipf distribution requires 'alpha'")
-        return ZipfDistribution(alpha, max_val=int(max_val) if max_val else None)
-
-    elif dist_type == "poisson":
-        if alpha is None:
-            raise ValueError("Poisson distribution requires 'alpha'")
-        return PoissonDistribution(alpha, max_val=int(max_val) if max_val else None)
-
-    elif dist_type == "lognormal":
-        if average is not None:
-            return LognormalDistribution(
-                average=average,
-                median_ratio=median_ratio,
-                max_val=int(max_val) if max_val else None,
-            )
-        elif min_val is not None and max_val is not None:
-            # Use min/max as rough bounds, estimate mean/sigma
-            mean = np.log((min_val + max_val) / 2)
-            sigma = 0.5
-            return LognormalDistribution(mean=mean, sigma=sigma, max_val=int(max_val))
-        else:
-            raise ValueError("Lognormal requires 'average' or 'min_val/max_val'")
-
-    elif dist_type == "exponential":
-        if alpha is None:
-            alpha = 1.0
-        return ExponentialDistribution(alpha, max_val)
-
-    else:
-        raise ValueError(f"Unknown distribution type: {dist_type}")
-
-
-def get_distribution_from_json(
-    conf: dict, section: str, subsection: str, optional: bool = False
-) -> Distribution:
-    """Parse distribution configuration from JSON."""
-    section_conf = conf.get(section, {})
-
-    if optional and subsection not in section_conf:
-        return ConstantDistribution(0)
-
-    if subsection not in section_conf:
-        raise ValueError(f"Missing subsection {subsection} in section {section}")
-
-    sub_conf = section_conf[subsection]
-    distribution = sub_conf.get("distribution")
-
-    if distribution is None:
-        raise ValueError(f"Missing 'distribution' in {section}/{subsection}")
-
-    if distribution == "constant":
-        return ConstantDistribution(sub_conf["value"])
-
-    elif distribution == "uniform":
-        min_value = sub_conf["min"]
-        max_value = sub_conf["max"]
-        is_integer = isinstance(min_value, int) and isinstance(max_value, int)
-        return UniformDistribution(min_value, max_value, is_integer)
-
-    elif distribution == "zipf":
-        return ZipfDistribution(sub_conf["alpha"], max_val=sub_conf.get("max"))
-
-    elif distribution == "poisson":
-        return PoissonDistribution(sub_conf["alpha"], max_val=sub_conf.get("max"))
-
-    elif distribution == "lognormal":
-        max_val = sub_conf.get("max")
-        if "average" in sub_conf:
-            return LognormalDistribution(
-                average=sub_conf["average"],
-                median_ratio=sub_conf.get("median_ratio"),
-                max_val=max_val,
-            )
-        return LognormalDistribution(
-            mean=sub_conf["mean"], sigma=sub_conf["sigma"], max_val=max_val
-        )
-
-    else:
-        raise ValueError(f"Unknown distribution: {distribution}")
-
-
-def parse_json_config_file(config_path: str) -> GenConvArgs:
-    """Parse a JSON configuration file for conversation generation."""
-    with open(config_path, "r") as f:
-        conf = json.load(f)
-
-    assert conf.get("filetype") == "generate_conversations", "Invalid config file type"
-
-    return GenConvArgs(
-        num_conversations=conf["num_conversations"],
-        text_files=conf["text_files"],
-        input_num_turns=get_distribution_from_json(conf, "prompt_input", "num_turns"),
-        input_prefix_num_tokens=get_distribution_from_json(
-            conf, "prompt_input", "prefix_num_tokens"
-        ),
-        input_num_tokens=get_distribution_from_json(conf, "prompt_input", "num_tokens"),
-        output_num_tokens=get_distribution_from_json(conf, "prompt_output", "num_tokens"),
-        print_stats=conf.get("print_stats", False),
-    )
-
-
-def build_gen_conv_args_from_config(config: MultiroundDataConfig) -> GenConvArgs:
-    """Build GenConvArgs from MultiroundDataConfig."""
-    # Build turn distribution
-    input_num_turns = create_distribution(
-        config.num_turns_distribution,
-        min_val=config.num_turns_min,
-        max_val=config.num_turns_max,
-        alpha=config.num_turns_alpha,
-        average=config.num_turns_average,
-    )
-
-    # Build input token distribution
-    input_num_tokens = create_distribution(
-        config.input_tokens_distribution,
-        min_val=config.input_tokens_min,
-        max_val=config.input_tokens_max,
-        alpha=config.input_tokens_alpha,
-        average=config.input_tokens_average,
-    )
-
-    # Build output token distribution
-    output_num_tokens = create_distribution(
-        config.output_tokens_distribution,
-        min_val=config.output_tokens_min,
-        max_val=config.output_tokens_max,
-        alpha=config.output_tokens_alpha,
-        average=config.output_tokens_average,
-    )
-
-    # Build prefix token distribution
-    input_prefix_num_tokens = create_distribution(
-        config.prefix_tokens_distribution,
-        min_val=config.prefix_tokens_min,
-        max_val=config.prefix_tokens_max,
-        alpha=config.prefix_tokens_alpha,
-        average=config.prefix_tokens_average,
-    )
-
-    return GenConvArgs(
-        num_conversations=config.num_conversations,
-        text_files=config.text_files,
-        input_num_turns=input_num_turns,
-        input_prefix_num_tokens=input_prefix_num_tokens,
-        input_num_tokens=input_num_tokens,
-        output_num_tokens=output_num_tokens,
-        print_stats=config.print_stats,
-    )
 
 
 # =============================================================================
@@ -659,216 +562,6 @@ def load_sharegpt_conversations(
 # =============================================================================
 # Worker, Controller and TaskCollection
 # =============================================================================
-class ChatTaskTraceCollector(TaskCollection):
-    """Task collection that captures comprehensive trace information for all ChatTask instances.
-
-    Records messages, token counts, timing, and other relevant trace data for debugging and analysis.
-    """
-
-    # Global traces: controller_name -> List[trace_dict]
-    traces: Dict[str, List[Dict[str, Any]]] = {}
-
-    def __init__(
-        self, controller_name: str, enable_print: bool = False, capture_messages: bool = True
-    ):
-        super().__init__()
-        self.controller_name = controller_name
-        self.enable_print = enable_print
-        self.capture_messages = capture_messages
-        self.start_time_map: Dict[int, float] = {}
-        self.pre_message_count_map: Dict[int, int] = {}
-
-        if controller_name not in ChatTaskTraceCollector.traces:
-            ChatTaskTraceCollector.traces[controller_name] = []
-
-    def _is_task_already_traced(self, task: ChatTask) -> bool:
-        return getattr(task, "_trace_in_progress", False)
-
-    def _mark_task_trace_start(self, task: ChatTask):
-        task._trace_in_progress = True
-
-    def _mark_task_trace_end(self, task: ChatTask):
-        task._trace_in_progress = False
-
-    def before_yield(self, tasks: List[Task]):
-        for task in tasks:
-            if not isinstance(task, ChatTask):
-                continue
-            if self._is_task_already_traced(task):
-                continue
-
-            self._mark_task_trace_start(task)
-            task_id = id(task)
-            self.start_time_map[task_id] = time.time()
-            self.pre_message_count_map[task_id] = len(task.messages)
-
-            # Enable token counting to capture token usage
-            task.enable_token_counting = True
-
-    def after_yield(self, tasks: List[Task]):
-        for task in tasks:
-            if not isinstance(task, ChatTask):
-                continue
-
-            task_id = id(task)
-            if task_id not in self.start_time_map:
-                continue
-
-            end_time = time.time()
-            start_time = self.start_time_map[task_id]
-            duration = end_time - start_time
-            pre_message_count = self.pre_message_count_map[task_id]
-
-            del self.start_time_map[task_id]
-            del self.pre_message_count_map[task_id]
-            self._mark_task_trace_end(task)
-
-            # Build trace record
-            trace_record = {
-                "controller": self.controller_name,
-                "timestamp": end_time,
-                "duration_ms": duration * 1000,
-                "prompt_tokens": getattr(task, "prompt_tokens_num", 0),
-                "completion_tokens": getattr(task, "completion_tokens_num", 0),
-                "reasoning_tokens": getattr(task, "reasoning_tokens_num", 0),
-                "total_tokens": getattr(task, "prompt_tokens_num", 0)
-                + getattr(task, "completion_tokens_num", 0),
-                "message_count_before": pre_message_count,
-                "message_count_after": len(task.messages),
-                "finish_reason": getattr(task, "finish_reason", None),
-                "unique_id": getattr(task, "unique_id", None),
-                "sub_request_markers": getattr(task, "sub_request_markers", []),
-                "perf_metrics": getattr(task, "perf_metrics", None),
-            }
-
-            # Capture messages if enabled
-            if self.capture_messages:
-                trace_record["messages"] = [self._serialize_message(msg) for msg in task.messages]
-                # Capture only the new messages added during this yield
-                if len(task.messages) > pre_message_count:
-                    trace_record["new_messages"] = [
-                        self._serialize_message(msg) for msg in task.messages[pre_message_count:]
-                    ]
-                else:
-                    trace_record["new_messages"] = []
-
-            ChatTaskTraceCollector.traces[self.controller_name].append(trace_record)
-
-            if self.enable_print:
-                self._print_trace(trace_record)
-
-    def _serialize_message(self, message) -> Dict[str, Any]:
-        """Serialize a RoleMessage to a dictionary."""
-        result = {
-            "role": getattr(message, "role", None),
-            "content": getattr(message, "content", None),
-        }
-        # Capture additional fields for AssistantMessage
-        if hasattr(message, "reasoning") and message.reasoning is not None:
-            result["reasoning"] = message.reasoning
-        if hasattr(message, "reasoning_content") and message.reasoning_content is not None:
-            result["reasoning_content"] = message.reasoning_content
-        if hasattr(message, "tool_calls") and message.tool_calls is not None:
-            result["tool_calls"] = [str(tc) for tc in message.tool_calls]
-        return result
-
-    def _print_trace(self, trace_record: Dict[str, Any]):
-        """Print a single trace record."""
-        print(f"\n{'=' * 60}")
-        print(f"[ChatTask Trace] Controller: {trace_record['controller']}")
-        print(f"Duration: {trace_record['duration_ms']:.2f}ms")
-        print(
-            f"Tokens: prompt={trace_record['prompt_tokens']}, "
-            f"completion={trace_record['completion_tokens']}, "
-            f"reasoning={trace_record['reasoning_tokens']}, "
-            f"total={trace_record['total_tokens']}"
-        )
-        print(
-            f"Messages: {trace_record['message_count_before']} -> {trace_record['message_count_after']}"
-        )
-        if "new_messages" in trace_record and trace_record["new_messages"]:
-            print("New Messages:")
-            for msg in trace_record["new_messages"]:
-                role = msg.get("role", "unknown")
-                content = msg.get("content", "")
-                # Truncate long content for display
-                if content and len(content) > 200:
-                    content = content[:200] + "..."
-                print(f"  [{role}]: {content}")
-        print(f"{'=' * 60}\n")
-
-    @staticmethod
-    def get_traces(controller_name: str = None) -> Dict[str, List[Dict[str, Any]]]:
-        """Get traces for a specific controller or all controllers."""
-        if controller_name is not None:
-            return {controller_name: ChatTaskTraceCollector.traces.get(controller_name, [])}
-        return ChatTaskTraceCollector.traces
-
-    @staticmethod
-    def get_all_traces() -> List[Dict[str, Any]]:
-        """Get all traces across all controllers as a flat list."""
-        all_traces = []
-        for traces in ChatTaskTraceCollector.traces.values():
-            all_traces.extend(traces)
-        # Sort by timestamp
-        all_traces.sort(key=lambda x: x.get("timestamp", 0))
-        return all_traces
-
-    @staticmethod
-    def export_traces(file_path: str, controller_name: str = None):
-        """Export traces to a JSON file."""
-        if controller_name is not None:
-            data = ChatTaskTraceCollector.traces.get(controller_name, [])
-        else:
-            data = ChatTaskTraceCollector.traces
-        with open(file_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False, default=str)
-
-    @staticmethod
-    def print_summary():
-        """Print summary of all collected traces."""
-        print("\n" + "=" * 80)
-        print("CHAT TASK TRACE SUMMARY")
-        print("=" * 80)
-
-        for controller_name, traces in ChatTaskTraceCollector.traces.items():
-            if not traces:
-                continue
-
-            print(f"\n📋 {controller_name} ({len(traces)} traces)")
-            print("-" * 70)
-
-            total_duration = sum(t["duration_ms"] for t in traces)
-            total_prompt_tokens = sum(t["prompt_tokens"] for t in traces)
-            total_completion_tokens = sum(t["completion_tokens"] for t in traces)
-            total_reasoning_tokens = sum(t["reasoning_tokens"] for t in traces)
-
-            print(f"  Total Duration: {total_duration:.2f}ms")
-            print(f"  Total Prompt Tokens: {total_prompt_tokens}")
-            print(f"  Total Completion Tokens: {total_completion_tokens}")
-            print(f"  Total Reasoning Tokens: {total_reasoning_tokens}")
-            print(f"  Total Tokens: {total_prompt_tokens + total_completion_tokens}")
-
-            if traces:
-                avg_duration = total_duration / len(traces)
-                print(f"  Average Duration: {avg_duration:.2f}ms")
-
-        print("\n" + "=" * 80 + "\n")
-
-    @staticmethod
-    def reset(controller_name: str = None):
-        """Reset traces for a specific controller or all controllers."""
-        if controller_name is not None:
-            if controller_name in ChatTaskTraceCollector.traces:
-                ChatTaskTraceCollector.traces[controller_name] = []
-        else:
-            ChatTaskTraceCollector.traces.clear()
-
-    @staticmethod
-    def get_global_info() -> Any:
-        return ChatTaskTraceCollector.traces
-
-
 class MultiroundChatWorker(Worker):
     """Worker that manages multi-turn conversations with real data."""
 
@@ -958,12 +651,14 @@ class MultiroundChatWorker(Worker):
 
 @drop_kv_cache_scope()
 @with_task_collection(
-    "trace", ChatTaskTraceCollector, controller_name="MultiroundChatController", enable_print=False
+    "trace",
+    TaskMetricsCollector,
+    controller_name="MultiroundChatController",
+    enable_print=False,
+    capture_messages=False,
 )
 class MultiroundChatController(Controller):
     """Controller for multi-turn chat conversations."""
-
-    request_index = 0
 
     class WorkerTag(Enum):
         GENERATION = "generation"
@@ -972,6 +667,7 @@ class MultiroundChatController(Controller):
     def __init__(self, max_rounds: int = 10):
         super().__init__()
         self.max_rounds = max_rounds
+        self.request_index = 0  # Instance variable instead of class variable
 
     def generate(self, prompt: str):
         task = ChatTask.create_from_prompt(
@@ -979,8 +675,8 @@ class MultiroundChatController(Controller):
             [SystemMessage(content="You are a helpful assistant.")],
             None,  # No tools
         )
-        task.customized_result_fields["request_index"] = MultiroundChatController.request_index
-        MultiroundChatController.request_index += 1
+        task.customized_result_fields["request_index"] = self.request_index
+        self.request_index += 1
 
         yield from self.process([task])
         return task.create_scaffolding_output()
@@ -1010,79 +706,84 @@ def load_or_generate_conversations(
     config: MultiroundDataConfig,
     tokenizer: AutoTokenizer,
 ) -> ConversationsMap:
-    """Load conversations from file or generate synthetic ones."""
-    # Option 1: JSON config file
-    if config.data_source == "json_config" and config.json_config_file:
-        if os.path.exists(config.json_config_file):
-            print(f"Loading config from: {config.json_config_file}")
-            gen_args = parse_json_config_file(config.json_config_file)
-            return generate_conversations(gen_args, tokenizer)
-        else:
-            print(f"Warning: JSON config file not found: {config.json_config_file}")
+    """Load conversations from file or generate synthetic ones.
+
+    Data source is determined by:
+    - If synthetic.enabled is True: generate synthetic conversations
+    - If sharegpt_file is set: load conversations from ShareGPT format
+    - If neither is set: raise an error
+    """
+    # Option 1: Synthetic generation
+    if config.synthetic.enabled:
+        print("Generating synthetic conversations...")
+        gen_args = config.synthetic.to_gen_conv_args(config.num_conversations)
+        return generate_conversations(gen_args, tokenizer)
 
     # Option 2: ShareGPT file
-    if config.data_source == "sharegpt" and config.sharegpt_file:
+    if config.sharegpt_file:
         if os.path.exists(config.sharegpt_file):
             print(f"Loading ShareGPT from: {config.sharegpt_file}")
             return load_sharegpt_conversations(
                 config.sharegpt_file, max_conversations=config.num_conversations
             )
         else:
-            print(f"Warning: ShareGPT file not found: {config.sharegpt_file}")
+            raise FileNotFoundError(f"ShareGPT file not found: {config.sharegpt_file}")
 
-    # Option 3: Synthetic generation with distributions
-    print(f"Generating {config.num_conversations} synthetic conversations")
-    gen_args = build_gen_conv_args_from_config(config)
-    return generate_conversations(gen_args, tokenizer)
+    # No data source provided
+    raise ValueError(
+        "No data source specified. Use --multiround_synthetic for synthetic data "
+        "or --multiround_sharegpt_file for ShareGPT data."
+    )
 
 
 async def async_multiround_chat_benchmark(args):
     """Run multiround chat benchmark with real conversation data."""
     # Build user delay config
     user_delay_config = UserDelayConfig(
-        enabled=getattr(args, "multiround_user_delay_enabled", True),
-        distribution=getattr(args, "multiround_user_delay_distribution", "exponential"),
-        lambda_param=getattr(args, "multiround_user_delay_lambda", 1.0),
-        constant_value=getattr(args, "multiround_user_delay_constant", 1.0),
-        min_val=getattr(args, "multiround_user_delay_min", 0.5),
-        max_val=getattr(args, "multiround_user_delay_max", 2.0),
-        cap=getattr(args, "multiround_user_delay_cap", 10.0),
+        enabled=args.multiround_user_delay_enabled,
+        distribution=args.multiround_user_delay_distribution,
+        lambda_param=args.multiround_user_delay_lambda,
+        constant_value=args.multiround_user_delay_constant,
+        min_val=args.multiround_user_delay_min,
+        max_val=args.multiround_user_delay_max,
+        cap=args.multiround_user_delay_cap,
+    )
+
+    # Build synthetic data config from CLI args
+    synthetic_config = SyntheticDataConfig(
+        enabled=args.multiround_synthetic,
+        text_files=args.multiround_text_files,
+        print_stats=args.multiround_print_stats,
+        # num_turns distribution
+        num_turns_distribution=args.multiround_num_turns_distribution,
+        num_turns_min=args.multiround_num_turns_min,
+        num_turns_max=args.multiround_num_turns_max,
+        num_turns_value=args.multiround_num_turns_value,
+        # prefix_num_tokens distribution
+        prefix_tokens_distribution=args.multiround_prefix_tokens_distribution,
+        prefix_tokens_average=args.multiround_prefix_tokens_average,
+        prefix_tokens_max=args.multiround_prefix_tokens_max,
+        prefix_tokens_min=args.multiround_prefix_tokens_min,
+        prefix_tokens_value=args.multiround_prefix_tokens_value,
+        # input_num_tokens distribution
+        input_tokens_distribution=args.multiround_input_tokens_distribution,
+        input_tokens_min=args.multiround_input_tokens_min,
+        input_tokens_max=args.multiround_input_tokens_max,
+        input_tokens_average=args.multiround_input_tokens_average,
+        input_tokens_value=args.multiround_input_tokens_value,
+        # output_num_tokens distribution
+        output_tokens_distribution=args.multiround_output_tokens_distribution,
+        output_tokens_min=args.multiround_output_tokens_min,
+        output_tokens_max=args.multiround_output_tokens_max,
+        output_tokens_average=args.multiround_output_tokens_average,
+        output_tokens_value=args.multiround_output_tokens_value,
     )
 
     # Build data config
     data_config = MultiroundDataConfig(
-        data_source=getattr(args, "multiround_data_source", "synthetic"),
-        sharegpt_file=getattr(args, "multiround_sharegpt_file", None),
-        json_config_file=getattr(args, "multiround_json_config_file", None),
-        num_conversations=getattr(args, "chat_prompt_num", 24),
-        text_files=getattr(args, "multiround_text_files", []),
-        # Turn distribution
-        num_turns_distribution=getattr(args, "multiround_turns_distribution", "uniform"),
-        num_turns_min=getattr(args, "multiround_min_turns", 4),
-        num_turns_max=getattr(args, "multiround_max_turns", 12),
-        num_turns_alpha=getattr(args, "multiround_turns_alpha", 2.0),
-        num_turns_average=getattr(args, "multiround_turns_average", 8),
-        # Input token distribution
-        input_tokens_distribution=getattr(args, "multiround_input_tokens_distribution", "uniform"),
-        input_tokens_min=getattr(args, "multiround_min_input_tokens", 50),
-        input_tokens_max=getattr(args, "multiround_max_input_tokens", 200),
-        input_tokens_alpha=getattr(args, "multiround_input_tokens_alpha", 2.0),
-        input_tokens_average=getattr(args, "multiround_input_tokens_average", 100),
-        # Output token distribution
-        output_tokens_distribution=getattr(
-            args, "multiround_output_tokens_distribution", "uniform"
-        ),
-        output_tokens_min=getattr(args, "multiround_min_output_tokens", 50),
-        output_tokens_max=getattr(args, "multiround_max_output_tokens", 200),
-        output_tokens_alpha=getattr(args, "multiround_output_tokens_alpha", 2.0),
-        output_tokens_average=getattr(args, "multiround_output_tokens_average", 100),
-        # Prefix token distribution
-        prefix_tokens_distribution=getattr(args, "multiround_prefix_distribution", "lognormal"),
-        prefix_tokens_min=getattr(args, "multiround_prefix_min", 100),
-        prefix_tokens_max=getattr(args, "multiround_prefix_max", 5000),
-        prefix_tokens_alpha=getattr(args, "multiround_prefix_alpha", 2.0),
-        prefix_tokens_average=getattr(args, "multiround_prefix_average", 1000),
-        print_stats=getattr(args, "multiround_print_stats", False),
+        sharegpt_file=args.multiround_sharegpt_file,
+        synthetic=synthetic_config,
+        num_conversations=args.multiround_num_conversations,
         user_delay=user_delay_config,
     )
 
@@ -1110,17 +811,17 @@ async def async_multiround_chat_benchmark(args):
 
     # Initialize workers
     client = AsyncOpenAI(api_key=args.openai_api_key, base_url=args.base_url)
-    generation_worker = TRTOpenaiWorker(client, args.model)
+    generation_worker = TRTOpenaiWorker(client, args.model, args.kv_cache_hint_enabled)
 
     multiround_worker = MultiroundChatWorker(
         model_dir=args.model_dir,
         conversations=conversations,
         user_delay_config=data_config.user_delay,
-        max_output_tokens=getattr(args, "max_tokens_chat", 512),
+        max_output_tokens=args.max_tokens_chat,
     )
 
     # Create controller and LLM
-    max_rounds = getattr(args, "chat_multiround_rounds", 10)
+    max_rounds = args.multiround_max_rounds
     chat_controller = MultiroundChatController(max_rounds=max_rounds)
 
     chat_llm = ScaffoldingLlm(
@@ -1130,19 +831,21 @@ async def async_multiround_chat_benchmark(args):
             MultiroundChatController.WorkerTag.MULTIROUND: multiround_worker,
             DropKVCacheWorkerTag.DROP_KV_CACHE: generation_worker,
         },
+        max_parallel_requests=args.max_parallel_requests,
     )
 
     # Create benchmark requests
-    num_requests = min(len(conversations), getattr(args, "chat_prompt_num", 24))
+    num_requests = len(conversations)
     requests = [ScaffoldingBenchRequest(prompt=f"conversation_{i}") for i in range(num_requests)]
 
     task_collection_types = {}
-    strategy = ConcurrentStrategy(concurrency=getattr(args, "chat_concurrency", 32))
+    concurrency = args.multiround_concurrency
+    strategy = ConcurrentStrategy(concurrency=concurrency)
 
     print("\nStarting multiround chat benchmark:")
     print(f"  Conversations: {num_requests}")
     print(f"  Max rounds: {max_rounds}")
-    print(f"  Concurrency: {strategy}")
+    print(f"  Concurrency: {concurrency}")
     print(
         f"  User delay: {data_config.user_delay.distribution} "
         f"(enabled={data_config.user_delay.enabled}, lambda={data_config.user_delay.lambda_param})"
@@ -1157,36 +860,10 @@ async def async_multiround_chat_benchmark(args):
         chat_llm, task_collection_types, requests, strategy=strategy
     )
 
-    # Print results
-    print("\n" + "=" * 60)
-    print("Multiround Chat Benchmark Results:")
-    print("=" * 60)
-    print(f"Total conversations: {len(results)}")
-    print(f"Total execution time: {total_time:.3f}s")
+    print_benchmark_results(
+        "Multiround-Chat", results, requests_start_time, requests_execution_time, total_time
+    )
 
-    if requests_execution_time:
-        avg_time = sum(requests_execution_time) / len(requests_execution_time)
-        print(f"Average conversation time: {avg_time:.3f}s")
-        print(f"Min conversation time: {min(requests_execution_time):.3f}s")
-        print(f"Max conversation time: {max(requests_execution_time):.3f}s")
-
-        # Percentiles
-        sorted_times = sorted(requests_execution_time)
-        p50_idx = int(len(sorted_times) * 0.5)
-        p90_idx = int(len(sorted_times) * 0.9)
-        p99_idx = int(len(sorted_times) * 0.99)
-        print(f"P50: {sorted_times[p50_idx]:.3f}s")
-        print(f"P90: {sorted_times[min(p90_idx, len(sorted_times) - 1)]:.3f}s")
-        print(f"P99: {sorted_times[min(p99_idx, len(sorted_times) - 1)]:.3f}s")
-
-    print("=" * 60 + "\n")
-
-    # Dump trace data
-    ChatTaskTraceCollector.print_summary()
-    trace_file = getattr(args, "trace_output_file", "multiround_traces.json")
-    ChatTaskTraceCollector.export_traces(trace_file)
-    print(f"Traces exported to: {trace_file}")
-
-    chat_llm.shutdown(shutdown_workers=True)
+    await shutdown_llm(chat_llm)
 
     return results, requests_start_time, requests_execution_time, total_time

@@ -46,6 +46,9 @@ class Worker(ABC):
     def shutdown(self):
         pass
 
+    async def async_shutdown(self):
+        pass
+
     def __enter__(self):
         return self
 
@@ -450,6 +453,12 @@ class MCPWorker(Worker):
                             queue_obj = task.result()
                             if queue_obj is None:
                                 # Shutdown signal received
+                                # Cancel all pending tasks before exit to avoid blocking
+                                for pending_task in pending:
+                                    pending_task.cancel()
+                                if pending:
+                                    await asyncio.gather(*pending,
+                                                         return_exceptions=True)
                                 return
                             else:
                                 tool_name = queue_obj.tool_name
@@ -475,8 +484,8 @@ class MCPWorker(Worker):
                 self._main_loop_async_client_iter(self.urls[index], index))
             self._background_tasks.append(task)
 
-    async def shutdown(self):
-        """Shutdown MCP worker and wait for all background tasks to complete."""
+    async def async_shutdown(self):
+        """Async shutdown MCP worker and wait for all background tasks to complete."""
         # Signal all background tasks to stop
         for queue in self.queues:
             queue.put_nowait(None)

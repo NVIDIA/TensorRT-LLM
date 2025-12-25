@@ -1,4 +1,4 @@
-# Scaffolding Benchmarks for Agentic/Chatbot Workloads
+# Scaffolding Benchmarks for Agentic/Chat Workloads
 
 This directory contains benchmarks for evaluating TensorRT-LLM scaffolding with realistic multi-turn conversation and agentic workloads.
 
@@ -8,8 +8,8 @@ This directory contains benchmarks for evaluating TensorRT-LLM scaffolding with 
 |-----------|------|-------------|
 | Normal Agent | `--enable_normal_agent` | Standard agent benchmark |
 | Burst Agent | `--enable_burst_agent` | Simulates sudden traffic spikes |
-| Chatbot | `--enable_chatbot` | Single-turn chat benchmark |
-| Multiround Chatbot | `--enable_multiround_chatbot` | Multi-turn conversation benchmark |
+| Chat | `--enable_chat` | Single-turn chat benchmark |
+| Multiround Chat | `--enable_multiround_chat` | Multi-turn conversation benchmark |
 
 ## Prerequisites
 
@@ -47,9 +47,8 @@ mv 1184.txt.utf-8 pg1184.txt
 |-----------|---------|-------------|
 | `--agent_prompt_num` | 100 | Number of prompts to run |
 | `--normal_agent_concurrency` | 32 | Max concurrent agent requests |
-| `--max_tokens` | 8192 | Maximum output tokens per generation |
+| `--max_tokens_agent` | 65536 | Maximum output tokens per generation |
 | `--max_parallel_requests` | 1024 | Maximum parallel requests to LLM |
-| `--times` | 1 | Number of benchmark iterations |
 
 **Prompt Loading**: Prompts are loaded from `contrib/DeepResearch/data/open_deepresearch_bench.json`. If unavailable, a default economic analysis prompt is used.
 
@@ -81,7 +80,7 @@ mv 1184.txt.utf-8 pg1184.txt
 
 ---
 
-### 3. Chat Benchmark (`--enable_chatbot`)
+### 3. Chat Benchmark (`--enable_chat`)
 
 **Purpose**: Simple single-turn chat benchmark for baseline latency measurements.
 
@@ -92,9 +91,9 @@ mv 1184.txt.utf-8 pg1184.txt
 **Key Parameters**:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--chat_prompt_num` | 20 | Number of chat requests |
+| `--chat_prompt_num` | 100 | Number of chat requests |
 | `--chat_concurrency` | 32 | Concurrent chat requests |
-| `--max_tokens_chat` | 1024 | Max output tokens per response |
+| `--max_tokens_chat` | 8192 | Max output tokens per response |
 
 **Sampling Configuration**:
 - Temperature: 0.9
@@ -102,7 +101,7 @@ mv 1184.txt.utf-8 pg1184.txt
 
 ---
 
-### 4. Multiround Chat Benchmark (`--enable_multiround_chatbot`)
+### 4. Multiround Chat Benchmark (`--enable_multiround_chat`)
 
 **Purpose**: Simulates realistic multi-turn conversations with configurable distributions for turns, tokens, and user delays.
 
@@ -124,16 +123,16 @@ MultiroundChatController
 **Key Parameters**:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--chat_prompt_num` | 20 | Number of conversations |
-| `--chat_concurrency` | 32 | Concurrent conversations |
-| `--chat_multiround_rounds` | 3 | Maximum turns per conversation |
-| `--max_tokens_chat` | 1024 | Max output tokens per turn |
+| `--multiround_num_conversations` | 100 | Number of conversations |
+| `--multiround_concurrency` | 32 | Concurrent conversations |
+| `--multiround_max_rounds` | 20 | Maximum turns per conversation |
+| `--max_tokens_chat` | 8192 | Max output tokens per turn |
 
 ---
 
 ## Data Sources for Multiround Benchmark
 
-### Source 1: Synthetic Generation (`--multiround_data_source synthetic`)
+### Source 1: Synthetic Generation (`--multiround_synthetic`)
 
 Generates conversations programmatically using configurable probability distributions.
 
@@ -145,29 +144,7 @@ Generates conversations programmatically using configurable probability distribu
 3. Each user turn contains: header tag, prefix (first turn only), base prompt, and content from text file
 4. Assistant turns are simulated with placeholder content (actual generation happens at runtime)
 
-### Source 2: JSON Config (`--multiround_data_source json_config`)
-
-Load generation parameters from a JSON configuration file for reproducible workloads.
-
-**Example** (`generate_multi_turn.json`):
-```json
-{
-    "filetype": "generate_conversations",
-    "num_conversations": 24,
-    "text_files": ["examples/scaffolding/benchmarks/pg1184.txt"],
-    "print_stats": false,
-    "prompt_input": {
-        "num_turns": { "distribution": "uniform", "min": 12, "max": 18 },
-        "prefix_num_tokens": { "distribution": "lognormal", "average": 1000, "max": 5000 },
-        "num_tokens": { "distribution": "uniform", "min": 120, "max": 160 }
-    },
-    "prompt_output": {
-        "num_tokens": { "distribution": "uniform", "min": 80, "max": 120 }
-    }
-}
-```
-
-### Source 3: ShareGPT (`--multiround_data_source sharegpt`)
+### Source 2: ShareGPT (`--multiround_sharegpt_file`)
 
 Load real conversations from ShareGPT-format datasets.
 
@@ -185,45 +162,44 @@ The multiround benchmark supports multiple probability distributions for realist
 ### Uniform Distribution
 Samples uniformly between min and max values.
 ```bash
---multiround_turns_distribution uniform
---multiround_min_turns 4
---multiround_max_turns 12
+--multiround_num_turns_distribution uniform
+--multiround_num_turns_min 4
+--multiround_num_turns_max 12
 ```
 
 ### Constant Distribution
 Always returns the same value.
 ```bash
-# (Use with JSON config - specify "distribution": "constant", "value": X)
+--multiround_num_turns_distribution constant
+--multiround_num_turns_value 10
 ```
 
 ### Zipf Distribution
 Power-law distribution - few items have high values, many have low values. Models "popularity" effects.
 ```bash
---multiround_turns_distribution zipf
---multiround_turns_alpha 2.0    # Higher alpha = steeper distribution
---multiround_max_turns 12       # Cap maximum value
+--multiround_num_turns_distribution zipf
+--multiround_num_turns_max 12       # Cap maximum value
 ```
 
 ### Poisson Distribution
 Discrete distribution for count data. Good for modeling arrival processes.
 ```bash
---multiround_input_tokens_distribution poisson
---multiround_input_tokens_alpha 100   # Lambda (mean) parameter
---multiround_max_input_tokens 200     # Cap maximum value
+--multiround_num_turns_distribution poisson
+--multiround_num_turns_value 10     # Lambda (mean) parameter
+--multiround_num_turns_max 20       # Cap maximum value
 ```
 
 ### Lognormal Distribution
 Right-skewed continuous distribution. Models quantities that are products of random effects.
 ```bash
---multiround_prefix_distribution lognormal
---multiround_prefix_average 1000      # Target average value
---multiround_prefix_max 5000          # Cap maximum value
+--multiround_prefix_tokens_distribution lognormal
+--multiround_prefix_tokens_average 1000      # Target average value
+--multiround_prefix_tokens_max 5000          # Cap maximum value
 ```
 
 **Lognormal Parameters**:
 - `average`: Target average value (internally calculates mean/sigma)
 - `median_ratio`: Ratio of median to average (default: 0.85)
-- Alternatively, can specify raw `mean` and `sigma` in JSON config
 
 ### Exponential Distribution
 Models inter-arrival times. Used primarily for user delays.
@@ -242,8 +218,7 @@ Simulates realistic user thinking/typing time between conversation turns.
 **Parameters**:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--multiround_user_delay_enabled` | True | Enable delay simulation |
-| `--multiround_user_delay_disabled` | - | Flag to disable delays |
+| `--multiround_user_delay_disabled` | - | Flag to disable delays (enabled by default) |
 | `--multiround_user_delay_distribution` | exponential | Distribution type |
 | `--multiround_user_delay_lambda` | 1.0 | Mean for exponential/poisson (seconds) |
 | `--multiround_user_delay_constant` | 1.0 | Value for constant distribution |
@@ -262,32 +237,12 @@ The prefix represents initial context/preamble for each conversation (e.g., syst
 **Parameters**:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--multiround_prefix_distribution` | lognormal | Distribution type |
-| `--multiround_prefix_min` | 100 | Min tokens (uniform) |
-| `--multiround_prefix_max` | 5000 | Max tokens |
-| `--multiround_prefix_average` | 1000 | Average (lognormal) |
-| `--multiround_prefix_alpha` | 2.0 | Alpha (zipf/poisson) |
+| `--multiround_prefix_tokens_distribution` | lognormal | Distribution type |
+| `--multiround_prefix_tokens_min` | 500 | Min tokens (uniform) |
+| `--multiround_prefix_tokens_max` | 5000 | Max tokens |
+| `--multiround_prefix_tokens_average` | 1000 | Average (lognormal) |
 
 **Behavior**: Prefix tokens are added only to the first user message in each conversation as a `<conv_prefix>` tagged block.
-
----
-
-## Trace Collection
-
-The multiround benchmark includes comprehensive trace collection via `ChatTaskTraceCollector`:
-
-**Captured Data**:
-- Controller name and timestamp
-- Duration (milliseconds)
-- Token counts: prompt, completion, reasoning, total
-- Message count before/after each yield
-- Finish reason
-- Performance metrics
-- Full message history (optional)
-
-**Output**:
-- Summary printed to console after benchmark
-- Full traces exported to JSON file (default: `multiround_traces.json`)
 
 ---
 
@@ -305,23 +260,24 @@ The multiround benchmark includes comprehensive trace collection via `ChatTaskTr
 ```bash
 --enable_normal_agent             # Run normal agent benchmark
 --enable_burst_agent              # Run burst agent benchmark
---enable_chatbot                  # Run single-turn chat benchmark
---enable_multiround_chatbot       # Run multi-turn chat benchmark
+--enable_chat                     # Run single-turn chat benchmark
+--enable_multiround_chat          # Run multi-turn chat benchmark
 ```
 
 ### Common Parameters
 ```bash
---times 1                         # Number of benchmark iterations
 --max_parallel_requests 1024      # Global max parallel requests
 --enable_statistics               # Print task metrics summary
 --enable_query_collector          # Dump query traces to JSON
+--kv_cache_hint_enabled           # Enable KV cache hint
+--export_task_metrics_path        # Export task metrics to JSON file
 ```
 
 ### Agent Parameters
 ```bash
 --agent_prompt_num 100
 --normal_agent_concurrency 32
---max_tokens 8192
+--max_tokens_agent 65536
 ```
 
 ### Burst Parameters
@@ -333,50 +289,52 @@ The multiround benchmark includes comprehensive trace collection via `ChatTaskTr
 
 ### Chat Parameters
 ```bash
---chat_prompt_num 20
+--chat_prompt_num 100
 --chat_concurrency 32
---max_tokens_chat 1024
+--max_tokens_chat 8192
 ```
 
 ### Multiround Parameters
 ```bash
-# Data source
---multiround_data_source synthetic|json_config|sharegpt
---multiround_sharegpt_file /path/to/sharegpt.json
---multiround_json_config_file examples/scaffolding/benchmarks/generate_multi_turn.json
+# Data source (one of these is required)
+--multiround_synthetic                    # Use synthetic data generation
+--multiround_sharegpt_file /path/to.json  # Use ShareGPT format file
+
+# General settings
+--multiround_num_conversations 100
+--multiround_concurrency 32
+--multiround_max_rounds 20
 --multiround_text_files file1.txt file2.txt
 --multiround_print_stats
 
 # Turn distribution
---multiround_turns_distribution uniform|constant|zipf|poisson|lognormal
---multiround_min_turns 4
---multiround_max_turns 12
---multiround_turns_alpha 2.0
---multiround_turns_average 8
+--multiround_num_turns_distribution uniform|constant|zipf|poisson
+--multiround_num_turns_min 12
+--multiround_num_turns_max 18
+--multiround_num_turns_value 10
 
 # Input token distribution
---multiround_input_tokens_distribution uniform|constant|zipf|poisson|lognormal
---multiround_min_input_tokens 50
---multiround_max_input_tokens 200
---multiround_input_tokens_alpha 2.0
---multiround_input_tokens_average 100
+--multiround_input_tokens_distribution uniform|constant|lognormal
+--multiround_input_tokens_min 200
+--multiround_input_tokens_max 400
+--multiround_input_tokens_average 300
+--multiround_input_tokens_value 300
 
 # Output token distribution
---multiround_output_tokens_distribution uniform|constant|zipf|poisson|lognormal
---multiround_min_output_tokens 50
---multiround_max_output_tokens 200
---multiround_output_tokens_alpha 2.0
---multiround_output_tokens_average 100
+--multiround_output_tokens_distribution uniform|constant|lognormal
+--multiround_output_tokens_min 200
+--multiround_output_tokens_max 400
+--multiround_output_tokens_average 300
+--multiround_output_tokens_value 300
 
 # Prefix token distribution
---multiround_prefix_distribution lognormal|uniform|constant|zipf|poisson
---multiround_prefix_min 100
---multiround_prefix_max 5000
---multiround_prefix_alpha 2.0
---multiround_prefix_average 1000
+--multiround_prefix_tokens_distribution lognormal|uniform|constant
+--multiround_prefix_tokens_min 500
+--multiround_prefix_tokens_max 5000
+--multiround_prefix_tokens_average 1000
+--multiround_prefix_tokens_value 1000
 
 # User delay distribution
---multiround_user_delay_enabled
 --multiround_user_delay_disabled
 --multiround_user_delay_distribution exponential|poisson|constant|uniform
 --multiround_user_delay_lambda 1.0
@@ -384,48 +342,46 @@ The multiround benchmark includes comprehensive trace collection via `ChatTaskTr
 --multiround_user_delay_min 0.5
 --multiround_user_delay_max 2.0
 --multiround_user_delay_cap 10.0
-
-# Conversation control
---chat_multiround_rounds 10       # Max rounds per conversation
 ```
 
 ---
 
 ## Usage Examples
 
-### Multi-Turn Conversation Benchmark with JSON Config
-```bash
-python -m examples.scaffolding.benchmarks.benchmark_agent_chat \
-    --model_dir /path/to/model \
-    --enable_multiround_chatbot \
-    --multiround_data_source json_config \
-    --multiround_json_config_file examples/scaffolding/benchmarks/generate_multi_turn.json
-```
-
 ### Synthetic Multiround with Custom Distributions
 ```bash
-python -m examples.scaffolding.benchmarks.benchmark_agent_chat \
+python -m examples.scaffolding.benchmarks \
     --model_dir /path/to/model \
-    --enable_multiround_chatbot \
-    --multiround_data_source synthetic \
+    --enable_multiround_chat \
+    --multiround_synthetic \
     --multiround_text_files examples/scaffolding/benchmarks/pg1184.txt \
-    --chat_prompt_num 50 \
-    --chat_concurrency 16 \
-    --chat_multiround_rounds 15 \
-    --multiround_turns_distribution lognormal \
-    --multiround_turns_average 8 \
-    --multiround_max_turns 20 \
+    --multiround_num_conversations 100 \
+    --multiround_concurrency 32 \
+    --multiround_max_rounds 15 \
+    --multiround_num_turns_distribution uniform \
+    --multiround_num_turns_min 8 \
+    --multiround_num_turns_max 20 \
     --multiround_user_delay_distribution exponential \
     --multiround_user_delay_lambda 2.0 \
     --multiround_print_stats
 ```
 
+### ShareGPT Multiround Benchmark
+```bash
+python -m examples.scaffolding.benchmarks \
+    --model_dir /path/to/model \
+    --enable_multiround_chat \
+    --multiround_sharegpt_file /path/to/sharegpt.json \
+    --multiround_num_conversations 50 \
+    --multiround_concurrency 16
+```
+
 ### Concurrent Agent and Chat Benchmarks
 ```bash
-python -m examples.scaffolding.benchmarks.benchmark_agent_chat \
+python -m examples.scaffolding.benchmarks \
     --model_dir /path/to/model \
     --enable_normal_agent \
-    --enable_chatbot \
+    --enable_chat \
     --agent_prompt_num 50 \
     --chat_prompt_num 100 \
     --normal_agent_concurrency 16 \
@@ -434,7 +390,7 @@ python -m examples.scaffolding.benchmarks.benchmark_agent_chat \
 
 ### Burst Testing with Normal Agent
 ```bash
-python -m examples.scaffolding.benchmarks.benchmark_agent_chat \
+python -m examples.scaffolding.benchmarks \
     --model_dir /path/to/model \
     --enable_normal_agent \
     --enable_burst_agent \
@@ -457,9 +413,7 @@ python -m examples.scaffolding.benchmarks.benchmark_agent_chat \
 ### Multiround Benchmark
 All of the above, plus:
 - Average turns per conversation
-- P50, P90, P99 latency percentiles
-- Trace summary with token counts
-- Detailed traces exported to JSON
+- Detailed traces exported to JSON (with `--export_task_metrics_path`)
 
 ---
 
@@ -467,12 +421,12 @@ All of the above, plus:
 
 ```
 benchmarks/
-├── benchmark_agent_chat.py      # Main entry point and CLI parser
+├── __main__.py                  # Main entry point and CLI parser
+├── __init__.py                  # Package exports
 ├── agent_benchmark.py           # Agent and burst agent implementations
 ├── chat_benchmark.py            # Single-turn chat implementation
 ├── multiround_chat_benchmark.py # Multi-turn conversation benchmark
-├── benchmark_utils.py           # Shared utilities (prompt loading, printing)
-├── __init__.py                  # Package exports
+├── benchmark_utils.py           # Shared utilities (prompt loading, printing, shutdown)
 ├── generate_multi_turn.json     # Example JSON config file
 ├── pg1184.txt                   # Source text for synthetic generation
 └── README.md                    # This documentation
