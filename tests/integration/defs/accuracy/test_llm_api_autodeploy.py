@@ -265,8 +265,8 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
                               n=beam_width,
                               use_beam_search=beam_width > 1)
 
-    @pytest.mark.skip_less_device_memory(
-        32000)  # might need to require more memory
+    # 180GB works, might be able to go lower
+    @pytest.mark.skip_less_device_memory(180000)
     @pytest.mark.skip_less_device(8)
     def test_bf16(self):
         kwargs = self.get_default_kwargs()
