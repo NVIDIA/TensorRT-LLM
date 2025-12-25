@@ -62,7 +62,7 @@ async def create_agent_resources(args):
     """
     client = AsyncOpenAI(api_key=args.openai_api_key, base_url=args.base_url)
     generation_worker = TRTOpenaiWorker(
-        client, args.model, getattr(args, "kv_cache_hint_enabled", False)
+        client, args.model, getattr(args, "kv_cache_hint_agent", False)
     )
 
     mcp_worker = MCPWorker.init_with_urls(["http://0.0.0.0:8082/sse"])
