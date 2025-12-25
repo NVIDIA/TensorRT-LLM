@@ -3121,6 +3121,7 @@ def launchTestJobs(pipeline, testFilter)
 // SBSA machines from the Blossom machine pool
     SBSATestConfigs = [
         "GH200-TensorRT-Post-Merge-1": ["gh200", "l0_gh200", 1, 1],
+        // DGX Spark is also named as GB10 Grace Blackwell Superchip.
         "GB10-PyTorch-1": ["gb10x", "l0_gb10", 1, 1],
     ]
     fullSet += SBSATestConfigs.keySet()
