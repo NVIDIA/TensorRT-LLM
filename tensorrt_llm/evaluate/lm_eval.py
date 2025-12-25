@@ -822,9 +822,9 @@ class LongBenchV1(LmEvalEvaluator):
                 f"lm-eval did not provide subgroup 'score' metrics for '{self.task_name}'. "
                 f"Missing subgroups: {missing[:10]}")
 
-        result_acc = float(np.mean(subgroup_scores))
+        result_acc = float(np.mean(subgroup_scores)) * 100
         logger.info(
-            f"lm-eval {self.task_name} average 'score' across {len(subgroup_scores)} subgroups: {result_acc:.4f}"
+            f"lm-eval {self.task_name} average 'score' across {len(subgroup_scores)} subgroups: {result_acc:.2f}"
         )
         return result_acc
 
