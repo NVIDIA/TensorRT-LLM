@@ -22,6 +22,9 @@ from tensorrt_llm.bindings.internal.runtime import delay_kernel
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
+# Unique tag to avoid collisions with other comms
+PP_COMM_TAG_AUTOTUNING = 30000
+
 
 class DistributedTuningStrategy(enum.Enum):
     """
@@ -358,7 +361,7 @@ class AutoTunerProfilingCache:
     """
 
     def __init__(self):
-        self.cache = {}
+        self.cache: Dict[Tuple, Tuple] = dict()
 
         # Cache metadata for local storage and validation
         self.lib_version = tensorrt_llm.__version__
@@ -430,7 +433,7 @@ class AutoTunerProfilingCache:
             ),
         )
 
-    def merge_cache_data(self, cache_data: Dict[str, Any]):
+    def merge_cache_data(self, cache_data: Dict[Tuple, Tuple]):
         self.cache.update(cache_data)
 
     def get_specific_custom_op(self, custom_op: str) -> Dict[Tuple, Tuple]:
@@ -615,7 +618,10 @@ class AutoTuner:
         self._last_capture: Optional['AutoTuner.TacticsCapture'] = None
 
         # Dsitributed tuning state
+        self._map_op_to_distributed_strategy: Dict[
+            str, DistributedTuningStrategy] = {}
         self._dist: Optional[Distributed] = None
+        self._has_received_cache: bool = False
         self.mapping: Mapping = Mapping()
 
     @classmethod
@@ -623,9 +629,6 @@ class AutoTuner:
         if cls._instance is None:
             cls._instance = AutoTuner()
         return cls._instance
-
-    def set_mapping(self, mapping: Mapping = None):
-        self.mapping = mapping
 
     class TacticsCapture:
         """Object returned by capture() that can be iterated to get all tactic combinations.
@@ -797,9 +800,17 @@ class AutoTuner:
         if self.is_tuning_mode and is_cache_hit:
             return (runners[best_runner_id], best_tactic)
 
+        # PP rank does not have cache hit, so we try to receive the cache from the previous rank
+        # Notice that only under tuning mode, pp_recv will be called
+        self.cache_pp_recv()
+
         assert len(runners) > 0, "At least one runner is required"
         assert all([isinstance(r, TunableRunner) for r in runners]), \
             "All Given runners must be subclass of TunableRunner"
+
+        # Record the distributed tuning strategy for the custom_op
+        self._map_op_to_distributed_strategy[
+            custom_op] = tuning_config.distributed_tuning_strategy
 
         tuning_start_time = time.perf_counter()
         profiles = self._optimization_profiles(tuning_config, inputs)
@@ -1507,3 +1518,32 @@ class AutoTuner:
                 f"[AutoTuner] Unknown distributed tuning strategy: {strategy}, falling back to independent"
             )
             return True
+
+    def cache_pp_recv(self):
+        if self.mapping.has_pp() and not self.mapping.is_first_pp_rank(
+        ) and not self._has_received_cache:
+            self._debug_logger(
+                f"[AutoTuner] Receiving cache data from previous pp rank {self.mapping.prev_pp_rank()}"
+            )
+            profiling_cache = self._dist.recv_object(
+                src=self.mapping.prev_pp_rank(),
+                tag=PP_COMM_TAG_AUTOTUNING,
+            )
+            # Guarantee that only receive cache once during a single warm-up run
+            # Notice that this flag should be reset after each warm-up run because isend is always called
+            self._has_received_cache = True
+            self.profiling_cache.merge_cache_data(profiling_cache)
+
+    def cache_pp_send(self):
+        if self.mapping.has_pp() and not self.mapping.is_last_pp_rank():
+            self._debug_logger(
+                f"[AutoTuner] Sending cache data to next pp rank {self.mapping.next_pp_rank()}"
+            )
+            self._dist.isend_object(
+                self.profiling_cache.cache,
+                dest=self.mapping.next_pp_rank(),
+                tag=PP_COMM_TAG_AUTOTUNING,
+            ).wait()
+
+    def clean_pp_flag(self):
+        self._has_received_cache = False
