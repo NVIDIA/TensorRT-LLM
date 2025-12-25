@@ -313,3 +313,50 @@ def test_fp4_moe_op_run(dtype):
     rtol, atol = 1.5, 1.0
     torch.testing.assert_close(output_torch_fp4_moe, output_torch_moe, rtol=rtol, atol=atol)
     torch.testing.assert_close(output_torch_fp4_moe, ref_output, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize(
+    "input_dtype,weight_dtype",
+    [
+        (torch.float32, torch.bfloat16),
+        (torch.float32, torch.float16),
+        (torch.bfloat16, torch.float16),
+    ],
+)
+def test_torch_moe_dtype_cast(input_dtype, weight_dtype):
+    """Verify torch_moe handles mixed input/weight dtypes by casting input to weight dtype."""
+    num_experts = 3
+    seq_len = 8
+    hidden_size = 64
+    intermediate_size = 32
+    top_k = 2
+
+    torch.manual_seed(42)
+    x = torch.rand(seq_len, hidden_size, dtype=input_dtype).cuda()
+
+    router_logits = torch.randn((seq_len, num_experts), dtype=torch.float32).cuda()
+    routing_weights = F.softmax(router_logits, dim=1)
+    final_scales, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+    final_scales = final_scales / final_scales.sum(dim=-1, keepdim=True)
+    final_scales = final_scales.to(x.dtype)
+
+    w1 = [
+        torch.rand(intermediate_size, hidden_size, dtype=weight_dtype).cuda()
+        for _ in range(num_experts)
+    ]
+    w2 = [
+        torch.rand(hidden_size, intermediate_size, dtype=weight_dtype).cuda()
+        for _ in range(num_experts)
+    ]
+    w3 = [
+        torch.rand(intermediate_size, hidden_size, dtype=weight_dtype).cuda()
+        for _ in range(num_experts)
+    ]
+
+    with torch.inference_mode():
+        output = torch.ops.auto_deploy.torch_moe(x, selected_experts, final_scales, w1, w2, w3)
+
+    # Output should be computed without errors
+    assert output is not None
+    assert not torch.isnan(output).any(), "Output contains NaN values"
+    assert not torch.isinf(output).any(), "Output contains Inf values"

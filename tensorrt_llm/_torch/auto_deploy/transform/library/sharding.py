@@ -900,14 +900,11 @@ def _load_hook(
     ad_logger.debug(f"Sharder LOAD hook is called for '{key}'")
     if key not in state_dict:
         return
-    ad_logger.debug(f"Sharder LOAD hook is working for '{key}'")
     p_to_load = state_dict[key]
 
-    # Skip if already sharded (loading a pre-sharded checkpoint)
-    if param_shape == p_to_load.shape:
-        return
+    p_to_load = p_to_load if param_shape == p_to_load.shape else f_split(p_to_load)
 
-    state_dict[key] = f_split(p_to_load)
+    state_dict[key] = p_to_load
 
 
 def _load_hook_remove(
@@ -917,7 +914,7 @@ def _load_hook_remove(
     param_key: str,
 ):
     key = prefix + param_key
-    ad_logger.debug(f"Sharder LOAD hook (remove) is called for '{key}'")
+    ad_logger.debug(f"Sharder LOAD hook is called for '{key}'")
     state_dict.pop(key, None)
 
 
@@ -1340,277 +1337,6 @@ def _update_node_args(node: Node, args: tuple) -> None:
     )
 
 
-def _insert_sharded_moe_stacked(
-    gm: GraphModule,
-    node: Node,
-    rank: int,
-    world_size: int,
-    allreduce_strategy: AllReduceStrategy,
-    scale_names: Sequence[str] = (),
-):
-    """Update the torch_moe node with sliced stacked weight tensors,
-    sharded `selected_experts` and `final_scales(router_logics)`.
-    Add an all_reduce node after the moe node.
-
-    For torch_moe with stacked tensor format (single-element lists containing 3D tensors).
-
-    NOTE: allreduce_strategy is MANDATORY and must be explicitly provided.
-    """
-    if allreduce_strategy is None:
-        raise ValueError(f"allreduce_strategy must be set for MoE sharding on node {node.name}")
-
-    # Extract the stacked tensors from single-element lists
-    # args[3] = w1_weight (Node representing list with one 3D tensor, or direct list)
-    # args[4] = w2_weight (Node representing list with one 3D tensor, or direct list)
-
-    # Helper to extract tensor node from list (handles both Node and direct list)
-    def extract_tensor_from_list_arg(list_arg):
-        if isinstance(list_arg, Node) and list_arg.target is list:
-            # It's a list() call node - extract from its args
-            return list_arg.args[0][0]  # args[0] is the list content, [0] is first element
-        elif isinstance(list_arg, (list, tuple)):
-            # Direct list
-            return list_arg[0]
-        else:
-            raise ValueError(f"Unexpected list format: {type(list_arg)}")
-
-    w3_w1_tensor_node = extract_tensor_from_list_arg(node.args[3])
-    # w2_tensor_node = extract_tensor_from_list_arg(node.args[4])  # Unused - see TODO below
-    num_experts = _get_dim0_from_arg(gm, w3_w1_tensor_node)
-
-    args = list(node.args)
-
-    # -- Handle selected_experts and final_scales sharding --
-    selected_experts = args[1]
-    final_scales = args[2]
-
-    experts_per_rank = num_experts // world_size
-
-    with gm.graph.inserting_before(node):
-        lower = experts_per_rank * rank
-        # selected_experts_local = selected_experts - low
-        selected_experts_local = gm.graph.create_node(
-            "call_function", operator.sub, args=(selected_experts, lower), kwargs={}
-        )
-
-        # For num_experts % world_size != 0 case,
-        # assign the last (num_experts % world_size) experts to the last rank
-        div_node = gm.graph.create_node(
-            "call_function", operator.floordiv, args=(selected_experts, experts_per_rank), kwargs={}
-        )
-
-        comp_op = torch.ge if rank == world_size - 1 else torch.eq
-        rank_mask = gm.graph.create_node("call_function", comp_op, args=(div_node, rank), kwargs={})
-
-        # final_scales_local = final_scales * rank_mask
-        final_scales_local = gm.graph.create_node(
-            "call_function", operator.mul, args=(final_scales, rank_mask), kwargs={}
-        )
-
-    # -- Transform expert weight parameters --
-    local_lo, local_hi = _split_range_last_remainder(num_experts, world_size, rank)
-
-    # TODO: Transform w3_w1_stacked: slice experts, swap [W1,W3]->[W3,W1], transpose (E,H,2I)->(E,2I,H)
-    # Note: _transform_bmm_moe_weight_param was removed in commit 34224a532
-    # This function (_insert_sharded_moe_stacked) is not currently called anywhere
-    # if isinstance(w3_w1_tensor_node, Node):
-    #     _transform_bmm_moe_weight_param(
-    #         gm, w3_w1_tensor_node, local_lo, local_hi, swap_gate_up=True
-    #     )
-
-    # TODO: Transform w2_stacked: slice experts, transpose (E,I,H)->(E,H,I)
-    # Note: _transform_bmm_moe_weight_param was removed in commit 34224a532
-    # if isinstance(w2_tensor_node, Node):
-    #     _transform_bmm_moe_weight_param(gm, w2_tensor_node, local_lo, local_hi, swap_gate_up=False)
-
-    # -- Update args (keep same lists/nodes, just with transformed parameters) --
-    args[1] = selected_experts_local
-    args[2] = final_scales_local
-    # args[3] and args[4] stay the same - we modified the parameters in-place
-
-    ad_logger.debug(
-        f"Updated node {node}: replaced original arguments {node.args} with sharded arguments {args}."
-    )
-
-    node.args = tuple(args)
-
-    # -- add an all_reduce node --
-    with gm.graph.inserting_after(node):
-        dist_node = gm.graph.call_function(
-            torch.ops.auto_deploy.torch_dist_all_reduce.default,
-            args=(node, allreduce_strategy),
-        )
-        node.replace_all_uses_with(dist_node)
-        dist_node.replace_input_with(dist_node, node)
-
-
-def _insert_sharded_mamba(
-    gm: GraphModule,
-    entry_node: Node,
-    dim: int,
-    config: ShardingTransformConfig,
-    min_local_shape: int,
-    weights_to_shard: Optional[list[str]] = None,
-    weight_shard_dims: Optional[Dict[str, int]] = None,
-    fused_weight_dims: Optional[Dict[str, list]] = None,
-    quantization_cb: Optional[
-        Callable[[GraphModule, nn.Module, Node, str, torch.Size, int, int, int], None]
-    ] = None,
-) -> bool:
-    """
-    To shard Mamba layer, first column-shard the first linear layer: entry_node,
-    then shard all remaining weight tensors found in the subgraph defined between
-    entry_node and the next successor linear node.
-    First, validate if this is indeed a mamba module: within the subgraph,
-    there should be an torch_ssm node and conv1d node.
-
-    Args:
-        gm: GraphModule
-        entry_node: The first linear node of the Mamba layer
-        dim: Default shard dimension
-        allreduce_strategy: AllReduceStrategy
-        min_local_shape: Minimum local shape constraint
-        weights_to_shard: Optional list of regex patterns to match weight names
-        weight_shard_dims: Optional dict mapping weight keys to their shard dimensions
-        fused_weight_dims: Optional dict mapping weight keys to their fused dimension lists
-        quantization_cb: Optional quantization callback
-    """
-    # Find next linear node to define subgraph boundary
-    try:
-        next_lin_node, depth = bfs(entry_node, is_any_lin_op, include_root=False)
-    except RuntimeError:
-        ad_logger.warning("Could not find next linear node after entry_node for Mamba sharding")
-        return False
-
-    rank, world_size = config.rank, config.world_size
-    # Get subgraph between entry_node and next linear node
-    subgraph_nodes = subgraph([entry_node], [next_lin_node])
-
-    ##############################################################
-    ########## validate if this is a valid Mamba module ##########
-    ##############################################################
-    # has_ssm = any(is_op(n, torch.ops.auto_deploy.mamba.torch_ssm_transform) for n in subgraph_nodes)
-    has_ssm = True
-    conv1d_nodes = [
-        n
-        for n in subgraph_nodes
-        if is_op(n, [torch.ops.aten.conv1d, torch.ops.auto_deploy.torch_causal_conv1d])
-    ]
-    if len(conv1d_nodes) != 1 or not has_ssm:
-        ad_logger.warning(
-            f"Subgraph does not contain exactly one conv1d node and torch_ssm_transform. "
-            f"Skipping Mamba sharding. conv1d_nodes={conv1d_nodes}, has_ssm={has_ssm}"
-        )
-        return False
-
-    ##############################################################
-    ########## infer split sizes for in_proj and conv1d ##########
-    ##############################################################
-    # in_proj and conv1d are most likely fused, followed up by split nodes. Infer split sizes:
-    if fused_weight_dims is None:
-        split_nodes = [
-            n
-            for n in subgraph_nodes
-            if is_op(n, [torch.ops.aten.split, torch.ops.aten.split_with_sizes])
-        ]
-        if len(split_nodes) != 2:
-            ad_logger.warning(
-                f"Subgraph does not contain exactly two split nodes. "
-                f"Skipping Mamba sharding. split_nodes={split_nodes}"
-            )
-            return False
-        split_sizes_1 = split_nodes[0].args[1]
-        split_sizes_2 = split_nodes[1].args[1]
-        if split_sizes_1[1] != sum(split_sizes_2):
-            ad_logger.warning(
-                f"Split nodes have different sizes. "
-                f"Skipping Mamba sharding. split_sizes_1={split_sizes_1}, split_sizes_2={split_sizes_2}"
-            )
-            return False
-        fused_weight_dims = {
-            "in_proj": split_sizes_1[0:1] + split_sizes_2 + split_sizes_1[2:],
-            "conv1d": split_sizes_2,
-        }
-
-    conv1d_node = conv1d_nodes[0]
-    # conv1d_node last argument is the number of output channels.
-    # This one is also sharded, so we need to update this parameter
-    conv_args = list(conv1d_node.args)
-    conv_args[-1] = conv1d_node.args[-1] // world_size
-    conv1d_node.args = tuple(conv_args)
-
-    # First, shard the entry_node (the first linear layer)
-    # Extract entry node's fused_weight_dims by matching weight name against patterns
-    entry_fused_dims = None
-    if fused_weight_dims:
-        entry_weight_key, _ = extract_param_names_from_node(entry_node)
-        for pattern, dims in fused_weight_dims.items():
-            if re.search(pattern, entry_weight_key):
-                entry_fused_dims = dims
-                break
-
-    _shard_parameter_node(
-        gm=gm,
-        node=entry_node,
-        dim=SplitDimension.COLUMN,
-        config=config,
-        add_dist=False,
-        min_local_shape=min_local_shape,
-        fused_weight_dims=entry_fused_dims,
-        quantization_cb=quantization_cb,
-    )
-
-    # Get all weight nodes in the subgraph except for out_proj
-    weight_nodes = [
-        n
-        for n in get_all_weights_in_subgraph([entry_node], [next_lin_node])
-        if "out_proj" not in str(n)
-    ]
-
-    # Shard remaining weights, such as conv1d or RMSNorm
-    for weight_node in weight_nodes:
-        weight_key = weight_node.target
-
-        # Filter by regex patterns if provided
-        if weights_to_shard is not None:
-            if not any(pattern in weight_key for pattern in weights_to_shard):
-                continue
-
-        # Determine shard dimension for this weight
-        shard_dim = weight_shard_dims.get(weight_key, dim) if weight_shard_dims else dim
-
-        # Get the weight parameter
-        try:
-            weight_param = gm.get_parameter(weight_key)
-        except AttributeError:
-            ad_logger.debug(f"Could not get parameter for {weight_key}, skipping")
-            continue
-
-        # Get fused dims for this weight if specified
-        fused_dims = None
-        for k, v in fused_weight_dims.items():
-            if k in weight_key:
-                fused_dims = v
-                break
-
-        # Shard the weight tensor (also updates the parameter in the module)
-        _, sharded_shape = shard_weight_tensor(
-            gm=gm,
-            weight_tensor=weight_param,
-            param_key=weight_key,
-            dim=shard_dim,
-            rank=rank,
-            world_size=world_size,
-            min_local_shape=min_local_shape,
-            fused_weight_dims=fused_dims,
-        )
-
-        ad_logger.debug(
-            f"Sharded weight {weight_key} on dim {shard_dim}: "
-            f"{weight_param.shape} -> {sharded_shape}"
-        )
-
-
 def _insert_sharded_moe(
     gm: GraphModule,
     node: Node,
@@ -1618,13 +1344,10 @@ def _insert_sharded_moe(
     mlp_type: MLPType,
     scale_names: Sequence[str] = (),
 ):
-    """Update the torch_moe node with sharded weight lists or stacked tensors,
+    """Update the torch_moe node with sharded weight lists,
     sharded `selected_experts` and `final_scales(router_logics)`.
     Add an all_reduce node after the moe node.
 
-    Handles both:
-    - Standard format: per-expert weight lists
-    - Stacked format: single-element lists containing stacked 3D tensors (Llama4 pattern)
 
     NOTE: allreduce_strategy is MANDATORY.
     """
@@ -1638,12 +1361,6 @@ def _insert_sharded_moe(
     if allreduce_strategy is None:
         raise ValueError(f"allreduce_strategy must be set for MoE sharding on node {node.name}")
     scale_names = list(scale_names)
-
-    # we have two variants of MoE: stacked and listed:
-    # - stacked: w1, w2, w3 weight args are order-3 tensors, where the 1st dimension corresponds
-    #            to the stacked expert weigthts.
-    # - listed: w1, w2, w3 weight args are lists of order-2 tensors, where each expert weight
-    #            is a separate entry in the list.
 
     # -- Handle selected_experts and final_scales sharding --
     selected_experts = args[1]
@@ -1691,11 +1408,12 @@ def _insert_sharded_moe(
         expert_end = (
             num_experts if (rank == world_size - 1) else expert_start + expert_size_per_partition
         )
-        return lst[expert_start:expert_end]
 
-    w_up_list_sharded = get_partition(args[3], ep_size, ep_rank)
-    w_down_list_sharded = get_partition(args[4], ep_size, ep_rank)
-    w_gate_list_sharded = get_partition(args[5], ep_size, ep_rank)
+        return lst[expert_start:expert_end], lst[:expert_start] + lst[expert_end:]
+
+    w_up_list_sharded, w_up_list_to_remove = get_partition(args[3], ep_size, ep_rank)
+    w_down_list_sharded, w_down_list_to_remove = get_partition(args[4], ep_size, ep_rank)
+    w_gate_list_sharded, w_gate_list_to_remove = get_partition(args[5], ep_size, ep_rank)
 
     # if tp_size > 1, we do 2D EP+TP sharding.
     # we add TP sharding of all expert weights.
@@ -1726,8 +1444,11 @@ def _insert_sharded_moe(
     args[5] = w_gate_list_sharded
 
     # Shard scales for quantized ops
+    scales_to_remove = []
     for i in range(len(scale_names) * 3):  # 3 layers (w1, w2, w3) × #scale_names per layer
-        args[6 + i] = get_partition(args[6 + i], ep_size, ep_rank)
+        sharded, to_remove = get_partition(args[6 + i], ep_size, ep_rank)
+        args[6 + i] = sharded
+        scales_to_remove.extend(to_remove)
 
     ad_logger.debug(
         f"Updated node {node}: replaced original arguments {node.args} with sharded arguments {args}."
@@ -1741,6 +1462,12 @@ def _insert_sharded_moe(
         )
         node.replace_all_uses_with(dist_node)
         dist_node.replace_input_with(dist_node, node)
+
+    gm.graph.eliminate_dead_code()
+    for expert in (
+        w_up_list_to_remove + w_down_list_to_remove + w_gate_list_to_remove + scales_to_remove
+    ):
+        delattr(gm, expert.target)
 
 
 def _slice_expert_dim(gm: GraphModule, tensor_node: Node, lo: int, hi: int) -> Node:
@@ -2719,10 +2446,9 @@ def detect_ep_shard(
         if not is_any_moe_op(node):
             continue
         args = node.args
+        mlp_type = MLPType.MLP
         if args[5] and len(args[5]) > 0:
-            mlp_type = MLPType.GATED_MLP if args[5] else MLPType.MLP
-        else:
-            mlp_type = MLPType.MLP
+            mlp_type = MLPType.GATED_MLP
         if transform_container.add(
             EPShardingInfo.from_node(
                 node,
