@@ -2783,6 +2783,8 @@ class PyExecutor:
             new_target_inputs = None
             num_accepted_tokens_device = None
             if has_draft_batch:
+                # Wait for the previous sampling to finish before using its outputs.
+                self.finish_sample_event.wait()
                 target_outputs = self.previous_batch.sample_state and self.previous_batch.sample_state.device
                 assert target_outputs is not None, "target_outputs should not be None"
                 new_target_inputs, num_accepted_tokens_device = self._accept_draft_tokens(
@@ -2790,7 +2792,6 @@ class PyExecutor:
                     target_inputs=target_inputs,
                     target_outputs=target_outputs)
 
-            if has_draft_batch:
                 self.drafter.generate_draft_tokens_with_overlap(
                     scheduled_batch, self.resource_manager,
                     previous_tensors.device if previous_tensors else None,
