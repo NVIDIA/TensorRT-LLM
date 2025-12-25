@@ -567,8 +567,7 @@ FP4_W_GEN_SCALE = 0.1
 @pytest.mark.parametrize("hidden_size, intermediate_size", FP4_TEST_SHAPES)
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS)
 @pytest.mark.parametrize("top_k", TOP_K_VALUES)
-@pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
-@pytest.mark.parametrize("otype, wtype", NVFP4_TEST_DTYPES)
+@pytest.mark.parametrize("otype", NVFP4_TEST_DTYPES)
 @pytest.mark.parametrize("activation_func", [ActivationType.Silu, ActivationType.Relu2])
 @pytest.mark.skipif(
     not fp4_compatible() or not trtllm_ops_available(),

@@ -259,6 +259,8 @@ def trtllm_quant_nvfp4_moe_fused(
         act_fn: "silu" for gated_mlp, "relu2" for mlp
     """
     NVFP4_BLOCK_SIZE = 16
+    n_experts, hidden_size, inter_size = fc2_expert_weights_fp4.shape
+    inter_size *= 2  # 2 FP4 elements are packed in each uint8 element.
 
     activation_type = ActivationType.Swiglu
     if is_gated_mlp:
