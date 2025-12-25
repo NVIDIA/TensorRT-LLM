@@ -106,17 +106,6 @@ def _append_extra_error_message_for_port_conflict(error_msg: str, port: int):
         else:
             logger.warning(f"Could not find a process listening on port {port}")
 
-        used_ports = list()
-        for p in range(10000, 14000):
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.bind(("localhost", p))
-            except OSError:
-                used_ports.append(p)
-
-        if len(used_ports) > 0:
-            extra_error_msg += f", Used ports in range 10000-14000: {used_ports}"
-
     except Exception as e:
         logger.warning(
             f"Error appending extra error message for port conflict: {e}")
@@ -227,6 +216,7 @@ def launch_server(
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
             s.bind((host, port))
+            s.listen(1)
         except OSError as e:
             error_msg = f"Failed to bind socket to {host}:{port}: {e}"
             error_msg = _append_extra_error_message_for_port_conflict(
@@ -697,6 +687,7 @@ def disaggregated(
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
             s.bind((disagg_cfg.hostname, disagg_cfg.port))
+            s.listen(1)
         except OSError as e:
             error_msg = f"Failed to bind socket to {disagg_cfg.hostname}:{disagg_cfg.port}: {e}"
             error_msg = _append_extra_error_message_for_port_conflict(
