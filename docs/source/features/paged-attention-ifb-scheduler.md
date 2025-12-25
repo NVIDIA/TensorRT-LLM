@@ -46,7 +46,7 @@ Use default `max_seq_len` (which is `max_position_embeddings`), no need to tune 
 
 `max_num_tokens` defines the maximum number of batched input tokens after padding is removed in each batch.​
 
-`max_num_tokens` is set to 16384 by default. It is recommended to tune --max_num_tokens for optimal performance.
+`max_num_tokens` is set to 8192 by default starting from v0.11. It is recommended to tune --max_num_tokens for optimal performance.
 
 The maximum number of tokens will not take effect when input padding is not removed. When input padding is removed, the tokens from different sequences are
 packed together and the maximum number of the tokens can be set to a different
