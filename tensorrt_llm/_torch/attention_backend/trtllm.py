@@ -967,7 +967,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             kv_lens = cached_token_lens.clone()
             kv_lens[active_rank] += self.seq_lens_kv[active_rank]
         else:
-            kv_lens = cached_token_lens + self.seq_lens_kv if cached_token_lens is not None else self.seq_lens_kv
+            kv_lens = cached_token_lens + \
+                self.seq_lens_kv if cached_token_lens is not None else self.seq_lens_kv
 
         # self.kv_lens is the valid kv cache length, while the self.kv_lens_cuda is
         # the sequence length including the cached tokens and the input tokens.
@@ -998,10 +999,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 self.host_kv_cache_block_offsets,
                 self.request_ids[self.num_contexts:], self.beam_width,
                 self.num_contexts)
-            self.kv_cache_block_offsets[:, :self.num_seqs].copy_(
-                self.host_kv_cache_block_offsets[:, :self.num_seqs],
-                non_blocking=True)
-
+            for pool_idx in range(self.host_kv_cache_block_offsets.shape[0]):
+                self.kv_cache_block_offsets[pool_idx, :self.num_seqs].copy_(
+                    self.host_kv_cache_block_offsets[pool_idx, :self.num_seqs],
+                    non_blocking=True)
             error_message = (
                 f"The max KV cache length of input sequences ({self.kv_lens[:self.num_seqs].max()}) "
                 f"exceeds the KV cache manager's maximum supported length "
