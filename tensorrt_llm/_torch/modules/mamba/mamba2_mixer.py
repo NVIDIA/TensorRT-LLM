@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
+from typing import Dict, Optional
 
 import torch
 from einops import rearrange, repeat
@@ -23,7 +23,9 @@ from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 
 from ...attention_backend import AttentionMetadata
 from ...model_config import ModelConfig
+from ...utils import AuxStreamType, EventType
 from ..linear import Linear, TensorParallelMode
+from ..multi_stream_utils import maybe_execute_in_parallel
 from .causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from .layernorm_gated import RMSNorm as RMSNormGated
 from .selective_state_update import selective_state_update
@@ -52,6 +54,8 @@ class Mamba2Mixer(nn.Module):
         rms_norm_eps: float = 1e-5,
         dtype: Optional[torch.dtype] = None,
         config: Optional[ModelConfig] = None,
+        aux_stream_dict: Optional[Dict[AuxStreamType,
+                                       torch.cuda.Stream]] = None,
     ):
         super().__init__()
 
@@ -153,6 +157,143 @@ class Mamba2Mixer(nn.Module):
 
         self._mamba_ssm_cache_dtype = config.quant_config.mamba_ssm_cache_dtype
 
+        # Multi-stream for parallel prefill/decode execution
+        if aux_stream_dict is not None and AuxStreamType.Attention in aux_stream_dict:
+            self.aux_stream = aux_stream_dict[AuxStreamType.Attention]
+            self.event_dict = {
+                key: torch.cuda.Event()
+                for key in [EventType.Main, EventType.Attention]
+            }
+        else:
+            self.aux_stream = None
+            self.event_dict = None
+
+    def _prefill_forward(
+        self,
+        xbc_p: torch.Tensor,
+        z_p: torch.Tensor,
+        dt_p: torch.Tensor,
+        conv_states: torch.Tensor,
+        ssm_states: torch.Tensor,
+        state_indices_p: torch.Tensor,
+        mamba_metadata: Mamba2Metadata,
+        num_prefills: int,
+    ) -> torch.Tensor:
+        """Execute prefill computation for context/prompt tokens."""
+        cu_seqlens = mamba_metadata.cu_seqlens[:num_prefills + 1]
+        seq_idx = mamba_metadata.seq_idx
+        has_initial_states = mamba_metadata.has_initial_states[:num_prefills]
+
+        xbc_p = causal_conv1d_fn(xbc_p.transpose(0, 1),
+                                 self.conv1d.weight,
+                                 self.conv1d.bias,
+                                 activation="silu",
+                                 conv_states=conv_states,
+                                 has_initial_state=has_initial_states,
+                                 query_start_loc=cu_seqlens,
+                                 cache_indices=state_indices_p).transpose(0, 1)
+
+        x_p, B_p, C_p = torch.split(xbc_p.unsqueeze(0), [
+            self.tp_d_inner,
+            self.tp_ngroups * self.d_state,
+            self.tp_ngroups * self.d_state,
+        ],
+                                    dim=-1)
+
+        x_p = rearrange(x_p, "b l (h p) -> b l h p", h=self.tp_nheads)
+        dt_p = dt_p.unsqueeze(0)
+        B_p = rearrange(B_p, "b l (g n) -> b l g n", g=self.tp_ngroups)
+        C_p = rearrange(C_p, "b l (g n) -> b l g n", g=self.tp_ngroups)
+        z_p = rearrange(z_p.unsqueeze(0),
+                        "b l (h p) -> b l h p",
+                        h=self.tp_nheads)
+
+        initial_states = None
+        if mamba_metadata.use_initial_states:
+            initial_states = torch.where(
+                has_initial_states[:, None, None, None],
+                ssm_states[state_indices_p], 0)
+
+        y, current_ssm_states = mamba_chunk_scan_combined(
+            x_p,
+            dt_p,
+            self.A,
+            B_p,
+            C_p,
+            chunk_size=self.chunk_size,
+            D=self.D,
+            z=z_p,
+            dt_bias=self.dt_bias,
+            initial_states=initial_states,
+            chunk_indices=mamba_metadata.chunk_indices,
+            chunk_offsets=mamba_metadata.chunk_offsets,
+            dt_softplus=self.delta_softplus,
+            cu_seqlens=cu_seqlens,
+            seq_idx=seq_idx,
+            return_varlen_states=True,
+            return_final_states=False,
+            mamba_ssm_cache_dtype=self._mamba_ssm_cache_dtype,
+        )
+
+        # copy new ssm state
+        ssm_states[state_indices_p] = current_ssm_states
+
+        return rearrange(y, "b l h p -> (b l) (h p)")
+
+    def _decode_forward(
+        self,
+        xbc_d: torch.Tensor,
+        z_d: torch.Tensor,
+        dt_d: torch.Tensor,
+        conv_states: torch.Tensor,
+        ssm_states: torch.Tensor,
+        state_indices_d: torch.Tensor,
+    ) -> torch.Tensor:
+        """Execute decode computation for generation tokens."""
+        xbc_d = causal_conv1d_update(xbc_d,
+                                     conv_states,
+                                     self.conv1d.weight,
+                                     self.conv1d.bias,
+                                     activation="silu",
+                                     conv_state_indices=state_indices_d)
+
+        x_d, B_d, C_d = torch.split(
+            xbc_d,
+            [
+                self.tp_d_inner,
+                self.tp_ngroups * self.d_state,
+                self.tp_ngroups * self.d_state,
+            ],
+            dim=-1,
+        )
+
+        x_d = rearrange(x_d, "b (h p) -> b h p", p=self.head_dim)
+        dt_d = repeat(dt_d, "b h -> b h p", p=self.head_dim)
+        B_d = rearrange(B_d, "b (g n) -> b g n", g=self.tp_ngroups)
+        C_d = rearrange(C_d, "b (g n) -> b g n", g=self.tp_ngroups)
+        z_d = rearrange(z_d, "b (h p) -> b h p", p=self.head_dim)
+
+        A = repeat(self.A, "h -> h p n", p=self.head_dim,
+                   n=self.d_state).to(dtype=torch.float32)
+        dt_bias = repeat(self.dt_bias, "h -> h p", p=self.head_dim)
+        D = repeat(self.D, "h -> h p", p=self.head_dim)
+
+        y = selective_state_update(
+            ssm_states,
+            x_d,
+            dt_d,
+            A,
+            B_d,
+            C_d,
+            D,
+            z=z_d,
+            dt_bias=dt_bias,
+            dt_softplus=self.delta_softplus,
+            state_batch_indices=state_indices_d,
+        )
+
+        return rearrange(y, "b h p -> b (h p)")
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -190,117 +331,70 @@ class Mamba2Mixer(nn.Module):
         xbc_p, xbc_d = torch.split(xbc, seqlen_split_size, dim=0)
         dt_p, dt_d = torch.split(dt, seqlen_split_size, dim=0)
 
-        out = []
+        # Check if we can use multi-stream parallel execution
+        # Multi-stream is beneficial when both prefill and decode are present
+        use_multi_stream = (num_prefills > 0 and num_decodes > 0
+                            and self.aux_stream is not None
+                            and self.event_dict is not None)
+        if use_multi_stream:
 
-        if num_prefills > 0:
+            def _compute_prefill():
+                return self._prefill_forward(
+                    xbc_p,
+                    z_p,
+                    dt_p,
+                    conv_states,
+                    ssm_states,
+                    state_indices_p,
+                    mamba_metadata,
+                    num_prefills,
+                )
 
-            cu_seqlens = mamba_metadata.cu_seqlens[:num_prefills + 1]
-            seq_idx = mamba_metadata.seq_idx
-            has_initial_states = mamba_metadata.has_initial_states[:
-                                                                   num_prefills]
+            def _compute_decode():
+                return self._decode_forward(
+                    xbc_d,
+                    z_d,
+                    dt_d,
+                    conv_states,
+                    ssm_states,
+                    state_indices_d,
+                )
 
-            xbc_p = causal_conv1d_fn(xbc_p.transpose(0, 1),
-                                     self.conv1d.weight,
-                                     self.conv1d.bias,
-                                     activation="silu",
-                                     conv_states=conv_states,
-                                     has_initial_state=has_initial_states,
-                                     query_start_loc=cu_seqlens,
-                                     cache_indices=state_indices_p).transpose(
-                                         0, 1)
+            out_p, out_d = maybe_execute_in_parallel(
+                _compute_prefill, _compute_decode,
+                self.event_dict[EventType.Main],
+                self.event_dict[EventType.Attention], self.aux_stream)
 
-            x_p, B_p, C_p = torch.split(xbc_p.unsqueeze(0), [
-                self.tp_d_inner,
-                self.tp_ngroups * self.d_state,
-                self.tp_ngroups * self.d_state,
-            ],
-                                        dim=-1)
+            out = torch.cat([out_p, out_d], dim=0)
+        else:
+            # Sequential execution when only prefill or only decode is present
+            out = []
 
-            x_p = rearrange(x_p, "b l (h p) -> b l h p", h=self.tp_nheads)
-            dt_p = dt_p.unsqueeze(0)
-            B_p = rearrange(B_p, "b l (g n) -> b l g n", g=self.tp_ngroups)
-            C_p = rearrange(C_p, "b l (g n) -> b l g n", g=self.tp_ngroups)
-            z_p = rearrange(z_p.unsqueeze(0),
-                            "b l (h p) -> b l h p",
-                            h=self.tp_nheads)
+            if num_prefills > 0:
+                out_p = self._prefill_forward(
+                    xbc_p,
+                    z_p,
+                    dt_p,
+                    conv_states,
+                    ssm_states,
+                    state_indices_p,
+                    mamba_metadata,
+                    num_prefills,
+                )
+                out.append(out_p)
 
-            initial_states = None
-            if mamba_metadata.use_initial_states:
-                initial_states = torch.where(
-                    has_initial_states[:, None, None, None],
-                    ssm_states[state_indices_p], 0)
+            if num_decodes > 0:
+                out_d = self._decode_forward(
+                    xbc_d,
+                    z_d,
+                    dt_d,
+                    conv_states,
+                    ssm_states,
+                    state_indices_d,
+                )
+                out.append(out_d)
 
-            y, current_ssm_states = mamba_chunk_scan_combined(
-                x_p,
-                dt_p,
-                self.A,
-                B_p,
-                C_p,
-                chunk_size=self.chunk_size,
-                D=self.D,
-                z=z_p,
-                dt_bias=self.dt_bias,
-                initial_states=initial_states,
-                chunk_indices=mamba_metadata.chunk_indices,
-                chunk_offsets=mamba_metadata.chunk_offsets,
-                dt_softplus=self.delta_softplus,
-                cu_seqlens=cu_seqlens,
-                seq_idx=seq_idx,
-                return_varlen_states=True,
-                return_final_states=False,
-                mamba_ssm_cache_dtype=self._mamba_ssm_cache_dtype,
-            )
-            out.append(rearrange(y, "b l h p -> (b l) (h p)"))
-
-            # copy new ssm state
-            ssm_states[state_indices_p] = current_ssm_states
-
-        if num_decodes > 0:
-            xbc_d = causal_conv1d_update(xbc_d,
-                                         conv_states,
-                                         self.conv1d.weight,
-                                         self.conv1d.bias,
-                                         activation="silu",
-                                         conv_state_indices=state_indices_d)
-
-            x_d, B_d, C_d = torch.split(
-                xbc_d,
-                [
-                    self.tp_d_inner,
-                    self.tp_ngroups * self.d_state,
-                    self.tp_ngroups * self.d_state,
-                ],
-                dim=-1,
-            )
-
-            x_d = rearrange(x_d, "b (h p) -> b h p", p=self.head_dim)
-            dt_d = repeat(dt_d, "b h -> b h p", p=self.head_dim)
-            B_d = rearrange(B_d, "b (g n) -> b g n", g=self.tp_ngroups)
-            C_d = rearrange(C_d, "b (g n) -> b g n", g=self.tp_ngroups)
-            z_d = rearrange(z_d, "b (h p) -> b h p", p=self.head_dim)
-
-            A = repeat(self.A, "h -> h p n", p=self.head_dim,
-                       n=self.d_state).to(dtype=torch.float32)
-            dt_bias = repeat(self.dt_bias, "h -> h p", p=self.head_dim)
-            D = repeat(self.D, "h -> h p", p=self.head_dim)
-
-            y = selective_state_update(
-                ssm_states,
-                x_d,
-                dt_d,
-                A,
-                B_d,
-                C_d,
-                D,
-                z=z_d,
-                dt_bias=dt_bias,
-                dt_softplus=self.delta_softplus,
-                state_batch_indices=state_indices_d,
-            )
-
-            out.append(rearrange(y, "b h p -> b (h p)"))
-
-        out = torch.cat(out, dim=0)
+            out = torch.cat(out, dim=0)
 
         # norm
         out = self.norm(out)
