@@ -146,7 +146,10 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
         int const numBlocksPerSM = std::max(1u, 2048u / block.x);
         // The number of blocks for m. The m dimension will be padded to 128 for swizzled layout.
         int numBlocksForM = layout == QuantizationSFLayout::SWIZZLED ? PadUpFn(m, 128) : m;
-        dim3 grid(std::min(numBlocksForM, multiProcessorCount * numBlocksPerSM));
+        int gridSize = std::min(numBlocksForM, multiProcessorCount * numBlocksPerSM);
+        // Ensure gridSize is not zero.
+        gridSize = std::max(1, gridSize);
+        dim3 grid(gridSize);
 
         // Launch the cvt kernel.
         auto* kernel_instance = useUE8M0
@@ -165,7 +168,10 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
         int const numBlocksPerSM = std::max(1u, 2048u / block.x);
         // The number of blocks for m. The m dimension will be padded to 128 for swizzled layout.
         int numBlocksForM = layout == QuantizationSFLayout::SWIZZLED ? PadUpFn(m, 128) : m;
-        dim3 grid(std::min(numBlocksForM, multiProcessorCount * numBlocksPerSM));
+        int gridSize = std::min(numBlocksForM, multiProcessorCount * numBlocksPerSM);
+        // Ensure gridSize is not zero.
+        gridSize = std::max(1, gridSize);
+        dim3 grid(gridSize);
 
         // Launch the cvt kernel.
         auto* kernel_instance = useUE8M0
