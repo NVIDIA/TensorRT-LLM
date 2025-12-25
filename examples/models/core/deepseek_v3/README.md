@@ -15,7 +15,7 @@ Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/
 ## Table of Contents
 
 
-- [DeepSeek‑V3, DeepSeek-R1, and DeepSeek-V3.2-Exp](#deepseekv3-deepseek-r1-and-deepseekv32-exp)
+- [DeepSeek‑V3, DeepSeek-R1, and DeepSeek-V3.2-Exp](#deepseekv3-deepseek-r1-and-deepseek-v32-exp)
   - [Table of Contents](#table-of-contents)
   - [Hardware Requirements](#hardware-requirements)
   - [Downloading the Model Weights](#downloading-the-model-weights)
@@ -43,6 +43,8 @@ Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/
       - [Slurm](#slurm)
       - [Example: Multi-node benchmark on GB200 Slurm cluster](#example-multi-node-benchmark-on-gb200-slurm-cluster)
     - [DeepGEMM](#deepgemm)
+      - [MOE GEMM Optimization](#moe-gemm-optimization)
+      - [Dense GEMM Optimization](#dense-gemm-optimization)
     - [FlashMLA](#flashmla)
     - [FP8 KV Cache and MLA](#fp8-kv-cache-and-mla)
     - [W4AFP8](#w4afp8)
@@ -51,7 +53,6 @@ Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/
     - [KV Cache Reuse](#kv-cache-reuse)
     - [Chunked Prefill](#chunked-prefill)
   - [Notes and Troubleshooting](#notes-and-troubleshooting)
-  - [Known Issues](#known-issues)
 
 
 ## Hardware Requirements
@@ -688,13 +689,12 @@ sbatch --nodes=2 --ntasks=8 --ntasks-per-node=4 benchmark.slurm
 
 
 ### DeepGEMM
-TensorRT LLM uses DeepGEMM for DeepSeek-V3/R1, which provides significant e2e performance boost on Hopper GPUs. DeepGEMM can be disabled by setting the environment variable `TRTLLM_DG_ENABLED` to `0`:
+TensorRT LLM uses DeepGEMM for DeepSeek-V3/R1, which provides significant e2e performance boost on Hopper GPUs.
 
 DeepGEMM-related behavior can be controlled by the following environment variables:
 
 | Environment Variable | Description |
 | ----------------------------- | ----------- |
-| `TRTLLM_DG_ENABLED` | When set to `0`, disable DeepGEMM. |
 | `TRTLLM_DG_JIT_DEBUG` | When set to `1`, enable JIT debugging. |
 | `TRTLLM_DG_JIT_USE_NVCC` | When set to `1`, use NVCC instead of NVRTC to compile the kernel, which has slightly better performance but requires CUDA Toolkit (>=12.3) and longer compilation time.|
 | `TRTLLM_DG_JIT_DUMP_CUBIN` | When set to `1`, dump the cubin file. This is only effective with NVRTC since NVCC will always dump the cubin file. NVRTC-based JIT will store the generated kernels in memory by default. If you want to persist the kernels across multiple runs, you can either use this variable or use NVCC. |
@@ -739,7 +739,6 @@ trtllm-bench \
 # multi-node
 mpirun -H <HOST1>:8,<HOST2>:8 \
       -n 16 \
-      -x "TRTLLM_DG_ENABLED=1" \
       -x "CUDA_HOME=/usr/local/cuda" \
       trtllm-llmapi-launch trtllm-bench \
       --model deepseek-ai/DeepSeek-V3 \
