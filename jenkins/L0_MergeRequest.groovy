@@ -1268,7 +1268,9 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
-                        def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+                        // def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+                        // change to true for testing temporarily
+                        def isOfficialPostMergeJob = true
                         if (isOfficialPostMergeJob) {
                             catchError(
                                 buildResult: 'SUCCESS',
