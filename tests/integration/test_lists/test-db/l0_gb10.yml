@@ -1,4 +1,5 @@
 version: 0.0.1
+# DGX Spark is also named as GB10 Grace Blackwell Superchip.
 l0_gb10:
 - condition:
     ranges:
