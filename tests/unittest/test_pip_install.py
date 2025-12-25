@@ -255,5 +255,6 @@ if __name__ == "__main__":
                         help="The wheel path")
     args = parser.parse_args()
 
-    test_pip_install(args)
+    # Run python_builds first (sanity check), then pip_install last
     test_python_builds(args)
+    test_pip_install(args)
