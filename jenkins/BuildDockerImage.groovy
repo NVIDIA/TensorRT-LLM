@@ -28,6 +28,10 @@ LLM_DEFAULT_TAG = env.defaultTag ?: "${LLM_SHORT_COMMIT}-${LLM_BRANCH_TAG}-${BUI
 
 RUN_SANITY_CHECK = params.runSanityCheck ?: false
 TRIGGER_TYPE = env.triggerType ?: "manual"
+// Default to true to avoid making the build fail in both pre-merge and post-merge jobs
+SKIP_NSPECT_FAILURE = true
+// In post-merge job, only warn the build failure
+SKIP_BUILD_FAILURE = RUN_SANITY_CHECK
 
 ENABLE_USE_WHEEL_FROM_BUILD_STAGE = params.useWheelFromBuildStage ?: false
 
@@ -501,9 +505,13 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
-                        catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                        def buildRes = SKIP_BUILD_FAILURE ? 'UNSTABLE' : 'FAILURE'
+                        def stageRes = SKIP_BUILD_FAILURE ? 'UNSTABLE' : 'FAILURE'
+                        catchError(buildResult: buildRes, stageResult: stageRes) {
                             echo "Build ${key} failed."
-                            throw e
+                            if (!SKIP_BUILD_FAILURE) {
+                                throw e
+                            }
                         }
                     }
                 }
@@ -699,34 +707,38 @@ pipeline {
             }
             steps {
                 script {
-                    container("python3") {
-                        trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade pip")
-                        trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade requests")
-                        def nspect_commit = "4cb9c0c42d44ebeeba1e40d2c3eb6aab6fb90173"
-                        withCredentials([string(credentialsId: "TRTLLM_NSPECT_REPO", variable: "NSPECT_REPO")]) {
-                            trtllm_utils.checkoutSource("${NSPECT_REPO}", nspect_commit, "nspect")
-                        }
-                        def nspect_env = params.nspect_env ? params.nspect_env : "prod"
-                        def program_version_name = params.program_version_name ? params.program_version_name : "PostMerge"
-                        def cmd = """./nspect/nspect.py \
-                            --env ${nspect_env} \
-                            --nspect_id ${params.nspect_id} \
-                            --program_version_name '${program_version_name}' \
-                            """
-                        if (params.register_images) {
-                            cmd += "--register "
-                        }
-                        if (params.osrb_ticket) {
-                            cmd += "--osrb_ticket ${params.osrb_ticket} "
-                        }
-                        if (params.wait_success_seconds) {
-                            cmd += "--check_launch_api "
-                            cmd += "--wait_success 1800 "
-                        }
-                        cmd += "--image "
-                        cmd += imageKeyToTag.values().join(" ")
-                        withCredentials([usernamePassword(credentialsId: "NSPECT_CLIENT-${nspect_env}", usernameVariable: 'NSPECT_CLIENT_ID', passwordVariable: 'NSPECT_CLIENT_SECRET')]) {
-                            trtllm_utils.llmExecStepWithRetry(this, script: cmd, numRetries: 6, shortCommondRunTimeMax: 7200)
+                    def buildRes = SKIP_NSPECT_FAILURE ? 'SUCCESS' : 'FAILURE'
+                    def stageRes = SKIP_NSPECT_FAILURE ? 'UNSTABLE' : 'FAILURE'
+                    catchError(buildResult: buildRes, stageResult: stageRes) {
+                        container("python3") {
+                            trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade pip")
+                            trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade requests")
+                            def nspect_commit = "4cb9c0c42d44ebeeba1e40d2c3eb6aab6fb90173"
+                            withCredentials([string(credentialsId: "TRTLLM_NSPECT_REPO", variable: "NSPECT_REPO")]) {
+                                trtllm_utils.checkoutSource("${NSPECT_REPO}", nspect_commit, "nspect")
+                            }
+                            def nspect_env = params.nspect_env ? params.nspect_env : "prod"
+                            def program_version_name = params.program_version_name ? params.program_version_name : "PostMerge"
+                            def cmd = """./nspect/nspect.py \
+                                --env ${nspect_env} \
+                                --nspect_id ${params.nspect_id} \
+                                --program_version_name '${program_version_name}' \
+                                """
+                            if (params.register_images) {
+                                cmd += "--register "
+                            }
+                            if (params.osrb_ticket) {
+                                cmd += "--osrb_ticket ${params.osrb_ticket} "
+                            }
+                            if (params.wait_success_seconds) {
+                                cmd += "--check_launch_api "
+                                cmd += "--wait_success 1800 "
+                            }
+                            cmd += "--image "
+                            cmd += imageKeyToTag.values().join(" ")
+                            withCredentials([usernamePassword(credentialsId: "NSPECT_CLIENT-${nspect_env}", usernameVariable: 'NSPECT_CLIENT_ID', passwordVariable: 'NSPECT_CLIENT_SECRET')]) {
+                                trtllm_utils.llmExecStepWithRetry(this, script: cmd, numRetries: 6, shortCommondRunTimeMax: 7200)
+                            }
                         }
                     }
                 }
