@@ -250,14 +250,23 @@ class NemotronHBlock(nn.Module):
 
 # Copied from transformers.models.nemotron.modeling_nemotron Nemotron->NemotronH
 class NemotronHMLP(nn.Module):
-    def __init__(self, config, layer_idx: int, intermediate_size: Optional[int] = None):
+    def __init__(
+        self,
+        config,
+        layer_idx: int,
+        intermediate_size: Optional[int] = None,
+        is_expert: bool = False,
+    ):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
         self.intermediate_size = intermediate_size or config.intermediate_size
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
+        # Use latent size for expert MLPs if provided by config (required for SuperV3)
+        use_latent_size = (getattr(self.config, "moe_latent_size", None) is not None) and is_expert
+        input_size = self.config.moe_latent_size if use_latent_size else self.hidden_size
+        self.up_proj = nn.Linear(input_size, self.intermediate_size, bias=config.mlp_bias)
+        self.down_proj = nn.Linear(self.intermediate_size, input_size, bias=config.mlp_bias)
         self.act_fn = ACT2FN[config.mlp_hidden_act]
 
     def forward(self, x):
@@ -271,7 +280,10 @@ class NemotronHMOE(nn.Module):
         self.experts = nn.ModuleList(
             [
                 NemotronHMLP(
-                    config, intermediate_size=config.moe_intermediate_size, layer_idx=layer_idx
+                    config,
+                    layer_idx=layer_idx,
+                    intermediate_size=config.moe_intermediate_size,
+                    is_expert=True,
                 )
                 for _ in range(config.n_routed_experts)
             ]
@@ -281,7 +293,19 @@ class NemotronHMOE(nn.Module):
             config=config,
             intermediate_size=config.moe_shared_expert_intermediate_size,
             layer_idx=layer_idx,
+            is_expert=False,
         )
+        # Add latent projections when using latent MoE (required for SuperV3)
+        if getattr(config, "moe_latent_size", None) is not None:
+            self.fc1_latent_proj = nn.Linear(
+                config.hidden_size, config.moe_latent_size, bias=config.mlp_bias
+            )
+            self.fc2_latent_proj = nn.Linear(
+                config.moe_latent_size, config.hidden_size, bias=config.mlp_bias
+            )
+        else:
+            self.fc1_latent_proj = nn.Identity()
+            self.fc2_latent_proj = nn.Identity()
 
     def forward(self, hidden_states: torch.Tensor):
         residuals = hidden_states
@@ -549,7 +573,8 @@ class NemotronHModel(NemotronHPreTrainedModel):
         self.post_init()
 
     def load_hook(self, state_dict, prefix, *args):
-        for k in state_dict:
+        # rename embedding if needed (required for SuperV3)
+        for k in list(state_dict.keys()):
             if "embedding." in k:
                 state_dict[k.replace("embedding.", "embeddings.")] = state_dict.pop(k)
                 break
