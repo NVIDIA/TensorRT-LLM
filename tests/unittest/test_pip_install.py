@@ -225,7 +225,7 @@ def test_python_builds(args):
     This test verifies the TRTLLM_PRECOMPILED_LOCATION workflow:
     1. Install required system libs
     2. Use precompiled wheel URL to extract C++ bindings
-    3. Build Python-only wheel (editable install)
+    3. Build Python-only wheel (editable install with --no-deps)
     4. Verify installation works correctly
     5. Run quickstart example
     6. Clean up editable install to leave env in clean state
@@ -250,7 +250,8 @@ def test_python_builds(args):
     env = os.environ.copy()
     env["TRTLLM_PRECOMPILED_LOCATION"] = wheel_url
 
-    subprocess.check_call(["pip3", "install", "-e", ".", "-v"],
+    # Use --no-deps to avoid changing torch/torchvision versions.
+    subprocess.check_call(["pip3", "install", "-e", ".", "--no-deps", "-v"],
                           cwd=repo_root,
                           env=env)
     run_sanity_check(examples_path=f"{repo_root}/examples")
