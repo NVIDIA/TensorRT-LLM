@@ -18,6 +18,7 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/vector.h>
+#include <tensorrt_llm/kernels/helixAllToAll.h>
 #include <tensorrt_llm/thop/attentionOp.h>
 #include <tensorrt_llm/thop/moeAlltoAllMeta.h>
 #include <torch/extension.h>
@@ -73,5 +74,10 @@ void initBindings(nb::module_& m)
         nb::arg("mla_bmm1_scale") = std::nullopt, nb::arg("mla_bmm2_scale") = std::nullopt,
         nb::arg("quant_q_buffer") = std::nullopt, "Multi-head attention operation",
         nb::call_guard<nb::gil_scoped_release>());
+
+    m.def(
+        "get_helix_workspace_size_per_rank",
+        [](int cp_size) { return tensorrt_llm::kernels::computeHelixWorkspaceSizePerRank(cp_size); },
+        nb::arg("cp_size"), "Get helix all-to-all workspace size per rank in bytes");
 }
 } // namespace tensorrt_llm::nanobind::thop

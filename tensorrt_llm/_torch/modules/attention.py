@@ -20,7 +20,7 @@ from ..attention_backend.interface import (AttentionBackend, AttentionMask,
 from ..attention_backend.sparse.dsa import (
     DSAtrtllmAttentionMetadata, transform_local_topk_and_prepare_pool_view)
 from ..attention_backend.utils import create_attention, get_attention_backend
-from ..distributed import AllReduceParams, alltoall_helix
+from ..distributed import AllReduceParams, HelixAllToAllNative, alltoall_helix
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
@@ -1120,24 +1120,60 @@ class MLA(nn.Module):
                 softmax_stats_tensor=softmax_stats,
                 **kwargs,
             )
-            # this is the post-processing of helix parallel attention,
-            # similar to the post-processing of ring attention
             kv_lora_rank = partial_o.shape[-1] // self.num_heads_tp
             assert self.kv_lora_rank == kv_lora_rank
-            # transpose the tensors to make the split across cp_size contiguous
-            # for both tensors, we need to split across the second dimension
-            chunks = []
-            for t in [partial_o, softmax_stats]:
-                t = t.transpose(1, 0).contiguous()
-                chunks.extend(torch.split(t,
-                                          t.shape[0] // self.mapping.cp_size))
-            gathered = alltoall_helix(chunks, self.mapping.cp_group)
-            # transpose the tensors back to ensure dimensions are ordered correctly
-            # note: an additional dimension was added at the first index for all-to-all,
-            # so the transpose dimensions are shifted by 1
-            gathered = [t.transpose(1, 2).contiguous() for t in gathered]
-            return torch.ops.trtllm.helix_post_process(gathered[0], gathered[1],
-                                                       1.0)
+
+            # Switch between NCCL-based and FIFO-based (MNNVL) all-to-all based on cp_config.
+            if self.mapping.cp_config.get("use_nccl_for_alltoall", True):
+                # NCCL-based implementation using alltoall_helix.
+                # This is the post-processing of helix parallel attention,
+                # similar to the post-processing of ring attention.
+                # Transpose the tensors to make the split across cp_size contiguous
+                # For both tensors, we need to split across the second dimension.
+                chunks = []
+                for t in [partial_o, softmax_stats]:
+                    t = t.transpose(1, 0).contiguous()
+                    chunks.extend(
+                        torch.split(t, t.shape[0] // self.mapping.cp_size))
+                gathered = alltoall_helix(chunks, self.mapping.cp_group)
+                # Transpose the tensors back to ensure dimensions are ordered correctly.
+                # Note: an additional dimension was added at the first index for all-to-all,
+                # so the transpose dimensions are shifted by 1.
+                gathered = [t.transpose(1, 2).contiguous() for t in gathered]
+                return torch.ops.trtllm.helix_post_process(
+                    gathered[0], gathered[1], 1.0)
+            else:
+                # FIFO-based implementation using MNNVL workspace and LL128 Proto.
+                # Get or create Helix All-to-All instance.
+                helix = HelixAllToAllNative.get(self.mapping)
+
+                # Get dimensions.
+                num_tokens = partial_o.shape[0]
+                cp_size = self.mapping.cp_size
+
+                # Reshape for FIFO-based all-to-all.
+                # partial_o: [num_tokens, num_heads * kv_lora_rank] -> [num_tokens, cp_size, num_heads_tp_cp, kv_lora_rank]
+                # softmax_stats: [num_tokens, num_heads, 2] -> [num_tokens, cp_size, num_heads_tp_cp, 2]
+
+                partial_o = partial_o.view(
+                    num_tokens, cp_size, self.num_heads_tp_cp,
+                    kv_lora_rank).transpose(1, 2).contiguous()
+                softmax_stats = softmax_stats.view(num_tokens, cp_size,
+                                                   self.num_heads_tp_cp,
+                                                   2).transpose(1,
+                                                                2).contiguous()
+
+                # Call FIFO-based helixAllToAll.
+                partial_o_out, softmax_stats_out = helix.alltoall_native(
+                    partial_o, softmax_stats)
+
+                # partial_o_out: [num_tokens, num_heads_tp_cp, cp_size, kv_lora_rank]
+                # softmax_stats_out: [num_tokens, num_heads_tp_cp, cp_size, 2]
+                # cp_dim = 2 (the dimension where cp_size is located)
+
+                # Call helix_post_process_native with cp_dim=2.
+                return torch.ops.trtllm.helix_post_process_native(
+                    partial_o_out, softmax_stats_out, 1.0, 2)
         else:
             attn_output = attn_backend.forward(q, k, v, attn_metadata, **kwargs)
             return attn_output

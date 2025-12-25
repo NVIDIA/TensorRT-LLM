@@ -693,6 +693,14 @@ def _(
 
 class NVFP4GemmUnifiedRunner(TunableRunner):
     runner_dict = dict()
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(
+            0, 0, get_last_power_of_2_num_tokens_buckets,
+            last_positive_power_of_2), ),
+        constraint_specs=(ConstraintSpec(2, 0, fp4_scale_infer_shape), ),
+        # nested tuning should always be independent
+        distributed_tuning_strategy=DistributedTuningStrategy.INDEPENDENT,
+    )
 
     def __init__(self, to_userbuffers: bool, output_dtype: torch.dtype,
                  allowed_backends: List[str]):
@@ -943,7 +951,7 @@ def nvfp4_gemm(
         _, best_tactic = tuner.choose_one(
             "trtllm::nvfp4_gemm::gemm",
             [runner],
-            FP4GemmRunner.
+            NVFP4GemmUnifiedRunner.
             tuning_config,  # All runners use the same tuning_config
             [act_fp4, weight, act_sf, weight_scale, alpha],
         )
