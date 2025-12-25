@@ -498,6 +498,22 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
         buildConfigs = buildConfigs.findAll { key, config ->
             key.contains("Build CI image")
         }
+        // Add NGC devel build configs for CI
+        buildConfigs += [
+            "Build NGC devel (x86_64)": [
+                target: "ngc-devel",
+                action: release_action,
+                args: "DOCKER_BUILD_OPTS='--load --platform linux/amd64'",
+                dockerfileStage: "devel",
+            ],
+            "Build NGC devel (SBSA)": [
+                target: "ngc-devel",
+                action: release_action,
+                args: "DOCKER_BUILD_OPTS='--load --platform linux/arm64'",
+                arch: "arm64",
+                dockerfileStage: "devel",
+            ],
+        ]
         echo "Build configs only for CI"
     }
     // Override all fields in build config with default values
