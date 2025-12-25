@@ -8,8 +8,24 @@ import threading
 from pathlib import Path
 from typing import List
 
+from tensorrt_llm.scaffolding import ScaffoldingLlm
+
 # Global lock for thread-safe printing
 print_lock = threading.Lock()
+
+
+async def shutdown_llm(llm: ScaffoldingLlm, shutdown_workers: bool = True) -> None:
+    """Gracefully shutdown a ScaffoldingLlm instance.
+
+    Args:
+        llm: The ScaffoldingLlm instance to shutdown.
+        shutdown_workers: Whether to shutdown workers as well.
+    """
+    llm.shutdown(shutdown_workers=shutdown_workers)
+
+    # Wait for LLM's internal event loop to fully stop
+    if not llm.own_loop:
+        await llm.main_loop_stop_event.wait()
 
 
 def load_prompts_from_json(num_prompts: int) -> List[str]:
@@ -22,7 +38,7 @@ def load_prompts_from_json(num_prompts: int) -> List[str]:
         List[str]: List of prompts with index prefixes
     """
     script_dir = Path(__file__).parent
-    data_dir = script_dir / "contrib" / "DeepResearch" / "data"
+    data_dir = script_dir.parent / "contrib" / "DeepResearch" / "data"
 
     prompts = []
 
@@ -31,9 +47,6 @@ def load_prompts_from_json(num_prompts: int) -> List[str]:
     else:
         try:
             json_files = ["open_deepresearch_bench.json"]
-
-            if not json_files:
-                print(f"Warning: No JSON files found in {data_dir}")
 
             # Sort to ensure consistent order across runs
             for json_file in sorted(json_files):
