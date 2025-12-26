@@ -4474,6 +4474,11 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                 "https://nvbugs/5636916: Remaining Hopper Eagle Accuracy Issue for only TP=4"
             )
 
+        if not one_model and overlap_scheduler:
+            pytest.skip(
+                "https://nvbugs/5745152: two_model + overlap_scheduler can sometimes time out."
+            )
+
         MAX_OUTPUT_LEN = 128179
         MAX_INPUT_LEN = 32768
 
