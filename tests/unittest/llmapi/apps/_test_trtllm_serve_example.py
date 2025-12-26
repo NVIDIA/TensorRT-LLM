@@ -33,7 +33,6 @@ def temp_extra_llm_api_options_file():
 @pytest.fixture(scope="module")
 def server(model_name: str, temp_extra_llm_api_options_file: str):
     model_path = get_model_path(model_name)
-    os.environ["TOKENIZER_PATH"] = model_path
     # fix port to facilitate concise trtllm-serve examples
     args = ["--extra_llm_api_options", temp_extra_llm_api_options_file]
     with RemoteOpenAIServer(model_path, args, port=8000) as remote_server:
@@ -55,15 +54,19 @@ def example_root():
                     ("bash", "curl_completion_client.sh"),
                     ("bash", "aiperf_client.sh"),
                     ("bash", "curl_responses_client.sh")])
-def test_trtllm_serve_examples(exe: str, script: str,
+def test_trtllm_serve_examples(exe: str, script: str, model_name: str,
                                server: RemoteOpenAIServer, example_root: str):
     client_script = os.path.join(example_root, script)
     # CalledProcessError will be raised if any errors occur
+    custom_env = os.environ.copy()
+    if script.startswith("aiperf"):
+        custom_env[""] = get_model_path(model_name)
     result = subprocess.run([exe, client_script],
                             stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE,
                             text=True,
-                            check=True)
+                            check=True,
+                            env=custom_env)
     if script.startswith("curl"):
         # For curl scripts, we expect a JSON response
         result_stdout = result.stdout.strip()
