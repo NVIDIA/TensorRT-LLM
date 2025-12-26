@@ -118,6 +118,9 @@ struct XQAParams
     SparseAttentionParams sparse_params;
     bool use_sparse_attention = false;
 
+    // Skip softmax threshold.
+    float skip_softmax_threshold_scale_factor = 0.0f;
+
     cudaStream_t stream = 0;
     // layer index
     int32_t layer_idx = 0;
@@ -195,6 +198,7 @@ struct XQAParams
            << "encoder_input_lengths: " << encoder_input_lengths << std::endl
            << "sparse_params: " << sparse_params.toString() << std::endl
            << "use_sparse_attention :" << (use_sparse_attention ? "true" : "false") << std ::endl
+           << "skip_softmax_threshold_scale_factor :" << skip_softmax_threshold_scale_factor << std ::endl
            << "stream :" << stream;
 
         return ss.str();

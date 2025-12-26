@@ -155,9 +155,17 @@ class KvCacheCreator:
             dummy_mm_prompt = input_processor.get_dummy_prompt(input_seq_len)
 
             if dummy_mm_prompt is not None:
-                prompt_token_ids, extra_processed_inputs = self._model_engine.input_processor(
+                prompt_token_ids, extra_processed_inputs = self._model_engine.input_processor_with_hash(
                     dummy_mm_prompt, sampling_params=None)
+
+                multimodal_input = extra_processed_inputs.get(
+                    'multimodal_input')
                 multimodal_data = extra_processed_inputs.get('multimodal_data')
+                req_mm_input = trtllm.MultimodalInput(
+                    multimodal_hashes=multimodal_input.multimodal_hashes,
+                    multimodal_positions=multimodal_input.multimodal_positions,
+                    multimodal_lengths=multimodal_input.multimodal_lengths
+                ) if multimodal_input else None
 
                 request = trtllm.Request(prompt_token_ids,
                                          max_tokens=1,
@@ -165,7 +173,8 @@ class KvCacheCreator:
                                          sampling_config=trtllm.SamplingConfig(
                                              beam_width=max_beam_width, ),
                                          output_config=trtllm.OutputConfig(),
-                                         end_id=-1)
+                                         end_id=-1,
+                                         multimodal_input=req_mm_input)
                 request.py_multimodal_data = multimodal_data
             else:
                 # Fall back to text-only prompt when we could not find the small image size.
@@ -266,9 +275,29 @@ class KvCacheCreator:
             # Requests cannot share KV cache blocks. Round up to nearest integer multiple of block size.
             num_cache_blocks += (num_req_tokens + self._tokens_per_block -
                                  1) // self._tokens_per_block
+
+        # Max cuda graph warmup required tokens
+        max_cuda_graph_bs = min(self._model_engine.batch_size,
+                                self._model_engine._max_cuda_graph_batch_size)
+        cuda_graph_warmup_block = (
+            self._model_engine.max_seq_len +
+            1) // self._tokens_per_block + max_cuda_graph_bs - 1
+        num_cache_blocks = max(cuda_graph_warmup_block, num_cache_blocks)
+
+        # This is the minimal blocks required to run with max bs
+        # If not able to allocate self._model_engine.batch_size blocks, the max batch size should be adjusted.
+        num_cache_blocks = max(num_cache_blocks, self._model_engine.batch_size)
+
+        free_mem, total_mem = torch.cuda.mem_get_info()
+        max_memory = self._kv_cache_config.free_gpu_memory_fraction * free_mem
+        max_num_tokens_in_memory = max_memory // self._get_kv_size_per_token(
+        ) // self._tokens_per_block * self._tokens_per_block
+
         # Multiply by beam width, to prevent rescaling of the max_seq_len caused by the influence of beam width during the preparation for kv_cache_estimation
-        return num_cache_blocks * self._tokens_per_block * self._dummy_reqs[
-            0].sampling_config.beam_width
+        return min(
+            num_cache_blocks * self._tokens_per_block *
+            self._dummy_reqs[0].sampling_config.beam_width,
+            max_num_tokens_in_memory)
 
     def try_prepare_estimation(self) -> bool:
         """Prepare for possible KV cache capacity estimation.
@@ -279,8 +308,10 @@ class KvCacheCreator:
         estimating_kv_cache = False
         if 'cp_type' not in self._mapping.cp_config:
             estimating_kv_cache = True
-            self._kv_cache_config.max_tokens = self._get_token_num_for_estimation(
-            )
+            estimate_max_tokens = self._get_token_num_for_estimation()
+            self._kv_cache_config.max_tokens = min(
+                estimate_max_tokens, self._kv_cache_config.max_tokens
+            ) if self._kv_cache_config.max_tokens is not None else estimate_max_tokens
         model_config = self._model_engine.model.model_config
         if model_config.attn_backend == "VANILLA":
             logger.info(

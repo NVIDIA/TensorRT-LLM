@@ -232,3 +232,50 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
             task.evaluate(llm, sampling_params=sampling_params)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+
+class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "nvidia/Nemotron-Super-V3"
+    MODEL_PATH_BF16 = "/scratch/models/super-v3-iter_0440000/hf"  # add to llm_models_root? I don't have permissions
+
+    def get_default_kwargs(self):
+        return {
+            "skip_tokenizer_init": False,
+            "trust_remote_code": True,
+            "skip_loading_weights": False,
+            "compile_backend": "torch-cudagraph",
+            "free_mem_ratio": 0.5,  # maybe we can increase
+            "max_batch_size": 128,
+            "max_seq_len": 8192,
+            "max_num_tokens": 8192,
+            "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
+            "transforms": {
+                "detect_sharding": {
+                    "sharding_source": ['factory', 'heuristic'],
+                    "sharding_dims": ['ep', 'bmm'],
+                },
+            }
+        }
+
+    def get_default_sampling_params(self):
+        eos_id = -1
+        beam_width = 1
+        return SamplingParams(end_id=eos_id,
+                              pad_id=eos_id,
+                              n=beam_width,
+                              use_beam_search=beam_width > 1)
+
+    @pytest.mark.skip_less_device_memory(
+        32000)  # might need to require more memory
+    @pytest.mark.skip_less_device(8)
+    def test_bf16(self):
+        kwargs = self.get_default_kwargs()
+        sampling_params = self.get_default_sampling_params()
+        with AutoDeployLLM(model=self.MODEL_PATH_BF16,
+                           tokenizer=self.MODEL_PATH_BF16,
+                           world_size=8,
+                           **kwargs) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=sampling_params)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)

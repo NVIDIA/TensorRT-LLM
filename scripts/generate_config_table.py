@@ -14,15 +14,27 @@
 # limitations under the License.
 
 
+from __future__ import annotations
+
+import json
 import os
 import sys
 from collections import defaultdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
-
-from examples.configs.database.database import DATABASE_LIST_PATH, RecipeList
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 REPO_ROOT = SCRIPT_DIR.parent
+
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from examples.configs.database.database import (  # noqa: E402
+    DATABASE_LIST_PATH,
+    RecipeList,
+    assign_profile,
+)
+
 MODEL_INFO = {
     "deepseek-ai/DeepSeek-R1-0528": {
         "display_name": "DeepSeek-R1",
@@ -38,31 +50,114 @@ MODEL_INFO = {
     },
 }
 
-LOW_LATENCY_CONCURRENCY_THRESHOLD = 8
-HIGH_THROUGHPUT_CONCURRENCY_THRESHOLD = 32
+
+@dataclass(frozen=True)
+class RecipeRow:
+    model: str
+    model_display_name: str
+    model_url: str
+    gpu: str
+    num_gpus: int
+    isl: int
+    osl: int
+    concurrency: int
+    config_path: str
+    gpu_display: str
+    performance_profile: str
+    command: str
+    config_filename: str
+    config_github_url: str
+    config_raw_url: str
+
+
+def _model_display_and_url(model: str) -> tuple[str, str]:
+    if model in MODEL_INFO:
+        info = MODEL_INFO[model]
+        return info["display_name"], info["url"]
+    return model, ""
+
+
+def build_rows(yaml_path) -> list[RecipeRow]:
+    recipe_list = RecipeList.from_yaml(Path(yaml_path))
+
+    model_groups = defaultdict(lambda: defaultdict(list))
+    for recipe in recipe_list:
+        key = (recipe.gpu, recipe.num_gpus, recipe.isl, recipe.osl)
+        model_groups[recipe.model][key].append(recipe)
+
+    rows: list[RecipeRow] = []
+
+    sorted_models = sorted(model_groups.keys())
+    for model in sorted_models:
+        subgroups = model_groups[model]
+        sorted_keys = sorted(
+            subgroups.keys(),
+            key=lambda k: (str(k[0]), int(k[1] or 0), int(k[2] or 0), int(k[3] or 0)),
+        )
+
+        model_display_name, model_url = _model_display_and_url(model)
+
+        for key in sorted_keys:
+            entries = subgroups[key]
+            entries.sort(key=lambda x: x.concurrency)
+
+            for idx, entry in enumerate(entries):
+                gpu = entry.gpu
+                num_gpus = entry.num_gpus
+                gpu_display = f"{num_gpus}x{gpu}" if num_gpus and num_gpus > 1 else gpu
+                isl = entry.isl
+                osl = entry.osl
+                conc = entry.concurrency
+                config_path = entry.config_path
+
+                profile = assign_profile(len(entries), idx, conc)
+
+                command = f"trtllm-serve {model} --config ${{TRTLLM_DIR}}/{config_path}"
+
+                config_filename = os.path.basename(config_path)
+                config_github_url = (
+                    f"https://github.com/NVIDIA/TensorRT-LLM/blob/main/{config_path}"
+                )
+                config_raw_url = (
+                    f"https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/{config_path}"
+                )
+
+                rows.append(
+                    RecipeRow(
+                        model=model,
+                        model_display_name=model_display_name,
+                        model_url=model_url,
+                        gpu=gpu,
+                        num_gpus=num_gpus,
+                        isl=isl,
+                        osl=osl,
+                        concurrency=conc,
+                        config_path=config_path,
+                        gpu_display=gpu_display,
+                        performance_profile=profile,
+                        command=command,
+                        config_filename=config_filename,
+                        config_github_url=config_github_url,
+                        config_raw_url=config_raw_url,
+                    )
+                )
+
+    return rows
 
 
 def generate_rst(yaml_path, output_file=None):
-    """Generate RST table from YAML config database.
-
-    Args:
-        yaml_path: Path to lookup.yaml (str or Path)
-        output_file: Optional output file path. If None, prints to stdout.
-    """
-    recipe_list = RecipeList.from_yaml(Path(yaml_path))
-
-    # Group by model -> (gpu, isl, osl) -> list of recipes
-    model_groups = defaultdict(lambda: defaultdict(list))
-    for recipe in recipe_list:
-        key = (recipe.gpu, recipe.isl, recipe.osl)
-        model_groups[recipe.model][key].append(recipe)
+    rows = build_rows(yaml_path)
+    model_groups = defaultdict(list)
+    for row in rows:
+        model_groups[row.model].append(row)
 
     lines = []
 
-    # Include note_sections.rst at the top (relative include for Sphinx)
-    lines.append(".. include:: note_sections.rst")
+    lines.append(".. start-config-table-note")
+    lines.append(".. include:: ../_includes/note_sections.rst")
     lines.append("   :start-after: .. start-note-traffic-patterns")
     lines.append("   :end-before: .. end-note-traffic-patterns")
+    lines.append(".. end-config-table-note")
     lines.append("")
 
     sorted_models = sorted(model_groups.keys())
@@ -71,16 +166,16 @@ def generate_rst(yaml_path, output_file=None):
         lines.append(f".. start-{model}")
         lines.append("")
 
-        if model in MODEL_INFO:
-            info = MODEL_INFO[model]
-            title_text = f"`{info['display_name']} <{info['url']}>`_"
+        model_display_name, model_url = _model_display_and_url(model)
+        if model_url:
+            title_text = f"`{model_display_name} <{model_url}>`_"
         else:
             title_text = model
 
         lines.append(f".. _{model}:")
         lines.append("")
         lines.append(title_text)
-        lines.append("^" * len(title_text))
+        lines.append("~" * len(title_text))
         lines.append("")
 
         lines.append(".. list-table::")
@@ -95,57 +190,25 @@ def generate_rst(yaml_path, output_file=None):
         lines.append("     - Config")
         lines.append("     - Command")
 
-        subgroups = model_groups[model]
-        sorted_keys = sorted(
-            subgroups.keys(), key=lambda k: (str(k[0]), int(k[1] or 0), int(k[2] or 0))
+        entries = sorted(
+            model_groups[model],
+            key=lambda r: (
+                str(r.gpu),
+                int(r.num_gpus or 0),
+                int(r.isl or 0),
+                int(r.osl or 0),
+                int(r.concurrency or 0),
+            ),
         )
 
-        for key in sorted_keys:
-            entries = subgroups[key]
-            entries.sort(key=lambda x: x.concurrency)
-            n = len(entries)
-
-            for idx, entry in enumerate(entries):
-                gpu = entry.gpu
-                num_gpus = entry.num_gpus
-                gpu_display = f"{num_gpus}x{gpu}" if num_gpus and num_gpus > 1 else gpu
-                isl = entry.isl
-                osl = entry.osl
-                conc = entry.concurrency
-                config_path = entry.config_path
-
-                if n == 1:
-                    if conc <= LOW_LATENCY_CONCURRENCY_THRESHOLD:
-                        profile = "Low Latency"
-                    elif conc >= HIGH_THROUGHPUT_CONCURRENCY_THRESHOLD:
-                        profile = "High Throughput"
-                    else:
-                        profile = "Balanced"
-                elif idx == 0:
-                    profile = "Min Latency"
-                elif idx == n - 1:
-                    profile = "Max Throughput"
-                elif idx in ((n - 1) // 2, n // 2):
-                    profile = "Balanced"
-                elif idx < n // 2:
-                    profile = "Low Latency"
-                else:
-                    profile = "High Throughput"
-
-                full_config_path = config_path
-                command = f"trtllm-serve {model} --extra_llm_api_options ${{TRTLLM_DIR}}/{full_config_path}"
-
-                config_filename = os.path.basename(full_config_path)
-
-                github_url = f"https://github.com/NVIDIA/TensorRT-LLM/blob/main/{full_config_path}"
-                config_link = f"`{config_filename} <{github_url}>`_"
-
-                lines.append(f"   * - {gpu_display}")
-                lines.append(f"     - {profile}")
-                lines.append(f"     - {isl} / {osl}")
-                lines.append(f"     - {conc}")
-                lines.append(f"     - {config_link}")
-                lines.append(f"     - ``{command}``")
+        for row in entries:
+            config_link = f"`{row.config_filename} <{row.config_github_url}>`_"
+            lines.append(f"   * - {row.gpu_display}")
+            lines.append(f"     - {row.performance_profile}")
+            lines.append(f"     - {row.isl} / {row.osl}")
+            lines.append(f"     - {row.concurrency}")
+            lines.append(f"     - {config_link}")
+            lines.append(f"     - ``{row.command}``")
 
         lines.append("")
         lines.append(f".. end-{model}")
@@ -155,15 +218,44 @@ def generate_rst(yaml_path, output_file=None):
     if output_file:
         with open(output_file, "w") as f:
             f.write(output_text)
-        print(f"Generated table written to: {output_file}", file=sys.stderr)
     else:
         print(output_text)
 
 
+def generate_json(yaml_path, output_file):
+    rows = build_rows(yaml_path)
+
+    source_path = Path(yaml_path)
+    try:
+        source = str(source_path.relative_to(REPO_ROOT))
+    except ValueError:
+        source = str(source_path)
+
+    models = {}
+    for row in rows:
+        if row.model not in models:
+            models[row.model] = {
+                "display_name": row.model_display_name,
+                "url": row.model_url,
+            }
+
+    payload = {
+        "source": source,
+        "models": models,
+        "entries": [asdict(r) for r in rows],
+    }
+
+    with open(output_file, "w") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+        f.write("\n")
+
+
 if __name__ == "__main__":
-    yaml_path = DATABASE_LIST_PATH
+    yaml_path = Path(DATABASE_LIST_PATH)
     if not yaml_path.exists():
         print(f"Error: YAML file not found at {yaml_path}", file=sys.stderr)
         sys.exit(1)
     output_path = REPO_ROOT / "docs/source/deployment-guide/config_table.rst"
+    json_output_path = REPO_ROOT / "docs/source/_static/config_db.json"
     generate_rst(yaml_path, output_file=output_path)
+    generate_json(yaml_path, output_file=json_output_path)

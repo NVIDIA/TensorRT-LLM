@@ -58,6 +58,20 @@ MINIMIZE_METRICS = [
     "d_p99_e2el",
 ]
 
+# Fields for scenario-only matching for recipe tests.
+# Unlike regular tests that match on all config fields, recipes match only on the benchmark
+# scenario, allowing the underlying config to change while still comparing against baselines
+# for the same scenario.
+SCENARIO_MATCH_FIELDS = [
+    "s_runtime",
+    "s_model_name",
+    "s_gpu_type",
+    "l_isl",
+    "l_osl",
+    "l_concurrency",
+    "l_num_gpus",
+]
+
 
 def add_id(data):
     OpenSearchDB.add_id_of_json(data)
@@ -131,7 +145,7 @@ def get_job_info():
 
         # Set trigger_mr_commit to commit
         trigger_mr_commit = commit
-        artifact_url = f"https://urm.nvidia.com/artifactory/sw-tensorrt-generic/llm-artifacts/LLM/main/L0_PostMerge/{job_id}" if job_id else ""
+        artifact_url = f"https://urm.nvidia.com/artifactory/sw-tensorrt-generic/llm-artifacts/LLM/main/L0_MergeRequest_PR/{job_id}" if job_id else ""
     else:
         artifact_url = f"https://urm.nvidia.com/artifactory/sw-tensorrt-generic/llm-artifacts/LLM/main/L0_PostMerge/{job_id}" if job_id else ""
 

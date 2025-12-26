@@ -21,3 +21,5 @@ microsoft/Phi-4-multimodal-instruct:
   - accuracy: 53.67
 Qwen/Qwen3-VL-30B-A3B-Instruct:
   - accuracy: 55.33
+mistral/Mistral-Large-3-675B:
+  - accuracy: 60.00

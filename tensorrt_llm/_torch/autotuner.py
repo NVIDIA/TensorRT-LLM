@@ -22,6 +22,9 @@ from tensorrt_llm.bindings.internal.runtime import delay_kernel
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
+# Unique tag to avoid collisions with other comms
+PP_COMM_TAG_AUTOTUNING = 30000
+
 
 class DistributedTuningStrategy(enum.Enum):
     """
@@ -358,7 +361,7 @@ class AutoTunerProfilingCache:
     """
 
     def __init__(self):
-        self.cache = {}
+        self.cache: Dict[Tuple, Tuple] = dict()
 
         # Cache metadata for local storage and validation
         self.lib_version = tensorrt_llm.__version__
@@ -430,7 +433,7 @@ class AutoTunerProfilingCache:
             ),
         )
 
-    def merge_cache_data(self, cache_data: Dict[str, Any]):
+    def merge_cache_data(self, cache_data: Dict[Tuple, Tuple]):
         self.cache.update(cache_data)
 
     def get_specific_custom_op(self, custom_op: str) -> Dict[Tuple, Tuple]:
@@ -615,7 +618,10 @@ class AutoTuner:
         self._last_capture: Optional['AutoTuner.TacticsCapture'] = None
 
         # Dsitributed tuning state
+        self._map_op_to_distributed_strategy: Dict[
+            str, DistributedTuningStrategy] = {}
         self._dist: Optional[Distributed] = None
+        self._has_received_cache: bool = False
         self.mapping: Mapping = Mapping()
 
     @classmethod
@@ -623,9 +629,6 @@ class AutoTuner:
         if cls._instance is None:
             cls._instance = AutoTuner()
         return cls._instance
-
-    def set_mapping(self, mapping: Mapping = None):
-        self.mapping = mapping
 
     class TacticsCapture:
         """Object returned by capture() that can be iterated to get all tactic combinations.
@@ -636,10 +639,13 @@ class AutoTuner:
         - Current replay state (which config and call index)
         """
 
+        runner_tactic_comb_checkers: List[Callable] = []
+
         def __init__(self, autotuner):
             # State for captured contexts
             self._captured_contexts: List[Dict[str, Any]] = []
-            self._configurations = None
+            self._context_tactics_lists: Optional[List[List[Tuple[int,
+                                                                  Any]]]] = None
             # State for replay mode
             self._replay_runner_tactic_list: Optional[List[Tuple[int,
                                                                  int]]] = None
@@ -651,10 +657,13 @@ class AutoTuner:
             For single context: yields (runner, tactic)
             For multiple contexts: yields ((runner_ctx0, tactic_ctx0), (runner_ctx1, tactic_ctx1), ...)
             """
-            if self._configurations is None:
-                self._configurations = self._generate_configurations()
+            if self._context_tactics_lists is None:
+                self._context_tactics_lists = self._generate_context_tactics_lists(
+                )
 
-            for config in self._configurations:
+            # Generate cartesian product from context and tactics where all_configrations[i][ctx] = (runner, tactic)
+            # Such that each element in all_configrations is a replay of multiple contexts of all possible replays
+            for config in itertools.product(*self._context_tactics_lists):
                 # config is a tuple of (runner_idx, tactic) for each context
                 # Convert to (runner, tactic) format for user
                 runner_tactic_pairs = []
@@ -663,9 +672,14 @@ class AutoTuner:
                     runner = runners[runner_idx]
                     runner_tactic_pairs.append((runner, tactic))
 
+                if not all(
+                        checker(runner_tactic_pairs) for checker in
+                        self.__class__.runner_tactic_comb_checkers):
+                    continue
+
                 yield tuple(runner_tactic_pairs)
 
-        def _generate_configurations(self):
+        def _generate_context_tactics_lists(self):
             """Generate all valid tactic combinations."""
             if not self._captured_contexts:
                 raise RuntimeError(
@@ -691,14 +705,16 @@ class AutoTuner:
                         tactics_lists.append((runner_idx, tactic))
                 context_tactics_lists.append(tactics_lists)
 
-            # Generate cartesian product from context and tactics where all_configrations[i][ctx] = (runner, tactic)
-            # Such that each element in all_configrations is a replay of multiple contexts of all possible replays
-            all_configurations = list(itertools.product(*context_tactics_lists))
-            return all_configurations
+            return context_tactics_lists
 
         def is_replaying(self) -> bool:
             """Check if this TacticsCapture is currently in replay mode."""
             return self._replay_runner_tactic_list is not None
+
+        @classmethod
+        def register_runner_tactic_comb_checker(cls, checker: Callable):
+            cls.runner_tactic_comb_checkers.append(checker)
+            return checker
 
     def choose_one(
         self,
@@ -797,9 +813,17 @@ class AutoTuner:
         if self.is_tuning_mode and is_cache_hit:
             return (runners[best_runner_id], best_tactic)
 
+        # PP rank does not have cache hit, so we try to receive the cache from the previous rank
+        # Notice that only under tuning mode, pp_recv will be called
+        self.cache_pp_recv()
+
         assert len(runners) > 0, "At least one runner is required"
         assert all([isinstance(r, TunableRunner) for r in runners]), \
             "All Given runners must be subclass of TunableRunner"
+
+        # Record the distributed tuning strategy for the custom_op
+        self._map_op_to_distributed_strategy[
+            custom_op] = tuning_config.distributed_tuning_strategy
 
         tuning_start_time = time.perf_counter()
         profiles = self._optimization_profiles(tuning_config, inputs)
@@ -1444,9 +1468,6 @@ class AutoTuner:
                                custom_op: str):
         """Synchronize cache data across all ranks."""
         if not self._is_distributed():
-            logger.warning(
-                f"[AutoTuner] Not in distributed environment, skipping synchronization"
-            )
             return
 
         if strategy == DistributedTuningStrategy.BROADCAST:
@@ -1510,3 +1531,32 @@ class AutoTuner:
                 f"[AutoTuner] Unknown distributed tuning strategy: {strategy}, falling back to independent"
             )
             return True
+
+    def cache_pp_recv(self):
+        if self.mapping.has_pp() and not self.mapping.is_first_pp_rank(
+        ) and not self._has_received_cache:
+            self._debug_logger(
+                f"[AutoTuner] Receiving cache data from previous pp rank {self.mapping.prev_pp_rank()}"
+            )
+            profiling_cache = self._dist.recv_object(
+                src=self.mapping.prev_pp_rank(),
+                tag=PP_COMM_TAG_AUTOTUNING,
+            )
+            # Guarantee that only receive cache once during a single warm-up run
+            # Notice that this flag should be reset after each warm-up run because isend is always called
+            self._has_received_cache = True
+            self.profiling_cache.merge_cache_data(profiling_cache)
+
+    def cache_pp_send(self):
+        if self.mapping.has_pp() and not self.mapping.is_last_pp_rank():
+            self._debug_logger(
+                f"[AutoTuner] Sending cache data to next pp rank {self.mapping.next_pp_rank()}"
+            )
+            self._dist.isend_object(
+                self.profiling_cache.cache,
+                dest=self.mapping.next_pp_rank(),
+                tag=PP_COMM_TAG_AUTOTUNING,
+            ).wait()
+
+    def clean_pp_flag(self):
+        self._has_received_cache = False

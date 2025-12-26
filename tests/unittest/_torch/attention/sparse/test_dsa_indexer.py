@@ -20,6 +20,7 @@ from tensorrt_llm._torch.attention_backend.interface import (
 from tensorrt_llm._torch.attention_backend.sparse.dsa import (
     DSACacheManager, DSAtrtllmAttentionMetadata, Indexer,
     compute_cu_seqlen_kv_bounds_with_cache, split_prefill_chunks)
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.bindings.internal.batch_manager import \
@@ -515,7 +516,11 @@ def _create_mock_metadata(request_ids,
 
             self.runtime_features = RuntimeFeatures()
 
-            # Add expanded buffers for MTP>1 support
+            # Add expanded buffers for MTP support
+            self.use_expanded_buffers_for_mtp = (
+                (self.max_draft_tokens > 1 and get_sm_version() == 90)
+                or ((self.max_draft_tokens == 2 or self.max_draft_tokens > 3)
+                    and get_sm_version() >= 100))
             self.kv_lens_expanded_cuda = torch.zeros(
                 (self.num_seqs * (1 + self.max_draft_tokens), ),
                 device='cuda',
@@ -531,7 +536,12 @@ def _create_mock_metadata(request_ids,
                 self.block_table_expanded, device='cpu', pin_memory=True)
             self.scheduler_metadata_buffer_expanded = torch.zeros(
                 (self.num_sms + 1, 2), device='cuda', dtype=torch.int32)
-            if self.max_draft_tokens > 1:
+            if self.max_draft_tokens == 3:
+                self.scheduler_metadata_buffer_mtp3 = torch.zeros(
+                    (self.num_sms // 2 + 1, 2),
+                    device='cuda',
+                    dtype=torch.int32)
+            if self.use_expanded_buffers_for_mtp:
                 gen_kv_lens = kv_lens[num_contexts:self.num_seqs]
                 gen_kv_lens_expanded = torch.stack([gen_kv_lens] *
                                                    (1 + self.max_draft_tokens),
@@ -885,7 +895,7 @@ def test_fp8_k_cache_roundtrip():
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
 @skip_pre_hopper
-@pytest.mark.parametrize("batch_size,next_n", [(4, 1), (2, 2), (4, 4)])
+@pytest.mark.parametrize("batch_size,next_n", [(4, 1), (2, 2), (4, 3), (4, 4)])
 def test_indexer_decode_with_paged_kv_cache(batch_size, next_n):
     """
     Test FP8 paged KV cache with two-phase workflow and variable context lengths.
@@ -1013,11 +1023,14 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n):
     kv_cache_fp8_pool = cache_manager.get_indexer_k_cache_buffers(layer_idx)
     q_fp8 = q.to(torch.float8_e4m3fn)
 
-    if next_n <= 2:
+    if not metadata_gen.use_expanded_buffers_for_mtp:
         q_fp8 = q_fp8
         context_lens = metadata_gen.kv_lens_cuda_runtime[0:batch_size]
         block_table = metadata_gen.indexer_k_cache_block_offsets[0:batch_size]
-        scheduler_metadata_buffer = metadata_gen.scheduler_metadata_buffer
+        if q_fp8.shape[1] == 4:
+            scheduler_metadata_buffer = metadata_gen.scheduler_metadata_buffer_mtp3
+        else:
+            scheduler_metadata_buffer = metadata_gen.scheduler_metadata_buffer
     else:
         q_fp8 = q_fp8.view(-1, 1, *q_fp8.shape[2:])
         num_tokens = batch_size * next_n
