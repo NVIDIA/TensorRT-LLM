@@ -1,5 +1,5 @@
 version: 0.0.1
-l0_gb200_multi_nodes_perf_sanity:
+l0_gb200_multi_nodes_aggr_perf_sanity_2_nodes_001:
 - condition:
     ranges:
       # 2 nodes with each node has 4 GPUs
@@ -13,4 +13,4 @@ l0_gb200_multi_nodes_perf_sanity:
       stage: post_merge
       backend: pytorch
   tests:
-  - perf/test_perf.py::test_perf[perf_sanity_upload-l0_gb200_multi_nodes-r1_fp4_v2_dep8_mtp1]
+  - perf/test_perf.py::test_perf[perf_sanity_aggr_upload-deepseek_r1_fp4_v2_2_nodes_grace_blackwell-r1_fp4_v2_dep8_mtp1]
