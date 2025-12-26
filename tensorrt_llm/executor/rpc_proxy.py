@@ -187,8 +187,17 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
         return self.rpc_client.abort_request(request_id).remote()
 
     def shutdown(self):
+        import traceback
+        traceback.print_stack()
+        import os
+        print(
+            f"====================== shutdown in generator is called pid:  {os.getpid()}"
+        )
         if self._shutdown_event.is_set():
             return
+        print(
+            f"====================== shutdown in generator 2 is called pid:  {os.getpid()}"
+        )
         self._shutdown_event.set()
         logger_debug(f"Shutting down GenerationExecutorRpcProxy",
                      color="yellow")

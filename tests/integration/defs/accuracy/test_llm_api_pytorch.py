@@ -14,6 +14,7 @@
 # limitations under the License.
 import os
 import sys
+import time
 
 import pytest
 import torch
@@ -59,9 +60,9 @@ from tensorrt_llm.llmapi import (AutoDecodingConfig, CudaGraphConfig,
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import (get_device_count, get_device_memory, llm_models_root,
-                        parametrize_with_ids, skip_no_hopper,
-                        skip_post_blackwell, skip_pre_ada, skip_pre_blackwell,
-                        skip_pre_hopper, skip_ray)
+                        parametrize_with_ids, print_device_memory,
+                        skip_no_hopper, skip_post_blackwell, skip_pre_ada,
+                        skip_pre_blackwell, skip_pre_hopper, skip_ray)
 from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
                             JsonModeEval, LlmapiAccuracyTestHarness,
                             LongBenchV2)
@@ -533,7 +534,9 @@ class TestLlama3_2_1B(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/llama-3.2-models/Llama-3.2-1B"
     EXAMPLE_FOLDER = "models/core/llama"
 
-    def test_auto_dtype(self):
+    @pytest.mark.parametrize("pp_size", [2, 4], ids=["pp2", "pp4"])
+    def test_auto_dtype(self, pp_size):
+        print_device_memory()
         with LLM(self.MODEL_PATH) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
@@ -1328,6 +1331,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("mtp_nextn", [0, 2])
     def test_bfloat16(self, mtp_nextn, attention_dp, cuda_graph,
                       overlap_scheduler, torch_compile, enable_chunked_prefill):
+        print_device_memory()
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         torch_compile_config = TorchCompileConfig(
             enable_fullgraph=True,
@@ -1351,6 +1355,11 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                  speculative_config=mtp_config) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+            print_device_memory()
+
+        time.sleep(60)
+        print(f"================= print mem after 60s")
+        print_device_memory()
 
     @pytest.mark.skip_less_device_memory(60000)
     def test_bfloat16_2_model_mtp(self):
@@ -1406,6 +1415,10 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         mtp_config = None
         if mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+
+        #time.sleep(5)
+        print(f"================= print mem before testing")
+        print_device_memory()
         with LLM(self.MODEL_PATH,
                  tensor_parallel_size=tp_size,
                  pipeline_parallel_size=pp_size,
@@ -1417,6 +1430,18 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                  speculative_config=mtp_config) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+            print(f"================= print mem after testing")
+            print_device_memory()
+
+        #time.sleep(5)
+        print(f"================= print mem after testing outside")
+        print_device_memory()
+
+        print(f"++++++++++++++++++++++++++++++++++++++++\n\n\n")
+
+        #time.sleep(60)
+        #print(f"================= print mem after 60s")
+        #print_device_memory()
 
     @skip_pre_hopper
     @parametrize_with_ids("torch_compile", [False, True])
@@ -2263,6 +2288,13 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
         if moe_backend == "TRTLLM" and sm_version in (120, 121):
             pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
 
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        print(f"\n--- nvidia-smi start to test  ---")
+        print_device_memory()
+
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.70)
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
@@ -2297,9 +2329,19 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             # Commented out because GPQA takes too long to run
-            # task = GPQADiamond(self.MODEL_NAME)
-            # task.evaluate(llm,
-            #               extra_evaluator_kwargs=dict(apply_chat_template=True))
+            task = GPQADiamond(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=dict(apply_chat_template=True))
+            print("=================================== test finishes")
+            print_device_memory()
+
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        time.sleep(180)
+        print(f"\n--- nvidia-smi after testing after 180s  ---")
+        print_device_memory()
 
     @skip_pre_blackwell
     @pytest.mark.parametrize(

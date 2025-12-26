@@ -452,6 +452,12 @@ class PyExecutor:
         """
         Signals the server to shutdown.
         """
+        import traceback
+        traceback.print_stack()
+        import os
+        print(
+            f"====================== shutdown in executor is called pid:  {os.getpid()}"
+        )
         self.executor_request_queue.enqueue_shutdown_request()
         self.shutdown_event.wait()
         self.worker_thread.join()

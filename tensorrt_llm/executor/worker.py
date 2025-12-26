@@ -84,6 +84,9 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
         self.start_thread(self.await_response_thread)
 
     def shutdown(self):
+        print(
+            f"====================== GenerationExecutorWorker shutdown is called pid:  {os.getpid()}"
+        )
 
         if self.doing_shutdown:
             return
