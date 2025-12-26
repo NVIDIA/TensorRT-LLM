@@ -119,7 +119,6 @@ l0_h100:
   - examples/test_ad_speculative_decoding.py::test_autodeploy_spec_dec_output[draft_target]
   - examples/test_ad_speculative_decoding.py::test_autodeploy_spec_dec_output[eagle3]
   - examples/test_ad_speculative_decoding.py::test_autodeploy_eagle3_acceptance_rate
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_bf16
 - condition:
     ranges:
       system_gpu_count:

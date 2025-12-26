@@ -267,13 +267,13 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
 
     # 180GB works, might be able to go lower
     @pytest.mark.skip_less_device_memory(180000)
-    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_device(4)
     def test_bf16(self):
         kwargs = self.get_default_kwargs()
         sampling_params = self.get_default_sampling_params()
         with AutoDeployLLM(model=self.MODEL_PATH_BF16,
                            tokenizer=self.MODEL_PATH_BF16,
-                           world_size=8,
+                           world_size=4,
                            **kwargs) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=sampling_params)
