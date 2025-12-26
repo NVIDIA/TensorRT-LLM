@@ -263,11 +263,13 @@ def trtllm_quant_nvfp4_moe_fused(
         act_fn: "silu" for gated_mlp, "relu2" for mlp
     """
     NVFP4_BLOCK_SIZE = TRTLLM_NVFP4_SCALING_VECTOR_SIZE
-    TRTLLM_NVFP4_NUM_ELEMENTS_PER_UINT8 = 2
+    FP4_PER_UINT8 = 2
 
+    _, fc1_inter_size, _ = fc1_expert_weights_fp4.shape
     n_experts, hidden_size, inter_size = fc2_expert_weights_fp4.shape
+
     # Convert the inter_size from number of uint8 elements to number of FP4 elements.
-    inter_size *= TRTLLM_NVFP4_NUM_ELEMENTS_PER_UINT8
+    inter_size *= FP4_PER_UINT8
 
     # Validate shapes and padding requirements as defined by the cutlass kernel.
     assert fc1_weight_blockscale_fp8.ndim == 3, "fc1_weight_blockscale_fp8 must be 3D"
@@ -290,28 +292,42 @@ def trtllm_quant_nvfp4_moe_fused(
         input_blockscale = None
         output_dtype = x.dtype
 
-    # Pad I to be divisible by 128
+    # Pad inter_size to be divisible by 128
     inter_size_padded = math.ceil(inter_size / TRTLLM_NVFP4_ROW_SIZE) * TRTLLM_NVFP4_ROW_SIZE
-    if not is_gated_mlp and inter_size_padded != inter_size:
-        # if False:
-        # fc1_expert_weights_fp4: [E, I, H]
+    fc1_inter_size_padded = (
+        math.ceil(fc1_inter_size / TRTLLM_NVFP4_ROW_SIZE) * TRTLLM_NVFP4_ROW_SIZE
+    )
+    hidden_size_padded = (
+        math.ceil(hidden_size / TRTLLM_NVFP4_COLUMN_SIZE) * TRTLLM_NVFP4_COLUMN_SIZE
+    )
+
+    inter_size_needs_padding = (is_gated_mlp and fc1_inter_size_padded != fc1_inter_size) or (
+        not is_gated_mlp and inter_size_padded != inter_size
+    )
+    hidden_size_needs_padding = hidden_size % TRTLLM_NVFP4_COLUMN_SIZE != 0
+    if inter_size_needs_padding or hidden_size_needs_padding:
+        # fc1_expert_weights_fp4: [E, I, H] or [E, 2*I, H]
         fc1_padded = fc1_expert_weights_fp4.new_zeros(
-            n_experts, inter_size_padded, hidden_size // 2
+            fc1_expert_weights_fp4.size(0),
+            fc1_inter_size_padded,
+            hidden_size_padded // FP4_PER_UINT8,
         )
-        fc1_padded[:, :inter_size, :] = fc1_expert_weights_fp4
+        fc1_padded[:, :fc1_inter_size, :] = fc1_expert_weights_fp4
         fc1_expert_weights_fp4 = fc1_padded
 
         # fc2_expert_weights_fp4: [E, H, I]
         fc2_padded = fc2_expert_weights_fp4.new_zeros(
-            n_experts, hidden_size, inter_size_padded // 2
+            n_experts, hidden_size_padded, inter_size_padded // FP4_PER_UINT8
         )
-        fc2_padded[:, :, : inter_size // 2] = fc2_expert_weights_fp4
+        fc2_padded[:, :, : inter_size // FP4_PER_UINT8] = fc2_expert_weights_fp4
         fc2_expert_weights_fp4 = fc2_padded
 
         fc2_blockscale_fp8_padded = fc2_weight_blockscale_fp8.new_zeros(
-            n_experts, hidden_size, inter_size_padded // 16
+            n_experts, hidden_size_padded, inter_size_padded // NVFP4_BLOCK_SIZE
         )
-        fc2_blockscale_fp8_padded[:, :, : inter_size // 16] = fc2_weight_blockscale_fp8
+        fc2_blockscale_fp8_padded[:, :, : inter_size // NVFP4_BLOCK_SIZE] = (
+            fc2_weight_blockscale_fp8
+        )
         fc2_weight_blockscale_fp8 = fc2_blockscale_fp8_padded
 
     # quant_scales is described by this code:
