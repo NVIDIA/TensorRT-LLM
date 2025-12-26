@@ -33,20 +33,25 @@ class JobManager:
     @staticmethod
     def submit_shell_job(
         job_name: str,
-        shell_script: str,
-        output_log_file: str,
-        timeout: int = 7200
+        script_path: str,
+        script_args: list[str] = None,
+        output_log_file: str = None,
+        timeout: int = 7200,
+        container_name: str = None
     ) -> tuple[bool, str]:
         """Submit a generic shell script job using sbatch --wrap.
 
-        This is a low-level method for submitting arbitrary shell scripts
-        directly to SLURM via sbatch --wrap (non-blocking).
+        This is a low-level method for submitting shell scripts to SLURM
+        via sbatch --wrap (non-blocking). Supports executing script files
+        with arguments inside containers.
 
         Args:
             job_name: SLURM job name
-            shell_script: Shell script content to execute
-            output_log_file: Full path to output log file
+            script_path: Path to the shell script file to execute
+            script_args: List of arguments to pass to the script (optional)
+            output_log_file: Full path to output log file (optional, defaults to OUTPUT_PATH/{job_name}.log)
             timeout: Job timeout in seconds (default: 7200 = 2 hours)
+            container_name: Container name for srun (optional, defaults to job_name)
 
         Returns:
             tuple: (success: bool, job_id: str)
@@ -60,13 +65,27 @@ class JobManager:
             # Ensure output directory exists
             os.makedirs(output_path, exist_ok=True)
 
+            # Set defaults
+            if output_log_file is None:
+                output_log_file = f"{output_path}/{job_name}.log"
+            if container_name is None:
+                container_name = job_name
+            if script_args is None:
+                script_args = []
+
+            # Build the bash command with script and arguments
+            # Quote the script path and each argument separately
+            quoted_script = f'"{script_path}"'
+            quoted_args = ' '.join(f'"{arg}"' for arg in script_args)
+            bash_command = f"bash {quoted_script} {quoted_args}".strip()
+
             # Build complete srun command (runs inside sbatch)
             srun_command = (
                 f"srun -l "
-                f"--container-name={job_name} "
+                f"--container-name={container_name} "
                 f"--container-image={container_image} "
                 f"--container-mounts={container_mount} "
-                f"bash -c '{shell_script}'"
+                f"{bash_command}"
             )
 
             # Build sbatch command with all parameters
@@ -107,6 +126,7 @@ class JobManager:
 
             # Submit the job
             logger.info(f"Submitting job '{job_name}' (using sbatch --wrap)...")
+            logger.debug(f"Script: {script_path}")
             logger.debug(f"Log file: {output_log_file}")
 
             output = exec_cmd_with_output(sbatch_args, timeout=60)
@@ -142,8 +162,8 @@ class JobManager:
     def submit_session_collect_job() -> tuple[bool, str]:
         """Submit session collect job using sbatch (non-blocking).
 
-        This method builds the shell script for session collection and
-        delegates to submit_shell_job() for actual submission.
+        This method prepares the arguments for the session_collect.sh script
+        and submits it via the generic submit_shell_job() method.
 
         Key benefits:
         - Non-blocking execution (pytest doesn't wait)
@@ -156,89 +176,25 @@ class JobManager:
             tuple: (success: bool, job_id: str)
         """
         try:
-            # Get environment configuration for building the script
+            # Get environment configuration
             work_dir = EnvManager.get_work_dir()
             repo_dir = EnvManager.get_repo_dir()
             install_mode = EnvManager.get_install_mode()
             trtllm_wheel_path = EnvManager.get_trtllm_wheel_path()
             output_path = EnvManager.get_output_path()
 
-            # Build the inner script specific to session collection
-            inner_script = f"""
-INSTALL_MODE="{install_mode}"
-REPO_DIR="{repo_dir}"
-WORK_DIR="{work_dir}"
-OUTPUT_PATH="{output_path}"
-WHEEL_PATH="{trtllm_wheel_path}"
+            # Prepare script path and arguments
+            script_path = f"{work_dir}/session_collect.sh"
+            script_args = [install_mode, repo_dir, work_dir, output_path, trtllm_wheel_path]
 
-echo "=========================================="
-echo "Session Collect Job Started"
-echo "Time: $(date)"
-echo "Install Mode: $INSTALL_MODE"
-echo "=========================================="
-
-# Step 1: Collect system information (no dependencies)
-echo ""
-echo "Step 1: Collecting system information..."
-cd "$WORK_DIR"
-python3 "$WORK_DIR/simple_collect.py" "$OUTPUT_PATH" 2>&1
-echo "System information collection completed"
-
-# Step 2: Handle different installation modes
-echo ""
-echo "Step 2: Installing TensorRT-LLM..."
-if [ "$INSTALL_MODE" = "none" ]; then
-    echo "Using built-in TensorRT-LLM, skipping installation"
-    
-elif [ "$INSTALL_MODE" = "wheel" ]; then
-    echo "Installing TensorRT-LLM wheel..."
-    echo "Wheel path pattern: $WHEEL_PATH"
-    
-    # Expand wildcard and install (use unquoted variable to allow glob expansion)
-    for wheel_file in $WHEEL_PATH; do
-        if [ -f "$wheel_file" ]; then
-            echo "Found wheel: $wheel_file"
-            pip3 install "$wheel_file" 2>&1 || echo "Wheel install failed, continuing..."
-            break
-        fi
-    done
-    echo "Wheel installation completed"
-    
-elif [ "$INSTALL_MODE" = "source" ]; then
-    echo "Installing TensorRT-LLM from source..."
-    cd "$REPO_DIR"
-    pip3 install -e . 2>&1 || echo "Source install failed, continuing..."
-    echo "Source installation completed"
-    
-else
-    echo "ERROR: Invalid install mode: $INSTALL_MODE"
-    exit 1
-fi
-
-# Step 3: Collect TensorRT-LLM version information
-echo ""
-echo "Step 3: Collecting TensorRT-LLM version information..."
-VERSION_FILE="$OUTPUT_PATH/trtllm_version.txt"
-python3 -c 'import tensorrt_llm; print(f"[TensorRT-LLM] TensorRT-LLM version: {{tensorrt_llm.__version__}}")' > "$VERSION_FILE" 2>&1 || echo "[TensorRT-LLM] TensorRT-LLM version: unknown" > "$VERSION_FILE"
-echo "TensorRT-LLM version written to: $VERSION_FILE"
-
-echo ""
-echo "=========================================="
-echo "Session Collect Job Completed"
-echo "Time: $(date)"
-echo "=========================================="
-
-# Explicitly exit to ensure job terminates immediately
-exit 0
-"""
-
-            # Submit using the shell job method
-            log_file = f"{output_path}/session_collect.log"
+            # Submit using the generic shell job method
             return JobManager.submit_shell_job(
                 job_name="session_collect",
-                shell_script=inner_script,
-                output_log_file=log_file,
-                timeout=7200  # 2 hours
+                script_path=script_path,
+                script_args=script_args,
+                output_log_file=f"{output_path}/session_collect.log",
+                timeout=7200,  # 2 hours
+                container_name="session-collect"
             )
 
         except Exception as e:
