@@ -169,5 +169,9 @@ ENABLE_PERFECT_ROUTER=1 trtllm-serve ...
 This feature currently requires model-specific integration. The plumbing to support perfect routing must be added to each MoE model implementation. If you need this feature for a model that doesn't yet support it, you will need to add the integration following the pattern used in existing implementations.
 ```
 
+```{note}
+The perfect router logits are specifically designed for `RenormalizeMoeRoutingMethod` (TopK first, then Softmax). Models using other routing methods such as `DefaultMoeRoutingMethod` or `DeepSeekV3MoeRoutingMethod` would require adapting the logit generation logic to match their routing behavior.
+```
+
 Currently supported:
-- GPT-OSS
+- GPT-OSS (uses `RenormalizeMoeRoutingMethod`)
