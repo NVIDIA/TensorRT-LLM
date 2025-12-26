@@ -177,14 +177,31 @@ echo "Time: $(date)"
 echo "Install Mode: $INSTALL_MODE"
 echo "=========================================="
 
-# Handle different installation modes
+# Step 1: Collect system information (no dependencies)
+echo ""
+echo "Step 1: Collecting system information..."
+cd "$WORK_DIR"
+python3 "$WORK_DIR/simple_collect.py" "$OUTPUT_PATH" 2>&1
+echo "System information collection completed"
+
+# Step 2: Handle different installation modes
+echo ""
+echo "Step 2: Installing TensorRT-LLM..."
 if [ "$INSTALL_MODE" = "none" ]; then
     echo "Using built-in TensorRT-LLM, skipping installation"
     
 elif [ "$INSTALL_MODE" = "wheel" ]; then
     echo "Installing TensorRT-LLM wheel..."
-    echo "Wheel path: $WHEEL_PATH"
-    pip3 install "$WHEEL_PATH" 2>&1 || echo "Wheel install failed, continuing..."
+    echo "Wheel path pattern: $WHEEL_PATH"
+    
+    # Expand wildcard and install (use unquoted variable to allow glob expansion)
+    for wheel_file in $WHEEL_PATH; do
+        if [ -f "$wheel_file" ]; then
+            echo "Found wheel: $wheel_file"
+            pip3 install "$wheel_file" 2>&1 || echo "Wheel install failed, continuing..."
+            break
+        fi
+    done
     echo "Wheel installation completed"
     
 elif [ "$INSTALL_MODE" = "source" ]; then
@@ -198,20 +215,12 @@ else
     exit 1
 fi
 
+# Step 3: Collect TensorRT-LLM version information
 echo ""
-echo "Collecting TensorRT-LLM version information..."
-# Get TensorRT-LLM version and write to file
+echo "Step 3: Collecting TensorRT-LLM version information..."
 VERSION_FILE="$OUTPUT_PATH/trtllm_version.txt"
-python3 -c "import tensorrt_llm; print(f'[TensorRT-LLM] TensorRT-LLM version: {{tensorrt_llm.__version__}}')" > "$VERSION_FILE" 2>&1 || {{
-    echo "[TensorRT-LLM] TensorRT-LLM version: unknown" > "$VERSION_FILE"
-    echo "Failed to get TensorRT-LLM version, wrote 'unknown' to $VERSION_FILE"
-}}
+python3 -c 'import tensorrt_llm; print(f"[TensorRT-LLM] TensorRT-LLM version: {{tensorrt_llm.__version__}}")' > "$VERSION_FILE" 2>&1 || echo "[TensorRT-LLM] TensorRT-LLM version: unknown" > "$VERSION_FILE"
 echo "TensorRT-LLM version written to: $VERSION_FILE"
-
-echo ""
-echo "Running simple_collect.py..."
-cd "$WORK_DIR"
-python3 "$WORK_DIR/simple_collect.py" "$OUTPUT_PATH" 2>&1
 
 echo ""
 echo "=========================================="
