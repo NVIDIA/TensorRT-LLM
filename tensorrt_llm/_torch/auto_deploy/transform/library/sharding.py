@@ -39,8 +39,7 @@ from ...utils.node_utils import (
     LayerSubgraph,
     LayerType,
     bfs,
-    extract_param_names_from_node,
-    extract_weight_node,
+    extract_weight_nodes,
     filtered_nodes,
     get_all_layer_subgraphs,
     get_layer_after_linear_node,
@@ -49,7 +48,6 @@ from ...utils.node_utils import (
     is_any_moe_op,
     is_any_ssm_op,
     is_op,
-    num_users_of_weight_node,
     shape,
     subgraph,
 )
@@ -1244,68 +1242,70 @@ def _shard_parameter_node(
 
     rank, world_size = config.rank, config.world_size
     allreduce_strategy = config.allreduce_strategy.name
-    num_users = num_users_of_weight_node(node)
-    if num_users > 1 or num_users == 0:
-        ad_logger.warning(
-            f"Weight node {node} has {num_users} users. This is not supported for sharding. Skipping."
-        )
-        return
-    # get weight and bias key
-    weight_key, bias_key = extract_param_names_from_node(node)
+    # num_users = num_users_of_weight_node(node)
+    # if num_users > 1 or num_users == 0:
+    #     ad_logger.warning(
+    #         f"Weight node {node} has {num_users} users. This is not supported for sharding. Skipping."
+    #     )
+    #     return
+    # # get weight and bias key
+    # weight_key, bias_key = extract_param_names_from_node(node)
 
-    modname = weight_key.rpartition(".")[0]
-    submod = gm.get_submodule(modname)
+    # modname = weight_key.rpartition(".")[0]
+    # submod = gm.get_submodule(modname)
 
-    # Shard weight using the unified function (also updates the parameter)
-    original_weight = gm.get_parameter(weight_key)
-
-    _, weight_new_shape = shard_weight_tensor(
-        gm=gm,
-        weight_tensor=original_weight,
-        param_key=weight_key,
-        dim=dim,
-        rank=rank,
-        world_size=world_size,
-        min_local_shape=min_local_shape,
-        fused_weight_dims=fused_weight_dims,
-    )
-
-    if bias_key is not None and dim == 0:
-        # update bias for dim 0 --> we can handle it like the weight
-        original_bias = gm.get_parameter(bias_key)
-        shard_weight_tensor(
+    # # Shard weight using the unified function (also updates the parameter)
+    # original_weight = gm.get_parameter(weight_key)
+    weight_nodes = extract_weight_nodes(node)
+    for weight_node, bias_node in weight_nodes:
+        _, weight_new_shape = shard_weight_tensor(
             gm=gm,
-            weight_tensor=original_bias,
-            param_key=bias_key,
+            weight_tensor=weight_node.node,
+            param_key=weight_node.node_key,
             dim=dim,
             rank=rank,
             world_size=world_size,
             min_local_shape=min_local_shape,
             fused_weight_dims=fused_weight_dims,
         )
-    elif bias_key is not None and rank != world_size - 1:
-        # update the bias for dim 1 --> in this case only the last rank gets the bias to avoid
-        # double counting it. For all other we will delete the bias.
-        args = list(node.args)
-        node_bias = args[2]
-        args[2] = None
-        node.args = tuple(args)
-        gm.graph.erase_node(node_bias)
-        bias_param_name = bias_key.rpartition(".")[-1]
-        setattr(submod, bias_param_name, None)
-        gm._register_load_state_dict_pre_hook(partial(_load_hook_remove, param_key=bias_key))
 
-    if quantization_cb is not None:
-        quantization_cb(
-            gm=gm,
-            submod=submod,
-            node=node,
-            weight_key=weight_key,
-            weight_new_shape=weight_new_shape,
-            dim=dim,
-            rank=rank,
-            world_size=world_size,
-        )
+        if bias_node is not None and dim == 0:
+            # update bias for dim 0 --> we can handle it like the weight
+            shard_weight_tensor(
+                gm=gm,
+                weight_tensor=bias_node.node,
+                param_key=bias_node.node_key,
+                dim=dim,
+                rank=rank,
+                world_size=world_size,
+                min_local_shape=min_local_shape,
+                fused_weight_dims=fused_weight_dims,
+            )
+        elif bias_node is not None and rank != world_size - 1:
+            # update the bias for dim 1 --> in this case only the last rank gets the bias to avoid
+            # double counting it. For all other we will delete the bias.
+            args = list(node.args)
+            node_bias = args[2]
+            args[2] = None
+            node.args = tuple(args)
+            gm.graph.erase_node(node_bias)
+            bias_param_name = bias_node.node_key.rpartition(".")[-1]
+            setattr(bias_node.submod, bias_param_name, None)
+            gm._register_load_state_dict_pre_hook(
+                partial(_load_hook_remove, param_key=bias_node.node_key)
+            )
+
+        if quantization_cb is not None:
+            quantization_cb(
+                gm=gm,
+                submod=weight_node.submod,
+                node=node,
+                weight_key=weight_node.node_key,
+                weight_new_shape=weight_new_shape,
+                dim=dim,
+                rank=rank,
+                world_size=world_size,
+            )
 
     # # # column shard with no gather: the output is sharded
     if not add_dist:
@@ -2052,7 +2052,7 @@ def detect_sharding_from_config(
 
     for lin_node in linear_nodes:
         # use node's weight name to get the module name
-        module_name = extract_weight_node(lin_node).target
+        module_name = extract_weight_nodes(lin_node)[0].target
 
         if any(attn_name in module_name for attn_name in attn_names):
             # find the next attention node and infer the head_dim

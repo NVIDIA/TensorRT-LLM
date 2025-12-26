@@ -117,8 +117,8 @@ def should_skip_quantization(
     else:
         if not (is_linear_op(node_or_name) or is_bmm_op(node_or_name)):
             return True
-        param_name, _ = extract_param_names_from_node(node_or_name)
-        modname, _, _ = param_name.rpartition(".")
+        param_names, _ = extract_param_names_from_node(node_or_name)
+        modname, _, _ = param_names[0].rpartition(".")
 
     return any(fnmatch(modname, pattern) for pattern in excluded_patterns)
 

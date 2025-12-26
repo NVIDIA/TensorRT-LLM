@@ -8,6 +8,7 @@ from typing import Callable, Iterable, List, Optional, Tuple, Union
 
 import torch
 from pydantic import BaseModel, ConfigDict
+from torch import nn
 from torch._ops import OpOverload, OpOverloadPacket
 from torch.fx import GraphModule, Node
 
@@ -49,6 +50,13 @@ class LayerSubgraph(BaseModel):
     terminating_node: Union[Node, None]
     layer_type: LayerType
     min_local_shape: int = 1
+
+
+class WeightNode(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    node: Node
+    node_key: str
+    submod: nn.Module
 
 
 @dataclass
@@ -129,10 +137,12 @@ def get_quantization_params_from_linear_node(linear_op: torch.fx.node.Node):
     return input_params, weight_params, output_params
 
 
-def extract_weight_node(node: Node) -> int:
-    """Extracts the weight node from the given parametrized node"""
+def extract_weight_nodes(node: Node) -> Tuple[List[WeightNode], List[WeightNode]]:
+    """Extracts the list of weight node and optional bias node from the given parametrized node"""
     gm = node.graph.owning_module
-    param_names = {name for name, _ in gm.named_parameters()}
+    param_names = {name for name, _ in gm.named_parameters()}.union(
+        {name for name, _ in gm.named_buffers()}
+    )
 
     def find_get_attr_node(weight_node: Node) -> Node:
         """Recursively traverse inputs of allowed nodes to find a node with 'get_attr' op."""
@@ -157,55 +167,68 @@ def extract_weight_node(node: Node) -> int:
         return None
 
     if is_op(node, torch.ops.aten.bmm):
-        weight_node = node.args[1]
+        # no bias for bmm
+        return [WeightNode(node=node.args[1], node_key=node.args[1].target)], []
     # for other parametrized nodes, we need to find the weight node
     else:
-        weight_nodes = [
+        all_weight_nodes = [
             n for n in node.args if isinstance(n, Node) and find_get_attr_node(n) is not None
         ]
-        # can be two weights (if bias weight is present)
-        weight_node = None
-        if weight_nodes:
-            weight_node = weight_nodes[0]
-        # for modelopt quantized graph, there will be a quantize_op
-        _, weight_params, _ = get_quantization_params_from_linear_node(node)
-        weight_node = weight_params.input_node if weight_params else weight_node
-        assert weight_node is not None, "Expected at least one weight node in the parametrized node"
-    return find_get_attr_node(weight_node)
+        # separate weight nodes and bias nodes
+        weight_nodes = [n for n in all_weight_nodes if n.target.endswith("weight")]
+        bias_nodes = [n for n in all_weight_nodes if n.target.endswith("bias")]
+        weight_nodes = [
+            WeightNode(
+                node=n, node_key=n.target, submod=gm.get_submodule(n.target.rpartition(".")[0])
+            )
+            for n in weight_nodes
+        ]
+        bias_nodes = [
+            WeightNode(
+                node=n, node_key=n.target, submod=gm.get_submodule(n.target.rpartition(".")[0])
+            )
+            for n in bias_nodes
+        ]
+    return weight_nodes, bias_nodes
 
 
 def num_users_of_weight_node(node: Node) -> int:
     """Returns the number of users of the weight node of the given parametrized node."""
-    weight_node = extract_weight_node(node)
+    weight_node = extract_weight_nodes(node)[0]
     return len(weight_node.users) if weight_node is not None else 0
 
 
-def extract_param_names_from_node(node: Node) -> Tuple[str, Optional[str]]:
+def extract_param_names_from_node(node: Node) -> Tuple[List[str], Optional[List[str]]]:
     """Extracts the name of the parameter associated with the given parametrized node.
 
     Args:
         node: node with weight parameters in the graph.
     """
-    weight_node = extract_weight_node(node)
+    # try:
 
-    assert weight_node, "Cannot identify weight parameter of linear node."
+    # except:
+    #     a = 1
 
-    # Map arg to named parameter
-    weight_name = weight_node.target
+    # assert weight_node, "Cannot identify weight parameter of linear node."
 
-    # check for bias
-    if is_op(node, torch.ops.aten.bmm):
-        bias_node = node.args[2] if len(node.args) > 2 else None
-    else:
-        weight_nodes = [n for n in node.args if isinstance(n, Node) and n.op == "get_attr"]
-        if len(weight_nodes) > 1:
-            bias_node = weight_nodes[1]
-        else:
-            bias_node = None
-    assert bias_node is None or bias_node.op == "get_attr"
-    bias_name = bias_node.target if bias_node is not None else None
+    # # Map arg to named parameter
+    # weight_name = weight_node.target
 
-    return weight_name, bias_name
+    # # check for bias
+    # if is_op(node, torch.ops.aten.bmm):
+    #     bias_node = node.args[2] if len(node.args) > 2 else None
+    # else:
+    #     weight_nodes = [n for n in node.args if isinstance(n, Node) and n.op == "get_attr"]
+    #     if len(weight_nodes) > 1:
+    #         bias_node = weight_nodes[1]
+    #     else:
+    #         bias_node = None
+    # assert bias_node is None or bias_node.op == "get_attr"
+    # bias_name = bias_node.target if bias_node is not None else None
+
+    # return weight_name, bias_name
+    weight_nodes, bias_nodes = extract_weight_nodes(node)
+    return [n.node_key for n in weight_nodes], [n.node_key for n in bias_nodes]
 
 
 def get_op_overload_packet(node: Union[OpOverloadPacket, OpOverload]) -> OpOverloadPacket:
