@@ -102,7 +102,7 @@ class TestDisaggBenchmark:
                 job_id = EnvManager.get_debug_job_id()
             else:
                 # Submit job using JobManager
-                success, job_id = JobManager.submit_job(test_config)
+                success, job_id = JobManager.submit_test_job(test_config)
 
                 # Validate submission result
                 assert success, f"Job submission failed: {test_config.test_id}"
@@ -180,7 +180,7 @@ class TestDisaggBenchmark:
                 job_id = EnvManager.get_debug_job_id()
             else:
                 # Submit job using JobManager
-                success, job_id = JobManager.submit_job(test_config)
+                success, job_id = JobManager.submit_test_job(test_config)
 
                 # Validate submission result
                 assert success, f"Job submission failed: {test_config.test_id}"
@@ -266,7 +266,7 @@ class TestDisaggBenchmark:
                 job_id = EnvManager.get_debug_job_id()
             else:
                 # Submit job using JobManager
-                success, job_id = JobManager.submit_job(test_config)
+                success, job_id = JobManager.submit_test_job(test_config)
 
                 # Validate submission result
                 assert success, f"Job submission failed: {test_config.test_id}"
