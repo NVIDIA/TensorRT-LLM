@@ -4,13 +4,12 @@ import os
 import re
 import shutil
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import yaml
 from reporting.report import LogParser, LogWriter, ResultSaver
 from utils.common import (
     GPU_RESOURCE_CONFIG,
-    SESSION_COLLECT_CMD_TYPE,
     EnvManager,
     extract_config_fields,
 )
@@ -18,177 +17,237 @@ from utils.logger import logger
 
 from execution.subprocess_utils import exec_cmd, exec_cmd_with_output
 
+
 # ============================================================================
-# SLURM Run Command Builder
+# Job Manager
 # ============================================================================
-
-
-class SlurmRunCommandBuilder:
-    """SLURM Run Command Builder.
-
-    Build srun commands for different GPU types and command types.
-    Reuses GPU_RESOURCE_CONFIG for consistency with SlurmJobBuilder.
-    """
-
-    def build_srun_prefix(self, job_name: str) -> List[str]:
-        """Build srun command prefix based on GPU type."""
-        gpu_type = EnvManager.get_gpu_type()
-
-        # Reuse the same GPU_RESOURCE_CONFIG as SlurmJobBuilder
-        gpu_config = GPU_RESOURCE_CONFIG.get(gpu_type)
-        if not gpu_config:
-            raise ValueError(
-                f"GPU resource configuration not found for {gpu_type}. "
-                f"Please add configuration in GPU_RESOURCE_CONFIG."
-            )
-
-        # Common srun arguments
-        srun_args = [
-            "srun",
-            "-l",
-            "--container-name=sysinfo-get",
-            f"--container-image={EnvManager.get_container_image()}",
-            f"--container-mounts={EnvManager.get_container_mount()}",
-        ]
-
-        # Add GPU-specific gres parameter (reuse gres_gpu field)
-        # If gres_gpu is not None, add --gres parameter
-        if gpu_config["gres_gpu"] is not None:
-            srun_args.append(f"--gres=gpu:{gpu_config['gres_gpu']}")
-
-        # Add common parameters
-        srun_args.extend(
-            [
-                f"--partition={EnvManager.get_slurm_partition()}",
-                f"--account={EnvManager.get_slurm_account()}",
-                f"--job-name={job_name}",
-                "--time=02:00:00",
-                "--mpi=pmix",
-                # Note: Removed --overlap to ensure GPU allocation for session_collect
-                # which runs after all test jobs have completed
-                "-N",
-                "1",
-                "-n",
-                "1",
-            ]
-        )
-
-        return srun_args
-
-    def build_script_command(self, cmd_type: str) -> List[str]:
-        """Build script command based on command type."""
-        work_dir = EnvManager.get_work_dir()
-        output_path = EnvManager.get_output_path()
-        install_mode = EnvManager.get_install_mode()
-        repo_dir = EnvManager.get_repo_dir()
-        trtllm_wheel_path = EnvManager.get_trtllm_wheel_path()
-
-        if cmd_type == SESSION_COLLECT_CMD_TYPE:
-            if install_mode == "none":
-                return [
-                    "bash",
-                    "-c",
-                    f"cd {work_dir} && python3 {work_dir}/simple_collect.py {output_path}",
-                ]
-            elif install_mode == "wheel":
-                # Install TensorRT-LLM wheel first, then run simple_collect.py
-                # Note: Use --no-deps to avoid overwriting container's pre-installed packages (like torch)
-                install_cmd = f"""
-                    cd {repo_dir}
-                    echo 'Step 1: Installing TensorRT-LLM wheel...'
-                    pip3 install {trtllm_wheel_path} || echo 'Wheel install failed, continuing...'
-                    echo 'Wheel installation completed'
-
-                    echo 'Step 2: Running simple_collect.py...'
-                    cd {work_dir}
-                    python3 {work_dir}/simple_collect.py {output_path}
-                """
-                return ["bash", "-c", install_cmd]
-            elif install_mode == "source":
-                install_cmd = f"""
-                cd {repo_dir}
-                pip3 install -e . || echo 'Source install failed, continuing...'
-
-                echo 'Source installation completed'
-
-                echo 'Step 3: Running simple_collect.py...'
-                cd {work_dir}
-                python3 {work_dir}/simple_collect.py {output_path}
-                """
-                return ["bash", "-c", install_cmd]
-            else:
-                raise ValueError(f"Invalid install mode: {install_mode}")
-        else:
-            # Future command types can be added here
-            # elif cmd_type == "benchmark_collect":
-            #     model_dir = EnvManager.get_model_dir()
-            #     return [
-            #         "bash", "-c",
-            #         f"cd {work_dir} && python3 {work_dir}/benchmark_collect.py "
-            #         f"--model-dir {model_dir} --output {output_path}"
-            #     ]
-            # elif cmd_type == "metrics_collect":
-            #     return [
-            #         "bash", "-c",
-            #         f"cd {work_dir} && python3 {work_dir}/metrics_collect.py --config {work_dir}/config.yaml"
-            #     ]
-            raise ValueError(
-                f"Unsupported command type: {cmd_type}. "
-                f"Currently supported: {SESSION_COLLECT_CMD_TYPE}"
-            )
-
-    def run_job(self, cmd_type: str, job_name: str, log_file: str = None) -> Dict[str, Any]:
-        """Execute srun job.
-
-        Args:
-            cmd_type: Type of command to execute
-            job_name: Name for the SLURM job
-            log_file: Optional path to save command output
-
-        Returns:
-            Dict with status and message
-        """
-        try:
-            # Build complete command
-            srun_prefix = self.build_srun_prefix(job_name)
-            script_command = self.build_script_command(cmd_type)
-            full_command = srun_prefix + script_command
-
-            # Execute with optional log file
-            if log_file:
-                logger.info(f"Saving output to: {log_file}")
-                # Use Python file redirection to avoid shell quoting issues
-                import subprocess
-
-                with open(log_file, "w") as f:
-                    result = subprocess.run(
-                        full_command, stdout=f, stderr=subprocess.STDOUT, timeout=7200, text=True
-                    )
-                    if result.returncode != 0:
-                        raise subprocess.CalledProcessError(result.returncode, full_command)
-                logger.success(f"Output saved to {log_file}")
-                output = ""  # Output is in file
-            else:
-                output = exec_cmd_with_output(full_command, timeout=7200)
-
-            return {"status": True, "msg": "Job executed successfully", "output": output}
-        except Exception as e:
-            logger.error(f"Job execution failed: {e}")
-            return {"status": False, "msg": str(e)}
-
-
-def make_slurm_run_command():
-    """Create run command function (maintain interface compatibility)."""
-    builder = SlurmRunCommandBuilder()
-    return builder.run_job
 
 
 class JobManager:
-    """Job manager class."""
+    """Job manager class for test jobs and session collection."""
+
+    # ============================================================================
+    # Generic Job Submission (Direct sbatch)
+    # ============================================================================
 
     @staticmethod
-    def submit_job(test_config) -> tuple:
-        """Submit job using submit.py with YAML config.
+    def submit_shell_job(
+        job_name: str,
+        shell_script: str,
+        output_log_file: str,
+        timeout: int = 7200
+    ) -> tuple[bool, str]:
+        """Submit a generic shell script job using sbatch --wrap.
+
+        This is a low-level method for submitting arbitrary shell scripts
+        directly to SLURM via sbatch --wrap (non-blocking).
+
+        Args:
+            job_name: SLURM job name
+            shell_script: Shell script content to execute
+            output_log_file: Full path to output log file
+            timeout: Job timeout in seconds (default: 7200 = 2 hours)
+
+        Returns:
+            tuple: (success: bool, job_id: str)
+        """
+        try:
+            # Get environment configuration
+            container_image = EnvManager.get_container_image()
+            container_mount = EnvManager.get_container_mount()
+            output_path = EnvManager.get_output_path()
+
+            # Ensure output directory exists
+            os.makedirs(output_path, exist_ok=True)
+
+            # Build complete srun command (runs inside sbatch)
+            srun_command = (
+                f"srun -l "
+                f"--container-name={job_name} "
+                f"--container-image={container_image} "
+                f"--container-mounts={container_mount} "
+                f"bash -c '{shell_script}'"
+            )
+
+            # Build sbatch command with all parameters
+            gpu_type = EnvManager.get_gpu_type()
+            gpu_config = GPU_RESOURCE_CONFIG.get(gpu_type)
+            if not gpu_config:
+                raise ValueError(f"GPU resource configuration not found for {gpu_type}")
+
+            # Convert timeout to HH:MM:SS format
+            hours = timeout // 3600
+            minutes = (timeout % 3600) // 60
+            seconds = timeout % 60
+            time_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+            sbatch_args = [
+                "sbatch",
+                f"--job-name={job_name}",
+                f"--partition={EnvManager.get_slurm_partition()}",
+                f"--account={EnvManager.get_slurm_account()}",
+                f"--time={time_str}",
+                "--nodes=1",
+                "--ntasks=1",
+                f"--output={output_log_file}",
+                "--parsable",  # Easier job ID parsing
+            ]
+
+            # Conditionally add gres parameter based on GPU configuration
+            if gpu_config["gres_gpu"] is not None:
+                sbatch_args.append(f"--gres=gpu:{gpu_config['gres_gpu']}")
+
+            # Add extra SLURM arguments if configured
+            slurm_extra_args = EnvManager.get_slurm_extra_args()
+            if slurm_extra_args:
+                sbatch_args.append(slurm_extra_args)
+
+            # Add --wrap with the srun command
+            sbatch_args.extend(["--wrap", srun_command])
+
+            # Submit the job
+            logger.info(f"Submitting job '{job_name}' (using sbatch --wrap)...")
+            logger.debug(f"Log file: {output_log_file}")
+
+            output = exec_cmd_with_output(sbatch_args, timeout=60)
+            job_id = output.strip()
+
+            # Parse job ID (--parsable returns just the job ID)
+            if job_id.isdigit():
+                logger.success(f"Job '{job_name}' submitted: {job_id}")
+                logger.info(f"All logs will be written to: {output_log_file}")
+                return True, job_id
+
+            # Fallback: try to extract from "Submitted batch job" format
+            match = re.search(r"Submitted batch job (\d+)", output)
+            if match:
+                job_id = match.group(1)
+                logger.success(f"Job '{job_name}' submitted: {job_id}")
+                return True, job_id
+
+            logger.error(f"Failed to parse job ID from output: {output}")
+            return False, ""
+
+        except Exception as e:
+            logger.error(f"Failed to submit job '{job_name}': {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return False, str(e)
+
+    # ============================================================================
+    # Session Collection Job Submission
+    # ============================================================================
+
+    @staticmethod
+    def submit_session_collect_job() -> tuple[bool, str]:
+        """Submit session collect job using sbatch (non-blocking).
+
+        This method builds the shell script for session collection and
+        delegates to submit_shell_job() for actual submission.
+
+        Key benefits:
+        - Non-blocking execution (pytest doesn't wait)
+        - Better resource scheduling (queues if resources unavailable)
+        - Fault tolerance (job survives parent process exit)
+        - Unified job management (reuses wait_for_completion)
+        - All logs redirected to session_collect.log
+
+        Returns:
+            tuple: (success: bool, job_id: str)
+        """
+        try:
+            # Get environment configuration for building the script
+            work_dir = EnvManager.get_work_dir()
+            repo_dir = EnvManager.get_repo_dir()
+            install_mode = EnvManager.get_install_mode()
+            trtllm_wheel_path = EnvManager.get_trtllm_wheel_path()
+            output_path = EnvManager.get_output_path()
+
+            # Build the inner script specific to session collection
+            inner_script = f"""
+INSTALL_MODE="{install_mode}"
+REPO_DIR="{repo_dir}"
+WORK_DIR="{work_dir}"
+OUTPUT_PATH="{output_path}"
+WHEEL_PATH="{trtllm_wheel_path}"
+
+echo "=========================================="
+echo "Session Collect Job Started"
+echo "Time: $(date)"
+echo "Install Mode: $INSTALL_MODE"
+echo "=========================================="
+
+# Handle different installation modes
+if [ "$INSTALL_MODE" = "none" ]; then
+    echo "Using built-in TensorRT-LLM, skipping installation"
+    
+elif [ "$INSTALL_MODE" = "wheel" ]; then
+    echo "Installing TensorRT-LLM wheel..."
+    echo "Wheel path: $WHEEL_PATH"
+    pip3 install "$WHEEL_PATH" 2>&1 || echo "Wheel install failed, continuing..."
+    echo "Wheel installation completed"
+    
+elif [ "$INSTALL_MODE" = "source" ]; then
+    echo "Installing TensorRT-LLM from source..."
+    cd "$REPO_DIR"
+    pip3 install -e . 2>&1 || echo "Source install failed, continuing..."
+    echo "Source installation completed"
+    
+else
+    echo "ERROR: Invalid install mode: $INSTALL_MODE"
+    exit 1
+fi
+
+echo ""
+echo "Collecting TensorRT-LLM version information..."
+# Get TensorRT-LLM version and write to file
+VERSION_FILE="$OUTPUT_PATH/trtllm_version.txt"
+python3 -c "import tensorrt_llm; print(f'[TensorRT-LLM] TensorRT-LLM version: {{tensorrt_llm.__version__}}')" > "$VERSION_FILE" 2>&1 || {{
+    echo "[TensorRT-LLM] TensorRT-LLM version: unknown" > "$VERSION_FILE"
+    echo "Failed to get TensorRT-LLM version, wrote 'unknown' to $VERSION_FILE"
+}}
+echo "TensorRT-LLM version written to: $VERSION_FILE"
+
+echo ""
+echo "Running simple_collect.py..."
+cd "$WORK_DIR"
+python3 "$WORK_DIR/simple_collect.py" "$OUTPUT_PATH" 2>&1
+
+echo ""
+echo "=========================================="
+echo "Session Collect Job Completed"
+echo "Time: $(date)"
+echo "=========================================="
+
+# Explicitly exit to ensure job terminates immediately
+exit 0
+"""
+
+            # Submit using the shell job method
+            log_file = f"{output_path}/session_collect.log"
+            return JobManager.submit_shell_job(
+                job_name="session_collect",
+                shell_script=inner_script,
+                output_log_file=log_file,
+                timeout=7200  # 2 hours
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to prepare session collect job: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return False, str(e)
+
+    # ============================================================================
+    # Test Job Submission (Via submit.py script)
+    # ============================================================================
+
+    @staticmethod
+    def submit_test_job(test_config) -> tuple:
+        """Submit benchmark test job using submit.py script.
+
+        This method submits test jobs by calling the submit.py script,
+        which handles test-specific configuration and SLURM job setup.
 
         Args:
             test_config: TestConfig object containing configuration
@@ -196,7 +255,7 @@ class JobManager:
         Returns:
             tuple: (success: bool, job_id: str)
         """
-        logger.info("Submitting job using submit.py...")
+        logger.info("Submitting test job via submit.py...")
 
         try:
             import re
@@ -846,6 +905,3 @@ class JobManager:
                 test_name=test_name,
             )
 
-
-# create executor function
-run_job = make_slurm_run_command()

@@ -2,8 +2,6 @@
 
 import os
 
-SESSION_COLLECT_CMD_TYPE = "session_collect"
-
 # GPU resource configuration
 # Simplified - only fields actually used in the codebase
 GPU_RESOURCE_CONFIG = {
