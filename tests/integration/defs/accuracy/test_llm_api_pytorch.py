@@ -74,6 +74,13 @@ def _get_default_torch_compile_config(torch_compile):
                               max_num_streams=3) if torch_compile else None
 
 
+def _get_default_torch_compile_config(torch_compile):
+    return TorchCompileConfig(enable_fullgraph=True,
+                              enable_piecewise_cuda_graph=True,
+                              capture_num_tokens=[2048, 8192],
+                              max_num_streams=3) if torch_compile else None
+
+
 class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.1-8B"
     MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Meta-Llama-3.1-8B"
