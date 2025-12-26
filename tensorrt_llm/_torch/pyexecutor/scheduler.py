@@ -1245,11 +1245,16 @@ class SimpleUnifiedScheduler(RequestScheduler):
         ctx_chunk_config: Optional[Tuple[StrEnum, int]] = None,
         cross_kv_cache_manager=None,
         two_step_lookahead: bool = False,
+        scheduler_capacity: Optional[int] = None,
     ):
+        # Use scheduler_capacity if provided, otherwise fall back to max_batch_size
+        # scheduler_capacity may differ from max_batch_size (e.g., adjusted for attention_dp + disagg)
+        capacity = scheduler_capacity if scheduler_capacity is not None else max_batch_size
+
         # 1. Initialize Python Capacity Scheduler
         # Now fully aligned with C++ CapacityScheduler
         self.capacity_scheduler = PyCapacityScheduler(
-            max_num_requests=max_batch_size,
+            max_num_requests=capacity,
             kv_cache_manager=kv_cache_manager,
             peft_cache_manager=peft_cache_manager,
             scheduler_policy=scheduler_policy,

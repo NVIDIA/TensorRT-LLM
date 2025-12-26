@@ -848,7 +848,8 @@ def create_py_executor_instance(
             if peft_cache_manager is not None else None,
             scheduler_policy=scheduler_config.capacity_scheduler_policy,
             ctx_chunk_config=ctx_chunk_config,
-            two_step_lookahead=mapping.has_pp())
+            two_step_lookahead=mapping.has_pp(),
+            scheduler_capacity=scheduler_capacity)
     else:
         capacity_scheduler = BindCapacityScheduler(
             scheduler_capacity,
