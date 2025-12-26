@@ -42,9 +42,7 @@ fi
 # Aggregated mode will run install together with pytest in slurm_run.sh
 # Disaggregated mode will run install separately in slurm_install.sh
 if [[ "$stageName" != *Disagg* ]]; then
-    # Derive install script path from run script path (both have same prefix, e.g., ${jobUID}-)
     installScriptPath="$(dirname "${BASH_SOURCE[0]}")/$(basename "${BASH_SOURCE[0]}" | sed 's/slurm_run\.sh/slurm_install.sh/')"
-    echo "Running slurm_install_setup in slurm_run.sh. BASH_SOURCE[0] = ${BASH_SOURCE[0]}, 0 = ${0} installScriptPath = ${installScriptPath}"
     source "$installScriptPath"
     slurm_install_setup
 fi

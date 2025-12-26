@@ -33,6 +33,5 @@ slurm_install_setup() {
 
 # Only run slurm_install_setup when script is executed directly (not sourced)
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    echo "Running slurm_install_setup in slurm_install.sh. BASH_SOURCE[0] = ${BASH_SOURCE[0]}, 0 = ${0}"
     slurm_install_setup
 fi
