@@ -1,8 +1,11 @@
 import concurrent
 import contextlib
+import functools
 import itertools
 import json
 import os
+import re
+import subprocess
 import tempfile
 import time
 from collections import namedtuple
@@ -13,8 +16,8 @@ import openai
 import pytest
 import requests
 import yaml
+from defs.common import revise_disaggregated_server_config_urls_with_free_ports
 
-from tensorrt_llm._utils import get_free_port
 from tensorrt_llm.executor.result import GenerationResultBase
 from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
 from tensorrt_llm.llmapi.llm_args import LlmArgs
@@ -45,9 +48,42 @@ class Result(GenerationResultBase):
 
 DuckLLM = namedtuple('DuckLLM', ['args', 'tokenizer', 'generate_async'])
 
-# TODO: Change back to 1800 when the disaggregated serving test slowdown issue is resolved.
-DEFAULT_TEST_TIMEOUT = 3600
-DEFAULT_SERVER_WAITING_TIMEOUT = 3600
+DEFAULT_TEST_TIMEOUT = 1200
+DEFAULT_SERVER_WAITING_TIMEOUT = 1200
+
+
+@functools.lru_cache(maxsize=1)
+def has_nvlink():
+    """
+    Check if the system has NVLink connectivity between GPUs.
+
+    Returns:
+        bool: True if NVLink is detected, False otherwise.
+    """
+    try:
+        # Execute nvidia-smi nvlink command to query NVLink status
+        result = subprocess.run(['nvidia-smi', 'nvlink', '-s'],
+                                capture_output=True,
+                                text=True,
+                                check=False)
+
+        # Check if the command executed successfully
+        if result.returncode != 0:
+            return False
+
+        # Look for bandwidth information (Link X: XX.XXX GB/s pattern)
+        # which indicates active NVLink connections
+        if re.search(r'Link \d+:\s+[\d.]+\s+GB/s', result.stdout):
+            return True
+
+        return False
+
+    except (FileNotFoundError, subprocess.SubprocessError):
+        # nvidia-smi not found or execution failed
+        return False
+    except Exception:
+        # Any other unexpected error
+        return False
 
 
 class MyThreadPoolExecutor(ThreadPoolExecutor):
@@ -66,23 +102,6 @@ class MyThreadPoolExecutor(ThreadPoolExecutor):
             future.cancel()
         self.shutdown(wait=True, cancel_futures=True)
         return False
-
-
-def revise_disaggregated_server_config_urls_with_free_ports(
-        disaggregated_server_config: Dict[str, Any]) -> Dict[str, Any]:
-    num_ctx_ports = len(disaggregated_server_config["context_servers"]["urls"])
-    num_gen_ports = len(
-        disaggregated_server_config["generation_servers"]["urls"])
-
-    disaggregated_server_config['port'] = get_free_port()
-    disaggregated_server_config["context_servers"]["urls"] = [
-        f"localhost:{get_free_port()}" for _ in range(num_ctx_ports)
-    ]
-    disaggregated_server_config["generation_servers"]["urls"] = [
-        f"localhost:{get_free_port()}" for _ in range(num_gen_ports)
-    ]
-
-    return disaggregated_server_config
 
 
 @contextlib.contextmanager
@@ -195,7 +214,7 @@ def launch_disaggregated_llm(
 
         ctx_server_args = ctx_args + [
             "--port",
-            str(port), "--extra_llm_api_options", ctx_server_config_path,
+            str(port), "--config", ctx_server_config_path,
             f"--tp_size={ctx_tp}", f"--pp_size={ctx_pp}", f"--cp_size={ctx_cp}"
         ]
         if "max_num_tokens" in ctx_server_config:
@@ -214,11 +233,13 @@ def launch_disaggregated_llm(
         gpu_range = range(current_gpu_offset,
                           current_gpu_offset + gen_total_gpus)
         env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_range))
+        if not has_nvlink():
+            env["UCX_TLS"] = "^cuda_ipc"
         current_gpu_offset += gen_total_gpus
 
         gen_server_args = gen_args + [
             "--port",
-            str(port), "--extra_llm_api_options", gen_server_config_path,
+            str(port), "--config", gen_server_config_path,
             f"--tp_size={gen_tp}", f"--pp_size={gen_pp}", f"--cp_size={gen_cp}"
         ]
         if "max_num_tokens" in gen_server_config:
@@ -851,7 +872,24 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device(4)
-    def test_auto_dtype_with_helix(self):
+    @pytest.mark.parametrize("cuda_graph_config", [
+        None,
+        {
+            "enable_padding": False,
+            "batch_sizes": [1, 2, 4, 8, 16, 32, 64]
+        },
+        {
+            "enable_padding": True,
+            "batch_sizes": [1, 2, 4, 8, 16, 32, 64]
+        },
+    ],
+                             ids=[
+                                 "cudagraph:none", "cudagraph:without_padding",
+                                 "cudagraph:with_padding"
+                             ])
+    @pytest.mark.parametrize("comms_medium", ["fifo", "nccl"])
+    def test_auto_dtype_with_helix(self, comms_medium, cuda_graph_config):
+        use_nccl_for_alltoall = comms_medium == "nccl"
         kv_cache_config = {
             "free_gpu_memory_fraction": 0.5,
             "enable_block_reuse": False,
@@ -876,12 +914,13 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "context_parallel_size": 2,
             "cp_config": {
                 "cp_type": "HELIX",
-                "tokens_per_block": 32
+                "tokens_per_block": 32,
+                "use_nccl_for_alltoall": use_nccl_for_alltoall
             },
             "disable_overlap_scheduler": True,
             "kv_cache_config": kv_cache_config,
             "enable_chunked_prefill": False,
-            "cuda_graph_config": None,
+            "cuda_graph_config": cuda_graph_config,
             "cache_transceiver_config": {
                 "backend": "UCX"
             },
@@ -969,6 +1008,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(2)
     @pytest.mark.parametrize("block_reuse", [False, True])
+    @skip_pre_hopper
     def test_auto_dtype(self, block_reuse):
 
         ctx_server_config = {
@@ -1051,11 +1091,13 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             "max_attention_window": [128, 32768],
             "enable_block_reuse": block_reuse,
             "enable_partial_reuse": False,
+            "free_gpu_memory_fraction": 0.5,
         }
         gen_server_config["kv_cache_config"] = {
             "max_attention_window": [128, 32768],
             "enable_block_reuse": block_reuse,
             "enable_partial_reuse": False,
+            "free_gpu_memory_fraction": 0.5,
         }
         disaggregated_server_config = {
             "hostname": "localhost",

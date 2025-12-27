@@ -25,6 +25,156 @@ from .attention_interface import (
 )
 
 
+# TODO: remove this when flashinfer version is updated to >0.5
+def fast_decode_plan(
+    wrapper: flashinfer.BatchDecodeWithPagedKVCacheWrapper,
+    indptr: torch.Tensor,
+    indices: torch.Tensor,
+    last_page_len: torch.Tensor,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    page_size: int,
+    pos_encoding_mode: str = "NONE",
+    window_left: int = -1,
+    logits_soft_cap: Optional[float] = None,
+    q_data_type: Optional[Union[str, torch.dtype]] = None,
+    kv_data_type: Optional[Union[str, torch.dtype]] = None,
+    data_type: Optional[Union[str, torch.dtype]] = None,
+    sm_scale: Optional[float] = None,
+    rope_scale: Optional[float] = None,
+    rope_theta: Optional[float] = None,
+    non_blocking: bool = True,
+    fixed_split_size: Optional[int] = None,
+    disable_split_kv: bool = False,
+    global_override_indptr_cpu: Optional[torch.Tensor] = None,
+) -> None:
+    """
+    Copied from flashinfer.decode.fast_decode_plan in flashinfer version >0.5.
+    Does not exist in flashinfer version 0.3.1, hence copied here.
+    """
+    batch_size = len(last_page_len)
+    if logits_soft_cap is None:
+        logits_soft_cap = 0.0
+
+    # Handle data types consistently
+    if data_type is not None:
+        if q_data_type is None:
+            q_data_type = data_type
+        if kv_data_type is None:
+            kv_data_type = data_type
+    elif q_data_type is None:
+        q_data_type = "float16"
+
+    if kv_data_type is None:
+        kv_data_type = q_data_type
+
+    if wrapper.use_tensor_cores:
+        qo_indptr_host = torch.arange(batch_size + 1, dtype=torch.int32, device="cpu")
+        # Here we set fixed_split_size to -1 to avoid the assertion error in flashinfer's plan function
+        if fixed_split_size is None:
+            fixed_split_size = -1
+
+    if wrapper.is_cuda_graph_enabled:
+        if batch_size != wrapper._fixed_batch_size:
+            raise ValueError(
+                "The batch size should be fixed in cudagraph mode, the runtime batch size {} "
+                " mismatches the batch size set during initialization {}".format(
+                    batch_size, wrapper._fixed_batch_size
+                )
+            )
+        if len(indices) > len(wrapper._paged_kv_indices_buf):
+            raise ValueError(
+                "The size of indices should be less than or equal to the allocated buffer"
+            )
+    else:
+        wrapper._paged_kv_indptr_buf = indptr
+        wrapper._paged_kv_indices_buf = indices
+        wrapper._paged_kv_last_page_len_buf = last_page_len
+        if wrapper.use_tensor_cores:
+            wrapper._qo_indptr_buf = qo_indptr_host.to(wrapper.device, non_blocking=non_blocking)
+
+    # Create empty tensors for dtype info if needed
+    empty_q_data = torch.empty(
+        0,
+        dtype=(getattr(torch, q_data_type) if isinstance(q_data_type, str) else q_data_type),
+        device=wrapper.device,
+    )
+
+    empty_kv_cache = torch.empty(
+        0,
+        dtype=(getattr(torch, kv_data_type) if isinstance(kv_data_type, str) else kv_data_type),
+        device=wrapper.device,
+    )
+
+    indptr_host = (
+        global_override_indptr_cpu if global_override_indptr_cpu is not None else indptr.cpu()
+    )
+
+    with torch.cuda.device(wrapper.device):
+        if wrapper.use_tensor_cores:
+            # ALSO convert last_page_len to CPU
+            if page_size == 1:
+                # When page size is 1, last_page_len is always 1.
+                # Directly construct the host tensor rather than executing a device-to-host copy.
+                last_page_len_host = torch.ones((batch_size,), dtype=torch.int32, device="cpu")
+            else:
+                last_page_len_host = last_page_len.cpu()
+
+            kv_lens_arr_host = flashinfer.get_seq_lens(indptr_host, last_page_len_host, page_size)
+
+            try:
+                # Make sure we pass exactly 15 arguments for tensor core version
+                wrapper._plan_info = wrapper._cached_module.plan(
+                    wrapper._float_workspace_buffer,
+                    wrapper._int_workspace_buffer,
+                    wrapper._pin_memory_int_workspace_buffer,
+                    qo_indptr_host,
+                    indptr_host,
+                    kv_lens_arr_host,
+                    batch_size,  # total_num_rows
+                    batch_size,
+                    num_qo_heads,
+                    num_kv_heads,
+                    page_size,
+                    wrapper.is_cuda_graph_enabled,
+                    head_dim,
+                    head_dim,
+                    False,  # causal
+                )
+            except Exception as e:
+                raise RuntimeError(f"Error in standard plan: {e}") from e
+        else:
+            try:
+                # Make sure we pass exactly 15 arguments for standard version
+                wrapper._plan_info = wrapper._cached_module.plan(
+                    wrapper._float_workspace_buffer,
+                    wrapper._int_workspace_buffer,
+                    wrapper._pin_memory_int_workspace_buffer,
+                    indptr_host,
+                    batch_size,
+                    num_qo_heads,
+                    num_kv_heads,
+                    page_size,
+                    wrapper.is_cuda_graph_enabled,
+                    window_left,
+                    logits_soft_cap,
+                    head_dim,
+                    head_dim,
+                    empty_q_data,
+                    empty_kv_cache,
+                )
+            except Exception as e:
+                raise RuntimeError(f"Error in standard plan: {e}") from e
+
+    wrapper._pos_encoding_mode = pos_encoding_mode
+    wrapper._window_left = window_left
+    wrapper._logits_soft_cap = logits_soft_cap
+    wrapper._sm_scale = sm_scale
+    wrapper._rope_scale = rope_scale
+    wrapper._rope_theta = rope_theta
+
+
 @dataclass
 class PlanParams:
     """Parameters that affect the flashinfer execution plan."""
@@ -52,21 +202,42 @@ class _FlashInferPlanner:
     workspace_buffer: Optional[torch.Tensor]
     prefill_wrapper: Optional[flashinfer.BatchPrefillWithPagedKVCacheWrapper]
     decode_wrapper: Optional[flashinfer.BatchDecodeWithPagedKVCacheWrapper]
-    cached_decode_wrappers: Dict[PlanParams, flashinfer.BatchDecodeWithPagedKVCacheWrapper]
+    cached_cuda_graph_decode_wrappers: Dict[
+        PlanParams, flashinfer.BatchDecodeWithPagedKVCacheWrapper
+    ]
     plan_params: Optional[PlanParams]
 
     def __init__(self):
         self.workspace_buffer = None
         self.prefill_wrapper = None
         self.decode_wrapper = None
-        self.cached_decode_wrappers = {}
+        self.cached_cuda_graph_decode_wrappers = {}
         self.plan_params = None
 
-    def _init_decode_wrapper(self):
+    def _init_decode_wrapper(
+        self,
+        use_cuda_graph: bool = False,
+        indptr: Optional[torch.Tensor] = None,
+        indices: Optional[torch.Tensor] = None,
+        last_page_len: Optional[torch.Tensor] = None,
+    ):
         assert self.workspace_buffer is not None
-        return flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-            self.workspace_buffer, "NHD", use_tensor_cores=True
-        )
+        if use_cuda_graph:
+            return flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+                self.workspace_buffer,
+                "NHD",
+                use_cuda_graph=True,
+                paged_kv_indptr_buffer=indptr,
+                paged_kv_indices_buffer=indices,
+                paged_kv_last_page_len_buffer=last_page_len,
+                use_tensor_cores=True,
+            )
+        else:
+            return flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+                self.workspace_buffer,
+                "NHD",
+                use_tensor_cores=True,
+            )
 
     def init_workspace(self, workspace_buffer: torch.Tensor):
         self.__init__()  # reset all state
@@ -84,6 +255,30 @@ class _FlashInferPlanner:
     def reset(self) -> None:
         self.plan_params = None
 
+    def plan_generate_only(
+        self,
+        num_seq: int,
+        cu_num_pages: torch.Tensor,
+        cache_loc: torch.Tensor,
+        last_page_len: torch.Tensor,
+    ):
+        for plan_params in self.cached_cuda_graph_decode_wrappers:
+            if plan_params.num_seq == num_seq:
+                wrapper = self.cached_cuda_graph_decode_wrappers[plan_params]
+                fast_decode_plan(
+                    wrapper,
+                    cu_num_pages,
+                    cache_loc,
+                    last_page_len,
+                    plan_params.n_heads,
+                    plan_params.n_kv_heads,
+                    plan_params.head_dim,
+                    plan_params.page_size,
+                    q_data_type=plan_params.q_dtype,
+                    kv_data_type=plan_params.kv_dtype,
+                    sm_scale=plan_params.sm_scale,
+                )
+
     def plan(
         self,
         qo_indptr: torch.Tensor,
@@ -96,7 +291,9 @@ class _FlashInferPlanner:
         flashinfer.BatchDecodeWithPagedKVCacheWrapper,
     ]:
         # plan decode helper function
-        def _plan_decode(wrapper: flashinfer.BatchDecodeWithPagedKVCacheWrapper):
+        def _plan_decode(
+            wrapper: flashinfer.BatchDecodeWithPagedKVCacheWrapper,
+        ):
             wrapper.plan(
                 kv_page_indptr,
                 kv_page_indices,
@@ -111,18 +308,23 @@ class _FlashInferPlanner:
             )
 
         # we want to plan during warm-up of cuda graph capture to ensure we have the plan cached
-        if cuda_graph_state.in_warm_up() and plan_params not in self.cached_decode_wrappers:
-            self.cached_decode_wrappers[plan_params] = self._init_decode_wrapper()
-            _plan_decode(self.cached_decode_wrappers[plan_params])
-
+        if (
+            cuda_graph_state.in_warm_up()
+            and plan_params not in self.cached_cuda_graph_decode_wrappers
+        ):
+            # During CUDA graph capture, the metadata tensors provided by auto-deploy are stable.
+            wrapper = self._init_decode_wrapper(
+                use_cuda_graph=True,
+                indptr=kv_page_indptr,
+                indices=kv_page_indices,
+                last_page_len=kv_last_page_len,
+            )
+            self.cached_cuda_graph_decode_wrappers[plan_params] = wrapper
+            _plan_decode(self.cached_cuda_graph_decode_wrappers[plan_params])
         # check if we are in cuda graph capture and just return the pre-cached decode wrapper
         if torch.cuda.is_current_stream_capturing() or cuda_graph_state.in_warm_up():
             assert plan_params.is_generate, "Only generate is supported during cuda graph capture."
-            wrapper = self.cached_decode_wrappers[plan_params]
-            # copy the metadata to the wrapper to ensure it is up-to-date for graph replay!
-            wrapper._paged_kv_indptr_buf.copy_(kv_page_indptr)
-            wrapper._paged_kv_indices_buf.copy_(kv_page_indices)
-            wrapper._paged_kv_last_page_len_buf.copy_(kv_last_page_len)
+            wrapper = self.cached_cuda_graph_decode_wrappers[plan_params]
             return wrapper
 
         # check for re-planning
@@ -157,13 +359,9 @@ _GlobalFlashInferPlanner = _FlashInferPlanner()
 @torch.library.custom_op("auto_deploy::flashinfer_attention_prepare_metadata", mutates_args=())
 def prepare_flashinfer_metadata(
     position_ids: torch.Tensor,
-    seq_len: torch.Tensor,
-    input_pos: torch.Tensor,
-    cache_loc: torch.Tensor,
-    pages_per_seq: torch.Tensor,
-    slot_idx: torch.Tensor,
-    page_size: int,
-    chunk_size: int,
+    batch_info: torch.Tensor,
+    cu_seqlen: torch.Tensor,
+    seq_len_with_cache: torch.Tensor,
 ) -> List[torch.Tensor]:
     """Prepare metadata for flashinfer attention.
 
@@ -171,61 +369,38 @@ def prepare_flashinfer_metadata(
     https://docs.flashinfer.ai/api/prefill.html#flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper.plan
     to understand the convention.
     """
-    # reset the planner
+    # retrieve host-side metadata
+    num_prefill, num_prefill_tokens, num_decode = batch_info.tolist()
+    num_seq = num_prefill + num_decode
+    num_tokens = num_prefill_tokens + num_decode
+
     _GlobalFlashInferPlanner.reset()
 
-    # retrieve sanitzed metadata
-    seq_len = SequenceInfo._get_sanitized_seq_len(position_ids, seq_len)
-    num_seq = len(seq_len)
+    qo_indptr = cu_seqlen[: num_seq + 1]
 
-    # prepare flashinfer-style metadata
-    offsets = input_pos[:num_seq].clone()
-
-    qo_indptr = torch.zeros(num_seq + 1, dtype=torch.int, device=seq_len.device)
-    qo_indptr[1:] = torch.cumsum(seq_len, 0)
-
-    paged_kv_indptr = torch.zeros_like(qo_indptr)
-    paged_kv_indptr[1:] = torch.cumsum(pages_per_seq[:num_seq], 0)
-
-    # NOTE: it is okay to clone cache_loc here without truncation. paged_kv_indptr is already
-    # truncated and will point to the correct sub range of cache_loc.
-    paged_kv_indices = cache_loc.clone()
-
-    paged_kv_last_page_len = ((offsets + seq_len - 1) % page_size) + 1
-
+    # NOTE: in theory we could easily precompute batch_indices. And positions is just position_ids
+    # so we could skip that as well. However, we still need a place for resetting the planner and
+    # for now we keep it here since the kernel is fast
     # Compute batch_indices and positions so that they can be reused for kv cache appends
     # for all the layers
     batch_indices, positions = flashinfer.get_batch_indices_positions(
-        qo_indptr,
-        flashinfer.get_seq_lens(paged_kv_indptr, paged_kv_last_page_len, page_size),
-        position_ids.numel(),
+        qo_indptr, seq_len_with_cache[:num_seq], num_tokens
     )
-    # return metadata
-    return (
-        qo_indptr,
-        paged_kv_indptr,
-        paged_kv_indices,
-        paged_kv_last_page_len,
-        batch_indices,
-        positions,
-    )
+    # return extra metadata
+    return batch_indices, positions
 
 
-# TODO: Move the truncation of seq_len out of this custom op
-# As SequenceInfo._get_sanitized_num_sequences could break in fake mode
 @prepare_flashinfer_metadata.register_fake
 def prepare_flashinfer_metadata_fake(
-    position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size, chunk_size
+    position_ids: torch.Tensor,
+    batch_info: torch.Tensor,
+    cu_seqlen: torch.Tensor,
+    seq_len_with_cache: torch.Tensor,
 ):
-    seq_len = SequenceInfo._get_sanitized_seq_len(position_ids, seq_len)
-    qo_indptr = torch.empty(len(seq_len) + 1, dtype=seq_len.dtype, device=seq_len.device)
+    num_tokens = position_ids.shape[0] * position_ids.shape[1]
     return (
-        qo_indptr,  # qo_indptr
-        torch.empty_like(qo_indptr),  # paged_kv_indptr
-        torch.empty_like(cache_loc),  # paged_kv_indices
-        torch.empty_like(seq_len),  # paged_kv_last_page_len
-        torch.empty_like(seq_len),  # batch_indices
-        torch.empty_like(seq_len),  # positions
+        torch.empty(num_tokens, dtype=torch.int32, device=position_ids.device),  # batch_indices
+        torch.empty(num_tokens, dtype=torch.int32, device=position_ids.device),  # positions
     )
 
 
@@ -235,13 +410,15 @@ def flashinfer_mha_with_cache(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    # METADATA
-    qo_indptr: torch.Tensor,
-    paged_kv_indptr: torch.Tensor,
-    paged_kv_indices: torch.Tensor,
-    paged_kv_last_page_len: torch.Tensor,
-    batch_indices: torch.Tensor,
-    positions: torch.Tensor,
+    # STANDARD METADATA
+    batch_info: torch.Tensor,
+    cu_seqlen: torch.Tensor,
+    cu_num_pages: torch.Tensor,
+    cache_loc: torch.Tensor,
+    last_page_len: torch.Tensor,
+    # EXTRA METADATA
+    flashinfer_batch_indices: torch.Tensor,
+    flashinfer_positions: torch.Tensor,
     # CACHES
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -260,6 +437,18 @@ def flashinfer_mha_with_cache(
     q = q.reshape(b * s, -1, head_dim)
     k = k.reshape(b * s, -1, head_dim)
     v = v.reshape(b * s, -1, head_dim)
+
+    # convert to flashinfer-style metadata
+    num_prefill, num_prefill_tokens, num_decode = batch_info.tolist()
+    num_seq = num_prefill + num_decode
+
+    qo_indptr = cu_seqlen[: num_seq + 1]
+    paged_kv_indptr = cu_num_pages[: num_seq + 1]
+
+    # NOTE: it is okay to have cache_loc here without truncation. paged_kv_indptr will be
+    # truncated and will point to the correct sub range of cache_loc.
+    paged_kv_indices = cache_loc
+    paged_kv_last_page_len = last_page_len[:num_seq]
 
     n_heads = q.shape[1]
     n_kv_heads = k.shape[1]
@@ -286,8 +475,8 @@ def flashinfer_mha_with_cache(
     flashinfer.page.append_paged_kv_cache(
         k,
         v,
-        batch_indices,
-        positions,
+        flashinfer_batch_indices,
+        flashinfer_positions,
         (k_cache, v_cache),
         paged_kv_indices,
         paged_kv_indptr,
@@ -316,13 +505,15 @@ def flashinfer_mha_with_cache_fake(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    # METADATA
-    qo_indptr: torch.Tensor,
-    paged_kv_indptr: torch.Tensor,
-    paged_kv_indices: torch.Tensor,
-    paged_kv_last_page_len: torch.Tensor,
-    batch_indices: torch.Tensor,
-    positions: torch.Tensor,
+    # STANDARD METADATA
+    batch_info: torch.Tensor,
+    cu_seqlen: torch.Tensor,
+    cu_num_pages: torch.Tensor,
+    cache_loc: torch.Tensor,
+    last_page_len: torch.Tensor,
+    # EXTRA METADATA
+    flashinfer_batch_indices: torch.Tensor,
+    flashinfer_positions: torch.Tensor,
     # CACHES
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -364,11 +555,17 @@ class FlashInferAttention(AttentionDescriptor):
 
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
-        return torch.ops.auto_deploy.flashinfer_attention_mha_with_cache
+        return torch.ops.auto_deploy.flashinfer_attention_mha_with_cache.default
 
     @classmethod
-    def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:
-        return torch.ops.auto_deploy.flashinfer_attention_prepare_metadata, 6
+    def get_standard_metadata_args(cls) -> List[str]:
+        return ["batch_info", "cu_seqlen", "cu_num_pages", "cache_loc", "last_page_len"]
+
+    @classmethod
+    def get_prepare_extra_metadata_info(
+        cls, any_source_attn_node: Node
+    ) -> Tuple[Optional[PrepareMetadataCallable], int, List[Constant]]:
+        return (torch.ops.auto_deploy.flashinfer_attention_prepare_metadata.default, 2, [])
 
     @classmethod
     def get_cache_initializers(
@@ -401,6 +598,20 @@ class FlashInferAttention(AttentionDescriptor):
             return buffer
 
         return {"workspace_buffer": _init_workspace}
+
+    @classmethod
+    def host_prepare_for_forward(cls, sequence_info: SequenceInfo):
+        batch_info = sequence_info._input_buffer.get_host_view("batch_info")
+        num_prefill, num_prefill_tokens, num_decode = batch_info.tolist()
+        # Call plan for generate-only batches.
+        if num_prefill == 0:
+            _GlobalFlashInferPlanner.plan_generate_only(
+                num_decode,
+                sequence_info._input_buffer.get_host_view("cu_num_pages")[: num_decode + 1],
+                sequence_info._input_buffer.get_host_view("cache_loc"),
+                sequence_info._input_buffer.get_host_view("last_page_len")[:num_decode],
+            )
+        return
 
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:

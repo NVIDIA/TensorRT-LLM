@@ -12,6 +12,8 @@ No complex process tree cleanup is needed because:
 import subprocess
 from typing import Optional
 
+from utils.logger import logger
+
 
 def exec_cmd(*popenargs, timeout: Optional[float] = None, **kwargs) -> int:
     """Execute command and return exit code.
@@ -54,4 +56,8 @@ def exec_cmd_with_output(*popenargs, timeout: Optional[float] = None, **kwargs) 
         check=True,
         **kwargs,
     )
+    # Log stderr if it exists
+    if result.stderr:
+        stderr_output = result.stderr.decode()
+        logger.error(f"Command stderr: {stderr_output}")
     return result.stdout.decode()

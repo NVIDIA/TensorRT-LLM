@@ -21,11 +21,18 @@ def model(request):
     return request.param
 
 
+@pytest.fixture(scope="module",
+                params=[0, 2],
+                ids=["disable_processpool", "enable_processpool"])
+def num_postprocess_workers(request):
+    return request.param
+
+
 @pytest.fixture(scope="module")
-def server(model: str):
+def server(model: str, num_postprocess_workers: int):
     model_path = get_model_path(model)
 
-    args = []
+    args = ["--num_postprocess_workers", f"{num_postprocess_workers}"]
     if model.startswith("Qwen3"):
         args.extend(["--reasoning_parser", "qwen3"])
     elif model.startswith("DeepSeek-R1"):
@@ -83,6 +90,7 @@ def check_tool_calling(response, first_resp=True, prefix=""):
         assert not tool_call_exist, f"{err_msg} tool call content should not exist! ({function_call})"
 
 
+@pytest.mark.skip(reason="https://nvbugs/5753250")
 @pytest.mark.asyncio(loop_scope="module")
 async def test_reasoning(client: openai.AsyncOpenAI, model: str):
     response = await client.responses.create(
@@ -93,6 +101,7 @@ async def test_reasoning(client: openai.AsyncOpenAI, model: str):
     check_reponse(response, "test_reasoning: ")
 
 
+@pytest.mark.skip(reason="https://nvbugs/5753250")
 @pytest.mark.asyncio(loop_scope="module")
 async def test_reasoning_effort(client: openai.AsyncOpenAI, model: str):
     for effort in ["low", "medium", "high"]:
@@ -105,6 +114,7 @@ async def test_reasoning_effort(client: openai.AsyncOpenAI, model: str):
         check_reponse(response, f"test_reasoning_effort_{effort}: ")
 
 
+@pytest.mark.skip(reason="https://nvbugs/5753250")
 @pytest.mark.asyncio(loop_scope="module")
 async def test_chat(client: openai.AsyncOpenAI, model: str):
     response = await client.responses.create(model=model,
@@ -129,6 +139,7 @@ async def test_chat(client: openai.AsyncOpenAI, model: str):
     check_reponse(response, "test_chat: ")
 
 
+@pytest.mark.skip(reason="https://nvbugs/5753250")
 @pytest.mark.asyncio(loop_scope="module")
 async def test_multi_turn_chat(client: openai.AsyncOpenAI, model: str):
     response = await client.responses.create(model=model,
@@ -148,6 +159,7 @@ def get_current_weather(location: str, format: str = "celsius") -> dict:
     return {"sunny": True, "temperature": 20 if format == "celsius" else 68}
 
 
+@pytest.mark.skip(reason="https://nvbugs/5753250")
 @pytest.mark.asyncio(loop_scope="module")
 async def test_tool_calls(client: openai.AsyncOpenAI, model: str):
     if model.startswith("DeepSeek-R1"):
@@ -199,6 +211,7 @@ async def test_tool_calls(client: openai.AsyncOpenAI, model: str):
     check_tool_calling(response, False, "test_tool_calls: ")
 
 
+@pytest.mark.skip(reason="https://nvbugs/5753250")
 @pytest.mark.asyncio(loop_scope="module")
 async def test_streaming(client: openai.AsyncOpenAI, model: str):
     stream = await client.responses.create(
@@ -220,6 +233,7 @@ async def test_streaming(client: openai.AsyncOpenAI, model: str):
     assert full_reasoning_response
 
 
+@pytest.mark.skip(reason="https://nvbugs/5753250")
 @pytest.mark.asyncio(loop_scope="module")
 async def test_streaming_tool_call(client: openai.AsyncOpenAI, model: str):
     if model.startswith("DeepSeek-R1"):

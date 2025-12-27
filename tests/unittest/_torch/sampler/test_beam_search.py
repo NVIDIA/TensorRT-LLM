@@ -20,7 +20,7 @@ import torch
 from test_beam_search_util import (BeamSearchTestOutput, DummyConfigLoader,
                                    DummyWeightLoader, get_expected_outputs)
 from utils.llm_data import llm_models_root
-from utils.util import force_ampere
+from utils.util import assert_no_cuda_sync, force_ampere
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.models.checkpoints import HfCheckpointLoader
@@ -28,7 +28,8 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
                                                         SamplingConfig)
 from tensorrt_llm._torch.pyexecutor.sampler import BeamHistory, TorchSampler
 from tensorrt_llm._torch.pyexecutor.sampling_utils import (
-    BeamSearchMetadata, FinishReason, beam_search_sampling_batch)
+    BEAM_SEARCH_PAD_TOKEN, BeamSearchMetadata, FinishReason,
+    beam_search_sampling_batch)
 from tensorrt_llm.executor import RequestError
 from tensorrt_llm.executor.result import CompletionOutput, GenerationResult
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
@@ -44,13 +45,16 @@ def fixed_params():
     return {"max_tokens": 8, "max_beam_width": 2}
 
 
-@pytest.fixture(scope="module", params=["TRTLLMSampler", "TorchSampler"])
-def sampler_type(request):
+@pytest.fixture(scope="module",
+                params=[("TRTLLMSampler", False), ("TorchSampler", False),
+                        ("TorchSampler", True)])
+def sampling_information(request):
     return request.param
 
 
 @pytest.fixture(scope="module")
-def model_kwargs(fixed_params, sampler_type) -> dict[str, Any]:
+def model_kwargs(fixed_params, sampling_information) -> dict[str, Any]:
+
     assert fixed_params[
         "max_beam_width"] == 2, "This test only works for a beam width of 2"
     return dict(
@@ -59,7 +63,8 @@ def model_kwargs(fixed_params, sampler_type) -> dict[str, Any]:
             weight_loader=DummyWeightLoader(),
             config_loader=DummyConfigLoader(),
         ),
-        sampler_type=sampler_type,
+        sampler_type=sampling_information[0],
+        disable_flashinfer_sampling=sampling_information[1],
     )
 
 
@@ -273,7 +278,7 @@ def test_beam_search_e2e(
         return_context_logits=gather_context_logits,
         return_generation_logits=gather_generation_logits,
         logprobs=return_log_probs,
-        end_id=999,
+        end_id=-1,
         additional_model_outputs=["cache_indirection"],
     )
     validate_outputs(llm, input_prompts[:num_prompts], sampling_params)
@@ -319,7 +324,7 @@ def test_beam_search_e2e_cuda_graph_and_overlap(
         return_context_logits=gather_context_logits,
         return_generation_logits=gather_generation_logits,
         logprobs=return_log_probs,
-        end_id=999,
+        end_id=-1,
         stop_token_ids=stop_token_ids,
         additional_model_outputs=["cache_indirection"],
     )
@@ -424,15 +429,16 @@ def test_beam_search_sampling_batch_basic():
     )
 
     # Run beam search sampling
-    next_tokens, softmax = beam_search_sampling_batch(
-        logits=logits,
-        beam_width_in=beam_width,
-        beam_width_out=beam_width,
-        beam_search_args=beam_search_args,
-        temperature=temperature,
-        generator=None,
-        return_probs=True,
-    )
+    with assert_no_cuda_sync():
+        next_tokens, softmax = beam_search_sampling_batch(
+            logits=logits,
+            beam_width_in=beam_width,
+            beam_width_out=beam_width,
+            beam_search_args=beam_search_args,
+            temperature=temperature,
+            generator=None,
+            return_probs=True,
+        )
 
     # Validate output shapes
     expected_tokens_shape = (batch_size, beam_width)
@@ -443,8 +449,11 @@ def test_beam_search_sampling_batch_basic():
         f"Expected shape {expected_softmax_shape}, got {softmax.shape}")
 
     # Validate tokens are within vocab range
-    assert torch.all(next_tokens >= 0) and torch.all(
-        next_tokens < vocab_size), "Tokens out of vocab range"
+    assert torch.all(next_tokens[1:] >= 0), "Tokens out of vocab range"
+    # First request has finished beams. Some beams may have BEAM_SEARCH_PAD_TOKEN (-1) as a token
+    assert torch.all(
+        next_tokens[0] >= BEAM_SEARCH_PAD_TOKEN), "Tokens out of vocab range"
+    assert torch.all(next_tokens < vocab_size), "Tokens out of vocab range"
 
     # Validate softmax probabilities sum to 1
     torch.testing.assert_close(softmax.sum(dim=-1),
@@ -521,7 +530,7 @@ def test_beam_search_sampling_batch_basic():
                 torch.tensor(predecessor_beam, dtype=torch.int32))
 
 
-def get_default_request(test_params: GeneralTestParams) -> LlmRequest:
+def create_default_request(test_params: GeneralTestParams) -> LlmRequest:
     sampling_params = SamplingParams(n=test_params.beam_width,
                                      best_of=test_params.beam_width,
                                      use_beam_search=True)
@@ -537,7 +546,7 @@ def get_default_request(test_params: GeneralTestParams) -> LlmRequest:
                       is_streaming=False)
 
 
-def get_default_sampler(test_params: GeneralTestParams) -> TorchSampler:
+def create_default_sampler(test_params: GeneralTestParams) -> TorchSampler:
     sampler = TorchSampler(
         TorchSampler.Args(
             max_seq_len=test_params.max_seq_len,
@@ -572,8 +581,8 @@ def test_create_beam_history():
     the cache_indirection backwards to obtain the correct token sequence.
     """
     test_params = GeneralTestParams()
-    request = get_default_request(test_params)
-    sampler = get_default_sampler(test_params)
+    request = create_default_request(test_params)
+    sampler = create_default_sampler(test_params)
 
     # Extract parameters from the test parameters
     beam_width = test_params.beam_width
@@ -700,11 +709,9 @@ def test_finish_beams():
     end_id = test_params.end_id
     batch_size = test_params.batch_size
     vocab_size = test_params.vocab_size
-    test_params.max_batch_size
-    max_beam_width = test_params.max_beam_width
     num_logprobs = 1
-    request = get_default_request(test_params)
-    sampler = get_default_sampler(test_params)
+    request = create_default_request(test_params)
+    sampler = create_default_sampler(test_params)
     store_device = sampler.store.cache_indirection.device
 
     request.set_generated_tokens(
@@ -732,12 +739,8 @@ def test_finish_beams():
         cum_logprobs != 0
     ), "Log probs and cumulative log probs must not only contain zeros. Otherwise change the seed."
 
-    tokens[batch_size - 1, 0,
-           num_generated_tokens // 2:] = end_id  # simulate early finished beam
-    finish_reasons_stop_words = torch.ones(
-        max_beam_width, dtype=torch.int32) * FinishReason.STOP_WORDS.value
-    finish_reasons_end_id = torch.ones(
-        max_beam_width, dtype=torch.int32) * FinishReason.END_ID.value
+    tokens[batch_size - 1, 0, num_generated_tokens //
+           2:] = BEAM_SEARCH_PAD_TOKEN  # simulate early finished beam
 
     for batch_idx in range(batch_size):
         beam_history = BeamHistory(
@@ -749,54 +752,17 @@ def test_finish_beams():
 
         if batch_idx < batch_size - 1:
             # requests are not finished yet
-            sampler._finalize_beam(request,
-                                   beam_history,
-                                   finish_reasons=torch.zeros(
-                                       max_beam_width, dtype=torch.int32))
+            sampler._finalize_beam(request, beam_history)
             final_tokens = torch.tensor(request.get_tokens(),
                                         device=store_device,
                                         dtype=torch.int32)[:, prompt_len:]
             torch.testing.assert_close(final_tokens,
                                        tokens[batch_idx, :beam_width])
-
-            # requests are finished by STOP_WORDS
-            sampler._finalize_beam(request,
-                                   beam_history,
-                                   finish_reasons=finish_reasons_stop_words)
-            final_tokens = torch.tensor(request.get_tokens(),
-                                        device=store_device,
-                                        dtype=torch.int32)[:, prompt_len:]
-            torch.testing.assert_close(final_tokens,
-                                       tokens[batch_idx, :beam_width])
-            # requests are finished by END_ID
-            sampler._finalize_beam(request,
-                                   beam_history,
-                                   finish_reasons=finish_reasons_end_id)
-            final_tokens = torch.tensor(request.get_tokens(),
-                                        device=store_device,
-                                        dtype=torch.int32)[:, prompt_len:]
-            torch.testing.assert_close(final_tokens,
-                                       tokens[batch_idx, :beam_width])
-
         # Test the case where end_ids are present in the output
         else:
-            # requests are not finished yet
-            sampler._finalize_beam(request,
-                                   beam_history,
-                                   finish_reasons=torch.zeros(
-                                       max_beam_width, dtype=torch.int32))
-            final_tokens = torch.tensor(request.get_tokens(),
-                                        device=store_device,
-                                        dtype=torch.int32)[:, prompt_len:]
-            torch.testing.assert_close(final_tokens,
-                                       tokens[batch_idx, :beam_width])
+            sampler._finalize_beam(request, beam_history)
 
-            # requests are finished by STOP_WORDS
-            sampler._finalize_beam(request,
-                                   beam_history,
-                                   finish_reasons=finish_reasons_stop_words)
-
-            # Given input for beam 0: [ token, token, ..., token, end_id, end_id, ..., end_id]
+            # Given input for beam 0: [ token, token, ..., token, BEAM_SEARCH_PAD_TOKEN, BEAM_SEARCH_PAD_TOKEN, ..., BEAM_SEARCH_PAD_TOKEN]
             # Expected output for beam 0: [ token, token, ..., token]
             final_tokens_1p = torch.tensor(request.get_tokens()[1:],
                                            device=store_device,
@@ -811,133 +777,6 @@ def test_finish_beams():
             torch.testing.assert_close(
                 final_tokens_0, tokens[batch_idx,
                                        0, :num_generated_tokens // 2])
-
-            # requests are finished by END_ID
-            sampler._finalize_beam(request,
-                                   beam_history,
-                                   finish_reasons=finish_reasons_end_id)
-
-            # Given input for beam 0: [ token, token, ..., token, end_id, end_id, ..., end_id]
-            # Expected output for beam 0: [ token, token, ..., token, end_id]
-            final_tokens_1p = torch.tensor(request.get_tokens()[1:],
-                                           device=store_device,
-                                           dtype=torch.int32)[:, prompt_len:]
-            final_tokens_0 = torch.tensor(request.get_tokens()[0],
-                                          device=store_device,
-                                          dtype=torch.int32)[prompt_len:]
-            torch.testing.assert_close(final_tokens_1p, tokens[batch_idx,
-                                                               1:beam_width])
-            torch.testing.assert_close(final_tokens_0.shape[0],
-                                       num_generated_tokens // 2 + 1)
-            torch.testing.assert_close(
-                final_tokens_0[:-1], tokens[batch_idx,
-                                            0, :num_generated_tokens // 2])
-            torch.testing.assert_close(final_tokens_0[-1].item(), end_id)
-
-
-@force_ampere  # Save H100 resource
-class TestParameterValidation:
-    """Ensure that unsupported request parameters do not crash/hang the engine."""
-
-    @pytest.fixture(scope="module")
-    @staticmethod
-    def fixed_params():
-        return {"max_tokens": 8, "max_beam_width": 4}
-
-    @pytest.fixture(scope="module")
-    @staticmethod
-    def model_kwargs() -> dict[str, Any]:
-        root = llm_models_root()
-        assert root is not None
-        return dict(model=root / "llama-models-v2" /
-                    "TinyLlama-1.1B-Chat-v1.0", )
-
-    # NB: Class-level fixture overrides do not work without this
-    @pytest.fixture(scope="module")
-    @staticmethod
-    def llm(fixed_params, input_prompts, model_kwargs):
-        return _build_llm(fixed_params, input_prompts, model_kwargs)
-
-    def _check_engine_responds(self, llm: LLM, input_prompts: list[str],
-                               fixed_params: dict):
-        _ = llm.generate(input_prompts,
-                         sampling_params=SamplingParams(
-                             max_tokens=fixed_params["max_tokens"],
-                             n=1,
-                             best_of=fixed_params["max_beam_width"],
-                             use_beam_search=True,
-                             end_id=-1,
-                         ))
-
-    @pytest.mark.timeout(120)
-    @pytest.mark.threadleak(enabled=False)
-    def test_use_beam_search_false(
-        self,
-        llm: LLM,
-        input_prompts: list[str],
-        fixed_params: dict,
-    ):
-        assert fixed_params["max_beam_width"] > 2
-        with pytest.raises(
-                ValueError,
-                match=
-                ".*Greedy decoding in the LLM API does not allow multiple returns.*"
-        ):
-            _ = llm.generate(input_prompts,
-                             sampling_params=SamplingParams(
-                                 max_tokens=fixed_params["max_tokens"],
-                                 n=1,
-                                 best_of=fixed_params["max_beam_width"],
-                                 use_beam_search=False,
-                                 end_id=-1,
-                             ))
-        self._check_engine_responds(llm, input_prompts, fixed_params)
-
-    @pytest.mark.timeout(120)
-    @pytest.mark.threadleak(enabled=False)
-    def test_use_beam_search_ommitted(
-        self,
-        llm: LLM,
-        input_prompts: list[str],
-        fixed_params: dict,
-    ):
-        assert fixed_params["max_beam_width"] > 2
-        with pytest.raises(
-                ValueError,
-                match=
-                ".*Greedy decoding in the LLM API does not allow multiple returns.*"
-        ):
-            _ = llm.generate(input_prompts,
-                             sampling_params=SamplingParams(
-                                 max_tokens=fixed_params["max_tokens"],
-                                 n=1,
-                                 best_of=fixed_params["max_beam_width"],
-                                 end_id=-1,
-                             ))
-        self._check_engine_responds(llm, input_prompts, fixed_params)
-
-    @pytest.mark.timeout(120)
-    @pytest.mark.threadleak(enabled=False)
-    def test_smaller_beam_width(
-        self,
-        llm: LLM,
-        input_prompts: list[str],
-        fixed_params: dict,
-    ):
-        assert fixed_params["max_beam_width"] > 2
-        with pytest.raises(
-                RequestError,
-                match=".*Request beam width 2 is not equal to max_beam_width 4*"
-        ):
-            _ = llm.generate(input_prompts,
-                             sampling_params=SamplingParams(
-                                 max_tokens=fixed_params["max_tokens"],
-                                 n=1,
-                                 best_of=2,
-                                 use_beam_search=True,
-                                 end_id=-1,
-                             ))
-        self._check_engine_responds(llm, input_prompts, fixed_params)
 
 
 @force_ampere  # Save H100 resource

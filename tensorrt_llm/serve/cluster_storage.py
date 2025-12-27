@@ -54,7 +54,7 @@ class WatchEventQueue:
         loop = asyncio.get_event_loop()
         for event in events:
             self.events.put_nowait(event)
-        loop._write_to_self()
+        loop.call_soon_threadsafe(lambda: None)
 
 
 class ClusterStorage(abc.ABC):
@@ -268,7 +268,7 @@ class HttpClusterStorageServer(ClusterStorage):
                 logger.info(
                     f"Notifying watch event for watch key {watch_key} with type {event_type}"
                 )
-            loop._write_to_self()
+            loop.call_soon_threadsafe(lambda: None)
         logger.info(
             f"Notified watch event for key {key} with type {event_type}")
 
@@ -426,10 +426,31 @@ class Etcd3WatchEventQueue(WatchEventQueue):
                         event_type=event_type,
                     ))
             if self.events._loop:
-                self.events._loop._write_to_self()
+                self.events._loop.call_soon_threadsafe(lambda: None)
         except Exception as e:
             logger.error(f"Error adding event: {e}")
             self.cancel_event()
+
+
+def handle_etcd_error(return_on_error: bool | None):
+
+    def decorator(f):
+
+        async def wrap(*args, **kwargs):
+            storage = args[0]
+            try:
+                return await f(*args, **kwargs)
+            except etcd3.Etcd3Exception as e:
+                logger.error(f"Etcd3 error in {f.__name__}: {e}")
+                return return_on_error
+            except ValueError:
+                logger.error(f"Etcd client value error in {f.__name__}")
+                storage.reconnect()
+                return return_on_error
+
+        return wrap
+
+    return decorator
 
 
 class Etcd3ClusterStorage(ClusterStorage):
@@ -440,8 +461,8 @@ class Etcd3ClusterStorage(ClusterStorage):
                  one_single_lease: bool = False,
                  **kwargs):
         cluster_uri = cluster_uri.replace("etcd://", "")
-        host, port = cluster_uri.rsplit(":", 1)
-        self._client = etcd3.client(host, port)
+        self._host, self._port = cluster_uri.rsplit(":", 1)
+        self._client = etcd3.client(self._host, self._port)
         self._leases = {}
         self._instance_lease = None
         self._watch_handles = {}
@@ -464,6 +485,10 @@ class Etcd3ClusterStorage(ClusterStorage):
     def client(self):
         return self._client
 
+    def reconnect(self):
+        logger.info(f"Reconnecting to {self._host}:{self._port}")
+        self._client = etcd3.client(self._host, self._port)
+
     async def start(self):
         # nothing to do
         ...
@@ -472,78 +497,60 @@ class Etcd3ClusterStorage(ClusterStorage):
         # nothing to do
         ...
 
+    @handle_etcd_error(return_on_error=False)
     async def set(self,
                   key: str,
                   value: str,
                   overwrite_if_exists: bool = False,
                   ttl: int = -1) -> bool:
-        try:
-            lease = self._get_lease(key, ttl)
-            if not overwrite_if_exists:
-                return self.client.put_if_not_exists(key, value, lease=lease)
-            else:
-                self.client.put(key, value, lease=lease)
-        except etcd3.Etcd3Exception as e:
-            logger.error(f"Error setting key {key}: {e}")
-            return False
-        return True
+        lease = self._get_lease(key, ttl)
+        if not overwrite_if_exists:
+            return self.client.put_if_not_exists(key, value, lease=lease)
+        else:
+            self.client.put(key, value, lease=lease)
+            return True
 
+    @handle_etcd_error(return_on_error=None)
     async def get(self, key: str) -> str:
-        try:
-            data, meta = self.client.get(key)
-            return data.decode('utf-8') if data else None
-        except etcd3.Etcd3Exception as e:
-            logger.error(f"Error getting key {key}: {e}")
-            return None
+        data, meta = self.client.get(key)
+        return data.decode('utf-8') if data else None
 
+    @handle_etcd_error(return_on_error=False)
     async def delete(self, key: str) -> bool:
-        try:
-            self.client.delete(key)
-        except etcd3.Etcd3Exception as e:
-            logger.error(f"Error deleting key {key}: {e}")
-            return False
-        return True
+        self.client.delete(key)
 
+    @handle_etcd_error(return_on_error=False)
     async def expire(self, key: str, ttl: int) -> bool:
         if ttl <= 0:
-            raise ValueError(f"TTL must be greater than 0, got {ttl}")
-        try:
-            lease = self._get_lease(key, ttl)
-            # TTL will be ignored since it can only be set when creating a lease
-            next(self.client.refresh_lease(lease_id=lease.id), None)
-        except etcd3.Etcd3Exception as e:
-            logger.error(f"Error refreshing lease {key}: {e}")
+            logger.error(f"TTL must be greater than 0, got {ttl}")
             return False
+        lease = self._get_lease(key, ttl)
+        assert lease is not None, "Lease must be created"
+        # TTL will be ignored since it can only be set when creating a lease
+        next(self.client.refresh_lease(lease_id=lease.id), None)
         return True
 
+    @handle_etcd_error(return_on_error={})
     async def get_prefix(self,
                          key_prefix: str,
                          keys_only: bool = False) -> Dict[str, str]:
-        try:
-            resp = self.client.get_prefix(key_prefix)
-            return {
-                metadata.key.decode("utf-8"):
-                "" if keys_only else v.decode("utf-8")
-                for v, metadata in resp
-            }
-        except etcd3.Etcd3Exception as e:
-            logger.error(f"Error getting keys {key_prefix}: {e}")
-            return {}
+        resp = self.client.get_prefix(key_prefix)
+        return {
+            metadata.key.decode("utf-8"): "" if keys_only else v.decode("utf-8")
+            for v, metadata in resp
+        }
 
+    @handle_etcd_error(return_on_error=None)
     async def watch(self, key_prefix: str) -> WatchEventQueue:
-        try:
-            if key_prefix in self._watch_handles:
-                return self._watch_handles[key_prefix]
-            watch_handle = Etcd3WatchEventQueue(key_prefix=key_prefix)
-            watch_id = self.client.add_watch_prefix_callback(
-                key_prefix, watch_handle.add_events_from_resp)
-            watch_handle.set_cancel_event(
-                lambda: self.client.cancel_watch(watch_id))
-            self._watch_handles[key_prefix] = watch_handle
-            return watch_handle
-        except etcd3.Etcd3Exception as e:
-            logger.error(f"Error watching key {key_prefix}: {e}")
-            return None
+        if key_prefix in self._watch_handles:
+            return self._watch_handles[key_prefix]
+        watch_handle = Etcd3WatchEventQueue(key_prefix=key_prefix)
+        watch_id = self.client.add_watch_prefix_callback(
+            key_prefix, watch_handle.add_events_from_resp)
+        watch_handle.set_cancel_event(
+            lambda: self.client.cancel_watch(watch_id))
+        self._watch_handles[key_prefix] = watch_handle
+        return watch_handle
 
     async def unwatch(self, key_prefix: str) -> None:
         handle = self._watch_handles.pop(key_prefix)

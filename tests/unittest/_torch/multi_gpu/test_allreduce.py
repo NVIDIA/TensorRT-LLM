@@ -123,7 +123,7 @@ def run_allreduce_op(x: torch.Tensor, residual: torch.Tensor, hidden_size: int,
         dtype=dtype,
         mapping=mapping,
         tensor_parallel_mode=TensorParallelMode.ROW,
-        allreduce_strategy=AllReduceStrategy.NCCL,
+        allreduce_strategy=AllReduceStrategy.NCCL_SYMMETRIC,
     ).cuda()
     allreduce = AllReduce(mapping=mapping)
     norm = RMSNorm(hidden_size=hidden_size, eps=eps, dtype=dtype).cuda()

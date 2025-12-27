@@ -3,6 +3,7 @@ import gc
 import json
 import os
 import signal  # Added import
+import socket
 import subprocess  # nosec B404
 import sys
 from pathlib import Path
@@ -81,6 +82,7 @@ def _signal_handler_cleanup_child(signum, frame):
 def get_llm_args(
         model: str,
         tokenizer: Optional[str] = None,
+        custom_tokenizer: Optional[str] = None,
         backend: str = "pytorch",
         max_beam_width: int = BuildConfig.model_fields["max_beam_width"].
     default,
@@ -136,6 +138,7 @@ def get_llm_args(
         "model": model,
         "scheduler_config": scheduler_config,
         "tokenizer": tokenizer,
+        "custom_tokenizer": custom_tokenizer,
         "tensor_parallel_size": tensor_parallel_size,
         "pipeline_parallel_size": pipeline_parallel_size,
         "context_parallel_size": context_parallel_size,
@@ -176,37 +179,43 @@ def launch_server(
 
     backend = llm_args["backend"]
     model = llm_args["model"]
-    if backend == 'pytorch':
-        llm_args.pop("build_config", None)
-        llm = PyTorchLLM(**llm_args)
-    elif backend == '_autodeploy':
-        from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind((host, port))
+        except OSError as e:
+            raise RuntimeError(f"Failed to bind socket to {host}:{port}: {e}")
 
-        # AutoDeploy does not support build_config
-        llm_args.pop("build_config", None)
-        llm = AutoDeployLLM(**llm_args)
-    elif backend == 'tensorrt' or backend == 'trt':
-        llm_args.pop("backend")
-        llm = LLM(**llm_args)
-    else:
-        raise click.BadParameter(
-            f"{backend} is not a known backend, check help for available options.",
-            param_hint="backend")
+        if backend == 'pytorch':
+            llm_args.pop("build_config", None)
+            llm = PyTorchLLM(**llm_args)
+        elif backend == '_autodeploy':
+            from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 
-    server = OpenAIServer(llm=llm,
-                          model=model,
-                          tool_parser=tool_parser,
-                          server_role=server_role,
-                          metadata_server_cfg=metadata_server_cfg,
-                          disagg_cluster_config=disagg_cluster_config,
-                          multimodal_server_config=multimodal_server_config,
-                          chat_template=chat_template)
+            # AutoDeploy does not support build_config
+            llm_args.pop("build_config", None)
+            llm = AutoDeployLLM(**llm_args)
+        elif backend == 'tensorrt' or backend == 'trt':
+            llm_args.pop("backend")
+            llm = LLM(**llm_args)
+        else:
+            raise click.BadParameter(
+                f"{backend} is not a known backend, check help for available options.",
+                param_hint="backend")
 
-    # Optionally disable GC (default: not disabled)
-    if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
-        gc.disable()
+        server = OpenAIServer(llm=llm,
+                              model=model,
+                              tool_parser=tool_parser,
+                              server_role=server_role,
+                              metadata_server_cfg=metadata_server_cfg,
+                              disagg_cluster_config=disagg_cluster_config,
+                              multimodal_server_config=multimodal_server_config,
+                              chat_template=chat_template)
 
-    asyncio.run(server(host, port))
+        # Optionally disable GC (default: not disabled)
+        if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
+            gc.disable()
+
+        asyncio.run(server(host, port, sockets=[s]))
 
 
 def launch_mm_encoder_server(
@@ -255,6 +264,14 @@ class ChoiceWithAlias(click.Choice):
               default=None,
               help="Path | Name of the tokenizer."
               "Specify this value only if using TensorRT engine as model.")
+@click.option(
+    "--custom_tokenizer",
+    type=str,
+    default=None,
+    help=
+    "Custom tokenizer type: alias (e.g., 'deepseek_v32') or Python import path "
+    "(e.g., 'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer'). [Experimental]"
+)
 @click.option("--host",
               type=str,
               default="localhost",
@@ -411,22 +428,22 @@ class ChoiceWithAlias(click.Choice):
               default=None,
               help="[Experimental] Specify a custom chat template. "
               "Can be a file path or one-liner template string")
-def serve(model: str, tokenizer: Optional[str], host: str, port: int,
-          log_level: str, backend: str, max_beam_width: int,
-          max_batch_size: int, max_num_tokens: int, max_seq_len: int,
-          tensor_parallel_size: int, pipeline_parallel_size: int,
-          context_parallel_size: int, moe_expert_parallel_size: Optional[int],
-          moe_cluster_parallel_size: Optional[int],
-          gpus_per_node: Optional[int], free_gpu_memory_fraction: float,
-          num_postprocess_workers: int, trust_remote_code: bool,
-          revision: Optional[str], extra_llm_api_options: Optional[str],
-          reasoning_parser: Optional[str], tool_parser: Optional[str],
-          metadata_server_config_file: Optional[str],
-          server_role: Optional[str],
-          fail_fast_on_attention_window_too_large: bool,
-          otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
-          disagg_cluster_uri: Optional[str], media_io_kwargs: Optional[str],
-          custom_module_dirs: list[Path], chat_template: Optional[str]):
+def serve(
+        model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
+        host: str, port: int, log_level: str, backend: str, max_beam_width: int,
+        max_batch_size: int, max_num_tokens: int, max_seq_len: int,
+        tensor_parallel_size: int, pipeline_parallel_size: int,
+        context_parallel_size: int, moe_expert_parallel_size: Optional[int],
+        moe_cluster_parallel_size: Optional[int], gpus_per_node: Optional[int],
+        free_gpu_memory_fraction: float, num_postprocess_workers: int,
+        trust_remote_code: bool, revision: Optional[str],
+        extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
+        tool_parser: Optional[str], metadata_server_config_file: Optional[str],
+        server_role: Optional[str],
+        fail_fast_on_attention_window_too_large: bool,
+        otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
+        disagg_cluster_uri: Optional[str], media_io_kwargs: Optional[str],
+        custom_module_dirs: list[Path], chat_template: Optional[str]):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -443,6 +460,7 @@ def serve(model: str, tokenizer: Optional[str], host: str, port: int,
     llm_args, _ = get_llm_args(
         model=model,
         tokenizer=tokenizer,
+        custom_tokenizer=custom_tokenizer,
         backend=backend,
         max_beam_width=max_beam_width,
         max_batch_size=max_batch_size,
@@ -628,29 +646,38 @@ def disaggregated(
 
     disagg_cfg = parse_disagg_config_file(config_file)
 
-    metadata_server_cfg = parse_metadata_server_config_file(
-        metadata_server_config_file)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind((disagg_cfg.hostname, disagg_cfg.port))
+        except OSError as e:
+            raise RuntimeError(
+                f"Failed to bind socket to {disagg_cfg.hostname}:{disagg_cfg.port}: {e}"
+            )
 
-    server = OpenAIDisaggServer(config=disagg_cfg,
-                                req_timeout_secs=request_timeout,
-                                server_start_timeout_secs=server_start_timeout,
-                                metadata_server_cfg=metadata_server_cfg,
-                                metrics_interval_secs=metrics_log_interval)
+        metadata_server_cfg = parse_metadata_server_config_file(
+            metadata_server_config_file)
 
-    # Disable GC by default
-    #   When concurrency is high, the number of Python objects increases, so
-    #   GC runs frequently and takes a long time to process. In this case,
-    #   requests are not immediately forwarded to CTX workers and GEN workers,
-    #   causing them to run with small batch sizes. Disabling GC can mitigate
-    #   this problem.
-    #   By testing this feature, we didn't observe significant RSS or VMS
-    #   increment, and observed that `count0` (obtained by `gc.get_count()`)
-    #   increases by fewer than 1,000 after every 200,000 requests, while the
-    #   maximum value of `count0` exceeded 3,000,000 during the test.
-    if os.getenv("TRTLLM_DISAGG_SERVER_DISABLE_GC", "1") == "1":
-        gc.disable()
+        server = OpenAIDisaggServer(
+            config=disagg_cfg,
+            req_timeout_secs=request_timeout,
+            server_start_timeout_secs=server_start_timeout,
+            metadata_server_cfg=metadata_server_cfg,
+            metrics_interval_secs=metrics_log_interval)
 
-    asyncio.run(server(disagg_cfg.hostname, disagg_cfg.port))
+        # Disable GC by default
+        #   When concurrency is high, the number of Python objects increases, so
+        #   GC runs frequently and takes a long time to process. In this case,
+        #   requests are not immediately forwarded to CTX workers and GEN workers,
+        #   causing them to run with small batch sizes. Disabling GC can mitigate
+        #   this problem.
+        #   By testing this feature, we didn't observe significant RSS or VMS
+        #   increment, and observed that `count0` (obtained by `gc.get_count()`)
+        #   increases by fewer than 1,000 after every 200,000 requests, while the
+        #   maximum value of `count0` exceeded 3,000,000 during the test.
+        if os.getenv("TRTLLM_DISAGG_SERVER_DISABLE_GC", "1") == "1":
+            gc.disable()
+
+        asyncio.run(server(disagg_cfg.hostname, disagg_cfg.port, sockets=[s]))
 
 
 def set_cuda_device():

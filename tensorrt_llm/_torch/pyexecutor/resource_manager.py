@@ -468,13 +468,17 @@ class KVCacheManager(BaseResourceManager):
                                 req, block_ids)
 
             for req in generation_batch:
-                # TODO: [TRTLLM-5972] Lift the limitation that last rank is always the active one for helix.
                 if self.mapping.has_cp_helix():
-                    if self.mapping.cp_rank != self.mapping.cp_size - 1:
+                    # Distribute the decode blocks across CP ranks in a round-robin manner.
+                    decode_block_id = (req.py_decoding_iter -
+                                       1) // self.tokens_per_block
+                    if decode_block_id % self.mapping.cp_size == self.mapping.cp_rank:
+                        req.py_helix_is_inactive_rank = False
+                        req.seqlen_this_rank_cp += 1
+                    else:
                         req.py_helix_is_inactive_rank = True
-                # Skip allocating KV cache at decode for inactive helix ranks.
-                if req.py_helix_is_inactive_rank:
-                    continue
+                        # Skip allocating KV cache at decode for inactive helix ranks.
+                        continue
                 self.impl.add_token(req.py_request_id)
                 for _ in range(get_draft_token_length(req)):
                     self.impl.add_token(req.py_request_id)
@@ -548,6 +552,23 @@ class KVCacheManager(BaseResourceManager):
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
                 req.prompt_len = token_num - 1
                 req.py_prompt_len = req.prompt_len
+                # Helix parallelism: each CP rank holds token_num tokens per sequence.
+                # Since KV cache write for query token happens only on the active rank,
+                # prompt_len is (token_num - 1) there and token_num on inactive ranks.
+                if self.mapping.has_cp_helix():
+                    # Mark only the last rank to be active for helix parallelism.
+                    if self.mapping.cp_size - 1 == self.mapping.cp_rank:
+                        req.py_helix_is_inactive_rank = False
+                        req.prompt_len = token_num - 1
+                        req.py_prompt_len = req.prompt_len
+                        req.seqlen_this_rank_cp = req.prompt_len
+                        req.total_input_len_cp = token_num * self.mapping.cp_size - 1
+                    else:
+                        req.py_helix_is_inactive_rank = True
+                        req.prompt_len = token_num
+                        req.py_prompt_len = req.prompt_len
+                        req.seqlen_this_rank_cp = req.prompt_len
+                        req.total_input_len_cp = token_num * self.mapping.cp_size - 1
                 req.py_draft_tokens = [1] * max_num_draft_tokens
                 if prepare_resource:
                     for _ in range(max_num_draft_tokens):
@@ -578,11 +599,11 @@ class KVCacheManager(BaseResourceManager):
             self.update_kv_cache_draft_token_location(scheduled_batch,
                                                       attn_metadata,
                                                       kv_cache_dtype_byte_size)
-            # rewind kv cache
-            for request in scheduled_batch.generation_requests:
-                if request.state != LlmRequestState.GENERATION_COMPLETE:
-                    if request.py_rewind_len > 0:
-                        self.rewind_kv_cache(request, request.py_rewind_len)
+        # rewind kv cache
+        for request in scheduled_batch.generation_requests:
+            if request.state != LlmRequestState.GENERATION_COMPLETE:
+                if request.py_rewind_len > 0:
+                    self.rewind_kv_cache(request, request.py_rewind_len)
 
         # For context requests, we store the blocks for reuse.
         for request in scheduled_batch.context_requests:

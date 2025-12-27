@@ -12,7 +12,6 @@ context_servers:
   max_num_tokens: 512
   max_seq_len: 768
   tensor_parallel_size: 2
-  moe_expert_parallel_size: 2
   enable_attention_dp: true
   pipeline_parallel_size: 1
   print_iter_log: true
@@ -34,7 +33,6 @@ generation_servers:
     max_num_tokens: 2048
     max_seq_len: 2560
   tensor_parallel_size: 1
-  moe_expert_parallel_size: 1
   enable_attention_dp: false
   enable_lm_head_tp_in_adp: false
   pipeline_parallel_size: 1
@@ -50,8 +48,6 @@ generation_servers:
     enable_block_reuse: false
     free_gpu_memory_fraction: 0.7
     max_tokens: 2560
-  moe_config:
-    backend: CUTLASS
   cache_transceiver_config:
     max_tokens_in_buffer: 8448
     backend: DEFAULT

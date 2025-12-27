@@ -15,9 +15,12 @@
  */
 
 #include "fmhaDispatcher.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -191,6 +194,7 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         tllmRunnerParams.cumSeqLensKvPtr = reinterpret_cast<int const*>(runnerParams.cuKvSeqLenPtr);
         // Attention scales device pointers (only fp8 kernels need to load scales from the device memory).
         tllmRunnerParams.outputScalePtr = reinterpret_cast<float const*>(runnerParams.scaleBmm2Ptr);
+        // TRTLLM-GEN kernels always use the Log2 scale
         tllmRunnerParams.scaleSoftmaxLog2Ptr = runnerParams.scaleBmm1Ptr
             ? reinterpret_cast<float const*>(runnerParams.scaleBmm1Ptr + kIdxScaleSoftmaxLog2Ptr)
             : nullptr;
@@ -224,6 +228,8 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         tllmRunnerParams.mSfStartTokenIdx = 0;
         // For mla chunked prefill
         tllmRunnerParams.softmaxStatsPtr = reinterpret_cast<float2*>(runnerParams.softmaxStatsPtr);
+        // For skip softmax
+        tllmRunnerParams.mSkipSoftmaxThresholdScaleFactor = runnerParams.skipSoftmaxThresholdScaleFactor;
         tllmRunnerParams.stream = runnerParams.stream;
         // Set the sparse attention parameters if sparseMLA is used.
         if (mFixedParams.useSparseMLA)
@@ -247,4 +253,6 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

@@ -140,7 +140,7 @@ class DeepseekV3WeightLoader:
         self.model_config = model.model_config
         self.is_draft_model = is_draft_model
 
-    def load_weights(self, weights: Dict):
+    def load_weights(self, weights: Dict, skip_modules: List[str] = []):
 
         def rename_moe_weight(weights: Dict, rename_rules: Dict):
             result = {}
@@ -282,6 +282,8 @@ class DeepseekV3WeightLoader:
         for name, module in tqdm(all_named_modules.items(),
                                  desc="Loading weights"):
             if len(module._parameters) <= 0 or name.startswith("draft_model"):
+                continue
+            elif any(skip_module in name for skip_module in skip_modules):
                 continue
             else:
                 names = name.split('.')
@@ -518,7 +520,7 @@ class DeepseekV3Linear(Linear):
                      layer_idx: Optional[int] | None = None):
         num_tokens = input.shape[0]
         if (not self.has_any_quant and 1 <= num_tokens <= 16
-                and get_sm_version() != 120):
+                and get_sm_version() not in [120, 121]):
             output = torch.ops.trtllm.dsv3_fused_a_gemm_op(
                 input, self.weight.t(), bias, None)
         else:
@@ -746,17 +748,19 @@ class Deepseekv3MoE(nn.Module):
         config = model_config.pretrained_config
         self.top_k = top_k
         self.use_dp = model_config.mapping.enable_attention_dp
-        self.gate = DeepseekV3Gate(
-            hidden_size,
-            num_experts,
-            top_k=top_k,
-            n_group=config.n_group,
-            topk_group=config.topk_group,
-            routed_scaling_factor=config.routed_scaling_factor,
-            dtype=dtype,
-            fuse_routing_kernel=True,
-            apply_routing=False,
-            moe_backend=model_config.moe_backend)
+        gate_cls = DeepseekV3Gate
+        if hasattr(model_config.pretrained_config, "gate_cls"):
+            gate_cls = model_config.pretrained_config.gate_cls
+        self.gate = gate_cls(hidden_size,
+                             num_experts,
+                             top_k=top_k,
+                             n_group=config.n_group,
+                             topk_group=config.topk_group,
+                             routed_scaling_factor=config.routed_scaling_factor,
+                             dtype=dtype,
+                             fuse_routing_kernel=True,
+                             apply_routing=False,
+                             moe_backend=model_config.moe_backend)
         self.experts = create_moe(
             num_experts=num_experts,
             routing_method=self.gate.routing_method,
@@ -1233,13 +1237,13 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 hidden_states, residual = self.moe_allreduce(
                     fc2_output, all_reduce_params=moe_all_reduce_params)
         else:
-            if spec_metadata is not None and spec_metadata.is_layer_capture(
-                    self.layer_idx):
-                spec_metadata.maybe_capture_hidden_states(
-                    self.layer_idx, hidden_states, residual)
             if self.next_layer_layernorm is not None:
                 hidden_states, residual = self.next_layer_layernorm(
                     hidden_states, residual)
+            if spec_metadata is not None and spec_metadata.is_layer_capture(
+                    self.layer_idx):
+                spec_metadata.maybe_capture_hidden_states(
+                    self.layer_idx, hidden_states, None)
 
         return hidden_states, residual
 
@@ -1357,6 +1361,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         embed_tokens: Embedding,
         attn_metadata: AttentionMetadata,
         all_rank_num_tokens: Optional[List[int]] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
 
@@ -1433,6 +1438,10 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         else:
             hidden_states, _ = self.shared_head.norm(hidden_states, residual)
 
+        # It's for 2-model path, capture the hidden states
+        if spec_metadata is not None:
+            spec_metadata.maybe_capture_hidden_states(0, hidden_states, None)
+
         return hidden_states
 
 
@@ -1445,12 +1454,13 @@ class DeepseekV3Model(DecoderModel):
         config = model_config.pretrained_config
         self.vocab_size = config.vocab_size
         self.num_hidden_layers = config.num_hidden_layers
-        aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
+        aux_stream_list = [torch.cuda.Stream() for _ in range(4)]
         self.aux_stream_dict = {
             AuxStreamType.Attention: aux_stream_list[0],
             AuxStreamType.MoeShared: aux_stream_list[0],
             AuxStreamType.MoeChunkingOverlap: aux_stream_list[1],
             AuxStreamType.MoeBalancer: aux_stream_list[2],
+            AuxStreamType.MoeOutputMemset: aux_stream_list[3],
         }
 
         self.embed_tokens = Embedding(

@@ -23,10 +23,9 @@ MARKER_LIST_IN_TEST = [" TIMEOUT"]
 
 
 def install_python_dependencies(llm_src):
-    subprocess.run(
-        f"cd {llm_src} && pip3 install --retries 1 -r requirements-dev.txt",
-        shell=True,
-        check=True)
+    subprocess.run(f"cd {llm_src} && pip3 install -r requirements-dev.txt",
+                   shell=True,
+                   check=True)
     subprocess.run(
         f"pip3 install --force-reinstall --no-deps {llm_src}/../tensorrt_llm-*.whl",
         shell=True,

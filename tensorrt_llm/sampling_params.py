@@ -337,9 +337,13 @@ class SamplingParams:
     #     bindings.SamplingConfig (not SamplingParams).
     @staticmethod
     def params_imply_greedy_decoding(
-        *, temperature: Optional[float], top_p: Optional[float], top_k: Optional[int]
+        *,
+        temperature: Optional[float],
+        top_p: Optional[float],
+        top_k: Optional[int],
+        use_beam_search: bool | None,
     ):
-        return (
+        return (not use_beam_search) and (
             (temperature is None and top_p is None and top_k is None)
             or top_k == 1
             or top_p == 0.0
@@ -348,10 +352,11 @@ class SamplingParams:
 
     @property
     def _greedy_decoding(self) -> bool:
-        return not self.use_beam_search and self.params_imply_greedy_decoding(
+        return self.params_imply_greedy_decoding(
             temperature=self.temperature,
             top_p=self.top_p,
             top_k=self.top_k,
+            use_beam_search=self.use_beam_search,
         )
 
     @property

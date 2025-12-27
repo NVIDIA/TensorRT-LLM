@@ -77,7 +77,7 @@ class AccuracyConfig:
 # Note: Only log_file is used by AccuracyParser (accuracy_parser.py)
 # The regex pattern is hardcoded in AccuracyParser._extract_accuracy_values()
 _COMMON_ACCURACY_METRICS = MetricsConfig(
-    log_file="accuracy_eval.log",
+    log_file="7_accuracy_eval.log",
     extractor_pattern=r"\|([a-zA-Z0-9_-]+)\|.*?\|([\w-]+)\|.*?\|exact_match\|.*?\|([0-9.]+)\|",
     metric_names=["flexible-extract", "strict-match"],
 )
@@ -85,35 +85,43 @@ _COMMON_ACCURACY_METRICS = MetricsConfig(
 DEFAULT_METRICS_CONFIG = {
     # Performance test default configuration
     ("disagg", "perf"): MetricsConfig(
-        log_file="bench.log",
+        log_file="6_bench.log",
         extractor_pattern=r"""
             ^.*?Median\ TTFT\ \(ms\):\s+([0-9.]+).*?$\n
-            ^.*?(?:\n|.)*?$\n
+            (?:.*\n)*?
             ^.*?Median\ E2EL\ \(ms\):\s+([0-9.]+).*?$\n
-            ^.*?(?:\n|.)*?$\n
+            (?:.*\n)*?
             ^.*?Benchmark\ with\ concurrency\ (\d+)\ done
         """,
         metric_names=["SERVER_MEDIAN_TTFT", "SERVER_MEDIAN_E2EL"],
     ),
     ("wideep", "perf"): MetricsConfig(
-        log_file="bench.log",
+        log_file="6_bench.log",
         extractor_pattern=r"""
             ^.*?Mean\ TTFT\ \(ms\):\s+([0-9.]+).*?$\n
+            (?:.*\n)*?
             ^.*?Median\ TTFT\ \(ms\):\s+([0-9.]+).*?$\n
+            (?:.*\n)*?
             ^.*?P99\ TTFT\ \(ms\):\s+([0-9.]+).*?$\n
-            ^.*?(?:\n|.)*?$\n
+            (?:.*\n)*?
             ^.*?Mean\ TPOT\ \(ms\):\s+([0-9.]+).*?$\n
+            (?:.*\n)*?
             ^.*?Median\ TPOT\ \(ms\):\s+([0-9.]+).*?$\n
+            (?:.*\n)*?
             ^.*?P99\ TPOT\ \(ms\):\s+([0-9.]+).*?$\n
-            ^.*?(?:\n|.)*?$\n
+            (?:.*\n)*?
             ^.*?Mean\ ITL\ \(ms\):\s+([0-9.]+).*?$\n
+            (?:.*\n)*?
             ^.*?Median\ ITL\ \(ms\):\s+([0-9.]+).*?$\n
+            (?:.*\n)*?
             ^.*?P99\ ITL\ \(ms\):\s+([0-9.]+).*?$\n
-            ^.*?(?:\n|.)*?$\n
+            (?:.*\n)*?
             ^.*?Mean\ E2EL\ \(ms\):\s+([0-9.]+).*?$\n
+            (?:.*\n)*?
             ^.*?Median\ E2EL\ \(ms\):\s+([0-9.]+).*?$\n
+            (?:.*\n)*?
             ^.*?P99\ E2EL\ \(ms\):\s+([0-9.]+).*?$\n
-            ^.*?(?:\n|.)*?$\n
+            (?:.*\n)*?
             ^.*?Benchmark\ with\ concurrency\ (\d+)\ done
         """,
         metric_names=[
@@ -308,7 +316,7 @@ class ConfigLoader:
         supported_gpus = metadata.get("supported_gpus", ["GB200", "GB300", "H100", "B200", "B300"])
 
         # Override config with environment variables (in memory only, do not write back)
-        config_data = self._apply_env_overrides(config_data)
+        config_data = self._apply_env_overrides(config_data, model_name)
 
         # Generate benchmark_type from sequence configuration
         benchmark_type = self._generate_benchmark_type(config_data)
@@ -440,7 +448,7 @@ class ConfigLoader:
             logger.debug(f"Using default metrics config for {test_category}")
             return default_config
 
-    def _apply_env_overrides(self, config_data: dict) -> dict:
+    def _apply_env_overrides(self, config_data: dict, model_name: str) -> dict:
         """Apply environment variable overrides to configuration.
 
         Intelligently replaces empty or None values based on field path.
@@ -461,7 +469,7 @@ class ConfigLoader:
             ("slurm", "partition"): lambda: EnvManager.get_slurm_partition(),
             ("slurm", "account"): lambda: EnvManager.get_slurm_account(),
             ("slurm", "job_name"): lambda: EnvManager.get_slurm_job_name(),
-            ("environment", "container_mount"): lambda: EnvManager.get_container_mount(),
+            ("environment", "container_mount"): lambda: EnvManager.get_container_mount(model_name),
             ("environment", "container_image"): lambda: EnvManager.get_container_image(),
             ("environment", "trtllm_repo"): lambda: EnvManager.get_repo_dir(),
             ("environment", "trtllm_wheel_path"): lambda: EnvManager.get_trtllm_wheel_path(),
@@ -469,6 +477,8 @@ class ConfigLoader:
             ("environment", "work_dir"): lambda: EnvManager.get_script_dir(),
             ("environment", "model_path"): lambda: self._get_full_model_path(config),
             ("slurm", "script_file"): lambda: self._get_script_file(config),
+            ("slurm", "set_segment"): lambda: EnvManager.get_slurm_set_segment(),
+            ("slurm", "extra_args"): lambda: EnvManager.get_slurm_extra_args(),
         }
 
         # Apply overrides based on field paths
@@ -500,7 +510,7 @@ class ConfigLoader:
         """
         metadata = config.get("metadata", {})
         dataset_file = metadata.get("dataset_file", "")
-        return os.path.join(EnvManager.get_model_dir(), dataset_file)
+        return os.path.join(EnvManager.get_dataset_dir(), dataset_file)
 
     def _get_script_file(self, config: dict) -> str:
         """Get script file by combining scripts directory with script file name.

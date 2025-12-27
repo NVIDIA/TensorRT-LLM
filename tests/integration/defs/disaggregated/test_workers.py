@@ -9,6 +9,7 @@ from typing import Generator, List, Optional, Tuple
 import aiohttp
 import pytest
 import yaml
+from defs.common import revise_disagg_config_file_with_free_ports
 from defs.conftest import skip_no_hopper
 from defs.trt_test_alternative import popen
 from transformers import AutoTokenizer
@@ -42,6 +43,7 @@ def run_disaggregated_workers(
     num_ranks: Optional[int] = None
 ) -> Tuple[Generator[subprocess.Popen, None, None], List[str], List[str]]:
 
+    config_file = revise_disagg_config_file_with_free_ports(config_file)
     ctx_servers, gen_servers = get_ctx_gen_server_urls_from_cfg(config_file)
 
     # TODO: auto detect num_ranks

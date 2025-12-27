@@ -23,7 +23,6 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 from torch import nn
-from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_rope_utils import rope_config_validation
 
@@ -318,9 +317,6 @@ class Qwen3NextConfig(PretrainedConfig):
         self.output_router_logits = output_router_logits
         self.router_aux_loss_coef = router_aux_loss_coef
         self.mlp_only_layers = mlp_only_layers
-
-
-AutoConfig.register("qwen3_next", Qwen3NextConfig)
 
 
 class Qwen3NextGate(nn.Module):
@@ -647,11 +643,10 @@ def fused_gdn_gating(
 
 class Qwen3NextGatedDeltaNet(nn.Module):
 
-    def __init__(
-        self,
-        model_config: ModelConfig[Qwen3NextConfig],
-        layer_idx: Optional[int] = None,
-    ):
+    def __init__(self,
+                 model_config: ModelConfig[Qwen3NextConfig],
+                 aux_stream: torch.cuda.Stream,
+                 layer_idx: Optional[int] = None):
         super().__init__()
         config = model_config.pretrained_config
         self.model_config = model_config
@@ -778,6 +773,12 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             force_dynamic_quantization=model_config.force_dynamic_quantization,
             use_cute_dsl_blockscaling_mm=False)
 
+        self.event_dict = {
+            key: torch.cuda.Event()
+            for key in [EventType.Main, EventType.Attention]
+        }
+        self.aux_stream = aux_stream
+
     def fix_query_key_value_ordering(self, mixed_qkvz, mixed_ba):
         """
         Derives `query`, `key` and `value` tensors from `mixed_qkvzba`.
@@ -825,17 +826,13 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         self,
         conv_states,
         ssm_states,
-        num_decodes,
-        cu_seqlens,
+        query_start_loc_long,
         **kwargs,
     ):
         mixed_qkv = kwargs["mixed_qkv"]
         a = kwargs["a"]
         b = kwargs["b"]
         cache_indices = kwargs["cache_indices"]
-        query_start_loc = torch.arange(0,
-                                       num_decodes + 1,
-                                       device=cu_seqlens.device).to(torch.long)
 
         mixed_qkv = causal_conv1d_update(
             mixed_qkv,
@@ -869,7 +866,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             b=b,
             initial_state_source=ssm_states,
             initial_state_indices=cache_indices,
-            cu_seqlens=query_start_loc,
+            cu_seqlens=query_start_loc_long,
             use_qk_l2norm_in_kernel=True,
             softplus_beta=1.0,
             softplus_threshold=20.0,
@@ -889,13 +886,13 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         batch_size = kwargs["batch_size"]
         has_initial_states = kwargs["has_initial_states"][:batch_size]
         cache_indices = kwargs["cache_indices"]
-        query_start_loc = kwargs["query_start_loc"][:batch_size + 1]
+        query_start_loc = kwargs["query_start_loc"]
+        query_start_loc_long = kwargs["query_start_loc_long"]
         num_prefill_tokens = kwargs["num_prefill_tokens"]
         num_decode_tokens = kwargs["num_decode_tokens"]
         state_indices_p = kwargs["state_indices_p"]
         state_indices_d = kwargs["state_indices_d"]
         num_prefill = kwargs["num_prefill"]
-        num_decode = kwargs["num_decode"]
 
         conv_states_to_use = conv_states
 
@@ -963,19 +960,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         recurrent_state = ssm_states[cache_indices]
 
-        if num_decode > 0:
-            # TODO set it in mambaCacheManager
-            decode_query_start_loc = torch.arange(
-                1, num_decode + 1,
-                device=query_start_loc.device)  # num_decode 个
-            decode_query_start_loc = decode_query_start_loc + query_start_loc[
-                num_prefill]
-            new_query_start_loc = torch.cat(
-                [query_start_loc[:num_prefill + 1], decode_query_start_loc])
-        else:
-            new_query_start_loc = query_start_loc
-
-        new_query_start_loc = new_query_start_loc.to(torch.long)
         core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
             q=query,
             k=key,
@@ -984,7 +968,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             beta=beta,
             initial_state=recurrent_state,
             output_final_state=True,
-            cu_seqlens=new_query_start_loc,
+            cu_seqlens=query_start_loc_long,
             head_first=False,
             use_qk_l2norm_in_kernel=True,
         )
@@ -1029,11 +1013,23 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         ssm_states = attn_metadata.kv_cache_manager.get_ssm_states(
             self.layer_idx)
         if num_prefills > 0:
-            ssm_states[state_indices_p] = 0
-            # conv_states[state_indices_p] = 0 # not necessary
+            ssm_states[state_indices_p] = torch.zeros((),
+                                                      dtype=ssm_states.dtype,
+                                                      device=ssm_states.device)
 
-        projected_states_qkvz = self.in_proj_qkvz(hidden_states)
-        projected_states_ba = self.in_proj_ba(hidden_states)
+        def _compute_projected_states_qkvz():
+            return self.in_proj_qkvz(hidden_states)
+
+        def _compute_projected_states_ba():
+            return self.in_proj_ba(hidden_states)
+
+        projected_states_qkvz, projected_states_ba = maybe_execute_in_parallel(
+            _compute_projected_states_qkvz,
+            _compute_projected_states_ba,
+            self.event_dict[EventType.Main],
+            self.event_dict[EventType.Attention],
+            self.aux_stream,
+        )
 
         # Use fused kernel when possible to avoid elementwise ops
         if self.num_v_heads // self.num_k_heads in [1, 2,
@@ -1060,20 +1056,19 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             "z": z,
             "has_initial_states": has_initial_states,
             "cache_indices": state_indices,
-            "query_start_loc": mamba_metadata.cu_seqlens,
+            "query_start_loc": mamba_metadata.query_start_loc,
+            "query_start_loc_long": mamba_metadata.query_start_loc_long,
             "batch_size": attn_metadata.seq_lens.shape[0],
             "num_prefill_tokens": num_prefill_tokens,
             "num_decode_tokens": num_decode_tokens,
             "state_indices_p": state_indices_p,
             "state_indices_d": state_indices_d,
             "num_prefill": num_prefills,
-            "num_decode": num_decodes,
         }
         if num_prefills > 0:
             attn_out = self.forward_extend(conv_states, ssm_states, **kwargs)
         else:
-            attn_out = self.forward_decode(conv_states, ssm_states, num_decodes,
-                                           mamba_metadata.cu_seqlens, **kwargs)
+            attn_out = self.forward_decode(conv_states, ssm_states, **kwargs)
 
         z_shape_og = z.shape
         # reshape input data into 2D tensor
@@ -1098,7 +1093,8 @@ class Qwen3NextLinearDecoderLayer(nn.Module):
         super().__init__()
         self.model_config = model_config
         config = model_config.pretrained_config
-        self.linear_attn = Qwen3NextGatedDeltaNet(model_config, layer_idx)
+        self.linear_attn = Qwen3NextGatedDeltaNet(model_config, aux_stream,
+                                                  layer_idx)
 
         self.mapping = model_config.mapping
         self.enable_attention_dp = self.mapping.enable_attention_dp

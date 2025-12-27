@@ -489,7 +489,7 @@ else:
 
 ## NVIDIA Copyright
 
-1. All TensorRT-LLM Open Source Software code should contain an NVIDIA copyright header that includes the current year.  The following block of text should be prepended to the top of all files.  This includes .cpp, .h, .cu, .py, and any other source files which are compiled or interpreted.
+1. All TensorRT-LLM Open Source Software code should contain an NVIDIA copyright header that includes the year of its latest meaningful modification.  The following block of text should be prepended to the top of all files.  This includes .cpp, .h, .cu, .py, and any other source files which are compiled or interpreted.
 ```cpp
 /*
  * Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.

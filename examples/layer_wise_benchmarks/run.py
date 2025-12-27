@@ -206,7 +206,7 @@ for autotune_flag, batch_size, seq_len_q, seq_len_kv_cache, balance_ratio in [
             if autotune_flag:
                 if args.enable_autotuner:
                     cache_path = os.getenv("TLLM_AUTOTUNER_CACHE_PATH") or None
-                    with autotune(cache_path=cache_path, rank=rank):
+                    with autotune(cache_path=cache_path):
                         run_pack()
                 if args.run_type == "GEN":
                     logger.info("Layer-wise benchmarks: Prefill KV cache")

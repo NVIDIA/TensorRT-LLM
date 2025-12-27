@@ -79,6 +79,35 @@ def get_model_yaml_config(model_label: str,
                 }
             }
         },
+        {
+            'patterns': [
+                'deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:32-maxnt:32768-input_output_len:8192,1024-reqs:20-con:1-ep:1-gpus:4'
+            ],
+            'config': {
+                'enable_iter_perf_stats': True,
+                'print_iter_log': False,
+                'cuda_graph_config': {
+                    'max_batch_size': 16,
+                    'enable_padding': False
+                },
+                'moe_config': {
+                    'backend': 'TRTLLM',
+                    'max_num_tokens': 32768
+                },
+                'speculative_config': {
+                    'decoding_type': 'MTP',
+                    'num_nextn_predict_layers': 3
+                },
+                'disable_overlap_scheduler': True,
+                'enable_autotuner': True,
+                'kv_cache_config': {
+                    'free_gpu_memory_fraction': 0.6,
+                    'enable_block_reuse': True,
+                    'enable_partial_reuse': False
+                },
+                'enable_chunked_prefill': True
+            }
+        },
         # DeepSeek R1 models with large batch sizes and cuda graph padding
         {
             'patterns': [
@@ -184,6 +213,23 @@ def get_model_yaml_config(model_label: str,
                 'moe_config': {
                     'backend': 'TRTLLM'
                 }
+            }
+        },
+        {
+            'patterns': [
+                'qwen3_4b-bench-pytorch-streaming-bfloat16-maxbs:4-kv_frac:0.6-input_output_len:500,100-reqs:200-con:4',
+            ],
+            'config': {
+                'speculative_config': {
+                    'decoding_type': 'Eagle',
+                    'eagle3_one_model': True,
+                    'speculative_model_dir': 'Qwen3-4B_eagle3',
+                    'max_draft_len': 3,
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                },
+                'enable_chunked_prefill': False,
             }
         },
         # Llama-v3.3 models with fp8 quantization

@@ -22,7 +22,6 @@ from ..attention_interface import (
     CacheInitializerDict,
     Constant,
     MHACallable,
-    PrepareMetadataCallable,
     SequenceInfo,
 )
 from .torch_mamba import _torch_ssm_prefill
@@ -111,52 +110,6 @@ def _update_ssm_state_cache(ssm_cache: torch.Tensor, ssm_state: torch.Tensor) ->
 # ---------------------------------------------------------------
 
 
-@torch.library.custom_op("auto_deploy::torch_ssm_prepare_metadata", mutates_args=())
-def _torch_ssm_prepare_metadata(
-    position_ids: torch.Tensor,
-    seq_len: torch.Tensor,
-    input_pos: torch.Tensor,
-    cache_loc: torch.Tensor,
-    pages_per_seq: torch.Tensor,
-    slot_idx: torch.Tensor,
-    page_size: int,
-    chunk_size: int,
-) -> List[torch.Tensor]:
-    """Prepare metadata for cached SSM transform.
-
-    Returns a tuple of (seq_len_sanitized, seq_start, slot_idx_sanitized).
-    """
-    # Determine number of active sequences and compute seq_start boundaries
-    seq_len_sanitized = SequenceInfo._get_sanitized_seq_len(position_ids, seq_len)
-    num_seq = len(seq_len_sanitized)
-
-    seq_start = torch.zeros_like(seq_len_sanitized)
-    if num_seq > 1:
-        seq_start[1:] = torch.cumsum(seq_len_sanitized[:-1], 0)
-
-    # Truncate slot indices to match active sequences
-    slot_idx_sanitized = slot_idx[:num_seq].clone().to(torch.long)
-    # TODO(https://github.com/NVIDIA/TensorRT-LLM/issues/8170): update torch
-    # reference implementation to support chunked prefill.
-    use_initial_states = input_pos > 0
-    return (seq_len_sanitized, seq_start, slot_idx_sanitized, use_initial_states)
-
-
-@_torch_ssm_prepare_metadata.register_fake
-def _torch_ssm_prepare_metadata_fake(
-    position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size, chunk_size
-):
-    # Use the same sanitization logic to determine sizes in fake mode
-    seq_len_sanitized = SequenceInfo._get_sanitized_seq_len(position_ids, seq_len)
-    num_seq = len(seq_len_sanitized)
-    return (
-        torch.empty_like(seq_len_sanitized),
-        torch.empty_like(seq_len_sanitized),
-        torch.empty(num_seq, dtype=torch.long, device=slot_idx.device),
-        torch.empty(num_seq, dtype=torch.bool, device=slot_idx.device),
-    )
-
-
 @torch.library.custom_op("auto_deploy::torch_cached_ssm", mutates_args={})
 def _torch_cached_ssm(
     # INPUTS (dense but may be flattened across sequences)
@@ -167,11 +120,14 @@ def _torch_cached_ssm(
     D: torch.Tensor,  # [num_heads]
     dt: torch.Tensor,  # [b, s, num_heads]
     dt_bias: torch.Tensor,  # [num_heads]
-    # METADATA
-    seq_len: torch.Tensor,  # [num_seq]
-    seq_start: torch.Tensor,  # [num_seq]
-    slot_idx: torch.Tensor,  # [num_seq]
-    use_initial_states: torch.Tensor,  # [num_seq]
+    # STANDARD METADATA
+    batch_info: torch.Tensor,
+    seq_len: torch.Tensor,
+    cu_seqlen: torch.Tensor,
+    slot_idx: torch.Tensor,
+    use_initial_states: torch.Tensor,
+    # EXTRA METADATA
+    #
     # CACHES
     ssm_state_cache: torch.Tensor,  # [max_batch_size, num_heads, head_dim, ssm_state_size]
     # CONSTANTS
@@ -187,6 +143,14 @@ def _torch_cached_ssm(
     """
     b, s = hidden_states.shape[:2]
     num_seq = seq_len.shape[0]
+
+    # get cleaned up metadata
+    num_prefill, num_prefill_tokens, num_decode = batch_info.tolist()
+    num_seq = num_prefill + num_decode
+    seq_len = seq_len[:num_seq]
+    seq_start = cu_seqlen[:num_seq]
+    slot_idx = slot_idx[:num_seq].to(torch.long)
+    use_initial_states = use_initial_states[:num_seq]
 
     if s == 1:
         # Generate-only batch: gather cache slices for slots (already sanitized by metadata)
@@ -273,21 +237,24 @@ def _torch_cached_ssm(
 
 @_torch_cached_ssm.register_fake
 def _torch_cached_ssm_fake(
-    # INPUTS
-    hidden_states: torch.Tensor,
-    A: torch.Tensor,
-    B: torch.Tensor,
-    C: torch.Tensor,
-    D: torch.Tensor,
-    dt: torch.Tensor,
-    dt_bias: torch.Tensor,
-    # METADATA
+    # INPUTS (dense but may be flattened across sequences)
+    hidden_states: torch.Tensor,  # [b, s, num_heads, head_dim]
+    A: torch.Tensor,  # [num_heads]
+    B: torch.Tensor,  # [b, s, n_groups, ssm_state_size]
+    C: torch.Tensor,  # [b, s, n_groups, ssm_state_size]
+    D: torch.Tensor,  # [num_heads]
+    dt: torch.Tensor,  # [b, s, num_heads]
+    dt_bias: torch.Tensor,  # [num_heads]
+    # STANDARD METADATA
+    batch_info: torch.Tensor,
     seq_len: torch.Tensor,
-    seq_start: torch.Tensor,
+    cu_seqlen: torch.Tensor,
     slot_idx: torch.Tensor,
     use_initial_states: torch.Tensor,
+    # EXTRA METADATA
+    #
     # CACHES
-    ssm_state_cache: torch.Tensor,
+    ssm_state_cache: torch.Tensor,  # [max_batch_size, num_heads, head_dim, ssm_state_size]
     # CONSTANTS
     time_step_limit: List[float],
     chunk_size: int,
@@ -322,12 +289,11 @@ class TorchBackendSSM(AttentionDescriptor):
 
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
-        return torch.ops.auto_deploy.torch_cached_ssm
+        return torch.ops.auto_deploy.torch_cached_ssm.default
 
     @classmethod
-    def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:
-        # Returns (seq_len, seq_start, slot_idx)
-        return torch.ops.auto_deploy.torch_ssm_prepare_metadata, 4
+    def get_standard_metadata_args(cls) -> List[str]:
+        return ["batch_info", "seq_len", "cu_seqlen", "slot_idx", "use_initial_states"]
 
     @classmethod
     def get_cache_initializers(
@@ -353,7 +319,7 @@ class TorchBackendSSM(AttentionDescriptor):
 
         def _get_ssm_cache(si: SequenceInfo):
             return torch.empty(
-                si.max_batch_size,
+                si.max_state_slots,
                 num_heads,
                 head_dim,
                 ssm_state_size,

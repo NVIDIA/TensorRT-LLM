@@ -22,6 +22,8 @@
 #include <ATen/cuda/EmptyTensor.h>
 #include <ATen/ops/index_select.h>
 
+TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 namespace btg = batchedGemm::trtllm::gen;
@@ -104,7 +106,7 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
         TORCH_CHECK(routing_bias.value().sizes()[0] == num_experts, "routing_bias has incorrect shape.");
     }
 
-    if (n_group.has_value() && n_group.value() != 0)
+    if (n_group.has_value() && n_group.value() > 1)
     {
         TORCH_CHECK(static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3,
             "Routing kernel with groups implies DeepSeekV3 routing method.");
@@ -576,17 +578,20 @@ torch::Tensor shuffleMatrix(torch::Tensor matrix, torch::Tensor permuteIndices)
 
 } // namespace torch_ext
 
+TRTLLM_NAMESPACE_END
+
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.class_<torch_ext::FP4BlockScaleMoeRunner>("FP4BlockScaleMoERunner")
+    m.class_<tensorrt_llm::torch_ext::FP4BlockScaleMoeRunner>("FP4BlockScaleMoERunner")
         .def(torch::init<>())
-        .def("get_valid_configs", &torch_ext::FP4BlockScaleMoeRunner::getValidConfigs)
-        .def("run_moe", &torch_ext::FP4BlockScaleMoeRunner::run);
-    m.class_<torch_ext::FP8FP4BlockScaleMoeRunner>("FP8FP4BlockScaleMoERunner")
+        .def("get_valid_configs", &tensorrt_llm::torch_ext::FP4BlockScaleMoeRunner::getValidConfigs)
+        .def("run_moe", &tensorrt_llm::torch_ext::FP4BlockScaleMoeRunner::run);
+    m.class_<tensorrt_llm::torch_ext::FP8FP4BlockScaleMoeRunner>("FP8FP4BlockScaleMoERunner")
         .def(torch::init<int64_t>())
-        .def("get_valid_configs", &torch_ext::FP8FP4BlockScaleMoeRunner::getValidConfigs)
-        .def("run_moe", &torch_ext::FP8FP4BlockScaleMoeRunner::run);
+        .def("get_valid_configs", &tensorrt_llm::torch_ext::FP8FP4BlockScaleMoeRunner::getValidConfigs)
+        .def("run_moe", &tensorrt_llm::torch_ext::FP8FP4BlockScaleMoeRunner::run);
 }
 
 // Accepts both CPU and CUDA tensors
-static auto shuffle_matrix = torch::RegisterOperators("trtllm::shuffle_matrix", &torch_ext::shuffleMatrix);
+static auto shuffle_matrix
+    = torch::RegisterOperators("trtllm::shuffle_matrix", &tensorrt_llm::torch_ext::shuffleMatrix);

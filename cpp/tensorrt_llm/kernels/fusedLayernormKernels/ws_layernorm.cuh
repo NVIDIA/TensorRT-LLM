@@ -15,6 +15,7 @@
  */
 
 #pragma once
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaBf16Fallbacks.cuh"
 #include "tensorrt_llm/common/cudaBufferUtils.cuh"
 #include "tensorrt_llm/common/cudaFp8Utils.h"
@@ -25,7 +26,9 @@
 
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
 
 struct DummyFusedOperator
@@ -208,7 +211,7 @@ struct WarpSpecializedLayerNorm
 
                 if constexpr (FIRST_RUN)
                 {
-                    asm volatile("griddepcontrol.wait;\n");
+                    cudaGridDependencySynchronize();
                 }
 
                 for (int i = 0; i < Traits::M_BLOCK; i++)
@@ -814,7 +817,7 @@ struct WarpSpecializedLayerNorm
                 {
                     scheduler(lane_id, gridDim.x * gridDim.y * gridDim.z, param, shared);
                     // PRE-EXIT after all tiles have been scheduled.
-                    asm volatile("griddepcontrol.launch_dependents;\n");
+                    cudaTriggerProgrammaticLaunchCompletion();
                 }
                 else if (warp_id == 1)
                 {
@@ -838,4 +841,6 @@ __global__ void __launch_bounds__(TARGET_THREADS, 1) warpSpecializedInvoker(type
     T::run(param);
 }
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END
