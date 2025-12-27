@@ -290,6 +290,9 @@ class GenerationExecutorProxy(GenerationExecutor):
             self.request_queue.put_noblock(None, retry=4)
 
     def shutdown(self):
+        print(
+            f"====================== shutdown in GenerationExecutorProxy is called pid:  {os.getpid()}"
+        )
         if not self.workers_started:
             return
 
@@ -325,6 +328,10 @@ class GenerationExecutorProxy(GenerationExecutor):
         self.result_queue.close()
 
         self.workers_started = False
+        print(
+            f"====================== shutdown in GenerationExecutorProxy 2 is called pid:  {os.getpid()}"
+        )
+
         self.mpi_session.shutdown()
 
         # Process the errors in-case error during shutting down the threads

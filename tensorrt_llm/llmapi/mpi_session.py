@@ -160,6 +160,7 @@ class MpiPoolSession(MpiSession):
         return [future.result() for future in futures]
 
     def shutdown(self, wait=True):
+        print(f"==================================== shutdown MPI pool session")
         if self.mpi_pool is not None:
             self.mpi_pool.shutdown(wait=wait)
             self.mpi_pool = None
@@ -237,6 +238,9 @@ class MpiCommSession(MpiSession):
     def shutdown(self, wait=True):
         # Only shutdown the mpi_pool if this instance created it
         # For shared global mpi_pool, we don't shut it down
+        print(
+            f"==================================== shutdown is called MPI comm session"
+        )
         if self.mpi_pool is not None and self.owns_mpi_pool:
             self.mpi_pool.shutdown(wait=wait)
         self.mpi_pool = None

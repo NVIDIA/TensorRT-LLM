@@ -101,6 +101,9 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
                     self.await_response_thread.stop()
                     self.await_response_thread.join()
 
+            print(
+                f"====================== GenerationExecutorWorker engine shutdown is called pid:  {os.getpid()}"
+            )
             self.engine.shutdown()
             self.engine = None
 
@@ -320,6 +323,9 @@ def worker_main(
                     else:
                         raise ValueError(f"Unknown request type: {type(req)}")
 
+                print(
+                    f"====================== Worker {mpi_rank()} received shutdown signal from proxy process."
+                )
                 notify_proxy_threads_to_quit()
 
         except GenerationExecutorWorker.WorkerExit as e:
@@ -328,7 +334,11 @@ def worker_main(
 
         except Exception as e:  # other critical errors
             if is_leader:
+                print(
+                    f"====================== Worker {mpi_rank()} received shutdown signal from proxy process."
+                )
                 notify_proxy_threads_to_quit()
             logger.error(traceback.format_exc())
             # This will be captured by mpi4py and handled by future.done_callback
             raise e
+    logger_debug(f"Worker {mpi_rank()} exiting worker_main...\n", "green")
