@@ -461,7 +461,7 @@ def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String jobUID){
         def cleanupCommands = [
             "rm -rf ${cluster.scratchPath}/users/svc_tensorrt/containers/container-${slurmJobID}.sqsh || true",
             "rm -rf ${jobWorkspace} || true",
-        ].join(" && ")
+        ].join(" ; ")
         Utils.exec(
             pipeline,
             script: Utils.sshUserCmd(
@@ -511,7 +511,7 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String nodeName, St
         def cleanupCommands = [
             "rm -rf /home/svc_tensorrt/bloom/scripts/agent-${nodeName}.jar /home/svc_tensorrt/bloom/scripts/${nodeName}-${entrypoint} || true",
             "rm -rf ${cluster.scratchPath}/users/svc_tensorrt/containers/container-${slurmJobID}.sqsh || true",
-        ].join(" && ")
+        ].join(" ; ")
         Utils.exec(
             pipeline,
             script: Utils.sshUserCmd(
@@ -924,7 +924,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             def scriptInstallPathNode = "${jobWorkspace}/${jobUID}-slurm_install.sh"
             def testListPathNode = "${jobWorkspace}/${testList}.txt"
             def waivesListPathNode = "${jobWorkspace}/waives.txt"
-            def outputPath = "${jobWorkspace}/job-output-${UUID.randomUUID().toString().replaceAll("-", "").substring(0, 6)}.log"
+            def outputPath = "${jobWorkspace}/job-output.log"
             def scriptLaunchPathLocal = Utils.createTempLocation(pipeline, "./slurm_launch.sh")
             def scriptLaunchPathNode = "${jobWorkspace}/${jobUID}-slurm_launch.sh"
             def scriptExecPathLocal = Utils.createTempLocation(pipeline, "./slurm_exec.sh")
@@ -1122,11 +1122,14 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     ${taskArgs.collect { "#SBATCH $it" }.join('\n')}
                     #SBATCH ${partition.additionalArgs}
                     ${(partition?.name && partition.name != "unspecified") ? "#SBATCH --partition=${partition.name}" : ""}
-                    echo "Starting job \$SLURM_JOB_ID on \$SLURM_NODELIST"
-                    echo "\$SLURM_JOB_ID > $jobWorkspace/slurm_job_id.txt
 
+                    # SBATCH directives must appear before any executable commands.
                     set -xEeuo pipefail
                     trap 'rc=\$?; echo "Error in file \${BASH_SOURCE[0]} on line \$LINENO: \$BASH_COMMAND (exit \$rc)"; exit \$rc' ERR
+
+                    echo "Starting job \$SLURM_JOB_ID on \$SLURM_NODELIST"
+                    echo \$SLURM_JOB_ID > "$jobWorkspace/slurm_job_id.txt"
+
                     export jobWorkspace=$jobWorkspace
                     export tarName=$tarName
                     export llmTarfile=$llmTarfile
@@ -1198,8 +1201,22 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 def scriptExec = """#!/bin/bash
                     set -xEeuo pipefail
                     trap 'rc=\$?; echo "Error in file \${BASH_SOURCE[0]} on line \$LINENO: \$BASH_COMMAND (exit \$rc)"; exit \$rc' ERR
-                    rm -rf ${outputPath}
-                    touch ${outputPath}
+
+                    # Clean up previous job intermediate files so that retry can work
+                    if [ -f "${jobWorkspace}/slurm_job_id.txt" ]; then
+                        previous_job_id=\$(cat "${jobWorkspace}/slurm_job_id.txt")
+                        echo "Found previous Slurm job ID: \${previous_job_id}"
+                        scancel "\${previous_job_id}" || true
+                        rm -rf "${jobWorkspace}/slurm_job_id.txt"
+                        # Wait for 60 seconds to ensure the previous job is canceled
+                        sleep 60
+                    fi
+                    rm -rf "${jobWorkspace}/results.xml"
+                    rm -rf "${jobWorkspace}/report.csv"
+                    rm -rf "${jobWorkspace}/unfinished_test.txt"
+                    rm -rf "${outputPath}"
+
+                    touch "${outputPath}"
                     jobId=\$(sbatch ${scriptLaunchPathNode} | awk '{print \$4}')
                     if [ -z "\$jobId" ]; then
                         echo "Error: Job submission failed, no job ID returned."
