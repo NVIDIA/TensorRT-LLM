@@ -895,6 +895,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
     try {
         // Run ssh command to start node in desired cluster via SLURM
         withCredentials([
+            string(credentialsId: 'TRTLLM_HF_TOKEN', variable: 'HF_TOKEN'),
             usernamePassword(
                 credentialsId: 'svc_tensorrt',
                 usernameVariable: 'USERNAME',
@@ -1125,6 +1126,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                     set -Eeuo pipefail
                     trap 'rc=\$?; echo "Error in file \${BASH_SOURCE[0]} on line \$LINENO: \$BASH_COMMAND (exit \$rc)"; exit \$rc' ERR
+                    export HF_TOKEN=$HF_TOKEN
                     export jobWorkspace=$jobWorkspace
                     export tarName=$tarName
                     export llmTarfile=$llmTarfile
@@ -2632,6 +2634,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         containerLD_LIBRARY_PATH = containerLD_LIBRARY_PATH.replaceAll(':+$', '')
         withEnv(["LD_LIBRARY_PATH=${containerLD_LIBRARY_PATH}"]) {
             withCredentials([
+                string(credentialsId: 'TRTLLM_HF_TOKEN', variable: 'HF_TOKEN'),
                 usernamePassword(
                     credentialsId: 'svc_tensorrt_gitlab_read_api_token',
                     usernameVariable: 'GITLAB_API_USER',
