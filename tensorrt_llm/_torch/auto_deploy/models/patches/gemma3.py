@@ -1,90 +1,123 @@
-"""Export-time patch for Gemma3 to avoid vmap-based mask creation (torch.export incompat).
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-This patch ensures:
-1. Mask creation functions return None (avoids vmap incompatibility with torch.export)
-2. token_type_ids is always present in Gemma3TextModel kwargs during export, so it can be
-   captured as a graph input for VLM custom mask generation.
+"""Export-time patch for Gemma3 models.
 
-The key insight is that we patch Gemma3TextModel.__call__ to inject token_type_ids into
-kwargs BEFORE any pre-hooks run. This ensures the capture hook sees token_type_ids.
+This patch sets model-specific attention kwargs mapping on Gemma3 attention classes.
+Gemma3 has nested config (text_config) and uses specific kwargs like logit_cap.
 """
 
-# ruff: noqa: I001
+from typing import Sequence
 
-import functools
 import torch
-from ...custom_ops.vlm_mask_registry import VlmMetadataKeys
-from ...export.interface import BaseExportPatch, ExportPatchRegistry
 
-from transformers.models.gemma3 import modeling_gemma3
+from ...export.interface import AdditionalGraphInput, BaseExportPatch, ExportPatchRegistry
 
 
-def _create_patched_text_model_call(original_call):
-    """Patch __call__ to inject token_type_ids into kwargs BEFORE pre-hooks run.
+class TokenTypeIdsInput(AdditionalGraphInput):
+    """token_type_ids input for bidirectional attention mask in Gemma3.
 
-    This ensures the capture hook sees token_type_ids when capturing kwargs.
+    In Gemma3 VLM, token_type_ids indicates whether each token is a text token (0)
+    or an image token (1). This is used by the mask generator to create the correct
+    bidirectional attention pattern for image tokens.
+
+    For text-only requests, the placeholder is all zeros (all text tokens).
     """
 
-    @functools.wraps(original_call)
-    def patched_call(self, *args, **kwargs):
-        # Inject token_type_ids before pre-hooks run
-        if "token_type_ids" not in kwargs or kwargs.get("token_type_ids") is None:
-            position_ids = kwargs.get("position_ids")
-            if position_ids is not None:
-                kwargs["token_type_ids"] = torch.zeros_like(position_ids)
-        return original_call(self, *args, **kwargs)
+    @property
+    def name(self) -> str:
+        return "token_type_ids"
 
-    return patched_call
+    @property
+    def needs_bypass(self) -> bool:
+        """Gemma3Model consumes token_type_ids but doesn't pass it to language_model."""
+        return True
+
+    def create_placeholder(self, input_ids: Sequence[Sequence[int]]) -> torch.Tensor:
+        """Create all-zeros placeholder indicating all tokens are text tokens."""
+        total_tokens = sum(len(seq) for seq in input_ids)
+        return torch.zeros(total_tokens, dtype=torch.long)
+
+
+# Gemma3-specific attention kwargs mapping
+# Extends/overrides the default mapping for Gemma3's specific attention parameters
+GEMMA3_ATTN_KWARGS_MAPPING = {
+    "dropout": "dropout_p",
+    "is_causal": "is_causal",
+    "scaling": "scale",
+    "scale": "scale",
+    "s_aux": "sinks",
+    "sinks": "sinks",
+    "sliding_window": "sliding_window",
+    "logit_cap": "logit_cap",  # Gemma3 uses soft-capping
+}
 
 
 @ExportPatchRegistry.register("hf_gemma3")
 class Gemma3ModelPatch(BaseExportPatch):
-    """Patch for Gemma3 to make mask functions export-compatible and pass token_type_ids.
+    """Patch for Gemma3 models during export.
 
-    This patch sets `_vlm_input_names` on the model class to specify which kwargs
-    should be captured as VLM inputs for mask generation.
+    Sets attributes on Gemma3Attention class:
+    - `_ad_attn_kwargs_mapping`: Model-specific HF-to-AD kwargs mapping
+    - `_ad_needs_custom_mask`: Enables custom mask marker insertion for VLM support
     """
 
-    # VLM inputs that this patch injects and expects to be captured
-    VLM_INPUT_NAMES = ["token_type_ids"]
+    # Additional inputs added to the graph beyond the nn.Module forward signature.
+    # TokenTypeIdsInput needs bypass (_ad_ prefix) because Gemma3Model consumes it
+    # but doesn't pass it to the inner language_model where mask generation runs.
+    ADDITIONAL_GRAPH_INPUTS = [TokenTypeIdsInput()]
 
     def _apply_patch(self):
         """Apply the Gemma3Model patch."""
+        # Import Gemma3 attention class and set the mapping attribute
+        try:
+            from transformers.models.gemma3.modeling_gemma3 import Gemma3Attention
 
-        # Patch Gemma3TextModel.forward to accept token_type_ids as an argument
-        # This is necessary for torch.export to capture it as a graph input.
-        if hasattr(modeling_gemma3, "Gemma3TextModel"):
-            # Patch __call__ to inject token_type_ids BEFORE pre-hooks run
-            # This ensures the capture hook sees token_type_ids in kwargs
-            self.original_values["Gemma3TextModel.__call__"] = (
-                modeling_gemma3.Gemma3TextModel.__call__
+            # Store originals to revert later
+            self.original_values["Gemma3Attention._ad_attn_kwargs_mapping"] = getattr(
+                Gemma3Attention, "_ad_attn_kwargs_mapping", None
             )
-            modeling_gemma3.Gemma3TextModel.__call__ = _create_patched_text_model_call(
-                modeling_gemma3.Gemma3TextModel.__call__
+            self.original_values["Gemma3Attention._ad_needs_custom_mask"] = getattr(
+                Gemma3Attention, "_ad_needs_custom_mask", None
             )
-
-            # Set VLM input names on the class so _set_vlm_metadata can discover them
-            attr_name = VlmMetadataKeys.MODULE_INPUT_NAMES
-            self.original_values[f"Gemma3TextModel.{attr_name}"] = getattr(
-                modeling_gemma3.Gemma3TextModel, attr_name, None
-            )
-            setattr(modeling_gemma3.Gemma3TextModel, attr_name, self.VLM_INPUT_NAMES)
+            # Set model-specific attributes
+            Gemma3Attention._ad_attn_kwargs_mapping = GEMMA3_ATTN_KWARGS_MAPPING
+            Gemma3Attention._ad_needs_custom_mask = True
+        except ImportError:
+            # Gemma3 not available in this transformers version
+            pass
 
     def _revert_patch(self):
         """Revert the Gemma3Model patch."""
-        # Revert __call__ patch
-        if "Gemma3TextModel.__call__" in self.original_values:
-            modeling_gemma3.Gemma3TextModel.__call__ = self.original_values[
-                "Gemma3TextModel.__call__"
-            ]
+        try:
+            from transformers.models.gemma3.modeling_gemma3 import Gemma3Attention
 
-        # Revert VLM input names
-        attr_name = VlmMetadataKeys.MODULE_INPUT_NAMES
-        key = f"Gemma3TextModel.{attr_name}"
-        if key in self.original_values:
-            original = self.original_values[key]
-            if original is None:
-                if hasattr(modeling_gemma3.Gemma3TextModel, attr_name):
-                    delattr(modeling_gemma3.Gemma3TextModel, attr_name)
+            # Revert _ad_attn_kwargs_mapping
+            original_mapping = self.original_values.get("Gemma3Attention._ad_attn_kwargs_mapping")
+            if original_mapping is None:
+                if hasattr(Gemma3Attention, "_ad_attn_kwargs_mapping"):
+                    delattr(Gemma3Attention, "_ad_attn_kwargs_mapping")
             else:
-                setattr(modeling_gemma3.Gemma3TextModel, attr_name, original)
+                Gemma3Attention._ad_attn_kwargs_mapping = original_mapping
+
+            # Revert _ad_needs_custom_mask
+            original_mask = self.original_values.get("Gemma3Attention._ad_needs_custom_mask")
+            if original_mask is None:
+                if hasattr(Gemma3Attention, "_ad_needs_custom_mask"):
+                    delattr(Gemma3Attention, "_ad_needs_custom_mask")
+            else:
+                Gemma3Attention._ad_needs_custom_mask = original_mask
+        except ImportError:
+            pass

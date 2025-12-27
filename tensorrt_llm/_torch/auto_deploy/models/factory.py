@@ -18,8 +18,8 @@ DynamicShape = Dict[int, Dim]  # indicating the dynamic shape in tensor dimensio
 
 # Kwargs that should be dropped from model inputs during export and at runtime.
 # HF often passes these, but we don't want them to participate in torch.export in_spec matching.
-# NOTE: token_type_ids will be included in the export so that
-# VLM custom mask generation can happen inside the exported GraphModule.
+# NOTE: VLM inputs like _ad_token_type_ids (with _ad_ prefix) will be included in the export
+# so that VLM custom mask generation can happen inside the exported GraphModule.
 DROP_MODEL_INPUT_KWARGS = {
     "attention_mask",
     "cache_position",

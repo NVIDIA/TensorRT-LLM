@@ -9,9 +9,34 @@ from ...llmapi.llm import RequestOutput, _TorchLLM
 from ...llmapi.tokenizer import TokenizerBase, TransformersTokenizer, tokenizer_factory
 from ...sampling_params import SamplingParams
 from .distributed import common as dist_ad
+from .export.interface import ExportPatchRegistry
 from .llm_args import LlmArgs
-from .models.factory import ModelFactory
+from .models import patches as _  # noqa: F401 - Ensure patches are registered
+from .models.factory import DROP_MODEL_INPUT_KWARGS, ModelFactory
 from .shim.demollm import DemoGenerationExecutor
+
+
+def _add_graph_input_aliases(multimodal_args: Dict[str, Any]) -> Dict[str, Any]:
+    """Add aliases for additional graph inputs that need bypass prefix.
+
+    Some models (e.g., Gemma3 VLM) explicitly consume certain kwargs in the outer model
+    but don't pass them to the inner language_model. For inputs marked with needs_bypass=True,
+    the aliased version (with _ad_ prefix) flows through **lm_kwargs.
+
+    Note: For text-only prompts, SequenceInfo.nest_sequences() creates placeholders
+    automatically, so this function only handles the multimodal aliasing case.
+
+    Args:
+        multimodal_args: Dictionary of multimodal inputs from the processor.
+
+    Returns:
+        Updated multimodal_args with graph input aliases for bypass inputs.
+    """
+    additional_inputs = ExportPatchRegistry.get_additional_graph_inputs()
+    for add_input in additional_inputs:
+        if add_input.needs_bypass and add_input.name in multimodal_args:
+            multimodal_args[add_input.graph_input_name] = multimodal_args[add_input.name]
+    return multimodal_args
 
 
 class ADInputProcessor(DefaultInputProcessor):
@@ -84,18 +109,19 @@ class ADInputProcessor(DefaultInputProcessor):
             all_args = None
 
         if all_args is not None:
-            # TODO: is there a more reliable way to avoid the attention_mask here?
-            all_args.pop("attention_mask", None)
+            for k in DROP_MODEL_INPUT_KWARGS:
+                all_args.pop(k, None)
 
             # TODO: can we avoid the extra tolist() here eventually?
             token_ids = all_args.pop("input_ids")
             assert token_ids.shape[0] == 1, "messages should be unbatched at this point."
+
+            _add_graph_input_aliases(all_args)
             if all_args:
-                extra_processed_inputs = {"multimodal_data": all_args}
-            else:
-                extra_processed_inputs = None
-            return token_ids[0].tolist(), extra_processed_inputs
+                return token_ids[0].tolist(), {"multimodal_data": all_args}
+            return token_ids[0].tolist(), None
         else:
+            # Text-only prompt: SequenceInfo.nest_sequences() creates VLM placeholders
             token_ids = self.tokenizer.encode(inputs["prompt"], **kwargs)
             return token_ids, None
 

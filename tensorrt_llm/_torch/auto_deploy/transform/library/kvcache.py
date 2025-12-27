@@ -1,5 +1,6 @@
 """Graph transformation to automatically add kv cache into fused MHA op."""
 
+import json
 import operator
 from typing import Dict, List, Optional, Tuple, Type
 
@@ -15,7 +16,7 @@ from ...custom_ops.attention_interface import (
     Constant,
     PrepareMetadataCallable,
 )
-from ...custom_ops.vlm_mask_registry import VlmMetadataKeys
+from ...custom_ops.custom_mask_registry import CustomMaskGeneratorRegistry
 from ...distributed.common import all_gather_object, get_world_size
 from ...distributed.common import is_initialized as is_distributed_initialized
 from ...models.factory import ModelFactory
@@ -83,106 +84,82 @@ class InsertCachedAttention(BaseTransform):
 
         return meta_nodes_extra
 
-    @staticmethod
-    def _is_flashinfer_cached_attn_op(cached_attn_op) -> bool:
-        """Return True if cached_attn_op is FlashInfer's paged cached-attention op.
+    def _get_backend_name(self) -> str:
+        """Get the backend name for registry lookup.
 
-        We keep this check isolated since OpOverload equality can be brittle in some environments.
+        Returns:
+            Backend name string (e.g., "flashinfer", "triton", "torch").
         """
-        try:
-            # Use string comparison to be robust against different op object instances
-            return "flashinfer_attention_mha_with_cache" in str(cached_attn_op)
-        except Exception:
-            return False
+        cached_attn_op = self.attn_descriptor.get_cached_attention_op()
+        op_str = str(cached_attn_op)
+        if "flashinfer" in op_str:
+            return "flashinfer"
+        elif "triton" in op_str:
+            return "triton"
+        else:
+            return "torch"
 
-    def _maybe_init_vlm_custom_mask(
+    def _process_custom_mask_markers(
         self,
         gm: GraphModule,
         cm: CachedSequenceInterface,
         meta_nodes_std: List[Node],
     ) -> None:
-        """Initialize VLM custom mask node if VLM inputs are present in the graph.
+        """Process custom_mask_marker nodes and replace with actual mask computation.
 
-        This method is model-agnostic: it checks for VLM inputs based on graph metadata
-        (_vlm_inputs) set during export, then inserts the generic create_attention_mask op.
+        This method finds all custom_mask_marker nodes inserted during export,
+        looks up the registered generator for (model_type, backend), and replaces
+        each marker with the actual mask computation.
 
-        The generated mask provides model-specific attention patterns (e.g., bidirectional
-        for image tokens in Gemma3). Sliding window constraints are handled separately
-        by the backend (e.g., FlashInfer's window_left parameter).
+        Args:
+            gm: The GraphModule being transformed.
+            cm: CachedSequenceInterface for adding inputs.
+            meta_nodes_std: Standard metadata nodes (includes cu_seqlen).
         """
-        # Only relevant for FlashInfer backend
-        cached_attn_op = self.attn_descriptor.get_cached_attention_op()
-        if not self._is_flashinfer_cached_attn_op(cached_attn_op):
-            self._vlm_custom_mask_node = None
+        # Find all custom_mask_marker nodes
+        marker_nodes = [
+            n for n in gm.graph.nodes if is_op(n, torch.ops.auto_deploy.custom_mask_marker)
+        ]
+
+        if not marker_nodes:
             return
 
-        if hasattr(self, "_vlm_custom_mask_node"):
-            return
+        backend = self._get_backend_name()
 
-        # Check for VLM metadata (model-agnostic)
-        vlm_inputs = getattr(gm, VlmMetadataKeys.GRAPH_INPUTS, [])
-        model_type = getattr(gm, VlmMetadataKeys.GRAPH_MODEL_TYPE, None)
+        # Group markers by model_type to potentially share masks
+        # (generators can cache internally by sliding_window, etc.)
+        for marker_node in marker_nodes:
+            # Extract args from marker
+            model_type = marker_node.args[0]
+            layer_idx = marker_node.args[1]
+            # metadata is passed as JSON string because torch.library.custom_op
+            # only supports primitive types; deserialize here for generators
+            metadata_json = marker_node.args[2]
+            metadata = json.loads(metadata_json)
 
-        if not vlm_inputs or model_type is None:
-            self._vlm_custom_mask_node = None
-            return
+            # Look up generator
+            generator = CustomMaskGeneratorRegistry.get(model_type, backend)
+            if generator is None:
+                raise ValueError(
+                    f"No custom mask generator registered for "
+                    f"(model_type={model_type}, backend={backend}). "
+                    f"Registered keys: {CustomMaskGeneratorRegistry.registered_keys()}"
+                )
 
-        # Find the VLM input node (first available from vlm_inputs)
-        vlm_input_node = None
-        for input_name in vlm_inputs:
-            nodes = gm.graph.find_nodes(op="placeholder", target=input_name)
-            if nodes:
-                vlm_input_node = nodes[0]
-                break
-
-        if vlm_input_node is None:
-            self._vlm_custom_mask_node = None
-            return
-
-        # Add seq_len as graph input if not already present
-        seq_len_node = self._add_or_retrieve_input(gm, cm, "seq_len")
-
-        # Get cu_seqlen from standard metadata (index 1 in FlashInfer standard args)
-        cu_seqlen_node = meta_nodes_std[1]  # cu_seqlen
-
-        # Find the last placeholder to insert after it
-        node_last_input = gm.graph.find_nodes(op="placeholder", sort=True)[-1]
-
-        # Use sequential inserting_after calls to ensure proper topological ordering
-        with gm.graph.inserting_after(node_last_input):
-            # Flatten the VLM input tensor
-            flatten_node = gm.graph.call_function(
-                torch.ops.aten.reshape.default, args=(vlm_input_node, [-1])
+            # Call generator to create mask node
+            # Generator handles: adding inputs, preprocessing, mask creation, caching
+            mask_node = generator(
+                gm=gm,
+                cm=cm,
+                layer_idx=layer_idx,
+                metadata=metadata,
+                attn_descriptor=self.attn_descriptor,
+                meta_nodes_std=meta_nodes_std,
             )
 
-        with gm.graph.inserting_after(flatten_node):
-            # Convert to boolean mask (e.g., token_type_ids == 1 for image tokens)
-            token_info_node = gm.graph.call_function(
-                torch.ops.aten.eq.Scalar, args=(flatten_node, 1)
-            )
-
-        with gm.graph.inserting_after(token_info_node):
-            # Call the generic mask generation op with model_type for dispatch
-            # sliding_window=-1 means backend handles it (FlashInfer uses window_left)
-            custom_mask_node = gm.graph.call_function(
-                torch.ops.auto_deploy.create_attention_mask.default,
-                args=(token_info_node, cu_seqlen_node, seq_len_node, -1, model_type),
-            )
-
-        self._vlm_custom_mask_node = custom_mask_node
-
-    def _get_vlm_custom_mask_node(self, cached_attn_op) -> Optional[Node]:
-        """Get the VLM custom mask node for FlashInfer attention ops.
-
-        All layers receive the same mask - it provides bidirectional attention
-        for image tokens. Sliding window is handled separately by window_left.
-
-        Returns:
-            The custom mask node, or None if not a FlashInfer op or no VLM.
-        """
-        if not self._is_flashinfer_cached_attn_op(cached_attn_op):
-            return None
-        return getattr(self, "_vlm_custom_mask_node", None)
+            # Replace marker with actual mask node
+            marker_node.replace_all_uses_with(mask_node)
+            gm.graph.erase_node(marker_node)
 
     def _process_metadata_extra(
         self, gm: GraphModule, cm: CachedSequenceInterface, any_source_attn_node: Node
@@ -212,6 +189,23 @@ class InsertCachedAttention(BaseTransform):
         """Process the cache nodes by inserting a cached attention replacement op."""
         return add_graph_input(gm, cache_name)
 
+    def _get_custom_mask_for_attn_node(self, attn_node: Node) -> Optional[Node]:
+        """Get the custom mask node for an attention node.
+
+        The attn_mask kwarg points to the mask node after marker replacement
+        during _process_custom_mask_markers.
+
+        Args:
+            attn_node: The source attention node.
+
+        Returns:
+            The custom mask node, or None if no custom mask.
+        """
+        attn_mask = attn_node.kwargs.get("attn_mask")
+        if attn_mask is not None and isinstance(attn_mask, Node):
+            return attn_mask
+        return None
+
     def _insert_cached_attn_node(
         self,
         gm: GraphModule,
@@ -226,7 +220,7 @@ class InsertCachedAttention(BaseTransform):
         """Insert a cached attention node into the graph."""
         with gm.graph.inserting_before(attn_node):
             cached_attn_op = self.attn_descriptor.get_cached_attention_op()
-            custom_mask_node = self._get_vlm_custom_mask_node(cached_attn_op)
+            custom_mask_node = self._get_custom_mask_for_attn_node(attn_node)
             args = (
                 *qkv_nodes,
                 custom_mask_node,
@@ -281,7 +275,8 @@ class InsertCachedAttention(BaseTransform):
 
         buffer_in_lookup: Dict[str, Node] = {}
 
-        self._maybe_init_vlm_custom_mask(gm, cm, meta_nodes_std)
+        # Process custom_mask_marker nodes (markers inserted at export time)
+        self._process_custom_mask_markers(gm, cm, meta_nodes_std)
 
         # replace fused attention node with attention node that has kv cache
         num_cached_attn_replacements = 0

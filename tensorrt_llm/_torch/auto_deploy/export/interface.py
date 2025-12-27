@@ -5,11 +5,55 @@ This module defines the base classes and interfaces for all export patches.
 
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, List, Optional, Type, Union, final
+from typing import Any, Callable, Dict, List, Optional, Sequence, Type, Union, final
 
+import torch
 from pydantic import BaseModel, Field
 
 from ..utils.logger import ad_logger
+
+
+class AdditionalGraphInput(ABC):
+    """Base class for inputs added to the GraphModule beyond the nn.Module forward signature captured during export.
+
+    These inputs are injected into the exported graph by transformations (e.g., custom
+    mask generators via _get_or_add_graph_input).
+
+    Subclasses define the input name, whether it needs bypass prefix, and how to create placeholders.
+    """
+
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """Original input name (e.g., 'token_type_ids')."""
+        pass
+
+    @property
+    def needs_bypass(self) -> bool:
+        """Whether this input needs _ad_ prefix to bypass outer model kwargs consumption.
+
+        Some models consume inputs in the outer model but don't pass them to inner
+        submodules. The _ad_ prefix allows the input to flow through **kwargs.
+        Defaults to False.
+        """
+        return False
+
+    @property
+    def graph_input_name(self) -> str:
+        """The name used for this input in the graph."""
+        return f"_ad_{self.name}" if self.needs_bypass else self.name
+
+    @abstractmethod
+    def create_placeholder(self, input_ids: Sequence[Sequence[int]]) -> torch.Tensor:
+        """Create a placeholder tensor when the actual input is not provided.
+
+        Args:
+            input_ids: The input token IDs for all sequences in the batch.
+
+        Returns:
+            A tensor placeholder with appropriate shape and dtype.
+        """
+        pass
 
 
 class ExportPatchError(Exception):
@@ -231,6 +275,21 @@ class ExportPatchRegistry:
     def list_patches(cls) -> List[str]:
         """List all registered patch names."""
         return list(cls._registry.keys())
+
+    @classmethod
+    def get_additional_graph_inputs(cls) -> List[AdditionalGraphInput]:
+        """Get all additional graph inputs from all registered patches.
+
+        These are inputs added to the GraphModule beyond the original nn.Module forward
+        signature. Each input knows how to create its own placeholder when not provided.
+
+        Returns:
+            List of AdditionalGraphInput instances from all registered patches.
+        """
+        inputs: List[AdditionalGraphInput] = []
+        for patch_cls in cls._registry.values():
+            inputs.extend(getattr(patch_cls, "ADDITIONAL_GRAPH_INPUTS", []))
+        return inputs
 
 
 @contextmanager

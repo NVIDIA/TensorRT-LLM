@@ -19,6 +19,7 @@ from torch.fx import Node
 from torch.types import Number
 
 from ...._utils import nvtx_range
+from ..export.interface import ExportPatchRegistry
 from ..utils.logger import ad_logger
 
 Constant = Union[int, float, str, None]
@@ -797,6 +798,7 @@ class SequenceInfo:
             cache_loc=cache_loc,  # vanilla page assignments
             pages_per_seq=pages_per_seq,  # vanilla page assignments
             slot_idx=slot_idx,  # vanilla slot indices
+            skip_placeholders_creation=True,  # Don't create placeholders during export
             **extra_args,
         )
 
@@ -821,6 +823,7 @@ class SequenceInfo:
         After reset the sequence information should correspond to a "generate-only" batch of
         sequences (b, s==1) without cache history.
         """
+        self._extra_args = {}  # Clear extra args on reset
         self.set_generate_only_batch()
 
     @staticmethod
@@ -903,6 +906,7 @@ class SequenceInfo:
         logits_gather_info: Optional[Sequence[int]] = None,
         _gather_idx: Optional[Sequence[int]] = None,
         _mask_scatter_indices: Optional[Sequence[int]] = None,
+        skip_placeholders_creation: bool = False,
         **extra_args: Dict[str, Union[torch.Tensor, Sequence[torch.Tensor]]],
     ) -> None:
         """Create and store sequence information for the next forward pass.
@@ -1036,9 +1040,25 @@ class SequenceInfo:
             self._store_arg("_mask_scatter_indices", _mask_scatter_indices, force_copy=True)
 
         ### UPDATE EXTRA INPUTS ####################################################################
-        self._extra_args = {}
+        # Preserve VLM bypass inputs (_ad_ prefixed) for decode-only batches.
+        # In prefill/mixed batches, extra_args provides fresh values that overwrite these.
+        # In decode-only batches, these serve as placeholders - the mask generator
+        # returns early (num_contexts == 0) without accessing them.
+        preserved = {k: v for k, v in self._extra_args.items() if k.startswith("_ad_")}
+        self._extra_args = preserved
         for key, value in extra_args.items():
             self._store_extra_arg(key, value)
+
+        # Create additional graph input placeholders if expected but not provided.
+        # This handles text-only requests to models with additional graph inputs (e.g., VLMs).
+        # Placeholder creation is skipped during export (set_example_sequence) to avoid
+        # polluting captured_kwargs with inputs that are added post-export by transformations.
+        if not skip_placeholders_creation:
+            additional_inputs = ExportPatchRegistry.get_additional_graph_inputs()
+            for add_input in additional_inputs:
+                if add_input.graph_input_name not in self._extra_args:
+                    placeholder = add_input.create_placeholder(input_ids)
+                    self._store_extra_arg(add_input.graph_input_name, placeholder)
 
         ### BATCH COPY TO DEVICE ###################################################################
         # Perform a single async H2D copy for all device tensors
