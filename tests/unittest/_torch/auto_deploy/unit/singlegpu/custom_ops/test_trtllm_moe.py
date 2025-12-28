@@ -307,7 +307,9 @@ FP8_TEST_DTYPES = [
 @pytest.mark.parametrize("top_k", TOP_K_VALUES)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
 @pytest.mark.parametrize("itype, otype, wtype", FP8_TEST_DTYPES)
-@pytest.mark.parametrize("activation_func", [ActivationType.Silu, ActivationType.Relu2])
+@pytest.mark.parametrize(
+    "activation_func", [ActivationType.Silu, ActivationType.Swiglu, ActivationType.Relu2]
+)
 @pytest.mark.skipif(
     not fp8_compatible() or not trtllm_ops_available(),
     reason="Requires fp8 and trtllm support",
@@ -411,18 +413,12 @@ def test_trtllm_fused_moe_fp8(
         x,  # Note! unquantized input is expected
         selected_experts.to(torch.int),
         routing_weights,
-        w1_weight=w1_weight.contiguous(),
-        w2_weight=w2_weight.contiguous(),
-        w3_weight=w3_weight.contiguous(),
-        w1_input_scale=hidden_states_scale.unsqueeze(0),
-        w2_input_scale=w2_input_scale,
-        w3_input_scale=w3_input_scale,
-        w1_weight_scale=w1_scales,
-        w2_weight_scale=w2_scales,
-        w3_weight_scale=w3_scales,
-        gemm1_dequant=gemm1_dequant,
-        gemm2_act_quant=gemm2_act_quant,
-        gemm2_dequant=gemm2_dequant,
+        fc1_expert_weights=w31_weight.contiguous() if is_gated_mlp else w1_weight.contiguous(),
+        fc2_expert_weights=w2_weight.contiguous(),
+        fc1_act_scale=hidden_states_scale.unsqueeze(0),
+        fc1_dequant_scale=gemm1_dequant,
+        fc2_act_scale_reciprocal=gemm2_act_quant,
+        fc2_dequant_scale=gemm2_dequant,
         is_gated_mlp=is_gated_mlp,
         act_fn=activation_func,
     )

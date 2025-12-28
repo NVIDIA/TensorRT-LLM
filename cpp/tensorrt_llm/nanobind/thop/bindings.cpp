@@ -18,6 +18,7 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/vector.h>
+#include <tensorrt_llm/kernels/helixAllToAll.h>
 #include <tensorrt_llm/thop/attentionOp.h>
 #include <tensorrt_llm/thop/moeAlltoAllMeta.h>
 #include <torch/extension.h>
@@ -38,9 +39,9 @@ void initBindings(nb::module_& m)
     m.def("attention", &torch_ext::attention,
         // Parameters with default values using std::nullopt for optional arguments
         nb::arg("q"), nb::arg("k") = std::nullopt, nb::arg("v") = std::nullopt, nb::arg("output"),
-        nb::arg("output_sf") = std::nullopt, nb::arg("out_dtype") = std::nullopt, nb::arg("workspace_") = std::nullopt,
-        nb::arg("sequence_length"), nb::arg("host_past_key_value_lengths"), nb::arg("host_total_kv_lens"),
-        nb::arg("context_lengths"), nb::arg("host_context_lengths"), nb::arg("host_request_types"),
+        nb::arg("output_sf") = std::nullopt, nb::arg("workspace_") = std::nullopt, nb::arg("sequence_length"),
+        nb::arg("host_past_key_value_lengths"), nb::arg("host_total_kv_lens"), nb::arg("context_lengths"),
+        nb::arg("host_context_lengths"), nb::arg("host_request_types"),
         nb::arg("kv_cache_block_offsets") = std::nullopt, nb::arg("host_kv_cache_block_offsets") = std::nullopt,
         nb::arg("host_kv_cache_pool_pointers") = std::nullopt, nb::arg("host_kv_cache_pool_mapping") = std::nullopt,
         nb::arg("cache_indirection") = std::nullopt, nb::arg("kv_scale_orig_quant") = std::nullopt,
@@ -73,5 +74,10 @@ void initBindings(nb::module_& m)
         nb::arg("mla_bmm1_scale") = std::nullopt, nb::arg("mla_bmm2_scale") = std::nullopt,
         nb::arg("quant_q_buffer") = std::nullopt, "Multi-head attention operation",
         nb::call_guard<nb::gil_scoped_release>());
+
+    m.def(
+        "get_helix_workspace_size_per_rank",
+        [](int cp_size) { return tensorrt_llm::kernels::computeHelixWorkspaceSizePerRank(cp_size); },
+        nb::arg("cp_size"), "Get helix all-to-all workspace size per rank in bytes");
 }
 } // namespace tensorrt_llm::nanobind::thop

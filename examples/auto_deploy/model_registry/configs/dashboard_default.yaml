@@ -3,7 +3,7 @@
 
 runtime: trtllm
 attn_backend: flashinfer
-compile_backend: torch-compile
+compile_backend: torch-cudagraph
 model_factory: AutoModelForCausalLM
 skip_loading_weights: false
 max_seq_len: 512

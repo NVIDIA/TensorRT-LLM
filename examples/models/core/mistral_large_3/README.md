@@ -7,6 +7,21 @@ export mistral_large_3_model_path=<mistral_large_3_model_path>
 export mistral_large_3_eagle_model_path=<mistral_large_3_eagle_model_path>
 ```
 
+## Multimodal run
+
+* Run the Mistral Large V3 by `quickstart_multimodal.py`
+
+```bash
+mpirun -n 1 --allow-run-as-root --oversubscribe python3 examples/llm-api/quickstart_multimodal.py \
+    --model_dir ${mistral_large_3_model_path} \
+    --tp_size 4 \
+    --moe_ep_size 4 \
+    --max_tokens 100 \
+    --checkpoint_format mistral \
+    --model_type mistral_large_3 \
+    --moe_backend TRTLLM
+```
+
 ## LLM-only run
 
 * Run the Mistral Large V3 by `quickstart_advanced.py`
@@ -44,9 +59,6 @@ echo "
 backend: pytorch
 tensor_parallel_size: 4
 moe_expert_parallel_size: 4
-enable_attention_dp: false
-kv_cache_config:
-  enable_block_reuse: true
 checkpoint_format: mistral
 " > serve.yml
 mpirun -n 1 --allow-run-as-root --oversubscribe python3 -m tensorrt_llm.commands.serve serve \

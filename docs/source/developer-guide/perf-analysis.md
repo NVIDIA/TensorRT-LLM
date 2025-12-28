@@ -98,3 +98,80 @@ TLLM_PROFILE_START_STOP=100-150 nsys profile \
 The Nsight Systems reports will be saved to `trace.nsys-rep`. Use NVIDIA Nsight Systems application to open it.
 
 The PyTorch profiler results will be saved to `trace.json`. Use [chrome://tracing/](chrome://tracing/) to inspect the saved profile.
+
+## MoE Expert Load Balance Analysis (Perfect Router)
+
+For Mixture-of-Experts (MoE) models, performance can vary significantly based on how tokens are routed to experts. Uneven expert load distribution can cause some GPUs to be overloaded while others are underutilized, leading to suboptimal throughput.
+
+TensorRT-LLM provides the `ENABLE_PERFECT_ROUTER` environment variable to help analyze and isolate expert load balancing issues from kernel performance.
+
+### What It Does
+
+When enabled, this feature **bypasses the learned router** and replaces it with pre-computed, perfectly load-balanced routing logits. This creates an idealized scenario where tokens are distributed evenly across all experts and GPUs.
+
+Key behaviors:
+- The learned gate/router is still computed (to maintain realistic timing)
+- The gate output is **discarded** and replaced with ideal balanced logits
+- Logits are pre-computed and cached for common batch sizes to minimize overhead
+- Works with all MoE backends (CUTLASS, TRTLLM, TRITON)
+
+```{warning}
+This feature is for **performance analysis only**. It produces **incorrect model outputs** because the learned router decisions are discarded. Never use this in production inference.
+```
+
+### When to Use It
+
+Use `ENABLE_PERFECT_ROUTER` when you want to:
+
+1. **Establish performance upper bounds**: Measure the theoretical best-case MoE throughput when expert loads are perfectly balanced.
+
+2. **Isolate routing bottlenecks**: Compare performance with vs. without perfect routing to determine if the learned router is causing load imbalance issues.
+
+3. **Test different load balancing strategies**: Validate that MoE kernels and communication patterns behave correctly with balanced loads before implementing custom routing logic.
+
+4. **Benchmark kernel efficiency**: Remove routing variability to get consistent, reproducible kernel performance measurements.
+
+### How to Enable
+
+Set the environment variable before running your workload. This works with both `trtllm-bench` and `trtllm-serve`:
+
+```bash
+export ENABLE_PERFECT_ROUTER=1
+```
+
+### Example Workflow
+
+```bash
+# Step 1: Benchmark with normal (learned) routing
+trtllm-bench ...
+# or
+trtllm-serve ...
+
+# Step 2: Benchmark with perfect routing (upper bound)
+ENABLE_PERFECT_ROUTER=1 trtllm-bench ...
+# or
+ENABLE_PERFECT_ROUTER=1 trtllm-serve ...
+
+# Step 3: Compare the throughput numbers
+# If perfect router shows >10% improvement, routing imbalance is significant
+```
+
+### Interpreting Results
+
+| Scenario | Interpretation |
+|----------|----------------|
+| Similar performance with/without perfect router | Router load balancing is not a bottleneck; focus optimization efforts elsewhere |
+| Significant improvement with perfect router | The learned router is causing load imbalance; consider router optimization or load balancing strategies |
+
+### Supported Models
+
+```{note}
+This feature currently requires model-specific integration. The plumbing to support perfect routing must be added to each MoE model implementation. If you need this feature for a model that doesn't yet support it, you will need to add the integration following the pattern used in existing implementations.
+```
+
+```{note}
+The perfect router logits are specifically designed for `RenormalizeMoeRoutingMethod` (TopK first, then Softmax). Models using other routing methods such as `DefaultMoeRoutingMethod` or `DeepSeekV3MoeRoutingMethod` would require adapting the logit generation logic to match their routing behavior.
+```
+
+Currently supported:
+- GPT-OSS (uses `RenormalizeMoeRoutingMethod`)

@@ -77,7 +77,7 @@ class AccuracyConfig:
 # Note: Only log_file is used by AccuracyParser (accuracy_parser.py)
 # The regex pattern is hardcoded in AccuracyParser._extract_accuracy_values()
 _COMMON_ACCURACY_METRICS = MetricsConfig(
-    log_file="accuracy_eval.log",
+    log_file="7_accuracy_eval.log",
     extractor_pattern=r"\|([a-zA-Z0-9_-]+)\|.*?\|([\w-]+)\|.*?\|exact_match\|.*?\|([0-9.]+)\|",
     metric_names=["flexible-extract", "strict-match"],
 )
@@ -85,7 +85,7 @@ _COMMON_ACCURACY_METRICS = MetricsConfig(
 DEFAULT_METRICS_CONFIG = {
     # Performance test default configuration
     ("disagg", "perf"): MetricsConfig(
-        log_file="bench.log",
+        log_file="6_bench.log",
         extractor_pattern=r"""
             ^.*?Median\ TTFT\ \(ms\):\s+([0-9.]+).*?$\n
             (?:.*\n)*?
@@ -96,7 +96,7 @@ DEFAULT_METRICS_CONFIG = {
         metric_names=["SERVER_MEDIAN_TTFT", "SERVER_MEDIAN_E2EL"],
     ),
     ("wideep", "perf"): MetricsConfig(
-        log_file="bench.log",
+        log_file="6_bench.log",
         extractor_pattern=r"""
             ^.*?Mean\ TTFT\ \(ms\):\s+([0-9.]+).*?$\n
             (?:.*\n)*?
@@ -478,6 +478,7 @@ class ConfigLoader:
             ("environment", "model_path"): lambda: self._get_full_model_path(config),
             ("slurm", "script_file"): lambda: self._get_script_file(config),
             ("slurm", "set_segment"): lambda: EnvManager.get_slurm_set_segment(),
+            ("slurm", "extra_args"): lambda: EnvManager.get_slurm_extra_args(),
         }
 
         # Apply overrides based on field paths
