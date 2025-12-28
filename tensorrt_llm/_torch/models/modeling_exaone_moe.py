@@ -9,6 +9,7 @@ from torch import nn
 from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._torch.modules.qk_norm_attention import QKNormRoPEAttention
 from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -84,6 +85,10 @@ def check_is_moe(config: ExaoneMoEConfig, layer_idx: int) -> bool:
     return hasattr(config, "is_moe_layer") and config.is_moe_layer[layer_idx]
 
 
+def enable_attn_allreduce(mapping: Mapping):
+    return not mapping.enable_attention_dp or mapping.has_tp()
+
+
 class ExaoneMoeAttention(QKNormRoPEAttention):
     def __init__(
         self,
@@ -126,6 +131,7 @@ class ExaoneMoeAttention(QKNormRoPEAttention):
             dtype=config.torch_dtype,
             config=model_config,
             disable_deep_gemm=disable_deep_gemm,
+            reduce_output=enable_attn_allreduce(model_config.mapping),
         )
 
     def forward(
