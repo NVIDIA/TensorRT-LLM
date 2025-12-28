@@ -1931,6 +1931,16 @@ class BaseLlmArgs(StrictBaseModel):
 
     # Below are all remaining arguments
 
+    model_kwargs: Dict[str, Any] = Field(
+        default_factory=dict,
+        description=
+        "Extra kwargs for the model config class to customize the model config. "
+        "These arguments take precedence over default values or config values in the model config "
+        "file. Arguments are resolved in order: 1) Default values in model config class, 2) Values "
+        "in model config file, 3) Values in model_kwargs. Note: if a kwarg doesn't exist in the "
+        "model config class, it will be ignored.",
+        status="beta")
+
     pipeline_parallel_size: int = Field(
         default=1, description="The pipeline parallel size.")
 
