@@ -1480,7 +1480,8 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
         if (stageIsInterrupted) {
             echo "Stage is interrupted, skip to upload test result."
         } else {
-            sh 'if [ "$(id -u)" -eq 0 ]; then dmesg || true; fi'
+            // Temporarily disable to reduce the log size
+            // sh 'if [ "$(id -u)" -eq 0 ]; then dmesg || true; fi'
             if (noResultIfSuccess && !stageIsFailed) {
                 // Clean up the workspace
                 sh """
@@ -2623,7 +2624,8 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         def containerPortNum = GlobalState.PORT_SECTION_SIZE
 
         // Some clusters do not allow dmesg -C so we add || true
-        sh 'if [ "$(id -u)" -eq 0 ]; then dmesg -C || true; fi'
+        // Temporarily disable to reduce the log size
+        // sh 'if [ "$(id -u)" -eq 0 ]; then dmesg -C || true; fi'
         def pytestCommand = getPytestBaseCommandLine(
             llmSrc,
             stageName,
