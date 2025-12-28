@@ -1239,17 +1239,6 @@ def _shard_parameter_node(
 
     rank, world_size = config.rank, config.world_size
     allreduce_strategy = config.allreduce_strategy.name
-    # num_users = num_users_of_weight_node(node)
-    # if num_users > 1 or num_users == 0:
-    #     ad_logger.warning(
-    #         f"Weight node {node} has {num_users} users. This is not supported for sharding. Skipping."
-    #     )
-    #     return
-    # # get weight and bias key
-    # weight_key, bias_key = extract_param_names_from_node(node)
-
-    # modname = weight_key.rpartition(".")[0]
-    # submod = gm.get_submodule(modname)
 
     # # Shard weight using the unified function (also updates the parameter)
     # original_weight = gm.get_parameter(weight_key)

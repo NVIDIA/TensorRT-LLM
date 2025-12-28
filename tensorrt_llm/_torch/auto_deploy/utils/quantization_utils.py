@@ -117,7 +117,6 @@ def should_skip_quantization(
     else:
         if not (is_linear_op(node_or_name) or is_bmm_op(node_or_name)):
             return True
-        # param_names, _ = extract_param_names_from_node(node_or_name)
         weight_name = extract_weight_name(node_or_name)
         modname = weight_name.rpartition(".")[0]
 

@@ -269,7 +269,7 @@ def extract_weight_nodes(node: Node) -> WeightNodes:
 
 def num_users_of_weight_node(node: Node) -> int:
     """Returns the number of users of the weight node of the given parametrized node."""
-    weight_node = extract_weight_nodes(node)[0]
+    weight_node = extract_weight_nodes(node).weights[0].node
     return len(weight_node.users) if weight_node is not None else 0
 
 
