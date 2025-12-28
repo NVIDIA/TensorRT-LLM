@@ -3,6 +3,7 @@ import datetime
 import functools
 import os
 import pickle  # nosec B403
+import statistics
 import threading
 import time
 import traceback
@@ -307,6 +308,14 @@ class PyExecutor:
         self.kv_connector_manager = kv_connector_manager
 
         self._maybe_init_kv_connector_manager()
+
+        # Schedule timing statistics
+        self._schedule_total_times: List[float] = []
+        self._schedule_request_times: List[float] = []
+        self._balance_adp_times: List[float] = []
+        self._waiting_request_times: List[float] = []
+        self._schedule_count = 0
+        self._schedule_log_interval = 200
 
         if start_worker:
             self.start_worker()
@@ -1975,27 +1984,72 @@ class PyExecutor:
 
     @nvtx_range("_schedule")
     def _schedule(self):
+        # Start total timing
+        total_start = time.perf_counter()
+
+        # Time schedule_request
+        t0 = time.perf_counter()
         scheduler_output = self.scheduler.schedule_request(
             self.active_requests, self.inflight_req_ids)
+        t1 = time.perf_counter()
+        self._schedule_request_times.append((t1 - t0) * 1e6)  # microseconds
+
         scheduled_context_requests = scheduler_output.context_requests
         if self.enable_attention_dp and self.attention_dp_enable_balance:
+            # Time balance_adp_requests
+            t2 = time.perf_counter()
             scheduled_context_requests = self._balance_adp_requests(
                 scheduler_output.context_requests,
                 scheduler_output.generation_requests)
+            t3 = time.perf_counter()
+            self._balance_adp_times.append((t3 - t2) * 1e6)  # microseconds
 
         # If no generation requests, no need to wait, to avoid dead waiting
         should_check_waiting = not self.enable_attention_dp and self.enable_batch_waiting and len(
             scheduler_output.context_requests) > 0 and len(
                 scheduler_output.generation_requests) > 0
         if should_check_waiting:
+            # Time waiting_requests
+            t4 = time.perf_counter()
             scheduled_context_requests = self._waiting_requests(
                 scheduler_output.context_requests,
                 scheduler_output.generation_requests)
+            t5 = time.perf_counter()
+            self._waiting_request_times.append((t5 - t4) * 1e6)  # microseconds
 
         scheduled_requests = ScheduledRequests()
         scheduled_requests.context_requests = scheduled_context_requests
         scheduled_requests.generation_requests = scheduler_output.generation_requests
         scheduled_requests.paused_requests = scheduler_output.paused_requests
+
+        # Record total timing
+        total_end = time.perf_counter()
+        self._schedule_total_times.append((total_end - total_start) * 1e6)  # microseconds
+
+        # Log cumulative statistics every N schedules
+        self._schedule_count += 1
+        if self._schedule_count % self._schedule_log_interval == 0:
+            scheduler_type = "PyScheduler" if os.getenv("TLLM_USE_PYTHON_SCHEDULER", "0") == "1" else "CppScheduler"
+            total_avg = statistics.mean(self._schedule_total_times)
+            total_median = statistics.median(self._schedule_total_times)
+            sched_avg = statistics.mean(self._schedule_request_times)
+            sched_median = statistics.median(self._schedule_request_times)
+            log_msg = (
+                f"[{scheduler_type}] Schedule count: {self._schedule_count}, "
+                f"total - Avg: {total_avg:.2f} us, Median: {total_median:.2f} us, "
+                f"schedule_request - Avg: {sched_avg:.2f} us, Median: {sched_median:.2f} us"
+            )
+            if self._balance_adp_times:
+                balance_avg = statistics.mean(self._balance_adp_times)
+                balance_median = statistics.median(self._balance_adp_times)
+                log_msg += f", balance_adp - Avg: {balance_avg:.2f} us, Median: {balance_median:.2f} us"
+            if self._waiting_request_times:
+                waiting_avg = statistics.mean(self._waiting_request_times)
+                waiting_median = statistics.median(self._waiting_request_times)
+                log_msg += f", waiting_request - Avg: {waiting_avg:.2f} us, Median: {waiting_median:.2f} us"
+            logger.info(log_msg)
+            print(f"[SCHEDULE_STATS] {log_msg}", flush=True)
+
         return scheduled_requests, scheduler_output.fitting_disagg_gen_init_requests, scheduler_output.num_fitting_requests
 
     @nvtx_range("_check_disagg_gen_transfer_status")
