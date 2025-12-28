@@ -231,7 +231,8 @@ def extract_weight_nodes(node: Node) -> WeightNodes:
                 WeightNode(
                     node=node.args[1],
                     node_key=node.args[1].target,
-                    tensor=gm.get_parameter(node.args[1].target),
+                    tensor=get_const_tensor(node.args[1].target, gm),
+                    submod=gm.get_submodule(node.args[1].target.rpartition(".")[0]),
                 )
             ],
             [],

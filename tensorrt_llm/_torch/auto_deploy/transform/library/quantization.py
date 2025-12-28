@@ -140,6 +140,7 @@ class Quantization(BaseTransform):
         The state_dict is also updated to contain the sharded weights.
         """
         weight_nodes = extract_weight_nodes(node)
+        assert len(weight_nodes.weights) == 1, "Expected exactly one weight node"
         lin_weight = weight_nodes.weights[0]
         new_param = nn.Parameter(self.quantize_weight(lin_weight.tensor), requires_grad=False)
         modname, _, attrname = lin_weight.node_key.rpartition(".")
