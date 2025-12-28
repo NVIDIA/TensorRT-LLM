@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Set up error handling
-set -Eeuo pipefail
+set -xEeuo pipefail
 trap 'rc=$?; echo "Error in file ${BASH_SOURCE[0]} on line $LINENO: $BASH_COMMAND (exit $rc)"; exit $rc' ERR
 
 slurm_install_setup() {
@@ -23,8 +23,10 @@ slurm_install_setup() {
         gpuUuids=$(nvidia-smi -q | grep "GPU UUID" | awk '{print $4}' | tr '\n' ',' || true)
         hostNodeName="${HOST_NODE_NAME:-$(hostname -f || hostname)}"
         echo "HOST_NODE_NAME = $hostNodeName ; GPU_UUIDS = $gpuUuids ; STAGE_NAME = $stageName"
+        echo "(Writing install lock) Current directory: $(pwd)"
         touch install_lock.lock
     else
+        echo "(Waiting for install lock) Current directory: $(pwd)"
         while [ ! -f install_lock.lock ]; do
             sleep 5
         done

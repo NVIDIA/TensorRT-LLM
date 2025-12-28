@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Set up error handling
-set -Eeuo pipefail
+set -xEeuo pipefail
 trap 'rc=$?; echo "Error in file ${BASH_SOURCE[0]} on line $LINENO: $BASH_COMMAND (exit $rc)"; exit $rc' ERR
 
 cd $resourcePathNode
@@ -29,10 +29,8 @@ set_value_in_command() {
     echo "$result"
 }
 
-# Only the first process will save the job ID and set the git config
+# Only the first process will set the git config
 if [ $SLURM_PROCID -eq 0 ]; then
-    # Save job ID in $jobWorkspace/slurm_job_id.txt for later job to retrieve
-    echo $SLURM_JOB_ID > $jobWorkspace/slurm_job_id.txt
     # Update HOME/.gitconfig
     if ! git config --global --get-all safe.directory | grep -Fxq "*"; then
         git config --global --add safe.directory "*"
