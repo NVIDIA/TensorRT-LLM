@@ -273,16 +273,6 @@ def num_users_of_weight_node(node: Node) -> int:
     return len(weight_node.users) if weight_node is not None else 0
 
 
-def extract_param_names_from_node(node: Node) -> Tuple[List[str], Optional[List[str]]]:
-    """Extracts the name of the parameter associated with the given parametrized node.
-
-    Args:
-        node: node with weight parameters in the graph.
-    """
-    weight_nodes, bias_nodes = extract_weight_nodes(node)
-    return [n.node_key for n in weight_nodes], [n.node_key for n in bias_nodes]
-
-
 def get_op_overload_packet(node: Union[OpOverloadPacket, OpOverload]) -> OpOverloadPacket:
     """Get the overload packet from the op overload."""
     if isinstance(node, OpOverloadPacket):
@@ -1024,10 +1014,10 @@ def shape(node: Node) -> Tuple[int, ...]:
     return node.meta["val"].shape
 
 
-def get_weight_tensor(gm: GraphModule, node: Node) -> "torch.Tensor":
+def get_weight_tensor(node: Node) -> torch.Tensor:
     """Extract the weight tensor from a node within a GraphModule."""
-    weight_name = extract_param_names_from_node(node)[0]
-    return gm.get_parameter(weight_name)
+    weight_nodes = extract_weight_nodes(node)
+    return weight_nodes.weights[0].tensor
 
 
 def draw_graph(gm: GraphModule, filename: str):
