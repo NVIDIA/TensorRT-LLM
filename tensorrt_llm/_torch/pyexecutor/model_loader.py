@@ -361,7 +361,8 @@ class ModelLoader:
             use_low_precision_moe_combine=self.llm_args.moe_config.
             use_low_precision_moe_combine,
             nvfp4_gemm_allowed_backends=self.llm_args.nvfp4_gemm_config.
-            allowed_backends)
+            allowed_backends,
+            model_kwargs=self.llm_args.model_kwargs)
 
         # Store nvfp4 config in extra_attrs for Linear layer access
         config.extra_attrs[
@@ -373,9 +374,13 @@ class ModelLoader:
             config, self.llm_args.kv_cache_config.mamba_ssm_cache_dtype)
 
         # Allow overriding the number of layers via environment variable
+        # Note: This is kept for backward compatibility, but model_kwargs is preferred
         num_layers_override = int(os.environ.get("TLLM_OVERRIDE_LAYER_NUM",
                                                  "0"))
         if num_layers_override > 0:
+            logger.warning(
+                f"TLLM_OVERRIDE_LAYER_NUM is deprecated. Use model_kwargs instead: "
+                f"model_kwargs={{'num_hidden_layers': {num_layers_override}}}")
             config.pretrained_config.num_hidden_layers = num_layers_override
             for sub_config in ["text_config", "vision_config"]:
                 if hasattr(config.pretrained_config, sub_config):
