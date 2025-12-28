@@ -585,8 +585,10 @@ def get_all_layer_subgraphs(gm: GraphModule) -> List[List[Node]]:
         # closing is the last linear node in the layer
         layer_subgraph = get_layer_after_linear_node(linear_nodes, terminating_indices)
         if layer_subgraph.opening_nodes is not None and len(layer_subgraph.opening_nodes) > 0:
-            unprocessed_linear_nodes -= set(layer_subgraph.opening_nodes) | set(
-                [layer_subgraph.terminating_node]
+            unprocessed_linear_nodes -= (
+                set(layer_subgraph.opening_nodes)
+                | set([layer_subgraph.terminating_node])
+                | set(layer_subgraph.subgraph_nodes)
             )
             layer_subgraphs.append(layer_subgraph)
         last_lin_index = terminating_indices[-1] + 1

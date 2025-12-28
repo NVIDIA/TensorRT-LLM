@@ -2238,7 +2238,6 @@ def detect_column_row_shard(
     min_local_shape is the minimum size of the local tensor shard, to prevent TP parallelism
     splitting, e.g., the individual heads into smaller shards.
     """
-    # test_moe_variants()
     ad_logger.debug("Before sharding graph: " + str(gm))
     config = transform_container.config
     world_size = config.world_size
@@ -2343,7 +2342,7 @@ def detect_column_row_shard(
     # simple shard remaining linear nodes
     if config.shard_all_unprocessed:
         num_simple_shards += _process_simple_shard(unprocessed_linear_nodes, transform_container)
-    num_column_row_shards += num_ssm_shards
+    num_column_row_shards += num_ssm_shards + num_mla_shards
     num_shards = num_simple_shards + num_column_row_shards
     ad_logger.info(
         f"Heuristics found {num_shards} TP shards. Simple: {num_simple_shards}, "
