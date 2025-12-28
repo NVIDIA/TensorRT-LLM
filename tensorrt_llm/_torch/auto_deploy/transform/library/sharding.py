@@ -39,6 +39,7 @@ from ...utils.node_utils import (
     LayerSubgraph,
     LayerType,
     bfs,
+    extract_weight_name,
     extract_weight_nodes,
     filtered_nodes,
     get_all_layer_subgraphs,
@@ -1186,10 +1187,6 @@ def shard_weight_tensor(
             fused_dims: list = fused_weight_dims,
             d: int = dim,
         ) -> torch.Tensor:
-            # dim_d = t.shape[d]
-            # num_parts = 1
-            # part_size = dim_d // num_parts
-            # fused_dims = [part_size] * num_parts
             return torch.cat(
                 [split_tensor(w) for w in torch.split(t, fused_dims, dim=d)],
                 dim=d,
@@ -1257,10 +1254,10 @@ def _shard_parameter_node(
     # # Shard weight using the unified function (also updates the parameter)
     # original_weight = gm.get_parameter(weight_key)
     weight_nodes = extract_weight_nodes(node)
-    for weight_node, bias_node in weight_nodes:
+    for weight_node in weight_nodes.weights:
         _, weight_new_shape = shard_weight_tensor(
             gm=gm,
-            weight_tensor=weight_node.node,
+            weight_tensor=weight_node.tensor,
             param_key=weight_node.node_key,
             dim=dim,
             rank=rank,
@@ -1268,12 +1265,24 @@ def _shard_parameter_node(
             min_local_shape=min_local_shape,
             fused_weight_dims=fused_weight_dims,
         )
+        if quantization_cb is not None:
+            quantization_cb(
+                gm=gm,
+                submod=weight_node.submod,
+                node=node,
+                weight_key=weight_node.node_key,
+                weight_new_shape=weight_new_shape,
+                dim=dim,
+                rank=rank,
+                world_size=world_size,
+            )
 
-        if bias_node is not None and dim == 0:
+    for bias_node in weight_nodes.biases:
+        if dim == 0:
             # update bias for dim 0 --> we can handle it like the weight
             shard_weight_tensor(
                 gm=gm,
-                weight_tensor=bias_node.node,
+                weight_tensor=bias_node.tensor,
                 param_key=bias_node.node_key,
                 dim=dim,
                 rank=rank,
@@ -1293,18 +1302,6 @@ def _shard_parameter_node(
             setattr(bias_node.submod, bias_param_name, None)
             gm._register_load_state_dict_pre_hook(
                 partial(_load_hook_remove, param_key=bias_node.node_key)
-            )
-
-        if quantization_cb is not None:
-            quantization_cb(
-                gm=gm,
-                submod=weight_node.submod,
-                node=node,
-                weight_key=weight_node.node_key,
-                weight_new_shape=weight_new_shape,
-                dim=dim,
-                rank=rank,
-                world_size=world_size,
             )
 
     # # # column shard with no gather: the output is sharded
@@ -2052,9 +2049,9 @@ def detect_sharding_from_config(
 
     for lin_node in linear_nodes:
         # use node's weight name to get the module name
-        module_name = extract_weight_nodes(lin_node)[0].target
+        weight_name = extract_weight_name(lin_node)
 
-        if any(attn_name in module_name for attn_name in attn_names):
+        if any(attn_name in weight_name for attn_name in attn_names):
             # find the next attention node and infer the head_dim
             next_attention_node, _ = bfs(
                 lin_node, is_any_attention_op, attr_next="users", include_root=False
@@ -2078,7 +2075,7 @@ def detect_sharding_from_config(
             # Then we escape dots, and finally we replace @ with .*
             pattern_string = pattern_string.replace("*", "@")
             pattern_regex = re.escape(pattern_string).replace("@", ".*")
-            if re.match(pattern_regex, module_name):
+            if re.match(pattern_regex, weight_name):
                 # we have a match. Get the config for this layer
                 config = tp_plan[key]
 
@@ -2117,7 +2114,7 @@ def detect_sharding_from_config(
                 elif "local" in config:
                     # Check if this applies to shared experts in EP parallelism.
                     # If yes, apply the TP col-row shard.
-                    if "shared" in module_name:
+                    if "shared" in weight_name:
                         col_row_action = config.replace("local_", "")
                         if col_row_action == "colwise":
                             transform_container.add(
