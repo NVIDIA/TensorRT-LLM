@@ -110,7 +110,7 @@ class BatchedLogitsProcessor(ABC):
 
 
 # default sampling parameters
-_DEFAULT_SAMPLING_PARAMS: dict = {
+DEFAULT_SAMPLING_PARAMS: dict = {
     "repetition_penalty": 1.0,
     "temperature": 1.0,
     "top_p": 1.0,
@@ -430,7 +430,7 @@ class SamplingParams:
                 self._stop_word_ids = [generation_config.eos_token_id]
 
         # load default sampling params from generation_config or defaults if not set by user
-        for key, default_value in _DEFAULT_SAMPLING_PARAMS.items():
+        for key, default_value in DEFAULT_SAMPLING_PARAMS.items():
             if getattr(self, key) is None:
                 try:
                     value = generation_config[key]
