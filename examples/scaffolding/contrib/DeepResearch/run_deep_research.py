@@ -7,6 +7,7 @@ from tensorrt_llm.scaffolding import (
     ChatTokenCounter,
     MCPWorker,
     QueryCollector,
+    TaskMetricsCollector,
     TaskTimer,
     TRTOpenaiWorker,
 )
@@ -33,7 +34,11 @@ async def main():
     await mcp_worker.init_in_asyncio_event_loop()
 
     llm = create_open_deep_research_scaffolding_llm(
-        generation_worker, mcp_worker, max_tokens=4096, enable_statistics=args.enable_statistics, enable_query_collector=args.enable_query_collector
+        generation_worker,
+        mcp_worker,
+        max_tokens=16384,
+        enable_statistics=args.enable_statistics,
+        enable_query_collector=args.enable_query_collector,
     )
 
     prompt = """
@@ -54,6 +59,7 @@ async def main():
         print("token counting info: " + str(token_counting_info))
         timer_info = TaskTimer.get_global_info()
         print("timer info: " + str(timer_info))
+        TaskMetricsCollector.export_to_json("task_metrics.json")
 
     if args.enable_query_collector:
         QueryCollector.get_global_info()
@@ -61,7 +67,7 @@ async def main():
 
     llm.shutdown()
     generation_worker.shutdown()
-    await mcp_worker.shutdown()
+    mcp_worker.shutdown()
     return
 
 

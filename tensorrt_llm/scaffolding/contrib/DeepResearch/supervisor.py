@@ -32,7 +32,6 @@ from .prompts import (
     compress_system_prompt,
     compress_system_prompt_prefix,
     final_report_generation_prompt,
-    final_report_generation_prompt_prefix,
     generate_research_brief_prompt,
     generate_research_brief_prompt_prefix,
     supervisor_system_prompt,
@@ -62,8 +61,8 @@ class SupervisorTask(Task):
 @drop_kv_cache_scope()
 class Supervisor(Controller):
     tools = [conduct_research_tool, complete_research_tool, think_tool]
-    max_research_iter = 3
-    max_concurrent_research_units = 5
+    max_research_iter = 12
+    max_concurrent_research_units = 8
 
     def __init__(
         self,
@@ -120,7 +119,8 @@ class Supervisor(Controller):
             ],
             tools=self.tools,
         )
-        prompt_index = len(research_planning_task.messages)
+
+        findings = []
 
         for _ in range(self.max_research_iter):
             yield from self.research_planning_controller.process([research_planning_task])
@@ -165,18 +165,17 @@ class Supervisor(Controller):
                     research_planning_task.add_message(
                         UserMessage(research_tasks[0].research_result)
                     )
+                    findings.append(research_tasks[0].research_result)
 
-        final_report_generation_task = ChatTask.create_from_prompt(
-            user_prompt=research_brief,
-            system_prompts=[
+        final_report_generation_task = ChatTask.create_from_messages(
+            [
                 SystemMessage(
                     final_report_generation_prompt.format(
                         research_brief=research_brief,
                         messages=research_planning_task.messages_to_dict_content(),
-                        findings=research_planning_task.messages_to_dict_content(prompt_index + 1),
+                        findings=findings,
                         date=get_today_str(),
                     ),
-                    prefix=final_report_generation_prompt_prefix,
                 ),
             ],
         )
@@ -219,7 +218,7 @@ class FinalReportController(NativeGenerationController):
 def create_open_deep_research_scaffolding_llm(
     generation_worker: Worker,
     mcp_worker: Worker,
-    max_tokens: int = 16 * 1024,
+    max_tokens: int = 16384,
     max_parallel_requests: int = 1024,
     enable_statistics: bool = False,
     enable_query_collector: bool = False,
@@ -265,7 +264,9 @@ def create_open_deep_research_scaffolding_llm(
             QueryCollector,
         )(chat_with_mcp_type)
 
-    research_chat_with_tools_controller = chat_with_mcp_type(gerneration_controller)
+    research_chat_with_tools_controller = chat_with_mcp_type(
+        gerneration_controller, max_iterations=1
+    )
     research_compress_controller = compressor_type(
         gerneration_controller,
         system_prompts=[
