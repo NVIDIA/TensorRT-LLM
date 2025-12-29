@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -430,6 +430,7 @@ _torch_dtype_to_np_typestr_dict = {
     torch.qint8: "|u1",
     torch.bool: "|b1",
     torch.bfloat16: "<f2",
+    torch.uint8: "|u1",
 }
 
 
@@ -473,10 +474,20 @@ def dim_resolve_negative(dim, ndim):
     return tuple(pos)
 
 
-def get_free_port():
-    with socket.socket() as sock:
-        sock.bind(("", 0))
-        return sock.getsockname()[1]
+def get_free_port() -> int:
+    return get_free_ports(1)[0]
+
+
+def get_free_ports(num=1) -> List[int]:
+    sockets = [
+        socket.socket(socket.AF_INET, socket.SOCK_STREAM) for _ in range(num)
+    ]
+    for s in sockets:
+        s.bind(('', 0))
+    ports = [s.getsockname()[1] for s in sockets]
+    for s in sockets:
+        s.close()
+    return ports
 
 
 # mpi4py only exports MPI_COMM_TYPE_SHARED, so we define OMPI_COMM_TYPE_HOST here
@@ -551,7 +562,15 @@ def mpi_world_size():
 
 
 def local_mpi_rank():
-    return local_comm.Get_rank() if ENABLE_MULTI_DEVICE else 0
+    if mpi_disabled():
+        # For Ray/non-MPI: the device was already set during worker init
+        # torch.cuda.current_device() returns the correct local device ID
+        try:
+            return torch.cuda.current_device()
+        except ValueError:
+            return 0
+    return mpi_comm().Get_rank() % torch.cuda.device_count(
+    ) if ENABLE_MULTI_DEVICE else 0
 
 
 def local_mpi_size():

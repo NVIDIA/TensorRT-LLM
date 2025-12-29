@@ -122,7 +122,7 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
         # ============================================================================
 
         # Get the allreduce strategy from shared_config
-        strategy = shared_config.sharding_transform_container.allreduce_strategy.name
+        strategy = shared_config.sharding_transform_container.config.allreduce_strategy.name
 
         # TRT-LLM backend (MPI mode) - two patterns for different addition orders
         _allreduce_residual_rmsnorm_pattern_trtllm = _make_allreduce_residual_rmsnorm_pattern(

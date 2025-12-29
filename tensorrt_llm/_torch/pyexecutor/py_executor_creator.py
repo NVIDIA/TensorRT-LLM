@@ -743,7 +743,5 @@ def create_py_executor(
     if mapping.rank == 0:
         logger.info(f"LLM Args:\n{llm_args}")
 
-    logger.info(f"{llm_args}")
-
     py_executor.start_worker()
     return py_executor

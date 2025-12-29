@@ -16,6 +16,7 @@ from enum import IntEnum
 from typing import List
 
 import torch
+from torch.distributed import ProcessGroup
 
 from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
 from tensorrt_llm._utils import mpi_disabled
@@ -518,23 +519,23 @@ class Mapping(MappingBase):
 
     # DeviceMesh specific methods
     @property
-    def tp_group_pg(self):
+    def tp_group_pg(self) -> ProcessGroup:
         raise NotImplementedError("tp_group_pg is not implemented.")
 
     @property
-    def pp_group_pg(self):
+    def pp_group_pg(self) -> ProcessGroup:
         raise NotImplementedError("pp_group_pg is not implemented.")
 
     @property
-    def cp_group_pg(self):
+    def cp_group_pg(self) -> ProcessGroup:
         raise NotImplementedError("cp_group_pg is not implemented.")
 
     @property
-    def moe_tp_group_pg(self):
+    def moe_tp_group_pg(self) -> ProcessGroup:
         raise NotImplementedError("moe_tp_group_pg is not implemented.")
 
     @property
-    def moe_ep_group_pg(self):
+    def moe_ep_group_pg(self) -> ProcessGroup:
         raise NotImplementedError("moe_ep_group_pg is not implemented.")
 
     def build_mesh(self):

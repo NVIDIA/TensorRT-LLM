@@ -140,7 +140,7 @@ class DeepseekV3WeightLoader:
         self.model_config = model.model_config
         self.is_draft_model = is_draft_model
 
-    def load_weights(self, weights: Dict):
+    def load_weights(self, weights: Dict, skip_modules: List[str] = []):
 
         def rename_moe_weight(weights: Dict, rename_rules: Dict):
             result = {}
@@ -282,6 +282,8 @@ class DeepseekV3WeightLoader:
         for name, module in tqdm(all_named_modules.items(),
                                  desc="Loading weights"):
             if len(module._parameters) <= 0 or name.startswith("draft_model"):
+                continue
+            elif any(skip_module in name for skip_module in skip_modules):
                 continue
             else:
                 names = name.split('.')
@@ -518,7 +520,7 @@ class DeepseekV3Linear(Linear):
                      layer_idx: Optional[int] | None = None):
         num_tokens = input.shape[0]
         if (not self.has_any_quant and 1 <= num_tokens <= 16
-                and get_sm_version() != 120):
+                and get_sm_version() not in [120, 121]):
             output = torch.ops.trtllm.dsv3_fused_a_gemm_op(
                 input, self.weight.t(), bias, None)
         else:
@@ -1452,12 +1454,13 @@ class DeepseekV3Model(DecoderModel):
         config = model_config.pretrained_config
         self.vocab_size = config.vocab_size
         self.num_hidden_layers = config.num_hidden_layers
-        aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
+        aux_stream_list = [torch.cuda.Stream() for _ in range(4)]
         self.aux_stream_dict = {
             AuxStreamType.Attention: aux_stream_list[0],
             AuxStreamType.MoeShared: aux_stream_list[0],
             AuxStreamType.MoeChunkingOverlap: aux_stream_list[1],
             AuxStreamType.MoeBalancer: aux_stream_list[2],
+            AuxStreamType.MoeOutputMemset: aux_stream_list[3],
         }
 
         self.embed_tokens = Embedding(

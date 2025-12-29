@@ -57,11 +57,12 @@ class RawRequestResponseHooks(ResponseHooks):
         self.raw_req = raw_req
         self.ctx_server = ""
         self.gen_server = ""
+        self.request_arrival_time = raw_req.state.server_arrival_time
         self.server_first_token_time = 0
         self.perf_metrics_collector = perf_metrics_collector
 
     def on_req_begin(self, request: UCompletionRequest):
-        ...
+        self.perf_metrics_collector.queue_latency_seconds.observe(get_steady_clock_now_in_seconds() - self.request_arrival_time)
 
     def on_ctx_resp(self, ctx_server: str, response: UCompletionResponse):
         self.ctx_server = ctx_server
@@ -93,8 +94,8 @@ class OpenAIDisaggServer:
         self._metrics_interval_secs = metrics_interval_secs
 
         self._ctx_servers, self._gen_servers = get_ctx_gen_server_addrs(config.server_configs)
-        self._ctx_router = create_router(config.ctx_router_config, self._ctx_servers, metadata_server_cfg, create_metadata_server(metadata_server_cfg))
-        self._gen_router = create_router(config.gen_router_config, self._gen_servers, metadata_server_cfg, create_metadata_server(metadata_server_cfg))
+        self._ctx_router = create_router(config.ctx_router_config, self._ctx_servers, metadata_server_cfg, create_metadata_server(metadata_server_cfg), self._sync_server_clock)
+        self._gen_router = create_router(config.gen_router_config, self._gen_servers, metadata_server_cfg, create_metadata_server(metadata_server_cfg), self._sync_server_clock)
         self._metadata_server = create_metadata_server(metadata_server_cfg)
         self._perf_metrics_collector = DisaggPerfMetricsCollector(config.perf_metrics_max_requests)
 
@@ -122,8 +123,10 @@ class OpenAIDisaggServer:
 
         @asynccontextmanager
         async def lifespan(app) -> None:
+            # Prepare servers (sync server clock) when static ctx/gen server list is used
+            await self._ctx_router.prepare_servers()
+            await self._gen_router.prepare_servers()
             await self._service.setup()
-            await self._set_steady_clock_offsets()
             yield
             await self._service.teardown()
 
@@ -133,6 +136,7 @@ class OpenAIDisaggServer:
 
         @self.app.exception_handler(RequestValidationError)
         async def validation_exception_handler(_, exc):
+            self._perf_metrics_collector.validation_exceptions.inc()
             return JSONResponse(status_code=400, content={"error": str(exc)})
 
         self.register_routes()
@@ -158,8 +162,14 @@ class OpenAIDisaggServer:
     def _wrap_entry_point(self, entry_point: Callable) -> Callable:
         async def wrapper(req: UCompletionRequest, raw_req: Request) -> Response:
             try:
+                self._perf_metrics_collector.total_requests.inc()
+                if req.stream:
+                    self._perf_metrics_collector.stream_requests.inc()
+                else:
+                    self._perf_metrics_collector.nonstream_requests.inc()
                 hooks = RawRequestResponseHooks(raw_req, self._perf_metrics_collector)
                 response_or_generator = await entry_point(req, hooks)
+                self._perf_metrics_collector.total_responses.inc()
                 if req.stream:
                     return StreamingResponse(content=response_or_generator, media_type="text/event-stream")
                 else:
@@ -173,9 +183,11 @@ class OpenAIDisaggServer:
             logger.error("CppExecutorError: ", traceback.format_exc())
             signal.raise_signal(signal.SIGINT)
         elif isinstance(exception, HTTPException):
+            self._perf_metrics_collector.http_exceptions.inc()
             logger.error(f"HTTPException {exception.status_code} {exception.detail}: ", traceback.format_exc())
             raise exception
         else:
+            self._perf_metrics_collector.internal_errors.inc()
             logger.error("Internal server error: ", traceback.format_exc())
             raise HTTPException(status_code=500, detail=f"Internal server error {str(exception)}")
 
@@ -199,13 +211,12 @@ class OpenAIDisaggServer:
                                 timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
         await uvicorn.Server(config).serve(sockets=sockets)
 
-    # TODO: rework this for service discovery, now it's only for static server list
-    async def _set_steady_clock_offsets(self):
-        STEADY_CLOCK_OFFSET_ENDPOINT = "/steady_clock_offset"
+    async def _sync_server_clock(self, server: str):
+        """ Sync the ctx/gen server's steady clock with the disagg-server's steady clock (in case NTP service is not running). """
         async def query_steady_clock_offset(session: aiohttp.ClientSession, server_url: str) -> tuple[Optional[float], Optional[float]]:
             try:
                 originate_ts = get_steady_clock_now_in_seconds()
-                async with session.get(server_url + STEADY_CLOCK_OFFSET_ENDPOINT) as response:
+                async with session.get(server_url) as response:
                     destination_ts = get_steady_clock_now_in_seconds()
                     if response.status == 200:
                         response_content = await response.json()
@@ -222,12 +233,11 @@ class OpenAIDisaggServer:
 
         async def set_steady_clock_offset(session: aiohttp.ClientSession, server_url: str, offset: float) -> None:
             payload = {"offset": offset}
-            async with session.post(server_url + STEADY_CLOCK_OFFSET_ENDPOINT, json=payload) as response:
+            async with session.post(server_url, json=payload) as response:
                 if response.status != 200:
                     logger.warning(f"Cannot set disagg server steady clock offset for server {server_url}, the perf metrics timestamps could be mis-aligned")
 
         async def align_steady_clock_offset(session: aiohttp.ClientSession, server_url: str) -> None:
-            server_url = f"http://{server_url}" if not server_url.startswith("http://") else server_url
             delay, offset = await query_steady_clock_offset(session, server_url)
             if delay is None or offset is None:
                 logger.warning(f"Unable to measure steady clock offset for {server_url}; skipping adjustment")
@@ -236,7 +246,13 @@ class OpenAIDisaggServer:
             # Negate the offset so that worker servers can adjust their steady clock by adding the new offset
             await set_steady_clock_offset(session, server_url, -offset)
 
-        async with aiohttp.ClientSession(
-            connector=aiohttp.TCPConnector(limit=0, limit_per_host=0, force_close=True),
-            timeout=aiohttp.ClientTimeout(total=self._req_timeout_secs)) as session:
-            await asyncio.gather(*[align_steady_clock_offset(session, server_url) for server_url in self._ctx_servers + self._gen_servers])
+        server_scheme = "http://" if not server.startswith("http://") else ""
+        server_url = f"{server_scheme}{server}/steady_clock_offset"
+
+        try:
+            async with aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(limit=0, limit_per_host=0, force_close=True),
+                timeout=aiohttp.ClientTimeout(total=self._req_timeout_secs)) as session:
+                await align_steady_clock_offset(session, server_url)
+        except (aiohttp.ClientError, OSError) as e:
+            logger.warning(f"Unable to align steady clock offset for {server_url}: {e}; skipping adjustment")

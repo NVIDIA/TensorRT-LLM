@@ -487,11 +487,12 @@ def test_llm_get_kv_cache_events_tp2():
     # created + stored events
     assert events and len(events) >= 2
     for event in events:
+        print(f"event: {event}")
         if event:
-            if event[0]["event_id"] == 0:
-                assert event[0]["data"]["type"] == "created"
-            elif event[0]["event_id"] == 1:
-                assert event[0]["data"]["type"] == "stored"
+            if event["event_id"] == 0:
+                assert event["data"]["type"] == "created"
+            elif event["event_id"] == 1:
+                assert event["data"]["type"] == "stored"
 
 
 @pytest.fixture(scope="module")

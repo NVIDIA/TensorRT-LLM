@@ -1,20 +1,38 @@
 import itertools
 import os
+import pickle
+import sys
 import tempfile
 from typing import Any, List
 
+import cloudpickle
+import pytest
 import torch
+from mpi4py import MPI
 
+import tensorrt_llm
 import tensorrt_llm._torch.autotuner as autotuner
-from tensorrt_llm._torch.autotuner import (AutoTuner, DynamicDim,
-                                           DynamicTensorSpec, FakeTensor,
-                                           OptimizationProfile, StaticDim,
-                                           TunableRunner, TuningConfig,
-                                           autotune)
+from tensorrt_llm._torch.autotuner import (AutoTuner, DistributedTuningStrategy,
+                                           DynamicDim, DynamicTensorSpec,
+                                           FakeTensor, OptimizationProfile,
+                                           StaticDim, TunableRunner,
+                                           TuningConfig, autotune)
 from tensorrt_llm._torch.utils import (get_power_of_2_num_tokens_buckets,
                                        next_positive_power_of_2)
 from tensorrt_llm.bindings.internal.runtime import delay_kernel
 from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import Mapping
+
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
+cloudpickle.register_pickle_by_value(sys.modules[__name__])
+MPI.pickle.__init__(
+    cloudpickle.dumps,
+    cloudpickle.loads,
+    pickle.HIGHEST_PROTOCOL,
+)
+
+# needed since we reuse the mpi executor pool, first test running will leak a thread
+pytestmark = pytest.mark.threadleak(enabled=False)
 
 
 def test_multi_dynamic_dims():
@@ -599,3 +617,105 @@ def test_kernel_testing_mismatched_ops():
         assert "Custom op mismatch" in error_msg, f"Expected 'Custom op mismatch' in error message, got: {error_msg}"
         assert "test_op_A" in error_msg, f"Expected 'test_op_A' in error message, got: {error_msg}"
         assert "test_op_B" in error_msg, f"Expected 'test_op_B' in error message, got: {error_msg}"
+
+
+class DistributedGemmRunner(TunableRunner):
+
+    def __init__(self, prefer_tactics: List[int] = [0, 1]):
+        self.prefer_tactics = prefer_tactics
+
+    def get_valid_tactics(self, inputs, profile, **kwargs):
+        # Return all tactics so merge strategy can choose between them
+        return self.prefer_tactics
+
+    def forward(self, inputs, *, tactic=-1, **kwargs):
+        # tactic 0 is slower
+        if tactic % 2 == 0:
+            for _ in range(5):
+                inputs[0] @ inputs[1]
+        return inputs[0] @ inputs[1]
+
+    def unique_id(self):
+        return ()
+
+
+def _distributed_worker_function(world_size, strategy):
+    """Worker function to run on each MPI rank."""
+    rank = tensorrt_llm.mpi_rank()
+    mapping = Mapping(world_size=world_size,
+                      rank=rank,
+                      tp_size=world_size,
+                      pp_size=1)
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    tuner.setup_distributed_state(mapping)
+
+    x = torch.randn(16, 32, device='cuda')
+    w = torch.randn(32, 64, device='cuda')
+    inputs = [x, w]
+
+    if strategy == DistributedTuningStrategy.PARALLEL:
+        # All ranks get the same set of tactics
+        prefer_tactics = [0, 1, 2, 3]
+    else:
+        # Each rank prefers different tactics
+        prefer_tactics = [rank]
+    runner = DistributedGemmRunner(prefer_tactics=prefer_tactics)
+    config = TuningConfig(distributed_tuning_strategy=strategy)
+
+    cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)
+    with autotune(tune_mode=True, cache_path=cache_path):
+        tuner.choose_one(custom_op=f"test_distributed_{strategy}",
+                         runners=[runner],
+                         tuning_config=config,
+                         inputs=inputs)
+    selected_runner, best_tactic = tuner.choose_one(
+        custom_op=f"test_distributed_{strategy}",
+        runners=[runner],
+        tuning_config=config,
+        inputs=inputs)
+
+    if strategy == DistributedTuningStrategy.BROADCAST:
+        # All ranks should select tactic 0
+        assert best_tactic == 0
+    elif strategy == DistributedTuningStrategy.INDEPENDENT:
+        # Each rank should select the tactic it prefers
+        assert best_tactic == rank
+    elif strategy == DistributedTuningStrategy.MERGE:
+        # Because tactic 0 is slower, two ranks should always select tactic 1
+        assert best_tactic == 1
+    elif strategy == DistributedTuningStrategy.PARALLEL:
+        # Tactic 1 or 3 should be selected since they are faster.
+        # TODO: This might not cover the case that rank1 tunes nothing
+        assert best_tactic % 2 == 1
+    else:
+        assert False, f"Unknown strategy: {strategy}"
+
+    return True
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2,
+                    reason="Requires at least 2 GPUs for this test")
+@pytest.mark.parametrize(
+    "strategy",
+    [
+        DistributedTuningStrategy.BROADCAST,
+        DistributedTuningStrategy.INDEPENDENT,
+        DistributedTuningStrategy.MERGE,
+        DistributedTuningStrategy.PARALLEL,
+    ],
+)
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_distributed_broadcast_strategy(strategy, mpi_pool_executor):
+    """Test broadcast strategy with real MPI processes."""
+    world_size = 2
+    # Use MPIPoolExecutor to run distributed test
+    results = mpi_pool_executor.map(
+        _distributed_worker_function,
+        *zip(*[(
+            world_size,
+            strategy,
+        )] * world_size),
+    )
+    for r in results:
+        assert r is True

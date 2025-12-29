@@ -738,6 +738,9 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/unittest/llmapi/test_llm_multi_gpu.py",
         "tests/unittest/llmapi/test_llm_multi_gpu_pytorch.py",
         "tests/integration/defs/accuracy/test_disaggregated_serving.py",
+        "tests/unittest/_torch/ray_orchestrator/multi_gpu/",
+        "tests/integration/defs/examples/test_ray.py",
+        "tests/unittest/llmapi/test_async_llm.py",
     ]
 
     def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
@@ -1238,7 +1241,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
     def dockerBuildJob = [
         "Build-Docker-Images": {
             script {
-                stage("[Build-Docker-Images] Remote Run") {
+                def testStageName = "[Build-Docker-Images] ${env.localJobCredentials ? "Remote Run" : "Run"}"
+                stage(testStageName) {
                     def branch = env.gitlabBranch ? env.gitlabBranch : "main"
                     if (globalVars[GITHUB_PR_API_URL]) {
                         branch = "github-pr-" + globalVars[GITHUB_PR_API_URL].split('/').last()

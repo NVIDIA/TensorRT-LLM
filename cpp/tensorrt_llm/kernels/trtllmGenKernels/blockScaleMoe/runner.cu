@@ -70,7 +70,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
 {
     if (routingMethodType == RoutingMethodType::DeepSeekV3)
     {
-        TLLM_CHECK_WITH_INFO(topK <= 8, "For DeepSeek routing method, must have topK <= 8");
+        TLLM_CHECK_WITH_INFO(topK <= 22, "For DeepSeek routing method, must have topK <= 22");
         TLLM_CHECK_WITH_INFO(topkGroup <= 4, "For DeepSeek routing method, must have topkGroup <= 4");
         moe::dev::routing::routingDeepSeek::Data routingData;
         routingData.mDtypeExpW = btg::Dtype::Bfloat16;

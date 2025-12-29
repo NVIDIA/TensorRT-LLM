@@ -1010,6 +1010,17 @@ class TestMoeFp4:
                 id="RoutingDSv3"),
             pytest.param(
                 {
+                    "num_experts": 512,
+                    "top_k": 22,
+                    "n_groups": 1,
+                    "top_k_groups": 1,
+                    "routed_scaling": 2.5,
+                    "has_routing_bias": True,
+                    "routing_method_type": RoutingMethodType.DeepSeekV3
+                },
+                id="RoutingDS_SuperV3"),
+            pytest.param(
+                {
                     "num_experts": 72,
                     "top_k": 6,
                     "n_groups": 1,
@@ -1238,7 +1249,7 @@ class TestMoeFp4:
             pytest.skip("https://nvbugs/5434352")
 
         assert top_k <= num_experts
-        assert top_k <= 10
+        assert top_k <= 22
         assert num_experts % 4 == 0
 
         if use_topk_as_input:

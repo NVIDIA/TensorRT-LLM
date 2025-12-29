@@ -35,44 +35,18 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
-from cutlass._mlir.dialects import math, nvvm
+from cutlass._mlir.dialects import math
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cute.typing import Float32
-from cutlass.cutlass_dsl import T, dsl_user_op
 
 from .custom_pipeline import PipelineCpAsyncUmma
-from .utils import is_power_of_2
-
-
-@dsl_user_op
-def fmin(
-    a: Union[float, Float32], b: Union[float, Float32], *, nan=False, loc=None, ip=None
-) -> Float32:
-    return Float32(
-        nvvm.fmin(
-            T.f32(),
-            Float32(a).ir_value(loc=loc, ip=ip),
-            Float32(b).ir_value(loc=loc, ip=ip),
-            nan=nan,
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-def sigmoid_f32(a: Union[float, Float32], fastmath: bool = False) -> Union[float, Float32]:
-    """
-    Compute the sigmoid of the input tensor.
-    """
-    return cute.arch.rcp_approx(1.0 + cute.math.exp(-a, fastmath=fastmath))
-
-
-def silu_f32(a: Union[float, Float32], fastmath: bool = False) -> Union[float, Float32]:
-    """
-    Compute the silu of the input tensor.
-    """
-    return a * sigmoid_f32(a, fastmath=fastmath)
-
+from .utils import (
+    TRTLLM_ENABLE_PDL,
+    fmin,
+    griddepcontrol_launch_dependents,
+    griddepcontrol_wait,
+    is_power_of_2,
+    silu_f32,
+)
 
 """
 High-performance persistent blockscaled contiguous grouped dense GEMM with gather and SwiGLU fusion
@@ -202,8 +176,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
     :param sf_vec_size: Scalefactor vector size (16 for NVF4, 32 for MXF4/MXF8).
     :type sf_vec_size: int
-    :param acc_dtype: Data type of the accumulator (e.g., cutlass.Float32).
-    :type acc_dtype: Type[cutlass.Numeric]
     :param mma_tiler_mn: Shape of the Matrix Multiply-Accumulate (MMA) tile (M,N).
         Note: use_2cta_instrs is automatically inferred from mma_tiler_mn[0]
         (True when M=256, False when M=128).
@@ -243,7 +215,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         >>> # (True when M=256, False when M=128)
         >>> gemm = BlockScaledContiguousGatherGroupedGemmKernel(
         ...     sf_vec_size=16,
-        ...     acc_dtype=cutlass.Float32,
         ...     mma_tiler_mn=(256, 128),  # use_2cta_instrs=True since M=256
         ...     cluster_shape_mn=(2, 1),
         ...     vectorized_f32=True,
@@ -269,11 +240,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
     def __init__(
         self,
         sf_vec_size: int,
-        acc_dtype: Type[cutlass.Numeric],
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
         vectorized_f32: bool,
-        topk: int,
+        topk: cutlass.Int64,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with
         gather operation and SwiGLU fusion.
@@ -300,8 +270,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
         :param sf_vec_size: Vector size for scale factors (16 for NVF4, 32 for MXF4/MXF8).
         :type sf_vec_size: int
-        :param acc_dtype: Data type of the accumulator.
-        :type acc_dtype: type[cutlass.Numeric]
         :param mma_tiler_mn: Tuple (M, N) shape of the MMA instruction.
             use_2cta_instrs is automatically set based on M (True if M=256, False if M=128).
         :type mma_tiler_mn: Tuple[int, int]
@@ -310,12 +278,12 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :param vectorized_f32: Enable vectorized f32x2 operations for better performance.
         :type vectorized_f32: bool
         :param topk: Number of experts selected per token (used for token ID mapping).
-        :type topk: int
+        :type topk: cutlass.Int64
         """
 
         self.sf_vec_size = sf_vec_size
         self.topk = topk
-        self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
+        self.acc_dtype = cutlass.Float32
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
         # K dimension is deferred in _setup_attributes
@@ -819,6 +787,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             smem=self.shared_storage.size_in_bytes(),
             stream=stream,
             min_blocks_per_mp=1,
+            use_pdl=TRTLLM_ENABLE_PDL,
         )
         return
 
@@ -1083,7 +1052,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         gC_mnl = cute.local_tile(
             mC_mnl, cute.slice_(self.mma_tiler_c, (None, None, 0)), (None, None, None)
         )
-        k_tile_cnt = cute.size(gA_mkl, mode=[3])
+        k_tile_cnt = cutlass.Int32(cute.size(gA_mkl, mode=[3]))
 
         #
         # Partition global tensor for TiledMMA_A/B/C
@@ -1147,6 +1116,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             cute.arch.cluster_wait()
         else:
             self.cta_sync_barrier.arrive_and_wait()
+
+        griddepcontrol_wait()
 
         #
         # Specialized Schedule warp
@@ -2282,6 +2253,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             #
             c_pipeline.producer_tail()
 
+        griddepcontrol_launch_dependents()
+
     def epilog_tmem_copy_and_partition(
         self,
         tidx: cutlass.Int32,
@@ -2641,7 +2614,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         ab_dtype: Type[cutlass.Numeric],
         sf_dtype: Type[cutlass.Numeric],
         sf_vec_size: int,
-        acc_dtype: Type[cutlass.Numeric],
         c_dtype: Type[cutlass.Numeric],
     ) -> bool:
         """
@@ -2653,8 +2625,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :type sf_dtype: Type[cutlass.Numeric]
         :param sf_vec_size: The vector size of the scale factor
         :type sf_vec_size: int
-        :param acc_dtype: The data type of the accumulator
-        :type acc_dtype: Type[cutlass.Numeric]
         :param c_dtype: The data type of the output tensor
         :type c_dtype: Type[cutlass.Numeric]
 
@@ -2683,8 +2653,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         if ab_dtype in {cutlass.Float8E5M2, cutlass.Float8E4M3FN} and sf_vec_size == 16:
             is_valid = False
 
-        if acc_dtype not in {cutlass.Float32}:
-            is_valid = False
         # Check valid c_dtype
         if c_dtype not in {
             cutlass.Float32,
@@ -2738,7 +2706,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         use_2cta_instrs: bool,
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
-        m_aligned: int,
     ) -> bool:
         """
         Check if the mma tiler and cluster shape are valid
@@ -2749,8 +2716,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :type mma_tiler_mn: Tuple[int, int]
         :param cluster_shape_mn: The (ClusterM, ClusterN) shape of the CTA cluster
         :type cluster_shape_mn: Tuple[int, int]
-        :param m_aligned: The alignment requirement for group M dimension (default: 128)
-        :type m_aligned: int
 
         :return: True if the mma tiler and cluster shape are valid, False otherwise
         :rtype: bool
@@ -2792,21 +2757,14 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         if cluster_tiler_m not in [64, 128, 256]:
             is_valid = False
 
-        # Check if m_aligned is a multiple of cluster_tiler_m
-        # This ensures that each group's M dimension (which is a multiple of m_aligned)
-        # won't be split across tiles, preventing a single tile from loading data
-        # from multiple groups (which would access wrong B matrix data)
-        if m_aligned % mma_tiler_mn[0] != 0:
-            is_valid = False
-
         return is_valid
 
     @staticmethod
     def is_valid_tensor_alignment(
-        m: int,
-        n: int,
-        k: int,
-        l: int,  # noqa: E741
+        m: cutlass.Int64,
+        n: cutlass.Int64,
+        k: cutlass.Int64,
+        l: cutlass.Int64,  # noqa: E741
         ab_dtype: Type[cutlass.Numeric],
         c_dtype: Type[cutlass.Numeric],
         a_major: str,
@@ -2817,13 +2775,13 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         Check if the tensor alignment is valid
 
         :param m: The number of rows in the A tensor
-        :type m: int
+        :type m: cutlass.Int64
         :param n: The number of columns in the B tensor
-        :type n: int
+        :type n: cutlass.Int64
         :param k: The number of columns in the A tensor
-        :type k: int
+        :type k: cutlass.Int64
         :param l: The number of columns in the C tensor
-        :type l: int
+        :type l: cutlass.Int64
         :param ab_dtype: The data type of the A and B operands
         :type ab_dtype: Type[cutlass.Numeric]
         :param c_dtype: The data type of the output tensor
@@ -2859,18 +2817,16 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         ab_dtype: Type[cutlass.Numeric],
         sf_dtype: Type[cutlass.Numeric],
         sf_vec_size: int,
-        acc_dtype: Type[cutlass.Numeric],
         c_dtype: Type[cutlass.Numeric],
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
-        m: int,
-        n: int,
-        k: int,
-        l: int,  # noqa: E741
+        m: cutlass.Int64,
+        n: cutlass.Int64,
+        k: cutlass.Int64,
+        l: cutlass.Int64,  # noqa: E741
         a_major: str,
         b_major: str,
         c_major: str,
-        m_aligned: int,
     ) -> bool:
         """
         Check if the gemm can be implemented
@@ -2881,8 +2837,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :type sf_dtype: Type[cutlass.Numeric]
         :param sf_vec_size: The vector size of the scale factor
         :type sf_vec_size: int
-        :param acc_dtype: The data type of the accumulator
-        :type acc_dtype: Type[cutlass.Numeric]
         :param c_dtype: The data type of the output tensor
         :type c_dtype: Type[cutlass.Numeric]
         :param use_2cta_instrs: Whether to use 2 CTA groups
@@ -2892,21 +2846,19 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :param cluster_shape_mn: The (ClusterM, ClusterN) shape of the CTA cluster
         :type cluster_shape_mn: Tuple[int, int]
         :param m: The number of rows in the A tensor
-        :type m: int
+        :type m: cutlass.Int64
         :param n: The number of columns in the B tensor
-        :type n: int
+        :type n: cutlass.Int64
         :param k: The number of columns in the A tensor
-        :type k: int
+        :type k: cutlass.Int64
         :param l: The number of columns in the C tensor
-        :type l: int
+        :type l: cutlass.Int64
         :param a_major: The major axis of the A tensor
         :type a_major: str
         :param b_major: The major axis of the B tensor
         :type b_major: str
         :param c_major: The major axis of the C tensor
         :type c_major: str
-        :param m_aligned: The alignment requirement for group M dimension (default: 128)
-        :type m_aligned: int
 
         :return: True if the gemm can be implemented, False otherwise
         :rtype: bool
@@ -2914,7 +2866,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         can_implement = True
         # Skip unsupported types
         if not BlockScaledContiguousGatherGroupedGemmKernel.is_valid_dtypes_and_scale_factor_vec_size(
-            ab_dtype, sf_dtype, sf_vec_size, acc_dtype, c_dtype
+            ab_dtype, sf_dtype, sf_vec_size, c_dtype
         ):
             can_implement = False
 
@@ -2924,10 +2876,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         ):
             can_implement = False
 
-        use_2cta_instrs = mma_tiler_mn[0] == 256
         # Skip invalid mma tile shape and cluster shape
+        use_2cta_instrs = mma_tiler_mn[0] == 256
         if not BlockScaledContiguousGatherGroupedGemmKernel.is_valid_mma_tiler_and_cluster_shape(
-            use_2cta_instrs, mma_tiler_mn, cluster_shape_mn, m_aligned
+            use_2cta_instrs, mma_tiler_mn, cluster_shape_mn
         ):
             can_implement = False
         # Skip illegal problem shape for load/store alignment
@@ -2955,11 +2907,11 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         token_id_mapping_ptr: cute.Pointer,
         num_non_exiting_tiles_ptr: cute.Pointer,
         global_sf_ptr: cute.Pointer,
-        orig_m: int,
-        m: int,
-        n: int,
-        k: int,
-        l: int,  # noqa: E741
+        orig_m: cutlass.Int64,
+        m: cutlass.Int64,
+        n: cutlass.Int64,
+        k: cutlass.Int64,
+        l: cutlass.Int64,  # noqa: E741
         tile_size: cutlass.Constexpr,
         scaling_vector_size: cutlass.Constexpr,
         max_active_clusters: cutlass.Constexpr,

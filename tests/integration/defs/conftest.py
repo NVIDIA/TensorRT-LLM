@@ -37,7 +37,6 @@ import tqdm
 import yaml
 from _pytest.mark import ParameterSet
 
-from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
 from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
 
@@ -2211,11 +2210,11 @@ def pytest_generate_tests(metafunc: pytest.Metafunc):
 
 # Test cases that use enable_configurable_moe parameter and need ID conversion
 TESTS_WITH_CONFIGURABLE_MOE = [
-    "TestDeepSeekV3Lite::test_nvfp4_4gpus",
-    "TestDeepSeekV3Lite::test_fp8_block_scales",
-    "TestGPTOSS::test_w4_4gpus",
-    "TestGPTOSS::test_w4_4gpus_online_eplb",
-    "TestQwen3_30B_A3B::test_w4a8_mxfp4",
+    "TestDeepSeekV3Lite::test_nvfp4_4gpus[",
+    "TestDeepSeekV3Lite::test_fp8_block_scales[",
+    "TestGPTOSS::test_w4_4gpus[",
+    "TestGPTOSS::test_w4_4gpus_online_eplb[",
+    "TestQwen3_30B_A3B::test_w4a8_mxfp4[",
 ]
 
 
@@ -2362,6 +2361,7 @@ def pytest_configure(config):
     tqdm.tqdm.monitor_interval = 0
     if config.getoption("--run-ray"):
         os.environ["TLLM_DISABLE_MPI"] = "1"
+        os.environ["TLLM_RAY_FORCE_LOCAL_CLUSTER"] = "1"
 
     # Initialize PeriodicJUnitXML reporter if enabled
     periodic = config.getoption("--periodic-junit", default=False)
@@ -2825,15 +2825,3 @@ def torch_empty_cache() -> None:
         gc.collect()
         torch.cuda.empty_cache()
         gc.collect()
-
-
-@pytest.fixture(autouse=True)
-def ray_cleanup(llm_venv) -> None:
-    yield
-
-    if mpi_disabled():
-        llm_venv.run_cmd([
-            "-m",
-            "ray.scripts.scripts",
-            "stop",
-        ])

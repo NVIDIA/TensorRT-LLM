@@ -460,10 +460,13 @@ void XqaDispatcher::runImpl(
         tllmRunnerParams.cumSeqLensQPtr = cu_seqlens;
         tllmRunnerParams.cumSeqLensKvPtr = reinterpret_cast<int const*>(launchParams.cu_kv_seq_lens);
         // Attention scales device pointers (only fp8 kernels need to load scales from the device memory).
-        tllmRunnerParams.outputScalePtr = reinterpret_cast<float const*>(launchParams.bmm2_scale_ptr);
-        tllmRunnerParams.scaleSoftmaxLog2Ptr = launchParams.bmm1_scale_ptr
-            ? reinterpret_cast<float const*>(launchParams.bmm1_scale_ptr + kIdxScaleSoftmaxLog2Ptr)
-            : nullptr;
+        if (mQDataType == DATA_TYPE_E4M3)
+        {
+            tllmRunnerParams.outputScalePtr = reinterpret_cast<float const*>(launchParams.bmm2_scale_ptr);
+            tllmRunnerParams.scaleSoftmaxLog2Ptr = launchParams.bmm1_scale_ptr
+                ? reinterpret_cast<float const*>(launchParams.bmm1_scale_ptr + kIdxScaleSoftmaxLog2Ptr)
+                : nullptr;
+        }
         tllmRunnerParams.oSfScalePtr = params.fp4_out_sf_scale;
 
         tllmRunnerParams.oPtr = params.output;
@@ -501,6 +504,7 @@ void XqaDispatcher::runImpl(
         tllmRunnerParams.customMaskPtr = params.spec_decoding_bl_tree_mask;
         tllmRunnerParams.customMaskOffsetsPtr = params.spec_decoding_bl_tree_mask_offset;
         tllmRunnerParams.firstSparseMaskOffsetsKvPtr = params.spec_bl_tree_first_sparse_mask_offset_kv;
+        tllmRunnerParams.mSkipSoftmaxThresholdScaleFactor = params.skip_softmax_threshold_scale_factor;
         mTllmGenFMHARunner->run(tllmRunnerParams);
     }
     else

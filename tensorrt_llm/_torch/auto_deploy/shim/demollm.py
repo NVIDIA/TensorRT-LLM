@@ -137,7 +137,7 @@ class DemoEngine(ADEngine):
         context_logits: Optional[List[torch.Tensor]] = None
 
         def _generate_single_step(idx: int):
-            logits = self._compute_logits()
+            logits = sequence_info.unnest_sequences(self._compute_logits())
             logits_last = torch.stack([l_one_seq[-1] for l_one_seq in logits]).float().unsqueeze(1)
 
             token_ids, _ = self._decode_tokens(logits_last, sampling_params)  # [b,1]

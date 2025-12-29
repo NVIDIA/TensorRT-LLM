@@ -4,39 +4,19 @@ set -euo pipefail
 # Parse named arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
-        # Worker configuration
-        --num-ctx-servers) num_ctx_servers="$2"; shift 2 ;;
-        --num-gen-servers) num_gen_servers="$2"; shift 2 ;;
-        --concurrency-list) concurrency_list="$2"; shift 2 ;;
-
-        # Sequence and benchmark parameters
-        --isl) isl="$2"; shift 2 ;;
-        --osl) osl="$2"; shift 2 ;;
-        --multi-round) multi_round="$2"; shift 2 ;;
-        --benchmark-ratio) benchmark_ratio="$2"; shift 2 ;;
-        --streaming) streaming="$2"; shift 2 ;;
-        --use-nv-sa-benchmark) use_nv_sa_benchmark="$2"; shift 2 ;;
+        # Benchmark Configuration
+        --benchmark-mode) benchmark_mode="$2"; shift 2 ;;
 
         # Environment and paths
-        --dataset-file) dataset_file="$2"; shift 2 ;;
-        --model-path) model_path="$2"; shift 2 ;;
         --trtllm-repo) trtllm_repo="$2"; shift 2 ;;
         --work-dir) work_dir="$2"; shift 2 ;;
         --full-logdir) full_logdir="$2"; shift 2 ;;
+        --container-name) container_name="$2"; shift 2 ;;
         --container-mount) container_mount="$2"; shift 2 ;;
         --container-image) container_image="$2"; shift 2 ;;
         --build-wheel) build_wheel="$2"; shift 2 ;;
         --cuda-architectures) cuda_architectures="$2"; shift 2 ;;
         --trtllm-wheel-path) trtllm_wheel_path="$2"; shift 2 ;;
-
-        # Accuracy evaluation
-        --enable-accuracy-test) enable_accuracy_test="$2"; shift 2 ;;
-        --accuracy-model) accuracy_model="$2"; shift 2 ;;
-        --accuracy-tasks) accuracy_tasks="$2"; shift 2 ;;
-        --model-args-extra) model_args_extra="$2"; shift 2 ;;
-
-        # Server environment variables
-        --server-env-var) server_env_var="$2"; shift 2 ;;
         *)
             echo "Unknown argument: $1"
             exit 1
@@ -47,48 +27,24 @@ done
 # Print all parsed arguments
 echo "Parsed arguments:"
 echo
-echo "Worker Configuration:"
-echo "  num_ctx_servers: ${num_ctx_servers}"
-echo "  num_gen_servers: ${num_gen_servers}"
-echo "  concurrency_list: ${concurrency_list}"
-echo
 echo "Benchmark Configuration:"
-echo "  isl: ${isl}"
-echo "  osl: ${osl}"
-echo "  multi_round: ${multi_round}"
-echo "  benchmark_ratio: ${benchmark_ratio}"
-echo "  streaming: ${streaming}"
-echo "  use_nv_sa_benchmark: ${use_nv_sa_benchmark}"
+echo "  benchmark_mode: ${benchmark_mode}"
 echo
 echo "Environment Configuration:"
-echo "  dataset_file: ${dataset_file}"
-echo "  model_path: ${model_path}"
 echo "  trtllm_repo: ${trtllm_repo}"
 echo "  work_dir: ${work_dir}"
 echo "  full_logdir: ${full_logdir}"
 echo "  container_mount: ${container_mount}"
 echo "  container_image: ${container_image}"
 echo "  build_wheel: ${build_wheel}"
+echo "  cuda_architectures: ${cuda_architectures}"
 echo "  trtllm_wheel_path: ${trtllm_wheel_path}"
-echo
-echo "Accuracy Configuration:"
-echo "  enable_accuracy_test: ${enable_accuracy_test}"
-echo "  accuracy_model: ${accuracy_model}"
-echo "  accuracy_tasks: ${accuracy_tasks}"
-echo "  model_args_extra: ${model_args_extra}"
-echo
-echo "Server Environment Variables:"
-echo "  server_env_var: ${server_env_var}"
 
 # Set TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 for gen_only_no_context mode
 if [ "${benchmark_mode}" = "gen_only_no_context" ]; then
     export TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1
-    worker_env_var="${worker_env_var} TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1"
-    server_env_var="${server_env_var} TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1"
     echo "Setting TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 for gen_only_no_context mode"
 fi
-
-container_name="disaggr-test"
 
 # Function to cleanup on failure
 cleanup_on_failure() {
@@ -97,7 +53,20 @@ cleanup_on_failure() {
     exit 1
 }
 
-echo "SLURM_JOB_ID: ${SLURM_JOB_ID}" > ${full_logdir}/job_info.txt
+replace_placeholder() {
+    file_path="$1"
+    all_nodes_str="$2"
+    IFS=',' read -r -a node_array <<< "$all_nodes_str"
+    for i in "${!node_array[@]}"; do
+        current_val="${node_array[$i]}"
+        placeholder="<node${i}_placeholder>"
+
+        # Use sed to replace the placeholder with the value in-place
+        sed -i "s|$placeholder|$current_val|g" "${file_path}"
+        echo "Replaced $placeholder with $current_val in ${file_path}"
+    done
+}
+
 env > ${full_logdir}/environment.txt
 
 # Start container
@@ -153,6 +122,11 @@ elif [ -d "${trtllm_repo}" ]; then
         cleanup_on_failure "TensorRT-LLM installation failed. Check ${full_logdir}/2_install.log for details"
     fi
     echo "TensorRT-LLM installation completed successfully"
+else
+    echo "trtllm_wheel_path and trtllm_repo are not provided, will use the installed TensorRT-LLM from the container"
+    if [ -v TRT_LLM_GIT_COMMIT ]; then
+        echo "TRT_LLM_GIT_COMMIT: ${TRT_LLM_GIT_COMMIT}"
+    fi
 fi
 
 # Get node lists and replace the placeholder with the actual node names
@@ -161,91 +135,39 @@ all_nodes=($(scontrol show hostname $SLURM_NODELIST | sort))
 all_nodes_str=$(IFS=','; echo "${all_nodes[*]}")
 echo "all_nodes_str: ${all_nodes_str}"
 
-start_worker_cmds_file=${full_logdir}/start_worker_cmds.txt
-IFS=',' read -r -a node_array <<< "$all_nodes_str"
-for i in "${!node_array[@]}"; do
-    current_val="${node_array[$i]}"
-    placeholder="<node${i}_placeholder>"
+start_server_cmds_file=${full_logdir}/start_server_cmds.sh
+replace_placeholder ${start_server_cmds_file} ${all_nodes_str}
+server_config_file=${full_logdir}/server_config.yaml
+replace_placeholder ${server_config_file} ${all_nodes_str}
+client_cmds_file=${full_logdir}/client_cmds.sh
+replace_placeholder ${client_cmds_file} ${all_nodes_str}
 
-    # Use sed to replace the placeholder with the value in-place
-    sed -i "s|$placeholder|$current_val|g" "${start_worker_cmds_file}"
-    echo "Replaced $placeholder with $current_val"
-done
-
-# start the workers (skip ctx workers if TRTLLM_DISAGG_BENCHMARK_GEN_ONLY is set).
-echo "Starting worker commands from ${start_worker_cmds_file}..."
-cat ${start_worker_cmds_file} | while read cmd; do
+# start the servers (skip ctx workers if TRTLLM_DISAGG_BENCHMARK_GEN_ONLY is set).
+echo "Starting worker commands from ${start_server_cmds_file}..."
+cat ${start_server_cmds_file} | while read cmd; do
     # Skip ctx worker commands if in gen-only mode
     # CTX appears as argument to start_worker.sh and in log filename
     if [ "${TRTLLM_DISAGG_BENCHMARK_GEN_ONLY:-0}" = "1" ] && [[ "$cmd" == *"start_worker.sh CTX"* ]]; then
         echo "Skipping ctx worker command (TRTLLM_DISAGG_BENCHMARK_GEN_ONLY is set): ${cmd}"
         continue
     fi
-    echo "Starting worker command: ${cmd}"
+    echo "Executing command: ${cmd}"
     eval "${cmd}"
 done
-
-# start the server (in background)
-echo "Starting server..."
-srun -l --container-name=${container_name} \
-    --container-image=${container_image} \
-    --container-mounts=${container_mount} \
-    --mpi=pmix --overlap -N 1 -n 1 \
-    bash ${work_dir}/start_server.sh ${num_ctx_servers} ${num_gen_servers} ${full_logdir} ${work_dir} "${server_env_var}" \
-    &> ${full_logdir}/4_output_server.log &
-
-# Wait for server to be ready (runs synchronously)
-echo "Waiting for server to be ready..."
-if ! srun -l --container-name=${container_name} \
-    --container-mounts=${container_mount} \
-    --mpi=pmix --overlap -N 1 -n 1 \
-    bash ${work_dir}/wait_server.sh ${full_logdir} \
-    &> ${full_logdir}/5_wait_server.log; then
-    cleanup_on_failure "Server failed to become ready. Check ${full_logdir}/5_wait_server.log for details"
-fi
 echo "Server is ready!"
 
-# Start benchmarking
-echo "Starting benchmark..."
-if [ "${use_nv_sa_benchmark}" = "true" ]; then
-    echo "Using NVIDIA SA benchmark script..."
-    if ! srun -l --container-name=${container_name} \
-            --container-mounts=${container_mount} \
-            --mpi=pmix --overlap -N 1 -n 1 \
-            bash ${work_dir}/run_benchmark_nv_sa.sh \
-            "${model_path}" "${isl}" "${osl}" "${benchmark_ratio}" "${multi_round}" "${num_gen_servers}" "${concurrency_list}" "${streaming}" "${full_logdir}/" \
-            &> ${full_logdir}/6_bench.log; then
-        cleanup_on_failure "NVIDIA SA benchmark failed. Check ${full_logdir}/6_bench.log for details"
+# Start client commands
+client_cmds_file=${full_logdir}/client_cmds.sh
+echo "Starting client commands from ${client_cmds_file}..."
+while read -r cmd <&3; do
+    echo "Starting client command: ${cmd}"
+    eval "${cmd}"
+    if [ $? -ne 0 ]; then
+        cleanup_on_failure "Command failed: ${cmd}."
     fi
-else
-    echo "Using default benchmark script..."
-    if ! srun -l --container-name=${container_name} \
-            --container-mounts=${container_mount} \
-            --mpi=pmix --overlap -N 1 -n 1 \
-            bash ${work_dir}/run_benchmark.sh \
-            "${model_path}" "${dataset_file}" "${multi_round}" "${num_gen_servers}" "${concurrency_list}" "${streaming}" "${full_logdir}/" \
-            &> ${full_logdir}/6_bench.log; then
-        cleanup_on_failure "Benchmark failed. Check ${full_logdir}/6_bench.log for details"
-    fi
-fi
-echo "Benchmark completed successfully"
+done 3< "${client_cmds_file}"
 
-# Run accuracy evaluation if enabled
-if [ "${enable_accuracy_test}" = "true" ]; then
-    echo "Starting accuracy evaluation..."
-    if ! srun -l --container-name=${container_name} \
-        --container-mounts=${container_mount} \
-        --mpi=pmix --overlap -N 1 -n 1 \
-        bash ${work_dir}/accuracy_eval.sh \
-        "${full_logdir}" "${accuracy_model}" "${accuracy_tasks}" "${model_path}" \
-        "${model_args_extra}" "${full_logdir}/accuracy_eval" \
-        &> ${full_logdir}/7_accuracy_eval.log; then
-        cleanup_on_failure "Accuracy evaluation failed. Check ${full_logdir}/7_accuracy_eval.log for details"
-    fi
-    echo "Accuracy evaluation completed successfully"
-fi
-
-echo "Total runtime: $SECONDS seconds"
+echo "Job completed successfully, total runtime: $SECONDS seconds"
 
 # try to kill the server and workers
 scancel ${SLURM_JOB_ID}

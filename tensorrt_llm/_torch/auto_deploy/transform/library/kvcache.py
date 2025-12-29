@@ -54,19 +54,6 @@ class InsertCachedAttention(BaseTransform):
     def attn_descriptor(self) -> Type[AttentionDescriptor]:
         return AttentionRegistry.get(self.config.backend)
 
-    def _add_or_retrieve_input(
-        self, gm: GraphModule, cm: CachedSequenceInterface, name: str
-    ) -> Node:
-        """Add or retrieve an input node from the graph."""
-        input_nodes = gm.graph.find_nodes(op="placeholder", target=name)
-        if len(input_nodes) == 0:
-            cm.info.activate_arg(name)
-            return add_graph_input(gm, name)
-        elif len(input_nodes) == 1:
-            return input_nodes[0]
-        else:
-            raise ValueError(f"Expected exactly one input node for {name=}, got {input_nodes=}")
-
     def _process_metadata_std(self, gm: GraphModule, cm: CachedSequenceInterface) -> List[Node]:
         """Process the standard metadata nodes."""
         return [
@@ -225,6 +212,11 @@ class InsertCachedAttention(BaseTransform):
                 cache_in_nodes,
                 buffer_in_nodes,
                 constants,
+            )
+            # Attention descriptor should register its host function with SequenceInfo.
+            # This function will be called before graph invocation.
+            cm.info.register_host_prepare_for_attention_forward(
+                attn_descriptor.host_prepare_for_forward
             )
             num_cached_attn_replacements += 1
 

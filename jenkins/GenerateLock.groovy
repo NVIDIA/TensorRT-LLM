@@ -38,14 +38,6 @@ def createKubernetesPodConfig()
     return podConfig
 }
 
-def getGitCredentialId (String repoUrlKey) {
-    if (repoUrlKey == "tensorrt_llm_internal") {
-        return 'svc_tensorrt_gitlab_api_token_no_username_as_string'
-    } else {
-        return 'github-cred-trtllm-ci'
-    }
-}
-
 def generate()
 {
     sh "pwd && ls -alh"
@@ -63,7 +55,6 @@ def generate()
             }
             LLM_REPO = params.customRepoUrl
         }
-        def CREDENTIAL_ID = getGitCredentialId(params.repoUrlKey)
         sh "apt update"
         sh "apt install -y python3-dev git curl git-lfs"
         sh "git config --global --add safe.directory ${env.WORKSPACE}"
@@ -83,8 +74,20 @@ def generate()
             sh "git status"
             sh "git add \$(find . -type f \\( -name 'poetry.lock' -o -name 'pyproject.toml' -o -name 'metadata.json' \\))"
             sh "git commit -s -m \"[None][infra] Check in most recent lock file from nightly pipeline\""
-            withCredentials([string(credentialsId: CREDENTIAL_ID, variable: 'API_TOKEN')]) {
-                def authedUrl = LLM_REPO.replaceFirst('https://', "https://svc_tensorrt:${API_TOKEN}@")
+            withCredentials([
+                string(credentialsId: 'svc_tensorrt_gitlab_api_token_no_username_as_string', variable: 'GITLAB_API_TOKEN'),
+                usernamePassword(
+                    credentialsId: 'github-cred-trtllm-ci',
+                    usernameVariable: 'NOT_IN_USE',
+                    passwordVariable: 'GITHUB_API_TOKEN'
+                )
+            ]) {
+                def authedUrl
+                if (params.repoUrlKey == "tensorrt_llm_internal") {
+                    authedUrl = LLM_REPO.replaceFirst('https://', "https://svc_tensorrt:${GITLAB_API_TOKEN}@")
+                } else {
+                    authedUrl = LLM_REPO.replaceFirst('https://', "https://svc_tensorrt:${GITHUB_API_TOKEN}@")
+                }
                 sh "git remote set-url origin ${authedUrl}"
                 sh "git fetch origin ${params.branchName}"
                 sh "git status"

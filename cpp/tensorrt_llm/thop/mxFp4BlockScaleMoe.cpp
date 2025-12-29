@@ -114,7 +114,7 @@ torch::Tensor dtype_mxe2m1_block_scale_moe_runner(torch::optional<torch::Tensor>
         TORCH_CHECK(routing_bias.value().sizes()[0] == num_experts, "routing_bias has incorrect shape.");
     }
 
-    if (n_group.has_value() && n_group.value() != 0)
+    if (n_group.has_value() && n_group.value() > 1)
     {
         TORCH_CHECK(static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3,
             "Routing kernel with groups implies DeepSeekV3 routing method.");

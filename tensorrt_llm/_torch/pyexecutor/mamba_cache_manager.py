@@ -131,8 +131,9 @@ class MambaCacheManager(BaseResourceManager):
                 block = self.mamba_cache_free_blocks.pop()
                 self.mamba_cache_index[r] = block
                 state_indices.append(block)
-        self.state_indices[:len(state_indices)] = torch.as_tensor(
-            state_indices, dtype=torch.int32, device=self.ssm_states.device)
+        self.state_indices[:len(state_indices)].copy_(torch.tensor(
+            state_indices, dtype=torch.int32, pin_memory=True),
+                                                      non_blocking=True)
 
     # When there exists padded requests, the state indices should not be repeated.
     def reorder_state_indices_when_padding_requests(self, request_size,

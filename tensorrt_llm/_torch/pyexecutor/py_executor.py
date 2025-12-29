@@ -650,10 +650,21 @@ class PyExecutor:
         stats.inflight_batching_stats = InflightBatchingStats()
         # staticBatchingStats is not used in pytorch path
         stats.static_batching_stats = StaticBatchingStats()
+
+        # Create specdec_stats if speculative decoding is enabled
+        # Either via spec_resource_manager (two-model mode) or spec_config (one-model mode)
         spec_resource_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.SPEC_RESOURCE_MANAGER)
-        if spec_resource_manager is not None:
+        has_spec_config = self.model_engine.spec_config is not None
+
+        if spec_resource_manager is not None or has_spec_config:
             stats.specdec_stats = SpecDecodingStats()
+            # Reset draft latency at the start of each iteration to prevent stale values
+            # from previous iterations when speculation is disabled
+            if self.drafter is not None and hasattr(self.drafter,
+                                                    'last_draft_latency_ms'):
+                self.drafter.last_draft_latency_ms = 0.0
+
         return stats
 
     def _populate_req_stats(
@@ -755,9 +766,57 @@ class PyExecutor:
             scheduled_batch.paused_requests)
         stats.inflight_batching_stats.avg_num_decoded_tokens_per_iter = 0
         stats.inflight_batching_stats.micro_batch_id = micro_batch_id
+
         if stats.specdec_stats is not None:
+            total_draft_tokens = 0
+            total_accepted_tokens = 0
+            num_requests_with_draft = 0
+
+            # Aggregate stats from all generation requests
+            for req in scheduled_batch.generation_requests:
+                draft_len = getattr(req, 'num_draft_tokens', 0)
+                py_draft_tokens = getattr(req, 'py_draft_tokens', None)
+                py_num_accepted = getattr(req, 'py_num_accepted_draft_tokens',
+                                          None)
+
+                # Use py_draft_tokens length if num_draft_tokens is 0
+                if draft_len == 0 and py_draft_tokens is not None:
+                    # Count non-zero draft tokens
+                    draft_len = sum(1 for t in py_draft_tokens if t != 0)
+
+                if draft_len > 0:
+                    total_draft_tokens += draft_len
+                    accepted_tokens = py_num_accepted if py_num_accepted is not None else 0
+                    total_accepted_tokens += accepted_tokens
+                    num_requests_with_draft += 1
+
+            stats.specdec_stats.num_draft_tokens = total_draft_tokens
+            stats.specdec_stats.num_accepted_tokens = total_accepted_tokens
+            stats.specdec_stats.num_requests_with_draft_tokens = num_requests_with_draft
+
+            # Calculate acceptance length: average tokens produced per step for requests with draft tokens
+            if num_requests_with_draft > 0:
+                # acceptance_length = (total_accepted_tokens + num_requests_with_draft) / num_requests_with_draft
+                # Each request produces 1 target token + accepted draft tokens per iteration
+                stats.specdec_stats.acceptance_length = float(
+                    total_accepted_tokens +
+                    num_requests_with_draft) / float(num_requests_with_draft)
+            else:
+                stats.specdec_stats.acceptance_length = 0.0
+
+            # Get draft latency from drafter if available (only for two-model mode)
+            # Only use draft latency if there were actually draft tokens in this iteration
+            draft_latency_ms = 0.0
+            if total_draft_tokens > 0 and self.drafter is not None and hasattr(
+                    self.drafter, 'last_draft_latency_ms'):
+                draft_latency_ms = getattr(self.drafter,
+                                           'last_draft_latency_ms', 0.0)
+
+            stats.specdec_stats.iter_latency_ms = draft_latency_ms
+
+            # Calculate draft overhead
             stats.specdec_stats.draft_overhead = 0.0 if iter_latency_ms <= 0.0 else float(
-                stats.specdec_stats.iter_latency_ms) / float(iter_latency_ms)
+                draft_latency_ms) / float(iter_latency_ms)
         return stats
 
     def _append_iter_stats(self,
@@ -1508,6 +1567,24 @@ class PyExecutor:
                         # For generation requests which have completed KV cache transfer
                         self._prepare_disagg_gen_transmission_complete(
                             scheduled_batch)
+
+                    has_draft_batch = self.drafter is not None and self.previous_batch is not None and self.use_spec_decode and self.drafter.should_forward_draft_model(
+                        scheduled_batch)
+                    # Reset the draft tokens to avoid preparing resources for the draft model.
+                    if self.drafter is not None and self.use_spec_decode and not has_draft_batch:
+                        self.use_spec_decode = False
+                        # We are not running the draft model. Remove the draft tokens and turn off spec
+                        # decode so that the requests get handled correctly.
+                        # One corner case: when we have at least one context request, we have to keep spec
+                        # dec on. This ensures that we capture hidden states for requests that haven't done
+                        # prefill yet.
+                        self.use_spec_decode = False
+                        self.model_engine.enable_spec_decode = len(
+                            scheduled_batch.context_requests) > 0
+                        if not self.model_engine.enable_spec_decode:
+                            for request in scheduled_batch.all_requests():
+                                request.py_draft_tokens = []
+
                     self.resource_manager.prepare_resources(scheduled_batch)
 
                     self._kv_connector_start_batch(scheduled_batch)
@@ -1542,9 +1619,13 @@ class PyExecutor:
                     # When there's any accepted tokens, we can't directly use the previous batch's outputs in this iteration for the target model,
                     # so we'll set the target model's input to None and skip updating the target requests after target model forward.
                     use_previous_draft_tokens = self.has_previous_draft_tokens
-                    if self.drafter is not None and (self.use_spec_decode or
-                                                     use_previous_draft_tokens):
-                        target_inputs = self._handle_speculative_decoding(
+                    num_accepted_tokens_device = None
+
+                    target_inputs = None
+                    num_accepted_tokens_device = None
+
+                    if has_draft_batch:
+                        target_inputs, num_accepted_tokens_device = self._handle_speculative_decoding(
                             scheduled_batch, previous_tensors,
                             previous_tensors_device)
 
@@ -1557,8 +1638,9 @@ class PyExecutor:
                     else:
                         previous_tensors_device = self.previous_batch and self.previous_batch.sample_state and self.previous_batch.sample_state.device
 
-                    batch_outputs = self._forward_step(scheduled_batch,
-                                                       previous_tensors_device)
+                    batch_outputs = self._forward_step(
+                        scheduled_batch, previous_tensors_device,
+                        num_accepted_tokens_device)
 
                 if self.previous_batch is not None:
                     self._update_requests(self.previous_batch.sample_state)
@@ -1625,6 +1707,7 @@ class PyExecutor:
 
                 self.iter_counter += 1
 
+    @nvtx_range("_accept_draft_tokens")
     def _accept_draft_tokens(
         self, scheduled_batch: ScheduledRequests,
         target_outputs: SampleStateTensors,
@@ -2125,22 +2208,26 @@ class PyExecutor:
         self.kv_cache_transceiver.check_gen_transfer_status(atLeastNum)
         self._check_cache_transfer_errors("generation requests")
 
-    def _forward_step(self,
-                      scheduled_requests,
-                      new_tensors_device: Optional[SampleStateTensors] = None):
+    def _forward_step(
+            self,
+            scheduled_requests,
+            new_tensors_device: Optional[SampleStateTensors] = None,
+            num_accepted_tokens_device: Optional[torch.Tensor] = None):
         ExpertStatistic.set_iter(self.iter_counter)
 
         @nvtx_range(
             f"[Executor] _forward_step {self.iter_counter}: {len(scheduled_requests.context_requests)} ctx reqs, {len(scheduled_requests.generation_requests)} gen reqs"
         )
         def forward(scheduled_requests, resource_manager, new_tensors_device,
-                    gather_context_logits, cache_indirection_buffer):
+                    gather_context_logits, cache_indirection_buffer,
+                    num_accepted_tokens_device):
             return self.model_engine.forward(
                 scheduled_requests,
                 resource_manager,
                 new_tensors_device,
                 gather_context_logits=gather_context_logits,
-                cache_indirection_buffer=cache_indirection_buffer)
+                cache_indirection_buffer=cache_indirection_buffer,
+                num_accepted_tokens_device=num_accepted_tokens_device)
 
         try:
             gather_context_logits = any(
@@ -2149,7 +2236,8 @@ class PyExecutor:
             cache_indirection_buffer = self.sampler.get_cache_indirection()
             outputs = forward(scheduled_requests, self.resource_manager,
                               new_tensors_device, gather_context_logits,
-                              cache_indirection_buffer)
+                              cache_indirection_buffer,
+                              num_accepted_tokens_device)
 
             self._kv_connector_wait_for_save()
 
@@ -2673,49 +2761,27 @@ class PyExecutor:
             )
             self.inflight_req_ids.erase(req.request_id)
 
-    def _handle_speculative_decoding(self, scheduled_batch, previous_tensors,
-                                     target_inputs):
+    def _handle_speculative_decoding(
+        self, scheduled_batch, previous_tensors, target_inputs
+    ) -> Tuple[Optional[SampleStateTensorsMTP], Optional[torch.Tensor]]:
         with request_context(is_draft=self.draft_model_engine is not None,
                              scheduled_requests=scheduled_batch):
-            # Do an early checking to see if we need to forward the draft model.
-            # If needed, the overlap should happen between the target requests and the draft requests.
-            # Otherwise, we can still do overlap between the previous target requests and the current target requests.
-            has_draft_batch = (
-                self.previous_batch is not None and self.use_spec_decode
-                and self.drafter.should_forward_draft_model(scheduled_batch))
+            target_outputs = self.previous_batch.sample_state and self.previous_batch.sample_state.device
+            assert target_outputs is not None, "target_outputs should not be None"
+            new_target_inputs, num_accepted_tokens_device = self._accept_draft_tokens(
+                scheduled_batch=scheduled_batch,
+                target_inputs=target_inputs,
+                target_outputs=target_outputs)
 
-            new_target_inputs = None
-            if has_draft_batch:
-                target_outputs = self.previous_batch.sample_state and self.previous_batch.sample_state.device
-                assert target_outputs is not None, "target_outputs should not be None"
-                new_target_inputs, num_accepted_tokens_device = self._accept_draft_tokens(
-                    scheduled_batch=scheduled_batch,
-                    target_inputs=target_inputs,
-                    target_outputs=target_outputs)
+            self.drafter.generate_draft_tokens_with_overlap(
+                scheduled_batch, self.resource_manager,
+                previous_tensors.device if previous_tensors else None,
+                new_target_inputs, num_accepted_tokens_device)
 
-            if has_draft_batch:
-                self.drafter.generate_draft_tokens_with_overlap(
-                    scheduled_batch, self.resource_manager,
-                    previous_tensors.device if previous_tensors else None,
-                    new_target_inputs, num_accepted_tokens_device)
+            # Pad draft tokens to the max draft length for CUDA graph compatibility
+            self.has_previous_draft_tokens = new_target_inputs is not None and new_target_inputs.next_draft_tokens is not None
 
-                # Pad draft tokens to the max draft length for CUDA graph compatibility
-                self.has_previous_draft_tokens = new_target_inputs is not None and new_target_inputs.next_draft_tokens is not None
-            else:
-                self.has_previous_draft_tokens = False
-                # We are not running the draft model. Remove the draft tokens and turn off spec
-                # decode so that the requests get handled correctly.
-                # One corner case: when we have at least one context request, we have to keep spec
-                # dec on. This ensures that we capture hidden states for requests that haven't done
-                # prefill yet.
-                self.use_spec_decode = False
-                self.model_engine.enable_spec_decode = len(
-                    scheduled_batch.context_requests) > 0
-                if not self.model_engine.enable_spec_decode:
-                    for request in scheduled_batch.all_requests():
-                        request.py_draft_tokens = []
-
-        return new_target_inputs
+        return new_target_inputs, num_accepted_tokens_device
 
     def reset_prefix_cache(self):
         self.kv_cache_manager.reset_reuse_state()
