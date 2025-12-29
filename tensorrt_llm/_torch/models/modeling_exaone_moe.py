@@ -65,7 +65,7 @@ def check_is_sliding(config: ExaoneMoEConfig, layer_idx: int) -> bool:
     """
     if config.sliding_window is None:
         return False
-    if isinstance(config.sliding_window_pattern, int):
+    elif isinstance(config.sliding_window_pattern, int):
         return ((layer_idx + 1) % config.sliding_window_pattern) != 0
     elif isinstance(config.sliding_window_pattern, str):
         assert isinstance(config.sliding_window, int), (
@@ -100,14 +100,12 @@ class ExaoneMoeAttention(QKNormRoPEAttention):
         config = model_config.pretrained_config
 
         self.attention_window_size = None
+        self.is_sliding = check_is_sliding(config, layer_idx)
 
         # NOTE: In ExaoneMoe, only sliding layers apply rope.
-        self.sliding_window = config.sliding_window
-        self.is_sliding = check_is_sliding(config, layer_idx)
         pos_embd_params = None
-        if self.sliding_window is None or self.is_sliding:
+        if self.is_sliding:
             self.attention_window_size = config.sliding_window
-
             pos_embd_params = PositionalEmbeddingParams(
                 type=PositionEmbeddingType.rope_gpt_neox,
                 rope=RopeParams.from_config(config),
@@ -126,7 +124,7 @@ class ExaoneMoeAttention(QKNormRoPEAttention):
             bias=False,
             pos_embd_params=pos_embd_params,
             fuse_qk_norm_rope=fuse_qk_norm_rope,
-            skip_rope=self.sliding_window and not self.is_sliding,
+            skip_rope=not self.is_sliding,
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             config=model_config,
@@ -547,7 +545,6 @@ class ExaoneMoeForCausalLM(DecoderModelForCausalLM[ExaoneMoeModel, ExaoneMoEConf
         self,
         model_config: ModelConfig[ExaoneMoEConfig],
     ):
-        model_config.pretrained_config.torch_dtype = torch.bfloat16
         super().__init__(
             ExaoneMoeModel(model_config),
             config=model_config,
