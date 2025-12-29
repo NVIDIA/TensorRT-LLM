@@ -110,14 +110,6 @@ class MambaCacheManager(BaseResourceManager):
                                                         device=device,
                                                         dtype=torch.int32)
 
-        # only for `reorder_state_indices_when_padding_requests`
-        self.request_mask = torch.ones(max_batch_size,
-                                       dtype=torch.bool,
-                                       device=device)
-        self.state_indices_arange = torch.arange(max_batch_size,
-                                                 dtype=torch.int32,
-                                                 device=device)
-
     def _prepare_mamba_cache_blocks(self, request_ids: List[int]):
         state_indices = []
         for r in request_ids:
@@ -141,11 +133,16 @@ class MambaCacheManager(BaseResourceManager):
         if padding_size == 0:
             return
 
-        self.request_mask[:] = True
-        self.request_mask[self.state_indices[:request_size]] = False
+        # we can use mamba_cache_free_blocks for padding_requests
+        assert len(
+            self.mamba_cache_free_blocks
+        ) >= padding_size, "Padding requests run out of available mamba cache blocks"
         self.state_indices[request_size:request_size +
-                           padding_size] = self.state_indices_arange[
-                               self.request_mask][:padding_size]
+                           padding_size] = torch.tensor(
+                               self.mamba_cache_free_blocks[:padding_size],
+                               dtype=self.state_indices.dtype,
+                               pin_memory=True).to(self.state_indices.device,
+                                                   non_blocking=True)
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         context_ids = [
