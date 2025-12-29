@@ -184,7 +184,6 @@ class AssistantMessage(RoleMessage):
         self.tool_calls = tool_calls
 
     def __str__(self) -> str:
-        # return f"role: assistant, content: {self.content}, reasoning: {self.reasoning}, reasoning_content: {self.reasoning_content}, tool_calls: {self.tool_calls}"
         return json.dumps({
             "role":
             "assistant",
