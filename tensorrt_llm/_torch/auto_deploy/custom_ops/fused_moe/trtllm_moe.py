@@ -306,6 +306,7 @@ def trtllm_quant_nvfp4_moe_fused(
     )
     hidden_size_needs_padding = hidden_size % TRTLLM_NVFP4_COLUMN_SIZE != 0
     if inter_size_needs_padding or hidden_size_needs_padding:
+        assert False, "See https://github.com/NVIDIA/TensorRT-LLM/issues/10331"
         # fc1_expert_weights_fp4: [E, I, H] or [E, 2*I, H]
         fc1_padded = fc1_expert_weights_fp4.new_zeros(
             fc1_expert_weights_fp4.size(0),
@@ -319,6 +320,11 @@ def trtllm_quant_nvfp4_moe_fused(
         fc2_padded = fc2_expert_weights_fp4.new_zeros(
             n_experts, hidden_size_padded, inter_size_padded // FP4_PER_UINT8
         )
+
+        assert inter_size % NVFP4_BLOCK_SIZE == 0, (
+            f"inter_size {inter_size} must be divisible by {NVFP4_BLOCK_SIZE}"
+        )
+
         fc2_padded[:, :, : inter_size // FP4_PER_UINT8] = fc2_expert_weights_fp4
         fc2_expert_weights_fp4 = fc2_padded
 
@@ -334,17 +340,20 @@ def trtllm_quant_nvfp4_moe_fused(
     # https://github.com/NVIDIA/TensorRT-LLM/blob/c9771ebb997683c08b26bbba796a7fc6aff09d93/cpp/tensorrt_llm/thop/moeOp.cpp#L1015
     quant_scales = [
         fc1_act_global_scale,  # torch.float32; [E] or scalar
-        fc1_weight_blockscale_fp8.view(torch.int32),
+        fc1_weight_blockscale_fp8.view(
+            torch.int32
+        ),  # 4 FP8 as packed int32; [E, I*2, H / 16 / 4] or [E, I, H / 16 / 4]
         fc1_alpha,  # torch.float32; [E]
         fc2_act_global_scale,  # torch.float32; [E] or scalar
-        fc2_weight_blockscale_fp8.view(torch.int32),
+        fc2_weight_blockscale_fp8.view(torch.int32),  # 4 FP8 as packed int32; [E, H, I / 16 / 4]
         fc2_alpha,  # torch.float32; [E]
     ]
 
     trtllm_output = torch.ops.trtllm.fused_moe(
-        x_q_fp4,
-        selected_experts.to(torch.int),
+        x_q_fp4.view(torch.long),
+        selected_experts.to(torch.int32),
         routing_weights.to(torch.float32),
+        # Groups of 16 FP4 weight elements are packed as a single int64 element (see isNvfp4Quant in moeOp.cpp)
         fc1_expert_weights=fc1_expert_weights_fp4.view(torch.long),
         fc1_expert_biases=None,
         fc2_expert_weights=fc2_expert_weights_fp4.view(torch.long),

@@ -1613,10 +1613,13 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
             "is_gated_mlp",
         )
 
-    def _stack(param_list, dim=0):
-        return torch.stack(
-            [get_param_or_buffer(element.target) for element in param_list], dim=dim
-        ).contiguous()
+    def _stack(param_list, dim=0, device=None, dtype=None):
+        if param_list:
+            return torch.stack(
+                [get_param_or_buffer(element.target) for element in param_list], dim=dim
+            ).contiguous()
+        else:
+            return torch.empty(0, device=device, dtype=dtype)
 
     def _prepare_args_cutlass_format_nvfp4():
         if is_gated_mlp:
@@ -1627,9 +1630,15 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
             fc1_act_scale = torch.cat(
                 [w3_input_scale_stacked, w1_input_scale_stacked], dim=1
             ).contiguous()
+            fc1_alpha_stacked = torch.cat([w3_alpha_stacked, w1_alpha_stacked], dim=1).contiguous()
+            fc1_weight_blockscale_fp8_stacked = torch.cat(
+                [w3_weight_blockscale_fp8_stacked, w1_weight_blockscale_fp8_stacked], dim=1
+            ).contiguous()
         else:
             fc1_expert_weights = w1_stacked
             fc1_act_scale = w1_input_scale_stacked
+            fc1_alpha_stacked = w1_alpha_stacked
+            fc1_weight_blockscale_fp8_stacked = w1_weight_blockscale_fp8_stacked
 
         fc2_expert_weights = w2_stacked
         fc2_act_scale = w2_input_scale_stacked
@@ -1651,11 +1660,13 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
         weight_dtype = torch.float8_e4m3fn
         _register_parameter(gm, new_key_fc1_expert_weights, fc1_expert_weights.to(weight_dtype))
         _register_parameter(gm, new_key_fc2_expert_weights, fc2_expert_weights.to(weight_dtype))
-        _register_parameter(gm, new_key_fc1_weight_blockscale_fp8, w1_weight_blockscale_fp8_stacked)
+        _register_parameter(
+            gm, new_key_fc1_weight_blockscale_fp8, fc1_weight_blockscale_fp8_stacked
+        )
         _register_parameter(gm, new_key_fc2_weight_blockscale_fp8, w2_weight_blockscale_fp8_stacked)
         _register_parameter(gm, new_key_fc1_act_scale, fc1_act_scale)
         _register_parameter(gm, new_key_fc2_act_scale, fc2_act_scale)
-        _register_parameter(gm, new_key_fc1_alpha, w1_alpha_stacked)
+        _register_parameter(gm, new_key_fc1_alpha, fc1_alpha_stacked)
         _register_parameter(gm, new_key_fc2_alpha, w2_alpha_stacked)
 
         with graph.inserting_before(node):
@@ -1705,50 +1716,23 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
         # Stack the actual tensor values (fast, like in quantize_moe.py)
         w1_stacked = _stack(w1_list, dim=0)
         w2_stacked = _stack(w2_list, dim=0)
-        w3_stacked = (
-            _stack(w3_list, dim=0)
-            if w3_list
-            else torch.empty(0, device=w1_stacked.device, dtype=w1_stacked.dtype)
-        )
+        device, dtype = (w1_stacked.device, w1_stacked.dtype)
+        w3_stacked = _stack(w3_list, dim=0, device=device, dtype=dtype)
 
         # Scales are buffers, not parameters
         w1_input_scale_stacked = _stack(w1_input_scale, dim=0)
         w2_input_scale_stacked = _stack(w2_input_scale, dim=0)
-        w3_input_scale_stacked = (
-            _stack(w3_input_scale, dim=0)
-            if w3_input_scale
-            else torch.empty(
-                0, device=w1_input_scale_stacked.device, dtype=w1_input_scale_stacked.dtype
-            )
-        )
-        # assert torch.all(w1_input_scale_stacked[0] == w1_input_scale_stacked), (
-        #     "All w1 scales should have the same value."
-        # )
-        # assert torch.all(w2_input_scale_stacked[0] == w2_input_scale_stacked), (
-        #     "All w2 scales should have the same value."
-        # )
+        w3_input_scale_stacked = _stack(w3_input_scale, dim=0, device=device, dtype=dtype)
 
         w1_weight_blockscale_fp8_stacked = _stack(w1_weight_scale, dim=0).to(torch.float8_e4m3fn)
         w2_weight_blockscale_fp8_stacked = _stack(w2_weight_scale, dim=0).to(torch.float8_e4m3fn)
-        # w3_weight_blockscale_fp8_stacked = (
-        #     (
-        #         _stack(w3_weight_scale, dim=0)
-        #         if w3_weight_scale
-        #         else torch.empty(
-        #             0,
-        #             device=w1_weight_blockscale_fp8_stacked.device,
-        #             dtype=w1_weight_blockscale_fp8_stacked.dtype,
-        #         )
-        #     )
-        #     .to(torch.float8_e4m3fn)
-        #     .contiguous()
-        # )
+        w3_weight_blockscale_fp8_stacked = _stack(
+            w3_weight_scale, dim=0, device=device, dtype=dtype
+        ).to(torch.float8_e4m3fn)
 
-        ###
         w1_alpha_stacked = _stack(w1_alpha, dim=0)
         w2_alpha_stacked = _stack(w2_alpha, dim=0)
-        # w3_alpha_stacked = _stack(w3_alpha, dim=0)
-        ###
+        w3_alpha_stacked = _stack(w3_alpha, dim=0, device=device, dtype=dtype)
 
         args = _prepare_args_cutlass_format_nvfp4()
 
@@ -1770,7 +1754,6 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
     # will remove the parameters/buffers that are no longer referenced
     gm.graph.eliminate_dead_code()
     gm.delete_all_unused_submodules()
-
     return fused_key_counter
 
 
