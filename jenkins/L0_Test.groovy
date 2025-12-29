@@ -694,9 +694,9 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
         }
 
         slurmRunner = null
-        if (cluster.containerRuntime == ContainerRuntime.DOCKER) {
+        if (cluster.containerRuntime.toString() == "DOCKER") {
             slurmRunner = runInDockerOnNodeMultiStage(LLM_DOCKER_IMAGE, nodeName, dockerArgs, true)
-        } else if (cluster.containerRuntime == ContainerRuntime.ENROOT) {
+        } else if (cluster.containerRuntime.toString() == "ENROOT") {
             slurmRunner = runInEnrootOnNode(nodeName)
         } else {
             throw new Exception("Unsupported container runtime: ${cluster.containerRuntime}")
@@ -799,7 +799,7 @@ def getPytestBaseCommandLine(
         "LLM_BACKEND_ROOT=${llmSrc}/triton_backend",
         "LLM_MODELS_ROOT=${MODEL_CACHE_DIR}",
         "MODEL_CACHE_DIR=${MODEL_CACHE_DIR}",
-        "COLUMNS=200",
+        "COLUMNS=400",
         extraInternalEnv,
         portEnvVars,
         pytestUtil,
@@ -860,11 +860,11 @@ def getMountListForSlurmTest(SlurmCluster cluster, boolean useSbatch = false)
     }
 
     // data/cache mounts
-    if (cluster.containerRuntime == ContainerRuntime.DOCKER) {
+    if (cluster.containerRuntime.toString() == "DOCKER") {
         mounts += [
             "/home/scratch.trt_llm_data:/scratch.trt_llm_data:ro",
         ]
-    } else if (cluster.containerRuntime == ContainerRuntime.ENROOT) {
+    } else if (cluster.containerRuntime.toString() == "ENROOT") {
         if (!cluster.scratchPath) {
             throw new Exception("Scratch path is not set for cluster: ${cluster.name}")
         }
@@ -922,6 +922,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             def scriptRunPathNode = "${jobWorkspace}/${jobUID}-slurm_run.sh"
             def scriptInstallLocalPath = "${llmSrcLocal}/jenkins/scripts/slurm_install.sh"
             def scriptInstallPathNode = "${jobWorkspace}/${jobUID}-slurm_install.sh"
+            def scriptBashUtilsLocalPath = "${llmSrcLocal}/jenkins/scripts/bash_utils.sh"
+            def scriptBashUtilsPathNode = "${jobWorkspace}/${jobUID}-bash_utils.sh"
             def testListPathNode = "${jobWorkspace}/${testList}.txt"
             def waivesListPathNode = "${jobWorkspace}/waives.txt"
             def outputPath = "${jobWorkspace}/job-output.log"
@@ -954,6 +956,14 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     remote,
                     scriptInstallLocalPath,
                     scriptInstallPathNode,
+                    true
+                )
+                Utils.exec(pipeline, script: "echo \"Script for Bash utilities: \" && cat ${scriptBashUtilsLocalPath}")
+                Utils.copyFileToRemoteHost(
+                    pipeline,
+                    remote,
+                    scriptBashUtilsLocalPath,
+                    scriptBashUtilsPathNode,
                     true
                 )
 
@@ -1040,7 +1050,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                 def containerImageArg = container
                 def srunPrologue = ""
-                if (cluster.containerRuntime == ContainerRuntime.ENROOT) {
+                if (cluster.containerRuntime.toString() == "ENROOT") {
                     def enrootImagePath = "${cluster.scratchPath}/users/svc_tensorrt/containers/container-\${SLURM_JOB_ID}.sqsh"
                     containerImageArg = enrootImagePath
 
@@ -1127,9 +1137,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     set -xEeuo pipefail
                     trap 'rc=\$?; echo "Error in file \${BASH_SOURCE[0]} on line \$LINENO: \$BASH_COMMAND (exit \$rc)"; exit \$rc' ERR
 
-                    echo "Starting job \$SLURM_JOB_ID on \$SLURM_NODELIST"
-                    echo \$SLURM_JOB_ID > "$jobWorkspace/slurm_job_id.txt"
-
+                    echo "Starting Slurm job \$SLURM_JOB_ID on \$SLURM_NODELIST"
                     export jobWorkspace=$jobWorkspace
                     export tarName=$tarName
                     export llmTarfile=$llmTarfile
@@ -1219,10 +1227,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     touch "${outputPath}"
                     jobId=\$(sbatch ${scriptLaunchPathNode} | awk '{print \$4}')
                     if [ -z "\$jobId" ]; then
-                        echo "Error: Job submission failed, no job ID returned."
+                        echo "Error: Slurm job submission failed, no job ID returned."
                         exit 1
                     fi
-                    echo "Submitted job \$jobId"
+                    echo "Submitted Slurm job \$jobId"
+                    echo "\$jobId" > "${jobWorkspace}/slurm_job_id.txt"
                     tail -f ${outputPath} &
                     tailPid=\$!
                     # Wait until sbatch job is done.
@@ -1232,9 +1241,28 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     # Kill tail -f process
                     kill \$tailPid
                     # Check if the job failed or not
-                    sleep 5
-                    STATUS=\$(sacct -j \$jobId --format=State --noheader | head -n 1 | awk '{print \$1}')
-                    EXIT_CODE=\$(sacct -j \$jobId --format=ExitCode -Pn --allocations | awk -F: '{print \$1}')
+                    sleep 10
+                    # Retry getting status and exit code as sacct might be delayed
+                    for i in {1..3}; do
+                        STATUS=\$(sacct -j \$jobId --format=State --noheader | head -n 1 | awk '{print \$1}')
+                        EXIT_CODE=\$(sacct -j \$jobId --format=ExitCode -Pn --allocations | awk -F: '{print \$1}')
+
+                        if [ -n "\$STATUS" ] && [ -n "\$EXIT_CODE" ]; then
+                            break
+                        fi
+                        echo "Waiting for sacct to update... attempt \$i"
+                        sleep 10
+                    done
+
+                    if [ -z "\$EXIT_CODE" ]; then
+                        echo "Error: Failed to get exit code from sacct after retries, defaulting to 1."
+                        EXIT_CODE=1
+                    fi
+                    if [ -z "\$STATUS" ]; then
+                        echo "Error: Failed to get status from sacct after retries, defaulting to UNKNOWN."
+                        STATUS="UNKNOWN"
+                    fi
+
                     if [[ "\$STATUS" == "COMPLETED" && \$EXIT_CODE -eq 0 ]]; then
                         echo "Pytest succeed in Slurm job \$jobId"
                         echo "Status: \$STATUS | Exit_code \$EXIT_CODE"
