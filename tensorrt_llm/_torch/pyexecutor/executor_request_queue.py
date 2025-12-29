@@ -11,6 +11,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import torch
 
 from tensorrt_llm._utils import mpi_disabled, nvtx_range
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType
 
 from ..distributed import Distributed
@@ -47,10 +48,16 @@ class RequestQueueItem:
 class ExecutorRequestQueue:
     """Handles fetching and processing of new requests from the request queue."""
 
-    def __init__(self, dist: Distributed, enable_attention_dp: bool,
-                 max_batch_size: int, max_beam_width: int,
-                 max_num_active_requests: int, enable_iter_perf_stats: bool,
-                 batch_wait_timeout_ms: float):
+    def __init__(self,
+                 dist: Distributed,
+                 enable_attention_dp: bool,
+                 max_batch_size: int,
+                 max_beam_width: int,
+                 max_num_active_requests: int,
+                 enable_iter_perf_stats: bool,
+                 batch_wait_timeout_ms: float,
+                 min_fetch_batch_size: Optional[int] = None,
+                 min_fetch_batch_timeout: Optional[float] = None):
         self.dist = dist
         self.request_queue: queue.Queue[RequestQueueItem] = queue.Queue()
         self.waiting_queue: deque[RequestQueueItem] = deque()
@@ -66,6 +73,10 @@ class ExecutorRequestQueue:
         self.active = True
         self.batch_wait_timeout_ms = batch_wait_timeout_ms
         self.send_requests_handler = None
+
+        # Minimum fetch batch size configuration
+        self.min_fetch_batch_size = min_fetch_batch_size
+        self.min_fetch_batch_timeout = min_fetch_batch_timeout
 
         # State tracking
         self.num_fetch_requests = 0
@@ -303,6 +314,64 @@ class ExecutorRequestQueue:
                 self.request_accumulated.clear()
                 # Reset timeout to 0 to avoid hanging when no new requests are available
                 timeout = datetime.timedelta(0)
+
+            # Wait for minimum batch size if configured
+            if (self.min_fetch_batch_size is not None
+                    and self.min_fetch_batch_size > 0):
+
+                # Check if we have capacity to accept new requests
+                available_capacity = total_max_num_active_requests - total_num_active_requests
+
+                # Only apply blocking if:
+                # 1. We have capacity AND
+                # 2. No active requests are being processed (idle state) AND
+                # 3. No accumulated requests from control request handling
+                # Justification:
+                # - When active requests are processing (decode phase), blocking is
+                #   counterproductive: with STATIC_BATCH, new context requests won't be
+                #   scheduled anyway; without STATIC_BATCH, we'd just delay processing.
+                # - After control request completes, accumulated requests should be
+                #   processed immediately (timeout=0), not subjected to blocking.
+                if (available_capacity > 0 and total_num_active_requests == 0
+                        and len(new_requests) == 0):
+                    timeout_seconds = self.min_fetch_batch_timeout if self.min_fetch_batch_timeout is not None else 10.0
+                    start_wait = time.time()
+
+                    # Wait for at least min_fetch_batch_size requests to arrive
+                    # This handles both:
+                    # 1. Initial case: queue empty, wait for first batch
+                    # 2. Subsequent fetches: queue has some, wait for full batch
+                    logger.info(
+                        f"[MIN_FETCH_BATCH] Waiting for at least {self.min_fetch_batch_size} requests "
+                        f"(current_queue={self.request_queue.qsize()}, active={total_num_active_requests}, "
+                        f"capacity={available_capacity}, timeout={timeout_seconds}s)"
+                    )
+
+                    while self.request_queue.qsize(
+                    ) < self.min_fetch_batch_size:
+                        elapsed = time.time() - start_wait
+                        if elapsed >= timeout_seconds:
+                            current_size = self.request_queue.qsize()
+                            if current_size > 0:
+                                logger.warning(
+                                    f"[MIN_FETCH_BATCH] Timeout after {elapsed:.2f}s, "
+                                    f"proceeding with {current_size} requests")
+                            else:
+                                logger.info(
+                                    f"[MIN_FETCH_BATCH] Timeout after {elapsed:.2f}s, "
+                                    f"no requests available")
+                            break
+                        time.sleep(0.001)  # 1ms sleep to avoid busy-waiting
+
+                    final_queue_size = self.request_queue.qsize()
+                    if final_queue_size >= self.min_fetch_batch_size:
+                        logger.info(
+                            f"[MIN_FETCH_BATCH] Proceeding with {final_queue_size} requests "
+                            f"after {time.time() - start_wait:.3f}s")
+
+                    # Override timeout to fetch immediately (don't wait again)
+                    timeout = datetime.timedelta(0)
+
             new_requests.extend(self._get_from_request_queue(timeout))
 
         # Broadcast requests and handle Python objects
