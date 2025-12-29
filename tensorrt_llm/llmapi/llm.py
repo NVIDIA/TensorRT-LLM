@@ -633,6 +633,11 @@ class BaseLLM:
             sampling_params: Optional[SamplingParams] = None) -> None:
         '''Set KV cache hints.
         '''
+        if isinstance(messages, str) and messages == "":
+            return
+        if isinstance(messages, list) and len(messages) == 0:
+            return
+
         messages_to_retain = prompt_inputs(messages_to_retain)
         messages = prompt_inputs(messages)
 

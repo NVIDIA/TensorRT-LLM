@@ -56,7 +56,7 @@ def prompt_inputs(inputs: PromptInputs, ) -> Union[TextPrompt, TokensPrompt]:
     if isinstance(inputs, str):
         prompt_inputs = TextPrompt(prompt=inputs)
     elif isinstance(inputs, list):
-        assert isinstance(inputs[0], int)
+        assert len(inputs) == 0 or isinstance(inputs[0], int)
         prompt_inputs = TokensPrompt(prompt_token_ids=inputs)
     elif isinstance(inputs, dict):
         assert inputs.get("prompt") is not None \

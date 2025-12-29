@@ -54,7 +54,7 @@ You have access to three main tools:
 2. **complete_research**: Indicate that research is complete
 3. **think_tool**: For reflection and strategic planning during research
 
-**CRITICAL: Use think_tool before calling conduct_research to plan your approach, and after each conduct_research to assess progress. Do not call think_tool with any other tools in parallel.**
+**CRITICAL: Use think_tool before calling conduct_research to plan your approach, and after each conduct_research to assess progress. Do not call think_tool with any other tools in parallel. It's better to call conduct_research for multiple sub-tasks simultaneously to maximize throughput.**
 
 A typical workflow is
 

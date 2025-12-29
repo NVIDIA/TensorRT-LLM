@@ -2,15 +2,17 @@ import logging
 from dataclasses import dataclass, field
 from typing import List
 
-from tensorrt_llm.scaffolding import ChatTask, Controller, SystemMessage, Task, UserMessage
+from tensorrt_llm.scaffolding import (
+    AssistantMessage,
+    ChatTask,
+    Controller,
+    SystemMessage,
+    Task,
+    UserMessage,
+)
 from tensorrt_llm.scaffolding.task_collection import drop_kv_cache_scope, sub_request_node
 
-from .prompts import (
-    compress_research_simple_human_prompt,
-    compress_research_simple_human_prompt_prefix,
-    research_system_prompt,
-    research_system_prompt_prefix,
-)
+from .prompts import research_system_prompt, research_system_prompt_prefix
 from .tools import reflection_tool, web_search_tool
 from .utils import get_today_str
 
@@ -52,13 +54,7 @@ class Compressor(Controller):
             "Compressor only supports one ChatTask"
         )
         compress_task = ChatTask.create_from_prompt(None, self.system_prompts)
-        compress_task.add_messages(tasks[0].messages)
-        compress_task.add_message(
-            UserMessage(
-                compress_research_simple_human_prompt,
-                prefix=compress_research_simple_human_prompt_prefix,
-            )
-        )
+        compress_task.add_message(UserMessage(str([str(message) for message in tasks[0].messages])))
 
         for i in range(self.max_iterations):
             yield from self.generation_controller.process([compress_task])
@@ -67,7 +63,11 @@ class Compressor(Controller):
             if i < self.max_iterations - 1:
                 compress_task.messages.pop()
 
-        tasks[0].output_str = compress_task.output_str
+        last_message = compress_task.messages[-1]
+        assert isinstance(last_message, AssistantMessage), (
+            f"last_message is not AssistantMessage, {type(last_message)=}"
+        )
+        tasks[0].output_str = last_message.content
         return
 
 
