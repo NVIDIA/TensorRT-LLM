@@ -1091,11 +1091,13 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             "max_attention_window": [128, 32768],
             "enable_block_reuse": block_reuse,
             "enable_partial_reuse": False,
+            "free_gpu_memory_fraction": 0.5,
         }
         gen_server_config["kv_cache_config"] = {
             "max_attention_window": [128, 32768],
             "enable_block_reuse": block_reuse,
             "enable_partial_reuse": False,
+            "free_gpu_memory_fraction": 0.5,
         }
         disaggregated_server_config = {
             "hostname": "localhost",

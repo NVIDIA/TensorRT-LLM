@@ -1,13 +1,15 @@
+.. start-config-table-note
 .. include:: ../_includes/note_sections.rst
    :start-after: .. start-note-traffic-patterns
    :end-before: .. end-note-traffic-patterns
+.. end-config-table-note
 
 .. start-deepseek-ai/DeepSeek-R1-0528
 
 .. _deepseek-ai/DeepSeek-R1-0528:
 
 `DeepSeek-R1 <https://huggingface.co/deepseek-ai/DeepSeek-R1-0528>`_
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. list-table::
    :width: 100%
@@ -148,7 +150,7 @@
 .. _nvidia/DeepSeek-R1-0528-FP4-v2:
 
 `DeepSeek-R1 (NVFP4) <https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4-v2>`_
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. list-table::
    :width: 100%
@@ -337,7 +339,7 @@
 .. _openai/gpt-oss-120b:
 
 `gpt-oss-120b <https://huggingface.co/openai/gpt-oss-120b>`_
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. list-table::
    :width: 100%

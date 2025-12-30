@@ -923,6 +923,12 @@ def shape(node: Node) -> Tuple[int, ...]:
     return node.meta["val"].shape
 
 
+def get_weight_tensor(gm: GraphModule, node: Node) -> "torch.Tensor":
+    """Extract the weight tensor from a node within a GraphModule."""
+    weight_name = extract_param_names_from_node(node)[0]
+    return gm.get_parameter(weight_name)
+
+
 def draw_graph(gm: GraphModule, filename: str):
     """
     Dump graphmodule to SVG file using PyTorch's built-in drawer.

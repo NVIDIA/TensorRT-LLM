@@ -91,7 +91,7 @@ __launch_bounds__(BLOCK_SIZE) __global__ void llama4_fp8_bf16_gemm_per_warp_kern
 #endif
 
 #if ENABLE_ACQBULK
-    asm volatile("griddepcontrol.wait;" ::: "memory");
+    cudaGridDependencySynchronize();
 #endif
 
     // Processing 8 elements each
@@ -263,7 +263,7 @@ __launch_bounds__(BLOCK_SIZE) __global__ void llama4_fp8_bf16_gemm_per_warp_kern
     }
 
 #if ENABLE_PREEXIT
-    asm volatile("griddepcontrol.launch_dependents;");
+    cudaTriggerProgrammaticLaunchCompletion();
 #endif
 #endif
 }

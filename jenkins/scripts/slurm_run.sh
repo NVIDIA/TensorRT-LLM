@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Set up error handling
-set -Eeuo pipefail
+set -xEeuo pipefail
 trap 'rc=$?; echo "Error in file ${BASH_SOURCE[0]} on line $LINENO: $BASH_COMMAND (exit $rc)"; exit $rc' ERR
 
 cd $resourcePathNode
@@ -29,36 +29,20 @@ set_value_in_command() {
     echo "$result"
 }
 
-# Only the first process will save the job ID and set the git config
+# Only the first process will set the git config
 if [ $SLURM_PROCID -eq 0 ]; then
-    # Save job ID in $jobWorkspace/slurm_job_id.txt for later job to retrieve
-    echo $SLURM_JOB_ID > $jobWorkspace/slurm_job_id.txt
     # Update HOME/.gitconfig
     if ! git config --global --get-all safe.directory | grep -Fxq "*"; then
         git config --global --add safe.directory "*"
     fi
 fi
 
-if [ $SLURM_LOCALID -eq 0 ]; then
-    wget -nv $llmTarfile
-    tar -zxf $tarName
-    which python3
-    python3 --version
-    apt-get install -y libffi-dev
-    nvidia-smi && nvidia-smi -q && nvidia-smi topo -m
-    if [[ $pytestCommand == *--run-ray* ]]; then
-        pip3 install --retries 10 ray[default]
-    fi
-    cd $llmSrcNode && pip3 install --retries 10 -r requirements-dev.txt
-    cd $resourcePathNode &&  pip3 install --retries 10 --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl
-    gpuUuids=$(nvidia-smi -q | grep "GPU UUID" | awk '{print $4}' | tr '\n' ',' || true)
-    hostNodeName="${HOST_NODE_NAME:-$(hostname -f || hostname)}"
-    echo "HOST_NODE_NAME = $hostNodeName ; GPU_UUIDS = $gpuUuids ; STAGE_NAME = $stageName"
-    touch install_lock.lock
-else
-    while [ ! -f install_lock.lock ]; do
-        sleep 5
-    done
+# Aggregated mode will run install together with pytest in slurm_run.sh
+# Disaggregated mode will run install separately in slurm_install.sh
+if [[ "$stageName" != *Disagg* ]]; then
+    installScriptPath="$(dirname "${BASH_SOURCE[0]}")/$(basename "${BASH_SOURCE[0]}" | sed 's/slurm_run\.sh/slurm_install.sh/')"
+    source "$installScriptPath"
+    slurm_install_setup
 fi
 
 if [[ "$stageName" == *GB200* ]]; then
@@ -79,9 +63,10 @@ pytestCommand=$(set_value_in_command "TRTLLM_WHL_PATH" "$trtllmWhlPath" "$pytest
 # Only the first process will save the coverage config file
 if [ $SLURM_PROCID -eq 0 ]; then
     sed -i "s|---wheel_path---|$trtllmWhlPath|g" "$coverageConfigFile"
+else
+    # Sleep 10 seconds to wait for the coverage config file to be saved
+    sleep 10
 fi
-# Sleep 10 seconds to wait for the coverage config file to be saved
-sleep 10
 
 containerPipLLMLibPath=$(pip3 show tensorrt_llm | grep "Location" | awk -F ":" '{ gsub(/ /, "", $2); print $2"/tensorrt_llm/libs"}')
 containerPipLLMLibPath=$(echo "$containerPipLLMLibPath" | sed 's/[[:space:]]+/_/g')
@@ -111,8 +96,17 @@ echo "Full Command: $pytestCommand"
     done
  fi
 
+# Turn off "exit on error" so the following lines always run
+set +e
+
+pytest_exit_code=0
+perf_check_exit_code=0
+perf_report_exit_code=0
+perf_sanity_check_exit_code=0
+
 eval $pytestCommand
-echo "Rank${SLURM_PROCID} Pytest finished execution"
+pytest_exit_code=$?
+echo "Rank${SLURM_PROCID} Pytest finished execution with exit code $pytest_exit_code"
 
 if [ $SLURM_PROCID -eq 0 ] && [ "$perfMode" = "true" ] && [[ "$stageName" != *Perf-Sanity* ]]; then
     if [[ "$stageName" == *PyTorch* ]]; then
@@ -125,9 +119,38 @@ if [ $SLURM_PROCID -eq 0 ] && [ "$perfMode" = "true" ] && [[ "$stageName" != *Pe
     python3 $llmSrcNode/tests/integration/defs/perf/sanity_perf_check.py \
         $stageName/perf_script_test_results.csv \
         $basePerfPath
-    echo "Check Perf Result"
+    perf_check_exit_code=$?
+
+    echo "Create Perf Report"
     python3 $llmSrcNode/tests/integration/defs/perf/create_perf_comparison_report.py \
         --output_path $stageName/report.pdf \
         --files $stageName/perf_script_test_results.csv \
         $basePerfPath
+    perf_report_exit_code=$?
+    echo "Rank${SLURM_PROCID} Perf report finished execution with exit code $perf_report_exit_code"
+
+    if [ "$perf_check_exit_code" -eq 0 ] && [ "$perf_report_exit_code" -ne 0 ]; then
+        perf_check_exit_code=$perf_report_exit_code
+    fi
+    echo "Rank${SLURM_PROCID} Perf check finished execution with exit code $perf_check_exit_code"
 fi
+
+if [ $SLURM_PROCID -eq 0 ] && [ "$perfMode" = "true" ] && [[ "$stageName" == *Perf-Sanity* ]]; then
+    echo "Check Perf-Sanity Result"
+    python3 $llmSrcNode/tests/integration/defs/perf/perf_regression_check.py \
+        $jobWorkspace
+    perf_sanity_check_exit_code=$?
+    echo "Rank${SLURM_PROCID} Perf-Sanity check finished execution with exit code $perf_sanity_check_exit_code"
+fi
+
+if [ "$pytest_exit_code" -ne 0 ]; then
+    final_exit_code=$pytest_exit_code
+elif [ "$perf_check_exit_code" -ne 0 ]; then
+    final_exit_code=$perf_check_exit_code
+elif [ "$perf_sanity_check_exit_code" -ne 0 ]; then
+    final_exit_code=$perf_sanity_check_exit_code
+else
+    final_exit_code=0
+fi
+echo "Rank${SLURM_PROCID} Final Slurm run finished execution with exit code $final_exit_code"
+exit $final_exit_code
