@@ -111,8 +111,12 @@ class NemotronHMamba2Mixer(nn.Module):
         # S4D real initialization. These are not discretized!
         # The core is to load them, compute the discrete states, then write the updated state. Keeps the memory bounded
         A = torch.arange(1, self.num_heads + 1)
-        self.A_log = nn.Parameter(torch.log(A))
-        self.A_log._no_weight_decay = True
+        # self.A_log = nn.Parameter(torch.log(A))
+        # self.A_log._no_weight_decay = True
+        # Instead of recomputing `-torch.exp(self.A_log.float())` on every forward pass, we will register a hook
+        # that sets this appropriately when loading weights.
+        self.A_minus = nn.Parameter(-A.float())
+        self.A_minus._no_weight_decay = True
         self.norm = MambaRMSNormGated(
             self.intermediate_size,
             eps=self.layer_norm_epsilon,
@@ -123,6 +127,8 @@ class NemotronHMamba2Mixer(nn.Module):
 
         self.out_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.use_bias)
         self.use_bias = config.use_bias
+
+        self.register_load_state_dict_pre_hook(self._load_state_dict_pre_hook)
 
     def torch_forward(self, input_states):
         batch_size, seq_len, _ = input_states.shape
@@ -159,10 +165,9 @@ class NemotronHMamba2Mixer(nn.Module):
         )
 
         # 3. SSM transformation
-        A = -torch.exp(self.A_log.float())
         y = torch.ops.auto_deploy.torch_ssm(
             hidden_states=hidden_states.view(batch_size, seq_len, -1, self.head_dim),
-            A=A,
+            A=self.A_minus,
             B=B.view(batch_size, seq_len, -1, self.ssm_state_size),
             C=C.view(batch_size, seq_len, -1, self.ssm_state_size),
             D=self.D,
@@ -185,6 +190,14 @@ class NemotronHMamba2Mixer(nn.Module):
 
     def forward(self, hidden_states):
         return self.torch_forward(hidden_states)
+
+    @staticmethod
+    def _load_state_dict_pre_hook(module, state_dict, prefix, local_metadata, strict,
+                                  missing_keys, unexpected_keys, error_msgs) -> None:
+        A_log_key = prefix + "A_log"
+        A_minus_key = prefix + "A_minus"
+        if A_log_key in state_dict:
+            state_dict[A_minus_key] = -torch.exp(state_dict.pop(A_log_key).float())
 
 
 class NemotronHRMSNorm(nn.Module):
@@ -479,7 +492,7 @@ class NemotronHPreTrainedModel(PreTrainedModel):
     def _init_weights(self, module):
         """Initialize the weights."""
         if isinstance(module, NemotronHMamba2Mixer):
-            module.A_log._no_weight_decay = True
+            module.A_minus._no_weight_decay = True
             module.D._no_weight_decay = True
 
             dt = torch.exp(
