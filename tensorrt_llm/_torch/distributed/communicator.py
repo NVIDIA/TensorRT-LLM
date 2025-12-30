@@ -407,6 +407,10 @@ class MPIDist(Distributed):
     def cp_allgather(self, obj):
         return self.cp_comm.allgather(obj)
 
+    def cp_broadcast(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
+        comm = self.cp_comm
+        return safe_broadcast(comm, obj, root=root, chunk_size=chunk_size)
+
     def tp_allgather(self, obj):
         return self.tp_comm.allgather(obj)
 
@@ -709,6 +713,20 @@ class TorchDist(Distributed):
                 ret,
                 src=root,
                 group=self.mapping.tp_group_pg,
+                device=torch.device("cpu"))
+            return ret[0]
+
+    @log_op
+    def cp_broadcast(self, obj, root=0):
+        if isinstance(obj, torch.Tensor):
+            dist.broadcast(obj, src=root, group=self.mapping.cp_group_pg)
+            return obj
+        else:
+            ret = [obj]
+            torch.distributed.broadcast_object_list(
+                ret,
+                src=root,
+                group=self.mapping.cp_group_pg,
                 device=torch.device("cpu"))
             return ret[0]
 

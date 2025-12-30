@@ -258,3 +258,167 @@ def test_allreduce_pg_op(setup_ray_cluster, seq_len, hidden_size):
     ])
     for r in results:
         assert r is True
+
+
+@ray.remote(num_gpus=1)
+class CpBroadcastTest:
+    """Test worker for cp_broadcast operations with context parallelism."""
+
+    def __init__(self, rank, world_size, tp_size, cp_size):
+        self.rank = rank
+        self.world_size = world_size
+        self.tp_size = tp_size
+        self.cp_size = cp_size
+        self.master_address = os.environ["MASTER_ADDR"]
+
+        assert len(ray.get_gpu_ids()) == 1
+        self.gpu = int(ray.get_gpu_ids()[0])
+        from tensorrt_llm.executor.ray_gpu_worker import RayWorkerWrapper
+        local_gpu = RayWorkerWrapper.physical_to_local_id(self.gpu)
+        torch.cuda.set_device(local_gpu)
+
+    def _create_tcp_store(self,
+                          port: Optional[int] = None
+                          ) -> torch.distributed.TCPStore:
+        actual_port = port if port is not None else 0
+        return torch.distributed.TCPStore(host_name=self.master_address,
+                                          port=actual_port,
+                                          world_size=self.world_size,
+                                          is_master=(self.rank == 0),
+                                          wait_for_workers=False)
+
+    def setup_tcp_store(self):
+        if self.rank != 0:
+            raise RuntimeError("Only the master worker can setup TCP store")
+        self.store = self._create_tcp_store()
+        return self.store.port
+
+    def setup_distributed_env(self, port: int):
+        if self.rank != 0:
+            self.store = self._create_tcp_store(port)
+
+        torch.distributed.init_process_group(backend="cuda:nccl,cpu:gloo",
+                                             store=self.store,
+                                             world_size=self.world_size,
+                                             rank=self.rank)
+        self.mapping = Mapping(world_size=self.world_size,
+                               gpus_per_node=self.world_size,
+                               tp_size=self.tp_size,
+                               cp_size=self.cp_size,
+                               rank=self.rank)
+        self.dist = TorchDist(self.mapping)
+
+    def run_tensor_broadcast(self, root_tensor: torch.Tensor, root: int = 0):
+        """Test broadcasting a tensor via cp_broadcast."""
+        cp_rank = self.mapping.cp_rank
+        if cp_rank == root:
+            # Root rank has the tensor to broadcast
+            tensor = root_tensor.cuda()
+        else:
+            # Non-root ranks start with zeros
+            tensor = torch.zeros_like(root_tensor).cuda()
+
+        result = self.dist.cp_broadcast(tensor, root=root)
+
+        # After broadcast, all CP ranks should have the same tensor
+        expected = root_tensor.cuda()
+        return torch.allclose(result, expected)
+
+    def run_object_broadcast(self, root_obj, root: int = 0):
+        """Test broadcasting a non-tensor object via cp_broadcast."""
+        cp_rank = self.mapping.cp_rank
+        if cp_rank == root:
+            obj = root_obj
+        else:
+            obj = None
+
+        result = self.dist.cp_broadcast(obj, root=root)
+
+        # After broadcast, all CP ranks should have the same object
+        return result == root_obj
+
+
+@pytest.mark.gpu2
+@pytest.mark.parametrize("hidden_size", [128, 512], ids=lambda x: f"hidden:{x}")
+@pytest.mark.parametrize("seq_len", [16, 32], ids=lambda x: f"seqlen:{x}")
+def test_cp_broadcast_tensor(setup_ray_cluster, seq_len, hidden_size):
+    """Test TorchDist.cp_broadcast with tensor data."""
+    torch.manual_seed(42)
+    dtype = torch.bfloat16
+    world_size = 2
+    tp_size = 1
+    cp_size = 2  # Enable context parallelism
+
+    # Create tensor to broadcast from root
+    root_tensor = torch.randn((seq_len, hidden_size), dtype=dtype)
+
+    runtime_env = ray.runtime_env.RuntimeEnv()
+    runtime_env["env_vars"] = os.environ.copy()
+    runtime_env["env_vars"].update({
+        "TLLM_DISABLE_MPI": "1",
+        "MASTER_ADDR": "127.0.0.1",
+    })
+
+    remote_tests = []
+    for rank in range(world_size):
+        remote_tests.append(
+            CpBroadcastTest.options(runtime_env=runtime_env).remote(
+                rank, world_size, tp_size, cp_size))
+
+    ray.get([test.__ray_ready__.remote() for test in remote_tests])
+
+    port = ray.get(remote_tests[0].setup_tcp_store.remote())
+    ray.get([test.setup_distributed_env.remote(port) for test in remote_tests])
+
+    # Test broadcasting from root=0
+    results = ray.get([
+        test.run_tensor_broadcast.remote(root_tensor, root=0)
+        for test in remote_tests
+    ])
+    for r in results:
+        assert r is True, "Tensor broadcast from root=0 failed"
+
+
+@pytest.mark.gpu2
+@pytest.mark.parametrize("test_object", [
+    {
+        "key1": "value1",
+        "key2": [1, 2, 3]
+    },
+    ["item1", "item2", {
+        "nested": True
+    }],
+    "simple_string",
+],
+                         ids=["dict", "list", "string"])
+def test_cp_broadcast_object(setup_ray_cluster, test_object):
+    """Test TorchDist.cp_broadcast with non-tensor objects."""
+    world_size = 2
+    tp_size = 1
+    cp_size = 2  # Enable context parallelism
+
+    runtime_env = ray.runtime_env.RuntimeEnv()
+    runtime_env["env_vars"] = os.environ.copy()
+    runtime_env["env_vars"].update({
+        "TLLM_DISABLE_MPI": "1",
+        "MASTER_ADDR": "127.0.0.1",
+    })
+
+    remote_tests = []
+    for rank in range(world_size):
+        remote_tests.append(
+            CpBroadcastTest.options(runtime_env=runtime_env).remote(
+                rank, world_size, tp_size, cp_size))
+
+    ray.get([test.__ray_ready__.remote() for test in remote_tests])
+
+    port = ray.get(remote_tests[0].setup_tcp_store.remote())
+    ray.get([test.setup_distributed_env.remote(port) for test in remote_tests])
+
+    # Test broadcasting object from root=0
+    results = ray.get([
+        test.run_object_broadcast.remote(test_object, root=0)
+        for test in remote_tests
+    ])
+    for r in results:
+        assert r is True, f"Object broadcast from root=0 failed for {type(test_object)}"
