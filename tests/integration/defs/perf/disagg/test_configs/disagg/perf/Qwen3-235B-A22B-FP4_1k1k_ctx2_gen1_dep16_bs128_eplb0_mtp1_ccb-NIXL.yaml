@@ -7,7 +7,6 @@ metadata:
   - GB300
   script_file: disaggr_torch.slurm
   benchmark_type: 1k1k
-  config_index: 18
 slurm:
   script_file: disaggr_torch.slurm
   partition: <partition>

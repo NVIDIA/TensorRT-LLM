@@ -12,6 +12,8 @@ from .torch_libs.float8_python_api import addmm_float8_unwrapped
 TRTLLM_FP4_OP_AVAILABLE = True
 
 TRTLLM_NVFP4_SCALING_VECTOR_SIZE = 16
+TRTLLM_NVFP4_ROW_SIZE = 128
+TRTLLM_NVFP4_COLUMN_SIZE = 4
 
 
 @torch.library.custom_op("auto_deploy::torch_quant_fn", mutates_args=())
