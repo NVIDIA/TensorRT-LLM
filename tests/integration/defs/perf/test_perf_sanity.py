@@ -37,6 +37,7 @@ from ..conftest import get_llm_root, llm_models_root
 from .open_search_db_utils import (
     SCENARIO_MATCH_FIELDS,
     add_id,
+    get_common_values,
     get_history_data,
     get_job_info,
     post_new_perf_data,
@@ -1223,7 +1224,6 @@ class PerfSanityTestConfig:
 
         if self.runtime == "aggr_server":
             job_config = get_job_info()
-            job_config["s_gpu_type"] = self.gpu_type
             is_post_merge = job_config["b_is_post_merge"]
             new_data_dict = {}
             cmd_idx = 0
@@ -1247,9 +1247,10 @@ class PerfSanityTestConfig:
                         continue
 
                     new_data = {
+                        "s_gpu_type": self.gpu_type,
                         "s_runtime": "multi_node_aggr_server"
                         if server_config.gpus != server_config.gpus_per_node
-                        else "aggr_server"
+                        else "aggr_server",
                     }
                     new_data.update(job_config)
                     new_data.update(server_config_dict)
@@ -1264,7 +1265,7 @@ class PerfSanityTestConfig:
                     cmd_idx += 1
 
                     if not match_keys:
-                        match_keys.append("s_runtime")
+                        match_keys.extend(["s_gpu_type", "s_runtime"])
                         if server_config.match_mode == "scenario":
                             match_keys = SCENARIO_MATCH_FIELDS.copy()
                         else:
@@ -1277,7 +1278,6 @@ class PerfSanityTestConfig:
                 return
 
             job_config = get_job_info()
-            job_config["s_gpu_type"] = self.gpu_type
             is_post_merge = job_config["b_is_post_merge"]
             new_data_dict = {}
             cmd_idx = 0
@@ -1306,6 +1306,7 @@ class PerfSanityTestConfig:
                     num_gen_servers = disagg_config.num_gen_servers
 
                     new_data = {
+                        "s_gpu_type": self.gpu_type,
                         "s_runtime": "multi_node_disagg_server",
                         "s_benchmark_mode": disagg_config.mode,
                         "s_server_env_var": disagg_config.server_env_var,
@@ -1329,7 +1330,15 @@ class PerfSanityTestConfig:
                     cmd_idx += 1
 
                     if not match_keys:
-                        match_keys.extend(["s_runtime", "l_num_ctx_servers", "l_num_gen_servers"])
+                        match_keys.extend(
+                            [
+                                "s_gpu_type",
+                                "s_runtime",
+                                "s_benchmark_mode",
+                                "l_num_ctx_servers",
+                                "l_num_gen_servers",
+                            ]
+                        )
                         if num_ctx_servers > 0:
                             match_keys.extend(add_list_prefix(ctx_config.to_match_keys(), "ctx"))
                         if num_gen_servers > 0:
@@ -1342,9 +1351,12 @@ class PerfSanityTestConfig:
             print_info("No data to upload to database.")
             return
 
+        # Find common values across all data entries to narrow down query scope
+        common_values_dict = get_common_values(new_data_dict, match_keys)
+
         # Get history data for each cmd_idx
         history_baseline_dict, history_data_dict = get_history_data(
-            new_data_dict, self.gpu_type, match_keys
+            new_data_dict, match_keys, common_values_dict
         )
 
         # Prepare regressive test cases

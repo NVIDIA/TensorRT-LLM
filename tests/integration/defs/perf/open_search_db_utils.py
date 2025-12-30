@@ -35,6 +35,8 @@ from jenkins.scripts.open_search_db import (PERF_SANITY_PROJECT_NAME,
 POC_PROJECT_NAME = "sandbox-temp-trtllm-ci-perf-v1-test_info"
 USE_POC_DB = os.environ.get("USE_POC_DB", "false").lower() == "true"
 TEST_INFO_PROJECT_NAME = POC_PROJECT_NAME if USE_POC_DB else PERF_SANITY_PROJECT_NAME
+MAX_QUERY_SIZE = 5000
+QUERY_LOOKBACK_DAYS = 90
 
 # Metrics where larger is better
 MAXIMIZE_METRICS = [
@@ -67,7 +69,6 @@ MINIMIZE_METRICS = [
 SCENARIO_MATCH_FIELDS = [
     "s_runtime",
     "s_model_name",
-    "s_gpu_type",
     "l_isl",
     "l_osl",
     "l_concurrency",
@@ -178,49 +179,85 @@ def get_job_info():
     }
 
 
-def query_history_data(gpu_type):
+def get_common_values(new_data_dict, match_keys):
     """
-    Query post-merge data with specific gpu type and model name
+    Find keys from match_keys where all data entries in new_data_dict have identical values.
+    Returns a dict with those common key-value pairs.
+    Skips entries that don't have the key or have None/empty values.
+    """
+    if not new_data_dict or not match_keys:
+        return {}
+
+    data_list = list(new_data_dict.values())
+    if not data_list:
+        return {}
+
+    common_values_dict = {}
+    for key in match_keys:
+        # Collect non-None, non-empty values for this key
+        values = []
+        for data in data_list:
+            if key in data and data[key] is not None:
+                values.append(data[key])
+
+        # Skip if no valid values found
+        if len(values) != len(data_list):
+            continue
+
+        # Check if all valid values are identical
+        first_value = values[0]
+        if all(v == first_value for v in values):
+            common_values_dict[key] = first_value
+
+    return common_values_dict
+
+
+def query_history_data(common_values_dict):
+    """
+    Query post-merge data with common values to narrow down scope.
     """
     # Query data from the last 90 days
-    last_days = 90
+    last_days = QUERY_LOOKBACK_DAYS
+
+    # Build must clauses with base filters
+    must_clauses = [
+        {
+            "term": {
+                "b_is_valid": True
+            }
+        },
+        {
+            "term": {
+                "b_is_post_merge": True
+            }
+        },
+        {
+            "term": {
+                "b_is_regression": False
+            }
+        },
+        {
+            "range": {
+                "ts_created": {
+                    "gte":
+                    int(time.time() - 24 * 3600 * last_days) // (24 * 3600) *
+                    24 * 3600 * 1000,
+                }
+            }
+        },
+    ]
+
+    # Add common values as term filters to narrow down the query
+    for key, value in common_values_dict.items():
+        must_clauses.append({"term": {key: value}})
+
     json_data = {
         "query": {
             "bool": {
-                "must": [
-                    {
-                        "term": {
-                            "b_is_valid": True
-                        }
-                    },
-                    {
-                        "term": {
-                            "b_is_post_merge": True
-                        }
-                    },
-                    {
-                        "term": {
-                            "b_is_regression": False
-                        }
-                    },
-                    {
-                        "term": {
-                            "s_gpu_type": gpu_type
-                        }
-                    },
-                    {
-                        "range": {
-                            "ts_created": {
-                                "gte":
-                                int(time.time() - 24 * 3600 * last_days) //
-                                (24 * 3600) * 24 * 3600 * 1000,
-                            }
-                        }
-                    },
-                ]
+                "must": must_clauses
             },
         },
-        "size": 3000,
+        "size": MAX_QUERY_SIZE,
     }
     json_data = json.dumps(json_data)
 
@@ -329,7 +366,7 @@ def calculate_best_perf_result(history_data_list, new_data):
     return best_metrics
 
 
-def get_history_data(new_data_dict, gpu_type, match_keys):
+def get_history_data(new_data_dict, match_keys, common_values_dict):
     """
     Query history post-merge data for each cmd_idx
     """
@@ -374,7 +411,7 @@ def get_history_data(new_data_dict, gpu_type, match_keys):
     cmd_idxs = new_data_dict.keys()
     history_data_list = None
     if cmd_idxs:
-        history_data_list = query_history_data(gpu_type)
+        history_data_list = query_history_data(common_values_dict)
 
     # If query_history_data returned None, it means network failure
     if history_data_list is None:
