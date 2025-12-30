@@ -2163,9 +2163,19 @@ class Linear(nn.Module):
         tp_valid = self.tp_mode is not None and self.tp_mode == TensorParallelMode.ROW and self.tp_size > 1
         quant_valid = self.quant_config is not None and self.quant_config.layer_quant_mode.has_nvfp4(
         )
+
+        device_supported = False
+        if torch.cuda.is_available():
+            capability = torch.cuda.get_device_capability(
+                torch.device('cuda:0'))
+            sm_version = capability[0] * 10 + capability[1]
+            if sm_version >= 100:
+                device_supported = True
+
         self.use_fused_gemm_allreduce = all([
             self.reduce_output, mpi_enabled, dtype_supported,
-            in_features_aligned, out_features_aligned, tp_valid, quant_valid
+            in_features_aligned, out_features_aligned, tp_valid, quant_valid,
+            device_supported
         ])
 
         self.enable_cuda_core = False
