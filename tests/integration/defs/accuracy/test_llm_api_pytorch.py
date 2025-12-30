@@ -4979,7 +4979,9 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
                                         enable_block_reuse=not eagle3)
         spec_config = None
-        os.system(f"sha256sum {llm_models_root()}/Mistral-Large-3-675B/Mistral-Large-3-675B-Instruct-2512-NVFP4/tokenizer.json")
+        os.system(
+            f"sha256sum {llm_models_root()}/Mistral-Large-3-675B/Mistral-Large-3-675B-Instruct-2512-NVFP4/tokenizer.json"
+        )
         if eagle3:
             spec_config = EagleDecodingConfig(
                 max_draft_len=2,
