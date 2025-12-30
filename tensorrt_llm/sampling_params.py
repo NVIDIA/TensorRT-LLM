@@ -438,6 +438,9 @@ class SamplingParams:
 
                 setattr(self, key, value)
 
+        # re-validate after loading from generation_config to catch invalid values
+        self._validate()
+
         return self
 
     def _get_bad_words(self) -> List[List[int]]:
