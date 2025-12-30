@@ -12,9 +12,9 @@ import openai
 import pytest
 import requests
 import yaml
+from defs.common import get_free_port_in_ci as get_free_port
 from defs.conftest import llm_models_root
 
-from tensorrt_llm._utils import get_free_port
 from tensorrt_llm.logger import logger
 
 HEARTBEAT_INTERVAL = 1
@@ -454,7 +454,7 @@ async def test_worker_restart(model_name, disagg_server_config, worker_config,
                                       port=disagg_port)
         print(response)
         # kill gen1, the request should fail
-        terminate(gen_worker1, release_port=False)
+        terminate(gen_worker1, release_port=True)
         await asyncio.sleep(CHECK_STATUS_INTERVAL)
         verify_cluster_info(False, 1, 0, port=disagg_port)
         with pytest.raises(Exception):
@@ -480,7 +480,7 @@ async def test_worker_restart(model_name, disagg_server_config, worker_config,
         assert len(response.choices[0].text) >= 1
 
         # kill ctx1, the request should fail
-        terminate(ctx_worker1, release_port=False)
+        terminate(ctx_worker1, release_port=True)
         await asyncio.sleep(CHECK_STATUS_INTERVAL)
         verify_cluster_info(False, 0, 1, port=disagg_port)
         with pytest.raises(Exception):
@@ -500,16 +500,16 @@ async def test_worker_restart(model_name, disagg_server_config, worker_config,
         assert len(response.choices[0].text) >= 1
 
         # start ctx1 and gen1 again, we have 2 ctxs and 2 gens now
-        await wait_for_port_released(ctx_worker1.port)
-        await wait_for_port_released(gen_worker1.port)
         ctx_worker1 = run_ctx_worker(model_name,
                                      worker_config,
                                      work_dir,
-                                     port=ctx_worker1.port)
+                                     port=0,
+                                     device=0)
         gen_worker1 = run_gen_worker(model_name,
                                      worker_config,
                                      work_dir,
-                                     port=gen_worker1.port)
+                                     port=0,
+                                     device=1)
         await wait_for_worker_ready(ctx_worker1.port)
         await wait_for_worker_ready(gen_worker1.port)
         await asyncio.sleep(CHECK_STATUS_INTERVAL)
@@ -556,6 +556,7 @@ async def test_disagg_server_restart(model_name, disagg_server_config,
         terminate(disagg_server)
         # wait for the port to be released, so we can rebind the new process to the same port
         await wait_for_port_released(disagg_port)
+        await asyncio.sleep(CHECK_STATUS_INTERVAL)
 
         with pytest.raises(requests.exceptions.RequestException):
             verify_cluster_info(False,

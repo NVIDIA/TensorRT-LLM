@@ -1241,7 +1241,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
     def dockerBuildJob = [
         "Build-Docker-Images": {
             script {
-                stage("[Build-Docker-Images] Remote Run") {
+                def testStageName = "[Build-Docker-Images] ${env.localJobCredentials ? "Remote Run" : "Run"}"
+                stage(testStageName) {
                     def branch = env.gitlabBranch ? env.gitlabBranch : "main"
                     if (globalVars[GITHUB_PR_API_URL]) {
                         branch = "github-pr-" + globalVars[GITHUB_PR_API_URL].split('/').last()

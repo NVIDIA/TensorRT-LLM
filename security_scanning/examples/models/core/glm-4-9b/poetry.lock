@@ -1883,13 +1883,13 @@ telegram = ["requests"]
 
 [[package]]
 name = "typer-slim"
-version = "0.20.1"
+version = "0.21.0"
 description = "Typer, build great CLIs. Easy to code. Based on Python type hints."
 optional = false
-python-versions = ">=3.8"
+python-versions = ">=3.9"
 files = [
-    {file = "typer_slim-0.20.1-py3-none-any.whl", hash = "sha256:8e89c5dbaffe87a4f86f4c7a9e2f7059b5b68c66f558f298969d42ce34f10122"},
-    {file = "typer_slim-0.20.1.tar.gz", hash = "sha256:bb9e4f7e6dc31551c8a201383df322b81b0ce37239a5ead302598a2ebb6f7c9c"},
+    {file = "typer_slim-0.21.0-py3-none-any.whl", hash = "sha256:92aee2188ac6fc2b2924bd75bb61a340b78bd8cd51fd9735533ce5a856812c8e"},
+    {file = "typer_slim-0.21.0.tar.gz", hash = "sha256:f2dbd150cfa0fead2242e21fa9f654dfc64773763ddf07c6be9a49ad34f79557"},
 ]
 
 [package.dependencies]
