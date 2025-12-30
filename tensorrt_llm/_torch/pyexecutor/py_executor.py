@@ -1052,20 +1052,25 @@ class PyExecutor:
                                 guided_decoder_failed_requests = self.guided_decoder.execute(
                                     batch_outputs['logits'])
 
-                            # Wait for the previous sample to finish.
-                            self.finish_sample_event.wait()
-                            # Copy the batch outputs as sampler inputs
-                            # to avoid next forward step overwriting them.
-                            batch_outputs_copy = {
-                                name: tensor.clone()
-                                for name, tensor in batch_outputs.items()
-                            }
-                            self.start_sample_event.record()
-                            with torch.cuda.stream(self.sample_stream):
-                                self.start_sample_event.wait()
+                            if os.environ.get("TRTLLM_PP_MULTI_STREAM_SAMPLE",
+                                              "1") == "1":
+                                # Wait for the previous sample to finish.
+                                self.finish_sample_event.wait()
+                                # Copy the batch outputs as sampler inputs
+                                # to avoid next forward step overwriting them.
+                                batch_outputs_copy = {
+                                    name: tensor.clone()
+                                    for name, tensor in batch_outputs.items()
+                                }
+                                self.start_sample_event.record()
+                                with torch.cuda.stream(self.sample_stream):
+                                    self.start_sample_event.wait()
+                                    sample_state = self._sample_async(
+                                        scheduled_batch, batch_outputs_copy)
+                                    self.finish_sample_event.record()
+                            else:
                                 sample_state = self._sample_async(
-                                    scheduled_batch, batch_outputs_copy)
-                                self.finish_sample_event.record()
+                                    scheduled_batch, batch_outputs)
                             assert sample_state is not None, "Sampling failed"
 
                             # Handle guided decoder errors after _sample_async to avoid state conflicts.
