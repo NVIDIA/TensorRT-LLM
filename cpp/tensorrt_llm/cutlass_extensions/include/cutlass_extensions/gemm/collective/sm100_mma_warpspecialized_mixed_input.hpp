@@ -230,11 +230,11 @@ public:
         = cute::conditional_t<!SwapAB, decltype(make_shape(size<0>(TileShape{}), size<2>(TileShape{}))),
             decltype(make_shape(size<1>(TileShape{}), size<2>(TileShape{})))>;
 
-    static constexpr int ScaleTileShape_MN = get<0>(ScaleTileShape{});
+    using SmemLayoutAtomScaleFull = decltype(ScaleConfig::smem_atom_layout_scale(ScaleTileShape{}));
 
-    static constexpr int ScaleK = get<1>(ScaleTileShape{}) / ScaleGranularityK;
-
-    using SmemLayoutAtomScale = decltype(ScaleConfig::smem_atom_layout_scale(ScaleTileShape{}));
+    // Getting the SmemSizeMN and SmemSizeK from the mixed_dtype blockwise utils.
+    using SmemLayoutAtomScale
+        = decltype(slice(make_coord(make_coord(_, 0), make_coord(_, 0)), SmemLayoutAtomScaleFull{}));
 
     static_assert(cute::rank(InternalSmemLayoutAtomA{}) == 2, "SmemLayoutAtom must be rank 2 (M/N, K)");
     static_assert((size<0>(TileShape{}) % size<0>(InternalSmemLayoutAtomA{})) == 0,
@@ -288,9 +288,9 @@ public:
         append(CtaShapeB_NK{}, Int<DispatchPolicy::Load2TransformPipelineStageCount>{}),
         (cute::conditional_t<cutlass::gemm::detail::is_mn_major<StrideB>(), Step<_2, _1, _3>, Step<_1, _2, _3>>{})));
 
-    using SmemLayoutScale = decltype(make_layout(
-        append(shape(SmemLayoutAtomScale{}), Int<DispatchPolicy::Load2TransformPipelineStageCount>{}),
-        append(stride(SmemLayoutAtomScale{}), size(filter_zeros(SmemLayoutAtomScale{})))));
+    using SmemLayoutScale = decltype(UMMA::tile_to_mma_shape(SmemLayoutAtomScale{},
+        append(CtaShapeA_MK{}, Int<DispatchPolicy::Load2TransformPipelineStageCount>{}),
+        (cute::conditional_t<cutlass::gemm::detail::is_mn_major<StrideA>(), Step<_2, _1, _3>, Step<_1, _2, _3>>{})));
 
     static_assert(DispatchPolicy::Load2TransformPipelineStageCount >= 2,
         "Specialization requires Stages set to value 2 or more.");
@@ -419,9 +419,9 @@ public:
                                         make_shape(uint32_t(0), uint32_t(0), Int<1>{}), ClusterShape{})),
                 make_tile(typename TiledMma::AtomThrID{})));
 
-        using TMA_Scale = decltype(make_tma_atom(GmemTiledCopyScale{},
+        using TMA_Scale = decltype(make_tma_atom_A_sm100(GmemTiledCopyScale{},
             make_tensor(static_cast<NonVoidElementScale const*>(nullptr), LayoutScale{}),
-            SmemLayoutScale{}(_, _, cute::Int<0>{}), ScaleTileShape{}, size<2>(ClusterLayout_VMNK{})));
+            SmemLayoutScale{}(_, _, _, cute::Int<0>{}), TileShape{}, TiledMma{}, ClusterLayout_VMNK{}));
 
         TMA_Scale tma_load_scale;
         TMA_Scale tma_load_zero;
@@ -527,8 +527,8 @@ public:
             ElementScale const* ptr_S = args.ptr_S;
 
             Tensor tensor_scale = make_tensor(detail::get_logical_ptr(ptr_S), args.layout_S);
-            typename Params::TMA_Scale tma_load_scale = make_tma_atom(GmemTiledCopyScale{}, tensor_scale,
-                SmemLayoutScale{}(_, _, cute::Int<0>{}), ScaleTileShape{}, size<2>(cluster_layout_vmnk));
+            typename Params::TMA_Scale tma_load_scale = make_tma_atom_A_sm100<ElementScale>(GmemTiledCopyScale{},
+                tensor_scale, SmemLayoutScale{}(_, _, _, cute::Int<0>{}), TileShape{}, TiledMma{}, cluster_layout_vmnk);
 
             if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale)
             {
@@ -539,8 +539,9 @@ public:
             else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero)
             {
                 Tensor tensor_zero = make_tensor(detail::get_logical_ptr(args.ptr_Z), args.layout_S);
-                typename Params::TMA_Scale tma_load_zero = make_tma_atom(GmemTiledCopyScale{}, tensor_zero,
-                    SmemLayoutScale{}(_, _, cute::Int<0>{}), ScaleTileShape{}, size<2>(cluster_layout_vmnk));
+                typename Params::TMA_Scale tma_load_zero
+                    = make_tma_atom_A_sm100<ElementScale>(GmemTiledCopyScale{}, tensor_zero,
+                        SmemLayoutScale{}(_, _, _, cute::Int<0>{}), TileShape{}, TiledMma{}, cluster_layout_vmnk);
 
                 typename Params::TMAScaleParams scale_params{tma_load_scale, tma_load_zero};
                 return {scale_params, tma_load_a, tma_load_b, tma_load_a_fallback, tma_load_b_fallback,
@@ -883,11 +884,10 @@ public:
             Tensor sS = make_tensor(make_smem_ptr(shared_storage.input.smem_scale.begin()), SmemLayoutScale{});
 
             Tensor tCgS_mkl = cta_mma.partition_A(gS_mkl); // (MMA, MMA_M, MMA_K, m, k, l)
-            Tensor tCsS = cta_mma.partition_A(sS);
 
             // Project the cta_layout for tma_scale along the n-modes
             auto [tSgS_mkl, tSsS] = tma_partition(params.tma_load_scale, get<2>(cta_coord_vmnk),
-                make_layout(size<2>(cta_layout_vmnk)), group_modes<0, 3>(tCsS), group_modes<0, 3>(tCgS_mkl));
+                make_layout(size<2>(cta_layout_vmnk)), group_modes<0, 3>(sS), group_modes<0, 3>(tCgS_mkl));
 
             if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale)
             {
@@ -904,10 +904,9 @@ public:
 
                 Tensor tCgZ_mkl = cta_mma.partition_A(gZ_mkl); // (MMA, MMA_M, MMA_K, m, k, l)
 
-                Tensor tCsZ = cta_mma.partition_A(sZ);
                 // Project the cta_layout for tma_scale along the n-modes
                 auto [tZgZ_mkl, tZsZ] = tma_partition(params.tma_load_zero, get<2>(cta_coord_vmnk),
-                    make_layout(size<2>(cta_layout_vmnk)), group_modes<0, 3>(tCsZ), group_modes<0, 3>(tCgZ_mkl));
+                    make_layout(size<2>(cta_layout_vmnk)), group_modes<0, 3>(sZ), group_modes<0, 3>(tCgZ_mkl));
                 return cute::make_tuple(gA_mkl, gB_nkl, // for scheduler
                     tAgA_mkl, tBgB_nkl, tAsA, tBsB,     // for input tensor values
                     mcast_mask_a, mcast_mask_b,         // multicast masks
@@ -1096,7 +1095,7 @@ public:
             ComputeCopyAtomA{});
 
         // Partition of thread -> shared and thread -> RF
-        auto fragment_compute = TiledMma::make_fragment_A(sACompute);
+        auto fragment_compute = TiledMma::make_fragment_A(sS);
         fragment_compute.data()
             = accumulators.data().get() + cutlass::detail::find_tmem_tensor_col_offset(accumulators);
         auto r2t_tiled_copy = make_tmem_copy(ComputeCopyAtomA{}, fragment_compute(_, _, _, 0));
