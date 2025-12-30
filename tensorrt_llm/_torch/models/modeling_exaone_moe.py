@@ -59,25 +59,6 @@ AutoConfig.register(ExaoneMoEConfig.model_type, ExaoneMoEConfig)
 # fmt: on
 
 
-def check_is_sliding(config: ExaoneMoEConfig, layer_idx: int) -> bool:
-    """
-    Check if the current layer is a sliding window (local attention) layer.
-    """
-    if config.sliding_window is None:
-        return False
-    elif isinstance(config.sliding_window_pattern, int):
-        return ((layer_idx + 1) % config.sliding_window_pattern) != 0
-    elif isinstance(config.sliding_window_pattern, str):
-        assert isinstance(config.sliding_window, int), (
-            f"Sliding window must be positive integer, but got {config.sliding_window}"
-        )
-        return (
-            layer_idx != config.num_hidden_layers - 1
-            and config.sliding_window_pattern[layer_idx % len(config.sliding_window_pattern)] == "L"
-        )
-    return False
-
-
 def check_is_moe(config: ExaoneMoEConfig, layer_idx: int) -> bool:
     """
     Check if the current layer is a MoE layer.
@@ -100,7 +81,7 @@ class ExaoneMoeAttention(QKNormRoPEAttention):
         config = model_config.pretrained_config
 
         self.attention_window_size = None
-        self.is_sliding = check_is_sliding(config, layer_idx)
+        self.is_sliding = config.layer_types[layer_idx] == "sliding_attention"
 
         # NOTE: In ExaoneMoe, only sliding layers apply rope.
         pos_embd_params = None
