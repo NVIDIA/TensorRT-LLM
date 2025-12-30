@@ -70,6 +70,7 @@ void sm100_generic_mixed_gemm_kernelLauncher(ActivationType const* A, WeightType
 
     using CutlassActivationType = typename TllmToCutlassTypeAdapter<ActivationType>::type;
 
+#ifdef COMPILE_BLACKWELL_TMA_GEMMS
     if constexpr (!should_filter_tma_warp_specialized_gemm_problem_shape_v<cutlass::arch::Sm100, CTAShape, ClusterShape,
                       false, ActivationType>)
     {
@@ -271,6 +272,8 @@ void sm100_generic_mixed_gemm_kernelLauncher(ActivationType const* A, WeightType
 
         throw std::runtime_error(ss.str());
     }
+
+#else // COMPILE_BLACKWELL_TMA_GEMMS
 }
 
 } // namespace cutlass_kernels_oss
