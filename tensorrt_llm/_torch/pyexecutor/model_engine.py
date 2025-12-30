@@ -597,6 +597,9 @@ class PyTorchModelEngine(ModelEngine):
         self._run_torch_compile_warmup(resource_manager)
         self._run_autotuner_warmup(resource_manager)
         self._run_cuda_graph_warmup(resource_manager)
+        if not kv_cache_manager.is_estimating_kv_cache and not self.is_draft_model:
+            # Run extra general warmup to warmup memory pool before running real requests.
+            self._general_warmup(resource_manager, reverse=True)
 
         # Set the value back to the original value after all warmups are complete
         self.enable_spec_decode = self.is_spec_decode
@@ -611,8 +614,8 @@ class PyTorchModelEngine(ModelEngine):
                 self.original_max_draft_len), self.max_num_tokens,
             self.batch_size * (self.max_seq_len - 1))
         max_batch_size = min(
-            self.batch_size,
-            curr_max_num_tokens // (1 + self.runtime_draft_len))
+            self.batch_size, curr_max_num_tokens //
+            (1 + self.runtime_draft_len) // self.max_beam_width)
 
         warmup_requests_configs = {
             (1, 1),  # Specialize for 1 token.
@@ -935,8 +938,8 @@ class PyTorchModelEngine(ModelEngine):
 
         blocks_to_use = num_full_seqs * math.ceil(
             max_seq_len / kv_cache_manager.tokens_per_block) + math.ceil(
-                num_left_over_tokens /
-                kv_cache_manager.tokens_per_block) + num_gen_requests
+                num_left_over_tokens / kv_cache_manager.tokens_per_block
+            ) + num_gen_requests * self.max_beam_width
 
         if blocks_to_use > available_blocks:
             return None
@@ -2594,8 +2597,6 @@ class PyTorchModelEngine(ModelEngine):
         num_generation_requests = len(gen_request_seq_slots)
         # Cache indirection is only used for beam search on generation requests
         if self.use_beam_search and num_generation_requests > 0:
-            # CUDA Graph needs to set beam width during warmup (where the graph is captured), to ensure that cache indirection buffer is correctly picked up by the CUDA graph
-            is_cuda_graph_during_warmup = self.is_warmup and attn_metadata.is_cuda_graph
             if cache_indirection_buffer is not None:
                 #Copy cache indirection to local buffer with offsets changing:  seq_slots[i] -> i
                 # Convert to GPU tensor to avoid implicit sync
@@ -2603,7 +2604,7 @@ class PyTorchModelEngine(ModelEngine):
                     gen_request_seq_slots, dtype=torch.long, device='cuda')
                 self.cache_indirection_attention[:num_generation_requests].copy_(
                     cache_indirection_buffer[gen_request_seq_slots_tensor])
-            if cache_indirection_buffer is not None or is_cuda_graph_during_warmup:
+            if cache_indirection_buffer is not None or self.is_warmup:
                 attn_metadata.beam_width = self.max_beam_width
         else:
             attn_metadata.beam_width = 1
