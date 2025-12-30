@@ -3018,7 +3018,7 @@ def runInEnrootOnNode(label, partitionTimeout)
 {
     return {
         runner -> node(label) {
-            // We submit the Slurm job with time in SlurmPartition
+            // We submit the Slurm job with the Slurm partition's time spec.
             // Minus 10 minutes to avoid the Slurm job being stopped earlier.
             timeout(time: partitionTimeout - 10, unit: 'MINUTES') {
                 runner()
