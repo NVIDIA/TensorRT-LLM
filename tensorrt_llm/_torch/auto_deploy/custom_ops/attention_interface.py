@@ -10,19 +10,7 @@ and operates on a purely functional paradigm that is compatible with the torch c
 """
 
 from abc import ABC, abstractmethod
-from typing import (
-    Callable,
-    Dict,
-    List,
-    Literal,
-    Optional,
-    Protocol,
-    Sequence,
-    Set,
-    Tuple,
-    Type,
-    Union,
-)
+from typing import Dict, List, Literal, Optional, Protocol, Sequence, Set, Tuple, Type, Union
 
 import torch
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -34,6 +22,10 @@ from ...._utils import nvtx_range
 from ..utils.logger import ad_logger
 
 Constant = Union[int, float, str, None]
+
+
+class PrepareMetadataHostCallable(Protocol):
+    def __call__(self, **sequence_info_args: torch.Tensor) -> None: ...
 
 
 class InputBuffer:
@@ -388,6 +380,9 @@ class SequenceInfo:
     - _mask_scatter_indices: [m_0, m_1, ..., m_{s_total-1}]
       Mask scatter indices used by the overlap scheduler to scatter results back.
 
+    NOTE: all tensors are also accessible as host tensors with the suffix "_host". For example,
+    the tensor "batch_info" is accessible as "batch_info_host" on the host.
+
     ################################################################################################
 
     Here are a couple of notes to emphasize this notation:
@@ -526,7 +521,7 @@ class SequenceInfo:
         ############################################################################################
 
         # HOST PREPARE FOR ATTENTION FORWARD #######################################################
-        self._host_prepare_functions: set[Callable[[SequenceInfo], None]] = set()
+        self._host_prepare_functions: List[Tuple[PrepareMetadataHostCallable, List[str]]] = []
 
         # call reset once to set a consistent initial state
         self.reset()
@@ -1043,13 +1038,13 @@ class SequenceInfo:
         return list(torch.split(t_squeezed, self.seq_len))
 
     def register_host_prepare_for_attention_forward(
-        self, host_function: Callable[["SequenceInfo"], None]
+        self, host_function: PrepareMetadataHostCallable, args: List[str]
     ):
-        self._host_prepare_functions.add(host_function)
+        self._host_prepare_functions.append((host_function, args))
 
     def run_host_prepare_for_attention_forward(self) -> None:
-        for host_function in self._host_prepare_functions:
-            host_function(self)
+        for host_function, args in self._host_prepare_functions:
+            host_function(**{arg: self._get_arg(arg) for arg in args})
 
 
 class MHACallable(Protocol):
@@ -1061,14 +1056,7 @@ class MHACallable(Protocol):
 
 class PrepareMetadataCallable(Protocol):
     def __call__(
-        self,
-        position_ids: torch.Tensor,
-        seq_len: torch.Tensor,
-        input_pos: torch.Tensor,
-        cache_loc: torch.Tensor,
-        pages_per_seq: torch.Tensor,
-        slot_idx: torch.Tensor,
-        page_size: int,
+        self, *sequence_info_args_and_constants: Union[torch.Tensor, Constant]
     ) -> List[torch.Tensor]: ...
 
 
@@ -1229,13 +1217,14 @@ class AttentionDescriptor(ABC):
         return []
 
     @classmethod
-    def host_prepare_for_forward(cls, sequence_info: SequenceInfo):
-        """Perform host-side preparation for the forward pass for the attention op.
+    def get_host_prepare_metadata_function(cls) -> Optional[PrepareMetadataHostCallable]:
+        """Get function that performs host-side prep for the forward pass for the attention op.
 
         This method is responsible for preparing the attention op for the forward pass.
-        This function is not expected to be graph capturable or compatible with cuda graphs.
+        This function is not expected to be graph capturable or compatible with cuda graphs. It can
+        use any argument from the SequenceInfo interface as input argument to its function.
         """
-        return
+        return None
 
 
 class AttentionRegistry:

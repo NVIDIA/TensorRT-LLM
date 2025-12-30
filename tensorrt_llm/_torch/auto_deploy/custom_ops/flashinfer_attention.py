@@ -21,6 +21,7 @@ from .attention_interface import (
     Constant,
     MHACallable,
     PrepareMetadataCallable,
+    PrepareMetadataHostCallable,
     SequenceInfo,
 )
 
@@ -183,7 +184,6 @@ class PlanParams:
     n_kv_heads: int
     head_dim: int
     num_seq: int
-    is_generate: bool
     page_size: int
     q_dtype: torch.dtype
     kv_dtype: torch.dtype
@@ -289,12 +289,17 @@ class _FlashInferPlanner:
         kv_page_indices: torch.Tensor,
         kv_last_page_len_host: torch.Tensor,
         kv_lens_arr_host: torch.Tensor,
-        seq_len_host: torch.Tensor,
         plan_params: PlanParams,
     ) -> None:
         # check for re-planning
         if plan_params != self.plan_params_prefill:
             # plan prefill
+            # NOTE (lucaslie): we use host versions here. the plan actually needs both (host+device)
+            # version. Unfortunately, there is no good way to access the plan API and provide both
+            # although we have both available. I have decided to use the host versions here to
+            # ensure non-blocking invocation of plan, whereas the other way around would trigger a
+            # blocking copy to cpu. This way we trigger a non-blocking copy to device (note that
+            # this is safe since we do have pinned CPU memory for all our host-side arguments).
             self.prefill_wrapper.plan(
                 qo_indptr_host,
                 kv_page_indptr_host,
@@ -308,7 +313,6 @@ class _FlashInferPlanner:
                 q_data_type=plan_params.q_dtype,
                 kv_data_type=plan_params.kv_dtype,
                 sm_scale=plan_params.sm_scale,
-                # max_token_per_sequence=max(seq_len_host).item(),
                 seq_lens=kv_lens_arr_host,
             )
             self.plan_params_prefill = plan_params
@@ -359,7 +363,6 @@ class _FlashInferPlanner:
             _plan_decode(self.cached_cuda_graph_decode_wrappers[plan_params])
         # check if we are in cuda graph capture and just return the pre-cached decode wrapper
         if torch.cuda.is_current_stream_capturing() or cuda_graph_state.in_warm_up():
-            assert plan_params.is_generate, "Only generate is supported during cuda graph capture."
             wrapper = self.cached_cuda_graph_decode_wrappers[plan_params]
             return wrapper
 
@@ -423,6 +426,23 @@ def prepare_flashinfer_metadata_fake(
     )
 
 
+def prepare_flashinfer_metadata_host(
+    batch_info_host: torch.Tensor,
+    cu_num_pages_host: torch.Tensor,
+    cache_loc_host: torch.Tensor,
+    last_page_len_host: torch.Tensor,
+) -> None:
+    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+
+    if num_prefill == 0:
+        _GlobalFlashInferPlanner.plan_generate_only(
+            num_decode,
+            cu_num_pages_host[: num_decode + 1],
+            cache_loc_host,
+            last_page_len_host[:num_decode],
+        )
+
+
 @torch.library.custom_op("auto_deploy::flashinfer_attention_mha_with_cache", mutates_args=())
 def flashinfer_mha_with_cache(
     # Q, K, V
@@ -438,7 +458,6 @@ def flashinfer_mha_with_cache(
     last_page_len: torch.Tensor,
     last_page_len_host: torch.Tensor,
     seq_len_with_cache_host: torch.Tensor,
-    seq_len_host: torch.Tensor,
     # EXTRA METADATA
     flashinfer_batch_indices: torch.Tensor,
     flashinfer_positions: torch.Tensor,
@@ -502,7 +521,6 @@ def flashinfer_mha_with_cache(
             n_kv_heads=n_kv_heads,
             head_dim=head_dim,
             num_seq=num_prefill,
-            is_generate=False,
             page_size=k_cache.shape[1],
             q_dtype=q_prefill.dtype,
             kv_dtype=k_cache.dtype,
@@ -515,7 +533,6 @@ def flashinfer_mha_with_cache(
             kv_page_indices=cache_loc,
             kv_last_page_len_host=last_page_len_host[:num_prefill],
             kv_lens_arr_host=seq_len_with_cache_host[:num_prefill],
-            seq_len_host=seq_len_host[:num_prefill],
             plan_params=pp_prefill,
         )
 
@@ -539,7 +556,6 @@ def flashinfer_mha_with_cache(
             n_kv_heads=n_kv_heads,
             head_dim=head_dim,
             num_seq=num_decode,
-            is_generate=True,
             page_size=k_cache.shape[1],
             q_dtype=q_decode.dtype,
             kv_dtype=k_cache.dtype,
@@ -584,7 +600,6 @@ def flashinfer_mha_with_cache_fake(
     last_page_len: torch.Tensor,
     last_page_len_host: torch.Tensor,
     seq_len_with_cache_host: torch.Tensor,
-    seq_len_host: torch.Tensor,
     # EXTRA METADATA
     flashinfer_batch_indices: torch.Tensor,
     flashinfer_positions: torch.Tensor,
@@ -642,7 +657,6 @@ class FlashInferAttention(AttentionDescriptor):
             "last_page_len",
             "last_page_len_host",
             "seq_len_with_cache_host",
-            "seq_len_host",
         ]
 
     @classmethod
@@ -684,18 +698,8 @@ class FlashInferAttention(AttentionDescriptor):
         return {"workspace_buffer": _init_workspace}
 
     @classmethod
-    def host_prepare_for_forward(cls, sequence_info: SequenceInfo):
-        batch_info = sequence_info._input_buffer.get_host_view("batch_info")
-        num_prefill, num_prefill_tokens, num_decode = batch_info.tolist()
-        # Call plan for generate-only batches.
-        if num_prefill == 0:
-            _GlobalFlashInferPlanner.plan_generate_only(
-                num_decode,
-                sequence_info._input_buffer.get_host_view("cu_num_pages")[: num_decode + 1],
-                sequence_info._input_buffer.get_host_view("cache_loc"),
-                sequence_info._input_buffer.get_host_view("last_page_len")[:num_decode],
-            )
-        return
+    def get_host_prepare_metadata_function(cls) -> Optional[PrepareMetadataHostCallable]:
+        return prepare_flashinfer_metadata_host
 
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
