@@ -4,22 +4,25 @@
 set -xEeuo pipefail
 trap 'rc=$?; echo "Error in file ${BASH_SOURCE[0]} on line $LINENO: $BASH_COMMAND (exit $rc)"; exit $rc' ERR
 
+# Source utilities
+bashUtilsPath="$(dirname "${BASH_SOURCE[0]}")/$(basename "${BASH_SOURCE[0]}" | sed 's/slurm_install\.sh/bash_utils.sh/')"
+source "$bashUtilsPath"
+
 slurm_install_setup() {
     cd $resourcePathNode
     llmSrcNode=$resourcePathNode/TensorRT-LLM/src
 
     if [ $SLURM_LOCALID -eq 0 ]; then
-        wget -nv $llmTarfile
-        tar -zxf $tarName
+        retry_command bash -c "wget -nv $llmTarfile && tar -zxf $tarName"
         which python3
         python3 --version
-        apt-get install -y libffi-dev
+        retry_command apt-get install -y libffi-dev
         nvidia-smi && nvidia-smi -q && nvidia-smi topo -m
         if [[ $pytestCommand == *--run-ray* ]]; then
-            pip3 install --retries 10 ray[default]
+            retry_command pip3 install --retries 10 ray[default]
         fi
-        cd $llmSrcNode && pip3 install --retries 10 -r requirements-dev.txt
-        cd $resourcePathNode && pip3 install --retries 10 --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl
+        retry_command bash -c "cd $llmSrcNode && pip3 install --retries 10 -r requirements-dev.txt"
+        retry_command bash -c "cd $resourcePathNode && pip3 install --retries 10 --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl"
         gpuUuids=$(nvidia-smi -q | grep "GPU UUID" | awk '{print $4}' | tr '\n' ',' || true)
         hostNodeName="${HOST_NODE_NAME:-$(hostname -f || hostname)}"
         echo "HOST_NODE_NAME = $hostNodeName ; GPU_UUIDS = $gpuUuids ; STAGE_NAME = $stageName"
