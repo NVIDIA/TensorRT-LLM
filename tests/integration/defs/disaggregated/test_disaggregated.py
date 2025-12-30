@@ -2044,6 +2044,7 @@ def test_disaggregated_deepseek_v3_lite_bf16_tllm_gen_helix(
                            prompt_file="long_prompts.json")
 
 
+@pytest.mark.timeout(12600)
 @pytest.mark.parametrize("test_config", [
     pytest.param(TestConfig(model_path='DeepSeek-R1/DeepSeek-R1-0528-FP4-v2',
                             test_desc='deepseek_r1_v2_fp4_stress',
