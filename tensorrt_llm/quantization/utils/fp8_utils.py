@@ -57,38 +57,42 @@ def _resmooth_kernel(
     s_ptr,
     M,
     K,
+    stride_wb,
     stride_wm,
     stride_wk,
+    stride_sb,
     stride_sm,
     stride_sk,
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    num_pid_k = tl.cdiv(K, BLOCK_K)
-    pid_m = pid // num_pid_k
-    pid_k = pid % num_pid_k
+    batch_idx = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    pid_k = tl.program_id(2)
 
-    s_offset = pid_m * stride_sm + pid_k * stride_sk
-    old_scale = tl.load(s_ptr + s_offset)
+    curr_w_ptr = w_ptr + batch_idx * stride_wb
+    curr_s_ptr = s_ptr + batch_idx * stride_sb
 
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     rk = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
 
+    s_offset = pid_m * stride_sm + pid_k * stride_sk
+    old_scale = tl.load(curr_s_ptr + s_offset)
+
     w_mask = (rm[:, None] < M) & (rk[None, :] < K)
     w_offsets = rm[:, None] * stride_wm + rk[None, :] * stride_wk
-    w_fp8 = tl.load(w_ptr + w_offsets, mask=w_mask, other=0.0)
+    w_fp8 = tl.load(curr_w_ptr + w_offsets, mask=w_mask, other=0.0)
     w_fp32 = w_fp8.to(tl.float32)
 
     w_val = w_fp32 * old_scale
     block_amax = tl.maximum(tl.max(tl.abs(w_val)), 1e-4)
 
-    # E8M0 sf = 2 ^ ceil(log2(sf))
+    # UE8M0 sf = 2 ^ ceil(log2(sf))
     new_scale = tl.math.exp2(tl.math.ceil(tl.math.log2(block_amax / 448.0)))
     w_requant = w_val * (1.0 / new_scale)
 
-    tl.store(w_ptr + w_offsets, w_requant, mask=w_mask)
-    tl.store(s_ptr + s_offset, new_scale)
+    tl.store(curr_w_ptr + w_offsets, w_requant, mask=w_mask)
+    tl.store(curr_s_ptr + s_offset, new_scale)
 
 
 def resmooth_to_fp8_e8m0(
@@ -108,16 +112,17 @@ def resmooth_to_fp8_e8m0(
     num_batches = w_view.shape[0]
     BLOCK_M, BLOCK_K = block_size
 
-    grid = (num_batches * (triton.cdiv(M, BLOCK_M)) *
-            (triton.cdiv(K, BLOCK_K)), )
+    grid = (num_batches, triton.cdiv(M, BLOCK_M), triton.cdiv(K, BLOCK_K))
 
     _resmooth_kernel[grid](
         w_view,
         s_view,
         M,
         K,
+        w_view.stride(0),
         w_view.stride(1),
         w_view.stride(2),
+        s_view.stride(0),
         s_view.stride(1),
         s_view.stride(2),
         BLOCK_M=BLOCK_M,
