@@ -128,8 +128,6 @@ class NemotronHMamba2Mixer(nn.Module):
         self.out_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.use_bias)
         self.use_bias = config.use_bias
 
-        self.register_load_state_dict_pre_hook(self._load_state_dict_pre_hook)
-
     def torch_forward(self, input_states):
         batch_size, seq_len, _ = input_states.shape
         dtype = input_states.dtype
@@ -190,14 +188,6 @@ class NemotronHMamba2Mixer(nn.Module):
 
     def forward(self, hidden_states):
         return self.torch_forward(hidden_states)
-
-    @staticmethod
-    def _load_state_dict_pre_hook(module, state_dict, prefix, local_metadata, strict,
-                                  missing_keys, unexpected_keys, error_msgs) -> None:
-        A_log_key = prefix + "A_log"
-        A_minus_key = prefix + "A_minus"
-        if A_log_key in state_dict:
-            state_dict[A_minus_key] = -torch.exp(state_dict.pop(A_log_key).float())
 
 
 class NemotronHRMSNorm(nn.Module):
@@ -616,6 +606,13 @@ class NemotronHForCausalLM(NemotronHPreTrainedModel, GenerationMixin):
         self.backbone = NemotronHModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        # Recursively iterate over all modules in self.backbone and list those with A_minus or A_log in their name
+        self.backbone_modules_with_A = []
+        for module_name, module in self.backbone.named_modules():
+            for param_name, _ in module.named_parameters(recurse=False):
+                if param_name in ("A_minus", "A_log"):
+                    self.register_load_state_dict_pre_hook(self._a_log_pre_hook)
+                    self.backbone_modules_with_A.append((module_name, param_name))
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -645,6 +642,24 @@ class NemotronHForCausalLM(NemotronHPreTrainedModel, GenerationMixin):
         logits = self.lm_head(hidden_states.to(self.lm_head.weight.dtype)).float()
 
         return NemotronHCausalLMOutput(logits)
+
+    @staticmethod
+    def _a_log_pre_hook(
+        module,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ) -> None:
+        all_keys = list(state_dict.keys())
+        for key in all_keys:
+            if "A_log" in key:
+                A_log_key = key
+                A_minus_key = key.replace("A_log", "A_minus")
+                state_dict[A_minus_key] = -torch.exp(state_dict.pop(A_log_key).float())
 
 
 AutoModelForCausalLMFactory.register_custom_model_cls("NemotronHConfig", NemotronHForCausalLM)

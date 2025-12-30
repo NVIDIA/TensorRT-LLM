@@ -895,13 +895,10 @@ def _load_hook(
     # This is quite a hacky solution. A better solution would be to store extra_state in
     # the state_dict to identify whether the state_dict is sharded or not.
     key = prefix + param_key
-    ad_logger.debug(f"Sharder LOAD hook is called for '{key}'")
     if key not in state_dict:
         return
     p_to_load = state_dict[key]
-
     p_to_load = p_to_load if param_shape == p_to_load.shape else f_split(p_to_load)
-
     state_dict[key] = p_to_load
 
 
