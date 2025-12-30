@@ -226,16 +226,17 @@ def extract_weight_nodes(node: Node) -> WeightNodes:
 
     if is_op(node, torch.ops.aten.bmm):
         # no bias for bmm
+        weight_node = find_get_attr_node(node.args[1])
         return WeightNodes(
-            [
+            weights=[
                 WeightNode(
                     node=node.args[1],
-                    node_key=node.args[1].target,
-                    tensor=get_const_tensor(node.args[1].target, gm),
-                    submod=gm.get_submodule(node.args[1].target.rpartition(".")[0]),
+                    node_key=weight_node.target,
+                    tensor=get_const_tensor(weight_node.target, gm),
+                    submod=gm.get_submodule(weight_node.target.rpartition(".")[0]),
                 )
             ],
-            [],
+            biases=[],
         )
     # for other parametrized nodes, we need to find the weight node
     else:
