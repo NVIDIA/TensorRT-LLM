@@ -2,11 +2,6 @@ import pickle
 import sys
 import traceback
 
-try:
-    pass
-except ImportError:
-    pass
-
 import cloudpickle
 import pytest
 import torch
