@@ -2996,7 +2996,7 @@ def runInDockerOnNodeMultiStage(image, label, dockerArgs, partitionTimeout, need
                 stage('Pull Docker Image') {
                     docker.image(image).pull()
                 }
-                // We submit the Slurm job with time in SlurmPartition
+                // We submit the Slurm job with the Slurm partition's time spec.
                 // Minus 10 minutes to avoid the Slurm job being stopped earlier.
                 timeout(time: partitionTimeout - 10, unit: 'MINUTES') {
                     docker.image(image).inside(dockerArgs) {
