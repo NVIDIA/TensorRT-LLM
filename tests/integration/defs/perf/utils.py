@@ -245,9 +245,7 @@ class PerfBenchScriptTestCmds(NamedTuple):
 
 class PerfAggrScriptTestCmds(NamedTuple):
     server_cmds: List[List[str]]
-    server_envs: List[Dict[str, str]]
     client_cmds: List[List[str]]
-    client_envs: List[Dict[str, str]]
     names: List[str]
     timeout: int
     output_dir: str
@@ -345,13 +343,9 @@ class PerfDisaggScriptTestCmds(NamedTuple):
 
 class PerfMultiNodeDisaggScriptTestCmds(NamedTuple):
     ctx_server_cmds: List[List[str]]
-    ctx_server_envs: List[Dict[str, str]]
     gen_server_cmds: List[List[str]]
-    gen_server_envs: List[Dict[str, str]]
     disagg_server_cmds: List[List[str]]
-    disagg_server_envs: List[Dict[str, str]]
     benchmark_cmds: List[List[str]]
-    benchmark_envs: List[Dict[str, str]]
     timeout: int
     hostname: str
     disagg_serving_type: str
@@ -694,22 +688,20 @@ class AbstractPerfScriptTestClass(abc.ABC):
             )
 
     def run_ex(self,
+               commands,
                full_test_name: str,
                metric_type: PerfMetricType,
                venv: Optional[PythonVenvRunnerImpl],
                gpu_clock_lock: GPUClockLock,
                session_data_writer: SessionDataWriter,
                output_dir: str,
+               cmd_idx: int = 0,
                outputs: Dict[int, str] = {},
                original_test_name: str = None,
-               cmd_idx: int = 0,
                **kwargs) -> List[str]:
         """
         Run the commands and write the results to the output csv and/or yaml files.
         """
-
-        # Get the commands.
-        commands = self.get_commands()
 
         # Avoid modifying argument directly
         outputs = outputs.copy()
@@ -723,7 +715,6 @@ class AbstractPerfScriptTestClass(abc.ABC):
 
         cmd_str = commands.get_cmd_str(cmd_idx)
         is_prepare_dataset_cmd = 'prepare_dataset' in cmd_str or "prepare-dataset" in cmd_str
-
         is_perf_sanity_test = "perf_sanity" in full_test_name
 
         is_disagg_server = False
@@ -804,7 +795,8 @@ class AbstractPerfScriptTestClass(abc.ABC):
                 outputs.pop(cmd_idx)
             elif is_disagg_server:
                 print_info(
-                    f"skip writing perf result when running disagg's server.")
+                    f"skip writing perf result when running disagg's worker or server."
+                )
             else:
                 self._perf_result = self.get_perf_result(outputs)
 
