@@ -17,8 +17,10 @@ from tensorrt_llm._torch.autotuner import (AutoTuner, DistributedTuningStrategy,
                                            FakeTensor, OptimizationProfile,
                                            StaticDim, TunableRunner,
                                            TuningConfig, autotune)
+from tensorrt_llm._torch.distributed.communicator import MPIDist, TorchDist
 from tensorrt_llm._torch.utils import (get_power_of_2_num_tokens_buckets,
                                        next_positive_power_of_2)
+from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.bindings.internal.runtime import delay_kernel
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -323,8 +325,9 @@ def test_multiple_dynamic_shapes_cache():
     # Do tuning with a sample input
     x = torch.randn(3, 64)
     temp_dir = tempfile.TemporaryDirectory()
-    with autotune(cache_path=os.path.join(temp_dir.name,
-                                          "test_multiple_dynamic_shapes.json")):
+    cache_path = os.path.join(temp_dir.name,
+                              "test_multiple_dynamic_shapes.json")
+    with autotune(cache_path=cache_path):
         tuner = AutoTuner.get()
         runner, tactic = tuner.choose_one("test_multiple_dynamic_shapes",
                                           runners, tuning_config, [x, w])
@@ -336,8 +339,7 @@ def test_multiple_dynamic_shapes_cache():
     # Verify cache size - should have 12 entries (3x4 combinations)
     # We also test the cache serialization and deserialization here.
     AutoTuner.get().profiling_cache.clear()
-    AutoTuner.get().profiling_cache.load_cache(
-        os.path.join(temp_dir.name, "test_multiple_dynamic_shapes.rank0.json"))
+    AutoTuner.get().profiling_cache.load_cache(cache_path, rank=0)
     cache_entries = tuner.profiling_cache.get_specific_custom_op(
         "test_multiple_dynamic_shapes")
 
@@ -427,8 +429,9 @@ def test_autotuner_tuning_configs():
         use_cuda_graph=False,
     )
     temp_dir = tempfile.TemporaryDirectory()
-    with autotune(cache_path=os.path.join(
-            temp_dir.name, "test_autotuner_tactic_configs.json")):
+    cache_path = os.path.join(temp_dir.name,
+                              "test_autotuner_tactic_configs.json")
+    with autotune(cache_path=cache_path):
         tuner = AutoTuner.get()
         runner, best_tactic = tuner.choose_one("test_autotuner_tactic_configs",
                                                runners, tuning_config, [x, w])
@@ -437,8 +440,7 @@ def test_autotuner_tuning_configs():
 
     # Test if the tactic can be loaded from cache correctly
     AutoTuner.get().profiling_cache.clear()
-    AutoTuner.get().profiling_cache.load_cache(
-        os.path.join(temp_dir.name, "test_autotuner_tactic_configs.rank0.json"))
+    AutoTuner.get().profiling_cache.load_cache(cache_path, rank=0)
 
     # No further tuning should be performed.
     runner, deserialized_tactic = tuner.choose_one(
@@ -646,9 +648,14 @@ def _distributed_worker_function(world_size, strategy):
                       rank=rank,
                       tp_size=world_size,
                       pp_size=1)
+    if mpi_disabled():
+        dist = TorchDist(mapping=mapping)
+    else:
+        dist = MPIDist(mapping=mapping)
+
     tuner = AutoTuner.get()
     tuner.clear_cache()
-    tuner.setup_distributed_state(mapping)
+    tuner.setup_distributed_state(mapping, dist)
 
     x = torch.randn(16, 32, device='cuda')
     w = torch.randn(32, 64, device='cuda')
@@ -663,12 +670,28 @@ def _distributed_worker_function(world_size, strategy):
     runner = DistributedGemmRunner(prefer_tactics=prefer_tactics)
     config = TuningConfig(distributed_tuning_strategy=strategy)
 
-    cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)
-    with autotune(tune_mode=True, cache_path=cache_path):
+    if rank == 0:
+        temp_dir = tempfile.TemporaryDirectory()
+        # rank 0 should broadcast the cache path to all ranks
+        cache_path = os.path.join(temp_dir.name, "test_distributed_tuning.json")
+        dist.broadcast(cache_path, root=0)
+    else:
+        cache_path = dist.broadcast(None, root=0)
+
+    with autotune(cache_path=cache_path):
         tuner.choose_one(custom_op=f"test_distributed_{strategy}",
                          runners=[runner],
                          tuning_config=config,
                          inputs=inputs)
+
+    # Check only one file is created in the cache path
+    assert len(os.listdir(os.path.dirname(
+        cache_path))) == 1, "Only one rank file should be created"
+
+    # Check cache for distributed tuning
+    AutoTuner.get().profiling_cache.clear()
+    AutoTuner.get().profiling_cache.load_cache(cache_path, rank)
+
     selected_runner, best_tactic = tuner.choose_one(
         custom_op=f"test_distributed_{strategy}",
         runners=[runner],
@@ -706,8 +729,7 @@ def _distributed_worker_function(world_size, strategy):
     ],
 )
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
-def test_distributed_broadcast_strategy(strategy, mpi_pool_executor):
-    """Test broadcast strategy with real MPI processes."""
+def test_autotuner_distributed_strategy(strategy, mpi_pool_executor):
     world_size = 2
     # Use MPIPoolExecutor to run distributed test
     results = mpi_pool_executor.map(
