@@ -696,11 +696,11 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
         slurmRunner = null
         if (cluster.containerRuntime.toString() == "DOCKER") {
             echo "partitionTimeout: ${partition.time}"
-            def partitionTimeout = partition.time ? (partition.time as Integer) : SlurmConfig.DEFAULT_TIMEOUT
+            def partitionTimeout = partition.time ? partition.time : SlurmConfig.DEFAULT_TIMEOUT_SHORT
             slurmRunner = runInDockerOnNodeMultiStage(LLM_DOCKER_IMAGE, nodeName, dockerArgs, partitionTimeout, true)
         } else if (cluster.containerRuntime.toString() == "ENROOT") {
             echo "partitionTimeout: ${partition.time}"
-            def partitionTimeout = partition.time ? (partition.time as Integer) : SlurmConfig.DEFAULT_TIMEOUT_SHORT
+            def partitionTimeout = partition.time ? partition.time : SlurmConfig.DEFAULT_TIMEOUT_SHORT
             slurmRunner = runInEnrootOnNode(nodeName, partitionTimeout)
         } else {
             throw new Exception("Unsupported container runtime: ${cluster.containerRuntime}")
@@ -1135,6 +1135,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     #SBATCH --output=${outputPath}
                     ${taskArgs.collect { "#SBATCH $it" }.join('\n')}
                     #SBATCH ${partition.additionalArgs}
+                    ${partition?.time ? "#SBATCH --time=${partition.time}" : ""}
                     ${(partition?.name && partition.name != "unspecified") ? "#SBATCH --partition=${partition.name}" : ""}
 
                     # SBATCH directives must appear before any executable commands.
