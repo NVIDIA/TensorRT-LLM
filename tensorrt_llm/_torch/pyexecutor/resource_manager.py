@@ -188,6 +188,7 @@ class KVCacheManager(BaseResourceManager):
             idx: offset
             for offset, idx in enumerate(self.pp_layers)
         }
+        self.is_estimating_kv_cache = is_estimating_kv_cache
 
         self.kv_connector_manager = kv_connector_manager
 
