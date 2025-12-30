@@ -1093,7 +1093,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
 
                 if (singleGpuTestFailed) {
                     //if (env.JOB_NAME ==~ /.*PostMerge.*/) {
-                    if (testFilter[(IS_POST_MERGE) || env.JOB_NAME ==~ /.*PostMerge.*/) {
+                    if (testFilter[(IS_POST_MERGE)] || env.JOB_NAME ==~ /.*PostMerge.*/) {
                         echo "In the official post-merge pipeline, x86_64 single-GPU test failed, whereas multi-GPU test is still kept running."
                     } else {
                         stage("[Test-x86_64-Multi-GPU] Blocked") {
@@ -1197,7 +1197,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 }
 
                 if (singleGpuTestFailed) {
-                    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+                    // if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+                    if (testFilter[(IS_POST_MERGE)] || env.JOB_NAME ==~ /.*PostMerge.*/) {
                         echo "In the official post-merge pipeline, SBSA single-GPU test failed, whereas multi-GPU test is still kept running."
                     } else {
                         stage("[Test-SBSA-Multi-GPU] Blocked") {

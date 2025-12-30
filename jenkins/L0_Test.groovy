@@ -3299,7 +3299,7 @@ def launchTestJobs(pipeline, testFilter)
     // Python version and OS for sanity check
     x86SanityCheckConfigs = [
         "PY312-DLFW": [
-            LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,
+            DLFW_IMAGE,
             "B200_PCIe",
             X86_64_TRIPLE,
             false,
@@ -3334,7 +3334,7 @@ def launchTestJobs(pipeline, testFilter)
             AARCH64_TRIPLE,
             false,
             "",
-            UBUNTU_24_04_IMAGE,
+            DLFW_IMAGE,
             true, // Extra PyTorch CUDA 13.0 install
         ],
         "PY312-DLFW": [
