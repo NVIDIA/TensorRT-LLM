@@ -444,7 +444,6 @@ unittest/_torch/auto_deploy/unit/singlegpu/test_ad_build_small_single.py::test_b
 triton_server/test_triton.py::test_opt[opt] SKIP (https://nvbugs/5739981)
 unittest/llmapi/test_llm_pytorch.py::test_tinyllama_logits_processor[False] SKIP (https://nvbugs/5771838)
 unittest/llmapi/test_llm_pytorch.py::test_tinyllama_logits_processor[True] SKIP (https://nvbugs/5771838)
-accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[dp4-trtllm-auto] SKIP (https://nvbugs/5772417)
 accuracy/test_cli_flow.py::TestPhi2::test_auto_dtype SKIP (https://nvbugs/5744293)
 accuracy/test_cli_flow.py::TestPhi2::test_tp2 SKIP (https://nvbugs/5744293)
 accuracy/test_cli_flow.py::TestPhi3Mini4kInstruct::test_auto_dtype SKIP (https://nvbugs/5744293)
