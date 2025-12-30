@@ -516,3 +516,5 @@ unittest/_torch/auto_deploy/unit/multigpu/transformations/library/test_tp_shardi
 test_e2e.py::test_ptp_quickstart_multimodal_kv_cache_reuse[mistral-small-3.1-24b-instruct-Mistral-Small-3.1-24B-Instruct-2503-0.6-image] SKIP (https://nvbugs/5773195)
 accuracy/test_cli_flow.py::TestVicuna7B::test_eagle_2[cuda_graph=True-chunked_context=True] SKIP (https://nvbugs/5773185)
 accuracy/test_cli_flow.py::TestVicuna7B::test_eagle_2[cuda_graph=True-chunked_context=False] SKIP (https://nvbugs/5773185)
+accuracy/test_disaggregated_serving.py::TestGPTOSS::test_auto_dtype[True] SKIP (https://nvbugs/5569696)
+accuracy/test_disaggregated_serving.py::TestGPTOSS::test_auto_dtype[False] SKIP (https://nvbugs/5569696)
