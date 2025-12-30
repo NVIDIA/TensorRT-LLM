@@ -208,3 +208,58 @@ def test_mpi_cp_broadcast_integration():
 if __name__ == "__main__":
     # Allow running directly with mpirun
     pytest.main([__file__, "-v"])
+
+
+class TestMPIDistTpCpBroadcast:
+    """Tests for MPIDist.tp_cp_broadcast functionality."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        """Set up MPI environment and mapping for each test."""
+        skip_if_not_mpi()
+        self.rank, self.world_size = get_mpi_info()
+
+        # Set up mapping with both TP and CP enabled
+        # For 2 ranks: tp_size=1, cp_size=2 (tp_cp_broadcast will only do cp_broadcast)
+        self.mapping = Mapping(
+            world_size=self.world_size,
+            rank=self.rank,
+            tp_size=1,
+            cp_size=self.world_size,
+            pp_size=1,
+        )
+        self.dist = MPIDist(mapping=self.mapping)
+
+    def test_tp_cp_broadcast_python_dict(self):
+        """Test broadcasting a Python dictionary via tp_cp_broadcast."""
+        root = 0
+
+        # Only rank 0 in both TP and CP groups should have the object
+        if self.mapping.tp_rank == root and self.mapping.cp_rank == root:
+            obj = {
+                "model_name": "llama",
+                "batch_size": 32,
+                "tokens": [1, 2, 3, 4, 5],
+            }
+        else:
+            obj = None
+
+        result = self.dist.tp_cp_broadcast(obj, root=root)
+
+        # Verify all ranks received the correct object
+        assert result["model_name"] == "llama"
+        assert result["batch_size"] == 32
+        assert result["tokens"] == [1, 2, 3, 4, 5]
+
+    def test_tp_cp_broadcast_python_list(self):
+        """Test broadcasting a Python list via tp_cp_broadcast."""
+        root = 0
+
+        if self.mapping.tp_rank == root and self.mapping.cp_rank == root:
+            obj = ["request1", "request2", {"id": 123, "data": [1, 2, 3]}]
+        else:
+            obj = None
+
+        result = self.dist.tp_cp_broadcast(obj, root=root)
+
+        assert result == ["request1", "request2", {"id": 123, "data": [1, 2, 3]}]

@@ -337,6 +337,21 @@ class CpBroadcastTest:
         # After broadcast, all CP ranks should have the same object
         return result == root_obj
 
+    def run_tp_cp_broadcast(self, root_obj, root: int = 0):
+        """Test broadcasting an object via tp_cp_broadcast."""
+        # For tp_cp_broadcast, only rank 0 in both TP and CP should have the object
+        tp_rank = self.mapping.tp_rank
+        cp_rank = self.mapping.cp_rank
+        if tp_rank == root and cp_rank == root:
+            obj = root_obj
+        else:
+            obj = None
+
+        result = self.dist.tp_cp_broadcast(obj, root=root)
+
+        # After broadcast, all TP and CP ranks should have the same object
+        return result == root_obj
+
 
 @pytest.mark.gpu2
 @pytest.mark.parametrize("hidden_size", [128, 512], ids=lambda x: f"hidden:{x}")
@@ -422,3 +437,52 @@ def test_cp_broadcast_object(setup_ray_cluster, test_object):
     ])
     for r in results:
         assert r is True, f"Object broadcast from root=0 failed for {type(test_object)}"
+
+
+@pytest.mark.gpu2
+@pytest.mark.parametrize("test_object", [
+    {
+        "key1": "value1",
+        "key2": [1, 2, 3]
+    },
+    ["item1", "item2", {
+        "nested": True
+    }],
+    "simple_string",
+],
+                         ids=["dict", "list", "string"])
+def test_tp_cp_broadcast(setup_ray_cluster, test_object):
+    """Test TorchDist.tp_cp_broadcast with various objects.
+
+    This tests the combined TP+CP broadcast which is used when both tensor
+    and context parallelism are enabled (e.g., helix parallelism).
+    """
+    world_size = 2
+    tp_size = 1
+    cp_size = 2  # Enable context parallelism (tp_cp_broadcast will only do cp_broadcast)
+
+    runtime_env = ray.runtime_env.RuntimeEnv()
+    runtime_env["env_vars"] = os.environ.copy()
+    runtime_env["env_vars"].update({
+        "TLLM_DISABLE_MPI": "1",
+        "MASTER_ADDR": "127.0.0.1",
+    })
+
+    remote_tests = []
+    for rank in range(world_size):
+        remote_tests.append(
+            CpBroadcastTest.options(runtime_env=runtime_env).remote(
+                rank, world_size, tp_size, cp_size))
+
+    ray.get([test.__ray_ready__.remote() for test in remote_tests])
+
+    port = ray.get(remote_tests[0].setup_tcp_store.remote())
+    ray.get([test.setup_distributed_env.remote(port) for test in remote_tests])
+
+    # Test tp_cp_broadcast from root=0
+    results = ray.get([
+        test.run_tp_cp_broadcast.remote(test_object, root=0)
+        for test in remote_tests
+    ])
+    for r in results:
+        assert r is True, f"tp_cp_broadcast from root=0 failed for {type(test_object)}"
