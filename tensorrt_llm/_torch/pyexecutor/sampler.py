@@ -960,15 +960,15 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         finish_reasons = int_tensor(self.NEW_TOKENS_SHAPE)
 
         # Only used for logprobs processing or beam search
-        sampled_log_probs = torch.zeros(self.LOGPROBS_SHAPE, device="cuda", dtype=torch.float32)
+        sampled_log_probs = torch.empty(self.LOGPROBS_SHAPE, device="cuda", dtype=torch.float32)
         # Only used for logprobs processing
-        sampled_log_prob_indices = torch.zeros(
+        sampled_log_prob_indices = torch.empty(
             self.LOGPROBS_SHAPE, device="cuda", dtype=torch.int32
         )
-        sampled_log_prob_ranks = torch.zeros(self.LOGPROBS_SHAPE, device="cuda", dtype=torch.int32)
+        sampled_log_prob_ranks = torch.empty(self.LOGPROBS_SHAPE, device="cuda", dtype=torch.int32)
         # These are 0 sized tensors, if topk-logprobs are not used
-        topk_indices = torch.zeros(self.topk_logprobs_shape, device="cuda", dtype=torch.int32)
-        topk_vals = torch.zeros(self.topk_logprobs_shape, device="cuda", dtype=torch.float32)
+        topk_indices = torch.empty(self.topk_logprobs_shape, device="cuda", dtype=torch.int32)
+        topk_vals = torch.empty(self.topk_logprobs_shape, device="cuda", dtype=torch.float32)
 
         # Only used for beam search
         cache_indirection: torch.Tensor | None = None
@@ -978,11 +978,11 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         original_tokens: torch.Tensor | None = None
         first_finish_reasons: torch.Tensor | None = None
         if self._use_beam_search:
-            cache_indirection = torch.zeros(
+            cache_indirection = torch.empty(
                 self.CACHE_INDIRECTION_SHAPE, device="cuda", dtype=torch.int
             )
             cache_indirection_buffer = int_tensor(self.CACHE_INDIRECTION_SHAPE)
-            cum_log_probs = torch.zeros(
+            cum_log_probs = torch.empty(
                 self.CACHE_INDIRECTION_SHAPE[:-1], device="cuda", dtype=torch.float32
             )
             predecessor_beams = int_tensor(self.CACHE_INDIRECTION_SHAPE[:-1])
