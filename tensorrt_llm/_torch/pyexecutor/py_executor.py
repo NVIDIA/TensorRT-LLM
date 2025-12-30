@@ -1708,7 +1708,6 @@ class PyExecutor:
                 self.iter_counter += 1
 
     @nvtx_range("_accept_draft_tokens")
-    @torch.compile(options={"max-autotune": True})
     def _accept_draft_tokens(
         self, scheduled_batch: ScheduledRequests,
         target_outputs: SampleStateTensors,
