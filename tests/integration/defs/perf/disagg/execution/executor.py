@@ -9,7 +9,6 @@ from typing import Any, Dict, Optional
 import yaml
 from reporting.report import LogParser, LogWriter, ResultSaver
 from utils.common import (
-    GPU_RESOURCE_CONFIG,
     EnvManager,
     extract_config_fields,
 )
@@ -88,12 +87,6 @@ class JobManager:
                 f"{bash_command}"
             )
 
-            # Build sbatch command with all parameters
-            gpu_type = EnvManager.get_gpu_type()
-            gpu_config = GPU_RESOURCE_CONFIG.get(gpu_type)
-            if not gpu_config:
-                raise ValueError(f"GPU resource configuration not found for {gpu_type}")
-
             # Convert timeout to HH:MM:SS format
             hours = timeout // 3600
             minutes = (timeout % 3600) // 60
@@ -112,11 +105,7 @@ class JobManager:
                 "--parsable",  # Easier job ID parsing
             ]
 
-            # Conditionally add gres parameter based on GPU configuration
-            if gpu_config["gres_gpu"] is not None:
-                sbatch_args.append(f"--gres=gpu:{gpu_config['gres_gpu']}")
-
-            # Add extra SLURM arguments if configured
+            # Add extra SLURM arguments (including --gres from GPU_RESOURCE_CONFIG)
             slurm_extra_args = EnvManager.get_slurm_extra_args()
             if slurm_extra_args:
                 sbatch_args.append(slurm_extra_args)
