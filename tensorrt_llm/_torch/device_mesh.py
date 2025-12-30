@@ -118,15 +118,17 @@ class DeviceMeshTopologyImpl(_MappingBaseForTypeCheck):
                 "DeviceMesh creation requested but torch.distributed process group "
                 "has not been initialised.")
 
-        dims = ["cp", "pp"]
-        shape = [self.cp_size, self.pp_size]
+        # Dimensions go from slowest-varying (outermost) to fastest-varying (innermost)
+        # Layout: pp is outermost, then tp, then cp is innermost (consecutive)
+        dims = ["pp", "tp"]
+        shape = [self.pp_size, self.tp_size]
 
         if self.moe_ep_size > 1:
             dims += ["moe_tp", "moe_ep"]
             shape += [self.moe_tp_size, self.moe_ep_size]
         else:
-            dims += ["tp"]
-            shape += [self.tp_size]
+            dims += ["cp"]
+            shape += [self.cp_size]
 
         cls.device_mesh = init_device_mesh(
             "cuda",

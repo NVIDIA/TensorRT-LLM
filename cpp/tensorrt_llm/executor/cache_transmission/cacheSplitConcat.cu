@@ -107,9 +107,9 @@ TargetRanksInfo TargetRanksInfoForDP(
     auto const peerCPNum = peerParConfig.mContextParallelism;
     auto const selfCPNum = selfParConfig.mContextParallelism;
 
-    auto const selfTPRank = selfRank % selfTPNum;
+    auto const selfCPRank = selfRank % selfCPNum;
+    auto const selfTPRank = (selfRank % (selfTPNum * selfCPNum)) / selfCPNum;
     auto const selfPPRank = selfRank / (selfTPNum * selfCPNum);
-    auto const selfCPRank = (selfRank % (selfTPNum * selfCPNum)) / selfTPNum;
 
     int peerPPRankStart = 0;
     int mDomainPPSize = 1;
@@ -211,7 +211,9 @@ TargetRanksInfo TargetRanksInfoForDP(
         {
             for (int k = peerPPRankStart; k < peerPPRankEnd; k++)
             {
-                int irank = (k * peerTPNum * peerCPNum) + (j * peerTPNum) + i;
+                // Rank formula: ppRank * (tpNum * cpNum) + tpRank * cpNum + cpRank
+                // where i=tpRank, j=cpRank, k=ppRank
+                int irank = (k * peerTPNum * peerCPNum) + (i * peerCPNum) + j;
                 retRanks.push_back(irank);
             }
         }
