@@ -176,8 +176,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
     :param sf_vec_size: Scalefactor vector size (16 for NVF4, 32 for MXF4/MXF8).
     :type sf_vec_size: int
-    :param acc_dtype: Data type of the accumulator (e.g., cutlass.Float32).
-    :type acc_dtype: Type[cutlass.Numeric]
     :param mma_tiler_mn: Shape of the Matrix Multiply-Accumulate (MMA) tile (M,N).
         Note: use_2cta_instrs is automatically inferred from mma_tiler_mn[0]
         (True when M=256, False when M=128).
@@ -217,7 +215,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         >>> # (True when M=256, False when M=128)
         >>> gemm = BlockScaledContiguousGatherGroupedGemmKernel(
         ...     sf_vec_size=16,
-        ...     acc_dtype=cutlass.Float32,
         ...     mma_tiler_mn=(256, 128),  # use_2cta_instrs=True since M=256
         ...     cluster_shape_mn=(2, 1),
         ...     vectorized_f32=True,
@@ -243,7 +240,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
     def __init__(
         self,
         sf_vec_size: int,
-        acc_dtype: Type[cutlass.Numeric],
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
         vectorized_f32: bool,
@@ -274,8 +270,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
         :param sf_vec_size: Vector size for scale factors (16 for NVF4, 32 for MXF4/MXF8).
         :type sf_vec_size: int
-        :param acc_dtype: Data type of the accumulator.
-        :type acc_dtype: type[cutlass.Numeric]
         :param mma_tiler_mn: Tuple (M, N) shape of the MMA instruction.
             use_2cta_instrs is automatically set based on M (True if M=256, False if M=128).
         :type mma_tiler_mn: Tuple[int, int]
@@ -289,7 +283,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
         self.sf_vec_size = sf_vec_size
         self.topk = topk
-        self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
+        self.acc_dtype = cutlass.Float32
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
         # K dimension is deferred in _setup_attributes
@@ -2620,7 +2614,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         ab_dtype: Type[cutlass.Numeric],
         sf_dtype: Type[cutlass.Numeric],
         sf_vec_size: int,
-        acc_dtype: Type[cutlass.Numeric],
         c_dtype: Type[cutlass.Numeric],
     ) -> bool:
         """
@@ -2632,8 +2625,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :type sf_dtype: Type[cutlass.Numeric]
         :param sf_vec_size: The vector size of the scale factor
         :type sf_vec_size: int
-        :param acc_dtype: The data type of the accumulator
-        :type acc_dtype: Type[cutlass.Numeric]
         :param c_dtype: The data type of the output tensor
         :type c_dtype: Type[cutlass.Numeric]
 
@@ -2662,8 +2653,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         if ab_dtype in {cutlass.Float8E5M2, cutlass.Float8E4M3FN} and sf_vec_size == 16:
             is_valid = False
 
-        if acc_dtype not in {cutlass.Float32}:
-            is_valid = False
         # Check valid c_dtype
         if c_dtype not in {
             cutlass.Float32,
@@ -2717,7 +2706,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         use_2cta_instrs: bool,
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
-        m_aligned: cutlass.Int64,
     ) -> bool:
         """
         Check if the mma tiler and cluster shape are valid
@@ -2728,8 +2716,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :type mma_tiler_mn: Tuple[int, int]
         :param cluster_shape_mn: The (ClusterM, ClusterN) shape of the CTA cluster
         :type cluster_shape_mn: Tuple[int, int]
-        :param m_aligned: The alignment requirement for group M dimension (default: 128)
-        :type m_aligned: cutlass.Int64
 
         :return: True if the mma tiler and cluster shape are valid, False otherwise
         :rtype: bool
@@ -2769,13 +2755,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         # It can't handle runtime oob when alignment is not align with the tile_M,
         # since the problem shape of TMA store can't be changed at runtime.
         if cluster_tiler_m not in [64, 128, 256]:
-            is_valid = False
-
-        # Check if m_aligned is a multiple of cluster_tiler_m
-        # This ensures that each group's M dimension (which is a multiple of m_aligned)
-        # won't be split across tiles, preventing a single tile from loading data
-        # from multiple groups (which would access wrong B matrix data)
-        if m_aligned % mma_tiler_mn[0] != 0:
             is_valid = False
 
         return is_valid
@@ -2838,7 +2817,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         ab_dtype: Type[cutlass.Numeric],
         sf_dtype: Type[cutlass.Numeric],
         sf_vec_size: int,
-        acc_dtype: Type[cutlass.Numeric],
         c_dtype: Type[cutlass.Numeric],
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
@@ -2849,7 +2827,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         a_major: str,
         b_major: str,
         c_major: str,
-        m_aligned: cutlass.Int64,
     ) -> bool:
         """
         Check if the gemm can be implemented
@@ -2860,8 +2837,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :type sf_dtype: Type[cutlass.Numeric]
         :param sf_vec_size: The vector size of the scale factor
         :type sf_vec_size: int
-        :param acc_dtype: The data type of the accumulator
-        :type acc_dtype: Type[cutlass.Numeric]
         :param c_dtype: The data type of the output tensor
         :type c_dtype: Type[cutlass.Numeric]
         :param use_2cta_instrs: Whether to use 2 CTA groups
@@ -2884,8 +2859,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :type b_major: str
         :param c_major: The major axis of the C tensor
         :type c_major: str
-        :param m_aligned: The alignment requirement for group M dimension (default: 128)
-        :type m_aligned: cutlass.Int64
 
         :return: True if the gemm can be implemented, False otherwise
         :rtype: bool
@@ -2893,7 +2866,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         can_implement = True
         # Skip unsupported types
         if not BlockScaledContiguousGatherGroupedGemmKernel.is_valid_dtypes_and_scale_factor_vec_size(
-            ab_dtype, sf_dtype, sf_vec_size, acc_dtype, c_dtype
+            ab_dtype, sf_dtype, sf_vec_size, c_dtype
         ):
             can_implement = False
 
@@ -2903,10 +2876,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         ):
             can_implement = False
 
-        use_2cta_instrs = mma_tiler_mn[0] == 256
         # Skip invalid mma tile shape and cluster shape
+        use_2cta_instrs = mma_tiler_mn[0] == 256
         if not BlockScaledContiguousGatherGroupedGemmKernel.is_valid_mma_tiler_and_cluster_shape(
-            use_2cta_instrs, mma_tiler_mn, cluster_shape_mn, m_aligned
+            use_2cta_instrs, mma_tiler_mn, cluster_shape_mn
         ):
             can_implement = False
         # Skip illegal problem shape for load/store alignment

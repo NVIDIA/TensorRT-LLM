@@ -1224,7 +1224,7 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
         auto [partialMatch, numMatched, matchingBlock] = searchRoot != nullptr && blockItr != blockKeys.end()
             ? searchRoot->findMatchingBlock(*blockItr, mEnablePartialReuse, mCopyOnPartialReuse)
             : std::make_tuple(false, 0, nullptr);
-        if (matchingBlock != nullptr)
+        if (matchingBlock != nullptr && numMatchedTokens + numMatched <= sequence.getCurrentPrepopulatedPromptLen())
         {
             KVCacheBlock::IdType matchingBlockId = matchingBlock->getBlockId();
 
@@ -1338,6 +1338,7 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
         }
     }
 
+    sequence.setCurrentPrepopulatedPromptLen(numMatchedTokens);
     return numMatchedTokens;
 }
 
@@ -1731,9 +1732,22 @@ std::optional<KVCacheBlock::IdType> BlockManager::releaseBlocks(
     // Released block will be stored when reuse is enabled.
     // Reuse is implied to be enabled if llmRequest is provided.
     std::optional<KVCacheBlock::IdType> lastStoredId = std::nullopt;
+
+    // For now, the attention kernel only accepts a single
+    // "prepopulatedPromptLen", that is, all window sizes will use the same
+    // prepopulated prompt length, so it is meaningless right now to save
+    // blocks only for a certain window size while blocks in the other
+    // window size are not valid for saving for reuse.
+    bool isAllWindowSizesValidForStoreForReuse = true;
+    for (auto& [windowSize, manager] : mWindowBlockManagers)
+    {
+        isAllWindowSizesValidForStoreForReuse &= manager.isSequenceValidForStoreForReuse(sequence.getRequestId());
+    }
+
     for (auto& [_, manager] : mWindowBlockManagers)
     {
-        if (!llmRequest.has_value() || llmRequest->isDummyRequest() || sequence.getBeamWidth() > 1)
+        if (!llmRequest.has_value() || llmRequest->isDummyRequest() || sequence.getBeamWidth() > 1
+            || !isAllWindowSizesValidForStoreForReuse)
         {
             lastStoredId = manager.releaseBlocks(sequence, std::nullopt);
         }

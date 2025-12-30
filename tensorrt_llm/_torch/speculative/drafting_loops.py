@@ -120,24 +120,27 @@ class LinearDraftingLoopWrapper(BaseDraftingLoopWrapper):
 
         new_draft_tokens = [self.sample(logits)]
         draft_logits = [logits]
-        with save_metadata_state(attn_metadata, spec_metadata):
-            batch_size = attn_metadata.num_seqs
+        if self.max_draft_len > 1:
+            is_eagle3 = isinstance(spec_metadata, Eagle3SpecMetadata)
+            with save_metadata_state(attn_metadata, spec_metadata):
+                batch_size = attn_metadata.num_seqs
 
-            new_position_ids = self.prepare_for_generation(
-                attn_metadata, spec_metadata, position_ids)
-            for i in range(self.max_draft_len - 1):
-                logits = self.draft_model.forward(
-                    input_ids=new_draft_tokens[-1],
-                    position_ids=new_position_ids,
-                    attn_metadata=attn_metadata,
-                    spec_metadata=spec_metadata)
-                new_draft_tokens.append(self.sample(logits))
-                draft_logits.append(logits)
-                new_position_ids += 1
-                attn_metadata.kv_lens_cuda[:batch_size] += 1
-                if i == 0 and isinstance(spec_metadata, Eagle3SpecMetadata):
-                    spec_metadata.hidden_states_read_indices[:batch_size].copy_(
-                        spec_metadata.hidden_states_write_indices[:batch_size])
+                new_position_ids = self.prepare_for_generation(
+                    attn_metadata, spec_metadata, position_ids)
+                for i in range(self.max_draft_len - 1):
+                    logits = self.draft_model.forward(
+                        input_ids=new_draft_tokens[-1],
+                        position_ids=new_position_ids,
+                        attn_metadata=attn_metadata,
+                        spec_metadata=spec_metadata)
+                    new_draft_tokens.append(self.sample(logits))
+                    draft_logits.append(logits)
+                    new_position_ids += 1
+                    attn_metadata.kv_lens_cuda[:batch_size] += 1
+                    if i == 0 and is_eagle3:
+                        spec_metadata.hidden_states_read_indices[:batch_size].copy_(
+                            spec_metadata.
+                            hidden_states_write_indices[:batch_size])
 
         return {
             "new_draft_tokens": torch.stack(new_draft_tokens),
@@ -153,7 +156,6 @@ class LinearDraftingLoopWrapper(BaseDraftingLoopWrapper):
 
         return tokens
 
-    @torch.compile(options={'max-autotune': True})
     def prepare_for_generation(self, attn_metadata: AttentionMetadata,
                                spec_metadata: SpecMetadata,
                                position_ids: torch.Tensor) -> torch.Tensor:

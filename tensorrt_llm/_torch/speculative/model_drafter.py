@@ -576,22 +576,53 @@ class ModelDrafter(Drafter):
         if target_inputs.next_draft_tokens is None:
             return
 
-        if draft_tensors is not None:
-            for req_idx, request in enumerate(draft_batch.all_requests()):
-                target_req = self.req_id_to_old_request[request.py_request_id]
-                if target_req.state != LlmRequestState.GENERATION_IN_PROGRESS:
-                    # Skip prefill requests
-                    continue
-                # Get the index of the draft/target tokens in the device tensor
-                draft_idx = req_idx if self.use_static_draft_loop else request.py_seq_slot
-                target_idx = target_req.py_seq_slot
-                target_inputs.new_tokens[draft_position + 1:draft_position +
-                                         draft_length + 1, target_idx,
-                                         0] = draft_tensors[0:draft_length,
-                                                            draft_idx]
-                target_inputs.next_draft_tokens[
-                    target_idx, draft_position:draft_position +
-                    draft_length] = draft_tensors[0:draft_length, draft_idx]
+        draft_indices = []
+        target_indices = []
+        for req_idx, request in enumerate(draft_batch.all_requests()):
+            target_req = self.req_id_to_old_request[request.py_request_id]
+            if target_req.state != LlmRequestState.GENERATION_IN_PROGRESS:
+                # Skip prefill requests
+                continue
+            # Get the index of the draft/target tokens in the device tensor
+            draft_idx = req_idx if self.use_static_draft_loop else request.py_seq_slot
+            target_idx = target_req.py_seq_slot
+            draft_indices.append(draft_idx)
+            target_indices.append(target_idx)
+
+        if len(draft_indices) == 0:
+            return
+
+        device = draft_tensors.device
+
+        # Create index tensors
+        draft_indices_tensor = torch.tensor(draft_indices,
+                                            dtype=torch.long,
+                                            pin_memory=True).to(
+                                                device, non_blocking=True)
+        target_indices_tensor = torch.tensor(target_indices,
+                                             dtype=torch.long,
+                                             pin_memory=True).to(
+                                                 device, non_blocking=True)
+
+        # Pre-slice draft tensors: [draft_length, batch_size]
+        draft_slice = draft_tensors[0:draft_length]
+
+        # Gather all source data at once using single index_select kernel
+        # Result shape: [draft_length, num_requests]
+        gathered = draft_slice.index_select(1, draft_indices_tensor).to(
+            torch.int32)
+
+        # Scatter to new_tokens using advanced indexing (single kernel)
+        # Shape: [draft_length, num_requests] -> [seq_len, batch_size, beam_width]
+        target_inputs.new_tokens[draft_position + 1:draft_position +
+                                 draft_length + 1, target_indices_tensor,
+                                 0] = gathered
+
+        # Scatter to next_draft_tokens using advanced indexing (single kernel)
+        # Shape: [num_requests, draft_length] -> [batch_size, max_draft_len]
+        target_inputs.next_draft_tokens[target_indices_tensor,
+                                        draft_position:draft_position +
+                                        draft_length] = gathered.t()
 
     def _setup_draft_batch_and_resources(
             self,

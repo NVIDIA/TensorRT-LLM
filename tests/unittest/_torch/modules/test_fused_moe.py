@@ -1375,10 +1375,14 @@ def test_fused_moe_fp8_blockwise_cute_dsl_multi_gpu(ep_size, routing_method,
 @pytest.mark.parametrize("moe_backend", [
     pytest.param("TRTLLM", marks=skip_blackwell_geforce), "CUTLASS", "CUTEDSL"
 ])
+@pytest.mark.parametrize(
+    "finalize_fusion", [True, False],
+    ids=["enable_finalize_fusion", "disable_finalize_fusion"])
 @pytest.mark.parametrize("enable_configurable_moe", [0, 1],
                          ids=lambda x: ""
                          if x == 0 else "enable_configurable_moe")
-def test_fused_moe_nvfp4(dtype, moe_backend, enable_configurable_moe, mocker):
+def test_fused_moe_nvfp4(dtype, moe_backend, finalize_fusion,
+                         enable_configurable_moe, mocker):
 
     if enable_configurable_moe == 1 and moe_backend not in [
             "TRTLLM", "CUTLASS"
@@ -1394,8 +1398,12 @@ def test_fused_moe_nvfp4(dtype, moe_backend, enable_configurable_moe, mocker):
             and moe_backend in ["TRTLLM", "CUTLASS"] else "0"
         })
 
-    if moe_backend == "TRTLLM" and dtype == torch.float16:
-        pytest.skip("TRTLLM NVFP4 MoE backend does not support float16 yet")
+    if moe_backend == "TRTLLM":
+        if dtype == torch.float16:
+            pytest.skip("TRTLLM NVFP4 MoE backend does not support float16 yet")
+        if finalize_fusion:
+            pytest.skip(
+                "TRTLLM NVFP4 MoE backend does not support fused finalize yet")
     if moe_backend == "CUTEDSL":
         if dtype == torch.float16:
             pytest.skip(
@@ -1501,9 +1509,11 @@ def test_fused_moe_nvfp4(dtype, moe_backend, enable_configurable_moe, mocker):
         fused_moe = create_moe(
             routing_method=routing_method,
             reduce_results=True,
-            model_config=ModelConfig(pretrained_config=pretrained_config,
-                                     quant_config=quant_config,
-                                     moe_backend=moe_backend),
+            model_config=ModelConfig(
+                pretrained_config=pretrained_config,
+                quant_config=quant_config,
+                moe_backend=moe_backend,
+                moe_disable_finalize_fusion=not finalize_fusion),
         )
         fused_moe.load_weights([weights])
         fused_moe.post_load_weights()

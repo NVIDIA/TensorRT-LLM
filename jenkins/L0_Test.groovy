@@ -461,7 +461,7 @@ def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String jobUID){
         def cleanupCommands = [
             "rm -rf ${cluster.scratchPath}/users/svc_tensorrt/containers/container-${slurmJobID}.sqsh || true",
             "rm -rf ${jobWorkspace} || true",
-        ].join(" && ")
+        ].join(" ; ")
         Utils.exec(
             pipeline,
             script: Utils.sshUserCmd(
@@ -511,7 +511,7 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String nodeName, St
         def cleanupCommands = [
             "rm -rf /home/svc_tensorrt/bloom/scripts/agent-${nodeName}.jar /home/svc_tensorrt/bloom/scripts/${nodeName}-${entrypoint} || true",
             "rm -rf ${cluster.scratchPath}/users/svc_tensorrt/containers/container-${slurmJobID}.sqsh || true",
-        ].join(" && ")
+        ].join(" ; ")
         Utils.exec(
             pipeline,
             script: Utils.sshUserCmd(
@@ -694,9 +694,9 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
         }
 
         slurmRunner = null
-        if (cluster.containerRuntime == ContainerRuntime.DOCKER) {
+        if (cluster.containerRuntime.toString() == "DOCKER") {
             slurmRunner = runInDockerOnNodeMultiStage(LLM_DOCKER_IMAGE, nodeName, dockerArgs, true)
-        } else if (cluster.containerRuntime == ContainerRuntime.ENROOT) {
+        } else if (cluster.containerRuntime.toString() == "ENROOT") {
             slurmRunner = runInEnrootOnNode(nodeName)
         } else {
             throw new Exception("Unsupported container runtime: ${cluster.containerRuntime}")
@@ -748,9 +748,9 @@ def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
 }
 // End of Methods to run Slurm job with Jenkins Agent
 
-def getNodeArgs(int nodeCount, int gpuCount) {
+def getNodeArgs(int nodeCount, int gpuCount, boolean setSegment = false) {
     int gpusPerNode = ((gpuCount / nodeCount) as BigDecimal).setScale(0, BigDecimal.ROUND_CEILING).intValue()
-    return nodeCount == 1 ? [
+    def args = nodeCount == 1 ? [
         "--nodes=${nodeCount}",
         "--gpus=${gpuCount}"
     ] : [
@@ -759,6 +759,10 @@ def getNodeArgs(int nodeCount, int gpuCount) {
         "--ntasks-per-node=${gpusPerNode}",
         "--gpus-per-node=${gpusPerNode}",
     ]
+    if (setSegment && gpuCount > 1) {
+        args += ["--segment=${nodeCount}"]
+    }
+    return args
 }
 
 def getPytestBaseCommandLine(
@@ -795,7 +799,7 @@ def getPytestBaseCommandLine(
         "LLM_BACKEND_ROOT=${llmSrc}/triton_backend",
         "LLM_MODELS_ROOT=${MODEL_CACHE_DIR}",
         "MODEL_CACHE_DIR=${MODEL_CACHE_DIR}",
-        "COLUMNS=200",
+        "COLUMNS=400",
         extraInternalEnv,
         portEnvVars,
         pytestUtil,
@@ -856,11 +860,11 @@ def getMountListForSlurmTest(SlurmCluster cluster, boolean useSbatch = false)
     }
 
     // data/cache mounts
-    if (cluster.containerRuntime == ContainerRuntime.DOCKER) {
+    if (cluster.containerRuntime.toString() == "DOCKER") {
         mounts += [
             "/home/scratch.trt_llm_data:/scratch.trt_llm_data:ro",
         ]
-    } else if (cluster.containerRuntime == ContainerRuntime.ENROOT) {
+    } else if (cluster.containerRuntime.toString() == "ENROOT") {
         if (!cluster.scratchPath) {
             throw new Exception("Scratch path is not set for cluster: ${cluster.name}")
         }
@@ -883,6 +887,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
     // Create a unique suffix for the job name
     String customSuffix = "${env.BUILD_TAG}-${UUID.randomUUID().toString().replaceAll("-", "").substring(0, 6)}".toLowerCase()
     def jobUID = "${cluster.host}-multi_node_test-${customSuffix}"
+    def disaggMode = stageName.contains("Perf-Sanity-Disagg")
+    def setSegment = disaggMode
 
     Utils.exec(pipeline, script: "env | sort && pwd && ls -alh")
 
@@ -914,6 +920,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             def llmSrcLocal = "${llmPath}/TensorRT-LLM/src"
             def scriptRunLocalPath = "${llmSrcLocal}/jenkins/scripts/slurm_run.sh"
             def scriptRunPathNode = "${jobWorkspace}/${jobUID}-slurm_run.sh"
+            def scriptInstallLocalPath = "${llmSrcLocal}/jenkins/scripts/slurm_install.sh"
+            def scriptInstallPathNode = "${jobWorkspace}/${jobUID}-slurm_install.sh"
+            def scriptBashUtilsLocalPath = "${llmSrcLocal}/jenkins/scripts/bash_utils.sh"
+            def scriptBashUtilsPathNode = "${jobWorkspace}/${jobUID}-bash_utils.sh"
             def testListPathNode = "${jobWorkspace}/${testList}.txt"
             def waivesListPathNode = "${jobWorkspace}/waives.txt"
             def outputPath = "${jobWorkspace}/job-output.log"
@@ -931,12 +941,29 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && wget -nv ${llmTarfile}")
                 sh "cd ${llmPath} && tar -zxf ${BUILD_CONFIGS[config][TARNAME]}"
 
-                Utils.exec(pipeline, script: "echo \"Script to trigger Slurm srun job: \" && cat ${scriptRunLocalPath}")
+                Utils.exec(pipeline, script: "echo \"Script for Slurm srun job to submit: \" && cat ${scriptRunLocalPath}")
                 Utils.copyFileToRemoteHost(
                     pipeline,
                     remote,
                     scriptRunLocalPath,
                     scriptRunPathNode,
+                    true
+                )
+
+                Utils.exec(pipeline, script: "echo \"Script to install TensorRT LLM dependencies: \" && cat ${scriptInstallLocalPath}")
+                Utils.copyFileToRemoteHost(
+                    pipeline,
+                    remote,
+                    scriptInstallLocalPath,
+                    scriptInstallPathNode,
+                    true
+                )
+                Utils.exec(pipeline, script: "echo \"Script for Bash utilities: \" && cat ${scriptBashUtilsLocalPath}")
+                Utils.copyFileToRemoteHost(
+                    pipeline,
+                    remote,
+                    scriptBashUtilsLocalPath,
+                    scriptBashUtilsPathNode,
                     true
                 )
 
@@ -1013,7 +1040,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 // Generate Job Launch Script
                 def container = LLM_DOCKER_IMAGE.replace("urm.nvidia.com/", "urm.nvidia.com#")
                 def mounts = getMountListForSlurmTest(cluster, true).join(",")
-                String[] taskArgs = getNodeArgs(nodeCount, gpuCount)
+                String[] taskArgs = getNodeArgs(nodeCount, gpuCount, setSegment)
                 if (taskArgs == null) {
                     error "Invalid Slurm test stage name is set"
                 }
@@ -1023,7 +1050,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                 def containerImageArg = container
                 def srunPrologue = ""
-                if (cluster.containerRuntime == ContainerRuntime.ENROOT) {
+                if (cluster.containerRuntime.toString() == "ENROOT") {
                     def enrootImagePath = "${cluster.scratchPath}/users/svc_tensorrt/containers/container-\${SLURM_JOB_ID}.sqsh"
                     containerImageArg = enrootImagePath
 
@@ -1076,17 +1103,13 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 srunArgs = [
                     "--container-name=multi_node_test-\${SLURM_JOB_ID}",
                     "--container-image=$containerImageArg",
-                    "--container-workdir=/home/svc_tensorrt/bloom/scripts",
+                    "--container-workdir=$jobWorkspace",
                     "--container-mounts=$mounts",
                     "--container-env=NVIDIA_IMEX_CHANNELS"
                 ]
                 envVarsToExport.each { varName, varValue ->
                     srunArgs.add("--container-env=${varName}")
                 }
-                if(nodeCount > 1) {
-                    srunArgs.add("--mpi=pmi2")
-                }
-
                 def exemptionComment = ""
                 if (cluster.host.contains("oci-nrt") || cluster.host.contains("oci-hsg") || cluster.host.contains("lbd-lax")) {
                     exemptionComment = """--comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"90","reason":"other","description":"Long data and model loading time and disaggregated serving tests"}}'"""
@@ -1102,15 +1125,19 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     "export ${varName}=\"${escapedValue}\""
                 }.join('\n')
 
-                def scriptContent = """#!/bin/bash
-                    #SBATCH ${exemptionComment} --output=${outputPath}
+                // Save job ID in $jobWorkspace/slurm_job_id.txt for later job to retrieve
+                def scriptLaunchPrefix = """#!/bin/bash
+                    #SBATCH ${exemptionComment}
+                    #SBATCH --output=${outputPath}
                     ${taskArgs.collect { "#SBATCH $it" }.join('\n')}
                     #SBATCH ${partition.additionalArgs}
                     ${(partition?.name && partition.name != "unspecified") ? "#SBATCH --partition=${partition.name}" : ""}
-                    echo "Starting job \$SLURM_JOB_ID on \$SLURM_NODELIST"
 
-                    set -Eeuo pipefail
+                    # SBATCH directives must appear before any executable commands.
+                    set -xEeuo pipefail
                     trap 'rc=\$?; echo "Error in file \${BASH_SOURCE[0]} on line \$LINENO: \$BASH_COMMAND (exit \$rc)"; exit \$rc' ERR
+
+                    echo "Starting Slurm job \$SLURM_JOB_ID on \$SLURM_NODELIST"
                     export jobWorkspace=$jobWorkspace
                     export tarName=$tarName
                     export llmTarfile=$llmTarfile
@@ -1128,11 +1155,49 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     echo "Env NVIDIA_VISIBLE_DEVICES: \$NVIDIA_VISIBLE_DEVICES"
 
                     ${srunPrologue}
-
-                    srun --kill-on-bad-exit=1 ${srunArgs.join(" ")} ${scriptRunPathNode}
                 """.replaceAll("(?m)^\\s*", "")
-                pipeline.writeFile(file: scriptLaunchPathLocal, text: scriptContent)
-                Utils.exec(pipeline, script: "echo \"Script to trigger Slurm sbatch job: \" && cat ${scriptLaunchPathLocal}")
+
+                if (disaggMode) {
+                    if(nodeCount > 1) {
+                        srunArgs.add("--mpi=pmix")
+                    }
+
+                    def scriptLaunchPrefixPathLocal = Utils.createTempLocation(pipeline, "./slurm_launch_prefix.sh")
+                    def scriptLaunchSrunArgsPathLocal = Utils.createTempLocation(pipeline, "./slurm_srun_args.txt")
+                    def scriptLaunchDraftPathLocal = "${llmSrcLocal}/jenkins/scripts/perf/disaggregated/slurm_launch_draft.sh"
+                    def scriptSubmitLocalPath = "${llmSrcLocal}/jenkins/scripts/perf/disaggregated/submit.py"
+
+                    pipeline.writeFile(file: scriptLaunchPrefixPathLocal, text: scriptLaunchPrefix)
+                    pipeline.writeFile(file: scriptLaunchSrunArgsPathLocal, text: srunArgs.join(" "))
+                    Utils.exec(pipeline, script: "echo \"Script for Slurm sbatch job prefix: \" && cat ${scriptLaunchPrefixPathLocal}")
+                    Utils.exec(pipeline, script: "echo \"Script for Slurm srun job args: \" && cat ${scriptLaunchSrunArgsPathLocal}")
+
+                    // Output is the corresponding scriptLaunchPathLocal script under the disaggMode
+                    sh """
+                        python3 ${scriptSubmitLocalPath} \\
+                        --run-ci \\
+                        --llm-src ${llmSrcLocal} \\
+                        --test-list ${testListPathLocal} \\
+                        --draft-launch-sh ${scriptLaunchDraftPathLocal} \\
+                        --launch-sh ${scriptLaunchPathLocal} \\
+                        --run-sh ${scriptRunPathNode} \\
+                        --install-sh ${scriptInstallPathNode} \\
+                        --script-prefix ${scriptLaunchPrefixPathLocal} \\
+                        --srun-args ${scriptLaunchSrunArgsPathLocal}
+                    """
+                } else {
+                    if(nodeCount > 1) {
+                        srunArgs.add("--mpi=pmi2")
+                    }
+
+                    def scriptContent = """
+                        ${scriptLaunchPrefix}
+                        srun --kill-on-bad-exit=1 ${srunArgs.join(" ")} ${scriptRunPathNode}
+                    """.replaceAll("(?m)^\\s*", "")
+                    pipeline.writeFile(file: scriptLaunchPathLocal, text: scriptContent)
+                }
+
+                Utils.exec(pipeline, script: "echo \"Script for Slurm sbatch job to submit: \" && cat ${scriptLaunchPathLocal}")
                 Utils.copyFileToRemoteHost(
                     pipeline,
                     remote,
@@ -1142,15 +1207,31 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 )
 
                 def scriptExec = """#!/bin/bash
-                    set -Eeuo pipefail
+                    set -xEeuo pipefail
                     trap 'rc=\$?; echo "Error in file \${BASH_SOURCE[0]} on line \$LINENO: \$BASH_COMMAND (exit \$rc)"; exit \$rc' ERR
-                    touch ${outputPath}
+
+                    # Clean up previous job intermediate files so that retry can work
+                    if [ -f "${jobWorkspace}/slurm_job_id.txt" ]; then
+                        previous_job_id=\$(cat "${jobWorkspace}/slurm_job_id.txt")
+                        echo "Found previous Slurm job ID: \${previous_job_id}"
+                        scancel "\${previous_job_id}" || true
+                        rm -rf "${jobWorkspace}/slurm_job_id.txt"
+                        # Wait for 60 seconds to ensure the previous job is canceled
+                        sleep 60
+                    fi
+                    rm -rf "${jobWorkspace}/results.xml"
+                    rm -rf "${jobWorkspace}/report.csv"
+                    rm -rf "${jobWorkspace}/unfinished_test.txt"
+                    rm -rf "${outputPath}"
+
+                    touch "${outputPath}"
                     jobId=\$(sbatch ${scriptLaunchPathNode} | awk '{print \$4}')
                     if [ -z "\$jobId" ]; then
-                        echo "Error: Job submission failed, no job ID returned."
+                        echo "Error: Slurm job submission failed, no job ID returned."
                         exit 1
                     fi
-                    echo "Submitted job \$jobId"
+                    echo "Submitted Slurm job \$jobId"
+                    echo "\$jobId" > "${jobWorkspace}/slurm_job_id.txt"
                     tail -f ${outputPath} &
                     tailPid=\$!
                     # Wait until sbatch job is done.
@@ -1160,9 +1241,28 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     # Kill tail -f process
                     kill \$tailPid
                     # Check if the job failed or not
-                    sleep 5
-                    STATUS=\$(sacct -j \$jobId --format=State --noheader | head -n 1 | awk '{print \$1}')
-                    EXIT_CODE=\$(sacct -j \$jobId --format=ExitCode -Pn --allocations | awk -F: '{print \$1}')
+                    sleep 10
+                    # Retry getting status and exit code as sacct might be delayed
+                    for i in {1..3}; do
+                        STATUS=\$(sacct -j \$jobId --format=State --noheader | head -n 1 | awk '{print \$1}')
+                        EXIT_CODE=\$(sacct -j \$jobId --format=ExitCode -Pn --allocations | awk -F: '{print \$1}')
+
+                        if [ -n "\$STATUS" ] && [ -n "\$EXIT_CODE" ]; then
+                            break
+                        fi
+                        echo "Waiting for sacct to update... attempt \$i"
+                        sleep 10
+                    done
+
+                    if [ -z "\$EXIT_CODE" ]; then
+                        echo "Error: Failed to get exit code from sacct after retries, defaulting to 1."
+                        EXIT_CODE=1
+                    fi
+                    if [ -z "\$STATUS" ]; then
+                        echo "Error: Failed to get status from sacct after retries, defaulting to UNKNOWN."
+                        STATUS="UNKNOWN"
+                    fi
+
                     if [[ "\$STATUS" == "COMPLETED" && \$EXIT_CODE -eq 0 ]]; then
                         echo "Pytest succeed in Slurm job \$jobId"
                         echo "Status: \$STATUS | Exit_code \$EXIT_CODE"
@@ -1408,7 +1508,8 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
         if (stageIsInterrupted) {
             echo "Stage is interrupted, skip to upload test result."
         } else {
-            sh 'if [ "$(id -u)" -eq 0 ]; then dmesg || true; fi'
+            // Temporarily disable to reduce the log size
+            // sh 'if [ "$(id -u)" -eq 0 ]; then dmesg || true; fi'
             if (noResultIfSuccess && !stageIsFailed) {
                 // Clean up the workspace
                 sh """
@@ -2551,7 +2652,8 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         def containerPortNum = GlobalState.PORT_SECTION_SIZE
 
         // Some clusters do not allow dmesg -C so we add || true
-        sh 'if [ "$(id -u)" -eq 0 ]; then dmesg -C || true; fi'
+        // Temporarily disable to reduce the log size
+        // sh 'if [ "$(id -u)" -eq 0 ]; then dmesg -C || true; fi'
         def pytestCommand = getPytestBaseCommandLine(
             llmSrc,
             stageName,
@@ -2634,7 +2736,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 if (noRegularTests && noIsolateTests) {
                     error "No tests were executed for stage ${stageName}, please check the test list and test-db rendering result."
                 }
-
             }
         }
 
@@ -2653,7 +2754,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             stage("Check perf result") {
                 def perfCheckResult = sh(
                     script: """
-                        python3 ${llmSrc}/tests/integration/defs/perf/sanity_perf_check.py \
+                    python3 ${llmSrc}/tests/integration/defs/perf/sanity_perf_check.py \
                         ${stageName}/perf_script_test_results.csv \
                         ${basePerfPath}
                     """,
@@ -2670,6 +2771,22 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                     --files ${stageName}/perf_script_test_results.csv \
                     ${basePerfPath}
                 """
+            }
+        }
+
+        if (perfMode && stageName.contains("Perf-Sanity")) {
+            stage ("Check perf result") {
+                def perfCheckResult = sh(
+                    script: """
+                        python3 ${llmSrc}/tests/integration/defs/perf/perf_regression_check.py \
+                        ${WORKSPACE}/${stageName}
+                    """,
+                    returnStatus: true
+                )
+                // TODO: Enable this when perf regression check is stable
+                // if (perfCheckResult != 0) {
+                //     error "Performance regression detected and failing the build (exit code: ${perfCheckResult})"
+                // }
             }
         }
     }
@@ -3027,7 +3144,8 @@ def launchTestJobs(pipeline, testFilter)
         // "RTXPro6000-PyTorch-Post-Merge-1": ["rtx-pro-6000", "l0_rtx_pro_6000", 1, 1],
         // "RTXPro6000-4_GPUs-PyTorch-Post-Merge-1": ["rtx-pro-6000-x4", "l0_rtx_pro_6000", 1, 2, 4],
         // "RTXPro6000-4_GPUs-PyTorch-Post-Merge-2": ["rtx-pro-6000-x4", "l0_rtx_pro_6000", 2, 2, 4],
-        "RTXPro6000D-PyTorch-Post-Merge-1": ["rtx-pro-6000d", "l0_rtx_pro_6000", 1, 1],
+        "RTXPro6000D-PyTorch-1": ["rtx-pro-6000d", "l0_rtx_pro_6000", 1, 2],
+        "RTXPro6000D-PyTorch-2": ["rtx-pro-6000d", "l0_rtx_pro_6000", 2, 2],
         "RTXPro6000D-4_GPUs-PyTorch-Post-Merge-1": ["rtx-pro-6000d-x4", "l0_rtx_pro_6000", 1, 2, 4],
         "RTXPro6000D-4_GPUs-PyTorch-Post-Merge-2": ["rtx-pro-6000d-x4", "l0_rtx_pro_6000", 2, 2, 4],
     ]
@@ -3056,11 +3174,11 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_H100-4_GPUs-PyTorch-Others-1": ["dgx-h100-x4-oci", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-PyTorch-Ray-1": ["dgx-h100-x4-oci", "l0_dgx_h100", 1, 1, 4],
         "B300-PyTorch-1": ["b300-single", "l0_b300", 1, 1],
-        "DGX_B200-4_GPUs-PyTorch-1": ["b200-x4", "l0_dgx_b200", 1, 1, 4],
+        "DGX_B200-4_GPUs-PyTorch-1": ["b200-x4-lbd", "l0_dgx_b200", 1, 1, 4, 1, true],
         "DGX_B200-4_GPUs-PyTorch-Ray-1": ["b200-x4-lbd", "l0_dgx_b200", 1, 1, 4, 1, true],
         "DGX_B200-8_GPUs-PyTorch-1": ["b200-x8-lbd", "l0_dgx_b200", 1, 1, 8, 1, true],
-        "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["b200-trtllm", "l0_dgx_b200", 1, 2, 4, 1, true],
-        "DGX_B200-4_GPUs-PyTorch-Post-Merge-2": ["b200-trtllm", "l0_dgx_b200", 2, 2, 4, 1, true],
+        "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["b200-x4-lbd", "l0_dgx_b200", 1, 2, 4, 1, true],
+        "DGX_B200-4_GPUs-PyTorch-Post-Merge-2": ["b200-x4-lbd", "l0_dgx_b200", 2, 2, 4, 1, true],
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["b300-x4", "l0_dgx_b300", 1, 2, 4],
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-2": ["b300-x4", "l0_dgx_b300", 2, 2, 4],
         // Perf sanity post merge test
@@ -3110,8 +3228,13 @@ def launchTestJobs(pipeline, testFilter)
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-1": ["gb200-oci-trtllm", "l0_gb200_multi_nodes", 1, 3, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-2": ["gb200-oci-trtllm", "l0_gb200_multi_nodes", 2, 3, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-3": ["gb200-oci-trtllm", "l0_gb200_multi_nodes", 3, 3, 8, 2],
-        // Perf sanity post merge test
-        "GB200-8_GPUs-2_Nodes-PyTorch-Perf-Sanity-Post-Merge-1": ["gb200-oci-trtllm", "l0_gb200_multi_nodes_perf_sanity", 1, 1, 8, 2],
+        // Perf sanity post merge aggr tests
+        "GB200-8_GPUs-2_Nodes-PyTorch-Perf-Sanity-Post-Merge-1": ["gb200-oci-trtllm", "l0_gb200_multi_nodes_aggr_perf_sanity_2_nodes_001", 1, 1, 8, 2],
+        // Perf sanity post merge disagg tests
+        "GB200-12_GPUs-3_Nodes-PyTorch-Perf-Sanity-Disagg-Post-Merge-1": ["gb200-oci-trtllm", "l0_gb200_multi_nodes_disagg_perf_sanity_3_nodes_001", 1, 1, 12, 3],
+        // "GB200-24_GPUs-6_Nodes-PyTorch-Perf-Sanity-Disagg-Post-Merge-1": ["gb200-oci-trtllm", "l0_gb200_multi_nodes_disagg_perf_sanity_6_nodes_001", 1, 1, 24, 6],
+        // "GB200-24_GPUs-6_Nodes-PyTorch-Perf-Sanity-Disagg-Post-Merge-2": ["gb200-oci-trtllm", "l0_gb200_multi_nodes_disagg_perf_sanity_6_nodes_002", 1, 1, 24, 6],
+        // "GB200-32_GPUs-8_Nodes-PyTorch-Perf-Sanity-Disagg-Post-Merge-1": ["gb200-oci-trtllm", "l0_gb200_multi_nodes_disagg_perf_sanity_8_nodes_001", 1, 1, 32, 8],
     ]
     fullSet += multiNodesSBSAConfigs.keySet()
 
