@@ -1723,9 +1723,6 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                 ${tolerations}
         """.stripIndent(),
     ]
-    if (type.contains("gb10x")) {
-        print(podConfig)
-    }
 
     return podConfig
 }
