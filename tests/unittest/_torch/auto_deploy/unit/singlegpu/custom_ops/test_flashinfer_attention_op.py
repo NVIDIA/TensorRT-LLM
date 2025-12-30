@@ -69,7 +69,6 @@ def test_flashinfer_attention_op_context(seq_length, n_heads, batch_size, dtype,
     paged_kv_indptr_host = paged_kv_indptr.cpu()
     paged_kv_last_page_len_host = paged_kv_last_page_len.cpu()
     seq_len_with_cache_host = (offsets + seq_len_tensor).cpu()
-    seq_len_host = seq_len_tensor.cpu()
 
     # Q,K,V are computed using GEMM.
     q = torch.randn(BATCH_SIZE, SEQ_LEN, N_HEADS * D_HEAD, dtype=DTYPE).to(device)
@@ -113,7 +112,6 @@ def test_flashinfer_attention_op_context(seq_length, n_heads, batch_size, dtype,
         paged_kv_last_page_len,
         paged_kv_last_page_len_host,
         seq_len_with_cache_host,
-        seq_len_host,
         # EXTRA METADATA
         batch_indices,
         positions,
@@ -184,7 +182,6 @@ def test_flashinfer_attention_op_decode(
     paged_kv_indptr_host = paged_kv_indptr.cpu()
     paged_kv_last_page_len_host = paged_kv_last_page_len.cpu()
     seq_len_with_cache_host = (offsets + seq_len_tensor).cpu()
-    seq_len_host = seq_len_tensor.cpu()
 
     # Q,K,V are computed using GEMM.
     q = torch.randn(BATCH_SIZE, SEQ_LEN, N_HEADS * D_HEAD, dtype=DTYPE).to(device)
@@ -259,7 +256,6 @@ def test_flashinfer_attention_op_decode(
         paged_kv_last_page_len,
         paged_kv_last_page_len_host,
         seq_len_with_cache_host,
-        seq_len_host,
         # EXTRA METADATA
         batch_indices,
         positions,
@@ -350,7 +346,6 @@ def test_flashinfer_attention_context_and_generate(
     paged_kv_indptr_host = paged_kv_indptr.cpu()
     paged_kv_last_page_len_host = paged_kv_last_page_len.cpu()
     seq_len_with_cache_host = (offsets + seq_len_tensor).cpu()
-    seq_len_host = seq_len_tensor.cpu()
 
     # Q,K,V for prefill phase
     q_1 = torch.randn(BATCH_SIZE, PREFILL_SEQ_LEN, N_HEADS * D_HEAD, dtype=DTYPE).to(device)
@@ -394,7 +389,6 @@ def test_flashinfer_attention_context_and_generate(
         paged_kv_last_page_len,
         paged_kv_last_page_len_host,
         seq_len_with_cache_host,
-        seq_len_host,
         # EXTRA METADATA
         batch_indices,
         positions,
@@ -453,7 +447,6 @@ def test_flashinfer_attention_context_and_generate(
     paged_kv_indptr_host = paged_kv_indptr.cpu()
     paged_kv_last_page_len_host = paged_kv_last_page_len.cpu()
     seq_len_with_cache_host = (offsets + seq_len_tensor).cpu()
-    seq_len_host = seq_len_tensor.cpu()
 
     # Q,K,V are computed using GEMM.
     q_3 = torch.randn(BATCH_SIZE, 1, N_HEADS * D_HEAD, dtype=DTYPE).to(device)
@@ -486,7 +479,6 @@ def test_flashinfer_attention_context_and_generate(
         paged_kv_last_page_len,
         paged_kv_last_page_len_host,
         seq_len_with_cache_host,
-        seq_len_host,
         # EXTRA METADATA
         batch_indices,
         positions,
@@ -568,7 +560,6 @@ def test_flashinfer_attention_op_context_input_pos(seq, batch_size, n_heads, dty
     paged_kv_indptr_host = paged_kv_indptr.cpu()
     paged_kv_last_page_len_host = paged_kv_last_page_len.cpu()
     seq_len_with_cache_host = (offsets + seq_len_tensor).cpu()
-    seq_len_host = seq_len_tensor.cpu()
 
     # Q,K,V are computed using GEMM.
     q = torch.randn(BATCH_SIZE, SEQ_LEN, N_HEADS * D_HEAD, dtype=DTYPE).to(device)
@@ -612,7 +603,6 @@ def test_flashinfer_attention_op_context_input_pos(seq, batch_size, n_heads, dty
         paged_kv_last_page_len,
         paged_kv_last_page_len_host,
         seq_len_with_cache_host,
-        seq_len_host,
         # EXTRA METADATA
         batch_indices,
         positions,
@@ -702,7 +692,6 @@ def test_flashinfer_attention_with_fp8_cache(
     paged_kv_indptr_host = paged_kv_indptr.cpu()
     paged_kv_last_page_len_host = paged_kv_last_page_len.cpu()
     seq_len_with_cache_host = (offsets + seq_len_tensor).cpu()
-    seq_len_host = seq_len_tensor.cpu()
 
     # Q,K,V are computed using GEMM, in fp16
     q = torch.randn(BATCH_SIZE, SEQ_LEN, N_HEADS * D_HEAD, dtype=DTYPE).to(device)
@@ -776,7 +765,6 @@ def test_flashinfer_attention_with_fp8_cache(
         paged_kv_last_page_len,
         paged_kv_last_page_len_host,
         seq_len_with_cache_host,
-        seq_len_host,
         # EXTRA METADATA
         batch_indices,
         positions,
@@ -858,7 +846,6 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
     paged_kv_indptr_host = paged_kv_indptr.cpu()
     paged_kv_last_page_len_host = paged_kv_last_page_len.cpu()
     seq_len_with_cache_host = (offsets + seq_len_tensor).cpu()
-    seq_len_host = seq_len_tensor.cpu()
 
     # make sure planner is initialized
     workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
@@ -887,7 +874,6 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
         paged_kv_last_page_len,
         paged_kv_last_page_len_host,
         seq_len_with_cache_host,
-        seq_len_host,
         # EXTRA METADATA
         batch_indices,
         positions,
@@ -957,7 +943,6 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
     paged_kv_indptr2_host = paged_kv_indptr2.cpu()
     paged_kv_last_page_len2_host = paged_kv_last_page_len2.cpu()
     seq_len_with_cache2_host = (offsets2 + seq_len_tensor2).cpu()
-    seq_len2_host = seq_len_tensor2.cpu()
 
     # Create FlashInferAttention class before calling the custom op
     _GlobalFlashInferPlanner.reset()
@@ -985,7 +970,6 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
         paged_kv_last_page_len2,
         paged_kv_last_page_len2_host,
         seq_len_with_cache2_host,
-        seq_len2_host,
         # EXTRA METADATA
         batch_indices,
         positions,
