@@ -2095,7 +2095,7 @@ __global__ void doActivationKernel(T* output, GemmOutputType const* gemm_result,
 
     // 2D grid: blockIdx.x for tokens in groups of kProcessRows, blockIdx.y for columns
     int64_t const row_offset = blockIdx.x * kProcessRows;
-    int64_t const col_offset = blockIdx.y * blockDim.x + threadIdx.x;
+    int64_t const col_offset = blockIdx.y * blockDim.y + threadIdx.y;
 
     assert(inter_size % ACTIVATION_ELEM_PER_THREAD == 0);
     int64_t const num_elems_in_col = inter_size / ACTIVATION_ELEM_PER_THREAD;
@@ -2439,7 +2439,7 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
 
         cudaLaunchConfig_t config;
         config.gridDim = dim3(grid_x, grid_y, 1);
-        config.blockDim = threads;
+        config.blockDim = dim3(1, threads, 1);
         config.dynamicSmemBytes = 0;
         config.stream = stream;
         cudaLaunchAttribute attrs[1];
