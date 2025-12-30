@@ -273,7 +273,12 @@ void sm100_generic_mixed_gemm_kernelLauncher(ActivationType const* A, WeightType
         throw std::runtime_error(ss.str());
     }
 
-#else // COMPILE_BLACKWELL_TMA_GEMMS
+#else  // COMPILE_BLACKWELL_TMA_GEMMS
+    throw std::runtime_error(
+        "[TensorRT LLM Error][fpA_intB Runner] Please recompile with support for blackwell by passing 100-real as an "
+        "arch "
+        "to build_wheel.py.");
+#endif // COMPILE_BLACKWELL_TMA_GEMMS
 }
 
 } // namespace cutlass_kernels_oss
