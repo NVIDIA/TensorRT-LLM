@@ -468,9 +468,7 @@ void CutlassFpAIntBGemmRunner<ActivationType, WeightType, QuantOp, ScaleZeroType
 #else  // COMPILE_BLACKWELL_TMA_GEMMS
         throw std::runtime_error(
             "[TensorRT LLM Error][fpA_intB Runner] Please recompile with support for blackwell by passing 100-real as "
-            "an "
-            "arch "
-            "to build_wheel.py.");
+            "an arch to build_wheel.py.");
 #endif // COMPILE_BLACKWELL_TMA_GEMMS
     }
     else
