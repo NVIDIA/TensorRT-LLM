@@ -116,6 +116,26 @@ class Distributed(ABC):
     def allgather(self, obj, root=0):
         pass
 
+    @abstractmethod
+    def tp_broadcast(self, obj, root=0, **kwargs):
+        pass
+
+    @abstractmethod
+    def cp_broadcast(self, obj, root=0, **kwargs):
+        pass
+
+    def tp_cp_broadcast(self, obj, root=0, **kwargs):
+        """Broadcast object across both TP and CP groups.
+
+        This is used when both TP and CP parallelism are enabled (e.g., helix parallelism).
+        First broadcasts within the TP group, then within the CP group.
+        """
+        if self.tp_size > 1:
+            obj = self.tp_broadcast(obj, root=root, **kwargs)
+        if self.cp_size > 1:
+            obj = self.cp_broadcast(obj, root=root, **kwargs)
+        return obj
+
 
 def safe_broadcast(comm, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
     """
@@ -407,21 +427,13 @@ class MPIDist(Distributed):
     def cp_allgather(self, obj):
         return self.cp_comm.allgather(obj)
 
-    def cp_broadcast(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
+    def cp_broadcast(self,
+                     obj,
+                     root=0,
+                     chunk_size: int = 4 * 1024 * 1024,
+                     **kwargs):
         comm = self.cp_comm
         return safe_broadcast(comm, obj, root=root, chunk_size=chunk_size)
-
-    def tp_cp_broadcast(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
-        """Broadcast object across both TP and CP groups.
-
-        This is used when both TP and CP parallelism are enabled (e.g., helix parallelism).
-        First broadcasts within the TP group, then within the CP group.
-        """
-        if self.tp_size > 1:
-            obj = self.tp_broadcast(obj, root=root, chunk_size=chunk_size)
-        if self.cp_size > 1:
-            obj = self.cp_broadcast(obj, root=root, chunk_size=chunk_size)
-        return obj
 
     def tp_allgather(self, obj):
         return self.tp_comm.allgather(obj)
@@ -430,7 +442,11 @@ class MPIDist(Distributed):
         comm = self.tp_comm
         return safe_gather(comm, obj, root=root, chunk_size=chunk_size)
 
-    def tp_broadcast(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
+    def tp_broadcast(self,
+                     obj,
+                     root=0,
+                     chunk_size: int = 4 * 1024 * 1024,
+                     **kwargs):
         comm = self.tp_comm
         return safe_broadcast(comm, obj, root=root, chunk_size=chunk_size)
 
@@ -715,7 +731,7 @@ class TorchDist(Distributed):
             return output_list
 
     @log_op
-    def tp_broadcast(self, obj, root=0):
+    def tp_broadcast(self, obj, root=0, **kwargs):
         if isinstance(obj, torch.Tensor):
             dist.broadcast(obj, src=root, group=self.mapping.tp_group_pg)
             return obj
@@ -729,7 +745,7 @@ class TorchDist(Distributed):
             return ret[0]
 
     @log_op
-    def cp_broadcast(self, obj, root=0):
+    def cp_broadcast(self, obj, root=0, **kwargs):
         if isinstance(obj, torch.Tensor):
             dist.broadcast(obj, src=root, group=self.mapping.cp_group_pg)
             return obj
@@ -741,19 +757,6 @@ class TorchDist(Distributed):
                 group=self.mapping.cp_group_pg,
                 device=torch.device("cpu"))
             return ret[0]
-
-    @log_op
-    def tp_cp_broadcast(self, obj, root=0):
-        """Broadcast object across both TP and CP groups.
-
-        This is used when both TP and CP parallelism are enabled (e.g., helix parallelism).
-        First broadcasts within the TP group, then within the CP group.
-        """
-        if self.tp_size > 1:
-            obj = self.tp_broadcast(obj, root=root)
-        if self.cp_size > 1:
-            obj = self.cp_broadcast(obj, root=root)
-        return obj
 
     @log_op
     def pp_allgather(self, obj):
