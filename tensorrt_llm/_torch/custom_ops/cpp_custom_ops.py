@@ -752,27 +752,27 @@ def _register_fake():
             for i in range(0, len(input_list), num_ranks)
         ]
 
-    @torch.library.register_fake("trtllm::alltoall_helix_native")
-    def _(partial_o, softmax_stats, workspace, cp_rank, cp_size):
-        # Returns outputs with same shapes as inputs
-        return partial_o.new_empty(partial_o.shape), softmax_stats.new_empty(
-            softmax_stats.shape)
+    # @torch.library.register_fake("trtllm::alltoall_helix_native")
+    # def _(partial_o, softmax_stats, workspace, cp_rank, cp_size):
+    #     # Returns outputs with same shapes as inputs
+    #     return partial_o.new_empty(partial_o.shape), softmax_stats.new_empty(
+    #         softmax_stats.shape)
 
-    @torch.library.register_fake("trtllm::initialize_helix_workspace")
-    def _(workspace, cp_rank, cp_size):
-        # This op initializes workspace in-place and returns nothing
-        return None
+    # @torch.library.register_fake("trtllm::initialize_helix_workspace")
+    # def _(workspace, cp_rank, cp_size):
+    #     # This op initializes workspace in-place and returns nothing
+    #     return None
 
-    @torch.library.register_fake("trtllm::helix_post_process")
-    def _(gathered_o, gathered_stats, scale):
-        return gathered_o.new_empty(*gathered_o.shape[1:])
+    # @torch.library.register_fake("trtllm::helix_post_process")
+    # def _(gathered_o, gathered_stats, scale):
+    #     return gathered_o.new_empty(*gathered_o.shape[1:])
 
-    @torch.library.register_fake("trtllm::helix_post_process_native")
-    def _(gathered_o, gathered_stats, scale, cp_dim):
-        # Remove the dimension at cp_dim (context parallelism dimension)
-        out_shape = list(gathered_o.shape)
-        del out_shape[cp_dim]
-        return gathered_o.new_empty(*out_shape)
+    # @torch.library.register_fake("trtllm::helix_post_process_native")
+    # def _(gathered_o, gathered_stats, scale, cp_dim):
+    #     # Remove the dimension at cp_dim (context parallelism dimension)
+    #     out_shape = list(gathered_o.shape)
+    #     del out_shape[cp_dim]
+    #     return gathered_o.new_empty(*out_shape)
 
     @torch.library.register_fake("trtllm::tinygemm2")
     def _(input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor):
