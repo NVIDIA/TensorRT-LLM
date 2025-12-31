@@ -120,13 +120,17 @@ class DeviceMeshTopologyImpl(_MappingBaseForTypeCheck):
 
         # Dimensions go from slowest-varying (outermost) to fastest-varying (innermost).
         # Layout: pp is outermost, then tp, then cp is innermost (consecutive).
-        dims = ["pp", "tp"]
-        shape = [self.pp_size, self.tp_size]
+        dims = ["pp"]
+        shape = [self.pp_size]
 
         if self.moe_ep_size > 1:
             dims += ["moe_tp", "moe_ep"]
             shape += [self.moe_tp_size, self.moe_ep_size]
         else:
+            dims += ["tp"]
+            shape += [self.tp_size]
+
+        if self.cp_size > 1:
             dims += ["cp"]
             shape += [self.cp_size]
 
