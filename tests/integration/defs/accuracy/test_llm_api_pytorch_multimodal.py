@@ -3,7 +3,7 @@ import pytest
 from tensorrt_llm import LLM
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MoeConfig, SamplingParams
 
-from ..conftest import llm_models_root, skip_pre_blackwell
+from ..conftest import llm_models_root, skip_post_blackwell, skip_pre_blackwell, skip_pre_hopper
 from .accuracy_core import MMMU, LlmapiAccuracyTestHarness
 
 
@@ -216,6 +216,8 @@ class TestPhi4MMFusedVisionLora(LlmapiAccuracyTestHarness):
             task.evaluate(llm, sampling_params=self.sampling_params)
 
 
+@skip_pre_hopper
+@skip_post_blackwell
 class TestGemma3_27BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "google/gemma-3-27b-it"
     MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-27b-it/"
