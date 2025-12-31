@@ -1,6 +1,7 @@
 """Tests for basic graph sharding."""
 
 from functools import partial
+from types import SimpleNamespace
 from typing import Type
 
 import pytest
@@ -13,6 +14,7 @@ from _model_test_utils import FakeFP8Linear
 
 import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.models.custom.modeling_nemotron_h import NemotronHMamba2Mixer
 from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
     FP8WeightShardingInfo,
     LayerType,
@@ -35,6 +37,14 @@ base_model_tp_plan = {
     "linear1": "colwise",
     "linear2": "rowwise",
     "linear": "gather",
+    # Mamba2 specific projections
+    "in_proj": "mamba",
+    "out_proj": "rowwise",
+    # MLA specific projections
+    "q_a_proj": "gather",
+    "q_b_proj": "colwise",
+    "kv_a_proj_with_mqa": "gather",
+    "kv_b_proj": "colwise",
     # "input_layernorm.weight": "sequence_parallel",
     # "post_attention_layernorm.weight": "sequence_parallel",
     # "norm.weight": "sequence_parallel",
@@ -50,7 +60,6 @@ base_model_tp_plan = {
 }
 
 predefined_config = {
-    "head_dim": 8,
     "tp_plan": base_model_tp_plan,
 }
 
@@ -125,6 +134,85 @@ class FP8MLP(nn.Module):
         return self.linear2(y)
 
 
+class MLA_Block(nn.Module):
+    """Multi-Latent Attention block - simplified standalone version.
+
+    Based on DeepSeek MLA architecture with KV compression.
+    This is a minimal, self-contained implementation for testing sharding patterns.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        q_lora_rank: int,
+        kv_lora_rank: int,
+        qk_nope_head_dim: int,
+        qk_rope_head_dim: int,
+        v_head_dim: int,
+        bias: bool = False,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.kv_lora_rank = kv_lora_rank
+        self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+        self.qk_nope_head_dim = qk_nope_head_dim
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.v_head_dim = v_head_dim
+
+        # KV compression path (not sharded - gather)
+        self.kv_a_proj_with_mqa = nn.Linear(hidden_size, kv_lora_rank + qk_rope_head_dim, bias=bias)
+
+        # KV decompression (sharded column-wise)
+        self.kv_b_proj = nn.Linear(
+            kv_lora_rank, num_heads * (qk_nope_head_dim + v_head_dim), bias=False
+        )
+
+        # Query path (sharded column-wise)
+        self.q_a_proj = nn.Linear(hidden_size, q_lora_rank, bias=bias)
+        self.q_b_proj = nn.Linear(q_lora_rank, num_heads * self.qk_head_dim, bias=bias)
+        self.q_a_layernorm = nn.LayerNorm(q_lora_rank)
+        # Output projection (sharded row-wise)
+        self.o_proj = nn.Linear(num_heads * v_head_dim, hidden_size, bias=bias)
+
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, s, _ = x.shape
+
+        # Compress KV to latent
+        compressed_kv_rope = self.kv_a_proj_with_mqa(x)  # (b, s, kv_lora_rank + rope_dim)
+        compressed_kv = compressed_kv_rope[:, :, : self.kv_lora_rank]  # (b, s, kv_lora_rank)
+
+        # Decompress to full K and V
+        kv = self.kv_b_proj(compressed_kv)  # (b, s, num_heads * (qk_nope + v))
+        k_nope_v = kv.view(b, s, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+        k_nope = k_nope_v[:, :, :, : self.qk_nope_head_dim]
+        v = k_nope_v[:, :, :, self.qk_nope_head_dim :]
+
+        # Query projection
+        # q = q_b_proj @ (layernorm(q_a_proj @ x))
+        q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(x)))  # (b, s, num_heads * qk_head_dim)
+        q = q.view(b, s, self.num_heads, self.qk_head_dim)
+        q_nope = q[:, :, :, : self.qk_nope_head_dim]
+
+        # Simplified attention: just use nope parts
+        # In real MLA, this would include rope and proper attention
+        # attn_out = torch.matmul(
+        #     q_nope, k_nope.transpose(-2, -1)
+        # ) @ v  # Simplified attention pattern
+
+        # attn_out = attn_out.contiguous().view(b, s, self.num_heads * self.v_head_dim)
+
+        attn_out = torch.ops.auto_deploy.torch_attention(
+            q_nope, k_nope, v, is_causal=True, layout="bsnd"
+        )
+        attn_out = attn_out.contiguous().view(b, s, -1)
+        # Output projection
+        output = self.o_proj(attn_out)
+        return output
+
+
 def _run_sharding_execution_job(
     model_cls: nn.Module,
     dist_op_expected: str,
@@ -150,6 +238,53 @@ def _run_sharding_execution_job(
         ).to(device="cuda", dtype=torch.float16)
     elif model_cls == FP8MLP:
         model = model_cls(num_features, num_features, bias=bias).to("cuda")
+    elif model_cls == NemotronHMamba2Mixer:
+        # Create config for Mamba2 based on Nemotron models
+        # Scaled down from typical values: hidden_size=5120, ssm_state_size=128
+        mamba_config = SimpleNamespace(
+            hidden_size=num_features,
+            ssm_state_size=16,  # Scaled from 128
+            mamba_num_heads=num_heads,
+            mamba_head_dim=num_features // num_heads,  # 8
+            n_groups=1,  # Typical value
+            chunk_size=256,
+            conv_kernel=4,
+            use_conv_bias=bias,
+            use_bias=bias,
+            mamba_hidden_act="silu",
+            layer_norm_epsilon=1e-5,
+            time_step_limit=(0.0, float("inf")),
+            time_step_min=0.001,
+            time_step_max=0.1,
+            time_step_floor=1e-4,
+            initializer_range=0.02,
+            rescale_prenorm_residual=False,
+            residual_in_fp32=False,
+            num_hidden_layers=1,
+        )
+        model = model_cls(mamba_config, layer_idx=0).to(device="cuda", dtype=torch.float16)
+    elif model_cls == MLA_Block:
+        # Use actual DeepSeek-V3/R1 production values
+        # From HuggingFace config (HunYuanPretrainedConfig defaults):
+        # hidden_size=4096, num_attention_heads=32
+        # kv_lora_rank=512, q_lora_rank=1536
+        # qk_rope_head_dim=64, v_head_dim=128, qk_nope_head_dim=128
+        num_heads_mla = 16
+        qk_nope_head_dim = 64
+        qk_rope_head_dim = 32
+        v_head_dim = 64
+        kv_lora_rank = 256
+
+        model = model_cls(
+            hidden_size=num_features,
+            num_heads=num_heads_mla,
+            q_lora_rank=kv_lora_rank,
+            kv_lora_rank=kv_lora_rank,
+            qk_nope_head_dim=qk_nope_head_dim,
+            qk_rope_head_dim=qk_rope_head_dim,
+            v_head_dim=v_head_dim,
+            bias=bias,
+        ).to(device="cuda", dtype=torch.float16)
     else:
         model = model_cls(num_features, num_features, bias=bias).to(
             device="cuda", dtype=torch.float16
@@ -178,6 +313,11 @@ def _run_sharding_execution_job(
             num_params = W_q_local_size + W_k_local_size + W_v_local_size + W_o_local_size
         else:
             num_params = num_p_og // world_size + num_update
+        if model_cls == MLA_Block:
+            # since q_a_proj is simple-sharded and followed by q_a_layernorm, the layernorm params
+            # are NOT sharded - they have to be replicated. To account for this, we need to add the
+            # number of parameters of the layernorm (weight and bias)to the number of parameters of the model.
+            num_params += 2 * kv_lora_rank * (world_size - 1) // world_size
         return num_params
 
     def verify_local_weight_sizes(gm) -> bool:
@@ -247,6 +387,47 @@ def _run_pattern_detection_job(
             num_attention_heads=num_heads,
             hidden_size=num_features,
             num_key_value_heads=num_key_value_heads,
+        ).to(device="cuda", dtype=torch.float16)
+    elif model_cls == NemotronHMamba2Mixer:
+        # Create config for Mamba2
+        mamba_config = SimpleNamespace(
+            hidden_size=num_features,
+            ssm_state_size=16,
+            mamba_num_heads=num_heads,
+            mamba_head_dim=num_features // num_heads,
+            n_groups=1,
+            chunk_size=256,
+            conv_kernel=4,
+            use_conv_bias=bias,
+            use_bias=bias,
+            mamba_hidden_act="silu",
+            layer_norm_epsilon=1e-5,
+            time_step_limit=(0.0, float("inf")),
+            time_step_min=0.001,
+            time_step_max=0.1,
+            time_step_floor=1e-4,
+            initializer_range=0.02,
+            rescale_prenorm_residual=False,
+            residual_in_fp32=False,
+            num_hidden_layers=1,
+        )
+        model = model_cls(mamba_config, layer_idx=0).to(device="cuda", dtype=torch.float16)
+    elif model_cls == MLA_Block:
+        # Create simplified MLA based on DeepSeek-V3 architecture
+        qk_nope_head_dim = 2
+        qk_rope_head_dim = 1
+        v_head_dim = 2
+        kv_lora_rank = 8
+
+        model = model_cls(
+            hidden_size=num_features,
+            num_heads=num_heads,
+            q_lora_rank=kv_lora_rank,
+            kv_lora_rank=kv_lora_rank,
+            qk_nope_head_dim=qk_nope_head_dim,
+            qk_rope_head_dim=qk_rope_head_dim,
+            v_head_dim=v_head_dim,
+            bias=bias,
         ).to(device="cuda", dtype=torch.float16)
     else:
         model = model_cls(num_features, num_features, bias=bias).to(
@@ -344,6 +525,52 @@ def _run_pattern_detection_job(
                             min_local_shape=1,
                         )
                     )
+        elif model_cls == NemotronHMamba2Mixer:
+            for node in gm.graph.nodes:
+                if is_linear_op(node):
+                    # in_proj should be sharded column-wise
+                    # out_proj should be sharded row-wise with all_reduce
+                    if "out_proj" in node.args[1].name:
+                        dim = SplitDimension.ROW
+                        dist_op = "all_reduce"
+                    else:
+                        dim = SplitDimension.COLUMN
+                        dist_op = None
+                    expected_transformations.append(
+                        WeightShardingInfo(
+                            target_node=node.name,
+                            split_dim=dim,
+                            config=config,
+                            dist_op=dist_op,
+                            min_local_shape=1,
+                            layer_type=LayerType.MLP,
+                        )
+                    )
+        elif model_cls == MLA_Block:
+            for node in gm.graph.nodes:
+                if is_linear_op(node):
+                    # kv_a_proj_with_mqa: gather (no sharding)
+                    # q_b_proj/kv_b_proj: column-wise
+                    # o_proj: row-wise with all_reduce
+                    if "o_proj" in node.args[1].name:
+                        dim = SplitDimension.ROW
+                        dist_op = "all_reduce"
+                    elif "kv_a_proj_with_mqa" in node.args[1].name:
+                        # This is gather, skip sharding
+                        continue
+                    else:
+                        dim = SplitDimension.COLUMN
+                        dist_op = None
+                    expected_transformations.append(
+                        WeightShardingInfo(
+                            target_node=node.name,
+                            split_dim=dim,
+                            config=config,
+                            dist_op=dist_op,
+                            min_local_shape=1,
+                            layer_type=LayerType.ATTENTION,
+                        )
+                    )
 
     # get detected transformations
     optimizer = InferenceOptimizer(
@@ -378,6 +605,8 @@ def _run_pattern_detection_job(
         (FP8MLP, "torch_dist_all_reduce"),
         (nn.Linear, "torch_dist_all_gather"),
         (GQA_Block, "torch_dist_all_reduce"),
+        (NemotronHMamba2Mixer, "torch_dist_all_reduce"),
+        (MLA_Block, "torch_dist_all_reduce"),
     ),
 )
 def test_sharding(
@@ -403,6 +632,8 @@ def test_sharding(
         (FP8MLP, "torch_dist_all_reduce"),
         (nn.Linear, "torch_dist_all_gather"),
         (GQA_Block, "torch_dist_all_reduce"),
+        (NemotronHMamba2Mixer, "torch_dist_all_reduce"),
+        (MLA_Block, "torch_dist_all_reduce"),
     ),
 )
 def test_sharding_pattern_detection(
