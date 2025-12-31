@@ -312,15 +312,15 @@ class CpBroadcastTest:
         """Test broadcasting a tensor via cp_broadcast."""
         cp_rank = self.mapping.cp_rank
         if cp_rank == root:
-            # Root rank has the tensor to broadcast
+            # Root rank has the tensor to broadcast.
             tensor = root_tensor.cuda()
         else:
-            # Non-root ranks start with zeros
+            # Non-root ranks start with zeros.
             tensor = torch.zeros_like(root_tensor).cuda()
 
         result = self.dist.cp_broadcast(tensor, root=root)
 
-        # After broadcast, all CP ranks should have the same tensor
+        # After broadcast, all CP ranks should have the same tensor.
         expected = root_tensor.cuda()
         return torch.allclose(result, expected)
 
@@ -334,12 +334,12 @@ class CpBroadcastTest:
 
         result = self.dist.cp_broadcast(obj, root=root)
 
-        # After broadcast, all CP ranks should have the same object
+        # After broadcast, all CP ranks should have the same object.
         return result == root_obj
 
     def run_tp_cp_broadcast(self, root_obj, root: int = 0):
         """Test broadcasting an object via tp_cp_broadcast."""
-        # For tp_cp_broadcast, only rank 0 in both TP and CP should have the object
+        # For tp_cp_broadcast, only rank 0 in both TP and CP should have the object.
         tp_rank = self.mapping.tp_rank
         cp_rank = self.mapping.cp_rank
         if tp_rank == root and cp_rank == root:
@@ -349,7 +349,7 @@ class CpBroadcastTest:
 
         result = self.dist.tp_cp_broadcast(obj, root=root)
 
-        # After broadcast, all TP and CP ranks should have the same object
+        # After broadcast, all TP and CP ranks should have the same object.
         return result == root_obj
 
 
@@ -362,9 +362,9 @@ def test_cp_broadcast_tensor(setup_ray_cluster, seq_len, hidden_size):
     dtype = torch.bfloat16
     world_size = 2
     tp_size = 1
-    cp_size = 2  # Enable context parallelism
+    cp_size = 2  # Enable context parallelism.
 
-    # Create tensor to broadcast from root
+    # Create tensor to broadcast from root.
     root_tensor = torch.randn((seq_len, hidden_size), dtype=dtype)
 
     runtime_env = ray.runtime_env.RuntimeEnv()
@@ -385,7 +385,7 @@ def test_cp_broadcast_tensor(setup_ray_cluster, seq_len, hidden_size):
     port = ray.get(remote_tests[0].setup_tcp_store.remote())
     ray.get([test.setup_distributed_env.remote(port) for test in remote_tests])
 
-    # Test broadcasting from root=0
+    # Test broadcasting from root=0.
     results = ray.get([
         test.run_tensor_broadcast.remote(root_tensor, root=0)
         for test in remote_tests
@@ -406,60 +406,21 @@ def test_cp_broadcast_tensor(setup_ray_cluster, seq_len, hidden_size):
     "simple_string",
 ],
                          ids=["dict", "list", "string"])
-def test_cp_broadcast_object(setup_ray_cluster, test_object):
-    """Test TorchDist.cp_broadcast with non-tensor objects."""
-    world_size = 2
-    tp_size = 1
-    cp_size = 2  # Enable context parallelism
-
-    runtime_env = ray.runtime_env.RuntimeEnv()
-    runtime_env["env_vars"] = os.environ.copy()
-    runtime_env["env_vars"].update({
-        "TLLM_DISABLE_MPI": "1",
-        "MASTER_ADDR": "127.0.0.1",
-    })
-
-    remote_tests = []
-    for rank in range(world_size):
-        remote_tests.append(
-            CpBroadcastTest.options(runtime_env=runtime_env).remote(
-                rank, world_size, tp_size, cp_size))
-
-    ray.get([test.__ray_ready__.remote() for test in remote_tests])
-
-    port = ray.get(remote_tests[0].setup_tcp_store.remote())
-    ray.get([test.setup_distributed_env.remote(port) for test in remote_tests])
-
-    # Test broadcasting object from root=0
-    results = ray.get([
-        test.run_object_broadcast.remote(test_object, root=0)
-        for test in remote_tests
-    ])
-    for r in results:
-        assert r is True, f"Object broadcast from root=0 failed for {type(test_object)}"
-
-
-@pytest.mark.gpu2
-@pytest.mark.parametrize("test_object", [
-    {
-        "key1": "value1",
-        "key2": [1, 2, 3]
-    },
-    ["item1", "item2", {
-        "nested": True
-    }],
-    "simple_string",
+@pytest.mark.parametrize("broadcast_method", [
+    "run_object_broadcast",
+    "run_tp_cp_broadcast",
 ],
-                         ids=["dict", "list", "string"])
-def test_tp_cp_broadcast(setup_ray_cluster, test_object):
-    """Test TorchDist.tp_cp_broadcast with various objects.
+                         ids=["cp_broadcast", "tp_cp_broadcast"])
+def test_cp_tp_broadcast_object(setup_ray_cluster, test_object,
+                                broadcast_method):
+    """Test TorchDist.cp_broadcast and tp_cp_broadcast with non-tensor objects.
 
-    This tests the combined TP+CP broadcast which is used when both tensor
-    and context parallelism are enabled (e.g., helix parallelism).
+    This tests both cp_broadcast (for context parallelism only) and tp_cp_broadcast
+    (for combined TP+CP broadcast used in helix parallelism).
     """
     world_size = 2
     tp_size = 1
-    cp_size = 2  # Enable context parallelism (tp_cp_broadcast will only do cp_broadcast)
+    cp_size = 2  # Enable context parallelism.
 
     runtime_env = ray.runtime_env.RuntimeEnv()
     runtime_env["env_vars"] = os.environ.copy()
@@ -479,10 +440,10 @@ def test_tp_cp_broadcast(setup_ray_cluster, test_object):
     port = ray.get(remote_tests[0].setup_tcp_store.remote())
     ray.get([test.setup_distributed_env.remote(port) for test in remote_tests])
 
-    # Test tp_cp_broadcast from root=0
+    # Test broadcasting object from root=0 using the specified method.
     results = ray.get([
-        test.run_tp_cp_broadcast.remote(test_object, root=0)
+        getattr(test, broadcast_method).remote(test_object, root=0)
         for test in remote_tests
     ])
     for r in results:
-        assert r is True, f"tp_cp_broadcast from root=0 failed for {type(test_object)}"
+        assert r is True, f"{broadcast_method} from root=0 failed for {type(test_object)}"
