@@ -120,7 +120,6 @@ class ServerConfig:
 
     def __init__(self, server_config_data: dict, env_vars: str = ""):
         # Extract required fields
-        self.mode = server_config_data.get("mode", "e2e")
         self.concurrency = server_config_data.get("concurrency", 1)
         self.model_name = server_config_data["model_name"]
         self.model_path = ""
@@ -257,7 +256,6 @@ class ServerConfig:
 
     def to_match_keys(self) -> List[str]:
         return [
-            "s_mode",
             "s_model_name",
             "l_tp",
             "l_ep",
@@ -290,7 +288,6 @@ class ServerConfig:
         """Convert ServerConfig to database data."""
         db_data = {
             "s_server_name": self.name,
-            "s_mode": self.mode,
             "s_model_name": self.model_name.lower(),
             "l_gpus": self.gpus,
             "l_tp": self.tp,
@@ -470,7 +467,7 @@ class DisaggConfig:
         hostname: str,
         numa_bind: bool,
         timeout: int,
-        mode: str,
+        benchmark_mode: str,
         model_name: str,
         hardware: dict,
         server_env_var: str,
@@ -479,7 +476,7 @@ class DisaggConfig:
         self.hostname = hostname
         self.numa_bind = numa_bind
         self.timeout = timeout
-        self.mode = mode
+        self.benchmark_mode = benchmark_mode
         self.model_name = model_name
         self.hardware = hardware
         self.server_env_var = server_env_var
@@ -908,7 +905,6 @@ class PerfSanityTestConfig:
                 if "model_name" not in server_config_data
                 else server_config_data["model_name"]
             )
-            server_config_data["mode"] = "e2e"
             server_config_data["concurrency"] = -1
             server_config_data["gpus_per_node"] = gpus_per_node
 
@@ -974,7 +970,6 @@ class PerfSanityTestConfig:
 
         # Create ctx server config
         ctx_server_config_data = {
-            "mode": benchmark_mode,
             "concurrency": max(concurrency_values),
             "name": f"ctx_{config_file_base_name}",
             "model_name": model_name,
@@ -984,7 +979,6 @@ class PerfSanityTestConfig:
 
         # Create gen server config
         gen_server_config_data = {
-            "mode": benchmark_mode,
             "concurrency": max(concurrency_values),
             "name": f"gen_{config_file_base_name}",
             "model_name": model_name,
@@ -1001,7 +995,7 @@ class PerfSanityTestConfig:
             hostname=socket.gethostname(),
             numa_bind=numa_bind,
             timeout=timeout,
-            mode=benchmark_mode,
+            benchmark_mode=benchmark_mode,
             model_name=model_name,
             hardware=hardware,
             server_env_var=server_env_var,
@@ -1308,7 +1302,7 @@ class PerfSanityTestConfig:
                     new_data = {
                         "s_gpu_type": self.gpu_type,
                         "s_runtime": "multi_node_disagg_server",
-                        "s_benchmark_mode": disagg_config.mode,
+                        "s_benchmark_mode": disagg_config.benchmark_mode,
                         "s_server_env_var": disagg_config.server_env_var,
                         "l_num_ctx_servers": num_ctx_servers,
                         "l_num_gen_servers": num_gen_servers,
