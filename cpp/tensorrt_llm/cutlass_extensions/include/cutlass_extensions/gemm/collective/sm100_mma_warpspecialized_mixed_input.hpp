@@ -42,6 +42,7 @@
 #include "cutlass/gemm/gemm.h"
 #include "cutlass/numeric_conversion.h"
 #include "cutlass/pipeline/pipeline.hpp"
+#include "cutlass_extensions/detail/collective/mixed_input_utils.hpp"
 
 #include "cute/algorithm/functional.hpp"
 #include "cute/algorithm/gemm.hpp"
@@ -97,6 +98,7 @@ private:
         ElementBOptionalTuple, StrideB_, TiledMma_, GmemTiledCopyA_, SmemLayoutAtomsA_, CopyAtomsA_, TransformA_,
         GmemTiledCopyB_, SmemLayoutAtomsB_, CopyAtomsB_, TransformB_>;
     using Utils = detail::MixedInputUtils<CollectiveType>;
+    using UtilsSM100 = detail::MixedInputUtilsSM100<CollectiveType>;
 
     using ElementScaleA = detail::deduce_mixed_width_dtype_t<1, ElementAOptionalTuple_>;
     using ElementScaleB = detail::deduce_mixed_width_dtype_t<1, ElementBOptionalTuple>;
@@ -984,7 +986,7 @@ public:
             CUTLASS_PRAGMA_UNROLL
             for (int k_block = 0; k_block < K_BLOCK_MAX; k_block++)
             {
-                Utils::dequantize_A_kblock_for_transform(tArA, tArACompute, partitioned_extra_info, k_block);
+                UtilsSM100::dequantize_A_kblock_for_transform(tArA, tArACompute, partitioned_extra_info, k_block);
             }
 
             // Dequantized A is stored into either Smem or Tmem
