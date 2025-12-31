@@ -1,6 +1,6 @@
 from .auto_heuristic import suggest_spec_config
 from .eagle3 import Eagle3SpecMetadata
-from .interface import SpecMetadata
+from .interface import SpecMetadata, SpecWorkerBase
 from .mtp import MTPEagleWorker, MTPSpecMetadata, MTPWorker
 from .ngram import NGramDrafter, NGramPoolManager
 from .save_hidden_state import SaveHiddenStatesDrafter
@@ -19,6 +19,7 @@ __all__ = [
     "NGramPoolManager",
     "SaveHiddenStatesDrafter",
     "SpecMetadata",
+    "SpecWorkerBase",
     "get_num_extra_kv_tokens",
     "get_num_spec_layers",
     "get_spec_decoder",
