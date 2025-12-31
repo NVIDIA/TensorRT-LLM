@@ -205,15 +205,14 @@ TargetRanksInfo TargetRanksInfoForDP(
     }
 
     std::vector<int> retRanks;
-    for (int i = peerTPRankStart; i < peerTPRankEnd; i++)
+    for (int i = peerCPRankStart; i < peerCPRankEnd; i++)
     {
-        for (int j = peerCPRankStart; j < peerCPRankEnd; j++)
+        for (int j = peerTPRankStart; j < peerTPRankEnd; j++)
         {
             for (int k = peerPPRankStart; k < peerPPRankEnd; k++)
             {
-                // Rank formula: ppRank * (tpNum * cpNum) + tpRank * cpNum + cpRank
-                // where i=tpRank, j=cpRank, k=ppRank
-                int irank = (k * peerTPNum * peerCPNum) + (i * peerCPNum) + j;
+                // Rank formula: ppRank * (tpNum * cpNum) + tpRank * cpNum + cpRank.
+                int irank = (k * peerTPNum * peerCPNum) + (j * peerCPNum) + i;
                 retRanks.push_back(irank);
             }
         }

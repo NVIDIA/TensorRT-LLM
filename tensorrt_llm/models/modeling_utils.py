@@ -740,7 +740,7 @@ class PretrainedModel(Module,
 
         rank = config.mapping.rank
         if config.mapping.cp_size > 1:
-            # cp_tp_pp rank -> tp_pp rank: because different cp ranks share the same ckpt
+            # cp_tp_pp rank -> tp_pp rank: because different cp ranks share the same ckpt.
             tp_size = config.mapping.tp_size
             cp_size = config.mapping.cp_size
             rank = (rank % (tp_size * cp_size)) // cp_size + rank // (

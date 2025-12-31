@@ -292,13 +292,13 @@ class MappingBase:
         return self.cp_size > 1
 
     def prev_cp_rank(self):
-        # cp ranks are consecutive, so prev is rank - 1 with wraparound within cp group
+        # cp ranks are consecutive, so prev is rank - 1 with wraparound within cp group.
         if self.cp_rank == 0:
             return self.rank + self.cp_size - 1
         return self.rank - 1
 
     def next_cp_rank(self):
-        # cp ranks are consecutive, so next is rank + 1 with wraparound within cp group
+        # cp ranks are consecutive, so next is rank + 1 with wraparound within cp group.
         if self.cp_rank == self.cp_size - 1:
             return self.rank - self.cp_size + 1
         return self.rank + 1
@@ -596,7 +596,7 @@ class MpiTopology(Mapping):
             ranks = range(i, self.world_size, self.tp_size * self.cp_size)
             self.pp_groups.append(list(ranks))
 
-        # init cp group (consecutive ranks within each tp slice)
+        # init cp group (consecutive ranks within each tp slice).
         for i in range(self.pp_size):
             for j in range(self.tp_size):
                 ranks = range(
@@ -604,7 +604,7 @@ class MpiTopology(Mapping):
                     i * self.tp_size * self.cp_size + (j + 1) * self.cp_size)
                 self.cp_groups.append(list(ranks))
 
-        # init tp group (interleaved ranks with stride of cp_size)
+        # init tp group (interleaved ranks with stride of cp_size).
         for i in range(self.pp_size):
             for j in range(self.cp_size):
                 ranks = range(i * self.tp_size * self.cp_size + j,

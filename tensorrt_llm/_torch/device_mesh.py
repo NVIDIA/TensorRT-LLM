@@ -118,8 +118,8 @@ class DeviceMeshTopologyImpl(_MappingBaseForTypeCheck):
                 "DeviceMesh creation requested but torch.distributed process group "
                 "has not been initialised.")
 
-        # Dimensions go from slowest-varying (outermost) to fastest-varying (innermost)
-        # Layout: pp is outermost, then tp, then cp is innermost (consecutive)
+        # Dimensions go from slowest-varying (outermost) to fastest-varying (innermost).
+        # Layout: pp is outermost, then tp, then cp is innermost (consecutive).
         dims = ["pp", "tp"]
         shape = [self.pp_size, self.tp_size]
 
