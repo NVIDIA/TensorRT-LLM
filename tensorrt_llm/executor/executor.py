@@ -77,10 +77,13 @@ class IterationResultQueue:
 
 class GenerationExecutor(ABC):
 
-    def __init__(self,
-                 num_postprocess_workers: int = 0,
-                 postprocess_tokenizer_dir: Optional[str] = None,
-                 is_llm_executor: Optional[bool] = None):
+    def __init__(
+        self,
+        num_postprocess_workers: int = 0,
+        postprocess_tokenizer_dir: Optional[str] = None,
+        is_llm_executor: Optional[bool] = None,
+        iter_stats_max_iterations: int = 0,
+    ):
         self.postproc_config = PostprocWorkerConfig(
             num_postprocess_workers=num_postprocess_workers,
             postprocess_tokenizer_dir=postprocess_tokenizer_dir)
@@ -102,6 +105,7 @@ class GenerationExecutor(ABC):
         self._is_llm_executor = is_llm_executor
         self._iter_kv_events_result: IterationResult | None = None
         self._iter_stats_result: IterationResult | None = None
+        self._iter_stats_max_iterations = iter_stats_max_iterations
 
     @abstractmethod
     def submit(self, request: GenerationRequest) -> GenerationResult:
@@ -239,7 +243,8 @@ class GenerationExecutor(ABC):
         if self._is_llm_executor:
             if self._iter_stats_result is None:
                 # singleton to store cpp runtime stats
-                self._iter_stats_result = IterationResult()
+                self._iter_stats_result = IterationResult(
+                    self._iter_stats_max_iterations)
             else:
                 # expect more engine stats whenever new prompts are submitted
                 self._iter_stats_result.mark_undone()

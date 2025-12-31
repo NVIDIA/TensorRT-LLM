@@ -1176,5 +1176,6 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
         max_beam_width=ad_config.max_beam_width,
         guided_decoder=guided_decoder,
         drafter=drafter,
+        iter_stats_max_iterations=ad_config.iter_stats_max_iterations,
     )
     return py_executor

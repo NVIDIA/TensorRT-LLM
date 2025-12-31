@@ -1,3 +1,4 @@
+import collections
 import dataclasses
 import datetime
 import functools
@@ -136,7 +137,8 @@ class PyExecutor:
                  kv_connector_manager: Optional[KvCacheConnectorManager] = None,
                  max_seq_len: Optional[int] = None,
                  peft_cache_config: Optional[PeftCacheConfig] = None,
-                 virtual_memory_pools: Optional[dict] = None):
+                 virtual_memory_pools: Optional[dict] = None,
+                 iter_stats_max_iterations: Optional[int] = None):
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
         self.global_rank = dist.rank
@@ -274,7 +276,8 @@ class PyExecutor:
         self.control_action_done = threading.Event()
 
         self.stats_lock = threading.Lock()
-        self.stats = []
+        self.stats = collections.deque(maxlen=iter_stats_max_iterations
+                                       if iter_stats_max_iterations else None)
         self.gather_all_responses = False
 
         self.kv_cache_transceiver = kv_cache_transceiver
@@ -487,7 +490,7 @@ class PyExecutor:
         latest_stats = (IterationStats(), None)
         with self.stats_lock:
             latest_stats = self.stats
-            self.stats = []
+            self.stats.clear()
         return latest_stats
 
     def get_latest_kv_cache_events(self):

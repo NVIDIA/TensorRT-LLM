@@ -41,8 +41,14 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
         os.environ['RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES'] = '1'
         os.environ["RAY_DEDUP_LOGS"] = "0"  # for debug
 
-        super().__init__(model_world_size, postproc_worker_config,
-                         is_llm_executor)
+        iter_stats_max_iterations = worker_kwargs[
+            "llm_args"].iter_stats_max_iterations if worker_kwargs.get(
+                "llm_args", None) is not None else 0
+
+        super().__init__(num_postprocess_workers=model_world_size,
+                         postprocess_tokenizer_dir=postproc_worker_config,
+                         is_llm_executor=is_llm_executor,
+                         iter_stats_max_iterations=iter_stats_max_iterations)
 
         self.has_start_local_cluser = False
         runtime_env = {

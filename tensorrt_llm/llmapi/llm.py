@@ -1140,8 +1140,7 @@ class _TorchLLM(BaseLLM):
             return_logits=return_logits,
             postproc_worker_config=PostprocWorkerConfig(
                 num_postprocess_workers=self.args.num_postprocess_workers,
-                postprocess_tokenizer_dir=self.args.postprocess_tokenizer_dir,
-            ),
+                postprocess_tokenizer_dir=self.args.postprocess_tokenizer_dir),
             is_llm_executor=True,
             hf_model_dir=self._hf_model_dir,
             tokenizer=self.tokenizer,

@@ -1991,8 +1991,11 @@ class BaseLlmArgs(StrictBaseModel):
         })
 
     iter_stats_max_iterations: Optional[int] = Field(
-        default=None,
-        description="The maximum number of iterations for iter stats.",
+        default=16384,
+        description=
+        "Maximum number of iterations to keep in the iteration statistics history. "
+        "Defaults to 16384 iterations. "
+        "When exceeded, older statistics are automatically removed to maintain this limit.",
         status="prototype")
 
     request_stats_max_iterations: Optional[int] = Field(
