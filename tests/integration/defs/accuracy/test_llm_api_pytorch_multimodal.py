@@ -220,7 +220,8 @@ class TestPhi4MMFusedVisionLora(LlmapiAccuracyTestHarness):
 @skip_post_blackwell
 class TestGemma3_27BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "google/gemma-3-27b-it"
-    MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-27b-it/"
+    # Note: This has only the LLM part quantized. Vision part is in bfloat16.
+    MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-27b-it-fp8/"
     MAX_NUM_TOKENS = 12800
 
     sampling_params = SamplingParams(
@@ -232,9 +233,10 @@ class TestGemma3_27BInstruct(LlmapiAccuracyTestHarness):
         enable_block_reuse=False,
         enable_partial_reuse=False,
         free_gpu_memory_fraction=0.4,
+        dtype="fp8",
     )
 
-    def test_auto_dtype(self):
+    def test_fp8_prequantized(self):
         # Gemma3 VLM needs FlashInfer attention backend for custom mask support.
         with LLM(
             self.MODEL_PATH,
