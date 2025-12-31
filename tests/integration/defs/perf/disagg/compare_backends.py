@@ -14,7 +14,7 @@ def extract_backend(test_name):
 
     New format: ccb-NIXL or ccb-UCX or ccb-DEFAULT
     Example: disagg_perf_deepseek-r1-fp4_1k1k_ctx2_gen1_dep16_bs128_eplb288_mtp3_ccb-NIXL
-    
+
     Note: "DEFAULT" is a special marker that represents the default backend
     """
     match = re.search(r"ccb-(\w+)", test_name)
@@ -158,7 +158,7 @@ def compare_backends(csv_path, threshold=5.0, default_backend="NIXL"):
         )
 
     # Print statistics
-    print(f"\n=== Backend Comparison Statistics ===")
+    print("\n=== Backend Comparison Statistics ===")
     print(f"Default backend: {default_backend}")
     print(f"Comparison pairs: {comparison_pairs}")
     print(f"Single-backend cases (skipped): {single_backend_skipped}")
@@ -166,8 +166,8 @@ def compare_backends(csv_path, threshold=5.0, default_backend="NIXL"):
 
     # If no comparison pairs found, exit with success
     if comparison_pairs == 0:
-        print(f"\nInfo: No backend comparison pairs found in disagg_perf tests")
-        print(f"All cases are single-backend only, no comparison needed")
+        print("\nInfo: No backend comparison pairs found in disagg_perf tests")
+        print("All cases are single-backend only, no comparison needed")
         sys.exit(0)
 
     # Convert to DataFrame

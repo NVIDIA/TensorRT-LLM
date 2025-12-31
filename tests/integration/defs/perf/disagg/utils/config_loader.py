@@ -45,7 +45,9 @@ class AccuracyConfig:
     """Accuracy test configuration (supports multiple datasets)."""
 
     datasets: List[DatasetThreshold]  # List of dataset threshold configurations
-    metrics: Optional[MetricsConfig] = None  # Optional custom metrics config (defaults to _COMMON_ACCURACY_METRICS)
+    metrics: Optional[MetricsConfig] = (
+        None  # Optional custom metrics config (defaults to _COMMON_ACCURACY_METRICS)
+    )
 
     def get_dataset_config(self, dataset_name: str) -> Optional[DatasetThreshold]:
         """Get configuration by dataset name.
@@ -68,10 +70,10 @@ class AccuracyConfig:
             List of dataset names
         """
         return [ds.dataset_name for ds in self.datasets]
-    
+
     def get_metrics_config(self) -> MetricsConfig:
         """Get metrics configuration for accuracy parsing.
-        
+
         Returns:
             Custom metrics config if provided, otherwise _COMMON_ACCURACY_METRICS
         """
@@ -398,20 +400,27 @@ class ConfigLoader:
                             higher_is_better=higher_is_better,
                         )
                     )
-                
+
                 # Check if custom accuracy metrics are provided
                 custom_metrics = None
                 if "metrics" in acc_meta:
                     metrics_override = acc_meta["metrics"]
                     custom_metrics = MetricsConfig(
                         log_file=metrics_override.get("log_file", "7_accuracy_eval.log"),
-                        extractor_pattern=metrics_override.get("extractor_pattern", r"\|([a-zA-Z0-9_-]+)\|.*?\|([\w-]+)\|.*?\|exact_match\|.*?\|([0-9.]+)\|"),
-                        metric_names=metrics_override.get("metric_names", ["flexible-extract", "strict-match"]),
+                        extractor_pattern=metrics_override.get(
+                            "extractor_pattern",
+                            r"\|([a-zA-Z0-9_-]+)\|.*?\|([\w-]+)\|.*?\|exact_match\|.*?\|([0-9.]+)\|",
+                        ),
+                        metric_names=metrics_override.get(
+                            "metric_names", ["flexible-extract", "strict-match"]
+                        ),
                     )
-                    logger.info(f"Using custom accuracy metrics config from YAML")
-                
+                    logger.info("Using custom accuracy metrics config from YAML")
+
                 accuracy_config = AccuracyConfig(datasets=datasets, metrics=custom_metrics)
-                logger.info(f"Loaded accuracy config with {len(datasets)} dataset(s) for {test_category} test")
+                logger.info(
+                    f"Loaded accuracy config with {len(datasets)} dataset(s) for {test_category} test"
+                )
 
         return TestConfig(
             config_path=str(yaml_path),
