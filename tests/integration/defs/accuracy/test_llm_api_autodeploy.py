@@ -205,11 +205,13 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device_memory(32000)
-    def test_fp8(self):
+    @pytest.mark.parametrize("world_size", [1, 4])
+    def test_fp8(self, world_size):
         kwargs = self.get_default_kwargs()
         kwargs["max_batch_size"] = 64
         with AutoDeployLLM(model=self.MODEL_PATH_FP8,
                            tokenizer=self.MODEL_PATH_FP8,
+                           world_size=world_size,
                            **kwargs) as llm:
             # Manually set quant_config for FP8 model to get the accuracy threshold
             llm.args.quant_config.quant_algo = QuantAlgo.FP8
