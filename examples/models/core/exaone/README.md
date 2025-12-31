@@ -91,8 +91,7 @@ Download the HuggingFace checkpoints of the K-EXAONE model:
 
 ```bash
 export HF_MODEL_DIR=hf_models/kexaone
-# [TODO] Replace <ORG>/<MODEL_NAME> with the actual Hugging Face model repo for K-EXAONE.
-git clone https://huggingface.co/<ORG>/<MODEL_NAME> $HF_MODEL_DIR
+git clone https://huggingface.co/LGAI-EXAONE/(TODO: FIll this with real URL) $HF_MODEL_DIR
 ```
 
 ## PyTorch flow
@@ -121,11 +120,6 @@ python ../../../llm-api/quickstart_advanced.py \
     --tp_size 8 \
     --ep_size 8 \
     --enable_attention_dp
-```
-
-The output will be like:
-```bash
-(TODO: Fill this with real CKPT)
 ```
 
 #### MoE Backend Options
