@@ -697,9 +697,13 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
 
         slurmRunner = null
         if (cluster.containerRuntime.toString() == "DOCKER") {
-            slurmRunner = runInDockerOnNodeMultiStage(LLM_DOCKER_IMAGE, nodeName, dockerArgs, true)
+            echo "${stageName} partitionTimeout: ${partition.time}"
+            def partitionTimeout = partition.time ? partition.time : SlurmConfig.DEFAULT_TIMEOUT_SHORT
+            slurmRunner = runInDockerOnNodeMultiStage(LLM_DOCKER_IMAGE, nodeName, dockerArgs, partitionTimeout, true)
         } else if (cluster.containerRuntime.toString() == "ENROOT") {
-            slurmRunner = runInEnrootOnNode(nodeName)
+            echo "${stageName} partitionTimeout: ${partition.time}"
+            def partitionTimeout = partition.time ? partition.time : SlurmConfig.DEFAULT_TIMEOUT_SHORT
+            slurmRunner = runInEnrootOnNode(nodeName, partitionTimeout)
         } else {
             throw new Exception("Unsupported container runtime: ${cluster.containerRuntime}")
         }
@@ -1133,6 +1137,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     #SBATCH --output=${outputPath}
                     ${taskArgs.collect { "#SBATCH $it" }.join('\n')}
                     #SBATCH ${partition.additionalArgs}
+                    ${partition?.time ? "#SBATCH --time=${partition.time}" : "#SBATCH --time=${SlurmConfig.DEFAULT_TIMEOUT_SHORT}"}
                     ${(partition?.name && partition.name != "unspecified") ? "#SBATCH --partition=${partition.name}" : ""}
 
                     # SBATCH directives must appear before any executable commands.
@@ -3013,7 +3018,7 @@ def ensureStageResultNotUploaded(stageName) {
 }
 
 // TODO: Update existing functions to use runInDockerOnNodeMultiStage and get rid of runInDockerOnNode
-def runInDockerOnNodeMultiStage(image, label, dockerArgs, needToDeleteDir=true)
+def runInDockerOnNodeMultiStage(image, label, dockerArgs, partitionTimeout, needToDeleteDir=true)
 {
     return {
         runner -> node(label) {
@@ -3024,9 +3029,9 @@ def runInDockerOnNodeMultiStage(image, label, dockerArgs, needToDeleteDir=true)
                 stage('Pull Docker Image') {
                     docker.image(image).pull()
                 }
-                // We submit the Slurm job with SlurmConfig.DEFAULT_TIMEOUT minutes (300) timeout
+                // We submit the Slurm job with the Slurm partition's time spec.
                 // Minus 10 minutes to avoid the Slurm job being stopped earlier.
-                timeout(time: SlurmConfig.DEFAULT_TIMEOUT - 10, unit: 'MINUTES') {
+                timeout(time: partitionTimeout - 10, unit: 'MINUTES') {
                     docker.image(image).inside(dockerArgs) {
                         runner()
                     }
@@ -3042,13 +3047,13 @@ def runInDockerOnNodeMultiStage(image, label, dockerArgs, needToDeleteDir=true)
     }
 }
 
-def runInEnrootOnNode(label)
+def runInEnrootOnNode(label, partitionTimeout)
 {
     return {
         runner -> node(label) {
-            // We submit the Slurm job with SlurmConfig.DEFAULT_TIMEOUT_SHORT minutes (240) timeout
+            // We submit the Slurm job with the Slurm partition's time spec.
             // Minus 10 minutes to avoid the Slurm job being stopped earlier.
-            timeout(time: SlurmConfig.DEFAULT_TIMEOUT_SHORT - 10, unit: 'MINUTES') {
+            timeout(time: partitionTimeout - 10, unit: 'MINUTES') {
                 runner()
             }
         }
