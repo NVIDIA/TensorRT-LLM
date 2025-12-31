@@ -82,6 +82,7 @@ def _signal_handler_cleanup_child(signum, frame):
 def get_llm_args(
         model: str,
         tokenizer: Optional[str] = None,
+        custom_tokenizer: Optional[str] = None,
         backend: str = "pytorch",
         max_beam_width: int = BuildConfig.model_fields["max_beam_width"].
     default,
@@ -137,6 +138,7 @@ def get_llm_args(
         "model": model,
         "scheduler_config": scheduler_config,
         "tokenizer": tokenizer,
+        "custom_tokenizer": custom_tokenizer,
         "tensor_parallel_size": tensor_parallel_size,
         "pipeline_parallel_size": pipeline_parallel_size,
         "context_parallel_size": context_parallel_size,
@@ -262,6 +264,14 @@ class ChoiceWithAlias(click.Choice):
               default=None,
               help="Path | Name of the tokenizer."
               "Specify this value only if using TensorRT engine as model.")
+@click.option(
+    "--custom_tokenizer",
+    type=str,
+    default=None,
+    help=
+    "Custom tokenizer type: alias (e.g., 'deepseek_v32') or Python import path "
+    "(e.g., 'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer'). [Experimental]"
+)
 @click.option("--host",
               type=str,
               default="localhost",
@@ -418,22 +428,22 @@ class ChoiceWithAlias(click.Choice):
               default=None,
               help="[Experimental] Specify a custom chat template. "
               "Can be a file path or one-liner template string")
-def serve(model: str, tokenizer: Optional[str], host: str, port: int,
-          log_level: str, backend: str, max_beam_width: int,
-          max_batch_size: int, max_num_tokens: int, max_seq_len: int,
-          tensor_parallel_size: int, pipeline_parallel_size: int,
-          context_parallel_size: int, moe_expert_parallel_size: Optional[int],
-          moe_cluster_parallel_size: Optional[int],
-          gpus_per_node: Optional[int], free_gpu_memory_fraction: float,
-          num_postprocess_workers: int, trust_remote_code: bool,
-          revision: Optional[str], extra_llm_api_options: Optional[str],
-          reasoning_parser: Optional[str], tool_parser: Optional[str],
-          metadata_server_config_file: Optional[str],
-          server_role: Optional[str],
-          fail_fast_on_attention_window_too_large: bool,
-          otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
-          disagg_cluster_uri: Optional[str], media_io_kwargs: Optional[str],
-          custom_module_dirs: list[Path], chat_template: Optional[str]):
+def serve(
+        model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
+        host: str, port: int, log_level: str, backend: str, max_beam_width: int,
+        max_batch_size: int, max_num_tokens: int, max_seq_len: int,
+        tensor_parallel_size: int, pipeline_parallel_size: int,
+        context_parallel_size: int, moe_expert_parallel_size: Optional[int],
+        moe_cluster_parallel_size: Optional[int], gpus_per_node: Optional[int],
+        free_gpu_memory_fraction: float, num_postprocess_workers: int,
+        trust_remote_code: bool, revision: Optional[str],
+        extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
+        tool_parser: Optional[str], metadata_server_config_file: Optional[str],
+        server_role: Optional[str],
+        fail_fast_on_attention_window_too_large: bool,
+        otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
+        disagg_cluster_uri: Optional[str], media_io_kwargs: Optional[str],
+        custom_module_dirs: list[Path], chat_template: Optional[str]):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -450,6 +460,7 @@ def serve(model: str, tokenizer: Optional[str], host: str, port: int,
     llm_args, _ = get_llm_args(
         model=model,
         tokenizer=tokenizer,
+        custom_tokenizer=custom_tokenizer,
         backend=backend,
         max_beam_width=max_beam_width,
         max_batch_size=max_batch_size,

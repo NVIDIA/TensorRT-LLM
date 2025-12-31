@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 import json
 import time
 import weakref
@@ -415,12 +416,19 @@ class GenerationResultBase:
             self.cached_tokens = getattr(response_result, 'cached_tokens', 0)
             self.avg_decoded_tokens_per_iter = response_result.avg_decoded_tokens_per_iter
             if context_phase_params is not None:
-                self.disaggregated_params = DisaggregatedParams(
+                existing_disagg_params = self.disaggregated_params
+                # Use `replace` to preserve things like `mrope_position_ids_handle` and
+                # `mrope_position_deltas_handle`. However, explicitly set
+                # `multimodal_embedding_handles=None` since they should no longer be needed.
+                self.disaggregated_params = dataclasses.replace(
+                    existing_disagg_params or DisaggregatedParams(),
                     request_type="context_only",
                     first_gen_tokens=context_phase_params.first_gen_tokens,
                     ctx_request_id=context_phase_params.req_id,
                     opaque_state=context_phase_params.opaque_state,
-                    draft_tokens=context_phase_params.draft_tokens)
+                    draft_tokens=context_phase_params.draft_tokens,
+                    multimodal_embedding_handles=None,
+                )
 
             finish_reasons = response_result.finish_reasons
             # output_token_ids = (beams, tokens)
@@ -440,6 +448,8 @@ class GenerationResultBase:
             if hasattr(response_result, 'mm_embedding_handle'
                        ) and response_result.mm_embedding_handle is not None:
                 self._mm_embedding_handle = response_result.mm_embedding_handle
+                mrope_position_ids_handle = response_result.mrope_position_ids_handle
+                mrope_position_deltas_handle = response_result.mrope_position_deltas_handle
                 if self.disaggregated_params is not None:
                     self.disaggregated_params.multimodal_embedding_handles = [
                         response_result.mm_embedding_handle
@@ -451,6 +461,8 @@ class GenerationResultBase:
                             response_result.mm_embedding_handle
                         ],
                         multimodal_hashes=self._multimodal_hashes)
+                self.disaggregated_params.mrope_position_ids_handle = mrope_position_ids_handle
+                self.disaggregated_params.mrope_position_deltas_handle = mrope_position_deltas_handle
 
             # Processing background errors here ASAF during generation.
             if self._background_error_handler and (
@@ -811,8 +823,12 @@ class GenerationResult(GenerationResultBase):
 
     def _repr_fields(self):
         return [
-            'request_id', 'prompt_token_ids', 'outputs', 'finished',
-            "context_logits", "mm_embedding_handle"
+            'request_id',
+            'prompt_token_ids',
+            'outputs',
+            'finished',
+            "context_logits",
+            "mm_embedding_handle",
         ]
 
     def __repr__(self) -> str:

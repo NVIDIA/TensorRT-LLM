@@ -1,16 +1,13 @@
 import json
 import os
 import subprocess
-import sys
 import tempfile
 
 import pytest
 import yaml
 
+from ..test_llm import get_model_path
 from .openai_server import RemoteOpenAIServer
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from test_llm import get_model_path
 
 
 @pytest.fixture(scope="module", ids=["TinyLlama-1.1B-Chat"])
@@ -55,17 +52,21 @@ def example_root():
                     ("python3", "openai_responses_client.py"),
                     ("bash", "curl_chat_client.sh"),
                     ("bash", "curl_completion_client.sh"),
-                    ("bash", "genai_perf_client.sh"),
+                    ("bash", "aiperf_client.sh"),
                     ("bash", "curl_responses_client.sh")])
-def test_trtllm_serve_examples(exe: str, script: str,
+def test_trtllm_serve_examples(exe: str, script: str, model_name: str,
                                server: RemoteOpenAIServer, example_root: str):
     client_script = os.path.join(example_root, script)
     # CalledProcessError will be raised if any errors occur
+    custom_env = os.environ.copy()
+    if script.startswith("aiperf"):
+        custom_env[""] = get_model_path(model_name)
     result = subprocess.run([exe, client_script],
                             stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE,
                             text=True,
-                            check=True)
+                            check=True,
+                            env=custom_env)
     if script.startswith("curl"):
         # For curl scripts, we expect a JSON response
         result_stdout = result.stdout.strip()

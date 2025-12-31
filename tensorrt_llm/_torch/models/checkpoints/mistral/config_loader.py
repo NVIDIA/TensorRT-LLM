@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+import torch
 from transformers import PretrainedConfig, WhisperConfig
 
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -280,7 +281,9 @@ class MistralConfigLoader(BaseConfigLoader):
         config_dict, pretrained_config = self._parse_mistral_config(checkpoint_dir)
 
         # Some checkpoints lack torch_dtype, populate with dtype
-        pretrained_config.torch_dtype = getattr(pretrained_config, "dtype", None)
+        pretrained_config.torch_dtype = (
+            getattr(pretrained_config, "dtype", torch.bfloat16) or torch.bfloat16
+        )
         quant_config = QuantConfig()
         layer_quant_config = None
 
@@ -301,7 +304,31 @@ class MistralConfigLoader(BaseConfigLoader):
             elif "FP8_BLOCK" in hf_quant_config.get("config_groups"):
                 quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
                 quant_config.group_size = 128
-                quant_config.exclude_modules = ["*q_a_proj*", "*kv_a_proj_with_mqa*"]
+                quant_config.exclude_modules = [
+                    "language_model.model.layers.*.self_attn.q_a_proj*",
+                    "language_model.model.layers.*.self_attn.kv_a_proj_with_mqa*",
+                    "model.layers.*.self_attn.q_a_proj*",
+                    "model.layers.*.self_attn.kv_a_proj_with_mqa*",
+                ]
+        elif hf_quant_config.get("quant_method") == "fp8":
+            # Used for Eagle3 weight
+            if (
+                hf_quant_config.get("weight_block_size") is not None
+                or hf_quant_config.get("activation_scheme", None) == "static"
+            ):
+                # hf_quant_config.get("weight_block_size") is for Eagle3 weight
+                # hf_quant_config.get("activation_scheme", None) == "static" is for DeepSeek V3 FP8 per tensor hack
+                quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
+                quant_config.exclude_modules = ["*kv_b_proj*", "*k_b_proj*", "*eh_proj"]
+
+                block_size = hf_quant_config.get("weight_block_size")
+                if block_size is not None:
+                    assert tuple(block_size) == (128, 128), (
+                        f"FP8_BLOCK_SCALES only supports block_size=(128,128), current block_size: {block_size}"
+                    )
+                else:
+                    block_size = (128, 128)
+                quant_config.group_size = block_size[0]
 
         kwargs.pop("trust_remote_code", None)  # ModelConfig does not have this input parameter
         model_config = ModelConfig(
@@ -310,5 +337,8 @@ class MistralConfigLoader(BaseConfigLoader):
             quant_config_dict=layer_quant_config,
             **kwargs,
         )
+        from tensorrt_llm._torch.models.modeling_mistral_large3 import Mistral3Gate
+
+        model_config.pretrained_config.gate_cls = Mistral3Gate
         model_config._frozen = True
         return model_config

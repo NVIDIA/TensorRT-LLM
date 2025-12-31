@@ -2,6 +2,13 @@
 
 # TensorRT LLM Benchmarking
 
+
+```{eval-rst}
+.. include:: ../_includes/note_sections.rst
+   :start-after: .. start-note-config-flag-alias
+   :end-before: .. end-note-config-flag-alias
+```
+
 TensorRT LLM provides the `trtllm-bench` CLI, a packaged benchmarking utility that aims to make it
 easier for users to reproduce our officially published [performance overview](./perf-overview.md#throughput-measurements). `trtllm-bench` provides the follows:
 
@@ -176,7 +183,7 @@ trtllm-bench --model meta-llama/Llama-3.1-8B prepare-dataset --output /tmp/synth
 
 To benchmark the PyTorch backend (`tensorrt_llm._torch`), use the following command with [dataset](#preparing-a-dataset) generated from previous steps. The `throughput` benchmark initializes the backend by tuning against the dataset provided via `--dataset` (or the other build mode settings described above).
 
-Note that CUDA graph is enabled by default. You can add additional pytorch config with `--extra_llm_api_options` followed by the path to a YAML file. For more details, please refer to the help text by running the command with `--help`.
+Note that CUDA graph is enabled by default. You can add additional pytorch config with `--config` followed by the path to a YAML file. For more details, please refer to the help text by running the command with `--help`.
 
 ```{tip}
 The command below specifies the `--model_path` option. The model path is optional and used only when you want to run a locally
@@ -289,7 +296,7 @@ The generated dataset will include LoRA request metadata. Below is an example of
 
 **LoRA Configuration**
 
-Create an `extra-llm-api-options.yaml` file with LoRA configuration:
+Create a `config.yaml` file with LoRA configuration:
 
 ```yaml
 lora_config:
@@ -314,7 +321,7 @@ trtllm-bench --model /path/to/base/model \
   throughput \
   --dataset synthetic_lora_data.json \
   --backend pytorch \
-  --extra_llm_api_options extra-llm-api-options.yaml
+  --config config.yaml
 ```
 
 ```{note}

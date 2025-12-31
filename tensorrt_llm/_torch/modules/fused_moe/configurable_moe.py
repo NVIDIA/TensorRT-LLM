@@ -37,6 +37,7 @@ from tensorrt_llm._torch.modules.fused_moe.interface import MoE
 from tensorrt_llm._torch.modules.fused_moe.routing import BaseMoeRoutingMethod
 from tensorrt_llm._torch.utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from tensorrt_llm.logger import logger
+from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from .communication import (
     AllGatherReduceScatter,
@@ -106,6 +107,7 @@ class ConfigurableMoE(MoE):
         weight_loading_mode=None,
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
+        override_quant_config: Optional["QuantConfig"] = None,
         **kwargs,
     ):
         super().__init__(
@@ -131,8 +133,8 @@ class ConfigurableMoE(MoE):
         # ========== Create MoE Backend (Default: Cutlass) ==========
         from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend, get_moe_cls
 
-        # Get MoE backend class based on model_config
-        moe_cls = get_moe_cls(model_config, override_quant_config=None)
+        # Get MoE backend class based on override_quant_config or model_config
+        moe_cls = get_moe_cls(model_config, override_quant_config=override_quant_config)
 
         # Call create_moe_backend with all necessary parameters
         # init_load_balancer=False: Prevents backend from registering itself with load balancer
@@ -175,7 +177,6 @@ class ConfigurableMoE(MoE):
             assert not torch.compiler.is_compiling(), (
                 "Backend should not be none if not in torch.compile"
             )
-            self.backend.aux_stream_dict = self.aux_stream_dict
             self.backend.layer_idx = self.layer_idx
             self.backend.layer_idx_str = self.layer_idx_str
             self.backend.num_slots = self.num_slots
@@ -476,8 +477,11 @@ class ConfigurableMoE(MoE):
 
         # Calculate the number of rows
         num_rows = x.shape[0]
-        if self.use_dp:
-            num_rows = sum(all_rank_num_tokens)
+        if self.use_dp and self.comm is not None:
+            # When using communication, dispatch will create tensors with shape:
+            # [ep_size * max_tokens_per_rank, ...] due to padding for balanced distribution
+            # So we need to allocate workspace based on this size
+            num_rows = self.mapping.moe_ep_size * max(all_rank_num_tokens)
 
         workspaces = self.backend.get_workspaces([num_rows])
         return workspaces[0]
@@ -745,20 +749,16 @@ class ConfigurableMoE(MoE):
 
         # Always need at least workspace_0
         chunk_size_0 = (
-            sum(all_rank_num_tokens_list[0])
+            self.mapping.moe_ep_size * max(all_rank_num_tokens_list[0])
             if self.use_dp and all_rank_num_tokens_list[0] is not None
             else chunk_size_list[0]
         )
         workspace_chunk_sizes = [chunk_size_0]
 
         # Add workspace_1 if using multi-stream for alternating between streams
+        # Reuse chunk_size_0 since it's always >= chunk_size_1 (first chunk is largest)
         if use_multi_stream:
-            chunk_size_1 = (
-                sum(all_rank_num_tokens_list[1])
-                if self.use_dp and all_rank_num_tokens_list[1] is not None
-                else chunk_size_list[1]
-            )
-            workspace_chunk_sizes.append(chunk_size_1)
+            workspace_chunk_sizes.append(chunk_size_0)
 
         workspaces = self.backend.get_workspaces(workspace_chunk_sizes)
         workspace_0 = workspaces[0]
@@ -991,23 +991,17 @@ class ConfigurableMoE(MoE):
         if not isinstance(self.comm, NVLinkOneSided):
             return None
 
+        if not self.backend.supports_moe_output_in_alltoall_workspace():
+            # Ensure payload_in_workspace is False if backend doesn't support it
+            self.comm.payload_in_workspace = False
+            return None
+
         # Determine workspace dtype and whether backend supports workspace output
         workspace_dtype = output_dtype
-        backend_supports_workspace = False
-
         if isinstance(self.backend, TRTLLMGenFusedMoE):
             # TRTLLMGen specific configuration
             self.comm.invalid_token_expert_id = -1
             workspace_dtype = torch.bfloat16
-            backend_supports_workspace = self.backend.has_w4a8_mxfp4_mxfp8
-        elif isinstance(self.backend, CutlassFusedMoE):
-            # Cutlass always supports workspace output with NVLinkOneSided
-            backend_supports_workspace = True
-
-        if not backend_supports_workspace:
-            # Ensure payload_in_workspace is False if backend doesn't support it
-            self.comm.payload_in_workspace = False
-            return None
 
         # Calculate runtime max tokens per rank
         assert all_rank_num_tokens is not None, (
@@ -1022,7 +1016,6 @@ class ConfigurableMoE(MoE):
 
         # Dynamically enable payload_in_workspace for this forward pass
         self.comm.payload_in_workspace = True
-
         return moe_output
 
     def _get_backend_kwargs(
@@ -1096,12 +1089,17 @@ class ConfigurableMoE(MoE):
 
             # Get moe_output for NVLinkOneSided backend
             kwargs["moe_output"] = self._get_nvlink_onesided_moe_output(
-                all_rank_num_tokens, output_dtype
+                all_rank_num_tokens=all_rank_num_tokens, output_dtype=output_dtype
             )
 
         # CuteDSL-specific parameters
         elif self.backend.__class__ == CuteDslFusedMoE:
             kwargs["enable_alltoall"] = self.enable_alltoall
+
+            # Get moe_output for NVLinkOneSided backend
+            kwargs["moe_output"] = self._get_nvlink_onesided_moe_output(
+                all_rank_num_tokens=all_rank_num_tokens, output_dtype=output_dtype
+            )
 
         # DeepGemm-specific parameters
         elif self.backend.__class__ == DeepGemmFusedMoE:
@@ -1123,7 +1121,7 @@ class ConfigurableMoE(MoE):
 
             # Get moe_output for NVLinkOneSided backend
             kwargs["moe_output"] = self._get_nvlink_onesided_moe_output(
-                all_rank_num_tokens, output_dtype
+                all_rank_num_tokens=all_rank_num_tokens, output_dtype=output_dtype
             )
 
         return kwargs

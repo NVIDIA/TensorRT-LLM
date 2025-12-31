@@ -63,8 +63,14 @@ class EnvManager:
     @staticmethod
     def get_slurm_set_segment() -> bool:
         gpu_type = EnvManager.get_gpu_type()
-        gpu_type_support_segment = {"GB200": True, "GB300": False}
+        gpu_type_support_segment = {"GB200": True, "GB300": True}
         return gpu_type_support_segment.get(gpu_type, False)
+
+    @staticmethod
+    def get_slurm_extra_args() -> str:
+        gpu_type = EnvManager.get_gpu_type()
+        gpu_type_support_extra_args = {"GB200": "--gres=gpu:4", "GB300": ""}
+        return gpu_type_support_extra_args.get(gpu_type, "")
 
     @staticmethod
     def get_container_image() -> str:
@@ -190,7 +196,7 @@ def extract_config_fields(config_data: dict) -> dict:
     date_prefix = datetime.now().strftime("%Y%m%d")
     log_base = f"{date_prefix}/{isl}-{osl}"
     context_dir = (
-        f"ctx{ctx_num}_gen{gen_num}_{dep_flag}{gen_tp_size}_"
+        f"disagg_ctx{ctx_num}_gen{gen_num}_{dep_flag}{gen_tp_size}_"
         f"batch{gen_batch_size}_eplb{eplb_slots}_mtp{mtp_size}"
     )
 

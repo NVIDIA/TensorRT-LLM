@@ -98,10 +98,10 @@ if self._config.backend == "pytorch":
     config = get_model_yaml_config(self._config.to_string(),
                                    lora_dirs=self.lora_dirs)
     print_info(f"pytorch model config: {config}")
-    with open('extra-llm-api-config.yml', 'w') as f:
+    with open('config.yml', 'w') as f:
         yaml.dump(config, f, default_flow_style=False)
     benchmark_cmd += [
-        f"--extra_llm_api_options=extra-llm-api-config.yml"
+        f"--config=config.yml"
     ]
 ```
 

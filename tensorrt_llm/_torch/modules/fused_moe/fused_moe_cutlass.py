@@ -389,6 +389,9 @@ class CutlassFusedMoE(MoE):
         self._weights_created = True
         self._check_configs()
 
+    def supports_moe_output_in_alltoall_workspace(self):
+        return True
+
     def run_moe(
         self,
         x: torch.Tensor,

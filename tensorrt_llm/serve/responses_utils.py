@@ -10,7 +10,7 @@ import uuid
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator
 from copy import copy
-from typing import Any, Literal, Optional, OrderedDict, Tuple, Union
+from typing import Any, List, Literal, Optional, OrderedDict, Tuple, Union
 
 from openai.types.responses import (ResponseCompletedEvent,
                                     ResponseContentPartAddedEvent,
@@ -41,6 +41,7 @@ from openai_harmony import (Author, Conversation, DeveloperContent,
 from transformers import AutoProcessor, PretrainedConfig
 
 from tensorrt_llm.bindings import steady_clock_now
+from tensorrt_llm.executor import GenerationResult
 from tensorrt_llm.inputs.utils import apply_chat_template
 from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.llmapi.llm import RequestOutput
@@ -962,7 +963,7 @@ def _apply_tool_parser(
     return normal_text, calls
 
 
-async def _create_output_content(
+def _create_output_content(
     final_res: RequestOutput,
     reasoning_parser: Optional[str] = None,
     tool_parser: Optional[str] = None,
@@ -973,6 +974,7 @@ async def _create_output_content(
     available_tools = _get_chat_completion_function_tools(tools)
 
     for output in final_res.outputs:
+        calls = []
         text, reasoning_text = _apply_reasoning_parser(reasoning_parser,
                                                        output.index,
                                                        output.text, False)
@@ -1040,7 +1042,7 @@ async def _create_output_content(
     return output_items, output_messages
 
 
-async def _create_output_content_harmony(
+def _create_output_content_harmony(
         final_res: RequestOutput
 ) -> Tuple[list[ResponseOutputItem], list[Message]]:
     output_messages = _parse_output_tokens(final_res.outputs[0].token_ids)
@@ -1057,12 +1059,53 @@ async def _create_output_content_harmony(
     return output_content, output_messages
 
 
+def _create_response(
+    final_res: GenerationResult,
+    use_harmony: bool,
+    request: ResponsesRequest,
+    model_name: str,
+    response_creation_time: int,
+    sampling_params: SamplingParams,
+    reasoning_parser: Optional[str] = None,
+    tool_parser: Optional[str] = None,
+) -> tuple[ResponsesResponse, list[Message | ChatCompletionMessageParam]]:
+    _responses_debug_log("================================================")
+    _responses_debug_log("RAW MODEL OUTPUT:")
+    _responses_debug_log(final_res.outputs)
+    _responses_debug_log("================================================")
+
+    # prepare responses output
+    output_content = []
+    if use_harmony:
+        output_content, output_messages = _create_output_content_harmony(
+            final_res)
+    else:
+        output_content, output_messages = _create_output_content(
+            final_res, reasoning_parser, tool_parser, request.tools)
+
+    response = ResponsesResponse.from_request(
+        request=request,
+        sampling_params=sampling_params,
+        model_name=model_name,
+        created_time=response_creation_time,
+        output=output_content,
+        status=finish_reason_mapping(final_res.outputs[0].finish_reason),
+    )
+
+    _responses_debug_log("========== Response ===========")
+    _responses_debug_log(response)
+    _responses_debug_log("===============================")
+
+    # return output_messages for store_response
+    return response, output_messages
+
+
 async def create_response(
-    generator,
     request: ResponsesRequest,
     sampling_params: SamplingParams,
     model_name: str,
     conversation_store: ConversationHistoryStore,
+    generator: Optional[AsyncGenerator[RequestOutput, None]] = None,
     generation_result: Optional[RequestOutput] = None,
     enable_store: bool = False,
     use_harmony: bool = True,
@@ -1078,33 +1121,22 @@ async def create_response(
 
     if generation_result is not None:
         final_res = generation_result
-    else:
+    elif generator is not None:
         final_res = await generator
 
     if final_res is None:
         raise RuntimeError("No output generated or provided")
 
-    _responses_debug_log("================================================")
-    _responses_debug_log("RAW MODEL OUTPUT:")
-    _responses_debug_log(final_res.outputs)
-    _responses_debug_log("================================================")
-
     # prepare responses output
-    output_content = []
-    if use_harmony:
-        output_content, output_messages = await _create_output_content_harmony(
-            final_res)
-    else:
-        output_content, output_messages = await _create_output_content(
-            final_res, reasoning_parser, tool_parser, request.tools)
-
-    response = ResponsesResponse.from_request(
+    response, output_messages = _create_response(
+        final_res=final_res,
+        use_harmony=use_harmony,
         request=request,
-        sampling_params=sampling_params,
         model_name=model_name,
-        created_time=response_creation_time,
-        output=output_content,
-        status=finish_reason_mapping(final_res.outputs[0].finish_reason),
+        response_creation_time=response_creation_time,
+        sampling_params=sampling_params,
+        reasoning_parser=reasoning_parser,
+        tool_parser=tool_parser,
     )
 
     if enable_store and request.store:
@@ -1112,9 +1144,34 @@ async def create_response(
                                                 resp_msgs=output_messages,
                                                 prev_resp_id=prev_response_id)
 
-    _responses_debug_log("========== Response ===========")
-    _responses_debug_log(response)
-    _responses_debug_log("===============================")
+    return response
+
+
+def create_response_non_store(
+    generation_result: RequestOutput,
+    request: ResponsesRequest,
+    sampling_params: SamplingParams,
+    model_name: str,
+    use_harmony: bool = True,
+    create_time: Optional[int] = None,
+    reasoning_parser: Optional[str] = None,
+    tool_parser: Optional[str] = None,
+) -> ResponsesResponse:
+    response_creation_time = create_time if create_time is not None else int(
+        time.time())
+
+    # prepare responses output
+    response, _ = _create_response(
+        final_res=generation_result,
+        use_harmony=use_harmony,
+        request=request,
+        model_name=model_name,
+        response_creation_time=response_creation_time,
+        sampling_params=sampling_params,
+        reasoning_parser=reasoning_parser,
+        tool_parser=tool_parser,
+    )
+
     return response
 
 
@@ -1649,6 +1706,143 @@ def _generate_streaming_event_harmony(
                 parser.last_content_delta)
 
 
+class ResponsesStreamingProcessor:
+
+    def __init__(
+        self,
+        request: ResponsesRequest,
+        sampling_params: SamplingParams,
+        model_name: str,
+        create_time: Optional[int] = None,
+        conversation_store: Optional[ConversationHistoryStore] = None,
+        enable_store: bool = False,
+        use_harmony: bool = True,
+        reasoning_parser: Optional[str] = None,
+        tool_parser: Optional[str] = None,
+    ):
+        self.model_name = model_name
+        self.request = request
+        self.sampling_params = sampling_params
+        self.sequence_number = 0
+        self.streaming_events_helper = ResponsesStreamingEventsHelper()
+        self.response_creation_time = create_time if create_time is not None else int(
+            time.time())
+        self.final_res: Optional[RequestOutput] = None
+        self.reasoning_parser_dict: dict[int, BaseReasoningParser] = {}
+        self.tool_parser_dict: dict[int, BaseToolParser] = {}
+        self.stream_request_id = f"responses-api-{request.request_id}"
+        self.conversation_store = conversation_store
+        self.enable_store = enable_store
+        self.use_harmony = use_harmony
+        self.reasoning_parser = reasoning_parser
+        self.tool_parser = tool_parser
+
+    def _send_event(self, event: OpenAIBaseModel):
+        # Set sequence_number if the event has this attribute
+        if hasattr(event, 'sequence_number'):
+            event.sequence_number = self.sequence_number
+        self.sequence_number += 1
+        # Get event type from the event's type field if it exists
+        event_type = getattr(event, 'type', 'unknown')
+        return (f"event: {event_type}\n"
+                f"data: {event.model_dump_json(indent=None)}\n\n")
+
+    def get_initial_responses(self) -> List[str]:
+        initial_response = ResponsesResponse.from_request(
+            request=self.request,
+            sampling_params=self.sampling_params,
+            model_name=self.model_name,
+            created_time=self.response_creation_time,
+            output=[],
+            status="in_progress",
+            usage=None,
+        ).model_dump()
+
+        resp_created = self._send_event(
+            self.streaming_events_helper.get_response_created_event(
+                initial_response))
+        resp_in_progress = self._send_event(
+            self.streaming_events_helper.get_response_in_progress_event(
+                initial_response))
+        return [resp_created, resp_in_progress]
+
+    async def get_final_response(
+        self,
+        final_res: RequestOutput,
+    ) -> str:
+        final_response = await create_response(
+            generator=None,
+            request=self.request,
+            sampling_params=self.sampling_params,
+            model_name=self.model_name,
+            conversation_store=self.conversation_store,
+            generation_result=final_res,
+            enable_store=self.enable_store,
+            use_harmony=self.use_harmony,
+            create_time=self.response_creation_time,
+            reasoning_parser=self.reasoning_parser,
+            tool_parser=self.tool_parser,
+        )
+
+        return self._send_event(
+            ResponseCompletedEvent(
+                type="response.completed",
+                sequence_number=-1,
+                response=final_response.model_dump(),
+            ))
+
+    def get_final_response_non_store(
+        self,
+        final_res: RequestOutput,
+    ) -> str:
+        final_response = create_response_non_store(
+            generation_result=final_res,
+            request=self.request,
+            sampling_params=self.sampling_params,
+            model_name=self.model_name,
+            use_harmony=self.use_harmony,
+            create_time=self.response_creation_time,
+            reasoning_parser=self.reasoning_parser,
+            tool_parser=self.tool_parser,
+        )
+
+        return self._send_event(
+            ResponseCompletedEvent(
+                type="response.completed",
+                sequence_number=-1,
+                response=final_response.model_dump(),
+            ))
+
+    def process_single_output(self, res: GenerationResult) -> list[str]:
+        event_generator = None
+        output = res.outputs[0]
+        if self.use_harmony:
+            event_generator = _generate_streaming_event_harmony(
+                harmony_adapter=get_harmony_adapter(),
+                stream_request_id=self.stream_request_id,
+                output=output,
+                request=self.request,
+                streaming_events_helper=self.streaming_events_helper,
+            )
+
+        else:
+            event_generator = _generate_streaming_event(
+                output=output,
+                request=self.request,
+                finished_generation=res._done,
+                streaming_events_helper=self.streaming_events_helper,
+                reasoning_parser_id=self.reasoning_parser,
+                tool_parser_id=self.tool_parser,
+                reasoning_parser_dict=self.reasoning_parser_dict,
+                tool_parser_dict=self.tool_parser_dict,
+            )
+
+        if event_generator is None:
+            raise RuntimeError("Failed to generate streaming events")
+
+        return [self._send_event(event) for event in event_generator]
+
+
 async def process_streaming_events(
     generator,
     request: ResponsesRequest,
@@ -1661,97 +1855,31 @@ async def process_streaming_events(
     reasoning_parser: Optional[str] = None,
     tool_parser: Optional[str] = None,
 ) -> AsyncGenerator[str, None]:
-    sequence_number = 0
-    response_creation_time = create_time if create_time is not None else int(
-        time.time())
-    final_res: Optional[RequestOutput] = None
-    reasoning_parser_dict: dict[int, BaseReasoningParser] = {}
-    tool_parser_dict: dict[int, BaseToolParser] = {}
-
-    def _send_event(event: OpenAIBaseModel):
-        nonlocal sequence_number
-        # Set sequence_number if the event has this attribute
-        if hasattr(event, 'sequence_number'):
-            event.sequence_number = sequence_number
-        sequence_number += 1
-        # Get event type from the event's type field if it exists
-        event_type = getattr(event, 'type', 'unknown')
-        return (f"event: {event_type}\n"
-                f"data: {event.model_dump_json(indent=None)}\n\n")
-
-    streaming_events_helper = ResponsesStreamingEventsHelper()
-
-    initial_response = ResponsesResponse.from_request(
-        request,
-        sampling_params,
-        model_name=model_name,
-        created_time=response_creation_time,
-        output=[],
-        status="in_progress",
-        usage=None,
-    ).model_dump()
-
-    yield _send_event(
-        streaming_events_helper.get_response_created_event(initial_response))
-    yield _send_event(
-        streaming_events_helper.get_response_in_progress_event(
-            initial_response))
-
-    stream_request_id = f"responses-api-{request.request_id}"
-    harmony_adapter = get_harmony_adapter()
-    async for res in generator:
-        final_res = res
-        # TODO(JunyiXu-nv): handle multiple outputs
-        output = res.outputs[0]
-
-        event_generator = None
-        if use_harmony:
-            event_generator = _generate_streaming_event_harmony(
-                harmony_adapter=harmony_adapter,
-                stream_request_id=stream_request_id,
-                output=output,
-                request=request,
-                streaming_events_helper=streaming_events_helper,
-            )
-
-        else:
-            event_generator = _generate_streaming_event(
-                output=output,
-                request=request,
-                finished_generation=res.finished,
-                streaming_events_helper=streaming_events_helper,
-                reasoning_parser_id=reasoning_parser,
-                tool_parser_id=tool_parser,
-                reasoning_parser_dict=reasoning_parser_dict,
-                tool_parser_dict=tool_parser_dict,
-            )
-
-        if event_generator is None:
-            raise RuntimeError("Failed to generate streaming events")
-
-        for event in event_generator:
-            yield _send_event(event)
-
-    final_response = await create_response(
-        generator=generator,
+    streaming_processor = ResponsesStreamingProcessor(
         request=request,
         sampling_params=sampling_params,
         model_name=model_name,
+        create_time=create_time,
         conversation_store=conversation_store,
-        generation_result=final_res,
         enable_store=enable_store,
         use_harmony=use_harmony,
-        create_time=response_creation_time,
         reasoning_parser=reasoning_parser,
         tool_parser=tool_parser,
     )
 
-    yield _send_event(
-        ResponseCompletedEvent(
-            type="response.completed",
-            sequence_number=-1,
-            response=final_response.model_dump(),
-        ))
+    initial_responses = streaming_processor.get_initial_responses()
+    for initial_response in initial_responses:
+        yield initial_response
+
+    async for res in generator:
+        final_res = res
+        events = streaming_processor.process_single_output(res)
+        for event in events:
+            yield event
+
+    final_response = await streaming_processor.get_final_response(final_res)
+
+    yield final_response
 
 
 class ServerArrivalTimeMiddleware:

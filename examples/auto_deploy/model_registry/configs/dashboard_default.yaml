@@ -1,0 +1,9 @@
+# Default configuration for all AutoDeploy dashboard tests
+# These are baseline settings that apply to all models unless overridden
+
+runtime: trtllm
+attn_backend: flashinfer
+compile_backend: torch-cudagraph
+model_factory: AutoModelForCausalLM
+skip_loading_weights: false
+max_seq_len: 512

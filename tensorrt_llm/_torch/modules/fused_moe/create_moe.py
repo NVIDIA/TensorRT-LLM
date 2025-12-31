@@ -20,8 +20,6 @@ from .interface import MoE, MoEWeightLoadingMode
 from .moe_load_balancer import get_moe_load_balancer
 from .routing import BaseMoeRoutingMethod
 
-ENABLE_CONFIGURABLE_MOE = os.environ.get("ENABLE_CONFIGURABLE_MOE", "0") == "1"
-
 
 def get_moe_cls(
         model_config: ModelConfig,
@@ -344,7 +342,9 @@ def create_moe(
 
     moe_cls = get_moe_cls(model_config, override_quant_config)
 
-    if ENABLE_CONFIGURABLE_MOE or moe_cls == CuteDslFusedMoE:
+    enable_configurable_moe = os.environ.get("ENABLE_CONFIGURABLE_MOE",
+                                             "0") == "1"
+    if enable_configurable_moe or moe_cls == CuteDslFusedMoE:
         if moe_cls in (DeepGemmFusedMoE, TRTLLMGenFusedMoE, CuteDslFusedMoE,
                        CutlassFusedMoE):
             return ConfigurableMoE(
@@ -359,6 +359,7 @@ def create_moe(
                 weight_loading_mode=weight_loading_mode,
                 apply_router_weight_on_input=apply_router_weight_on_input,
                 layer_idx=layer_idx,
+                override_quant_config=override_quant_config,
                 bias=bias,
                 swiglu_alpha=swiglu_alpha,
                 swiglu_beta=swiglu_beta,
