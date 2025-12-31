@@ -237,7 +237,7 @@ def _run_sharding_execution_job(
             ssm_state_size=16,  # Scaled from 128
             mamba_num_heads=num_heads,
             mamba_head_dim=num_features // num_heads,  # 8
-            n_groups=1,  # Typical value
+            n_groups=num_heads,  # Typical value
             chunk_size=256,
             conv_kernel=4,
             use_conv_bias=bias,
@@ -388,7 +388,7 @@ def _run_pattern_detection_job(
             ssm_state_size=16,
             mamba_num_heads=num_heads,
             mamba_head_dim=num_features // num_heads,
-            n_groups=1,
+            n_groups=num_heads,
             chunk_size=256,
             conv_kernel=4,
             use_conv_bias=bias,
