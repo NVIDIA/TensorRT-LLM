@@ -36,7 +36,7 @@ from defs.trt_test_alternative import check_call, check_output, popen
 from test_common.perf_metrics_utils import (get_timing_metrics,
                                             validate_timing_metrics)
 
-from tensorrt_llm._utils import mpi_disabled
+from tensorrt_llm._utils import get_free_port, mpi_disabled
 from tensorrt_llm.logger import logger
 
 
