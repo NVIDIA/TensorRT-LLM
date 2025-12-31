@@ -622,8 +622,7 @@ class TorchDist(Distributed):
 
     @log_op
     def send_object(self, obj, dest, tag=0):
-        raise NotImplementedError(
-            "send_object is not implemented for TorchDist")
+        self.isend_object(obj, dest, tag).wait()
 
     @log_op
     def isend_object(self, obj, dest, tag=0):
@@ -639,16 +638,6 @@ class TorchDist(Distributed):
                                     tag=tag))
         works.append(torch.distributed.isend(input_tensor, dst=dest, tag=tag))
         return MultiHandleWrapper(works)
-
-    @log_op
-    def recv_object_from_isend(self, src, tag):
-        size_tensor = torch.tensor([0], dtype=torch.int32)
-        torch.distributed.recv(size_tensor, src=src, tag=tag)
-        bytes_size = size_tensor.item()
-        recv_tensor = torch.empty(bytes_size, dtype=torch.uint8)
-        torch.distributed.recv(recv_tensor, src=src, tag=tag)
-        return _tensor_to_object(recv_tensor, bytes_size,
-                                 torch.distributed.group.WORLD)
 
     @log_op
     def allreduce(self,
