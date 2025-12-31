@@ -4,6 +4,37 @@ metadata:
   - B200
   - B300
 server_configs:
+  - name: "gpt_oss_fp4_dep4_1k8k"
+    model_name: "gpt_oss_120b_fp4"
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 4
+    pipeline_parallel_size: 1
+    max_batch_size: 640
+    max_num_tokens: 20000
+    attn_backend: "TRTLLM"
+    enable_attention_dp: true
+    attention_dp_config:
+      enable_balance: true
+    moe_config:
+      backend: 'TRTLLM'
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 640
+    kv_cache_config:
+      dtype: 'fp8'
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.8
+    num_postprocess_workers: 4
+    stream_interval: 20
+    client_configs:
+      - name: "con2560_iter5_1k8k"
+        concurrency: 2560
+        iterations: 5
+        isl: 1024
+        osl: 8192
+        random_range_ratio: 0.8
+        backend: "openai"
+
   - name: "gpt_oss_fp4_dep2_1k1k"
     model_name: "gpt_oss_120b_fp4"
     tensor_parallel_size: 2
@@ -32,25 +63,23 @@ server_configs:
         iterations: 5
         isl: 1024
         osl: 1024
-        random_range_ratio: 0.2
+        random_range_ratio: 0.8
         backend: "openai"
 
-  - name: "gpt_oss_fp4_dep4_1k1k"
+  - name: "gpt_oss_fp4_tep2_1k8k"
     model_name: "gpt_oss_120b_fp4"
-    tensor_parallel_size: 4
-    moe_expert_parallel_size: 4
+    tensor_parallel_size: 2
+    moe_expert_parallel_size: 2
     pipeline_parallel_size: 1
-    max_batch_size: 512
+    max_batch_size: 128
     max_num_tokens: 20000
     attn_backend: "TRTLLM"
-    enable_attention_dp: true
-    attention_dp_config:
-      enable_balance: true
+    enable_attention_dp: false
     moe_config:
       backend: 'TRTLLM'
     cuda_graph_config:
       enable_padding: true
-      max_batch_size: 512
+      max_batch_size: 128
     kv_cache_config:
       dtype: 'fp8'
       enable_block_reuse: false
@@ -58,12 +87,41 @@ server_configs:
     num_postprocess_workers: 4
     stream_interval: 20
     client_configs:
-      - name: "con2048_iter5_1k1k"
-        concurrency: 2048
-        iterations: 5
+      - name: "con128_iter10_1k8k"
+        concurrency: 128
+        iterations: 10
         isl: 1024
-        osl: 1024
-        random_range_ratio: 0.2
+        osl: 8192
+        random_range_ratio: 0.8
+        backend: "openai"
+
+  - name: "gpt_oss_fp4_tp2_1k8k"
+    model_name: "gpt_oss_120b_fp4"
+    tensor_parallel_size: 2
+    moe_expert_parallel_size: 1
+    pipeline_parallel_size: 1
+    max_batch_size: 8
+    max_num_tokens: 20000
+    attn_backend: "TRTLLM"
+    enable_attention_dp: false
+    moe_config:
+      backend: 'TRTLLM'
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 8
+    kv_cache_config:
+      dtype: 'fp8'
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.8
+    num_postprocess_workers: 4
+    stream_interval: 20
+    client_configs:
+      - name: "con8_iter10_1k8k"
+        concurrency: 8
+        iterations: 10
+        isl: 1024
+        osl: 8192
+        random_range_ratio: 0.8
         backend: "openai"
 
   - name: "gpt_oss_fp4_tp4_eagle3_1k1k"
@@ -97,5 +155,5 @@ server_configs:
         iterations: 32
         isl: 1024
         osl: 1024
-        random_range_ratio: 0.2
+        random_range_ratio: 0.8
         backend: "openai"
