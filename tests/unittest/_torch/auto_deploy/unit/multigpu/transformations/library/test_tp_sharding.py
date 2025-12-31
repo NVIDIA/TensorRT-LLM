@@ -204,9 +204,7 @@ class MLA_Block(nn.Module):
 
         # attn_out = attn_out.contiguous().view(b, s, self.num_heads * self.v_head_dim)
 
-        attn_out = torch.ops.auto_deploy.torch_attention(
-            q_nope, k_nope, v, is_causal=True, layout="bsnd"
-        )
+        attn_out = torch.ops.auto_deploy.torch_attention(q_nope, k_nope, v, is_causal=True)
         attn_out = attn_out.contiguous().view(b, s, -1)
         # Output projection
         output = self.o_proj(attn_out)
@@ -533,9 +531,11 @@ def _run_pattern_detection_job(
                     if "out_proj" in node.args[1].name:
                         dim = SplitDimension.ROW
                         dist_op = "all_reduce"
+                        fused_weight_dims = None
                     else:
                         dim = SplitDimension.COLUMN
                         dist_op = None
+                        fused_weight_dims = (num_features, num_features, 16, 16, num_heads)
                     expected_transformations.append(
                         WeightShardingInfo(
                             target_node=node.name,
@@ -543,7 +543,44 @@ def _run_pattern_detection_job(
                             config=config,
                             dist_op=dist_op,
                             min_local_shape=1,
-                            layer_type=LayerType.MLP,
+                            layer_type=LayerType.SSM,
+                            fused_weight_dims=fused_weight_dims,
+                        )
+                    )
+                if is_op(node, torch.ops.auto_deploy.torch_causal_conv1d):
+                    expected_transformations.append(
+                        WeightShardingInfo(
+                            target_node=node.name,
+                            split_dim=SplitDimension.COLUMN,
+                            config=config,
+                            dist_op=None,
+                            min_local_shape=1,
+                            layer_type=LayerType.SSM,
+                            fused_weight_dims=(num_features, 16, 16),
+                        )
+                    )
+                if is_op(node, torch.ops.auto_deploy.torch_ssm):
+                    expected_transformations.append(
+                        WeightShardingInfo(
+                            target_node=node.name,
+                            split_dim=SplitDimension.COLUMN,
+                            config=config,
+                            dist_op=None,
+                            min_local_shape=1,
+                            layer_type=LayerType.SSM,
+                            fused_weight_dims=None,
+                        )
+                    )
+                if len(node.args) > 1 and "norm_weight" in node.args[0].name:
+                    expected_transformations.append(
+                        WeightShardingInfo(
+                            target_node=node.name,
+                            split_dim=SplitDimension.COLUMN,
+                            config=config,
+                            dist_op=None,
+                            min_local_shape=1,
+                            layer_type=LayerType.SSM,
+                            fused_weight_dims=None,
                         )
                     )
         elif model_cls == MLA_Block:
@@ -552,12 +589,17 @@ def _run_pattern_detection_job(
                     # kv_a_proj_with_mqa: gather (no sharding)
                     # q_b_proj/kv_b_proj: column-wise
                     # o_proj: row-wise with all_reduce
+                    min_local_shape = 2
                     if "o_proj" in node.args[1].name:
                         dim = SplitDimension.ROW
                         dist_op = "all_reduce"
-                    elif "kv_a_proj_with_mqa" in node.args[1].name:
-                        # This is gather, skip sharding
-                        continue
+                    elif (
+                        "kv_a_proj_with_mqa" in node.args[1].name or "q_a_proj" in node.args[1].name
+                    ):
+                        # This is simple-shard gather
+                        dim = SplitDimension.COLUMN
+                        dist_op = "all_gather"
+                        min_local_shape = 1
                     else:
                         dim = SplitDimension.COLUMN
                         dist_op = None
@@ -567,8 +609,8 @@ def _run_pattern_detection_job(
                             split_dim=dim,
                             config=config,
                             dist_op=dist_op,
-                            min_local_shape=1,
-                            layer_type=LayerType.ATTENTION,
+                            min_local_shape=min_local_shape,
+                            layer_type=LayerType.MLA,
                         )
                     )
 
