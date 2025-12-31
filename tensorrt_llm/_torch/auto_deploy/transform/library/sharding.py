@@ -268,7 +268,7 @@ class WeightShardingInfo(ShardingTransformInfo):
     min_local_shape: int = 1
     layer_type: LayerType = LayerType.MLP
     # used for TP sharding of fused weights
-    fused_weight_dims: Optional[list] = None
+    fused_weight_dims: Optional[tuple] = None
 
     def quantization_cb(
         self,
@@ -1230,7 +1230,7 @@ def _shard_parameter_node(
     config: ShardingTransformConfig,
     add_dist: bool = False,
     min_local_shape: int = 1,
-    fused_weight_dims: Optional[list] = None,
+    fused_weight_dims: Optional[tuple] = None,
     quantization_cb: Optional[
         Callable[[GraphModule, nn.Module, Node, str, torch.Size, int, int, int], None]
     ] = None,
@@ -1634,7 +1634,7 @@ def _process_ssm_sharding(
             config=config,
             dist_op=None,
             min_local_shape=1,
-            fused_weight_dims=fused_weight_dims["in_proj"],
+            fused_weight_dims=tuple(fused_weight_dims["in_proj"]),
             layer_type=LayerType.SSM,
         )
     ):
@@ -1703,7 +1703,7 @@ def _process_ssm_sharding(
         fused_dims = None
         for k, v in fused_weight_dims.items():
             if k in weight_key:
-                fused_dims = v
+                fused_dims = tuple(v)
                 break
 
         # Shard the weight tensor (also updates the parameter in the module)
@@ -1888,7 +1888,7 @@ def _determine_fused_weight_dims(
                 ad_logger.warning(
                     f"Fused weight dims {fused_weight_dims} do not sum to weight dim {weight_dim}. Skipping."
                 )
-                return
+                return None
     chunk_nodes = list(filtered_nodes(linear_node.users, ops=torch.ops.aten.chunk))
     if len(chunk_nodes) > 0:
         assert len(linear_nodes) == 1
@@ -1897,7 +1897,7 @@ def _determine_fused_weight_dims(
         num_chunks = chunk_nodes[0].args[1]
         weight_dim = shape(linear_node)[2]
         fused_weight_dims = [weight_dim // num_chunks] * num_chunks
-    return fused_weight_dims
+    return tuple(fused_weight_dims)
 
 
 def _process_column_sharding(
