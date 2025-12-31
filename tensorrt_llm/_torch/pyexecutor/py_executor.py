@@ -136,10 +136,21 @@ class PyExecutor:
                  kv_connector_manager: Optional[KvCacheConnectorManager] = None,
                  max_seq_len: Optional[int] = None,
                  peft_cache_config: Optional[PeftCacheConfig] = None,
-                 virtual_memory_pools: Optional[dict] = None):
+                 virtual_memory_pools: Optional[dict] = None,
+                 execution_stream: Optional[torch.cuda.Stream] = None):
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
         self.global_rank = dist.rank
+
+        # Store the execution stream for model forward operations.
+        # This stream is used for proper synchronization with KVCacheTransferManager.
+        # execution_stream can be provided by create_py_executor
+        # Create a new stream if none provided
+        self.execution_stream = execution_stream if execution_stream is not None else torch.cuda.Stream(
+        )
+        logger.info(
+            f"[PyExecutor] execution_stream initialized: {self.execution_stream}. "
+        )
 
         self.peft_cache_config = peft_cache_config
 
@@ -245,10 +256,19 @@ class PyExecutor:
         self.inflight_req_ids = ReqIdsSet()
 
         # During warmup, we don't enable the profiler
+        # Run warmup on the execution_stream for proper synchronization with
+        # KVCacheTransferManager's onboard/offload operations.
         self.is_warmup = True
-        self.model_engine.warmup(self.resource_manager)
-        if self.draft_model_engine is not None:
-            self.draft_model_engine.warmup(self.resource_manager)
+
+        self.execution_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self.execution_stream):
+            self.model_engine.warmup(self.resource_manager)
+            if self.draft_model_engine is not None:
+                self.draft_model_engine.warmup(self.resource_manager)
+
+        # Ensure the default stream waits for execution_stream to complete
+        # before subsequent operations.
+        torch.cuda.current_stream().wait_stream(self.execution_stream)
         self.is_warmup = False
 
         self.is_shutdown = False
@@ -2231,10 +2251,19 @@ class PyExecutor:
                 a.py_return_context_logits
                 for a in scheduled_requests.context_requests)
             cache_indirection_buffer = self.sampler.get_cache_indirection()
-            outputs = forward(scheduled_requests, self.resource_manager,
-                              new_tensors_device, gather_context_logits,
-                              cache_indirection_buffer,
-                              num_accepted_tokens_device)
+
+            # Run model forward on the execution stream for proper synchronization
+            # with KVCacheTransferManager's onboard/offload operations.
+            self.execution_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self.execution_stream):
+                outputs = forward(scheduled_requests, self.resource_manager,
+                                  new_tensors_device, gather_context_logits,
+                                  cache_indirection_buffer,
+                                  num_accepted_tokens_device)
+
+            # Ensure the default stream waits for execution_stream to complete
+            # before downstream operations use the outputs.
+            torch.cuda.current_stream().wait_stream(self.execution_stream)
 
             self._kv_connector_wait_for_save()
 
