@@ -218,8 +218,8 @@ class TestDisaggBenchmark:
     @pytest.mark.parametrize("test_config", STRESS_TEST_CASES)
     def test_stress(self, request, test_config: TestConfig):
         """Stress test combining performance benchmarks and accuracy validation.
-        
-        This test type is designed for stress testing scenarios where both 
+
+        This test type is designed for stress testing scenarios where both
         performance metrics (CSV output) and accuracy (e.g., GSM8K) need to be validated.
         """
         full_test_name = request.node.name
@@ -249,12 +249,12 @@ class TestDisaggBenchmark:
             logger.info(f"Category: {test_config.test_category}")
             logger.info(f"Model: {test_config.model_name}")
             logger.info(f"Benchmark: {test_config.benchmark_type}")
-            
+
             # Log accuracy datasets if configured
             if test_config.accuracy_config:
                 dataset_names = test_config.accuracy_config.get_all_dataset_names()
                 logger.info(f"Accuracy Datasets: {', '.join(dataset_names)}")
-            
+
             logger.info(f"Metrics log: {test_config.metrics_config.log_file}")
             logger.info(f"Supported GPUs: {', '.join(test_config.supported_gpus)}")
             logger.info(f"{'=' * 60}")
@@ -283,9 +283,7 @@ class TestDisaggBenchmark:
 
             # Check results - this will handle both perf CSV writing AND accuracy validation
             result = JobManager.check_result(job_id, test_config, timestamps, full_test_name)
-            assert result["success"], (
-                f"Stress test failed: {result.get('error', 'Unknown error')}"
-            )
+            assert result["success"], f"Stress test failed: {result.get('error', 'Unknown error')}"
 
         except Exception as e:
             test_tracker.end_test_case()

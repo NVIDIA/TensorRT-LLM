@@ -65,7 +65,7 @@ class EnvManager:
     @staticmethod
     def get_slurm_set_segment() -> bool:
         """Get whether to use SLURM segment parameter based on GPU type.
-        
+
         Returns:
             bool: True if GPU type requires --segment parameter, False otherwise
         """
@@ -76,14 +76,14 @@ class EnvManager:
     @staticmethod
     def get_slurm_extra_args() -> str:
         """Get SLURM extra arguments based on GPU configuration.
-        
+
         Returns extra SLURM arguments from GPU_RESOURCE_CONFIG.
         This allows flexible configuration of GPU-specific SLURM parameters
         like --gres, --constraint, etc.
-        
+
         Returns:
             str: Extra SLURM arguments (e.g., "--gres=gpu:4" or "")
-        
+
         Examples:
             GB200: "--gres=gpu:4"
             GB300: ""

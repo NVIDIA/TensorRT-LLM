@@ -75,7 +75,7 @@ class SessionTracker:
 
     def end_and_collect(self):
         """Record end time and trigger session collection.
-        
+
         Uses the new sbatch-based approach for non-blocking execution.
         Submits the job and waits for completion using JobManager.
         """
@@ -84,7 +84,7 @@ class SessionTracker:
 
         # Submit session collect job (non-blocking sbatch)
         success, job_id = JobManager.submit_session_collect_job()
-        
+
         if not success:
             logger.error(f"Failed to submit session collect job: {job_id}")
             return False
@@ -95,13 +95,13 @@ class SessionTracker:
             job_id=job_id,
             timeout=7200,  # 2 hours
             test_config=None,  # No test config for session collect
-            check_early_failure=False  # Don't check early failures
+            check_early_failure=False,  # Don't check early failures
         )
 
         # Check if log file was created (indicates success)
         output_path = EnvManager.get_output_path()
         log_file = os.path.join(output_path, "session_collect.log")
-        
+
         if os.path.exists(log_file):
             # Update timestamps in CSV
             self._update_csv_timestamps()

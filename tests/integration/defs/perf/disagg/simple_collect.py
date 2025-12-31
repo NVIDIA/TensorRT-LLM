@@ -17,7 +17,6 @@ import re
 import socket
 import subprocess
 import sys
-import time
 from collections import OrderedDict
 from datetime import datetime
 

@@ -8,14 +8,10 @@ from typing import Any, Dict, Optional
 
 import yaml
 from reporting.report import LogParser, LogWriter, ResultSaver
-from utils.common import (
-    EnvManager,
-    extract_config_fields,
-)
+from utils.common import EnvManager
 from utils.logger import logger
 
 from execution.subprocess_utils import exec_cmd, exec_cmd_with_output
-
 
 # ============================================================================
 # Job Manager
@@ -36,7 +32,7 @@ class JobManager:
         script_args: list[str] = None,
         output_log_file: str = None,
         timeout: int = 7200,
-        container_name: str = None
+        container_name: str = None,
     ) -> tuple[bool, str]:
         """Submit a generic shell script job using sbatch --wrap.
 
@@ -75,7 +71,7 @@ class JobManager:
             # Build the bash command with script and arguments
             # Quote the script path and each argument separately
             quoted_script = f'"{script_path}"'
-            quoted_args = ' '.join(f'"{arg}"' for arg in script_args)
+            quoted_args = " ".join(f'"{arg}"' for arg in script_args)
             bash_command = f"bash {quoted_script} {quoted_args}".strip()
 
             # Build complete srun command (runs inside sbatch)
@@ -140,6 +136,7 @@ class JobManager:
         except Exception as e:
             logger.error(f"Failed to submit job '{job_name}': {e}")
             import traceback
+
             logger.debug(traceback.format_exc())
             return False, str(e)
 
@@ -183,12 +180,13 @@ class JobManager:
                 script_args=script_args,
                 output_log_file=f"{output_path}/session_collect.log",
                 timeout=7200,  # 2 hours
-                container_name="session-collect"
+                container_name="session-collect",
             )
 
         except Exception as e:
             logger.error(f"Failed to prepare session collect job: {e}")
             import traceback
+
             logger.debug(traceback.format_exc())
             return False, str(e)
 
@@ -232,7 +230,7 @@ class JobManager:
 
             # Call submit.py with the temporary config file
             submit_script = os.path.join(EnvManager.get_script_dir(), "submit.py")
-           
+
             case_log_dir = JobManager.get_result_dir(test_config)
 
             cmd = ["python3", submit_script, "-c", temp_config_path, "--log-dir", case_log_dir]
@@ -292,22 +290,22 @@ class JobManager:
 
         try:
             final_dir = result_dir
-            
+
             # For FAILED cases, rename directory to add _ERROR suffix
             if not is_passed:
                 error_dir = f"{result_dir}_ERROR"
                 logger.info(f"Renaming failed case directory: {result_dir} -> {error_dir}")
-                
+
                 # Remove old error directory if exists
                 if os.path.exists(error_dir):
                     logger.warning(f"Removing existing error directory: {error_dir}")
                     shutil.rmtree(error_dir)
-                
+
                 # Rename to add _ERROR suffix
                 shutil.move(result_dir, error_dir)
                 final_dir = error_dir
                 logger.success(f"Directory renamed to: {final_dir}")
-            
+
             # Copy temporary config file to the directory
             temp_config_path = test_config.temp_config_path
             if os.path.exists(temp_config_path):
@@ -811,23 +809,23 @@ class JobManager:
                 timestamps=timestamps,
                 test_name=test_name,
             )
-            
+
             # If perf check failed, return immediately
             if not perf_result.get("success", False):
                 return perf_result
-            
+
             # Then check accuracy if accuracy_config is provided
             if accuracy_config:
                 # Use metrics config from accuracy_config (defaults to _COMMON_ACCURACY_METRICS)
                 accuracy_metrics = accuracy_config.get_metrics_config()
-                
+
                 accuracy_result = JobManager._check_accuracy_result(
                     job_id=job_id,
                     metrics_config=accuracy_metrics,
                     accuracy_config=accuracy_config,
                     result_dir=result_dir,
                 )
-                
+
                 # If accuracy check failed, merge results and return
                 if not accuracy_result.get("success", False):
                     return {
@@ -836,7 +834,7 @@ class JobManager:
                         "accuracy_result": accuracy_result,
                         "error": f"Perf passed but accuracy failed: {accuracy_result.get('error', 'Unknown')}",
                     }
-                
+
                 # Both passed, merge results
                 return {
                     **perf_result,
@@ -858,4 +856,3 @@ class JobManager:
                 timestamps=timestamps,
                 test_name=test_name,
             )
-
