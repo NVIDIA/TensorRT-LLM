@@ -223,6 +223,7 @@ class ServerConfig:
             "gpus",
             "gpus_per_node",
             "client_configs",
+            "match_mode",
         ]
         self.extra_llm_api_config_data = {
             k: v for k, v in server_config_data.items() if k not in exclude_keys
