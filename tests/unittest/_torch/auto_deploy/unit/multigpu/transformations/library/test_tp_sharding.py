@@ -530,7 +530,13 @@ def _run_pattern_detection_job(
                     else:
                         dim = SplitDimension.COLUMN
                         dist_op = None
-                        fused_weight_dims = (num_features, num_features, 16, 16, num_heads)
+                        fused_weight_dims = (
+                            num_features,
+                            num_features,
+                            16 * num_heads,
+                            16 * num_heads,
+                            num_heads,
+                        )
                     expected_transformations.append(
                         WeightShardingInfo(
                             target_node=node.name,
@@ -551,7 +557,7 @@ def _run_pattern_detection_job(
                             dist_op=None,
                             min_local_shape=1,
                             layer_type=LayerType.SSM,
-                            fused_weight_dims=(num_features, 16, 16),
+                            fused_weight_dims=(num_features, 16 * num_heads, 16 * num_heads),
                         )
                     )
                 if is_op(node, torch.ops.auto_deploy.torch_ssm):
