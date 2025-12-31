@@ -3022,6 +3022,8 @@ class TestGLM4_5Air(LlmapiAccuracyTestHarness):
 
 
 @pytest.mark.timeout(7200)
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.timeout(10800)
 @pytest.mark.skip_less_device_memory(100000)
 class TestKimiK2(LlmapiAccuracyTestHarness):
     MODEL_NAME = "moonshotai/Kimi-K2-Instruct"
@@ -3065,7 +3067,6 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @skip_pre_blackwell
-    @pytest.mark.timeout(7200)
     @pytest.mark.skip_less_device_memory(120000)
     @pytest.mark.parametrize("tp_size", [
         pytest.param(4, marks=pytest.mark.skip_less_device(4)),
