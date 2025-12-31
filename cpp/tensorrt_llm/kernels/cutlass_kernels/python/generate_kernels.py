@@ -952,6 +952,7 @@ if __name__ == "__main__":
     inl_map = {
         (GemmKind.Gemm, 90): [fpA_intB_inl],
         (GemmKind.Gemm, 100): [fpA_intB_sm100_inl],
+        (GemmKind.Gemm, 103): [fpA_intB_sm100_inl],
         (GemmKind.Grouped, 90): [moe_gemm_inl],
         (GemmKind.Grouped, 100): [moe_gemm_inl],
         (GemmKind.Grouped, 103): [moe_gemm_inl],

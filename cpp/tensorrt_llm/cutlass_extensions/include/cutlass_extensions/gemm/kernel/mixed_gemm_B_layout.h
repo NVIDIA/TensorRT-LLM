@@ -88,7 +88,8 @@ public:
 // which signals that we want to dequantize after loading from smem.
 template <typename TypeA, typename Arch>
 struct LayoutDetailsB<TypeA, uint8_t, Arch,
-    typename platform::enable_if<Arch::kMinComputeCapability >= 75 && Arch::kMinComputeCapability != 100>::type>
+    typename platform::enable_if<Arch::kMinComputeCapability >= 75 && Arch::kMinComputeCapability != 100
+        && Arch::kMinComputeCapability != 103>::type>
 {
     static constexpr int ThreadblockK = 128 * 8 / cutlass::sizeof_bits<TypeA>::value;
 
@@ -104,7 +105,8 @@ public:
 
 template <typename TypeA, typename Arch>
 struct LayoutDetailsB<TypeA, uint4b_t, Arch,
-    typename platform::enable_if<Arch::kMinComputeCapability >= 75 && Arch::kMinComputeCapability != 100>::type>
+    typename platform::enable_if<Arch::kMinComputeCapability >= 75 && Arch::kMinComputeCapability != 100
+        && Arch::kMinComputeCapability != 103>::type>
 {
     static constexpr int ThreadblockK = 128 * 8 / cutlass::sizeof_bits<TypeA>::value;
 
@@ -119,7 +121,8 @@ public:
 };
 
 template <typename TypeA, typename Arch>
-struct LayoutDetailsB<TypeA, uint8_t, Arch, typename platform::enable_if<Arch::kMinComputeCapability == 100>::type>
+struct LayoutDetailsB<TypeA, uint8_t, Arch,
+    typename platform::enable_if<Arch::kMinComputeCapability == 100 || Arch::kMinComputeCapability == 103>::type>
 {
     static constexpr int ThreadblockK = 128 * 8 / cutlass::sizeof_bits<TypeA>::value;
     using Layout = layout::ColumnMajor;
@@ -128,7 +131,8 @@ struct LayoutDetailsB<TypeA, uint8_t, Arch, typename platform::enable_if<Arch::k
 };
 
 template <typename TypeA, typename Arch>
-struct LayoutDetailsB<TypeA, uint4b_t, Arch, typename platform::enable_if<Arch::kMinComputeCapability == 100>::type>
+struct LayoutDetailsB<TypeA, uint4b_t, Arch,
+    typename platform::enable_if<Arch::kMinComputeCapability == 100 || Arch::kMinComputeCapability == 103>::type>
 {
     static constexpr int ThreadblockK = 128 * 8 / cutlass::sizeof_bits<TypeA>::value;
     using Layout = layout::ColumnMajor;

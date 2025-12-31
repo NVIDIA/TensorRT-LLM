@@ -430,7 +430,7 @@ void CutlassFpAIntBGemmRunner<ActivationType, WeightType, QuantOp, ScaleZeroType
             QuantOp, EpilogueTag>(A, B, weight_scales, weight_zero_points, biases, alpha, C, m, n, k, group_size,
             workspace_ptr, workspace_bytes, gemm_config, stream, occupancy);
     }
-    else if ((sm_ >= 80 && sm_ < 89) || sm_ > 100)
+    else if ((sm_ >= 80 && sm_ < 89) || sm_ >= 120)
     {
         dispatch_gemm_to_cutlass<ActivationType, WeightType, ScaleZeroType, BiasType, OutputType, cutlass::arch::Sm80,
             QuantOp, EpilogueTag>(A, B, weight_scales, weight_zero_points, biases, alpha, C, m, n, k, group_size,
@@ -455,11 +455,17 @@ void CutlassFpAIntBGemmRunner<ActivationType, WeightType, QuantOp, ScaleZeroType
         static_assert(!cutlass::platform::is_same<ActivationType, __nv_fp8_e4m3>::value
                 || cutlass::platform::is_same<ScaleZeroType, half>::value,
             "ScaleZeroType must be half for activation=fp8");
+#ifdef COMPILE_HOPPER_TMA_GEMMS
         cutlass_kernels_oss::sm90_dispatch_gemm_to_cutlass<ActivationType, WeightType, ScaleZeroType, BiasType,
             OutputType, QuantOp, EpilogueTag>(A, B, weight_scales, weight_zero_points, biases, alpha, C, m, n, k,
             group_size, workspace_ptr, workspace_bytes, gemm_config, stream, occupancy);
+#else  // COMPILE_HOPPER_TMA_GEMMS
+        throw std::runtime_error(
+            "[TensorRT LLM Error][fpA_intB Runner] Please recompile with support for hopper by passing 90-real as an "
+            "arch to build_wheel.py.");
+#endif // COMPILE_HOPPER_TMA_GEMMS
     }
-    else if (sm_ == 100)
+    else if (sm_ == 100 || sm_ == 103)
     {
 #ifdef COMPILE_BLACKWELL_TMA_GEMMS
         cutlass_kernels_oss::sm100_dispatch_gemm_to_cutlass<ActivationType, WeightType, ScaleZeroType, BiasType,
@@ -550,7 +556,7 @@ CutlassFpAIntBGemmRunner<ActivationType, WeightType, QuantOp, ScaleZeroType, Bia
 {
 
     static constexpr bool is_weight_only = !std::is_same<ActivationType, WeightType>::value;
-    tkc::CutlassGemmConfig::CandidateConfigTypeParam config_type_param = (sm_ == 100)
+    tkc::CutlassGemmConfig::CandidateConfigTypeParam config_type_param = (sm_ >= 100)
         ? tkc::CutlassGemmConfig::CandidateConfigTypeParam::BLACKWELL
         : tkc::CutlassGemmConfig::CandidateConfigTypeParam::HOPPER;
     if (is_weight_only)

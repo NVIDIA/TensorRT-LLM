@@ -138,8 +138,13 @@ LayoutDetails getLayoutDetailsForTransform(QuantType quant_type, int arch)
     {
         return getLayoutDetailsForArch<cutlass::arch::Sm100>(quant_type);
     }
-    else if (arch > 100)
+    else if (arch == 103)
     {
+        return getLayoutDetailsForArch<cutlass::arch::Sm103>(quant_type);
+    }
+    else if (arch >= 120)
+    {
+        // Use SM80 implementation for GB20x.
         return getLayoutDetailsForArch<cutlass::arch::Sm80>(quant_type);
     }
     else
@@ -607,14 +612,14 @@ void preprocess_weights_for_mixed_gemm(int8_t* preprocessed_quantized_weight, in
         src_buf.swap(dst_buf);
     }
 
-    if (details.columns_interleaved > 1 && (arch != 90 && arch != 100))
+    if (details.columns_interleaved > 1 && (arch != 90))
     {
         TLLM_LOG_INFO("interleave_column_major_tensor");
         interleave_column_major_tensor(dst_buf.data(), src_buf.data(), shape, quant_type, details);
         src_buf.swap(dst_buf);
     }
 
-    if (arch != 100)
+    if (arch != 100 && arch != 103)
     {
         TLLM_LOG_INFO("add_bias_and_interleave_quantized_tensor_inplace");
         add_bias_and_interleave_quantized_tensor_inplace(src_buf.data(), num_elts, quant_type);

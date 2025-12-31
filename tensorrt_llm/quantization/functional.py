@@ -961,7 +961,7 @@ def preprocess_weights_for_mixed_gemm(
         tensor = tensor.unsqueeze(0)
     elif sm_ >= 90:
         sm_ = 80
-    if sm_ == 100:
+    if sm_ == 100 or sm_ == 103:
         do_weight_interleave = False
 
     permutation_map = {
