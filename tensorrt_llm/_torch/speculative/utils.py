@@ -31,6 +31,7 @@ def get_spec_metadata(spec_config,
             mtp_num_modules=spec_config.num_nextn_predict_layers,
             max_num_requests=max_num_requests,
             mtp_hidden_states_manager=spec_resource_manager,
+            allow_advanced_sampling=spec_config.allow_advanced_sampling,
         )
     if spec_config.spec_dec_mode.is_mtp_eagle():
         return Eagle3SpecMetadata(
