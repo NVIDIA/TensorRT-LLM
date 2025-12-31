@@ -124,13 +124,18 @@ def cleanup():
         dist.destroy_process_group()
 
 
-def _try_init_process_group(local_rank: int, world_size: int, port: int) -> bool:
-    """Attempt to initialize process group. Returns True on success, False on EADDRINUSE."""
+def _set_distributed_env_vars(local_rank: int, world_size: int, port: int) -> None:
+    """Set environment variables required by NCCL's env:// init method."""
     os.environ["RANK"] = str(local_rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     os.environ["LOCAL_RANK"] = str(local_rank)
+
+
+def _try_init_process_group(local_rank: int, world_size: int, port: int) -> bool:
+    """Attempt to initialize process group. Returns True on success, False on EADDRINUSE."""
+    _set_distributed_env_vars(local_rank, world_size, port)
 
     try:
         dist.init_process_group(
@@ -216,6 +221,7 @@ def initialize(
             if port == -1:
                 raise RuntimeError("Rank 0 failed to initialize, cannot proceed")
             ad_logger.info(f"Initializing for: {lib=}, {local_rank=}, {world_size=}, {port=}")
+            _set_distributed_env_vars(local_rank, world_size, port)
             dist.init_process_group(
                 "nccl",
                 world_size=world_size,
@@ -225,6 +231,7 @@ def initialize(
     else:
         # Original path: no retry mechanism (OMPI, torchelastic, or single process)
         ad_logger.info(f"Initializing for: {lib=}, {local_rank=}, {world_size=}, {port=}")
+        _set_distributed_env_vars(local_rank, world_size, port)
         dist.init_process_group(
             "nccl",
             world_size=world_size,
