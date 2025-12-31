@@ -136,7 +136,7 @@ class ShardingTransformConfig(TransformConfig):
         default_factory=lambda: [ShardingDim.TP, ShardingDim.EP, ShardingDim.BMM]
     )
     shard_all_unprocessed: bool = Field(
-        default=False,
+        default=True,
         description="When True, apply simple shard (column split + all_gather) to "
         "'leftover' linear nodes that are not part of any layer subgraph.",
     )
