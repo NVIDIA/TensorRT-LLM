@@ -594,8 +594,6 @@ class BMMShardingInfo(ShardingTransformInfo):
 class EPShardingInfo(ShardingTransformInfo):
     """Configuration for EP sharding transformations."""
 
-    mlp_type: MLPType
-
     @classmethod
     def from_node(cls, node: Node, **kwargs) -> "EPShardingInfo":
         """
@@ -613,7 +611,7 @@ class EPShardingInfo(ShardingTransformInfo):
 
     def apply(self, gm: GraphModule, node: Node) -> None:
         """Apply EP sharding transformation to the graph module."""
-        _insert_sharded_moe(gm, node, self.config, mlp_type=self.mlp_type)
+        _insert_sharded_moe(gm, node, self.config)
 
 
 class MXFP4EPShardingInfo(EPShardingInfo):
@@ -1341,7 +1339,6 @@ def _insert_sharded_moe(
     gm: GraphModule,
     node: Node,
     config: ShardingTransformConfig,
-    mlp_type: MLPType,
     scale_names: Sequence[str] = (),
 ):
     """Update the torch_moe node with sharded weight lists,
@@ -1464,6 +1461,9 @@ def _insert_sharded_moe(
         dist_node.replace_input_with(dist_node, node)
 
     gm.graph.eliminate_dead_code()
+    # Expert weights registered via gm.register_parameter() are top-level attributes.
+    # Unlike submodules, these aren't cleaned up by eliminate_dead_code() or
+    # delete_all_unused_submodules() - must delete manually after removing their get_attr nodes.
     for expert in (
         w_up_list_to_remove + w_down_list_to_remove + w_gate_list_to_remove + scales_to_remove
     ):
@@ -2445,17 +2445,7 @@ def detect_ep_shard(
     for node in list(gm.graph.nodes):
         if not is_any_moe_op(node):
             continue
-        args = node.args
-        mlp_type = MLPType.MLP
-        if args[5] and len(args[5]) > 0:
-            mlp_type = MLPType.GATED_MLP
-        if transform_container.add(
-            EPShardingInfo.from_node(
-                node,
-                config=config,
-                mlp_type=mlp_type,
-            )
-        ):
+        if transform_container.add(EPShardingInfo.from_node(node, config=config)):
             num_moe_patterns += 1
 
     ad_logger.info(f"Found {num_moe_patterns} MoE patterns")

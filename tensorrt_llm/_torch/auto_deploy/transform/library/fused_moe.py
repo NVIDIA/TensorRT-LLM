@@ -181,34 +181,15 @@ def _process_moe_node(
     param_w_down = torch.nn.Parameter(fused_w_down_experts)
     gm.register_parameter(new_key_w_down, param_w_down)
 
-    # Get weight dtype for casting - fused kernel requires activation dtype to match weight dtype
-    weight_dtype = fused_w_up_experts.dtype
-
     # Create fused MoE node - kernel applies routing to output
     with graph.inserting_before(node):
         w_up_arg = graph.get_attr(new_key_w_up)
         w_down_arg = graph.get_attr(new_key_w_down)
-
-        # Cast hidden_states to weight dtype if needed
-        hidden_states_dtype = hidden_states.meta["val"].dtype
-        if hidden_states_dtype != weight_dtype:
-            hidden_states = graph.call_function(
-                torch.ops.aten._to_copy.default,
-                args=(hidden_states,),
-                kwargs={"dtype": weight_dtype},
-            )
-
-        # Cast routing_weights to weight dtype if needed (for apply_routing_on_input multiplication)
-        routing_weights_dtype = routing_weights.meta["val"].dtype
-        if routing_weights_dtype != weight_dtype:
-            routing_weights = graph.call_function(
-                torch.ops.aten._to_copy.default,
-                args=(routing_weights,),
-                kwargs={"dtype": weight_dtype},
-            )
+        # Get weight dtype for casting - fused kernel requires activation dtype to match weight dtype
+        weight_dtype = fused_w_up_experts.dtype
 
         if apply_routing_on_input:
-            # Scale input: hidden_states = hidden_states * routing_weights (both same dtype now)
+            # Scale input: hidden_states = hidden_states * routing_weights
             hidden_states = graph.call_function(
                 torch.ops.aten.mul.Tensor,
                 args=(hidden_states, routing_weights),
@@ -219,6 +200,12 @@ def _process_moe_node(
                 torch.ops.aten.ones_like.default,
                 args=(routing_weights,),
             )
+
+        # Kernel requires activation dtype to match weight dtype
+        hidden_states = graph.call_function(
+            torch.ops.aten.to,
+            args=(hidden_states, weight_dtype),
+        )
 
         new_node = graph.call_function(
             replacement_op,
@@ -1257,11 +1244,13 @@ class MatchBmmMoePattern(BaseTransform):
 
                 # Now create get_attr nodes for each expert weight
                 # These must be created within the insertion context for proper graph ordering
-                with graph.inserting_before(output_node):
+                insertion_point = graph.find_nodes(op="get_attr")[0]
+                with graph.inserting_before(insertion_point):
                     w1_nodes = [graph.get_attr(key) for key in w1_keys]
                     w2_nodes = [graph.get_attr(key) for key in w2_keys]
                     w3_nodes = [graph.get_attr(key) for key in w3_keys]
 
+                with graph.inserting_before(output_node):
                     fused_moe_node = graph.call_function(
                         torch.ops.auto_deploy.torch_moe,
                         args=(
