@@ -273,7 +273,7 @@ class TestDisaggBenchmark:
                 assert job_id, "Unable to get job ID"
 
                 # Wait for completion (longer timeout for stress tests: 4 hours)
-                JobManager.wait_for_completion(job_id, 14400, test_config, check_early_failure=True)
+                JobManager.wait_for_completion(job_id, 10800, test_config, check_early_failure=True)
 
             # End tracking test case
             test_tracker.end_test_case()
