@@ -1035,12 +1035,12 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
         ctx_server_config["kv_cache_config"] = {
             "max_attention_window": [512, 512, 512, 512, 512, 32768],
             "enable_block_reuse": block_reuse,
-            "enable_partial_reuse": False,
+            "enable_partial_reuse": True,
         }
         gen_server_config["kv_cache_config"] = {
             "max_attention_window": [512, 512, 512, 512, 512, 32768],
             "enable_block_reuse": block_reuse,
-            "enable_partial_reuse": False,
+            "enable_partial_reuse": True,
         }
         disaggregated_server_config = {
             "hostname": "localhost",
@@ -1097,13 +1097,13 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         ctx_server_config["kv_cache_config"] = {
             "max_attention_window": [128, 32768],
             "enable_block_reuse": block_reuse,
-            "enable_partial_reuse": False,
+            "enable_partial_reuse": True,
             "free_gpu_memory_fraction": 0.5,
         }
         gen_server_config["kv_cache_config"] = {
             "max_attention_window": [128, 32768],
             "enable_block_reuse": block_reuse,
-            "enable_partial_reuse": False,
+            "enable_partial_reuse": True,
             "free_gpu_memory_fraction": 0.5,
         }
         disaggregated_server_config = {
