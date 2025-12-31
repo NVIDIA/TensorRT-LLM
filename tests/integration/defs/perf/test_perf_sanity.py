@@ -517,7 +517,7 @@ class AggrTestCmds(NamedTuple):
                 )
 
             wait_for_endpoint_ready(
-                f"http://{server_hostname}:{server_port}/health", timeout=self.timeout
+                f"http://{server_hostname}:{server_port}/health", timeout=self.timeout, server_proc=server_proc
             )
 
             # Run all clients for this server
