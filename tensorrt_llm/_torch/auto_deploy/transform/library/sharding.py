@@ -1897,7 +1897,9 @@ def _determine_fused_weight_dims(
         num_chunks = chunk_nodes[0].args[1]
         weight_dim = shape(linear_node)[2]
         fused_weight_dims = [weight_dim // num_chunks] * num_chunks
-    return tuple(fused_weight_dims)
+    if fused_weight_dims is not None:
+        fused_weight_dims = tuple(fused_weight_dims)
+    return fused_weight_dims
 
 
 def _process_column_sharding(
