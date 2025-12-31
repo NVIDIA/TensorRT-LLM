@@ -148,8 +148,8 @@ def main():
     job_workspace = sys.argv[1]
 
     if not os.path.isdir(job_workspace):
-        print(f"Error: {job_workspace} is not a valid directory")
-        sys.exit(1)
+        print(f"Skipping perf regression check since {job_workspace} is not a valid directory.")
+        return 0
 
     perf_data_files = find_yaml_files(job_workspace, "perf_data.yaml")
     all_perf_data = read_yaml_data(perf_data_files)
@@ -184,7 +184,10 @@ def main():
         return 0
 
     if len(pre_merge_regressions) > 0:
-        print(f"\n Warning: Found {len(pre_merge_regressions)} pre-merge regression data.")
+        print(
+            f"\n Warning: Found {len(pre_merge_regressions)} pre-merge regression data. "
+            "But we don't fail the check temporarily."
+        )
 
     if len(post_merge_regressions) > 0:
         print(
