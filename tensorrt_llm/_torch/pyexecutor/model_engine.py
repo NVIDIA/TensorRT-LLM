@@ -1418,7 +1418,8 @@ class PyTorchModelEngine(ModelEngine):
                 request.py_multimodal_data = multimodal_params.multimodal_data
                 multimodal_params_list.append(multimodal_params)
 
-            request.py_batch_idx = request.py_seq_slot
+            if not self.sm_disagg_enabled:
+                request.py_batch_idx = request.py_seq_slot
 
         if len(multimodal_params_list) > 0:
             # discard the text token indices as it only includes context tokens at this moment
@@ -1460,10 +1461,8 @@ class PyTorchModelEngine(ModelEngine):
             # the request has no previous tensor:
             # (1) next_draft_tokens_device is None, which means overlap scheduler is disabled; or
             # (2) a dummy request; or
-            # (3) the first step in the generation server of disaggregated serving; or
-            # (4) the first step in the generation phase of SM-level disaggregation
-            if next_draft_tokens_device is None or request.is_dummy or request.py_batch_idx is None \
-                    or self.sm_disagg_enabled and request.max_num_generated_tokens == 0:
+            # (3) the first step in the generation server of disaggregated serving
+            if next_draft_tokens_device is None or request.is_dummy or request.py_batch_idx is None:
                 # get token ids, including input token ids and draft token ids. For these dummy requests,
                 # no need to copy the token ids.
                 if not (request.is_attention_dp_dummy
@@ -1587,10 +1586,8 @@ class PyTorchModelEngine(ModelEngine):
                 # the request has no previous tensor:
                 # (1) new_tokens_device is None, which means overlap scheduler is disabled; or
                 # (2) a dummy request; or
-                # (3) the first step in the generation server of disaggregated serving; or
-                # (4) the first step in the generation phase of SM-level disaggregation
-                if new_tokens_device is None or request.is_dummy or request.py_batch_idx is None \
-                        or self.sm_disagg_enabled and request.max_num_generated_tokens == 0:
+                # (3) the first step in the generation server of disaggregated serving
+                if new_tokens_device is None or request.is_dummy or request.py_batch_idx is None:
                     # skip adding input_ids of CUDA graph dummy requests so that new_tokens_device
                     # can be aligned to the correct positions.
                     if not request.is_cuda_graph_dummy:

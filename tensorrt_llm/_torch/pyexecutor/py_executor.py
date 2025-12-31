@@ -52,7 +52,8 @@ from .kv_cache_connector import KvCacheConnectorManager
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
                           LlmResponse, get_context_requests,
-                          get_draft_token_length, get_generation_requests)
+                          get_draft_token_length, get_generation_requests,
+                          get_generation_to_complete_requests)
 from .model_engine import ModelEngine
 from .resource_manager import ResourceManager
 from .sampler import Sampler, SampleState, SampleStateTensors
@@ -1198,7 +1199,7 @@ class PyExecutor:
                 f'scheduled {len(scheduled_batch.generation_requests)} generation requests'
             )
 
-            if scheduled_batch.batch_size == 0:
+            if scheduled_batch.batch_size == 0 and not get_generation_to_complete_requests(self.active_requests):
                 self.sm_disagg_ctx_cv.wait()
 
         return scheduled_batch, iter_stats
@@ -1529,17 +1530,14 @@ class PyExecutor:
 
                 if can_queue:
 
-                    # The generation requests that are do not have batch_idx (for disaggregated serving),
-                    # or those just finished context phase (for SM-level disaggregation),
+                    # The generation requests that are do not have batch_idx,
                     # needs to be in front of the batch due to the assumptions
-                    # made in model_engine.py::_forward_step. For non-disaggregated serving,
+                    # made in model_engine.py::_forward_step. This is only important
+                    # for disaggregated serving. For non-disaggregated serving,
                     # the generation requests always have batch_idx.
                     scheduled_batch.generation_requests = sorted(  # stable sort
                         scheduled_batch.generation_requests,
-                        key=lambda req:
-                        int(req.py_batch_idx is not None or phase ==
-                            ExecutorLoopPhase.SM_DISAGG_GEN and req.
-                            max_num_generated_tokens > 0),
+                        key=lambda req: int(req.py_batch_idx is not None),
                     )
 
                     if self.kv_cache_transceiver:
@@ -2511,6 +2509,10 @@ class PyExecutor:
             # Skip active requests that are not scheduled
             if request.return_perf_metrics and request.py_decoding_iter >= 1:
                 request.update_perf_metrics(self.model_engine.iter_counter)
+
+            if self.ctx_model_engine is not None and request.py_batch_idx is None and not request.is_finished:
+                new_active_requests.append(request)
+                continue
 
             request_done = False
             if request.py_decoding_iter == 1 or request.is_finished or \

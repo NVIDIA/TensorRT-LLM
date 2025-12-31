@@ -180,7 +180,7 @@ class BindMicroBatchScheduler(MicroBatchScheduler):
         ctx_chunk_config: Optional[Tuple[StrEnum, int]] = None,
         no_schedule_until_state: LlmRequestState = LlmRequestState.CONTEXT_INIT,
         no_schedule_after_state: LlmRequestState = LlmRequestState.
-        GENERATION_COMPLETE,
+        GENERATION_TO_COMPLETE,
     ) -> None:
         super(BindMicroBatchScheduler, self).__init__()
         self.max_batch_size = max_batch_size
