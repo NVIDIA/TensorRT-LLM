@@ -1506,7 +1506,7 @@ class AutoTuner:
         """Broadcast tactics from root rank to all other ranks."""
         cache_data = self.profiling_cache.get_specific_custom_op(custom_op)
         root = 0
-        cache_data = self._dist.tp_broadcast(obj=cache_data, root=root)
+        cache_data = self._dist.tp_cp_broadcast(obj=cache_data, root=root)
 
         self.profiling_cache.merge_cache_data(cache_data)
 
