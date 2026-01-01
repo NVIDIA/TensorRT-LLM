@@ -401,3 +401,23 @@ def get_lm_head_weights(model: nn.Module) -> torch.Tensor:
     gm, output_node = get_output_node(model)
     lm_head_node = get_lm_head_node(gm, output_node)
     return get_weight_tensor(gm, lm_head_node)
+
+
+def get_attr_by_name(obj, name):
+    for part in name.split("."):
+        obj = getattr(obj, part)
+    return obj
+
+
+def set_attr_by_name(obj, name, value):
+    parts = name.split(".")
+    for part in parts[:-1]:
+        obj = getattr(obj, part)
+    setattr(obj, parts[-1], value)
+
+
+def del_attr_by_name(obj, name):
+    parts = name.split(".")
+    for part in parts[:-1]:
+        obj = getattr(obj, part)
+    delattr(obj, parts[-1])

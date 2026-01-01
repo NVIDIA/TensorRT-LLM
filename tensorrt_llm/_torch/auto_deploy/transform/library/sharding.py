@@ -33,7 +33,7 @@ from .....functional import AllReduceStrategy
 from ...custom_ops.trtllm_dist import is_trtllm_op_available
 from ...models.factory import ModelFactory, ShardingConfigSource
 from ...shim.interface import CachedSequenceInterface
-from ...utils.attr import del_attr_by_name as _del_attr_by_name
+from ...utils._graph import del_attr_by_name
 from ...utils.logger import ad_logger
 from ...utils.node_utils import (
     LayerSubgraph,
@@ -1469,7 +1469,7 @@ def _insert_sharded_moe(
         w_up_list_to_remove + w_down_list_to_remove + w_gate_list_to_remove + scales_to_remove
     ):
         try:
-            _del_attr_by_name(gm, expert.target)
+            del_attr_by_name(gm, expert.target)
         except AttributeError:
             ad_logger.warning(
                 f"Failed to delete unused parameter {expert.target} from GraphModule."

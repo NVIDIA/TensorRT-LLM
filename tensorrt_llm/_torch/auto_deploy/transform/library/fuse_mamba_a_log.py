@@ -31,9 +31,7 @@ from torch.fx import GraphModule, Node
 
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
-from ...utils.attr import del_attr_by_name as _del_attr_by_name
-from ...utils.attr import get_attr_by_name as _get_attr_by_name
-from ...utils.attr import set_attr_by_name as _set_attr_by_name
+from ...utils._graph import del_attr_by_name, get_attr_by_name, set_attr_by_name
 from ...utils.logger import ad_logger
 from ...utils.pattern_matcher import ADPatternMatcherPass
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
@@ -64,13 +62,13 @@ def _ensure_a_fused_param(gm: GraphModule, param_name: str) -> Optional[str]:
 
     new_param_name = param_name.replace("A_log", "A_fused")
     try:
-        _get_attr_by_name(gm, new_param_name)
+        get_attr_by_name(gm, new_param_name)
         return new_param_name
     except AttributeError:
         pass
 
     try:
-        a_log = _get_attr_by_name(gm, param_name)
+        a_log = get_attr_by_name(gm, param_name)
     except AttributeError:
         ad_logger.warning(f"Could not find attribute {param_name} in gm.")
         return None
@@ -78,7 +76,7 @@ def _ensure_a_fused_param(gm: GraphModule, param_name: str) -> Optional[str]:
     with torch.no_grad():
         a_fused = -torch.exp(a_log.float())
 
-    _set_attr_by_name(
+    set_attr_by_name(
         gm,
         new_param_name,
         nn.Parameter(a_fused, requires_grad=False),
@@ -102,7 +100,7 @@ def _remove_unused_a_log_params(gm: GraphModule) -> bool:
         if not name.endswith("A_log") or name in used_a_log_targets:
             return
         try:
-            _del_attr_by_name(gm, name)
+            del_attr_by_name(gm, name)
             removed = True
         except AttributeError:
             ad_logger.warning(f"Failed to delete unused parameter {name} from GraphModule.")
