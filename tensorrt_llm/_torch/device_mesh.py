@@ -130,9 +130,8 @@ class DeviceMeshTopologyImpl(_MappingBaseForTypeCheck):
             dims += ["tp"]
             shape += [self.tp_size]
 
-        if self.cp_size > 1:
-            dims += ["cp"]
-            shape += [self.cp_size]
+        dims += ["cp"]
+        shape += [self.cp_size]
 
         cls.device_mesh = init_device_mesh(
             "cuda",
