@@ -31,30 +31,12 @@ from torch.fx import GraphModule, Node
 
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
+from ...utils.attr import del_attr_by_name as _del_attr_by_name
+from ...utils.attr import get_attr_by_name as _get_attr_by_name
+from ...utils.attr import set_attr_by_name as _set_attr_by_name
 from ...utils.logger import ad_logger
 from ...utils.pattern_matcher import ADPatternMatcherPass
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
-
-
-def _get_attr_by_name(obj, name):
-    for part in name.split("."):
-        obj = getattr(obj, part)
-    return obj
-
-
-def _set_attr_by_name(obj, name, value):
-    parts = name.split(".")
-    for part in parts[:-1]:
-        obj = getattr(obj, part)
-    setattr(obj, parts[-1], value)
-
-
-def _del_attr_by_name(obj, name):
-    parts = name.split(".")
-    for part in parts[:-1]:
-        obj = getattr(obj, part)
-    delattr(obj, parts[-1])
-
 
 _PATTERN_INPUT_NAME = "a_log_like"
 
