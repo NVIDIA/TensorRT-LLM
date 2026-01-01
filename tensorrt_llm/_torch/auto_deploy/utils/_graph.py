@@ -404,12 +404,34 @@ def get_lm_head_weights(model: nn.Module) -> torch.Tensor:
 
 
 def get_attr_by_name(obj, name):
+    """Get an attribute specified by a dot-separated path on an object.
+
+    Args:
+        obj: The root object from which to resolve the attribute path.
+        name (str): Dot-separated attribute path (e.g., "a.b.c").
+
+    Returns:
+        The value of the resolved attribute.
+
+    Raises:
+        AttributeError: If any component in the path does not exist.
+    """
     for part in name.split("."):
         obj = getattr(obj, part)
     return obj
 
 
 def set_attr_by_name(obj, name, value):
+    """Set an attribute specified by a dot-separated path on an object.
+
+    Args:
+        obj: The root object on which to set the attribute.
+        name (str): Dot-separated attribute path (e.g., "a.b.c").
+        value: The value to assign to the target attribute.
+
+    Raises:
+        AttributeError: If any intermediate component in the path does not exist.
+    """
     parts = name.split(".")
     for part in parts[:-1]:
         obj = getattr(obj, part)
@@ -417,6 +439,16 @@ def set_attr_by_name(obj, name, value):
 
 
 def del_attr_by_name(obj, name):
+    """Delete an attribute specified by a dot-separated path from an object.
+
+    Args:
+        obj: The root object from which to delete the attribute.
+        name (str): Dot-separated attribute path (e.g., "a.b.c").
+
+    Raises:
+        AttributeError: If any intermediate component in the path does not exist
+            or if the final attribute does not exist.
+    """
     parts = name.split(".")
     for part in parts[:-1]:
         obj = getattr(obj, part)
