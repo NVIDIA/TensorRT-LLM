@@ -2445,12 +2445,7 @@ class PyExecutor:
                     self.ctx_in_transmission_requests[request.py_request_id] = (
                         (request, block_id, self.ctx_in_transmission_counter))
 
-        store_blocks_for_reuse = not (self.block_reuse_enabled
-                                      and not self.kv_cache_manager.is_vswa
-                                      and self.kv_cache_transceiver
-                                      and request.is_context_only_request)
-        self.resource_manager.free_resources(
-            request, store_blocks_for_reuse=store_blocks_for_reuse)
+        self.resource_manager.free_resources(request)
 
         if self.gather_all_responses or self.dist.rank == 0:
             self.result_wait_queues.pop(request.py_request_id, None)

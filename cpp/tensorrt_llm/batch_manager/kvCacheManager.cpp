@@ -1797,10 +1797,8 @@ void WindowBlockManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const
 
     for (auto const& blockId : blockIds)
     {
-        if (blockId < 0 || static_cast<size_t>(blockId) >= mAllBlocksById.size())
-        {
-            continue;
-        }
+        TLLM_CHECK_WITH_INFO(blockId >= 0 && static_cast<size_t>(blockId) < mAllBlocksById.size(),
+            "Block id %d is out of range", blockId);
         auto block = mAllBlocksById[blockId];
         if (block && block->getBlockId() != KVCacheBlock::kCachedBlocksRootId)
         {
