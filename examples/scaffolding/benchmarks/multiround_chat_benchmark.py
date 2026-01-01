@@ -12,6 +12,7 @@ Adapted from: https://github.com/vllm-project/vllm/tree/main/benchmarks/multi_tu
 """
 
 import asyncio
+import itertools
 import json
 import os
 from abc import ABC, abstractmethod
@@ -594,9 +595,9 @@ class MultiroundChatWorker(Worker):
         delay = float(self.user_delay_distribution.sample(1)[0])
         return max(0.0, delay)
 
-    def _get_conversation_for_request(self, request_index: int) -> Tuple[str, MessagesList]:
-        """Get the conversation data for a given request index."""
-        conv_id = self.conv_ids[request_index % len(self.conv_ids)]
+    def _get_conversation_for_worker(self, worker_id: int) -> Tuple[str, MessagesList]:
+        """Get the conversation data for a given conversation index."""
+        conv_id = self.conv_ids[worker_id % len(self.conv_ids)]
         return conv_id, self.conversations[conv_id]
 
     async def multiround_handler(self, task: ChatTask) -> TaskStatus:
@@ -604,8 +605,8 @@ class MultiroundChatWorker(Worker):
         # Initialize the conversation state if it is not set
         conv_state = task.customized_result_fields.get("conversation_state")
         if conv_state is None:
-            request_index = task.customized_result_fields.get("request_index", 0)
-            conv_id, messages = self._get_conversation_for_request(request_index)
+            worker_id = task.customized_result_fields.get("worker_id", 0)
+            conv_id, messages = self._get_conversation_for_worker(worker_id)
             conv_state = {
                 "conv_id": conv_id,
                 "messages": [m.copy() for m in messages],
@@ -661,6 +662,8 @@ class MultiroundChatWorker(Worker):
 class MultiroundChatController(Controller):
     """Controller for multi-turn chat conversations."""
 
+    _worker_id_counter = itertools.count()
+
     class WorkerTag(Enum):
         GENERATION = "generation"
         MULTIROUND = "multiround"
@@ -668,7 +671,10 @@ class MultiroundChatController(Controller):
     def __init__(self, max_rounds: int = 10):
         super().__init__()
         self.max_rounds = max_rounds
-        self.request_index = 0  # Instance variable instead of class variable
+        self.worker_id = next(self._worker_id_counter)
+
+    def clone(self):
+        return MultiroundChatController(max_rounds=self.max_rounds)
 
     def generate(self, prompt: str):
         task = ChatTask.create_from_prompt(
@@ -676,8 +682,7 @@ class MultiroundChatController(Controller):
             [SystemMessage(content="You are a helpful assistant.")],
             None,  # No tools
         )
-        task.customized_result_fields["request_index"] = self.request_index
-        self.request_index += 1
+        task.customized_result_fields["worker_id"] = self.worker_id
 
         yield from self.process([task])
         return task.create_scaffolding_output()
