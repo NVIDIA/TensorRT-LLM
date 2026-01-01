@@ -66,9 +66,9 @@ def test_generate_only_with_slot_mapping(mamba_env):
     seq_len = torch.ones(batch, device=device, dtype=torch.int32)
     cu_seqlen = torch.zeros(batch, device=device, dtype=torch.int32)
     use_initial_states = torch.zeros(batch, device=device, dtype=torch.bool)
-    # batch_info: [num_prefill, num_prefill_tokens, num_decode]
+    # batch_info_host: [num_prefill, num_prefill_tokens, num_decode]
     # For generate-only: num_decode = batch, num_prefill = 0
-    batch_info = torch.tensor([0, 0, batch], device=device, dtype=torch.int32)
+    batch_info_host = torch.tensor([0, 0, batch], device=device, dtype=torch.int32)
     # Snapshot caches for reference before running op (op mutates caches)
     gathered_before = ssm_state_cache.clone().index_select(0, slot_idx)
 
@@ -83,7 +83,7 @@ def test_generate_only_with_slot_mapping(mamba_env):
         dt,
         dt_bias,
         # STANDARD METADATA
-        batch_info,
+        batch_info_host,
         seq_len,
         cu_seqlen,
         slot_idx,
@@ -141,11 +141,13 @@ def test_context_flattened_and_state_writeback(mamba_env):
     seq_len = torch.tensor(lens, device=device, dtype=torch.int32)
     cu_seqlen = torch.tensor([0, lens[0]], device=device, dtype=torch.int32)
     use_initial_states = torch.zeros(batch, device=device, dtype=torch.bool)
-    # batch_info: [num_prefill, num_prefill_tokens, num_decode]
+    # batch_info_host: [num_prefill, num_prefill_tokens, num_decode]
     # For context/prefill phase: num_prefill = len(lens), num_decode = 0
     num_seqs = len(lens)
     num_prefill_tokens = sum(lens)
-    batch_info = torch.tensor([num_seqs, num_prefill_tokens, 0], device=device, dtype=torch.int32)
+    batch_info_host = torch.tensor(
+        [num_seqs, num_prefill_tokens, 0], device=device, dtype=torch.int32
+    )
     y = torch.ops.auto_deploy.torch_cached_ssm(
         # INPUTS
         hidden_states,
@@ -156,7 +158,7 @@ def test_context_flattened_and_state_writeback(mamba_env):
         dt,
         dt_bias,
         # STANDARD METADATA
-        batch_info,
+        batch_info_host,
         seq_len,
         cu_seqlen,
         slot_idx,

@@ -380,23 +380,43 @@ class LmEvalEvaluator(Evaluator):
 
     @contextmanager
     def _patch_lm_eval(self):
-        if self.dataset_path is None:
-            yield
-            return
+        from pathlib import Path
 
         import lm_eval
-        self._task_config_post_init = lm_eval.api.task.TaskConfig.__post_init__
+        import lm_eval.tasks
 
-        def _patched(task_config, *args, **kwargs):
-            task_config.dataset_path = self.dataset_path
-            self._task_config_post_init(task_config, *args, **kwargs)
+        # Patch Path.relative_to to handle custom task paths outside lm_eval/tasks
+        # This is needed with lm_eval>=0.4.9.2 with new function pretty_print_task (a local function inside
+        # get_task_dict) calls yaml_path.relative_to(lm_eval_tasks_path) which fails
+        # when the yaml is from tensorrt_llm/evaluate/lm_eval_tasks
+        original_relative_to = Path.relative_to
 
-        lm_eval.api.task.TaskConfig.__post_init__ = _patched
+        def _patched_relative_to(self, other, *args, **kwargs):
+            try:
+                return original_relative_to(self, other, *args, **kwargs)
+            except ValueError:
+                # Return absolute path if relative_to fails (path not under base)
+                return self
+
+        Path.relative_to = _patched_relative_to
+
+        # Optionally patch dataset_path if provided
+        original_post_init = None
+        if self.dataset_path is not None:
+            original_post_init = lm_eval.api.task.TaskConfig.__post_init__
+
+            def _patched_post_init(task_config, *args, **kwargs):
+                task_config.dataset_path = self.dataset_path
+                original_post_init(task_config, *args, **kwargs)
+
+            lm_eval.api.task.TaskConfig.__post_init__ = _patched_post_init
 
         try:
             yield
         finally:
-            lm_eval.api.task.TaskConfig.__post_init__ = self._task_config_post_init
+            Path.relative_to = original_relative_to
+            if original_post_init is not None:
+                lm_eval.api.task.TaskConfig.__post_init__ = original_post_init
 
     def generate_samples(self) -> Iterable[tuple]:
         raise NotImplementedError()

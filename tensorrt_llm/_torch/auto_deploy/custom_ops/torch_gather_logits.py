@@ -5,14 +5,14 @@ import torch
 def gather_logits_before_lm_head(
     hidden_states: torch.Tensor,
     logits_gather_indices: torch.Tensor,  # long tensor
-    logits_gather_info: torch.Tensor,  # int tensor
+    logits_gather_info_host: torch.Tensor,  # int tensor
 ) -> torch.Tensor:
     """Gather hidden states using logits_gather_indices before LM head.
 
     Args:
         hidden_states: Hidden states tensor [b, 1, hidden] or [1, s_total, hidden]
         logits_gather_indices: indices for gathering logits.
-        logits_gather_info: info for gathering logits.
+        logits_gather_info_host: info for gathering logits.
     Returns:
         Gathered and flattened hidden states [num_gathered_tokens, hidden]
     """
@@ -21,7 +21,7 @@ def gather_logits_before_lm_head(
     hidden_states = hidden_states.squeeze(int(is_decode_only))
 
     # info object
-    num_tokens_to_gather, gather_required = logits_gather_info.tolist()
+    num_tokens_to_gather, gather_required = logits_gather_info_host.tolist()
 
     if gather_required:
         out = hidden_states.index_select(0, logits_gather_indices[:num_tokens_to_gather])
@@ -34,7 +34,7 @@ def gather_logits_before_lm_head(
 def gather_logits_before_lm_head_fake(
     hidden_states: torch.Tensor,
     logits_gather_indices: torch.Tensor,
-    logits_gather_info: torch.Tensor,
+    logits_gather_info_host: torch.Tensor,
 ) -> torch.Tensor:
     # NOTE: shape is not correct in fake mode
     # see https://github.com/NVIDIA/TensorRT-LLM/issues/9878
