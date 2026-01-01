@@ -1253,9 +1253,7 @@ class PerfSanityTestConfig:
                     new_data.update(server_config_dict)
                     new_data.update(client_config_dict)
                     # Add test_case_name for convenient filtering on OpenSearch
-                    new_data["s_test_case_name"] = (
-                        f"{new_data['s_server_name']}-{new_data['s_client_name']}"
-                    )
+                    new_data["s_test_case_name"] = f"{server_config.name}-{client_config.name}"
 
                     for metric_name in PERF_METRIC_LOG_QUERIES:
                         if metric_name in self._test_results[cmd_idx]:
@@ -1321,7 +1319,7 @@ class PerfSanityTestConfig:
                         new_data.update(gen_server_config_dict)
                     new_data.update(client_config_dict)
                     # Add test_case_name for convenient filtering on OpenSearch
-                    new_data["s_test_case_name"] = f"{disagg_config.name}-{client_config['name']}"
+                    new_data["s_test_case_name"] = f"{disagg_config.name}-{client_config.name}"
 
                     for metric_name in PERF_METRIC_LOG_QUERIES:
                         if metric_name in self._test_results[cmd_idx]:
