@@ -463,6 +463,7 @@ class DisaggConfig:
 
     def __init__(
         self,
+        name: str,
         disagg_serving_type: str,
         hostname: str,
         numa_bind: bool,
@@ -472,6 +473,7 @@ class DisaggConfig:
         hardware: dict,
         server_env_var: str,
     ):
+        self.name = name
         self.disagg_serving_type = disagg_serving_type
         self.hostname = hostname
         self.numa_bind = numa_bind
@@ -971,7 +973,7 @@ class PerfSanityTestConfig:
         # Create ctx server config
         ctx_server_config_data = {
             "concurrency": max(concurrency_values),
-            "name": f"ctx_{config_file_base_name}",
+            "name": config_file_base_name,
             "model_name": model_name,
             "gpus_per_node": gpus_per_node,
             **worker_config.get("ctx", {}),
@@ -980,7 +982,7 @@ class PerfSanityTestConfig:
         # Create gen server config
         gen_server_config_data = {
             "concurrency": max(concurrency_values),
-            "name": f"gen_{config_file_base_name}",
+            "name": config_file_base_name,
             "model_name": model_name,
             "gpus_per_node": gpus_per_node,
             **worker_config.get("gen", {}),
@@ -991,6 +993,7 @@ class PerfSanityTestConfig:
 
         # Create disagg config
         disagg_config = DisaggConfig(
+            name=config_file_base_name,
             disagg_serving_type=disagg_serving_type,
             hostname=socket.gethostname(),
             numa_bind=numa_bind,
@@ -1249,6 +1252,10 @@ class PerfSanityTestConfig:
                     new_data.update(job_config)
                     new_data.update(server_config_dict)
                     new_data.update(client_config_dict)
+                    # Add test_case_name for convenient filtering on OpenSearch
+                    new_data["s_test_case_name"] = (
+                        f"{new_data['s_server_name']}-{new_data['s_client_name']}"
+                    )
 
                     for metric_name in PERF_METRIC_LOG_QUERIES:
                         if metric_name in self._test_results[cmd_idx]:
@@ -1308,12 +1315,13 @@ class PerfSanityTestConfig:
                         "l_num_gen_servers": num_gen_servers,
                     }
                     new_data.update(job_config)
-
                     if num_ctx_servers > 0:
                         new_data.update(ctx_server_config_dict)
                     if num_gen_servers > 0:
                         new_data.update(gen_server_config_dict)
                     new_data.update(client_config_dict)
+                    # Add test_case_name for convenient filtering on OpenSearch
+                    new_data["s_test_case_name"] = f"{disagg_config.name}-{client_config['name']}"
 
                     for metric_name in PERF_METRIC_LOG_QUERIES:
                         if metric_name in self._test_results[cmd_idx]:
