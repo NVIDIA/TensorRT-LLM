@@ -304,6 +304,16 @@ def is_any_lin_op(node: Node) -> bool:
     return is_linear_op(node) or is_fake_quantized_linear_op(node)
 
 
+def is_fp4_op(node: Node) -> bool:
+    return is_op(
+        node,
+        [
+            torch.ops.auto_deploy.torch_quant_nvfp4_linear,
+            torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear,
+        ],
+    )
+
+
 def is_any_moe_op(node: Node) -> bool:
     return is_op(
         node,
@@ -739,10 +749,14 @@ def get_weight_shape(
     """Get the shape of the weight node."""
     if not is_any_lin_op(node):
         return None
+    s = list(shape(extract_weight_node(node)))
+    if is_fp4_op(node):
+        # FP4 weights are stored as half-sized FP8 tensor
+        s[-1] *= 2
     if dim is None:
-        return shape(extract_weight_node(node))
+        return s
     else:
-        return shape(extract_weight_node(node))[dim]
+        return s[dim]
 
 
 def get_layer_after_linear_node(
