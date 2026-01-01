@@ -197,23 +197,37 @@ def initialize(
     if shared_port is not None and port_ready_barrier is not None:
         if local_rank == 0:
             # Rank 0: try ports until one works, then share with other ranks
-            for attempt in range(max_retries):
-                ad_logger.info(
-                    f"Initializing for: {lib=}, {local_rank=}, {world_size=}, {port=} (attempt {attempt + 1})"
-                )
-                if _try_init_process_group(local_rank, world_size, port):
-                    # Success! Share the working port with other ranks
-                    shared_port.value = port
-                    port_ready_barrier.wait()  # Signal other ranks
-                    break
+            init_success = False
+            init_error = None
+            try:
+                for attempt in range(max_retries):
+                    ad_logger.info(
+                        f"Initializing for: {lib=}, {local_rank=}, {world_size=}, {port=} (attempt {attempt + 1})"
+                    )
+                    if _try_init_process_group(local_rank, world_size, port):
+                        # Success! Share the working port with other ranks
+                        shared_port.value = port
+                        init_success = True
+                        break
+                    else:
+                        # Port was taken, try a new one
+                        port = get_free_port()
                 else:
-                    # Port was taken, try a new one
-                    port = get_free_port()
-            else:
-                # All retries exhausted
-                shared_port.value = -1  # Signal failure
+                    # All retries exhausted
+                    init_error = RuntimeError(
+                        f"Failed to find available port after {max_retries} attempts"
+                    )
+            except Exception as e:
+                # Catch any unexpected error so we can still signal other ranks
+                init_error = e
+            finally:
+                # ALWAYS signal other ranks, even on error, to prevent deadlock
+                if not init_success:
+                    shared_port.value = -1
                 port_ready_barrier.wait()
-                raise RuntimeError(f"Failed to find available port after {max_retries} attempts")
+
+            if init_error is not None:
+                raise init_error
         else:
             # Other ranks: wait for rank 0 to find a working port
             port_ready_barrier.wait()
