@@ -279,12 +279,9 @@ def main(config: Optional[ExperimentConfig] = None):
     )
     results = {
         "prompts_and_outputs": print_outputs(outs),
-        # Add config values so they get logged to JET extra
-        "tp": config.args.world_size,
-        "compile_backend": config.args.compile_backend,
-        "attn_backend": config.args.attn_backend,
-        "runtime": config.args.runtime,
     }
+    # Add config values so they get logged to JET extra
+    results.update(config.model_dump(mode="json"))
 
     # run a benchmark for the model with batch_size == config.benchmark_bs
     if config.benchmark.enabled and config.args.runtime != "trtllm":
