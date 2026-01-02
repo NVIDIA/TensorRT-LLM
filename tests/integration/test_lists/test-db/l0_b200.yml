@@ -97,7 +97,6 @@ l0_b200:
     # ------------- AutoDeploy tests ---------------
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[False-1]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_fp8[1]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_fp8[4]
   - unittest/_torch/auto_deploy/unit/singlegpu
 - condition:
     ranges:
