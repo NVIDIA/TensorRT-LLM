@@ -77,6 +77,7 @@ class KvCacheCreator:
         speculative_config: SpeculativeConfig,
         sparse_attention_config: SparseAttentionConfig,
         profiling_stage_data: Optional[dict],
+        execution_stream: Optional[torch.cuda.Stream] = None,
     ):
         self._model_engine = model_engine
         self._draft_model_engine = draft_model_engine
@@ -97,6 +98,7 @@ class KvCacheCreator:
         self._profiling_stage_data = profiling_stage_data
         self._kv_cache_manager_cls = get_kv_cache_manager_cls(
             model_engine.model.model_config)
+        self._execution_stream = execution_stream
 
     def _get_kv_size_per_token(self):
         model_config = self._model_engine.model.model_config
@@ -474,6 +476,7 @@ class KvCacheCreator:
             max_beam_width=self._max_beam_width,
             kv_connector_manager=self._kv_connector_manager,
             estimating_kv_cache=estimating_kv_cache,
+            execution_stream=self._execution_stream,
         )
 
         # KVCacheManager (Non-draft) modifies the max_seq_len field, update it to self
@@ -527,14 +530,20 @@ class KvCacheCreator:
 
 
 def _create_kv_cache_manager(
-        model_engine: PyTorchModelEngine, kv_cache_manager_cls,
-        mapping: Mapping, kv_cache_config: KvCacheConfig, tokens_per_block: int,
-        max_seq_len: int, max_batch_size: int,
+        model_engine: PyTorchModelEngine,
+        kv_cache_manager_cls,
+        mapping: Mapping,
+        kv_cache_config: KvCacheConfig,
+        tokens_per_block: int,
+        max_seq_len: int,
+        max_batch_size: int,
         spec_config: Optional[SpeculativeConfig],
         sparse_attn_config: Optional[SparseAttentionConfig],
-        max_num_tokens: int, max_beam_width: int,
+        max_num_tokens: int,
+        max_beam_width: int,
         kv_connector_manager: Optional[KvCacheConnectorManager],
-        estimating_kv_cache: bool) -> KVCacheManager:
+        estimating_kv_cache: bool,
+        execution_stream: Optional[torch.cuda.Stream] = None) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model_engine
@@ -580,6 +589,7 @@ def _create_kv_cache_manager(
             if not estimating_kv_cache else None,
             sparse_attn_config=sparse_attn_config,
             is_estimating_kv_cache=estimating_kv_cache,
+            execution_stream=execution_stream,
         )
     elif is_nemotron_hybrid(config):
         if max_beam_width > 1:
@@ -623,6 +633,7 @@ def _create_kv_cache_manager(
             dtype=kv_cache_dtype,
             spec_config=spec_config,
             is_estimating_kv_cache=estimating_kv_cache,
+            execution_stream=execution_stream,
         )
     elif is_qwen3_next(config):
         if max_beam_width > 1:
@@ -672,6 +683,7 @@ def _create_kv_cache_manager(
             dtype=kv_cache_dtype,
             spec_config=spec_config,
             is_estimating_kv_cache=estimating_kv_cache,
+            execution_stream=execution_stream,
         )
     else:
         # NOTE: this is a workaround for VSWA to switch to calculate_max_num_blocks_from_cpp in KVCahceManager
@@ -700,6 +712,7 @@ def _create_kv_cache_manager(
             if not estimating_kv_cache else None,
             sparse_attn_config=sparse_attn_config,
             is_estimating_kv_cache=estimating_kv_cache,
+            execution_stream=execution_stream,
         )
     return kv_cache_manager
 
@@ -727,6 +740,7 @@ def create_py_executor_instance(
     scheduler_config: Optional[SchedulerConfig] = None,
     cache_transceiver_config: Optional[CacheTransceiverConfig] = None,
     virtual_memory_pools: Optional[dict] = None,
+    execution_stream: Optional[torch.cuda.Stream] = None,
 ) -> PyExecutor:
     kv_cache_manager = resources.get(ResourceManagerType.KV_CACHE_MANAGER, None)
 
@@ -813,6 +827,7 @@ def create_py_executor_instance(
             lora_config=lora_config,
             model_config=model_binding_config,
             world_config=world_config,
+            execution_stream=execution_stream,
         )
         resources[ResourceManagerType.PEFT_CACHE_MANAGER] = peft_cache_manager
         model_engine.set_lora_model_config(
@@ -875,7 +890,8 @@ def create_py_executor_instance(
         kv_connector_manager=kv_connector_manager,
         max_seq_len=max_seq_len,
         peft_cache_config=peft_cache_config,
-        virtual_memory_pools=virtual_memory_pools)
+        virtual_memory_pools=virtual_memory_pools,
+        execution_stream=execution_stream)
 
 
 def create_torch_sampler_args(

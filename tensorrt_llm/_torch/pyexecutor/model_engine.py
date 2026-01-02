@@ -888,9 +888,6 @@ class PyTorchModelEngine(ModelEngine):
         available_tokens = kv_cache_manager.get_num_available_tokens(
             self.runtime_draft_len)
         available_blocks = kv_cache_manager.get_num_free_blocks()
-        print(
-            f"available_tokens: {available_tokens}, num_tokens: {num_tokens}, num_gen_requests: {num_gen_requests}"
-        )
         if num_tokens > self.max_num_tokens or num_tokens > available_tokens:
             return None
 

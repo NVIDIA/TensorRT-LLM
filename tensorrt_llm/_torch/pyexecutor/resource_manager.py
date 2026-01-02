@@ -176,6 +176,7 @@ class KVCacheManager(BaseResourceManager):
         indexer_k_cache_quant_block_size: int = 128,
         indexer_k_cache_index_head_dim: int = 0,
         is_estimating_kv_cache: bool = False,
+        execution_stream: Optional[torch.cuda.Stream] = None,
         **kwargs,
     ) -> None:
         self.mapping = mapping
@@ -351,9 +352,13 @@ class KVCacheManager(BaseResourceManager):
         # Set up temp_attention_window_inputs
         temp_attention_window_inputs = self._set_temp_attention_window_inputs()
 
-        # Note that this stream is unused for now. Will be used for copying to host
-        # when that feature is enabled.
-        self._stream = torch.cuda.Stream()
+        # Use the provided execution stream for proper synchronization with KVCacheTransferManager.
+        # The execution stream is the stream where model forward kernels run, and KVCacheTransferManager
+        # needs to synchronize with it for onboard/offload operations.
+        # If no execution stream is provided, create a new one (for backward compatibility).
+        self._stream = execution_stream if execution_stream is not None else torch.cuda.Stream(
+        )
+        logger.info(f"[KVCacheManager] execution_stream: {self._stream}")
         kwargs = {
             'num_kv_heads_per_layer': self.num_kv_heads_per_layer,
             'size_per_head': head_dim,
@@ -365,7 +370,7 @@ class KVCacheManager(BaseResourceManager):
             'temp_attention_window_inputs': temp_attention_window_inputs,
             'dtype': dtype,
             'sink_token_length': sink_token_length,
-            'stream': self._stream.cuda_stream,
+            'stream': self._stream.cuda_stream,  # Pass to BufferManager
             'max_sequence_length': max_seq_len,
             'enable_block_reuse': kv_cache_config.enable_block_reuse,
             'onboard_blocks': kv_cache_config.onboard_blocks,
@@ -1442,7 +1447,8 @@ class PeftCacheManager(BaseResourceManager):
                  peft_cache_config: PeftCacheConfig,
                  lora_config: LoraConfig,
                  model_config: ModelConfigCpp,
-                 world_config: WorldConfig | None = None):
+                 world_config: WorldConfig | None = None,
+                 execution_stream: Optional[torch.cuda.Stream] = None):
         import tensorrt_llm.bindings as _tb
 
         peft_cache_config = peft_cache_config._to_pybind()
@@ -1467,8 +1473,12 @@ class PeftCacheManager(BaseResourceManager):
             world_config = _tb.WorldConfig()
 
         BufferManager = tensorrt_llm.bindings.internal.runtime.BufferManager
-        buffer_manager = BufferManager(torch.cuda.current_stream().cuda_stream,
-                                       True)
+        buffer_manager_stream = execution_stream.cuda_stream if execution_stream is not None else torch.cuda.current_stream(
+        ).cuda_stream
+        buffer_manager = BufferManager(buffer_manager_stream, True)
+        logger.info(
+            f"[PeftCacheManager] buffer_manager_stream: {buffer_manager_stream}"
+        )
         self.impl = PeftCacheManagerCpp(config=peft_cache_manager_config,
                                         model_config=model_config,
                                         world_config=world_config,

@@ -697,9 +697,13 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
 
         slurmRunner = null
         if (cluster.containerRuntime.toString() == "DOCKER") {
-            slurmRunner = runInDockerOnNodeMultiStage(LLM_DOCKER_IMAGE, nodeName, dockerArgs, true)
+            echo "${stageName} partitionTimeout: ${partition.time}"
+            def partitionTimeout = partition.time ? partition.time : SlurmConfig.DEFAULT_TIMEOUT_SHORT
+            slurmRunner = runInDockerOnNodeMultiStage(LLM_DOCKER_IMAGE, nodeName, dockerArgs, partitionTimeout, true)
         } else if (cluster.containerRuntime.toString() == "ENROOT") {
-            slurmRunner = runInEnrootOnNode(nodeName)
+            echo "${stageName} partitionTimeout: ${partition.time}"
+            def partitionTimeout = partition.time ? partition.time : SlurmConfig.DEFAULT_TIMEOUT_SHORT
+            slurmRunner = runInEnrootOnNode(nodeName, partitionTimeout)
         } else {
             throw new Exception("Unsupported container runtime: ${cluster.containerRuntime}")
         }
@@ -889,7 +893,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
     // Create a unique suffix for the job name
     String customSuffix = "${env.BUILD_TAG}-${UUID.randomUUID().toString().replaceAll("-", "").substring(0, 6)}".toLowerCase()
     def jobUID = "${cluster.host}-multi_node_test-${customSuffix}"
-    def disaggMode = stageName.contains("Perf-Sanity-Disagg")
+    def perfSanityMode = stageName.contains("PerfSanity")
+    def disaggMode = stageName.contains("PerfSanity-Disagg")
     def setSegment = disaggMode
 
     Utils.exec(pipeline, script: "env | sort && pwd && ls -alh")
@@ -1090,7 +1095,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 // Define environment variables to export
                 def envVarNames = [
                     'OPEN_SEARCH_DB_BASE_URL',
-                    'OPEN_SEARCH_DB_CREDENTIALS',
+                    'OPEN_SEARCH_DB_CREDENTIALS_USR',
+                    'OPEN_SEARCH_DB_CREDENTIALS_PSW',
                     'BUILD_ID',
                     'BUILD_URL',
                     'JOB_NAME',
@@ -1133,6 +1139,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     #SBATCH --output=${outputPath}
                     ${taskArgs.collect { "#SBATCH $it" }.join('\n')}
                     #SBATCH ${partition.additionalArgs}
+                    ${partition?.time ? "#SBATCH --time=${partition.time}" : "#SBATCH --time=${SlurmConfig.DEFAULT_TIMEOUT_SHORT}"}
                     ${(partition?.name && partition.name != "unspecified") ? "#SBATCH --partition=${partition.name}" : ""}
 
                     # SBATCH directives must appear before any executable commands.
@@ -2780,7 +2787,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             error "Some tests still failed after rerun attempts, please check the test report."
         }
 
-        if (perfMode && !stageName.contains("Perf-Sanity")) {
+        if (perfMode) {
             basePerfFilename = stageName.contains("PyTorch") ? "base_perf_pytorch.csv" : "base_perf.csv"
             basePerfPath = "${llmSrc}/tests/integration/defs/perf/${basePerfFilename}"
             stage("Check perf result") {
@@ -2806,7 +2813,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             }
         }
 
-        if (perfMode && stageName.contains("Perf-Sanity")) {
+        if (stageName.contains("PerfSanity")) {
             stage ("Check perf result") {
                 def perfCheckResult = sh(
                     script: """
@@ -2815,10 +2822,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                     """,
                     returnStatus: true
                 )
-                // TODO: Enable this when perf regression check is stable
-                // if (perfCheckResult != 0) {
-                //     error "Performance regression detected and failing the build (exit code: ${perfCheckResult})"
-                // }
+                if (perfCheckResult != 0) {
+                    error "Performance regression detected and failing the build (exit code: ${perfCheckResult})"
+                }
             }
         }
     }
@@ -3013,7 +3019,7 @@ def ensureStageResultNotUploaded(stageName) {
 }
 
 // TODO: Update existing functions to use runInDockerOnNodeMultiStage and get rid of runInDockerOnNode
-def runInDockerOnNodeMultiStage(image, label, dockerArgs, needToDeleteDir=true)
+def runInDockerOnNodeMultiStage(image, label, dockerArgs, partitionTimeout, needToDeleteDir=true)
 {
     return {
         runner -> node(label) {
@@ -3024,9 +3030,9 @@ def runInDockerOnNodeMultiStage(image, label, dockerArgs, needToDeleteDir=true)
                 stage('Pull Docker Image') {
                     docker.image(image).pull()
                 }
-                // We submit the Slurm job with SlurmConfig.DEFAULT_TIMEOUT minutes (300) timeout
+                // We submit the Slurm job with the Slurm partition's time spec.
                 // Minus 10 minutes to avoid the Slurm job being stopped earlier.
-                timeout(time: SlurmConfig.DEFAULT_TIMEOUT - 10, unit: 'MINUTES') {
+                timeout(time: partitionTimeout - 10, unit: 'MINUTES') {
                     docker.image(image).inside(dockerArgs) {
                         runner()
                     }
@@ -3042,13 +3048,13 @@ def runInDockerOnNodeMultiStage(image, label, dockerArgs, needToDeleteDir=true)
     }
 }
 
-def runInEnrootOnNode(label)
+def runInEnrootOnNode(label, partitionTimeout)
 {
     return {
         runner -> node(label) {
-            // We submit the Slurm job with SlurmConfig.DEFAULT_TIMEOUT_SHORT minutes (240) timeout
+            // We submit the Slurm job with the Slurm partition's time spec.
             // Minus 10 minutes to avoid the Slurm job being stopped earlier.
-            timeout(time: SlurmConfig.DEFAULT_TIMEOUT_SHORT - 10, unit: 'MINUTES') {
+            timeout(time: partitionTimeout - 10, unit: 'MINUTES') {
                 runner()
             }
         }
@@ -3182,7 +3188,7 @@ def launchTestJobs(pipeline, testFilter)
         "RTXPro6000D-4_GPUs-PyTorch-Post-Merge-2": ["rtx-pro-6000d-x4", "l0_rtx_pro_6000", 2, 2, 4],
     ]
 
-    parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("Perf")), {
+    parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("-Perf-")), {
         def config = VANILLA_CONFIG
         if (key.contains("single-device")) {
             config = SINGLE_DEVICE_CONFIG
@@ -3193,7 +3199,7 @@ def launchTestJobs(pipeline, testFilter)
         if (key.contains("Pybind")) {
             config = PYBIND_CONFIG
         }
-        runLLMTestlistOnPlatform(pipeline, values[0], values[1], config, key.contains("Perf"), key, values[2], values[3])
+        runLLMTestlistOnPlatform(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3])
     }]]}
     fullSet = parallelJobs.keySet()
 
@@ -3214,9 +3220,12 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["b300-x4", "l0_dgx_b300", 1, 2, 4],
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-2": ["b300-x4", "l0_dgx_b300", 2, 2, 4],
         // Perf sanity post merge test
-        // "DGX_B200-4_GPUs-PyTorch-Perf-Sanity-Post-Merge-1": ["b200-x4", "l0_dgx_b200_perf_sanity", 1, 1, 4],
-        // "DGX_B200-8_GPUs-PyTorch-Perf-Sanity-Post-Merge-1": ["b200-x8", "l0_dgx_b200_perf_sanity", 1, 1, 8],
-        // "DGX_B300-4_GPUs-PyTorch-Perf-Sanity-Post-Merge-1": ["b300-x4", "l0_dgx_b300_perf_sanity", 1, 1, 4],
+        // "DGX_B200-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["b200-x4", "l0_dgx_b200_perf_sanity", 1, 3, 4],
+        // "DGX_B200-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["b200-x4", "l0_dgx_b200_perf_sanity", 2, 3, 4],
+        // "DGX_B200-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["b200-x4", "l0_dgx_b200_perf_sanity", 3, 3, 4],
+        // "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["b200-x8", "l0_dgx_b200_perf_sanity", 1, 3, 8],
+        // "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["b200-x8", "l0_dgx_b200_perf_sanity", 2, 3, 8],
+        // "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["b200-x8", "l0_dgx_b200_perf_sanity", 3, 3, 8],
     ]
     fullSet += x86SlurmTestConfigs.keySet()
 
@@ -3228,7 +3237,7 @@ def launchTestJobs(pipeline, testFilter)
         if (key.contains("llvm")) {
             config = LLVM_CONFIG
         }
-        runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("Perf"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false)
+        runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false)
     }]]}
 
     parallelJobs += parallelSlurmJobs
@@ -3247,11 +3256,25 @@ def launchTestJobs(pipeline, testFilter)
         "GB200-4_GPUs-PyTorch-2": ["gb200-x4-oci", "l0_gb200_multi_gpus", 2, 2, 4],
         "GB200-4_GPUs-PyTorch-Post-Merge-1": ["gb200-x4-oci", "l0_gb200_multi_gpus", 1, 1, 4],
         "GB10-PyTorch-Post-Merge-1": ["gb10x-single", "l0_gb10", 1, 1],
-        // Perf sanity post merge test
-        "GB200-4_GPUs-PyTorch-Perf-Sanity-Post-Merge-1": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 1, 1, 4],
         // Disable GB300 stages due to nodes will be offline temporarily.
         // "GB300-PyTorch-1": ["gb300-single", "l0_gb300", 1, 1],
         // "GB300-4_GPUs-PyTorch-Post-Merge-1": ["gb300-x4", "l0_gb300_multi_gpus", 1, 1, 4],
+        // Perf sanity pre merge test
+        "GB200-4_GPUs-PyTorch-PerfSanity-4": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 4, 14, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-5": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 5, 14, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-6": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 6, 14, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-11": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 11, 14, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-12": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 12, 14, 4],
+        // Perf sanity post merge test
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 1, 14, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 2, 14, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 3, 14, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-7": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 7, 14, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-8": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 8, 14, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-9": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 9, 14, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-10": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 10, 14, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-13": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 13, 14, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-14": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 14, 14, 4],
     ]
     fullSet += SBSASlurmTestConfigs.keySet()
 
@@ -3263,13 +3286,15 @@ def launchTestJobs(pipeline, testFilter)
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-1": ["gb200-oci-trtllm", "l0_gb200_multi_nodes", 1, 3, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-2": ["gb200-oci-trtllm", "l0_gb200_multi_nodes", 2, 3, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-3": ["gb200-oci-trtllm", "l0_gb200_multi_nodes", 3, 3, 8, 2],
-        // Perf sanity post merge aggr tests
-        "GB200-8_GPUs-2_Nodes-PyTorch-Perf-Sanity-Post-Merge-1": ["gb200-oci-trtllm", "l0_gb200_multi_nodes_aggr_perf_sanity_2_nodes_001", 1, 1, 8, 2],
-        // Perf sanity post merge disagg tests
-        "GB200-12_GPUs-3_Nodes-PyTorch-Perf-Sanity-Disagg-Post-Merge-1": ["gb200-oci-trtllm", "l0_gb200_multi_nodes_disagg_perf_sanity_3_nodes_001", 1, 1, 12, 3],
-        // "GB200-24_GPUs-6_Nodes-PyTorch-Perf-Sanity-Disagg-Post-Merge-1": ["gb200-oci-trtllm", "l0_gb200_multi_nodes_disagg_perf_sanity_6_nodes_001", 1, 1, 24, 6],
-        // "GB200-24_GPUs-6_Nodes-PyTorch-Perf-Sanity-Disagg-Post-Merge-2": ["gb200-oci-trtllm", "l0_gb200_multi_nodes_disagg_perf_sanity_6_nodes_002", 1, 1, 24, 6],
-        // "GB200-32_GPUs-8_Nodes-PyTorch-Perf-Sanity-Disagg-Post-Merge-1": ["gb200-oci-trtllm", "l0_gb200_multi_nodes_disagg_perf_sanity_8_nodes_001", 1, 1, 32, 8],
+        // Perf sanity pre merge tests
+        // "GB200-12_GPUs-3_Nodes-PyTorch-PerfSanity-Disagg-1": ["gb200-oci-trtllm", "l0_gb200_multi_nodes_disagg_perf_sanity_3_nodes", 1, 1, 12, 3],
+        // Perf sanity post merge tests
+        "GB200-8_GPUs-2_Nodes-PyTorch-PerfSanity-Post-Merge-1": ["gb200-oci-trtllm", "l0_gb200_multi_nodes_aggr_perf_sanity_2_nodes", 1, 2, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-PerfSanity-Post-Merge-2": ["gb200-oci-trtllm", "l0_gb200_multi_nodes_aggr_perf_sanity_2_nodes", 2, 2, 8, 2],
+        "GB200-12_GPUs-3_Nodes-PyTorch-PerfSanity-Disagg-Post-Merge-1": ["gb200-oci-trtllm", "l0_gb200_multi_nodes_disagg_perf_sanity_3_nodes", 1, 1, 12, 3],
+        // "GB200-24_GPUs-6_Nodes-PyTorch-PerfSanity-Disagg-Post-Merge-1": ["gb200-oci-trtllm", "l0_gb200_multi_nodes_disagg_perf_sanity_6_nodes", 1, 2, 24, 6],
+        // "GB200-24_GPUs-6_Nodes-PyTorch-PerfSanity-Disagg-Post-Merge-2": ["gb200-oci-trtllm", "l0_gb200_multi_nodes_disagg_perf_sanity_6_nodes", 2, 2, 24, 6],
+        // "GB200-32_GPUs-8_Nodes-PyTorch-PerfSanity-Disagg-Post-Merge-1": ["gb200-oci-trtllm", "l0_gb200_multi_nodes_disagg_perf_sanity_8_nodes", 1, 1, 32, 8],
     ]
     fullSet += multiNodesSBSAConfigs.keySet()
 
@@ -3287,7 +3312,7 @@ def launchTestJobs(pipeline, testFilter)
             if (key.contains("llvm")) {
                 config = LLVM_CONFIG
             }
-            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("Perf"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false)
+            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false)
         }]]}
         parallelJobs += parallelSlurmJobs
 
@@ -3300,7 +3325,7 @@ def launchTestJobs(pipeline, testFilter)
             if (key.contains("llvm")) {
                 config = LLVM_CONFIG
             }
-            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("Perf"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 2, values[6] ?: false)
+            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 2, values[6] ?: false)
         }]]}
 
         parallelJobs += parallelMultiNodesSBSAJobs
