@@ -11,8 +11,11 @@ deepseek-ai/DeepSeek-V3-Lite:
 google/gemma-3-1b-it:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
-    accuracy: 63.00
+    accuracy: 61.00
 GPT-OSS/120B-MXFP4:
+  - quant_algo: W4A16_MXFP4
+    spec_dec_algo: Eagle
+    accuracy: 62.00
   - quant_algo: W4A8_MXFP4_MXFP8
     spec_dec_algo: Eagle
-    accuracy: 56.00
+    accuracy: 62.00
