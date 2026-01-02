@@ -19,7 +19,6 @@ from torch.fx import GraphModule, Node
 
 from ..models.factory import ModelFactory
 from ..shim.interface import CachedSequenceInterface
-from ..transform.graph_module_visualizer import to_dot
 from ..utils._graph import (
     add_graph_input,
     canonicalize_graph,
@@ -30,6 +29,7 @@ from ..utils._graph import (
 )
 from ..utils.cuda_mem_tracker import get_mem_info
 from ..utils.logger import ad_logger
+from .graph_module_visualizer import to_dot
 
 # ANSI color codes for log formatting (set to False to disable colors)
 # NOTE: colors disabled by default to make logging in CI/CD pipelines easier to read

@@ -160,8 +160,8 @@ class ExportToONNX(BaseTransform):
     4. Processing and exporting chat templates
 
     The exported ONNX model includes custom ops from the auto_deploy. These custom ops include:
-    - AttentionPlugin: Fused RoPE + Attention for efficient inference(exported as DriveOS LLM's custom op)
-    - GatherND: N-dimensional gather operation (exported as onnxscript.opset20.GatherND)
+    - torch_onnx_attention_plugin: Fused RoPE + Attention for efficient inference(exported as DriveOS LLM's custom op)
+    - torch_onnx_gather_nd: N-dimensional gather operation (exported as onnxscript.opset20.GatherND)
 
     Note:
         This transform does NOT modify the input graph. It only exports the graph
@@ -242,7 +242,7 @@ class ExportToONNX(BaseTransform):
         # Add dynamic shapes for past_key_values
         num_layers = len(
             gm.graph.find_nodes(
-                op="call_function", target=torch.ops.auto_deploy.AttentionPlugin.default
+                op="call_function", target=torch.ops.auto_deploy.torch_onnx_attention_plugin.default
             )
         )
         for i in range(num_layers):
@@ -269,8 +269,8 @@ class ExportToONNX(BaseTransform):
             # Before and after fuse rope attention
             torch.ops.auto_deploy.torch_linear_simple.default: _translate_simple_linear_op,
             # After fuse rope attention
-            torch.ops.auto_deploy.AttentionPlugin.default: _translate_rope_attention_op,
-            torch.ops.auto_deploy.GatherND.default: _translate_gather_nd_op,
+            torch.ops.auto_deploy.torch_onnx_attention_plugin.default: _translate_rope_attention_op,
+            torch.ops.auto_deploy.torch_onnx_gather_nd.default: _translate_gather_nd_op,
         }
 
         # Prepare output names
