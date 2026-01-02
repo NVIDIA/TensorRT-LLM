@@ -606,13 +606,7 @@ class NemotronHForCausalLM(NemotronHPreTrainedModel, GenerationMixin):
         self.backbone = NemotronHModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        # Recursively iterate over all modules in self.backbone and list those with A_minus or A_log in their name
-        self.backbone_modules_with_A = []
-        for module_name, module in self.backbone.named_modules():
-            for param_name, _ in module.named_parameters(recurse=False):
-                if param_name in ("A_minus", "A_log"):
-                    self.register_load_state_dict_pre_hook(self._a_log_pre_hook)
-                    self.backbone_modules_with_A.append((module_name, param_name))
+        self.register_load_state_dict_pre_hook(self._a_log_pre_hook)
 
         # Initialize weights and apply final processing
         self.post_init()
