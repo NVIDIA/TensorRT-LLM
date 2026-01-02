@@ -281,7 +281,7 @@ class ExecutorRequestQueue:
     def _fetch_and_process_requests(
         self,
         total_num_active_requests: int,
-        total_max_num_active_requests: int,
+        remaining_capacity: int,
         enable_attention_dp: bool,
         all_ranks_num_active_requests: Optional[List[int]] = None
     ) -> List[RequestQueueItem]:
@@ -328,7 +328,7 @@ class ExecutorRequestQueue:
 
         new_requests = self._get_from_waiting_queue(
             self.waiting_queue,
-            total_max_num_active_requests - total_num_active_requests,
+            remaining_capacity,
             enable_attention_dp, all_ranks_num_active_requests)
 
         # Update performance metrics
@@ -347,18 +347,16 @@ class ExecutorRequestQueue:
         else:
             num_active_requests = num_active_requests_on_engine if self.is_sm_disagg else len(
                 activate_requests)
-            return self._fetch_new_requests_attention_tp(num_active_requests)
+            remaining_capacity = self.max_num_active_requests - len(activate_requests)
+            return self._fetch_new_requests_attention_tp(num_active_requests, remaining_capacity)
 
     def _fetch_new_requests_attention_tp(
-            self, num_active_requests: int) -> List[LlmRequest]:
+            self, num_active_requests: int, remaining_capacity: int) -> List[LlmRequest]:
         """Handle standard (non-attention DP) request fetching."""
-        total_num_active_requests = num_active_requests
-        total_max_num_active_requests = self.max_num_active_requests
-
         # fetch and process requests into waiting queue
         new_requests = self._fetch_and_process_requests(
-            total_num_active_requests,
-            total_max_num_active_requests,
+            num_active_requests,
+            remaining_capacity,
             enable_attention_dp=False)
 
         # Merge requests and add to active list
@@ -385,7 +383,7 @@ class ExecutorRequestQueue:
         # fetch and process requests into waiting queue
         new_requests = self._fetch_and_process_requests(
             total_num_active_requests,
-            total_max_num_active_requests,
+            total_max_num_active_requests - total_num_active_requests,
             enable_attention_dp=True,
             all_ranks_num_active_requests=all_ranks_num_active_requests)
 
