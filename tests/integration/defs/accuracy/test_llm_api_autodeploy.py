@@ -272,15 +272,15 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
                               n=beam_width,
                               use_beam_search=beam_width > 1)
 
-    # 180GB works, might be able to go lower
-    @pytest.mark.skip_less_device_memory(180000)
-    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(
+        32000)  # might need to require more memory
+    @pytest.mark.skip_less_device(8)
     def test_bf16(self):
         kwargs = self.get_default_kwargs()
         sampling_params = self.get_default_sampling_params()
         with AutoDeployLLM(model=self.MODEL_PATH_BF16,
                            tokenizer=self.MODEL_PATH_BF16,
-                           world_size=4,
+                           world_size=8,
                            **kwargs) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=sampling_params)
