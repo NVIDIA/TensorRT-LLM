@@ -1140,8 +1140,15 @@ class AutoTuner:
                 opt_shapes = spec.gen_tuning_buckets
             # Add the current input value as one of the opt values
             opt_shapes = set(opt_shapes)
-            opt_shapes.add(
-                base_profile.shapes[spec.input_idx][spec.dim_idx].val)
+            if tuning_config.tune_max_num_tokens is not None:
+                opt_shapes.add(
+                    min(
+                        tuning_config.tune_max_num_tokens,
+                        base_profile.shapes[spec.input_idx][spec.dim_idx].val,
+                    ))
+            else:
+                opt_shapes.add(
+                    base_profile.shapes[spec.input_idx][spec.dim_idx].val)
             opt_shapes = sorted(list(opt_shapes))
             opt_shapes_max = tuple(opt_shapes[1:]) + (float('inf'), )
             opt_shapes_max = {
