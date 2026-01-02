@@ -1077,7 +1077,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(8)
     @pytest.mark.parametrize("block_reuse", [False, True])
-    def test_auto_dtype(self, block_reuse, mocker):
+    def test_mxfp4(self, block_reuse, mocker):
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
                           {"scores_filter": "exact_match,flexible-extract"})
