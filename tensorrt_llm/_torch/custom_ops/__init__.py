@@ -2,6 +2,8 @@ from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..modules.attention import attn_custom_op_inplace, mla_custom_op_inplace
 from .cpp_custom_ops import _register_fake
+from .nccl_window_custom_ops import (add_to_nccl_window, copy_to_nccl_window,
+                                     matmul_to_nccl_window)
 from .torch_custom_ops import bmm_out
 from .trtllm_gen_custom_ops import fp8_block_scale_moe_runner
 from .userbuffers_custom_ops import add_to_ub, copy_to_userbuffers, matmul_to_ub
@@ -14,6 +16,9 @@ __all__ = [
     'add_to_ub',
     'copy_to_userbuffers',
     'matmul_to_ub',
+    'add_to_nccl_window',
+    'copy_to_nccl_window',
+    'matmul_to_nccl_window',
     'attn_custom_op_inplace',
     'mla_custom_op_inplace',
     'IS_CUTLASS_DSL_AVAILABLE',

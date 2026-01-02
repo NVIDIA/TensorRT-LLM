@@ -7,6 +7,9 @@ from torch._inductor.pattern_matcher import (MULTIPLE, CallFunction, KeywordArg,
 aten = torch.ops.aten
 from torch._higher_order_ops.auto_functionalize import auto_functionalized
 
+import tensorrt_llm
+from tensorrt_llm import logger
+
 
 def register_add_norm(custom_pass: PatternMatcherPass):
     residual = KeywordArg("residual")
@@ -45,17 +48,32 @@ def register_add_norm(custom_pass: PatternMatcherPass):
         return at[1], at[2]
 
     def extra_check(match: Match):
+        if tensorrt_llm.mpi_rank() == 0:
+            logger.debug(
+                "[ADD_NORM] Pattern: extra_check called - pattern matched! "
+                f"pattern_to_node keys: {list(match.ctx.pattern_to_node.keys())}"
+            )
         # Check the original residual and hidden has no other users since we will inplace update them
         residual_node = match.ctx.pattern_to_node[add_Tensor]
         if not isinstance(residual_node, torch.fx.graph.Node):
+            if tensorrt_llm.mpi_rank() == 0:
+                logger.debug(
+                    "[ADD_NORM] Pattern: extra_check failed: residual_node is not a Node"
+                )
             return False
 
         # torch uses dict here to guarantee the order of the uses
         if list(residual_node.args[0].users.keys()
                 )[-1] != residual_node or list(
                     residual_node.args[1].users.keys())[-1] != residual_node:
+            if tensorrt_llm.mpi_rank() == 0:
+                logger.debug(
+                    "[ADD_NORM] Pattern: extra_check failed: users check failed"
+                )
             return False
 
+        if tensorrt_llm.mpi_rank() == 0:
+            logger.debug("[ADD_NORM] Pattern: extra_check passed")
         return True
 
     register_replacement(

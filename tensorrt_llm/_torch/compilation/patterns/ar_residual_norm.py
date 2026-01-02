@@ -11,11 +11,18 @@ from torch._inductor.pattern_matcher import (MULTIPLE, CallFunction, Ignored,
 from ...distributed import AllReduceFusionOp, AllReduceStrategy
 
 aten = torch.ops.aten
+import tensorrt_llm
+from tensorrt_llm import logger
 from tensorrt_llm.mapping import Mapping
 
 
 def register_ar_residual_norm(custom_pass: PatternMatcherPass,
                               mapping: Mapping):
+    if tensorrt_llm.mpi_rank() == 0:
+        logger.debug(
+            "[AR_RESIDUAL_NORM] Pattern: Registering pattern with "
+            f"group={mapping.tp_group}, fusion_op={int(AllReduceFusionOp.NONE)}"
+        )
     residual_key = KeywordArg("residual")
     trtllm_allreduce_default = CallFunction(
         torch.ops.trtllm.allreduce.default, KeywordArg("input"), None, None,
@@ -64,22 +71,46 @@ def register_ar_residual_norm(custom_pass: PatternMatcherPass,
         return all_reduce_output[0], all_reduce_output[1]
 
     def extra_check(match: Match) -> bool:
+        if tensorrt_llm.mpi_rank() == 0:
+            logger.debug(
+                "[AR_RESIDUAL_NORM] Pattern: extra_check called - pattern matched! "
+                f"pattern_to_node keys: {list(match.ctx.pattern_to_node.keys())}"
+            )
         # Residual should be a tensor
         residual_node = match.ctx.pattern_to_node[residual_key]
         if not isinstance(residual_node, torch.fx.graph.Node):
+            if tensorrt_llm.mpi_rank() == 0:
+                logger.debug(
+                    "[AR_RESIDUAL_NORM] Pattern: extra_check failed: residual_node is not a Node"
+                )
             return False
         getitem_node = match.ctx.pattern_to_node[getitem_x]
         if not isinstance(getitem_node, torch.fx.graph.Node):
+            if tensorrt_llm.mpi_rank() == 0:
+                logger.debug(
+                    "[AR_RESIDUAL_NORM] Pattern: extra_check failed: getitem_node is not a Node"
+                )
             return False
 
         getitem_node_shape = getitem_node.meta["tensor_meta"].shape
         residual_node_shape = residual_node.meta["tensor_meta"].shape
 
         if getitem_node_shape != residual_node_shape:
+            if tensorrt_llm.mpi_rank() == 0:
+                logger.debug(
+                    f"[AR_RESIDUAL_NORM] Pattern: extra_check failed: shape mismatch "
+                    f"getitem={getitem_node_shape}, residual={residual_node_shape}"
+                )
             return False
 
+        if tensorrt_llm.mpi_rank() == 0:
+            logger.debug("[AR_RESIDUAL_NORM] Pattern: extra_check passed")
         return True
 
+    if tensorrt_llm.mpi_rank() == 0:
+        logger.debug(
+            "[AR_RESIDUAL_NORM] Pattern: Registering replacement for ar_residual_norm"
+        )
     register_replacement(
         empty_pattern,
         target_pattern,
@@ -716,6 +747,351 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
     register_ub_finalize_patterns(custom_passes[-1])
 
 
+def register_nccl_symmetric_patterns(custom_passes: List[PatternMatcherPass],
+                                     mapping: Mapping,
+                                     match_auto_strategy: bool = False):
+    """
+    Register NCCL_SYMMETRIC patterns.
+
+    Args:
+        custom_passes: List of pattern matcher passes to register patterns in
+        mapping: Mapping configuration for TP group
+        match_auto_strategy: If True, match AUTO strategy nodes (strategy=3) and convert to NCCL_SYMMETRIC.
+                           If False, match NCCL_SYMMETRIC strategy nodes (strategy=8) directly.
+                           Should be True when NCCL_SYMMETRIC is requested but graph nodes have AUTO.
+    """
+
+    def register_convert_supported_ar_to_nccl_symmetric(
+            custom_pass: PatternMatcherPass):
+        # FX normalizes keyword arguments to positional arguments based on schema
+        # Pattern should match positional arguments in schema order:
+        # input, residual, norm_weight, scale, bias, workspace, group, strategy, op, eps, trigger_completion_at_end
+        # When match_auto_strategy=True, match AUTO strategy nodes (strategy=3) since graph nodes
+        # typically have AUTO even when NCCL_SYMMETRIC is requested in config. The pattern will convert them to NCCL_SYMMETRIC.
+        # When match_auto_strategy=False, match NCCL_SYMMETRIC strategy nodes (strategy=8) directly.
+        strategy = int(AllReduceStrategy.AUTO) if match_auto_strategy else int(
+            AllReduceStrategy.NCCL_SYMMETRIC)
+        input_node = KeywordArg('input')
+        fusion = KeywordArg('op')  # Schema uses 'op', not 'fusion_op'
+        trtllm_allreduce_default = CallFunction(
+            torch.ops.trtllm.allreduce.default, input_node,
+            KeywordArg('residual'), KeywordArg('norm_weight'),
+            KeywordArg('scale'), None, Ignored(), mapping.tp_group, strategy,
+            fusion, KeywordArg('eps'), Ignored())
+
+        if tensorrt_llm.mpi_rank() == 0:
+            if match_auto_strategy:
+                logger.debug(
+                    "[NCCL_SYMMETRIC] Pattern: Registering pattern to match AUTO strategy "
+                    f"(strategy={strategy}) and convert to NCCL_SYMMETRIC, group={mapping.tp_group}"
+                )
+            else:
+                logger.debug(
+                    "[NCCL_SYMMETRIC] Pattern: Registering pattern to match NCCL_SYMMETRIC strategy "
+                    f"(strategy={strategy}), group={mapping.tp_group}")
+
+        def empty_convert_supported_ar_to_nccl_symmetric(
+            input: torch.Tensor,
+            residual_in: torch.Tensor,
+            gamma: torch.Tensor,
+            scale: Optional[torch.Tensor],
+            fusion_op: int,
+            eps: float,
+        ):
+            return
+
+        def target_convert_supported_ar_to_nccl_symmetric(
+            input: torch.Tensor,
+            residual_in: torch.Tensor,
+            gamma: torch.Tensor,
+            scale: Optional[torch.Tensor],
+            fusion_op: int,
+            eps: float,
+        ):
+            input = torch.ops.trtllm.copy_to_nccl_window(
+                input, mapping.tp_group)
+            all_reduce_output = torch.ops.trtllm.allreduce(
+                input, residual_in, gamma, scale, None, None, mapping.tp_group,
+                int(AllReduceStrategy.NCCL_SYMMETRIC), fusion_op, eps, False)
+            return all_reduce_output
+
+        def extra_check_convert_supported_ar_to_nccl_symmetric(
+                match: Match) -> bool:
+            # No dtype restriction for NCCL_SYMMETRIC - it supports all dtypes (f32, f16, bf16, etc.)
+            # The dtype check is only needed for UB patterns, not NCCL_SYMMETRIC
+
+            if tensorrt_llm.mpi_rank() == 0:
+                logger.debug(
+                    "[NCCL_SYMMETRIC] Pattern: extra_check called - pattern matched! "
+                    f"pattern_to_node keys: {list(match.ctx.pattern_to_node.keys())}"
+                )
+
+            try:
+                fusion_value = match.ctx.pattern_to_node[fusion]
+                if tensorrt_llm.mpi_rank() == 0:
+                    logger.debug(
+                        f"[NCCL_SYMMETRIC] Pattern: extra_check extracted fusion_value={fusion_value} (type={type(fusion_value)})"
+                    )
+            except KeyError as e:
+                if tensorrt_llm.mpi_rank() == 0:
+                    logger.debug(
+                        f"[NCCL_SYMMETRIC] Pattern: extra_check failed: fusion (op) not found: {e}, "
+                        f"pattern_to_node keys: {list(match.ctx.pattern_to_node.keys())}"
+                    )
+                return False
+
+            if not isinstance(fusion_value, int):
+                if tensorrt_llm.mpi_rank() == 0:
+                    logger.debug(
+                        f"[NCCL_SYMMETRIC] Pattern: extra_check failed: fusion_value is not int, got {type(fusion_value)}"
+                    )
+                return False
+            # NCCL_SYMMETRIC supports: RESIDUAL_RMS_NORM and RESIDUAL_RMS_NORM_QUANT_FP8
+            # FP4 (RESIDUAL_RMS_NORM_QUANT_NVFP4) is NOT supported for NCCL_SYMMETRIC
+            if fusion_value != int(
+                    AllReduceFusionOp.RESIDUAL_RMS_NORM
+            ) and fusion_value != int(
+                    AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8):
+                if tensorrt_llm.mpi_rank() == 0:
+                    logger.debug(
+                        f"[NCCL_SYMMETRIC] Pattern: extra_check failed: fusion_value={fusion_value} not in supported list "
+                        f"(RESIDUAL_RMS_NORM={int(AllReduceFusionOp.RESIDUAL_RMS_NORM)}, "
+                        f"RESIDUAL_RMS_NORM_QUANT_FP8={int(AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8)})"
+                    )
+                return False
+
+            if tensorrt_llm.mpi_rank() == 0:
+                logger.debug(
+                    f"[NCCL_SYMMETRIC] Pattern: extra_check passed: fusion_value={fusion_value}"
+                )
+            return True
+
+        if tensorrt_llm.mpi_rank() == 0:
+            logger.debug(
+                "[NCCL_SYMMETRIC] Pattern: Registering replacement for convert_supported_ar_to_nccl_symmetric"
+            )
+        register_replacement(
+            empty_convert_supported_ar_to_nccl_symmetric,
+            target_convert_supported_ar_to_nccl_symmetric,
+            [],
+            fwd_only,
+            custom_pass,
+            search_fn_pattern=trtllm_allreduce_default,
+            extra_check=extra_check_convert_supported_ar_to_nccl_symmetric,
+        )
+
+    def register_nccl_symmetric_prologue_patterns(
+            custom_pass: PatternMatcherPass):
+
+        def register_scaled_mm_prologue(custom_pass: PatternMatcherPass):
+            trtllm_cublas_scaled_mm_default = CallFunction(
+                torch.ops.trtllm.cublas_scaled_mm.default, KeywordArg('mm0_a'),
+                KeywordArg('mm0_b'), KeywordArg('mm0_a_scale'),
+                KeywordArg('mm0_b_scale'), KeywordArg('mm0_bias'),
+                KeywordArg('mm_dtype'))
+            nccl_copy = CallFunction(torch.ops.trtllm.copy_to_nccl_window,
+                                     trtllm_cublas_scaled_mm_default,
+                                     mapping.tp_group)
+
+            def empty_scaled_mm_prologue_pattern(
+                mm0_a: torch.Tensor,
+                mm0_b: torch.Tensor,
+                mm0_a_scale: torch.Tensor,
+                mm0_b_scale: torch.Tensor,
+                mm0_bias: Optional[torch.Tensor],
+                mm_dtype: torch.dtype,
+            ):
+                return
+
+            def target_scaled_mm_prologue_pattern(
+                mm0_a: torch.Tensor,
+                mm0_b: torch.Tensor,
+                mm0_a_scale: torch.Tensor,
+                mm0_b_scale: torch.Tensor,
+                mm0_bias: Optional[torch.Tensor],
+                mm_dtype: torch.dtype,
+            ):
+                # TODO: When GEMM refactoring is done, use allocator parameter
+                # For now, create window tensor and use it as output
+                scaled_mm_output = torch.ops.trtllm.cublas_scaled_mm(
+                    mm0_a, mm0_b, mm0_a_scale, mm0_b_scale, mm0_bias, mm_dtype,
+                    False)  # Keep False for now until allocator refactoring
+                return torch.ops.trtllm.copy_to_nccl_window(
+                    scaled_mm_output, mapping.tp_group)
+
+            register_replacement(
+                empty_scaled_mm_prologue_pattern,
+                target_scaled_mm_prologue_pattern,
+                [],
+                fwd_only,
+                custom_pass,
+                search_fn_pattern=nccl_copy,
+            )
+
+        def register_nvfp4_gemm_prologue(custom_pass: PatternMatcherPass):
+            act_fp4_key = KeywordArg('act_fp4')
+            weight_key = KeywordArg('weight')
+            act_sf_key = KeywordArg('act_sf')
+            weight_scale_key = KeywordArg('weight_scale')
+            alpha_key = KeywordArg('alpha')
+            output_dtype_key = KeywordArg('output_dtype')
+            to_userbuffers_key = KeywordArg('to_userbuffers')
+            allowed_backends_key = KeywordArg('allowed_backends')
+            trtllm_nvfp4_gemm_default = CallFunction(
+                torch.ops.trtllm.nvfp4_gemm.default,
+                act_fp4_key,
+                weight_key,
+                act_sf_key,
+                weight_scale_key,
+                alpha_key,
+                output_dtype_key,
+                to_userbuffers=to_userbuffers_key,
+                allowed_backends=allowed_backends_key)
+            nccl_copy = CallFunction(torch.ops.trtllm.copy_to_nccl_window,
+                                     trtllm_nvfp4_gemm_default,
+                                     mapping.tp_group)
+
+            def empty_nvfp4_gemm_prologue_pattern(
+                act_fp4: torch.Tensor,
+                weight: torch.Tensor,
+                act_sf: torch.Tensor,
+                weight_scale: torch.Tensor,
+                alpha: torch.Tensor,
+                output_dtype: torch.dtype,
+                to_userbuffers: bool,
+                allowed_backends: str,
+            ):
+                return
+
+            def target_nvfp4_gemm_prologue_pattern(
+                act_fp4: torch.Tensor,
+                weight: torch.Tensor,
+                act_sf: torch.Tensor,
+                weight_scale: torch.Tensor,
+                alpha: torch.Tensor,
+                output_dtype: torch.dtype,
+                to_userbuffers: bool,
+                allowed_backends: str,
+            ):
+                # TODO: When GEMM refactoring is done, use allocator parameter
+                # For now, create window tensor and use it as output
+                nvfp4_gemm_output = torch.ops.trtllm.nvfp4_gemm(
+                    act_fp4, weight, act_sf, weight_scale, alpha, output_dtype,
+                    False, allowed_backends
+                )  # Keep False for now until allocator refactoring
+                return torch.ops.trtllm.copy_to_nccl_window(
+                    nvfp4_gemm_output, mapping.tp_group)
+
+            def extra_check(match: Match) -> bool:
+                # Validate allowed_backends if present (now a comma-separated string)
+                allowed_backends_value = match.kwargs.get('allowed_backends')
+                if allowed_backends_value is not None:
+                    # allowed_backends should be a comma-separated string
+                    if not isinstance(allowed_backends_value, str):
+                        return False
+                    backends_list = [
+                        b.strip() for b in allowed_backends_value.split(',')
+                        if b.strip()
+                    ]
+                    valid_individual = {
+                        'cutlass', 'cublaslt', 'cutedsl', 'cuda_core'
+                    }
+                    if not all(b in valid_individual for b in backends_list):
+                        return False
+
+                return True
+
+            register_replacement(
+                empty_nvfp4_gemm_prologue_pattern,
+                target_nvfp4_gemm_prologue_pattern,
+                [],
+                fwd_only,
+                custom_pass,
+                search_fn_pattern=nccl_copy,
+                extra_check=extra_check,
+            )
+
+        def register_mm_prologue(custom_pass: PatternMatcherPass):
+            aten_mm_default = CallFunction(aten.mm.default, KeywordArg('mm0_a'),
+                                           KeywordArg('mm0_b'))
+            nccl_copy = CallFunction(torch.ops.trtllm.copy_to_nccl_window,
+                                     aten_mm_default, mapping.tp_group)
+
+            def empty_mm_prologue_pattern(
+                mm0_a: torch.Tensor,
+                mm0_b: torch.Tensor,
+            ):
+                return
+
+            def target_mm_prologue_pattern(
+                mm0_a: torch.Tensor,
+                mm0_b: torch.Tensor,
+            ):
+                mm_output = torch.ops.trtllm.matmul_to_nccl_window(
+                    mm0_a, mm0_b, mapping.tp_group)
+                return mm_output
+
+            register_replacement(
+                empty_mm_prologue_pattern,
+                target_mm_prologue_pattern,
+                [],
+                fwd_only,
+                custom_pass,
+                search_fn_pattern=nccl_copy,
+            )
+
+        def register_add_prologue(custom_pass: PatternMatcherPass):
+            aten_add_default = CallFunction(aten.add.Tensor,
+                                            KeywordArg('add_a'),
+                                            KeywordArg('add_b'))
+            nccl_copy = CallFunction(torch.ops.trtllm.copy_to_nccl_window,
+                                     aten_add_default, mapping.tp_group)
+
+            def empty_add_prologue_pattern(
+                add_a: torch.Tensor,
+                add_b: torch.Tensor,
+            ):
+                return
+
+            def target_add_prologue_pattern(
+                add_a: torch.Tensor,
+                add_b: torch.Tensor,
+            ):
+                add_output = torch.ops.trtllm.add_to_nccl_window(
+                    add_a, add_b, mapping.tp_group)
+                return add_output
+
+            register_replacement(
+                empty_add_prologue_pattern,
+                target_add_prologue_pattern,
+                [],
+                fwd_only,
+                custom_pass,
+                search_fn_pattern=nccl_copy,
+            )
+
+        register_scaled_mm_prologue(custom_pass)
+        # FP4 GEMM prologue not supported for NCCL_SYMMETRIC
+        # register_nvfp4_gemm_prologue(custom_pass)
+        register_mm_prologue(custom_pass)
+        register_add_prologue(custom_pass)
+
+    if tensorrt_llm.mpi_rank() == 0:
+        logger.debug(
+            "[NCCL_SYMMETRIC] Pattern: Registering NCCL_SYMMETRIC patterns")
+    custom_passes.append(PatternMatcherPass())
+    register_convert_supported_ar_to_nccl_symmetric(custom_passes[-1])
+    if tensorrt_llm.mpi_rank() == 0:
+        logger.debug(
+            "[NCCL_SYMMETRIC] Pattern: Registered initial pattern (convert_supported_ar_to_nccl_symmetric)"
+        )
+
+    custom_passes.append(PatternMatcherPass())
+    register_nccl_symmetric_prologue_patterns(custom_passes[-1])
+    if tensorrt_llm.mpi_rank() == 0:
+        logger.debug("[NCCL_SYMMETRIC] Pattern: Registered prologue patterns")
+
+
 def register_ar_fusions(custom_passes: List[PatternMatcherPass],
                         mapping: Mapping, enable_ub: bool):
     register_ar_residual_norm(custom_passes[-1], mapping)
@@ -730,3 +1106,9 @@ def register_ar_fusions(custom_passes: List[PatternMatcherPass],
 
     if enable_ub:
         register_ub_patterns(custom_passes, mapping)
+
+    # Register NCCL_SYMMETRIC patterns - by default match NCCL_SYMMETRIC strategy nodes directly
+    # Set match_auto_strategy=True only when NCCL_SYMMETRIC is requested but graph has AUTO nodes
+    register_nccl_symmetric_patterns(custom_passes,
+                                     mapping,
+                                     match_auto_strategy=False)

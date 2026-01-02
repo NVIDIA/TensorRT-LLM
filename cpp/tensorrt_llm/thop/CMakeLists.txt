@@ -88,6 +88,7 @@ add_library(
   IndexerKCacheScatterOp.cpp
   IndexerTopKOp.cpp
   ncclCommunicatorOp.cpp
+  ncclWindowTensor.cpp
   parallelDecodeKVCacheUpdateOp.cpp
   redrafterCurandOp.cpp
   reducescatterOp.cpp
