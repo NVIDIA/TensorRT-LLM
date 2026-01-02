@@ -104,7 +104,7 @@ class ShortReshapeAttentionOutput(BaseTransform):
         for node in reshape_nodes:
             # Looking for AttentionPlugin from the input of the reshape node
             attention_plugin_node = self._lookup_ascending_node(
-                node.args[0], torch.ops.auto_deploy.AttentionPlugin.default
+                node.args[0], torch.ops.auto_deploy.torch_onnx_attention_plugin.default
             )
             if attention_plugin_node is None:
                 continue

@@ -21,9 +21,9 @@ from torch.fx import GraphModule, Node
 from ...models import hf
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
-from ...utils._graph import add_graph_input, add_graph_output, remove_graph_input, run_shape_prop
+from ...utils._graph import add_graph_input, add_graph_output, remove_graph_input
 from ...utils.logger import ad_logger
-from ...utils.node_utils import is_op
+from ...utils.node_utils import extract_op_args, is_op
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
 
@@ -162,9 +162,9 @@ class FuseRopeAttention(BaseTransform):
                 ad_logger.error(f"  Skipping: insufficient args ({len(attn_node.args)})")
                 continue
 
-            rope_q_node = attn_node.args[0]
-            rope_k_node = attn_node.args[1]
-            view_v_node = attn_node.args[2]
+            rope_q_node, rope_k_node, view_v_node = extract_op_args(
+                attn_node, "query", "key", "value"
+            )
 
             # Step 1: Match rope_q and rope_k as getitem[1] and getitem[0] from rope output
             if not (is_op(rope_q_node, operator.getitem) and is_op(rope_k_node, operator.getitem)):
@@ -172,8 +172,10 @@ class FuseRopeAttention(BaseTransform):
                 continue
 
             # Verify they come from the same rope node
-            rope_node_from_q = rope_q_node.args[0]
-            rope_node_from_k = rope_k_node.args[0]
+            assert rope_q_node.target == operator.getitem
+            assert rope_k_node.target == operator.getitem
+            rope_node_from_q, rope_q_idx = rope_q_node.args
+            rope_node_from_k, rope_k_idx = rope_k_node.args
 
             if rope_node_from_q != rope_node_from_k:
                 ad_logger.error("  Skipping: rope_q and rope_k come from different rope nodes")
@@ -182,9 +184,6 @@ class FuseRopeAttention(BaseTransform):
             rope_node = rope_node_from_q
 
             # Verify getitem indices: rope[0] = rope_k, rope[1] = rope_q
-            rope_k_idx = rope_k_node.args[1]
-            rope_q_idx = rope_q_node.args[1]
-
             if rope_k_idx != 0 or rope_q_idx != 1:
                 ad_logger.error(
                     f"  Skipping: incorrect getitem indices (k={rope_k_idx}, q={rope_q_idx})"
@@ -430,7 +429,7 @@ class FuseRopeAttention(BaseTransform):
                     torch.ops.aten.to.dtype, args=(qkv_node, torch.float16)
                 )
                 rope_attn_node = graph.call_function(
-                    torch.ops.auto_deploy.AttentionPlugin.default,
+                    torch.ops.auto_deploy.torch_onnx_attention_plugin.default,
                     args=(
                         cast_node,
                         past_key_values_node,
@@ -543,14 +542,9 @@ class FuseRopeAttention(BaseTransform):
         removed_node_name = self._remove_position_ids_placeholder(gm)
         ad_logger.debug(f"Removed position_ids placeholder: {removed_node_name}")
 
-        # Recompile and lint
-        gm.recompile()
-        gm.graph.lint()
-
         info = TransformInfo(
             skipped=False, num_matches=num_replaced, is_clean=True, has_valid_shapes=True
         )
         ad_logger.info(f"Fused {num_replaced} rope attention patterns")
-        run_shape_prop(gm)
 
         return gm, info

@@ -18,7 +18,6 @@ from torch.fx import GraphModule, Node
 
 from ..models.factory import ModelFactory
 from ..shim.interface import CachedSequenceInterface
-from ..transform.graph_module_visualizer import to_dot
 from ..utils._graph import (
     add_graph_input,
     canonicalize_graph,
@@ -28,6 +27,7 @@ from ..utils._graph import (
     run_shape_prop,
 )
 from ..utils.logger import ad_logger
+from .graph_module_visualizer import to_dot
 
 
 class TransformError(Exception):
