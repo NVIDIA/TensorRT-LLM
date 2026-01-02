@@ -134,6 +134,9 @@ class RPCServer:
         # Set the stop event to True, this will trigger immediate shutdown
         self._stop_event.set()
 
+        print(
+            f"==================================== RPCServer shutdown called, is_remote_call={is_remote_call}"
+        )
         # Log pending requests that will be cancelled
         logger_debug(
             f"[server] RPCServer is shutting down: {self._num_pending_requests} pending requests will be cancelled"

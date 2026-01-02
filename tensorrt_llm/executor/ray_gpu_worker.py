@@ -151,6 +151,9 @@ class RayWorkerWrapper:
                 f"The RayGPUWorker has no method called '{method_name}'.")
 
     def shutdown(self):
+        print(
+            f"====================== shutdown in RayWorkerWrapper is called pid:  {os.getpid()}"
+        )
         if hasattr(self, 'worker'):
             self.worker.shutdown()
 
@@ -298,6 +301,9 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
             return
         else:
             self.doing_shutdown = True
+        print(
+            f"====================== shutdown in RayWorkerWrapper is called pid:  {os.getpid()}"
+        )
 
         logger.debug(f'Worker {self.rank} shutting down...')
 

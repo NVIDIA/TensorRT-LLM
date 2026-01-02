@@ -102,6 +102,9 @@ class RpcWorker(RpcWorkerMixin, BaseWorker):
         logger_debug(f"[worker] RpcWorker #{mpi_rank()} is shutting down",
                      color="yellow")
         self.shutdown_event.set()
+        print(
+            f"====================== shutdown in RpcWorker is called pid:  {os.getpid()}"
+        )
         super().shutdown()
         logger_debug(f"[worker] RpcWorker #{mpi_rank()} is shutdown",
                      color="yellow")
