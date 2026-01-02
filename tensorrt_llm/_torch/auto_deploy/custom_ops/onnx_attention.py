@@ -25,7 +25,7 @@ from typing import Tuple
 import torch
 
 
-@torch.library.custom_op("auto_deploy::AttentionPlugin", mutates_args=())
+@torch.library.custom_op("auto_deploy::torch_onnx_attention_plugin", mutates_args=())
 def attention_plugin(
     # Inputs
     qkv: torch.Tensor,
@@ -147,7 +147,7 @@ def _fake_gather_nd(data: torch.Tensor, indices: torch.Tensor, batch_dims: int) 
     return torch.empty(result_shape, device=data.device, dtype=data.dtype)
 
 
-@torch.library.custom_op("auto_deploy::GatherND", mutates_args=())
+@torch.library.custom_op("auto_deploy::torch_onnx_gather_nd", mutates_args=())
 def gather_nd(
     data: torch.Tensor,
     indices: torch.Tensor,

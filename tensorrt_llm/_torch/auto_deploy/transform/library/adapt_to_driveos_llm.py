@@ -89,7 +89,7 @@ class AdaptToDriveOSLLM(BaseTransform):
 
         # Find all AttentionPlugin nodes
         attention_plugin_nodes = graph.find_nodes(
-            op="call_function", target=torch.ops.auto_deploy.AttentionPlugin.default
+            op="call_function", target=torch.ops.auto_deploy.torch_onnx_attention_plugin.default
         )
 
         num_inserted = 0

@@ -23,7 +23,7 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B ",
+        default="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
         help="The HF model to use for onnx export.",
     )
     parser.add_argument(
@@ -62,7 +62,7 @@ def main():
     ad_config.attn_backend = "torch"
     if args.output_dir is not None:
         ad_config.transforms["export_to_onnx"]["output_dir"] = args.output_dir
-    _ = LLM(**ad_config.to_llm_kwargs())
+    LLM(**ad_config.to_llm_kwargs())
 
 
 if __name__ == "__main__":

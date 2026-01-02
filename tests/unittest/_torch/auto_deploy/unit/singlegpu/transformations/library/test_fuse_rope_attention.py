@@ -190,7 +190,7 @@ def _run_test(
     gm_transformed.to("cuda")
 
     fused_nodes = gm_transformed.graph.find_nodes(
-        op="call_function", target=torch.ops.auto_deploy.AttentionPlugin.default
+        op="call_function", target=torch.ops.auto_deploy.torch_onnx_attention_plugin.default
     )
     assert len(fused_nodes) == 1, "Expected 1 AttentionPlugin node, got {len(fused_nodes)}"
     input_nodes = gm_transformed.graph.find_nodes(op="placeholder")

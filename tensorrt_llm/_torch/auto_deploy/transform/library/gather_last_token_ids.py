@@ -118,7 +118,7 @@ class GatherLastTokenIds(BaseTransform):
                 torch.ops.aten.unsqueeze.default, args=(last_token_ids_node, -1)
             )
             gather_nd_node = graph.call_function(
-                torch.ops.auto_deploy.GatherND.default,
+                torch.ops.auto_deploy.torch_onnx_gather_nd.default,
                 args=(linear_input, unsqueeze_node, 1),  # Use linear_input, not linear_simple!
             )
             ad_logger.info(f"Created GatherND node: {gather_nd_node.name}")
