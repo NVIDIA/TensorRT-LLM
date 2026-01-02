@@ -62,6 +62,10 @@ MINIMIZE_METRICS = [
     "d_p99_e2el",
 ]
 
+# Default threshold values for performance regression detection
+POST_MERGE_THRESHOLD = 0.05
+PRE_MERGE_THRESHOLD = 0.1
+
 # Fields for scenario-only matching for recipe tests.
 # Unlike regular tests that match on all config fields, recipes match only on the benchmark
 # scenario, allowing the underlying config to change while still comparing against baselines

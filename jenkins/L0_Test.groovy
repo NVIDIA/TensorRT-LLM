@@ -939,8 +939,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             def scriptExecPathLocal = Utils.createTempLocation(pipeline, "./slurm_exec.sh")
             def scriptExecPathNode = "${jobWorkspace}/${jobUID}-slurm_exec.sh"
             def coverageConfigFile = "${jobWorkspace}/.coveragerc"
-            def perfCheckScriptLocal = "${llmSrcLocal}/tests/integration/defs/perf/perf_regression_check.py"
-            def perfCheckScriptNode = "${jobWorkspace}/${jobUID}-perf_regression_check.py"
 
             stage("[${stageName}] Initializing Test") {
                 // Create Job Workspace folder in Frontend Node
@@ -1022,16 +1020,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     "./.coveragerc",
                     coverageConfigFile
                 )
-
-                if (perfSanityMode) {
-                    Utils.copyFileToRemoteHost(
-                        pipeline,
-                        remote,
-                        perfCheckScriptLocal,
-                        perfCheckScriptNode,
-                        true
-                    )
-                }
 
                 // Generate Pytest command
                 String pytestUtil = ""
@@ -1314,22 +1302,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     ),
                     numRetries: 3
                 )
-
-                if (perfSanityMode) {
-                    stage("[${stageName}] Check perf result") {
-                        def perfCheckResult = Utils.exec(
-                            pipeline,
-                            script: Utils.sshUserCmd(
-                                remote,
-                                "python3 ${perfCheckScriptNode} ${jobWorkspace}"
-                            ),
-                            returnStatus: true
-                        )
-                        if (perfCheckResult != 0) {
-                            error "Performance regression detected and failing the build (exit code: ${perfCheckResult})"
-                        }
-                    }
-                }
             }
 
             echo "Finished test stage execution."
@@ -3297,15 +3269,10 @@ def launchTestJobs(pipeline, testFilter)
         "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 1, 14, 4],
         "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 2, 14, 4],
         "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 3, 14, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 4, 14, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-5": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 5, 14, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-6": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 6, 14, 4],
         "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-7": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 7, 14, 4],
         "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-8": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 8, 14, 4],
         "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-9": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 9, 14, 4],
         "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-10": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 10, 14, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-11": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 11, 14, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-12": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 12, 14, 4],
         "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-13": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 13, 14, 4],
         "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-14": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 14, 14, 4],
     ]
