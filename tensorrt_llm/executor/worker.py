@@ -84,22 +84,12 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
         self.start_thread(self.await_response_thread)
 
     def shutdown(self):
-        print(
-            f"====================== GenerationExecutorWorker shutdown is called pid:  {os.getpid()}"
-        )
-
         if self.doing_shutdown:
-            print(
-                f"====================== GenerationExecutorWorker shutdown is doing shutdown:  {os.getpid()}"
-            )
             return
         else:
-            print(
-                f"====================== GenerationExecutorWorker shutdown set doing shutdown:  {os.getpid()}"
-            )
             self.doing_shutdown = True
 
-        logger_info(f'Worker {mpi_rank()} shutdown...\n', "yellow")
+        logger_debug(f'Worker {mpi_rank()} shutdown...\n', "yellow")
 
         if self.engine is not None:
             if self.engine.can_enqueue_requests():
@@ -107,9 +97,6 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
                     self.await_response_thread.stop()
                     self.await_response_thread.join()
 
-            print(
-                f"====================== GenerationExecutorWorker engine shutdown is called pid:  {os.getpid()}"
-            )
             self.engine.shutdown()
             self.engine = None
 

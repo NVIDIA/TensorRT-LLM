@@ -221,10 +221,7 @@ def create_py_executor(
     tokenizer: Optional[TokenizerBase] = None,
     profiling_stage_data: Optional[dict] = None,
 ) -> PyExecutor:
-    # import os
-    # print(f"====================== create_py_executor pid:  {os.getpid()}")
-    # import traceback
-    # print(f"====================== backtrace: {traceback.print_stack()}")
+    torch.cuda.set_per_process_memory_fraction(1.0)
     garbage_collection_gen0_threshold = llm_args.garbage_collection_gen0_threshold
     lora_config = llm_args.lora_config
     kv_connector_config = llm_args.kv_connector_config

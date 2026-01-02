@@ -276,7 +276,6 @@ class GenerationExecutorProxy(GenerationExecutor):
     def pre_shutdown(self):
         if not self.workers_started:
             return
-        logger_info('Proxy.pre_shutdown...\n', "yellow")
 
         if self.doing_shutdown:
             return
@@ -290,9 +289,6 @@ class GenerationExecutorProxy(GenerationExecutor):
             self.request_queue.put_noblock(None, retry=4)
 
     def shutdown(self):
-        print(
-            f"====================== shutdown in GenerationExecutorProxy is called pid:  {os.getpid()}"
-        )
         if not self.workers_started:
             return
 

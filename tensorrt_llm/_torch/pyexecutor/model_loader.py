@@ -257,7 +257,14 @@ class ModelLoader:
                 )
                 model = AutoModelForCausalLM.from_config(config)
 
-            model.to("cuda")
+            try:
+                model.to("cuda")
+            except Exception:
+                logger.error(
+                    f"================== Fallback to regular model init: {traceback.format_exc(limit=50)}\n"
+                )
+                model.to("cuda")
+
             rank_model_storage = get_rank_model_storage(model)
             logger.info(
                 f"Use {rank_model_storage / (1024**3):.2f} GB for model weights."
