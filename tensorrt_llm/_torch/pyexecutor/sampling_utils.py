@@ -472,10 +472,10 @@ def sample(
     strategy: Strategy,
     logits: torch.Tensor,
     *,
-    generator: Optional[torch.Generator] = None,
+    generator: torch.Generator | None = None,
     group_metadata: StrategyMetadata | None = None,
     return_probs: bool = True,
-) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[float]]:
+) -> tuple[torch.Tensor, torch.Tensor | None, float | None]:
     match strategy:
         case ("top_k", top_k, temperature):
             tokens, softmax = top_k_sampling_batch(
@@ -547,11 +547,11 @@ class GroupedStrategySampler(Generic[GenericStrategyKeyType], abc.ABC):
         strategies: list[Strategy],
         logits: torch.Tensor,
         *,
-        group_logit_indices: Optional[torch.Tensor] = None,
-        generator: Optional[torch.Generator] = None,
+        group_logit_indices: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
         return_probs: bool,
         group_metadata: StrategyMetadata | None = None,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], float | torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, float | torch.Tensor | None]:
         raise NotImplementedError
 
 
@@ -581,11 +581,11 @@ class SimpleGroupedStrategySampler(GroupedStrategySampler[Strategy]):
         strategies: list[Strategy],
         logits: torch.Tensor,
         *,
-        group_logit_indices: Optional[torch.Tensor] = None,
-        generator: Optional[torch.Generator] = None,
+        group_logit_indices: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
         return_probs: bool,
         group_metadata: StrategyMetadata | None = None,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], float | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, float | None]:
         if group_key[0] == "beam_search":
             beam_width_in = group_key[1]
         else:

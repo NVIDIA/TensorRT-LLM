@@ -15,7 +15,7 @@
 import enum
 import sys
 from abc import ABC, abstractmethod
-from collections import defaultdict
+from collections import defaultdict, namedtuple
 from collections.abc import Iterable
 from concurrent import futures
 from dataclasses import dataclass
@@ -99,11 +99,14 @@ class LogProbsState:
 
 @dataclass(kw_only=True)
 class LogProbsStateList:
-    sampled_vals: list[list[list[float]]]
-    sampled_indices: list[list[list[int]]]
-    sampled_rank: list[list[list[int]]]
-    topk_vals: list[list[list[float]]]
-    topk_indices: list[list[list[int]]]
+    FloatState = list[list[list[float]]]
+    IntState = list[list[list[float]]]
+
+    sampled_vals: FloatState
+    sampled_indices: IntState
+    sampled_rank: IntState
+    topk_vals: FloatState
+    topk_indices: IntState
 
     @staticmethod
     def from_logprobs_state(logprobs_state: LogProbsState) -> "LogProbsStateList":
@@ -241,7 +244,7 @@ class SampleStateWithMMResult:
     data: MultimodalResult
 
 
-@dataclass(kw_only=True, frozen=True)
+@dataclass(kw_only=True, frozen=True, slots=True)
 class RequestGroupKey(Generic[GenericStrategyKeyType]):
     strategy_key: GenericStrategyKeyType
     needs_probs: bool
@@ -420,10 +423,20 @@ def _group_requests_by_strategy_key(
     vocab_size: int,
 ) -> dict[RequestGroupKey[GenericStrategyKeyType], RequestGroupValue]:
     # NB: Client code relies on request indices in returned torch.Tensor being sorted.
-    group_dict: dict[
-        tuple[GenericStrategyKeyType, bool],
-        tuple[list[int], list[Strategy], list[int], list[bool], list[bool]],
-    ] = defaultdict(lambda: ([], [], [], [], []))
+    RequestGroupValueBuilder = namedtuple(
+        "RequestGroupValueBuilder",
+        [
+            "indices",
+            "strategies",
+            "speculation_needs_probs_list",
+            "need_processed_logprobs_list",
+            "need_raw_logprobs_list",
+        ],
+    )
+
+    group_dict: dict[RequestGroupKey, RequestGroupValueBuilder] = defaultdict(
+        lambda: RequestGroupValueBuilder([], [], [], [], [])
+    )
 
     for req_index, req in enumerate(requests):
         strategy = _request_strategy(req, vocab_size=vocab_size)
@@ -438,37 +451,30 @@ def _group_requests_by_strategy_key(
         need_raw_logprobs = req.py_logprobs_mode == LogprobMode.RAW and req.return_log_probs
         needs_probs = speculation_needs_probs or need_processed_logprobs
         strategy_key = strategy_to_key(strategy, needs_probs)
-        group_dict_entry = group_dict[(strategy_key, needs_probs)]
-        group_dict_entry[0].append(req_index)
-        group_dict_entry[1].append(strategy)
+        group_dict_entry = group_dict[
+            RequestGroupKey(strategy_key=strategy_key, needs_probs=needs_probs)
+        ]
+        group_dict_entry.indices.append(req_index)
+        group_dict_entry.strategies.append(strategy)
         if speculation_needs_probs:
-            group_dict_entry[2].append(req_index)
-        group_dict_entry[3].append(need_processed_logprobs)
-        group_dict_entry[4].append(need_raw_logprobs)
+            group_dict_entry.speculation_needs_probs_list.append(req_index)
+        group_dict_entry.need_processed_logprobs_list.append(need_processed_logprobs)
+        group_dict_entry.need_raw_logprobs_list.append(need_raw_logprobs)
     return {
-        RequestGroupKey(
-            strategy_key=group_key[0],
-            needs_probs=group_key[1],
-        ): RequestGroupValue(
-            indices=torch.tensor(indices, pin_memory=pin_memory, dtype=torch.int32),
-            strategies=strategies,
+        group_key: RequestGroupValue(
+            indices=torch.tensor(group_value.indices, pin_memory=pin_memory, dtype=torch.int32),
+            strategies=group_value.strategies,
             speculation_needs_probs_indices=torch.tensor(
-                speculation_needs_probs_list, pin_memory=pin_memory, dtype=torch.int32
+                group_value.speculation_needs_probs_list, pin_memory=pin_memory, dtype=torch.int32
             ),
             need_processed_logprobs=torch.tensor(
-                need_processed_logprobs_list, pin_memory=pin_memory, dtype=torch.bool
+                group_value.need_processed_logprobs_list, pin_memory=pin_memory, dtype=torch.bool
             ),
             need_raw_logprobs=torch.tensor(
-                need_raw_logprobs_list, pin_memory=pin_memory, dtype=torch.bool
+                group_value.need_raw_logprobs_list, pin_memory=pin_memory, dtype=torch.bool
             ),
         )
-        for group_key, (
-            indices,
-            strategies,
-            speculation_needs_probs_list,
-            need_processed_logprobs_list,
-            need_raw_logprobs_list,
-        ) in group_dict.items()
+        for group_key, group_value in group_dict.items()
     }
 
 
@@ -967,8 +973,8 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         )
         sampled_log_prob_ranks = torch.empty(self.LOGPROBS_SHAPE, device="cuda", dtype=torch.int32)
         # These are 0 sized tensors, if topk-logprobs are not used
-        topk_indices = torch.empty(self.topk_logprobs_shape, device="cuda", dtype=torch.int32)
-        topk_vals = torch.empty(self.topk_logprobs_shape, device="cuda", dtype=torch.float32)
+        topk_indices = torch.empty(self.TOPK_LOGPROBS_SHAPE, device="cuda", dtype=torch.int32)
+        topk_vals = torch.empty(self.TOPK_LOGPROBS_SHAPE, device="cuda", dtype=torch.float32)
 
         # Only used for beam search
         cache_indirection: torch.Tensor | None = None
@@ -1034,7 +1040,7 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
             self.max_seq_len + (0 if args.disable_overlap_scheduler else 1),
         )
         self.LOGPROBS_SHAPE = (self.max_num_sequences, self.max_beam_width, self.max_tokens)
-        self.topk_logprobs_shape = (self.max_num_sequences, self.max_tokens, self.max_topk_logprobs)
+        self.TOPK_LOGPROBS_SHAPE = (self.max_num_sequences, self.max_tokens, self.max_topk_logprobs)
         # AutoDeploy build creates the sampler in inference mode,
         # which would disallow in-place mutating of new_tokens.
         # So, we temporarily exit inference mode.
@@ -2036,13 +2042,13 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         )
         if self.max_topk_logprobs < self.batch_max_topk_logprobs:
             self.max_topk_logprobs = self.batch_max_topk_logprobs
-            self.topk_logprobs_shape = (
+            self.TOPK_LOGPROBS_SHAPE = (
                 self.max_num_sequences,
                 self.max_tokens,
                 self.max_topk_logprobs,
             )
-            self.store.topk_vals.resize_(self.topk_logprobs_shape)
-            self.store.topk_indices.resize_(self.topk_logprobs_shape)
+            self.store.topk_vals.resize_(self.TOPK_LOGPROBS_SHAPE)
+            self.store.topk_indices.resize_(self.TOPK_LOGPROBS_SHAPE)
 
     @override
     @torch.inference_mode()

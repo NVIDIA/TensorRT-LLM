@@ -486,7 +486,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             is_first_draft: bool = False,
             use_chunked_generation_logits: bool = True,
             logits_chunk_size: int = 8,
-            logprobs_mode: LogprobMode | None = None,
+            logprobs_mode: LogprobMode = LogprobMode.RAW,
             **kwargs):
 
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
@@ -568,7 +568,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # currently, keep py_stop_words_list as python list, rather than tensor.
         self.py_stop_words_list = stop_words_list
 
-        self.py_logprobs_mode = LogprobMode.RAW if logprobs_mode is None else logprobs_mode
+        self.py_logprobs_mode = LogprobMode(
+            logprobs_mode)  # handle passed a raw string
 
         self.py_result = PyResult(
             prompt_len=self.py_prompt_len,
@@ -596,15 +597,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             self, exclude_last_generation_logits: bool):
         self.py_result.set_exclude_last_generation_logits(
             exclude_last_generation_logits)
-
-    def validate_logprobs_mode(self):
-        if self.py_logprobs_mode not in [
-                LogprobMode.RAW, LogprobMode.PROCESSED
-        ]:
-            raise ValueError(
-                f"Invalid logprobs_mode: {self.py_logprobs_mode} "
-                f"Expected one of {LogprobMode.RAW.value}, {LogprobMode.PROCESSED.value}"
-            )
 
     @property
     def cached_tokens(self) -> int:
@@ -839,7 +831,8 @@ def executor_request_to_llm_request(
         py_multimodal_data=getattr(executor_request, "py_multimodal_data",
                                    None),
         kv_cache_retention_config=executor_request.kv_cache_retention_config,
-        logprobs_mode=getattr(executor_request, "py_logprobs_mode", None),
+        logprobs_mode=getattr(executor_request, "py_logprobs_mode",
+                              LogprobMode.RAW),
     )
     if child_req_ids:
         for child_id in child_req_ids:
