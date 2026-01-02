@@ -2670,7 +2670,11 @@ class PyExecutor:
 
     @nvtx_range("_enqueue_responses")
     def _enqueue_responses(self, responses: Iterable[Tuple[int, LlmResponse]]):
-        if 0 not in self.dist.mapping.tp_group and not self.gather_all_responses:
+        # When CP is enabled, CP ranks are included in the tp_comm and all ranks
+        # must participate in collective operations. Skip the early return check
+        # in this case to prevent deadlocks where some ranks call tp_gather
+        # while others proceed to different collective operations.
+        if self.dist.cp_size <= 1 and 0 not in self.dist.mapping.tp_group and not self.gather_all_responses:
             return
 
         if self.enable_attention_dp and self.dist.world_size != 1:
@@ -2681,6 +2685,11 @@ class PyExecutor:
             if self.dist.rank == 0 or self.gather_all_responses:
                 gather_responses = []
                 if responses_list is not None:
+                    # When CP is enabled, tp_gather returns data from all ranks
+                    # including CP ranks. CP ranks with the same tp_rank have identical
+                    # data, so we need to deduplicate by striding by cp_size.
+                    if self.dist.cp_size > 1:
+                        responses_list = responses_list[::self.dist.cp_size]
                     for resp in responses_list:
                         if resp is not None:
                             gather_responses.extend(resp)
