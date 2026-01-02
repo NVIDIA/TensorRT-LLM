@@ -35,7 +35,7 @@ def fla_cached_delta_rule(
     v: torch.Tensor,
     beta: torch.Tensor,
     # STANDARD METADATA
-    batch_info: torch.Tensor,
+    batch_info_host: torch.Tensor,
     cu_seqlen: torch.Tensor,
     slot_idx: torch.Tensor,
     use_initial_states: torch.Tensor,
@@ -58,7 +58,7 @@ def fla_cached_delta_rule(
     y = torch.empty_like(v, memory_format=torch.contiguous_format)
     y_flat = y.view(b * s, num_heads, -1)
 
-    num_prefill, num_prefill_tokens, num_decode = batch_info.tolist()
+    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
     num_seq = num_prefill + num_decode
 
     # clean up metadata
@@ -120,7 +120,7 @@ def fla_cached_delta_rule_fake(
     v: torch.Tensor,
     beta: torch.Tensor,
     # STANDARD METADATA
-    batch_info: torch.Tensor,
+    batch_info_host: torch.Tensor,
     cu_seqlen: torch.Tensor,
     slot_idx: torch.Tensor,
     use_initial_states: torch.Tensor,
@@ -160,7 +160,7 @@ class FlaDeltaBackend(AttentionDescriptor):
 
     @classmethod
     def get_standard_metadata_args(cls) -> List[str]:
-        return ["batch_info", "cu_seqlen", "slot_idx", "use_initial_states"]
+        return ["batch_info_host", "cu_seqlen", "slot_idx", "use_initial_states"]
 
     @classmethod
     def get_cache_initializers(

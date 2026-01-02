@@ -31,12 +31,12 @@ server_configs:
       decoding_type: 'MTP'
       num_nextn_predict_layers: 1
     client_configs:
-      - name: "con2048_iter10_1k1k"
+      - name: "con2048_iter5_1k1k"
         concurrency: 2048
-        iterations: 10
+        iterations: 5
         isl: 1024
         osl: 1024
-        random_range_ratio: 0.2
+        random_range_ratio: 0.8
         backend: "openai"
 
   - name: "r1_fp4_v2_tep4_mtp3_1k1k"
@@ -66,7 +66,7 @@ server_configs:
         iterations: 10
         isl: 1024
         osl: 1024
-        random_range_ratio: 0.2
+        random_range_ratio: 0.8
         backend: "openai"
 
   - name: "r1_fp4_v2_tp4_mtp3_1k1k"
@@ -96,7 +96,7 @@ server_configs:
         iterations: 10
         isl: 1024
         osl: 1024
-        random_range_ratio: 0.2
+        random_range_ratio: 0.8
         backend: "openai"
 
   # 8k1k configs
@@ -126,12 +126,12 @@ server_configs:
       decoding_type: 'MTP'
       num_nextn_predict_layers: 1
     client_configs:
-      - name: "con2048_iter10_8k1k"
+      - name: "con2048_iter5_8k1k"
         concurrency: 2048
-        iterations: 10
+        iterations: 5
         isl: 8192
         osl: 1024
-        random_range_ratio: 0.2
+        random_range_ratio: 0.8
         backend: "openai"
 
   - name: "r1_fp4_v2_tep4_mtp3_8k1k"
@@ -161,7 +161,7 @@ server_configs:
         iterations: 10
         isl: 8192
         osl: 1024
-        random_range_ratio: 0.2
+        random_range_ratio: 0.8
         backend: "openai"
 
   - name: "r1_fp4_v2_tp4_mtp3_8k1k"
@@ -191,7 +191,7 @@ server_configs:
         iterations: 10
         isl: 8192
         osl: 1024
-        random_range_ratio: 0.2
+        random_range_ratio: 0.8
         backend: "openai"
 
   # 1k8k configs
@@ -221,12 +221,12 @@ server_configs:
       decoding_type: 'MTP'
       num_nextn_predict_layers: 1
     client_configs:
-      - name: "con2048_iter10_1k8k"
+      - name: "con2048_iter5_1k8k"
         concurrency: 2048
-        iterations: 10
+        iterations: 5
         isl: 1024
         osl: 8192
-        random_range_ratio: 0.2
+        random_range_ratio: 0.8
         backend: "openai"
 
   - name: "r1_fp4_v2_tep4_mtp3_1k8k"
@@ -256,7 +256,7 @@ server_configs:
         iterations: 10
         isl: 1024
         osl: 8192
-        random_range_ratio: 0.2
+        random_range_ratio: 0.8
         backend: "openai"
 
   - name: "r1_fp4_v2_tp4_mtp3_1k8k"
@@ -286,5 +286,5 @@ server_configs:
         iterations: 10
         isl: 1024
         osl: 8192
-        random_range_ratio: 0.2
+        random_range_ratio: 0.8
         backend: "openai"

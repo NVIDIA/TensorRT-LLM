@@ -147,7 +147,7 @@ class ConfigurableMoE(MoE):
         model_config.skip_create_weights_in_init = True
         model_config._frozen = True
 
-        self.backend = create_moe_backend(
+        backend = create_moe_backend(
             moe_cls=moe_cls,
             routing_method=routing_method,
             num_experts=self.num_experts,
@@ -168,15 +168,14 @@ class ConfigurableMoE(MoE):
             without_comm=True,
         )
 
+        self.validate_backend(backend)
+        self.backend = backend
+
         # Sync critical attributes from ConfigurableMoE to backend
         # ConfigurableMoE's super().__init__() was called with real layer_idx and initialized load balancer.
         # Backend was created with init_load_balancer=False and without_comm=True to avoid
         # duplicate initialization. Now sync all attributes from ConfigurableMoE to backend.
         if self.backend is not None:
-            # Add a check to WAR the issue that the backend is none during torch.compile
-            assert not torch.compiler.is_compiling(), (
-                "Backend should not be none if not in torch.compile"
-            )
             self.backend.layer_idx = self.layer_idx
             self.backend.layer_idx_str = self.layer_idx_str
             self.backend.num_slots = self.num_slots
@@ -197,7 +196,7 @@ class ConfigurableMoE(MoE):
             self.backend.create_weights()
 
         # ========== Create Communication Strategy ==========
-        self._comm = self._create_comm_strategy_auto()
+        self.comm = self._create_comm_strategy_auto()
 
         # ========== Chunking Configuration ==========
         # moe_max_num_tokens is set in ModelConfig.__post_init__ if not specified
@@ -892,23 +891,13 @@ class ConfigurableMoE(MoE):
 
         return outputs
 
-    # ========== Backend Property with Validation ==========
+    # ========== Backend Validation ==========
 
-    @property
-    def backend(self) -> MoE:
+    def validate_backend(self, backend: MoE):
         """
-        Get the current MoE backend implementation
+        Validate MOE backend.
 
-        Note: Returns a FusedMoE instance (e.g., CutlassFusedMoE, CuteDslFusedMoE)
-        """
-        return self._backend
-
-    @backend.setter
-    def backend(self, backend: MoE):
-        """
-        Set MoE backend with validation
-
-        This setter validates that:
+        It validates that:
         1. Backend is not None
         2. If EPLB is enabled, backend must support routing separation
 
@@ -931,38 +920,6 @@ class ConfigurableMoE(MoE):
                 f"does not support load balancer. "
                 f"Either disable EPLB or use a backend that supports load balancer."
             )
-
-        # Set backend (validation passed)
-        self._backend = backend
-
-    @property
-    def comm(self) -> Optional[Communication]:
-        """Get the current communication strategy"""
-        return self._comm
-
-    @comm.setter
-    def comm(self, strategy: Optional[Communication]):
-        """
-        Set communication strategy with validation
-
-        This setter validates that the strategy is compatible with the configuration.
-
-        Args:
-            strategy: Communication instance to set (can be None for lazy creation)
-
-        Raises:
-            ValueError: If strategy is incompatible with current configuration
-
-        Note: Unlike backend, comm can be None (will be created lazily).
-              This allows for automatic strategy selection based on hardware.
-        """
-        # comm can be None (lazy creation)
-        if strategy is None:
-            self._comm = None
-            return
-
-        # Set strategy (validation passed)
-        self._comm = strategy
 
     # ========== Helper Methods ==========
 

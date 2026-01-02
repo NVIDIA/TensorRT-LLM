@@ -7,7 +7,6 @@ metadata:
   - GB300
   script_file: disaggr_torch.slurm
   benchmark_type: 1k1k
-  config_index: 0
   dataset_file: disagg_datasets/deepseek-r1-1024-1024-100000-ratio-1_for_serve.json
   accuracy:
     datasets:
@@ -19,7 +18,7 @@ slurm:
   script_file: disaggr_torch.slurm
   partition: <partition>
   account: <account>
-  job_time: 02:00:00
+  job_time: 03:00:00
   job_name: unified-benchmark
   extra_args: "--gres=gpu:4"
   numa_bind: true
