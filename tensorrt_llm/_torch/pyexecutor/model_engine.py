@@ -888,15 +888,10 @@ class PyTorchModelEngine(ModelEngine):
         available_tokens = kv_cache_manager.get_num_available_tokens(
             self.runtime_draft_len)
         available_blocks = kv_cache_manager.get_num_free_blocks()
-        print(
-            f"available_tokens: {available_tokens}, num_tokens: {num_tokens}, num_gen_requests: {num_gen_requests}"
-        )
         if num_tokens > self.max_num_tokens or num_tokens > available_tokens:
             return None
 
         num_extra_decoding_steps = self._get_num_extra_decoding_steps()
-        if num_extra_decoding_steps > 0:
-            return None  # Disable autotuning for fused drafting loops for now.
 
         if num_gen_requests > self.batch_size:
             return None
@@ -909,7 +904,10 @@ class PyTorchModelEngine(ModelEngine):
         ctx_requests = []
         gen_requests = []
 
-        max_seq_len = self.max_seq_len - 1
+        # For drafting loops, reduce max_seq_len to leave room for extra decoding steps
+        max_seq_len = self.max_seq_len - 1 - num_extra_decoding_steps
+        if max_seq_len < 1:
+            return None  # Not enough sequence length for drafting loop
         num_full_seqs = 0
         num_left_over_tokens = 0
 
@@ -954,7 +952,8 @@ class PyTorchModelEngine(ModelEngine):
                 token_nums=ctx_token_nums,
                 is_gen=False,
                 max_num_draft_tokens=self.runtime_draft_len,
-                use_mrope=self.use_mrope)
+                use_mrope=self.use_mrope,
+                num_extra_decoding_steps=num_extra_decoding_steps)
 
             if spec_resource_manager is not None:
                 spec_resource_manager.add_dummy_requests(
@@ -1546,7 +1545,6 @@ class PyTorchModelEngine(ModelEngine):
 
         return lora_params
 
-    @torch.compile(options={"max-autotune": True})
     def _update_draft_input_tensors(self,
                                     num_accepted_tokens_device: torch.Tensor,
                                     new_tokens_device: torch.Tensor,
@@ -1671,7 +1669,6 @@ class PyTorchModelEngine(ModelEngine):
 
         return inputs, self.gather_ids_cuda[:num_generation_tokens]
 
-    @torch.compile(options={"max-autotune": True})
     def _update_target_input_tensors(
             self, num_accepted_tokens_device: torch.Tensor,
             new_tokens_device: torch.Tensor,
