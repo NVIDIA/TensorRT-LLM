@@ -65,46 +65,6 @@ class WeightNodes(BaseModel):
     biases: list[WeightNode]
 
 
-class ModuleParams:
-    """Static class for caching module parameters and buffers to avoid repeated lookups."""
-
-    _parameters: dict = {}
-    _buffers: dict = {}
-
-    @classmethod
-    def get_all_params(cls, gm: GraphModule) -> set:
-        """Get all parameter and buffer names for a GraphModule."""
-        if gm not in cls._parameters:
-            cls._set_params(gm)
-        return cls._parameters[gm].union(cls._buffers[gm])
-
-    @classmethod
-    def get_buffers(cls, gm: GraphModule) -> set:
-        """Get all buffer names for a GraphModule."""
-        if gm not in cls._buffers:
-            cls._set_params(gm)
-        return cls._buffers[gm]
-
-    @classmethod
-    def get_parameters(cls, gm: GraphModule) -> set:
-        """Get all parameter names for a GraphModule."""
-        if gm not in cls._parameters:
-            cls._set_params(gm)
-        return cls._parameters[gm]
-
-    @classmethod
-    def _set_params(cls, gm: GraphModule):
-        """Cache parameter and buffer names for a GraphModule."""
-        cls._parameters[gm] = {name for name, _ in gm.named_parameters()}
-        cls._buffers[gm] = {name for name, _ in gm.named_buffers()}
-
-    @classmethod
-    def clear_cache(cls):
-        """Clear the cached parameters and buffers."""
-        cls._parameters.clear()
-        cls._buffers.clear()
-
-
 @dataclass
 class modelopt_quant_params:
     input_node: torch.fx.node.Node = None
@@ -188,10 +148,10 @@ def extract_weight_name(node: Node) -> str:
     return weight_nodes.weights[0].node_key
 
 
-def get_const_tensor(tensor_name: str, gm: GraphModule) -> torch.Tensor:
-    if tensor_name in ModuleParams.get_parameters(gm):
+def get_param_or_buffer(tensor_name: str, gm: GraphModule) -> torch.Tensor:
+    if tensor_name in dict(gm.named_parameters()):
         return gm.get_parameter(tensor_name)
-    elif tensor_name in ModuleParams.get_buffers(gm):
+    elif tensor_name in dict(gm.named_buffers()):
         return gm.get_buffer(tensor_name)
     else:
         raise ValueError(f"Tensor {tensor_name} not found in the graph")
@@ -200,7 +160,9 @@ def get_const_tensor(tensor_name: str, gm: GraphModule) -> torch.Tensor:
 def extract_weight_nodes(node: Node) -> WeightNodes:
     """Extracts the list of weight node and optional bias node from the given parametrized node"""
     gm = node.graph.owning_module
-    param_names = ModuleParams.get_all_params(gm)
+    param_names = {name for name, _ in gm.named_parameters()}.union(
+        {name for name, _ in gm.named_buffers()}
+    )
 
     def find_get_attr_node(weight_node: Node) -> Node:
         """Recursively traverse inputs of allowed nodes to find a node with 'get_attr' op."""
@@ -232,7 +194,7 @@ def extract_weight_nodes(node: Node) -> WeightNodes:
                 WeightNode(
                     node=node.args[1],
                     node_key=weight_node.target,
-                    tensor=get_const_tensor(weight_node.target, gm),
+                    tensor=get_param_or_buffer(weight_node.target, gm),
                     submod=gm.get_submodule(weight_node.target.rpartition(".")[0]),
                 )
             ],
@@ -253,7 +215,7 @@ def extract_weight_nodes(node: Node) -> WeightNodes:
                 node=n,
                 node_key=n.target,
                 submod=gm.get_submodule(n.target.rpartition(".")[0]),
-                tensor=get_const_tensor(n.target, gm),
+                tensor=get_param_or_buffer(n.target, gm),
             )
             for n in weight_nodes
         ]
@@ -262,7 +224,7 @@ def extract_weight_nodes(node: Node) -> WeightNodes:
                 node=n,
                 node_key=n.target,
                 submod=gm.get_submodule(n.target.rpartition(".")[0]),
-                tensor=get_const_tensor(n.target, gm),
+                tensor=get_param_or_buffer(n.target, gm),
             )
             for n in bias_nodes
         ]

@@ -204,7 +204,7 @@ def test_custom_model_implementation_can_be_exported(
         factory.load_or_random_init(gm, device="cuda")
         move_to_device(gm, "cuda")
         factory._to_maybe_random(model, "cuda")
-        # In order to ensure the `A_minus` (non-persistent buffer) is correct, we need to run the
+        # In order to ensure the `_minus_A` (non-persistent buffer) is correct, we need to run the
         # model's load state pre/post hooks by loading the state dicts after initialization.
         # NOTE: this is done under the hood by `torch_export_to_gm`, so we only need this in this
         # `if` clause.
