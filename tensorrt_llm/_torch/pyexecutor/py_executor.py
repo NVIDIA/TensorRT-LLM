@@ -1199,7 +1199,8 @@ class PyExecutor:
                 f'scheduled {len(scheduled_batch.generation_requests)} generation requests'
             )
 
-            if scheduled_batch.batch_size == 0 and not get_generation_to_complete_requests(self.active_requests):
+            if scheduled_batch.batch_size == 0 and not get_generation_to_complete_requests(
+                    self.active_requests):
                 self.sm_disagg_ctx_cv.wait()
 
         return scheduled_batch, iter_stats

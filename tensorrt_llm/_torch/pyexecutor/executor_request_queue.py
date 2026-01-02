@@ -327,9 +327,8 @@ class ExecutorRequestQueue:
         self.waiting_queue.extend(new_requests)
 
         new_requests = self._get_from_waiting_queue(
-            self.waiting_queue,
-            remaining_capacity,
-            enable_attention_dp, all_ranks_num_active_requests)
+            self.waiting_queue, remaining_capacity, enable_attention_dp,
+            all_ranks_num_active_requests)
 
         # Update performance metrics
         if self.enable_iter_perf_stats and self.dist.rank == 0:
@@ -347,17 +346,18 @@ class ExecutorRequestQueue:
         else:
             num_active_requests = num_active_requests_on_engine if self.is_sm_disagg else len(
                 activate_requests)
-            remaining_capacity = self.max_num_active_requests - len(activate_requests)
-            return self._fetch_new_requests_attention_tp(num_active_requests, remaining_capacity)
+            remaining_capacity = self.max_num_active_requests - len(
+                activate_requests)
+            return self._fetch_new_requests_attention_tp(
+                num_active_requests, remaining_capacity)
 
     def _fetch_new_requests_attention_tp(
-            self, num_active_requests: int, remaining_capacity: int) -> List[LlmRequest]:
+            self, num_active_requests: int,
+            remaining_capacity: int) -> List[LlmRequest]:
         """Handle standard (non-attention DP) request fetching."""
         # fetch and process requests into waiting queue
         new_requests = self._fetch_and_process_requests(
-            num_active_requests,
-            remaining_capacity,
-            enable_attention_dp=False)
+            num_active_requests, remaining_capacity, enable_attention_dp=False)
 
         # Merge requests and add to active list
         merged_requests = self._merge_requests(new_requests)

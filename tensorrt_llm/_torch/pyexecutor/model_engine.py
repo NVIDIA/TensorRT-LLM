@@ -149,10 +149,8 @@ class PyTorchModelEngine(ModelEngine):
             max_num_tokens,
             max_seq_len,
             max_batch_size,
-        ) = llm_args.get_runtime_sizes()
-        if is_sm_disagg_ctx_phase:
-            max_num_tokens = llm_args.sm_disagg_config.context_max_num_tokens
-            max_batch_size = llm_args.sm_disagg_config.context_max_batch_size
+        ) = llm_args.get_runtime_sizes(
+            sm_disagg_mode='ctx' if is_sm_disagg_ctx_phase else 'gen')
 
         self.batch_size = max_batch_size
         self.max_num_tokens = max_num_tokens

@@ -255,7 +255,7 @@ def create_py_executor(
         max_num_tokens,
         max_seq_len,
         max_batch_size,
-    ) = llm_args.get_runtime_sizes()
+    ) = llm_args.get_runtime_sizes(sm_disagg_mode='sum')
 
     tokens_per_block = kv_cache_config.tokens_per_block
     if llm_args.attn_backend == "VANILLA":
@@ -451,6 +451,8 @@ def create_py_executor(
 
     max_seq_len = model_engine_max_seq_len
     max_num_tokens = model_engine.max_num_tokens
+    if ctx_model_engine is not None:
+        max_num_tokens += ctx_model_engine.max_num_tokens
     sparse_attention_config = model_engine.sparse_attention_config
 
     config = model_engine.model.model_config.pretrained_config

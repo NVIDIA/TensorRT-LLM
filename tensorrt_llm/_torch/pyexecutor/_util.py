@@ -206,7 +206,9 @@ class KvCacheCreator:
         if requests:
             return requests
         vocab_size = self._model_engine.model.model_config.pretrained_config.vocab_size
-        max_num_tokens = self._max_num_tokens
+        max_num_tokens = min(
+            self._llm_args.get_runtime_sizes(sm_disagg_mode='ctx')[1],
+            self._max_num_tokens)
         max_beam_width = self._max_beam_width
 
         input_seq_len = min(max_num_tokens, input_seq_len)
@@ -775,9 +777,16 @@ def create_py_executor_instance(
         resource_manager.resource_managers.move_to_end(
             ResourceManagerType.KV_CACHE_MANAGER, last=True)
 
+    (
+        _,
+        generation_max_num_tokens,
+        _,
+        generation_max_batch_size,
+    ) = llm_args.get_runtime_sizes()
+
     # When scheduler_capacity == 1, attention dp dummy request will prevent the scheduling of DISAGG_GENERATION_INIT.
     # Enlarge scheduler capacity to avoid DISAGG_GENERATION_INIT stuck in the scheduler.
-    scheduler_capacity = max_num_sequences
+    scheduler_capacity = generation_max_batch_size * mapping.pp_size
     if scheduler_capacity == 1 and mapping.enable_attention_dp and kv_cache_manager:
         scheduler_capacity += 1
 
@@ -787,7 +796,8 @@ def create_py_executor_instance(
         peft_cache_manager.impl if peft_cache_manager is not None else None,
         scheduler_config.capacity_scheduler_policy,
         two_step_lookahead=mapping.has_pp())
-    mb_scheduler = BindMicroBatchScheduler(max_batch_size, max_num_tokens,
+    mb_scheduler = BindMicroBatchScheduler(generation_max_batch_size,
+                                           generation_max_num_tokens,
                                            ctx_chunk_config)
     scheduler = SimpleScheduler(capacity_scheduler, mb_scheduler)
 

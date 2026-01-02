@@ -825,5 +825,9 @@ def get_context_requests(requests: List[LlmRequest]):
 def get_generation_requests(requests: List[LlmRequest]):
     return [req for req in requests if not req.is_context_init_state]
 
+
 def get_generation_to_complete_requests(requests: List[LlmRequest]):
-    return [req for req in requests if req.state == LlmRequestState.GENERATION_TO_COMPLETE]
+    return [
+        req for req in requests
+        if req.state == LlmRequestState.GENERATION_TO_COMPLETE
+    ]

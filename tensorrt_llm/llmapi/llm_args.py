@@ -2429,14 +2429,6 @@ class BaseLlmArgs(StrictBaseModel):
             moe_tp_size=moe_tp_size,
             moe_ep_size=moe_ep_size)
 
-    def get_runtime_sizes(self, ) -> Tuple[int, int, int, int]:
-        return (
-            self.max_beam_width,
-            self.max_num_tokens,
-            self.max_seq_len,
-            self.max_batch_size,
-        )
-
 
 class TrtLlmArgs(BaseLlmArgs):
     enable_tqdm: bool = Field(default=False,
@@ -3062,6 +3054,38 @@ class TorchLlmArgs(BaseLlmArgs):
         executor_config = super().get_executor_config(_hf_model_dir, tokenizer)
         executor_config.mm_encoder_only = self.mm_encoder_only
         return executor_config
+
+    def get_runtime_sizes(self,
+                          sm_disagg_mode='gen') -> Tuple[int, int, int, int]:
+        max_num_tokens = self.max_num_tokens
+        max_batch_size = self.max_batch_size
+        if self.sm_disagg_config is not None:
+            if sm_disagg_mode == 'ctx':
+                max_num_tokens = self.sm_disagg_config.context_max_num_tokens
+                max_batch_size = self.sm_disagg_config.context_max_batch_size
+            elif sm_disagg_mode == 'sum':
+                max_num_tokens += self.sm_disagg_config.context_max_num_tokens
+                max_batch_size += self.sm_disagg_config.context_max_batch_size
+            elif sm_disagg_mode == 'max':
+                max_num_tokens = max(
+                    self.max_num_tokens,
+                    self.sm_disagg_config.context_max_num_tokens)
+                max_batch_size = max(
+                    self.max_batch_size,
+                    self.sm_disagg_config.context_max_batch_size)
+            elif sm_disagg_mode == 'min':
+                max_num_tokens = min(
+                    self.max_num_tokens,
+                    self.sm_disagg_config.context_max_num_tokens)
+                max_batch_size = min(
+                    self.max_batch_size,
+                    self.sm_disagg_config.context_max_batch_size)
+        return (
+            self.max_beam_width,
+            max_num_tokens,
+            self.max_seq_len,
+            max_batch_size,
+        )
 
 
 def update_llm_args_with_extra_dict(
