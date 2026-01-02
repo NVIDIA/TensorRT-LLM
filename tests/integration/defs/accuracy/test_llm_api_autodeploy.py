@@ -235,7 +235,7 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
 
 class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Nemotron-Super-V3"
-    MODEL_PATH_BF16 = "/scratch/models/super-v3-iter_0440000/hf"  # add to llm_models_root? I don't have permissions
+    MODEL_PATH_BF16 = f"{llm_models_root()}/Nemotron-Super-3-120B-A12B-dev"
 
     def get_default_kwargs(self):
         return {
@@ -264,15 +264,15 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
                               n=beam_width,
                               use_beam_search=beam_width > 1)
 
-    @pytest.mark.skip_less_device_memory(
-        32000)  # might need to require more memory
-    @pytest.mark.skip_less_device(8)
+    # 180GB works, might be able to go lower
+    @pytest.mark.skip_less_device_memory(180000)
+    @pytest.mark.skip_less_device(4)
     def test_bf16(self):
         kwargs = self.get_default_kwargs()
         sampling_params = self.get_default_sampling_params()
         with AutoDeployLLM(model=self.MODEL_PATH_BF16,
                            tokenizer=self.MODEL_PATH_BF16,
-                           world_size=8,
+                           world_size=4,
                            **kwargs) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=sampling_params)
