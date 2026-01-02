@@ -743,15 +743,15 @@ def subgraph(
     return subgraph_nodes
 
 
-def get_weight_shape(
-    node: Node, dim: Optional[int] = None
-) -> Optional[Union[int, Tuple[int, ...]]]:
+def get_weight_shape(node: Node, dim: Optional[int] = None) -> Optional[Union[int, List[int]]]:
     """Get the shape of the weight node."""
     if not is_any_lin_op(node):
         return None
     s = list(shape(extract_weight_node(node)))
+    if len(s) == 0:
+        return None
     if is_fp4_op(node):
-        # FP4 weights are stored as half-sized FP8 tensor
+        # FP4 weights are packed as uint8 type with 2 FP4 values per element
         s[-1] *= 2
     if dim is None:
         return s
