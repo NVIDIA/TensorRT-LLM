@@ -359,13 +359,30 @@ class ExecutorRequestQueue:
     def _fetch_new_requests_attention_dp(
             self, activate_requests: List[LlmRequest]) -> List[LlmRequest]:
         """Handle attention DP request fetching with load balancing."""
-        # Get active request counts across all ranks
+        # Get active request counts across all ranks.
         all_ranks_num_active_requests = []
         all_ranks_num_active_tokens = []
         num_active_tokens = sum(
             [req.py_orig_prompt_len for req in activate_requests])
         responses_list = self.dist.tp_allgather(
             [len(activate_requests), num_active_tokens])
+
+        if self.dist.has_cp_helix:
+            # When CP is enabled with Helix parallelism, tp_allgather returns one entry per rank,
+            # but CP ranks within the same DP group (same tp_rank) handle the same requests with
+            # different token portions (sequence is split across CP ranks).
+            aggregated_responses = []
+            for dp_group_idx in range(self.dist.tp_size):
+                # Get all entries for this DP group (cp_size entries per group)
+                group_start = dp_group_idx * self.dist.cp_size
+                group_entries = responses_list[group_start:group_start +
+                                               self.dist.cp_size]
+
+                # Sum the token counts across CP ranks (sequence is split)
+                total_tokens = sum(entry[1] for entry in group_entries)
+                aggregated_responses.append([group_entries[0][0], total_tokens])
+            responses_list = aggregated_responses
+
         for num_active_requests, num_active_tokens in responses_list:
             all_ranks_num_active_requests.append(num_active_requests)
             all_ranks_num_active_tokens.append(num_active_tokens)
