@@ -638,7 +638,6 @@ class BaseWorker(GenerationExecutor):
         return result
 
     def shutdown(self):
-        print(f"========================== Shutting down worker {self.rank}")
         if self.doing_shutdown:
             return
         else:

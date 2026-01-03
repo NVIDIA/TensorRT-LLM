@@ -294,9 +294,7 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
             self._shutdown_event.set()
 
         logger_debug(f"Shutting down RayExecutor", color="yellow")
-        print(
-            f"====================== shutdown in RayExecutor is called pid:  {os.getpid()}"
-        )
+
         if hasattr(self, 'main_loop') and self.main_loop and hasattr(
                 self, 'main_loop_task_obj') and self.main_loop_task_obj:
             logger_debug("Cancelling main loop task.", color="yellow")

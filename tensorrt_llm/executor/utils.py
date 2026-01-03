@@ -101,9 +101,6 @@ class ProcessPoolExecutorSession(MpiSession):
         return [future.result() for future in futures]
 
     def shutdown(self):
-        print(
-            f"==================================== shutdown ProcessPoolExecutor session"
-        )
         self.mpi_pool.shutdown(wait=True)
 
 

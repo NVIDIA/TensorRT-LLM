@@ -44,9 +44,6 @@ _child_p_global: Optional[subprocess.Popen] = None
 
 def _signal_handler_cleanup_child(signum, frame):
     """Signal handler to clean up the child process."""
-    print(
-        f"================================================ server received signal {signal.Signals(signum).name}"
-    )
     global _child_p_global
     if _child_p_global and _child_p_global.poll() is None:
         # Using print for safety in signal handlers
