@@ -231,6 +231,10 @@ methods:
         annotation: int
         default: 1000
         status: prototype
+      model_kwargs:
+        annotation: object
+        default: null
+        status: beta
     return_annotation: None
   generate:
     parameters:
