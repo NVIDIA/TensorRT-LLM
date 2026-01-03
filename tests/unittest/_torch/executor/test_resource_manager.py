@@ -764,6 +764,93 @@ class TestResourceManager(unittest.TestCase):
         )
         kv_cache_manager.free_resources(req3)
 
+    def test_kv_cache_manager_with_execution_stream(self):
+        """
+        Test that KVCacheManager uses the provided execution_stream.
+        """
+        # Create a dedicated execution stream
+        execution_stream = torch.cuda.Stream()
+
+        kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=0.1,
+            max_tokens=256,
+        )
+
+        # Create KVCacheManager with the execution stream
+        kv_cache_manager = KVCacheManager(
+            kv_cache_config=kv_cache_config,
+            kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.
+            CacheType.SELF,
+            num_layers=2,
+            num_kv_heads=2,
+            head_dim=128,
+            tokens_per_block=64,
+            max_seq_len=1024,
+            max_batch_size=1,
+            mapping=Mapping(),
+            execution_stream=execution_stream,
+        )
+
+        # Verify the KVCacheManager uses the provided execution stream
+        # The internal stream should be the same as the execution stream we provided
+        self.assertEqual(
+            kv_cache_manager._stream.cuda_stream, execution_stream.cuda_stream,
+            "KVCacheManager should use the provided execution_stream")
+
+        kv_cache_manager.shutdown()
+
+    def test_kv_cache_manager_without_execution_stream(self):
+        """Test that KVCacheManager creates its own stream when no execution_stream is provided.
+
+        This verifies backward compatibility.
+        """
+        kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=0.1,
+            max_tokens=256,
+        )
+
+        # Create KVCacheManager without providing an execution stream
+        kv_cache_manager = KVCacheManager(
+            kv_cache_config=kv_cache_config,
+            kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.
+            CacheType.SELF,
+            num_layers=2,
+            num_kv_heads=2,
+            head_dim=128,
+            tokens_per_block=64,
+            max_seq_len=1024,
+            max_batch_size=1,
+            mapping=Mapping(),
+        )
+
+        # Verify the KVCacheManager creates its own stream
+        self.assertIsNotNone(
+            kv_cache_manager._stream,
+            "KVCacheManager should create its own stream when none is provided")
+
+        # The stream should not be the default stream (0)
+        self.assertNotEqual(kv_cache_manager._stream.cuda_stream, 0,
+                            "KVCacheManager should not use the default stream")
+
+        kv_cache_manager.shutdown()
+
+    def test_peft_cache_manager_with_execution_stream(self):
+        """Test that PeftCacheManager uses the provided execution_stream.
+        """
+        peft_cache_config = self.create_peft_cache_config()
+        execution_stream = torch.cuda.Stream()
+
+        # Create PeftCacheManager with execution_stream
+        peft_cache_manager = PeftCacheManager(
+            peft_cache_config=peft_cache_config,
+            lora_config=LoraConfig(),
+            model_config=self.model_config,
+            execution_stream=execution_stream,
+        )
+
+        # The PeftCacheManager should be created successfully with the provided stream
+        self.assertTrue(peft_cache_manager.impl.enabled)
+
 
 if __name__ == "__main__":
     unittest.main()

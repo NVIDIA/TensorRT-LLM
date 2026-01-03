@@ -32,7 +32,8 @@ from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.lora_manager import LoraConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
-from .trt_test_alternative import check_call, check_output, exists, is_windows
+from .trt_test_alternative import (check_call, check_output, exists, is_windows,
+                                   print_info, print_warning)
 
 
 def venv_check_call(venv, cmd, env=None, **kwargs):
@@ -1229,3 +1230,32 @@ def revise_disagg_config_file_with_free_ports(disagg_config_file: str) -> str:
         yaml.dump(new_config, f)
 
     return new_config_file
+
+
+def parse_gsm8k_output(output_text: str) -> float:
+    """
+    Parse accuracy value from lm_eval output for GSM8K flexible-extract exact_match
+
+    Args:
+        output_text: The output text from gsm8k command
+
+    Returns:
+        float: The accuracy value (0.7582 in the example)
+    """
+
+    # Look for the specific pattern: |gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.7559|±  |0.0118|
+    patterns = [
+        r'flexible-extract\|\s+\d+\|exact_match\|\↑\s+\|(\d+\.\d+)',
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, output_text)
+        if match:
+            accuracy_value = float(match.group(1))
+            print_info(f"Extracted GSM8K accuracy value: {accuracy_value}")
+            return accuracy_value
+
+    print_warning("Could not find GSM8K accuracy value in gsm8k output")
+    print_warning(f"Output text: {output_text}")
+
+    return 0.0

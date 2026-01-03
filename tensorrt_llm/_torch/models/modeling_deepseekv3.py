@@ -1377,13 +1377,13 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 hidden_states, residual = self.moe_allreduce(
                     fc2_output, all_reduce_params=moe_all_reduce_params)
         else:
-            if self.next_layer_layernorm is not None:
-                hidden_states, residual = self.next_layer_layernorm(
-                    hidden_states, residual)
             if spec_metadata is not None and spec_metadata.is_layer_capture(
                     self.layer_idx):
                 spec_metadata.maybe_capture_hidden_states(
-                    self.layer_idx, hidden_states, None)
+                    self.layer_idx, hidden_states, residual)
+            if self.next_layer_layernorm is not None:
+                hidden_states, residual = self.next_layer_layernorm(
+                    hidden_states, residual)
 
         return hidden_states, residual
 

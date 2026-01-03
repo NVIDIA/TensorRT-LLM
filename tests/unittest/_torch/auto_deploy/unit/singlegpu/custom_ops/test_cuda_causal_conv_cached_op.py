@@ -59,9 +59,9 @@ def test_generate_only_with_slot_mapping_cuda(conv_env):
     # Metadata (not used in generate-only op entry, but required by the interface)
     cu_seqlen = torch.zeros(batch, device=device, dtype=torch.int32)
     use_initial_states = torch.zeros(batch, device=device, dtype=torch.bool)
-    # batch_info: [num_prefill, num_prefill_tokens, num_decode]
+    # batch_info_host: [num_prefill, num_prefill_tokens, num_decode]
     # For generate-only: num_decode = batch, num_prefill = 0
-    batch_info = torch.tensor([0, 0, batch], device=device, dtype=torch.int32)
+    batch_info_host = torch.tensor([0, 0, batch], device=device, dtype=torch.int32)
     # Snapshot caches for reference before running op (op mutates caches)
     gathered_before = conv_state_cache.clone().index_select(0, slot_idx)
     x_ref = x.clone()
@@ -72,7 +72,7 @@ def test_generate_only_with_slot_mapping_cuda(conv_env):
         w,
         b,
         # STANDARD METADATA
-        batch_info,
+        batch_info_host,
         cu_seqlen,
         slot_idx,
         use_initial_states,
