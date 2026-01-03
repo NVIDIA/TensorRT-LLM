@@ -781,16 +781,17 @@ class DisaggTestCmds(NamedTuple):
         return ["multi-node disaggregated server tests, please check config files"]
 
 
-def parse_select_pattern(select_pattern: str) -> str:
-    """Parse select pattern (server config name).
+def parse_select_pattern(select_pattern: str) -> list:
+    """Parse select pattern (server config names).
 
     Args:
-        select_pattern: Server config name (e.g., "r1_fp8_dep8_mtp1_1k1k").
+        select_pattern: Server config names separated by comma
+            (e.g., "r1_fp4_v2_dep4_mtp1_1k1k,r1_fp4_v2_tep4_mtp3_1k1k,r1_fp4_v2_tp4_mtp3_1k1k").
 
     Returns:
-        Server config name string.
+        List of server config name strings.
     """
-    return select_pattern
+    return [name.strip() for name in select_pattern.split(",")]
 
 
 class PerfSanityTestConfig:
@@ -873,11 +874,11 @@ class PerfSanityTestConfig:
 
     def _parse_aggr_config_file(self, config_file_path: str):
         """Parse YAML config file for aggregated server."""
-        # Parse selection pattern (server config name)
+        # Parse selection pattern (server config names)
         if self.select_pattern:
-            selected_server_name = parse_select_pattern(self.select_pattern)
+            selected_server_names = parse_select_pattern(self.select_pattern)
         else:
-            selected_server_name = None
+            selected_server_names = None
 
         with open(config_file_path, "r") as f:
             config = yaml.safe_load(f)
@@ -895,10 +896,10 @@ class PerfSanityTestConfig:
         server_client_configs = {}
 
         for server_idx, server_config_data in enumerate(config["server_configs"]):
-            # Check if this server should be included based on selected_server_name
+            # Check if this server should be included based on selected_server_names
             if (
-                selected_server_name is not None
-                and server_config_data.get("name") != selected_server_name
+                selected_server_names is not None
+                and server_config_data.get("name") not in selected_server_names
             ):
                 continue
 
@@ -1444,10 +1445,18 @@ def get_disagg_test_cases() -> List[str]:
     return test_cases
 
 
+# Hardcoded multi-test test cases from test db.
+MULTI_TEST_TEST_CASES = [
+    "aggr_upload-deepseek_r1_fp4_v2_grace_blackwell-r1_fp4_v2_dep4_mtp1_1k1k,r1_fp4_v2_tep4_mtp3_1k1k,r1_fp4_v2_tp4_mtp3_1k1k",
+    "aggr_upload-deepseek_r1_fp4_v2_grace_blackwell-r1_fp4_v2_dep4_mtp1_8k1k,r1_fp4_v2_tep4_mtp3_8k1k,r1_fp4_v2_tep4_mtp3_8k1k",
+    "aggr_upload-deepseek_r1_fp4_v2_grace_blackwell-r1_fp4_v2_dep4_mtp1_1k8k,r1_fp4_v2_tep4_mtp3_1k8k,r1_fp4_v2_tp4_mtp3_1k8k",
+    "aggr_upload-gpt_oss_120b_fp4_grace_blackwell-gpt_oss_fp4_dep4_1k8k,gpt_oss_fp4_dep2_1k1k,gpt_oss_fp4_tep2_1k8k,gpt_oss_fp4_tp2_1k8k,gpt_oss_fp4_tp4_eagle3_1k1k",
+]
+
 # Generate all test case combinations
 # For aggr: {test_type}-{config_yml}, {test_type}-{config_yml}-{server_config_name}
 # For disagg: {test_type}-{config_yml}
-PERF_SANITY_TEST_CASES = get_aggr_test_cases() + get_disagg_test_cases()
+PERF_SANITY_TEST_CASES = get_aggr_test_cases() + get_disagg_test_cases() + MULTI_TEST_TEST_CASES
 
 
 @pytest.mark.parametrize("perf_sanity_test_case", PERF_SANITY_TEST_CASES)
