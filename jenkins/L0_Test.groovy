@@ -3261,18 +3261,18 @@ def launchTestJobs(pipeline, testFilter)
         // "GB300-4_GPUs-PyTorch-Post-Merge-1": ["gb300-x4", "l0_gb300_multi_gpus", 1, 1, 4],
         // Perf sanity pre merge test
         "GB200-4_GPUs-PyTorch-PerfSanity-4": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 4, 14, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-5": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 5, 14, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-6": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 6, 14, 4],
         "GB200-4_GPUs-PyTorch-PerfSanity-11": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 11, 14, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-12": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 12, 14, 4],
         // Perf sanity post merge test
         "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 1, 14, 4],
         "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 2, 14, 4],
         "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 3, 14, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-5": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 5, 14, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-6": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 6, 14, 4],
         "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-7": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 7, 14, 4],
         "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-8": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 8, 14, 4],
         "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-9": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 9, 14, 4],
         "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-10": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 10, 14, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-12": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 12, 14, 4],
         "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-13": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 13, 14, 4],
         "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-14": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 14, 14, 4],
     ]
