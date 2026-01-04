@@ -691,12 +691,8 @@ def _print_perf_data(data):
 
 
 def _print_regression_data(data, print_func=None):
-    """Print regression info, metrics with baselines/thresholds, and config.
-
-    Args:
-        data: The regression data dictionary to print.
-        print_func: The print function to use (e.g., print_info, print_warning, print_error).
-                   Defaults to print_info if not specified.
+    """
+    Print regression info, metrics with baselines/thresholds, and config.
     """
     if print_func is None:
         print_func = print_info
