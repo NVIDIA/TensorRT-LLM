@@ -251,7 +251,7 @@ class TRTLLMGenFusedMoE(MoE):
         self._weights_created = True
         self._check_configs()
 
-        if (self.has_nvfp4 or self.has_w4a16_mxfp4 or self.has_w4a8_nvfp4_fp8
+        if (self.has_w4a16_mxfp4 or self.has_w4a8_nvfp4_fp8
                 or self.has_w4a8_mxfp4_fp8
                 or self.has_w4a8_mxfp4_mxfp8) and not self.bias:
             self.w3_w1_bias = nn.Parameter(torch.zeros(
