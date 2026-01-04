@@ -1138,7 +1138,8 @@ class KVCacheManager(BaseResourceManager):
             tensor_parallelism=self.mapping.tp_size,
             pipeline_parallelism=self.mapping.pp_size,
             rank=self.mapping.rank,
-            gpus_per_node=self.mapping.gpus_per_node)
+            gpus_per_node=self.mapping.gpus_per_node,
+            enable_attention_dp=self.mapping.enable_attention_dp)
 
         window_size_to_layers = self._get_window_size_to_layers()
         logger.debug(f"window_size_to_layers: {window_size_to_layers}")

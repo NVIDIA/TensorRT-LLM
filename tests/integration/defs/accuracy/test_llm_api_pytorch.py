@@ -4270,6 +4270,44 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
+    @pytest.mark.skip_less_device(2)
+    @pytest.mark.skip_blackwell
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler", [
+            (2, 1, 1, False, True, True),
+            (2, 1, 2, False, True, True),
+            (2, 1, 2, True, True, True),
+        ],
+        ids=["tp2", "ep2", "dp2"])
+    def test_w4_2gpus_nvfp4(self, tp_size, pp_size, ep_size, attention_dp,
+                            cuda_graph, overlap_scheduler, mocker):
+        pytest.skip("Models not uploaded to CI")
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
+                                        dtype="auto")
+
+        llm = LLM("./nvfp4ckpt",
+                  tensor_parallel_size=tp_size,
+                  pipeline_parallel_size=pp_size,
+                  moe_expert_parallel_size=ep_size,
+                  kv_cache_config=kv_cache_config,
+                  max_seq_len=8192,
+                  **pytorch_config,
+                  enable_attention_dp=attention_dp,
+                  moe_config=MoeConfig(backend="TRTLLM"))
+
+        with llm:
+            model_name = "GPT-OSS/20B-NVFP4"
+            task = GSM8K(model_name)
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
+            mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
+                              {"scores_filter": "exact_match,flexible-extract"})
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.extra_evaluator_kwargs)
+
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize(
         "kv_cache_dtype",
