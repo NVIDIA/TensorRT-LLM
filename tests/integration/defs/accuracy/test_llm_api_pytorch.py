@@ -2610,7 +2610,7 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
     @skip_pre_hopper
     @pytest.mark.skip_less_device_memory(140000)
     @pytest.mark.parametrize(
-        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend,skip_indexer",
+        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend,disable_skip_indexer",
         [
             (8, 1, 8, 0, False, True, True, True, 24, "_DEFAULT", False),
             (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT", False),
@@ -2621,11 +2621,11 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
         ],
         ids=[
             "baseline", "baseline_mtp1", "baseline_fp8kv", "latency",
-            "latency_default", "skip_indexer"
+            "latency_default", "disable_skip_indexer"
         ])
     def test_fp8_blockscale(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                             attention_dp, cuda_graph, overlap_scheduler,
-                            max_batch_size, moe_backend, skip_indexer):
+                            max_batch_size, moe_backend, disable_skip_indexer):
         if get_sm_version() == 100 or get_sm_version() == 103:
             moe_backend = "DEEPGEMM" if moe_backend == "_DEFAULT" else moe_backend
             moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
@@ -2652,9 +2652,9 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
             kv_cache_config.dtype = "fp8"
 
         dsa_config = None
-        if skip_indexer:
+        if disable_skip_indexer:
             dsa_config = DeepSeekSparseAttentionConfig(
-                skip_indexer_for_short_seqs=True)
+                skip_indexer_for_short_seqs=False)
 
         mtp_config = None
         if mtp_nextn > 0:
@@ -2686,7 +2686,7 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_mpi_world_size(8)
     @skip_pre_blackwell
     @pytest.mark.parametrize(
-        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend,skip_indexer",
+        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend,disable_skip_indexer",
         [
             (8, 1, 8, 0, False, True, True, True, 24, "CUTLASS", False),
             (8, 1, 8, 1, False, True, True, True, 24, "CUTLASS", False),
@@ -2696,11 +2696,12 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
         ],
         ids=[
             "baseline", "baseline_mtp1", "baseline_fp8kv", "latency",
-            "skip_indexer"
+            "disable_skip_indexer"
         ])
     def test_nvfp4_multi_gpus(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                               attention_dp, cuda_graph, overlap_scheduler,
-                              max_batch_size, moe_backend, skip_indexer):
+                              max_batch_size, moe_backend,
+                              disable_skip_indexer):
         sm_version = get_sm_version()
         if moe_backend == "TRTLLM" and sm_version in (120, 121):
             pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
@@ -2721,9 +2722,9 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
             kv_cache_config.dtype = "fp8"
 
         dsa_config = None
-        if skip_indexer:
+        if disable_skip_indexer:
             dsa_config = DeepSeekSparseAttentionConfig(
-                skip_indexer_for_short_seqs=True)
+                skip_indexer_for_short_seqs=False)
 
         mtp_config = None
         if mtp_nextn > 0:
