@@ -69,6 +69,9 @@ RequestPerfMetrics Serialization::deserializeRequestPerfMetrics(std::istream& is
     auto numReusedBlocks = su::deserialize<SizeType32>(is);
     auto numMissedBlocks = su::deserialize<SizeType32>(is);
     auto kvCacheHitRate = su::deserialize<FloatType>(is);
+    auto maxNumBlocks = su::deserialize<SizeType32>(is);
+    auto usedNumBlocks = su::deserialize<SizeType32>(is);
+    auto freeNumBlocks = su::deserialize<SizeType32>(is);
 
     auto acceptanceRate = su::deserialize<FloatType>(is);
     auto totalAcceptedDraftTokens = su::deserialize<SizeType32>(is);
@@ -80,8 +83,8 @@ RequestPerfMetrics Serialization::deserializeRequestPerfMetrics(std::istream& is
 
     RequestPerfMetrics::TimingMetrics timingMetrics{arrivalTime, firstScheduledTime, firstTokenTime, lastTokenTime,
         kvCacheTransferStart, kvCacheTransferEnd, kvCacheSize};
-    RequestPerfMetrics::KvCacheMetrics kvCacheMetrics{
-        numTotalAllocatedBlocks, numNewAllocatedBlocks, numReusedBlocks, numMissedBlocks, kvCacheHitRate};
+    RequestPerfMetrics::KvCacheMetrics kvCacheMetrics{numTotalAllocatedBlocks, numNewAllocatedBlocks, numReusedBlocks,
+        numMissedBlocks, kvCacheHitRate, maxNumBlocks, usedNumBlocks, freeNumBlocks};
     RequestPerfMetrics::SpeculativeDecodingMetrics specDecMetrics{
         acceptanceRate, totalAcceptedDraftTokens, totalDraftTokens};
     return RequestPerfMetrics{timingMetrics, kvCacheMetrics, specDecMetrics, firstIter, lastIter, iter};
@@ -103,6 +106,9 @@ void Serialization::serialize(RequestPerfMetrics const& metrics, std::ostream& o
     su::serialize(metrics.kvCacheMetrics.numReusedBlocks, os);
     su::serialize(metrics.kvCacheMetrics.numMissedBlocks, os);
     su::serialize(metrics.kvCacheMetrics.kvCacheHitRate, os);
+    su::serialize(metrics.kvCacheMetrics.maxNumBlocks, os);
+    su::serialize(metrics.kvCacheMetrics.usedNumBlocks, os);
+    su::serialize(metrics.kvCacheMetrics.freeNumBlocks, os);
 
     su::serialize(metrics.speculativeDecoding.acceptanceRate, os);
     su::serialize(metrics.speculativeDecoding.totalAcceptedDraftTokens, os);
@@ -131,6 +137,9 @@ size_t Serialization::serializedSize(RequestPerfMetrics const& metrics)
     totalSize += su::serializedSize(metrics.kvCacheMetrics.numReusedBlocks);
     totalSize += su::serializedSize(metrics.kvCacheMetrics.numMissedBlocks);
     totalSize += su::serializedSize(metrics.kvCacheMetrics.kvCacheHitRate);
+    totalSize += su::serializedSize(metrics.kvCacheMetrics.maxNumBlocks);
+    totalSize += su::serializedSize(metrics.kvCacheMetrics.usedNumBlocks);
+    totalSize += su::serializedSize(metrics.kvCacheMetrics.freeNumBlocks);
 
     totalSize += su::serializedSize(metrics.speculativeDecoding.acceptanceRate);
     totalSize += su::serializedSize(metrics.speculativeDecoding.totalAcceptedDraftTokens);

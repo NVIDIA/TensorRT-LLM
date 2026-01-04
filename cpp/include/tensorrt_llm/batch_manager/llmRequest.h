@@ -1905,6 +1905,13 @@ public:
                     mPerfMetrics.kvCacheMetrics.numReusedBlocks + mPerfMetrics.kvCacheMetrics.numMissedBlocks));
     }
 
+    void setKvCacheSystemStats(SizeType32 maxNumBlocks, SizeType32 usedNumBlocks, SizeType32 freeNumBlocks)
+    {
+        mPerfMetrics.kvCacheMetrics.maxNumBlocks = maxNumBlocks;
+        mPerfMetrics.kvCacheMetrics.usedNumBlocks = usedNumBlocks;
+        mPerfMetrics.kvCacheMetrics.freeNumBlocks = freeNumBlocks;
+    }
+
     void updatePerfMetrics(executor::IterationType iter)
     {
         auto const currentTokenTime = getSteadyClockNow();
