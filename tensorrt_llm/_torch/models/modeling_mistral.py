@@ -345,7 +345,7 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
                 model_path,
                 use_fast=self.use_fast,
                 trust_remote_code=trust_remote_code)
-            self.text_processor = None
+            self.text_processor = self._processor
 
     @property
     def config(self) -> PretrainedConfig:
@@ -457,19 +457,22 @@ class MistralCommonInputProcessor(Mistral3InputProcessor):
         trust_remote_code: bool = False,
         **kwargs,
     ):
-        tokenizer = self.load_tokenizer(model_path, config=config)
+        tokenizer = self.load_tokenizer(model_path,
+                                        config=config,
+                                        tokenizer=tokenizer)
         super().__init__(model_path=model_path,
                          config=config,
                          tokenizer=tokenizer,
                          trust_remote_code=trust_remote_code,
-                         model_type="mistral_large_3",
+                         model_type=getattr(config, "input_processor_type",
+                                            "mistral3"),
                          **kwargs)
 
     @staticmethod
     def load_tokenizer(model_path: str,
                        config: PretrainedConfig,
-                       checkpoint_format: str = "mistral_large_3"):
-        if checkpoint_format == "mistral_large_3":
+                       tokenizer: AutoTokenizer | None = None):
+        if getattr(config, "input_processor_type", None) == "mistral_large_3":
             try:
                 return MistralTokenizer.from_pretrained(model_path)
 
@@ -478,10 +481,8 @@ class MistralCommonInputProcessor(Mistral3InputProcessor):
                     f"Could not load mistral-common tokenizer from {model_path}, falling back to HuggingFace"
                 )
 
-        tokenizer = AutoTokenizer.from_pretrained(model_path,
-                                                  config=config,
-                                                  use_fast=True,
-                                                  trust_remote_code=True)
+        tokenizer = tokenizer if tokenizer is not None else AutoTokenizer.from_pretrained(
+            model_path, config=config, use_fast=True, trust_remote_code=True)
         return tokenizer
 
 
@@ -498,7 +499,7 @@ class MistralCommonInputProcessor(Mistral3InputProcessor):
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
     ))
 @register_input_processor(
-    Mistral3InputProcessor,
+    MistralCommonInputProcessor,
     model_type="mistral3",
     placeholder_metadata=MultimodalPlaceholderMetadata(
         placeholder_map={
