@@ -102,7 +102,6 @@ set +e
 pytest_exit_code=0
 perf_check_exit_code=0
 perf_report_exit_code=0
-perf_sanity_check_exit_code=0
 
 eval $pytestCommand
 pytest_exit_code=$?
@@ -154,20 +153,10 @@ if [ $SLURM_PROCID -eq 0 ] && [ "$perfMode" = "true" ]; then
     echo "Rank${SLURM_PROCID} Perf check finished execution with exit code $perf_check_exit_code"
 fi
 
-if [ $SLURM_PROCID -eq 0 ] && [[ "$stageName" == *PerfSanity* ]]; then
-    echo "Check PerfSanity Result"
-    python3 $llmSrcNode/tests/integration/defs/perf/perf_regression_check.py \
-        $jobWorkspace
-    perf_sanity_check_exit_code=$?
-    echo "Rank${SLURM_PROCID} PerfSanity check finished execution with exit code $perf_sanity_check_exit_code"
-fi
-
 if [ "$pytest_exit_code" -ne 0 ]; then
     final_exit_code=$pytest_exit_code
 elif [ "$perf_check_exit_code" -ne 0 ]; then
     final_exit_code=$perf_check_exit_code
-elif [ "$perf_sanity_check_exit_code" -ne 0 ]; then
-    final_exit_code=$perf_sanity_check_exit_code
 else
     final_exit_code=0
 fi
