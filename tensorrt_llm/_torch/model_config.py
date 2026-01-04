@@ -495,10 +495,15 @@ class ModelConfig(Generic[TConfig]):
         # TODO smor- currently assuming no rnn layers, no MOE
         from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
 
-        num_heads = self.pretrained_config.num_attention_heads // (
-            self.mapping.tp_size * self.mapping.cp_size)
+        # Attention DP should not shard attention heads; use attn_tp_size=1 in that case
+        # so downstream KV calculations see the full (non-partitioned) head count.
+        attn_tp_size = self.mapping.attn_tp_size if not self.mapping.enable_attention_dp else 1
+        attn_cp_size = self.mapping.attn_cp_size
 
-        hidden_size = self.pretrained_config.hidden_size // self.mapping.tp_size
+        num_heads = self.pretrained_config.num_attention_heads // (
+            attn_tp_size * attn_cp_size)
+
+        hidden_size = self.pretrained_config.hidden_size // attn_tp_size
 
         model_config_cpp = ModelConfigCpp(
             vocab_size=self.pretrained_config.vocab_size,
@@ -523,13 +528,12 @@ class ModelConfig(Generic[TConfig]):
         if isinstance(num_key_value_heads, (list, tuple)):
             # Per-layer KV heads (e.g., Nemotron-NAS, variable GQA models)
             num_kv_heads_per_layer = [
-                kv_heads // (self.mapping.tp_size * self.mapping.cp_size)
+                kv_heads // (attn_tp_size * attn_cp_size)
                 for kv_heads in num_key_value_heads
             ]
             model_config_cpp.num_kv_heads_per_layer = num_kv_heads_per_layer
         else:
-            num_kv_heads = num_key_value_heads // (self.mapping.tp_size *
-                                                   self.mapping.cp_size)
+            num_kv_heads = num_key_value_heads // (attn_tp_size * attn_cp_size)
             model_config_cpp.set_num_kv_heads(num_kv_heads)
 
         mlp_hidden_size = None
