@@ -323,8 +323,8 @@ class FP4BlockScaleMoERunner(TunableRunner):
 
         ROUTER_LOGITS_IDX = 0
         CONSTRAINED_RL_DIM = 0
-        TOPK_WEIGHTS_IDX = 11
-        TOPK_IDS_IDX = 12
+        TOPK_WEIGHTS_IDX = 16
+        TOPK_IDS_IDX = 17
 
         constraint_routing_logits = ConstraintSpec(ROUTER_LOGITS_IDX,
                                                    CONSTRAINED_RL_DIM,
