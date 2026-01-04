@@ -1746,16 +1746,16 @@ def tunable_allreduce(
     bias: Optional[torch.Tensor],
     workspace: Optional[torch.Tensor],
     group: List[int],
+    strategy: int,
     op: int,
     eps: float,
-    tp_size: int,
     trigger_completion_at_end: bool,
 ) -> List[torch.Tensor]:
 
     tuner = AutoTuner.get()
 
     allreduce_runner = AllReduceRunner(
-        tp_size,
+        len(group),
         group,
         op,
         eps,
@@ -1784,9 +1784,9 @@ def _(
     bias: Optional[torch.Tensor],
     workspace: Optional[torch.Tensor],
     group: List[int],
+    strategy: int,
     op: int,
     eps: float,
-    tp_size: int,
     trigger_completion_at_end: bool,
 ) -> List[torch.Tensor]:
     if op == int(AllReduceFusionOp.NONE):

@@ -845,9 +845,9 @@ class AllReduce(nn.Module):
                 bias=all_reduce_params.bias,
                 workspace=self.workspace,
                 group=self.mapping.tp_group,
+                strategy=allreduce_strategy,
                 op=all_reduce_params.fusion_op,
                 eps=all_reduce_params.eps,
-                tp_size=self.mapping.tp_size,
                 trigger_completion_at_end=all_reduce_params.
                 trigger_completion_at_end,
             )
