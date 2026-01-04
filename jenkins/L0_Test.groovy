@@ -3260,11 +3260,12 @@ def launchTestJobs(pipeline, testFilter)
         // "GB300-PyTorch-1": ["gb300-single", "l0_gb300", 1, 1],
         // "GB300-4_GPUs-PyTorch-Post-Merge-1": ["gb300-x4", "l0_gb300_multi_gpus", 1, 1, 4],
         // Perf sanity pre merge test
-        "GB200-4_GPUs-PyTorch-PerfSanity-2": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 2, 4, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-4": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 4, 4, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-1": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 1, 2, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-2": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 2, 2, 4],
         // Perf sanity post merge test
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 1, 4, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 3, 4, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 1, 3, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 2, 3, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 3, 3, 4],
     ]
     fullSet += SBSASlurmTestConfigs.keySet()
 

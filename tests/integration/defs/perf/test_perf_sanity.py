@@ -1446,12 +1446,7 @@ def get_disagg_test_cases() -> List[str]:
 
 
 # Hardcoded multi-test test cases from test db.
-MULTI_TEST_TEST_CASES = [
-    "aggr_upload-deepseek_r1_fp4_v2_grace_blackwell-r1_fp4_v2_dep4_mtp1_1k1k,r1_fp4_v2_tep4_mtp3_1k1k,r1_fp4_v2_tp4_mtp3_1k1k",
-    "aggr_upload-deepseek_r1_fp4_v2_grace_blackwell-r1_fp4_v2_dep4_mtp1_8k1k,r1_fp4_v2_tep4_mtp3_8k1k,r1_fp4_v2_tep4_mtp3_8k1k",
-    "aggr_upload-deepseek_r1_fp4_v2_grace_blackwell-r1_fp4_v2_dep4_mtp1_1k8k,r1_fp4_v2_tep4_mtp3_1k8k,r1_fp4_v2_tp4_mtp3_1k8k",
-    "aggr_upload-gpt_oss_120b_fp4_grace_blackwell-gpt_oss_fp4_dep4_1k8k,gpt_oss_fp4_dep2_1k1k,gpt_oss_fp4_tep2_1k8k,gpt_oss_fp4_tp2_1k8k,gpt_oss_fp4_tp4_eagle3_1k1k",
-]
+MULTI_TEST_TEST_CASES = []
 
 # Generate all test case combinations
 # For aggr: {test_type}-{config_yml}, {test_type}-{config_yml}-{server_config_name}

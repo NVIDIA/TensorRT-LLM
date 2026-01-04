@@ -17,25 +17,7 @@ import os
 import sys
 
 import yaml
-
-METRICS = [
-    "seq_throughput",
-    "token_throughput",
-    "total_token_throughput",
-    "user_throughput",
-    "mean_tpot",
-    "median_tpot",
-    "p99_tpot",
-    "mean_ttft",
-    "median_ttft",
-    "p99_ttft",
-    "mean_itl",
-    "median_itl",
-    "p99_itl",
-    "mean_e2el",
-    "median_e2el",
-    "p99_e2el",
-]
+from open_search_db_utils import MAXIMIZE_METRICS, MINIMIZE_METRICS
 
 
 def should_skip_execution():
@@ -76,20 +58,21 @@ def read_yaml_data(yaml_files):
 
 def get_metric_keys():
     metric_keys = set()
-    for metric in METRICS:
-        metric_keys.add(f"d_{metric}")
-        metric_keys.add(f"d_baseline_{metric}")
-        metric_keys.add(f"d_threshold_{metric}")
+    for metric in MAXIMIZE_METRICS + MINIMIZE_METRICS:
+        metric_suffix = metric[2:]  # Strip "d_" prefix
+        metric_keys.add(metric)
+        metric_keys.add(f"d_baseline_{metric_suffix}")
+        metric_keys.add(f"d_threshold_post_merge_{metric_suffix}")
+        metric_keys.add(f"d_threshold_pre_merge_{metric_suffix}")
     return metric_keys
 
 
 def print_perf_data(data):
     print("=== Metrics ===")
-    for metric in METRICS:
-        value_key = f"d_{metric}"
-        if value_key in data:
-            value = data.get(value_key, "N/A")
-            print(f'"{value_key}": {value}')
+    for metric in MAXIMIZE_METRICS + MINIMIZE_METRICS:
+        if metric in data:
+            value = data.get(metric, "N/A")
+            print(f'"{metric}": {value}')
 
     metric_keys = get_metric_keys()
     print("\n=== Config ===")
@@ -105,29 +88,39 @@ def print_regression_data(data):
         print(f"{data['s_regression_info']}")
 
     metric_keys = get_metric_keys()
+    is_post_merge = data.get("b_is_post_merge", False)
 
     print("=== Metrics ===")
-    for metric in METRICS:
-        value_key = f"d_{metric}"
-        baseline_key = f"d_baseline_{metric}"
-        threshold_key = f"d_threshold_{metric}"
+    for metric in MAXIMIZE_METRICS + MINIMIZE_METRICS:
+        metric_suffix = metric[2:]  # Strip "d_" prefix
+        baseline_key = f"d_baseline_{metric_suffix}"
+        if is_post_merge:
+            threshold_key = f"d_threshold_post_merge_{metric_suffix}"
+        else:
+            threshold_key = f"d_threshold_pre_merge_{metric_suffix}"
         # Only print if at least one of the keys exists
-        if value_key in data or baseline_key in data or threshold_key in data:
-            value = data.get(value_key, "N/A")
+        if metric in data or baseline_key in data or threshold_key in data:
+            value = data.get(metric, "N/A")
             baseline = data.get(baseline_key, "N/A")
             threshold = data.get(threshold_key, "N/A")
             # Calculate percentage difference between value and baseline
+            # Positive percentage means better perf, negative means regression
             if (
                 isinstance(value, (int, float))
                 and isinstance(baseline, (int, float))
                 and baseline != 0
             ):
-                percentage = (value - baseline) / baseline * 100
+                if metric in MAXIMIZE_METRICS:
+                    # Larger is better: value > baseline is positive (better)
+                    percentage = (value - baseline) / baseline * 100
+                else:
+                    # Smaller is better: value < baseline is positive (better)
+                    percentage = (baseline - value) / baseline * 100
                 percentage_str = f"{percentage:+.2f}%"
             else:
                 percentage_str = "N/A"
             print(
-                f'"{value_key}": {value}, "{baseline_key}": {baseline}, '
+                f'"{metric}": {value}, "{baseline_key}": {baseline}, '
                 f'"{threshold_key}": {threshold}, "diff": {percentage_str}'
             )
 
