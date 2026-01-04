@@ -17,7 +17,30 @@ import os
 import sys
 
 import yaml
-from open_search_db_utils import MAXIMIZE_METRICS, MINIMIZE_METRICS
+
+# Metrics where larger is better
+MAXIMIZE_METRICS = [
+    "d_seq_throughput",
+    "d_token_throughput",
+    "d_total_token_throughput",
+    "d_user_throughput",
+    "d_mean_tpot",
+    "d_median_tpot",
+    "d_p99_tpot",
+]
+
+# Metrics where smaller is better
+MINIMIZE_METRICS = [
+    "d_mean_ttft",
+    "d_median_ttft",
+    "d_p99_ttft",
+    "d_mean_itl",
+    "d_median_itl",
+    "d_p99_itl",
+    "d_mean_e2el",
+    "d_median_e2el",
+    "d_p99_e2el",
+]
 
 
 def should_skip_execution():
