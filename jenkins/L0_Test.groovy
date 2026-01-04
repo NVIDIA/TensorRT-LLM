@@ -125,7 +125,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String st
         def hasTimeoutTest = false
         def downloadResultSucceed = false
 
-        pipeline.stage('Submit Test Results') {
+        pipeline.stage('Submit Test Result') {
             sh "mkdir -p ${stageName}"
             // Download timeout test results
             def timeoutTestFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/unfinished_test.txt"
@@ -554,7 +554,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
             ]
 
             Utils.exec(pipeline, script: "apt-get update && apt-get install -y sshpass openssh-client")
-            stage('Request Node via SLURM') {
+            stage('Request Node Via Slurm') {
                 println("Selected Cluster: ${cluster.name}")
 
                 def jenkinsSetupPath = Utils.copyLibraryResource(pipeline, entrypoint)
@@ -603,7 +603,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
             }
         }
 
-        stage('Checking if the Node is Online') {
+        stage('Check If Node Is Online') {
             withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
                 def randomLoginNode = SlurmConfig.getRandomLoginNode(cluster.host)
                 def remote = [
@@ -707,7 +707,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
         }
         executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner)
     } finally {
-        stage("Clean up SLURM Resources") {
+        stage("Clean Up Slurm Resource") {
             // Workaround to handle the interruption during clean up SLURM resources
             retry(3) {
                 try {
@@ -892,7 +892,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
     String customSuffix = "${env.BUILD_TAG}-${UUID.randomUUID().toString().replaceAll("-", "").substring(0, 6)}".toLowerCase()
     def jobUID = "${cluster.host}-multi_node_test-${customSuffix}"
     def disaggMode = stageName.contains("PerfSanity-Disagg")
-    def setSegment = disaggMode
 
     Utils.exec(pipeline, script: "env | sort && pwd && ls -alh")
 
@@ -939,7 +938,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             def scriptTrackPathNode = "${jobWorkspace}/${jobUID}-slurm_track.sh"
             def coverageConfigFile = "${jobWorkspace}/.coveragerc"
 
-            stage("Initializing Test") {
+            stage("Initialize Test") {
                 println("Selected Cluster: ${cluster.name}")
                 // Create Job Workspace folder in Frontend Node
                 Utils.exec(pipeline, script: Utils.sshUserCmd(remote, "\"mkdir -p ${jobWorkspace}\""), numRetries: 3)
@@ -1047,7 +1046,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 // Generate Job Launch Script
                 def container = LLM_DOCKER_IMAGE.replace("urm.nvidia.com/", "urm.nvidia.com#")
                 def mounts = getMountListForSlurmTest(cluster, true).join(",")
-                String[] taskArgs = getNodeArgs(nodeCount, gpuCount, setSegment)
+                String[] taskArgs = getNodeArgs(nodeCount, gpuCount, disaggMode)
                 if (taskArgs == null) {
                     error "Invalid Slurm test stage name is set"
                 }
@@ -1369,7 +1368,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
         }
     } finally {
         uploadResults(pipeline, cluster, jobUID, stageName)
-        stage("Clean up SLURM Resources") {
+        stage("Clean Up Slurm Resource") {
             // Workaround to handle the interruption during clean up SLURM resources
             retry(3) {
                 try {
@@ -2587,7 +2586,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
     }
 
     // Step 2: run tests
-    stage ("Setup environment")
+    stage ("Setup Environment")
     {
         // Random sleep to avoid resource contention
         sleep(10 * Math.random())
@@ -2639,7 +2638,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
     }
 
     if (testFilter[(DEBUG_MODE)]) {
-        stage("Interactive debug session")
+        stage("Interactive Debug Session")
         {
             testFilter[(DEBUG_MODE)] = false
 
@@ -3071,7 +3070,7 @@ def ensureStageResultNotUploaded(stageName) {
     if(!GlobalState.uploadResultStageNames.contains(stageName)) {
         GlobalState.uploadResultStageNames.add(stageName)
     } else {
-        stage('Upload Test Results') {
+        stage('Upload Test Result') {
             catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
                 error "Upload test results for ${stageName} failed because it has already been uploaded."
             }
@@ -3528,7 +3527,7 @@ def launchTestJobs(pipeline, testFilter)
             }
 
             if (checkPipStage) {
-                stage("Run LLMAPI tests") {
+                stage("Run LLMAPI Test") {
                     pipInstallSanitySpec = createKubernetesPodConfig(values[5], gpu_type, k8s_arch)
                     trtllm_utils.launchKubernetesPod(pipeline, pipInstallSanitySpec, "trt-llm", {
                         echo "###### Prerequisites Start ######"
@@ -3740,8 +3739,8 @@ def launchTestJobs(pipeline, testFilter)
     parallelJobsFiltered = parallelJobsFiltered.collectEntries { key, values -> [key, {
         stage(key) {
             if (key in testFilter[REUSE_STAGE_LIST]) {
-                stage("Skip - reused") {
-                    echo "Skip - Passed in the last pipeline."
+                stage("Skip - Reused") {
+                    echo "Skip - Passed in the previous pipelines."
                 }
             } else if (values instanceof List) {
                 trtllm_utils.launchKubernetesPod(pipeline, values[0], "trt-llm", {
@@ -3865,7 +3864,7 @@ pipeline {
         OPEN_SEARCH_DB_CREDENTIALS=credentials("open_search_db_credentials")
     }
     stages {
-        stage("Setup environment")
+        stage("Setup Environment")
         {
             steps
             {
@@ -3880,7 +3879,7 @@ pipeline {
                 }
             }
         }
-        stage("Check Test Lists")
+        stage("Check Test List")
         {
             when {
                 expression {
