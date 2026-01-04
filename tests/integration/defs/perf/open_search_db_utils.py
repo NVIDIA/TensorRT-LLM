@@ -749,19 +749,8 @@ def _print_regression_data(data, print_func=None):
 
 def check_perf_regression(regressive_data_list, new_data_dict):
     """
-    Check performance regression by printing perf data and regression data.
+    Check performance regression by printing regression data.
     """
-    # Print perf data
-    all_perf_data = list(new_data_dict.values())
-    print_info(f"Found {len(all_perf_data)} perf data")
-    for i, data in enumerate(all_perf_data):
-        print_info(f"\n{'=' * 60}")
-        print_info(f"Perf Data #{i + 1}")
-        print_info("=" * 60)
-        _print_perf_data(data)
-
-    print_info(f"\n{'=' * 60}\n")
-
     # Split regression data into post-merge and pre-merge
     post_merge_regressions = [
         data for data in regressive_data_list
@@ -782,15 +771,15 @@ def check_perf_regression(regressive_data_list, new_data_dict):
             print_warning("=" * 60)
             _print_regression_data(data, print_func=print_warning)
 
-    # Print post-merge regression data with print_error
+    # Print post-merge regression data with print_warning for content
     if len(post_merge_regressions) > 0:
+        for i, data in enumerate(post_merge_regressions):
+            print_warning(f"\n{'=' * 60}")
+            print_warning(f"Post-merge Regression Data #{i + 1}")
+            print_warning("=" * 60)
+            _print_regression_data(data, print_func=print_warning)
         print_error(
             f"Found {len(post_merge_regressions)} post-merge regression data")
-        for i, data in enumerate(post_merge_regressions):
-            print_error(f"\n{'=' * 60}")
-            print_error(f"Post-merge Regression Data #{i + 1}")
-            print_error("=" * 60)
-            _print_regression_data(data, print_func=print_error)
 
     # Print summary if no regressions
     if len(regressive_data_list) == 0:
