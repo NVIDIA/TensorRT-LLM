@@ -466,6 +466,12 @@ struct RequestPerfMetrics
         SizeType32 numMissedBlocks{0};
         /// @brief KV Cache Hit Rate, defined as reusedBlocks / (reusedBlocks + missedBlocks)
         FloatType kvCacheHitRate{0.f};
+        /// @brief Maximum number of blocks available in the system KV cache
+        SizeType32 maxNumBlocks{0};
+        /// @brief Number of used blocks in the system KV cache
+        SizeType32 usedNumBlocks{0};
+        /// @brief Number of free blocks in the system KV cache
+        SizeType32 freeNumBlocks{0};
     };
 
     struct SpeculativeDecodingMetrics

@@ -114,6 +114,10 @@ class KvCacheMetrics(OpenAIBaseModel):
     num_new_allocated_blocks: Optional[int] = None
     num_reused_blocks: Optional[int] = None
     num_missed_blocks: Optional[int] = None
+    max_num_blocks: Optional[int] = None
+    used_num_blocks: Optional[int] = None
+    free_num_blocks: Optional[int] = None
+    utilization: Optional[float] = None
 
 
 class SpeculativeDecodingMetrics(OpenAIBaseModel):
