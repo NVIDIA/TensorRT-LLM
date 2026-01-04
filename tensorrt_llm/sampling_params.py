@@ -399,9 +399,13 @@ class SamplingParams:
                 generation_config.eos_token_id = [generation_config.eos_token_id]
             # else is always List[int]
 
+            if not self.stop_token_ids:
+                self.stop_token_ids = []
             for stop_token in generation_config.eos_token_id:
                 if stop_token != self.end_id and stop_token not in self.stop_token_ids:
                     self.stop_token_ids.append(stop_token)
+            if not self.stop_token_ids:
+                self.stop_token_ids = None
 
         return self
 
