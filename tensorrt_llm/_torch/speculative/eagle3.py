@@ -133,7 +133,7 @@ class Eagle3SpecMetadata(SpecMetadata):
             self.layers_to_capture = (self.num_layers - 1, )
         elif self.layers_to_capture is None:
             if self.num_layers == 1 or self.is_mtp_eagle:
-                self.layers_to_capture = (self.num_layers - 1, )
+                self.layers_to_capture = (-1, )
             else:
                 if self.num_layers <= 5:
                     raise ValueError(
