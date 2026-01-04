@@ -234,6 +234,11 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
 
 
 class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
+    """Accuracy regression tests for Nemotron Super V3.
+
+    Runs the model via AutoDeploy and verifies benchmark performance on MMLU and GSM8K
+    """
+
     MODEL_NAME = "nvidia/Nemotron-Super-V3"
     MODEL_PATH_BF16 = f"{llm_models_root()}/Nemotron-Super-3-120B-A12B-dev"
     # Set minimum possible seq len + small buffer, for test speed & memory usage
