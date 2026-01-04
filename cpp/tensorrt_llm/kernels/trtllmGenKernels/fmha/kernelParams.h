@@ -54,7 +54,7 @@ public:
     {
         // Explicitly initialize the unused member variable to avoid compiler warnings.
         mAdd = 0;
-        mShift = ceilLog2(mDivisor) - 1;
+        mShift = std::max(0, ceilLog2(mDivisor) - 1);
         mMultiplier = static_cast<uint32_t>(ceilDiv(uint64_t(1) << (32 + mShift), static_cast<uint64_t>(mDivisor)));
     }
 

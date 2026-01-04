@@ -691,6 +691,19 @@ private:
                 continue;
             }
 
+            // Update the tileSizeQ.
+            selectKernelParamsCopy.mTileSizeQ = tileSizeQ;
+            if (tileSizeQ >= 64)
+            {
+                selectKernelParamsCopy.mKernelType = FmhaKernelType::KeepsMmaAbForGeneration;
+            }
+            else
+            {
+                selectKernelParamsCopy.mKernelType = FmhaKernelType::SwapsMmaAbForGeneration;
+            }
+            // Load the kernel.
+            std::tie(func, kernelMeta) = loadKernel(params, selectKernelParamsCopy);
+
             // Compute the number of CTAs.
             computeNumCtas(ctaLaunchParams, params, kernelMeta, selectKernelParamsCopy);
 
