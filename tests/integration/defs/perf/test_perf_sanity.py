@@ -37,13 +37,13 @@ from ..conftest import get_llm_root, llm_models_root
 from .open_search_db_utils import (
     SCENARIO_MATCH_FIELDS,
     add_id,
+    check_perf_regression,
     get_common_values,
     get_history_data,
     get_job_info,
     post_new_perf_data,
     prepare_baseline_data,
     prepare_regressive_test_cases,
-    write_regressive_test_cases,
 )
 from .utils import collect_and_clean_myelin_time
 
@@ -1376,8 +1376,7 @@ class PerfSanityTestConfig:
             # Upload the new perf data and baseline data to database
             post_new_perf_data(new_baseline_data_dict, new_data_dict, regressive_data_list)
 
-        perf_result_output_dir = os.path.join(self._output_dir, self._test_param_labels)
-        write_regressive_test_cases(regressive_data_list, new_data_dict, perf_result_output_dir)
+        check_perf_regression(regressive_data_list, new_data_dict)
 
 
 # Perf sanity test case parameters

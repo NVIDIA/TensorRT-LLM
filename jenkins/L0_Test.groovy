@@ -2813,20 +2813,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             }
         }
 
-        if (stageName.contains("PerfSanity")) {
-            stage ("Check perf result") {
-                def perfCheckResult = sh(
-                    script: """
-                        python3 ${llmSrc}/tests/integration/defs/perf/perf_regression_check.py \
-                        ${WORKSPACE}/${stageName}
-                    """,
-                    returnStatus: true
-                )
-                if (perfCheckResult != 0) {
-                    error "Performance regression detected and failing the build (exit code: ${perfCheckResult})"
-                }
-            }
-        }
     }
 }
 
