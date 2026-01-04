@@ -12,7 +12,14 @@ slurm_install_setup() {
     cd $resourcePathNode
     llmSrcNode=$resourcePathNode/TensorRT-LLM/src
 
+    # Use unique lock file for this job ID
+    lock_file="install_lock_job_${SLURM_JOB_ID:-local}_node_${SLURM_NODEID:-0}.lock"
+
     if [ $SLURM_LOCALID -eq 0 ]; then
+        if [ -f "$lock_file" ]; then
+            rm -f "$lock_file"
+        fi
+
         retry_command bash -c "wget -nv $llmTarfile && tar -zxf $tarName"
         which python3
         python3 --version
@@ -27,11 +34,11 @@ slurm_install_setup() {
         hostNodeName="${HOST_NODE_NAME:-$(hostname -f || hostname)}"
         echo "HOST_NODE_NAME = $hostNodeName ; GPU_UUIDS = $gpuUuids ; STAGE_NAME = $stageName"
         echo "(Writing install lock) Current directory: $(pwd)"
-        touch install_lock.lock
+        touch "$lock_file"
     else
         echo "(Waiting for install lock) Current directory: $(pwd)"
-        while [ ! -f install_lock.lock ]; do
-            sleep 5
+        while [ ! -f "$lock_file" ]; do
+            sleep 10
         done
     fi
 }
