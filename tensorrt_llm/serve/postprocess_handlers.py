@@ -77,11 +77,19 @@ def build_perf_metrics(request_perf_metrics) -> Optional[PerfMetrics]:
     kv_cache_metrics = None
     if request_perf_metrics.kv_cache_metrics:
         kv = request_perf_metrics.kv_cache_metrics
+        # Calculate utilization from system-level KV cache stats
+        utilization = None
+        if kv.max_num_blocks and kv.max_num_blocks > 0:
+            utilization = kv.used_num_blocks / kv.max_num_blocks
         kv_cache_metrics = KvCacheMetrics(
             num_total_allocated_blocks=kv.num_total_allocated_blocks,
             num_new_allocated_blocks=kv.num_new_allocated_blocks,
             num_reused_blocks=kv.num_reused_blocks,
             num_missed_blocks=kv.num_missed_blocks,
+            max_num_blocks=kv.max_num_blocks if kv.max_num_blocks else None,
+            used_num_blocks=kv.used_num_blocks if kv.used_num_blocks else None,
+            free_num_blocks=kv.free_num_blocks if kv.free_num_blocks else None,
+            utilization=utilization,
         )
 
     speculative_decoding = None
