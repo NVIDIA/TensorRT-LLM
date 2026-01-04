@@ -26,7 +26,9 @@ namespace tensorrt_llm::batch_manager
 TransferTagServer::TransferTagServer()
 {
     mThread = std::thread(&TransferTagServer::loop, this);
+#ifdef __linux__
     pthread_setname_np(mThread.native_handle(), "TransferTagServer");
+#endif
 }
 
 TransferTagServer::~TransferTagServer()
@@ -124,7 +126,7 @@ void TransferTagServer::handleRequest()
         auto key = std::make_pair(
             req.payload.getTransferTag.receiverTransferId, req.payload.getTransferTag.receiverServerUuid);
         auto it = mTransferTagRefCount.find(key);
-        uint64_t transferTag;
+        TransferTagType transferTag;
         if (it == mTransferTagRefCount.end())
         {
             transferTag = TransferTagGenerator::get();
@@ -144,6 +146,8 @@ void TransferTagServer::handleRequest()
             req.payload.releaseTransferTag.receiverTransferId, req.payload.releaseTransferTag.receiverServerUuid);
         auto it = mTransferTagRefCount.find(key);
         TLLM_CHECK_WITH_INFO(it != mTransferTagRefCount.end(), "Unique ID not found");
+        TLLM_CHECK_WITH_INFO(it->second.first > 0, "Transfer tag ref count already zero for request %lu",
+            req.payload.releaseTransferTag.receiverTransferId);
         it->second.first--;
         if (it->second.first == 0)
         {
@@ -151,6 +155,12 @@ void TransferTagServer::handleRequest()
             mTransferTagRefCount.erase(it);
         }
         response.rebuild(0);
+    }
+    else
+    {
+        TLLM_LOG_ERROR("Invalid request type: %d", static_cast<int>(req.type));
+        int errorCode = -1;
+        response.rebuild(&errorCode, sizeof(errorCode));
     }
 
     mSocket->send(identity, zmq::send_flags::sndmore);

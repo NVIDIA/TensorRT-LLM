@@ -163,7 +163,7 @@ public:
             tensorrt_llm::pg_utils::PgHelper pgh{mPgComm};
 
             auto const rank = getRank();
-            int64_t vecSize = (rank == root) ? static_cast<int64_t>(vec.size()) : int64_t(0);
+            int64_t vecSize = (rank == root) ? static_cast<int64_t>(vec.size()) : 0;
             PGCHECK_THROW(pgh.broadcast(&vecSize, root));
 
             vec.resize(static_cast<size_t>(vecSize));
@@ -220,10 +220,10 @@ public:
         return instance;
     }
 
-    uint64_t getTransferTag(std::string const& serverEndpoint, RequestIdType const& receiverTransferId,
+    TransferTagType getTransferTag(std::string const& serverEndpoint, RequestIdType const& receiverTransferId,
         UuidType const& receiverServerUuid, int32_t expectedRefCount);
     void releaseTransferTag(std::string const& serverEndpoint, RequestIdType const& receiverTransferId,
-        UuidType const& receiverServerUuid, uint64_t transferTag);
+        UuidType const& receiverServerUuid, TransferTagType transferTag);
 
 private:
     TransferTagClient();

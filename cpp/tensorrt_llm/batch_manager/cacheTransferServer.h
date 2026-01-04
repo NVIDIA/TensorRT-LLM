@@ -46,19 +46,19 @@ static constexpr TransferTagType kInvalidTransferTag = 0;
 class TransferTagGenerator
 {
 public:
-    static uint64_t get()
+    static TransferTagType get()
     {
         std::lock_guard<std::mutex> lock(mMutex);
         if (!mReleasedIds.empty())
         {
-            uint64_t id = *mReleasedIds.begin();
+            TransferTagType id = *mReleasedIds.begin();
             mReleasedIds.erase(mReleasedIds.begin());
             return id;
         }
         return mNextId++;
     }
 
-    static void release(uint64_t id)
+    static void release(TransferTagType id)
     {
         std::lock_guard<std::mutex> lock(mMutex);
         if (id < mNextId)
@@ -68,15 +68,15 @@ public:
     }
 
 private:
-    static uint64_t mNextId;
-    static std::set<uint64_t> mReleasedIds;
+    static TransferTagType mNextId;
+    static std::set<TransferTagType> mReleasedIds;
     static std::mutex mMutex;
 };
 
 inline std::mutex TransferTagGenerator::mMutex;
 // 8192 is chosen to avoid conflicts with other MPI tags.
-inline uint64_t TransferTagGenerator::mNextId = 8192;
-inline std::set<uint64_t> TransferTagGenerator::mReleasedIds;
+inline TransferTagType TransferTagGenerator::mNextId = 8192;
+inline std::set<TransferTagType> TransferTagGenerator::mReleasedIds;
 
 enum class TransferTagRequestType
 {
@@ -101,7 +101,7 @@ struct TransferTagRequest
         {
             RequestIdType receiverTransferId;
             UuidType receiverServerUuid;
-            uint64_t transferTag;
+            TransferTagType transferTag;
         } releaseTransferTag;
     } payload;
 };
@@ -139,7 +139,7 @@ private:
 
     std::unique_ptr<zmq::context_t> mContext;
     std::unique_ptr<zmq::socket_t> mSocket;
-    std::map<std::pair<RequestIdType, UuidType>, std::pair<int32_t, uint64_t>> mTransferTagRefCount;
+    std::map<std::pair<RequestIdType, UuidType>, std::pair<int32_t, TransferTagType>> mTransferTagRefCount;
     std::string mEndpoint;
     std::atomic<bool> mRunning{true};
     std::thread mThread;

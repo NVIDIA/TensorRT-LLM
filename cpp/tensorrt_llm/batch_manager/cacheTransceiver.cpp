@@ -68,8 +68,8 @@ TransferTagClient::TransferTagClient()
     mContext = std::make_unique<zmq::context_t>(1);
 }
 
-uint64_t TransferTagClient::getTransferTag(std::string const& serverEndpoint, RequestIdType const& receiverTransferId,
-    UuidType const& receiverServerUuid, int32_t expectedRefCount)
+TransferTagType TransferTagClient::getTransferTag(std::string const& serverEndpoint,
+    RequestIdType const& receiverTransferId, UuidType const& receiverServerUuid, int32_t expectedRefCount)
 {
     std::lock_guard<std::mutex> lock(mMutex);
 
@@ -88,16 +88,16 @@ uint64_t TransferTagClient::getTransferTag(std::string const& serverEndpoint, Re
 
     zmq::message_t responseMsg;
     (void) socket.recv(responseMsg, zmq::recv_flags::none);
-    TLLM_CHECK_WITH_INFO(
-        responseMsg.size() == sizeof(int), "TransferTagClient received invalid response size: %zu", responseMsg.size());
+    TLLM_CHECK_WITH_INFO(responseMsg.size() == sizeof(TransferTagType),
+        "TransferTagClient received invalid response size: %zu", responseMsg.size());
 
-    uint64_t transferTag;
-    std::memcpy(&transferTag, responseMsg.data(), sizeof(uint64_t));
+    TransferTagType transferTag;
+    std::memcpy(&transferTag, responseMsg.data(), sizeof(TransferTagType));
     return transferTag;
 }
 
 void TransferTagClient::releaseTransferTag(std::string const& serverEndpoint, RequestIdType const& receiverTransferId,
-    UuidType const& receiverServerUuid, uint64_t transferTag)
+    UuidType const& receiverServerUuid, TransferTagType transferTag)
 {
     std::lock_guard<std::mutex> lock(mMutex);
 
@@ -124,8 +124,13 @@ TransferTagClient::~TransferTagClient()
     {
         mContext->close();
     }
+    catch (std::exception const& e)
+    {
+        TLLM_LOG_ERROR("Error closing ZMQ context in TransferTagClient destructor: %s", e.what());
+    }
     catch (...)
     {
+        TLLM_LOG_ERROR("Unknown error closing ZMQ context in TransferTagClient");
     }
 }
 
