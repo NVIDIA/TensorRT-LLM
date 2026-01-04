@@ -29,10 +29,14 @@ _project_root = os.path.abspath(
     os.path.join(os.path.dirname(__file__), '../../../..'))
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
-from jenkins.scripts.open_search_db import OpenSearchDB
+from jenkins.scripts.open_search_db import (PERF_SANITY_PROJECT_NAME,
+                                            OpenSearchDB)
 
-PROJECT_ROOT = "sandbox-temp-trtllm-ci-perf-v1"  # "sandbox-trtllm-ci-perf"
-TEST_INFO_PROJECT_NAME = f"{PROJECT_ROOT}-test_info"
+POC_PROJECT_NAME = "sandbox-temp-trtllm-ci-perf-v1-test_info"
+USE_POC_DB = os.environ.get("USE_POC_DB", "false").lower() == "true"
+TEST_INFO_PROJECT_NAME = POC_PROJECT_NAME if USE_POC_DB else PERF_SANITY_PROJECT_NAME
+MAX_QUERY_SIZE = 5000
+QUERY_LOOKBACK_DAYS = 90
 
 # Metrics where larger is better
 MAXIMIZE_METRICS = [
@@ -58,6 +62,10 @@ MINIMIZE_METRICS = [
     "d_p99_e2el",
 ]
 
+# Default threshold values for performance regression detection
+POST_MERGE_THRESHOLD = 0.05
+PRE_MERGE_THRESHOLD = 0.1
+
 # Fields for scenario-only matching for recipe tests.
 # Unlike regular tests that match on all config fields, recipes match only on the benchmark
 # scenario, allowing the underlying config to change while still comparing against baselines
@@ -65,7 +73,6 @@ MINIMIZE_METRICS = [
 SCENARIO_MATCH_FIELDS = [
     "s_runtime",
     "s_model_name",
-    "s_gpu_type",
     "l_isl",
     "l_osl",
     "l_concurrency",
@@ -176,49 +183,85 @@ def get_job_info():
     }
 
 
-def query_history_data(gpu_type):
+def get_common_values(new_data_dict, match_keys):
     """
-    Query post-merge data with specific gpu type and model name
+    Find keys from match_keys where all data entries in new_data_dict have identical values.
+    Returns a dict with those common key-value pairs.
+    Skips entries that don't have the key or have None/empty values.
     """
-    # Query data from the last 14 days
-    last_days = 14
+    if not new_data_dict or not match_keys:
+        return {}
+
+    data_list = list(new_data_dict.values())
+    if not data_list:
+        return {}
+
+    common_values_dict = {}
+    for key in match_keys:
+        # Collect non-None, non-empty values for this key
+        values = []
+        for data in data_list:
+            if key in data and data[key] is not None:
+                values.append(data[key])
+
+        # Skip if no valid values found
+        if len(values) != len(data_list):
+            continue
+
+        # Check if all valid values are identical
+        first_value = values[0]
+        if all(v == first_value for v in values):
+            common_values_dict[key] = first_value
+
+    return common_values_dict
+
+
+def query_history_data(common_values_dict):
+    """
+    Query post-merge data with common values to narrow down scope.
+    """
+    # Query data from the last 90 days
+    last_days = QUERY_LOOKBACK_DAYS
+
+    # Build must clauses with base filters
+    must_clauses = [
+        {
+            "term": {
+                "b_is_valid": True
+            }
+        },
+        {
+            "term": {
+                "b_is_post_merge": True
+            }
+        },
+        {
+            "term": {
+                "b_is_regression": False
+            }
+        },
+        {
+            "range": {
+                "ts_created": {
+                    "gte":
+                    int(time.time() - 24 * 3600 * last_days) // (24 * 3600) *
+                    24 * 3600 * 1000,
+                }
+            }
+        },
+    ]
+
+    # Add common values as term filters to narrow down the query
+    for key, value in common_values_dict.items():
+        must_clauses.append({"term": {key: value}})
+
     json_data = {
         "query": {
             "bool": {
-                "must": [
-                    {
-                        "term": {
-                            "b_is_valid": True
-                        }
-                    },
-                    {
-                        "term": {
-                            "b_is_post_merge": True
-                        }
-                    },
-                    {
-                        "term": {
-                            "b_is_regression": False
-                        }
-                    },
-                    {
-                        "term": {
-                            "s_gpu_type": gpu_type
-                        }
-                    },
-                    {
-                        "range": {
-                            "ts_created": {
-                                "gte":
-                                int(time.time() - 24 * 3600 * last_days) //
-                                (24 * 3600) * 24 * 3600 * 1000,
-                            }
-                        }
-                    },
-                ]
+                "must": must_clauses
             },
         },
-        "size": 3000,
+        "size": MAX_QUERY_SIZE,
     }
     json_data = json.dumps(json_data)
 
@@ -231,13 +274,13 @@ def query_history_data(gpu_type):
             print_info(
                 f"Fail to query from {TEST_INFO_PROJECT_NAME}, returned no response"
             )
-            return []
+            return None
         else:
             payload = res.json().get("hits", {}).get("hits", [])
             if len(payload) == 0:
                 # No history data found in database, return empty list
                 print_info(
-                    f"Fail to query from {TEST_INFO_PROJECT_NAME}, returned no data"
+                    f"No history data found in {TEST_INFO_PROJECT_NAME}, returned empty list"
                 )
                 return []
             for hit in payload:
@@ -248,7 +291,7 @@ def query_history_data(gpu_type):
                         f"Fail to query from {TEST_INFO_PROJECT_NAME}, returned data with no _id"
                     )
                     # Invalid data, return None
-                    return []
+                    return None
                 data_list.append(data_dict)
             print_info(
                 f"Successfully query from {TEST_INFO_PROJECT_NAME}, queried {len(data_list)} entries"
@@ -257,7 +300,7 @@ def query_history_data(gpu_type):
     except Exception as e:
         print_info(
             f"Fail to query from {TEST_INFO_PROJECT_NAME}, returned error: {e}")
-        return []
+        return None
 
 
 def match(history_data, new_data, match_keys):
@@ -268,24 +311,7 @@ def match(history_data, new_data, match_keys):
     def is_empty(value):
         return value is None or value == ""
 
-    def should_skip_field(field):
-        # Skip fields starting with @, _, ts_
-        if field.startswith('@') or field.startswith('_') or field.startswith(
-                'ts_'):
-            return True
-        # Skip log links and speculative_model_dir and job configs
-        if field in [
-                's_speculative_model_dir', 's_server_log_link',
-                's_ctx_server_log_link', 's_gen_server_log_link',
-                's_client_log_link'
-        ]:
-            return True
-        return False
-
     for field in match_keys:
-        # Skip excluded fields
-        if should_skip_field(field):
-            continue
         history_value = history_data.get(field, None)
         new_value = new_data.get(field, None)
         if is_empty(history_value) and is_empty(new_value):
@@ -344,7 +370,7 @@ def calculate_best_perf_result(history_data_list, new_data):
     return best_metrics
 
 
-def get_history_data(new_data_dict, gpu_type, match_keys):
+def get_history_data(new_data_dict, match_keys, common_values_dict):
     """
     Query history post-merge data for each cmd_idx
     """
@@ -386,15 +412,23 @@ def get_history_data(new_data_dict, gpu_type, match_keys):
                           key=lambda x: parse_timestamp(x.get("@timestamp", 0)))
         return latest_data
 
+    cmd_idxs = new_data_dict.keys()
+    history_data_list = None
+    if cmd_idxs:
+        history_data_list = query_history_data(common_values_dict)
+
+    # If query_history_data returned None, it means network failure
+    if history_data_list is None:
+        return None, None
+
+    # Query was successful (even if empty list), initialize dicts
     history_baseline_dict = {}
     history_data_dict = {}
-    cmd_idxs = new_data_dict.keys()
     for cmd_idx in cmd_idxs:
         history_data_dict[cmd_idx] = []
         history_baseline_dict[cmd_idx] = []
-    history_data_list = []
-    if cmd_idxs:
-        history_data_list = query_history_data(gpu_type)
+
+    # Process history data if we have any
     if history_data_list:
         for history_data in history_data_list:
             for cmd_idx in cmd_idxs:
@@ -405,11 +439,40 @@ def get_history_data(new_data_dict, gpu_type, match_keys):
                     else:
                         history_data_dict[cmd_idx].append(history_data)
                     break
+
     # Sometime database has several baselines and we only use the latest baseline one
+    # If list is empty, set to None for each cmd_idx
     for cmd_idx, baseline_list in history_baseline_dict.items():
         latest_baseline = get_latest_data(baseline_list)
         history_baseline_dict[cmd_idx] = latest_baseline
     return history_baseline_dict, history_data_dict
+
+
+def get_threshold(baseline_data, metric):
+    """
+    Get the threshold for a metric from baseline data.
+    """
+    is_post_merge = baseline_data.get("b_is_post_merge", False)
+
+    metric_suffix = metric[2:]  # Remove "d_" prefix
+    if is_post_merge:
+        threshold_key = f"d_threshold_post_merge_{metric_suffix}"
+    else:
+        threshold_key = f"d_threshold_pre_merge_{metric_suffix}"
+
+    # Try to get the specific threshold (post_merge or pre_merge)
+    if threshold_key in baseline_data:
+        return baseline_data[threshold_key]
+
+    # Fall back to general threshold
+    fallback_key = f"d_threshold_{metric_suffix}"
+    if fallback_key in baseline_data:
+        return baseline_data[fallback_key]
+
+    # No threshold found, raise error
+    raise KeyError(
+        f"No threshold found for metric '{metric}'. "
+        f"Expected '{threshold_key}' or '{fallback_key}' in baseline data.")
 
 
 def prepare_regressive_test_cases(history_baseline_dict, new_data_dict):
@@ -418,24 +481,27 @@ def prepare_regressive_test_cases(history_baseline_dict, new_data_dict):
     2. For Minimize metrics, if new perf is above baseline * (1 + threshold)
     Set it as regressive.
     """
+    # If history_baseline_dict is None (network failure), skip regression check
+    if history_baseline_dict is None:
+        return []
+
     regressive_data_list = []
     # Find regressive test cases
     for cmd_idx in new_data_dict:
         if history_baseline_dict[cmd_idx] is None:
             continue
 
-        baseline_data = history_baseline_dict[cmd_idx]
+        history_baseline = history_baseline_dict[cmd_idx]
         new_data = new_data_dict[cmd_idx]
         is_regressive = False
         regressive_metrics = []
 
         # Check MAXIMIZE_METRICS (new should be >= baseline * (1 - threshold))
         for metric in MAXIMIZE_METRICS:
-            if metric not in new_data or metric not in baseline_data:
+            if metric not in new_data or metric not in history_baseline:
                 continue
-            threshold_key = f"d_threshold_{metric[2:]}"
-            threshold = baseline_data[threshold_key]
-            baseline_value = baseline_data[metric]
+            threshold = get_threshold(history_baseline, metric)
+            baseline_value = history_baseline[metric]
             new_value = new_data[metric]
             # Regressive if new_value < baseline_value * (1 - threshold)
             if new_value < baseline_value * (1 - threshold):
@@ -444,11 +510,10 @@ def prepare_regressive_test_cases(history_baseline_dict, new_data_dict):
 
         # Check MINIMIZE_METRICS (new should be <= baseline * (1 + threshold))
         for metric in MINIMIZE_METRICS:
-            if metric not in new_data or metric not in baseline_data:
+            if metric not in new_data or metric not in history_baseline:
                 continue
-            threshold_key = f"d_threshold_{metric[2:]}"
-            threshold = baseline_data.get(threshold_key, 0.1)
-            baseline_value = baseline_data[metric]
+            threshold = get_threshold(history_baseline, metric)
+            baseline_value = history_baseline[metric]
             new_value = new_data[metric]
             # Regressive if new_value > baseline_value * (1 + threshold)
             if new_value > baseline_value * (1 + threshold):
@@ -460,14 +525,20 @@ def prepare_regressive_test_cases(history_baseline_dict, new_data_dict):
             regressive_data = new_data.copy()
             # Add baseline values and thresholds for all metrics
             for metric in MAXIMIZE_METRICS + MINIMIZE_METRICS:
-                if metric in baseline_data:
+                if metric in history_baseline:
                     baseline_key = f"d_baseline_{metric[2:]}"
-                    regressive_data[baseline_key] = baseline_data[metric]
+                    regressive_data[baseline_key] = history_baseline[metric]
 
-                    threshold_key = f"d_threshold_{metric[2:]}"
-                    if threshold_key in baseline_data:
-                        regressive_data[threshold_key] = baseline_data[
-                            threshold_key]
+                    # Copy all threshold keys from baseline
+                    metric_suffix = metric[2:]
+                    for threshold_key in [
+                            f"d_threshold_{metric_suffix}",
+                            f"d_threshold_post_merge_{metric_suffix}",
+                            f"d_threshold_pre_merge_{metric_suffix}"
+                    ]:
+                        if threshold_key in history_baseline:
+                            regressive_data[threshold_key] = history_baseline[
+                                threshold_key]
 
             # Add regression info string
             regressive_data["s_regression_info"] = ", ".join(regressive_metrics)
@@ -478,12 +549,24 @@ def prepare_regressive_test_cases(history_baseline_dict, new_data_dict):
     return regressive_data_list
 
 
+def _is_valid_baseline(baseline_data):
+    """Check if baseline data is valid (non-empty dict)."""
+    if isinstance(baseline_data, dict) and len(baseline_data) > 0:
+        return True
+    return False
+
+
 def prepare_baseline_data(history_baseline_dict, history_data_dict,
                           new_data_dict):
     """
     Calculate new baseline from history post-merge data and new data.
     Then return new baseline data.
     """
+    # If history_baseline_dict and history_data_dict are None (network failure),
+    # return None to indicate we cannot prepare baseline data
+    if history_baseline_dict is None and history_data_dict is None:
+        return {}
+
     new_baseline_data_dict = {}
     cmd_idxs = new_data_dict.keys()
     # Find the best history post-merge data for each cmd
@@ -491,20 +574,43 @@ def prepare_baseline_data(history_baseline_dict, history_data_dict,
         # Calculate best metrics from history post-merge data and new data
         best_metrics = calculate_best_perf_result(history_data_dict[cmd_idx],
                                                   new_data_dict[cmd_idx])
-        new_baseline_data = history_baseline_dict[cmd_idx]
-        if new_baseline_data:
-            print_info(f"Baseline data found (cmd_idx: {cmd_idx}) in history")
-        else:
-            print_info(
-                f"No baseline data found (cmd_idx: {cmd_idx}), created a new baseline"
-            )
-            new_baseline_data = new_data_dict[cmd_idx].copy()
-            new_baseline_data["b_is_baseline"] = True
-            add_id(new_baseline_data)
-        # Add or update baseline metrics
+
+        # Create new_baseline_data from new_data_dict and set b_is_baseline
+        new_baseline_data = new_data_dict[cmd_idx].copy()
+        new_baseline_data["b_is_baseline"] = True
+
+        # Initialize metric_threshold_dict with default thresholds for all metrics
+        metric_threshold_dict = {}
+        for metric in MAXIMIZE_METRICS + MINIMIZE_METRICS:
+            metric_suffix = metric[2:]
+            post_merge_key = f"d_threshold_post_merge_{metric_suffix}"
+            pre_merge_key = f"d_threshold_pre_merge_{metric_suffix}"
+            metric_threshold_dict[post_merge_key] = POST_MERGE_THRESHOLD
+            metric_threshold_dict[pre_merge_key] = PRE_MERGE_THRESHOLD
+
+        # If history baseline is valid, extract thresholds and update metric_threshold_dict
+        history_baseline = history_baseline_dict[cmd_idx]
+        if _is_valid_baseline(history_baseline):
+            for metric in MAXIMIZE_METRICS + MINIMIZE_METRICS:
+                metric_suffix = metric[2:]
+                post_merge_key = f"d_threshold_post_merge_{metric_suffix}"
+                pre_merge_key = f"d_threshold_pre_merge_{metric_suffix}"
+                if post_merge_key in history_baseline:
+                    metric_threshold_dict[post_merge_key] = history_baseline[
+                        post_merge_key]
+                if pre_merge_key in history_baseline:
+                    metric_threshold_dict[pre_merge_key] = history_baseline[
+                        pre_merge_key]
+
+        # Update new_baseline_data with best_metrics values
         for metric, value in best_metrics.items():
             new_baseline_data[metric] = value
-            new_baseline_data[f"d_threshold_{metric[2:]}"] = 0.1
+
+        # Add all thresholds to new_baseline_data
+        for threshold_key, threshold_value in metric_threshold_dict.items():
+            new_baseline_data[threshold_key] = threshold_value
+
+        add_id(new_baseline_data)
         new_baseline_data_dict[cmd_idx] = new_baseline_data
 
     return new_baseline_data_dict
@@ -524,7 +630,8 @@ def post_new_perf_data(new_baseline_data_dict, new_data_dict,
         if cmd_idx in new_data_dict:
             data_list.append(new_data_dict[cmd_idx])
     # Only post regressive test cases when post-merge.
-    if new_baseline_data_dict:
+    # new_baseline_data_dict is None means pre-merge.
+    if new_baseline_data_dict and regressive_data_list:
         data_list.extend(regressive_data_list)
     if not data_list:
         return
