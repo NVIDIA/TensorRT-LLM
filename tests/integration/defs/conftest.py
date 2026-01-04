@@ -2689,8 +2689,7 @@ def get_gpu_memory_wo_pynvml():
     import psutil
 
     logger.warning(
-        f"\nWarning: pynvml not available, using fallback commands for memory monitoring"
-    )
+        f"pynvml not available, using fallback commands for memory monitoring")
 
     gpu_memory = {}
     system_total_mb = 0

@@ -696,13 +696,11 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
         }
 
         slurmRunner = null
+        echo "${stageName} Slurm partition timeout: ${partition.time}"
+        def partitionTimeout = partition?.time ? partition.time : SlurmConfig.DEFAULT_TIMEOUT_SHORT
         if (cluster.containerRuntime.toString() == "DOCKER") {
-            echo "${stageName} partitionTimeout: ${partition.time}"
-            def partitionTimeout = partition.time ? partition.time : SlurmConfig.DEFAULT_TIMEOUT_SHORT
             slurmRunner = runInDockerOnNodeMultiStage(LLM_DOCKER_IMAGE, nodeName, dockerArgs, partitionTimeout, true)
         } else if (cluster.containerRuntime.toString() == "ENROOT") {
-            echo "${stageName} partitionTimeout: ${partition.time}"
-            def partitionTimeout = partition.time ? partition.time : SlurmConfig.DEFAULT_TIMEOUT_SHORT
             slurmRunner = runInEnrootOnNode(nodeName, partitionTimeout)
         } else {
             throw new Exception("Unsupported container runtime: ${cluster.containerRuntime}")
@@ -805,7 +803,7 @@ def getPytestBaseCommandLine(
         "LLM_BACKEND_ROOT=${llmSrc}/triton_backend",
         "LLM_MODELS_ROOT=${MODEL_CACHE_DIR}",
         "MODEL_CACHE_DIR=${MODEL_CACHE_DIR}",
-        "COLUMNS=400",
+        "COLUMNS=300",
         extraInternalEnv,
         portEnvVars,
         pytestUtil,
@@ -893,7 +891,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
     // Create a unique suffix for the job name
     String customSuffix = "${env.BUILD_TAG}-${UUID.randomUUID().toString().replaceAll("-", "").substring(0, 6)}".toLowerCase()
     def jobUID = "${cluster.host}-multi_node_test-${customSuffix}"
-    def perfSanityMode = stageName.contains("PerfSanity")
     def disaggMode = stageName.contains("PerfSanity-Disagg")
     def setSegment = disaggMode
 
@@ -933,19 +930,17 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             def scriptBashUtilsPathNode = "${jobWorkspace}/${jobUID}-bash_utils.sh"
             def testListPathNode = "${jobWorkspace}/${testList}.txt"
             def waivesListPathNode = "${jobWorkspace}/waives.txt"
-            def sbatchLogPath = "${jobWorkspace}/job-output.log"
+            def slurmJobLogPath = "${jobWorkspace}/job-output.log"
             def scriptLaunchPathLocal = Utils.createTempLocation(pipeline, "./slurm_launch.sh")
             def scriptLaunchPathNode = "${jobWorkspace}/${jobUID}-slurm_launch.sh"
             def scriptSubmitPathLocal = Utils.createTempLocation(pipeline, "./slurm_submit.sh")
             def scriptSubmitPathNode = "${jobWorkspace}/${jobUID}-slurm_submit.sh"
             def scriptTrackPathLocal = Utils.createTempLocation(pipeline, "./slurm_track.sh")
             def scriptTrackPathNode = "${jobWorkspace}/${jobUID}-slurm_track.sh"
-            def scriptStatusPathLocal = Utils.createTempLocation(pipeline, "./slurm_status.sh")
-            def scriptStatusPathNode = "${jobWorkspace}/${jobUID}-slurm_status.sh"
-            def isAarch64 = config.contains("aarch64")
             def coverageConfigFile = "${jobWorkspace}/.coveragerc"
 
-            stage("[${stageName}] Initializing Test") {
+            stage("Initializing Test") {
+                println("Selected Cluster: ${cluster.name}")
                 // Create Job Workspace folder in Frontend Node
                 Utils.exec(pipeline, script: Utils.sshUserCmd(remote, "\"mkdir -p ${jobWorkspace}\""), numRetries: 3)
 
@@ -1140,7 +1135,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                 def scriptLaunchPrefix = """#!/bin/bash
                     #SBATCH ${exemptionComment}
-                    #SBATCH --output=${sbatchLogPath}
+                    #SBATCH --output=${slurmJobLogPath}
                     ${taskArgs.collect { "#SBATCH $it" }.join('\n')}
                     #SBATCH ${partition.additionalArgs}
                     ${partition?.time ? "#SBATCH --time=${partition.time}" : "#SBATCH --time=${SlurmConfig.DEFAULT_TIMEOUT_SHORT}"}
@@ -1182,8 +1177,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                     pipeline.writeFile(file: scriptLaunchPrefixPathLocal, text: scriptLaunchPrefix)
                     pipeline.writeFile(file: scriptLaunchSrunArgsPathLocal, text: srunArgs.join(" "))
-                    Utils.exec(pipeline, script: "echo \"Script for Slurm sbatch job prefix: \" && cat ${scriptLaunchPrefixPathLocal}")
-                    Utils.exec(pipeline, script: "echo \"Script for Slurm srun job args: \" && cat ${scriptLaunchSrunArgsPathLocal}")
 
                     // Output is the corresponding scriptLaunchPathLocal script under the disaggMode
                     sh """
@@ -1218,8 +1211,22 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     scriptLaunchPathNode,
                     true
                 )
+
+                def filesToKeepWhenRetry = [
+                    scriptRunPathNode,
+                    scriptInstallPathNode,
+                    scriptBashUtilsPathNode,
+                    scriptLaunchPathNode,
+                    scriptSubmitPathNode,
+                    scriptTrackPathNode,
+                    testListPathNode,
+                    waivesListPathNode,
+                    coverageConfigFile
+                ]
+                def findKeepWhenRetryArgs = filesToKeepWhenRetry.collect { " ! -name \"\$(basename \"${it}\")\"" }.join("")
+
                 def scriptSubmit = """#!/bin/bash
-                    set -Eeuo pipefail
+                    set -xEeuo pipefail
                     trap 'rc=\$?; echo "Error in file \${BASH_SOURCE[0]} on line \$LINENO: \$BASH_COMMAND (exit \$rc)"; exit \$rc' ERR
 
                     # Clean up previous job intermediate files so that retry can work
@@ -1227,26 +1234,26 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         previous_job_id=\$(cat "${jobWorkspace}/slurm_job_id.txt")
                         echo "Found previous Slurm job ID: \${previous_job_id}"
                         scancel "\${previous_job_id}" || true
-                        rm -rf "${jobWorkspace}/slurm_job_id.txt"
-                        # Wait for 60 seconds to ensure the previous job is canceled
-                        sleep 60
+                        # Wait for 120 seconds to ensure the previous job is canceled
+                        sleep 120
                     fi
-                    rm -rf "${jobWorkspace}/results.xml"
-                    rm -rf "${jobWorkspace}/report.csv"
-                    rm -rf "${jobWorkspace}/unfinished_test.txt"
-                    rm -rf "${sbatchLogPath}"
 
-                    touch ${sbatchLogPath}
+                    # Clean up workspace: remove all files/dirs not in the keep list
+                    find "${jobWorkspace}" -maxdepth 1 -mindepth 1 ${findKeepWhenRetryArgs} -exec rm -rf {} +
+
+                    touch ${slurmJobLogPath}
                     jobId=\$(sbatch ${scriptLaunchPathNode} | awk '{print \$4}')
                     if [ -z "\$jobId" ]; then
                         echo "Error: Slurm job submission failed, no job ID returned."
                         exit 1
                     fi
                     echo "Submitted Slurm job \$jobId"
-                    # save job ID in $jobWorkspace/slurm_job_id.txt for later job to retrieve
-                    echo \$jobId > $jobWorkspace/slurm_job_id.txt
+                    # Save Slurm job ID for later steps to retrieve
+                    echo "\$jobId" > "${jobWorkspace}/slurm_job_id.txt"
                 """.replaceAll("(?m)^\\s*", "").trim()
+
                 pipeline.writeFile(file: scriptSubmitPathLocal, text: scriptSubmit)
+                Utils.exec(pipeline, script: "echo \"Script to submit the final Slurm job: \" && cat ${scriptSubmitPathLocal}")
                 Utils.copyFileToRemoteHost(
                     pipeline,
                     remote,
@@ -1255,8 +1262,9 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     true
                 )
             }
+
             stage("[${stageName}] Run Pytest") {
-                // Submit the sbatch job
+                // Submit the Slurm job
                 Utils.exec(
                     pipeline,
                     timeout: false,
@@ -1266,42 +1274,56 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     ),
                     numRetries: 3
                 )
-                def sbatchJobId = Utils.exec(
+
+                def slurmJobId = Utils.exec(
                     pipeline,
-                    returnStdout: true,
                     script: Utils.sshUserCmd(
                         remote,
-                        "cat $jobWorkspace/slurm_job_id.txt"
-                    )
+                        "\"cat ${jobWorkspace}/slurm_job_id.txt\""
+                    ),
+                    returnStdout: true,
+                    numRetries: 3
                 ).trim()
+                Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobId}")
+
                 def scriptTrack = """#!/bin/bash
-                    jobId=\$(cat $jobWorkspace/slurm_job_id.txt)
-                    tail -f ${sbatchLogPath} &
+                    set -xEeuo pipefail
+                    trap 'rc=\$?; echo "Error in file \${BASH_SOURCE[0]} on line \$LINENO: \$BASH_COMMAND (exit \$rc)"; exit \$rc' ERR
+
+                    jobId=${slurmJobId}
+                    tail -f ${slurmJobLogPath} &
                     tailPid=\$!
-                    # Wait until sbatch job is done.
+
+                    # Wait until Slurm job is done
                     while true; do
-                        state=\$(sacct -j \$jobId --format=JobIDRaw,State --noheader | awk -v jobId=\$jobId '""\$1"" == jobId {print \$2}')
-                        if [[ -z \$state || \$state == "RUNNING" || \$state == "PENDING" || \$state == "CONFIGURING" ]]; then
-                            echo "job is still running"
+                        # Use --allocations to ensure we match the exact job ID and not job steps (like 123.batch, 123.0)
+                        STATUS=\$(sacct -j \$jobId --format=State -Pn --allocations)
+
+                        if [[ -z \$STATUS || \$STATUS == "RUNNING" || \$STATUS == "PENDING" || \$STATUS == "CONFIGURING" ]]; then
+                            echo "Slurm job \$jobId is still running"
                             sleep 300
                         else
-                            echo "Job \$jobId finished with state: \$state"
+                            echo "Slurm job \$jobId finished with state: \$STATUS"
                             break
                         fi
                     done
+
                     # Kill tail -f process
                     kill \$tailPid
-                    # Check if the job failed or not
+
+                    # Wait briefly to ensure accounting is consistent
                     sleep 10
-                    # Retry getting status and exit code as sacct might be delayed
+
+                    # Get exit code (STATUS is already known from loop break)
+                    # Retry for exit code if missing
                     for i in {1..3}; do
-                        STATUS=\$(sacct -j \$jobId --format=State --noheader | head -n 1 | awk '{print \$1}')
+                        # Use awk to parse exit code from format like "0:0"
                         EXIT_CODE=\$(sacct -j \$jobId --format=ExitCode -Pn --allocations | awk -F: '{print \$1}')
 
-                        if [ -n "\$STATUS" ] && [ -n "\$EXIT_CODE" ]; then
+                        if [ -n "\$EXIT_CODE" ]; then
                             break
                         fi
-                        echo "Waiting for sacct to update... attempt \$i"
+                        echo "Waiting for sacct exit code to update... attempt \$i"
                         sleep 10
                     done
 
@@ -1309,11 +1331,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         echo "Error: Failed to get exit code from sacct after retries, defaulting to 1."
                         EXIT_CODE=1
                     fi
-                    if [ -z "\$STATUS" ]; then
-                        echo "Error: Failed to get status from sacct after retries, defaulting to UNKNOWN."
-                        STATUS="UNKNOWN"
-                    fi
 
+                    # We already have valid STATUS from the loop that caused the break
                     if [[ "\$STATUS" == "COMPLETED" && \$EXIT_CODE -eq 0 ]]; then
                         echo "Pytest succeed in Slurm job \$jobId"
                         echo "Status: \$STATUS | Exit_code \$EXIT_CODE"
@@ -1324,7 +1343,9 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         exit 1
                     fi
                 """.replaceAll("(?m)^\\s*", "").trim()
+
                 pipeline.writeFile(file: scriptTrackPathLocal, text: scriptTrack)
+                Utils.exec(pipeline, script: "echo \"Script to track Slurm job and pull the log: \" && cat ${scriptTrackPathLocal}")
                 Utils.copyFileToRemoteHost(
                     pipeline,
                     remote,
@@ -1332,46 +1353,17 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     scriptTrackPathNode,
                     true
                 )
-                def scriptStatus = """#!/bin/bash
-                    jobId=\$(cat $jobWorkspace/slurm_job_id.txt)
-                    sacct -j \$jobId --format=JobIDRaw,State --noheader | awk -v jobId=\$jobId '""\$1"" == jobId {print \$2}'
-                """
-                pipeline.writeFile(file: scriptStatusPathLocal, text: scriptStatus)
-                Utils.copyFileToRemoteHost(
-                    pipeline,
-                    remote,
-                    scriptStatusPathLocal,
-                    scriptStatusPathNode,
-                    true
-                )
 
-                sh "cat $scriptStatusPathLocal"
-                while (true) {
-                    // Check if the job is done by running sacct via SSH
-                    def result = Utils.exec(
-                        pipeline,
-                        returnStdout: true,
-                        script: Utils.sshUserCmd(
-                            remote,
-                            scriptStatusPathNode
-                        )
-                    ).trim()
-                    if (!result || result == "RUNNING" || result == "PENDING" || result == "CONFIGURING") {
-                        echo "Slurm job $sbatchJobId is still running, pulling the job log."
-                        // Pulling the sbatch output log
-                        Utils.exec(
-                            pipeline,
-                            timeout: false,
-                            script: Utils.sshUserCmd(
-                                remote,
-                                scriptTrackPathNode
-                            )
-                        )
-                    } else {
-                        echo "Slurm job $sbatchJobId is done."
-                        break
-                    }
-                }
+                // Track the Slurm job
+                Utils.exec(
+                    pipeline,
+                    timeout: false,
+                    script: Utils.sshUserCmd(
+                        remote,
+                        scriptTrackPathNode
+                    ),
+                    numRetries: 3
+                )
             }
             echo "Finished test stage execution."
         }
@@ -1736,7 +1728,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         targetCloud = "kubernetes"
         // DGX Spark requires a special setting for accessing the device.
         // It has 128GB unified memory as per spec. Use half of the memory at the CPU side.
-        if (type == "gb10x") {
+        if (type.contains("gb10x")) {
             targetCloud = "nvks-sparks-cloud"
             memorySize = "64Gi"
             tolerations = """
@@ -1755,7 +1747,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
 
         // The following GPU types doesn't support dynamic driver flashing.
         if (REQUIRED_NO_DRIVER_TYPES.any { type.contains(it) }) {
-            if (type == "gb10x") {
+            if (type.contains("gb10x")) {
                 selectors = """
                     kubernetes.io/arch: ${arch}
                     kubernetes.io/os: linux
@@ -2848,7 +2840,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         }
 
         // Generate comprehensive rerun report if any reruns occurred
-        stage ("[${stageName}] Generate Report") {
+        stage ("Generate Report") {
             generateRerunReport(stageName, llmSrc)
         }
 
@@ -2859,7 +2851,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         if (perfMode) {
             basePerfFilename = stageName.contains("PyTorch") ? "base_perf_pytorch.csv" : "base_perf.csv"
             basePerfPath = "${llmSrc}/tests/integration/defs/perf/${basePerfFilename}"
-            stage("Check perf result") {
+            stage("Check Perf Result") {
                 def perfCheckResult = sh(
                     script: """
                     python3 ${llmSrc}/tests/integration/defs/perf/sanity_perf_check.py \
@@ -2872,7 +2864,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                     error "Performance regression detected and failing the build (exit code: ${perfCheckResult})"
                 }
             }
-            stage("Create perf report") {
+            stage("Create Perf Report") {
                 sh """
                     python3 ${llmSrc}/tests/integration/defs/perf/create_perf_comparison_report.py \
                     --output_path ${stageName}/report.pdf \
@@ -2883,7 +2875,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         }
 
         if (stageName.contains("PerfSanity")) {
-            stage ("Check perf result") {
+            stage ("Check PerfSanity Result") {
                 def perfCheckResult = sh(
                     script: """
                         python3 ${llmSrc}/tests/integration/defs/perf/perf_regression_check.py \
@@ -3288,7 +3280,7 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_B200-4_GPUs-PyTorch-Post-Merge-2": ["b200-x4-lbd", "l0_dgx_b200", 2, 2, 4, 1, true],
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["b300-x4", "l0_dgx_b300", 1, 2, 4],
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-2": ["b300-x4", "l0_dgx_b300", 2, 2, 4],
-        // Perf sanity post merge test
+        // PerfSanity post-merge tests
         // "DGX_B200-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["b200-x4", "l0_dgx_b200_perf_sanity", 1, 3, 4],
         // "DGX_B200-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["b200-x4", "l0_dgx_b200_perf_sanity", 2, 3, 4],
         // "DGX_B200-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["b200-x4", "l0_dgx_b200_perf_sanity", 3, 3, 4],
@@ -3311,8 +3303,7 @@ def launchTestJobs(pipeline, testFilter)
 
     parallelJobs += parallelSlurmJobs
 
-    // Try to match what are being tested on x86 H100_PCIe.
-// SBSA machines from the Blossom machine pool
+    // SBSA machines from the Blossom machine pool
     SBSATestConfigs = [
         "GH200-TensorRT-Post-Merge-1": ["gh200", "l0_gh200", 1, 1],
         // DGX Spark is also named as GB10 Grace Blackwell Superchip.
@@ -3328,13 +3319,13 @@ def launchTestJobs(pipeline, testFilter)
         // Disable GB300 stages due to nodes will be offline temporarily.
         // "GB300-PyTorch-1": ["gb300-single", "l0_gb300", 1, 1],
         // "GB300-4_GPUs-PyTorch-Post-Merge-1": ["gb300-x4", "l0_gb300_multi_gpus", 1, 1, 4],
-        // Perf sanity pre merge test
+        // PerfSanity pre-merge tests
         "GB200-4_GPUs-PyTorch-PerfSanity-4": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 4, 14, 4],
         "GB200-4_GPUs-PyTorch-PerfSanity-5": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 5, 14, 4],
         "GB200-4_GPUs-PyTorch-PerfSanity-6": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 6, 14, 4],
         "GB200-4_GPUs-PyTorch-PerfSanity-11": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 11, 14, 4],
         "GB200-4_GPUs-PyTorch-PerfSanity-12": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 12, 14, 4],
-        // Perf sanity post merge test
+        // PerfSanity post-merge tests
         "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 1, 14, 4],
         "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 2, 14, 4],
         "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 3, 14, 4],
@@ -3355,9 +3346,7 @@ def launchTestJobs(pipeline, testFilter)
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-1": ["gb200-oci-trtllm", "l0_gb200_multi_nodes", 1, 3, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-2": ["gb200-oci-trtllm", "l0_gb200_multi_nodes", 2, 3, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-3": ["gb200-oci-trtllm", "l0_gb200_multi_nodes", 3, 3, 8, 2],
-        // Perf sanity pre merge tests
-        // "GB200-12_GPUs-3_Nodes-PyTorch-PerfSanity-Disagg-1": ["gb200-oci-trtllm", "l0_gb200_multi_nodes_disagg_perf_sanity_3_nodes", 1, 1, 12, 3],
-        // Perf sanity post merge tests
+        // PerfSanity post-merge tests
         "GB200-8_GPUs-2_Nodes-PyTorch-PerfSanity-Post-Merge-1": ["gb200-oci-trtllm", "l0_gb200_multi_nodes_aggr_perf_sanity_2_nodes", 1, 2, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-PerfSanity-Post-Merge-2": ["gb200-oci-trtllm", "l0_gb200_multi_nodes_aggr_perf_sanity_2_nodes", 2, 2, 8, 2],
         "GB200-12_GPUs-3_Nodes-PyTorch-PerfSanity-Disagg-Post-Merge-1": ["gb200-oci-trtllm", "l0_gb200_multi_nodes_disagg_perf_sanity_3_nodes", 1, 1, 12, 3],
