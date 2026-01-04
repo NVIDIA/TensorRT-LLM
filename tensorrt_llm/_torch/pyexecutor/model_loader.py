@@ -261,7 +261,7 @@ class ModelLoader:
                 model.to("cuda")
             except Exception:
                 logger.error(
-                    f"================== Fallback to regular model init: {traceback.format_exc(limit=50)}\n"
+                    f"Fallback to regular model init: {traceback.format_exc(limit=50)}\n"
                 )
                 model.to("cuda")
 
