@@ -100,7 +100,7 @@ class LogProbsState:
 @dataclass(kw_only=True)
 class LogProbsStateList:
     FloatState = list[list[list[float]]]
-    IntState = list[list[list[float]]]
+    IntState = list[list[list[int]]]
 
     sampled_vals: FloatState
     sampled_indices: IntState
@@ -389,6 +389,10 @@ def _get_max_beam_width(request: LlmRequest) -> int:
     return max_beam_width
 
 
+def _request_sampling_params_cachable(params: UtilsSamplingParams) -> bool:
+    return not params.use_beam_search
+
+
 def _request_get_sampling_params(request: LlmRequest) -> UtilsSamplingParams:
     sampling_config = request.sampling_config
     temperature = _unwrap_singleton(cast(Optional[list[float]], sampling_config.temperature))
@@ -409,10 +413,16 @@ def _request_get_sampling_params(request: LlmRequest) -> UtilsSamplingParams:
 
 
 def _request_strategy(request: LlmRequest, *, vocab_size: int) -> Strategy:
-    if not hasattr(request, "py_sampling_strategy") or _get_max_beam_width(request) > 1:
-        params = _request_get_sampling_params(request)
+    # We try to cache the resolved strategy on the request object, as it's not cheap enough to
+    # resolve it on every iteration.
+    if hasattr(request, "py_sampling_strategy"):
+        return request.py_sampling_strategy
+
+    params = _request_get_sampling_params(request)
+    sampling_strategy = resolve_sampling_strategy(params, vocab_size=vocab_size)
+    if _request_sampling_params_cachable(params):
         request.py_sampling_strategy = resolve_sampling_strategy(params, vocab_size=vocab_size)
-    return request.py_sampling_strategy
+    return sampling_strategy
 
 
 def _group_requests_by_strategy_key(
