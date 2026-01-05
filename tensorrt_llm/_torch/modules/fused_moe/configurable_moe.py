@@ -634,8 +634,9 @@ class ConfigurableMoE(MoE):
         else:
             token_selected_slots = token_selected_experts
 
-        ExpertStatistic.set_layer(self.layer_idx)
-        ExpertStatistic.maybe_add_info(self.num_slots, token_selected_slots)
+        if token_selected_slots is not None:
+            ExpertStatistic.set_layer(self.layer_idx)
+            ExpertStatistic.maybe_add_info(self.num_slots, token_selected_slots)
 
         # ========== Step 3.5: Communication Prepare Phase (BEFORE quantization) ==========
         # NVLINK two-sided has a prepare phase to gather EPLB statistics
