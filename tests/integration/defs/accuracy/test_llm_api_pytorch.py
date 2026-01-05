@@ -5197,3 +5197,84 @@ class TestNemotronV3Nano(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+
+class TestNemotronV3Super(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "nvidia/Nemotron-Super-V3"
+    # No thinking mode for now.
+    EXTRA_EVALUATOR_KWARGS = dict(chat_template_kwargs=dict(
+        enable_thinking=False))
+
+    @pytest.mark.skip_less_device_memory(64000)
+    @pytest.mark.skip_less_mpi_world_size(4)
+    @pytest.mark.parametrize(
+        "tp_size, ep_size, attention_dp, overlap_scheduler, cuda_graph",
+        [
+            (4, 4, False, True, True),
+            (4, 1, False, False, True),
+            (4, 4, True, False, True),
+            (4, 1, True, True, True),
+            (4, 4, False, True, False),
+            (4, 1, False, False, False),
+            (4, 4, True, False, False),
+            (4, 1, True, True, False),
+        ],
+    )
+    def test_auto_dtype_4gpus(self, tp_size, ep_size, attention_dp,
+                              overlap_scheduler, cuda_graph):
+        if attention_dp:
+            pytest.skip(
+                "Attention DP is not supported for Nemotron-3-Super yet")
+
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        mamba_ssm_cache_dtype="float32")
+        pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
+                              cuda_graph_config=CudaGraphConfig(
+                                  max_batch_size=512, enable_padding=True)
+                              if cuda_graph else None)
+
+        with LLM(
+                f"{llm_models_root()}/Nemotron-Super-3-120B-A12B-dev",
+                kv_cache_config=kv_cache_config,
+                max_batch_size=32,
+                tensor_parallel_size=tp_size,
+                moe_expert_parallel_size=ep_size,
+                enable_attention_dp=attention_dp,
+                **pytorch_config,
+        ) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(8)
+    def test_nvfp4_8gpus(self):
+        # Use this test to track the best performance config.
+        # The optimized config is still under investigation.
+        # Adding this test as placeholder.
+        with LLM(
+                f"{llm_models_root()}/Nemotron-SuperV3-phase1-mtp-nvfp4-fp8kv",
+                kv_cache_config=KvCacheConfig(
+                    enable_block_reuse=False,
+                    mamba_ssm_cache_dtype="float16",
+                    free_gpu_memory_fraction=0.5,
+                ),
+                max_batch_size=32,
+                tensor_parallel_size=8,
+                moe_expert_parallel_size=8,
+                pipeline_parallel_size=1,
+                enable_attention_dp=False,
+                cuda_graph_config=CudaGraphConfig(max_batch_size=32,
+                                                  enable_padding=True),
+                disable_overlap_scheduler=False,
+                moe_config=MoeConfig(backend="CUTLASS"),
+        ) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
