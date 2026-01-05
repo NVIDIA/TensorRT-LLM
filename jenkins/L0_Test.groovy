@@ -3890,12 +3890,12 @@ pipeline {
                     singleGpuJobs = parallelJobs
                     dgxJobs = [:]
 
-                    def testPhase2StageName = env.testPhase2StageName
+                    /*def testPhase2StageName = env.testPhase2StageName
                     if (testPhase2StageName) {
                         def dgxSigns = ["2_GPUs", "4_GPUs", "8_GPUs"]
                         singleGpuJobs = parallelJobs.findAll{!dgxSigns.any{sign -> it.key.contains(sign)}}
                         dgxJobs = parallelJobs.findAll{dgxSigns.any{sign -> it.key.contains(sign)}}
-                    }
+                    }*/
 
                     if (env.JOB_NAME ==~ /.*Single-GPU.*/) {
                         echo "Only run single-GPU tests."
