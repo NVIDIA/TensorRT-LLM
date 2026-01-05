@@ -212,8 +212,8 @@ class FP4BlockScaleMoERunner(TunableRunner):
         self.routing_method_type = routing_method_type
         self.do_finalize = do_finalize
 
-        FP4BlockScaleMoERunner.tuning_config = FP4BlockScaleMoERunner.get_tuning_config(
-        )
+        self.tuning_config = FP4BlockScaleMoERunner.get_tuning_config(
+            self.num_experts // self.local_num_experts)
 
     # The unique_id is used by the autotuner to get the cache key, so we hash on members
     # that influence tactic validity here. e.g. we are tuning FC1 and FC2 so the routing type does not matter
@@ -275,17 +275,22 @@ class FP4BlockScaleMoERunner(TunableRunner):
         return tactics
 
     @classmethod
-    def get_dynamic_tensor_specs(cls) -> Tuple[DynamicTensorSpec, ...]:
+    def get_dynamic_tensor_specs(cls,
+                                 ep_size: int) -> Tuple[DynamicTensorSpec, ...]:
         HIDDEN_STATES_IDX = 2
         TUNED_DIM = 0
         MAX_PROFILE_BUCKET = 4096
 
         m_values = get_last_power_of_2_num_tokens_buckets(MAX_PROFILE_BUCKET)
-        round_rule = lambda x: min(last_positive_power_of_2(x),
-                                   MAX_PROFILE_BUCKET)
 
-        specs = (DynamicTensorSpec(HIDDEN_STATES_IDX, TUNED_DIM, m_values,
-                                   round_rule), )
+        def round_rule(x: int) -> int:
+            value = last_positive_power_of_2(x) // ep_size
+            return min(max(1, value), MAX_PROFILE_BUCKET)
+
+        specs = (DynamicTensorSpec(HIDDEN_STATES_IDX,
+                                   TUNED_DIM,
+                                   m_values,
+                                   map_to_tuning_buckets=round_rule), )
 
         return specs
 
@@ -346,9 +351,9 @@ class FP4BlockScaleMoERunner(TunableRunner):
 
     @classmethod
     @lru_cache(maxsize=None)
-    def get_tuning_config(cls) -> TuningConfig:
+    def get_tuning_config(cls, ep_size: int) -> TuningConfig:
 
-        dynamic_tensor_specs = cls.get_dynamic_tensor_specs()
+        dynamic_tensor_specs = cls.get_dynamic_tensor_specs(ep_size)
         constraint_specs = cls.get_constraint_specs()
 
         tuning_config = TuningConfig(dynamic_tensor_specs=dynamic_tensor_specs,
@@ -410,7 +415,7 @@ def fp4_block_scale_moe_runner(
             topk_ids=topk_ids,
             hidden_states=hidden_states,
             routing_logits=routing_logits,
-            base_tuning_config=FP4BlockScaleMoERunner.get_tuning_config(),
+            base_tuning_config=kernel_runner.tuning_config,
             top_k=top_k,
             num_experts=num_experts,
             n_group=n_group,
@@ -571,8 +576,8 @@ class FP8BlockScaleMoERunner(TunableRunner):
         self.routed_scaling_factor = routed_scaling_factor
         self.routing_method_type = routing_method_type
 
-        FP8BlockScaleMoERunner.tuning_config = FP8BlockScaleMoERunner.get_tuning_config(
-        )
+        self.tuning_config = FP8BlockScaleMoERunner.get_tuning_config(
+            self.num_experts // self.local_num_experts)
 
     # The unique_id is used by the autotuner to get the cache key, so we hash on members
     # that influence tactic validity here. e.g. we are tuning FC1 and FC2 so the routing
@@ -629,18 +634,22 @@ class FP8BlockScaleMoERunner(TunableRunner):
         return tactics
 
     @classmethod
-    def get_dynamic_tensor_specs(cls) -> Tuple[DynamicTensorSpec, ...]:
+    def get_dynamic_tensor_specs(cls,
+                                 ep_size: int) -> Tuple[DynamicTensorSpec, ...]:
         HIDDEN_STATES_IDX = 2
         TUNED_DIM = 0
-
         MAX_PROFILE_BUCKET = 4096
 
         m_values = get_last_power_of_2_num_tokens_buckets(MAX_PROFILE_BUCKET)
-        round_rule = lambda x: min(last_positive_power_of_2(x),
-                                   MAX_PROFILE_BUCKET)
 
-        specs = (DynamicTensorSpec(HIDDEN_STATES_IDX, TUNED_DIM, m_values,
-                                   round_rule), )
+        def round_rule(x: int) -> int:
+            value = last_positive_power_of_2(x) // ep_size
+            return min(max(1, value), MAX_PROFILE_BUCKET)
+
+        specs = (DynamicTensorSpec(HIDDEN_STATES_IDX,
+                                   TUNED_DIM,
+                                   m_values,
+                                   map_to_tuning_buckets=round_rule), )
 
         return specs
 
@@ -683,9 +692,9 @@ class FP8BlockScaleMoERunner(TunableRunner):
 
     @classmethod
     @lru_cache(maxsize=None)
-    def get_tuning_config(cls) -> TuningConfig:
+    def get_tuning_config(cls, ep_size: int) -> TuningConfig:
 
-        dynamic_tensor_specs = cls.get_dynamic_tensor_specs()
+        dynamic_tensor_specs = cls.get_dynamic_tensor_specs(ep_size)
         constraint_specs = cls.get_constraint_specs()
 
         tuning_config = TuningConfig(dynamic_tensor_specs=dynamic_tensor_specs,
@@ -717,19 +726,17 @@ def fp8_block_scale_moe_runner(
         topk_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
 
     tuner = AutoTuner.get()
-    kernel_runners = [
-        FP8BlockScaleMoERunner(
-            num_experts,
-            top_k,
-            n_group,
-            topk_group,
-            intermediate_size,
-            local_expert_offset,
-            local_num_experts,
-            routed_scaling_factor,
-            routing_method_type,
-        )
-    ]
+    kernel_runner = FP8BlockScaleMoERunner(
+        num_experts,
+        top_k,
+        n_group,
+        topk_group,
+        intermediate_size,
+        local_expert_offset,
+        local_num_experts,
+        routed_scaling_factor,
+        routing_method_type,
+    )
 
     # Prepare dummy topk tensors and hook for AutoTuner profiling
     routing_logits_for_tuner, topk_weights_for_tuner, topk_ids_for_tuner, tuning_config_with_hook = \
@@ -739,7 +746,7 @@ def fp8_block_scale_moe_runner(
             topk_ids=topk_ids,
             hidden_states=hidden_states,
             routing_logits=routing_logits,
-            base_tuning_config=FP8BlockScaleMoERunner.get_tuning_config(),
+            base_tuning_config=kernel_runner.tuning_config,
             top_k=top_k,
             num_experts=num_experts,
             n_group=n_group,
@@ -763,7 +770,7 @@ def fp8_block_scale_moe_runner(
 
     kernel_runner, best_tactic = tuner.choose_one(
         "trtllm::fp8_block_scale_moe_runner",
-        kernel_runners,
+        [kernel_runner],
         tuning_config_with_hook,
         input_tensors_for_tuner,
     )
@@ -848,8 +855,8 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
         self.routing_method_type = routing_method_type
         self.act_type = act_type
 
-        MxE4m3MxE2m1BlockScaleMoERunner.tuning_config = MxE4m3MxE2m1BlockScaleMoERunner.get_tuning_config(
-        )
+        self.tuning_config = MxE4m3MxE2m1BlockScaleMoERunner.get_tuning_config(
+            self.num_experts // self.local_num_experts)
 
     # The unique_id is used by the autotuner to get the cache key, so we hash on members
     # that influence tactic validity here. e.g. we are tuning FC1 and FC2 so the routing
@@ -920,15 +927,22 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
         return tactics
 
     @classmethod
-    def get_dynamic_tensor_specs(cls) -> Tuple[DynamicTensorSpec, ...]:
+    def get_dynamic_tensor_specs(cls,
+                                 ep_size: int) -> Tuple[DynamicTensorSpec, ...]:
         HIDDEN_STATES_IDX = 2
         TUNED_DIM = 0
+        MAX_PROFILE_BUCKET = 4096
 
-        m_values = get_last_power_of_2_num_tokens_buckets(4096)
-        round_rule = lambda x: min(last_positive_power_of_2(x), 4096)
+        m_values = get_last_power_of_2_num_tokens_buckets(MAX_PROFILE_BUCKET)
 
-        specs = (DynamicTensorSpec(HIDDEN_STATES_IDX, TUNED_DIM, m_values,
-                                   round_rule), )
+        def round_rule(x: int) -> int:
+            value = last_positive_power_of_2(x) // ep_size
+            return min(max(1, value), MAX_PROFILE_BUCKET)
+
+        specs = (DynamicTensorSpec(HIDDEN_STATES_IDX,
+                                   TUNED_DIM,
+                                   m_values,
+                                   map_to_tuning_buckets=round_rule), )
 
         return specs
 
@@ -982,9 +996,9 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
 
     @classmethod
     @lru_cache(maxsize=None)
-    def get_tuning_config(cls) -> TuningConfig:
+    def get_tuning_config(cls, ep_size: int) -> TuningConfig:
 
-        dynamic_tensor_specs = cls.get_dynamic_tensor_specs()
+        dynamic_tensor_specs = cls.get_dynamic_tensor_specs(ep_size)
         constraint_specs = cls.get_constraint_specs()
 
         tuning_config = TuningConfig(dynamic_tensor_specs=dynamic_tensor_specs,
@@ -1049,7 +1063,7 @@ def mxe4m3_mxe2m1_block_scale_moe_runner(
             topk_ids=topk_ids,
             hidden_states=hidden_states,
             routing_logits=routing_logits,
-            base_tuning_config=MxE4m3MxE2m1BlockScaleMoERunner.get_tuning_config(),
+            base_tuning_config=kernel_runner.tuning_config,
             top_k=top_k,
             num_experts=num_experts,
             n_group=n_group,
@@ -1139,8 +1153,8 @@ class E4m3MxE2m1BlockScaleMoERunner(TunableRunner):
         self.routing_method_type = routing_method_type
         self.act_type = act_type
 
-        E4m3MxE2m1BlockScaleMoERunner.tuning_config = E4m3MxE2m1BlockScaleMoERunner.get_tuning_config(
-        )
+        self.tuning_config = E4m3MxE2m1BlockScaleMoERunner.get_tuning_config(
+            self.num_experts // self.local_num_experts)
 
     # The unique_id is used by the autotuner to get the cache key, so we hash on members
     # that influence tactic validity here. e.g. we are tuning FC1 and FC2 so the routing
@@ -1211,15 +1225,22 @@ class E4m3MxE2m1BlockScaleMoERunner(TunableRunner):
         return tactics
 
     @classmethod
-    def get_dynamic_tensor_specs(cls) -> Tuple[DynamicTensorSpec, ...]:
+    def get_dynamic_tensor_specs(cls,
+                                 ep_size: int) -> Tuple[DynamicTensorSpec, ...]:
         HIDDEN_STATES_IDX = 2
         TUNED_DIM = 0
+        MAX_PROFILE_BUCKET = 4096
 
-        m_values = get_last_power_of_2_num_tokens_buckets(4096)
-        round_rule = lambda x: min(last_positive_power_of_2(x), 4096)
+        m_values = get_last_power_of_2_num_tokens_buckets(MAX_PROFILE_BUCKET)
 
-        specs = (DynamicTensorSpec(HIDDEN_STATES_IDX, TUNED_DIM, m_values,
-                                   round_rule), )
+        def round_rule(x: int) -> int:
+            value = last_positive_power_of_2(x) // ep_size
+            return min(max(1, value), MAX_PROFILE_BUCKET)
+
+        specs = (DynamicTensorSpec(HIDDEN_STATES_IDX,
+                                   TUNED_DIM,
+                                   m_values,
+                                   map_to_tuning_buckets=round_rule), )
 
         return specs
 
@@ -1253,9 +1274,9 @@ class E4m3MxE2m1BlockScaleMoERunner(TunableRunner):
 
     @classmethod
     @lru_cache(maxsize=None)
-    def get_tuning_config(cls) -> TuningConfig:
+    def get_tuning_config(cls, ep_size: int) -> TuningConfig:
 
-        dynamic_tensor_specs = cls.get_dynamic_tensor_specs()
+        dynamic_tensor_specs = cls.get_dynamic_tensor_specs(ep_size)
         constraint_specs = cls.get_constraint_specs()
 
         tuning_config = TuningConfig(dynamic_tensor_specs=dynamic_tensor_specs,
@@ -1321,7 +1342,7 @@ def e4m3_mxe2m1_block_scale_moe_runner(
             topk_ids=topk_ids,
             hidden_states=hidden_states,
             routing_logits=routing_logits,
-            base_tuning_config=E4m3MxE2m1BlockScaleMoERunner.get_tuning_config(),
+            base_tuning_config=kernel_runner.tuning_config,
             top_k=top_k,
             num_experts=num_experts,
             n_group=n_group,
@@ -1410,8 +1431,8 @@ class Bf16MxE2m1BlockScaleMoERunner(TunableRunner):
         self.routing_method_type = routing_method_type
         self.act_type = act_type
 
-        Bf16MxE2m1BlockScaleMoERunner.tuning_config = Bf16MxE2m1BlockScaleMoERunner.get_tuning_config(
-        )
+        self.tuning_config = Bf16MxE2m1BlockScaleMoERunner.get_tuning_config(
+            self.num_experts // self.local_num_experts)
 
     # The unique_id is used by the autotuner to get the cache key, so we hash on members
     # that influence tactic validity here. e.g. we are tuning FC1 and FC2 so the routing
@@ -1480,15 +1501,22 @@ class Bf16MxE2m1BlockScaleMoERunner(TunableRunner):
         return tactics
 
     @classmethod
-    def get_dynamic_tensor_specs(cls) -> Tuple[DynamicTensorSpec, ...]:
+    def get_dynamic_tensor_specs(cls,
+                                 ep_size: int) -> Tuple[DynamicTensorSpec, ...]:
         HIDDEN_STATES_IDX = 2
         TUNED_DIM = 0
+        MAX_PROFILE_BUCKET = 4096
 
-        m_values = get_last_power_of_2_num_tokens_buckets(4096)
-        round_rule = lambda x: min(last_positive_power_of_2(x), 4096)
+        m_values = get_last_power_of_2_num_tokens_buckets(MAX_PROFILE_BUCKET)
 
-        specs = (DynamicTensorSpec(HIDDEN_STATES_IDX, TUNED_DIM, m_values,
-                                   round_rule), )
+        def round_rule(x: int) -> int:
+            value = last_positive_power_of_2(x) // ep_size
+            return min(max(1, value), MAX_PROFILE_BUCKET)
+
+        specs = (DynamicTensorSpec(HIDDEN_STATES_IDX,
+                                   TUNED_DIM,
+                                   m_values,
+                                   map_to_tuning_buckets=round_rule), )
 
         return specs
 
@@ -1522,9 +1550,9 @@ class Bf16MxE2m1BlockScaleMoERunner(TunableRunner):
 
     @classmethod
     @lru_cache(maxsize=None)
-    def get_tuning_config(cls) -> TuningConfig:
+    def get_tuning_config(cls, ep_size: int) -> TuningConfig:
 
-        dynamic_tensor_specs = cls.get_dynamic_tensor_specs()
+        dynamic_tensor_specs = cls.get_dynamic_tensor_specs(ep_size)
         constraint_specs = cls.get_constraint_specs()
 
         tuning_config = TuningConfig(dynamic_tensor_specs=dynamic_tensor_specs,
@@ -1587,7 +1615,7 @@ def bf16_mxe2m1_block_scale_moe_runner(
             topk_ids=topk_ids,
             hidden_states=hidden_states,
             routing_logits=routing_logits,
-            base_tuning_config=Bf16MxE2m1BlockScaleMoERunner.get_tuning_config(),
+            base_tuning_config=kernel_runner.tuning_config,
             top_k=top_k,
             num_experts=num_experts,
             n_group=n_group,
@@ -1671,8 +1699,8 @@ class FP8FP4BlockScaleMoERunner(TunableRunner):
         self.do_finalize = do_finalize
         self.act_type = act_type
 
-        FP8FP4BlockScaleMoERunner.tuning_config = FP8FP4BlockScaleMoERunner.get_tuning_config(
-        )
+        self.tuning_config = FP8FP4BlockScaleMoERunner.get_tuning_config(
+            self.num_experts // self.local_num_experts)
 
     def unique_id(self):
         return (
@@ -1734,17 +1762,22 @@ class FP8FP4BlockScaleMoERunner(TunableRunner):
         return tactics
 
     @classmethod
-    def get_dynamic_tensor_specs(cls) -> Tuple[DynamicTensorSpec, ...]:
+    def get_dynamic_tensor_specs(cls,
+                                 ep_size: int) -> Tuple[DynamicTensorSpec, ...]:
         HIDDEN_STATES_IDX = 2
         TUNED_DIM = 0
         MAX_PROFILE_BUCKET = 4096
 
         m_values = get_last_power_of_2_num_tokens_buckets(MAX_PROFILE_BUCKET)
-        round_rule = lambda x: min(last_positive_power_of_2(x),
-                                   MAX_PROFILE_BUCKET)
 
-        specs = (DynamicTensorSpec(HIDDEN_STATES_IDX, TUNED_DIM, m_values,
-                                   round_rule), )
+        def round_rule(x: int) -> int:
+            value = last_positive_power_of_2(x) // ep_size
+            return min(max(1, value), MAX_PROFILE_BUCKET)
+
+        specs = (DynamicTensorSpec(HIDDEN_STATES_IDX,
+                                   TUNED_DIM,
+                                   m_values,
+                                   map_to_tuning_buckets=round_rule), )
 
         return specs
 
@@ -1780,9 +1813,9 @@ class FP8FP4BlockScaleMoERunner(TunableRunner):
 
     @classmethod
     @lru_cache(maxsize=None)
-    def get_tuning_config(cls) -> TuningConfig:
+    def get_tuning_config(cls, ep_size: int) -> TuningConfig:
 
-        dynamic_tensor_specs = cls.get_dynamic_tensor_specs()
+        dynamic_tensor_specs = cls.get_dynamic_tensor_specs(ep_size)
         constraint_specs = cls.get_constraint_specs()
 
         tuning_config = TuningConfig(dynamic_tensor_specs=dynamic_tensor_specs,
@@ -1841,7 +1874,7 @@ def fp8_fp4_block_scale_moe_runner(
             topk_ids=topk_ids,
             hidden_states=hidden_states,
             routing_logits=routing_logits,
-            base_tuning_config=FP8FP4BlockScaleMoERunner.get_tuning_config(),
+            base_tuning_config=kernel_runner.tuning_config,
             top_k=top_k,
             num_experts=num_experts,
             n_group=n_group,
