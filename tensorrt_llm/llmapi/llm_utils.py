@@ -9,9 +9,10 @@ from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple, Union
 
 import torch
-import transformers
 from pydantic import BaseModel
 from tqdm import tqdm
+
+import transformers
 
 from .._utils import (global_mpi_rank, local_mpi_rank, mpi_barrier,
                       mpi_broadcast, mpi_rank, release_gc)
@@ -145,9 +146,7 @@ class ModelLoader:
             return
 
         if (self.model_obj.is_hub_model
-                and self._model_format is not _ModelFormatKind.TLLM_ENGINE) or (
-                    self.speculative_model_obj
-                    and self.speculative_model_obj.is_hub_model):
+                and self._model_format is not _ModelFormatKind.TLLM_ENGINE):
             # Download HF model if necessary
             if self.model_obj.model_name is None:
                 raise ValueError(
@@ -305,31 +304,18 @@ class ModelLoader:
     def _download_hf_model(self):
         ''' Download HF model from third-party model hub like www.modelscope.cn or huggingface.  '''
         model_dir = None
-        speculative_model_dir = None
         # Only the rank0 are allowed to download model
         if mpi_rank() == 0:
             assert self._workspace is not None
             assert isinstance(self.model_obj.model_name, str)
             # this will download only once when multiple MPI processes are running
-
             model_dir = download_hf_model(self.model_obj.model_name,
                                           revision=self.llm_args.revision)
             print_colored(f"Downloaded model to {model_dir}\n", 'grey')
-            if self.speculative_model_obj:
-                speculative_model_dir = download_hf_model(
-                    self.speculative_model_obj.model_name)
-                print_colored(f"Downloaded model to {speculative_model_dir}\n",
-                              'grey')
         # Make all the processes got the same model_dir
         self._model_dir = mpi_broadcast(model_dir, root=0)
         self.model_obj.model_dir = self._model_dir  # mark as a local model
         assert self.model_obj.is_local_model
-        if self.speculative_model_obj:
-            self._speculative_model_dir = mpi_broadcast(speculative_model_dir,
-                                                        root=0)
-            self.speculative_model_obj.model_dir = self._speculative_model_dir
-
-            assert self.speculative_model_obj.is_local_model
 
     def _update_from_hf_quant_config(self) -> bool:
         """Update quant_config from the config file of pre-quantized HF checkpoint.
