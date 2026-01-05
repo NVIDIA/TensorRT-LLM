@@ -48,7 +48,7 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
         assert self.page_size == next_power_of_2(
             self.page_size), "Page size must be a power of 2"
 
-        capture_graph = torch.cuda.is_current_stream_capturing()
+        capture_graph = self.is_cuda_graph
 
         # Cumulative valid sequence lengths for query and key
         self.q_cu_seqlens_cuda = self.get_empty(
