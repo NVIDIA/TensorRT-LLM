@@ -620,7 +620,7 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
         model_path = f"{llm_models_root()}/modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8"
         eagle_model_dir = f"{llm_models_root()}/EAGLE3-LLaMA3.3-Instruct-70B"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
-        spec_config = EagleDecodingConfig(max_draft_len=4,
+        spec_config = EagleDecodingConfig(max_draft_len=3,
                                           speculative_model_dir=eagle_model_dir,
                                           eagle3_one_model=eagle3_one_model)
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
