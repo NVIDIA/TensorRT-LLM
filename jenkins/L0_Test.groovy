@@ -3464,7 +3464,7 @@ def launchTestJobs(pipeline, testFilter)
             false,
             "",
             DLFW_IMAGE,
-            true, // Extra PyTorch CUDA 13.0 install
+            false, // Extra PyTorch CUDA 13.0 install
         ],
         "PY312-DLFW": [
             LLM_DOCKER_IMAGE,
