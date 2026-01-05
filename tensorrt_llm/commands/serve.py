@@ -358,6 +358,12 @@ class ChoiceWithAlias(click.Choice):
               default=1,
               help=help_info_with_stability_tag('Context parallelism size.',
                                                 'beta'))
+@click.option("--context_parallel_type",
+              "--cp_type",
+              type=click.Choice([member.name for member in CpType]),
+              default='ULYSSES',
+              help=help_info_with_stability_tag("Context parallelism type.",
+                                                "beta"))
 @click.option("--moe_expert_parallel_size",
               "--ep_size",
               type=int,
@@ -472,22 +478,23 @@ class ChoiceWithAlias(click.Choice):
                   "Specify a custom chat template. "
                   "Can be a file path or one-liner template string",
                   "prototype"))
-def serve(
-        model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
-        host: str, port: int, log_level: str, backend: str, max_beam_width: int,
-        max_batch_size: int, max_num_tokens: int, max_seq_len: int,
-        tensor_parallel_size: int, pipeline_parallel_size: int,
-        context_parallel_size: int, moe_expert_parallel_size: Optional[int],
-        moe_cluster_parallel_size: Optional[int], gpus_per_node: Optional[int],
-        free_gpu_memory_fraction: float, num_postprocess_workers: int,
-        trust_remote_code: bool, revision: Optional[str],
-        extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
-        tool_parser: Optional[str], metadata_server_config_file: Optional[str],
-        server_role: Optional[str],
-        fail_fast_on_attention_window_too_large: bool,
-        otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
-        disagg_cluster_uri: Optional[str], media_io_kwargs: Optional[str],
-        custom_module_dirs: list[Path], chat_template: Optional[str]):
+def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
+          host: str, port: int, log_level: str, backend: str,
+          max_beam_width: int, max_batch_size: int, max_num_tokens: int,
+          max_seq_len: int, tensor_parallel_size: int,
+          pipeline_parallel_size: int, context_parallel_size: int,
+          context_parallel_type: str, moe_expert_parallel_size: Optional[int],
+          moe_cluster_parallel_size: Optional[int],
+          gpus_per_node: Optional[int], free_gpu_memory_fraction: float,
+          num_postprocess_workers: int, trust_remote_code: bool,
+          revision: Optional[str], extra_llm_api_options: Optional[str],
+          reasoning_parser: Optional[str], tool_parser: Optional[str],
+          metadata_server_config_file: Optional[str],
+          server_role: Optional[str],
+          fail_fast_on_attention_window_too_large: bool,
+          otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
+          disagg_cluster_uri: Optional[str], media_io_kwargs: Optional[str],
+          custom_module_dirs: list[Path], chat_template: Optional[str]):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -513,6 +520,8 @@ def serve(
         tensor_parallel_size=tensor_parallel_size,
         pipeline_parallel_size=pipeline_parallel_size,
         context_parallel_size=context_parallel_size,
+        cp_config={"cp_type": context_parallel_type}
+        if context_parallel_size > 1 else {},
         moe_expert_parallel_size=moe_expert_parallel_size,
         moe_cluster_parallel_size=moe_cluster_parallel_size,
         gpus_per_node=gpus_per_node,

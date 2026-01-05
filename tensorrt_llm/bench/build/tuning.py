@@ -23,6 +23,7 @@ def calc_engine_setting(
     quant_config: QuantConfig,
     tp_size: int,
     pp_size: int,
+    cp_size: int,
     target_input_len: int,
     target_output_len: int,
     kv_cache_gpu_mem_fraction: float = 0.95,
@@ -40,6 +41,7 @@ def calc_engine_setting(
         quant_config (QuantConfig): Quantization specifications.
         tp_size (int): Number of tensor parallel shards.
         pp_size (int): Number of pipeline parallel stages.
+        cp_size (int): Number of context parallel stages.
         target_input_len (int): Target input length to compile the engine.
         target_output_len (int): Target output length to compile the engine.
         kv_cache_gpu_mem_fraction (float): Fraction of free memory to allocate
@@ -66,7 +68,7 @@ def calc_engine_setting(
         * model_config.head_size * byte_per_kv_elem / (1024 ** 3)
 
     # Number of GPU used for this run.
-    n_gpus = tp_size * pp_size
+    n_gpus = tp_size * pp_size * cp_size
     # Total engine size.
     engine_size = model_config.param_count * byte_per_elem / (1024**3)
     total_gpu_memory = get_device_memory() * n_gpus
