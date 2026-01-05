@@ -17,6 +17,7 @@ from pydantic import AliasChoices, BaseModel
 from pydantic import Field as PydanticField
 from pydantic import PrivateAttr, field_validator, model_validator
 from strenum import StrEnum
+
 from transformers import PreTrainedTokenizerBase
 
 try:
@@ -2143,9 +2144,6 @@ class BaseLlmArgs(StrictBaseModel):
 
     _parallel_config: Optional[_ParallelConfig] = PrivateAttr(default=None)
     _model_format: Optional[_ModelFormatKind] = PrivateAttr(default=None)
-    _speculative_model: Optional[str] = PrivateAttr(default=None)
-    _speculative_model_format: Optional[_ModelFormatKind] = PrivateAttr(
-        default=None)
 
     @property
     def parallel_config(self) -> _ParallelConfig:
@@ -2156,12 +2154,8 @@ class BaseLlmArgs(StrictBaseModel):
         return self._model_format
 
     @property
-    def speculative_model(self) -> Optional[str]:
-        return self._speculative_model
-
-    @property
-    def speculative_model_format(self) -> _ModelFormatKind:
-        return self._speculative_model_format
+    def speculative_model(self) -> Optional[Union[str, Path]]:
+        return self.speculative_config.speculative_model if self.speculative_config is not None else None
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "BaseLlmArgs":
@@ -2551,14 +2545,6 @@ class TrtLlmArgs(BaseLlmArgs):
 
         else:
             self.decoding_config = None
-
-        self._speculative_model = getattr(self.speculative_config,
-                                          "speculative_model", None)
-        speculative_model_obj = _ModelWrapper(
-            self._speculative_model
-        ) if self._speculative_model is not None else None
-        if self._speculative_model and speculative_model_obj.is_local_model:
-            self._speculative_model_format = _ModelFormatKind.HF
 
         return self
 
@@ -3080,14 +3066,6 @@ class TorchLlmArgs(BaseLlmArgs):
 
         else:
             self.decoding_config = None
-
-        self._speculative_model = getattr(self.speculative_config,
-                                          "speculative_model", None)
-        speculative_model_obj = _ModelWrapper(
-            self._speculative_model
-        ) if self._speculative_model is not None else None
-        if self._speculative_model and speculative_model_obj.is_local_model:
-            self._speculative_model_format = _ModelFormatKind.HF
 
         return self
 
