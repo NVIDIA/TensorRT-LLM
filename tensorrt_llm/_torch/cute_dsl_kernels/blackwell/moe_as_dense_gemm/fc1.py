@@ -27,7 +27,7 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import argparse
-from typing import Tuple, Type, Union
+from typing import Optional, Tuple, Type, Union
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -38,8 +38,11 @@ import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 import torch
+from cutlass._mlir.dialects import math
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import from_dlpack
+
+from tensorrt_llm._torch.cute_dsl_kernels.blackwell.utils import fmin, silu_f32
 
 num_fused_gemm: int = 2
 
@@ -179,8 +182,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         weight_per_expert: int,
         use_prefetch: bool = False,
         prefetch_dist: int = 3,
+        vectorized_f32: bool = True,
     ):
-        """Initializes the configuration for a Blackwell dense GEMM kernel.
+        """Initializes the configuration for a Blackwell dense GEMM kernel with SwiGLU fusion.
 
         This configuration includes several key aspects:
 
@@ -191,6 +195,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
         2.  Cluster Shape:
             - cluster_shape_mn: The (ClusterM, ClusterN) shape of the CTA cluster.
+
+        3.  SwiGLU Fusion:
+            - The kernel computes C = up * silu(gate) where up and gate come from
+              interleaved weight matrix B (granularity=64)
+            - Output N dimension is N/2 due to SwiGLU fusion
 
         :param sf_vec_size: Scalefactor vector size.
         :type sf_vec_size: int
@@ -204,6 +213,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         :type use_prefetch: bool
         :param prefetch_dist: Prefetch distance for TMA operations (default: 3).
         :type prefetch_dist: int
+        :param vectorized_f32: Enable vectorized f32x2 operations for better performance (default: True).
+        :type vectorized_f32: bool
         """
 
         self.acc_dtype = cutlass.Float32
@@ -248,6 +259,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
         self.use_prefetch = use_prefetch
         self.prefetch_dist = prefetch_dist
+        self.vectorized_f32 = vectorized_f32
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -333,11 +345,17 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         self.is_sfb_mcast = self.num_mcast_ctas_sfb > 1
 
         # Compute epilogue subtile
-        self.epi_tile = sm100_utils.compute_epilogue_tile_shape(
-            self.cta_tile_shape_mnk,
-            self.use_2cta_instrs,
-            self.c_layout,
-            self.c_dtype,
+        # self.epi_tile = sm100_utils.compute_epilogue_tile_shape(
+        #     self.cta_tile_shape_mnk,
+        #     self.use_2cta_instrs,
+        #     self.c_layout,
+        #     self.c_dtype,
+        # )
+        self.epi_tile = (128, 64)
+        # Compute epilogue tile count for SFC quantization
+        self.epi_tile_cnt = (
+            self.cta_tile_shape_mnk[0] // self.epi_tile[0],
+            self.cta_tile_shape_mnk[1] // self.epi_tile[1],
         )
 
         # Setup A/B/C stage count in shared memory and ACC stage count in tensor memory
@@ -396,11 +414,20 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         sfb_tensor: cute.Tensor,
         alpha_scale: cute.Tensor,
         c_tensor: cute.Tensor,
+        sfc_tensor: Optional[cute.Tensor],
+        norm_const_tensor: Optional[cute.Tensor],
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
     ):
-        """Execute the GEMM operation in steps:
+        """Execute the GEMM operation with SwiGLU fusion and optional quantization.
+
+        This method performs FC1 layer computation:
+        1. GEMM: acc = alpha * (SFA * A) * (SFB * B)
+        2. SwiGLU: C = up * silu(gate), where up/gate are extracted from interleaved acc (granularity=64)
+        3. Optional Quant: When sfc_tensor is provided, generates SFC and quantizes output
+
+        Steps:
         - Setup static attributes before smem/grid/tma computation
         - Setup TMA load/store atoms and tensors
         - Compute grid size with regard to hardware constraints
@@ -409,14 +436,20 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
         :param a_tensor: Input tensor A
         :type a_tensor: cute.Tensor
-        :param b_tensor: Input tensor B
+        :param b_tensor: Input tensor B (weights are interleaved: [up_0:64, gate_64:128, ...])
         :type b_tensor: cute.Tensor
         :param sfa_tensor: Scale factor tensor A
         :type sfa_tensor: cute.Tensor
         :param sfb_tensor: Scale factor tensor B
         :type sfb_tensor: cute.Tensor
-        :param c_tensor: Output tensor C
+        :param alpha_scale: Alpha scaling tensor for each expert
+        :type alpha_scale: cute.Tensor
+        :param c_tensor: Output tensor C (N dimension is N/2 due to SwiGLU)
         :type c_tensor: cute.Tensor
+        :param sfc_tensor: Scale factor tensor C for quantized output (None if not quantizing)
+        :type sfc_tensor: Optional[cute.Tensor]
+        :param norm_const_tensor: Normalization constant for scale factor generation (None if not quantizing)
+        :type norm_const_tensor: Optional[cute.Tensor]
         :param max_active_clusters: Maximum number of active clusters
         :type max_active_clusters: cutlass.Constexpr
         :param stream: CUDA stream for asynchronous execution
@@ -457,6 +490,12 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         # ((Atom_N, Rest_N),(Atom_K, Rest_K),RestL)
         sfb_layout = blockscaled_utils.tile_atom_to_shape_SF(b_tensor.shape, self.sf_vec_size)
         sfb_tensor = cute.make_tensor(sfb_tensor.iterator, sfb_layout)
+
+        # Determine if we need to generate scale factor C for quantization
+        self.generate_sfc = sfc_tensor is not None and norm_const_tensor is not None
+        if cutlass.const_expr(self.generate_sfc):
+            sfc_layout = blockscaled_utils.tile_atom_to_shape_SF(c_tensor.shape, self.sf_vec_size)
+            sfc_tensor = cute.make_tensor(sfc_tensor.iterator, sfc_layout)
 
         tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
             self.a_dtype,
@@ -611,6 +650,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             tma_tensor_sfb,
             tma_atom_c,
             tma_tensor_c,
+            sfc_tensor,
+            norm_const_tensor,
             alpha_scale,
             self.cluster_layout_vmnk,
             self.cluster_layout_sfb_vmnk,
@@ -647,6 +688,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         mSFB_nkl: cute.Tensor,
         tma_atom_c: cute.CopyAtom,
         mC_mnl: cute.Tensor,
+        mSFC_mnl: Optional[cute.Tensor],
+        norm_const_tensor: Optional[cute.Tensor],
         alpha_scale: cute.Tensor,
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: cute.Layout,
@@ -1273,12 +1316,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             (
                 tiled_copy_t2r,
                 tTR_tAcc_base,
-                tTR_rAcc,
+                tTR_rAcc_up,
+                tTR_rAcc_gate,
             ) = self.epilog_tmem_copy_and_partition(
                 epi_tidx, tCtAcc_base, tCgC, epi_tile, use_2cta_instrs
             )
 
-            tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, self.c_dtype)
+            tTR_rC = cute.make_rmem_tensor(tTR_rAcc_up.shape, self.c_dtype)
             tiled_copy_r2s, tRS_rC, tRS_sC = self.epilog_smem_copy_and_partition(
                 tiled_copy_t2r, tTR_rC, epi_tidx, sC
             )
@@ -1287,6 +1331,21 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 bSG_sC,
                 bSG_gC_partitioned,
             ) = self.epilog_gmem_copy_and_partition(epi_tidx, tma_atom_c, tCgC, epi_tile, sC)
+
+            # Setup SFC tensor partition for quantization (if needed)
+            if cutlass.const_expr(self.generate_sfc):
+                norm_const = norm_const_tensor[0]
+                # (EPI_TILE_M, EPI_TILE_N, RestM, RestN, RestL)
+                gSFC_mnl = cute.local_tile(mSFC_mnl, epi_tile, (None, None, None))
+                thr_copy_t2r = tiled_copy_t2r.get_slice(tidx)
+                # (T2R, T2R_M, T2R_N, RestM, RestN, RestL)
+                tCgSFC_mnl = thr_copy_t2r.partition_D(gSFC_mnl)
+                tCgSFC_mnl = cute.filter_zeros(tCgSFC_mnl)
+                # (T2R, T2R_M, T2R_N)
+                tCrSFC = cute.make_rmem_tensor(
+                    tCgSFC_mnl[(None, None, None, 0, 0, 0)].layout, self.sf_dtype
+                )
+                tCrSFC_pvscale = cute.make_rmem_tensor_like(tCrSFC, cutlass.Float32)
 
             #
             # Persistent tile scheduling loop
@@ -1343,6 +1402,19 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 # (T2R, T2R_M, T2R_N, EPI_M, EPI_M)
                 tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None, acc_consumer_state.index)]
 
+                if cutlass.const_expr(self.generate_sfc):
+                    # (T2R, T2R_M, T2R_N, RestM, RestN)
+                    tCgSFC_mn = tCgSFC_mnl[
+                        (
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            0,
+                        )
+                    ]
+
                 #
                 # Wait for accumulator buffer full
                 #
@@ -1352,29 +1424,223 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
 
                 #
-                # Store accumulator to global memory in subtiles
+                # Process accumulator subtiles with SwiGLU fusion and store to global memory
+                # Each iteration processes a pair of subtiles (up, gate) and computes
+                # up * silu(gate)
                 #
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
                 num_prev_subtiles = tile_sched.num_tiles_executed * subtile_cnt
-                for subtile_idx in cutlass.range(subtile_cnt):
+
+                for subtile_idx in cutlass.range(0, subtile_cnt, 2):
                     #
                     # Load accumulator from tensor memory buffer to register
+                    # Load both up and gate subtiles
                     #
-                    tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
-                    cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
+                    tTR_tAcc_mn_up = tTR_tAcc[(None, None, None, subtile_idx)]
+                    tTR_tAcc_mn_gate = tTR_tAcc[(None, None, None, subtile_idx + 1)]
+
+                    cute.copy(tiled_copy_t2r, tTR_tAcc_mn_up, tTR_rAcc_up)
+                    cute.copy(tiled_copy_t2r, tTR_tAcc_mn_gate, tTR_rAcc_gate)
+
+                    acc_vec_up = tTR_rAcc_up.load()
+                    acc_vec_gate = tTR_rAcc_gate.load()
 
                     #
-                    # Convert to C type
+                    # SwiGLU activation: output = up * silu(gate)
+                    # where silu(x) = x * sigmoid(x)
+                    # up and gate are extracted from interleaved accumulator subtiles
                     #
-                    acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
-                    acc_vec = acc_vec * current_alpha_scale
-                    acc_vec = epilogue_op(acc_vec.to(self.c_dtype))
-                    tRS_rC.store(acc_vec)
+                    tCompute = cute.make_rmem_tensor(acc_vec_gate.shape, self.acc_dtype)
+                    if cutlass.const_expr(self.vectorized_f32):
+                        # SwiGLU Packed Version: uses f32x2 packed operations for better performance
+                        # Computes: output = (alpha * up) * silu(alpha * gate)
+                        # where silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+                        LOG2_E = cutlass.Float32(1.4426950408889634)
+                        for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc_up), 2):
+                            acc_vec_up_alpha = cute.arch.mul_packed_f32x2(
+                                (acc_vec_up[i], acc_vec_up[i + 1]),
+                                (
+                                    cutlass.Float32(current_alpha_scale),
+                                    cutlass.Float32(current_alpha_scale),
+                                ),
+                            )
+                            acc_vec_gate_alpha = cute.arch.mul_packed_f32x2(
+                                (acc_vec_gate[i], acc_vec_gate[i + 1]),
+                                (
+                                    cutlass.Float32(current_alpha_scale),
+                                    cutlass.Float32(current_alpha_scale),
+                                ),
+                            )
+                            tCompute_log2e = cute.arch.mul_packed_f32x2(
+                                (acc_vec_gate_alpha[0], acc_vec_gate_alpha[1]), (-LOG2_E, -LOG2_E)
+                            )
+                            (
+                                tCompute[i],
+                                tCompute[i + 1],
+                            ) = cute.arch.add_packed_f32x2(
+                                (
+                                    cute.math.exp2(tCompute_log2e[0], fastmath=True),
+                                    cute.math.exp2(tCompute_log2e[1], fastmath=True),
+                                ),
+                                (1.0, 1.0),
+                            )
+                            tCompute[i] = cute.arch.rcp_approx(tCompute[i])
+                            tCompute[i + 1] = cute.arch.rcp_approx(tCompute[i + 1])
+                            (
+                                tCompute[i],
+                                tCompute[i + 1],
+                            ) = cute.arch.mul_packed_f32x2(
+                                (tCompute[i], tCompute[i + 1]),
+                                (acc_vec_gate_alpha[0], acc_vec_gate_alpha[1]),
+                            )
+                            (
+                                tCompute[i],
+                                tCompute[i + 1],
+                            ) = cute.arch.mul_packed_f32x2(
+                                (tCompute[i], tCompute[i + 1]),
+                                (acc_vec_up_alpha[0], acc_vec_up_alpha[1]),
+                            )
+                    else:
+                        # SwiGLU Unpacked Version: scalar operations
+                        # Computes: output = (alpha * up) * silu(alpha * gate)
+                        for i in cutlass.range_constexpr(cute.size(tTR_rAcc_up)):
+                            acc_vec_up_alpha = acc_vec_up[i] * cutlass.Float32(current_alpha_scale)
+                            acc_vec_gate_alpha = acc_vec_gate[i] * cutlass.Float32(
+                                current_alpha_scale
+                            )
+                            tCompute[i] = acc_vec_up_alpha * silu_f32(
+                                acc_vec_gate_alpha, fastmath=True
+                            )
+
+                    if cutlass.const_expr(self.generate_sfc):
+                        #
+                        # Quantization path for Float4E2M1FN output:
+                        # 1. Compute per-vector absolute max from SwiGLU result
+                        # 2. Generate scale factor C (SFC) based on max values
+                        # 3. Store SFC to global memory
+                        # 4. Quantize output by scaling with reciprocal of SFC
+                        #
+                        # Assume subtile partitioned always happens on n dimension
+                        sfc_subtile_idx_mn = (
+                            cur_tile_coord[0] * self.epi_tile_cnt[0],
+                            cur_tile_coord[1] * self.epi_tile_cnt[1] + subtile_idx // 2,
+                        )
+                        tCgSFC = tCgSFC_mn[
+                            (
+                                None,
+                                None,
+                                None,
+                                *sfc_subtile_idx_mn,
+                            )
+                        ]
+
+                        #
+                        # Get absolute max across a vector and Compute SFC
+                        #
+                        tTR_rAcc_frg = cute.logical_divide(
+                            tCompute, cute.make_layout(self.sf_vec_size)
+                        )
+                        acc_frg = tTR_rAcc_frg.load()
+                        acc_frg = epilogue_op(acc_frg)
+
+                        # Apply element-wise absolute value using math.absf (supports vectors)
+                        abs_acc_frg_ir = math.absf(acc_frg.ir_value())
+                        abs_acc_frg = type(acc_frg)(abs_acc_frg_ir, acc_frg.shape, acc_frg.dtype)
+
+                        if cutlass.const_expr(self.vectorized_f32):
+                            for vi in cutlass.range_constexpr(abs_acc_frg.shape[1]):
+                                tCrSFC_pvscale[vi] = abs_acc_frg[None, vi].reduce(
+                                    cute.ReductionOp.MAX,
+                                    cutlass.Float32(0.0),
+                                    0,  # Use 0.0 as init for abs values
+                                )
+                            for vi in cutlass.range_constexpr(0, abs_acc_frg.shape[1], 2):
+                                tCrSFC_pvscale[vi], tCrSFC_pvscale[vi + 1] = (
+                                    cute.arch.mul_packed_f32x2(
+                                        (tCrSFC_pvscale[vi], tCrSFC_pvscale[vi + 1]),
+                                        (
+                                            self.get_dtype_rcp_limits(self.c_dtype),
+                                            self.get_dtype_rcp_limits(self.c_dtype),
+                                        ),
+                                    )
+                                )
+                                tCrSFC_pvscale[vi], tCrSFC_pvscale[vi + 1] = (
+                                    cute.arch.mul_packed_f32x2(
+                                        (tCrSFC_pvscale[vi], tCrSFC_pvscale[vi + 1]),
+                                        (norm_const, norm_const),
+                                    )
+                                )
+                        else:
+                            for vi in cutlass.range_constexpr(abs_acc_frg.shape[1]):
+                                tCrSFC_pvscale[vi] = (
+                                    abs_acc_frg[None, vi].reduce(
+                                        cute.ReductionOp.MAX,
+                                        cutlass.Float32(0.0),
+                                        0,  # Use 0.0 as init for abs values
+                                    )
+                                    * self.get_dtype_rcp_limits(self.c_dtype)
+                                    * norm_const
+                                )
+
+                        # Store SFC to register
+                        tCrSFC.store(tCrSFC_pvscale.load().to(self.sf_dtype))
+
+                        #
+                        # Store SFC to global memory
+                        #
+                        cute.autovec_copy(tCrSFC, tCgSFC)
+
+                        #
+                        # Compute quantized output values and convert to C type
+                        #
+                        tCrSFC_qpvscale_up = tCrSFC.load().to(cutlass.Float32)
+                        fp32_max = cutlass.Float32(3.40282346638528859812e38)
+                        if cutlass.const_expr(self.vectorized_f32):
+                            for vi in cutlass.range_constexpr(0, cute.size(tCrSFC), 2):
+                                acc_scale = cute.arch.mul_packed_f32x2(
+                                    (
+                                        cute.arch.rcp_approx(tCrSFC_qpvscale_up[vi]),
+                                        cute.arch.rcp_approx(tCrSFC_qpvscale_up[vi + 1]),
+                                    ),
+                                    (norm_const, norm_const),
+                                )
+                                acc_scale_min0 = fmin(acc_scale[0], fp32_max, nan=True)
+                                acc_scale_min1 = fmin(acc_scale[1], fp32_max, nan=True)
+
+                                vec0 = tTR_rAcc_frg[None, vi]
+                                vec1 = tTR_rAcc_frg[None, vi + 1]
+                                for ei in cutlass.range_constexpr(self.sf_vec_size):
+                                    vec0[ei], vec1[ei] = cute.arch.mul_packed_f32x2(
+                                        (vec0[ei], vec1[ei]),
+                                        (acc_scale_min0, acc_scale_min1),
+                                    )
+                        else:
+                            for vi in cutlass.range_constexpr(cute.size(tCrSFC)):
+                                acc_scale = norm_const * cute.arch.rcp_approx(
+                                    tCrSFC_qpvscale_up[vi]
+                                )
+                                acc_scale = fmin(acc_scale, fp32_max, nan=True)
+
+                                vec = tTR_rAcc_frg[None, vi]
+                                for ei in cutlass.range_constexpr(self.sf_vec_size):
+                                    vec[ei] = vec[ei] * acc_scale
+
+                        acc_vec = tiled_copy_r2s.retile(tCompute).load()
+                        tRS_rC.store(acc_vec.to(self.c_dtype))
+                    else:
+                        #
+                        # Convert to C type (non-quantization path)
+                        #
+                        acc_vec = tiled_copy_r2s.retile(tCompute).load()
+                        acc_vec = epilogue_op(acc_vec.to(self.c_dtype))
+                        tRS_rC.store(acc_vec)
 
                     #
                     # Store C to shared memory
                     #
-                    c_buffer = (num_prev_subtiles + subtile_idx) % self.num_c_stage
+                    num_prev_subtiles = num_prev_subtiles + 1
+                    c_buffer = (num_prev_subtiles + subtile_idx // 2) % self.num_c_stage
+
                     cute.copy(
                         tiled_copy_r2s,
                         tRS_rC,
@@ -1394,7 +1660,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         cute.copy(
                             tma_atom_c,
                             bSG_sC[(None, c_buffer)],
-                            bSG_gC[(None, subtile_idx)],
+                            bSG_gC[(None, subtile_idx // 2)],
                         )
                         # Fence and barrier to make sure shared memory store is visible to TMA store
                         c_pipeline.producer_commit()
@@ -1485,10 +1751,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         gC_mnl: cute.Tensor,
         epi_tile: cute.Tile,
         use_2cta_instrs: Union[cutlass.Boolean, bool],
-    ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
+    ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor, cute.Tensor]:
         """
         Make tiledCopy for tensor memory load, then use it to partition tensor memory
-        (source) and register array (destination).
+        (source) and register array (destination). Returns separate accumulator tensors
+        for up and gate values used in SwiGLU fusion.
 
         :param tidx: The thread index in epilogue warp groups
         :type tidx: cutlass.Int32
@@ -1501,11 +1768,12 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         :param use_2cta_instrs: Whether use_2cta_instrs is enabled
         :type use_2cta_instrs: bool
 
-        :return: A tuple containing (tiled_copy_t2r, tTR_tAcc, tTR_rAcc) where:
+        :return: A tuple containing (tiled_copy_t2r, tTR_tAcc, tTR_rAcc_up, tTR_rAcc_gate) where:
             - tiled_copy_t2r: The tiled copy operation for tmem to register copy(t2r)
             - tTR_tAcc: The partitioned accumulator tensor
-            - tTR_rAcc: The accumulated tensor in register used to hold t2r results
-        :rtype: Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]
+            - tTR_rAcc_up: The accumulated tensor in register for up values
+            - tTR_rAcc_gate: The accumulated tensor in register for gate values
+        :rtype: Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor, cute.Tensor]
         """
         # Make tiledCopy for tensor memory load
         copy_atom_t2r = sm100_utils.get_tmem_load_op(
@@ -1532,11 +1800,15 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         gC_mnl_epi = cute.flat_divide(gC_mnl[((None, None), 0, 0, None, None, None)], epi_tile)
         # (T2R, T2R_M, T2R_N, EPI_M, EPI_N, RestM, RestN, RestL)
         tTR_gC = thr_copy_t2r.partition_D(gC_mnl_epi)
-        # (T2R, T2R_M, T2R_N)
-        tTR_rAcc = cute.make_rmem_tensor(
+        # (T2R, T2R_M, T2R_N) - for up values
+        tTR_rAcc_up = cute.make_rmem_tensor(
             tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, self.acc_dtype
         )
-        return tiled_copy_t2r, tTR_tAcc, tTR_rAcc
+        # (T2R, T2R_M, T2R_N) - for gate values
+        tTR_rAcc_gate = cute.make_rmem_tensor(
+            tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, self.acc_dtype
+        )
+        return tiled_copy_t2r, tTR_tAcc, tTR_rAcc_up, tTR_rAcc_gate
 
     def epilog_smem_copy_and_partition(
         self,
@@ -1620,6 +1892,28 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             gC_for_tma_partition,
         )
         return tma_atom_c, bSG_sC, bSG_gC
+
+    @staticmethod
+    def get_dtype_rcp_limits(dtype: Type[cutlass.Numeric]) -> float:
+        """
+        Get the reciprocal of the maximum representable value for quantization.
+
+        This is used to compute the scale factor for block-scaled quantization.
+        The scale factor is computed as: sf = max_abs_value * rcp_limit * norm_const
+
+        :param dtype: The target data type for quantization
+        :type dtype: Type[cutlass.Numeric]
+        :return: The reciprocal of the maximum representable value
+        :rtype: float
+        """
+        if dtype == cutlass.Float4E2M1FN:
+            return 1.0 / 6.0  # 6.0 is max value for FP4 E2M1
+        elif dtype == cutlass.Float8E4M3FN:
+            return 1.0 / 448.0  # Max value for FP8 E4M3
+        elif dtype == cutlass.Float8E5M2:
+            return 1.0 / 57344.0  # Max value for FP8 E5M2
+        else:
+            return 1.0
 
     @staticmethod
     def _compute_stages(
@@ -2085,6 +2379,7 @@ def run(
     cluster_shape_mn: Tuple[int, int],
     use_prefetch: bool = False,
     prefetch_dist: int = 3,
+    vectorized_f32: bool = True,
     tolerance: float = 1e-01,
     warmup_iterations: int = 0,
     iterations: int = 1,
@@ -2129,7 +2424,7 @@ def run(
     :return: Execution time of the GEMM kernel
     :rtype: float
     """
-    print("Running Sm100 Persistent Dense BlockScaled GEMM test with:")
+    print("Running Sm100 Persistent Dense BlockScaled GEMM with SwiGLU fusion test with:")
     print(f"mnkl: {mnkl}")
     print(f"AB dtype: {ab_dtype}, SF dtype: {sf_dtype}, SF Vec size: {sf_vec_size}")
     print(f"C dtype: {c_dtype}")
@@ -2139,6 +2434,7 @@ def run(
     print(f"Weight per expert: {weight_per_expert}")
     print(f"Use prefetch: {'True' if use_prefetch else 'False'}")
     print(f"Prefetch dist: {prefetch_dist}")
+    print(f"Vectorized f32: {'True' if vectorized_f32 else 'False'}")
     print(f"Tolerance: {tolerance}")
     print(f"Warmup iterations: {warmup_iterations}")
     print(f"Iterations: {iterations}")
@@ -2178,9 +2474,10 @@ def run(
     torch.manual_seed(1111)
 
     # Create tensor A/B/C
+    # Note: C has n//2 columns due to SwiGLU fusion (pairs of up/gate columns are combined)
     a_ref = cutlass_torch.matrix(l, m, k, a_major == "m", cutlass.Float32)
     b_ref = cutlass_torch.matrix(l, n, k, b_major == "n", cutlass.Float32)
-    c_ref = cutlass_torch.matrix(l, m, n, c_major == "m", cutlass.Float32)
+    c_ref = cutlass_torch.matrix(l, m, n // 2, c_major == "m", cutlass.Float32)
 
     a_tensor, a_torch = cutlass_torch.cute_tensor_like(
         a_ref, ab_dtype, is_dynamic_layout=True, assumed_align=16
@@ -2343,7 +2640,7 @@ def run(
         l, expert_count
     )
 
-    # Configure gemm kernel
+    # Configure gemm kernel with SwiGLU fusion
     gemm = Sm100BlockScaledPersistentDenseGemmKernel(
         sf_vec_size,
         mma_tiler_mn,
@@ -2351,6 +2648,7 @@ def run(
         weight_per_expert,
         use_prefetch,
         prefetch_dist,
+        vectorized_f32,
     )
 
     # Compute max active clusters on current device
@@ -2362,7 +2660,7 @@ def run(
     # Initialize Stream
     current_stream = cutlass_torch.default_stream()
 
-    # Compile gemm kernel
+    # Compile gemm kernel (sfc_tensor and norm_const_tensor are None for non-quantized output)
     compiled_gemm = cute.compile(
         gemm,
         a_tensor,
@@ -2371,6 +2669,8 @@ def run(
         sfb_tensor,
         alpha_scale_tensor,
         c_tensor,
+        None,  # sfc_tensor - None for non-quantized output
+        None,  # norm_const_tensor - None for non-quantized output
         max_active_clusters,
         current_stream,
     )
@@ -2385,6 +2685,8 @@ def run(
             sfb_tensor,
             alpha_scale_tensor,
             c_tensor,
+            None,  # sfc_tensor
+            None,  # norm_const_tensor
             current_stream,
         )
         print("Verifying results...")
@@ -2392,6 +2694,19 @@ def run(
         res_b = torch.einsum("nkl,nkl->nkl", b_ref, sfb_ref)
         ref = torch.einsum("mkl,nkl->mnl", res_a, res_b)
         ref = torch.einsum("mnl,ml->mnl", ref, alpha_scale_ref)
+
+        # Apply SwiGLU fusion: output = up * silu(gate)
+        # up and gate are interleaved in the N dimension (granularity=64)
+        # Extract up (even subtiles) and gate (odd subtiles)
+        # ref shape is (m, n, l), we need to reshape to extract up and gate
+        # Assuming interleaving at granularity 64
+        granularity = 64
+        ref_reshaped = ref.view(m, n // granularity, granularity, l)
+        ref_up = ref_reshaped[:, 0::2, :, :].contiguous().view(m, n // 2, l)
+        ref_gate = ref_reshaped[:, 1::2, :, :].contiguous().view(m, n // 2, l)
+
+        # silu(x) = x * sigmoid(x)
+        ref = ref_up * (ref_gate * torch.sigmoid(ref_gate))
 
         # Convert c back to f32 for comparison.
         c_ref_device = c_ref.cuda()
@@ -2403,11 +2718,13 @@ def run(
         )
         c_ref = c_ref_device.cpu()
 
+        # Note: n_out = n // 2 due to SwiGLU fusion
+        n_out = n // 2
         if c_dtype in (cutlass.Float32, cutlass.Float16, cutlass.BFloat16):
             torch.testing.assert_close(c_ref, ref, atol=tolerance, rtol=1e-02)
         elif c_dtype in (cutlass.Float8E5M2, cutlass.Float8E4M3FN):
             # Convert ref : f32 -> f8 -> f32
-            ref_f8_ = torch.empty(*(l, m, n), dtype=torch.uint8, device="cuda").permute(1, 2, 0)
+            ref_f8_ = torch.empty(*(l, m, n_out), dtype=torch.uint8, device="cuda").permute(1, 2, 0)
             ref_f8 = from_dlpack(ref_f8_, assumed_align=16).mark_layout_dynamic(leading_dim=1)
             ref_f8.element_type = c_dtype
             ref_device = ref.permute(2, 0, 1).contiguous().permute(1, 2, 0).cuda()
@@ -2421,7 +2738,7 @@ def run(
         # {$nv-internal-release begin}
         elif c_dtype is cutlass.Float4E2M1FN:
             # Convert ref : f32 -> f4 -> f32
-            ref_f4_ = torch.empty(*(l, m, n), dtype=torch.uint8, device="cuda").permute(1, 2, 0)
+            ref_f4_ = torch.empty(*(l, m, n_out), dtype=torch.uint8, device="cuda").permute(1, 2, 0)
             ref_f4 = from_dlpack(ref_f4_, assumed_align=16).mark_layout_dynamic(leading_dim=1)
             ref_f4.element_type = c_dtype
             ref_device = ref.permute(2, 0, 1).contiguous().permute(1, 2, 0).cuda()
@@ -2472,6 +2789,8 @@ def run(
             sfb_tensor,
             alpha_scale_tensor,
             c_tensor,
+            None,  # sfc_tensor
+            None,  # norm_const_tensor
             current_stream,
         )
 
@@ -2510,7 +2829,7 @@ if __name__ == "__main__":
             raise argparse.ArgumentTypeError("Invalid format. Expected comma-separated integers.")
 
     parser = argparse.ArgumentParser(
-        description="Example of Sm100 Dense Persistent BlockScaled GEMM."
+        description="Example of Sm100 Dense Persistent BlockScaled GEMM with SwiGLU fusion."
     )
 
     parser.add_argument(
@@ -2542,6 +2861,12 @@ if __name__ == "__main__":
         type=int,
         default=7,
         help="Prefetch distance for TMA operations (default: 3)",
+    )
+    parser.add_argument(
+        "--vectorized_f32",
+        action="store_true",
+        default=True,
+        help="Enable vectorized f32x2 operations for better performance (default: True)",
     )
     parser.add_argument(
         "--mma_tiler_mn",
@@ -2604,6 +2929,7 @@ if __name__ == "__main__":
         args.cluster_shape_mn,
         args.use_prefetch,
         args.prefetch_dist,
+        args.vectorized_f32,
         args.tolerance,
         args.warmup_iterations,
         args.iterations,
