@@ -59,16 +59,28 @@ class MistralAttention(Attention):
         layer_idx: int | None = None,
     ):
         config = model_config.pretrained_config
+        rope_params = RopeParams.from_config(config)
+        rope_params_section = getattr(config, "rope_scaling", None) or getattr(
+            config, "rope_parameters", None)
+        rope_type = getattr(rope_params_section, "rope_type", None)
+        if rope_type == "yarn":
+            pos_embd_params = PositionalEmbeddingParams(
+                type=PositionEmbeddingType.yarn,
+                rope=rope_params,
+                is_neox=False)
+        else:
+            pos_embd_params = PositionalEmbeddingParams(
+                type=PositionEmbeddingType.rope_gpt_neox,
+                rope=rope_params,
+            )
+
         super().__init__(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
             num_key_value_heads=config.num_key_value_heads,
             max_position_embeddings=config.max_position_embeddings,
             bias=False,
-            pos_embd_params=PositionalEmbeddingParams(
-                type=PositionEmbeddingType.rope_gpt_neox,
-                rope=RopeParams.from_config(config),
-            ),
+            pos_embd_params=pos_embd_params,
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             config=model_config,
