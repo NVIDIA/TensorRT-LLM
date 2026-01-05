@@ -1143,6 +1143,11 @@ class PyTorchModelEngine(ModelEngine):
         return self.spec_metadata
 
     def __del__(self) -> None:
+        self.model = None
+        self.model_loader = None
+        self._release_cuda_graphs()
+        self.input_processor = None
+        self.input_processor_with_hash = None
         if getattr(self, 'ub_buffers', None):
             for u in self.ub_buffers:
                 ub.ub_deallocate(u.addr)
