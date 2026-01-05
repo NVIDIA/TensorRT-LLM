@@ -469,9 +469,8 @@ def _get_threshold_for_metric(baseline_data, metric, is_post_merge):
     if threshold_key in baseline_data:
         return baseline_data[threshold_key]
 
-    raise KeyError(
-        f"No threshold found for metric '{metric}'. "
-        f"Expected '{threshold_key}' or '{fallback_key}' in baseline data.")
+    raise KeyError(f"No threshold found for metric '{metric}'. "
+                   f"Expected '{threshold_key}' in baseline data.")
 
 
 def _calculate_diff(metric, new_value, baseline_value):
