@@ -9,10 +9,9 @@ from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple, Union
 
 import torch
+import transformers
 from pydantic import BaseModel
 from tqdm import tqdm
-
-import transformers
 
 from .._utils import (global_mpi_rank, local_mpi_rank, mpi_barrier,
                       mpi_broadcast, mpi_rank, release_gc)
