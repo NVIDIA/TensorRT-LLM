@@ -605,37 +605,6 @@ def test_llama_3_3_70b_fp8_with_squad_lora_tp2() -> None:
 
 
 @skip_gpu_memory_less_than_80gb
-def test_llama_3_3_70b_fp8_with_squad_lora_tp2() -> None:
-    skip_fp8_pre_ada(use_fp8=True)
-
-    model_dir = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct-FP8"
-    lora_dir = f"/code/tensorrt_llm/llama-3.3-70b-instruct_vhf-squad-lora-031925331-v3"
-
-    prompt = "What is the capital of the United States?"
-
-    lora_config = LoraConfig(lora_dir=[lora_dir],
-                             max_lora_rank=8,
-                             max_loras=2,
-                             max_cpu_loras=2)
-    lora_req = LoRARequest("squad-lora", 0, lora_dir)
-
-    llm = LLM(model_dir,
-              tensor_parallel_size=2,
-              lora_config=lora_config,
-              cuda_graph_config=None)
-
-    try:
-        output = llm.generate(prompt,
-                              SamplingParams(max_tokens=50, temperature=0.0),
-                              lora_request=[lora_req])
-        print(f"Generated output: {output.outputs[0].text}")
-        assert len(
-            output.outputs[0].text) > 0, "Generated output should not be empty"
-    finally:
-        llm.shutdown()
-
-
-@skip_gpu_memory_less_than_80gb
 @pytest.mark.part2
 def test_bielik_11b_v2_2_instruct_multi_lora() -> None:
     model_dir = f"{llm_models_root()}/Bielik-11B-v2.2-Instruct"
