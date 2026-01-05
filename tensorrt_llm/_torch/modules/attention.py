@@ -1392,9 +1392,7 @@ class MLA(nn.Module):
             self.ln_events[1],
             self.aux_stream,
         )
-        q, indexer_q_pe, indexer_q_nope, indexer_k_pe, indexer_k_nope = q_and_k
-        indxer_q_and_k = (indexer_q_pe, indexer_q_nope, indexer_k_pe,
-                          indexer_k_nope)
+        q, indxer_q_and_k = q_and_k
 
         # Indexer
         topk_indices = self.indexer(
