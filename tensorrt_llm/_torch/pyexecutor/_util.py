@@ -834,6 +834,8 @@ def create_py_executor_instance(
             lora_config.lora_target_modules,
             lora_config.trtllm_modules_to_hf_modules,
             lora_config.swap_gate_up_proj_lora_b_weight)
+        if isinstance(model_engine, PyTorchModelEngine):
+            model_engine._init_cuda_graph_lora_manager(lora_config)
 
     resources[ResourceManagerType.SEQ_SLOT_MANAGER] = SeqSlotManager(
         max_num_sequences)
