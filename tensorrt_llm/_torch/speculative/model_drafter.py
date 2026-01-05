@@ -99,6 +99,9 @@ class ModelDrafter(Drafter):
 
         # Create accumulator for draft tokens in non-CDL mode
         self.draft_tokens_accumulator: Dict[int, List[int]] = {}
+
+        # Initialize draft latency tracking for specDecodingStats
+        self.last_draft_latency_ms = 0.0
         # Track previous draft batch for overlap scheduling
         self.previous_draft_batch: Optional[ScheduledRequests] = None
         self.previous_draft_outputs: Optional[Any] = None
@@ -171,6 +174,16 @@ class ModelDrafter(Drafter):
             input_tokens) - num_accepted_tokens - 1
         return new_request
 
+    def _get_previous_draft_request(
+            self, request: LlmRequest) -> Optional[LlmRequest]:
+        """Get the previous draft request for the given request."""
+        if self.previous_draft_batch is None:
+            return None
+        for req in self.previous_draft_batch.all_requests():
+            if req.py_request_id == request.py_request_id:
+                return req
+        return None
+
     def _create_accepted_tokens_request_for_trtllm_attn(
             self, request: LlmRequest, input_tokens: Any,
             num_accepted_tokens: int) -> LlmRequest:
@@ -183,14 +196,24 @@ class ModelDrafter(Drafter):
         # because at most max_draft_len draft tokens are accepted.
         input_tokens.extend(
             0 for _ in range(self.max_draft_len - num_accepted_tokens))
-        new_request = self._create_draft_request(request, input_tokens)
-        new_request.state = LlmRequestState.GENERATION_IN_PROGRESS
-        new_request.py_num_accepted_draft_tokens = request.py_num_accepted_draft_tokens
-        new_request.py_is_first_draft = True
+
+        # Reuse the previous draft request if it exists.
+        # This can reduce host overhead significantly.
+        draft_request = self._get_previous_draft_request(request)
+        if draft_request is not None:
+            generated_tokens = input_tokens[draft_request.py_prompt_len:]
+            draft_request.set_generated_tokens([generated_tokens])
+        else:
+            draft_request = self._create_draft_request(request, input_tokens)
+
+        draft_request.state = LlmRequestState.GENERATION_IN_PROGRESS
+        draft_request.py_num_accepted_draft_tokens = request.py_num_accepted_draft_tokens
+        draft_request.py_is_first_draft = True
         # For tree decoding, we need to store the accepted tokens indices for these requests,
         # which will be used to update the hidden_states_read_indices.
-        new_request.py_num_accepted_draft_tokens_indices = request.py_num_accepted_draft_tokens_indices
-        return new_request
+        draft_request.py_num_accepted_draft_tokens_indices = request.py_num_accepted_draft_tokens_indices
+
+        return draft_request
 
     def _create_draft_request_for_request(
             self, request: LlmRequest) -> Optional[LlmRequest]:
@@ -530,10 +553,13 @@ class ModelDrafter(Drafter):
 
         if has_draft_tokens:
             # We already updated the target state, so the new_tokens_lens should be all ones.
-            new_tokens_lens = torch.ones(batch_size, device=device)
+            new_tokens_lens = torch.ones(batch_size,
+                                         dtype=torch.int,
+                                         device=device)
             new_tokens_lens += num_accepted_tokens_device
             next_draft_tokens = torch.zeros(batch_size,
                                             self.max_draft_len,
+                                            dtype=torch.int,
                                             device=device)
         target_inputs.new_tokens_lens = new_tokens_lens
         target_inputs.next_draft_tokens = next_draft_tokens
@@ -550,22 +576,53 @@ class ModelDrafter(Drafter):
         if target_inputs.next_draft_tokens is None:
             return
 
-        if draft_tensors is not None:
-            for req_idx, request in enumerate(draft_batch.all_requests()):
-                target_req = self.req_id_to_old_request[request.py_request_id]
-                if target_req.state != LlmRequestState.GENERATION_IN_PROGRESS:
-                    # Skip prefill requests
-                    continue
-                # Get the index of the draft/target tokens in the device tensor
-                draft_idx = req_idx if self.use_static_draft_loop else request.py_seq_slot
-                target_idx = target_req.py_seq_slot
-                target_inputs.new_tokens[draft_position + 1:draft_position +
-                                         draft_length + 1, target_idx,
-                                         0] = draft_tensors[0:draft_length,
-                                                            draft_idx]
-                target_inputs.next_draft_tokens[
-                    target_idx, draft_position:draft_position +
-                    draft_length] = draft_tensors[0:draft_length, draft_idx]
+        draft_indices = []
+        target_indices = []
+        for req_idx, request in enumerate(draft_batch.all_requests()):
+            target_req = self.req_id_to_old_request[request.py_request_id]
+            if target_req.state != LlmRequestState.GENERATION_IN_PROGRESS:
+                # Skip prefill requests
+                continue
+            # Get the index of the draft/target tokens in the device tensor
+            draft_idx = req_idx if self.use_static_draft_loop else request.py_seq_slot
+            target_idx = target_req.py_seq_slot
+            draft_indices.append(draft_idx)
+            target_indices.append(target_idx)
+
+        if len(draft_indices) == 0:
+            return
+
+        device = draft_tensors.device
+
+        # Create index tensors
+        draft_indices_tensor = torch.tensor(draft_indices,
+                                            dtype=torch.long,
+                                            pin_memory=True).to(
+                                                device, non_blocking=True)
+        target_indices_tensor = torch.tensor(target_indices,
+                                             dtype=torch.long,
+                                             pin_memory=True).to(
+                                                 device, non_blocking=True)
+
+        # Pre-slice draft tensors: [draft_length, batch_size]
+        draft_slice = draft_tensors[0:draft_length]
+
+        # Gather all source data at once using single index_select kernel
+        # Result shape: [draft_length, num_requests]
+        gathered = draft_slice.index_select(1, draft_indices_tensor).to(
+            torch.int32)
+
+        # Scatter to new_tokens using advanced indexing (single kernel)
+        # Shape: [draft_length, num_requests] -> [seq_len, batch_size, beam_width]
+        target_inputs.new_tokens[draft_position + 1:draft_position +
+                                 draft_length + 1, target_indices_tensor,
+                                 0] = gathered
+
+        # Scatter to next_draft_tokens using advanced indexing (single kernel)
+        # Shape: [num_requests, draft_length] -> [batch_size, max_draft_len]
+        target_inputs.next_draft_tokens[target_indices_tensor,
+                                        draft_position:draft_position +
+                                        draft_length] = gathered.t()
 
     def _setup_draft_batch_and_resources(
             self,
@@ -809,6 +866,8 @@ class ModelDrafter(Drafter):
                 - Updated target inputs or None
                 - Draft sample state or None
         """
+        import time
+        draft_start_time = time.time()
 
         self.disable_overlap_scheduler = False
         if target_inputs is None:
@@ -896,6 +955,10 @@ class ModelDrafter(Drafter):
         self.previous_draft_outputs = previous_draft_state
         self.previous_scheduled_batch = scheduled_batch
 
+        # Record draft latency for stats
+        draft_end_time = time.time()
+        self.last_draft_latency_ms = (draft_end_time - draft_start_time) * 1e3
+
     @nvtx_range("prepare_draft_tokens")
     def prepare_draft_tokens(
         self,
@@ -909,6 +972,9 @@ class ModelDrafter(Drafter):
             scheduled_requests: The scheduled requests for this iteration
             resource_manager: The resource manager for this iteration
         """
+        import time
+        draft_start_time = time.time()
+
         self.disable_overlap_scheduler = True
         if not self.draft_model_engine:
             raise ValueError("Draft model engine is not set")
@@ -936,6 +1002,10 @@ class ModelDrafter(Drafter):
                 # Clean up draft_seq_slot_manager resources
                 for req in draft_batch.all_requests():
                     self.draft_seq_slot_manager.free_resources(req)
+                # Record draft latency before returning
+                draft_end_time = time.time()
+                self.last_draft_latency_ms = (draft_end_time -
+                                              draft_start_time) * 1e3
                 return
 
             if self.guided_decoder is not None:
@@ -958,6 +1028,11 @@ class ModelDrafter(Drafter):
             for req_id, tokens in self.draft_tokens_accumulator.items():
                 target_model_req = self.req_id_to_old_request[req_id]
                 target_model_req.py_draft_tokens = tokens
+
+            # Record draft latency for stats
+            draft_end_time = time.time()
+            self.last_draft_latency_ms = (draft_end_time -
+                                          draft_start_time) * 1e3
         except Exception as e:
             traceback.print_exc()
             error_msg = str(e)

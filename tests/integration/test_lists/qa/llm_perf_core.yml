@@ -94,7 +94,6 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[mistral_small_v3.1_24b-bench-pytorch-bfloat16-maxbs:48-maxnt:256-input_output_len:1000,2000-reqs:500-con:200]
   - perf/test_perf.py::test_perf[mistral_small_v3.1_24b-bench-pytorch-bfloat16-maxbs:128-maxnt:512-input_output_len:1000,2000-reqs:500-con:200]
     #llama_v3.1_8b
-  - perf/test_perf.py::test_perf[llama_v3.1_8b-bench-pytorch-bfloat16-mp-maxbs:256-input_output_len:128,128-pp:2]
   - perf/test_perf.py::test_perf[llama_v3.1_8b-bench-pytorch-streaming-bfloat16-input_output_len:128,128-gpus:2]
   - perf/test_perf.py::test_perf[llama_v3.1_8b-bench-pytorch-bfloat16-maxbs:256-input_output_len:128,128-gpus:2]
   #mixtral_8x7b_v0.1

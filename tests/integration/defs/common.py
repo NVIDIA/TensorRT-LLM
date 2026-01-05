@@ -32,7 +32,8 @@ from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.lora_manager import LoraConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
-from .trt_test_alternative import check_call, check_output, exists, is_windows
+from .trt_test_alternative import (check_call, check_output, exists, is_windows,
+                                   print_info, print_warning)
 
 
 def venv_check_call(venv, cmd, env=None, **kwargs):
@@ -1153,17 +1154,57 @@ def wait_for_server(host, port, timeout_seconds=180):
     return False
 
 
+PORTS_IN_USE = set()
+
+
+def get_free_port_in_ci(max_attempts=100):
+    """
+    Get a free port in the range [CONTAINER_PORT_START, CONTAINER_PORT_START + CONTAINER_PORT_NUM - 1]
+    If CONTAINER_PORT_START and CONTAINER_PORT_NUM are not set or all ports are already in use, fallback to get_free_port
+    """
+    container_port_start = int(os.environ.get("CONTAINER_PORT_START", -1))
+    container_port_num = int(os.environ.get("CONTAINER_PORT_NUM", -1))
+    if container_port_start != -1 and container_port_num != -1:
+        for i in range(container_port_num):
+            port = container_port_start + i
+            if port in PORTS_IN_USE:
+                continue
+
+            # Check if the port is free
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                try:
+                    s.bind(("localhost", port))
+
+                    # Port is free, add it to the set of used ports
+                    PORTS_IN_USE.add(port)
+                    return port
+                except OSError:
+                    # Port is not free, try the next port
+                    continue
+
+    # No port found in the range, try to get a random free port from the system
+    for i in range(max_attempts):
+        port = get_free_port()
+        if port not in PORTS_IN_USE:
+            PORTS_IN_USE.add(port)
+            return port
+
+    raise Exception(
+        f"Failed to find a free port both in container port range and system after {max_attempts} attempts"
+    )
+
+
 def revise_disaggregated_server_config_urls_with_free_ports(
         disaggregated_server_config: dict[str, Any]) -> dict[str, Any]:
     # Revise serve port
-    disaggregated_server_config['port'] = get_free_port()
+    disaggregated_server_config['port'] = get_free_port_in_ci()
 
     # Revise context and generation server urls
     ctx_urls = disaggregated_server_config["context_servers"]["urls"]
     gen_urls = disaggregated_server_config["generation_servers"]["urls"]
     url_map = dict()
     for url in set(ctx_urls + gen_urls):
-        url_map[url] = (url.split(':')[0], get_free_port())
+        url_map[url] = (url.split(':')[0], get_free_port_in_ci())
 
     for i, url in enumerate(ctx_urls):
         disaggregated_server_config["context_servers"]["urls"][
@@ -1189,3 +1230,32 @@ def revise_disagg_config_file_with_free_ports(disagg_config_file: str) -> str:
         yaml.dump(new_config, f)
 
     return new_config_file
+
+
+def parse_gsm8k_output(output_text: str) -> float:
+    """
+    Parse accuracy value from lm_eval output for GSM8K flexible-extract exact_match
+
+    Args:
+        output_text: The output text from gsm8k command
+
+    Returns:
+        float: The accuracy value (0.7582 in the example)
+    """
+
+    # Look for the specific pattern: |gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.7559|±  |0.0118|
+    patterns = [
+        r'flexible-extract\|\s+\d+\|exact_match\|\↑\s+\|(\d+\.\d+)',
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, output_text)
+        if match:
+            accuracy_value = float(match.group(1))
+            print_info(f"Extracted GSM8K accuracy value: {accuracy_value}")
+            return accuracy_value
+
+    print_warning("Could not find GSM8K accuracy value in gsm8k output")
+    print_warning(f"Output text: {output_text}")
+
+    return 0.0

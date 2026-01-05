@@ -83,7 +83,10 @@ inline void launchWithPdlWhenEnabled(char const* name, KernelFn kernelFn, dim3 g
 bool getEnvUseUCXKvCache();
 
 bool getEnvUseMPIKvCache();
+
 bool getEnvUseNixlKvCache();
+
+bool getEnvUseMooncakeKvCache();
 
 bool getEnvUseRoundRobinBlockDistForCP();
 
@@ -92,6 +95,8 @@ std::string getEnvUCXInterface();
 std::string getEnvNixlInterface();
 
 std::string getEnvNixlBackend();
+
+std::string getEnvMooncakeInterface();
 
 bool getEnvDisaggLayerwise();
 
@@ -155,6 +160,8 @@ int getEnvMoeA2ACombineBlockSize();
 bool getEnvKVCacheTransferAllBlocksForWindow();
 
 bool getEnvEplbForceGdrcopy();
+
+bool getEnvPrintSkipSoftmaxStat();
 
 } // namespace common
 

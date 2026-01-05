@@ -1,8 +1,11 @@
 import concurrent
 import contextlib
+import functools
 import itertools
 import json
 import os
+import re
+import subprocess
 import tempfile
 import time
 from collections import namedtuple
@@ -47,6 +50,40 @@ DuckLLM = namedtuple('DuckLLM', ['args', 'tokenizer', 'generate_async'])
 
 DEFAULT_TEST_TIMEOUT = 1200
 DEFAULT_SERVER_WAITING_TIMEOUT = 1200
+
+
+@functools.lru_cache(maxsize=1)
+def has_nvlink():
+    """
+    Check if the system has NVLink connectivity between GPUs.
+
+    Returns:
+        bool: True if NVLink is detected, False otherwise.
+    """
+    try:
+        # Execute nvidia-smi nvlink command to query NVLink status
+        result = subprocess.run(['nvidia-smi', 'nvlink', '-s'],
+                                capture_output=True,
+                                text=True,
+                                check=False)
+
+        # Check if the command executed successfully
+        if result.returncode != 0:
+            return False
+
+        # Look for bandwidth information (Link X: XX.XXX GB/s pattern)
+        # which indicates active NVLink connections
+        if re.search(r'Link \d+:\s+[\d.]+\s+GB/s', result.stdout):
+            return True
+
+        return False
+
+    except (FileNotFoundError, subprocess.SubprocessError):
+        # nvidia-smi not found or execution failed
+        return False
+    except Exception:
+        # Any other unexpected error
+        return False
 
 
 class MyThreadPoolExecutor(ThreadPoolExecutor):
@@ -177,7 +214,7 @@ def launch_disaggregated_llm(
 
         ctx_server_args = ctx_args + [
             "--port",
-            str(port), "--extra_llm_api_options", ctx_server_config_path,
+            str(port), "--config", ctx_server_config_path,
             f"--tp_size={ctx_tp}", f"--pp_size={ctx_pp}", f"--cp_size={ctx_cp}"
         ]
         if "max_num_tokens" in ctx_server_config:
@@ -196,11 +233,13 @@ def launch_disaggregated_llm(
         gpu_range = range(current_gpu_offset,
                           current_gpu_offset + gen_total_gpus)
         env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_range))
+        if not has_nvlink():
+            env["UCX_TLS"] = "^cuda_ipc"
         current_gpu_offset += gen_total_gpus
 
         gen_server_args = gen_args + [
             "--port",
-            str(port), "--extra_llm_api_options", gen_server_config_path,
+            str(port), "--config", gen_server_config_path,
             f"--tp_size={gen_tp}", f"--pp_size={gen_pp}", f"--cp_size={gen_cp}"
         ]
         if "max_num_tokens" in gen_server_config:
@@ -832,8 +871,30 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @pytest.mark.skip_less_device(4)
-    def test_auto_dtype_with_helix(self):
+    @pytest.mark.skip_less_device(8)
+    @pytest.mark.parametrize("gen_pp,gen_tp,gen_cp", [(1, 1, 4), (1, 2, 2),
+                                                      (2, 1, 2)],
+                             ids=["pp1tp1cp4", "pp1tp2cp2", "pp2tp1cp2"])
+    @pytest.mark.parametrize("cuda_graph_config", [
+        None,
+        {
+            "enable_padding": False,
+            "batch_sizes": [1, 2, 4, 8, 16, 32, 64]
+        },
+        {
+            "enable_padding": True,
+            "batch_sizes": [1, 2, 4, 8, 16, 32, 64]
+        },
+    ],
+                             ids=[
+                                 "cudagraph:none", "cudagraph:without_padding",
+                                 "cudagraph:with_padding"
+                             ])
+    @pytest.mark.parametrize("comms_medium", ["fifo", "nccl"])
+    def test_auto_dtype_with_helix(self, comms_medium, cuda_graph_config,
+                                   gen_pp, gen_tp, gen_cp):
+        use_nccl_for_alltoall = comms_medium == "nccl"
+        gen_ep = gen_tp * gen_cp
         kv_cache_config = {
             "free_gpu_memory_fraction": 0.5,
             "enable_block_reuse": False,
@@ -842,33 +903,34 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         }
         ctx_server_config = {
             "pipeline_parallel_size": 1,
-            "tensor_parallel_size": 2,
+            "tensor_parallel_size": 4,
             "context_parallel_size": 1,
             "disable_overlap_scheduler": True,
             "kv_cache_config": kv_cache_config,
             "enable_chunked_prefill": False,
             "cuda_graph_config": None,
             "cache_transceiver_config": {
-                "backend": "UCX"
+                "backend": "UCX",
+                "max_tokens_in_buffer": 8192,
             },
         }
         gen_server_config = {
-            "tensor_parallel_size": 1,
-            "pipeline_parallel_size": 1,
-            "context_parallel_size": 2,
+            "tensor_parallel_size": gen_tp,
+            "pipeline_parallel_size": gen_pp,
+            "context_parallel_size": gen_cp,
+            "moe_expert_parallel_size": gen_ep,
             "cp_config": {
                 "cp_type": "HELIX",
-                "tokens_per_block": 32
+                "tokens_per_block": 32,
+                "use_nccl_for_alltoall": use_nccl_for_alltoall
             },
             "disable_overlap_scheduler": True,
             "kv_cache_config": kv_cache_config,
             "enable_chunked_prefill": False,
-            "cuda_graph_config": {
-                "enable_padding": True,
-                "batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128]
-            },
+            "cuda_graph_config": cuda_graph_config,
             "cache_transceiver_config": {
-                "backend": "UCX"
+                "backend": "UCX",
+                "max_tokens_in_buffer": 8192,
             },
         }
         disaggregated_server_config = {
@@ -954,6 +1016,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(2)
     @pytest.mark.parametrize("block_reuse", [False, True])
+    @skip_pre_hopper
     def test_auto_dtype(self, block_reuse):
 
         ctx_server_config = {
@@ -1036,11 +1099,13 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             "max_attention_window": [128, 32768],
             "enable_block_reuse": block_reuse,
             "enable_partial_reuse": False,
+            "free_gpu_memory_fraction": 0.5,
         }
         gen_server_config["kv_cache_config"] = {
             "max_attention_window": [128, 32768],
             "enable_block_reuse": block_reuse,
             "enable_partial_reuse": False,
+            "free_gpu_memory_fraction": 0.5,
         }
         disaggregated_server_config = {
             "hostname": "localhost",
@@ -1275,3 +1340,60 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
                                  gen_model=gen_model,
                                  ctx_instances=1,
                                  gen_instances=1)
+
+
+@pytest.mark.timeout(10800)
+@skip_pre_blackwell
+class TestKimiK2(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "moonshotai/Kimi-K2-Instruct"
+    MODEL_PATH = f"{llm_models_root()}/Kimi-K2-Instruct"
+
+    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_device_memory(200000)
+    def test_nvfp4(self):
+        model_name = "moonshotai/Kimi-K2-Thinking"
+        model_path = f"{llm_models_root()}/Kimi-K2-Thinking-NVFP4"
+        ctx_server_config = {
+            "max_batch_size": 16,
+            "disable_overlap_scheduler": True,
+            "cache_transceiver_config": {
+                "backend": "DEFAULT"
+            },
+            "tensor_parallel_size": 4,
+            "enable_attention_dp": True,
+            "trust_remote_code": True,
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.8,
+            },
+        }
+        gen_server_config = {
+            "max_batch_size": 16,
+            "disable_overlap_scheduler": True,
+            "cache_transceiver_config": {
+                "backend": "DEFAULT"
+            },
+            "tensor_parallel_size": 4,
+            "enable_attention_dp": True,
+            "trust_remote_code": True,
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.8,
+            },
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "port": 8000,
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8001"]
+            },
+            "generation_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8002"]
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      model_path) as llm:
+            task = GSM8K(model_name)
+            task.evaluate(llm)

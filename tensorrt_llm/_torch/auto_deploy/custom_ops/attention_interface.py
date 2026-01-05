@@ -24,6 +24,10 @@ from ..utils.logger import ad_logger
 Constant = Union[int, float, str, None]
 
 
+class PrepareMetadataHostCallable(Protocol):
+    def __call__(self, **sequence_info_args: torch.Tensor) -> None: ...
+
+
 class InputBuffer:
     """Manages contiguous memory buffers for efficient host-to-device transfers.
 
@@ -367,10 +371,17 @@ class SequenceInfo:
       of decode sequences.
     - cache_loc: [c_0, c_1, ..., c_{np-1}] where np is total number of pages allocated to describe
       all sequences in the batch. Each value is a page index in the cache.
+    - logits_gather_indices: [g_0, g_1, ..., g_{s_total-1}]
+      Gather indices used by the gather_logits_before_lm_head custom op to gather logits before the LM head.
+    - logits_gather_info: [num_tokens_to_gather, gather_required]. Info for the
+      gather_logits_before_lm_head custom op to gather logits before the LM head.
     - _gather_idx: [g_0, g_1, ..., g_{s_total-1}]
       Gather indices used by the overlap scheduler to reorder input tokens.
     - _mask_scatter_indices: [m_0, m_1, ..., m_{s_total-1}]
       Mask scatter indices used by the overlap scheduler to scatter results back.
+
+    NOTE: all tensors are also accessible as host tensors with the suffix "_host". For example,
+    the tensor "batch_info" is accessible as "batch_info_host" on the host.
 
     ################################################################################################
 
@@ -480,6 +491,8 @@ class SequenceInfo:
             ("slot_idx", self.max_batch_size, torch.long),
             ("use_initial_states", self.max_batch_size, torch.bool),
             ("batch_info", 3, torch.int),
+            ("logits_gather_indices", self.max_num_tokens, torch.long),
+            ("logits_gather_info", 2, torch.int),
             # OTHER FIELDS WHERE WE NEED EFFICIENT HOST<>DEVICE TRANSFER
             ("_gather_idx", self.max_num_tokens, torch.int),
             ("_mask_scatter_indices", self.max_num_tokens, torch.int),
@@ -490,6 +503,9 @@ class SequenceInfo:
         # Create the InputBuffer that manages contiguous host and device memory
         # Starts on default device; use to() to move to target device
         self._input_buffer = InputBuffer(tensor_specs)
+        self._available_args = set(self._input_buffer.tensor_names) | {
+            f"{name}_host" for name in self._input_buffer.tensor_names
+        }
 
         # Initialize args_list from tensor specs
         self._args_list: Dict[str, List[int]] = {
@@ -497,14 +513,15 @@ class SequenceInfo:
         }
 
         self._active_args = ("input_ids", "position_ids")
-        self._shapeable_args = ("input_ids", "position_ids")
-        # Args that should be returned from host (pinned memory) instead of device in _named_args
-        self._host_return_args = ("batch_info",)
+        self._shapeable_args = ("input_ids", "position_ids", "input_ids_host", "position_ids_host")
         ############################################################################################
 
         # EXTRA TENSOR FIELDS ######################################################################
         self._extra_args: Dict[str, Optional[torch.Tensor]] = {}
         ############################################################################################
+
+        # HOST PREPARE FOR ATTENTION FORWARD #######################################################
+        self._host_prepare_functions: List[Tuple[PrepareMetadataHostCallable, List[str]]] = []
 
         # call reset once to set a consistent initial state
         self.reset()
@@ -535,15 +552,16 @@ class SequenceInfo:
         # truncate to total tokens now, reshape, and return
         return tnsr[: self.total_num_tokens].view(bs, sl, *tnsr.shape[1:])
 
+    def _get_arg(self, name: str) -> torch.Tensor:
+        """Get the argument from the input buffer either on device or host."""
+        if name.endswith("_host"):
+            arg = self._input_buffer.get_host_view(name.replace("_host", ""))
+        else:
+            arg = self._input_buffer.get_view(name)
+        return self._shape_for_forward(arg) if name in self._shapeable_args else arg
+
     def _named_args(self, include_extra_args: bool = True) -> Dict[str, torch.Tensor]:
-        # Build args dict, using host views for _host_return_args, device views otherwise
-        args = {}
-        for name in self._active_args:
-            if name in self._host_return_args:
-                view = self._input_buffer.get_host_view(name)
-            else:
-                view = self._input_buffer.get_view(name)
-            args[name] = self._shape_for_forward(view) if name in self._shapeable_args else view
+        args = {k: self._get_arg(k) for k in self._active_args}
 
         # check other args to include
         if include_extra_args:
@@ -554,7 +572,7 @@ class SequenceInfo:
     @property
     def available_args(self) -> Set[str]:
         """Return a list of available arguments."""
-        return set(self._input_buffer.tensor_names)
+        return self._available_args
 
     @property
     def named_args(self) -> Dict[str, torch.Tensor]:
@@ -674,68 +692,6 @@ class SequenceInfo:
         pages_per_seq = [len(p) for p in page_assignments]
         return cache_loc_flat, pages_per_seq
 
-    # TODO: remove after updating all cached backends
-    @classmethod
-    def _get_sanitized_seq_len(
-        cls, input_or_position_ids: torch.Tensor, seq_len: torch.Tensor
-    ) -> torch.Tensor:
-        """Sanitize sequence lengths.
-
-        We want to cover the following scenarios with this function:
-
-        1. Pre-fill:
-            input_ids: [1, s_total, ...]
-            seq_len: [s_0, s_1, ..., s_{b-1}, 0, 0, ..., 0]
-            ---> returns [s_0, s_1, ..., s_{b-1}]
-        2. Decode:
-            input_ids: [b, 1, ...]
-            seq_len: [1, 1, ..., 1, 0, 0, ..., ..., ..., ..., 0]
-                     |---- b ----|--- (max_batch_size - b) ---|
-            --> returns [1,] * b
-        3. Decode in Cudagraph:
-            input_ids: [b_cudagraph, 1, ...]
-            seq_len: [1, 1, ..., 1, 0, 0, ..., ..., ..., ..., 0]
-                     |---- b ----|--- (max_batch_size - b) ---|
-
-            --> returns [1,] * b_cudagraph
-            Here b <= b_cudagraph. We want to make sure that the seq_len is one-padded to
-            b_cudagraph.
-
-            # TODO: I could see one possible issue with this approach in the future.
-            # If we have b < b_cudagraph we now one-pad. However, we don't pad the cache location
-            # information. What could happen is that the for the padded sequences the cache location
-            # tensors point to allocated pages. This could lead to a situation where we write into
-            # allocated cache pages polluting the cache of other sequences. Now this is not an issue
-            # if we write the dummy sequences into unallocated cache pages... One fix could be to
-            # pad not only the seq len but also pad the cache locations by just repeating the last
-            # valid cache location in the batch. This would ensure that the dummy sequences just
-            # repeats valid computation...
-        """
-        _, s = input_or_position_ids.shape[:2]
-        num_seq = cls._get_sanitized_num_sequences(input_or_position_ids, seq_len)
-        if s > 1:
-            return seq_len[:num_seq].clone()
-        else:
-            return torch.ones(num_seq, dtype=seq_len.dtype, device=seq_len.device)
-
-    @staticmethod
-    def _get_sanitized_num_sequences(
-        input_or_position_ids: torch.Tensor, seq_len: torch.Tensor
-    ) -> int:
-        """Get number of sequences.
-
-        We makes sure that this function is compatible with both torch graph capture and cudagraph.
-        Both can be a bit temparamental when trying to extract the number of sequences from a tensor
-        with max_batch_size or max_batch_size*max_seq_len.
-        """
-        b, s = input_or_position_ids.shape[:2]
-        if s > 1:
-            num_seq = torch.sum(seq_len > 0)
-            assert seq_len[num_seq:].sum() == 0, "seq_len should be zero-padded"
-        else:
-            num_seq = b
-        return num_seq
-
     def activate_arg(self, arg_name: str) -> bool:
         """Activate a desired argument.
 
@@ -801,7 +757,11 @@ class SequenceInfo:
 
     def set_generate_only_batch(self, batch_size: Optional[int] = None) -> None:
         """Set an example sequence for generate-only batch."""
-        self.set_example_sequence([[1]] * (batch_size or self.max_batch_size))
+        batch_size = batch_size or self.max_batch_size
+        self.set_example_sequence(
+            [[1]] * batch_size,
+            logits_gather_info=[batch_size, 0],
+        )
 
     def reset(self) -> None:
         """Reset the sequence information.
@@ -842,7 +802,7 @@ class SequenceInfo:
             self._args_list[name] = tnsr_like.copy()
 
             # Only store to buffer when the argument is active or force_copy is True
-            if not (name in self._active_args or force_copy):
+            if not (name in self._active_args or f"{name}_host" in self._active_args or force_copy):
                 return
 
             # Store to the InputBuffer's pinned host memory
@@ -887,6 +847,8 @@ class SequenceInfo:
         last_page_len: Optional[Sequence[int]] = None,
         slot_idx: Optional[Sequence[int]] = None,
         use_initial_states: Optional[Sequence[bool]] = None,
+        logits_gather_indices: Optional[Sequence[int]] = None,
+        logits_gather_info: Optional[Sequence[int]] = None,
         _gather_idx: Optional[Sequence[int]] = None,
         _mask_scatter_indices: Optional[Sequence[int]] = None,
         **extra_args: Dict[str, Union[torch.Tensor, Sequence[torch.Tensor]]],
@@ -917,6 +879,8 @@ class SequenceInfo:
             slot_idx: Slot index for each sequence in the batch.
             use_initial_states: Per-sequence boolean indicating if the initial states should be
                 used. If None, auto-computed as (input_pos > 0).
+            logits_gather_indices: Gather indices for the logits before/after the LM head.
+            logits_gather_info: Info list containing [num_tokens_to_gather, gather_required].
             _gather_idx: Gather indices for the overlap scheduler to reorder input tokens.
             _mask_scatter_indices: Mask scatter indices for the overlap scheduler.
             extra_args: Extra arguments to be stored in the interface.
@@ -999,6 +963,17 @@ class SequenceInfo:
             use_initial_states = [i_p > 0 for i_p in self.input_pos]
         self._store_arg("use_initial_states", use_initial_states)
 
+        # check for updated logits_gather_indices
+        if logits_gather_indices is None:
+            # default is to gather all logits
+            logits_gather_indices = list(range(self.total_num_tokens))
+        self._store_arg("logits_gather_indices", logits_gather_indices, force_copy=True)
+
+        # check for updated logits_gather_info
+        if logits_gather_info is None:
+            logits_gather_info = [len(logits_gather_indices), 1]
+        self._store_arg("logits_gather_info", logits_gather_info, force_copy=True)
+
         ### UPDATE OVERLAP SCHEDULER METADATA ######################################################
         # check for updated _gather_idx
         if _gather_idx is not None:
@@ -1042,10 +1017,34 @@ class SequenceInfo:
             ungathered_input_ids, gather_ids_device, mask_scatter_indices_device, input_ids_device
         )
 
+    # TODO: remove once https://github.com/NVIDIA/TensorRT-LLM/issues/9878 is fixed and
+    # logits gather is enabled by default (only keep squeeze_logits)
+    @nvtx_range("ad_maybe_gather_logits")
+    def maybe_gather_and_squeeze_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """Maybe gather the logits if logits have not been gathered yet."""
+        num_tokens = logits.shape[0] * logits.shape[1]
+        num_tokens_to_gather, gather_required = self._get_arg("logits_gather_info_host").tolist()
+        if gather_required and num_tokens_to_gather < num_tokens:
+            logits = torch.ops.auto_deploy.gather_logits_before_lm_head(
+                logits,
+                self._get_arg("logits_gather_indices"),
+                self._get_arg("logits_gather_info_host"),
+            )
+        return logits.squeeze(int(self.is_generate))
+
     @nvtx_range("ad_unnest_sequences")
     def unnest_sequences(self, t_nested: torch.Tensor) -> List[torch.Tensor]:
-        t_squeezed = t_nested.squeeze(1) if self.is_generate else t_nested.squeeze(0)
+        t_squeezed = t_nested.squeeze(int(self.is_generate))
         return list(torch.split(t_squeezed, self.seq_len))
+
+    def register_host_prepare_for_attention_forward(
+        self, host_function: PrepareMetadataHostCallable, args: List[str]
+    ):
+        self._host_prepare_functions.append((host_function, args))
+
+    def run_host_prepare_for_attention_forward(self) -> None:
+        for host_function, args in self._host_prepare_functions:
+            host_function(**{arg: self._get_arg(arg) for arg in args})
 
 
 class MHACallable(Protocol):
@@ -1057,14 +1056,7 @@ class MHACallable(Protocol):
 
 class PrepareMetadataCallable(Protocol):
     def __call__(
-        self,
-        position_ids: torch.Tensor,
-        seq_len: torch.Tensor,
-        input_pos: torch.Tensor,
-        cache_loc: torch.Tensor,
-        pages_per_seq: torch.Tensor,
-        slot_idx: torch.Tensor,
-        page_size: int,
+        self, *sequence_info_args_and_constants: Union[torch.Tensor, Constant]
     ) -> List[torch.Tensor]: ...
 
 
@@ -1223,6 +1215,16 @@ class AttentionDescriptor(ABC):
         caches and buffers. The constants are expected to be of type int, float, str, or None.
         """
         return []
+
+    @classmethod
+    def get_host_prepare_metadata_function(cls) -> Optional[PrepareMetadataHostCallable]:
+        """Get function that performs host-side prep for the forward pass for the attention op.
+
+        This method is responsible for preparing the attention op for the forward pass.
+        This function is not expected to be graph capturable or compatible with cuda graphs. It can
+        use any argument from the SequenceInfo interface as input argument to its function.
+        """
+        return None
 
 
 class AttentionRegistry:

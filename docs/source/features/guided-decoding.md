@@ -9,14 +9,20 @@ TensorRT LLM supports two grammar backends:
 
 ## Online API: `trtllm-serve`
 
-If you are using `trtllm-serve`, enable guided decoding by specifying `guided_decoding_backend` with `xgrammar` or `llguidance` in the YAML configuration file, and pass it to `--extra_llm_api_options`. For example,
+If you are using `trtllm-serve`, enable guided decoding by specifying `guided_decoding_backend` with `xgrammar` or `llguidance` in the YAML configuration file, and pass it to `--config`. For example,
+
+```{eval-rst}
+.. include:: ../_includes/note_sections.rst
+   :start-after: .. start-note-config-flag-alias
+   :end-before: .. end-note-config-flag-alias
+```
 
 ```bash
-cat > extra_llm_api_options.yaml <<EOF
+cat > config.yaml <<EOF
 guided_decoding_backend: xgrammar
 EOF
 
-trtllm-serve nvidia/Llama-3.1-8B-Instruct-FP8 --extra_llm_api_options extra_llm_api_options.yaml
+trtllm-serve nvidia/Llama-3.1-8B-Instruct-FP8 --config config.yaml
 ```
 
 You should see a log like the following, which indicates the grammar backend is successfully enabled.

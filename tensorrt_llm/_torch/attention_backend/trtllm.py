@@ -2,7 +2,7 @@ import math
 import os
 import weakref
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
+from tensorrt_llm.llmapi import SkipSoftmaxAttentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -83,6 +84,9 @@ class TrtllmAttentionWrapper:
     spec_decoding_bl_tree_mask_offset: Optional[torch.Tensor]
     spec_decoding_bl_tree_mask: Optional[torch.Tensor]
     spec_bl_tree_first_sparse_mask_offset_kv: Optional[torch.Tensor]
+    helix_position_offsets: Optional[torch.Tensor]
+    helix_is_inactive_rank: Optional[torch.Tensor]
+    attention_input_type: Optional[torch.Tensor]
     kwargs: dict
 
     def __init__(
@@ -145,8 +149,15 @@ class TrtllmAttentionWrapper:
         self.rotary_embedding_long_m_scale = rope_params.long_m_scale
         self.rotary_embedding_max_positions = rope_params.max_positions
         self.rotary_embedding_original_max_positions = rope_params.original_max_positions
+        self.attention_input_type = None
         self.kwargs = {}
         self.kwargs.update(kwargs)
+        self.skip_softmax_stat = torch.zeros(2,
+                                             dtype=torch.uint32,
+                                             device='cuda')
+        # Default disabled, but allow manual enabling through `TRTLLM_PRINT_SKIP_SOFTMAX_STAT=1`
+        self.print_skip_softmax_stat = os.environ.get(
+            "TRTLLM_PRINT_SKIP_SOFTMAX_STAT", "0") == "1"
 
     def update_quant_config(self, quant_config: Optional[QuantConfig] = None):
         quant_config = quant_config or QuantConfig()
@@ -206,6 +217,8 @@ class TrtllmAttentionWrapper:
         sparse_attn_offsets: Optional[torch.Tensor] = None,
         sparse_attn_indices_block_size: int = 1,
         sparse_mla_topk: int = 0,
+        skip_softmax_threshold_scale_factor_prefill: Optional[float] = None,
+        skip_softmax_threshold_scale_factor_decode: Optional[float] = None,
         helix_position_offsets: Optional[torch.Tensor] = None,
         helix_is_inactive_rank: Optional[torch.Tensor] = None,
         **kwargs,
@@ -252,6 +265,8 @@ class TrtllmAttentionWrapper:
             sparse_attn_offsets (torch.Tensor): The batch offsets for the sparse attention indices, with shape of (num_generations + 1) on GPU.
             sparse_attn_indices_block_size (int): The granularity of the sparse attention indices, used by block sparse attention.
             sparse_mla_topk (int): The topk for the sparse MLA, used by DSA attention.
+            skip_softmax_threshold_scale_factor_prefill (float): The scale factor for the skip softmax threshold in prefill phase.
+            skip_softmax_threshold_scale_factor_decode (float): The scale factor for the skip softmax threshold in decode phase.
             helix_position_offsets (torch.Tensor): The tensor to store the helix position offsets, with shape (num_tokens) on GPU.
             helix_is_inactive_rank (torch.Tensor): For Helix: whether the current rank is inactive, with shape (batch_size) on GPU.
         """
@@ -298,10 +313,6 @@ class TrtllmAttentionWrapper:
         self.sparse_mla_topk = sparse_mla_topk
         self.helix_position_offsets = helix_position_offsets
         self.helix_is_inactive_rank = helix_is_inactive_rank
-        if self.helix_is_inactive_rank is not None and not isinstance(
-                self.helix_is_inactive_rank, torch.Tensor):
-            self.helix_is_inactive_rank = torch.tensor(
-                self.helix_is_inactive_rank, dtype=torch.bool, pin_memory=True)
 
         if max_sequence_length > self.rope_params.max_positions:
             self.rope_params.max_positions = max_sequence_length
@@ -317,20 +328,24 @@ class TrtllmAttentionWrapper:
         self.spec_decoding_bl_tree_mask = spec_decoding_bl_tree_mask
         self.spec_bl_tree_first_sparse_mask_offset_kv = spec_bl_tree_first_sparse_mask_offset_kv
         self.chunked_prefill_buffer_batch_size = chunked_prefill_buffer_batch_size
+        self.skip_softmax_threshold_scale_factor_prefill = skip_softmax_threshold_scale_factor_prefill
+        self.skip_softmax_threshold_scale_factor_decode = skip_softmax_threshold_scale_factor_decode
         self.kwargs.update(kwargs)
 
-    def create_output(self, q: torch.Tensor, out_dtype: torch.dtype):
+    def create_output(
+        self,
+        q: torch.Tensor,
+        out_dtype: Optional[torch.dtype],
+        use_nvfp4_output: bool,
+        is_gen_only: bool,
+    ):
         num_tokens = q.size(0)
-        attention_input_type = (AttentionInputType(self.attention_input_type)
-                                if self.attention_input_type is not None else
-                                AttentionInputType.mixed)
         if out_dtype is None:
             out_dtype = q.dtype
-        is_gen_only = attention_input_type == AttentionInputType.generation_only
         v_head_size = self.head_size
         if self.is_mla_enable:
             v_head_size = self.kv_lora_rank if is_gen_only else self.v_head_dim
-        if out_dtype == torch.uint8:
+        if use_nvfp4_output:
             num_nvfp4_elements_per_container = 2
             scaling_vector_size = 16
             size_per_token = self.num_heads * v_head_size
@@ -342,20 +357,20 @@ class TrtllmAttentionWrapper:
             padded_row, padded_col = compute_swizzled_sf_shape(
                 num_tokens, size_per_token // scaling_vector_size)
             output_sf = q.new_empty(padded_row * padded_col, dtype=torch.uint8)
+            return [output, output_sf]
         else:
-            output = q.new_empty((num_tokens, self.num_heads * v_head_size),
-                                 dtype=out_dtype)
-            output_sf = None
-        return output, output_sf
+            return [
+                q.new_empty((num_tokens, self.num_heads * v_head_size),
+                            dtype=out_dtype)
+            ]
 
     def run(
         self,
         q: torch.Tensor,
+        output: torch.Tensor,
+        output_sf: Optional[torch.Tensor] = None,
         k: Optional[torch.Tensor] = None,
         v: Optional[torch.Tensor] = None,
-        output: Optional[torch.Tensor] = None,
-        output_sf: Optional[torch.Tensor] = None,
-        out_dtype: Optional[torch.dtype] = None,
         is_fused_qkv: bool = True,
         update_kv_cache: bool = True,
         attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
@@ -370,9 +385,10 @@ class TrtllmAttentionWrapper:
         Run the attention operation.
         Args:
             q (torch.Tensor): Query tensor with shape (num_tokens, num_heads * head_dim) or QKV tensor with shape (num_tokens, (num_heads + 2 * num_kv_heads) * head_dim).
+            output (torch.Tensor): Output tensor with shape.
+            output_sf (Optional[torch.Tensor]): Output scaling factors tensor.
             k (Optional[torch.Tensor]): Key tensor with shape (num_tokens, num_kv_heads * head_dim) or None if QKV tensor is provided.
             v (Optional[torch.Tensor]): Value tensor with shape (num_tokens, num_kv_heads * head_dim) or None if QKV tensor is provided.
-            out_dtype (Optional[torch.dtype]): Output data type if provided.
             is_fused_qkv (bool): Whether QKV tensor is provided.
             update_kv_cache (bool): Whether KV cache is updated.
             attention_mask (AttentionMask): Attention mask. See definition of AttentionMask for accepted types. Defaults to predefined causal mask.
@@ -451,13 +467,6 @@ class TrtllmAttentionWrapper:
             else:
                 raise ValueError("Unexpected attention mask type")
 
-        if output is None:
-            assert output_sf is None
-            output, output_sf = self.create_output(q, out_dtype)
-        else:
-            # output is provided, expect output_sf be provided as well if has NVFP4 output.
-            assert out_dtype is None or out_dtype != torch.uint8 or output_sf is not None
-
         # packing parameters to avoid maxing out 64 arguments
         rotary_embedding_scales = [
             self.rotary_embedding_scale, self.rotary_embedding_short_m_scale,
@@ -485,13 +494,15 @@ class TrtllmAttentionWrapper:
             self.helix_position_offsets, self.helix_is_inactive_rank
         ]
 
+        if self.print_skip_softmax_stat:
+            self.skip_softmax_stat.zero_()
+
         thop.attention(
             q,
             k,
             v,
             output,
             output_sf,
-            out_dtype,
             self.workspace,
             self.sequence_length,
             self.host_past_key_value_lengths,
@@ -557,6 +568,9 @@ class TrtllmAttentionWrapper:
             self.sparse_attn_offsets,
             self.sparse_attn_indices_block_size,
             self.sparse_mla_topk,
+            self.skip_softmax_threshold_scale_factor_prefill,
+            self.skip_softmax_threshold_scale_factor_decode,
+            self.skip_softmax_stat,
             cu_q_seqlens,
             cu_kv_seqlens,
             fmha_scheduler_counter,
@@ -564,9 +578,16 @@ class TrtllmAttentionWrapper:
             mla_bmm2_scale,
             quant_q_buffer,
         )
+
+        if self.print_skip_softmax_stat:
+            (total_blocks, skipped_blocks) = self.skip_softmax_stat
+            if total_blocks != 0:
+                print(
+                    f"SKIP_SOFTMAX_STAT: layer{self.layer_idx}: {skipped_blocks} / {total_blocks}"
+                    f" = {skipped_blocks / total_blocks * 100: .2f}%")
+
         # reset the planned states (especially tensors) to avoid memory leak
         self.plan()
-        return output, output_sf
 
     def is_nvfp4_output_kernel_available(
         self,
@@ -646,12 +667,22 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     spec_decoding_bl_tree_mask: Optional[torch.Tensor] = None
     spec_bl_tree_first_sparse_mask_offset_kv: Optional[torch.Tensor] = None
 
+    # Flag to enable helix parallelism.
+    enable_helix: bool = False
+
+    # Global position ids of tokens for each sequence in the batch. Given
+    # each helix rank has only a subset of tokens for a sequence, we compute
+    # a global position id for each token here.
+    helix_position_offsets: Optional[torch.Tensor] = None
+    helix_position_offsets_cpu: Optional[torch.Tensor] = None
+
     # Whether the current rank is inactive for helix parallelism.
     # In helix parallelism, only the active rank appends KV cache for the query token
     # and attends to the previously cached tokens as well as the query token. Inactive
     # ranks do not append KV cache for the query token and attend to the previously
     # cached tokens only.
     helix_is_inactive_rank: Optional[torch.Tensor] = None
+    helix_is_inactive_rank_cpu: Optional[torch.Tensor] = None
 
     @property
     def max_seq_len(self) -> int:
@@ -696,6 +727,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        self.enable_helix = self.mapping.has_cp_helix(
+        ) if self.mapping is not None else False
         self._post_init_with_buffers(self.cuda_graph_buffers)
 
     def _post_init_with_buffers(self, buffers) -> None:
@@ -704,7 +737,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if self.max_num_sequences is None:
             self.max_num_sequences = self.max_num_requests
 
-        capture_graph = torch.cuda.is_current_stream_capturing()
+        capture_graph = self.is_cuda_graph
 
         self.prompt_lens_cuda = self.get_empty(
             buffers,
@@ -824,10 +857,63 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     pin_memory=True,
                 )
 
+        # Allocate static buffers for helix parallelism support.
+        if self.enable_helix:
+            self.helix_position_offsets = self.get_empty(
+                buffers,
+                (self.max_num_tokens, ),
+                cache_name="helix_position_offsets",
+                dtype=torch.int,
+                capture_graph=capture_graph,
+            )
+            self.helix_position_offsets_cpu = torch.empty_like(
+                self.helix_position_offsets,
+                device='cpu',
+                pin_memory=True,
+            )
+            self.helix_is_inactive_rank = self.get_empty(
+                buffers,
+                (self.max_num_sequences, ),
+                cache_name="helix_is_inactive_rank",
+                dtype=torch.bool,
+                capture_graph=capture_graph,
+            )
+            self.helix_is_inactive_rank_cpu = torch.empty_like(
+                self.helix_is_inactive_rank,
+                device='cpu',
+                pin_memory=True,
+            )
+
     def on_update_kv_lens(self):
         # After changing the kv_lens/kv_lens_cuda, we may need to update other metadata.
         # Especially for the changes in the _preprocess_inputs() of model_engine.py.
         pass
+
+    def update_helix_param(
+        self,
+        helix_position_offsets: List[int],
+        helix_is_inactive_rank: List[bool],
+    ) -> None:
+        """
+        Update helix parameters by copying into static buffers for CUDA graph compatibility.
+
+        Args:
+            helix_position_offsets: Position offsets for helix parallelism with shape (num_tokens,).
+            helix_is_inactive_rank: Whether the current rank is inactive with shape (batch_size,).
+        """
+        if helix_position_offsets is not None and self.helix_position_offsets is not None:
+            num_tokens = len(helix_position_offsets)
+            self.helix_position_offsets_cpu[:num_tokens].copy_(
+                torch.tensor(helix_position_offsets, dtype=torch.int))
+            self.helix_position_offsets[:num_tokens].copy_(
+                self.helix_position_offsets_cpu[:num_tokens], non_blocking=True)
+
+        if helix_is_inactive_rank is not None and self.helix_is_inactive_rank is not None:
+            batch_size = len(helix_is_inactive_rank)
+            self.helix_is_inactive_rank_cpu[:batch_size].copy_(
+                torch.tensor(helix_is_inactive_rank, dtype=torch.bool))
+            self.helix_is_inactive_rank[:batch_size].copy_(
+                self.helix_is_inactive_rank_cpu[:batch_size], non_blocking=True)
 
     def prepare(self) -> None:
         extra_attrs = get_model_extra_attrs()
@@ -868,21 +954,17 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
         if self.enable_flash_mla:
             self.prepare_flash_mla()
-        # number of tokens needed in the kv cache for each sequence after the next pass
-        if self.helix_is_inactive_rank is not None and len(
-                self.helix_is_inactive_rank):
+
+        # number of tokens needed in the kv cache for each sequence after the next pass.
+        if self.enable_helix:
             # If helix is inactive, attend to the previously cached tokens only.
             assert cached_token_lens is not None, "cached_token_lens should be set for helix"
+            active_rank = ~self.helix_is_inactive_rank_cpu[:self.num_seqs]
             kv_lens = cached_token_lens.clone()
-            helix_is_inactive_rank_cpu = torch.tensor(
-                self.helix_is_inactive_rank,
-                dtype=torch.bool,
-                device='cpu',
-            )
-            active_rank = ~helix_is_inactive_rank_cpu
             kv_lens[active_rank] += self.seq_lens_kv[active_rank]
         else:
-            kv_lens = cached_token_lens + self.seq_lens_kv if cached_token_lens is not None else self.seq_lens_kv
+            kv_lens = cached_token_lens + \
+                self.seq_lens_kv if cached_token_lens is not None else self.seq_lens_kv
 
         # self.kv_lens is the valid kv cache length, while the self.kv_lens_cuda is
         # the sequence length including the cached tokens and the input tokens.
@@ -913,10 +995,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 self.host_kv_cache_block_offsets,
                 self.request_ids[self.num_contexts:], self.beam_width,
                 self.num_contexts)
-            self.kv_cache_block_offsets[:, :self.num_seqs].copy_(
-                self.host_kv_cache_block_offsets[:, :self.num_seqs],
-                non_blocking=True)
-
+            for pool_idx in range(self.host_kv_cache_block_offsets.shape[0]):
+                self.kv_cache_block_offsets[pool_idx, :self.num_seqs].copy_(
+                    self.host_kv_cache_block_offsets[pool_idx, :self.num_seqs],
+                    non_blocking=True)
             error_message = (
                 f"The max KV cache length of input sequences ({self.kv_lens[:self.num_seqs].max()}) "
                 f"exceeds the KV cache manager's maximum supported length "
@@ -1467,12 +1549,66 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         else:
             return metadata.kv_cache_manager.layer_offsets[self.layer_idx]
 
+    def use_nvfp4_output(
+        self,
+        metadata: TrtllmAttentionMetadata,
+        attention_mask: AttentionMask,
+    ) -> bool:
+        # Not running NVFP4
+        if not self.has_nvfp4:
+            return False
+
+        # Default enabled, but allow manual disabling through `TRTLLM_ENABLE_ATTENTION_NVFP4_OUTPUT=0`
+        if not os.environ.get("TRTLLM_ENABLE_ATTENTION_NVFP4_OUTPUT",
+                              "1") == "1":
+            return False
+
+        use_paged_context_fmha = (
+            metadata.runtime_features.chunked_prefill
+            or metadata.runtime_features.cache_reuse
+            or metadata.runtime_features.has_speculative_draft_tokens
+        ) if metadata.runtime_features else False
+
+        return self.wrapper.is_nvfp4_output_kernel_available(
+            tokens_per_block=metadata.tokens_per_block,
+            attention_mask=attention_mask,
+            use_paged_context_fmha=use_paged_context_fmha,
+            is_mla_enable=self.is_mla_enable,
+        )
+
+    def get_quantize_output_dtype(
+            self, use_nvfp4_output: bool) -> Optional[torch.dtype]:
+        if use_nvfp4_output:
+            # Use UINT8 as the container dtype for NVFP4.
+            return torch.uint8
+        elif (self.has_fp8_qdq or self.has_nvfp4 or self.has_fp8_block_wise
+              or self.has_fp8_rowwise
+              or self.has_w4a8_nvfp4_fp8) and (self.has_fp8_kv_cache
+                                               or self.has_fp4_kv_cache):
+            return torch.float8_e4m3fn
+        return None
+
+    def create_output(self, q, *, is_quantize_output: bool,
+                      metadata: TrtllmAttentionMetadata,
+                      attention_mask: AttentionMask, is_gen_only: bool,
+                      **kwargs) -> List[torch.Tensor]:
+        use_nvfp4_output = False
+        out_dtype = None
+        if is_quantize_output:
+            use_nvfp4_output = self.use_nvfp4_output(metadata, attention_mask)
+            out_dtype = self.get_quantize_output_dtype(use_nvfp4_output)
+
+        return self.wrapper.create_output(q, out_dtype, use_nvfp4_output,
+                                          is_gen_only)
+
     def forward(
         self,
         q: torch.Tensor,
         k: Optional[torch.Tensor],
         v: Optional[torch.Tensor],
         metadata: TrtllmAttentionMetadata,
+        output: Optional[torch.Tensor] = None,
+        output_sf: Optional[torch.Tensor] = None,
         out_scale: Optional[torch.Tensor] = None,
         out_scale_sf: Optional[torch.Tensor] = None,
         kv_scales_sf: Optional[torch.Tensor] = None,
@@ -1485,10 +1621,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         mrope_config: Optional[dict] = None,
         attention_window_size: Optional[int] = None,
         softmax_stats_tensor: Optional[torch.Tensor] = None,
-        helix_position_offsets: Optional[torch.Tensor] = None,
         enable_attn_nvfp4_output: bool = True,
-        output: Optional[torch.Tensor] = None,
-        output_sf: Optional[torch.Tensor] = None,
         attention_sinks: Optional[torch.Tensor] = None,
         chunked_prefill_buffer_batch_size: int = 1,
         cu_q_seqlens: Optional[torch.Tensor] = None,
@@ -1498,7 +1631,31 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         mla_bmm2_scale: Optional[torch.Tensor] = None,
         quant_q_buffer: Optional[torch.Tensor] = None,
         **kwargs,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[torch.Tensor]]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Execute the attention operation.
+        Args:
+            q (torch.Tensor): Query tensor or QKV tensor.
+            k (Optional[torch.Tensor]): Key tensor or None if QKV tensor is provided.
+            v (Optional[torch.Tensor]): Value tensor or None if QKV tensor is provided.
+            metadata (TrtllmAttentionMetadata): Metadata for the attention operation.
+            output (Optional[torch.Tensor]): Output tensor to store the attention output.
+            output_sf (Optional[torch.Tensor]): Output scale factor tensor for NVFP4.
+            out_scale (Optional[torch.Tensor]): Scale factor tensor for quantizing output.
+            out_scale_sf (Optional[torch.Tensor]): Global scale factor tensor for NVFP4 for quantizingoutput.
+            kv_scales_sf (Optional[torch.Tensor]): KV scale factor tensor.
+            kv_scales_sf_inv (Optional[torch.Tensor]): KV scale factor inverse tensor.
+            attention_mask (AttentionMask): Attention mask.
+            attention_input_type (AttentionInputType): Attention input type.
+            latent_cache (Optional[torch.Tensor]): Latent cache tensor.
+            q_pe (Optional[torch.Tensor]): Q position embedding tensor.
+            mrope_config (Optional[dict]): Mrope configuration.
+            attention_window_size (Optional[int]): Attention window size.
+            softmax_stats_tensor (Optional[torch.Tensor]): Softmax statistics tensor.
+            helix_position_offsets (Optional[torch.Tensor]): Helix position offsets tensor.
+            attention_sinks (Optional[torch.Tensor]): Attention sinks tensor.
+            chunked_prefill_buffer_batch_size (int): Chunked prefill buffer batch size.
+        """
         assert isinstance(
             metadata,
             TrtllmAttentionMetadata,
@@ -1515,26 +1672,39 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             # Context MLA uses separate qkv instead of paged_context_fmha
             use_paged_context_fmha = False
 
-        use_nvfp4_output = False
-        if enable_attn_nvfp4_output and self.has_nvfp4 and self.support_nvfp4_output(
-        ):
-            # Runtime check whether the NVFP4 output kernel is available.
-            use_nvfp4_output = self.wrapper.is_nvfp4_output_kernel_available(
-                tokens_per_block=metadata.tokens_per_block,
+        if output is None:
+            # Output is not provided.
+            is_gen_only = attention_input_type == AttentionInputType.generation_only
+            outputs = self.create_output(
+                q,
+                is_quantize_output=out_scale is not None,
+                metadata=metadata,
                 attention_mask=attention_mask,
                 use_paged_context_fmha=use_paged_context_fmha,
                 is_mla_enable=self.is_mla_enable,
+                is_gen_only=is_gen_only,
             )
+
+            output = outputs[0]
+            output_sf = outputs[1] if len(outputs) == 2 else None
 
         sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets = None, None, None, None
         sparse_attn_indices_block_size = 1
+        skip_softmax_threshold_scale_factor_prefill = None
+        skip_softmax_threshold_scale_factor_decode = None
         if self.sparse_attention_config is not None:
-            sparse_kv_indices, sparse_kv_offsets = self.sparse_kv_predict(
-                q, k, metadata, **kwargs)
-            sparse_attn_indices, sparse_attn_offsets = self.sparse_attn_predict(
-                q, k, metadata, **kwargs)
-            sparse_attn_indices_block_size = self.sparse_attention_config.get_indices_block_size(
-            )
+            if isinstance(self.sparse_attention_config,
+                          SkipSoftmaxAttentionConfig):
+                skip_softmax_threshold_scale_factor_prefill = self.sparse_attention_config.threshold_scale_factor_prefill
+                skip_softmax_threshold_scale_factor_decode = self.sparse_attention_config.threshold_scale_factor_decode
+
+            else:
+                sparse_kv_indices, sparse_kv_offsets = self.sparse_kv_predict(
+                    q, k, metadata, **kwargs)
+                sparse_attn_indices, sparse_attn_offsets = self.sparse_attn_predict(
+                    q, k, metadata, **kwargs)
+                sparse_attn_indices_block_size = self.sparse_attention_config.get_indices_block_size(
+                )
 
         self.wrapper.plan(
             layer_idx=self.get_local_layer_idx(metadata),
@@ -1567,7 +1737,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             out_scale_sf=out_scale_sf,
             kv_scales_sf=kv_scales_sf,
             kv_scales_sf_inv=kv_scales_sf_inv,
-            use_nvfp4_output=use_nvfp4_output,
+            use_nvfp4_output=output_sf
+            is not None,  # NVFP4 output will setup output_sf tensor
             use_paged_context_fmha=use_paged_context_fmha,
             attention_input_type=attention_input_type,
             latent_cache=latent_cache,
@@ -1596,42 +1767,33 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             sparse_attn_indices_block_size=sparse_attn_indices_block_size,
             sparse_mla_topk=metadata.sparse_mla_topk if hasattr(
                 metadata, 'sparse_mla_topk') else 0,
-            helix_position_offsets=helix_position_offsets,
+            skip_softmax_threshold_scale_factor_prefill=
+            skip_softmax_threshold_scale_factor_prefill,
+            skip_softmax_threshold_scale_factor_decode=
+            skip_softmax_threshold_scale_factor_decode,
+            helix_position_offsets=metadata.helix_position_offsets,
             helix_is_inactive_rank=metadata.helix_is_inactive_rank,
         )
-        out_dtype = None
-        if out_scale is not None:
-            if use_nvfp4_output:
-                # Use UINT8 as the container dtype for NVFP4.
-                out_dtype = torch.uint8
-            elif (self.has_fp8_qdq or self.has_nvfp4 or self.has_fp8_block_wise
-                  or self.has_fp8_rowwise
-                  or self.has_w4a8_nvfp4_fp8) and (self.has_fp8_kv_cache
-                                                   or self.has_fp4_kv_cache):
-                # TODO(qijun): revisit fp8_context_fmha logic
-                out_dtype = torch.float8_e4m3fn
 
-        output, output_sf = self.wrapper.run(
-            q,
-            k,
-            v,
-            output=output,
-            output_sf=output_sf,
-            out_dtype=out_dtype,
-            is_fused_qkv=not metadata.is_cross and k is None,
-            update_kv_cache=not metadata.is_cross or k is not None,
-            attention_mask=attention_mask,
-            cu_q_seqlens=cu_q_seqlens,
-            cu_kv_seqlens=cu_kv_seqlens,
-            fmha_scheduler_counter=fmha_scheduler_counter,
-            mla_bmm1_scale=mla_bmm1_scale,
-            mla_bmm2_scale=mla_bmm2_scale,
-            quant_q_buffer=quant_q_buffer)
+        self.wrapper.run(q,
+                         output,
+                         output_sf,
+                         k,
+                         v,
+                         is_fused_qkv=not metadata.is_cross and k is None,
+                         update_kv_cache=not metadata.is_cross or k is not None,
+                         attention_mask=attention_mask,
+                         cu_q_seqlens=cu_q_seqlens,
+                         cu_kv_seqlens=cu_kv_seqlens,
+                         fmha_scheduler_counter=fmha_scheduler_counter,
+                         mla_bmm1_scale=mla_bmm1_scale,
+                         mla_bmm2_scale=mla_bmm2_scale,
+                         quant_q_buffer=quant_q_buffer)
 
-        if use_nvfp4_output:
+        if output_sf is None:
+            return output
+        else:
             return output, output_sf
-
-        return output
 
     @classmethod
     def support_fused_rope(cls) -> bool:
@@ -1644,12 +1806,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     @classmethod
     def support_mla(cls) -> bool:
         return True
-
-    @classmethod
-    def support_nvfp4_output(cls) -> bool:
-        # Default enabled, but allow manual disabling through `TRTLLM_ENABLE_ATTENTION_NVFP4_OUTPUT=0`
-        return os.environ.get("TRTLLM_ENABLE_ATTENTION_NVFP4_OUTPUT",
-                              "1") == "1"
 
     def has_cached_kv_for_mla_context(
         self,
@@ -1856,8 +2012,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         mla_bmm1_scale: torch.Tensor,
         mla_bmm2_scale: torch.Tensor,
         quant_q_buffer: torch.Tensor,
-        helix_position_offsets: Optional[torch.Tensor] = None,
-        helix_is_inactive_rank: Optional[torch.Tensor] = None,
         out_scale: Optional[torch.Tensor] = None,
     ) -> None:
         """
@@ -1878,13 +2032,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         assert metadata.kv_cache_manager is not None
         sink_token_length = 0
 
-        # Ensure helix_is_inactive_rank and position_ids are on the same device.
-        if helix_is_inactive_rank is not None:
-            assert helix_is_inactive_rank.device == helix_position_offsets.device, \
-                f"helix_is_inactive_rank must be on the same device as helix_position_offsets, " \
-                f"got {helix_is_inactive_rank.device} vs {helix_position_offsets.device}"
-
-        mla_tensor_params = [helix_position_offsets, helix_is_inactive_rank]
+        mla_tensor_params = [
+            metadata.helix_position_offsets, metadata.helix_is_inactive_rank
+        ]
 
         torch.ops.trtllm.mla_rope_generation(
             fused_q,

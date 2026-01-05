@@ -7,14 +7,12 @@ from torch import nn
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
-from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
-from .interface import SpecMetadata, get_force_num_accepted_tokens
+from .interface import SpecMetadata, SpecWorkerBase
 from .mtp import MTPSampler
-from .one_model_sampler import sampling_batch_spec_dec_one_model
 from .spec_tree_manager import SpecTreeManager
 
 if TYPE_CHECKING:
@@ -135,7 +133,7 @@ class Eagle3SpecMetadata(SpecMetadata):
             self.layers_to_capture = (self.num_layers - 1, )
         elif self.layers_to_capture is None:
             if self.num_layers == 1 or self.is_mtp_eagle:
-                self.layers_to_capture = (self.num_layers - 1, )
+                self.layers_to_capture = (-1, )
             else:
                 if self.num_layers <= 5:
                     raise ValueError(
@@ -358,15 +356,16 @@ class Eagle3OneModelSampler(MTPSampler):
         super().__init__(args, nextn=args.max_draft_len)
 
 
-class Eagle3OneModelWorker(nn.Module):
+class Eagle3OneModelWorker(SpecWorkerBase):
 
     def __init__(self, spec_config: "EagleDecodingConfig", mapping: Mapping):
         super().__init__()
         self.spec_config = spec_config
-        self.max_draft_len = self.spec_config.max_draft_len
         self.mapping = mapping
-        self.guided_decoder: Optional[CapturableGuidedDecoder] = None
-        self.force_num_accepted_tokens = get_force_num_accepted_tokens()
+
+    @property
+    def max_draft_len(self) -> int:
+        return self.spec_config.max_draft_len
 
     # Skip torch.compile for now since current Torch is not compatible with Triton 3.4
     # @torch.compile(options={"max-autotune": True})
@@ -401,6 +400,7 @@ class Eagle3OneModelWorker(nn.Module):
 
         # Predict draft tokens
         next_draft_tokens = []
+        original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
         for i in range(self.max_draft_len):
             if i == 0:
                 start_ids_gen = (spec_metadata.batch_indices_cuda[:num_gens] *
@@ -420,6 +420,13 @@ class Eagle3OneModelWorker(nn.Module):
                 self.guided_decoder.add_draft_batch(new_tokens,
                                                     num_accepted_tokens,
                                                     draft_step=i)
+
+            # Update attn_metadata.all_rank_num_tokens for attention DP
+            if original_all_rank_num_tokens is not None:
+                if i == 0:
+                    attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
+                elif spec_metadata.all_rank_num_seqs is not None:
+                    attn_metadata.all_rank_num_tokens = spec_metadata.all_rank_num_seqs
 
             hidden_states, hidden_states_to_save = draft_model.model(**inputs)
 
@@ -462,8 +469,6 @@ class Eagle3OneModelWorker(nn.Module):
             elif hasattr(attn_metadata, 'kv_lens_cuda'):
                 attn_metadata.kv_lens_cuda[:batch_size] += 1
             # support attention dp
-            if spec_metadata.all_rank_num_tokens is not None:
-                spec_metadata.all_rank_num_tokens = spec_metadata.all_rank_num_seqs
             inputs = {
                 "input_ids": new_draft_token,
                 "position_ids": position_ids,
@@ -476,6 +481,9 @@ class Eagle3OneModelWorker(nn.Module):
         # restore attn_metadata to support cuda graph
         attn_metadata.restore_from_spec_dec()
         attn_metadata.on_update()
+        # restore all_rank_num_tokens for attention DP
+        if original_all_rank_num_tokens is not None:
+            attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
 
         # prepare next new tokens to support overlap scheduler
         next_new_tokens = accepted_tokens[
@@ -493,40 +501,6 @@ class Eagle3OneModelWorker(nn.Module):
             'next_draft_tokens': next_draft_tokens,
             'next_new_tokens': next_new_tokens,
         }
-
-    def _sample_tokens_for_batch(
-        self,
-        logits: torch.Tensor,
-        spec_metadata: Eagle3OneModelSpecMetadata,
-        num_contexts: int,
-        batch_size: int,
-    ) -> torch.Tensor:
-        """
-        Sample tokens from logits using per-request sampling parameters.
-        Supports both greedy and non-greedy sampling.
-
-        Args:
-            logits: [num_tokens, vocab_size] - Logits to sample from
-            spec_metadata: Metadata containing sampling parameters
-            batch_size: Number of requests in the batch
-
-        Returns:
-            sampled_tokens: [num_tokens] - Sampled token ids
-        """
-        if spec_metadata.allow_advanced_sampling:
-            num_gens = batch_size - num_contexts
-            num_tokens = num_contexts + num_gens * (self.max_draft_len + 1)
-
-            temperatures = spec_metadata.temperatures[:num_tokens]
-            top_ks = spec_metadata.top_ks[:num_tokens]
-            top_ps = spec_metadata.top_ps[:num_tokens]
-
-            sampled_tokens = sampling_batch_spec_dec_one_model(
-                logits, temperatures, top_ks, top_ps)
-        else:
-            sampled_tokens = torch.argmax(logits, dim=-1)
-
-        return sampled_tokens
 
     def sample_and_accept_draft_tokens(
         self,
@@ -578,7 +552,7 @@ class Eagle3OneModelWorker(nn.Module):
         draft_model: nn.Module,
     ):
         '''
-        Sampling draft tokens.
+        Sampling draft tokens with support for non-greedy sampling.
 
         Args:
             logits: torch.Tensor
@@ -649,8 +623,3 @@ class Eagle3OneModelWorker(nn.Module):
             "attn_metadata": attn_metadata,
             "spec_metadata": spec_metadata,
         }
-
-    def set_guided_decoder(self,
-                           guided_decoder: CapturableGuidedDecoder) -> bool:
-        self.guided_decoder = guided_decoder
-        return True

@@ -1,3 +1,4 @@
+import math
 from functools import partial
 from typing import Dict, List, Tuple
 
@@ -8,6 +9,8 @@ from torch.fx import GraphModule, Node
 from ...custom_ops.quant import (
     FP4_GLOBAL_SCALE_MAX,
     FP8_MAX,
+    TRTLLM_NVFP4_COLUMN_SIZE,
+    TRTLLM_NVFP4_ROW_SIZE,
     TRTLLM_NVFP4_SCALING_VECTOR_SIZE,
     is_column_major,
 )
@@ -123,7 +126,7 @@ class Quantization(BaseTransform):
             cnt += 1
 
         return gm, TransformInfo(
-            skipped=False, num_matches=cnt, is_clean=False, has_valid_shapes=True
+            skipped=False, num_matches=cnt, is_clean=False, has_valid_shapes=(cnt == 0)
         )
 
     def _insert_quantized_linear(
@@ -317,20 +320,28 @@ class NVFP4LinearQuantizationFromConfig(Quantization):
     def scale_names(self) -> List[str]:
         return ["input_scale", "weight_scale", "alpha"]
 
+    def _pad_m_n(self, m: int, n: int) -> Tuple[int, int]:
+        """Pad m and n to be divisible by 128 and 4 respectively.
+        Check cpp/tensorrt_llm/plugins/fp4GemmPlugin/fp4GemmPlugin.cpp for more details.
+        """
+        padded_m = math.ceil(m / TRTLLM_NVFP4_ROW_SIZE) * TRTLLM_NVFP4_ROW_SIZE
+        padded_n = math.ceil(n / TRTLLM_NVFP4_COLUMN_SIZE) * TRTLLM_NVFP4_COLUMN_SIZE
+        return padded_m, padded_n
+
     def default_scales(self, original_weight_shape: Tuple) -> Dict[str, torch.Tensor]:
         m, n = original_weight_shape
-        # scaling factors m is padded along 128 and n is padded along 4.
-        # check cpp/tensorrt_llm/plugins/fp4GemmPlugin/fp4GemmPlugin.cpp for more details.
         n = n // TRTLLM_NVFP4_SCALING_VECTOR_SIZE
-        padded_m = (m + 127) // 128 * 128
-        padded_n = (n + 3) // 4 * 4
+        padded_m, padded_n = self._pad_m_n(m, n)
         # definition of scales
         # input_scale: FP4_GLOBAL_SCALE_MAX / input_amax
         # weight_scale_2: FP4_GLOBAL_SCALE_MAX / weight_amax
         # alpha: 1 / (input_scale * weight_scale_2)
         return {
             "input_scale": torch.tensor(1.0 / 6.0),
-            "weight_scale": torch.empty((padded_m * padded_n), dtype=torch.uint8),
+            "weight_scale": torch.empty((padded_m, padded_n), dtype=torch.uint8),
+            # "weight_scale": torch.empty((m, n), dtype=torch.uint8),
+            # "weight_scale": torch.empty(padded_m * padded_n, dtype=torch.float8_e4m3fn),
+            # "weight_scale": torch.empty(padded_m * padded_n, dtype=torch.uint8),
             "alpha": torch.tensor(1.0 / 6.0),
         }
 
@@ -375,12 +386,19 @@ class NVFP4LinearQuantizationFromConfig(Quantization):
                     )
                     state_dict[input_scale_name] = 1 / state_dict[input_scale_name]
                     weight_scale = state_dict[weight_name + "_scale"].view(float4_sf_dtype)
-                    state_dict[weight_name + "_scale"] = (
-                        torch.ops.trtllm.block_scale_interleave(
-                            weight_scale.view(torch.uint8).cpu().contiguous()
-                        )
-                        .view(float4_sf_dtype)
-                        .reshape(-1)
+                    # Round the weight block scale factors to 128x4 and then swizzle.
+                    weight_scale_swizzled = torch.ops.trtllm.block_scale_interleave(
+                        weight_scale.view(torch.uint8).cpu().contiguous()
+                    ).view(float4_sf_dtype)
+
+                    m, n = weight_scale.shape
+                    # scaling factors m is padded along 128 and n is padded along 4.
+                    # check cpp/tensorrt_llm/plugins/fp4GemmPlugin/fp4GemmPlugin.cpp for more details.
+                    padded_m, padded_n = self._pad_m_n(m, n)
+                    swizzled_shape = (padded_m, padded_n)
+
+                    state_dict[weight_name + "_scale"] = weight_scale_swizzled.reshape(
+                        swizzled_shape
                     )
 
     def convert_amax_hook(self, state_dict, prefix, *args, scale_name: str, amax_name: str):
