@@ -111,8 +111,6 @@ class NemotronHMamba2Mixer(nn.Module):
         # S4D real initialization. These are not discretized!
         # The core is to load them, compute the discrete states, then write the updated state. Keeps the memory bounded
         A = torch.arange(1, self.num_heads + 1)
-        # self.A_log = nn.Parameter(torch.log(A))
-        # self.A_log._no_weight_decay = True
         # Instead of recomputing `-torch.exp(self.A_log.float())` on every forward pass, we will register a hook
         # that sets this appropriately when loading weights.
         self.A_minus = nn.Parameter(-A.float())

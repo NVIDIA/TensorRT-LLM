@@ -1120,6 +1120,7 @@ def init_process_grid_from_config(
         ShardingDim.EP: {"p": ep_rank, "w": ep_size},
         ShardingDim.TP: {"p": tp_rank, "w": tp_size},
     }
+    ad_logger.info(f"EP + TP sharding process grid: {process_grid}")
     config.process_grid = process_grid
     return process_grid
 
