@@ -102,10 +102,6 @@ def torch_moe(
     Unified Mixture-of-Experts (MoE) operator that uses a Mixtral-style dispatch
     (token routing + index_add_ accumulation) and a selectable per-expert MLP.
 
-    Supports both:
-    - Standard MoE with per-expert weight lists (apply_routing_on_input=False)
-    - Llama4 MoE with stacked weight tensors (apply_routing_on_input=True)
-
     Parameters:
         x (torch.Tensor): Input tensor of shape (B, H) or (B, S, H), where B is the batch size,
             S is the sequence length, and H is the hidden size.
@@ -113,87 +109,31 @@ def torch_moe(
             of the selected experts for each token. Only experts within range [0,num_experts) is processed
         routing_weights (torch.Tensor): A tensor of shape (B, TOP_K) or (B*S, TOP_K) containing the normalized
             routing weights for the selected experts.
-            - Standard MoE: softmax normalized weights
-            - Llama4 MoE: sigmoid activated weights
-        w1_weight:
-            For per-expert lists:
-              • is_gated_mlp==True: List of W1 with shape (I, H)  — "gate" projection.
-              • is_gated_mlp==False: List of W_up with shape (I, H) — up projection.
-            For stacked tensors (Llama4):
-              • Single-element list containing stacked w3_w1 tensor with shape (E, 2*I, H) in TRT-LLM format
-        w2_weight:
-            For per-expert lists:
-              • List of W2/W_down with shape (H, I) — down projection.
-            For stacked tensors (Llama4):
-              • Single-element list containing stacked w2 tensor with shape (E, H, I) in TRT-LLM format
-        w3_weight:
-            For per-expert lists with gated_mlp:
-              • List of W3 with shape (I, H) — "up" (second) projection in gated MLP.
-            For is_gated_mlp==False or stacked tensors:
-              • pass an empty list []; ignored.
-        is_gated_mlp:
-            Selects the per-expert MLP computation:
-              • is_gated_mlp==True (default, Mixtral/DeepSeek/Llama4-style):
-                    y = W2( act(W1 x) * (W3 x) )
-              • is_gated_mlp==False (NemotronH-style 2-layer MLP):
-                    y = W_down( act(W_up x) )
-        act_fn:
-            Elementwise activation applied inside the expert MLP.
+        w1_weight: List of per-expert weight tensors of up projection.
+        w2_weight: List of per-expert weight tensors of down projection.
+        w3_weight: List of per-expert weight tensors of gate projection.
+        is_gated_mlp: If True, use a gated MLP. If False, use a simple MLP.
+        act_fn: Activation function applied inside the expert MLP.
             Supported: ActivationType.Silu (default), ActivationType.Relu2 (ReLU then square).
-        apply_routing_on_input:
-            If True (Llama4 pattern): multiply routing weights with INPUT before MLP
-                Result: act(input * routing_weight) - routing affects activation
-            If False (standard pattern): multiply routing weights with OUTPUT after MLP
-                Result: act(input) * routing_weight - routing scales output
+        apply_routing_on_input: If True, multiply routing weights with INPUT before MLP
+                                This means: silu(input * routing_weight)
+                                If False, multiply routing weights with OUTPUT after MLP
+                                This means: silu(input) * routing_weight
     Returns:
         torch.Tensor: Output tensor with the same shape as the input x.
     """
     torch_act_fn = _resolve_torch_fn(act_fn)
 
-    # Detect if using stacked tensor format (Llama4) vs per-expert lists (standard)
-    is_stacked = len(w1_weight) == 1 and w1_weight[0].ndim == 3
-
-    # Todo: either change torch_moe to use a single condition, or refactor this code.
-    # it should be :
-    # is_gated_mlp:
-    #    stacked:
-    #        ...
-    #    not stacked:
-    #   .
-    # else:
-    #    assert (not stacked)
-    #    ...
-    #   .
-    if is_stacked:
-        # Llama4 stacked tensor format - only supports gated_mlp
-        if not is_gated_mlp:
-            raise ValueError("Stacked tensor format only supports gated MLP style")
-
-        w3_w1_stacked = w1_weight[0]  # (E, 2*I, H)
-        intermediate_size = w3_w1_stacked.shape[1] // 2
-        w2_stacked = w2_weight[0]  # (E, H, I)
-
-        def make_mlp(idx: int):
-            gate_up = w3_w1_stacked[idx]  # (2*I, H)
-            W3 = gate_up[:intermediate_size, :]  # (I, H)
-            W1 = gate_up[intermediate_size:, :]  # (I, H)
-            W2 = w2_stacked[idx]  # (H, I)
-            weight_dtype = W1.dtype
-            return lambda inp: F.linear(
-                torch_act_fn(F.linear(inp.to(weight_dtype), W1))
-                * F.linear(inp.to(weight_dtype), W3),
-                W2,
-            )
-
-        mlps = [make_mlp(idx) for idx in range(w3_w1_stacked.shape[0])]
-
-    elif is_gated_mlp:
+    mlps = []
+    if is_gated_mlp:
         # Standard per-expert list format with gated MLP
         def make_mlp(i: int):
             W1 = w1_weight[i]  # (I, H)
             W2 = w2_weight[i]  # (H, I)
             W3 = w3_weight[i]  # (I, H)
-            return lambda inp: F.linear(torch_act_fn(F.linear(inp, W1)) * F.linear(inp, W3), W2)
+            return lambda inp: F.linear(
+                torch_act_fn(F.linear(inp.to(W1.dtype), W1)) * F.linear(inp.to(W3.dtype), W3), W2
+            )
 
         mlps = [make_mlp(i) for i in range(len(w1_weight))]
 

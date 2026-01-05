@@ -188,7 +188,7 @@ def flattened_mha_with_cache(
     k: torch.Tensor,
     v: torch.Tensor,
     # STANDARD METADATA
-    batch_info: torch.Tensor,
+    batch_info_host: torch.Tensor,
     seq_len: torch.Tensor,
     input_pos: torch.Tensor,
     cache_loc: torch.Tensor,
@@ -210,7 +210,7 @@ def flattened_mha_with_cache(
     NOTE: this op can also handle seq_len==0, which might be useful for CUDAGRAPH.
     """
     # check for sequence info and truncate metadata
-    num_prefill, num_prefill_tokens, num_decode = batch_info.tolist()
+    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
     num_seq = num_prefill + num_decode
 
     seq_len = seq_len[:num_seq]
@@ -290,7 +290,7 @@ def flattened_mha_fake(
     k: torch.Tensor,
     v: torch.Tensor,
     # STANDARD METADATA
-    batch_info: torch.Tensor,
+    batch_info_host: torch.Tensor,
     seq_len: torch.Tensor,
     input_pos: torch.Tensor,
     cache_loc: torch.Tensor,
@@ -337,7 +337,7 @@ class TritonAttention(AttentionDescriptor):
 
     @classmethod
     def get_standard_metadata_args(cls) -> List[str]:
-        return ["batch_info", "seq_len", "input_pos", "cache_loc", "cu_seqlen"]
+        return ["batch_info_host", "seq_len", "input_pos", "cache_loc", "cu_seqlen"]
 
     @classmethod
     def get_cache_initializers(

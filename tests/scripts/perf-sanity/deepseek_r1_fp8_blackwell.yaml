@@ -1,0 +1,99 @@
+metadata:
+  model_name: deepseek_r1_0528_fp8
+  supported_gpus:
+  - B200
+  - B300
+server_configs:
+  - name: "r1_fp8_dep8_mtp1_1k1k"
+    model_name: "deepseek_r1_0528_fp8"
+    tensor_parallel_size: 8
+    moe_expert_parallel_size: 8
+    pipeline_parallel_size: 1
+    max_batch_size: 512
+    max_num_tokens: 8192
+    attn_backend: "TRTLLM"
+    enable_attention_dp: true
+    attention_dp_config:
+      batching_wait_iters: 0
+      enable_balance: true
+      timeout_iters: 60
+    moe_config:
+      backend: 'DEEPGEMM'
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 512
+    kv_cache_config:
+      dtype: 'fp8'
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.8
+    speculative_config:
+      decoding_type: 'MTP'
+      num_nextn_predict_layers: 1
+    client_configs:
+      - name: "con4096_iter5_1k1k"
+        concurrency: 4096
+        iterations: 5
+        isl: 1024
+        osl: 1024
+        random_range_ratio: 0.8
+        backend: "openai"
+
+  - name: "r1_fp8_tep8_mtp3_1k1k"
+    model_name: "deepseek_r1_0528_fp8"
+    tensor_parallel_size: 8
+    moe_expert_parallel_size: 8
+    pipeline_parallel_size: 1
+    max_batch_size: 64
+    max_num_tokens: 8192
+    attn_backend: "TRTLLM"
+    enable_attention_dp: false
+    moe_config:
+      backend: 'DEEPGEMM'
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 64
+    kv_cache_config:
+      dtype: 'fp8'
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.8
+    speculative_config:
+      decoding_type: 'MTP'
+      num_nextn_predict_layers: 3
+    client_configs:
+      - name: "con64_iter10_1k1k"
+        concurrency: 64
+        iterations: 10
+        isl: 1024
+        osl: 1024
+        random_range_ratio: 0.8
+        backend: "openai"
+
+  - name: "r1_fp8_tp8_mtp3_1k1k"
+    model_name: "deepseek_r1_0528_fp8"
+    tensor_parallel_size: 8
+    moe_expert_parallel_size: 1
+    pipeline_parallel_size: 1
+    max_batch_size: 8
+    max_num_tokens: 8192
+    attn_backend: "TRTLLM"
+    enable_attention_dp: false
+    moe_config:
+      backend: 'TRTLLM'
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 8
+    kv_cache_config:
+      dtype: 'fp8'
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.8
+    speculative_config:
+      decoding_type: 'MTP'
+      num_nextn_predict_layers: 3
+    client_configs:
+      - name: "con8_iter10_1k1k"
+        concurrency: 8
+        iterations: 10
+        isl: 1024
+        osl: 1024
+        random_range_ratio: 0.8
+        backend: "openai"

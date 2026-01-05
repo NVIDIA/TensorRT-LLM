@@ -602,43 +602,54 @@ class PyTorchModelEngine(ModelEngine):
         # Set the value back to the original value after all warmups are complete
         self.enable_spec_decode = self.is_spec_decode
 
-    def _run_torch_compile_warmup(self, resource_manager: ResourceManager):
-        """Runs warmup iterations to specialize torch.compile kernels."""
-        if not self._torch_compile_enabled:
-            return
-
-        logger.info("Running torch.compile warmup...")
+    def _general_warmup(self,
+                        resource_manager: ResourceManager,
+                        reverse: bool = False):
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
         curr_max_num_tokens = min(
             kv_cache_manager.get_num_available_tokens(
                 self.original_max_draft_len), self.max_num_tokens,
             self.batch_size * (self.max_seq_len - 1))
+        max_batch_size = min(
+            self.batch_size,
+            curr_max_num_tokens // (1 + self.runtime_draft_len))
 
         warmup_requests_configs = {
             (1, 1),  # Specialize for 1 token.
-            (self.batch_size,
-             self.batch_size),  # max_batch_size, pure generation
+            (max_batch_size, max_batch_size),  # max_batch_size, pure generation
             (2, 0),  # Non-one, pure context
             (curr_max_num_tokens, 0),  # max_num_tokens, pure context
         }
 
+        warmup_requests_configs = sorted(list(warmup_requests_configs),
+                                         reverse=reverse)
+
+        for num_tokens, num_gen_tokens in warmup_requests_configs:
+            with self._release_batch_context(
+                    self._create_warmup_request(resource_manager, num_tokens,
+                                                num_gen_tokens),
+                    resource_manager) as batch:
+                if batch is None:
+                    continue  # Not enough KV cache space
+                logger.info(
+                    f"Run warmup with {num_tokens} tokens, include {num_gen_tokens} generation tokens"
+                )
+                self.forward(batch,
+                             new_tensors_device=None,
+                             resource_manager=resource_manager)
+                torch.cuda.synchronize()
+
+    def _run_torch_compile_warmup(self, resource_manager: ResourceManager):
+        """Runs warmup iterations to specialize torch.compile kernels."""
+        if not self._torch_compile_enabled:
+            return
+
+        logger.info("Running torch.compile warmup...")
+
         # Disable cuda graph capture here so that we can properly capture it later
         with self.no_cuda_graph():
-            for num_tokens, num_gen_tokens in warmup_requests_configs:
-                with self._release_batch_context(
-                        self._create_warmup_request(resource_manager,
-                                                    num_tokens, num_gen_tokens),
-                        resource_manager) as batch:
-                    if batch is None:
-                        continue  # Not enough KV cache space
-                    logger.info(
-                        f"Run warmup with {num_tokens} tokens, include {num_gen_tokens} generation tokens"
-                    )
-                    self.forward(batch,
-                                 new_tensors_device=None,
-                                 resource_manager=resource_manager)
-                    torch.cuda.synchronize()
+            self._general_warmup(resource_manager)
 
     def _run_autotuner_warmup(self, resource_manager: ResourceManager):
         """Runs a forward pass to populate the autotuner cache."""
@@ -762,7 +773,7 @@ class PyTorchModelEngine(ModelEngine):
                                                      resource_manager) as batch:
                         if batch is None:
                             # No KV cache space, cannot continue capturing graphs
-                            return
+                            continue
 
                         logger.info(
                             f"Run generation-only CUDA graph warmup for batch size={bs}, draft_len={draft_len}, max_seq_len={max_seq_len}"
@@ -812,6 +823,27 @@ class PyTorchModelEngine(ModelEngine):
                     gc.collect()
                     torch.cuda.empty_cache()
 
+        # When using piecewise cuda graph, the logits may suffer severe memory faction problem.
+        # When the num of requests is growing, the block allocated by torch cannot be reused.
+        # So after piecewise cuda graph capture, a request with most requests is triggered to make
+        # sure that large enough blocks are allocated and can be correctly reused.
+        for num_tokens in piecewise_cuda_graph_num_tokens:
+            warmup_request = self._create_warmup_request(resource_manager,
+                                                         num_tokens,
+                                                         0,
+                                                         least_requests=False)
+            with self._release_batch_context(warmup_request,
+                                             resource_manager) as batch:
+                if batch is None:
+                    continue
+                logger.info(
+                    f"Run piecewise CUDA graph warmup for num tokens={num_tokens} with most requests"
+                )
+                self.forward(batch,
+                             new_tensors_device=None,
+                             resource_manager=resource_manager)
+                torch.cuda.synchronize()
+
     ### Helper methods promoted from the original warmup method ###
 
     @contextlib.contextmanager
@@ -842,8 +874,11 @@ class PyTorchModelEngine(ModelEngine):
             return 0
 
     def _create_warmup_request(
-            self, resource_manager: ResourceManager, num_tokens: int,
-            num_gen_tokens: int) -> Optional[ScheduledRequests]:
+            self,
+            resource_manager: ResourceManager,
+            num_tokens: int,
+            num_gen_requests: int,
+            least_requests: bool = True) -> Optional[ScheduledRequests]:
         """Creates a generic dummy ScheduledRequests object for warmup."""
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
@@ -857,31 +892,52 @@ class PyTorchModelEngine(ModelEngine):
             return None
 
         num_extra_decoding_steps = self._get_num_extra_decoding_steps()
-        if num_extra_decoding_steps > 0:
-            return None  # Disable autotuning for fused drafting loops for now.
+
+        if num_gen_requests > self.batch_size:
+            return None
+        num_gen_tokens = num_gen_requests * (1 + self.runtime_draft_len)
+        if num_gen_tokens > self.max_num_tokens:
+            return None
 
         num_ctx_tokens = num_tokens - num_gen_tokens
         num_ctx_requests = 0
         ctx_requests = []
         gen_requests = []
 
-        max_seq_len = self.max_seq_len - 1
+        # For drafting loops, reduce max_seq_len to leave room for extra decoding steps
+        max_seq_len = self.max_seq_len - 1 - num_extra_decoding_steps
+        if max_seq_len < 1:
+            return None  # Not enough sequence length for drafting loop
         num_full_seqs = 0
         num_left_over_tokens = 0
 
+        max_context_requests = self.batch_size - num_gen_requests
+        if max_context_requests * max_seq_len < num_ctx_tokens:
+            return None
+
         if num_ctx_tokens > 0:
-            num_full_seqs = num_ctx_tokens // max_seq_len
-            num_left_over_tokens = num_ctx_tokens - num_full_seqs * max_seq_len
+            if least_requests:
+                num_full_seqs = num_ctx_tokens // max_seq_len
+                num_left_over_tokens = num_ctx_tokens - num_full_seqs * max_seq_len
+
+            else:
+                max_bs = min(num_ctx_tokens, max_context_requests)
+                if num_ctx_tokens % max_bs == 0:
+                    num_full_seqs = max_bs
+                else:
+                    num_full_seqs = max_bs - 1
+                max_seq_len = num_ctx_tokens // num_full_seqs
+                num_left_over_tokens = num_ctx_tokens - max_seq_len * num_full_seqs
             num_ctx_requests = num_full_seqs + (1 if num_left_over_tokens > 0
                                                 else 0)
 
-        if num_ctx_requests + num_gen_tokens > self.batch_size:
+        if num_ctx_requests + num_gen_requests > self.batch_size:
             return None  # Not enough batch size to fill the request
 
         blocks_to_use = num_full_seqs * math.ceil(
             max_seq_len / kv_cache_manager.tokens_per_block) + math.ceil(
                 num_left_over_tokens /
-                kv_cache_manager.tokens_per_block) + num_gen_tokens
+                kv_cache_manager.tokens_per_block) + num_gen_requests
 
         if blocks_to_use > available_blocks:
             return None
@@ -896,23 +952,28 @@ class PyTorchModelEngine(ModelEngine):
                 token_nums=ctx_token_nums,
                 is_gen=False,
                 max_num_draft_tokens=self.runtime_draft_len,
-                use_mrope=self.use_mrope)
+                use_mrope=self.use_mrope,
+                num_extra_decoding_steps=num_extra_decoding_steps)
 
             if spec_resource_manager is not None:
                 spec_resource_manager.add_dummy_requests(
                     request_ids=list(range(num_ctx_requests)))
 
-        if num_gen_tokens > 0:
+        if num_gen_requests > 0:
             gen_requests = kv_cache_manager.add_dummy_requests(
-                list(range(num_ctx_requests,
-                           num_ctx_requests + num_gen_tokens)),
-                token_nums=[1] * num_gen_tokens,
+                list(
+                    range(num_ctx_requests,
+                          num_ctx_requests + num_gen_requests)),
+                token_nums=[1] * num_gen_requests,
                 is_gen=True,
                 max_num_draft_tokens=self.max_total_draft_tokens,
-                use_mrope=self.use_mrope)
+                use_mrope=self.use_mrope,
+                max_beam_width=self.max_beam_width,
+                num_extra_decoding_steps=num_extra_decoding_steps)
             if spec_resource_manager is not None:
                 spec_resource_manager.add_dummy_requests(request_ids=list(
-                    range(num_ctx_requests, num_ctx_requests + num_gen_tokens)))
+                    range(num_ctx_requests, num_ctx_requests +
+                          num_gen_requests)))
 
         result = ScheduledRequests()
         result.context_requests = ctx_requests
@@ -1009,7 +1070,12 @@ class PyTorchModelEngine(ModelEngine):
         num_attention_heads = getattr(config, 'num_attention_heads', None)
         num_key_value_heads = getattr(config, 'num_key_value_heads', None)
 
-        if num_attention_heads is not None and num_key_value_heads is not None:
+        # Calculate the number of attention heads per KV head (GQA ratio)
+        if isinstance(num_key_value_heads, (list, tuple)):
+            # Filter out invalid KV heads, default to 0 if no valid KV heads are found
+            num_key_value_heads = min(
+                (kv for kv in num_key_value_heads if kv and kv > 0), default=0)
+        if num_attention_heads and num_key_value_heads:
             num_heads_per_kv = num_attention_heads // num_key_value_heads
         else:
             num_heads_per_kv = 1
@@ -1484,7 +1550,6 @@ class PyTorchModelEngine(ModelEngine):
 
         return lora_params
 
-    @torch.compile(options={"max-autotune": True})
     def _update_draft_input_tensors(self,
                                     num_accepted_tokens_device: torch.Tensor,
                                     new_tokens_device: torch.Tensor,
@@ -1609,7 +1674,6 @@ class PyTorchModelEngine(ModelEngine):
 
         return inputs, self.gather_ids_cuda[:num_generation_tokens]
 
-    @torch.compile(options={"max-autotune": True})
     def _update_target_input_tensors(
             self, num_accepted_tokens_device: torch.Tensor,
             new_tokens_device: torch.Tensor,

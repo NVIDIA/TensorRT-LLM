@@ -17,7 +17,6 @@ import re
 import socket
 import subprocess
 import sys
-import time
 from collections import OrderedDict
 from datetime import datetime
 
@@ -235,63 +234,6 @@ class TextWriter:
         print(f"Generated CPU file: {cpu_file}")
         return cpu_model
 
-    def write_trtllm_version(self):
-        """Write TensorRT-LLM version information to trtllm_version.txt."""
-        version_info = "[TensorRT-LLM] TensorRT-LLM version: unknown"
-
-        try:
-            # Try to import tensorrt_llm and get version
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    "-c",
-                    'import tensorrt_llm; print(f"[TensorRT-LLM] TensorRT-LLM version: {tensorrt_llm.__version__}")',
-                ],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-
-            if result.returncode == 0 and result.stdout.strip():
-                version_info = result.stdout.strip()
-            else:
-                # Print error for debugging
-                print(f"TensorRT-LLM import failed (returncode={result.returncode}):")
-                if result.stderr:
-                    print(f"  stderr:\n{result.stderr}")
-
-                # Try one more time with a simple sleep
-                print("Retrying after 10 seconds...")
-                time.sleep(10)
-                result = subprocess.run(
-                    [
-                        sys.executable,
-                        "-c",
-                        "import tensorrt_llm; "
-                        'print(f"[TensorRT-LLM] TensorRT-LLM version: {tensorrt_llm.__version__}")',
-                    ],
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                )
-
-                if result.returncode == 0 and result.stdout.strip():
-                    version_info = result.stdout.strip()
-                    print("TensorRT-LLM version retrieved on second attempt")
-                else:
-                    print(f"TensorRT-LLM import failed again (returncode={result.returncode}):")
-                    if result.stderr:
-                        print(f"  stderr:\n{result.stderr}")
-
-        except Exception as e:
-            print(f"Error getting TensorRT-LLM version: {e}")  # Keep default unknown version
-
-        trtllm_file = os.path.join(self.output_dir, "trtllm_version.txt")
-        with open(trtllm_file, "w") as f:
-            f.write(version_info)
-        print(f"Generated TensorRT-LLM version file: {trtllm_file}")
-        return version_info
-
     def write_driver_info(self, data):
         """Write GPU driver information to driver.txt."""
         driver_version = data.get("nvidia_driver_version", "unknown")
@@ -307,13 +249,11 @@ class TextWriter:
         gpu_info = self.write_gpu_info(data)
         cpu_info = self.write_cpu_info(data)
         driver_info = self.write_driver_info(data)
-        trtllm_info = self.write_trtllm_version()
 
         return {
             "GPU": gpu_info,
             "CPU": cpu_info,
             "Driver": driver_info,
-            "TensorRT-LLM": trtllm_info,
         }
 
 
@@ -347,7 +287,6 @@ def main():
     print("  - gpu.txt")
     print("  - cpu.txt")
     print("  - driver.txt")
-    print("  - trtllm_version.txt")
 
     print("\n=== Collected Information ===")
     for key, value in system_data.items():

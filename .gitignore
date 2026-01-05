@@ -63,6 +63,7 @@ docs/source/**/*.rst
 .coverage.*
 results_trt/
 llm-test-workspace/
+ad-test-workspace/
 
 # build/debug
 *.safetensors

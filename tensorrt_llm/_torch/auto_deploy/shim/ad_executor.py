@@ -379,7 +379,7 @@ def maybe_pad_for_cuda_graph(func):
 
         # check if we have a dummy request to use
         if self.padding_dummy_request is None:
-            ad_logger.error("No CUDA graph padding possible due to missing dummy request.")
+            ad_logger.info("No CUDA graph padding possible due to missing dummy request.")
             return _call_func()
 
         # pad the scheduled requests with the dummy request

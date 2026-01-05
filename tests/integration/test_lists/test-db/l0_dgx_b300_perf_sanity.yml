@@ -16,9 +16,9 @@ l0_dgx_b300_perf_sanity:
       backend: pytorch
       orchestrator: mpi
   tests:
-  - perf/test_perf.py::test_perf[perf_sanity_upload-l0_dgx_b200-r1_fp8_dep8_mtp1_1k1k] TIMEOUT (180)
-  - perf/test_perf.py::test_perf[perf_sanity_upload-l0_dgx_b200-r1_fp8_tep8_mtp3_1k1k] TIMEOUT (180)
-  - perf/test_perf.py::test_perf[perf_sanity_upload-l0_dgx_b200-r1_fp8_tp8_mtp3_1k1k] TIMEOUT (180)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp8_blackwell-r1_fp8_dep8_mtp1_1k1k] TIMEOUT (180)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp8_blackwell-r1_fp8_tep8_mtp3_1k1k] TIMEOUT (180)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp8_blackwell-r1_fp8_tp8_mtp3_1k1k] TIMEOUT (180)
 
 - condition:
     ranges:
@@ -36,6 +36,6 @@ l0_dgx_b300_perf_sanity:
       backend: pytorch
       orchestrator: mpi
   tests:
-  - perf/test_perf.py::test_perf[perf_sanity_upload-l0_dgx_b200-r1_fp4_v2_dep4_mtp1_1k1k] TIMEOUT (180)
-  - perf/test_perf.py::test_perf[perf_sanity_upload-l0_dgx_b200-r1_fp4_v2_tep4_mtp3_1k1k] TIMEOUT (180)
-  - perf/test_perf.py::test_perf[perf_sanity_upload-l0_dgx_b200-r1_fp4_v2_tp4_mtp3_1k1k] TIMEOUT (180)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp4_v2_blackwell-r1_fp4_v2_dep4_mtp1_1k1k] TIMEOUT (180)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp4_v2_blackwell-r1_fp4_v2_tep4_mtp3_1k1k] TIMEOUT (180)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp4_v2_blackwell-r1_fp4_v2_tp4_mtp3_1k1k] TIMEOUT (180)

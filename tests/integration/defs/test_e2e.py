@@ -3175,7 +3175,6 @@ def test_multi_nodes_eval(model_path, tp_size, pp_size, ep_size, eval_task,
         f"--pp_size={pp_size}",
         f"--kv_cache_free_gpu_memory_fraction={_MEM_FRACTION_80}",
         "--max_batch_size=32",
-        "--enable_attention_dp",
         "--backend=pytorch",
     ]
 

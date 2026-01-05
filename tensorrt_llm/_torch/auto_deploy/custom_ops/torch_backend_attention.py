@@ -253,7 +253,7 @@ def torch_backend_mha_with_cache(
     k: torch.Tensor,
     v: torch.Tensor,
     # STANDARD METADATA
-    batch_info: torch.Tensor,
+    batch_info_host: torch.Tensor,
     seq_len: torch.Tensor,
     input_pos: torch.Tensor,
     cache_loc: torch.Tensor,
@@ -278,7 +278,7 @@ def torch_backend_mha_with_cache(
     b, s = q.shape[:2]
 
     # get cleaned up metadata
-    num_prefill, num_prefill_tokens, num_decode = batch_info.tolist()
+    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
     num_seq = num_prefill + num_decode
     seq_len = seq_len[:num_seq]
     input_pos = input_pos[:num_seq]
@@ -352,7 +352,7 @@ def torch_backend_mha_with_cache_fake(
     k: torch.Tensor,
     v: torch.Tensor,
     # STANDARD METADATA
-    batch_info: torch.Tensor,
+    batch_info_host: torch.Tensor,
     seq_len: torch.Tensor,
     input_pos: torch.Tensor,
     cache_loc: torch.Tensor,
@@ -400,7 +400,7 @@ class TorchBackendAttention(AttentionDescriptor):
 
     @classmethod
     def get_standard_metadata_args(cls) -> List[str]:
-        return ["batch_info", "seq_len", "input_pos", "cache_loc", "cu_seqlen"]
+        return ["batch_info_host", "seq_len", "input_pos", "cache_loc", "cu_seqlen"]
 
     @classmethod
     def get_cache_initializers(

@@ -178,8 +178,8 @@ struct LowLatencyLayerNorm
 #if (defined(__CUDA_ARCH__) && (__CUDACC_VER_MAJOR__ >= 12))
         if constexpr (arch::is_major_v<9> || arch::is_major_v<10>)
         {
-            asm volatile("griddepcontrol.wait;\n");
-            asm volatile("griddepcontrol.launch_dependents;\n");
+            cudaGridDependencySynchronize();
+            cudaTriggerProgrammaticLaunchCompletion();
         }
 #endif
         load_to_register(&param.input[work_id * param.n], data, param.n);

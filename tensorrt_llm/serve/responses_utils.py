@@ -974,6 +974,7 @@ def _create_output_content(
     available_tools = _get_chat_completion_function_tools(tools)
 
     for output in final_res.outputs:
+        calls = []
         text, reasoning_text = _apply_reasoning_parser(reasoning_parser,
                                                        output.index,
                                                        output.text, False)

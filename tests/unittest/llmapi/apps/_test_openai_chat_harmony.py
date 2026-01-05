@@ -1,12 +1,18 @@
 import json
+import os
 
 import openai
 import pytest
+from utils.llm_data import llm_datasets_root
 
 from ..test_llm import get_model_path
 from .openai_server import RemoteOpenAIServer
 
 pytestmark = pytest.mark.threadleak(enabled=False)
+os.environ['TIKTOKEN_RS_CACHE_DIR'] = os.path.join(llm_datasets_root(),
+                                                   'tiktoken_vocab')
+os.environ['TIKTOKEN_ENCODINGS_BASE'] = os.path.join(llm_datasets_root(),
+                                                     'tiktoken_vocab')
 
 
 @pytest.fixture(scope="module", ids=["GPT-OSS-20B"])
@@ -114,8 +120,10 @@ async def test_tool_calls(client: openai.AsyncOpenAI, model: str):
         model=model,
         messages=messages,
         tools=[tool_get_current_weather],
+        extra_body={"top_k": 1},
     )
     message = response.choices[0].message
+    print(message)
     assert response.choices[0].finish_reason == "tool_calls"
     assert message.content is None
     assert message.reasoning
@@ -137,6 +145,7 @@ async def test_tool_calls(client: openai.AsyncOpenAI, model: str):
     response = await client.chat.completions.create(
         model=model,
         messages=messages,
+        extra_body={"top_k": 1},
     )
     message = response.choices[0].message
     assert message.content
@@ -205,6 +214,7 @@ async def test_streaming_tool_call(client: openai.AsyncOpenAI, model: str):
         messages=messages,
         tools=[tool_get_current_weather],
         stream=True,
+        extra_body={"top_k": 1},
     )
     tool_name: str
     reasoning_chunks: list[str] = []

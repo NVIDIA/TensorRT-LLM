@@ -328,7 +328,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
         self.sparse_mla_topk = self.sparse_attention_config.index_topk
         self.enable_indexer_skip = self.sparse_attention_config.skip_indexer_for_short_seqs
-        capture_graph = torch.cuda.is_current_stream_capturing()
+        capture_graph = self.is_cuda_graph
 
         self.indexer_k_cache_block_offsets = self.get_empty(
             self.cuda_graph_buffers,
@@ -550,7 +550,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.max_draft_tokens = max_draft_len
         init_shape = self.kv_lens_expanded_host.shape[0]
         if self.max_num_sequences * (1 + self.max_draft_tokens) != init_shape:
-            capture_graph = torch.cuda.is_current_stream_capturing()
+            capture_graph = self.is_cuda_graph
             self.create_expanded_buffers(capture_graph=capture_graph)
 
     def prepare_dense_topk_indices(self,

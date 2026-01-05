@@ -961,8 +961,8 @@ def preprocess_weights_for_mixed_gemm(
         tensor = tensor.unsqueeze(0)
     elif sm_ >= 90:
         sm_ = 80
-    if sm_ > 90:
-        sm_ = 80
+    if sm_ == 100 or sm_ == 103:
+        do_weight_interleave = False
 
     permutation_map = {
         "16_8": [0, 1, 8, 9, 2, 3, 10, 11, 4, 5, 12, 13, 6, 7, 14, 15],
@@ -990,7 +990,7 @@ def preprocess_weights_for_mixed_gemm(
     assert (num_rows % B_ROWS_PER_MMA == 0)
     assert (num_cols % MMA_SHAPE_N == 0)
 
-    if do_weight_interleave:
+    if do_weight_interleave and sm_ < 100:
         row_idx_list = [(row_idx // B_ROWS_PER_MMA) * B_ROWS_PER_MMA +
                         permutation_map[f"{BITS_PER_ELT_A}_{BITS_PER_ELT_B}"][
                             row_idx % B_ROWS_PER_MMA]

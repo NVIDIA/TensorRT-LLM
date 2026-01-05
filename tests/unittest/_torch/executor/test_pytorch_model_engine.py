@@ -101,7 +101,8 @@ def _create_request(num_tokens, req_id: int):
     return result
 
 
-def create_model_engine_and_kvcache(llm_args: TorchLlmArgs = None):
+def create_model_engine_and_kvcache(llm_args: TorchLlmArgs = None,
+                                    execution_stream: torch.cuda.Stream = None):
     tokens_per_block = 1
     max_tokens = 258  # Atleast 1 more than the max seq len
     num_layers = 1
@@ -135,6 +136,7 @@ def create_model_engine_and_kvcache(llm_args: TorchLlmArgs = None):
         max_batch_size=batch_size,
         mapping=mapping,
         dtype=tensorrt_llm.bindings.DataType.HALF,
+        execution_stream=execution_stream,
     )
 
     return model_engine, kv_cache_manager
@@ -479,6 +481,41 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                    'seq_lens') and attn_metadata.seq_lens is not None:
             actual_seq_lens = attn_metadata.seq_lens.cpu().tolist()
             self.assertEqual(actual_seq_lens, expected_seq_lens)
+
+    def test_kv_cache_manager_with_execution_stream(self):
+        """Test that KVCacheManager uses the provided execution_stream.
+        """
+        # Create a dedicated execution stream
+        execution_stream = torch.cuda.Stream()
+
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache(
+            execution_stream=execution_stream)
+
+        # Verify the KVCacheManager uses the provided execution stream
+        self.assertEqual(
+            kv_cache_manager._stream.cuda_stream, execution_stream.cuda_stream,
+            "KVCacheManager should use the provided execution_stream")
+
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
+
+        prompt_len = 32
+        requests = [_create_request(prompt_len, 0)]
+
+        batch = ScheduledRequests()
+        batch.context_requests = requests
+        batch.generation_requests = []
+        kv_cache_manager.prepare_resources(batch)
+        with torch.cuda.stream(execution_stream):
+            model_engine.forward(batch, resource_manager)
+
+        # Verify the stream is still the same after forward pass
+        self.assertEqual(
+            kv_cache_manager._stream.cuda_stream, execution_stream.cuda_stream,
+            "KVCacheManager should still use the provided execution_stream after forward"
+        )
+
+        kv_cache_manager.shutdown()
 
 
 if __name__ == "__main__":

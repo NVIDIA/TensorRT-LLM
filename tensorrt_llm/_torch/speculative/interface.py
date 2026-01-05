@@ -1,16 +1,21 @@
 import copy
 import os
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
-from typing import List, Optional, Type
+from typing import TYPE_CHECKING, List, Optional, Type
 
 import torch
+from torch import nn
 
 from tensorrt_llm.logger import logger
 
 from ..._utils import get_sm_version
 from ..attention_backend.trtllm import AttentionBackend, TrtllmAttention
 from ..pyexecutor.resource_manager import BaseResourceManager
+
+if TYPE_CHECKING:
+    from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
 
 # Environment variable name for forcing the number of accepted tokens in speculative decoding
 FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR = "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS"
@@ -351,3 +356,65 @@ class SpecMetadata:
                                                      dtype=torch.float32,
                                                      pin_memory=True),
                                         non_blocking=True)
+
+
+class SpecWorkerBase(nn.Module, ABC):
+    """
+    Base class for speculative decoding workers.
+    Provides common functionality for sampling and token handling.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.guided_decoder: Optional["CapturableGuidedDecoder"] = None
+        self.force_num_accepted_tokens = get_force_num_accepted_tokens()
+
+    @property
+    @abstractmethod
+    def max_draft_len(self) -> int:
+        """
+        Returns the maximum draft length for this worker.
+        Subclasses should override this property.
+        """
+
+    def set_guided_decoder(self,
+                           guided_decoder: "CapturableGuidedDecoder") -> bool:
+        self.guided_decoder = guided_decoder
+        return True
+
+    def _sample_tokens_for_batch(
+        self,
+        logits: torch.Tensor,
+        spec_metadata: SpecMetadata,
+        num_contexts: int,
+        batch_size: int,
+    ) -> torch.Tensor:
+        """
+        Sample tokens from logits using per-request sampling parameters.
+        Supports both greedy and non-greedy sampling.
+
+        Args:
+            logits: [num_tokens, vocab_size] - Logits to sample from
+            spec_metadata: Metadata containing sampling parameters
+            num_contexts: Number of context requests in the batch
+            batch_size: Number of requests in the batch
+
+        Returns:
+            sampled_tokens: [num_tokens] - Sampled token ids
+        """
+        if spec_metadata.allow_advanced_sampling:
+            from .one_model_sampler import sampling_batch_spec_dec_one_model
+
+            num_gens = batch_size - num_contexts
+            num_tokens = num_contexts + num_gens * (self.max_draft_len + 1)
+
+            temperatures = spec_metadata.temperatures[:num_tokens]
+            top_ks = spec_metadata.top_ks[:num_tokens]
+            top_ps = spec_metadata.top_ps[:num_tokens]
+
+            sampled_tokens = sampling_batch_spec_dec_one_model(
+                logits, temperatures, top_ks, top_ps)
+        else:
+            sampled_tokens = torch.argmax(logits, dim=-1)
+
+        return sampled_tokens

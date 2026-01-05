@@ -26,7 +26,7 @@ namespace kernels::moe_comm
 {
 
 // Configuration constants
-static constexpr int kMaxTopK = 16;    // Maximum top-k experts per token
+static constexpr int kMaxTopK = 22;    // Maximum top-k experts per token
 static constexpr int kMaxPayloads = 4; // Maximum number of different payload types
 static constexpr int kMaxRanks = 64;   // Maximum supported EP size
 

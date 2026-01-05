@@ -21,7 +21,10 @@ from ...inputs import (
     BaseMultimodalDummyInputsBuilder,
     BaseMultimodalInputProcessor,
     ExtraProcessedInputs,
+    MultimodalPlaceholderMetadata,
+    MultimodalPlaceholderPlacement,
     TextPrompt,
+    register_input_processor,
 )
 from ...inputs.multimodal import MultimodalParams
 from ...logger import logger
@@ -33,6 +36,8 @@ from ..modules.layer_norm import LayerNorm
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mlp import MLP
 from ..modules.rotary_embedding import MRotaryEmbedding
+from .checkpoints.base_weight_mapper import BaseWeightMapper
+from .checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_utils import (
     find_input_mm_embeds,
@@ -40,7 +45,14 @@ from .modeling_multimodal_utils import (
     get_multimodal_embeddings,
 )
 from .modeling_qwen2vl import Qwen2_5_VLVisionAttention
-from .modeling_utils import ModelConfig, QuantConfig, _load_weights_impl, filter_weights
+from .modeling_utils import (
+    ModelConfig,
+    QuantConfig,
+    _load_weights_impl,
+    filter_weights,
+    register_auto_model,
+    register_vision_encoder,
+)
 
 
 class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDummyInputsBuilder):
@@ -807,7 +819,12 @@ class Qwen3VLModelBase(PreTrainedModel):
 
         llm_model_config = copy.deepcopy(model_config)
         llm_model_config.pretrained_config = config.text_config
-        llm_model_config.pretrained_config.architectures = ["Qwen3MoeForCausalLM"]
+        if self.original_arch == "Qwen3VLForConditionalGeneration":
+            llm_model_config.pretrained_config.architectures = ["Qwen3ForCausalLM"]
+        elif self.original_arch == "Qwen3VLMoeForConditionalGeneration":
+            llm_model_config.pretrained_config.architectures = ["Qwen3MoeForCausalLM"]
+        else:
+            raise ValueError(f"Unsupported architecture: {self.original_arch}")
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 
         if not _is_disagg():
@@ -990,3 +1007,42 @@ class Qwen3VLModelBase(PreTrainedModel):
         )
         logger.debug(f"output shape: {output_prob.shape}")
         return output_prob
+
+
+@register_vision_encoder(Qwen3VisionModelBase, vlm_base_model=Qwen3VisionModel)
+@register_auto_model("Qwen3VLForConditionalGeneration")
+@register_input_processor(
+    Qwen3VLInputProcessorBase,
+    model_type="qwen3_vl",
+    placeholder_metadata=MultimodalPlaceholderMetadata(
+        placeholder_map={
+            "image": "<|vision_start|><|image_pad|><|vision_end|>",
+            "video": "<|vision_start|><|video_pad|><|vision_end|>",
+        },
+        placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+    ),
+)
+class Qwen3VLModel(Qwen3VLModelBase):
+    def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
+        # NOTE: HF implementation.
+        kwargs["vision_model_class"] = Qwen3VisionModel
+        kwargs["disable_fuse_rope"] = kwargs.get(
+            "disable_fuse_rope", False
+        )  # TODO: Make this ModelConfig's argument
+        super().__init__(model_config, *args, **kwargs)
+
+    @property
+    def multimodal_data_device_paths(self) -> List[str]:
+        return ["image.pixel_values", "video.pixel_values_videos", "multimodal_embedding"]
+
+    def load_weights(self, weights: Dict[str, torch.Tensor], weight_mapper: BaseWeightMapper):
+        if not _is_disagg():
+            self.mm_encoder.load_weights(weights)
+
+        weight_mapper = Qwen3VLHfWeightMapper()
+        weight_mapper.init_model_and_config(self.llm, self.model_config)
+        filtered_weights = {k: v for k, v in weights.items() if not k.startswith("model.visual.")}
+        params_map = {
+            r"^model\.language_model\.(.*)$": r"model.\1",
+        }
+        self.llm.load_weights(filtered_weights, weight_mapper, params_map=params_map)

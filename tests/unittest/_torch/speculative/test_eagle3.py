@@ -462,6 +462,114 @@ def test_deepseek_eagle3():
             pass
 
 
+def test_deepseek_mla_eagle3():
+    use_cuda_graph = True
+    attn_backend = "TRTLLM"
+    disable_overlap_scheduler = False
+    enable_block_reuse = False
+    use_one_model = True
+    enable_chunked_prefill = False
+
+    # Eagle3 one model works with overlap scheduler and block reuse.
+    total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+    if total_mem_gb < 150:
+        pytest.skip("Not enough memory to load target + draft model")
+
+    models_path = llm_models_root()
+    eagle_config = {
+        "architectures": ["Eagle3DeepseekV3ForCausalLM"],
+        "attention_bias": False,
+        "attention_dropout": 0.0,
+        "first_k_dense_replace": 1,
+        "hidden_act": "silu",
+        "hidden_size": 2560,
+        "intermediate_size": 8192,
+        "kv_lora_rank": 512,
+        "max_position_embeddings": 4096,
+        "model_type": "kimi_k2",
+        "num_attention_heads": 32,
+        "num_hidden_layers": 1,
+        "num_key_value_heads": 32,
+        "num_nextn_predict_layers": 0,
+        "q_lora_rank": 1536,
+        "qk_nope_head_dim": 128,
+        "qk_rope_head_dim": 64,
+        "rms_norm_eps": 1e-05,
+        "rope_scaling": {
+            "beta_fast": 1.0,
+            "beta_slow": 1.0,
+            "factor": 64.0,
+            "mscale": 1.0,
+            "mscale_all_dim": 1.0,
+            "original_max_position_embeddings": 4096,
+            "type": "yarn"
+        },
+        "rope_theta": 50000.0,
+        "routed_scaling_factor": 2.827,
+        "scoring_func": "sigmoid",
+        "seq_aux": True,
+        "topk_group": 1,
+        "topk_method": "noaux_tc",
+        "torch_dtype": "bfloat16",
+        "torchscript": False,
+        "transformers_version": "4.51.3",
+        "use_bfloat16": False,
+        "use_cache": True,
+        "v_head_dim": 128,
+        "vocab_size": 129280,
+        "draft_vocab_size": 129280,
+        "eagle_config": {
+            "use_aux_hidden_state": True,
+            "use_input_layernorm_in_first_layer": True,
+            "use_last_layernorm": True,
+            "use_mtp_layernorm": False
+        }
+    }
+    with tempfile.TemporaryDirectory() as temp_dir:
+        eagle_model_dir = Path(temp_dir)
+        config_path = eagle_model_dir / "config.json"
+        with config_path.open("w") as f:
+            json.dump(eagle_config, f, indent=2)
+        target_model_dir = f"{models_path}/DeepSeek-V3-Lite/nvfp4_moe_only"
+
+        # bs > 1 gives non-deterministic when doing IFB. There are slight chances
+        # that ref and spec does not match 100%
+        max_batch_size = 16
+        max_draft_len = 3
+        kv_cache_config = KvCacheConfig(enable_block_reuse=enable_block_reuse,
+                                        max_tokens=8192)
+        cuda_graph_config = CudaGraphConfig(
+            batch_sizes=[1]) if use_cuda_graph else None
+
+        llm_common_config = dict(
+            model=target_model_dir,
+            attn_backend=attn_backend,
+            disable_overlap_scheduler=disable_overlap_scheduler,
+            cuda_graph_config=cuda_graph_config,
+            max_batch_size=max_batch_size,
+            max_num_tokens=4096,
+            max_seq_len=4096,
+            kv_cache_config=kv_cache_config,
+            enable_chunked_prefill=enable_chunked_prefill,
+            load_format="dummy",
+        )
+
+        spec_config = EagleDecodingConfig(max_draft_len=max_draft_len,
+                                          speculative_model_dir=eagle_model_dir,
+                                          eagle3_one_model=use_one_model,
+                                          load_format="dummy")
+
+        llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
+
+        tok_ids = llm_spec.tokenizer.encode("The future of AI is")
+
+        sampling_params = SamplingParams(max_tokens=32, temperature=0)
+        for output in llm_spec.generate_async(tok_ids,
+                                              sampling_params,
+                                              streaming=True):
+            pass
+
+
 @pytest.mark.parametrize("use_one_model", [True, False])
 def test_multi_eagle3(use_one_model: bool):
     use_cuda_graph = True
@@ -588,7 +696,7 @@ def test_eagle3_cuda_graph_padding(disable_overlap_scheduler: bool):
     max_batch_size = 4
     max_draft_len = 4
     kv_cache_config = KvCacheConfig(enable_block_reuse=enable_block_reuse,
-                                    max_tokens=8192)
+                                    max_tokens=4096)
     cuda_graph_config = CudaGraphConfig(batch_sizes=[1, 2, 4],
                                         enable_padding=True)
 
@@ -599,7 +707,7 @@ def test_eagle3_cuda_graph_padding(disable_overlap_scheduler: bool):
         cuda_graph_config=cuda_graph_config,
         max_batch_size=max_batch_size,
         kv_cache_config=kv_cache_config,
-        max_seq_len=8192,
+        max_seq_len=2048,
         enable_chunked_prefill=enable_chunked_prefill,
     )
 
@@ -617,7 +725,7 @@ def test_eagle3_cuda_graph_padding(disable_overlap_scheduler: bool):
         "The future of AI is"
     ]
 
-    sampling_params = SamplingParams(max_tokens=20, temperature=0)
+    sampling_params = SamplingParams(max_tokens=2048, temperature=0)
     llm_spec.generate(prompts, sampling_params)
     llm_spec.shutdown()
 

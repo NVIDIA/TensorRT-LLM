@@ -12,8 +12,10 @@ import pandas as pd
 def extract_backend(test_name):
     """Extract backend type from test_name.
 
-    New format: ccb-NIXL or ccb-UCX
+    New format: ccb-NIXL or ccb-UCX or ccb-DEFAULT
     Example: disagg_perf_deepseek-r1-fp4_1k1k_ctx2_gen1_dep16_bs128_eplb288_mtp3_ccb-NIXL
+
+    Note: "DEFAULT" is a special marker that represents the default backend
     """
     match = re.search(r"ccb-(\w+)", test_name)
     return match.group(1) if match else None
@@ -41,6 +43,7 @@ def compare_backends(csv_path, threshold=5.0, default_backend="NIXL"):
         csv_path: CSV file path
         threshold: Performance difference threshold (percentage)
         default_backend: DEFAULT backend name (currently NIXL, may switch in the future)
+                        Cases marked as "ccb-DEFAULT" will be treated as this backend
 
     Returns:
         DataFrame: Comparison results
@@ -71,19 +74,36 @@ def compare_backends(csv_path, threshold=5.0, default_backend="NIXL"):
     df["backend"] = df["test_name"].apply(extract_backend)
     df["base_case_name"] = df["test_name"].apply(extract_base_case_name)
 
+    # Normalize "DEFAULT" backend to the actual default_backend value
+    # This allows cases marked as "ccb-DEFAULT" to be treated as the default backend
+    df["backend"] = df["backend"].apply(
+        lambda x: default_backend if x and x.upper() == "DEFAULT" else x
+    )
+
     # Group by base_case_name and metric_type
     grouped = df.groupby(["base_case_name", "metric_type"])
 
     results = []
+    comparison_pairs = 0
+    single_backend_skipped = 0
 
     for (base_case, metric_type), group in grouped:
         # Get DEFAULT backend and UCX data
         default_data = group[group["backend"] == default_backend]
         ucx_data = group[group["backend"] == "UCX"]
 
-        # If both have no data, skip (this case may not exist)
+        # Skip if both have no data (this case may not exist)
         if len(default_data) == 0 and len(ucx_data) == 0:
             continue
+
+        # Skip single-backend cases (only has one backend, not a comparison pair)
+        # This happens when a test case only runs on one backend
+        if len(default_data) == 0 or len(ucx_data) == 0:
+            single_backend_skipped += 1
+            continue
+
+        # This is a valid comparison pair
+        comparison_pairs += 1
 
         # Extract values and original test names
         default_value = default_data["perf_metric"].values[0] if len(default_data) > 0 else None
@@ -136,6 +156,19 @@ def compare_backends(csv_path, threshold=5.0, default_backend="NIXL"):
                 "status": status,
             }
         )
+
+    # Print statistics
+    print("\n=== Backend Comparison Statistics ===")
+    print(f"Default backend: {default_backend}")
+    print(f"Comparison pairs: {comparison_pairs}")
+    print(f"Single-backend cases (skipped): {single_backend_skipped}")
+    print("=" * 37)
+
+    # If no comparison pairs found, exit with success
+    if comparison_pairs == 0:
+        print("\nInfo: No backend comparison pairs found in disagg_perf tests")
+        print("All cases are single-backend only, no comparison needed")
+        sys.exit(0)
 
     # Convert to DataFrame
     result_df = pd.DataFrame(results)

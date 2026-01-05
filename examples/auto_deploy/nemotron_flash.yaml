@@ -5,7 +5,14 @@ max_num_tokens: 8192
 enable_chunked_prefill: true
 model_factory: NemotronFlashForCausalLM
 free_mem_ratio: 0.9
-cuda_graph_batch_sizes: [1, 2, 4, 8, 16, 24, 32, 64,96, 128, 256, 320, 384]
+cuda_graph_batch_sizes: [1, 2, 4, 8, 16, 24, 32, 64, 96, 128, 256, 320, 384]
 kv_cache_config:
   # disable kv_cache reuse since not supported for hybrid/ssm models
   enable_block_reuse: false
+transforms:
+  gather_logits_before_lm_head:
+    # TODO: fix https://github.com/NVIDIA/TensorRT-LLM/issues/9878 to enable by default
+    enabled: true
+  fuse_mamba_a_log:
+    stage: post_load_fusion
+    enabled: true

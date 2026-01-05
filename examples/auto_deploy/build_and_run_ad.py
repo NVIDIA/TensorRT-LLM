@@ -277,7 +277,11 @@ def main(config: Optional[ExperimentConfig] = None):
         config.prompt.queries,
         sampling_params=SamplingParams(**config.prompt.sp_kwargs),
     )
-    results = {"prompts_and_outputs": print_outputs(outs)}
+    results = {
+        "prompts_and_outputs": print_outputs(outs),
+    }
+    # Add config values so they get logged to JET extra
+    results.update(config.model_dump(mode="json"))
 
     # run a benchmark for the model with batch_size == config.benchmark_bs
     if config.benchmark.enabled and config.args.runtime != "trtllm":
