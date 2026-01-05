@@ -1353,3 +1353,27 @@ Refer to the {ref}`support-matrix-software` section for a list of supported mode
 ### Known Issues
 
 - The hang reported in issue [#149](https://github.com/triton-inference-server/tensorrtllm_backend/issues/149) has not been reproduced by the TensorRT-LLM team. If it is caused by a bug in TensorRT-LLM, that bug may be present in that release.
+- If users create project with tensorrt-llm==1.1.0 in pyproject.toml file as dependency as below:
+  ```toml
+  dependencies = [
+    "tensorrt-llm==1.1.0",
+  ]
+  ```
+
+  when users install project dependencies with command `uv sync`, error will happend with message:
+  ```
+  No solution found when resolving dependencies for split (markers: python_full_version >= '3.13' and sys_platform == 'darwin'):
+  ╰─▶ Because patchelf==0.18.0.0 was yanked (reason: https://github.com/mayeut/patchelf-pypi/issues/87) and tensorrt-llm==1.1.0 depends on patchelf==0.18.0, we can
+      conclude that tensorrt-llm==1.1.0 cannot be used.
+      And because your project depends on tensorrt-llm==1.1.0, we can conclude that your project's requirements are unsatisfiable.". 
+  ```
+
+  That's because patchelf 0.18.0 was yanked by author.
+
+  A valid work around for this issue is to add block in pyproject.toml:
+  ```toml
+  [tool.uv]
+   override-dependencies = [
+   "patchelf==0.17.2.4",
+  ]
+  ```
