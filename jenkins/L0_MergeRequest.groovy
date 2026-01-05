@@ -451,7 +451,7 @@ def launchReleaseCheck(pipeline)
     }
 
     def image = "urm.nvidia.com/docker/golang:1.22"
-    stageName = "Release Check"
+    stageName = "Release-Check"
     trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "package"), "trt-llm", {
         stage("[${stageName}] Run") {
             if (RELESE_CHECK_CHOICE == STAGE_CHOICE_SKIP) {
@@ -834,7 +834,7 @@ def collectTestResults(pipeline, testFilter)
 {
     collectResultPodSpec = createKubernetesPodConfig("", "agent")
     trtllm_utils.launchKubernetesPod(pipeline, collectResultPodSpec, "alpine", {
-        stage ("Collect test result") {
+        stage ("Collect Test Result") {
             sh "rm -rf **/*.xml *.tar.gz"
 
             testResultLink = "https://urm.nvidia.com/artifactory/sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}/test-results"
@@ -864,7 +864,7 @@ def collectTestResults(pipeline, testFilter)
 
             junit(testResults: '**/results*.xml', allowEmptyResults : true)
         } // Collect test result stage
-        stage("Rerun report") {
+        stage("Rerun Report") {
             sh "rm -rf rerun && mkdir -p rerun"
             sh "find . -type f -wholename '*/rerun_results.xml' -exec sh -c 'mv \"{}\" \"rerun/\$(basename \$(dirname \"{}\"))_rerun_results.xml\"' \\; || true"
             sh "find rerun -type f"
@@ -904,7 +904,7 @@ def collectTestResults(pipeline, testFilter)
             }
         } // Rerun report stage
         try {
-            stage("Test coverage") {
+            stage("Test Coverage") {
                 sh "ls"
                 def CUR_PATH = sh(returnStdout: true, script: 'pwd').replaceAll("\\s","")
                 sh "echo ${CUR_PATH}"
@@ -1030,14 +1030,15 @@ def launchJob(jobName, reuseBuild, enableFailFast, globalVars, platform="x86_64"
 def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
 {
     stages = [
-        "Release Check": {
+        "Release-Check": {
             script {
                 launchReleaseCheck(this)
             }
         },
-        "x86_64-linux": {
+        "x86_64-Linux": {
             script {
-                stage("Build") {
+                def testStageName = "[Build-x86_64] ${env.localJobCredentials ? "Remote Run" : "Run"}"
+                stage(testStageName) {
                     def additionalParameters = [
                         'dockerImage': globalVars["LLM_DOCKER_IMAGE"],
                         'wheelDockerImagePy310': globalVars["LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE"],
@@ -1045,7 +1046,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     ]
                     launchJob("/LLM/helpers/Build-x86_64", reuseBuild, enableFailFast, globalVars, "x86_64", additionalParameters)
                 }
-                def testStageName = "[Test-x86_64-Single-GPU] ${env.localJobCredentials ? "Remote Run" : "Run"}"
+
+                testStageName = "[Test-x86_64-Single-GPU] ${env.localJobCredentials ? "Remote Run" : "Run"}"
                 def singleGpuTestFailed = false
                 stage(testStageName) {
                     if (X86_TEST_CHOICE == STAGE_CHOICE_SKIP) {
@@ -1135,24 +1137,23 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 }
             }
         },
-        "SBSA-linux": {
+        "SBSA-Linux": {
             script {
-                def jenkinsUrl = ""
-                def credentials = ""
-                def testStageName = "[Test-SBSA-Single-GPU] ${env.localJobCredentials ? "Remote Run" : "Run"}"
-                def singleGpuTestFailed = false
-
                 if (testFilter[(ONLY_ONE_GROUP_CHANGED)] == "Docs") {
                     echo "SBSA build job is skipped due to Jenkins configuration or conditional pipeline run"
                     return
                 }
 
-                stage("Build") {
+                def testStageName = "[Build-SBSA] ${env.localJobCredentials ? "Remote Run" : "Run"}"
+                stage(testStageName) {
                     def additionalParameters = [
                         "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
                     ]
                     launchJob("/LLM/helpers/Build-SBSA", reuseBuild, enableFailFast, globalVars, "SBSA", additionalParameters)
                 }
+
+                testStageName = "[Test-SBSA-Single-GPU] ${env.localJobCredentials ? "Remote Run" : "Run"}"
+                def singleGpuTestFailed = false
                 stage(testStageName) {
                     if (SBSA_TEST_CHOICE == STAGE_CHOICE_SKIP) {
                         echo "SBSA test job is skipped due to Jenkins configuration"
@@ -1241,7 +1242,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
     def dockerBuildJob = [
         "Build-Docker-Images": {
             script {
-                stage("[Build-Docker-Images] Remote Run") {
+                def testStageName = "[Build-Docker-Images] ${env.localJobCredentials ? "Remote Run" : "Run"}"
+                stage(testStageName) {
                     def branch = env.gitlabBranch ? env.gitlabBranch : "main"
                     if (globalVars[GITHUB_PR_API_URL]) {
                         branch = "github-pr-" + globalVars[GITHUB_PR_API_URL].split('/').last()
@@ -1268,9 +1270,9 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         testFilter[(TEST_STAGE_LIST)]?.remove("Build-Docker-Images")
         testFilter[(EXTRA_STAGE_LIST)]?.remove("Build-Docker-Images")
         echo "Will run Build-Docker-Images job"
-        stages.remove("x86_64-linux")
-        stages.remove("SBSA-linux")
-        echo "Build-Docker-Images job is set explicitly. Both x86_64-linux and SBSA-linux sub-pipelines will be disabled."
+        stages.remove("x86_64-Linux")
+        stages.remove("SBSA-Linux")
+        echo "Build-Docker-Images job is set explicitly. Both x86_64-Linux and SBSA-Linux sub-pipelines will be disabled."
     }
 
     parallelJobs = stages.collectEntries{key, value -> [key, {
@@ -1338,11 +1340,11 @@ pipeline {
                 }
             }
         }
-        stage("Build and Test") {
+        stage("Build And Test") {
             steps {
                 script {
                     if (isReleaseCheckMode) {
-                        stage("Release Check") {
+                        stage("Release-Check") {
                             script {
                                 launchReleaseCheck(this)
                             }

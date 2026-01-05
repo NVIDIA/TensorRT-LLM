@@ -1,5 +1,6 @@
 """Graph transformation to automatically add kv cache into fused MHA op."""
 
+import inspect
 import operator
 from typing import Dict, List, Optional, Tuple, Type
 
@@ -106,6 +107,23 @@ class InsertCachedAttention(BaseTransform):
             gm, prep_meta_op, inputs_for_prep_meta, const_args, num_meta_out
         )
 
+    def _process_metadata_host(self, cm: CachedSequenceInterface):
+        """Process the host-side prepare metadata function."""
+        prep_meta_host_op = self.attn_descriptor.get_host_prepare_metadata_function()
+        if prep_meta_host_op is None:
+            return
+
+        # analyze the args of the host-side prepare metadata function using inspect
+        sig = inspect.signature(prep_meta_host_op)
+        args = sig.parameters.keys()
+
+        # check if all args are available in the cached sequence interface
+        unavailable_args = args - cm.info.available_args
+        assert not unavailable_args, f"Missing args in SequenceInfo: {unavailable_args=}"
+
+        # add the host-side prepare metadata function to the graph
+        cm.info.register_host_prepare_for_attention_forward(prep_meta_host_op, list(args))
+
     def _process_cache_node(self, gm: GraphModule, cache_name: str) -> Node:
         """Process the cache nodes by inserting a cached attention replacement op."""
         return add_graph_input(gm, cache_name)
@@ -173,6 +191,9 @@ class InsertCachedAttention(BaseTransform):
         # insert metadata computation and extract each argument as a node
         meta_nodes_extra = self._process_metadata_extra(gm, cm, source_attn_nodes[0])
 
+        # Register host-side prepare_metadata function for attention descriptor.
+        self._process_metadata_host(cm)
+
         buffer_in_lookup: Dict[str, Node] = {}
 
         # replace fused attention node with attention node that has kv cache
@@ -213,6 +234,7 @@ class InsertCachedAttention(BaseTransform):
                 buffer_in_nodes,
                 constants,
             )
+
             num_cached_attn_replacements += 1
 
         info = TransformInfo(

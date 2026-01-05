@@ -211,7 +211,7 @@ struct WarpSpecializedLayerNorm
 
                 if constexpr (FIRST_RUN)
                 {
-                    asm volatile("griddepcontrol.wait;\n");
+                    cudaGridDependencySynchronize();
                 }
 
                 for (int i = 0; i < Traits::M_BLOCK; i++)
@@ -817,7 +817,7 @@ struct WarpSpecializedLayerNorm
                 {
                     scheduler(lane_id, gridDim.x * gridDim.y * gridDim.z, param, shared);
                     // PRE-EXIT after all tiles have been scheduled.
-                    asm volatile("griddepcontrol.launch_dependents;\n");
+                    cudaTriggerProgrammaticLaunchCompletion();
                 }
                 else if (warp_id == 1)
                 {

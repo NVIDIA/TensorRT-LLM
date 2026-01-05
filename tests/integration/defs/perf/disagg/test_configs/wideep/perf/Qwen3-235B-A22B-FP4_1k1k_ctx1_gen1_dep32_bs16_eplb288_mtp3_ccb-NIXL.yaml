@@ -7,7 +7,6 @@ metadata:
   - GB300
   script_file: disaggr_torch.slurm
   benchmark_type: 1k1k
-  config_index: 10
   dataset_file: disagg_datasets/deepseek-r1-1024-1024-100000-ratio-1_for_serve.json
 slurm:
   script_file: disaggr_torch.slurm

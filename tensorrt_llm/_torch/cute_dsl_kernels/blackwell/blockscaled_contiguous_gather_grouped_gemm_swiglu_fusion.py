@@ -177,8 +177,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
     :param sf_vec_size: Scalefactor vector size (16 for NVF4, 32 for MXF4/MXF8).
     :type sf_vec_size: int
-    :param acc_dtype: Data type of the accumulator (e.g., cutlass.Float32).
-    :type acc_dtype: Type[cutlass.Numeric]
     :param mma_tiler_mn: Shape of the Matrix Multiply-Accumulate (MMA) tile (M,N).
         Note: use_2cta_instrs is automatically inferred from mma_tiler_mn[0]
         (True when M=256, False when M=128).
@@ -2875,8 +2873,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :type sf_dtype: Type[cutlass.Numeric]
         :param sf_vec_size: The vector size of the scale factor
         :type sf_vec_size: int
-        :param acc_dtype: The data type of the accumulator
-        :type acc_dtype: Type[cutlass.Numeric]
         :param c_dtype: The data type of the output tensor
         :type c_dtype: Type[cutlass.Numeric]
 

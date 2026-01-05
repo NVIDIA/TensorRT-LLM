@@ -1327,7 +1327,7 @@ def _(
 
 class FinegrainedMixedDtypeGemm(TunableRunner):
     _runner_dict = dict()
-    MAX_SUPPORTED_SM_VERSION = 90
+    MAX_SUPPORTED_SM_VERSION = 103
 
     def __init__(self, activation_dtype: torch.dtype, output_dtype: torch.dtype,
                  quant_mode: int):
@@ -1362,7 +1362,7 @@ class FinegrainedMixedDtypeGemm(TunableRunner):
 
         if get_sm_version() > self.MAX_SUPPORTED_SM_VERSION:
             raise ValueError(
-                f"SM version {get_sm_version()} is not supported for W4A16 GEMM"
+                f"SM version {get_sm_version()} is not supported for W4A16/W4A8 finegrained mixed dtype GEMM"
             )
 
         activation, weights_packed, scales = inputs
@@ -1441,7 +1441,7 @@ def _(
     return input.new_empty((M, N), dtype=output_dtype)
 
 
-def fp8_swap_ab_gen_tuning_buckets(x: int):
+def deep_gemm_gen_tuning_buckets(x: int):
     buckets = tuple(range(8, 128, 8))
     if x >= 128:
         buckets += tuple(range(128, x, 128))
@@ -1451,7 +1451,7 @@ def fp8_swap_ab_gen_tuning_buckets(x: int):
 class fp8SwapABGemmRunner(TunableRunner):
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
-            0, 0, fp8_swap_ab_gen_tuning_buckets), ),
+            0, 0, deep_gemm_gen_tuning_buckets), ),
         tune_max_num_tokens=4096,
     )
 
@@ -1534,6 +1534,78 @@ def _(
     tune_max_num_tokens: int = 4096,
 ) -> torch.Tensor:
     return input.new_empty((input.size(0), weight.size(0)), dtype=output_dtype)
+
+
+# The runner is used to trigger deepgemm jit during autotune.
+class Fp8BlockScalingGemmRunner(TunableRunner):
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(
+            0, 0, deep_gemm_gen_tuning_buckets), ),
+        tune_max_num_tokens=4096,
+    )
+
+    def get_valid_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        profile: OptimizationProfile,
+    ) -> List[int]:
+        return [0]
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: int = -1,
+    ) -> torch.Tensor:
+        a, b, a_scale, b_scale = inputs
+        return torch.ops.trtllm.fp8_block_scaling_gemm_impl(
+            a, b, a_scale, b_scale)
+
+
+def get_fp8_block_scaling_gemm_constraint_spec():
+    # The implementation aligns with the fp8_quantize_1x128 custom op.
+    def fp8_quantize_1x128_sm90_constrant(inputs: List[List[int]]):
+        pad_m = fp4_utils.pad_up(inputs[0][0], 4)
+        blocked_n = (inputs[0][1] + 127) // 128
+        return fp4_utils.pad_up(pad_m * blocked_n * 4, 128) // 4
+
+    if get_sm_version() >= 100:
+        return (ConstraintSpec(2, 1, lambda inputs: inputs[0][0]), )
+    else:
+        return (ConstraintSpec(2, 0, fp8_quantize_1x128_sm90_constrant), )
+
+
+@torch.library.custom_op("trtllm::fp8_block_scaling_gemm", mutates_args=())
+def fp8_block_scaling_gemm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    tune_max_num_tokens: int = 4096,
+) -> torch.Tensor:
+    tuner = AutoTuner.get()
+    fp8_block_scaling_gemm_runner = Fp8BlockScalingGemmRunner()
+    Fp8BlockScalingGemmRunner.tuning_config.tune_max_num_tokens = tune_max_num_tokens
+
+    Fp8BlockScalingGemmRunner.tuning_config.constraint_specs = get_fp8_block_scaling_gemm_constraint_spec(
+    )
+
+    _, best_tactic = tuner.choose_one(
+        "trtllm::fp8_block_scaling_gemm",
+        [fp8_block_scaling_gemm_runner],
+        Fp8BlockScalingGemmRunner.tuning_config,
+        [a, b, a_scale, b_scale],
+    )
+    return fp8_block_scaling_gemm_runner(
+        inputs=[a, b, a_scale, b_scale],
+        tactic=best_tactic,
+    )
+
+
+@fp8_block_scaling_gemm.register_fake
+def _(a, b, a_scale, b_scale, tune_max_num_tokens=4096):
+    m = a.shape[0]
+    n = b.shape[0]
+    return a.new_empty((m, n), dtype=torch.bfloat16)
 
 
 @torch.library.custom_op("trtllm::silu_and_mul", mutates_args=())
