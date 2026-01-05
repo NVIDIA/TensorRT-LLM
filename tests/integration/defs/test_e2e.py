@@ -26,7 +26,7 @@ import pytest
 import yaml
 from defs.common import convert_weights
 from defs.trt_test_alternative import (check_call, check_call_negative_test,
-                                       check_output)
+                                       check_output, print_info, print_warning)
 
 from .common import (PluginOptions, convert_weights, get_mmlu_accuracy,
                      prune_checkpoint, quantize_data, refit_model,
@@ -559,7 +559,7 @@ class BenchRunner:
             benchmark_cmd += " --backend tensorrt"
 
         if self.extra_llm_api_options:
-            benchmark_cmd += f" --extra_llm_api_options {self.extra_llm_api_options}"
+            benchmark_cmd += f" --config {self.extra_llm_api_options}"
         if self.concurrency:
             benchmark_cmd += f" --concurrency {self.concurrency}"
         if self.num_requests:
@@ -723,7 +723,7 @@ def test_trtllm_bench_invalid_token_pytorch(llm_root, llm_venv, model_name,
                 f"--model_path {llama_model_root} " \
                 f"throughput " \
                 f"--dataset {str(dataset_path)} --backend pytorch " \
-                f"--extra_llm_api_options {extra_options_path} " \
+                f"--config {extra_options_path} " \
                 f"> {output_path} 2>&1"
         # Check clean shutdown (no hang)
         with pytest.raises(subprocess.CalledProcessError) as exc_info:
@@ -899,7 +899,7 @@ def test_trtllm_bench_sanity(llm_root, llm_venv, engine_dir, model_subdir,
 
     assert not pytorch_backend_config
     if use_extra_config:
-        benchmark_cmd += f" --extra_llm_api_options {temp_extra_llm_api_options_file}"
+        benchmark_cmd += f" --config {temp_extra_llm_api_options_file}"
     check_call(benchmark_cmd, shell=True)
 
 
@@ -950,7 +950,7 @@ def test_trtllm_bench_pytorch_backend_sanity(llm_root, llm_venv,
         "Meta-Llama-3.1-8B-NVFP4": 10.2
     }
     if use_extra_config:
-        benchmark_cmd += f" --extra_llm_api_options {temp_extra_llm_api_options_file}"
+        benchmark_cmd += f" --config {temp_extra_llm_api_options_file}"
 
     model_id = llama_model_root.split(r"/")[-1]
     if "nvfp4-quantized" in llama_model_root:
@@ -1771,6 +1771,21 @@ def test_trtllm_multimodal_benchmark_serving(llm_root, llm_venv):
 
 @pytest.mark.skip_less_device(4)
 @pytest.mark.skip_less_device_memory(40000)
+@pytest.mark.parametrize("service_discovery", ["etcd", "http"])
+def test_openai_disagg_multi_nodes_completion_service_discovery(
+        llm_root, llm_venv, service_discovery):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m",
+        "pytest",
+        str(test_root /
+            f"_test_disagg_serving_multi_nodes_service_discovery.py::test_completion[{service_discovery}]"
+            ),
+    ])
+
+
+@pytest.mark.skip_less_device(4)
+@pytest.mark.skip_less_device_memory(40000)
 @pytest.mark.parametrize("gen_config",
                          ["gen_tp2pp1", "gen_tp1pp2", "gen_tp1pp1"])
 @pytest.mark.parametrize("ctx_config",
@@ -2095,6 +2110,40 @@ def test_draft_token_tree_quickstart_advanced_eagle3(llm_root, llm_venv,
             "--disable_overlap_scheduler",
             "--eagle_choices",
             "[[0], [1], [2], [0, 0], [0, 1], [0, 2], [1, 0], [1, 1], [2, 0], [0, 0, 0], [0, 1, 0], [1, 0, 0]]",
+        ],
+                         stdout=running_log)
+        _check_mem_usage(running_log, [27, 0, 0, 0])
+
+
+@pytest.mark.parametrize("model_name,model_path,eagle_model_path", [
+    ("Llama-3.1-8b-Instruct", "llama-3.1-model/Llama-3.1-8B-Instruct",
+     "EAGLE3-LLaMA3.1-Instruct-8B"),
+])
+def test_draft_token_tree_quickstart_advanced_eagle3_depth_1_tree(
+        llm_root, llm_venv, model_name, model_path, eagle_model_path):
+    print(f"Testing {model_name}.")
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
+    with tempfile.NamedTemporaryFile(mode='w+t',
+                                     suffix=f".{model_name}.log",
+                                     dir="./",
+                                     delete=True,
+                                     delete_on_close=True) as running_log:
+        llm_venv.run_cmd([
+            str(example_root / "quickstart_advanced.py"),
+            "--prompt",
+            "You are a good assistant. Please tell me the capital of France is",
+            "--spec_decode_max_draft_len",
+            "3",
+            "--spec_decode_algo",
+            "eagle3",
+            "--model_dir",
+            f"{llm_models_root()}/{model_path}",
+            "--draft_model_dir",
+            f"{llm_models_root()}/{eagle_model_path}",
+            "--disable_kv_cache_reuse",
+            "--disable_overlap_scheduler",
+            "--eagle_choices",
+            "[[0], [1], [2]]",
         ],
                          stdout=running_log)
         _check_mem_usage(running_log, [27, 0, 0, 0])
@@ -2490,10 +2539,6 @@ def test_ptp_quickstart_advanced_mixed_precision(llm_root, llm_venv):
     pytest.param("mistral-small-3.1-24b-instruct",
                  "Mistral-Small-3.1-24B-Instruct-2503",
                  marks=pytest.mark.skip_less_device_memory(80000)),
-    pytest.param("gemma-3-27b-it",
-                 "gemma/gemma-3-27b-it",
-                 marks=(pytest.mark.skip_less_device_memory(80000),
-                        skip_post_blackwell)),
     pytest.param(
         "Nano-v2-VLM",
         "Nano-v2-VLM",
@@ -2574,25 +2619,8 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
     ]
     if use_cuda_graph:
         cmd.append("--use_cuda_graph")
-    # Gemma3 VLM needs a custom mask which is only supported by flashinfer backend currently.
-    # Custom mask involves bidirectional masking of image tokens in context phase. To get this
-    # correct, chunked prefill and kv cache reuse need to be turned off.
-    if model_name == "gemma-3-27b-it":
-        cmd.append("--image_format=pil")
-        cmd.append("--attention_backend=FLASHINFER")
-        cmd.append("--disable_kv_cache_reuse")
-        cmd.append("--kv_cache_fraction=0.5")
-        cmd.append("--max_seq_len=1024")
 
     output = llm_venv.run_cmd(cmd, caller=check_output)
-
-    # For gemma-3-27b-it, we only smoke test the model. Keyword matching is flaky.
-    if model_name == "gemma-3-27b-it":
-        print(
-            f"Skipping keyword matching test for {model_name}. Smoke test completed successfully."
-        )
-        print("output:", output)
-        return
 
     match_ratio = 4.0 / 5
     parsed_outputs = parse_output(output)
@@ -2860,8 +2888,6 @@ def test_ptp_quickstart_multimodal_phi4mm(llm_root, llm_venv, model_name,
 @pytest.mark.skip_less_device(2)
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("model_name,model_path", [
-    pytest.param(
-        "gemma-3-27b-it", "gemma/gemma-3-27b-it", marks=skip_post_blackwell),
     ("mistral-small-3.1-24b-instruct", "Mistral-Small-3.1-24B-Instruct-2503"),
 ])
 def test_ptp_quickstart_multimodal_2gpu(llm_root, llm_venv, model_name,
@@ -2915,28 +2941,11 @@ def test_ptp_quickstart_multimodal_2gpu(llm_root, llm_venv, model_name,
     ]
 
     # Add model-specific configurations
-    if model_name == "gemma-3-27b-it":
-        # Gemma3 VLM needs a custom mask which is only supported by flashinfer backend currently.
-        # Custom mask involves bidirectional masking of image tokens in context phase. To get this
-        # correct, chunked prefill and kv cache reuse need to be turned off.
-        cmd.append("--image_format=pil")
-        cmd.append("--attention_backend=FLASHINFER")
-        cmd.append("--disable_kv_cache_reuse")
-        cmd.append("--kv_cache_fraction=0.5")
-        cmd.append("--max_seq_len=1024")
-    elif model_name == "mistral-small-3.1-24b-instruct":
+    if model_name == "mistral-small-3.1-24b-instruct":
         # TODO: remove this once kv cache reuse is supported for Mistral
         cmd.append("--disable_kv_cache_reuse")
 
     output = llm_venv.run_cmd(cmd, caller=check_output)
-
-    # For gemma-3-27b-it, we only smoke test the model. Keyword matching is flaky.
-    if model_name == "gemma-3-27b-it":
-        print(
-            f"Skipping keyword matching test for {model_name}. Smoke test completed successfully."
-        )
-        print("output:", output)
-        return
 
     # Set match ratio based on model
     match_ratio = 4.0 / 5
@@ -2957,8 +2966,6 @@ def test_ptp_quickstart_multimodal_2gpu(llm_root, llm_venv, model_name,
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("model_name,model_path", [
     ("mistral-small-3.1-24b-instruct", "Mistral-Small-3.1-24B-Instruct-2503"),
-    pytest.param(
-        "gemma-3-27b-it", "gemma/gemma-3-27b-it", marks=skip_post_blackwell),
 ])
 def test_ptp_quickstart_multimodal_multiturn(llm_root, llm_venv, model_name,
                                              model_path):
@@ -3008,29 +3015,12 @@ def test_ptp_quickstart_multimodal_multiturn(llm_root, llm_venv, model_name,
     ]
 
     # Add model-specific configurations
-    if model_name == "gemma-3-27b-it":
-        # Gemma3 VLM needs a custom mask which is only supported by flashinfer backend currently.
-        # Custom mask involves bidirectional masking of image tokens in context phase. To get this
-        # correct, chunked prefill and kv cache reuse need to be turned off.
-        cmd.append("--image_format=pil")
-        cmd.append("--attention_backend=FLASHINFER")
-        cmd.append("--disable_kv_cache_reuse")
-        cmd.append("--kv_cache_fraction=0.5")
-        cmd.append("--max_seq_len=1024")
-
-    elif model_name == "mistral-small-3.1-24b-instruct":
+    if model_name == "mistral-small-3.1-24b-instruct":
         # TODO: remove this once kv cache reuse is supported for Mistral
         cmd.append("--disable_kv_cache_reuse")
 
     output = llm_venv.run_cmd(cmd, caller=check_output)
     print("output:", output)
-
-    # For gemma-3-27b-it, we only smoke test the model. Keyword matching is flaky.
-    if model_name == "gemma-3-27b-it":
-        print(
-            f"Skipping keyword matching test for {model_name}. Smoke test completed successfully."
-        )
-        return
 
     # Set match ratio based on model
     match_ratio = 4.0 / 5
@@ -3199,13 +3189,12 @@ def test_ptp_quickstart_advanced_llama_multi_nodes(llm_root, llm_venv,
     pytest.param('Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf',
                  marks=skip_pre_blackwell),
     pytest.param('DeepSeek-R1/DeepSeek-R1-0528-FP4', marks=skip_pre_blackwell),
-    pytest.param('Kimi-K2-Instruct',
-                 marks=(skip_pre_hopper, skip_post_blackwell)),
+    pytest.param('Kimi-K2-Thinking-NVFP4', marks=skip_pre_blackwell),
     pytest.param('nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1',
                  marks=skip_pre_hopper),
 ])
-def test_multi_nodes_eval(llm_venv, model_path, tp_size, pp_size, ep_size,
-                          eval_task, mmlu_dataset_root):
+def test_multi_nodes_eval(model_path, tp_size, pp_size, ep_size, eval_task,
+                          mmlu_dataset_root):
     if "Llama-4" in model_path and tp_size == 16:
         pytest.skip("Llama-4 with tp16 is not supported")
 
@@ -3230,12 +3219,21 @@ def test_multi_nodes_eval(llm_venv, model_path, tp_size, pp_size, ep_size,
 
     run_cmd.extend([eval_task, f"--dataset_path={mmlu_dataset_root}"])
 
-    llm_venv._new_env["TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL"] = "1"
-    output = check_output(" ".join(run_cmd), shell=True, env=llm_venv._new_env)
-
-    if os.environ.get("SLURM_PROCID", '0') == '0':
-        mmlu_accuracy = get_mmlu_accuracy(output)
-        assert mmlu_accuracy > mmlu_threshold, f"MMLU accuracy {mmlu_accuracy} is less than threshold {mmlu_threshold}"
+    try:
+        # run the command with trtllm-llmapi-launch pytest wrapper
+        output = subprocess.check_output(run_cmd,
+                                         text=True,
+                                         stderr=subprocess.STDOUT,
+                                         timeout=7200)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        print_warning(f"eval failed: {e.returncode}")
+        print_warning(f"eval output:\n{e.output}")
+        raise
+    else:
+        if os.environ.get("SLURM_PROCID", '0') == '0':
+            print_info(f"eval output:\n{output}")
+            mmlu_accuracy = get_mmlu_accuracy(output)
+            assert mmlu_accuracy > mmlu_threshold, f"MMLU accuracy {mmlu_accuracy} is less than threshold {mmlu_threshold}"
 
 
 @pytest.mark.skip_less_device_memory(80000)
@@ -3404,3 +3402,15 @@ def test_eagle3_output_consistency_4gpus(model_dir: str, draft_model_dir: str):
         f"Eagle3 output contains repetitive characters: {output_spec[:500]}")
     assert not repetitive_pattern.search(output_ref), (
         f"Baseline output contains repetitive characters: {output_ref[:500]}")
+
+
+def test_get_ci_container_port():
+    container_port_start = os.environ.get("CONTAINER_PORT_START", None)
+    container_port_num = os.environ.get("CONTAINER_PORT_NUM", None)
+    assert container_port_start is not None
+    assert container_port_num is not None
+    container_port_start = int(container_port_start)
+    container_port_num = int(container_port_num)
+    assert container_port_start > 0
+    assert container_port_num > 0
+    assert container_port_start + container_port_num <= 60000

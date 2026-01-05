@@ -60,6 +60,10 @@ methods:
         annotation: Optional[str]
         default: null
         status: prototype
+      custom_tokenizer:
+        annotation: Optional[str]
+        default: null
+        status: prototype
       # reasoning
       reasoning_parser:
         annotation: Optional[str]
@@ -127,6 +131,10 @@ methods:
         annotation: Union[str, tensorrt_llm.llmapi.llm_args.SamplerType]
         default: auto
         status: beta
+      sampler_force_async_worker:
+        annotation: bool
+        default: False
+        status: prototype
       enable_iter_perf_stats:
         annotation: bool
         default: False
@@ -205,6 +213,10 @@ methods:
         status: prototype
       ray_worker_extension_cls:
         annotation: Optional[str]
+        default: null
+        status: prototype
+      ray_placement_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.RayPlacementConfig]
         default: null
         status: prototype
       enable_sleep:

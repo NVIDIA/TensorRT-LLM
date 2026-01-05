@@ -34,7 +34,7 @@ For the full syntax and argument descriptions, refer to :ref:`syntax`.
 Inference Endpoints
 -------------------
 
-After you start the server, you can send inference requests through completions API and Chat API, which are compatible with corresponding OpenAI APIs. We use `TinyLlama-1.1B-Chat-v1.0 <https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0>`_ for examples in the following sections.
+After you start the server, you can send inference requests through completions API, Chat API and Responses API, which are compatible with corresponding OpenAI APIs. We use `TinyLlama-1.1B-Chat-v1.0 <https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0>`_ for examples in the following sections.
 
 Chat API
 ~~~~~~~~
@@ -66,6 +66,24 @@ Another example uses ``curl``:
     :language: bash
     :linenos:
 
+Responses API
+~~~~~~~~~~~~~~~
+
+You can query Responses API with any http clients, a typical example is OpenAI Python client:
+
+.. literalinclude:: ../../../../examples/serve/openai_responses_client.py
+    :language: python
+    :linenos:
+
+Another example uses ``curl``:
+
+.. literalinclude:: ../../../../examples/serve/curl_responses_client.sh
+    :language: bash
+    :linenos:
+
+
+More openai compatible examples can be found in the `compatibility examples <https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/serve/compatibility>`_ directory.
+
 Multimodal Serving
 ~~~~~~~~~~~~~~~~~~
 
@@ -80,7 +98,7 @@ First, create a configuration file:
 
 .. code-block:: bash
 
-   cat >./extra-llm-api-config.yml<<EOF
+   cat >./config.yml<<EOF
    kv_cache_config:
        enable_block_reuse: false
    EOF
@@ -90,7 +108,7 @@ Then, start the server with the configuration file:
 .. code-block:: bash
 
    trtllm-serve Qwen/Qwen2-VL-7B-Instruct \
-       --extra_llm_api_options ./extra-llm-api-config.yml
+       --config ./config.yml
 
 Multimodal Chat API
 ~~~~~~~~~~~~~~~~~~~
@@ -183,7 +201,7 @@ You can deploy `DeepSeek-V3 <https://huggingface.co/deepseek-ai/DeepSeek-V3>`_ m
 
 .. code-block:: bash
 
-    echo -e "enable_attention_dp: true\npytorch_backend_config:\n  enable_overlap_scheduler: true" > extra-llm-api-config.yml
+    echo -e "enable_attention_dp: true\npytorch_backend_config:\n  enable_overlap_scheduler: true" > config.yml
 
     srun -N 2 -w [NODES] \
         --output=benchmark_2node.log \
@@ -192,7 +210,7 @@ You can deploy `DeepSeek-V3 <https://huggingface.co/deepseek-ai/DeepSeek-V3>`_ m
         --container-image=<CONTAINER_IMG> \
         --container-mounts=/workspace:/workspace \
         --container-workdir /workspace \
-        bash -c "trtllm-llmapi-launch trtllm-serve deepseek-ai/DeepSeek-V3 --max_batch_size 161 --max_num_tokens 1160 --tp_size 16 --ep_size 4 --kv_cache_free_gpu_memory_fraction 0.95 --extra_llm_api_options ./extra-llm-api-config.yml"
+        bash -c "trtllm-llmapi-launch trtllm-serve deepseek-ai/DeepSeek-V3 --max_batch_size 161 --max_num_tokens 1160 --tp_size 16 --ep_size 4 --kv_cache_free_gpu_memory_fraction 0.95 --config ./config.yml"
 
 See `the source code <https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/llmapi/trtllm-llmapi-launch>`_ of ``trtllm-llmapi-launch`` for more details.
 
@@ -216,11 +234,11 @@ For the default PyTorch backend, iteration statistics logging is enabled by sett
    # extra_llm_config.yaml
    enable_iter_perf_stats: true
 
-Start the server and specify the ``--extra_llm_api_options`` argument with the path to the YAML file:
+Start the server and specify the ``--config`` argument with the path to the YAML file:
 
 .. code-block:: bash
 
-   trtllm-serve "TinyLlama/TinyLlama-1.1B-Chat-v1.0" --extra_llm_api_options extra_llm_config.yaml
+   trtllm-serve "TinyLlama/TinyLlama-1.1B-Chat-v1.0" --config config.yaml
 
 After sending at least one inference request to the server, you can fetch runtime iteration statistics by polling the ``/metrics`` endpoint.
 Since the statistics are stored in an internal queue and removed once retrieved, it's recommended to poll the endpoint shortly after each request and store the results if needed.
@@ -254,10 +272,16 @@ Example output:
         }
     ]
 
+.. _configuring-with-yaml-files:
+
 Configuring with YAML Files
 ----------------------------
 
-You can configure various options of ``trtllm-serve`` using YAML files by setting the ``--extra_llm_api_options`` option to the path of a YAML file, the arguments in the file will override the corresponding command line arguments.
+You can configure various options of ``trtllm-serve`` using YAML files by setting the ``--config`` option to the path of a YAML file. The arguments in the file override the corresponding command line arguments.
+
+.. include:: ../../_includes/note_sections.rst
+   :start-after: .. start-note-config-flag-alias
+   :end-before: .. end-note-config-flag-alias
 
 The yaml file is configuration of `tensorrt_llm.llmapi.LlmArgs <https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs>`_, the class has multiple levels of hierarchy, to configure the top level arguments like ``max_batch_size``, the yaml file should be like:
 
@@ -274,6 +298,8 @@ To configure the nested level arguments like ``moe_config.backend``, the yaml fi
 
 Syntax
 ------
+
+This syntax section lists all command line arguments for ``trtllm-serve``'s subcommands. Some of the arguments are accompanied with a stability tag indicating their development status. Refer to our `API Reference <https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html>`__ for details
 
 .. click:: tensorrt_llm.commands.serve:main
    :prog: trtllm-serve

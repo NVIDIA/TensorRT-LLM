@@ -1,0 +1,5 @@
+# Configuration for models that require simple sharding only
+# Used for very large models with specific sharding requirements
+transforms:
+  detect_sharding:
+    simple_shard_only: true

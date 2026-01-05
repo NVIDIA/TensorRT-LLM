@@ -1,3 +1,4 @@
+import pytest
 import torch
 from _model_test_utils import get_small_model_config
 from build_and_run_ad import ExperimentConfig
@@ -9,6 +10,10 @@ from tensorrt_llm._torch.auto_deploy.utils._graph import move_to_device
 
 
 def test_build_run_llama4_vlm():
+    pytest.skip(
+        "Skipping test_build_run_llm4_vlm because Llama4 is giving an error on upgrading transformers version to 4.57.1"
+        "https://nvbugspro.nvidia.com/bug/5732942"
+    )
     atol = 1e-3
     rtol = 1e-3
 

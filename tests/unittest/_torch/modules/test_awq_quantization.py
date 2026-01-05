@@ -2,10 +2,12 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from transformers.configuration_utils import PretrainedConfig
 from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe import DefaultMoeRoutingMethod, create_moe
+from tensorrt_llm._torch.modules.fused_moe.configurable_moe import ConfigurableMoE
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -101,28 +103,36 @@ def test_fused_moe_trtllm_gen_input_scaling(has_scale):
         pytest.skip("CUDA not available")
 
     # Setup
-    mapping = Mapping(world_size=1, rank=0, tp_size=1)
-    quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
-    model_config = ModelConfig(mapping=mapping, quant_config=quant_config, moe_backend="TRTLLM")
-
     num_experts = 8
     hidden_size = 128
     intermediate_size = 256
     top_k = 2
     seq_len = 4
 
+    # Create pretrained_config with necessary parameters (following test_fused_moe.py pattern)
+    pretrained_config = PretrainedConfig()
+    pretrained_config.num_experts = num_experts
+    pretrained_config.hidden_size = hidden_size
+    pretrained_config.intermediate_size = intermediate_size
+    pretrained_config.torch_dtype = torch.bfloat16
+
+    mapping = Mapping(world_size=1, rank=0, tp_size=1)
+    quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+    model_config = ModelConfig(
+        pretrained_config=pretrained_config,
+        mapping=mapping,
+        quant_config=quant_config,
+        moe_backend="TRTLLM",
+    )
+
     routing_method = DefaultMoeRoutingMethod(top_k=top_k)
 
     torch.manual_seed(0)
     torch.cuda.manual_seed(0)
 
-    # Create actual MoE module
+    # Create actual MoE module (parameters inferred from model_config.pretrained_config)
     moe = create_moe(
-        num_experts=num_experts,
         routing_method=routing_method,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-        dtype=torch.bfloat16,
         reduce_results=False,
         model_config=model_config,
     ).cuda()
@@ -130,7 +140,13 @@ def test_fused_moe_trtllm_gen_input_scaling(has_scale):
     # Set fc31_act_scale directly (simulating AWQ pre_quant_scale)
     if has_scale:
         scale = torch.full((hidden_size,), 0.5, dtype=torch.bfloat16, device="cuda")
-        moe.fc31_act_scale = torch.nn.Parameter(scale, requires_grad=False)
+
+        # For ConfigurableMoE, set fc31_act_scale on backend instead of the wrapper
+        if isinstance(moe, ConfigurableMoE):
+            moe.backend.fc31_act_scale = torch.nn.Parameter(scale, requires_grad=False)
+        else:
+            # For direct TRTLLMGenFusedMoE, set on moe itself
+            moe.fc31_act_scale = torch.nn.Parameter(scale, requires_grad=False)
 
     # Prepare input
     x = torch.ones(seq_len, hidden_size, dtype=torch.bfloat16, device="cuda")

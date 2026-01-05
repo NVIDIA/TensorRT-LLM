@@ -32,6 +32,8 @@ namespace common = tensorrt_llm::common;
 namespace kernels = tensorrt_llm::kernels;
 namespace cutlass_kernels = tensorrt_llm::kernels::cutlass_kernels;
 
+TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -329,6 +331,8 @@ torch::Tensor run_moe_finalize_scale_op(torch::Tensor const& gemm2_output, torch
 
 } // namespace torch_ext
 
+TRTLLM_NAMESPACE_END
+
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
@@ -347,6 +351,6 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("moe_permute_op", &torch_ext::moe_permute_op);
-    m.impl("moe_finalize_scale_op", &torch_ext::run_moe_finalize_scale_op);
+    m.impl("moe_permute_op", &tensorrt_llm::torch_ext::moe_permute_op);
+    m.impl("moe_finalize_scale_op", &tensorrt_llm::torch_ext::run_moe_finalize_scale_op);
 }

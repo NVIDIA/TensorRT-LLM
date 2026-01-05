@@ -35,6 +35,8 @@ namespace tr = tensorrt_llm::runtime;
 namespace tk = tensorrt_llm::kernels;
 namespace tksd = tensorrt_llm::kernels::speculative_decoding;
 
+TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -163,5 +165,7 @@ void prepareRandomTensors(th::Tensor& curandState, // [maxBatchSize, 48], uint8_
 
 } // namespace torch_ext
 
-static auto redrafter_prepare_random_tensors
-    = torch::RegisterOperators("tensorrt_llm::redrafter_prepare_random_tensors", &torch_ext::prepareRandomTensors);
+TRTLLM_NAMESPACE_END
+
+static auto redrafter_prepare_random_tensors = torch::RegisterOperators(
+    "tensorrt_llm::redrafter_prepare_random_tensors", &tensorrt_llm::torch_ext::prepareRandomTensors);

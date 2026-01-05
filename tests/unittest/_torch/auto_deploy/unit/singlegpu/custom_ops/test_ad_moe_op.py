@@ -1,7 +1,7 @@
 import pytest
 import torch
 import torch.nn.functional as F
-from _torch.helpers import reference_bmm_moe_torch, reference_moe_torch
+from _torch.helpers import reference_moe_torch
 from _torch_test_utils import fp4_compatible, fp8_compatible, trtllm_ops_available
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
@@ -143,62 +143,6 @@ def test_moe_op_run(dtype):
             fused_w2_weight,
         )
         ref_output = reference_moe_torch(x, selected_experts, final_scales, num_experts, weights)
-
-    torch.cuda.synchronize()
-    torch.testing.assert_close(output_trt_fused_moe, output_torch_fused_moe, rtol=5e-2, atol=5e-2)
-    torch.testing.assert_close(output_trt_fused_moe, ref_output, rtol=5e-2, atol=5e-2)
-    torch.testing.assert_close(output_torch_fused_moe, ref_output, rtol=1e-5, atol=1e-5)
-    torch.testing.assert_close(output_torch_moe, ref_output, rtol=1e-5, atol=1e-5)
-
-
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_bmm_based_moe_op_run(dtype):
-    num_experts = 3
-    (
-        x,
-        selected_experts,
-        final_scales,
-        fused_w3_w1_stacked_weight,
-        fused_w2_weight,
-    ) = setup_bmm_moe_test(dtype, num_experts)
-
-    with torch.inference_mode():
-        x = final_scales * x
-        selected_experts = torch.ones_like(selected_experts)
-        # Use torch_moe with stacked tensor format (single-element lists)
-        output_torch_moe = torch.ops.auto_deploy.torch_moe(
-            x,
-            selected_experts,
-            final_scales,
-            [fused_w3_w1_stacked_weight],  # Wrap in list for unified interface
-            [fused_w2_weight],  # Wrap in list for unified interface
-            [],  # Empty w3_weight list for stacked gated MLP
-            mlp_style="gated_mlp",
-            act_fn="silu",
-            apply_routing_on_input=True,
-        )
-        output_torch_fused_moe = torch.ops.auto_deploy.torch_moe_fused(
-            x,
-            selected_experts,
-            final_scales,
-            fused_w3_w1_stacked_weight,
-            fused_w2_weight,
-        )
-        output_trt_fused_moe = torch.ops.auto_deploy.trtllm_moe_fused(
-            x,
-            selected_experts,
-            final_scales,
-            fused_w3_w1_stacked_weight,
-            fused_w2_weight,
-        )
-        ref_output = reference_bmm_moe_torch(
-            x,
-            selected_experts,
-            final_scales,
-            fused_w3_w1_stacked_weight,
-            fused_w2_weight,
-            apply_routing_on_input=True,
-        )
 
     torch.cuda.synchronize()
     torch.testing.assert_close(output_trt_fused_moe, output_torch_fused_moe, rtol=5e-2, atol=5e-2)

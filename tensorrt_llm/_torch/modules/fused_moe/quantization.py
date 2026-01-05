@@ -218,13 +218,11 @@ class FusedMoEMethodBase(ABC):
 
         # bias
         if module.bias:
+            # The shape might be padded so we use weight shape[:2]
             if w3_w1_bias_shape is None:
-                w3_w1_bias_shape = (module.expert_size_per_partition,
-                                    module.intermediate_size_per_partition *
-                                    module.intermediate_size_expand_ratio)
+                w3_w1_bias_shape = w3_w1_weight_shape[:2]
             if w2_bias_shape is None:
-                w2_bias_shape = (module.expert_size_per_partition,
-                                 module.hidden_size)
+                w2_bias_shape = w2_weight_shape[:2]
             bias_dtype = bias_dtype or module.dtype
             w3_w1_bias = nn.Parameter(torch.empty(w3_w1_bias_shape,
                                                   dtype=bias_dtype),
@@ -475,12 +473,21 @@ class FusedMoEMethodBase(ABC):
             TensorParallelMode.COLUMN,
             device=device) if w3_weight is not None else None
 
-        dst_w3_weight, dst_w1_weight = dst_w3_w1_weight.chunk(2, dim=0)
+        src_w3_size_shard = w3_weight_shard.shape[
+            0] if w3_weight_shard is not None else 0
+        src_w1_size_shard = w1_weight_shard.shape[
+            0] if w1_weight_shard is not None else 0
         if w1_weight is not None:
+            dst_w1_weight = dst_w3_w1_weight.narrow(dim=0,
+                                                    start=src_w3_size_shard,
+                                                    length=src_w1_size_shard)
             dst_w1_weight.copy_(w1_weight_shard.contiguous().view(
                 dst_w3_w1_weight.dtype),
                                 non_blocking=True)
         if w3_weight is not None:
+            dst_w3_weight = dst_w3_w1_weight.narrow(dim=0,
+                                                    start=0,
+                                                    length=src_w3_size_shard)
             dst_w3_weight.copy_(w3_weight_shard.contiguous().view(
                 dst_w3_w1_weight.dtype),
                                 non_blocking=True)
@@ -515,8 +522,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
     def create_weights(self, module: torch.nn.Module):
         weight_dtype = module.dtype
         w3_w1_weight_shape = (module.expert_size_per_partition,
-                              module.intermediate_size_per_partition *
-                              module.intermediate_size_expand_ratio,
+                              module.expand_intermediate_size_per_partition,
                               module.hidden_size)
         w2_weight_shape = (
             module.expert_size_per_partition,
@@ -581,7 +587,7 @@ def requantize_expert_w3_w1_weight_fp8_qdq(module: torch.nn.Module,
     w3_weight_scale = w3_weight_scale[...].reshape([])
     max_w3_w1_weight_scale = max(w1_weight_scale, w3_weight_scale)
 
-    split_length = module.intermediate_size_per_partition * module.intermediate_size_expand_ratio // 2
+    split_length = module.expand_intermediate_size_per_partition // 2
     w3_weight = dst_w3_w1_weight.narrow(
         dim=0, start=0, length=split_length).to(dtype=module.dtype)
     w1_weight = dst_w3_w1_weight.narrow(
@@ -605,8 +611,7 @@ class FP8QDQFusedMoEMethod(FusedMoEMethodBase):
         weight_dtype = torch.float8_e4m3fn
 
         w3_w1_weight_shape = (module.expert_size_per_partition,
-                              module.intermediate_size_per_partition *
-                              module.intermediate_size_expand_ratio,
+                              module.expand_intermediate_size_per_partition,
                               module.hidden_size)
         w2_weight_shape = (
             module.expert_size_per_partition,
@@ -702,6 +707,37 @@ class FP8QDQFusedMoEMethod(FusedMoEMethodBase):
         module.fc2_quant.data.copy_(max_fc2_input_scale.reciprocal())
         module.fc2_dequant.data.copy_(tmp_w2_weight_scale * max_fc2_input_scale)
         module.fc31_input_dequant.data.copy_(max_fc31_input_scale)
+
+    def post_load_weights(self, module):
+        super().post_load_weights(module)
+
+        # Padding weights to meet FP8 GEMM alignment requirements.
+        def _maybe_padding_weights(tensor: torch.Tensor, row_alignment: int,
+                                   col_alignment: int):
+            row_pad_size = (row_alignment - tensor.size(1)) % row_alignment
+            col_pad_size = (col_alignment - tensor.size(2)) % col_alignment
+            is_padded = row_pad_size != 0 or col_pad_size != 0
+            if is_padded:
+                return F.pad(tensor, (0, col_pad_size, 0, row_pad_size),
+                             mode='constant',
+                             value=0), is_padded
+            return tensor, is_padded
+
+        if getattr(module, "moe_backend", None) == "CUTLASS":
+            cutlass_fp8_row_alignment, cutlass_fp8_col_alignment = 32, 16
+            padded_w3_w1_weight, is_padded_w3_w1_weight = _maybe_padding_weights(
+                module.w3_w1_weight, cutlass_fp8_row_alignment,
+                cutlass_fp8_col_alignment)
+            # Use `row_alignment` for `w2_weight.shape[2]` to match the shape of `w3_w1_weight.shape[1]`.
+            padded_w2_weight, is_padded_w2_weight = _maybe_padding_weights(
+                module.w2_weight, cutlass_fp8_row_alignment,
+                cutlass_fp8_row_alignment)
+            if is_padded_w3_w1_weight:
+                module.w3_w1_weight = nn.Parameter(padded_w3_w1_weight,
+                                                   requires_grad=False)
+            if is_padded_w2_weight:
+                module.w2_weight = nn.Parameter(padded_w2_weight,
+                                                requires_grad=False)
 
 
 class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
@@ -1655,44 +1691,65 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
     Base class for NVFP4 fused MoE methods for all backends.
     """
 
+    def get_weights_shapes(self, module: torch.nn.Module, weight_vec_size: int,
+                           block_scales_vec_size: int):
+        # Divide by 16 because we use int64 to pack 16 fp4 values
+        w3_w1_weight_shape = (module.expert_size_per_partition,
+                              module.expand_intermediate_size_per_partition,
+                              module.hidden_size // weight_vec_size)
+        w2_weight_shape = (module.expert_size_per_partition, module.hidden_size,
+                           module.intermediate_size_per_partition //
+                           weight_vec_size)
+
+        w3_w1_weight_scale_shape = (
+            module.expert_size_per_partition,
+            module.expand_intermediate_size_per_partition, module.hidden_size //
+            module.scaling_vector_size // block_scales_vec_size)
+        w2_weight_scale_shape = (module.expert_size_per_partition,
+                                 module.hidden_size,
+                                 module.intermediate_size_per_partition //
+                                 module.scaling_vector_size //
+                                 block_scales_vec_size)
+
+        if module.bias:
+            w3_w1_bias_shape = (module.expert_size_per_partition,
+                                module.expand_intermediate_size_per_partition)
+            w2_bias_shape = (module.expert_size_per_partition,
+                             module.hidden_size)
+        else:
+            w3_w1_bias_shape = None
+            w2_bias_shape = None
+
+        return (w3_w1_weight_shape, w2_weight_shape, w3_w1_bias_shape,
+                w2_bias_shape, w3_w1_weight_scale_shape, w2_weight_scale_shape)
+
     def create_weights(self,
                        module: torch.nn.Module,
                        weight_dtype,
                        weight_vec_size,
                        block_scales_dtype,
                        block_scales_vec_size,
-                       scaling_vector_size=16):
+                       scaling_vector_size=16,
+                       bias_dtype: Optional[torch.dtype] = None):
 
         module.scaling_vector_size = scaling_vector_size
-        # Divide by 16 because we use int64 to pack 16 fp4 values
-        w3_w1_weight_shape = (module.expert_size_per_partition,
-                              module.intermediate_size_per_partition *
-                              module.intermediate_size_expand_ratio,
-                              module.hidden_size // weight_vec_size)
-        w2_weight_shape = (module.expert_size_per_partition, module.hidden_size,
-                           module.intermediate_size_per_partition //
-                           weight_vec_size)
+
+        (w3_w1_weight_shape, w2_weight_shape, w3_w1_bias_shape, w2_bias_shape,
+         w3_w1_weight_scale_shape,
+         w2_weight_scale_shape) = self.get_weights_shapes(
+             module, weight_vec_size, block_scales_vec_size)
 
         # Divide by 4 because we use int32 to pack 4 fp8 values
         # column parallel
-        w3_w1_weight_scale = nn.Parameter(
-            torch.ones(module.expert_size_per_partition,
-                       module.intermediate_size_per_partition *
-                       module.intermediate_size_expand_ratio,
-                       module.hidden_size // module.scaling_vector_size //
-                       block_scales_vec_size,
-                       dtype=block_scales_dtype),
-            requires_grad=False)
+        w3_w1_weight_scale = nn.Parameter(torch.ones(w3_w1_weight_scale_shape,
+                                                     dtype=block_scales_dtype),
+                                          requires_grad=False)
         module.register_parameter("w3_w1_weight_scale", w3_w1_weight_scale)
 
         # row parallel
-        w2_weight_scale = nn.Parameter(
-            torch.ones(module.expert_size_per_partition,
-                       module.hidden_size,
-                       module.intermediate_size_per_partition //
-                       module.scaling_vector_size // block_scales_vec_size,
-                       dtype=block_scales_dtype),
-            requires_grad=False)
+        w2_weight_scale = nn.Parameter(torch.ones(w2_weight_scale_shape,
+                                                  dtype=block_scales_dtype),
+                                       requires_grad=False)
         module.register_parameter("w2_weight_scale", w2_weight_scale)
 
         fc31_input_scale = nn.Parameter(torch.tensor(1., dtype=torch.float32),
@@ -1717,8 +1774,13 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         # This will be initialized in load_quant_scales if pre_quant_scale exists
         module.register_parameter("fc31_act_scale", None)
 
-        super().create_weights(module, weight_dtype, w3_w1_weight_shape,
-                               w2_weight_shape)
+        super().create_weights(module,
+                               weight_dtype,
+                               w3_w1_weight_shape=w3_w1_weight_shape,
+                               w2_weight_shape=w2_weight_shape,
+                               w3_w1_bias_shape=w3_w1_bias_shape,
+                               w2_bias_shape=w2_bias_shape,
+                               bias_dtype=bias_dtype)
 
         self.setup_quant_scales(module)
 
@@ -2005,13 +2067,64 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
 class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
     weight_dtype = FUSED_MOE_NVFP4_WEIGHT_DTYPE
     block_scales_dtype = FUSED_MOE_NVFP4_WEIGHT_BLOCK_SCALE_DTYPE
+    NVFP4_ROW_ALIGNMENT = 128
+    NVFP4_COL_ALIGNMENT = 4
+
+    def get_weights_shapes(self, module: torch.nn.Module, weight_vec_size: int,
+                           block_scales_vec_size: int):
+        """Override the base method to get aligned weights shapes for Cutlass nvfp4 alignment."""
+        intermediate_size_expand_aligned = (
+            module.expand_intermediate_size_per_partition +
+            self.NVFP4_ROW_ALIGNMENT -
+            1) // self.NVFP4_ROW_ALIGNMENT * self.NVFP4_ROW_ALIGNMENT
+
+        if module.hidden_size % self.NVFP4_COL_ALIGNMENT != 0:
+            raise ValueError(
+                f"hidden_size {module.hidden_size} must be divisible by {self.NVFP4_COL_ALIGNMENT}"
+            )
+        hidden_size_aligned = module.hidden_size
+
+        w3_w1_weight_shape = (module.expert_size_per_partition,
+                              intermediate_size_expand_aligned,
+                              hidden_size_aligned // weight_vec_size)
+        w2_weight_shape = (module.expert_size_per_partition,
+                           hidden_size_aligned,
+                           intermediate_size_expand_aligned //
+                           module.intermediate_size_expand_ratio //
+                           weight_vec_size)
+
+        w3_w1_weight_scale_shape = (module.expert_size_per_partition,
+                                    intermediate_size_expand_aligned,
+                                    hidden_size_aligned //
+                                    module.scaling_vector_size //
+                                    block_scales_vec_size)
+        w2_weight_scale_shape = (module.expert_size_per_partition,
+                                 hidden_size_aligned,
+                                 intermediate_size_expand_aligned //
+                                 module.intermediate_size_expand_ratio //
+                                 module.scaling_vector_size //
+                                 block_scales_vec_size)
+
+        if module.bias:
+            w3_w1_bias_shape = (module.expert_size_per_partition,
+                                intermediate_size_expand_aligned)
+            w2_bias_shape = (module.expert_size_per_partition,
+                             hidden_size_aligned)
+        else:
+            w3_w1_bias_shape = None
+            w2_bias_shape = None
+
+        return (w3_w1_weight_shape, w2_weight_shape, w3_w1_bias_shape,
+                w2_bias_shape, w3_w1_weight_scale_shape, w2_weight_scale_shape)
 
     def create_weights(self, module: torch.nn.Module):
         weight_vec_size = torch.iinfo(self.weight_dtype).bits // 4
-        block_scales_vec_size = torch.iinfo(self.block_scales_dtype).bits // 8
+        self.block_scales_vec_size = torch.iinfo(
+            self.block_scales_dtype).bits // 8
 
         super().create_weights(module, self.weight_dtype, weight_vec_size,
-                               self.block_scales_dtype, block_scales_vec_size)
+                               self.block_scales_dtype,
+                               self.block_scales_vec_size)
 
     def load_expert_w3_w1_weight_scale_nvfp4(
             self, module: torch.nn.Module, w1_weight_scale: torch.Tensor,
@@ -2029,21 +2142,16 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
                                             module.tp_rank,
                                             TensorParallelMode.COLUMN,
                                             device=device)
-        # Keep weights in device buffer
-        # w3
-        split_length = module.intermediate_size_per_partition * module.intermediate_size_expand_ratio // 2
-        dst_w3_weight_scale = dst_w3_w1_weight_scale.narrow(dim=0,
-                                                            start=0,
-                                                            length=split_length)
-        dst_w3_weight_scale.copy_(
-            w3_weight_scale.view(dst_w3_weight_scale.dtype))
 
-        # w1
-        dst_w1_weight_scale = dst_w3_w1_weight_scale.narrow(dim=0,
-                                                            start=split_length,
-                                                            length=split_length)
-        dst_w1_weight_scale.copy_(
-            w1_weight_scale.view(dst_w1_weight_scale.dtype))
+        cast_w3_weight_scale = w3_weight_scale.contiguous().view(
+            dst_w3_w1_weight_scale.dtype)
+        cast_w1_weight_scale = w1_weight_scale.contiguous().view(
+            dst_w3_w1_weight_scale.dtype)
+        cast_w31_weight_scale = torch.cat(
+            [cast_w3_weight_scale, cast_w1_weight_scale], dim=0)
+        cast_w31_weight_scale = self._maybe_padding_shape(
+            cast_w31_weight_scale, dst_w3_w1_weight_scale)
+        dst_w3_w1_weight_scale.copy_(cast_w31_weight_scale)
 
         orig_shape = dst_w3_w1_weight_scale.shape
 
@@ -2065,9 +2173,22 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
                                             module.tp_rank,
                                             TensorParallelMode.ROW,
                                             device=device)
+        # Padding w2_weight_scale (dtype=float8_e4m3fn) to match the shape of dst_w2_weight_scale (dtype=float32)
+        src_w2_scale_size = w2_weight_scale.shape[1]
+        adjusted_dst_w2_scale_size = dst_w2_weight_scale.shape[
+            1] * self.block_scales_vec_size
+        assert adjusted_dst_w2_scale_size >= src_w2_scale_size, "adjusted_dst_w2_scale_size must be greater than or equal to src_w2_scale_size"
+        if adjusted_dst_w2_scale_size > src_w2_scale_size:
+            w2_weight_scale = torch.nn.functional.pad(
+                w2_weight_scale,
+                (0, adjusted_dst_w2_scale_size - src_w2_scale_size), "constant",
+                0).contiguous()
+
+        cast_w2_weight_scale = w2_weight_scale.view(dst_w2_weight_scale.dtype)
+        cast_w2_weight_scale = self._maybe_padding_shape(
+            cast_w2_weight_scale, dst_w2_weight_scale)
         # Keep weights in device buffer
-        dst_w2_weight_scale.copy_(
-            w2_weight_scale.view(dst_w2_weight_scale.dtype))
+        dst_w2_weight_scale.copy_(cast_w2_weight_scale)
 
         orig_shape = dst_w2_weight_scale.shape
 
@@ -2078,6 +2199,63 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
         torch.cuda.synchronize()
 
         dst_w2_weight_scale.copy_(dst_w2_weight_scale_interleaved)
+
+    def load_expert_w3_w1_weight(self, module: torch.nn.Module,
+                                 w1_weight: torch.Tensor,
+                                 w3_weight: torch.Tensor,
+                                 dst_w3_w1_weight: torch.Tensor):
+        """Load and pad w1 and w3 weights for each expert, to match shape requirements for Cutlass nvfp4 alignment."""
+        device = dst_w3_w1_weight.device
+        w1_weight_shard = load_weight_shard(w1_weight,
+                                            module.tp_size,
+                                            module.tp_rank,
+                                            TensorParallelMode.COLUMN,
+                                            device=device)
+        w3_weight_shard = load_weight_shard(w3_weight,
+                                            module.tp_size,
+                                            module.tp_rank,
+                                            TensorParallelMode.COLUMN,
+                                            device=device)
+
+        cast_w1_weight_shard = w1_weight_shard.contiguous().view(
+            dst_w3_w1_weight.dtype)
+        cast_w3_weight_shard = w3_weight_shard.contiguous().view(
+            dst_w3_w1_weight.dtype)
+        cast_w31_weight_shard = torch.cat(
+            [cast_w3_weight_shard, cast_w1_weight_shard], dim=0)
+        cast_w31_weight_shard = self._maybe_padding_shape(
+            cast_w31_weight_shard, dst_w3_w1_weight)
+        dst_w3_w1_weight.copy_(cast_w31_weight_shard, non_blocking=True)
+
+    def load_expert_w2_weight(self, module: torch.nn.Module,
+                              w2_weight: torch.Tensor,
+                              dst_w2_weight: torch.Tensor):
+        """Load and pad w2 weight for each expert, to match shape requirements for Cutlass nvfp4 alignment."""
+        device = dst_w2_weight.device
+        w2_weight_shard = load_weight_shard(w2_weight,
+                                            module.tp_size,
+                                            module.tp_rank,
+                                            TensorParallelMode.ROW,
+                                            device=device)
+        cast_w2_weight_shard = w2_weight_shard.contiguous().view(
+            dst_w2_weight.dtype)
+        cast_w2_weight_shard = self._maybe_padding_shape(
+            cast_w2_weight_shard, dst_w2_weight)
+        dst_w2_weight.copy_(cast_w2_weight_shard, non_blocking=True)
+
+    def _maybe_padding_shape(self, source_tensor, dst_tensor):
+        """Pad the source tensor to match the shape of the destination tensor."""
+        # In `get_weights_shapes` method, the shape of `weights` and `weight_scales` might be tuned to align with `NVFP4_ROW_ALIGNMENT`.
+        # Padding the `source_tensor` to match the shape of `dst_tensor` here.
+        assert len(source_tensor.shape) == 2 and len(
+            dst_tensor.shape) == 2, "Only support 2D weights padding for now."
+        dst_row, dst_col = dst_tensor.shape
+        _row, _col = source_tensor.shape
+        if _row != dst_row or _col != dst_col:
+            source_tensor = torch.nn.functional.pad(
+                source_tensor, (0, dst_col - _col, 0, dst_row - _row),
+                "constant", 0).contiguous()
+        return source_tensor
 
 
 class NVFP4CuteDslFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
@@ -2122,7 +2300,7 @@ class NVFP4CuteDslFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
         dst_w3_w1_weight_scale.copy_(w3_w1_weight_scale_interleaved)
 
 
-class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
+class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
     weight_dtype = float4_sf_dtype
     block_scales_dtype = torch.float8_e4m3fn
 
@@ -2130,12 +2308,18 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
     # This assumes the same input shape always results in the same permute indices
     _cache_permute_indices: Dict[torch.Size, torch.Tensor] = {}
 
-    def create_weights(self, module: torch.nn.Module):
+    def create_weights(self,
+                       module: torch.nn.Module,
+                       bias_dtype: Optional[torch.dtype] = None):
         weight_vec_size = torch.iinfo(self.weight_dtype).bits // 4
         block_scales_vec_size = 1
 
-        super().create_weights(module, self.weight_dtype, weight_vec_size,
-                               self.block_scales_dtype, block_scales_vec_size)
+        super().create_weights(module,
+                               self.weight_dtype,
+                               weight_vec_size,
+                               self.block_scales_dtype,
+                               block_scales_vec_size,
+                               bias_dtype=bias_dtype)
 
         fc31_scale_c = nn.Parameter(torch.ones(module.expert_size_per_partition,
                                                dtype=torch.float32),
@@ -2387,7 +2571,340 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
             })
 
 
-class W4A8NVFP4FP8TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEMethod):
+class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
+    weight_alignment = 32
+    input_hidden_alignment = 32
+
+    def get_weights_shapes(self, module: torch.nn.Module, weight_vec_size: int,
+                           block_scales_vec_size: int):
+
+        def round_up(x, alignment):
+            return (x + alignment - 1) // alignment * alignment
+
+        # Compute padded sizes
+        intermediate_size_per_partition_padded = round_up(
+            module.intermediate_size_per_partition, self.weight_alignment)
+        w3_w1_hidden_size_padded = round_up(module.hidden_size,
+                                            self.input_hidden_alignment)
+        w2_hidden_size_padded = round_up(module.hidden_size,
+                                         self.weight_alignment)
+
+        # Divide by 16 because we use int64 to pack 16 fp4 values
+        w3_w1_weight_shape = (module.expert_size_per_partition,
+                              intermediate_size_per_partition_padded *
+                              module.intermediate_size_expand_ratio,
+                              w3_w1_hidden_size_padded // weight_vec_size)
+        w2_weight_shape = (module.expert_size_per_partition,
+                           w2_hidden_size_padded,
+                           intermediate_size_per_partition_padded //
+                           weight_vec_size)
+
+        w3_w1_weight_scale_shape = (module.expert_size_per_partition,
+                                    intermediate_size_per_partition_padded *
+                                    module.intermediate_size_expand_ratio,
+                                    w3_w1_hidden_size_padded //
+                                    module.scaling_vector_size //
+                                    block_scales_vec_size)
+        w2_weight_scale_shape = (module.expert_size_per_partition,
+                                 w2_hidden_size_padded,
+                                 intermediate_size_per_partition_padded //
+                                 module.scaling_vector_size //
+                                 block_scales_vec_size)
+
+        if module.bias:
+            w3_w1_bias_shape = (module.expert_size_per_partition,
+                                intermediate_size_per_partition_padded *
+                                module.intermediate_size_expand_ratio)
+            w2_bias_shape = (module.expert_size_per_partition,
+                             w2_hidden_size_padded)
+        else:
+            w3_w1_bias_shape = None
+            w2_bias_shape = None
+
+        return (w3_w1_weight_shape, w2_weight_shape, w3_w1_bias_shape,
+                w2_bias_shape, w3_w1_weight_scale_shape, w2_weight_scale_shape)
+
+    def create_weights(self, module: torch.nn.Module):
+        # Here we only enable padding for hidden_size > 1024 since there are small unit tests that expect no padding.
+        if module.hidden_size > 1024 and module.hidden_size % 256 != 0:
+            self.weight_alignment = 256
+            # For now let's keep input alignment same as weight alignment. There are practical reasons that this might be a different value.
+            # See the comment in MXFP4WeightTRTLLMGenFusedMoEMethod for more details.
+            self.input_hidden_alignment = 256
+
+        super().create_weights(module, bias_dtype=torch.float32)
+
+    def setup_quant_scales(self, module: torch.nn.Module):
+        module.quant_scales = tuple()
+
+    def load_expert_w3_w1_weight(self, module: torch.nn.Module,
+                                 w1_weight: torch.Tensor,
+                                 w3_weight: torch.Tensor,
+                                 dst_w3_w1_weight: torch.Tensor):
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        dst_on_gpu = dst_w3_w1_weight.device.type == "cuda"
+        dst_w3_w1_weight_gpu = dst_w3_w1_weight if dst_on_gpu else dst_w3_w1_weight.cuda(
+        )
+
+        alignment = _get_weight_alignment(self.weight_alignment,
+                                          module.scaling_vector_size,
+                                          module.tp_size, w1_weight.shape[0])
+        if len(w1_weight.shape) == 2:
+            # Pad weights
+            # We already satisfy alignment factor of 2 for we pack two MXFP4 into Uint8.
+            assert w1_weight.dtype == torch.uint8
+            w1_weight = maybe_pad_for_mxfp4(w1_weight,
+                                            self.input_hidden_alignment // 2,
+                                            alignment)
+            assert w3_weight.dtype == torch.uint8
+            w3_weight = maybe_pad_for_mxfp4(w3_weight,
+                                            self.input_hidden_alignment // 2,
+                                            alignment)
+        else:
+            # Pad bias, TRTLLM backend expects float32 bias.
+            assert len(w1_weight.shape) == 1
+            assert len(w3_weight.shape) == 1
+            w1_weight = maybe_pad_for_mxfp4(w1_weight, alignment).float()
+            w3_weight = maybe_pad_for_mxfp4(w3_weight, alignment).float()
+
+        w1_weight_shard = load_weight_shard(w1_weight,
+                                            module.tp_size,
+                                            module.tp_rank,
+                                            TensorParallelMode.COLUMN,
+                                            device=device)
+        w3_weight_shard = load_weight_shard(w3_weight,
+                                            module.tp_size,
+                                            module.tp_rank,
+                                            TensorParallelMode.COLUMN,
+                                            device=device)
+
+        # FIXME: this depends on the kernel internals
+        epilogue_tile_m = 128
+
+        # Keep weights in device buffer
+        dst_w3_weight, dst_w1_weight = dst_w3_w1_weight_gpu.chunk(2, dim=0)
+        dst_w3_weight.copy_(w3_weight_shard.view(dst_w3_weight.dtype))
+        dst_w1_weight.copy_(w1_weight_shard.view(dst_w1_weight.dtype))
+
+        # Get permute indices
+        permute_indices = trtllmgen_maybe_get_cached_w3_w1_permute_indices(
+            dst_w3_w1_weight_gpu, self._cache_permute_indices, epilogue_tile_m)
+
+        # Shuffle the weight according to permute indices
+        processed_w31_weight_shard = torch.ops.trtllm.shuffle_matrix(
+            dst_w3_w1_weight_gpu,
+            permute_indices.to(dst_w3_w1_weight_gpu.device))
+
+        # Copy the result into device buffer
+        dst_w3_w1_weight_gpu.copy_(processed_w31_weight_shard.view(
+            dst_w3_w1_weight_gpu.dtype),
+                                   non_blocking=dst_on_gpu)
+        if not dst_on_gpu:
+            dst_w3_w1_weight.copy_(dst_w3_w1_weight_gpu)
+
+    def load_expert_w2_weight(self, module: torch.nn.Module,
+                              w2_weight: torch.Tensor,
+                              dst_w2_weight: torch.Tensor):
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        dst_on_gpu = dst_w2_weight.device.type == "cuda"
+        dst_w2_weight_gpu = dst_w2_weight if dst_on_gpu else dst_w2_weight.cuda(
+        )
+
+        shard_w2_weight_dim = 2 * w2_weight.shape[1] if len(
+            w2_weight.shape) == 2 else w2_weight.shape[0]
+        alignment = _get_weight_alignment(self.weight_alignment,
+                                          module.scaling_vector_size,
+                                          module.tp_size, shard_w2_weight_dim)
+        if len(w2_weight.shape) == 2:
+            assert w2_weight.dtype == torch.uint8
+            w2_weight = maybe_pad_for_mxfp4(w2_weight, alignment // 2,
+                                            self.weight_alignment)
+        else:
+            assert len(w2_weight.shape) == 1
+            w2_weight = maybe_pad_for_mxfp4(w2_weight, self.weight_alignment)
+
+            # Divide bias by tp_size as we shard along the hidden dimension.
+            # The bias is applied at each TP rank before the final accumulation.
+            w2_weight /= module.tp_size
+
+        w2_weight_shard = load_weight_shard(w2_weight,
+                                            module.tp_size,
+                                            module.tp_rank,
+                                            TensorParallelMode.ROW,
+                                            device=device)
+
+        # FIXME: this depends on the kernel internals
+        epilogue_tile_m = 128
+
+        # Keep weights in device buffer
+        dst_w2_weight_gpu.copy_(w2_weight_shard.view(dst_w2_weight_gpu.dtype),
+                                non_blocking=dst_on_gpu)
+        # Get permuted indices
+        permute_indices = trtllmgen_maybe_get_cached_w2_permute_indices(
+            dst_w2_weight_gpu, self._cache_permute_indices, epilogue_tile_m)
+
+        # Shuffle the weight according to permute indices
+        processed_w2_weight = torch.ops.trtllm.shuffle_matrix(
+            dst_w2_weight_gpu, permute_indices.to(dst_w2_weight_gpu.device))
+
+        # Copy the result into device buffer
+        dst_w2_weight_gpu.copy_(processed_w2_weight.view(
+            dst_w2_weight_gpu.dtype),
+                                non_blocking=dst_on_gpu)
+
+        if not dst_on_gpu:
+            dst_w2_weight.copy_(dst_w2_weight_gpu)
+
+    def load_expert_w3_w1_weight_scale_nvfp4(
+            self,
+            module: torch.nn.Module,
+            w1_weight_scale: torch.Tensor,
+            w3_weight_scale: torch.Tensor,
+            dst_w3_w1_weight_scale: torch.Tensor,
+            num_elts_per_sf: int = 16):
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        dst_on_gpu = dst_w3_w1_weight_scale.device.type == "cuda"
+        dst_w3_w1_weight_scale_gpu = dst_w3_w1_weight_scale if dst_on_gpu else dst_w3_w1_weight_scale.cuda(
+        )
+
+        alignment = _get_weight_alignment(self.weight_alignment,
+                                          module.scaling_vector_size,
+                                          module.tp_size,
+                                          w3_weight_scale.shape[0])
+        w1_weight_scale = maybe_pad_for_mxfp4(
+            w1_weight_scale,
+            self.input_hidden_alignment // module.scaling_vector_size,
+            alignment)
+        w3_weight_scale = maybe_pad_for_mxfp4(
+            w3_weight_scale,
+            self.input_hidden_alignment // module.scaling_vector_size,
+            alignment)
+
+        w1_weight_scale = load_weight_shard(w1_weight_scale,
+                                            module.tp_size,
+                                            module.tp_rank,
+                                            TensorParallelMode.COLUMN,
+                                            device=device)
+        w3_weight_scale = load_weight_shard(w3_weight_scale,
+                                            module.tp_size,
+                                            module.tp_rank,
+                                            TensorParallelMode.COLUMN,
+                                            device=device)
+        # Keep weights in device buffer
+        dst_w3_weight_scale, dst_w1_weight_scale = dst_w3_w1_weight_scale_gpu.chunk(
+            2, dim=0)
+        dst_w3_weight_scale.copy_(
+            w3_weight_scale.view(dst_w3_weight_scale.dtype))
+        dst_w1_weight_scale.copy_(
+            w1_weight_scale.view(dst_w1_weight_scale.dtype))
+
+        orig_shape = dst_w3_w1_weight_scale_gpu.shape
+
+        # trtllm-gen specific block scales preprocessing logics
+        epilogue_tile_m = 128  # FIXME
+
+        # Get permute indices
+        permute_indices = trtllmgen_maybe_get_cached_w3_w1_permute_indices(
+            dst_w3_w1_weight_scale_gpu.view(float4_sf_dtype),
+            self._cache_permute_indices,
+            epilogue_tile_m,
+            num_elts_per_sf=num_elts_per_sf)
+
+        # Shuffle the weight according to permute indices
+        w3_w1_weight_scale = torch.ops.trtllm.shuffle_matrix(
+            dst_w3_w1_weight_scale_gpu.view(float4_sf_dtype), permute_indices)
+
+        # Assert should only be removed during debugging
+        assert w3_w1_weight_scale.is_cuda, "w3_w1_weight_scale.is_cuda should be true or suffer from slow speed"
+        # Interleave the weight.
+        processed_w3_w1_weight_scale = torch.ops.trtllm.block_scale_interleave(
+            w3_w1_weight_scale.view(float4_sf_dtype).reshape(orig_shape))
+        # Copy the result into device buffer
+        dst_w3_w1_weight_scale_gpu.copy_(
+            processed_w3_w1_weight_scale.view(
+                self.block_scales_dtype).reshape(orig_shape))
+
+        if not dst_on_gpu:
+            dst_w3_w1_weight_scale.copy_(dst_w3_w1_weight_scale_gpu)
+
+    def load_expert_w2_weight_scale_nvfp4(self,
+                                          module: torch.nn.Module,
+                                          w2_weight_scale: torch.Tensor,
+                                          dst_w2_weight_scale: torch.Tensor,
+                                          num_elts_per_sf: int = 16):
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        dst_on_gpu = dst_w2_weight_scale.device.type == "cuda"
+        dst_w2_weight_scale_gpu = dst_w2_weight_scale if dst_on_gpu else dst_w2_weight_scale.cuda(
+        )
+
+        alignment = _get_weight_alignment(self.weight_alignment,
+                                          module.scaling_vector_size,
+                                          module.tp_size,
+                                          w2_weight_scale.shape[-1])
+        w2_weight_scale = maybe_pad_for_mxfp4(
+            w2_weight_scale, alignment // module.scaling_vector_size,
+            self.weight_alignment)
+
+        w2_weight_scale = load_weight_shard(w2_weight_scale,
+                                            module.tp_size,
+                                            module.tp_rank,
+                                            TensorParallelMode.ROW,
+                                            device=device)
+        # Keep weights in device buffer
+        dst_w2_weight_scale_gpu.copy_(
+            w2_weight_scale.view(dst_w2_weight_scale_gpu.dtype))
+
+        orig_shape = dst_w2_weight_scale_gpu.shape
+
+        # trtllm-gen specific block scales preprocessing logics
+        epilogue_tile_m = 128  # FIXME: read from kernel
+
+        # Assert should only be removed during debugging
+        assert dst_w2_weight_scale_gpu.is_cuda, "dst_w2_weight_scale.is_cuda should be true or suffer from slow speed"
+
+        # Get permute indices
+        permute_indices = trtllmgen_maybe_get_cached_w2_permute_indices(
+            dst_w2_weight_scale_gpu.view(float4_sf_dtype),
+            self._cache_permute_indices,
+            epilogue_tile_m,
+            num_elts_per_sf=num_elts_per_sf)
+
+        # Shuffle the weight according to permute indices
+        w_shuffled = torch.ops.trtllm.shuffle_matrix(
+            dst_w2_weight_scale_gpu.view(dtype=float4_sf_dtype),
+            permute_indices)
+        # Interleave the weight.
+        processed_w2_weight_scale = torch.ops.trtllm.block_scale_interleave(
+            w_shuffled)
+        # Copy the result into device buffer
+        dst_w2_weight_scale_gpu.copy_(
+            processed_w2_weight_scale.view(
+                self.block_scales_dtype).reshape(orig_shape))
+
+        if not dst_on_gpu:
+            dst_w2_weight_scale.copy_(dst_w2_weight_scale_gpu)
+
+    def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
+        super().load_quant_scales(module, weights)
+
+        # Normalize biases to account for the global scale factors,
+        # matching the kernel's expectation (similar to test_moe.py logic).
+        if module.w3_w1_bias is not None:
+            # gemm1_bias * gemm1_scales_global * hidden_states_scale_global
+            module.w3_w1_bias.data.div_((module.fc31_alpha.data).view(-1, 1))
+
+        if module.w2_bias is not None:
+            # gemm2_bias * c_global_sf * gemm2_scales_global
+            module.w2_bias.data.div_((module.fc2_alpha.data).view(-1, 1))
+
+        if module.swiglu_beta is not None:
+            module.swiglu_beta.data.div_((module.fc31_alpha.data))
+
+        if module.swiglu_limit is not None:
+            module.swiglu_limit.data.div_((module.fc31_alpha.data))
+
+
+class W4A8NVFP4FP8TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
 
     def create_weights(self, module: torch.nn.Module):
         weight_vec_size = torch.iinfo(self.weight_dtype).bits // 4

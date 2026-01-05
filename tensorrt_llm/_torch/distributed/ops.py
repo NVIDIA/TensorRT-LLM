@@ -2,14 +2,16 @@ import math
 import os
 import platform
 import threading
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
 
+from tensorrt_llm._mnnvl_utils import HelixCpMnnvlMemory, MnnvlMemory
 from tensorrt_llm._torch.distributed.symm_mem_allreduce import \
     SymmetricMemoryAllReduce
 from tensorrt_llm._utils import mpi_comm, mpi_disabled
+from tensorrt_llm.bindings import internal as _tllm_internal
 from tensorrt_llm.bindings.internal.runtime import McastGPUBuffer
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
                                      AllReduceStrategy, MoEAllReduceParams)
@@ -363,6 +365,84 @@ def alltoall_helix(
     return torch.ops.trtllm.alltoall_helix(inputs, group, num_lists)
 
 
+class HelixAllToAllNative:
+    """
+    Manager for Helix All-to-All operations with MNNVL workspace management.
+
+    Exchanges data along the cp_size dimension:
+    - partial_o: [..., cp_size, kv_lora_rank] half-precision
+    - softmax_stats: [..., cp_size, 2] float32
+    """
+
+    # Global cache: mapping -> instance
+    _cache: Dict[Mapping, "HelixAllToAllNative"] = {}
+
+    def __init__(self, mapping: Mapping, workspace: HelixCpMnnvlMemory,
+                 workspace_tensor: torch.Tensor):
+        """Private constructor - use get() instead."""
+        self.mapping = mapping
+        self.workspace = workspace
+        self.workspace_tensor = workspace_tensor
+
+    @staticmethod
+    def get(mapping: Mapping) -> "HelixAllToAllNative":
+        """
+        Get or create a HelixAllToAllNative instance for the given configuration.
+
+        Args:
+            mapping: TensorRT-LLM mapping object containing cp_size and cp_rank
+
+        Returns:
+            Cached or newly-created HelixAllToAllNative instance
+        """
+        if mapping not in HelixAllToAllNative._cache:
+            logger.info(
+                f"Rank {mapping.cp_rank} initializing HelixCpMnnvlMemory for Helix"
+            )
+            MnnvlMemory.initialize()
+
+            # Get workspace size (in bytes)
+            workspace_size_per_rank = _tllm_internal.thop.get_helix_workspace_size_per_rank(
+                mapping.cp_size)
+
+            # Allocate MNNVL memory using CP communicator for Helix
+            workspace = HelixCpMnnvlMemory(mapping, workspace_size_per_rank)
+            workspace_tensor = workspace.as_torch_strided_tensor(torch.uint64)
+
+            torch.ops.trtllm.initialize_helix_workspace(workspace_tensor,
+                                                        mapping.cp_rank,
+                                                        mapping.cp_size)
+            torch.cuda.synchronize()
+            HelixCpMnnvlMemory.get_comm(mapping).barrier()
+
+            HelixAllToAllNative._cache[mapping] = HelixAllToAllNative(
+                mapping, workspace, workspace_tensor)
+
+        return HelixAllToAllNative._cache[mapping]
+
+    def alltoall_native(self, partial_o: torch.Tensor,
+                        softmax_stats: torch.Tensor):
+        """
+        Perform all-to-all data exchange.
+
+        Args:
+            partial_o: Tensor with shape [..., cp_size, kv_lora_rank], dtype half.
+            softmax_stats: Tensor with shape [..., cp_size, 2], dtype float32.
+
+        Returns:
+            Tuple of (partial_o_out, softmax_stats_out) with same shapes as inputs.
+        """
+        partial_o_out, softmax_stats_out = torch.ops.trtllm.alltoall_helix_native(
+            partial_o,
+            softmax_stats,
+            self.workspace_tensor,
+            self.mapping.cp_rank,
+            self.mapping.cp_size,
+        )
+
+        return partial_o_out, softmax_stats_out
+
+
 def reducescatter(
     input: Union[torch.Tensor, List[torch.Tensor]],
     mapping: Mapping,
@@ -612,7 +692,6 @@ class AllReduce(nn.Module):
         self._disable_mpi = mpi_disabled()
 
         self.all_reduce_op = torch.ops.trtllm.allreduce_pg if self._disable_mpi else torch.ops.trtllm.allreduce
-
         if self.mapping.tp_size > 1:
             # Initialize Symmetric Memory AllReduce if needed (before workspace allocation)
             if self.strategy == AllReduceStrategy.SYMM_MEM:
@@ -708,6 +787,7 @@ class AllReduce(nn.Module):
         input = input.contiguous()  # Underlying op requires contiguous input
 
         allreduce_strategy = self.strategy
+
         if all_reduce_params is None:
             all_reduce_params = AllReduceParams()
 
@@ -751,21 +831,42 @@ class AllReduce(nn.Module):
                 "pg": pg.boxed(),
             }
 
-        output = self.all_reduce_op(
-            input=input,
-            residual=all_reduce_params.residual,
-            norm_weight=all_reduce_params.norm_weight,
-            scale=all_reduce_params.scale,
-            bias=all_reduce_params.bias,
-            workspace=self.workspace,
-            group=self.mapping.tp_group,
-            strategy=allreduce_strategy,
-            op=all_reduce_params.fusion_op,
-            eps=all_reduce_params.eps,
-            trigger_completion_at_end=all_reduce_params.
-            trigger_completion_at_end,
-            **additional_args,
-        )
+        # In case that AutoTuner brings potential perf regression
+        # TODO: Remove this if no perf regression is observed.
+        disable_allreduce_autotune = os.environ.get(
+            "TLLM_DISABLE_ALLREDUCE_AUTOTUNE", "0") == "1"
+
+        if allreduce_strategy == AllReduceStrategy.AUTO and not disable_allreduce_autotune and not self._disable_mpi:
+            output = torch.ops.trtllm.tunable_allreduce(
+                input=input,
+                residual=all_reduce_params.residual,
+                norm_weight=all_reduce_params.norm_weight,
+                scale=all_reduce_params.scale,
+                bias=all_reduce_params.bias,
+                workspace=self.workspace,
+                group=self.mapping.tp_group,
+                strategy=allreduce_strategy,
+                op=all_reduce_params.fusion_op,
+                eps=all_reduce_params.eps,
+                trigger_completion_at_end=all_reduce_params.
+                trigger_completion_at_end,
+            )
+        else:
+            output = self.all_reduce_op(
+                input=input,
+                residual=all_reduce_params.residual,
+                norm_weight=all_reduce_params.norm_weight,
+                scale=all_reduce_params.scale,
+                bias=all_reduce_params.bias,
+                workspace=self.workspace,
+                group=self.mapping.tp_group,
+                strategy=allreduce_strategy,
+                op=all_reduce_params.fusion_op,
+                eps=all_reduce_params.eps,
+                trigger_completion_at_end=all_reduce_params.
+                trigger_completion_at_end,
+                **additional_args,
+            )
 
         return output if len(output) > 1 else output[0]
 

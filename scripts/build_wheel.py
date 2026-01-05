@@ -290,6 +290,11 @@ def generate_fmha_cu(project_dir, venv_python):
     move_if_updated(fmha_v2_dir / "generated/fmha_cubin.h",
                     cubin_dir / "fmha_cubin.h")
 
+    # Copy generated source file (fmha_cubin.cpp) to the same directory as header
+    cpp_src = fmha_v2_dir / "generated/fmha_cubin.cpp"
+    if cpp_src.exists():
+        move_if_updated(cpp_src, cubin_dir / "fmha_cubin.cpp")
+
     generated_files = set()
     for cu_file in (fmha_v2_dir / "generated").glob("*sm*.cu"):
         dst_file = fmha_v2_cu_dir / os.path.basename(cu_file)
@@ -453,6 +458,7 @@ def main(*,
          trt_root: str = '/usr/local/tensorrt',
          nccl_root: str = None,
          nixl_root: str = None,
+         mooncake_root: str = None,
          internal_cutlass_kernels_root: str = None,
          clean: bool = False,
          clean_wheel: bool = False,
@@ -553,6 +559,11 @@ def main(*,
 
     if nixl_root is not None:
         cmake_def_args.append(f"-DNIXL_ROOT={nixl_root}")
+
+    if mooncake_root is not None:
+        if on_windows:
+            raise RuntimeError("Mooncake is not supported on Windows.")
+        cmake_def_args.append(f"-DMOONCAKE_ROOT={mooncake_root}")
 
     build_dir = get_build_dir(build_dir, build_type)
     first_build = not Path(build_dir, "CMakeFiles").exists()
@@ -814,6 +825,14 @@ def main(*,
                 build_run(
                     f"find {nixl_dir} -type f -name '*.so*' -exec patchelf --set-rpath \'$ORIGIN:$ORIGIN/plugins:$ORIGIN/../:$ORIGIN/../ucx/:$ORIGIN/../../ucx/\' {{}} \\;"
                 )
+        if os.path.exists(
+                build_dir /
+                "tensorrt_llm/executor/cache_transmission/mooncake_utils/libtensorrt_llm_mooncake_wrapper.so"
+        ):
+            install_file(
+                build_dir /
+                "tensorrt_llm/executor/cache_transmission/mooncake_utils/libtensorrt_llm_mooncake_wrapper.so",
+                lib_dir / "libtensorrt_llm_mooncake_wrapper.so")
         install_file(
             build_dir /
             "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/libdecoder_attention_0.so",
@@ -1036,6 +1055,10 @@ def add_arguments(parser: ArgumentParser):
                         help="Directory containing NCCL headers and libraries")
     parser.add_argument("--nixl_root",
                         help="Directory containing NIXL headers and libraries")
+    parser.add_argument(
+        "--mooncake_root",
+        help=
+        "Directory containing Mooncake transfer engine headers and libraries")
     parser.add_argument(
         "--internal-cutlass-kernels-root",
         default="",

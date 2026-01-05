@@ -1,7 +1,7 @@
 ### :title OpenAI Completion Client with JSON Schema
 
 # This example requires to specify `guided_decoding_backend` as
-# `xgrammar` or `llguidance` in the extra_llm_api_options.yaml file.
+# `xgrammar` or `llguidance` in the config.yaml file.
 import json
 
 from openai import OpenAI

@@ -1,6 +1,6 @@
 import nvtx
 
-from tensorrt_llm._torch.models.modeling_deepseekv3 import DeepseekV3Gate
+from tensorrt_llm._torch.models.modeling_deepseekv3 import DeepseekV3Gate, Deepseekv3MoE
 from tensorrt_llm._torch.models.modeling_qwen3_next import (
     Qwen3NextGatedDeltaNet,
     Qwen3NextSparseMoeBlock,
@@ -12,6 +12,7 @@ from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 
 def mark_ranges():
     DeepseekV3Gate.forward = nvtx.annotate("DeepseekV3Gate")(DeepseekV3Gate.forward)
+    Deepseekv3MoE.forward = nvtx.annotate("Deepseekv3MoE")(Deepseekv3MoE.forward)
     Qwen3NextGatedDeltaNet.forward = nvtx.annotate("Qwen3NextGatedDeltaNet")(
         Qwen3NextGatedDeltaNet.forward
     )

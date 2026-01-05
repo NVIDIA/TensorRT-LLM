@@ -8,10 +8,13 @@ import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm import deep_gemm
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
 from tensorrt_llm.logger import logger
+from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 
-from ..autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
-                         OptimizationProfile, TunableRunner, TuningConfig)
+from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
+                         DynamicTensorSpec, OptimizationProfile, TunableRunner,
+                         TuningConfig)
 from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..modules.multi_stream_utils import do_multi_stream
@@ -35,6 +38,7 @@ class MoERunner(TunableRunner):
             0, 0, get_last_power_of_2_num_tokens_buckets,
             last_positive_power_of_2), ),
         tune_max_num_tokens=8192,
+        distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
     )
 
     def __init__(
@@ -103,11 +107,8 @@ class MoERunner(TunableRunner):
             self.output_dtype,
             self.top_k,
             self.tp_size,
-            self.tp_rank,
             self.ep_size,
-            self.ep_rank,
             self.cluster_size,
-            self.cluster_rank,
             self.enable_alltoall,
             self.use_deepseek_fp8_block_scale,
             self.use_w4_group_scaling,
@@ -694,6 +695,14 @@ def _(
 
 class NVFP4GemmUnifiedRunner(TunableRunner):
     runner_dict = dict()
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(
+            0, 0, get_last_power_of_2_num_tokens_buckets,
+            last_positive_power_of_2), ),
+        constraint_specs=(ConstraintSpec(2, 0, fp4_scale_infer_shape), ),
+        # nested tuning should always be independent
+        distributed_tuning_strategy=DistributedTuningStrategy.INDEPENDENT,
+    )
 
     def __init__(self, to_userbuffers: bool, output_dtype: torch.dtype,
                  allowed_backends: List[str]):
@@ -944,7 +953,7 @@ def nvfp4_gemm(
         _, best_tactic = tuner.choose_one(
             "trtllm::nvfp4_gemm::gemm",
             [runner],
-            FP4GemmRunner.
+            NVFP4GemmUnifiedRunner.
             tuning_config,  # All runners use the same tuning_config
             [act_fp4, weight, act_sf, weight_scale, alpha],
         )
@@ -1320,7 +1329,7 @@ def _(
 
 class FinegrainedMixedDtypeGemm(TunableRunner):
     _runner_dict = dict()
-    MAX_SUPPORTED_SM_VERSION = 90
+    MAX_SUPPORTED_SM_VERSION = 103
 
     def __init__(self, activation_dtype: torch.dtype, output_dtype: torch.dtype,
                  quant_mode: int):
@@ -1355,7 +1364,7 @@ class FinegrainedMixedDtypeGemm(TunableRunner):
 
         if get_sm_version() > self.MAX_SUPPORTED_SM_VERSION:
             raise ValueError(
-                f"SM version {get_sm_version()} is not supported for W4A16 GEMM"
+                f"SM version {get_sm_version()} is not supported for W4A16/W4A8 finegrained mixed dtype GEMM"
             )
 
         activation, weights_packed, scales = inputs
@@ -1434,7 +1443,7 @@ def _(
     return input.new_empty((M, N), dtype=output_dtype)
 
 
-def fp8_swap_ab_gen_tuning_buckets(x: int):
+def deep_gemm_gen_tuning_buckets(x: int):
     buckets = tuple(range(8, 128, 8))
     if x >= 128:
         buckets += tuple(range(128, x, 128))
@@ -1444,7 +1453,7 @@ def fp8_swap_ab_gen_tuning_buckets(x: int):
 class fp8SwapABGemmRunner(TunableRunner):
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
-            0, 0, fp8_swap_ab_gen_tuning_buckets), ),
+            0, 0, deep_gemm_gen_tuning_buckets), ),
         tune_max_num_tokens=4096,
     )
 
@@ -1529,6 +1538,78 @@ def _(
     return input.new_empty((input.size(0), weight.size(0)), dtype=output_dtype)
 
 
+# The runner is used to trigger deepgemm jit during autotune.
+class Fp8BlockScalingGemmRunner(TunableRunner):
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(
+            0, 0, deep_gemm_gen_tuning_buckets), ),
+        tune_max_num_tokens=4096,
+    )
+
+    def get_valid_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        profile: OptimizationProfile,
+    ) -> List[int]:
+        return [0]
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: int = -1,
+    ) -> torch.Tensor:
+        a, b, a_scale, b_scale = inputs
+        return torch.ops.trtllm.fp8_block_scaling_gemm_impl(
+            a, b, a_scale, b_scale)
+
+
+def get_fp8_block_scaling_gemm_constraint_spec():
+    # The implementation aligns with the fp8_quantize_1x128 custom op.
+    def fp8_quantize_1x128_sm90_constrant(inputs: List[List[int]]):
+        pad_m = fp4_utils.pad_up(inputs[0][0], 4)
+        blocked_n = (inputs[0][1] + 127) // 128
+        return fp4_utils.pad_up(pad_m * blocked_n * 4, 128) // 4
+
+    if get_sm_version() >= 100:
+        return (ConstraintSpec(2, 1, lambda inputs: inputs[0][0]), )
+    else:
+        return (ConstraintSpec(2, 0, fp8_quantize_1x128_sm90_constrant), )
+
+
+@torch.library.custom_op("trtllm::fp8_block_scaling_gemm", mutates_args=())
+def fp8_block_scaling_gemm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    tune_max_num_tokens: int = 4096,
+) -> torch.Tensor:
+    tuner = AutoTuner.get()
+    fp8_block_scaling_gemm_runner = Fp8BlockScalingGemmRunner()
+    Fp8BlockScalingGemmRunner.tuning_config.tune_max_num_tokens = tune_max_num_tokens
+
+    Fp8BlockScalingGemmRunner.tuning_config.constraint_specs = get_fp8_block_scaling_gemm_constraint_spec(
+    )
+
+    _, best_tactic = tuner.choose_one(
+        "trtllm::fp8_block_scaling_gemm",
+        [fp8_block_scaling_gemm_runner],
+        Fp8BlockScalingGemmRunner.tuning_config,
+        [a, b, a_scale, b_scale],
+    )
+    return fp8_block_scaling_gemm_runner(
+        inputs=[a, b, a_scale, b_scale],
+        tactic=best_tactic,
+    )
+
+
+@fp8_block_scaling_gemm.register_fake
+def _(a, b, a_scale, b_scale, tune_max_num_tokens=4096):
+    m = a.shape[0]
+    n = b.shape[0]
+    return a.new_empty((m, n), dtype=torch.bfloat16)
+
+
 @torch.library.custom_op("trtllm::silu_and_mul", mutates_args=())
 def silu_and_mul(x: torch.Tensor,
                  scale: Optional[torch.Tensor] = None,
@@ -1571,6 +1652,173 @@ def _(
 
     o_dtype = dtype or x.dtype
     return x.new_empty((b, d), dtype=o_dtype)
+
+
+class AllReduceRunner(TunableRunner):
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(
+            0, 0, get_last_power_of_2_num_tokens_buckets(8192),
+            last_positive_power_of_2), ),
+        constraint_specs=(ConstraintSpec(1, 0, lambda shapes: shapes[0][0]), ),
+        distributed_tuning_strategy=DistributedTuningStrategy.MERGE,
+    )
+
+    def __init__(
+        self,
+        tp_size: int,
+        group: List[int],
+        op: int,
+        eps: float,
+        trigger_completion_at_end: bool,
+    ):
+        self.tp_size = tp_size
+        self.op = op
+        self.group = group
+        self.eps = eps
+        self.trigger_completion_at_end = trigger_completion_at_end
+
+    def unique_id(self):
+        return (
+            self.tp_size,
+            self.op,
+        )
+
+    def get_valid_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        profile: OptimizationProfile,
+        **kwargs,
+    ) -> List[int]:
+        valid_strategies = [
+            # TODO: NCCL_SYMMETRIC will cause hang during tuning process
+            # AllReduceStrategy.NCCL_SYMMETRIC.value,
+            AllReduceStrategy.NCCL.value,
+        ]
+        # Fallback in allreduceOp is set to NCCL_SYMMETRIC as default
+        # So we need to check if the workspace size is too large to avoid hanging.
+        workspace_size = inputs[0].numel() * inputs[0].element_size()
+        max_workspace_size = CustomAllReduceHelper.max_workspace_size_auto(
+            self.tp_size,
+            support_deterministic=False,
+        )
+        if workspace_size > max_workspace_size:
+            return valid_strategies
+
+        valid_strategies.append(AllReduceStrategy.ONESHOT.value)
+
+        # Additional restrictions for TWOSHOT strategy
+        if inputs[0].shape[0] >= self.tp_size:
+            valid_strategies.append(AllReduceStrategy.TWOSHOT.value)
+
+        return valid_strategies
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: int = -1,
+    ) -> torch.Tensor:
+        input, residual, norm_weight, scale, bias, workspace = inputs
+        if tactic == -1:
+            # TODO: Use NCCL instead of NCCL_SYMMETRIC to avoid hanging during tuning process
+            tactic = AllReduceStrategy.NCCL.value
+
+        return torch.ops.trtllm.allreduce(
+            input,
+            residual,
+            norm_weight,
+            scale,
+            bias,
+            workspace,
+            self.group,
+            tactic,
+            self.op,
+            self.eps,
+            self.trigger_completion_at_end,
+        )
+
+
+@torch.library.custom_op("trtllm::tunable_allreduce", mutates_args=())
+def tunable_allreduce(
+    input: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    norm_weight: Optional[torch.Tensor],
+    scale: Optional[torch.Tensor],
+    bias: Optional[torch.Tensor],
+    workspace: Optional[torch.Tensor],
+    group: List[int],
+    strategy: int,
+    op: int,
+    eps: float,
+    trigger_completion_at_end: bool,
+) -> List[torch.Tensor]:
+
+    tuner = AutoTuner.get()
+
+    allreduce_runner = AllReduceRunner(
+        len(group),
+        group,
+        op,
+        eps,
+        trigger_completion_at_end,
+    )
+
+    _, best_tactic = tuner.choose_one(
+        "trtllm::tunable_allreduce::allreduce",
+        [allreduce_runner],
+        AllReduceRunner.tuning_config,
+        [input, residual, norm_weight, scale, bias, workspace],
+    )
+
+    return allreduce_runner(
+        [input, residual, norm_weight, scale, bias, workspace],
+        tactic=best_tactic,
+    )
+
+
+@tunable_allreduce.register_fake
+def _(
+    input: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    norm_weight: Optional[torch.Tensor],
+    scale: Optional[torch.Tensor],
+    bias: Optional[torch.Tensor],
+    workspace: Optional[torch.Tensor],
+    group: List[int],
+    strategy: int,
+    op: int,
+    eps: float,
+    trigger_completion_at_end: bool,
+) -> List[torch.Tensor]:
+    if op == int(AllReduceFusionOp.NONE):
+        return [torch.empty_like(input)]
+    elif op == int(AllReduceFusionOp.RESIDUAL_RMS_NORM):
+        norm_out = torch.empty_like(input)
+        residual_out = torch.empty_like(input)
+        return [norm_out, residual_out]
+    elif op == int(AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8):
+        quant_out = torch.empty_like(input, dtype=torch.float8_e4m3fn)
+        residual_out = torch.empty_like(input)
+        return [quant_out, residual_out]
+    elif op == int(AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8):
+        norm_out = torch.empty_like(input)
+        quant_out = torch.empty_like(input, dtype=torch.float8_e4m3fn)
+        residual_out = torch.empty_like(input)
+        return [norm_out, quant_out, residual_out]
+    elif op == int(AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4):
+        fp4_shape, scale_shape = fp4_utils.get_fp4_shape(input.shape, 16)
+        quant_fp4 = input.new_empty(fp4_shape, dtype=torch.uint8)
+        scale_fp4 = input.new_empty(scale_shape, dtype=torch.uint8)
+        residual_out = torch.empty_like(input)
+        return [quant_fp4, scale_fp4, residual_out]
+    elif op == int(AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4):
+        fp4_shape, scale_shape = fp4_utils.get_fp4_shape(input.shape, 16)
+        quant_fp4 = input.new_empty(fp4_shape, dtype=torch.uint8)
+        scale_fp4 = input.new_empty(scale_shape, dtype=torch.uint8)
+        norm_out = torch.empty_like(input)
+        residual_out = torch.empty_like(input)
+        return [norm_out, quant_fp4, scale_fp4, residual_out]
+    else:
+        return [torch.empty_like(input)]
 
 
 def get_event(event_idx: int):

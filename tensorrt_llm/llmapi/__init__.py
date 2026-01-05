@@ -1,3 +1,4 @@
+from .._torch.async_llm import AsyncLLM
 from ..disaggregated_params import DisaggregatedParams
 from ..executor import CompletionOutput, LoRARequest, RequestError
 from ..sampling_params import GuidedDecodingParams, SamplingParams
@@ -14,8 +15,8 @@ from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BatchingType,
                        MedusaDecodingConfig, MoeConfig, MTPDecodingConfig,
                        NGramDecodingConfig, RocketSparseAttentionConfig,
                        SaveHiddenStatesDecodingConfig, SchedulerConfig,
-                       TorchCompileConfig, TorchLlmArgs, TrtLlmArgs,
-                       UserProvidedDecodingConfig)
+                       SkipSoftmaxAttentionConfig, TorchCompileConfig,
+                       TorchLlmArgs, TrtLlmArgs, UserProvidedDecodingConfig)
 from .llm_utils import (BuildConfig, KvCacheRetentionConfig, QuantAlgo,
                         QuantConfig)
 from .mm_encoder import MultimodalEncoder
@@ -23,6 +24,7 @@ from .mpi_session import MpiCommSession
 
 __all__ = [
     'LLM',
+    'AsyncLLM',
     'MultimodalEncoder',
     'CompletionOutput',
     'RequestOutput',
@@ -64,4 +66,5 @@ __all__ = [
     'SaveHiddenStatesDecodingConfig',
     'RocketSparseAttentionConfig',
     'DeepSeekSparseAttentionConfig',
+    'SkipSoftmaxAttentionConfig',
 ]
