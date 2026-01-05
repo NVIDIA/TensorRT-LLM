@@ -169,7 +169,7 @@ def generate_condition_entry(
     }
 
     tests = [
-        f"perf/test_perf.py::test_perf[perf_sanity_upload-{config_name}-{name}]"
+        f"perf/test_perf_sanity.py::test_e2e[aggr_upload-{config_name}-{name}]"
         for name in server_names
     ]
     return {"condition": condition, "tests": tests}
