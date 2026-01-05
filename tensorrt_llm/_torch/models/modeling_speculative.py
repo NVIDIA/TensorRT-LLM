@@ -1,9 +1,10 @@
-import warnings
 from typing import Dict, Generic, List, Optional, Tuple
 
 import torch
 from torch import nn
 from transformers import LlamaConfig, PretrainedConfig
+
+from tensorrt_llm.logger import logger
 
 from ...functional import PositionEmbeddingType
 from ..attention_backend import AttentionMetadata
@@ -29,7 +30,7 @@ def _ensure_draft_vocab_size(config: PretrainedConfig) -> None:
     if hasattr(config, "draft_vocab_size"):
         return
 
-    warnings.warn(
+    logger.warning(
         "Missing 'draft_vocab_size' in pretrained config; defaulting to 'vocab_size'. "
         "Set 'draft_vocab_size' explicitly if the draft head uses a different vocabulary."
     )
