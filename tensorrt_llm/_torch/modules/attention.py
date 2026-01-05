@@ -1346,6 +1346,14 @@ class MLA(nn.Module):
         Returns:
             torch.Tensor: The output tensor.
         """
+
+        def _qk_projection_and_rope(q: torch.Tensor, k: torch.Tensor,
+                                    position_ids: torch.Tensor):
+            q_b_proj = self.q_b_proj(q)
+            indexer_q_and_k = self.indexer._qk_projection_and_rope(
+                q, k, position_ids)
+            return q_b_proj, indexer_q_and_k
+
         assert self.mha is None and self.mqa is not None, "DSA is only supported in MQA mode"
         # split q, k, v into context and gen batches
         num_contexts = attn_metadata.num_contexts
@@ -1363,7 +1371,6 @@ class MLA(nn.Module):
                 self.indexer.head_dim
             ], -1)
 
-        # TODO: possibly overlap/fuse q_a_rmsnorm + kv_a_rmsnorm + indexer.k_layernorm?
         q, compressed_kv = maybe_execute_in_parallel(
             lambda: self.q_a_layernorm(q),
             lambda: self.kv_a_layernorm(compressed_kv),
@@ -1371,15 +1378,28 @@ class MLA(nn.Module):
             self.ln_events[1],
             self.aux_stream,
         )
-        qr = q
-        latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
+        latent_cache, indexer_k = maybe_execute_in_parallel(
+            lambda: torch.concat([compressed_kv, k_pe], dim=-1),
+            lambda: self.indexer.k_norm(indexer_k),
+            self.ln_events[0],
+            self.ln_events[1],
+            self.aux_stream,
+        )
+        q_and_k, indexer_weights = maybe_execute_in_parallel(
+            lambda: _qk_projection_and_rope(q, indexer_k, position_ids),
+            lambda: self.indexer._weight_proj(hidden_states),
+            self.ln_events[0],
+            self.ln_events[1],
+            self.aux_stream,
+        )
+        q, indexer_q_pe, indexer_q_nope, indexer_k_pe, indexer_k_nope = q_and_k
+        indxer_q_and_k = (indexer_q_pe, indexer_q_nope, indexer_k_pe,
+                          indexer_k_nope)
 
-        # TODO: fuse wq_b + (indexer) wlq here
-        q = self.q_b_proj(q)
         # Indexer
         topk_indices = self.indexer(
-            qr,
-            hidden_states,
+            indxer_q_and_k,
+            indexer_weights,
             attn_metadata,
             position_ids,
             indexer_k=indexer_k,  # indexer K proj
