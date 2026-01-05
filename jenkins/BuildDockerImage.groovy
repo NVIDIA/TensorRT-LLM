@@ -276,7 +276,7 @@ def buildImage(config, imageKeyToTag)
     }
 
     // Step 2: Build the images
-    stage ("Install packages") {
+    stage ("Install Package") {
         sh "pwd && ls -alh"
         sh "env | sort"
         sh "apk add make git"
@@ -372,7 +372,7 @@ def buildImage(config, imageKeyToTag)
                 IMAGE_WITH_TAG=${imageWithTag} \
                 STAGE=${dockerfileStage} \
                 BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
-                """, sleepInSecs: randomSleep, numRetries: 2, shortCommondRunTimeMax: 7200)
+                """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
             }
             if (target == "ngc-release") {
                 imageKeyToTag["NGC Release Image ${config.arch}"] = imageWithTag
@@ -380,7 +380,7 @@ def buildImage(config, imageKeyToTag)
         }
 
         if (customTag) {
-            stage ("custom tag: ${customTag} (${arch})") {
+            stage ("Custom Tag: ${customTag} (${arch})") {
                 sh """
                 cd ${LLM_ROOT} && make -C docker ${target}_${action} \
                 BASE_IMAGE=${BASE_IMAGE} \
@@ -395,7 +395,7 @@ def buildImage(config, imageKeyToTag)
     } catch (Exception ex) {
         containerGenFailure = ex
     } finally {
-        stage ("Docker logout") {
+        stage ("Docker Logout") {
             withCredentials([string(credentialsId: 'default-git-url', variable: 'DEFAULT_GIT_URL')]) {
                 sh "docker logout urm.nvidia.com"
                 sh "docker logout ${DEFAULT_GIT_URL}:5005"
@@ -424,14 +424,14 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
 
     def release_action = params.action
     def buildConfigs = [
-        "Build trtllm release (x86_64)": [
+        "Build Internal release (x86_64 trtllm)": [
             target: "trtllm",
             action: release_action,
             customTag: LLM_BRANCH_TAG + "-x86_64",
             build_wheel: true,
             dockerfileStage: "release",
         ],
-        "Build trtllm release (SBSA)": [
+        "Build Internal release (SBSA trtllm)": [
             target: "trtllm",
             action: release_action,
             customTag: LLM_BRANCH_TAG + "-sbsa",
@@ -439,21 +439,21 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             arch: "arm64",
             dockerfileStage: "release",
         ],
-        "Build CI image (x86_64 tritondevel)": [:],
-        "Build CI image (SBSA tritondevel)": [
+        "Build CI Image (x86_64 tritondevel)": [:],
+        "Build CI Image (SBSA tritondevel)": [
             arch: "arm64",
         ],
-        "Build CI image (RockyLinux8 Python310)": [
+        "Build CI Image (RockyLinux8 Python310)": [
             target: "rockylinux8",
             args: "PYTHON_VERSION=3.10.12",
             postTag: "-py310",
         ],
-        "Build CI image (RockyLinux8 Python312)": [
+        "Build CI Image (RockyLinux8 Python312)": [
             target: "rockylinux8",
             args: "PYTHON_VERSION=3.12.3",
             postTag: "-py312",
         ],
-        "Build NGC devel and release (x86_64)": [
+        "Build NGC devel And release (x86_64)": [
             target: "ngc-release",
             action: release_action,
             args: "DOCKER_BUILD_OPTS='--load --platform linux/amd64'",
@@ -464,7 +464,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             ],
             dockerfileStage: "release",
         ],
-        "Build NGC devel and release (SBSA)": [
+        "Build NGC devel And release (SBSA)": [
             target: "ngc-release",
             action: release_action,
             args: "DOCKER_BUILD_OPTS='--load --platform linux/arm64'",
@@ -583,7 +583,7 @@ pipeline {
                 }
             }
         }
-        stage("Upload Artifacts") {
+        stage("Upload Artifact") {
             steps {
                 script {
                     String imageKeyToTagJson = writeJSON returnText: true, json: imageKeyToTag
@@ -594,7 +594,7 @@ pipeline {
                 }
             }
         }
-        stage("Wait for Build Jobs Complete") {
+        stage("Wait For Build Job Complete") {
             when {
                 expression {
                     RUN_SANITY_CHECK
@@ -655,7 +655,7 @@ pipeline {
                 }
             }
         }
-        stage("Sanity Check for NGC Images") {
+        stage("Sanity Check For NGC Image") {
             when {
                 expression {
                     RUN_SANITY_CHECK
@@ -691,7 +691,7 @@ pipeline {
                 }
             }
         }
-        stage("Register NGC Images for Security Checks") {
+        stage("Register NGC Image For Security Check") {
             when {
                 expression {
                     return params.nspect_id && params.action == "push"
@@ -726,7 +726,7 @@ pipeline {
                         cmd += "--image "
                         cmd += imageKeyToTag.values().join(" ")
                         withCredentials([usernamePassword(credentialsId: "NSPECT_CLIENT-${nspect_env}", usernameVariable: 'NSPECT_CLIENT_ID', passwordVariable: 'NSPECT_CLIENT_SECRET')]) {
-                            trtllm_utils.llmExecStepWithRetry(this, script: cmd, numRetries: 6, shortCommondRunTimeMax: 7200)
+                            trtllm_utils.llmExecStepWithRetry(this, script: cmd, sleepInSecs: 600, numRetries: 6, shortCommondRunTimeMax: 7200)
                         }
                     }
                 }

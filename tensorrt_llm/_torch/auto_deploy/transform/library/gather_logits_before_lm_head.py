@@ -25,7 +25,9 @@ from typing import Tuple
 import torch
 from torch.fx import GraphModule
 
-from ...utils.node_utils import is_linear_op, is_op
+from tensorrt_llm._torch.auto_deploy.utils._graph import get_lm_head_node
+
+from ...utils.node_utils import is_linear_op
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
 
@@ -54,9 +56,7 @@ class GatherLogitsBeforeLmHeadTransform(BaseTransform):
         self._log_info("Applying GatherLogitsBeforeLmHead transform...")
 
         # assume lm head node is the input to the output node
-        lm_head_node = gm.graph.find_nodes(op="output")[0].all_input_nodes[0]
-        if is_op(lm_head_node, torch.ops.aten.to):
-            lm_head_node = lm_head_node.all_input_nodes[0]
+        lm_head_node = get_lm_head_node(gm)
 
         if is_linear_op(lm_head_node):
             node_to_gather = lm_head_node.all_input_nodes[0]
@@ -67,12 +67,14 @@ class GatherLogitsBeforeLmHeadTransform(BaseTransform):
 
         # Add logits_gather_mask as input in the graph and the sequence info interface
         logits_gather_indices_node = self._add_or_retrieve_input(gm, cm, "logits_gather_indices")
-        logits_gather_info_node = self._add_or_retrieve_input(gm, cm, "logits_gather_info")
+        logits_gather_info_host_node = self._add_or_retrieve_input(
+            gm, cm, "logits_gather_info_host"
+        )
 
         with gm.graph.inserting_after(node_to_gather):
             gathered_node = gm.graph.call_function(
                 torch.ops.auto_deploy.gather_logits_before_lm_head.default,
-                args=(node_to_gather, logits_gather_indices_node, logits_gather_info_node),
+                args=(node_to_gather, logits_gather_indices_node, logits_gather_info_host_node),
             )
         node_to_gather.replace_all_uses_with(gathered_node)
         gathered_node.replace_input_with(gathered_node, node_to_gather)

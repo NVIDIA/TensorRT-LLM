@@ -122,4 +122,4 @@ def store_benchmark_results(results: dict, results_path: str):
     results_path = pathlib.Path(results_path)
     results_path.parent.mkdir(parents=True, exist_ok=True)
     with results_path.open("w") as results_file:
-        json.dump(results, results_file)
+        json.dump(results, results_file, indent=2)

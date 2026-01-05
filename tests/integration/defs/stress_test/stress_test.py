@@ -44,6 +44,7 @@ import pandas as pd
 import pytest
 import requests
 import yaml
+from defs.common import parse_gsm8k_output
 from defs.conftest import get_device_count, get_device_memory, llm_models_root
 from defs.trt_test_alternative import (Popen, cleanup_process_tree, print_info,
                                        print_warning)
@@ -1067,35 +1068,6 @@ def format_time(seconds: int) -> str:
         return f"{seconds}s"
 
 
-def parse_accuracy_from_lm_eval_output(output_text: str) -> float:
-    """
-    Parse accuracy value from lm_eval output for GSM8K flexible-extract exact_match
-
-    Args:
-        output_text: The output text from lm_eval command
-
-    Returns:
-        float: The accuracy value (0.7582 in the example)
-    """
-    import re
-
-    # Look for the specific pattern: |gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.7559|±  |0.0118|
-    patterns = [
-        r'flexible-extract\|\s+\d+\|exact_match\|\↑\s+\|(\d+\.\d+)',
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, output_text)
-        if match:
-            accuracy_value = float(match.group(1))
-            print_info(f"Extracted accuracy value: {accuracy_value}")
-            return accuracy_value
-
-    print_warning("Could not find accuracy value in lm_eval output")
-    print_warning(f"Output text: {output_text}")
-    return None
-
-
 def run_accuracy_test(model_path: str,
                       server_config: ServerConfig,
                       stress_config: StressTestConfig,
@@ -1155,7 +1127,7 @@ def run_accuracy_test(model_path: str,
 
             # Parse accuracy value from output
             output_text = result.stdout
-            accuracy_value = parse_accuracy_from_lm_eval_output(output_text)
+            accuracy_value = parse_gsm8k_output(output_text)
             return True, accuracy_value
         else:
             print_warning(

@@ -134,8 +134,8 @@ def test_triton_context_flattened_and_state_writeback(mamba_env):
         torch.arange(len(lens), device=device, dtype=torch.int32),
         seq_len,
     ).view(1, -1)
-    # batch_info: [num_prefill, num_prefill_tokens, num_decode]
-    batch_info_tensor = torch.tensor([len(lens), sum(lens), 0], dtype=torch.int32, device=device)
+    # batch_info_host: [num_prefill, num_prefill_tokens, num_decode]
+    batch_info_host = torch.tensor([len(lens), sum(lens), 0], dtype=torch.int32, device=device)
     # Torch reference
     y_torch = torch.ops.auto_deploy.torch_cached_ssm(
         hidden_states,
@@ -146,7 +146,7 @@ def test_triton_context_flattened_and_state_writeback(mamba_env):
         dt,
         dt_bias,
         # STANDARD METADATA
-        batch_info_tensor,
+        batch_info_host,
         seq_len,
         cu_seqlen,
         slot_idx,
@@ -168,7 +168,7 @@ def test_triton_context_flattened_and_state_writeback(mamba_env):
         dt,
         dt_bias,
         # STANDARD METADATA
-        batch_info_tensor,
+        batch_info_host,
         cu_seqlens,
         slot_idx,
         use_initial_states,
