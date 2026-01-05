@@ -326,6 +326,18 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.mma_tiler[2],
         )
 
+        # Output tile shape for C (N dimension is halved due to SwiGLU fusion)
+        self.mma_tiler_c = (
+            self.mma_inst_shape_mn[0],
+            self.mma_inst_shape_mn[1] // 2,
+            mma_inst_shape_k * mma_inst_tile_k,
+        )
+        self.cta_tile_shape_mnk_c = (
+            self.mma_tiler_c[0] // cute.size(tiled_mma.thr_id.shape),
+            self.mma_tiler_c[1],
+            self.mma_tiler_c[2],
+        )
+
         # Compute cluster layout
         self.cluster_layout_vmnk = cute.tiled_divide(
             cute.make_layout((*self.cluster_shape_mn, 1)),
@@ -352,10 +364,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         #     self.c_dtype,
         # )
         self.epi_tile = (128, 64)
-        # Compute epilogue tile count for SFC quantization
+        # Compute epilogue tile count for SFC quantization (use output tile shape)
         self.epi_tile_cnt = (
-            self.cta_tile_shape_mnk[0] // self.epi_tile[0],
-            self.cta_tile_shape_mnk[1] // self.epi_tile[1],
+            self.cta_tile_shape_mnk_c[0] // self.epi_tile[0],
+            self.cta_tile_shape_mnk_c[1] // self.epi_tile[1],
         )
 
         # Setup A/B/C stage count in shared memory and ACC stage count in tensor memory
@@ -586,10 +598,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.epi_tile,
         )
 
-        # Compute grid size
+        # Compute grid size (use output tile shape for C due to SwiGLU fusion)
         self.tile_sched_params, grid = self._compute_grid(
             c_tensor,
-            self.cta_tile_shape_mnk,
+            self.cta_tile_shape_mnk_c,
             self.cluster_shape_mn,
             max_active_clusters,
         )
@@ -839,9 +851,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             cute.slice_(self.mma_tiler_sfb, (0, None, None)),
             (None, None, None),
         )
-        # (bM, bN, RestM, RestN, RestL)
+        # (bM, bN, RestM, RestN, RestL) - use mma_tiler_c for output due to SwiGLU fusion
         gC_mnl = cute.local_tile(
-            mC_mnl, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
+            mC_mnl, cute.slice_(self.mma_tiler_c, (None, None, 0)), (None, None, None)
         )
         k_tile_cnt = cute.size(gA_mkl, mode=[3])
 
@@ -1371,8 +1383,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             )
 
             ### core code to get alpha_scale
-            unroll_scale_idx = work_tile.tile_idx[0] // (
-                self.weight_per_expert // self.cta_tile_shape_mnk[0]
+            unroll_scale_idx = work_tile.tile_idx[1] // (
+                self.weight_per_expert // self.cta_tile_shape_mnk[1]
             )
             current_alpha_scale = alpha_scale[unroll_scale_idx, work_tile.tile_idx[2]]
 
@@ -1679,15 +1691,15 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 #
                 tile_sched.advance_to_next_work()
 
-                prev_work_tile_tile_idx_m = work_tile.tile_idx[0]
+                prev_work_tile_tile_idx_n = work_tile.tile_idx[1]
                 work_tile = tile_sched.get_current_work()
 
                 # if previous tile and current tile has same tile_idx_m,
                 # then we don't need to update alpha_scale,
                 # otherwise we need to update alpha_scale with ldg
-                if work_tile.is_valid_tile and prev_work_tile_tile_idx_m != work_tile.tile_idx[0]:
-                    unroll_scale_idx = work_tile.tile_idx[0] // (
-                        self.weight_per_expert // self.cta_tile_shape_mnk[0]
+                if work_tile.is_valid_tile and prev_work_tile_tile_idx_n != work_tile.tile_idx[1]:
+                    unroll_scale_idx = work_tile.tile_idx[1] // (
+                        self.weight_per_expert // self.cta_tile_shape_mnk[1]
                     )
                     current_alpha_scale = alpha_scale[unroll_scale_idx, work_tile.tile_idx[2]]
 
@@ -2332,18 +2344,17 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         ):
             can_implement = False
 
-        # We swap A and B, we need to make sure weight_per_expert is multiple of cta_tile_shape_m
-        cta_tile_shape_m = 128
+        # Alpha scale is indexed by N dimension, weight_per_expert should divide cta_tile_shape_n
+        cta_tile_shape_n = 128
 
-        if weight_per_expert % cta_tile_shape_m != 0:
+        if weight_per_expert % cta_tile_shape_n != 0:
             can_implement = False
 
-        # expert_count should be 256 or 257, and m / expert_count should be 256(e_per_w)
-        # we swap A and B, so when token size is 128, if we put B as token,
-        # as weight's N is large, we could benefit with mma.2sm without wave quantization.
-        if m % expert_count != 0:
+        # expert_count * num_fused_gemm experts in N dimension
+        # n = expert_count * num_fused_gemm * weight_per_expert
+        if n % expert_count != 0:
             can_implement = False
-        if m // expert_count // num_fused_gemm != weight_per_expert:  # 2 gemm are fused into 1
+        if n // expert_count // num_fused_gemm != weight_per_expert:
             can_implement = False
 
         return can_implement
@@ -2362,6 +2373,62 @@ def cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
     for i in cutlass.range(cute.size(sf_ref_tensor)):
         mkl_coord = sf_ref_tensor.layout.get_hier_coord(i)
         sf_mma_tensor[mkl_coord] = sf_ref_tensor[mkl_coord]
+
+
+@cute.jit
+def cvt_sf_M32x4xrm_K4xrk_L_to_MKL(
+    sf_mma_tensor: cute.Tensor,
+    sf_ref_tensor: cute.Tensor,
+):
+    """Convert scale factor tensor from mma specification M(32x4xrest_m)xK(4xrest_k)xL layout to MKL layout"""
+    # sf_mma_tensor has flatten shape (32, 4, rest_m, 4, rest_k, l)
+    # group to ((32, 4, rest_m), (4, rest_k), l)
+    sf_mma_tensor = cute.group_modes(sf_mma_tensor, 0, 3)
+    sf_mma_tensor = cute.group_modes(sf_mma_tensor, 1, 3)
+    for i in cutlass.range(cute.size(sf_ref_tensor)):
+        mkl_coord = sf_ref_tensor.layout.get_hier_coord(i)
+        sf_ref_tensor[mkl_coord] = sf_mma_tensor[mkl_coord]
+
+
+def create_sf_layout_tensor(l, mn, k, sf_vec_size):  # noqa: E741
+    """Create scale factor tensor in MMA layout for SFC verification.
+
+    :param l: Batch dimension (L)
+    :param mn: M or N dimension
+    :param k: K dimension (for SFC, this is n_out // sf_vec_size)
+    :param sf_vec_size: Vector size for scale factor
+    :return: Tuple of (swizzled_tensor_cpu, ref_shape)
+    """
+
+    def ceil_div(a, b):
+        return (a + b - 1) // b
+
+    sf_k = ceil_div(k, sf_vec_size)
+    ref_shape = (l, mn, sf_k)
+
+    atom_m = (32, 4)
+    atom_k = 4
+    mma_shape = (
+        l,
+        ceil_div(mn, atom_m[0] * atom_m[1]),
+        ceil_div(sf_k, atom_k),
+        atom_m[0],
+        atom_m[1],
+        atom_k,
+    )
+
+    mma_permute_order = (3, 4, 1, 5, 2, 0)
+
+    # Create f32 cute torch tensor (cpu) with MMA layout
+    cute_f32_torch_tensor_cpu = cutlass_torch.create_and_permute_torch_tensor(
+        mma_shape,
+        torch.float32,
+        permute_order=mma_permute_order,
+        init_type=cutlass_torch.TensorInitType.SCALAR,
+        init_config=cutlass_torch.ScalarInitConfig(value=0.0),
+    )
+
+    return cute_f32_torch_tensor_cpu, ref_shape
 
 
 def run(
@@ -2591,6 +2658,7 @@ def run(
     sfb_ref, sfb_tensor, sfb_torch = create_scale_factor_tensor(l, n, k, sf_vec_size, sf_dtype)
 
     # Create scale factor tensor alpha_scale_tensor
+    # Alpha scale is indexed by N dimension (not M) since we don't swap A/B
     def create_alpha_scale_tensor(l, expert_count):  # noqa: E741
         # 2 Gemm are fused into 1
         ref_shape = (l, expert_count * num_fused_gemm)
@@ -2621,7 +2689,8 @@ def run(
             assumed_align=4 * num_fused_gemm,
         )
 
-        # (l, m)
+        # Expand to (n, l) for einsum "mnl,nl->mnl" (alpha indexed by N dimension)
+        # n = expert_count * num_fused_gemm * weight_per_expert
         ref_f32_torch_tensor_cpu = (
             ref_f32_torch_tensor_cpu.permute(1, 0)
             .unsqueeze(-1)
@@ -2639,6 +2708,34 @@ def run(
     alpha_scale_ref, alpha_scale_tensor, alpha_scale_torch = create_alpha_scale_tensor(
         l, expert_count
     )
+
+    # Create SFC tensor and norm_const tensor for FP4 quantized output
+    # SFC (Scale Factor C) is used to store per-block scale factors for FP4 quantization
+    generate_sfc = c_dtype is cutlass.Float4E2M1FN
+    sfc_tensor = None
+    sfc_torch = None
+    norm_const_tensor = None
+    norm_const = 1.0
+
+    print(f"FP4 quantization with SFC: {'True' if generate_sfc else 'False'}")
+
+    if generate_sfc:
+        # SFC shape: (m, n_out // sf_vec_size, l) where n_out = n // 2 due to SwiGLU
+        # SFC tensor needs to be created with swizzled MMA layout (same as SFA/SFB)
+        n_out = n // 2
+
+        # Create SFC tensor with swizzled MMA layout using create_sf_layout_tensor
+        # This creates tensor with ref_shape (l, m, sfc_n) in MMA swizzled layout
+        sfc_swizzled_cpu, _ = create_sf_layout_tensor(l, m, n_out, sf_vec_size)
+        sfc_tensor, sfc_torch = cutlass_torch.cute_tensor_like(
+            sfc_swizzled_cpu, sf_dtype, is_dynamic_layout=True, assumed_align=16
+        )
+
+        # Create norm_const tensor (scalar tensor containing normalization constant)
+        norm_const_ref = torch.tensor([norm_const], dtype=torch.float32)
+        norm_const_tensor, _ = cutlass_torch.cute_tensor_like(
+            norm_const_ref, cutlass.Float32, is_dynamic_layout=True, assumed_align=4
+        )
 
     # Configure gemm kernel with SwiGLU fusion
     gemm = Sm100BlockScaledPersistentDenseGemmKernel(
@@ -2660,7 +2757,7 @@ def run(
     # Initialize Stream
     current_stream = cutlass_torch.default_stream()
 
-    # Compile gemm kernel (sfc_tensor and norm_const_tensor are None for non-quantized output)
+    # Compile gemm kernel
     compiled_gemm = cute.compile(
         gemm,
         a_tensor,
@@ -2669,8 +2766,8 @@ def run(
         sfb_tensor,
         alpha_scale_tensor,
         c_tensor,
-        None,  # sfc_tensor - None for non-quantized output
-        None,  # norm_const_tensor - None for non-quantized output
+        sfc_tensor,  # SFC tensor for FP4 quantized output (None if not quantizing)
+        norm_const_tensor,  # Normalization constant tensor (None if not quantizing)
         max_active_clusters,
         current_stream,
     )
@@ -2685,15 +2782,16 @@ def run(
             sfb_tensor,
             alpha_scale_tensor,
             c_tensor,
-            None,  # sfc_tensor
-            None,  # norm_const_tensor
+            sfc_tensor,  # SFC tensor for FP4 quantized output
+            norm_const_tensor,  # Normalization constant tensor
             current_stream,
         )
         print("Verifying results...")
         res_a = torch.einsum("mkl,mkl->mkl", a_ref, sfa_ref)
         res_b = torch.einsum("nkl,nkl->nkl", b_ref, sfb_ref)
         ref = torch.einsum("mkl,nkl->mnl", res_a, res_b)
-        ref = torch.einsum("mnl,ml->mnl", ref, alpha_scale_ref)
+        # Alpha scale indexed by N dimension (not M) since we don't swap A/B
+        ref = torch.einsum("mnl,nl->mnl", ref, alpha_scale_ref)
 
         # Apply SwiGLU fusion: output = up * silu(gate)
         # up and gate are interleaved in the N dimension (granularity=64)
@@ -2737,18 +2835,210 @@ def run(
             torch.testing.assert_close(c_ref, ref, atol=tolerance, rtol=1e-02)
         # {$nv-internal-release begin}
         elif c_dtype is cutlass.Float4E2M1FN:
-            # Convert ref : f32 -> f4 -> f32
-            ref_f4_ = torch.empty(*(l, m, n_out), dtype=torch.uint8, device="cuda").permute(1, 2, 0)
-            ref_f4 = from_dlpack(ref_f4_, assumed_align=16).mark_layout_dynamic(leading_dim=1)
-            ref_f4.element_type = c_dtype
-            ref_device = ref.permute(2, 0, 1).contiguous().permute(1, 2, 0).cuda()
-            ref_tensor = from_dlpack(ref_device, assumed_align=16).mark_layout_dynamic(
-                leading_dim=1
+            # FP4 quantization with SFC (Scale Factor C) verification
+            # Reference: run_blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion.py
+
+            def ceil_div(a, b):
+                return (a + b - 1) // b
+
+            def simulate_f8_quantization(tensor_f32: torch.Tensor, f8_dtype) -> torch.Tensor:
+                """Simulate f8 quantization: fp32 -> f8 -> fp32.
+
+                This models the precision loss when storing scale factors in f8 format.
+
+                :param tensor_f32: Input fp32 tensor (on CPU), shape (m, n, num_groups)
+                :param f8_dtype: Target f8 dtype (e.g., cutlass.Float8E4M3FN)
+                :return: Tensor after f32 -> f8 -> f32 round-trip (on CPU)
+                """
+                shape = tensor_f32.shape
+                # Create f8 tensor on GPU
+                f8_torch = torch.empty(*shape, dtype=torch.uint8, device="cuda")
+                f8_tensor = from_dlpack(f8_torch, assumed_align=16).mark_layout_dynamic(
+                    leading_dim=1
+                )
+                f8_tensor.element_type = f8_dtype
+                # Create f32 tensor on GPU
+                f32_device = tensor_f32.cuda()
+                f32_tensor = from_dlpack(f32_device, assumed_align=16).mark_layout_dynamic(
+                    leading_dim=1
+                )
+                # f32 -> f8 -> f32
+                cute.testing.convert(f32_tensor, f8_tensor)
+                cute.testing.convert(f8_tensor, f32_tensor)
+                return f32_device.cpu()
+
+            def simulate_nvfp4_quantization(tensor_f32: torch.Tensor) -> torch.Tensor:
+                """Simulate nvfp4 quantization: fp32 -> nvfp4 -> fp32.
+
+                This models the precision loss when storing output in nvfp4 format.
+
+                :param tensor_f32: Input fp32 tensor (on CPU), shape (m, n, ng)
+                :return: Tensor after f32 -> nvfp4 -> f32 round-trip (on CPU)
+                """
+                m_dim, n_dim, ng = tensor_f32.shape
+                # Create properly packed nvfp4 tensor using cutlass_torch utilities
+                ref_f32_torch = cutlass_torch.matrix(ng, m_dim, n_dim, False, cutlass.Float32)
+                f4_tensor, _ = cutlass_torch.cute_tensor_like(
+                    ref_f32_torch, cutlass.Float4E2M1FN, is_dynamic_layout=True, assumed_align=16
+                )
+                # Create f32 tensor on GPU
+                f32_device = tensor_f32.cuda()
+                f32_tensor = from_dlpack(f32_device, assumed_align=16).mark_layout_dynamic(
+                    leading_dim=1
+                )
+                # f32 -> f4 -> f32
+                cute.testing.convert(f32_tensor, f4_tensor)
+                cute.testing.convert(f4_tensor, f32_tensor)
+                return f32_device.cpu()
+
+            def compute_scale_factor(
+                tensor_f32: torch.Tensor,
+                sf_vec_size_local: int,
+                norm_const_local: float,
+                rcp_limits: float,
+            ) -> torch.Tensor:
+                """Compute scale factor for nvfp4 quantization.
+
+                Scale factor = abs_max_per_vector * norm_const * rcp_limits
+
+                :param tensor_f32: Input fp32 tensor, shape (m, n, ng)
+                :param sf_vec_size_local: Vector size for scale factor (e.g., 16)
+                :param norm_const_local: Normalization constant
+                :param rcp_limits: Reciprocal of dtype max value (e.g., 1/6.0 for nvfp4)
+                :return: Scale factor tensor, shape (m, sfn, ng) where sfn = ceil(n / sf_vec_size)
+                """
+                m_dim, n_dim, ng = tensor_f32.shape
+                sfn = ceil_div(n_dim, sf_vec_size_local)
+                # Reshape to (m, sfn, sf_vec_size, ng) for abs max computation
+                # Pad n dimension if needed
+                padded_n = sfn * sf_vec_size_local
+                if padded_n > n_dim:
+                    tensor_padded = torch.zeros(m_dim, padded_n, ng, dtype=tensor_f32.dtype)
+                    tensor_padded[:, :n_dim, :] = tensor_f32
+                else:
+                    tensor_padded = tensor_f32
+                tensor_reshaped = tensor_padded.view(m_dim, sfn, sf_vec_size_local, ng)
+                # Compute abs max over sf_vec_size dimension
+                abs_max, _ = torch.abs(tensor_reshaped).max(dim=2)  # (m, sfn, ng)
+                # Compute scale factor
+                scale_factor = abs_max * norm_const_local * rcp_limits
+                return scale_factor
+
+            def apply_quantization_scale(
+                tensor_f32: torch.Tensor,
+                scale_factor: torch.Tensor,
+                sf_vec_size_local: int,
+                norm_const_local: float,
+            ) -> torch.Tensor:
+                """Apply quantization scale to tensor.
+
+                Output = tensor * (norm_const / scale_factor).
+                This simulates the kernel's quantization scaling.
+
+                :param tensor_f32: Input fp32 tensor, shape (m, n, ng)
+                :param scale_factor: Scale factor tensor, shape (m, sfn, ng)
+                :param sf_vec_size_local: Vector size for scale factor
+                :param norm_const_local: Normalization constant
+                :return: Scaled tensor, shape (m, n, ng)
+                """
+                m_dim, n_dim, ng = tensor_f32.shape
+                sfn = scale_factor.shape[1]
+                # Compute reciprocal scale, clamping inf to fp32_max (matching kernel fmin behavior)
+                fp32_max = torch.tensor(3.40282346638528859812e38, dtype=torch.float32)
+                scale_rcp = norm_const_local * scale_factor.reciprocal()
+                scale_rcp = torch.where(torch.isinf(scale_rcp), fp32_max, scale_rcp)
+                # Expand scale factor to match tensor dimensions
+                # (m, sfn, ng) -> (m, sfn, sf_vec_size, ng) -> (m, sfn * sf_vec_size, ng)
+                scale_rcp_expanded = scale_rcp.unsqueeze(2).expand(
+                    m_dim, sfn, sf_vec_size_local, ng
+                )
+                scale_rcp_expanded = scale_rcp_expanded.reshape(m_dim, sfn * sf_vec_size_local, ng)
+                # Trim to exact n dimension
+                scale_rcp_expanded = scale_rcp_expanded[:, :n_dim, :]
+                # Apply scale
+                return tensor_f32 * scale_rcp_expanded
+
+            def unswizzle_kernel_sfc(
+                sfc_cute_tensor,
+                m_dim: int,
+                n_dim: int,
+                sf_vec_size_local: int,
+                l_dim: int,
+            ) -> torch.Tensor:
+                """Unswizzle kernel's scale factor tensor from MMA layout to MKL layout.
+
+                :param sfc_cute_tensor: Kernel's scale factor cute tensor (swizzled MMA layout)
+                :param m_dim: M dimension
+                :param n_dim: Output N dimension (n_out)
+                :param sf_vec_size_local: Vector size for scale factor
+                :param l_dim: L dimension (batch)
+                :return: Unswizzled scale factor tensor, shape (m, sfn, l)
+                """
+                sfn = ceil_div(n_dim, sf_vec_size_local)
+
+                # Create swizzled layout tensor matching kernel's SFC layout
+                swizzled_sfc_cpu, _ = create_sf_layout_tensor(
+                    l_dim, m_dim, n_dim, sf_vec_size_local
+                )
+                swizzled_sfc_tensor, swizzled_sfc_torch = cutlass_torch.cute_tensor_like(
+                    swizzled_sfc_cpu, cutlass.Float32, is_dynamic_layout=True, assumed_align=16
+                )
+
+                # Copy kernel SFC (sf_dtype) to swizzled layout tensor (Float32)
+                cute.testing.convert(sfc_cute_tensor, swizzled_sfc_tensor)
+                swizzled_sfc_cpu = swizzled_sfc_torch.cpu()
+
+                # Unswizzle: MMA layout -> MKL layout (m, sfn, l)
+                unswizzled_sfc = torch.empty(m_dim, sfn, l_dim, dtype=torch.float32)
+                cvt_sf_M32x4xrm_K4xrk_L_to_MKL(
+                    from_dlpack(swizzled_sfc_cpu),
+                    from_dlpack(unswizzled_sfc),
+                )
+
+                return unswizzled_sfc
+
+            # ============================================================
+            # Step 1: Compute reference scale factor (SFC) from SwiGLU output
+            # ============================================================
+            rcp_limits = gemm.get_dtype_rcp_limits(c_dtype)
+
+            # Compute reference SFC: abs_max * norm_const * rcp_limits
+            ref_sfc_before_f8 = compute_scale_factor(ref, sf_vec_size, norm_const, rcp_limits)
+            # Simulate f8 quantization for SFC (kernel stores SFC in sf_dtype format)
+            ref_sfc_f32 = simulate_f8_quantization(ref_sfc_before_f8, sf_dtype)
+
+            # ============================================================
+            # Step 2: Verify kernel SFC matches reference SFC (using pass rate)
+            # ============================================================
+            if sfc_tensor is not None:
+                kernel_sfc = unswizzle_kernel_sfc(sfc_tensor, m, n_out, sf_vec_size, l)
+
+                sfc_diff = torch.abs(ref_sfc_f32 - kernel_sfc)
+                sfc_within_tolerance = (sfc_diff <= tolerance) | (
+                    sfc_diff <= torch.abs(ref_sfc_f32) * 1e-02
+                )
+                sfc_pass_rate = sfc_within_tolerance.float().mean().item()
+                print(f"SFC Tensor pass rate: {sfc_pass_rate * 100:.2f}%")
+
+            # ============================================================
+            # Step 3: Apply quantization scale and simulate nvfp4 precision loss
+            # ============================================================
+            # Apply scale: ref_scaled = ref * (norm_const / sfc)
+            ref_scaled = apply_quantization_scale(ref, ref_sfc_f32, sf_vec_size, norm_const)
+            # Simulate nvfp4 quantization: f32 -> nvfp4 -> f32
+            ref_quantized = simulate_nvfp4_quantization(ref_scaled)
+
+            # ============================================================
+            # Step 4: Compare kernel output with reference (using pass rate)
+            # ============================================================
+            print("Verifying C Tensor...")
+            diff = torch.abs(c_ref - ref_quantized)
+            within_tolerance = (diff <= tolerance) | (diff <= torch.abs(ref_quantized) * 1e-02)
+            pass_rate = within_tolerance.float().mean().item()
+            print(f"C Tensor pass rate: {pass_rate * 100:.2f}% (threshold: 95%)")
+            assert pass_rate >= 0.95, (
+                f"Only {pass_rate * 100:.2f}% elements within tolerance, expected >= 95%"
             )
-            cute.testing.convert(ref_tensor, ref_f4)
-            cute.testing.convert(ref_f4, ref_tensor)
-            ref = ref_device.cpu()
-            torch.testing.assert_close(c_ref, ref, atol=tolerance, rtol=1e-02)
         # {$nv-internal-release end}
 
     def generate_tensors():
@@ -2782,6 +3072,22 @@ def run(
         _, sfa_tensor, _ = create_scale_factor_tensor(l, m, k, sf_vec_size, sf_dtype)
         _, sfb_tensor, _ = create_scale_factor_tensor(l, n, k, sf_vec_size, sf_dtype)
         _, alpha_scale_tensor, _ = create_alpha_scale_tensor(l, expert_count)
+
+        # Create SFC tensor and norm_const tensor for FP4 quantized output
+        gen_sfc_tensor = None
+        gen_norm_const_tensor = None
+        if generate_sfc:
+            n_out = n // 2
+            # Create SFC tensor with swizzled MMA layout
+            sfc_swizzled_cpu_gen, _ = create_sf_layout_tensor(l, m, n_out, sf_vec_size)
+            gen_sfc_tensor, _ = cutlass_torch.cute_tensor_like(
+                sfc_swizzled_cpu_gen, sf_dtype, is_dynamic_layout=True, assumed_align=16
+            )
+            norm_const_ref_gen = torch.tensor([norm_const], dtype=torch.float32)
+            gen_norm_const_tensor, _ = cutlass_torch.cute_tensor_like(
+                norm_const_ref_gen, cutlass.Float32, is_dynamic_layout=True, assumed_align=4
+            )
+
         return cute.testing.JitArguments(
             a_tensor,
             b_tensor,
@@ -2789,8 +3095,8 @@ def run(
             sfb_tensor,
             alpha_scale_tensor,
             c_tensor,
-            None,  # sfc_tensor
-            None,  # norm_const_tensor
+            gen_sfc_tensor,  # SFC tensor for FP4 quantized output
+            gen_norm_const_tensor,  # Normalization constant tensor
             current_stream,
         )
 
@@ -2804,6 +3110,8 @@ def run(
             + alpha_scale_torch.numel() * alpha_scale_torch.element_size()
             + c_torch.numel() * c_torch.element_size()
         )
+        if sfc_torch is not None:
+            one_workspace_bytes += sfc_torch.numel() * sfc_torch.element_size()
         workspace_count = cute.testing.get_workspace_count(
             one_workspace_bytes, warmup_iterations, iterations
         )
@@ -2881,7 +3189,7 @@ if __name__ == "__main__":
         help="Cluster shape (comma-separated)",
     )
     parser.add_argument("--ab_dtype", type=cutlass.dtype, default=cutlass.Float4E2M1FN)
-    parser.add_argument("--sf_dtype", type=cutlass.dtype, default=cutlass.Float8E8M0FNU)
+    parser.add_argument("--sf_dtype", type=cutlass.dtype, default=cutlass.Float8E4M3FN)
     parser.add_argument("--sf_vec_size", type=int, default=16)
     parser.add_argument("--c_dtype", type=cutlass.dtype, default=cutlass.Float16)
     parser.add_argument("--a_major", choices=["k", "m"], type=str, default="k")
