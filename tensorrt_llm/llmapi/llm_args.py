@@ -17,7 +17,6 @@ from pydantic import AliasChoices, BaseModel
 from pydantic import Field as PydanticField
 from pydantic import PrivateAttr, field_validator, model_validator
 from strenum import StrEnum
-
 from transformers import PreTrainedTokenizerBase
 
 try:
