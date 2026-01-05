@@ -529,7 +529,6 @@ unittest/_torch/thop/parallel/deep_gemm_tests.py::test_fp8_block_scaling_bmm[204
 unittest/_torch/thop/parallel/deep_gemm_tests.py::test_fp8_block_scaling_bmm[2048-7168-2-512] SKIP (https://nvbugs/5761699)
 unittest/_torch/thop/parallel/deep_gemm_tests.py::test_fp8_block_scaling_bmm[2048-7168-4-256] SKIP (https://nvbugs/5761699)
 unittest/_torch/thop/parallel/test_fp8_block_scale_gemm.py::test_deep_gemm_in_subprocess[env2] SKIP (https://nvbugs/5766853)
-accuracy/test_llm_api_pytorch_multimodal.py::TestGemma3_27BInstruct::test_auto_dtype SKIP (https://nvbugs/5766864)
 unittest/_torch/auto_deploy/unit/multigpu/transformations/library/test_dist_backend.py::test_dist_backend_all_gather[torch] SKIP (https://nvbugs/5766986)
 unittest/_torch/auto_deploy/unit/multigpu/transformations/library/test_dist_backend.py::test_dist_backend_all_gather[trtllm] SKIP (https://nvbugs/5766986)
 unittest/_torch/auto_deploy/unit/multigpu/transformations/library/test_tp_sharding.py::test_sharding[Linear-torch_dist_all_gather-False-False-2] SKIP (https://nvbugs/5766982)
