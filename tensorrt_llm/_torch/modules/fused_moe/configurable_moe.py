@@ -28,10 +28,12 @@ Design Principles:
 4. Unified EPLB integration for backends that support it
 """
 
+import os
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 
+from tensorrt_llm._torch.expert_statistic import ExpertStatistic
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe.interface import MoE
 from tensorrt_llm._torch.modules.fused_moe.routing import BaseMoeRoutingMethod
@@ -221,6 +223,9 @@ class ConfigurableMoE(MoE):
         # Validate configuration
         self.validate_config()
 
+        # Debug function for eliminating imbalance during performance analysis.
+        self.enable_dummy_allreduce = os.environ.get("TRTLLM_ENABLE_DUMMY_ALLREDUCE", "0") == "1"
+
         # Mark as _weights_removed to skip ConfigurableMoE's post_load_weights in model_loader
         # The backend's post_load_weights will be called directly by model_loader
         # This avoids duplicate post_load_weights calls (once for ConfigurableMoE, once for backend)
@@ -234,6 +239,16 @@ class ConfigurableMoE(MoE):
         if not hasattr(self, "backend") or self.backend is None:
             return self.use_dp and self.parallel_size > 1
         return self.backend._supports_load_balancer()
+
+    def dummy_allreduce(self):
+        """
+        Debug function for eliminating imbalance during performance analysis.
+        Creates a small dummy tensor and performs allreduce to synchronize processes
+        and eliminate timing imbalances for more accurate profiling measurements.
+        """
+        dummy_tensor = torch.zeros(4, dtype=torch.float32, device="cuda")
+        dummy_tensor = self.all_reduce(dummy_tensor)
+        return dummy_tensor
 
     def validate_config(self):
         """
@@ -619,6 +634,9 @@ class ConfigurableMoE(MoE):
         else:
             token_selected_slots = token_selected_experts
 
+        ExpertStatistic.set_layer(self.layer_idx)
+        ExpertStatistic.maybe_add_info(self.num_slots, token_selected_slots)
+
         # ========== Step 3.5: Communication Prepare Phase (BEFORE quantization) ==========
         # NVLINK two-sided has a prepare phase to gather EPLB statistics
 
@@ -646,6 +664,10 @@ class ConfigurableMoE(MoE):
             # Check if we should use post-quant dispatch
             # supports_post_quant_dispatch checks strategy capability for the current quant mode
             supports_post_quant = self.comm.supports_post_quant_dispatch()
+
+            # Call dummy_allreduce before allgather for load balancing debug
+            if self.enable_dummy_allreduce:
+                self.dummy_allreduce()
 
             if supports_post_quant:
                 # ===== Post-quant flow: Quantize → Dispatch =====
@@ -710,6 +732,8 @@ class ConfigurableMoE(MoE):
 
         # ========== Step 9: Communication - Combine ==========
         if self.comm is not None:
+            if self.enable_dummy_allreduce:
+                self.dummy_allreduce()
             # Use unified combine interface (reads dispatch state from strategy)
             final_hidden_states = self.comm.combine(final_hidden_states)
         else:
