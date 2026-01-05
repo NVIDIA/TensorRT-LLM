@@ -707,7 +707,7 @@ pipeline {
             }
             steps {
                 script {
-                    def buildRes = SKIP_NSPECT_FAILURE ? 'SUCCESS' : 'FAILURE'
+                    def buildRes = SKIP_NSPECT_FAILURE ? 'UNSTABLE' : 'FAILURE'
                     def stageRes = SKIP_NSPECT_FAILURE ? 'UNSTABLE' : 'FAILURE'
                     catchError(buildResult: buildRes, stageResult: stageRes) {
                         container("python3") {
