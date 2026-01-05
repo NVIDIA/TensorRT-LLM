@@ -89,7 +89,6 @@ To quickly run DeepSeek-V3, [examples/llm-api/quickstart_advanced.py](../llm-api
 cd examples/llm-api
 python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --tp_size 8
 ```
-Please include `--tokens_per_block 64` when running DeepSeek-V3.2-Exp, as this model uses the deep_gemm.fp8_paged_mqa_logits kernel, which requires a KV cache block size of 64.
 
 The model will be run by PyTorch backend and generate outputs like:
 ```
@@ -107,7 +106,7 @@ cd examples/llm-api
 python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --spec_decode_algo MTP --spec_decode_max_draft_len N
 ```
 
-`N` is the number of MTP modules. When `N` is equal to `0`, which means that MTP is not used (default). When `N` is greater than `0`, which means that `N` MTP modules are enabled. In the current implementation, the weight of each MTP module is shared. Please include `--tokens_per_block 64` when running DeepSeek-V3.2-Exp.
+`N` is the number of MTP modules. When `N` is equal to `0`, which means that MTP is not used (default). When `N` is greater than `0`, which means that `N` MTP modules are enabled. In the current implementation, the weight of each MTP module is shared.
 
 #### Relaxed acceptance
 **NOTE: This feature can only be used for DeepSeek R1.**
