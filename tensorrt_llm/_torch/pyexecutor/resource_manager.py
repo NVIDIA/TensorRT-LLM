@@ -10,8 +10,7 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings
-from tensorrt_llm._utils import mpi_disabled
-from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
+from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
 from tensorrt_llm.llmapi.llm_args import (KvCacheConfig, PeftCacheConfig,
                                           PybindMirror)
 from tensorrt_llm.lora_helper import LoraConfig
@@ -27,11 +26,6 @@ from .kv_cache_connector import KvCacheConnectorManager
 from .llm_request import (LlmRequest, LlmRequestState, SamplingConfig,
                           get_draft_token_length)
 from .scheduler import ScheduledRequests
-
-if ENABLE_MULTI_DEVICE:
-    from mpi4py import MPI
-
-    from tensorrt_llm._utils import mpi_comm
 
 BufferManagerCpp = tensorrt_llm.bindings.internal.runtime.BufferManager
 KVCacheManagerCpp = tensorrt_llm.bindings.internal.batch_manager.KVCacheManager
@@ -803,12 +797,11 @@ class KVCacheManager(BaseResourceManager):
 
         if mapping.world_size > 1:
             # make sure all ranks use same value for maxTokens
-            if mpi_disabled():
-                from tensorrt_llm._utils import torch_comm
-                max_tokens = torch_comm().allreduce(
-                    max_tokens, op=torch.distributed.ReduceOp.MIN)
-            else:
-                max_tokens = mpi_comm().allreduce(max_tokens, op=MPI.MIN)
+            dist = Distributed.get(mapping)
+            max_tokens = dist.allreduce(
+                max_tokens,
+                op=ReduceOp.MIN,
+            )
 
         # get number of blocks
         blocks_in_primary_pool = int(max_tokens // tokens_per_block)

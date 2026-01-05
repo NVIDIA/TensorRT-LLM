@@ -17,15 +17,12 @@ import struct
 import sys
 from typing import List, Tuple
 
-from tensorrt_llm._utils import mpi_disabled
-
 try:
     from cuda.bindings import driver as cuda
     from cuda.bindings import runtime as cudart
 except ImportError:
     from cuda import cuda, cudart
 
-from ._utils import mpi_comm
 from .logger import logger
 from .mapping import Mapping
 
@@ -107,15 +104,9 @@ class IpcMemory:
                 size += alignment - (size % alignment)
             return size
 
-        if mpi_disabled():
-            from tensorrt_llm._utils import torch_comm
+        from tensorrt_llm._torch.distributed.communicator import Distributed
 
-            allgather = torch_comm().tp_allgather
-        else:
-            comm = mpi_comm().Split(
-                mapping.pp_rank * mapping.cp_size + mapping.cp_rank, mapping.tp_rank
-            )
-            allgather = comm.allgather
+        dist = Distributed.get(mapping)
 
         # see allocateIpcMemory in cpp/tensorrt_llm/runtime/ipcUtils.cpp for alignment reason
         # 1 << 21 is 2MB
@@ -126,7 +117,7 @@ class IpcMemory:
             _raise_if_error(cudart.cudaMemset(local_ptr, 0, aligned_size)[0])
         error, local_handle = cudart.cudaIpcGetMemHandle(local_ptr)
         _raise_if_error(error)
-        handles_reserved = allgather(local_handle.reserved)
+        handles_reserved = dist.tp_allgather(local_handle.reserved)
 
         handles = []
         for reserved in handles_reserved:
