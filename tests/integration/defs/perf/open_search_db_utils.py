@@ -22,7 +22,6 @@ import sys
 import time
 from datetime import datetime
 
-import yaml
 from defs.trt_test_alternative import print_error, print_info, print_warning
 
 _project_root = os.path.abspath(
@@ -104,7 +103,7 @@ def get_job_info():
     global_vars_str = os.getenv("globalVars", "{}")
     try:
         global_vars = json.loads(global_vars_str)
-    except:
+    except Exception:
         global_vars = {}
 
     # Get job_url and job_id
@@ -280,7 +279,7 @@ def query_history_data(common_values_dict):
         if res is None:
             # No response from database, return None
             print_info(
-                f"Fail to query from {TEST_INFO_PROJECT_NAME}, returned no response"
+                f"Failed to query from {TEST_INFO_PROJECT_NAME}, returned no response"
             )
             return None
         else:
@@ -296,24 +295,25 @@ def query_history_data(common_values_dict):
                 data_dict["_id"] = hit.get("_id", "")
                 if data_dict["_id"] == "":
                     print_info(
-                        f"Fail to query from {TEST_INFO_PROJECT_NAME}, returned data with no _id"
+                        f"Failed to query from {TEST_INFO_PROJECT_NAME}, returned data with no _id"
                     )
                     # Invalid data, return None
                     return None
                 data_list.append(data_dict)
             print_info(
-                f"Successfully query from {TEST_INFO_PROJECT_NAME}, queried {len(data_list)} entries"
+                f"Successfully queried from {TEST_INFO_PROJECT_NAME}, queried {len(data_list)} entries"
             )
             return data_list
     except Exception as e:
         print_info(
-            f"Fail to query from {TEST_INFO_PROJECT_NAME}, returned error: {e}")
+            f"Failed to query from {TEST_INFO_PROJECT_NAME}, returned error: {e}"
+        )
         return None
 
 
 def match(history_data, new_data, match_keys):
     """
-    Check if the server and client config of history data matches the new data
+    Check if the server and client config of history data match the new data
     """
 
     def is_empty(value):
@@ -448,7 +448,7 @@ def get_history_data(new_data_dict, match_keys, common_values_dict):
                         history_data_dict[cmd_idx].append(history_data)
                     break
 
-    # Sometime database has several baselines and we only use the latest baseline one
+    # Sometimes the database has several baselines and we only use the latest one
     # If list is empty, set to None for each cmd_idx
     for cmd_idx, baseline_list in history_baseline_dict.items():
         latest_baseline = get_latest_data(baseline_list)
@@ -476,7 +476,7 @@ def _get_threshold_for_metric(baseline_data, metric, is_post_merge):
 def _calculate_diff(metric, new_value, baseline_value):
     """
     Calculate the percentage difference between new and baseline values.
-    Returns positive number if perf is better, negative if worse.
+    Returns a positive number if perf is better, negative if worse.
     """
     if baseline_value == 0:
         return 0.0
@@ -627,26 +627,8 @@ def post_new_perf_data(new_baseline_data_dict, new_data_dict):
             f"Ready to post {len(data_list)} data to {TEST_INFO_PROJECT_NAME}")
         OpenSearchDB.postToOpenSearchDB(data_list, TEST_INFO_PROJECT_NAME)
     except Exception as e:
-        print_info(f"Fail to post data to {TEST_INFO_PROJECT_NAME}, error: {e}")
-
-
-def write_regressive_test_cases(regressive_data_list, new_data_dict,
-                                perf_result_output_dir):
-    """
-    Write regressive test cases to regressive.yaml
-    """
-    regression_yaml_path = os.path.join(perf_result_output_dir,
-                                        "regression.yaml")
-    with open(regression_yaml_path, 'w') as f:
-        yaml.dump(regressive_data_list, f, default_flow_style=False)
-
-    perf_data_yaml_path = os.path.join(perf_result_output_dir, "perf_data.yaml")
-    with open(perf_data_yaml_path, 'w') as f:
-        yaml.dump(list(new_data_dict.values()), f, default_flow_style=False)
-
-    if len(regressive_data_list) > 0:
-        print_warning(
-            f"Found {len(regressive_data_list)} regressive test cases")
+        print_info(
+            f"Failed to post data to {TEST_INFO_PROJECT_NAME}, error: {e}")
 
 
 def _get_metric_keys():
