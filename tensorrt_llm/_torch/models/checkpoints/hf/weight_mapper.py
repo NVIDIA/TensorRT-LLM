@@ -69,12 +69,17 @@ class HfWeightMapper(BaseWeightMapper):
                 num_kv_heads = kv_shape * 2 // self._head_dim
             else:
                 num_kv_heads = kv_shape // self._head_dim
+
+            duplicated_keys = ["weight", "bias"]
+            if module.quant_config.quant_mode.has_nvfp4():
+                duplicated_keys.append("weight_scale")
+
             processed_weights = {
                 k:
                 self._duplicate_kv(weight=v[:],
                                    num_kv_heads=num_kv_heads,
                                    tensor_parallel_size=self._tp_size)
-                if k in ["weight", "bias"] else v
+                if k in duplicated_keys else v
                 for k, v in weights.items()
             }
             return processed_weights

@@ -48,6 +48,12 @@ namespace kernels::moe_comm
 #define SWITCH_TOP_K(top_k, TOP_K, ...)                                                                                \
     switch (top_k)                                                                                                     \
     {                                                                                                                  \
+    case 22:                                                                                                           \
+    {                                                                                                                  \
+        constexpr int TOP_K = 22;                                                                                      \
+        __VA_ARGS__;                                                                                                   \
+        break;                                                                                                         \
+    }                                                                                                                  \
     case 16:                                                                                                           \
     {                                                                                                                  \
         constexpr int TOP_K = 16;                                                                                      \
@@ -654,7 +660,69 @@ __device__ void vectorized_combine_impl(
             acc[k].load(recv_buffer + base_token + offset);
         }
         // Reduce acc[TOP_K] into acc[0]
-        if constexpr (TOP_K == 16)
+        if constexpr (TOP_K == 22)
+        {
+            T* a0 = reinterpret_cast<T*>(&acc[0]);
+            T* a1 = reinterpret_cast<T*>(&acc[1]);
+            T* a2 = reinterpret_cast<T*>(&acc[2]);
+            T* a3 = reinterpret_cast<T*>(&acc[3]);
+            T* a4 = reinterpret_cast<T*>(&acc[4]);
+            T* a5 = reinterpret_cast<T*>(&acc[5]);
+            T* a6 = reinterpret_cast<T*>(&acc[6]);
+            T* a7 = reinterpret_cast<T*>(&acc[7]);
+            T* a8 = reinterpret_cast<T*>(&acc[8]);
+            T* a9 = reinterpret_cast<T*>(&acc[9]);
+            T* a10 = reinterpret_cast<T*>(&acc[10]);
+            T* a11 = reinterpret_cast<T*>(&acc[11]);
+            T* a12 = reinterpret_cast<T*>(&acc[12]);
+            T* a13 = reinterpret_cast<T*>(&acc[13]);
+            T* a14 = reinterpret_cast<T*>(&acc[14]);
+            T* a15 = reinterpret_cast<T*>(&acc[15]);
+            T* a16 = reinterpret_cast<T*>(&acc[16]);
+            T* a17 = reinterpret_cast<T*>(&acc[17]);
+            T* a18 = reinterpret_cast<T*>(&acc[18]);
+            T* a19 = reinterpret_cast<T*>(&acc[19]);
+            T* a20 = reinterpret_cast<T*>(&acc[20]);
+            T* a21 = reinterpret_cast<T*>(&acc[21]);
+#pragma unroll
+            for (int j = 0; j < elems_per_vec; ++j)
+            {
+                a0[j] += a1[j];
+                a2[j] += a3[j];
+                a4[j] += a5[j];
+                a6[j] += a7[j];
+                a8[j] += a9[j];
+                a10[j] += a11[j];
+                a12[j] += a13[j];
+                a14[j] += a15[j];
+                a16[j] += a17[j];
+                a18[j] += a19[j];
+                a20[j] += a21[j];
+            }
+#pragma unroll
+            for (int j = 0; j < elems_per_vec; ++j)
+            {
+                a0[j] += a2[j];
+                a4[j] += a6[j];
+                a8[j] += a10[j];
+                a12[j] += a14[j];
+                a16[j] += a18[j];
+            }
+#pragma unroll
+            for (int j = 0; j < elems_per_vec; ++j)
+            {
+                a0[j] += a4[j];
+                a8[j] += a12[j];
+                a16[j] += a20[j];
+            }
+#pragma unroll
+            for (int j = 0; j < elems_per_vec; ++j)
+            {
+                a0[j] += a8[j];
+                a0[j] += a16[j];
+            }
+        }
+        else if constexpr (TOP_K == 16)
         {
             T* a0 = reinterpret_cast<T*>(&acc[0]);
             T* a1 = reinterpret_cast<T*>(&acc[1]);

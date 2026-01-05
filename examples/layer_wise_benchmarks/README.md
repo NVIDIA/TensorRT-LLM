@@ -15,6 +15,9 @@ pip install -e ../..
 **Step 3:** In the container, run benchmarks and generate profiles:
 
 ```bash
+# Set autotune cache path
+export TLLM_AUTOTUNER_CACHE_PATH=autotuner_cache/cache
+
 # Run DeepSeek-R1 NVFP4
 NP=4 ./mpi_launch.sh ./run.sh config_ctx.yaml
 NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml
@@ -24,16 +27,16 @@ NP=4 ./mpi_launch.sh ./run.sh config_ctx.yaml --model deepseek-ai/DeepSeek-V3.2-
 NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --model deepseek-ai/DeepSeek-V3.2-Exp --tokens-per-block 64 --moe-backend DEEPGEMM
 
 # Run DeepSeek-V3.2-Exp with 32k context length
-NP=4 ./mpi_launch.sh ./run.sh config_ctx.yaml --model deepseek-ai/DeepSeek-V3.2-Exp --tokens-per-block 64 --max-seq-len $((32768 + 1024 + 4)) --moe-backend DEEPGEMM --batch-size 1 --seq-len-q 32769
-NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --model deepseek-ai/DeepSeek-V3.2-Exp --tokens-per-block 64 --max-seq-len $((32768 + 1024 + 4)) --moe-backend DEEPGEMM --seq-len-kv-cache 32769
+NP=4 ./mpi_launch.sh ./run.sh config_ctx.yaml --model deepseek-ai/DeepSeek-V3.2-Exp --tokens-per-block 64 --moe-backend DEEPGEMM --batch-size 1 --seq-len-q 32769
+NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --model deepseek-ai/DeepSeek-V3.2-Exp --tokens-per-block 64 --moe-backend DEEPGEMM --seq-len-kv-cache 32769
 
 # Run with attention TP
 NP=4 ./mpi_launch.sh ./run.sh config_ctx.yaml --no-enable-attention-dp
 NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --no-enable-attention-dp
 
 # Run with attention TP and TRTLLMGen
-NP=4 ./mpi_launch.sh -x TRTLLM_ENABLE_PDL=1 ./run.sh config_ctx.yaml --no-enable-attention-dp --moe-backend TRTLLM --balance-method NotModified
-NP=4 ./mpi_launch.sh -x TRTLLM_ENABLE_PDL=1 ./run.sh config_gen.yaml --no-enable-attention-dp --moe-backend TRTLLM --balance-method NotModified
+NP=4 ./mpi_launch.sh -x TRTLLM_ENABLE_PDL=1 ./run.sh config_ctx.yaml --no-enable-attention-dp --moe-backend TRTLLM
+NP=4 ./mpi_launch.sh -x TRTLLM_ENABLE_PDL=1 ./run.sh config_gen.yaml --no-enable-attention-dp --moe-backend TRTLLM
 
 # Run with MTP3
 NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --batch-size 32 --seq-len-q 4
@@ -48,7 +51,7 @@ NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --scaled-from 16 --moe-backend WID
 # Scale TEP=16 to 4 GPUs: reduce the number of attention heads and experts
 NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --scaled-from 16 --no-enable-attention-dp
 
-# Run Qwen3-Next (balanced routing is not implemented)
+# Run Qwen3-Next
 NP=2 ./mpi_launch.sh ./run.sh config_ctx.yaml --model Qwen/Qwen3-Next-80B-A3B-Instruct --layer-indices 6,7 --no-enable-attention-dp --batch-size 4
 NP=2 ./mpi_launch.sh ./run.sh config_gen.yaml --model Qwen/Qwen3-Next-80B-A3B-Instruct --layer-indices 6,7 --no-enable-attention-dp --batch-size 512
 
@@ -69,13 +72,13 @@ NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --balance-method ImbalancedExperts
 ### Run with Slurm
 
 > Tips:
-> 1. If you have a running Slurm job, please skip step 1 and go straight to step 2 and 3.
-> 2. Further, if you have installed `tensorrt_llm` in the Slurm job, you can also skip step 2 and run step 3 with `export CONTAINER_NAME=aaa` specified. If you don't know the container name, run `export CONTAINER_NAME=$(SLURM_JOB_ID=$SLURM_JOB_ID ./slurm_query_container_name.sh)` to get it.
+> 1. If you have a running Slurm job, you can set environment variable `export SLURM_JOB_ID=aaa` and skip step 1.
+> 2. Further, if you have installed `tensorrt_llm` in the Slurm job, you can also skip step 2. Just run step 3 with `export CONTAINER_NAME=aaa` specified. If you don't know the container name, run `export CONTAINER_NAME=$(./slurm_query_container_name.sh)` to get it.
 
-**Step 1:** On the controller node, allocate one or multiple nodes, and record the `SLURM_JOB_ID`:
+**Step 1:** On the controller node, allocate one or multiple nodes, and export the `SLURM_JOB_ID`:
 
 ```bash
-SLURM_JOB_ID=$(NODES=4 TIME=02:00:00 ./slurm_alloc.sh)
+export SLURM_JOB_ID=$(NODES=4 TIME=02:00:00 ./slurm_alloc.sh)
 ```
 
 Please fill the variables in `./slurm_alloc.sh`.
@@ -83,28 +86,47 @@ Please fill the variables in `./slurm_alloc.sh`.
 **Step 2:** Start a container and install `tensorrt_llm`. Run the following command on the controller node:
 
 ```bash
-SLURM_JOB_ID=$SLURM_JOB_ID ./slurm_init_containers.sh
+./slurm_init_containers.sh
 ```
 
 It uses the image recorded in `../../jenkins/current_image_tags.properties`. The image will be downloaded to `../../enroot/` for once.
 
 > Tips: If you want to change the image, no need to reallocate Slurm jobs. Just start another container by running step 2 with `export CONTAINER_NAME=aaa`, and step 3 will run in the container specified by the `CONTAINER_NAME` env.
 
+**(Optional) Get an interactive shell**
+
+```bash
+NODES=1 NP=1 ./slurm_launch.sh --overlap --pty middleware/exclude_slurm_envs bash
+```
+
+The `--overlap` option allows this shell to share the node with other jobs. The middleware enables nested MPI process spawning from within Slurm jobs.
+
+You may compile C++ extensions in the interactive shell:
+
+```bash
+cd ../..
+export CCACHE_DIR=$(realpath cpp/.ccache)
+python3 scripts/build_wheel.py --cuda_architectures native --no-venv --skip_building_wheel -G Ninja --use_ccache --clean
+```
+
 **Step 3:** Run benchmarks to generate profiles. Run the following command on the controller node, where `NODES` &le; the number of allocated nodes:
 
 ```bash
+# Set autotune cache path
+export TLLM_AUTOTUNER_CACHE_PATH=autotuner_cache/cache
+
 # Run DeepSeek-R1 NVFP4 with wide ep: uses MNNVL A2A if applicable
-SLURM_JOB_ID=$SLURM_JOB_ID NODES=4 NP=16 ./slurm_launch.sh ./run.sh config_gen.yaml --moe-backend WIDEEP
+NODES=4 NP=16 ./slurm_launch.sh ./run.sh config_gen.yaml --moe-backend WIDEEP
 
 # Run with TRTLLMGen
-SLURM_JOB_ID=$SLURM_JOB_ID NODES=4 NP=16 TRTLLM_ENABLE_PDL=1 ./slurm_launch.sh ./run.sh config_gen.yaml --moe-backend TRTLLM
+NODES=4 NP=16 TRTLLM_ENABLE_PDL=1 ./slurm_launch.sh ./run.sh config_gen.yaml --moe-backend TRTLLM
 
 # Run with DeepEPLowLatency
-SLURM_JOB_ID=$SLURM_JOB_ID NODES=4 NP=16 TRTLLM_FORCE_ALLTOALL_METHOD=DeepEPLowLatency ./slurm_launch.sh ./run.sh config_gen.yaml --moe-backend WIDEEP
+NODES=4 NP=16 TRTLLM_FORCE_ALLTOALL_METHOD=DeepEPLowLatency ./slurm_launch.sh ./run.sh config_gen.yaml --moe-backend WIDEEP
 
-# You can run 4-GPU and 8-GPU tasks without reallocate the slurm job
-SLURM_JOB_ID=$SLURM_JOB_ID NODES=1 NP=4 ./slurm_launch.sh ./run.sh config_ctx.yaml
-SLURM_JOB_ID=$SLURM_JOB_ID NODES=2 NP=8 ./slurm_launch.sh ./run.sh config_gtx.yaml
+# You can run 4-GPU and 8-GPU tasks without reallocating the slurm job
+NODES=1 NP=4 ./slurm_launch.sh ./run.sh config_ctx.yaml
+NODES=2 NP=8 ./slurm_launch.sh ./run.sh config_gen.yaml
 ```
 
 ### Batched run
@@ -131,9 +153,11 @@ NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --scaled-from 16 --moe-backend WID
 Run the following command in the container:
 
 ```bash
+# Parse the profile at the default directory
 python3 parse.py --world-size 4
 
-# Specify the location of the .nsys-rep file
+# Specify the file path
+python3 parse.py --file-path profiles/report_np4_rank0.nsys-rep
 python3 parse.py --profile-dir ./profiles --world-size 4 --rank 0
 
 # Parse a specific module. The module must appear exactly once in each run.
@@ -144,6 +168,15 @@ You will receive three reports, each containing kernel timing statistics grouped
 1. A printed report on stdout
 2. A CSV report at `profiles/report_np4_rank0.csv`
 3. An HTML report at `profiles/report_np4_rank0.html`
+
+## Developer utilities
+
+1. Less startup time when debug a model
+   1. Disable autotuner: add `--no-enable-autotuner` option
+   2. Disable nsys profile: set `PROFILE=0` environment variable
+2. Capture more information
+   1. Enable GPU metrics: set `GPU_METRICS=1` environment variable
+   2. Enable backtrace: set `BACKTRACE=1` environment variable
 
 ## Trouble shooting
 

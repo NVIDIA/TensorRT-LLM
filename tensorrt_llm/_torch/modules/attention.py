@@ -1,6 +1,6 @@
 import math
 import weakref
-from typing import Optional, Union, cast
+from typing import List, Optional, Union, cast
 
 import torch
 from torch import nn
@@ -15,6 +15,7 @@ from ..attention_backend import (AttentionInputType, AttentionMetadata,
                                  FlashInferAttentionMetadata, TrtllmAttention,
                                  TrtllmAttentionMetadata)
 from ..attention_backend.interface import (AttentionBackend, AttentionMask,
+                                           CustomAttentionMask,
                                            PositionalEmbeddingParams,
                                            PredefinedAttentionMask)
 from ..attention_backend.sparse.dsa import (
@@ -87,8 +88,25 @@ def maybe_compiled_cat(tensors, dim):
     return torch.cat(tensors, dim)
 
 
+def create_attn_outputs_impl(q: torch.Tensor, attention_mask: str,
+                             layer_idx: str) -> List[torch.Tensor]:
+    metadata, attn_layer = extract_extra_attrs(layer_idx, "attn")
+    return attn_layer.create_output(q, metadata, attention_mask)
+
+
+@torch.library.custom_op("trtllm::create_attn_outputs", mutates_args=())
+def create_attn_outputs(q: torch.Tensor, attention_mask: str,
+                        layer_idx: str) -> List[torch.Tensor]:
+    return create_attn_outputs_impl(q, attention_mask, layer_idx)
+
+
+@create_attn_outputs.register_fake
+def _(q, attention_mask, layer_idx):
+    return create_attn_outputs_impl(q, attention_mask, layer_idx)
+
+
 @torch.library.custom_op("trtllm::attn_custom_op_inplace",
-                         mutates_args=("output", ))
+                         mutates_args=("output", "output_sf"))
 def attn_custom_op_inplace(
     q: torch.Tensor,
     k: Optional[torch.Tensor],
@@ -101,20 +119,25 @@ def attn_custom_op_inplace(
     attention_sinks: Optional[torch.Tensor],
     layer_idx: str,
     output: torch.Tensor,
+    output_sf: Optional[torch.Tensor],
 ) -> None:
     metadata, attn_layer = extract_extra_attrs(layer_idx, "attn")
+    mask = PredefinedAttentionMask(
+        attention_mask
+    ) if attention_mask != CustomAttentionMask.CUSTOM else CustomAttentionMask(
+        attention_mask)
     # NVFP4 output cannot be supported by torch compile for TRTLLM backend.
     attn_layer._attn_impl(q,
                           k,
                           v,
                           metadata,
-                          PredefinedAttentionMask(attention_mask),
+                          mask,
                           mrope_rotary_cos_sin,
                           mrope_position_deltas,
                           attention_window_size,
                           attention_mask_data,
-                          enable_attn_nvfp4_output=False,
                           output=output,
+                          output_sf=output_sf,
                           attention_sinks=attention_sinks)
 
 
@@ -170,6 +193,11 @@ class Attention(nn.Module):
         if config is not None:
             if "attn_layers" not in config.extra_attrs:
                 config.extra_attrs["attn_layers"] = {}
+            suffix = 0
+            # Makes sure there is no duplicate attention layer identifier.
+            while self.layer_idx_str in config.extra_attrs["attn_layers"]:
+                self.layer_idx_str = str(layer_idx) + f"_{suffix}"
+                suffix += 1
             config.extra_attrs["attn_layers"][self.layer_idx_str] = weakref.ref(
                 self)
             self.register_to_config = True
@@ -358,7 +386,6 @@ class Attention(nn.Module):
         )
 
         self.support_fused_qkv = self.attn.support_fused_qkv()
-        self.support_nvfp4_output = self.attn.support_nvfp4_output()
 
         if not config.skip_create_weights_in_init:
             self.create_weights()
@@ -387,20 +414,22 @@ class Attention(nn.Module):
             q, k, v = qkv, None, None
         return q, k, v
 
-    def create_output(self, q: torch.Tensor):
-        num_tokens = q.shape[0]
-        hidden_size = self.o_proj.in_features
-        out_dtype = q.dtype
+    def _use_quantize_output(self):
+        has_awq_pre_quant_scale = hasattr(
+            self.o_proj,
+            'pre_quant_scale') and self.o_proj.pre_quant_scale is not None
 
-        if self.attn_backend == "TRTLLM":
-            # Don't use FP8 output if o_proj has pre_quant_scale - keep BF16 for better precision
-            has_pre_quant_scale = getattr(self.o_proj, 'pre_quant_scale',
-                                          None) is not None
-            if self.has_quant_scale and not has_pre_quant_scale and (
-                    self.attn.has_fp8_kv_cache or self.attn.has_fp4_kv_cache):
-                out_dtype = torch.float8_e4m3fn
-        output = q.new_empty([num_tokens, hidden_size], dtype=out_dtype)
-        return output
+        return self.has_quant_scale and not self.attn_output_gate and not has_awq_pre_quant_scale
+
+    def create_output(self, q: torch.Tensor, attn_metadata: AttentionMetadata,
+                      mask_type: str):
+        # Attention is treated as mixed request by default.
+        return self.attn.create_output(
+            q,
+            is_quantize_output=self._use_quantize_output(),
+            metadata=attn_metadata,
+            attention_mask=mask_type,
+            is_gen_only=False)
 
     def _attn_impl(
         self,
@@ -413,7 +442,6 @@ class Attention(nn.Module):
         mrope_position_deltas: Optional[torch.Tensor],
         attention_window_size: Optional[int],
         attention_mask_data: Optional[torch.Tensor],
-        enable_attn_nvfp4_output: bool = True,
         output: Optional[torch.Tensor] = None,
         output_sf: Optional[torch.Tensor] = None,
         attention_sinks: Optional[torch.Tensor] = None,
@@ -428,19 +456,10 @@ class Attention(nn.Module):
 
         out_scale = None
         out_scale_sf = None
-        has_awq_pre_quant_scale = hasattr(
-            self.o_proj,
-            'pre_quant_scale') and self.o_proj.pre_quant_scale is not None
         # Don't set out_scale if o_proj has pre_quant_scale - this prevents FP8/FP4 output
         # and keeps attention output in BF16 for better precision when applying pre_quant_scale
-        if self.has_quant_scale and not self.attn_output_gate and not has_awq_pre_quant_scale:
+        if self._use_quantize_output():
             out_scale = self.o_proj.inv_input_scale
-        if has_awq_pre_quant_scale and enable_attn_nvfp4_output:
-            logger.warning_once(
-                "Disable attn nvfp4 output because o_proj has pre_quant_scale for AWQ.",
-                key="disable_attn_nvfp4_output_for_awq")
-            enable_attn_nvfp4_output = False
-        if self.o_proj.has_nvfp4 and self.support_nvfp4_output and enable_attn_nvfp4_output and not self.attn_output_gate:
             out_scale_sf = self.o_proj.input_scale
 
         kv_scales_sf = None
@@ -471,7 +490,6 @@ class Attention(nn.Module):
             mrope_config=mrope_config,
             attention_window_size=attention_window_size,
             attention_mask_data=attention_mask_data,
-            enable_attn_nvfp4_output=enable_attn_nvfp4_output,
             output=output[:num_tokens, :] if output is not None else None,
             output_sf=output_sf,
             attention_sinks=attention_sinks)
@@ -510,7 +528,10 @@ class Attention(nn.Module):
                                  and is_torch_compiling())
 
         if use_custom_inplace_op:
-            output = self.create_output(q)
+            outputs = create_attn_outputs(q, attention_mask, self.layer_idx_str)
+            assert len(outputs) == 1 or len(outputs) == 2
+            output = outputs[0]
+            output_sf = outputs[1] if len(outputs) == 2 else None
             attn_custom_op_inplace(
                 q,
                 k,
@@ -523,6 +544,7 @@ class Attention(nn.Module):
                 attention_sinks,
                 self.layer_idx_str,
                 output,
+                output_sf,
             )
         else:
             output, output_sf = self._attn_impl(q,
@@ -535,8 +557,8 @@ class Attention(nn.Module):
                                                 attention_window_size,
                                                 attention_mask_data,
                                                 attention_sinks=attention_sinks)
-            if output_sf is not None:
-                output = Fp4QuantizedTensor(output, output_sf)
+        if output_sf is not None:
+            output = Fp4QuantizedTensor(output, output_sf)
 
         return output
 

@@ -1,13 +1,13 @@
-# Hardware Config
+metadata:
+  model_name: deepseek_r1_0528_fp4_v2
+  supported_gpus:
+  - GB200
+  - GB300
 hardware:
   gpus_per_node: 4
-  gpus_per_server: 8
-
 server_configs:
   - name: "r1_fp4_v2_dep8_mtp1"
     model_name: "deepseek_r1_0528_fp4_v2"
-    gpus: 8
-    gpus_per_node: 4
     trust_remote_code: true
     tensor_parallel_size: 8
     moe_expert_parallel_size: 8
@@ -35,13 +35,11 @@ server_configs:
         iterations: 12
         isl: 1024
         osl: 1024
-        random_range_ratio: 0.2
+        random_range_ratio: 0.8
         backend: "openai"
 
   - name: "r1_fp4_v2_tep8_mtp3"
     model_name: "deepseek_r1_0528_fp4_v2"
-    gpus: 8
-    gpus_per_node: 4
     trust_remote_code: true
     tensor_parallel_size: 8
     moe_expert_parallel_size: 8
@@ -67,5 +65,5 @@ server_configs:
         iterations: 12
         isl: 1024
         osl: 1024
-        random_range_ratio: 0.2
+        random_range_ratio: 0.8
         backend: "openai"

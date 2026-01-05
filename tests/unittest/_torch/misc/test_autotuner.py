@@ -17,8 +17,10 @@ from tensorrt_llm._torch.autotuner import (AutoTuner, DistributedTuningStrategy,
                                            FakeTensor, OptimizationProfile,
                                            StaticDim, TunableRunner,
                                            TuningConfig, autotune)
+from tensorrt_llm._torch.distributed.communicator import MPIDist, TorchDist
 from tensorrt_llm._torch.utils import (get_power_of_2_num_tokens_buckets,
                                        next_positive_power_of_2)
+from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.bindings.internal.runtime import delay_kernel
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -38,18 +40,21 @@ pytestmark = pytest.mark.threadleak(enabled=False)
 def test_multi_dynamic_dims():
     tuner = autotuner.AutoTuner()
     x = torch.rand([5, 1024])
-    w = torch.rand([7, 19])
+    w = torch.rand([7, 9])
     dynamic_tensor_specs = (
         DynamicTensorSpec(0, 0, [1, 3, 5]),
         DynamicTensorSpec(0, 1, [16, 24, 1024]),
-        DynamicTensorSpec(1, 1, [3, 7, 9], lambda x: x // 2),
+        # map_to_tuning_buckets is only applied at runtime, not during tuning
+        DynamicTensorSpec(1,
+                          1, [3, 7, 9],
+                          map_to_tuning_buckets=lambda x: x // 2),
     )
 
     profiles = tuner._optimization_profiles(
         tuning_config=TuningConfig(dynamic_tensor_specs=dynamic_tensor_specs),
         inputs=[x, w])
     # choice(0, 0) * choice(0, 1) * choice(1, 1)
-    # 3 * 3 * 3 = 27, because 19 is mapped to 9 and already inside the bucket
+    # 3 * 3 * 3 = 27, input value 9 is already inside the bucket
     assert len(profiles) == 27
     sample_0 = OptimizationProfile(shapes=[[
         DynamicDim(min=1, opt=1, max=3),
@@ -169,6 +174,75 @@ def test_autotuner_cache_basic():
             torch.randn(m, 64), w)
         check_gemm_tactic_valid(best_tactic, m)
         m //= 2
+
+
+def test_bucket_mapping():
+    """Test that map_to_tuning_buckets correctly maps runtime sizes to tuning buckets.
+
+    This test demonstrates the single mapper approach:
+    - During tuning: NO mapper is applied, raw bucket values are used as cache keys
+    - During runtime: map_to_tuning_buckets is applied to map buffer size to actual work size
+
+    With sparsity=0.25, the buffer contains 25% actual work:
+    - Tuning stores buckets: 1, 2, 4, 8, 16, 32 as raw cache keys
+    - Runtime buffer 4 -> maps to bucket int(4 * 0.25) = 1
+    - Runtime buffer 16 -> maps to bucket int(16 * 0.25) = 4
+
+    In MoE EP, the input buffer is allocated for worst-case but sparsely filled.
+    Using map_to_tuning_buckets allows us to map buffer size to actual work size at runtime.
+    """
+    w = torch.randn(64, 128)
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+
+    # Sparsity indicates the fraction of buffer containing valid work
+    sparsity = 0.25
+
+    tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        input_idx=0,
+        dim_idx=0,
+        gen_tuning_buckets=get_power_of_2_num_tokens_buckets(M),
+        map_to_tuning_buckets=lambda x: int(x * sparsity)), ), )
+
+    with autotune():
+        tuner.choose_one("test_bucket_mapping", [GemmRunner()], tuning_config,
+                         [torch.randn(1, 64), w])
+
+    # Verify cache entries use raw tuning bucket values
+    cache_entries = tuner.profiling_cache.get_specific_custom_op(
+        "test_bucket_mapping")
+
+    # Extract the first dimension of the first input shape from each cache key
+    assert len(cache_entries) == len(tuning_config.dynamic_tensor_specs[0].gen_tuning_buckets), \
+        f"Expected {len(tuning_config.dynamic_tensor_specs[0].gen_tuning_buckets)} cache entries, got {len(cache_entries)}"
+
+    # Test runtime mapping: buffer size is mapped via map_to_runtime_buckets
+    # to find the correct tuning bucket based on actual work size
+    test_cases = [
+        # size 4 -> valid work size (4*0.25)=1, tactic 0 since 1 <= M//2
+        (4, 1, 0),
+        # size 8 -> valid work size (8*0.25)=2, tactic 0 since 2 <= M//2
+        (8, 2, 0),
+        # size 16 -> valid work size (16*0.25)=4, tactic 0 since 4 <= M//2
+        (16, 4, 0),
+        # size 32 -> valid work size (32*0.25)=8, tactic 0 since 8 <= M//2
+        (32, 8, 0),
+        # size 64 -> valid work size (64*0.25)=16, tactic 0 since 16 <= M//2
+        (64, 16, 0),
+        # size 128 -> valid work size (128*0.25)=32, tactic 1 since 32 > M//2
+        (128, 32, 1),
+        # size 256 -> valid work size (256*0.25)=64, tactic -1 since 64 > M
+        (256, 64, -1),
+    ]
+
+    for buffer_size, valid_size, expected_tactic in test_cases:
+        # Verify cache lookup succeeds with the mapped bucket
+        x = torch.randn(buffer_size, 64)
+        runner, tactic = tuner.choose_one("test_bucket_mapping", [GemmRunner()],
+                                          tuning_config, [x, w])
+        assert (
+            tactic == expected_tactic
+        ), f"buffer size={buffer_size} -> valid work size={valid_size}, expected tactic {expected_tactic} but got {tactic}"
 
 
 def test_autotuner_try_block():
@@ -323,8 +397,9 @@ def test_multiple_dynamic_shapes_cache():
     # Do tuning with a sample input
     x = torch.randn(3, 64)
     temp_dir = tempfile.TemporaryDirectory()
-    with autotune(cache_path=os.path.join(temp_dir.name,
-                                          "test_multiple_dynamic_shapes.json")):
+    cache_path = os.path.join(temp_dir.name,
+                              "test_multiple_dynamic_shapes.json")
+    with autotune(cache_path=cache_path):
         tuner = AutoTuner.get()
         runner, tactic = tuner.choose_one("test_multiple_dynamic_shapes",
                                           runners, tuning_config, [x, w])
@@ -336,8 +411,7 @@ def test_multiple_dynamic_shapes_cache():
     # Verify cache size - should have 12 entries (3x4 combinations)
     # We also test the cache serialization and deserialization here.
     AutoTuner.get().profiling_cache.clear()
-    AutoTuner.get().profiling_cache.load_cache(
-        os.path.join(temp_dir.name, "test_multiple_dynamic_shapes.rank0.json"))
+    AutoTuner.get().profiling_cache.load_cache(cache_path, rank=0)
     cache_entries = tuner.profiling_cache.get_specific_custom_op(
         "test_multiple_dynamic_shapes")
 
@@ -427,8 +501,9 @@ def test_autotuner_tuning_configs():
         use_cuda_graph=False,
     )
     temp_dir = tempfile.TemporaryDirectory()
-    with autotune(cache_path=os.path.join(
-            temp_dir.name, "test_autotuner_tactic_configs.json")):
+    cache_path = os.path.join(temp_dir.name,
+                              "test_autotuner_tactic_configs.json")
+    with autotune(cache_path=cache_path):
         tuner = AutoTuner.get()
         runner, best_tactic = tuner.choose_one("test_autotuner_tactic_configs",
                                                runners, tuning_config, [x, w])
@@ -437,8 +512,7 @@ def test_autotuner_tuning_configs():
 
     # Test if the tactic can be loaded from cache correctly
     AutoTuner.get().profiling_cache.clear()
-    AutoTuner.get().profiling_cache.load_cache(
-        os.path.join(temp_dir.name, "test_autotuner_tactic_configs.rank0.json"))
+    AutoTuner.get().profiling_cache.load_cache(cache_path, rank=0)
 
     # No further tuning should be performed.
     runner, deserialized_tactic = tuner.choose_one(
@@ -646,9 +720,14 @@ def _distributed_worker_function(world_size, strategy):
                       rank=rank,
                       tp_size=world_size,
                       pp_size=1)
+    if mpi_disabled():
+        dist = TorchDist(mapping=mapping)
+    else:
+        dist = MPIDist(mapping=mapping)
+
     tuner = AutoTuner.get()
     tuner.clear_cache()
-    tuner.setup_distributed_state(mapping)
+    tuner.setup_distributed_state(mapping, dist)
 
     x = torch.randn(16, 32, device='cuda')
     w = torch.randn(32, 64, device='cuda')
@@ -663,12 +742,28 @@ def _distributed_worker_function(world_size, strategy):
     runner = DistributedGemmRunner(prefer_tactics=prefer_tactics)
     config = TuningConfig(distributed_tuning_strategy=strategy)
 
-    cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)
-    with autotune(tune_mode=True, cache_path=cache_path):
+    if rank == 0:
+        temp_dir = tempfile.TemporaryDirectory()
+        # rank 0 should broadcast the cache path to all ranks
+        cache_path = os.path.join(temp_dir.name, "test_distributed_tuning.json")
+        dist.broadcast(cache_path, root=0)
+    else:
+        cache_path = dist.broadcast(None, root=0)
+
+    with autotune(cache_path=cache_path):
         tuner.choose_one(custom_op=f"test_distributed_{strategy}",
                          runners=[runner],
                          tuning_config=config,
                          inputs=inputs)
+
+    # Check only one file is created in the cache path
+    assert len(os.listdir(os.path.dirname(
+        cache_path))) == 1, "Only one rank file should be created"
+
+    # Check cache for distributed tuning
+    AutoTuner.get().profiling_cache.clear()
+    AutoTuner.get().profiling_cache.load_cache(cache_path, rank)
+
     selected_runner, best_tactic = tuner.choose_one(
         custom_op=f"test_distributed_{strategy}",
         runners=[runner],
@@ -706,8 +801,7 @@ def _distributed_worker_function(world_size, strategy):
     ],
 )
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
-def test_distributed_broadcast_strategy(strategy, mpi_pool_executor):
-    """Test broadcast strategy with real MPI processes."""
+def test_autotuner_distributed_strategy(strategy, mpi_pool_executor):
     world_size = 2
     # Use MPIPoolExecutor to run distributed test
     results = mpi_pool_executor.map(

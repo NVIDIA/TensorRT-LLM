@@ -23,6 +23,7 @@ from torch._prims_common import DeviceLikeType
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionRuntimeFeatures
 from tensorrt_llm._torch.auto_deploy.utils._graph import get_input_embeddings, get_lm_head_weights
+from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.models.modeling_speculative import Eagle3ForCausalLM
 from tensorrt_llm._torch.pyexecutor._util import (
     _create_kv_cache_manager,
@@ -379,7 +380,7 @@ def maybe_pad_for_cuda_graph(func):
 
         # check if we have a dummy request to use
         if self.padding_dummy_request is None:
-            ad_logger.error("No CUDA graph padding possible due to missing dummy request.")
+            ad_logger.info("No CUDA graph padding possible due to missing dummy request.")
             return _call_func()
 
         # pad the scheduled requests with the dummy request
@@ -1008,6 +1009,10 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     torch.cuda.set_device(rank)
     port = mpi_dist.broadcast(dist.get_free_port())  # use MPI broadcast to pick a free port
     dist.initialize_or_skip(rank, world_size, port)
+
+    # Setup AutoTuner with distributed state for allreduce autotuning
+    AutoTuner.get().setup_distributed_state(dist_mapping, mpi_dist)
+
     # some config
     assert ad_config.max_beam_width <= 1, "_autodeploy + beam_search is not supported"
 

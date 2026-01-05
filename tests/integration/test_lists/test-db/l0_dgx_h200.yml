@@ -19,7 +19,7 @@ l0_dgx_h200:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_fp8_blockscale[latency] # 1h
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_fp8_blockscale[baseline]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_fp8_blockscale[latency_default]
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_fp8_blockscale[skip_indexer]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_fp8_blockscale[disable_skip_indexer]
   - accuracy/test_disaggregated_serving.py::TestLlama4ScoutInstruct::test_auto_dtype[True]
   - accuracy/test_disaggregated_serving.py::TestLlama4ScoutInstruct::test_auto_dtype[False]
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype[mtp_nextn=0-overlap_scheduler=True]
@@ -134,6 +134,7 @@ l0_dgx_h200:
   # ------------- AutoDeploy tests ---------------
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[False-4]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_bf16
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_bf16
 - condition:
     ranges:
       system_gpu_count:
