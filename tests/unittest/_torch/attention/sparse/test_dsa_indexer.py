@@ -440,12 +440,20 @@ def _create_mock_metadata(request_ids,
             self.scheduler_metadata_buffer = torch.zeros((self.num_sms + 1, 2),
                                                          device='cuda',
                                                          dtype=torch.int32)
+            self.host_scheduler_metadata_buffer = torch.zeros_like(
+                self.scheduler_metadata_buffer, device='cpu', pin_memory=True)
             self.cu_seqlen_ks = torch.zeros((num_tokens, ),
                                             device='cuda',
                                             dtype=torch.int32)
+            self.host_cu_seqlen_ks = torch.zeros_like(self.cu_seqlen_ks,
+                                                      device='cpu',
+                                                      pin_memory=True)
             self.cu_seqlen_ke = torch.zeros((num_tokens, ),
                                             device='cuda',
                                             dtype=torch.int32)
+            self.host_cu_seqlen_ke = torch.zeros_like(self.cu_seqlen_ke,
+                                                      device='cpu',
+                                                      pin_memory=True)
             self.ctx_kv_offsets = torch.zeros((num_tokens, 1),
                                               device='cuda',
                                               dtype=torch.int32)
@@ -536,11 +544,19 @@ def _create_mock_metadata(request_ids,
                 self.block_table_expanded, device='cpu', pin_memory=True)
             self.scheduler_metadata_buffer_expanded = torch.zeros(
                 (self.num_sms + 1, 2), device='cuda', dtype=torch.int32)
+            self.host_scheduler_metadata_buffer_expanded = torch.zeros_like(
+                self.scheduler_metadata_buffer_expanded,
+                device='cpu',
+                pin_memory=True)
             if self.max_draft_tokens == 3:
                 self.scheduler_metadata_buffer_mtp3 = torch.zeros(
                     (self.num_sms // 2 + 1, 2),
                     device='cuda',
                     dtype=torch.int32)
+                self.host_scheduler_metadata_buffer_mtp3 = torch.zeros_like(
+                    self.scheduler_metadata_buffer_mtp3,
+                    device='cpu',
+                    pin_memory=True)
             if self.use_expanded_buffers_for_mtp:
                 gen_kv_lens = kv_lens[num_contexts:self.num_seqs]
                 gen_kv_lens_expanded = torch.stack([gen_kv_lens] *
