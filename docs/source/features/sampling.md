@@ -16,10 +16,10 @@ The Pytorch backend supports a wide variety of features, listed below:
 
 ## General usage
 
-By default, the sampling backend is chosen to be `auto`. This will use:
+There are two sampling backends available.
 
-* TRTLLM Sampler when using Beam Search.
-* Torch Sampler otherwise.
+* Torch Sampler
+* TRTLLM Sampler
 
 Torch Sampler currently supports a superset of features of TRTLLM Sampler, and is intended as the long term solution. One can specify which sampler to use explicitly with:
 
@@ -35,7 +35,12 @@ llm = LLM(model='nvidia/Llama-3.1-8B-Instruct-FP8',
           sampler_type="TRTLLMSampler")
 ```
 
-Here is an example to run a model with basic usage of sampling parameters. The following example prepares two identical prompts which will give different results due to the sampling parameters chosen:
+By default, the sampling backend is chosen to be `auto`. This will use:
+
+* TRTLLM Sampler when using Beam Search.
+* Torch Sampler otherwise.
+
+Here is an example to run a model with basic usage of sampling parameters. This example prepares two identical prompts which will give different results due to the sampling parameters chosen:
 
 ```python
 from tensorrt_llm import LLM, SamplingParams
