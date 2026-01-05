@@ -3392,7 +3392,7 @@ def launchTestJobs(pipeline, testFilter)
     // Python version and OS for sanity check
     x86SanityCheckConfigs = [
         "PY312-DLFW": [
-            DLFW_IMAGE,
+            LLM_DOCKER_IMAGE,
             "B200_PCIe",
             X86_64_TRIPLE,
             false,
