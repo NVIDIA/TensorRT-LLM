@@ -788,7 +788,7 @@ def get_weight_shape(node: Node, dim: Optional[int] = None) -> Optional[Union[in
     """Get the shape of the weight node."""
     if not is_any_lin_op(node):
         return None
-    s = list(shape(extract_weight_node(node)))
+    s = list(shape(extract_weight_nodes(node).weights[0].node))
     if len(s) == 0:
         return None
     if is_fp4_op(node):
