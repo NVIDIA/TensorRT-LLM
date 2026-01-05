@@ -1138,7 +1138,6 @@ class PyTorchModelEngine(ModelEngine):
         return self.spec_metadata
 
     def __del__(self) -> None:
-        self.model.to("cpu")
         self.model = None
         self.model_loader = None
         self._release_cuda_graphs()
