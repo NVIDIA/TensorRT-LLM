@@ -255,6 +255,10 @@ class Attention(nn.Module):
             gpus_per_node=config.mapping.gpus_per_node,
             enable_attention_dp=config.mapping.enable_attention_dp,
         )
+        if config.mapping.has_cp_ulysses():
+            tp_size = tp_size * cp_size
+            assert self.num_heads % tp_size == 0
+            assert self.num_key_value_heads % tp_size == 0
         self.tp_size = tp_size
         self.tp_rank = mapping.tp_rank
         assert self.num_heads % tp_size == 0
@@ -430,6 +434,60 @@ class Attention(nn.Module):
             metadata=attn_metadata,
             attention_mask=mask_type,
             is_gen_only=False)
+
+    def ulysses_context_preprocess(self, q, k, v, attn_metadata, total_seq_len):
+        cp_size = attn_metadata.mapping.cp_size
+        if cp_size == 1:
+            return q, k, v
+        assert k is None and v is None
+        cp_q_head_num = self.num_heads * cp_size
+        cp_kv_head_num = self.num_key_value_heads * cp_size
+        q_view = q.view(-1, cp_q_head_num + 2 * cp_kv_head_num, self.head_dim)
+
+        q_slices = []
+        for cp_idx in range(cp_size):
+            q_slice_start = cp_idx * self.num_heads
+            k_slice_start = cp_idx * self.num_key_value_heads + cp_q_head_num
+            v_slice_start = cp_idx * self.num_key_value_heads + cp_q_head_num + cp_kv_head_num
+            ranges = [(q_slice_start, q_slice_start + self.num_heads),
+                      (k_slice_start, k_slice_start + self.num_key_value_heads),
+                      (v_slice_start, v_slice_start + self.num_key_value_heads)]
+            idx_list = [torch.arange(s, e, device=q.device) for s, e in ranges]
+            idx = torch.cat(idx_list)
+            q_selected = q_view.index_select(dim=1, index=idx)
+            q_slices.append(q_selected)
+
+        q_all2all = alltoall_helix(q_slices, attn_metadata.mapping.cp_group)
+        q_final = torch.flatten(q_all2all[0], start_dim=0,
+                                end_dim=1)[:total_seq_len,
+                                           ...].flatten(start_dim=1, end_dim=-1)
+        return q_final, k, v
+
+    def ulysses_context_postprocess(self, o, attn_metadata):
+        cp_size = attn_metadata.mapping.cp_size
+        if cp_size == 1:
+            return o
+        chunk_size = (o.shape[0] + cp_size - 1) // cp_size
+
+        o_slices = []
+        for cp_idx in range(cp_size):
+            o_slice_start = cp_idx * chunk_size
+            o_slice_end = o_slice_start + chunk_size
+            o_slice = o[o_slice_start:o_slice_end, ...]
+            if o_slice_end > o.shape[0]:
+                o_slice = torch.cat([
+                    o_slice,
+                    torch.zeros(chunk_size - o_slice.shape[0],
+                                o.shape[1],
+                                device=o.device,
+                                dtype=o.dtype)
+                ],
+                                    dim=0)
+            o_slices.append(o_slice)
+
+        o_all2all = alltoall_helix(o_slices, attn_metadata.mapping.cp_group)
+        o_final = o_all2all[0].permute(1, 0, 2).flatten(start_dim=1, end_dim=2)
+        return o_final
 
     def _attn_impl(
         self,
@@ -617,6 +675,12 @@ class Attention(nn.Module):
         else:
             q, k, v = qkv, None, None
 
+        # ulysses context preprocess: convert CP to TP
+        if attn_metadata.mapping.has_cp_ulysses():
+            assert position_ids is not None, "position_ids is required for ulysses context preprocess"
+            q, k, v = self.ulysses_context_preprocess(q, k, v, attn_metadata,
+                                                      position_ids.shape[-1])
+
         q, k, v = self.apply_rope(q, k, v, position_ids)
         q, k, v = self.convert_qkv(q, k, v)
 
@@ -633,6 +697,10 @@ class Attention(nn.Module):
                                         mrope_config=mrope_config,
                                         attention_sinks=attention_sinks)
 
+        # ulysses context postprocess: convert TP to CP
+        if attn_metadata.mapping.has_cp_ulysses():
+            attn_output = self.ulysses_context_postprocess(
+                attn_output, attn_metadata)
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)
             attn_output = attn_output * gate
