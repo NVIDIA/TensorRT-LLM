@@ -351,12 +351,17 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
             # When the input only contains text, we use the text processor to process the input.
             self._processor = MistralCommonImageProcessor(
                 tokenizer=self._tokenizer, dtype=self.dtype)
+            self.text_processor = AutoProcessor.from_pretrained(
+                model_path,
+                use_fast=self.use_fast,
+                trust_remote_code=trust_remote_code)
         else:
             # For other mistral models, we use the AutoProcessor to process the input.
             self._processor = AutoProcessor.from_pretrained(
                 model_path,
                 use_fast=self.use_fast,
                 trust_remote_code=trust_remote_code)
+            self.text_processor = self._processor
 
     @property
     def config(self) -> PretrainedConfig:
@@ -390,11 +395,17 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
             # format is "pt" (pytorch tensors), but not for "pil" (PIL images).
             do_rescale = False
 
-        processed = self.processor(
-            text=inputs["prompt"],
-            images=images,
-            do_rescale=do_rescale,
-        )
+        if images is not None:
+            processed = self.processor(
+                text=inputs["prompt"],
+                images=images,
+                do_rescale=do_rescale,
+            )
+        else:
+            processed = self.text_processor(
+                text=inputs["prompt"],
+                do_rescale=do_rescale,
+            )
         input_ids = processed.pop("input_ids").tolist()[0]
         # Remaining in `processed`:
         # * "attention_mask": [B, num_input_tokens]
