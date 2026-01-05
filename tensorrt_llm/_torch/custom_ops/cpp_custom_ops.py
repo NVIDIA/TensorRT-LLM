@@ -15,18 +15,18 @@ def _register_fake():
 
     @torch.library.register_fake("trtllm::allreduce")
     def allreduce(
-        input,
-        residual,
-        norm_weight,
-        scale,
-        bias,
-        workspace,
-        group,
-        strategy,
-        op,
-        eps,
-        trigger_completion_at_end,
-    ):
+        input: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        norm_weight: Optional[torch.Tensor],
+        scale: Optional[torch.Tensor],
+        bias: Optional[torch.Tensor],
+        workspace: Optional[torch.Tensor],
+        group: List[int],
+        strategy: int,
+        op: int,
+        eps: float,
+        trigger_completion_at_end: bool,
+    ) -> List[torch.Tensor]:
         from tensorrt_llm.functional import AllReduceFusionOp
         if op == int(AllReduceFusionOp.NONE):
             return [torch.empty_like(input)]
@@ -61,19 +61,19 @@ def _register_fake():
 
     @torch.library.register_fake("trtllm::allreduce_pg")
     def _(
-        input,
-        residual,
-        norm_weight,
-        scale,
-        bias,
-        workspace,
-        group,
-        rank,
+        input: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        norm_weight: Optional[torch.Tensor],
+        scale: Optional[torch.Tensor],
+        bias: Optional[torch.Tensor],
+        workspace: Optional[torch.Tensor],
+        group: List[int],
+        rank: int,
         pg,
-        strategy,
-        op,
-        eps,
-        trigger_completion_at_end,
+        strategy: int,
+        op: int,
+        eps: float,
+        trigger_completion_at_end: bool,
     ):
         return allreduce(input, residual, norm_weight, scale, bias, workspace,
                          group, strategy, op, eps, trigger_completion_at_end)
