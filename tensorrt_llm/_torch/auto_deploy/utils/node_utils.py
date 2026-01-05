@@ -173,7 +173,12 @@ def extract_weight_nodes(node: Node) -> WeightNodes:
             torch.ops.aten.view.default,
         }
 
-        if weight_node.op == "get_attr" and weight_node.target in param_names:
+        if (
+            weight_node.op == "get_attr"
+            and weight_node.target in param_names
+            and has_shape(weight_node)
+            and len(shape(weight_node)) > 0
+        ):
             return weight_node
 
         # If node is not in the list of allowable ops then return None
