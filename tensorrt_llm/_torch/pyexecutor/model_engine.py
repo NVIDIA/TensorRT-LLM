@@ -1070,7 +1070,12 @@ class PyTorchModelEngine(ModelEngine):
         num_attention_heads = getattr(config, 'num_attention_heads', None)
         num_key_value_heads = getattr(config, 'num_key_value_heads', None)
 
-        if num_attention_heads is not None and num_key_value_heads is not None:
+        # Calculate the number of attention heads per KV head (GQA ratio)
+        if isinstance(num_key_value_heads, (list, tuple)):
+            # Filter out invalid KV heads, default to 0 if no valid KV heads are found
+            num_key_value_heads = min(
+                (kv for kv in num_key_value_heads if kv and kv > 0), default=0)
+        if num_attention_heads and num_key_value_heads:
             num_heads_per_kv = num_attention_heads // num_key_value_heads
         else:
             num_heads_per_kv = 1
