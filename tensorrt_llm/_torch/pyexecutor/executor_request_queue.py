@@ -210,7 +210,8 @@ class ExecutorRequestQueue:
 
     def _get_request_id(self, request: Optional[ExecutorRequest] = None):
         # if client id is a global disagg request id, use it
-        if request and request.client_id is not None and request.client_id >= MIN_GLOBAL_ID:
+        if request and isinstance(request.client_id,
+                                  int) and request.client_id >= MIN_GLOBAL_ID:
             return request.client_id
         current_id = self.next_request_id
         self.next_request_id = get_local_request_id(current_id)
