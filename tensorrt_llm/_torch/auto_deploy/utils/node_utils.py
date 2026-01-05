@@ -154,7 +154,7 @@ def get_param_or_buffer(tensor_name: str, gm: GraphModule) -> torch.Tensor:
     elif tensor_name in dict(gm.named_buffers()):
         return gm.get_buffer(tensor_name)
     else:
-        raise ValueError(f"Tensor {tensor_name} not found in the graph")
+        raise KeyError(f"Tensor {tensor_name} not found in the graph")
 
 
 def extract_weight_nodes(node: Node) -> WeightNodes:
@@ -203,9 +203,9 @@ def extract_weight_nodes(node: Node) -> WeightNodes:
     # for other parametrized nodes, we need to find the weight node
     else:
         all_weight_nodes = [
-            find_get_attr_node(n)
-            for n in node.args
-            if isinstance(n, Node) and find_get_attr_node(n) is not None
+            attr_node
+            for n in node.all_input_nodes
+            if (attr_node := find_get_attr_node(n)) is not None
         ]
         # separate weight nodes and bias nodes
         bias_nodes = [n for n in all_weight_nodes if n.target.endswith("bias")]

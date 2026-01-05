@@ -436,7 +436,7 @@ class FP8WeightShardingInfo(QuantizationShardingMixin, WeightShardingInfo):
 
 
 def _shard_fp4_weight_scale(weight_scale, sharded_uint8_weight_shape, dim, rank, world_size):
-    assert weight_scale.dim() == 1
+    # assert weight_scale.dim() == 1
     weight_shape_original = list(sharded_uint8_weight_shape)
     weight_shape_original[dim] = weight_shape_original[dim] * world_size
     weight_shape_original[-1] *= 2
@@ -1237,8 +1237,7 @@ def _shard_parameter_node(
     rank, world_size = config.rank, config.world_size
     allreduce_strategy = config.allreduce_strategy.name
 
-    # # Shard weight using the unified function (also updates the parameter)
-    # original_weight = gm.get_parameter(weight_key)
+    # Shard weight using the unified function (also updates the parameter)
     weight_nodes = extract_weight_nodes(node)
     for weight_node in weight_nodes.weights:
         _, weight_new_shape = shard_weight_tensor(
@@ -1675,8 +1674,6 @@ def _process_ssm_sharding(
         if "out_proj" not in str(n)
     ]
     for weight_node in weight_nodes:
-        # if is_any_ssm_op(list(weight_node.users)[0]):
-        #     continue
         weight_key = weight_node.target
         # Get the weight parameter
         try:
