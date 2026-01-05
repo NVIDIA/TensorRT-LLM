@@ -37,13 +37,13 @@ from ..conftest import get_llm_root, llm_models_root
 from .open_search_db_utils import (
     SCENARIO_MATCH_FIELDS,
     add_id,
+    check_perf_regression,
     get_common_values,
     get_history_data,
     get_job_info,
     post_new_perf_data,
     prepare_baseline_data,
     prepare_regressive_test_cases,
-    write_regressive_test_cases,
 )
 from .utils import collect_and_clean_myelin_time
 
@@ -463,6 +463,7 @@ class DisaggConfig:
 
     def __init__(
         self,
+        name: str,
         disagg_serving_type: str,
         hostname: str,
         numa_bind: bool,
@@ -472,6 +473,7 @@ class DisaggConfig:
         hardware: dict,
         server_env_var: str,
     ):
+        self.name = name
         self.disagg_serving_type = disagg_serving_type
         self.hostname = hostname
         self.numa_bind = numa_bind
@@ -779,16 +781,17 @@ class DisaggTestCmds(NamedTuple):
         return ["multi-node disaggregated server tests, please check config files"]
 
 
-def parse_select_pattern(select_pattern: str) -> str:
-    """Parse select pattern (server config name).
+def parse_select_pattern(select_pattern: str) -> list:
+    """Parse select pattern (server config names).
 
     Args:
-        select_pattern: Server config name (e.g., "r1_fp8_dep8_mtp1_1k1k").
+        select_pattern: Server config names separated by comma
+            (e.g., "r1_fp4_v2_dep4_mtp1_1k1k,r1_fp4_v2_tep4_mtp3_1k1k,r1_fp4_v2_tp4_mtp3_1k1k").
 
     Returns:
-        Server config name string.
+        List of server config name strings.
     """
-    return select_pattern
+    return [name.strip() for name in select_pattern.split(",")]
 
 
 class PerfSanityTestConfig:
@@ -871,11 +874,11 @@ class PerfSanityTestConfig:
 
     def _parse_aggr_config_file(self, config_file_path: str):
         """Parse YAML config file for aggregated server."""
-        # Parse selection pattern (server config name)
+        # Parse selection pattern (server config names)
         if self.select_pattern:
-            selected_server_name = parse_select_pattern(self.select_pattern)
+            selected_server_names = parse_select_pattern(self.select_pattern)
         else:
-            selected_server_name = None
+            selected_server_names = None
 
         with open(config_file_path, "r") as f:
             config = yaml.safe_load(f)
@@ -893,10 +896,10 @@ class PerfSanityTestConfig:
         server_client_configs = {}
 
         for server_idx, server_config_data in enumerate(config["server_configs"]):
-            # Check if this server should be included based on selected_server_name
+            # Check if this server should be included based on selected_server_names
             if (
-                selected_server_name is not None
-                and server_config_data.get("name") != selected_server_name
+                selected_server_names is not None
+                and server_config_data.get("name") not in selected_server_names
             ):
                 continue
 
@@ -971,7 +974,7 @@ class PerfSanityTestConfig:
         # Create ctx server config
         ctx_server_config_data = {
             "concurrency": max(concurrency_values),
-            "name": f"ctx_{config_file_base_name}",
+            "name": config_file_base_name,
             "model_name": model_name,
             "gpus_per_node": gpus_per_node,
             **worker_config.get("ctx", {}),
@@ -980,7 +983,7 @@ class PerfSanityTestConfig:
         # Create gen server config
         gen_server_config_data = {
             "concurrency": max(concurrency_values),
-            "name": f"gen_{config_file_base_name}",
+            "name": config_file_base_name,
             "model_name": model_name,
             "gpus_per_node": gpus_per_node,
             **worker_config.get("gen", {}),
@@ -991,6 +994,7 @@ class PerfSanityTestConfig:
 
         # Create disagg config
         disagg_config = DisaggConfig(
+            name=config_file_base_name,
             disagg_serving_type=disagg_serving_type,
             hostname=socket.gethostname(),
             numa_bind=numa_bind,
@@ -1249,6 +1253,8 @@ class PerfSanityTestConfig:
                     new_data.update(job_config)
                     new_data.update(server_config_dict)
                     new_data.update(client_config_dict)
+                    # Add test_case_name for convenient filtering on OpenSearch
+                    new_data["s_test_case_name"] = f"{server_config.name}-{client_config.name}"
 
                     for metric_name in PERF_METRIC_LOG_QUERIES:
                         if metric_name in self._test_results[cmd_idx]:
@@ -1308,12 +1314,13 @@ class PerfSanityTestConfig:
                         "l_num_gen_servers": num_gen_servers,
                     }
                     new_data.update(job_config)
-
                     if num_ctx_servers > 0:
                         new_data.update(ctx_server_config_dict)
                     if num_gen_servers > 0:
                         new_data.update(gen_server_config_dict)
                     new_data.update(client_config_dict)
+                    # Add test_case_name for convenient filtering on OpenSearch
+                    new_data["s_test_case_name"] = f"{disagg_config.name}-{client_config.name}"
 
                     for metric_name in PERF_METRIC_LOG_QUERIES:
                         if metric_name in self._test_results[cmd_idx]:
@@ -1369,8 +1376,7 @@ class PerfSanityTestConfig:
             # Upload the new perf data and baseline data to database
             post_new_perf_data(new_baseline_data_dict, new_data_dict, regressive_data_list)
 
-        perf_result_output_dir = os.path.join(self._output_dir, self._test_param_labels)
-        write_regressive_test_cases(regressive_data_list, new_data_dict, perf_result_output_dir)
+        check_perf_regression(regressive_data_list, new_data_dict)
 
 
 # Perf sanity test case parameters
@@ -1438,10 +1444,13 @@ def get_disagg_test_cases() -> List[str]:
     return test_cases
 
 
+# Hardcoded multi-test test cases from test db.
+MULTI_TEST_TEST_CASES = []
+
 # Generate all test case combinations
 # For aggr: {test_type}-{config_yml}, {test_type}-{config_yml}-{server_config_name}
 # For disagg: {test_type}-{config_yml}
-PERF_SANITY_TEST_CASES = get_aggr_test_cases() + get_disagg_test_cases()
+PERF_SANITY_TEST_CASES = get_aggr_test_cases() + get_disagg_test_cases() + MULTI_TEST_TEST_CASES
 
 
 @pytest.mark.parametrize("perf_sanity_test_case", PERF_SANITY_TEST_CASES)

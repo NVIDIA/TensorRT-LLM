@@ -23,7 +23,7 @@ import time
 from datetime import datetime
 
 import yaml
-from defs.trt_test_alternative import print_info, print_warning
+from defs.trt_test_alternative import print_error, print_info, print_warning
 
 _project_root = os.path.abspath(
     os.path.join(os.path.dirname(__file__), '../../../..'))
@@ -61,6 +61,10 @@ MINIMIZE_METRICS = [
     "d_median_e2el",
     "d_p99_e2el",
 ]
+
+# Default threshold values for performance regression detection
+POST_MERGE_THRESHOLD = 0.05
+PRE_MERGE_THRESHOLD = 0.1
 
 # Fields for scenario-only matching for recipe tests.
 # Unlike regular tests that match on all config fields, recipes match only on the benchmark
@@ -656,3 +660,123 @@ def write_regressive_test_cases(regressive_data_list, new_data_dict,
     if len(regressive_data_list) > 0:
         print_warning(
             f"Found {len(regressive_data_list)} regressive test cases")
+
+
+def _get_metric_keys():
+    """Get all metric-related keys for filtering config keys."""
+    metric_keys = set()
+    for metric in MAXIMIZE_METRICS + MINIMIZE_METRICS:
+        metric_suffix = metric[2:]  # Strip "d_" prefix
+        metric_keys.add(metric)
+        metric_keys.add(f"d_baseline_{metric_suffix}")
+        metric_keys.add(f"d_threshold_post_merge_{metric_suffix}")
+        metric_keys.add(f"d_threshold_pre_merge_{metric_suffix}")
+    return metric_keys
+
+
+def _print_perf_data(data):
+    """Print performance metrics and config for a single data entry."""
+    print_info("=== Metrics ===")
+    for metric in MAXIMIZE_METRICS + MINIMIZE_METRICS:
+        if metric in data:
+            value = data.get(metric, "N/A")
+            print_info(f'"{metric}": {value}')
+
+    metric_keys = _get_metric_keys()
+    print_info("\n=== Config ===")
+    config_keys = sorted([key for key in data.keys() if key not in metric_keys])
+    for key in config_keys:
+        value = data[key]
+        print_info(f'"{key}": {value}')
+
+
+def _print_regression_data(data, print_func=None):
+    """
+    Print regression info, metrics with baselines/thresholds, and config.
+    """
+    if print_func is None:
+        print_func = print_info
+
+    if "s_regression_info" in data:
+        print_func("=== Regression Info ===")
+        print_func(f"{data['s_regression_info']}")
+
+    metric_keys = _get_metric_keys()
+    is_post_merge = data.get("b_is_post_merge", False)
+
+    print_func("=== Metrics ===")
+    for metric in MAXIMIZE_METRICS + MINIMIZE_METRICS:
+        metric_suffix = metric[2:]  # Strip "d_" prefix
+        baseline_key = f"d_baseline_{metric_suffix}"
+        if is_post_merge:
+            threshold_key = f"d_threshold_post_merge_{metric_suffix}"
+        else:
+            threshold_key = f"d_threshold_pre_merge_{metric_suffix}"
+        # Only print if at least one of the keys exists
+        if metric in data or baseline_key in data or threshold_key in data:
+            value = data.get(metric, "N/A")
+            baseline = data.get(baseline_key, "N/A")
+            threshold = data.get(threshold_key, "N/A")
+            # Calculate percentage difference between value and baseline
+            # Positive percentage means better perf, negative means regression
+            if (isinstance(value, (int, float))
+                    and isinstance(baseline, (int, float)) and baseline != 0):
+                if metric in MAXIMIZE_METRICS:
+                    # Larger is better: value > baseline is positive (better)
+                    percentage = (value - baseline) / baseline * 100
+                else:
+                    # Smaller is better: value < baseline is positive (better)
+                    percentage = (baseline - value) / baseline * 100
+                percentage_str = f"{percentage:+.2f}%"
+            else:
+                percentage_str = "N/A"
+            print_func(
+                f'"{metric}": {value}, "{baseline_key}": {baseline}, '
+                f'"{threshold_key}": {threshold}, "diff": {percentage_str}')
+
+    print_func("\n=== Config ===")
+    config_keys = sorted([key for key in data.keys() if key not in metric_keys])
+    for key in config_keys:
+        if key == "s_regression_info":
+            continue
+        value = data[key]
+        print_func(f'"{key}": {value}')
+
+
+def check_perf_regression(regressive_data_list, new_data_dict):
+    """
+    Check performance regression by printing regression data.
+    """
+    # Split regression data into post-merge and pre-merge
+    post_merge_regressions = [
+        data for data in regressive_data_list
+        if data.get("b_is_post_merge", False)
+    ]
+    pre_merge_regressions = [
+        data for data in regressive_data_list
+        if not data.get("b_is_post_merge", False)
+    ]
+
+    # Print pre-merge regression data with print_warning
+    if len(pre_merge_regressions) > 0:
+        print_warning(
+            f"Found {len(pre_merge_regressions)} pre-merge regression data")
+        for i, data in enumerate(pre_merge_regressions):
+            print_warning(f"\n{'=' * 60}")
+            print_warning(f"Pre-merge Regression Data #{i + 1}")
+            print_warning("=" * 60)
+            _print_regression_data(data, print_func=print_warning)
+
+    # Print post-merge regression data with print_warning for content
+    if len(post_merge_regressions) > 0:
+        for i, data in enumerate(post_merge_regressions):
+            print_warning(f"\n{'=' * 60}")
+            print_warning(f"Post-merge Regression Data #{i + 1}")
+            print_warning("=" * 60)
+            _print_regression_data(data, print_func=print_warning)
+        print_error(
+            f"Found {len(post_merge_regressions)} post-merge regression data")
+
+    # Print summary if no regressions
+    if len(regressive_data_list) == 0:
+        print_info("No regression data found.")

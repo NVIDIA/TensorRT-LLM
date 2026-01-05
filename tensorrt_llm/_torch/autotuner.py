@@ -2,6 +2,7 @@ import ast
 import contextlib
 import copy
 import enum
+import fcntl
 import inspect
 import itertools
 import json
@@ -266,15 +267,11 @@ def autotune(tune_mode: bool = True, cache_path: str = None):
     tune_required = tune_mode
     if cache_path is not None:
         # check if the rank-specific file exists
-        cache_path_no_ext = os.path.splitext(cache_path)[0]
-        cache_path_no_ext_rank = cache_path_no_ext + f".rank{rank}.json"
         # if the rank-specific file exists, load it
-        file_exists = os.path.exists(cache_path_no_ext_rank)
-        # if the rank-specific file exists, do not enable tuning mode
+        file_exists = os.path.exists(cache_path)
         if file_exists:
-            logger.info(
-                f"[Autotuner] Loading cache from {cache_path_no_ext_rank}")
-            autotuner.profiling_cache.load_cache(cache_path_no_ext_rank)
+            logger.info(f"[Autotuner] Loading cache from {cache_path}")
+            autotuner.profiling_cache.load_cache(cache_path, rank)
 
     # record the old tuning mode
     old_mode = autotuner.is_tuning_mode
@@ -293,8 +290,8 @@ def autotune(tune_mode: bool = True, cache_path: str = None):
 
         # save cache
         if cache_path is not None:
-            logger.info(f"[Autotuner] Saving cache to {cache_path_no_ext_rank}")
-            autotuner.profiling_cache.save_cache(cache_path_no_ext_rank)
+            logger.info(f"[Autotuner] Saving cache to {cache_path}")
+            autotuner.profiling_cache.save_cache(cache_path, rank)
 
 
 @dataclass
@@ -439,7 +436,7 @@ class AutoTunerProfilingCache:
     def get_specific_custom_op(self, custom_op: str) -> Dict[Tuple, Tuple]:
         return {k: v for k, v in self.cache.items() if k[0] == custom_op}
 
-    def save_cache(self, file_path: Union[str, Path]) -> None:
+    def save_cache(self, file_path: Union[str, Path], rank: int) -> None:
         """Save the profiling cache to disk in JSON format.
 
         Args:
@@ -456,9 +453,21 @@ class AutoTunerProfilingCache:
         file_path.parent.mkdir(parents=True, exist_ok=True)
 
         try:
-            serializable_cache = self._serialize_cache_to_json()
-            with open(file_path, 'w') as f:
-                json.dump(serializable_cache, f, indent=2, default=str)
+            serialized_rank_cache_data = self._serialize_cache_data()
+            with open(file_path, 'a+') as f:
+                fcntl.flock(f, fcntl.LOCK_EX)
+                f.seek(0)
+                content = f.read()
+                if content.strip():
+                    current_cache = json.loads(content)
+                else:
+                    current_cache = {
+                        "metadata": self._serialize_metadata(),
+                    }
+                f.seek(0)
+                f.truncate()
+                current_cache[f"rank_{rank}"] = serialized_rank_cache_data
+                json.dump(current_cache, f, indent=2, default=str)
             logger.info(
                 f"[AutoTuner] Successfully saved cache to {file_path} using JSON format"
             )
@@ -466,7 +475,7 @@ class AutoTunerProfilingCache:
             logger.error(f"[AutoTuner] Failed to save cache with JSON: {e}")
             raise
 
-    def load_cache(self, file_path: Union[str, Path]) -> None:
+    def load_cache(self, file_path: Union[str, Path], rank: int) -> None:
         """Load the profiling cache from disk in JSON format.
 
         Args:
@@ -486,8 +495,12 @@ class AutoTunerProfilingCache:
 
         try:
             with open(file_path, 'r') as f:
-                serializable_cache = json.load(f)
-            self.cache = self._deserialize_cache_from_json(serializable_cache)
+                fcntl.flock(f, fcntl.LOCK_SH)
+                current_cache_contents = json.load(f)
+                self._deserialize_metadata(current_cache_contents["metadata"])
+                assert f"rank_{rank}" in current_cache_contents, f"Rank {rank} cache not found in {file_path}"
+            self.cache = self._deserialize_cache_data(
+                current_cache_contents[f'rank_{rank}'])
             logger.info(
                 f"[AutoTuner] Successfully loaded cache from {file_path} using JSON format"
             )
@@ -495,7 +508,21 @@ class AutoTunerProfilingCache:
             logger.error(f"[AutoTuner] Failed to load cache with JSON: {e}")
             raise
 
-    def _serialize_cache_to_json(self) -> Dict[str, Any]:
+    def _serialize_metadata(self) -> Dict[str, Any]:
+        return {
+            "lib_version": self.lib_version,
+            "creation_timestamp": self.creation_timestamp,
+            "device_name": self.device_name,
+            "device_capability": self.device_capability,
+        }
+
+    def _deserialize_metadata(self, metadata: Dict[str, Any]) -> None:
+        self.lib_version = metadata["lib_version"]
+        self.creation_timestamp = metadata["creation_timestamp"]
+        self.device_name = metadata["device_name"]
+        self.device_capability = metadata["device_capability"]
+
+    def _serialize_cache_data(self) -> Dict[str, Any]:
         """Convert the profiling cache to a JSON-serializable format.
 
         Returns:
@@ -505,15 +532,7 @@ class AutoTunerProfilingCache:
             This method handles the conversion of complex objects to JSON-compatible
             representations. Some type information may be lost in the conversion.
         """
-        serializable_cache = {
-            "metadata": {
-                "lib_version": self.lib_version,
-                "creation_timestamp": self.creation_timestamp,
-                "device_name": self.device_name,
-                "device_capability": self.device_capability,
-            },
-            "cache_data": {},
-        }
+        serializable_cache = {}
 
         for key, value in self.cache.items():
             # Convert any simple object to string for JSON compatibility
@@ -529,7 +548,7 @@ class AutoTunerProfilingCache:
                     f"[AutoTuner] Could not serialize tactic: {tactic_str} for cache key {key_str} due to {e}. Deserialization may fail.",
                     key=tactic_str)
 
-            serializable_cache["cache_data"][key_str] = {
+            serializable_cache[key_str] = {
                 "runner_id": runner_id,
                 "tactic": tactic_str,
                 "min_time": min_time,
@@ -537,8 +556,8 @@ class AutoTunerProfilingCache:
 
         return serializable_cache
 
-    def _deserialize_cache_from_json(
-            self, serializable_cache: Dict[str, Any]) -> Dict[Tuple, Tuple]:
+    def _deserialize_cache_data(
+            self, cache_data: Dict[str, Any]) -> Dict[Tuple, Tuple]:
         """Convert JSON-serialized cache back to the original format.
 
         Args:
@@ -551,14 +570,7 @@ class AutoTunerProfilingCache:
             This attempts to reconstruct the original data structures but may not
             perfectly preserve all type information, especially for complex tactic objects.
         """
-        metadata = serializable_cache["metadata"]
-        self.lib_version = metadata["lib_version"]
-        self.creation_timestamp = metadata["creation_timestamp"]
-        self.device_name = metadata["device_name"]
-        self.device_capability = metadata["device_capability"]
-
         cache = {}
-        cache_data = serializable_cache["cache_data"]
 
         for key_str, value in cache_data.items():
             # Reconstruct the tuple key safely
@@ -1506,7 +1518,7 @@ class AutoTuner:
         """Broadcast tactics from root rank to all other ranks."""
         cache_data = self.profiling_cache.get_specific_custom_op(custom_op)
         root = 0
-        cache_data = self._dist.tp_broadcast(obj=cache_data, root=root)
+        cache_data = self._dist.tp_cp_broadcast(obj=cache_data, root=root)
 
         self.profiling_cache.merge_cache_data(cache_data)
 

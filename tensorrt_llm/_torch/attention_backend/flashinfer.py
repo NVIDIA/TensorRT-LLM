@@ -130,7 +130,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._post_init_with_buffers(self.cuda_graph_buffers)
 
     def _post_init_with_buffers(self, buffers) -> None:
-        capture_graph = torch.cuda.is_current_stream_capturing()
+        capture_graph = self.is_cuda_graph
 
         if self.workspace_buffer is None:
             # Note: even though flashinfer only recommends 128 MB, we have to push it
