@@ -47,7 +47,6 @@ class Evaluator(ABC):
         self.system_prompt = system_prompt
         self.chat_template_kwargs = chat_template_kwargs
         self.output_dir = output_dir
-        self.inference_results = []
 
     @abstractmethod
     def generate_samples(self) -> Iterable[tuple]:
@@ -108,16 +107,11 @@ class Evaluator(ABC):
             references.append(reference)
             auxiliaries.append(aux)
         results = []
-        task_id = 0
-        self.inference_results = []
         for output in tqdm(outputs, desc="Fetching responses"):
-            res = output.result()
-            results.append(res)
-            collect_inference_result(self.inference_results, res, task_id)
-            task_id += 1
+            results.append(output.result())
 
         if self.output_dir:
-            dump_inference_results(self.output_dir, self.inference_results,
+            dump_inference_results(self.output_dir, results,
                                    getattr(llm, 'tokenizer', None))
 
         profiler.stop("trtllm exec")
@@ -133,23 +127,27 @@ class Evaluator(ABC):
         raise NotImplementedError()
 
 
-def collect_inference_result(results_list: List[dict], result: RequestOutput,
-                             task_id: int):
-    input_ids = result.prompt_token_ids
-    output_ids = result.outputs[0].token_ids
-    results_list.append({
-        "task_id": task_id,
-        "input_ids": input_ids,
-        "output_ids": output_ids
-    })
-
-
-def dump_inference_results(output_dir: str, results_list: List[dict],
+def dump_inference_results(output_dir: str, results: List[dict],
                            tokenizer: Any):
     if not output_dir:
         return
 
     os.makedirs(output_dir, exist_ok=True)
+
+    # Collect results
+    results_list = []
+    for task_id, result in enumerate(results):
+        output_ids = result.outputs[0].token_ids
+        output_text = result.outputs[0].text.strip()
+        input_text = result.prompt.strip()
+        input_ids = tokenizer.encode(input_text)
+        results_list.append({
+            "task_id": task_id,
+            "input_ids": input_ids,
+            "output_ids": output_ids,
+            "input_text": input_text,
+            "output_text": output_text
+        })
 
     # Dump token ids
     ids_path = os.path.join(output_dir, "dumped_ids.json")
@@ -168,24 +166,19 @@ def dump_inference_results(output_dir: str, results_list: List[dict],
     except Exception as e:
         logger.warning(f"Failed to dump IDs to {ids_path}: {e}")
 
-    # Dump text if tokenizer available
-    if tokenizer is not None:
-        text_path = os.path.join(output_dir, "dumped_text.json")
-        try:
-            with open(text_path, "w") as f:
-                for item in results_list:
-                    input_text = tokenizer.decode(item["input_ids"])
-                    output_text = tokenizer.decode(item["output_ids"])
-                    data = {
-                        "task_id": item["task_id"],
-                        "input_text": input_text,
-                        "output_text": output_text,
-                        "input_len": len(input_text),
-                        "output_len": len(output_text)
-                    }
-                    f.write(json.dumps(data) + "\n")
-            logger.info(f"Dumped text to {text_path}")
-        except Exception as e:
-            logger.warning(f"Failed to dump text to {text_path}: {e}")
-    else:
-        logger.warning("Tokenizer not found, skipping text dump")
+    # Dump text
+    text_path = os.path.join(output_dir, "dumped_text.json")
+    try:
+        with open(text_path, "w") as f:
+            for item in results_list:
+                data = {
+                    "task_id": item["task_id"],
+                    "input_text": item["input_text"],
+                    "output_text": item["output_text"],
+                    "input_len": len(item["input_text"]),
+                    "output_len": len(item["output_text"])
+                }
+                f.write(json.dumps(data) + "\n")
+        logger.info(f"Dumped text to {text_path}")
+    except Exception as e:
+        logger.warning(f"Failed to dump text to {text_path}: {e}")

@@ -39,8 +39,7 @@ from ..inputs.utils import apply_chat_template as trtllm_apply_chat_template
 from ..llmapi import RequestOutput
 from ..logger import logger
 from ..sampling_params import SamplingParams
-from .interface import (Evaluator, collect_inference_result,
-                        dump_inference_results)
+from .interface import Evaluator, dump_inference_results
 
 # NOTE: lm_eval uses "<image>" as the default image placeholder
 # https://github.com/EleutherAI/lm-evaluation-harness/blob/7f04db12d2f8e7a99a0830d99eb78130e1ba2122/lm_eval/models/hf_vlms.py#L25
@@ -63,7 +62,6 @@ class LmEvalWrapper(TemplateLM):
         self.streaming = streaming
         self.chat_template_kwargs = chat_template_kwargs
         self.output_dir = output_dir
-        self.inference_results = []
 
     @property
     def eot_token_id(self) -> int:
@@ -143,18 +141,13 @@ class LmEvalWrapper(TemplateLM):
             results.append(output)
 
         outputs = []
-        task_id = 0
-        self.inference_results = []
         for output in tqdm(results,
                            desc="Fetching responses",
                            disable=disable_tqdm):
-            res = output.result()
-            outputs.append(res)
-            collect_inference_result(self.inference_results, res, task_id)
-            task_id += 1
+            outputs.append(output.result())
 
         if self.output_dir:
-            dump_inference_results(self.output_dir, self.inference_results,
+            dump_inference_results(self.output_dir, outputs,
                                    getattr(self.llm, 'tokenizer', None))
 
         profiler.stop("trtllm exec")
@@ -326,18 +319,13 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
             results.append(output)
 
         outputs = []
-        self.inference_results = []
-        task_id = 0
         for output in tqdm(results,
                            desc="Fetching responses",
                            disable=disable_tqdm):
-            res = output.result()
-            outputs.append(res)
-            collect_inference_result(self.inference_results, res, task_id)
-            task_id += 1
+            outputs.append(output.result())
 
         if self.output_dir:
-            dump_inference_results(self.output_dir, self.inference_results,
+            dump_inference_results(self.output_dir, outputs,
                                    getattr(self.llm, 'tokenizer', None))
 
         profiler.stop("trtllm exec")
@@ -947,6 +935,10 @@ class LongBenchV1(LmEvalEvaluator):
                   type=str,
                   default=None,
                   help="System prompt.")
+    @click.option("--output_dir",
+                  type=str,
+                  default=None,
+                  help="Directory to save the results.")
     @click.pass_context
     @staticmethod
     def command(ctx, **kwargs) -> None:
@@ -958,7 +950,8 @@ class LongBenchV1(LmEvalEvaluator):
             random_seed=kwargs.pop("random_seed", 0),
             apply_chat_template=kwargs.pop("apply_chat_template", True),
             system_prompt=kwargs.pop("system_prompt", None),
-            chat_template_kwargs=kwargs.pop("chat_template_kwargs", None))
+            chat_template_kwargs=kwargs.pop("chat_template_kwargs", None),
+            output_dir=kwargs.pop("output_dir", None))
 
         # Let lm-eval task configs control sampling via gen_kwargs.
         sampling_params = None
