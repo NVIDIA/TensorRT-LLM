@@ -148,7 +148,10 @@ l0_h100:
     - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_qwen3[False-False-Qwen3-8B-FP8]
     - unittest/_torch/executor
     - unittest/_torch/ray_orchestrator/single_gpu
-    - unittest/llmapi/test_llm_pytorch.py
+    - unittest/llmapi/test_llm_pytorch.py -m "part0"
+    - unittest/llmapi/test_llm_pytorch.py -m "part1"
+    - unittest/llmapi/test_llm_pytorch.py -m "part2"
+    - unittest/llmapi/test_llm_pytorch.py -m "part3"
     - unittest/llmapi/test_async_llm.py -m "not (gpu2 or gpu4)"
     - examples/test_ray.py::test_llm_inference_async_ray
 - condition:
