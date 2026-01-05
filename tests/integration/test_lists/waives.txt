@@ -518,3 +518,4 @@ unittest/_torch/attention/test_flashinfer_star_attn.py::TestStarAttention::test_
 unittest/_torch/ray_orchestrator/multi_gpu/test_ops.py::test_reducescatter_pg_op[var_len:True-seqlen:16-hidden:128] SKIP (https://nvbugs/5781383)
 cpp/test_e2e.py::test_model[-mamba-86] SKIP (https://nvbugs/5781665)
 unittest/llmapi/test_llm_multi_gpu_pytorch.py::test_tinyllama_logits_processor_tp2pp2 SKIP (https://nvbugs/5781731)
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=2-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=True-enable_chunked_prefill=False] SKIP (https://nvbugs/5759338)
