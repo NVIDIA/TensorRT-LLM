@@ -285,6 +285,7 @@ class MistralCommonImageProcessor:
         return ncols * nrows + nrows
 
     def __call__(self, text, images, **kwargs):
+        mm_items = []
         if images:
             mm_items = [{
                 "type": "image",
@@ -301,13 +302,6 @@ class MistralCommonImageProcessor:
 
         encoded = self.tokenizer.transformers_tokenizer.apply_chat_template(
             conversation, tokenize=True, return_dict=True, return_tensors='pt')
-
-        logger.debug(
-            f"encoded.pixel_values.shape: {encoded.pixel_values.shape}, encoded.input_ids: {encoded.input_ids[0][-20:]}"
-        )
-        logger.debug(
-            f"encoded.input_ids list: {self.tokenizer.transformers_tokenizer.apply_chat_template(conversation)}"
-        )
 
         processed = {
             "input_ids": encoded.input_ids,
