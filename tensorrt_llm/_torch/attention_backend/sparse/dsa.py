@@ -1539,9 +1539,6 @@ class Indexer(nn.Module):
         k = self._prep_q_or_k(k_pe, k_nope)
         return q, k
 
-    def _weight_proj(self, hidden_states: torch.Tensor):
-        return self.weights_proj(_to_float(hidden_states))
-
     def _prep_q_or_k(self, qk_pe: torch.Tensor, qk_nope: torch.Tensor):
         """Concatenate, rotate, and FP8 quantize for Q or K"""
         q_or_k = torch.cat([qk_pe, qk_nope], dim=-1)
@@ -1552,12 +1549,19 @@ class Indexer(nn.Module):
         return q_or_k
 
     @torch.inference_mode()
-    def forward(self, q_and_k: torch.Tensor, weights: torch.Tensor,
+    def forward(self, qr: torch.Tensor, hidden_states: torch.Tensor,
                 metadata: DSAtrtllmAttentionMetadata,
                 position_ids: torch.Tensor, indexer_k: torch.Tensor):
         quant_block_size = metadata.kv_cache_manager.quant_block_size
         assert quant_block_size == 128, "Only support quant_block_size = 128 for now"
 
+        q_and_k, weights = maybe_execute_in_parallel(
+            lambda: self._qk_projection_and_rope(qr, indexer_k, position_ids),
+            lambda: self.weights_proj(_to_float(hidden_states)),
+            self.ln_events[0],
+            self.ln_events[1],
+            self.aux_stream,
+        )
         q, k = q_and_k
         q_fp8, q_scale = q
         k_fp8, k_scale = k

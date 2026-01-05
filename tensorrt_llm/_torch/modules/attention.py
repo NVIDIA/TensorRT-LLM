@@ -1346,14 +1346,6 @@ class MLA(nn.Module):
         Returns:
             torch.Tensor: The output tensor.
         """
-
-        def _qk_projection_and_rope(q: torch.Tensor, k: torch.Tensor,
-                                    position_ids: torch.Tensor):
-            q_b_proj = self.q_b_proj(q)
-            indexer_q_and_k = self.indexer._qk_projection_and_rope(
-                q, k, position_ids)
-            return q_b_proj, indexer_q_and_k
-
         assert self.mha is None and self.mqa is not None, "DSA is only supported in MQA mode"
         # split q, k, v into context and gen batches
         num_contexts = attn_metadata.num_contexts
@@ -1378,6 +1370,7 @@ class MLA(nn.Module):
             self.ln_events[1],
             self.aux_stream,
         )
+        qr = q
         latent_cache, indexer_k = maybe_execute_in_parallel(
             lambda: torch.concat([compressed_kv, k_pe], dim=-1),
             lambda: self.indexer.k_norm(indexer_k),
@@ -1385,19 +1378,12 @@ class MLA(nn.Module):
             self.ln_events[1],
             self.aux_stream,
         )
-        q_and_k, indexer_weights = maybe_execute_in_parallel(
-            lambda: _qk_projection_and_rope(q, indexer_k, position_ids),
-            lambda: self.indexer._weight_proj(hidden_states),
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
-        )
-        q, indxer_q_and_k = q_and_k
 
+        q = self.q_b_proj(q)
         # Indexer
         topk_indices = self.indexer(
-            indxer_q_and_k,
-            indexer_weights,
+            qr,
+            hidden_states,
             attn_metadata,
             position_ids,
             indexer_k=indexer_k,  # indexer K proj
