@@ -198,7 +198,7 @@ class ConversationHistoryStore:
         # Map from conversation id to response id, which is the latest response in the conversation.
         self.conversation_to_response: dict[str, str] = {}
 
-    async def load_response(self, resp_id: str) -> ResponsesResponse:
+    async def load_response(self, resp_id: str) -> ResponsesResponse | None:
         _responses_debug_log(
             f"ConversationHistoryStore loading resp: {resp_id}")
         async with self.responses_lock:
