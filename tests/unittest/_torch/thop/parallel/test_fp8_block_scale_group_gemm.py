@@ -38,7 +38,7 @@ def test_cute_dsl_fp8_block_scale_group_gemm(dtype, num_experts, k, n, max_token
 
     group_m = []
     for i in range(num_experts):
-        group_m.append(random.randint(0, max_tokens_per_group))
+        group_m.append(math.ceil(random.randint(0, max_tokens_per_group) / 128) * 128)
     group_m = torch.tensor(group_m, dtype=torch.int32, device="cuda")
     group_m_cum = torch.cumsum(group_m, dim=0)
 
