@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, List, Optional, Type
 import torch
 from torch import nn
 
+from ..cute_dsl_kernels.argmax import argmax as cute_argmax
+
 from tensorrt_llm.logger import logger
 
 from ..._utils import get_sm_version
@@ -415,6 +417,7 @@ class SpecWorkerBase(nn.Module, ABC):
             sampled_tokens = sampling_batch_spec_dec_one_model(
                 logits, temperatures, top_ks, top_ps)
         else:
-            sampled_tokens = torch.argmax(logits, dim=-1)
+            # cute_argmax returns (M, 2) where col 0 = max value, col 1 = argmax index
+            sampled_tokens = cute_argmax(logits)[:, 1].long()
 
         return sampled_tokens
