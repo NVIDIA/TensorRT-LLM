@@ -114,7 +114,6 @@ def transform_local_topk_and_prepare_pool_view(
     num_blocks, num_layers, _, _ = all_layer_kv_pool.shape
     tokens_per_block = kv_cache_manager.tokens_per_block
     head_dim = kv_cache_manager.head_dim
-    assert num_layers == kv_cache_manager.num_local_layers, "PP is not enabled yet for DeepSeek V3.2"
     assert all_layer_kv_pool.is_contiguous(
     ), "all_layer_kv_pool should be contiguous"
     all_layer_kv_pool = all_layer_kv_pool.squeeze(2).view(-1, 1, head_dim)
@@ -1647,7 +1646,7 @@ class DSATrtllmAttention(TrtllmAttention):
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         # Transform the local topk indices to global topk indices in paged kv cache
         topk_indices_global, _ = transform_local_topk_and_prepare_pool_view(
-            topk_indices, metadata, self.layer_idx, is_generation)
+            topk_indices, metadata, self.get_local_layer_idx(metadata), is_generation)
 
         # TODO: Use sparse_attn_indexer to predict the indices for DSA attention
         # return self.indexer(q, k, metadata, hidden_states, qr, position_ids)
