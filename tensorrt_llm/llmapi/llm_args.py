@@ -1936,7 +1936,7 @@ class BaseLlmArgs(StrictBaseModel):
         description="Optional parameters overriding model config defaults. "
         "Precedence: (1) model_kwargs, (2) model config file, (3) model config class defaults. "
         "Unknown keys are ignored",
-        status="beta")
+        status="prototype")
 
     pipeline_parallel_size: int = Field(
         default=1, description="The pipeline parallel size.")
