@@ -26,6 +26,38 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+"""Example usage of the kernel.
+
+Functional testing:
+python run_blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion.py \
+        --ab_dtype Float4E2M1FN --c_dtype Float4E2M1FN \
+        --sf_dtype Float8E4M3FN --sf_vec_size 16 \
+        --mma_tiler_mn 128,128 --cluster_shape_mn 1,1 \
+        --nkl 4096,7168,8 --fixed_m 128
+or use a benchmark file:
+python run_blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion.py \
+        --ab_dtype Float4E2M1FN --c_dtype Float4E2M1FN \
+        --sf_dtype Float8E4M3FN --sf_vec_size 16 \
+        --mma_tiler_mn 128,128 --cluster_shape_mn 1,1 \
+        --benchmark benchmark.txt
+Perf testing:
+python run_blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion.py \
+        --ab_dtype Float4E2M1FN --c_dtype Float4E2M1FN \
+        --sf_dtype Float8E4M3FN --sf_vec_size 16 \
+        --mma_tiler_mn 128,128 --cluster_shape_mn 1,1 \
+        --benchmark benchmark.txt \
+        --skip_ref_check --use_cold_l2 --use_cupti --warmup_iterations 10 --iterations 50
+A sample benchmark.txt file is shown below:
+0 89x4096x7168
+1 200x4096x7168
+2 145x4096x7168
+3 178x4096x7168
+4 241x4096x7168
+5 78x4096x7168
+6 198x4096x7168
+7 60x4096x7168
+"""
+
 import argparse
 import sys
 from pathlib import Path
@@ -577,6 +609,8 @@ def run(
         raise RuntimeError("GPU is required to run this example!")
 
     # Skip unsupported testcase
+    # Note: For grouped GEMM, we use mma_tiler_mn[0] as the m parameter for can_implement check
+    # since individual group M values vary
     if not BlockScaledContiguousGatherGroupedGemmKernel.can_implement(
         ab_dtype,
         sf_dtype,
@@ -584,6 +618,7 @@ def run(
         c_dtype,
         mma_tiler_mn,
         cluster_shape_mn,
+        mma_tiler_mn[0],  # m (use mma_tiler_m as placeholder for grouped GEMM)
         n,
         k,
         num_groups,
