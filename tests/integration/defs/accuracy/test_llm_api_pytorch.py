@@ -3902,7 +3902,7 @@ class TestQwen3_30B_A3B_Instruct_2507(LlmapiAccuracyTestHarness):
                 "prefill": thr_prefill,
                 "decode": thr_decode,
             })
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.85)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
 
         if get_sm_version() >= 100:
             pytest.skip("https://nvbugs/5783509: Bug to be fixed on Blackwell")
@@ -3936,7 +3936,7 @@ class TestQwen3_30B_A3B_Instruct_2507(LlmapiAccuracyTestHarness):
                 "prefill": thr_prefill,
                 "decode": thr_decode,
             })
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.85)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
 
         with LLM(self.MODEL_PATH,
                  attn_backend="TRTLLM",
