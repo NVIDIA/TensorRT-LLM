@@ -13,6 +13,9 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 
+# ============================================================================
+# NIXL Wrapper Library
+# ============================================================================
 if(NIXL_ROOT)
   find_package(NIXL REQUIRED)
   # Check if all required packages were found
@@ -30,11 +33,94 @@ if(NIXL_ROOT)
 
   # Add include directories
   target_include_directories(${NIXL_WRAPPER_TARGET} PRIVATE NIXL::nixl)
+  target_include_directories(${NIXL_WRAPPER_TARGET}
+                             PRIVATE ${PROJECT_SOURCE_DIR}/include)
 
   # Link against all NIXL libraries
   target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE NIXL::nixl)
 
   # Link against CUDA
   target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE CUDA::cudart)
+
+  set(NIXL_ENABLED TRUE)
+else()
+  set(NIXL_ENABLED FALSE)
+endif()
+
+# ============================================================================
+# Check if Mooncake wrapper is available (built in mooncake_utils)
+# ============================================================================
+if(MOONCAKE_ROOT AND TARGET tensorrt_llm_mooncake_wrapper)
+  set(MOONCAKE_ENABLED TRUE)
+else()
+  set(MOONCAKE_ENABLED FALSE)
+endif()
+
+# ============================================================================
+# TensorRT-LLM Transfer Agent Binding Python Module Build if either NIXL or
+# Mooncake is enabled
+# ============================================================================
+if(NIXL_ENABLED OR MOONCAKE_ENABLED)
+  set(TRANSFER_AGENT_BINDING_TARGET "tensorrt_llm_transfer_agent_binding")
+
+  # Collect binding source files
+  set(AGENT_BINDING_SOURCES "")
+  if(BINDING_TYPE STREQUAL "pybind")
+    list(APPEND AGENT_BINDING_SOURCES agentBindingsPybind.cpp)
+  else()
+    list(APPEND AGENT_BINDING_SOURCES agentBindingsNanobind.cpp)
+  endif()
+
+  if(BINDING_TYPE STREQUAL "pybind")
+    # Use pybind11 (already fetched via FetchContent)
+    pybind11_add_module(${TRANSFER_AGENT_BINDING_TARGET}
+                        ${AGENT_BINDING_SOURCES})
+    message(STATUS "Building tensorrt_llm_transfer_agent_binding with pybind11")
+  else()
+    # Default to nanobind (already fetched via FetchContent)
+    nanobind_add_module(${TRANSFER_AGENT_BINDING_TARGET}
+                        ${AGENT_BINDING_SOURCES})
+    message(STATUS "Building tensorrt_llm_transfer_agent_binding with nanobind")
+  endif()
+
+  target_compile_options(${TRANSFER_AGENT_BINDING_TARGET} PRIVATE -Wno-error)
+
+  # Add common include directories
+  target_include_directories(${TRANSFER_AGENT_BINDING_TARGET}
+                             PRIVATE ${PROJECT_SOURCE_DIR}/include)
+
+  # Conditionally add NIXL support
+  if(NIXL_ENABLED)
+    target_compile_definitions(${TRANSFER_AGENT_BINDING_TARGET}
+                               PRIVATE ENABLE_NIXL)
+    target_include_directories(${TRANSFER_AGENT_BINDING_TARGET}
+                               PRIVATE NIXL::nixl)
+    target_link_libraries(${TRANSFER_AGENT_BINDING_TARGET}
+                          PRIVATE ${NIXL_WRAPPER_TARGET})
+    target_link_libraries(${TRANSFER_AGENT_BINDING_TARGET} PRIVATE NIXL::nixl)
+    message(STATUS "Transfer agent binding: NIXL support enabled")
+  endif()
+
+  # Conditionally add Mooncake support
+  if(MOONCAKE_ENABLED)
+    target_compile_definitions(${TRANSFER_AGENT_BINDING_TARGET}
+                               PRIVATE ENABLE_MOONCAKE)
+    target_include_directories(${TRANSFER_AGENT_BINDING_TARGET}
+                               PRIVATE ${TRANSFER_ENGINE_INCLUDE_DIR})
+    target_link_libraries(${TRANSFER_AGENT_BINDING_TARGET}
+                          PRIVATE tensorrt_llm_mooncake_wrapper)
+    message(STATUS "Transfer agent binding: Mooncake support enabled")
+  endif()
+
+  # Common dependencies
+  target_link_libraries(${TRANSFER_AGENT_BINDING_TARGET} PRIVATE CUDA::cudart)
+  target_link_libraries(${TRANSFER_AGENT_BINDING_TARGET}
+                        PRIVATE ${SHARED_TARGET})
+
+  # Set RPATH for the module to find wrapper libraries
+  set_target_properties(
+    ${TRANSFER_AGENT_BINDING_TARGET}
+    PROPERTIES BUILD_RPATH "$ORIGIN;$ORIGIN/libs;$ORIGIN/libs/nixl"
+               INSTALL_RPATH "$ORIGIN;$ORIGIN/libs;$ORIGIN/libs/nixl")
 
 endif()

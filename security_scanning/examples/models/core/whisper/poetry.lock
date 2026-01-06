@@ -833,31 +833,38 @@ files = [
 
 [[package]]
 name = "kaldialign"
-version = "0.9.2"
+version = "0.9.3"
 description = "Kaldi alignment methods wrapped into Python"
 optional = false
 python-versions = "*"
 files = [
-    {file = "kaldialign-0.9.2-cp310-cp310-macosx_10_9_universal2.whl", hash = "sha256:64167b0c18cd2f97e43708d0564d61f16cb7c2a5bbff151e6f02e7e36d11dcd4"},
-    {file = "kaldialign-0.9.2-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:4922abd2bda24d518d0d91031ada06714bb667138451d62d604654bbcb4f5aee"},
-    {file = "kaldialign-0.9.2-cp310-cp310-win_amd64.whl", hash = "sha256:16883b9c7b9ceda9adf4bb1fcba3f466d0a8d65134a0ee0af221fb15353d015c"},
-    {file = "kaldialign-0.9.2-cp311-cp311-macosx_10_9_universal2.whl", hash = "sha256:337ef383aa482d123030248d76d7ac6b2529cb3761d591265bc958a4090c60c8"},
-    {file = "kaldialign-0.9.2-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:7954665b95e326b19bd7c737fc0f8109fdda9970f5f692e833468563f0363192"},
-    {file = "kaldialign-0.9.2-cp311-cp311-win_amd64.whl", hash = "sha256:f74b9086c3f5efdf54c149d28495e2648015c501669245c38b0e02aa9309f08e"},
-    {file = "kaldialign-0.9.2-cp312-cp312-macosx_10_13_universal2.whl", hash = "sha256:cb498f84fd6cb51ed946ae650fbe8d38ead6d2f071deb3a539780c6292d73acb"},
-    {file = "kaldialign-0.9.2-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:bef805669578bea2d766fcddb602695d5fbb657a43519aa1f94836750c27d9b7"},
-    {file = "kaldialign-0.9.2-cp312-cp312-win_amd64.whl", hash = "sha256:fea66f7f35a1d96d430f717a79b2919e341b6371a9491e52304db3b370e3097d"},
-    {file = "kaldialign-0.9.2-cp313-cp313-macosx_10_13_universal2.whl", hash = "sha256:af7ff8a0648c77994f39dfcbb49f0ddcd5c1bc7e0ca449ba1b0d165facedab25"},
-    {file = "kaldialign-0.9.2-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:6fb471fee0e868e4edd768e3bcd181837f2a27f0d8495ee931e5d516f12dc43e"},
-    {file = "kaldialign-0.9.2-cp313-cp313-win_amd64.whl", hash = "sha256:8cfc96622b90c2eda56a40b73b2274c5e94f1df12481f7cb5b46cb599d3a0be9"},
-    {file = "kaldialign-0.9.2-cp37-cp37m-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:36731f5d89e799f5986b19b7b7c082478fba1acee56596d72ffced86b0d22c49"},
-    {file = "kaldialign-0.9.2-cp37-cp37m-win_amd64.whl", hash = "sha256:d1e96b6ba907cee2ab7a745a50b88156ae0949fdd6455a2f4a3a96ecdb4b3ba3"},
-    {file = "kaldialign-0.9.2-cp38-cp38-macosx_10_9_universal2.whl", hash = "sha256:58afd951e2153db24b9e3a115d7eeb58451c9a7dda04dea26e488eca739153bb"},
-    {file = "kaldialign-0.9.2-cp38-cp38-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:62f9d8e8ebca76ffc92352d37d19831984c78e086ee9962bc3e80f0afc75a802"},
-    {file = "kaldialign-0.9.2-cp38-cp38-win_amd64.whl", hash = "sha256:ce73acd0ab6c372dd947cc9ebe2d88afb556ce2d8f6f15f5258ade656ace51d2"},
-    {file = "kaldialign-0.9.2-cp39-cp39-macosx_10_9_universal2.whl", hash = "sha256:9182fd5612c8988a6b69078c41e6077b60d00019e77e42c23ea6090757406536"},
-    {file = "kaldialign-0.9.2-cp39-cp39-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:d265de1aea084533d88bee8843860440a22a0e6a2940730dae588a795e0cceda"},
-    {file = "kaldialign-0.9.2-cp39-cp39-win_amd64.whl", hash = "sha256:fc9e47c4023eb11ca9cd8ddaf82f2769ab54aa9759bea4b7b5b0474dff64f99d"},
+    {file = "kaldialign-0.9.3-cp310-cp310-macosx_10_9_universal2.whl", hash = "sha256:36aee4343882fb240f5aff6c5570ffc2838a65f5502cad6d6af129abf1c9b951"},
+    {file = "kaldialign-0.9.3-cp310-cp310-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:c051fd8265f303a230ca6952ab235b0604b4b1810ecc6d5ce97fd3def3962b01"},
+    {file = "kaldialign-0.9.3-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:5323c72b66aeecbad594395a5620f4435822a20c9577222b31f17efc182ddf92"},
+    {file = "kaldialign-0.9.3-cp310-cp310-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:1523bfa18108235bd4b6164ccc2534a2c21c9e6a562ad1e60e562ce8f5aa52cb"},
+    {file = "kaldialign-0.9.3-cp310-cp310-win32.whl", hash = "sha256:ab2261e0e3db35b9781f8c87ed5581769a4a19d71f061d30099e767bdb84b116"},
+    {file = "kaldialign-0.9.3-cp310-cp310-win_amd64.whl", hash = "sha256:01fe7d02be70cfa82ce5d6d188872c78b854654e7446fa3d7fda2cb11bb52393"},
+    {file = "kaldialign-0.9.3-cp311-cp311-macosx_10_9_universal2.whl", hash = "sha256:f9518e95fc11ee4ffcf987a2be8438877bbbf7a19c4c10c68eb3daf1df7db65f"},
+    {file = "kaldialign-0.9.3-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:961c698f8df485cecf64b36211a17071a25f6b67f6158514d2a51df67cf03362"},
+    {file = "kaldialign-0.9.3-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:93e320e1f9870f515ab6bcd7e6b3a998d2196d16fa53c3933815cc8444f461bb"},
+    {file = "kaldialign-0.9.3-cp311-cp311-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:6709ab3a0e10f90f6f3f852189d1d479e2aea7e0787f1aa9816287f7f4d960c3"},
+    {file = "kaldialign-0.9.3-cp311-cp311-win32.whl", hash = "sha256:53e3f3d7f35ce992732253ccb484e4d0a88ff9eb2a90af2c0ec38ea07c88af16"},
+    {file = "kaldialign-0.9.3-cp311-cp311-win_amd64.whl", hash = "sha256:362600f7b4262ddfa10cb565ea90c481a1e5f4c2d497dd548ef160ef79e0b0f5"},
+    {file = "kaldialign-0.9.3-cp312-cp312-macosx_10_13_universal2.whl", hash = "sha256:18e7cd1f94b88c1608239150cb843d1d4c184757dcd0fec2731c5934767172af"},
+    {file = "kaldialign-0.9.3-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:11c22ed75c67e6d15a2f015dcd8a365daa3d82756a7e5c7c2c388dc4b957477e"},
+    {file = "kaldialign-0.9.3-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:65e853ddedef5ea26ec6aa0776f00f5b6b2b603642a8b83c1f1b6e42fddbfa0f"},
+    {file = "kaldialign-0.9.3-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:aaf266b2dc33567e35d81c35e1ccbb3a71e6932ad66afaf5b2ce710727783274"},
+    {file = "kaldialign-0.9.3-cp312-cp312-win32.whl", hash = "sha256:407cf02cb8ce73d420f6a78c7ef344a7b55003df8ef23bb0c90ba9a02e9e6dc2"},
+    {file = "kaldialign-0.9.3-cp312-cp312-win_amd64.whl", hash = "sha256:5e1a85f33ffd4acf3c179ed6d60695352a1e6bcc5598fd0bdca42c0cad91300d"},
+    {file = "kaldialign-0.9.3-cp313-cp313-macosx_10_13_universal2.whl", hash = "sha256:191aee838e1065aa47574c0101bd0a4f447061ca0ea86b66c385653bb2dd7cb4"},
+    {file = "kaldialign-0.9.3-cp313-cp313-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:71af789750bb52dd8453e61ecdea0627e72a479eed024b6bc5c230f3c25b09a7"},
+    {file = "kaldialign-0.9.3-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:7af6d54caadd479946b750a84a098bbf4b9070c89ee0c3dd0a77653e64f7477d"},
+    {file = "kaldialign-0.9.3-cp313-cp313-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:20453959da4576eb61abe0ca7827d87e96d01082a52aed850928152287243c03"},
+    {file = "kaldialign-0.9.3-cp313-cp313-win32.whl", hash = "sha256:85ef5bca5ee88cd946185831a0307f17bec70ff3b0a43c265b6c49d1320d440f"},
+    {file = "kaldialign-0.9.3-cp313-cp313-win_amd64.whl", hash = "sha256:1577539103b648de413283d7af189f063f0b679a9a6194efc5e7a3579e568636"},
+    {file = "kaldialign-0.9.3-cp314-cp314-macosx_10_15_universal2.whl", hash = "sha256:a05dd8b26fb8261a2d717993fb4fbdf309863c51035e90bc1ceac15b3e44ad7a"},
+    {file = "kaldialign-0.9.3-cp314-cp314-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:8a37d75db6c42a4d7f2a5224693d82d88dfdd92121966424288399cf51380851"},
+    {file = "kaldialign-0.9.3-cp314-cp314-win32.whl", hash = "sha256:7d804de65bd60d15abe36cf8eec15060f567acbc7d0d375996d8b0ef0eaac707"},
 ]
 
 [package.extras]
@@ -2613,26 +2620,35 @@ blobfile = ["blobfile (>=2)"]
 
 [[package]]
 name = "tokenizers"
-version = "0.22.1"
+version = "0.22.2"
 description = ""
 optional = false
 python-versions = ">=3.9"
 files = [
-    {file = "tokenizers-0.22.1-cp39-abi3-macosx_10_12_x86_64.whl", hash = "sha256:59fdb013df17455e5f950b4b834a7b3ee2e0271e6378ccb33aa74d178b513c73"},
-    {file = "tokenizers-0.22.1-cp39-abi3-macosx_11_0_arm64.whl", hash = "sha256:8d4e484f7b0827021ac5f9f71d4794aaef62b979ab7608593da22b1d2e3c4edc"},
-    {file = "tokenizers-0.22.1-cp39-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:19d2962dd28bc67c1f205ab180578a78eef89ac60ca7ef7cbe9635a46a56422a"},
-    {file = "tokenizers-0.22.1-cp39-abi3-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:38201f15cdb1f8a6843e6563e6e79f4abd053394992b9bbdf5213ea3469b4ae7"},
-    {file = "tokenizers-0.22.1-cp39-abi3-manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:d1cbe5454c9a15df1b3443c726063d930c16f047a3cc724b9e6e1a91140e5a21"},
-    {file = "tokenizers-0.22.1-cp39-abi3-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:e7d094ae6312d69cc2a872b54b91b309f4f6fbce871ef28eb27b52a98e4d0214"},
-    {file = "tokenizers-0.22.1-cp39-abi3-manylinux_2_17_s390x.manylinux2014_s390x.whl", hash = "sha256:afd7594a56656ace95cdd6df4cca2e4059d294c5cfb1679c57824b605556cb2f"},
-    {file = "tokenizers-0.22.1-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:e2ef6063d7a84994129732b47e7915e8710f27f99f3a3260b8a38fc7ccd083f4"},
-    {file = "tokenizers-0.22.1-cp39-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:ba0a64f450b9ef412c98f6bcd2a50c6df6e2443b560024a09fa6a03189726879"},
-    {file = "tokenizers-0.22.1-cp39-abi3-musllinux_1_2_armv7l.whl", hash = "sha256:331d6d149fa9c7d632cde4490fb8bbb12337fa3a0232e77892be656464f4b446"},
-    {file = "tokenizers-0.22.1-cp39-abi3-musllinux_1_2_i686.whl", hash = "sha256:607989f2ea68a46cb1dfbaf3e3aabdf3f21d8748312dbeb6263d1b3b66c5010a"},
-    {file = "tokenizers-0.22.1-cp39-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:a0f307d490295717726598ef6fa4f24af9d484809223bbc253b201c740a06390"},
-    {file = "tokenizers-0.22.1-cp39-abi3-win32.whl", hash = "sha256:b5120eed1442765cd90b903bb6cfef781fd8fe64e34ccaecbae4c619b7b12a82"},
-    {file = "tokenizers-0.22.1-cp39-abi3-win_amd64.whl", hash = "sha256:65fd6e3fb11ca1e78a6a93602490f134d1fdeb13bcef99389d5102ea318ed138"},
-    {file = "tokenizers-0.22.1.tar.gz", hash = "sha256:61de6522785310a309b3407bac22d99c4db5dba349935e99e4d15ea2226af2d9"},
+    {file = "tokenizers-0.22.2-cp39-abi3-macosx_10_12_x86_64.whl", hash = "sha256:544dd704ae7238755d790de45ba8da072e9af3eea688f698b137915ae959281c"},
+    {file = "tokenizers-0.22.2-cp39-abi3-macosx_11_0_arm64.whl", hash = "sha256:1e418a55456beedca4621dbab65a318981467a2b188e982a23e117f115ce5001"},
+    {file = "tokenizers-0.22.2-cp39-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:2249487018adec45d6e3554c71d46eb39fa8ea67156c640f7513eb26f318cec7"},
+    {file = "tokenizers-0.22.2-cp39-abi3-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:25b85325d0815e86e0bac263506dd114578953b7b53d7de09a6485e4a160a7dd"},
+    {file = "tokenizers-0.22.2-cp39-abi3-manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:bfb88f22a209ff7b40a576d5324bf8286b519d7358663db21d6246fb17eea2d5"},
+    {file = "tokenizers-0.22.2-cp39-abi3-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:1c774b1276f71e1ef716e5486f21e76333464f47bece56bbd554485982a9e03e"},
+    {file = "tokenizers-0.22.2-cp39-abi3-manylinux_2_17_s390x.manylinux2014_s390x.whl", hash = "sha256:df6c4265b289083bf710dff49bc51ef252f9d5be33a45ee2bed151114a56207b"},
+    {file = "tokenizers-0.22.2-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:369cc9fc8cc10cb24143873a0d95438bb8ee257bb80c71989e3ee290e8d72c67"},
+    {file = "tokenizers-0.22.2-cp39-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:29c30b83d8dcd061078b05ae0cb94d3c710555fbb44861139f9f83dcca3dc3e4"},
+    {file = "tokenizers-0.22.2-cp39-abi3-musllinux_1_2_armv7l.whl", hash = "sha256:37ae80a28c1d3265bb1f22464c856bd23c02a05bb211e56d0c5301a435be6c1a"},
+    {file = "tokenizers-0.22.2-cp39-abi3-musllinux_1_2_i686.whl", hash = "sha256:791135ee325f2336f498590eb2f11dc5c295232f288e75c99a36c5dbce63088a"},
+    {file = "tokenizers-0.22.2-cp39-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:38337540fbbddff8e999d59970f3c6f35a82de10053206a7562f1ea02d046fa5"},
+    {file = "tokenizers-0.22.2-cp39-abi3-win32.whl", hash = "sha256:a6bf3f88c554a2b653af81f3204491c818ae2ac6fbc09e76ef4773351292bc92"},
+    {file = "tokenizers-0.22.2-cp39-abi3-win_amd64.whl", hash = "sha256:c9ea31edff2968b44a88f97d784c2f16dc0729b8b143ed004699ebca91f05c48"},
+    {file = "tokenizers-0.22.2-cp39-abi3-win_arm64.whl", hash = "sha256:9ce725d22864a1e965217204946f830c37876eee3b2ba6fc6255e8e903d5fcbc"},
+    {file = "tokenizers-0.22.2-pp310-pypy310_pp73-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:753d47ebd4542742ef9261d9da92cd545b2cacbb48349a1225466745bb866ec4"},
+    {file = "tokenizers-0.22.2-pp310-pypy310_pp73-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:e10bf9113d209be7cd046d40fbabbaf3278ff6d18eb4da4c500443185dc1896c"},
+    {file = "tokenizers-0.22.2-pp310-pypy310_pp73-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:64d94e84f6660764e64e7e0b22baa72f6cd942279fdbb21d46abd70d179f0195"},
+    {file = "tokenizers-0.22.2-pp310-pypy310_pp73-manylinux_2_17_s390x.manylinux2014_s390x.whl", hash = "sha256:f01a9c019878532f98927d2bacb79bbb404b43d3437455522a00a30718cdedb5"},
+    {file = "tokenizers-0.22.2-pp39-pypy39_pp73-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:319f659ee992222f04e58f84cbf407cfa66a65fe3a8de44e8ad2bc53e7d99012"},
+    {file = "tokenizers-0.22.2-pp39-pypy39_pp73-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:1e50f8554d504f617d9e9d6e4c2c2884a12b388a97c5c77f0bc6cf4cd032feee"},
+    {file = "tokenizers-0.22.2-pp39-pypy39_pp73-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:1a62ba2c5faa2dd175aaeed7b15abf18d20266189fb3406c5d0550dd34dd5f37"},
+    {file = "tokenizers-0.22.2-pp39-pypy39_pp73-manylinux_2_17_s390x.manylinux2014_s390x.whl", hash = "sha256:143b999bdc46d10febb15cbffb4207ddd1f410e2c755857b5a0797961bbdc113"},
+    {file = "tokenizers-0.22.2.tar.gz", hash = "sha256:473b83b915e547aa366d1eee11806deaf419e17be16310ac0a14077f1e28f917"},
 ]
 
 [package.dependencies]
@@ -2641,7 +2657,7 @@ huggingface-hub = ">=0.16.4,<2.0"
 [package.extras]
 dev = ["tokenizers[testing]"]
 docs = ["setuptools-rust", "sphinx", "sphinx-rtd-theme"]
-testing = ["black (==22.3)", "datasets", "numpy", "pytest", "pytest-asyncio", "requests", "ruff"]
+testing = ["datasets", "numpy", "pytest", "pytest-asyncio", "requests", "ruff", "ty"]
 
 [[package]]
 name = "torch"
@@ -3168,4 +3184,4 @@ propcache = ">=0.2.1"
 [metadata]
 lock-version = "2.0"
 python-versions = ">=3.10,<3.13"
-content-hash = "8b8f546b8a8feedb3338e059d93a8214223ddc316af5a3ba93bfd40582a8ec3a"
+content-hash = "771a1457d7a5af820a3bb9e8c380058383ed5ff99932447d51222fc66cb98d95"

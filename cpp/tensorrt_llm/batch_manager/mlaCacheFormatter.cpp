@@ -60,7 +60,8 @@ std::vector<size_t> MLACacheFormatter::pickRecvConnections(
 bool MLACacheFormatter::needSendCache(
     CacheState const& selfConfig, CacheState const& destConfig, runtime::SizeType32 selfIdx)
 {
-    int selfTpRank = selfIdx % selfConfig.getParallelConfig().mTensorParallelism;
+    int selfCpSize = selfConfig.getParallelConfig().mContextParallelism;
+    int selfTpRank = (selfIdx % (selfConfig.getParallelConfig().mTensorParallelism * selfCpSize)) / selfCpSize;
 
     int destTPNumInDPGroup = destConfig.getParallelConfig().mEnableAttentionDP
         ? destConfig.getParallelConfig().mTensorParallelism / destConfig.getParallelConfig().mDPsize
