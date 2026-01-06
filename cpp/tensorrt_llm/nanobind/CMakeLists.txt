@@ -66,3 +66,8 @@ if(NOT WIN32)
     ${TRTLLM_NB_MODULE} PROPERTIES LINK_FLAGS
                                    "${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}")
 endif()
+
+# Build transfer_agent_binding when building bindings (if NIXL is enabled)
+if(TARGET ${TRANSFER_AGENT_BINDING_TARGET})
+  add_dependencies(${TRTLLM_NB_MODULE} ${TRANSFER_AGENT_BINDING_TARGET})
+endif()
