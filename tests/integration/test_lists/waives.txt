@@ -516,3 +516,4 @@ disaggregated/test_auto_scaling.py::test_worker_restart[etcd-round_robin] SKIP (
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_vswa_reuse_4gpus[one_model] SKIP (https://nvbugs/5756028)
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_vswa_reuse_4gpus[two_model] SKIP (https://nvbugs/5756028)
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_fp8[latency-torch_compile=False] SKIP (https://nvbugs/5785206)
+examples/test_gpt.py::test_llm_gpt2_parallel_embedding_2gpu[float16-0] SKIP (https://nvbugs/5784518)
