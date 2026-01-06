@@ -73,7 +73,8 @@ def _patched_phi3_long_emb_init(
     ext_factors_tensor = torch.tensor(
         self.short_factor, dtype=torch.float32, device=torch.device("cpu")
     )
-    self._buffers.pop("ext_factors", None)
+    if hasattr(self, "ext_factors"):
+        delattr(self, "ext_factors")
     self.register_buffer("ext_factors", ext_factors_tensor, persistent=False)
 
 
