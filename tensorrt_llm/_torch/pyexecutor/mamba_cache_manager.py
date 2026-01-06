@@ -143,7 +143,6 @@ class MambaCacheManager(BaseResourceManager):
         assert request_size + padding_size <= self.state_indices.numel(
         ), "Padding requests run out of available mamba cache blocks"
         # we can use mamba_cache_free_blocks for padding_requests
-        # But just finished requests won't free their used resources immediately
         if padding_size <= len(self.mamba_cache_free_blocks):
             self.state_indices[request_size:request_size +
                                padding_size] = torch.tensor(
@@ -152,12 +151,19 @@ class MambaCacheManager(BaseResourceManager):
                                    pin_memory=True).to(
                                        self.state_indices.device,
                                        non_blocking=True)
+        # But just finished requests won't free their used resources immediately
+        # In explicit, the running order is self.scheduler.schedule_request, self._forward_step() and self._process_previous_batch() in the PyExecutor.
+        # In this way, the current forward step will remove finished requests but will not remove mamba_cache immediately.
         else:
-            self.request_mask[:] = True
-            self.request_mask[self.state_indices[:request_size]] = False
+            self.request_mask.fill_(True)
+            self.request_mask.index_fill_(
+                0, self.state_indices[:request_size].to(torch.int64), False)
+            _, top_indices = torch.topk(self.request_mask.to(torch.int64),
+                                        k=padding_size,
+                                        sorted=False)
             self.state_indices[request_size:request_size +
                                padding_size] = self.state_indices_arange[
-                                   self.request_mask][:padding_size]
+                                   top_indices]
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         context_ids = [
