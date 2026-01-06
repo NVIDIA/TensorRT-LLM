@@ -625,7 +625,7 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
 
     def _handle_response(self, response: "GenerationExecutor.Response"):
         # Save token lengths before processing to detect which outputs received new tokens
-        prev_token_lens = {o.index: len(o.token_ids) for o in self._outputs}
+        prev_token_lens = {id(o): len(o.token_ids) for o in self._outputs}
 
         GenerationResultBase._handle_response(self, response)
 
@@ -647,7 +647,7 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
                 # to prevent re-decoding the same tokens multiple times
                 output_received_new_tokens = len(
                     beam_output.token_ids) != prev_token_lens.get(
-                        beam_output.index, 0)
+                        id(beam_output), 0)
                 if not output_received_new_tokens:
                     continue
                 if hasattr(
