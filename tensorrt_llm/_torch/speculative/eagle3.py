@@ -4,6 +4,8 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set
 import torch
 from torch import nn
 
+from ..cute_dsl_kernels.argmax import argmax as cute_argmax
+
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
