@@ -620,7 +620,7 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
         model_path = f"{llm_models_root()}/modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8"
         eagle_model_dir = f"{llm_models_root()}/EAGLE3-LLaMA3.3-Instruct-70B"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
-        spec_config = EagleDecodingConfig(max_draft_len=4,
+        spec_config = EagleDecodingConfig(max_draft_len=3,
                                           speculative_model_dir=eagle_model_dir,
                                           eagle3_one_model=eagle3_one_model)
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
@@ -2633,14 +2633,12 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
         if get_sm_version() == 100 or get_sm_version() == 103:
             moe_backend = "DEEPGEMM" if moe_backend == "_DEFAULT" else moe_backend
             moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
-            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
-                                            tokens_per_block=64)
+            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
         else:
             if moe_backend != "_DEFAULT":
                 pytest.skip("Not supported MoE backend!")
             moe_config = MoeConfig()
-            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
-                                            tokens_per_block=64)
+            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
 
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
@@ -2711,8 +2709,7 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
             pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
 
         moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
-                                        tokens_per_block=64)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
         cuda_graph_config = CudaGraphConfig(
             enable_padding=True,
             max_batch_size=max_batch_size) if cuda_graph else None
@@ -2775,8 +2772,7 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
             pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
 
         moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
-                                        tokens_per_block=64)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
         cuda_graph_config = CudaGraphConfig(
             enable_padding=True,
             max_batch_size=max_batch_size) if cuda_graph else None
@@ -4400,11 +4396,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         if get_sm_version() == 90:
             pytest.skip(
                 "https://nvbugs/5636916: Remaining Hopper Eagle Accuracy Issue for only TP=4"
-            )
-
-        if not one_model and overlap_scheduler:
-            pytest.skip(
-                "https://nvbugs/5745152: two_model + overlap_scheduler can sometimes time out."
             )
 
         MAX_OUTPUT_LEN = 128179

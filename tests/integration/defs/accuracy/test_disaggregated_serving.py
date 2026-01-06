@@ -872,8 +872,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device(8)
-    @pytest.mark.parametrize("gen_pp,gen_tp,gen_cp", [(1, 2, 2), (2, 1, 2)],
-                             ids=["pp1tp2cp2", "pp2tp1cp2"])
+    @pytest.mark.parametrize("gen_pp,gen_tp,gen_cp", [(1, 1, 4), (1, 2, 2),
+                                                      (2, 1, 2)],
+                             ids=["pp1tp1cp4", "pp1tp2cp2", "pp2tp1cp2"])
     @pytest.mark.parametrize("cuda_graph_config", [
         None,
         {
@@ -1339,3 +1340,60 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
                                  gen_model=gen_model,
                                  ctx_instances=1,
                                  gen_instances=1)
+
+
+@pytest.mark.timeout(10800)
+@skip_pre_blackwell
+class TestKimiK2(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "moonshotai/Kimi-K2-Instruct"
+    MODEL_PATH = f"{llm_models_root()}/Kimi-K2-Instruct"
+
+    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_device_memory(200000)
+    def test_nvfp4(self):
+        model_name = "moonshotai/Kimi-K2-Thinking"
+        model_path = f"{llm_models_root()}/Kimi-K2-Thinking-NVFP4"
+        ctx_server_config = {
+            "max_batch_size": 16,
+            "disable_overlap_scheduler": True,
+            "cache_transceiver_config": {
+                "backend": "DEFAULT"
+            },
+            "tensor_parallel_size": 4,
+            "enable_attention_dp": True,
+            "trust_remote_code": True,
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.8,
+            },
+        }
+        gen_server_config = {
+            "max_batch_size": 16,
+            "disable_overlap_scheduler": True,
+            "cache_transceiver_config": {
+                "backend": "DEFAULT"
+            },
+            "tensor_parallel_size": 4,
+            "enable_attention_dp": True,
+            "trust_remote_code": True,
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.8,
+            },
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "port": 8000,
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8001"]
+            },
+            "generation_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8002"]
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      model_path) as llm:
+            task = GSM8K(model_name)
+            task.evaluate(llm)
