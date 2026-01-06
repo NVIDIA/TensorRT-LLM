@@ -2269,6 +2269,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
         torch.cuda.empty_cache()
 
     @skip_pre_blackwell
+    @pytest.mark.skip_less_device_memory(95000)
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend",
         [
