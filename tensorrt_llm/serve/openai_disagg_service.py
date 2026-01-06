@@ -124,7 +124,7 @@ class OpenAIDisaggregatedService(OpenAIService):
                 ctx_req, server=reserved_ctx_server, hooks=hooks
             )
             await self._verify_ctx_response(ctx_response)
-            gen_req = self._get_gen_request(request, ctx_response, request_id)
+            gen_req = self._get_gen_request(request, ctx_response)
         if ctx_response is None or self._need_gen(ctx_response):
             return await self._gen_client.send_request(
                 gen_req, server=reserved_gen_server, hooks=hooks
@@ -157,12 +157,8 @@ class OpenAIDisaggregatedService(OpenAIService):
         self,
         request: UCompletionRequest,
         ctx_response: UCompletionResponse,
-        ctx_request_id: int,
     ) -> UCompletionRequest:
         request.disaggregated_params = ctx_response.choices[0].disaggregated_params
-        assert (
-            request.disaggregated_params.ctx_request_id == ctx_request_id or ctx_request_id is None
-        )
         request.disaggregated_params.request_type = "generation_only"
         # Replace the string prompt with prompt_tokens_ids
         if isinstance(request, CompletionRequest):
