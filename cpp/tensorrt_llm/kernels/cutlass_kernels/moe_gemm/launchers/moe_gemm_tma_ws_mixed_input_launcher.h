@@ -28,8 +28,9 @@ namespace cutlass_kernels_oss
 {
 using tensorrt_llm::kernels::cutlass_kernels::GroupedGemmInput;
 using tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput;
-template <typename T, typename WeightType, typename GemmOutputType, typename EpilogueTag, typename CTAShape,
-    typename ClusterShape, typename MainloopScheduleType, typename EpilogueScheduleType,
+using EpilogueFusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion;
+template <typename T, typename WeightType, typename GemmOutputType, typename EpilogueTag, EpilogueFusion FUSION,
+    typename CTAShape, typename ClusterShape, typename MainloopScheduleType, typename EpilogueScheduleType,
     cutlass::WeightOnlyQuantOp QuantOp>
 void sm90_generic_mixed_moe_gemm_kernelLauncher(
     tensorrt_llm::kernels::cutlass_kernels::GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputType> inputs,
