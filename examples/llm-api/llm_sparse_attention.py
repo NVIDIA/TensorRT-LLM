@@ -42,8 +42,7 @@ def parse_arguments():
     parser.add_argument(
         '--input_file',
         type=str,
-        default="tests/unittest/_torch/multi_gpu/test_star_attention_input.jsonl"
-    )
+        default="tests/unittest/_torch/multi_gpu/NIAH_simple_data.jsonl")
 
     # Build config
     parser.add_argument('--algo',
