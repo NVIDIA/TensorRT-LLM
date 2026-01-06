@@ -1,6 +1,6 @@
 import os
 import tempfile
-from typing import Any, List
+from typing import Any
 
 import openai
 import pytest
