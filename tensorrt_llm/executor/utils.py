@@ -55,9 +55,9 @@ def create_mpi_comm_session(
         logger_debug(
             f"Using RemoteMpiPoolSessionClient to bind to external MPI processes at {get_spawn_proxy_process_ipc_addr_env()}\n",
             "yellow")
-        get_spawn_proxy_process_ipc_hmac_key_env()
+        hmac_key = get_spawn_proxy_process_ipc_hmac_key_env()
         return RemoteMpiCommSessionClient(
-            addr=get_spawn_proxy_process_ipc_addr_env())
+            addr=get_spawn_proxy_process_ipc_addr_env(), hmac_key=hmac_key)
     else:
         logger_debug(
             f"Using MpiCommSession to bind to external MPI processes\n",
