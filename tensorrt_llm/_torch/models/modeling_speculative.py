@@ -450,7 +450,7 @@ class Eagle3ForCausalLM(DecoderModelForCausalLM[Eagle3DraftModel,
             draft_model,
             config=model_config,
             hidden_size=config.hidden_size,
-            vocab_size=draft_vocab_size,
+            vocab_size=config.draft_vocab_size,
         )
         self.load_lm_head_from_target = True
 
