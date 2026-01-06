@@ -4,6 +4,8 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set
 import torch
 from torch import nn
 
+from ..cute_dsl_kernels.argmax import argmax as cute_argmax
+
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
@@ -570,7 +572,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # Note: using greedy for draft tokens is a bit easier to implement and
         # faster. It doesn't affect the final output and seems to have a negligible
         # impact on AR.
-        draft_tokens = torch.argmax(logits, dim=-1)
+        # cute_argmax returns (M, 2) where col 0 = max value, col 1 = argmax index
+        draft_tokens = cute_argmax(logits)[:, 1].long()
 
         # Apply d2t (offsets between draft model dictionary and main model dictionary).
         if (d2t := getattr(draft_model.model, "d2t", None)) is not None:
