@@ -54,7 +54,6 @@ def test_deepseek_r1_ctx_tep(llm_root, world_size):
             **os.environ,
             "NP": f"{world_size:d}",
             "PROFILE_DIR": profile_dir,
-            "TRTLLM_ENABLE_PDL": "1",
         },
     )
     check_call(
@@ -144,7 +143,6 @@ def test_qwen3_next_gen_tep(llm_root, world_size):
             **os.environ,
             "NP": f"{world_size:d}",
             "PROFILE_DIR": profile_dir,
-            "TRTLLM_ENABLE_PDL": "1",
         },
     )
     check_call(

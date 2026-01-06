@@ -1,7 +1,6 @@
 import contextlib
 import functools
 import itertools
-import os
 import unittest.mock
 import weakref
 from abc import ABC, abstractmethod
@@ -466,8 +465,6 @@ class RunnerMixin(ABC):
         kv_cache_manager: KVCacheManager,
         attn_workspace: Optional[torch.Tensor] = None,
     ):
-        if self.model_config.moe_backend == "TRTLLM" and os.getenv("TRTLLM_ENABLE_PDL") != "1":
-            raise ValueError("Suggest to set TRTLLM_ENABLE_PDL=1 when moe_backend is TRTLLM")
         world_size = mpi_world_size()
         AttentionCls = get_attention_backend(
             self.model_config.attn_backend, self.model_config.sparse_attention_config
