@@ -15,6 +15,7 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
 
 from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_disagg
 from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.mapping import Mapping
 
 from ..._utils import nvtx_range, nvtx_range_debug
 from ...inputs import (
@@ -439,7 +440,13 @@ class Qwen3VLVisionAttention(Qwen2_5_VLVisionAttention):
         model_config.pretrained_config.vision_config.torch_dtype = (
             model_config.pretrained_config.text_config.dtype
         )
-        super().__init__(model_config, layer_idx)
+        super().__init__(
+            model_config,
+            layer_idx=layer_idx,
+            reduce_output=(
+                not model_config.mapping.enable_attention_dp and model_config.mapping.tp_size > 1
+            ),
+        )
 
 
 class Qwen3VLVisionMLP(MLP):
@@ -453,12 +460,14 @@ class Qwen3VLVisionMLP(MLP):
             dtype=model_config.pretrained_config.text_config.dtype,
             config=model_config,
             layer_idx=layer_idx,
+            overridden_tp_size=1 if model_config.mapping.enable_attention_dp else None,
         )
 
 
 class Qwen3VLVisionBlock(torch.nn.Module):
     def __init__(self, model_config: ModelConfig[PretrainedConfig], layer_idx: int):
         super().__init__()
+        self.model_config = model_config
         config = model_config.pretrained_config.vision_config
 
         self.norm1 = LayerNorm(
@@ -510,11 +519,29 @@ class Qwen3VLVisionPatchMerger(torch.nn.Module):
             eps=model_config.pretrained_config.text_config.rms_norm_eps,
             dtype=model_config.pretrained_config.text_config.dtype,
         )
+
+        self.mapping = model_config.mapping
+        overridden_tp_size = 1 if model_config.mapping.enable_attention_dp else None
+        if overridden_tp_size is not None:
+            assert self.mapping.tp_size % overridden_tp_size == 0
+            tp_size = overridden_tp_size
+            # "Misuse" pp_size here to perform all-reduce within smaller groups
+            pp_size = self.mapping.pp_size * self.mapping.tp_size // overridden_tp_size
+            mapping = Mapping(
+                world_size=tp_size * pp_size,
+                rank=self.mapping.rank,
+                gpus_per_node=self.mapping.gpus_per_node,
+                tp_size=tp_size,
+                pp_size=pp_size,
+            )
+        else:
+            mapping = self.mapping
+
         self.linear_fc1 = Linear(
             in_features=self.hidden_size,
             out_features=self.hidden_size,
             bias=True,
-            mapping=model_config.mapping,
+            mapping=mapping,
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             allreduce_strategy=model_config.allreduce_strategy,
         )
@@ -523,7 +550,7 @@ class Qwen3VLVisionPatchMerger(torch.nn.Module):
             in_features=self.hidden_size,
             out_features=config.out_hidden_size,
             bias=True,
-            mapping=model_config.mapping,
+            mapping=mapping,
             tensor_parallel_mode=TensorParallelMode.ROW,
             allreduce_strategy=model_config.allreduce_strategy,
         )
@@ -704,9 +731,7 @@ class Qwen3VisionModel(torch.nn.Module):
         return attn_metadata
 
     @torch.inference_mode()
-    def forward(
-        self, hidden_states: torch.Tensor, grid_thw: torch.Tensor, **kwargs
-    ) -> torch.Tensor:
+    def forward(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor, **kwargs) -> torch.Tensor:
         seq_lens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).tolist()
         attn_metadata = self.prepare_attn_metadata(seq_lens, self.attn_metadata)
 
@@ -714,7 +739,7 @@ class Qwen3VisionModel(torch.nn.Module):
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
 
         # From this point, pure GPU operation
-        hidden_states = self.patch_embed(hidden_states)
+        hidden_states = self.patch_embed(pixel_values)
         seq_len, _ = hidden_states.size()
         hidden_states = hidden_states.reshape(seq_len, -1)
 
