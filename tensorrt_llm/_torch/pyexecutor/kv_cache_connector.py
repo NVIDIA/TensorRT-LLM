@@ -49,6 +49,7 @@ from tensorrt_llm.bindings.internal.batch_manager import \
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
+from .llm_request import get_draft_token_length
 from .scheduler import ScheduledRequests
 
 if TYPE_CHECKING:
@@ -310,7 +311,7 @@ class KvCacheConnectorSchedulerOutputRequest:
                                        req.context_chunk_size)
         else:
             computed_position = len(tokens) - 1
-            num_scheduled_tokens = 1  # Specdec with draft tokens is not supported yet.
+            num_scheduled_tokens = 1 + get_draft_token_length(req)  # Specdec with draft tokens is not supported yet.
 
         return RequestData(req.request_id, new_tokens, new_block_ids,
                            computed_position, num_scheduled_tokens)
