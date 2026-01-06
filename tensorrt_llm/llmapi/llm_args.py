@@ -1230,9 +1230,9 @@ class RayPlacementConfig(StrictBaseModel):
                 )
             if PlacementGroup is not None:
                 for i, pg in enumerate(self.placement_groups):
-                    if not isinstance(pg, PlacementGroup):
+                    if not isinstance(pg, (PlacementGroup, list)):
                         raise TypeError(
-                            f"placement_groups[{i}] must be a Ray PlacementGroup, "
+                            f"placement_groups[{i}] must be a Ray PlacementGroup or list, "
                             f"got {type(pg).__name__}")
 
         if self.per_worker_gpu_share is not None:
@@ -2953,7 +2953,7 @@ class TorchLlmArgs(BaseLlmArgs):
         default=None,
         description=
         "Placement config for RayGPUWorker. Only used with AsyncLLM and orchestrator_type='ray'.",
-        exclude=True,
+        exclude=False,
         status="prototype")
 
     enable_sleep: bool = Field(

@@ -374,19 +374,60 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
                     f"Total bundle indices ({total_workers}) must equal world_size ({self.world_size})"
                 )
 
-            logger.info(
-                f"Creating {self.world_size} workers with external placement groups"
-            )
+            # Check type at runtime: List[List[int]] from YAML or List[PlacementGroup] from Python API
+            first_elem = placement_config.placement_groups[0]
 
-            flat_pgs = []
-            flat_indices = []
-            for pg, indices in zip(placement_config.placement_groups,
-                                   placement_config.placement_bundle_indices):
-                for idx in indices:
-                    flat_pgs.append(pg)
-                    flat_indices.append(idx)
+            if isinstance(first_elem, list):
+                # YAML mode: placement_groups is List[List[int]] - create PlacementGroups at runtime
+                logger.info(
+                    f"Creating {self.world_size} workers with placement config from YAML"
+                )
 
-            return flat_pgs, flat_indices
+                # Create placement groups - Ray automatically assigns GPUs to bundles
+                created_pgs = []
+                for i, gpu_list in enumerate(placement_config.placement_groups):
+                    num_gpus = len(gpu_list)
+                    bundles = [{"GPU": 1, "CPU": 1} for _ in range(num_gpus)]
+
+                    # Add node affinity to first bundle of first group (head node)
+                    if i == 0:
+                        head_tag = f"node:{self.master_address}"
+                        bundles[0][head_tag] = 0.01
+
+                    pg = placement_group(bundles, strategy="STRICT_PACK")
+                    ray.get(pg.ready())
+                    created_pgs.append(pg)
+
+                    logger.info(
+                        f"Created placement group {i} with {num_gpus} bundles (GPUs auto-assigned by Ray)"
+                    )
+
+                # Flatten PGs and bundle indices for worker assignment
+                flat_pgs = []
+                flat_indices = []
+                for pg, indices in zip(
+                        created_pgs, placement_config.placement_bundle_indices):
+                    for idx in indices:
+                        flat_pgs.append(pg)
+                        flat_indices.append(idx)
+
+                return flat_pgs, flat_indices
+            else:
+                # Python API mode: use provided PlacementGroup objects directly
+                logger.info(
+                    f"Creating {self.world_size} workers with external placement groups"
+                )
+
+                flat_pgs = []
+                flat_indices = []
+                for pg, indices in zip(
+                        placement_config.placement_groups,
+                        placement_config.placement_bundle_indices):
+                    for idx in indices:
+                        flat_pgs.append(pg)
+                        flat_indices.append(idx)
+
+                return flat_pgs, flat_indices
 
         bundle_indices = os.getenv("TRTLLM_RAY_BUNDLE_INDICES", None)
 
