@@ -421,7 +421,6 @@ accuracy/test_cli_flow.py::TestPhi3_5MiniInstruct::test_auto_dtype SKIP (https:/
 unittest/_torch/auto_deploy/unit/singlegpu/models/test_llama4_vlm_patch.py::test_build_run_llama4_vlm SKIP (https://nvbugs/5747878)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus_online_eplb[fp8kv=True-moe_backend=TRTLLM] SKIP (https://nvbugs/5740377)
 cpp/test_multi_gpu.py::TestDisagg::test_symmetric_executor[gpt-2proc-mpi_kvcache-90] SKIP (https://nvbugs/5755941)
-accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_guided_decoding[xgrammar-mtp_nextn=0] SKIP (https://nvbugs/5748600)
 examples/test_bert.py::test_llm_bert_general[compare_hf-enable_remove_input_padding-use_attention_plugin-enable_context_fmha-tp:1-pp:1-float16-BertForQuestionAnswering-bert/bert-base-cased-squad2] SKIP (https://nvbugs/5608979)
 examples/test_bert.py::test_llm_bert_general[compare_hf-enable_remove_input_padding-use_attention_plugin-enable_context_fmha-tp:1-pp:1-float16-RobertaForQuestionAnswering-bert/roberta-base-squad2] SKIP (https://nvbugs/5608979)
 examples/test_bert.py::test_llm_bert_general[compare_hf-disable_remove_input_padding-use_attention_plugin-disable_context_fmha-tp:2-pp:1-float16-BertForQuestionAnswering-bert/bert-base-cased-squad2] SKIP (https://nvbugs/5608979)
