@@ -272,23 +272,23 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
         # Match C++ MicroBatchScheduler defaults (see algorithms.cpp line 68-70)
         self.no_schedule_until_state = no_schedule_until_state
         self.no_schedule_after_state = no_schedule_after_state
-
-    def _has_reached_state(self, req: LlmRequest,
-                           target_state: LlmRequestState) -> bool:
-        """Check if request has reached the target state."""
-        # C++ equivalent: req->hasReachedState(state)
-        return req.state.value >= target_state.value
+        # Cache state values to avoid repeated .value access (optimization)
+        self._no_schedule_until_state_value = no_schedule_until_state.value
+        self._no_schedule_after_state_value = no_schedule_after_state.value
+        self._context_init_state_value = LlmRequestState.CONTEXT_INIT.value
+        self._encoder_init_state_value = LlmRequestState.ENCODER_INIT.value
 
     def _can_be_scheduled(self, req: LlmRequest) -> bool:
         """
         Check if request is within the schedulable state range.
         C++ reference: microBatchScheduler.cpp line 192-195
+        Optimized: use state_value property to avoid enum object creation
         """
-        if not self._has_reached_state(req, self.no_schedule_until_state):
-            return False
-        if self._has_reached_state(req, self.no_schedule_after_state):
-            return False
-        return True
+        # Use state_value property (returns int directly, avoids enum object creation)
+        state_value = req.state_value
+        # Inline comparison: must have reached until_state but not after_state
+        return (state_value >= self._no_schedule_until_state_value
+                and state_value < self._no_schedule_after_state_value)
 
     def schedule(
             self, active_requests: RequestList,
@@ -307,29 +307,35 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
         num_chunked_tokens = 0
         all_context_requests_fit = True
 
+        # Cache instance attributes as locals for faster access in loop
+        max_batch_size = self.max_batch_size
+        max_num_tokens = self.max_num_tokens
+        max_context_length = self.max_context_length
+        ctx_chunk_config = self.ctx_chunk_config
+
         # 1. Main Scheduling Loop
         for req in active_requests:
+            req_state_value = req.state_value
             # Skip requests already in flight (should be filtered by caller, but C++ checks)
             if req.request_id in inflight_request_ids:
                 continue
 
-            # Skip if request cannot be scheduled yet or should no longer be scheduled
-            # C++ reference: microBatchScheduler.cpp line 192-195
-            if not self._can_be_scheduled(req):
+            # Skip if request cannot be scheduled yet or should no longer be scheduled, manually inline the condition to reuse req.state_value
+            if not (req_state_value >= self._no_schedule_until_state_value
+                    and req_state_value < self._no_schedule_after_state_value):
                 continue
 
             req_num_tokens = 0
 
             # --- A. Encoder Request Handling ---
-            if req.state == LlmRequestState.ENCODER_INIT:
+            if req_state_value == self._encoder_init_state_value:
                 req_num_tokens = req.encoder_output_len
 
-                assert self.max_context_length is None or req_num_tokens <= self.max_context_length, \
-                    f"The number of encoder tokens ({req_num_tokens}) exceeds the limit value ({self.max_context_length})"
+                assert max_context_length is None or req_num_tokens <= max_context_length, \
+                    f"The number of encoder tokens ({req_num_tokens}) exceeds the limit value ({max_context_length})"
 
-                if self.max_num_tokens is not None and (batch_num_tokens +
-                                                        req_num_tokens
-                                                        > self.max_num_tokens):
+                if max_num_tokens is not None and (
+                        batch_num_tokens + req_num_tokens > max_num_tokens):
                     break
 
                 logger.debug(f"encoder request scheduled: ID {req.request_id}")
@@ -337,20 +343,19 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
                 batch_num_tokens += req_num_tokens
 
             # --- B. Context Request Handling ---
-            elif req.state == LlmRequestState.CONTEXT_INIT:
-                if not self.ctx_chunk_config:
+            elif req_state_value == self._context_init_state_value:
+                if not ctx_chunk_config:
                     # No Chunking: Schedule full context
                     # C++ uses getNumTokens(beam=0) which is tokens.size() - numPreDecodedTokens
                     base_tokens = req.get_num_tokens(0)
                     draft_tokens = req.num_draft_tokens if req.has_draft_tokens else 0
                     req_num_tokens = base_tokens + draft_tokens
 
-                    assert self.max_context_length is None or req_num_tokens <= self.max_context_length, \
-                        f"The number of context tokens ({req_num_tokens}) exceeds the limit value ({self.max_context_length})"
+                    assert max_context_length is None or req_num_tokens <= max_context_length, \
+                        f"The number of context tokens ({req_num_tokens}) exceeds the limit value ({max_context_length})"
 
-                    if self.max_num_tokens is not None and (
-                            batch_num_tokens + req_num_tokens
-                            > self.max_num_tokens):
+                    if max_num_tokens is not None and (
+                            batch_num_tokens + req_num_tokens > max_num_tokens):
                         break
 
                     logger.debug(
@@ -366,9 +371,9 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
                         and req.has_draft_tokens) else 0
                     req_num_tokens = req.context_chunk_size + draft_tokens
 
-                    if self.max_context_length is not None:
-                        if self.max_context_length < req_num_tokens:
-                            req_num_tokens = self.max_context_length
+                    if max_context_length is not None:
+                        if max_context_length < req_num_tokens:
+                            req_num_tokens = max_context_length
                             all_context_requests_fit = False
 
                     logger.debug(
@@ -385,9 +390,8 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
                     for_next_iteration=False)
                 req_num_tokens = beam_width + req.num_draft_tokens
 
-                if self.max_num_tokens is not None and (batch_num_tokens +
-                                                        req_num_tokens
-                                                        > self.max_num_tokens):
+                if max_num_tokens is not None and (
+                        batch_num_tokens + req_num_tokens > max_num_tokens):
                     break
 
                 # Beam Width Consistency Check
@@ -399,30 +403,26 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
                         f"beam width ({beam_width}) is different from scheduled ones "
                         f"({scheduled_beam_width})")
                     continue
-
-                logger.debug(
-                    f"generation request scheduled: ID {req.request_id} "
-                    f"with beam width {beam_width}")
                 generation_requests.append(req)
                 batch_num_tokens += req_num_tokens
 
             # --- Batch Size Limit Check ---
             scheduled_req_size += 1
-            if scheduled_req_size >= self.max_batch_size:
+            if scheduled_req_size >= max_batch_size:
                 break
 
         # 2. Verify Chunking Fits
-        if self.max_num_tokens is not None and num_chunked_tokens > (
-                self.max_num_tokens - batch_num_tokens):
+        if max_num_tokens is not None and num_chunked_tokens > (
+                max_num_tokens - batch_num_tokens):
             all_context_requests_fit = False
 
         # 3. Apply Chunking Strategy if needed
         if not all_context_requests_fit and contexts_to_be_chunked:
-            assert self.ctx_chunk_config is not None, \
+            assert ctx_chunk_config is not None, \
                 "If chunking is not enabled, context scheduling should be completed."
             remaining_capacity = (
-                self.max_num_tokens -
-                batch_num_tokens) if self.max_num_tokens is not None else None
+                max_num_tokens -
+                batch_num_tokens) if max_num_tokens is not None else None
 
             self._set_ctx_requests_chunk_size(contexts_to_be_chunked,
                                               remaining_capacity)
@@ -444,12 +444,7 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
         logger.debug(f"batchSize (num ctx/enc requests + num gen requests): "
                      f"{len(context_requests) + len(generation_requests)}")
         logger.debug(f"batchNumTokens / maxNumTokens: {batch_num_tokens} / "
-                     f"{self.max_num_tokens or 0}")
-        logger.debug(
-            f"[Summary] Micro Batch scheduler schedules {len(context_requests)} "
-            f"context/encoder requests, {len(generation_requests)} generation requests. "
-            f"{len(inflight_request_ids)} requests inflight with the model already"
-        )
+                     f"{max_num_tokens or 0}")
 
         return context_requests, generation_requests
 
@@ -662,7 +657,7 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
             self, scheduler: 'PyCapacityScheduler',
             active_requests: RequestList) -> Tuple[RequestList, RequestList]:
         scheduled_requests: RequestList = []
-        max_peft_pages = scheduler._get_max_peft_pages()
+        has_peft = scheduler.peft_cache_manager is not None
 
         skipping_is_relevant = scheduler._is_skipping_relevant()
 
@@ -679,8 +674,11 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
             reserved_cross_blocks = NoEvictScheduledBlocksManager(
                 scheduler.cross_kv_cache_manager)
 
+        # PEFT state - only used when has_peft
         claimed_peft_pages = 0
-        uniq_task_ids: Set[int] = set()
+        available_peft_pages = scheduler._get_max_peft_pages(
+        ) if has_peft else 0
+        uniq_task_ids: Set[int] = set() if has_peft else None
 
         pending_requests: RequestList = []
         pending_dis_gen_init_requests: RequestList = []
@@ -699,11 +697,12 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
                 if reserved_cross_blocks is not None:
                     reserved_cross_blocks.decrement_reserved_blocks(req)
 
-                lora_task_id, is_new_task, peft_pages = scheduler._get_peft_task_info(
-                    req, uniq_task_ids)
-                if is_new_task:
-                    claimed_peft_pages += peft_pages
-                    uniq_task_ids.add(lora_task_id)
+                if has_peft:
+                    lora_task_id, is_new_task, peft_pages = scheduler._get_peft_task_info(
+                        req, uniq_task_ids)
+                    if is_new_task:
+                        claimed_peft_pages += peft_pages
+                        uniq_task_ids.add(lora_task_id)
 
             elif req.is_disagg_generation_init_state:
                 pending_dis_gen_init_requests.append(req)
@@ -712,7 +711,8 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
 
         # Second pass: process pending requests
         if not self.static_batch or len(scheduled_requests) == 0:
-            available_peft_pages = max_peft_pages - claimed_peft_pages
+            if has_peft:
+                available_peft_pages -= claimed_peft_pages
 
             for requests in [pending_dis_gen_init_requests, pending_requests]:
                 for req in requests:
@@ -734,21 +734,23 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
                             enough_cross_blocks = reserved_cross_blocks.enough_available_blocks(
                                 req)
 
-                        lora_task_id, is_new_task, needed_peft_pages = scheduler._get_peft_task_info(
-                            req, uniq_task_ids)
+                        if not enough_blocks or not enough_cross_blocks:
+                            break
 
-                        if (enough_blocks and enough_cross_blocks
-                                and needed_peft_pages <= available_peft_pages):
-                            scheduled_requests.append(req)
-                            reserved_blocks.decrement_reserved_blocks(req)
-                            if reserved_cross_blocks is not None:
-                                reserved_cross_blocks.decrement_reserved_blocks(
-                                    req)
+                        # PEFT check only when needed
+                        if has_peft:
+                            lora_task_id, is_new_task, needed_peft_pages = scheduler._get_peft_task_info(
+                                req, uniq_task_ids)
+                            if needed_peft_pages > available_peft_pages:
+                                continue
                             available_peft_pages -= needed_peft_pages
                             if is_new_task:
                                 uniq_task_ids.add(lora_task_id)
-                        elif not enough_blocks or not enough_cross_blocks:
-                            break
+
+                        scheduled_requests.append(req)
+                        reserved_blocks.decrement_reserved_blocks(req)
+                        if reserved_cross_blocks is not None:
+                            reserved_cross_blocks.decrement_reserved_blocks(req)
 
         return scheduled_requests, []
 
@@ -845,33 +847,30 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
         if len(scheduled_requests) >= scheduler.max_num_requests:
             return False
 
-        lora_task_id, is_new_task, num_required_peft_pages = scheduler._get_peft_task_info(
-            req, seen_task_ids)
-        logger.debug(f"MaxUtilizationScheduler: request ID {req.request_id} "
-                     f"required peft pages: {num_required_peft_pages}")
-
         blocks_if_scheduled = scheduled_blocks_manager.prepare_blocks_if_schedulable(
             req)
-        fits_kv_cache = blocks_if_scheduled is not None
+        if blocks_if_scheduled is None:
+            return False
 
-        fits_peft = True
+        # PEFT check only when needed
         if scheduler.peft_cache_manager is not None:
+            lora_task_id, is_new_task, num_required_peft_pages = scheduler._get_peft_task_info(
+                req, seen_task_ids)
+            logger.debug(
+                f"MaxUtilizationScheduler: request ID {req.request_id} "
+                f"required peft pages: {num_required_peft_pages}")
             max_peft_pages = scheduler._get_max_peft_pages()
-            fits_peft = (num_required_peft_pages + num_scheduled_peft_pages
-                         <= max_peft_pages)
-
-        if fits_kv_cache and fits_peft:
-            scheduled_blocks_manager.update_scheduled_blocks(
-                blocks_if_scheduled)
+            if num_required_peft_pages + num_scheduled_peft_pages > max_peft_pages:
+                return False
             logger.debug(
                 f"MaxUtilizationScheduler: scheduled peft pages: {num_required_peft_pages}"
             )
-            scheduled_requests.append(req)
             if is_new_task:
                 seen_task_ids.add(lora_task_id)
-            return True
 
-        return False
+        scheduled_blocks_manager.update_scheduled_blocks(blocks_if_scheduled)
+        scheduled_requests.append(req)
+        return True
 
 
 class NoEvictScheduledBlocksManager:
@@ -1018,6 +1017,9 @@ class PyCapacityScheduler:
         self.two_step_lookahead = two_step_lookahead
         self.no_schedule_until_state = no_schedule_until_state
         self.no_schedule_after_state = no_schedule_after_state
+        # Cache state values to avoid repeated .value access (optimization)
+        self._no_schedule_until_state_value = no_schedule_until_state.value
+        self._no_schedule_after_state_value = no_schedule_after_state.value
 
         # Initialize the appropriate policy
         self._policy = self._create_policy()
@@ -1036,24 +1038,18 @@ class PyCapacityScheduler:
             raise ValueError(
                 f"Unsupported scheduler policy: {self.scheduler_policy}")
 
-    def _has_reached_state(self, req: LlmRequest,
-                           target_state: LlmRequestState) -> bool:
-        """Check if request has reached the target state."""
-        # C++ equivalent: req->hasReachedState(state)
-        # States are ordered: ENCODER_INIT(1) < CONTEXT_INIT(2) < GENERATION_IN_PROGRESS(3) < ...
-        return req.state.value >= target_state.value
-
     def _can_be_scheduled(self, req: LlmRequest) -> bool:
         """
         Check if request is within the schedulable state range.
         Returns True if request has reached no_schedule_until_state
         but has not yet reached no_schedule_after_state.
+        Optimized: use state_value property to avoid enum object creation
         """
-        if not self._has_reached_state(req, self.no_schedule_until_state):
-            return False
-        if self._has_reached_state(req, self.no_schedule_after_state):
-            return False
-        return True
+        # Use state_value property (returns int directly, avoids enum object creation)
+        state_value = req.state_value
+        # Inline comparison: must have reached until_state but not after_state
+        return (state_value >= self._no_schedule_until_state_value
+                and state_value < self._no_schedule_after_state_value)
 
     def _is_skipping_relevant(self) -> bool:
         """
@@ -1285,12 +1281,12 @@ class SimpleUnifiedScheduler(RequestScheduler):
     def schedule_request(self, active_requests: RequestList,
                          inflight_request_ids: set[int]) -> SchedulerOutput:
         # Step 1: Capacity Check (Who fits in memory?)
-        fitting_requests, fitting_disagg_gen_init, paused_requests = self.capacity_scheduler.schedule_request(
-            active_requests)
+        fitting_requests, fitting_disagg_gen_init, paused_requests = \
+            self.capacity_scheduler.schedule_request(active_requests)
 
         # Step 2: MicroBatch Check (Who fits in token budget? + Chunking)
-        context_requests, generation_requests = self.micro_batch_scheduler.schedule(
-            fitting_requests, inflight_request_ids)
+        context_requests, generation_requests = \
+            self.micro_batch_scheduler.schedule(fitting_requests, inflight_request_ids)
 
         return SchedulerOutput(
             context_requests=context_requests,

@@ -838,7 +838,6 @@ def create_py_executor_instance(
         scheduler_capacity += 1
 
     use_python_scheduler = os.getenv("TLLM_USE_PYTHON_SCHEDULER", "0") == "1"
-    logger.info(f"use_python_scheduler: {use_python_scheduler}")
     if use_python_scheduler:
         scheduler = SimpleUnifiedScheduler(
             max_batch_size=max_batch_size,
