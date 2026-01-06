@@ -35,7 +35,7 @@ public:
 
     [[nodiscard]] bool isCompleted() const override;
 
-    void wait() const override;
+    TransferState wait(int64_t timeout_ms = -1) const override;
 
 private:
     transfer_engine_t mEngine;
