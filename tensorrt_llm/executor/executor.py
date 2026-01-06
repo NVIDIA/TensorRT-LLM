@@ -213,7 +213,12 @@ class GenerationExecutor(ABC):
 
         return futures
 
-    def _get_next_client_id(self):
+    def _get_client_id(self, request: GenerationRequest) -> int:
+        if request.id is not None:
+            return request.id
+        if request.disaggregated_params and isinstance(
+                request.disaggregated_params.ctx_request_id, int):
+            return request.disaggregated_params.ctx_request_id
         self._last_client_id = get_local_request_id(self._last_client_id)
         return self._last_client_id
 

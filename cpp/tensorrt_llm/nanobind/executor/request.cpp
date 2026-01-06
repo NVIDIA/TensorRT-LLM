@@ -929,8 +929,8 @@ void initRequestBindings(nb::module_& m)
         {
             throw std::runtime_error("Invalid Request state!");
         }
-        new (&response) tle::Response(
-            nb::cast<SizeType32>(state[0]), nb::cast<tle::Result>(state[1]), nb::cast<SizeType32>(state[2]));
+        new (&response)
+            tle::Response(nb::cast<IdType>(state[0]), nb::cast<tle::Result>(state[1]), nb::cast<IdType>(state[2]));
     };
 
     nb::class_<tle::Response>(m, "Response")
