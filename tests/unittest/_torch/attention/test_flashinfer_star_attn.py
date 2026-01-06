@@ -115,6 +115,7 @@ class TestStarAttention(unittest.TestCase):
     ], lambda testcase_func, param_num, param:
                           f"{testcase_func.__name__}[{param.args[0]}]")
     def test_flashinfer_star_attention(self, scenario: Scenario):
+        pytest.skip("https://nvbugspro.nvidia.com/bug/5781389")
         num_layers = scenario.num_layers
         num_heads = scenario.num_heads
         num_kv_heads = scenario.num_kv_heads
@@ -552,6 +553,7 @@ class TestStarAttention(unittest.TestCase):
                           skip_on_empty=True)
     def test_attention_with_cuda_graphs(
             self, test_scenario: CUDAGraphTestScenario) -> None:
+        pytest.skip("https://nvbugspro.nvidia.com/bug/5781389")
         # This test exercises our CUDAGraph metadata class and makes sure
         # that the flashinfer attention layer is compatible with graph capture/replay.
         # We compare the CUDA graph results to the results without CUDA graph.
