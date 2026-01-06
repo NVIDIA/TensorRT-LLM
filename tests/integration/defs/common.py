@@ -1174,7 +1174,7 @@ def get_free_port_in_ci(max_attempts=100):
             if port not in PORTS_IN_USE
         ]
 
-        for _ in range(min(max_attempts, len(available_ports))):
+        for _ in range(len(available_ports)):
             # Get a random port from the available ports
             port = random.choice(available_ports)
 
