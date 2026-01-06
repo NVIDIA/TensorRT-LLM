@@ -3316,12 +3316,10 @@ class TestQwen3_4B(LlmapiAccuracyTestHarness):
         spec_config = EagleDecodingConfig(max_draft_len=draft_len,
                                           speculative_model_dir=eagle_model_dir)
 
-        llm = LLM(model=target_model_dir,
-                  **pytorch_config,
-                  kv_cache_config=kv_cache_config,
-                  speculative_config=spec_config)
-
-        with llm:
+        with LLM(model=target_model_dir,
+                 **pytorch_config,
+                 kv_cache_config=kv_cache_config,
+                 speculative_config=spec_config) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
