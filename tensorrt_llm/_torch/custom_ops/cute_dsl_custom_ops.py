@@ -2560,12 +2560,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 c = torch.empty((m, n_out), dtype=c_dtype, device=a.device)
 
             # Allocate output scale factor (for FP4 output quantization)
-            # Shape: (32, 4, m // 128, 4, scale_n_out // 4, l)
+            # Shape: (32, 4, pad_up(m, 128) // 128, 4, scale_n_out // 4, l)
             scale_n_out = n_out // self.scaling_vector_size
-            c_sf_shape = (32, 4, m // 128, 4, scale_n_out // 4, l)
-            c_sf = torch.empty(c_sf_shape,
-                               dtype=torch.float8_e4m3fn,
-                               device=a.device)
+            c_sf_shape = (32, 4, pad_up(m, 128) // 128, 4, scale_n_out // 4, l)
+            c_sf = torch.empty(c_sf_shape, dtype=torch.uint8, device=a.device)
 
             # Get CUDA stream
             torch_stream = torch.cuda.current_stream()
@@ -2710,7 +2708,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         # Output scale factor shape
         scale_n_out = n_out // scaling_vector_size
-        c_sf_shape = (32, 4, m // 128, 4, scale_n_out // 4, l)
-        output_sf = input.new_empty(c_sf_shape, dtype=torch.float8_e4m3fn)
+        c_sf_shape = (32, 4, pad_up(m, 128) // 128, 4, scale_n_out // 4, l)
+        output_sf = input.new_empty(c_sf_shape, dtype=torch.uint8)
 
         return output, output_sf
