@@ -620,7 +620,7 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
         model_path = f"{llm_models_root()}/modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8"
         eagle_model_dir = f"{llm_models_root()}/EAGLE3-LLaMA3.3-Instruct-70B"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
-        spec_config = EagleDecodingConfig(max_draft_len=4,
+        spec_config = EagleDecodingConfig(max_draft_len=3,
                                           speculative_model_dir=eagle_model_dir,
                                           eagle3_one_model=eagle3_one_model)
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
@@ -1103,6 +1103,37 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    def test_fp8_vswa_reuse(self):
+        # NOTE: Test with VSWA kv cache config.
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=True,
+            max_attention_window=[512, 512, 512, 512, 512, 32768],
+        )
+        prequantized_model_path = f"{llm_models_root()}/gemma/gemma-3-1b-it-fp8/"
+        with LLM(prequantized_model_path,
+                 kv_cache_config=kv_cache_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.parametrize("backend", ["xgrammar"])
+    def test_fp8_guided_decoding_vswa_reuse(self, backend: str, mocker):
+        mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
+        prequantized_model_path = f"{llm_models_root()}/gemma/gemma-3-1b-it-fp8/"
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=True,
+            max_attention_window=[512, 512, 512, 512, 512, 32768],
+        )
+        cuda_graph_config = CudaGraphConfig(enable_padding=True)
+        llm = LLM(prequantized_model_path,
+                  guided_decoding_backend=backend,
+                  kv_cache_config=kv_cache_config,
+                  cuda_graph_config=cuda_graph_config)
+        with llm:
+            task = JsonModeEval(self.MODEL_NAME)
             task.evaluate(llm)
 
     def test_auto_dtype_vswa_without_reuse(self):
@@ -2269,6 +2300,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
         torch.cuda.empty_cache()
 
     @skip_pre_blackwell
+    @pytest.mark.skip_less_device_memory(95000)
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend",
         [
@@ -4398,11 +4430,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                 "https://nvbugs/5636916: Remaining Hopper Eagle Accuracy Issue for only TP=4"
             )
 
-        if not one_model and overlap_scheduler:
-            pytest.skip(
-                "https://nvbugs/5745152: two_model + overlap_scheduler can sometimes time out."
-            )
-
         MAX_OUTPUT_LEN = 128179
         MAX_INPUT_LEN = 32768
 
@@ -4464,6 +4491,114 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           sampling_params=sampling_params,
                           extra_evaluator_kwargs=extra_evaluator_kwargs)
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.parametrize("one_model", [True, False],
+                             ids=["one_model", "two_model"])
+    def test_eagle3_vswa_reuse_4gpus(self, one_model, mocker):
+        MAX_OUTPUT_LEN = 128179
+        MAX_INPUT_LEN = 32768
+
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
+        mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
+                          {"scores_filter": "exact_match,flexible-extract"})
+
+        mocker.patch.object(GPQADiamond, "MAX_OUTPUT_LEN", MAX_OUTPUT_LEN)
+        mocker.patch.object(GPQADiamond, "MAX_INPUT_LEN", MAX_INPUT_LEN)
+
+        pytorch_config = dict(cuda_graph_config=CudaGraphConfig())
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
+                                        dtype="auto",
+                                        enable_block_reuse=True,
+                                        max_attention_window=[128, 32768])
+
+        eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
+        draft_len = 3
+        spec_config = EagleDecodingConfig(max_draft_len=draft_len,
+                                          speculative_model_dir=eagle_model_dir,
+                                          eagle3_one_model=one_model,
+                                          allow_advanced_sampling=True)
+
+        max_seq_len = MAX_INPUT_LEN + MAX_OUTPUT_LEN
+        llm = LLM(self.MODEL_PATH,
+                  tensor_parallel_size=4,
+                  pipeline_parallel_size=1,
+                  moe_expert_parallel_size=1,
+                  kv_cache_config=kv_cache_config,
+                  max_seq_len=max_seq_len,
+                  speculative_config=spec_config,
+                  **pytorch_config,
+                  enable_attention_dp=False)
+
+        with llm:
+            model_name = "GPT-OSS/120B-MXFP4"
+
+            # GSM8K
+            task = GSM8K(model_name)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.extra_evaluator_kwargs)
+
+            # GPQA Medium Reasoning
+            task = GPQADiamond(model_name)
+
+            chat_template_kwargs = dict(reasoning_effort="medium")
+            extra_evaluator_kwargs = {
+                **self.extra_evaluator_kwargs, "chat_template_kwargs":
+                chat_template_kwargs
+            }
+
+            sampling_params = SamplingParams(
+                temperature=1.0,
+                top_p=1.0,
+                max_tokens=MAX_OUTPUT_LEN,
+                truncate_prompt_tokens=MAX_INPUT_LEN)
+
+            task.evaluate(llm,
+                          sampling_params=sampling_params,
+                          extra_evaluator_kwargs=extra_evaluator_kwargs)
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.parametrize("one_model", [True, False],
+                             ids=["one_model", "two_model"])
+    def test_eagle3_guided_decoding_4gpus(self, one_model, mocker):
+        MAX_OUTPUT_LEN = 128179
+        MAX_INPUT_LEN = 32768
+
+        mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
+        mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
+                          {"scores_filter": "exact_match,flexible-extract"})
+
+        mocker.patch.object(GPQADiamond, "MAX_OUTPUT_LEN", MAX_OUTPUT_LEN)
+        mocker.patch.object(GPQADiamond, "MAX_INPUT_LEN", MAX_INPUT_LEN)
+
+        pytorch_config = dict(cuda_graph_config=CudaGraphConfig())
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
+                                        dtype="auto")
+
+        eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
+        draft_len = 3
+        spec_config = EagleDecodingConfig(max_draft_len=draft_len,
+                                          speculative_model_dir=eagle_model_dir,
+                                          eagle3_one_model=one_model,
+                                          allow_advanced_sampling=True)
+
+        max_seq_len = MAX_INPUT_LEN + MAX_OUTPUT_LEN
+        llm = LLM(self.MODEL_PATH,
+                  tensor_parallel_size=4,
+                  pipeline_parallel_size=1,
+                  moe_expert_parallel_size=1,
+                  guided_decoding_backend="xgrammar",
+                  kv_cache_config=kv_cache_config,
+                  max_seq_len=max_seq_len,
+                  speculative_config=spec_config,
+                  **pytorch_config,
+                  enable_attention_dp=False)
+
+        with llm:
+            model_name = "GPT-OSS/120B-MXFP4"
+            task = JsonModeEval(model_name)
+            task.evaluate(llm)
 
     @pytest.mark.skip_less_device(2)
     @pytest.mark.timeout(14400)

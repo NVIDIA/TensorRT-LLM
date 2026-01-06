@@ -287,7 +287,7 @@ def submit_job(config, log_dir, dry_run):
                 f"--container-image {env_config['container_image']}",
                 f"--container-name {container_name}",
                 f"--container-mounts {env_config['container_mount']}",
-                "--mpi=pmix --overlap",
+                "--no-container-mount-home --mpi=pmix --overlap",
                 f"bash {os.path.join(env_config['work_dir'], 'start_worker.sh')}",
                 server_type,
                 str(server_id),
@@ -313,7 +313,7 @@ def submit_job(config, log_dir, dry_run):
         f"--container-name={container_name}",
         f"--container-image={env_config['container_image']}",
         f"--container-mounts={env_config['container_mount']}",
-        f"--mpi=pmix --overlap -N 1 -n 1",
+        f"--no-container-mount-home --mpi=pmix --overlap -N 1 -n 1",
         f"bash {env_config['work_dir']}/start_server.sh {os.path.join(log_dir, 'server_config.yaml')} \"{server_env_var}\"",
         f"&> {log_dir}/4_output_server.log &",
     ]
