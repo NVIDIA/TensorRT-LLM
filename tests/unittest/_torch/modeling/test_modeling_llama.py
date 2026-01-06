@@ -230,7 +230,14 @@ class TestLlama(unittest.TestCase):
 
             llama = LlamaForCausalLM(model_config).to(dtype).to(device)
             llama.load_weights(hf_llama.state_dict())
-            llama.post_load_weights()
+            for module in llama.modules():
+                if hasattr(module,
+                           "process_weights_after_loading") and not getattr(
+                               module, "_weights_removed", False):
+                    module.process_weights_after_loading()
+                if hasattr(module, "post_load_weights") and not getattr(
+                        module, "_weights_removed", False):
+                    module.post_load_weights()
 
         num_blocks = 1
         tokens_per_block = 128

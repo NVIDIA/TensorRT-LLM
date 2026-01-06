@@ -521,10 +521,18 @@ class MoE(nn.Module):
         raise NotImplementedError
 
     @abstractmethod
-    def load_weights(self, weights: List[Dict]):
+    def load_weights(self,
+                     weights: List[Dict],
+                     allow_partial_loading: bool = False):
         raise NotImplementedError
 
+    def process_weights_after_loading(self):
+        pass
+
     def post_load_weights(self):
+        pass
+
+    def pre_reload_weights(self):
         pass
 
     @abstractmethod
