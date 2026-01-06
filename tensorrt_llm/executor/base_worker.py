@@ -541,7 +541,8 @@ class BaseWorker(GenerationExecutor):
                 guided_decoding_params=request.sampling_params.
                 _get_guided_decoding_params(),
                 bad_words=request.sampling_params._get_bad_words(),
-                stop_words=request.sampling_params._get_stop_words(),
+                stop_words=[] if request.sampling_params.ignore_eos else
+                request.sampling_params._get_stop_words(),
                 embedding_bias=request.sampling_params.embedding_bias,
                 lora_config=lora_config,
                 prompt_tuning_config=prompt_tuning_config,
