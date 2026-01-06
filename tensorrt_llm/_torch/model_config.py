@@ -474,7 +474,6 @@ class ModelConfig(Generic[TConfig]):
         # Apply model_kwargs to override config parameters if provided
         model_kwargs = kwargs.pop('model_kwargs', None)
         if model_kwargs:
-            from tensorrt_llm.logger import logger
 
             def _recursive_update_config(config: transformers.PretrainedConfig,
                                          update_dict: Dict[str, Any]):

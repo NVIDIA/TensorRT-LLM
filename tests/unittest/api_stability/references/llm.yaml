@@ -232,9 +232,9 @@ methods:
         default: 1000
         status: prototype
       model_kwargs:
-        annotation: object
+        annotation: Optional[Dict[str, Any]]
         default: null
-        status: beta
+        status: prototype
     return_annotation: None
   generate:
     parameters:
