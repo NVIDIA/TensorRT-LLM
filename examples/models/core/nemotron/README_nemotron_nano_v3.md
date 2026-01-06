@@ -83,7 +83,7 @@ TRTLLM_ENABLE_PDL=1 trtllm-serve <model_path> \
 --port 8000 \
 --backend _autodeploy \
 --trust_remote_code \
---extra_llm_api_options nano_v3.yaml
+--config nano_v3.yaml
 
 # OR you can launch trtllm-server to support reasoning content parsing.
 TRTLLM_ENABLE_PDL=1 trtllm-serve <model_path> \
@@ -92,7 +92,7 @@ TRTLLM_ENABLE_PDL=1 trtllm-serve <model_path> \
 --backend _autodeploy \
 --trust_remote_code \
 --reasoning_parser nano-v3 \
---extra_llm_api_options nano_v3.yaml
+--config nano_v3.yaml
 
 # OR you can launch trtllm-server to support tool-calling.
 TRTLLM_ENABLE_PDL=1 trtllm-serve <model_path> \
@@ -102,7 +102,7 @@ TRTLLM_ENABLE_PDL=1 trtllm-serve <model_path> \
 --trust_remote_code \
 --reasoning_parser nano-v3 \
 --tool_parser qwen3_coder \
---extra_llm_api_options nano_v3.yaml
+--config nano_v3.yaml
 ```
 
 For the client:
