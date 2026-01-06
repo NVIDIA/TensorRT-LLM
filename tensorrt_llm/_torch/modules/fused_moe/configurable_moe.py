@@ -225,6 +225,11 @@ class ConfigurableMoE(MoE):
 
         # Debug function for eliminating imbalance during performance analysis.
         self.enable_dummy_allreduce = os.environ.get("TRTLLM_ENABLE_DUMMY_ALLREDUCE", "0") == "1"
+        if self.enable_dummy_allreduce and self.all_reduce is None:
+            from tensorrt_llm._torch.distributed import AllReduce
+            from tensorrt_llm.functional import AllReduceStrategy
+
+            self.all_reduce = AllReduce(mapping=self.mapping, strategy=AllReduceStrategy.NCCL)
 
         # Mark as _weights_removed to skip ConfigurableMoE's post_load_weights in model_loader
         # The backend's post_load_weights will be called directly by model_loader
