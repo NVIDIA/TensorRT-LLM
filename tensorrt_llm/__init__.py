@@ -17,6 +17,7 @@ import os
 
 # Disable UCC to WAR allgather issue before NGC PyTorch 25.12 upgrade.
 os.environ["OMPI_MCA_coll_ucc_enable"] = "0"
+os.environ["TLLM_USE_PYTHON_SCHEDULER"] = "1"
 
 
 def _add_trt_llm_dll_directory():
