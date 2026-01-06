@@ -414,3 +414,15 @@ def maybe_compiled_copy_(dst, src):
 @maybe_compile
 def maybe_compiled_cat(tensors, dim):
     return torch.cat(tensors, dim)
+
+
+def replace_parameter_and_save_metadata(module: torch.nn.Module,
+                                        param_name: str,
+                                        new_param: torch.nn.Parameter,
+                                        metadata_dict: Dict):
+    """
+    Replace a parameter in a module and save the metadata of the original parameter.
+    """
+    if param_name not in metadata_dict:
+        metadata_dict[param_name] = getattr(module, param_name).to("meta")
+    module.register_parameter(param_name, new_param)

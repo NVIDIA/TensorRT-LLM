@@ -791,6 +791,7 @@ def test_fused_moe_fp8_blockwise_wide_ep(alltoall_method_type):
             )
         alltoall_model.to("cuda")
         alltoall_model.load_weights([weights])
+        alltoall_model.process_weights_after_loading()
         alltoall_model.post_load_weights()
 
         # Use DeepGemmFusedMoE as reference
@@ -807,6 +808,7 @@ def test_fused_moe_fp8_blockwise_wide_ep(alltoall_method_type):
         )
         ref_model.to("cuda")
         ref_model.load_weights([weights])
+        ref_model.process_weights_after_loading()
         ref_model.post_load_weights()
 
         # Evaluate the outputs on variant sequence lengths
@@ -953,6 +955,7 @@ def test_fused_moe_fp8_blockwise_deepgemm(dtype,
     )
     fused_moe.cuda()
     fused_moe.load_weights([weights])
+    fused_moe.process_weights_after_loading()
     fused_moe.post_load_weights()
 
     def swiglu_fused_moe(x):
@@ -1600,6 +1603,7 @@ def run_fused_moe_nvfp4(dtype,
             swiglu_limit=swiglu_limit_tensor,
         )
         fused_moe.load_weights([weights])
+        fused_moe.process_weights_after_loading()
         fused_moe.post_load_weights()
         fused_moe.cuda()
 
@@ -2295,6 +2299,7 @@ def test_fused_moe_mxfp4_mxfp8(moe_backend, hidden_unpadded, seq_len, bias,
     )
     fused_moe.cuda()
     fused_moe.load_weights([weights_pad_unsanitized])
+    fused_moe.process_weights_after_loading()
     fused_moe.post_load_weights()
 
     if moe_backend == "TRTLLM":

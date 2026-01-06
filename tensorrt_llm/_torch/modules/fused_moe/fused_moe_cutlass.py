@@ -1,3 +1,4 @@
+import inspect
 import os
 from functools import cached_property
 from typing import Dict, List, Optional, Tuple, Union
@@ -865,16 +866,22 @@ class CutlassFusedMoE(MoE):
         assert len(weights) == 1
         weights = weights[0]
 
-        if not isinstance(self.quant_method, UnquantizedFusedMoEMethod):
-            assert not allow_partial_loading, "Partial loading is not supported for quantized MoE now"
-            self.quant_method.load_weights(self, weights,
-                                           self.weight_loading_mode)
-        else:
-            self.quant_method.load_weights(
-                self,
-                weights,
-                self.weight_loading_mode,
-                allow_partial_loading=allow_partial_loading)
+        kargs = {}
+        if "allow_partial_loading" in inspect.getfullargspec(
+                self.quant_method.load_weights).args:
+            kargs["allow_partial_loading"] = allow_partial_loading
+        self.quant_method.load_weights(self, weights, self.weight_loading_mode,
+                                       **kargs)
 
     def post_load_weights(self):
         self.quant_method.post_load_weights(self)
+
+    def process_weights_after_loading(self):
+        if hasattr(self.quant_method, 'process_weights_after_loading'):
+            self.quant_method.process_weights_after_loading(self)
+
+    def pre_reload_weights(self):
+        assert hasattr(
+            self.quant_method, 'pre_reload_weights'
+        ), "pre_reload_weights is not supported for this quant method"
+        self.quant_method.pre_reload_weights(self)
