@@ -173,7 +173,6 @@ def extract_from_precompiled(precompiled_location: str, package_data: List[str],
     - Remote URL: Downloads and extracts from URL (wheel or tar.gz)
     """
     import fnmatch
-    import glob
     import shutil
     import tarfile
     import zipfile
@@ -183,6 +182,7 @@ def extract_from_precompiled(precompiled_location: str, package_data: List[str],
 
     # Handle local directory (assuming repo structure)
     if os.path.isdir(precompiled_location):
+        precompiled_location = os.path.abspath(precompiled_location)
         print(
             f"Using local directory as precompiled source: {precompiled_location}"
         )
@@ -192,14 +192,13 @@ def extract_from_precompiled(precompiled_location: str, package_data: List[str],
                 f"Directory {precompiled_location} does not contain a tensorrt_llm folder."
             )
 
-        for pattern in package_data:
-            full_pattern = os.path.join(source_tensorrt_llm, pattern)
-            for src_file in glob.glob(full_pattern, recursive=True):
-                if not os.path.isfile(src_file):
-                    continue
-
+        # Walk through all files and match using fnmatch (consistent with wheel extraction)
+        for root, dirs, files in os.walk(source_tensorrt_llm):
+            for filename in files:
+                src_file = os.path.join(root, filename)
+                # Get path relative to precompiled_location (e.g., "tensorrt_llm/libs/libtensorrt_llm.so")
                 rel_path = os.path.relpath(src_file, precompiled_location)
-                dst_file = rel_path  # e.g., "tensorrt_llm/libs/libtensorrt_llm.so"
+                dst_file = rel_path
 
                 # Skip yaml files
                 if dst_file.endswith(".yaml"):
@@ -213,6 +212,14 @@ def extract_from_precompiled(precompiled_location: str, package_data: List[str],
                                     "tensorrt_llm/flash_mla/")
                     if not any(dst_file.startswith(d) for d in allowed_dirs):
                         continue
+
+                # Check if file matches any pattern using fnmatch (same as wheel extraction)
+                for filename_pattern in package_data:
+                    if fnmatch.fnmatchcase(rel_path,
+                                           f"tensorrt_llm/{filename_pattern}"):
+                        break
+                else:
+                    continue
 
                 dst_dir = os.path.dirname(dst_file)
                 if dst_dir:
