@@ -35,9 +35,7 @@ GITHUB_CREDENTIALS_ID = env.GithubCredencialId ?: 'github-cred-trtllm-ci'
 
 // "normal": will build and run all stages
 // "build_for_ci": will only build the images for CI
-// "no_ci": will only run other stages except the CI image update stage
 MODE = params.mode ?: "normal"
-MODE = "build_for_ci" // TODO: Remove after the CI job is stable
 
 WAIT_TIME_FOR_BUILD_STAGE = 60  // minutes
 

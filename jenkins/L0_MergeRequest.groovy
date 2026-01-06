@@ -1316,6 +1316,9 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         'triggerType': env.JOB_NAME ==~ /.*PostMerge.*/ ? "post-merge" : "pre-merge",
                         'runSanityCheck': env.JOB_NAME ==~ /.*PostMerge.*/ ? true : false,
                     ]
+                    if (testFilter[(BUILD_DOCKER_IMAGE)]) {
+                        additionalParameters['mode'] = "build_for_ci"
+                    }
 
                     launchJob("/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, "x86_64", additionalParameters)
                 }
