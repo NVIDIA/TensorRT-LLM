@@ -400,9 +400,15 @@ class FuseRopeAttention(BaseTransform):
             ad_logger.debug(f"Processing match {match_id}: {match}")
 
             # 1. Create past_key_values_<id> placeholder
-            # Shape: float16[batch_size, 2, 2, past_len, head_dim]
+            # Shape: float16[batch_size, 2, num_kv_heads, past_len, head_dim]
             past_key_values_example = torch.zeros(
-                batch_size_dim, 2, 2, past_len, match.head_dim, dtype=torch.float16, device="meta"
+                batch_size_dim,
+                2,
+                match.num_kv_heads,
+                past_len,
+                match.head_dim,
+                dtype=torch.float16,
+                device="meta",
             )
             past_key_values_node = add_graph_input(
                 gm, name=f"past_key_values_{match_id}", val=past_key_values_example
