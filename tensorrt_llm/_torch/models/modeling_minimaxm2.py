@@ -169,28 +169,31 @@ class MiniMaxM2Attention(Attention):
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
     def apply_qk_norm(self, q, k):
-        # collect q and k from all gpus
-        from ..distributed import allgather
+        if self.qkv_proj.mapping.tp_size > 1:
+            # collect q and k from all gpus
+            from ..distributed import allgather
 
-        temp_q = allgather(q, self.qkv_proj.mapping)
-        temp_k = allgather(k, self.qkv_proj.mapping)
-        temp_q = self.q_norm(temp_q)
-        temp_k = self.k_norm(temp_k)
-        # temp_q, temp_k = maybe_execute_in_parallel(
-        #     self.q_norm(temp_q),
-        #     self.k_norm(temp_k),
-        #     self.ln_events[0],
-        #     self.ln_events[1],
-        #     self.aux_stream,
-        # )
-        # split q and k to each gpus
-        # Fixme: tp_size may not be equal to the world size of current mapping
-        q = temp_q.reshape(-1, self.tp_size, self.q_size)[:, self.tp_rank, :].reshape(
-            -1, self.q_size
-        )
-        k = temp_k.reshape(-1, self.tp_size, self.kv_size)[:, self.tp_rank, :].reshape(
-            -1, self.kv_size
-        )
+            temp_q = allgather(q, self.qkv_proj.mapping)
+            temp_k = allgather(k, self.qkv_proj.mapping)
+            temp_q = self.q_norm(temp_q)
+            temp_k = self.k_norm(temp_k)
+            # temp_q, temp_k = maybe_execute_in_parallel(
+            #     self.q_norm(temp_q),
+            #     self.k_norm(temp_k),
+            #     self.ln_events[0],
+            #     self.ln_events[1],
+            # )
+            # split q and k to each gpus
+            # Fixme: tp_size may not be equal to the world size of current mapping
+            q = temp_q.reshape(-1, self.tp_size, self.q_size)[:, self.tp_rank, :].reshape(
+                -1, self.q_size
+            )
+            k = temp_k.reshape(-1, self.tp_size, self.kv_size)[:, self.tp_rank, :].reshape(
+                -1, self.kv_size
+            )
+        else:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
 
         return q, k
 
