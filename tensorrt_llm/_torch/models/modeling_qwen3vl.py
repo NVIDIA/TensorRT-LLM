@@ -731,7 +731,9 @@ class Qwen3VisionModel(torch.nn.Module):
         return attn_metadata
 
     @torch.inference_mode()
-    def forward(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor, **kwargs) -> torch.Tensor:
+    def forward(
+        self, pixel_values: torch.Tensor, grid_thw: torch.Tensor, **kwargs
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         seq_lens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).tolist()
         attn_metadata = self.prepare_attn_metadata(seq_lens, self.attn_metadata)
 
