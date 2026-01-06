@@ -224,7 +224,10 @@ class MTPSampler(TorchSampler):
         next_draft_tokens: torch.Tensor
         new_tokens_lens: torch.Tensor
         max_total_draft_tokens: torch.Tensor
-        finish_reasons: None = None  # Necessary to satisfy the interface of TorchSampler.Store
+        # Necessary to satisfy the interface of TorchSampler.Store
+        finish_reasons: None = None
+        end_ids: None = None
+        max_lengths_tensor: None = None
 
         def __post_init__(self):
             pass  # finish_reasons has no size to compare against new_tokens in MTPSampler

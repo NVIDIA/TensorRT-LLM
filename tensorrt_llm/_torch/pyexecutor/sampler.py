@@ -1541,15 +1541,16 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
             or request.is_disagg_generation_transmission_complete
         )
 
-    def setup_sampler_step(self, requests: ScheduledRequests):
+    @override
+    def setup_sampler_step(self, scheduled_requests: ScheduledRequests):
         """Setup the sampler step for the requests
 
         Args:
             requests: list[LlmRequest]. The requests to setup the sampler step for
         """
         if self._use_beam_search:
-            self._prepare_beam_search(requests.all_requests())
-        for request in requests.all_requests():
+            self._prepare_beam_search(scheduled_requests.all_requests())
+        for request in scheduled_requests.all_requests():
             if self._is_new_request(request):
                 self.store.max_lengths_tensor[request.py_seq_slot].fill_(
                     min(self.max_seq_len, request.orig_prompt_len + request.py_max_new_tokens)
