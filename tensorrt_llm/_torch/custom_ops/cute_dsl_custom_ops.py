@@ -3037,24 +3037,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 assumed_align=16,
             )
 
-            # a_tmp = a.view(torch.uint8)
-            # b_tmp = b.view(torch.uint8)
-
-            # mA = from_dlpack(a_tmp,
-            #                 assumed_align=16).mark_layout_dynamic(leading_dim=1)
-            # mB = from_dlpack(b_tmp,
-            #                 assumed_align=16).mark_layout_dynamic(leading_dim=2)
-            # mC = from_dlpack(c, assumed_align=16).mark_layout_dynamic(leading_dim=1)
-            # mA.element_type = cutlass.Float8E4M3FN
-            # mB.element_type = cutlass.Float8E4M3FN
-
-            # mSFB = from_dlpack(b_sf,
-            #                 assumed_align=16).mark_layout_dynamic(leading_dim=2)
-            # mSFA = from_dlpack(a_sf,
-            #                 assumed_align=16).mark_layout_dynamic(leading_dim=1)
-            # group_offset_cute_tensor = from_dlpack(
-            #     group_offset).mark_layout_dynamic()
-
             # get stream
             torch_stream = torch.cuda.current_stream()
             stream = cuda.CUstream(torch_stream.cuda_stream)
@@ -3075,26 +3057,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 hardware_info = cutlass.utils.HardwareInfo()
                 max_active_clusters = hardware_info.get_max_active_clusters(
                     cluster_shape_mn[0] * cluster_shape_mn[1])
-
-                # @cute.jit
-                # def group_gemm_permute_wrapper(
-                #     a: cute.Tensor,
-                #     b: cute.Tensor,
-                #     c: cute.Tensor,
-                #     a_sf: cute.Tensor,
-                #     b_sf: cute.Tensor,
-                #     group_offset: cute.Tensor,
-                #     max_active_clusters: cutlass.Constexpr,
-                #     stream: cuda.CUstream,
-                # ):
-                #     a = append_ones_wrapper(a)
-                #     c = append_ones_wrapper(c)
-                #     b = permute(b, (1, 2, 0))
-                #     b_sf = permute(b_sf, (1, 2, 0))
-                #     a_sf = permute(a_sf, (1, 0))
-                #     a_sf = append_ones_wrapper(a_sf)
-                #     gemm(a, b, c, a_sf, b_sf, group_offset, max_active_clusters,
-                #         stream)
 
                 compiled_gemm = cute.compile(
                     gemm.wrapper,
