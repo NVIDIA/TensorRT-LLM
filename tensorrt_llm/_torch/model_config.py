@@ -161,7 +161,7 @@ class ModelConfig(Generic[TConfig]):
                 "TWOSHOT": AllReduceStrategy.TWOSHOT,
                 "LOWPRECISION": AllReduceStrategy.LOWPRECISION,
                 "MNNVL": AllReduceStrategy.MNNVL,
-                "NCCL_SYMMETRIC": AllReduceStrategy.NCCL_SYMMETRIC
+                "NCCL_SYMMETRIC": AllReduceStrategy.NCCL_SYMMETRIC,
             }
             key = strategy.upper()
             return maps[key] if key in maps else AllReduceStrategy.AUTO
@@ -427,7 +427,7 @@ class ModelConfig(Generic[TConfig]):
                         index_head_dim = pretrained_config.index_head_dim
                         index_topk = pretrained_config.index_topk
                         indexer_max_chunk_size = None
-                        skip_indexer_for_short_seqs = False
+                        skip_indexer_for_short_seqs = True
                     kwargs[
                         'sparse_attention_config'] = DeepSeekSparseAttentionConfig(
                             index_n_heads=index_n_heads,

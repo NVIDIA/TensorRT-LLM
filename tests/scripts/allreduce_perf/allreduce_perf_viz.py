@@ -570,7 +570,6 @@ def main():
 
     if not os.path.exists(os.path.join(args.data_dir, "viz")):
         os.makedirs(os.path.join(args.data_dir, "viz"))
-        os.makedirs(os.path.join(args.data_dir, "viz", fusion_op))
 
     for tp_size in tp_size_list:
         case_name = f"benchmark.tp{tp_size}.sm{get_sm_version()}"
@@ -581,7 +580,10 @@ def main():
 
         df = pd.read_csv(Path(fname))
         for fusion_op in fusion_op_list:
-            os.makedirs(os.path.join(args.data_dir, "viz", fusion_op))
+            # if not exists, create the directory
+            if not os.path.exists(os.path.join(args.data_dir, "viz",
+                                               fusion_op)):
+                os.makedirs(os.path.join(args.data_dir, "viz", fusion_op))
 
             if df is not None:
                 print(f"\n=== TP Size: {tp_size} ===")
@@ -599,7 +601,7 @@ def main():
                                            save_path=viz_path_best_strategy)
 
                 # Create strategy difference heatmaps and save to data/viz directory
-                viz_path_diff = f"{os.path.dirname(__file__)}/{args.data_dir}/viz/{fusion_op}/{case_name}_strategy_difference_heatmap.png"
+                viz_path_diff = f"{args.data_dir}/viz/{fusion_op}/{case_name}_strategy_difference_heatmap.png"
                 visualize_strategy_difference_heatmaps(df,
                                                        fusion_op,
                                                        save_path=viz_path_diff)

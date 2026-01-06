@@ -1360,8 +1360,8 @@ class PerfSanityTestConfig:
             new_data_dict, match_keys, common_values_dict
         )
 
-        # Prepare regressive test cases
-        regressive_data_list = prepare_regressive_test_cases(history_baseline_dict, new_data_dict)
+        # Update regression info in new_data_dict
+        prepare_regressive_test_cases(history_baseline_dict, new_data_dict)
 
         if is_post_merge:
             # Prepare new baseline data for post-merge
@@ -1374,9 +1374,9 @@ class PerfSanityTestConfig:
 
         if self.upload_to_db:
             # Upload the new perf data and baseline data to database
-            post_new_perf_data(new_baseline_data_dict, new_data_dict, regressive_data_list)
+            post_new_perf_data(new_baseline_data_dict, new_data_dict)
 
-        check_perf_regression(regressive_data_list, new_data_dict)
+        check_perf_regression(new_data_dict)
 
 
 # Perf sanity test case parameters
