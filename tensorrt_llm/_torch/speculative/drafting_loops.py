@@ -294,6 +294,13 @@ class TreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
             self.draft_tokens_buffer[:batch_size, :-1], 0, 1)
 
         # return_draft_logits: [batch_size, max_total_draft_tokens + 1, vocab_size] -> [max_total_draft_tokens, batch_size, vocab_size]
+        if return_draft_logits is None:
+            # When max_draft_len == 1, the loop doesn't execute.
+            # Expand the initial logits to match the expected shape.
+            return_draft_logits = logits.unsqueeze(1).expand(
+                batch_size, self.max_total_draft_tokens + 1,
+                vocab_size).reshape(-1, vocab_size)
+
         return_draft_logits = return_draft_logits.reshape(
             batch_size, self.max_total_draft_tokens + 1, vocab_size)
         return_draft_logits = torch.transpose(return_draft_logits[:, :-1, :], 0,
