@@ -480,13 +480,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         if cutlass.const_expr(self.a_dtype != self.b_dtype):
             raise TypeError(f"Type must match: {self.a_dtype} != {self.b_dtype}")
 
-        cute.printf("cute tensors :")
-        cute.printf("a_tensor : {}", a_tensor.layout)
-        cute.printf("sfa_tensor : {}", sfa_tensor.layout)
-        cute.printf("b_tensor : {}", b_tensor.layout)
-        cute.printf("sfb_tensor : {}", sfb_tensor.layout)
-        cute.printf("c_tensor : {}", c_tensor.layout)
-        cute.printf("alpha_scale : {}", alpha_scale.layout)
+        # cute.printf("cute tensors :")
+        # cute.printf("a_tensor : {}", a_tensor.layout)
+        # cute.printf("sfa_tensor : {}", sfa_tensor.layout)
+        # cute.printf("b_tensor : {}", b_tensor.layout)
+        # cute.printf("sfb_tensor : {}", sfb_tensor.layout)
+        # cute.printf("c_tensor : {}", c_tensor.layout)
+        # cute.printf("alpha_scale : {}", alpha_scale.layout)
 
         # Setup attributes that dependent on gemm inputs
         self._setup_attributes()
@@ -852,7 +852,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         gC_mnl = cute.local_tile(
             mC_mnl, cute.slice_(self.mma_tiler_c, (None, None, 0)), (None, None, None)
         )
-        k_tile_cnt = cute.size(gA_mkl, mode=[3])
+        k_tile_cnt = cutlass.Int32(cute.size(gA_mkl, mode=[3]))
 
         #
         # Partition global tensor for TiledMMA_A/B/C
@@ -2351,6 +2351,129 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             can_implement = False
 
         return can_implement
+
+    @cute.jit
+    def wrapper(
+        self,
+        a_ptr: cute.Pointer,
+        b_ptr: cute.Pointer,
+        a_sf_ptr: cute.Pointer,
+        b_sf_ptr: cute.Pointer,
+        c_ptr: cute.Pointer,
+        c_sf_ptr: cute.Pointer,
+        alpha_ptr: cute.Pointer,
+        norm_const_ptr: cute.Pointer,
+        m: cutlass.Int64,
+        n: cutlass.Int64,
+        k: cutlass.Int64,
+        l: cutlass.Int64,  # noqa: E741
+        expert_count: cutlass.Constexpr,
+        scaling_vector_size: cutlass.Constexpr,
+        max_active_clusters: cutlass.Constexpr,
+        stream: cuda.CUstream,
+    ):
+        """Wrapper function to create cute tensors from raw pointers and call the kernel.
+
+        This wrapper is designed for integration with TensorRT-LLM custom ops.
+        It creates the appropriate cute tensor layouts from raw pointers and dimensions.
+
+        :param a_ptr: Pointer to input activation tensor A (M, K, L)
+        :type a_ptr: cute.Pointer
+        :param b_ptr: Pointer to weight tensor B (N, K, L)
+        :type b_ptr: cute.Pointer
+        :param a_sf_ptr: Pointer to scale factor tensor for A
+        :type a_sf_ptr: cute.Pointer
+        :param b_sf_ptr: Pointer to scale factor tensor for B
+        :type b_sf_ptr: cute.Pointer
+        :param c_ptr: Pointer to output tensor C (M, N//2, L) - N//2 due to SwiGLU
+        :type c_ptr: cute.Pointer
+        :param c_sf_ptr: Pointer to scale factor tensor for C (can be null)
+        :type c_sf_ptr: cute.Pointer
+        :param alpha_ptr: Pointer to per-expert alpha scale tensor (expert_count, L)
+        :type alpha_ptr: cute.Pointer
+        :param norm_const_ptr: Pointer to normalization constant for SFC generation (can be null)
+        :type norm_const_ptr: cute.Pointer
+        :param m: M dimension (number of tokens/rows)
+        :type m: cutlass.Int64
+        :param n: N dimension (full weight width, before SwiGLU)
+        :type n: cutlass.Int64
+        :param k: K dimension (hidden size)
+        :type k: cutlass.Int64
+        :param l: L dimension (batch/expert dimension, typically 1 for dense)
+        :type l: cutlass.Int64
+        :param expert_count: Number of experts
+        :type expert_count: cutlass.Constexpr
+        :param scaling_vector_size: Vector size for block scaling (typically 16)
+        :type scaling_vector_size: cutlass.Constexpr
+        :param max_active_clusters: Maximum number of active clusters for persistent scheduling
+        :type max_active_clusters: cutlass.Constexpr
+        :param stream: CUDA stream for kernel execution
+        :type stream: cuda.CUstream
+        """
+        # Compute derived dimensions
+        scale_k = k // scaling_vector_size
+        n_out = n // 2  # Output N dimension after SwiGLU fusion
+        scale_n_out = n_out // scaling_vector_size
+
+        # Create A tensor: (M, K, L) row-major K
+        a = cute.make_tensor(a_ptr, layout=cute.make_ordered_layout((m, k, l), order=(1, 0, 2)))
+
+        # Create B tensor: (N, K, L) row-major K
+        b = cute.make_tensor(b_ptr, layout=cute.make_ordered_layout((n, k, l), order=(1, 0, 2)))
+
+        # Create C tensor: (M, N//2, L) row-major N
+        c = cute.make_tensor(c_ptr, layout=cute.make_ordered_layout((m, n_out, l), order=(1, 0, 2)))
+
+        # Create scale factor tensors with blockscaled MMA layout
+        # Layout: (32, 4, dim // 128, 4, scale_k // 4, L) with order (2, 1, 4, 0, 3, 5)
+        a_sf = cute.make_tensor(
+            a_sf_ptr,
+            layout=cute.make_ordered_layout(
+                (32, 4, m // 128, 4, scale_k // 4, l), order=(2, 1, 4, 0, 3, 5)
+            ),
+        )
+
+        b_sf = cute.make_tensor(
+            b_sf_ptr,
+            layout=cute.make_ordered_layout(
+                (32, 4, n // 128, 4, scale_k // 4, l), order=(2, 1, 4, 0, 3, 5)
+            ),
+        )
+
+        # Create C scale factor tensor (optional, for FP4 output quantization)
+        c_sf = None
+        if cutlass.const_expr(c_sf_ptr is not None):
+            c_sf = cute.make_tensor(
+                c_sf_ptr,
+                layout=cute.make_ordered_layout(
+                    (32, 4, m // 128, 4, scale_n_out // 4, l), order=(2, 1, 4, 0, 3, 5)
+                ),
+            )
+
+        # Create alpha scale tensor: (expert_count, L)
+        # Indexed by N dimension using weight_per_expert
+        alpha = cute.make_tensor(
+            alpha_ptr,
+            layout=cute.make_ordered_layout((expert_count, l), order=(1, 0)),
+        )
+
+        # Create norm_const tensor (optional, for FP4 output quantization)
+        norm_const = None
+        if cutlass.const_expr(norm_const_ptr is not None):
+            norm_const = cute.make_tensor(norm_const_ptr, layout=cute.make_layout((1,)))
+
+        return self(
+            a,
+            b,
+            a_sf,
+            b_sf,
+            alpha,
+            c,
+            c_sf,
+            norm_const,
+            max_active_clusters=max_active_clusters,
+            stream=stream,
+        )
 
 
 @cute.jit
