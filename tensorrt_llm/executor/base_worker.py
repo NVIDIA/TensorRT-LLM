@@ -442,8 +442,6 @@ class BaseWorker(GenerationExecutor):
                 == "context_and_generation"
             ), "kv_cache_transceiver is disabled, please set 'cache_transceiver_config: backend:<backend_type>` in config file for disaggregated serving"
             request_type = request.disaggregated_params.get_request_type()
-            if request.disaggregated_params.ctx_request_id is not None and request.disaggregated_params.ctx_request_id > 0:
-                client_id = request.disaggregated_params.ctx_request_id
             if request_type == tllm.RequestType.REQUEST_TYPE_GENERATION_ONLY:
                 context_phase_params = request.disaggregated_params.get_context_phase_params(
                 )
@@ -618,8 +616,7 @@ class BaseWorker(GenerationExecutor):
                 "To fix this, ensure that the llm.generate(...) method is "
                 "guarded with the `if __name__ == '__main__':` block.")
 
-        client_id = request.id if request.id is not None else self._get_next_client_id(
-        )
+        client_id = self._get_client_id(request)
         if request.id is None:
             request.set_id(client_id)
 

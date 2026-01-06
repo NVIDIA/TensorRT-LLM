@@ -870,7 +870,7 @@ void initRequestBindings(pybind11::module_& m)
             throw std::runtime_error("Invalid Request state!");
         }
         return std::make_unique<tle::Response>(
-            state[0].cast<SizeType32>(), state[1].cast<tle::Result>(), state[2].cast<SizeType32>());
+            state[0].cast<IdType>(), state[1].cast<tle::Result>(), state[2].cast<IdType>());
     };
 
     py::class_<tle::Response>(m, "Response")
