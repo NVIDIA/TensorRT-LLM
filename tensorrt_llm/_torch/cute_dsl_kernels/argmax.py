@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025, Tri Dao.
+# SPDX-FileCopyrightText: Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -12,29 +14,27 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+#
 # This file contains code derived from the Quack library:
 # https://github.com/Dao-AILab/quack
-# Copyright (c) 2024-2025 Dao-AILab
-# Licensed under the Apache License, Version 2.0
 #
 # Argmax kernel using CuTE DSL for TensorRT-LLM speculative decoding.
 
-from typing import Type, Tuple, Optional
+from typing import Optional, Tuple, Type
 
 import torch
 
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 
 if IS_CUTLASS_DSL_AVAILABLE:
+    import cuda.bindings.driver as cuda
     import cutlass
     import cutlass.cute as cute
-    from cutlass.cute.runtime import from_dlpack
     from cutlass._mlir.dialects import llvm
-    from cutlass.cute.typing import Float32, Int32, Int
-    from cutlass.cutlass_dsl import T, dsl_user_op
     from cutlass.cute.arch.nvvm_wrappers import FULL_MASK
-    import cuda.bindings.driver as cuda
+    from cutlass.cute.runtime import from_dlpack
+    from cutlass.cute.typing import Float32, Int, Int32
+    from cutlass.cutlass_dsl import T, dsl_user_op
 
     # ============================================================================
     # Torch to CuTE dtype mapping
@@ -119,7 +119,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
     def predicate_k(tAcA: cute.Tensor, limit: cutlass.Int32) -> cute.Tensor:
         tApA = cute.make_fragment(
             cute.make_layout(
-                (cute.size(tAcA, mode=[0, 1]), cute.size(tAcA, mode=[1]), cute.size(tAcA, mode=[2])),
+                (
+                    cute.size(tAcA, mode=[0, 1]),
+                    cute.size(tAcA, mode=[1]),
+                    cute.size(tAcA, mode=[2]),
+                ),
                 stride=(cute.size(tAcA, mode=[2]), 0, 1),
             ),
             cutlass.Boolean,
@@ -142,7 +146,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     cute.autovec_copy(tXrX_fill, tXsX[(None, rest_v), None, rest_k])
 
     @dsl_user_op
-    def domain_offset_i64(coord: cute.Coord, tensor: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
+    def domain_offset_i64(
+        coord: cute.Coord, tensor: cute.Tensor, *, loc=None, ip=None
+    ) -> cute.Tensor:
         flat_coord_i64 = tuple(cutlass.Int64(c) for c in cute.flatten(coord))
         flat_stride = cute.flatten_to_tuple(tensor.stride)
         offset = sum(c * s for c, s in zip(flat_coord_i64, flat_stride))
@@ -158,7 +164,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
     # Inline PTX for redux.sync operations
     # ============================================================================
     @dsl_user_op
-    def ptx_redux_sync_max_f32(value: Float32, mask: Int = FULL_MASK, *, loc=None, ip=None) -> Float32:
+    def ptx_redux_sync_max_f32(
+        value: Float32, mask: Int = FULL_MASK, *, loc=None, ip=None
+    ) -> Float32:
         return Float32(
             llvm.inline_asm(
                 T.f32(),
@@ -300,28 +308,36 @@ if IS_CUTLASS_DSL_AVAILABLE:
         def _calculate_threads_per_row(self):
             N = self.N
             return (
-                8 if N <= 64
-                else (16 if N <= 128
-                      else (32 if N <= 3072
-                            else (64 if N <= 6144
-                                  else (128 if N <= 16384 else 256))))
+                8
+                if N <= 64
+                else (
+                    16
+                    if N <= 128
+                    else (32 if N <= 3072 else (64 if N <= 6144 else (128 if N <= 16384 else 256)))
+                )
             )
 
         def _set_cluster_n(self):
             N = self.N
             if cutlass.const_expr(self.dtype.width == 16):
                 self.cluster_n = (
-                    1 if N <= 16 * 1024
-                    else (2 if N <= 32 * 1024
-                          else (4 if N <= 64 * 1024
-                                else (8 if N <= 128 * 1024 else 16)))
+                    1
+                    if N <= 16 * 1024
+                    else (
+                        2
+                        if N <= 32 * 1024
+                        else (4 if N <= 64 * 1024 else (8 if N <= 128 * 1024 else 16))
+                    )
                 )
             else:
                 self.cluster_n = (
-                    1 if N <= 32 * 1024
-                    else (2 if N <= 64 * 1024
-                          else (4 if N <= 128 * 1024
-                                else (8 if N <= 256 * 1024 else 16)))
+                    1
+                    if N <= 32 * 1024
+                    else (
+                        2
+                        if N <= 64 * 1024
+                        else (4 if N <= 128 * 1024 else (8 if N <= 256 * 1024 else 16))
+                    )
                 )
 
         def _get_reduction_buffer_layout(self, tv_layout: cute.Layout, cluster_n: int):
@@ -355,7 +371,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             )
 
         @cute.kernel
-        def kernel(self, mX: cute.Tensor, mO: cute.Tensor, tv_layout: cute.Layout, tiler_mn: cute.Shape):
+        def kernel(
+            self, mX: cute.Tensor, mO: cute.Tensor, tv_layout: cute.Layout, tiler_mn: cute.Shape
+        ):
             tidx, _, _ = cute.arch.thread_idx()
             bidx, bidy, bidz = cute.arch.block_idx()
 
@@ -395,7 +413,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self._initialize_cluster(tidx, mbar_ptr, num_warps)
 
             is_even_N = cutlass.const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
-            tXpX = predicate_k(thr_copy_X.partition_S(cX), limit=shape[1]) if not is_even_N else None
+            tXpX = (
+                predicate_k(thr_copy_X.partition_S(cX), limit=shape[1]) if not is_even_N else None
+            )
 
             if tXcX[0][0] < shape[0]:
                 cute.copy(copy_atom_load_X, tXgX, tXsX, pred=tXpX)
@@ -437,7 +457,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
                 if lane_idx < warps_per_row:
                     block_reduce_max = reduction_buffer[row_idx, lane_idx, 0, 0]
-                    block_reduce_argmax = reduction_buffer[row_idx, lane_idx, 0, 1].to(cutlass.Int32)
+                    block_reduce_argmax = reduction_buffer[row_idx, lane_idx, 0, 1].to(
+                        cutlass.Int32
+                    )
 
                 warp_max, warp_argmax = warp_argmax_redux(block_reduce_max, block_reduce_argmax)
             else:
@@ -458,13 +480,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 if lane_idx < cluster_n:
                     store_shared_remote(
                         warp_max,
-                        elem_pointer(reduction_buffer, (row_idx, (col_idx, cta_rank_in_cluster), 0, 0)),
+                        elem_pointer(
+                            reduction_buffer, (row_idx, (col_idx, cta_rank_in_cluster), 0, 0)
+                        ),
                         mbar_ptr,
                         peer_cta_rank_in_cluster=lane_idx,
                     )
                     store_shared_remote(
                         warp_argmax.to(cutlass.Float32),
-                        elem_pointer(reduction_buffer, (row_idx, (col_idx, cta_rank_in_cluster), 0, 1)),
+                        elem_pointer(
+                            reduction_buffer, (row_idx, (col_idx, cta_rank_in_cluster), 0, 1)
+                        ),
                         mbar_ptr,
                         peer_cta_rank_in_cluster=lane_idx,
                     )
@@ -551,4 +577,3 @@ else:
         """Fallback argmax using PyTorch when CUTLASS DSL is not available."""
         max_vals, max_indices = torch.max(x, dim=-1, keepdim=True)
         return torch.cat([max_vals, max_indices.to(x.dtype)], dim=-1)
-

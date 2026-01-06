@@ -8,13 +8,15 @@ from typing import TYPE_CHECKING, List, Optional, Type
 import torch
 from torch import nn
 
-from ..cute_dsl_kernels.argmax import argmax as cute_argmax
-
 from tensorrt_llm.logger import logger
 
 from ..._utils import get_sm_version
 from ..attention_backend.trtllm import AttentionBackend, TrtllmAttention
+<<<<<<< HEAD
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
+=======
+from ..cute_dsl_kernels.argmax import argmax as cute_argmax
+>>>>>>> fe9f4a405 (update copyright information)
 from ..pyexecutor.resource_manager import BaseResourceManager
 
 if TYPE_CHECKING:
