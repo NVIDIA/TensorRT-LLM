@@ -60,18 +60,14 @@ cvt_sf_MKL_to_M32x4xrm_K4xrk_L = kernel_module.cvt_sf_MKL_to_M32x4xrm_K4xrk_L
 cvt_sf_M32x4xrm_K4xrk_L_to_MKL = kernel_module.cvt_sf_M32x4xrm_K4xrk_L_to_MKL
 
 
-def create_mask(group_m_list, cta_tile_m, m_aligned=128, permuted_m=None):
+def create_mask(group_m_list, mma_tiler_m, permuted_m=None):
     """Create mask and group mapping for contiguous grouped GEMM.
 
-    :param group_m_list: List of M values for each group (will be aligned to m_aligned)
-    :param cta_tile_m: CTA tile size in M dimension (from mma_tiler_mn[0])
+    :param group_m_list: List of M values for each group (will be aligned to mma_tiler_m)
+    :param mma_tiler_m: MMA tile size in M dimension (from mma_tiler_mn[0]), also used for alignment
     :param permuted_m: Optional padded M dimension for cuda_graph support. If provided,
                      tile_idx_to_expert_idx will be padded to this size.
                      When tile_idx >= num_non_exiting_tiles, the kernel exits.
-
-    Note: m_aligned should be a multiple of the CTA tile M dimension to prevent
-          a single tile from spanning multiple groups, which would cause incorrect
-          B matrix access.
 
     Note: For cuda_graph support, set permuted_m to the pre-calculated padded size:
           permuted_m = m * topK + num_local_experts * (256 - 1)
@@ -80,8 +76,9 @@ def create_mask(group_m_list, cta_tile_m, m_aligned=128, permuted_m=None):
           valid data. The kernel will exit when tile_idx >= num_non_exiting_tiles.
 
     :return: Tuple of (valid_m, aligned_group_m_list, tile_idx_to_expert_idx, num_non_exiting_tiles)
-             - tile_idx_to_expert_idx: shape (permuted_m/cta_tile_m,) if permuted_m provided, else (valid_m/cta_tile_m,)
-             - num_non_exiting_tiles: scalar value = valid_m/cta_tile_m
+             - tile_idx_to_expert_idx: shape (permuted_m/mma_tiler_m,) if permuted_m provided,
+               else (valid_m/mma_tiler_m,)
+             - num_non_exiting_tiles: scalar value = valid_m/mma_tiler_m
     """
     valid_m = 0
     aligned_group_m_list = []
@@ -89,17 +86,17 @@ def create_mask(group_m_list, cta_tile_m, m_aligned=128, permuted_m=None):
     tile_idx_to_mn_limit = []
 
     for i, group_m in enumerate(group_m_list):
-        aligned_group_m = ((group_m + m_aligned - 1) // m_aligned) * m_aligned
+        aligned_group_m = ((group_m + mma_tiler_m - 1) // mma_tiler_m) * mma_tiler_m
         aligned_group_m_list.append(aligned_group_m)
 
-        # Calculate number of tiles for this group based on CTA tile M size
-        # Each tile covers cta_tile_m rows in M dimension
-        num_tiles_in_group = aligned_group_m // cta_tile_m
+        # Calculate number of tiles for this group based on MMA tile M size
+        # Each tile covers mma_tiler_m rows in M dimension
+        num_tiles_in_group = aligned_group_m // mma_tiler_m
         # Add expert_idx for each tile in this group
         tile_idx_to_expert_idx.extend([i] * num_tiles_in_group)
         for tile_idx_in_group in range(num_tiles_in_group):
             tile_idx_to_mn_limit.append(
-                valid_m + min(tile_idx_in_group * cta_tile_m + cta_tile_m, group_m)
+                valid_m + min(tile_idx_in_group * mma_tiler_m + mma_tiler_m, group_m)
             )
         valid_m += aligned_group_m
 
@@ -114,13 +111,14 @@ def create_mask(group_m_list, cta_tile_m, m_aligned=128, permuted_m=None):
                 f"Cannot pad to a smaller size."
             )
         if permuted_m > valid_m:
-            # Calculate how many padding tiles are needed based on CTA tile M size
-            num_padding_tiles = (permuted_m - valid_m) // cta_tile_m
+            # Calculate how many padding tiles are needed based on MMA tile M size
+            num_padding_tiles = (permuted_m - valid_m) // mma_tiler_m
             # Pad with 0 (these tiles won't be accessed due to num_non_exiting_tiles check)
             tile_idx_to_expert_idx.extend([int(-2e9)] * num_padding_tiles)
             tile_idx_to_mn_limit.extend([int(-2e9)] * num_padding_tiles)
 
-    # Final shape of tile_idx_to_expert_idx: (permuted_m/cta_tile_m,) if permuted_m provided, else (valid_m/cta_tile_m,)
+    # Final shape of tile_idx_to_expert_idx: (permuted_m/mma_tiler_m,) if permuted_m provided,
+    # else (valid_m/mma_tiler_m,)
     tile_idx_to_expert_idx = torch.tensor(tile_idx_to_expert_idx, device="cuda", dtype=torch.int32)
     num_non_exiting_tiles_tensor = torch.tensor(
         [num_non_exiting_tiles], device="cuda", dtype=torch.int32
@@ -293,11 +291,11 @@ def create_sf_layout_tensor(num_groups, mn, nk, sf_vec_size):
 # Shape: (valid_m,) or (permuted_m,) if padding is requested
 # Each element contains the token ID (input row index) for that output position
 # Invalid positions (padding) are marked with -1
-def create_token_id_mapping_tensor(group_m_list, aligned_m, max_token_id, permuted_m=None):
+def create_token_id_mapping_tensor(group_m_list, mma_tiler_m, max_token_id, permuted_m=None):
     """Create token_id_mapping tensor for gather operation with random distribution.
 
-    :param group_m_list: List of M values for each group (will be aligned to aligned_m)
-    :param aligned_m: Alignment requirement for each group
+    :param group_m_list: List of M values for each group (will be aligned to mma_tiler_m)
+    :param mma_tiler_m: MMA tile size in M dimension (from mma_tiler_mn[0]), also used for alignment
     :param max_token_id: Maximum token ID (typically the number of input tokens)
     :param permuted_m: Optional padded M dimension for cuda_graph support
 
@@ -306,7 +304,7 @@ def create_token_id_mapping_tensor(group_m_list, aligned_m, max_token_id, permut
     """
     valid_m = 0
     for group_m in group_m_list:
-        valid_m += ((group_m + aligned_m - 1) // aligned_m) * aligned_m
+        valid_m += ((group_m + mma_tiler_m - 1) // mma_tiler_m) * mma_tiler_m
 
     tensor_m = permuted_m if permuted_m is not None else valid_m
 
@@ -316,7 +314,7 @@ def create_token_id_mapping_tensor(group_m_list, aligned_m, max_token_id, permut
     accumulated_m = 0
     for group_m in group_m_list:
         start_idx = accumulated_m
-        rounded_group_m = ((group_m + aligned_m - 1) // aligned_m) * aligned_m
+        rounded_group_m = ((group_m + mma_tiler_m - 1) // mma_tiler_m) * mma_tiler_m
         # Generate random token IDs instead of contiguous ones
         # Random sampling with replacement to simulate real MoE routing
         random_token_ids = torch.randint(0, max_token_id, (group_m,), dtype=torch.int32)
@@ -343,8 +341,7 @@ def create_tensors(
     c_dtype,
     sf_dtype,
     sf_vec_size,
-    m_aligned,
-    cta_tile_m,
+    mma_tiler_m,
     permuted_m=None,
 ):
     """Create tensors for contiguous grouped GEMM with gather operation and SwiGLU fusion.
@@ -362,6 +359,7 @@ def create_tensors(
     - token_id_mapping: Maps output row position to input row position (for gather)
     - num_non_exiting_tiles: Number of valid tiles to process
 
+    :param mma_tiler_m: MMA tile size in M dimension (from mma_tiler_mn[0]), also used for alignment
     :param permuted_m: Optional padded M dimension for cuda_graph support. If provided,
                      A matrix, C matrix, token_id_mapping, and scale factor A will be padded to this size.
                      The kernel exits when tile_idx >= num_non_exiting_tiles.
@@ -378,8 +376,7 @@ def create_tensors(
             c_dtype=cutlass.BFloat16,
             sf_dtype=cutlass.Float8E4M3FN,
             sf_vec_size=16,
-            m_aligned=256,
-            cta_tile_m=128,  # CTA tile size in M dimension
+            mma_tiler_m=128,  # MMA tile size in M dimension, also used for alignment
             permuted_m=34808  # Enable padding for cuda_graph
         )
         # Returns tensors with A, C, SFA, and token_id_mapping padded to permuted_m size,
@@ -395,7 +392,7 @@ def create_tensors(
         _tile_idx_to_expert_idx,
         _num_non_exiting_tiles,
         _tile_idx_to_mn_limit,
-    ) = create_mask(group_m_list, cta_tile_m, m_aligned, permuted_m)
+    ) = create_mask(group_m_list, mma_tiler_m, permuted_m)
 
     max_m = max(group_m_list)
 
@@ -444,7 +441,7 @@ def create_tensors(
     )
 
     token_id_mapping_cpu, token_id_mapping, token_id_mapping_torch = create_token_id_mapping_tensor(
-        group_m_list, m_aligned, max_token_id=max_m, permuted_m=permuted_m
+        group_m_list, mma_tiler_m, max_token_id=max_m, permuted_m=permuted_m
     )
 
     tile_idx_to_expert_idx = from_dlpack(_tile_idx_to_expert_idx).mark_layout_dynamic()
@@ -523,7 +520,6 @@ def run(
     iterations: int = 1,
     skip_ref_check: bool = False,
     use_cold_l2: bool = False,
-    m_aligned: int = 128,
     permuted_m: int = None,
     use_cupti: bool = False,
     raster_along_m: bool = False,
@@ -549,6 +545,7 @@ def run(
 
     :param nkl: (N, K, L) dimensions where L is the number of experts/groups
     :param group_m_list: List of M values for each group
+    :param mma_tiler_mn: MMA tile shape (M, N), where mma_tiler_mn[0] is used for group M alignment
     :param permuted_m: Optional padded M dimension for CUDA graph support. If provided,
                      A/C matrices, token_id_mapping, and scale factor A will be padded to this size.
     """
@@ -559,7 +556,6 @@ def run(
         f"AB dtype: {ab_dtype}, C dtype: {c_dtype}, Acc dtype: {acc_dtype}, "
         f"Scale factor dtype: {sf_dtype}, SF Vec size: {sf_vec_size}"
     )
-    print(f"Group M alignment: {m_aligned}")
     if permuted_m is not None:
         print(f"Padded M (CUDA graph support): {permuted_m}")
     print(f"Matrix majors - A: {a_major}, B: {b_major}, C: {c_major}")
@@ -588,7 +584,6 @@ def run(
         c_dtype,
         mma_tiler_mn,
         cluster_shape_mn,
-        m_aligned,
         n,
         k,
         num_groups,
@@ -599,7 +594,7 @@ def run(
         raise TypeError(
             f"Unsupported testcase {ab_dtype}, {sf_dtype}, {sf_vec_size}, {acc_dtype}, "
             f"{c_dtype}, {mma_tiler_mn}, {cluster_shape_mn}, {n}, {k}, {num_groups}, "
-            f"{a_major}, {b_major}, {c_major}, {m_aligned}"
+            f"{a_major}, {b_major}, {c_major}"
         )
 
     (
@@ -645,8 +640,7 @@ def run(
         c_dtype,
         sf_dtype,
         sf_vec_size,
-        m_aligned,
-        mma_tiler_mn[0],  # cta_tile_m
+        mma_tiler_mn[0],  # mma_tiler_m, also used for alignment
         permuted_m,
     )
     # Configure gemm kernel
@@ -1021,8 +1015,7 @@ def run(
             c_dtype,
             sf_dtype,
             sf_vec_size,
-            m_aligned,
-            mma_tiler_mn[0],  # cta_tile_m
+            mma_tiler_mn[0],  # mma_tiler_m, also used for alignment
             permuted_m,
         )
         return cute.testing.JitArguments(
@@ -1173,13 +1166,6 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--m_aligned",
-        type=int,
-        default=128,
-        help="Alignment requirement for group M dimension",
-    )
-
-    parser.add_argument(
         "--permuted_m",
         type=int,
         default=None,
@@ -1276,7 +1262,6 @@ if __name__ == "__main__":
         args.iterations,
         args.skip_ref_check,
         args.use_cold_l2,
-        args.m_aligned,
         args.permuted_m,
         args.use_cupti,
         args.raster_along_m,
