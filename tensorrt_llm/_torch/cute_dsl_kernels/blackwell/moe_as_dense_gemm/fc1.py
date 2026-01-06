@@ -44,8 +44,6 @@ from cutlass.cute.runtime import from_dlpack
 
 from tensorrt_llm._torch.cute_dsl_kernels.blackwell.utils import fmin, silu_f32
 
-num_fused_gemm: int = 2
-
 """
 This example provides an experimental implementation of the SM100 batched dense blockscaled
 GEMM kernel, please note that the APIs and implementation details related to this kernel
@@ -207,7 +205,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         :type mma_tiler_mn: Tuple[int, int]
         :param cluster_shape_mn: Tuple (ClusterM, ClusterN) shape of the cluster.
         :type cluster_shape_mn: Tuple[int, int]
-        :param weight_per_expert: Number of experts per tile.
+        :param weight_per_expert: Number of weights per expert (computed as N // num_experts).
         :type weight_per_expert: int
         :param use_prefetch: Enable prefetch operations (default: False).
         :type use_prefetch: bool
@@ -255,7 +253,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         self.num_tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
         self.weight_per_expert = weight_per_expert
-        self.num_fused_gemm = num_fused_gemm
 
         self.use_prefetch = use_prefetch
         self.prefetch_dist = prefetch_dist
@@ -2344,17 +2341,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         ):
             can_implement = False
 
-        # Alpha scale is indexed by N dimension, weight_per_expert should divide cta_tile_shape_n
+        # n must equal expert_count * weight_per_expert
+        if n != expert_count * weight_per_expert:
+            can_implement = False
+
+        # weight_per_expert should divide cta_tile_shape_n
         cta_tile_shape_n = 128
-
         if weight_per_expert % cta_tile_shape_n != 0:
-            can_implement = False
-
-        # expert_count * num_fused_gemm experts in N dimension
-        # n = expert_count * num_fused_gemm * weight_per_expert
-        if n % expert_count != 0:
-            can_implement = False
-        if n // expert_count // num_fused_gemm != weight_per_expert:
             can_implement = False
 
         return can_implement
@@ -2434,7 +2427,6 @@ def create_sf_layout_tensor(l, mn, k, sf_vec_size):  # noqa: E741
 def run(
     mnkl: Tuple[int, int, int, int],
     expert_count: int,
-    weight_per_expert: int,
     ab_dtype: Type[cutlass.Numeric],
     sf_dtype: Type[cutlass.Numeric],
     sf_vec_size: int,
@@ -2491,6 +2483,12 @@ def run(
     :return: Execution time of the GEMM kernel
     :rtype: float
     """
+    # Unpack parameters
+    m, n, k, l = mnkl  # noqa: E741
+
+    # Compute weight_per_expert from n and expert_count
+    weight_per_expert = n // expert_count
+
     print("Running Sm100 Persistent Dense BlockScaled GEMM with SwiGLU fusion test with:")
     print(f"mnkl: {mnkl}")
     print(f"AB dtype: {ab_dtype}, SF dtype: {sf_dtype}, SF Vec size: {sf_vec_size}")
@@ -2498,7 +2496,7 @@ def run(
     print(f"Matrix majors - A: {a_major}, B: {b_major}, C: {c_major}")
     print(f"Mma Tiler (M, N): {mma_tiler_mn}, Cluster Shape (M, N): {cluster_shape_mn}")
     print(f"Expert count: {expert_count}")
-    print(f"Weight per expert: {weight_per_expert}")
+    print(f"Weight per expert (n // expert_count): {weight_per_expert}")
     print(f"Use prefetch: {'True' if use_prefetch else 'False'}")
     print(f"Prefetch dist: {prefetch_dist}")
     print(f"Vectorized f32: {'True' if vectorized_f32 else 'False'}")
@@ -2507,9 +2505,6 @@ def run(
     print(f"Iterations: {iterations}")
     print(f"Skip reference checking: {skip_ref_check}")
     print(f"Use cold L2: {'True' if use_cold_l2 else 'False'}")
-
-    # Unpack parameters
-    m, n, k, l = mnkl  # noqa: E741
 
     # Skip unsupported testcase
     if not Sm100BlockScaledPersistentDenseGemmKernel.can_implement(
@@ -2659,9 +2654,8 @@ def run(
 
     # Create scale factor tensor alpha_scale_tensor
     # Alpha scale is indexed by N dimension (not M) since we don't swap A/B
-    def create_alpha_scale_tensor(l, expert_count):  # noqa: E741
-        # 2 Gemm are fused into 1
-        ref_shape = (l, expert_count * num_fused_gemm)
+    def create_alpha_scale_tensor(l, expert_count, weight_per_expert):  # noqa: E741
+        ref_shape = (l, expert_count)
         ref_permute_order = (1, 0)
 
         # Create f32 ref torch tensor (cpu)
@@ -2681,21 +2675,20 @@ def run(
         )
 
         # Create cute alpha_scale_tensor
-        # assume 4B * num_fused_gemm aligned
         cute_alpha_scale_tensor, cute_alpha_scale_torch_tensor = cutlass_torch.cute_tensor_like(
             ref_f32_torch_tensor_cpu,
             cutlass.Float32,
             is_dynamic_layout=True,
-            assumed_align=4 * num_fused_gemm,
+            assumed_align=4,
         )
 
         # Expand to (n, l) for einsum "mnl,nl->mnl" (alpha indexed by N dimension)
-        # n = expert_count * num_fused_gemm * weight_per_expert
+        # n = expert_count * weight_per_expert
         ref_f32_torch_tensor_cpu = (
             ref_f32_torch_tensor_cpu.permute(1, 0)
             .unsqueeze(-1)
-            .expand(l, expert_count * num_fused_gemm, weight_per_expert)
-            .reshape(l, expert_count * num_fused_gemm * weight_per_expert)
+            .expand(l, expert_count, weight_per_expert)
+            .reshape(l, expert_count * weight_per_expert)
             .permute(*ref_permute_order)
         )
 
@@ -2706,7 +2699,7 @@ def run(
         )
 
     alpha_scale_ref, alpha_scale_tensor, alpha_scale_torch = create_alpha_scale_tensor(
-        l, expert_count
+        l, expert_count, weight_per_expert
     )
 
     # Create SFC tensor and norm_const tensor for FP4 quantized output
@@ -3071,7 +3064,7 @@ def run(
 
         _, sfa_tensor, _ = create_scale_factor_tensor(l, m, k, sf_vec_size, sf_dtype)
         _, sfb_tensor, _ = create_scale_factor_tensor(l, n, k, sf_vec_size, sf_dtype)
-        _, alpha_scale_tensor, _ = create_alpha_scale_tensor(l, expert_count)
+        _, alpha_scale_tensor, _ = create_alpha_scale_tensor(l, expert_count, weight_per_expert)
 
         # Create SFC tensor and norm_const tensor for FP4 quantized output
         gen_sfc_tensor = None
@@ -3153,12 +3146,6 @@ if __name__ == "__main__":
         help="expert count",
     )
     parser.add_argument(
-        "--weight_per_expert",
-        type=int,
-        default=256,  # should be 256 for DeepSeek model with TP8, and 1536 for DeepSeek lite model with TP1
-        help="weight per expert",
-    )
-    parser.add_argument(
         "--use_prefetch",
         action="store_true",
         default=False,
@@ -3225,7 +3212,6 @@ if __name__ == "__main__":
     run(
         args.mnkl,
         args.expert_count,
-        args.weight_per_expert,
         args.ab_dtype,
         args.sf_dtype,
         args.sf_vec_size,
