@@ -41,9 +41,9 @@ EpiTag = {
 
 EpiFusion = {
     TrtLlm_EpilogueFusion.epilogue_fusion_none:
-    "tensorrt_llm::TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE",
+    "tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE",
     TrtLlm_EpilogueFusion.epilogue_fusion_finalize:
-    "tensorrt_llm::TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE",
+    "tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE",
 }
 
 EpiFusionSuffixes = {
@@ -229,9 +229,11 @@ const {act_tag}*, const {weight_tag}*, const {scale_zero_tag}*, const {scale_zer
                 or operation.weight_type != e2m1):
             # Mixed MoE GEMM
             weight_tag = CudaTypeName[operation.weight_type]
+            assert operation.epi_fusion is not None
+            epi_fusion = EpiFusion[operation.epi_fusion]
             instantiation = f"""
 template void sm90_generic_mixed_moe_gemm_kernelLauncher<{act_tag}, {weight_tag}, {out_tag},
-{epi_tag}, {cute_cta_shape}, {cute_cga_shape}, {kernel_sched}, {epi_sched}, {quant_op}> (
+{epi_tag}, {epi_fusion}, {cute_cta_shape}, {cute_cga_shape}, {kernel_sched}, {epi_sched}, {quant_op}> (
 GroupedGemmInput<{act_tag}, {weight_tag}, {out_tag}, {out_tag}>inputs, TmaWarpSpecializedGroupedGemmInput hopper_inputs, int sm_count_, size_t* workspace_size);
 """
         else:
@@ -590,6 +592,11 @@ def generate_sm90_mixed_type_grouped_gemm_operations(is_arch_enabled):
 
     epi_tags = [TrtLlm_EpilogueTag.epilogue_op_default]
 
+    epi_fusions = [
+        TrtLlm_EpilogueFusion.epilogue_fusion_none,
+        TrtLlm_EpilogueFusion.epilogue_fusion_finalize
+    ]
+
     M_TILES = [64, 128]  # Currently M tile must be 128 for Grouped GEMM
     N_TILES = [16, 32, 64, 128]
     K_TILES = [128, 256, 512]
@@ -607,13 +614,13 @@ def generate_sm90_mixed_type_grouped_gemm_operations(is_arch_enabled):
     cga_shapes = list(product([1, 2], [1, 2], [1]))
 
     partial_args_int4 = product(supported_dtypes_int4, quant_ops, epi_tags,
-                                cta_shapes_mnk_int4, cga_shapes)
+                                epi_fusions, cta_shapes_mnk_int4, cga_shapes)
     partial_args_fp4 = product(supported_dtypes_fp4, quant_ops, epi_tags,
-                               cta_shapes_mnk_fp4, cga_shapes)
+                               epi_fusions, cta_shapes_mnk_fp4, cga_shapes)
     partial_args = chain(partial_args_int4, partial_args_fp4)
 
     operations = list()
-    for dtype_combo, quant_op, epi_tag, cta_shape_mnk, cga_shape in partial_args:
+    for dtype_combo, quant_op, epi_tag, epi_fusion, cta_shape_mnk, cga_shape in partial_args:
         use_coop = cta_shape_mnk[0] >= 128
         mainloop_schedules = [
             KernelScheduleType.TmaWarpSpecializedCooperative,
@@ -626,7 +633,7 @@ def generate_sm90_mixed_type_grouped_gemm_operations(is_arch_enabled):
                     == KernelScheduleType.TmaWarpSpecializedCooperative):
                 continue
             moe_gemm_operation = TrtLlm_GemmLauncher(GemmKind.Grouped, arch, *dtype_combo, quant_op, epi_tag, cta_shape_mnk, \
-                                                    warp_shape, stages, cga_shape, mainloop_schedule, epi_schedule)
+                                                    warp_shape, stages, cga_shape, mainloop_schedule, epi_schedule, epi_fusion)
             operations.append(moe_gemm_operation)
     return operations
 
