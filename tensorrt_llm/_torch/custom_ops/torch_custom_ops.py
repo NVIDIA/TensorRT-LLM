@@ -151,7 +151,7 @@ class MoERunner(TunableRunner):
         )
 
 
-@torch.library.custom_op("trtllm::fused_moe", mutates_args=("out_tensor", ))
+@torch.library.custom_op("trtllm::fused_moe", mutates_args=())
 def fused_moe(
     input: torch.Tensor,
     token_selected_experts: torch.Tensor,
