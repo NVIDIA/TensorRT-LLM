@@ -12,6 +12,7 @@ By NVIDIA TensorRT LLM team
         - [MTP](#mtp)
         - [Disaggregated Serving](#disaggregated-serving)
         - [Chunked Prefill and KV Cache Reuse](#chunked-prefill-and-kv-cache-reuse)
+        - [Wide Expert Parallelism (Wide-EP)](#wide-expert-parallelism-wide-ep)
     - [Key Optimizations](#key-optimizations)
         - [Kernel Optimizations](#kernel-optimizations)
             - [Sparse MLA Kernel](#sparse-mla-kernel)
@@ -26,6 +27,7 @@ By NVIDIA TensorRT LLM team
         - [Benchmark on B200](#benchmark-on-b200)
             - [Min-latency](#min-latency)
             - [Max-throughput](#max-throughput)
+        - [Benchmark with Wide-EP on GB200](#benchmark-with-wide-ep-on-gb200)
     - [Future Works](#future-works)
     - [Acknowledgement](#acknowledgement)
 
