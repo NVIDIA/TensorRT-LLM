@@ -16,15 +16,20 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include <assert.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-namespace tensorrt_llm::kernels::dsv3MinLatencyKernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::dsv3MinLatencyKernels
 {
 
 template <typename T, int kNumTokens, int kNumExperts, int kHiddenDim>
 void invokeRouterGemm(float* output, T const* mat_a, T const* mat_b, cudaStream_t stream);
 
-} // namespace tensorrt_llm::kernels::dsv3MinLatencyKernels
+} // namespace kernels::dsv3MinLatencyKernels
+
+TRTLLM_NAMESPACE_END

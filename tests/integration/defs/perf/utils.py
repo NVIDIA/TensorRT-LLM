@@ -19,18 +19,16 @@ import io
 import os
 import re
 import subprocess
-import time
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional
 
-import requests
-import yaml
 from _pytest.nodes import Item
 from _pytest.python import Function
 from defs.trt_test_alternative import (check_output, popen, print_error,
                                        print_info)
+from test_common.http_utils import wait_for_endpoint_ready
 
 from ..common import get_trt_llm_lib_dir, venv_mpi_check_output
 from ..local_venv import PythonVenvRunnerImpl
@@ -127,6 +125,10 @@ def temp_wd(path):
         yield
     finally:
         os.chdir(prev_cwd)
+
+
+def add_host_port_to_cmd(cmd: List[str], host: str, port: int) -> List[str]:
+    return cmd + ["--host", host, "--port", str(port)]
 
 
 class PerfBenchScriptTestCmds(NamedTuple):
@@ -236,101 +238,12 @@ class PerfBenchScriptTestCmds(NamedTuple):
         return cmd_str
 
 
-class PerfAggrScriptTestCmds(NamedTuple):
-    server_cmds: List[List[str]]
-    server_envs: List[Dict[str, str]]
-    client_cmds: List[List[str]]
-    client_envs: List[Dict[str, str]]
-    names: List[str]
-    timeout: int
-    output_dir: str
-
-    def wait_for_endpoint_ready(self, url: str, timeout: int = 7200):
-        start = time.monotonic()
-        while True:
-            elapsed_time = time.monotonic() - start
-            if elapsed_time > timeout:
-                print_error(
-                    f"Timeout waiting for endpoint {url} to be ready after {timeout} seconds"
-                )
-                break
-            try:
-                print_info(
-                    f"Waiting for endpoint {url} to be ready, elapsed time: {elapsed_time}s"
-                )
-                time.sleep(1)
-                if requests.get(url).status_code == 200:
-                    print_info(f"endpoint {url} is ready")
-                    return
-            except Exception as err:
-                print_info(
-                    f"endpoint {url} is not ready, with exception: {err}")
-        print_error(
-            f"Endpoint {url} did not become ready within {timeout} seconds")
-
-    def run_cmd(self, cmd_idx: int, venv) -> str:
-        output = ""
-        server_proc = None
-        server_file_path = os.path.join(
-            self.output_dir, f"trtllm-serve.{self.names[cmd_idx]}.log")
-        client_file_path = os.path.join(
-            self.output_dir, f"trtllm-benchmark.{self.names[cmd_idx]}.log")
-        try:
-            server_envs = copy.deepcopy(os.environ)
-            # server_envs.update(self.server_envs[cmd_idx])
-            print_info(
-                f"Starting server. cmd is {self.server_cmds[cmd_idx]} envs are {server_envs}"
-            )
-            with open(server_file_path, 'w') as server_ctx:
-                server_proc = subprocess.Popen(
-                    self.server_cmds[cmd_idx],
-                    stdout=server_ctx,
-                    stderr=subprocess.STDOUT,
-                    env=server_envs,
-                )
-            self.wait_for_endpoint_ready("http://localhost:8000/health",
-                                         timeout=self.timeout)
-            client_envs = copy.deepcopy(os.environ)
-            # client_envs.update(self.client_envs[cmd_idx])
-            print_info(
-                f"Starting client. cmd is {self.client_cmds[cmd_idx]} envs are {client_envs}"
-            )
-            output = subprocess.check_output(
-                self.client_cmds[cmd_idx],
-                env=client_envs,
-                stderr=subprocess.STDOUT,
-            ).decode()
-
-            with open(client_file_path, 'w') as client_ctx:
-                client_ctx.write(output)
-        finally:
-            server_proc.terminate()
-            server_proc.wait()
-        return output
-
-    def get_cmd_str(self, cmd_idx) -> List[str]:
-        return ["aggr_server tests, please check config files"]
-
-
 class PerfDisaggScriptTestCmds(NamedTuple):
     ctx_cmd: str
     gen_cmd: str
     server_cmd: str
     client_cmd: List[str]
     benchmark_cmd: List[str]
-
-    def wait_for_endpoint_ready(self, url: str, timeout: int = 600):
-        start = time.monotonic()
-        while time.monotonic() - start < timeout:
-            try:
-                time.sleep(1)
-                if requests.get(url).status_code == 200:
-                    print(f"endpoint {url} is ready")
-                    return
-            except Exception as err:
-                print(f"endpoint {url} is not ready, with exception: {err}")
-        print_error(
-            f"Endpoint {url} did not become ready within {timeout} seconds")
 
     def run_cmd(self, cmd_idx: int, venv) -> str:
         output = ""
@@ -356,7 +269,7 @@ class PerfDisaggScriptTestCmds(NamedTuple):
                           stderr=subprocess.STDOUT,
                           env=venv._new_env,
                           shell=True) as server_proc):
-                self.wait_for_endpoint_ready(
+                wait_for_endpoint_ready(
                     f"http://localhost:8000/health",
                     timeout=1800)  # 30 minutes for large models
                 check_output(self.client_cmd, env=venv._new_env)
@@ -372,259 +285,6 @@ class PerfDisaggScriptTestCmds(NamedTuple):
 
     def get_cmd_str(self, cmd_idx) -> List[str]:
         return ["disaggregated server tests, please check config files"]
-
-
-class PerfMultiNodeDisaggScriptTestCmds(NamedTuple):
-    ctx_server_cmds: List[List[str]]
-    ctx_server_envs: List[Dict[str, str]]
-    gen_server_cmds: List[List[str]]
-    gen_server_envs: List[Dict[str, str]]
-    disagg_server_cmds: List[List[str]]
-    disagg_server_envs: List[Dict[str, str]]
-    benchmark_cmds: List[List[str]]
-    benchmark_envs: List[Dict[str, str]]
-    timeout: int
-    hostname: str
-    disagg_serving_type: str
-    num_ctx_servers: int
-    num_gen_servers: int
-    output_dir: str
-
-    def _generate_disagg_server_config(self,
-                                       cmd_idx: int,
-                                       ctx_gen_port: int = 8336,
-                                       disagg_server_port: int = 8333) -> str:
-        print_info(
-            f"Generating disagg server config for command index {cmd_idx}")
-        # Wait for all hostname files to be created
-        hostnames_folder = os.path.join(self.output_dir, "hostnames")
-        print_info(f"Waiting for hostnames folder: {hostnames_folder}")
-
-        expected_count = self.num_ctx_servers + self.num_gen_servers
-        start_time = time.time()
-        hostnames = []
-        while True:
-            elapsed_time = time.time() - start_time
-            print_info(
-                f"Waiting for hostnames in {hostnames_folder}, elapsed time: {elapsed_time}s, current: {len(hostnames)}, expected: {expected_count}"
-            )
-            if elapsed_time > self.timeout:
-                print_error(
-                    f"Time out. Hostnames files are not ready after {self.timeout}s"
-                )
-            time.sleep(10)
-            if not os.path.exists(hostnames_folder):
-                continue
-            hostnames = os.listdir(hostnames_folder)
-            if len(hostnames) >= expected_count:
-                break
-        print_info(
-            f"All hostnames found in {hostnames_folder} after elapsed time: {elapsed_time}s"
-        )
-
-        # Read ctx and gen hostnames
-        ctx_hostnames = []
-        gen_hostnames = []
-        for hostname_file in hostnames:
-            hostname_file_path = os.path.join(hostnames_folder, hostname_file)
-            with open(hostname_file_path, 'r') as f:
-                actual_hostname = f.read().strip()
-                print_info(f"Hostname: {actual_hostname} in {hostname_file}")
-            if hostname_file.startswith("CTX"):
-                ctx_hostnames.append(actual_hostname)
-            elif hostname_file.startswith("GEN"):
-                gen_hostnames.append(actual_hostname)
-        print_info(f"ctx_hostnames: {ctx_hostnames}")
-        print_info(f"gen_hostnames: {gen_hostnames}")
-
-        # Generate server config
-        server_config = {
-            'hostname': self.hostname,
-            'port': disagg_server_port,
-            'backend': 'pytorch',
-            'context_servers': {
-                'num_instances': self.num_ctx_servers,
-                'urls': [f'{host}:{ctx_gen_port}' for host in ctx_hostnames]
-            },
-            'generation_servers': {
-                'num_instances': self.num_gen_servers,
-                'urls': [f'{host}:{ctx_gen_port}' for host in gen_hostnames]
-            }
-        }
-
-        config_path = os.path.join(self.output_dir, "server_config.yaml")
-        with open(config_path, 'w') as f:
-            yaml.dump(server_config, f)
-        print_info(f"Server config file {config_path} generated")
-
-        return config_path
-
-    def _get_disagg_server_hostname_and_port(self) -> tuple:
-        config_path = os.path.join(self.output_dir, "server_config.yaml")
-        print_info(f"Waiting for server config file: {config_path}")
-        start_time = time.time()
-        while True:
-            if os.path.exists(config_path):
-                print_info(f"Server config file found: {config_path}")
-                break
-            elapsed_time = time.time() - start_time
-            if elapsed_time > self.timeout:
-                print_error(
-                    f"Server config file {config_path} not found after {self.timeout}s"
-                )
-            print_info(
-                f"Waiting for server config file, elapsed time: {elapsed_time}s"
-            )
-            time.sleep(10)  # Check every 10 seconds
-
-        # Read server config to get hostname and port
-        with open(config_path, 'r') as f:
-            server_config = yaml.safe_load(f)
-        disagg_server_hostname = server_config['hostname']
-        disagg_server_port = str(server_config['port'])
-        return disagg_server_hostname, disagg_server_port
-
-    def wait_for_benchmark_ready(self,
-                                 benchmark_status_file: str,
-                                 timeout: int = 7200):
-        print_info(
-            f"Server {self.disagg_serving_type} waiting for benchmark status file: {benchmark_status_file}"
-        )
-        start_time = time.time()
-        while True:
-            if os.path.exists(benchmark_status_file):
-                print_info(
-                    f"Benchmark status file found, terminating server {self.disagg_serving_type}"
-                )
-                break
-            elapsed_time = time.time() - start_time
-            print_info(
-                f"Waiting for benchmark status file, elapsed time: {elapsed_time}s"
-            )
-            if elapsed_time > timeout:
-                print_error(
-                    f"Timeout waiting for benchmark status file after {timeout}s, terminating server {self.disagg_serving_type}"
-                )
-                break
-            time.sleep(10)  # Check every 10 seconds
-
-    def wait_for_endpoint_ready(self, url: str, timeout: int = 7200):
-        start = time.monotonic()
-        while True:
-            elapsed_time = time.monotonic() - start
-            if elapsed_time > timeout:
-                print_error(
-                    f"Timeout waiting for endpoint {url} to be ready after {timeout} seconds"
-                )
-                break
-            print_info(
-                f"Waiting for endpoint {url} to be ready, elapsed time: {elapsed_time}s"
-            )
-            try:
-                time.sleep(10)
-                if requests.get(url).status_code == 200:
-                    print_info(f"endpoint {url} is ready")
-                    return
-            except Exception as err:
-                print_info(
-                    f"endpoint {url} is not ready, with exception: {err}")
-        print_error(
-            f"Endpoint {url} did not become ready within {timeout} seconds")
-
-    def run_cmd(self, cmd_idx: int, venv) -> str:
-        output = ""
-        server_proc = None
-        benchmark_status_file = os.path.join(self.output_dir,
-                                             f"benchmark_status.{cmd_idx}.txt")
-        if "CTX" in self.disagg_serving_type or "GEN" in self.disagg_serving_type:
-            server_file_path = os.path.join(
-                self.output_dir,
-                f"trtllm-serve.{cmd_idx}.{self.disagg_serving_type}.log")
-            is_ctx = "CTX" in self.disagg_serving_type
-            server_cmd = self.ctx_server_cmds[
-                cmd_idx] if is_ctx else self.gen_server_cmds[cmd_idx]
-            server_envs = copy.deepcopy(os.environ)
-            # server_envs.update(self.ctx_server_envs[cmd_idx]
-            #                    if is_ctx else self.gen_server_envs[cmd_idx])
-            try:
-                print_info(
-                    f"Starting server. disagg_serving_type: {self.disagg_serving_type} cmd is {server_cmd} envs are {server_envs}"
-                )
-                with open(server_file_path, 'w') as server_ctx:
-                    server_proc = subprocess.Popen(
-                        server_cmd,
-                        stdout=server_ctx,
-                        stderr=subprocess.STDOUT,
-                        env=server_envs,
-                    )
-                self.wait_for_benchmark_ready(benchmark_status_file,
-                                              timeout=self.timeout)
-            finally:
-                print_info(f"Server {self.disagg_serving_type} stopped")
-                server_proc.terminate()
-                server_proc.wait()
-        elif self.disagg_serving_type == "DISAGG_SERVER":
-            disagg_server_file_path = os.path.join(
-                self.output_dir,
-                f"trtllm-serve.{cmd_idx}.{self.disagg_serving_type}.log")
-            disagg_server_cmd = self.disagg_server_cmds[cmd_idx]
-            disagg_server_envs = copy.deepcopy(os.environ)
-            # disagg_server_envs.update(self.disagg_server_envs[cmd_idx])
-            try:
-                # Generate disagg server config (this will wait for all hostnames)
-                self._generate_disagg_server_config(cmd_idx)
-                print_info(
-                    f"Starting disagg server. disagg_serving_type: {self.disagg_serving_type} disagg server cmd is {disagg_server_cmd} envs are {disagg_server_envs}"
-                )
-                with open(disagg_server_file_path, 'w') as disagg_server_ctx:
-                    disagg_server_proc = subprocess.Popen(
-                        disagg_server_cmd,
-                        stdout=disagg_server_ctx,
-                        stderr=subprocess.STDOUT,
-                        env=disagg_server_envs,
-                    )
-                self.wait_for_benchmark_ready(benchmark_status_file,
-                                              timeout=self.timeout)
-            finally:
-                print_info(f"Disagg server {self.disagg_serving_type} stopped")
-                disagg_server_proc.terminate()
-                disagg_server_proc.wait()
-        elif self.disagg_serving_type == "BENCHMARK":
-            benchmark_file_path = os.path.join(
-                self.output_dir, f"trtllm-benchmark.{cmd_idx}.log")
-            try:
-                # Get disagg server's hostname and port
-                disagg_server_hostname, disagg_server_port = self._get_disagg_server_hostname_and_port(
-                )
-                # Add hostname and port to benchmark command
-                benchmark_cmd = self.benchmark_cmds[cmd_idx] + [
-                    '--host', disagg_server_hostname, '--port',
-                    disagg_server_port
-                ]
-                benchmark_envs = copy.deepcopy(os.environ)
-                # benchmark_envs.update(self.benchmark_envs[cmd_idx])
-                self.wait_for_endpoint_ready(
-                    f"http://{disagg_server_hostname}:{disagg_server_port}/health",
-                    timeout=self.timeout,
-                )
-                # Run benchmark
-                print_info(
-                    f"Starting benchmark. disagg_serving_type: {self.disagg_serving_type} benchmark cmd is {benchmark_cmd} envs are {benchmark_envs}"
-                )
-                output = subprocess.check_output(
-                    benchmark_cmd, env=benchmark_envs,
-                    stderr=subprocess.STDOUT).decode()
-                with open(benchmark_file_path, 'w') as benchmark_ctx:
-                    benchmark_ctx.write(output)
-            finally:
-                with open(benchmark_status_file, 'w') as status_file:
-                    status_file.write("Done")
-        return output
-
-    def get_cmd_str(self, cmd_idx) -> List[str]:
-        return [
-            "multi-node disaggregated server tests, please check config files"
-        ]
 
 
 class AbstractPerfScriptTestClass(abc.ABC):
@@ -702,23 +362,49 @@ class AbstractPerfScriptTestClass(abc.ABC):
         """
         return self._error
 
+    def _check_benchmark_output_for_errors(self, output: str) -> None:
+        """
+        Check whether the benchmark output contains error messages (e.g., failed requests).
+        """
+        if not output:
+            return
+
+        # Check for non-zero failed requests
+        failed_requests_match = re.search(r'Failed requests:\s+(\d+)', output)
+        if failed_requests_match:
+            failed_count = int(failed_requests_match.group(1))
+            if failed_count > 0:
+                self._result_state = "failed"
+                self._error = Exception(
+                    f"Benchmark has {failed_count} failed requests")
+                print_error(
+                    f"Benchmark output contains {failed_count} failed requests. Marking test as failed."
+                )
+                return
+
+        # Check for explicit failure markers
+        if "!FAILED REQUESTS!" in output or "!CHECK LOG FOR ERRORS!" in output:
+            self._result_state = "failed"
+            self._error = Exception("Benchmark output contains failure markers")
+            print_error(
+                "Benchmark output contains failure markers. Marking test as failed."
+            )
+
     def run_ex(self,
+               commands,
                full_test_name: str,
                metric_type: PerfMetricType,
                venv: Optional[PythonVenvRunnerImpl],
                gpu_clock_lock: GPUClockLock,
                session_data_writer: SessionDataWriter,
                output_dir: str,
+               cmd_idx: int = 0,
                outputs: Dict[int, str] = {},
                original_test_name: str = None,
-               cmd_idx: int = 0,
                **kwargs) -> List[str]:
         """
         Run the commands and write the results to the output csv and/or yaml files.
         """
-
-        # Get the commands.
-        commands = self.get_commands()
 
         # Avoid modifying argument directly
         outputs = outputs.copy()
@@ -732,15 +418,6 @@ class AbstractPerfScriptTestClass(abc.ABC):
 
         cmd_str = commands.get_cmd_str(cmd_idx)
         is_prepare_dataset_cmd = 'prepare_dataset' in cmd_str or "prepare-dataset" in cmd_str
-
-        is_perf_sanity_test = "perf_sanity" in full_test_name
-
-        is_disagg_server = False
-        if self._config.runtime == "multi_node_disagg_server":
-            disagg_serving_type = self._config.disagg_configs[0][
-                'disagg_serving_type']
-            is_disagg_server = disagg_serving_type != "BENCHMARK"
-
         # Start the timer.
         self._start_timestamp = datetime.utcnow()
         try:
@@ -748,8 +425,7 @@ class AbstractPerfScriptTestClass(abc.ABC):
                 # Capture the stdout from _gpu_clock_lock because the pipeline JUnit update script tries to parse
                 # the log to find the GPU clocks.
                 with io.StringIO() as buf:
-                    # Perf-sanity test doesn't lock gpu clock
-                    if self._gpu_clock_lock and not is_perf_sanity_test:
+                    if self._gpu_clock_lock:
                         # Lock GPU clock and start monitoring.
                         with contextlib.redirect_stdout(
                                 buf), self._gpu_clock_lock, tmpDir:
@@ -762,6 +438,10 @@ class AbstractPerfScriptTestClass(abc.ABC):
                             # Print the output log to buf.
                             # if not is_prepare_dataset_cmd:
                             print(collect_and_clean_myelin_time(output))
+
+                    # Check whether output has error message
+                    if not is_prepare_dataset_cmd:
+                        self._check_benchmark_output_for_errors(output)
 
                     # Print the output log to stdout and cache it.
                     if is_prepare_dataset_cmd:
@@ -807,9 +487,6 @@ class AbstractPerfScriptTestClass(abc.ABC):
                     f"skip writing perf result when calling generating dataset in trtllm-bench."
                 )
                 outputs.pop(cmd_idx)
-            elif is_disagg_server:
-                print_info(
-                    f"skip writing perf result when running disagg's server.")
             else:
                 self._perf_result = self.get_perf_result(outputs)
 
@@ -831,11 +508,6 @@ class AbstractPerfScriptTestClass(abc.ABC):
         Store the test results in the _test_results.
         Write the test results and GPU monitoring data to the output csv and/or yaml files.
         """
-        # Store the test result
-        if cmd_idx not in self._test_results:
-            self._test_results[cmd_idx] = {}
-        self._test_results[cmd_idx][metric_type] = self._perf_result
-
         # Get GPU monitoring data
         self._gpu_monitor_data = self._gpu_clock_lock.get_state_data()
         if not self._gpu_monitor_data:

@@ -16,8 +16,9 @@
 
 #pragma once
 
-namespace tensorrt_llm
-{
+#include "tensorrt_llm/common/config.h"
+
+TRTLLM_NAMESPACE_BEGIN
 
 // Base class for algorithms
 struct Algorithm
@@ -29,4 +30,4 @@ struct Algorithm
     Algorithm& operator=(Algorithm const&) = delete;
 };
 
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

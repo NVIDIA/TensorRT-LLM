@@ -1,0 +1,4 @@
+# Configuration for DemoLLM runtime with Triton backend
+# Used for experimental or specific model requirements
+runtime: demollm
+attn_backend: triton

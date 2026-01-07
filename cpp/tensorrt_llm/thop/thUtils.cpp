@@ -18,6 +18,8 @@
 #include <NvInferRuntime.h>
 #include <array>
 
+TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -111,3 +113,5 @@ cudaDataType_t convert_torch_dtype(torch::ScalarType dtype)
 }
 
 } // namespace torch_ext
+
+TRTLLM_NAMESPACE_END

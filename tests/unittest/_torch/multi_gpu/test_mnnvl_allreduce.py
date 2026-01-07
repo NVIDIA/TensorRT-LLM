@@ -164,7 +164,6 @@ def row_linear_residual_norm_fusion_forward(
             )
 
 
-@pytest.mark.skip(reason="https://nvbugs/5597647")
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason="needs 2 GPUs to run this test")
 @pytest.mark.parametrize(
@@ -180,7 +179,7 @@ def row_linear_residual_norm_fusion_forward(
     ],  # Test for max_num_token fallback
     ids=lambda x: f"seqlen:{x}",
 )
-@pytest.mark.parametrize("hidden_size", [8, 2880, 7168, 7176, 8192],
+@pytest.mark.parametrize("hidden_size", [8, 2880, 7168, 7176, 8192, 16384],
                          ids=lambda x: f"hidden:{x}")
 @pytest.mark.parametrize("dtype", [torch.bfloat16],
                          ids=lambda x: f"dtype:{torch.finfo(x).dtype}")

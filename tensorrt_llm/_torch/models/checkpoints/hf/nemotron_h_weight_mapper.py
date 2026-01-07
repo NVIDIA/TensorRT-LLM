@@ -15,6 +15,30 @@ class NemotronHHfWeightMapper(HfWeightMapper):
         tp_rank = self.config.mapping.tp_rank
         d_inner = config.mamba_head_dim * config.mamba_num_heads
 
+        def _split_mamba2_mixer_in_proj(w: torch.Tensor) -> torch.Tensor:
+            # Special handling for Mamba2 mixer in_proj.weights and scales.
+            in_proj_z, in_proj_x, in_proj_b, in_proj_c, in_proj_dt = torch.split(
+                w, [
+                    d_inner, d_inner, n_groups * d_state, n_groups * d_state,
+                    nheads
+                ],
+                dim=0)
+            w = []
+            for rank in range(tp_size):
+                in_proj_z_rank = split(in_proj_z, tp_size, rank)
+                in_proj_x_rank = split(in_proj_x, tp_size, rank)
+                in_proj_b_rank = split(in_proj_b, tp_size, rank)
+                in_proj_c_rank = split(in_proj_c, tp_size, rank)
+                in_proj_dt_rank = split(in_proj_dt, tp_size, rank)
+                y = torch.concat([
+                    in_proj_z_rank, in_proj_x_rank, in_proj_b_rank,
+                    in_proj_c_rank, in_proj_dt_rank
+                ])
+                w.append(y)
+            w = torch.concat(w).contiguous()
+            return w
+
+        is_nvfp4 = self.config.quant_config.quant_algo == "NVFP4"
         n_groups = config.n_groups
         d_state = config.ssm_state_size
         nheads = config.mamba_num_heads
@@ -36,7 +60,12 @@ class NemotronHHfWeightMapper(HfWeightMapper):
 
             if ("mixer.in_proj" in key
                     or "mixer.out_proj" in key) and "_scale" in key:
-                new_weights[key] = weights[name]
+                # Special handing for nvfp4 Mamba2 mixer in_proj.weight_scale.
+                if is_nvfp4 and "in_proj.weight_scale_2" not in key and "in_proj.weight_scale" in key:
+                    new_weights[key] = _split_mamba2_mixer_in_proj(
+                        weights[name])
+                else:
+                    new_weights[key] = weights[name]
             elif "A" in key:
                 w = split(weights[name], tp_size, tp_rank)
                 w = w.to(torch.float32)
@@ -51,29 +80,7 @@ class NemotronHHfWeightMapper(HfWeightMapper):
                 w = w.to(torch.float32)
                 new_weights[key] = w
             elif "mixer.in_proj" in key:
-                w = weights[name]
-                in_proj_z, in_proj_x, in_proj_b, in_proj_c, in_proj_dt = torch.split(
-                    w, [
-                        d_inner, d_inner, n_groups * d_state,
-                        n_groups * d_state, nheads
-                    ],
-                    dim=0)
-
-                w = []
-                for rank in range(tp_size):
-                    in_proj_z_rank = split(in_proj_z, tp_size, rank)
-                    in_proj_x_rank = split(in_proj_x, tp_size, rank)
-                    in_proj_b_rank = split(in_proj_b, tp_size, rank)
-                    in_proj_c_rank = split(in_proj_c, tp_size, rank)
-                    in_proj_dt_rank = split(in_proj_dt, tp_size, rank)
-                    y = torch.concat([
-                        in_proj_z_rank, in_proj_x_rank, in_proj_b_rank,
-                        in_proj_c_rank, in_proj_dt_rank
-                    ])
-                    w.append(y)
-
-                w = torch.concat(w).contiguous()
-                new_weights[key] = w
+                new_weights[key] = _split_mamba2_mixer_in_proj(weights[name])
             elif "conv1d" in key:
                 w = weights[name]
                 # removing dim(1) because we are using Linear to store conv1d weights
@@ -110,19 +117,21 @@ class NemotronHHfWeightMapper(HfWeightMapper):
                         elif "weight_scale" in key:
                             # NVFP4 case.
                             if weights[name].shape:
-                                new_weights[w3_key] = weights[
-                                    name][:weights[name].shape[0] // 2]
-                                new_weights[w1_key] = weights[name][
-                                    weights[name].shape[0] // 2:]
+                                # w3 weight (gate_proj) scale should be empty for Nemotron-H MoE model.
+                                # Use [:0] to keep the same input dimension as the other weights.
+                                # The w3 weight_scale shape should be [0, input_dim].
+                                new_weights[w3_key] = weights[name][:0]
+                                new_weights[w1_key] = weights[name]
                             # FP8 case.
                             else:
                                 new_weights[w3_key] = weights[name]
                                 new_weights[w1_key] = weights[name]
                         else:
-                            new_weights[w3_key] = weights[name][:weights[name].
-                                                                shape[0] // 2]
-                            new_weights[w1_key] = weights[name][weights[name].
-                                                                shape[0] // 2:]
+                            # w3 weight (gate_proj) should be empty for Nemotron-H MoE model.
+                            # Use [:0] to keep the same input dimension as the other weights.
+                            # The w3 weight shape should be [0, input_dim].
+                            new_weights[w3_key] = weights[name][:0]
+                            new_weights[w1_key] = weights[name]
                     elif "down_proj" in key:
                         key = key.replace("down_proj", "w2")
                         new_weights[key] = weights[name]

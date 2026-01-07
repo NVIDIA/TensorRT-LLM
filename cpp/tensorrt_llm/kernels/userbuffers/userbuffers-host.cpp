@@ -123,7 +123,7 @@ void ub_free(void* ptr)
 }
 } // namespace
 
-int create_communicator_grouped2(communicator** comm, tensorrt_llm::runtime::WorldConfig const& world_config)
+int create_communicator_grouped2(communicator** comm, ::tensorrt_llm::runtime::WorldConfig const& world_config)
 {
     *comm = (communicator*) malloc(sizeof(communicator));
 

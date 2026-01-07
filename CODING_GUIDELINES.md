@@ -487,9 +487,17 @@ else:
     f.read()
 ```
 
+## Documentation Guidelines
+
+#### CLI Options in Documentation
+1. When documenting CLI commands for `trtllm-serve`, `trtllm-bench`, `trtllm-eval`, or similar tools, prefer using `--config` over `--extra_llm_api_options` for specifying configuration files.
+   - `--config` is the preferred, shorter alias for configuration file options.
+   - Example: `trtllm-serve --model <model_path> --config config.yaml` (preferred)
+   - Avoid: `trtllm-serve --model <model_path> --extra_llm_api_options config.yaml`
+
 ## NVIDIA Copyright
 
-1. All TensorRT-LLM Open Source Software code should contain an NVIDIA copyright header that includes the current year.  The following block of text should be prepended to the top of all files.  This includes .cpp, .h, .cu, .py, and any other source files which are compiled or interpreted.
+1. All TensorRT-LLM Open Source Software code should contain an NVIDIA copyright header that includes the year of its latest meaningful modification.  The following block of text should be prepended to the top of all files.  This includes .cpp, .h, .cu, .py, and any other source files which are compiled or interpreted.
 ```cpp
 /*
  * Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.

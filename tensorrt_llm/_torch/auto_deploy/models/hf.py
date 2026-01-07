@@ -141,13 +141,6 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         model_config, _ = self._get_model_config()
         return getattr(model_config, "vocab_size", None)
 
-    @property
-    def chunk_size(self) -> Optional[int]:
-        """Returns the chunk size for this model."""
-        model_config, _ = self._get_model_config()
-        # chunk_size is an input to a custom op, so it can not be none. We set it to a default value of 128.
-        return getattr(model_config, "chunk_size", 128)
-
     def _recursive_update_config(
         self, config: PretrainedConfig, update_dict: Dict[str, Any]
     ) -> Tuple[PretrainedConfig, Dict[str, Any]]:
@@ -246,7 +239,7 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         else:
             model.to(device)
 
-        # if present, initialize sharding config. We need head_dim for colwise sharding.
+        # if present, initialize sharding config.
         self._set_sharding_config(model.config)
         self._checkpoint_conversion_mapping = getattr(model, "_checkpoint_conversion_mapping", None)
 
@@ -259,17 +252,8 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
 
     def _set_sharding_config(self, model_config: PretrainedConfig):
         """Set the sharding config for the model."""
-        self._sharding_config["head_dim"] = 1
         if hasattr(model_config, "base_model_tp_plan"):
             self._sharding_config["tp_plan"] = model_config.base_model_tp_plan
-        if hasattr(model_config, "head_dim") and model_config.head_dim is not None:
-            self._sharding_config["head_dim"] = model_config.head_dim
-        elif hasattr(model_config, "hidden_size") and hasattr(model_config, "num_attention_heads"):
-            self._sharding_config["head_dim"] = (
-                model_config.hidden_size // model_config.num_attention_heads
-            )
-        if hasattr(model_config, "num_hidden_layers"):
-            self._sharding_config["num_hidden_layers"] = model_config.num_hidden_layers
 
     def get_quant_config(self) -> Dict:
         """Returns the quantization config for this model or an empty dict if not quantized."""
@@ -649,10 +633,6 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
             text_config = model_config.text_config
             if hasattr(text_config, "base_model_tp_plan"):
                 self._sharding_config["tp_plan"] = text_config.base_model_tp_plan
-            if hasattr(text_config, "head_dim"):
-                self._sharding_config["head_dim"] = text_config.head_dim
-            if hasattr(text_config, "num_hidden_layers"):
-                self._sharding_config["num_hidden_layers"] = text_config.num_hidden_layers
 
     @property
     def automodel_cls(self) -> Type[_BaseAutoModelClass]:

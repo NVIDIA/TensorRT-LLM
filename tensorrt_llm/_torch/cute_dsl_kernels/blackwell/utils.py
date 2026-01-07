@@ -44,11 +44,18 @@
 # This file is copied and modified from cutlass https://github.com/NVIDIA/cutlass/blob/main/python/CuTeDSL/cutlass/cute/core.py
 
 import ctypes
+import os
 from typing import Union
 
+import cutlass
 import cutlass._mlir.dialects.cute as _cute_ir
+import cutlass.cute as cute
 from cutlass._mlir import ir
+from cutlass._mlir.dialects import llvm, nvvm
 from cutlass.cute.typing import AddressSpace, Numeric, Pointer, Type
+from cutlass.cutlass_dsl import T, dsl_user_op
+
+TRTLLM_ENABLE_PDL = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
 
 
 # WAR for CuTeDSL make_ptr implementation
@@ -190,3 +197,150 @@ def make_ptr(
 
 def is_power_of_2(x: int) -> bool:
     return x > 0 and (x & (x - 1)) == 0
+
+
+@dsl_user_op
+def fmin(a: Union[float, cutlass.Float32],
+         b: Union[float, cutlass.Float32],
+         *,
+         nan=False,
+         loc=None,
+         ip=None) -> cutlass.Float32:
+    return cutlass.Float32(
+        nvvm.fmin(
+            T.f32(),
+            cutlass.Float32(a).ir_value(loc=loc, ip=ip),
+            cutlass.Float32(b).ir_value(loc=loc, ip=ip),
+            nan=nan,
+            loc=loc,
+            ip=ip,
+        ))
+
+
+def sigmoid_f32(a: Union[float, cutlass.Float32],
+                fastmath: bool = False) -> Union[float, cutlass.Float32]:
+    """
+    Compute the sigmoid of the input tensor.
+    """
+    return cute.arch.rcp_approx(1.0 + cute.math.exp(-a, fastmath=fastmath))
+
+
+def silu_f32(a: Union[float, cutlass.Float32],
+             fastmath: bool = False) -> Union[float, cutlass.Float32]:
+    """
+    Compute the silu of the input tensor.
+    """
+    return a * sigmoid_f32(a, fastmath=fastmath)
+
+
+# TODO(zhichenj): try to move these to NVVM wrapper or helper functions
+@dsl_user_op
+def vectorized_atomic_add_bf16x8(rOut_epi_packed,
+                                 scatter_out_offset,
+                                 loc=None,
+                                 ip=None):
+    llvm.inline_asm(
+        None,
+        [
+            scatter_out_offset.iterator.llvm_ptr,
+            llvm.bitcast(T.i32(), rOut_epi_packed[0, None].load().ir_value()),
+            llvm.bitcast(T.i32(), rOut_epi_packed[1, None].load().ir_value()),
+            llvm.bitcast(T.i32(), rOut_epi_packed[2, None].load().ir_value()),
+            llvm.bitcast(T.i32(), rOut_epi_packed[3, None].load().ir_value()),
+        ],
+        "red.global.v4.bf16x2.add.noftz [$0], {$1, $2, $3, $4};",
+        "l,r,r,r,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def vectorized_atomic_add_fp32x2(rOut_epi_packed,
+                                 scatter_out_offset,
+                                 loc=None,
+                                 ip=None):
+    llvm.inline_asm(
+        None,
+        [
+            scatter_out_offset.iterator.llvm_ptr,
+            rOut_epi_packed[0].ir_value(),
+            rOut_epi_packed[1].ir_value(),
+        ],
+        "red.global.v2.f32.add [$0], {$1, $2};",
+        "l,f,f",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def atomic_add_func(rOut_epi_packed, scatter_out_offset, loc=None, ip=None):
+    if cutlass.const_expr(rOut_epi_packed.dtype == cutlass.Float32):
+        llvm.inline_asm(
+            None,
+            [
+                scatter_out_offset.iterator.llvm_ptr,
+                rOut_epi_packed.ir_value(),
+            ],
+            "red.global.add.f32 [$0], $1;",
+            "l,f",
+            has_side_effects=True,
+            loc=loc,
+            ip=ip,
+        )
+    elif cutlass.const_expr(rOut_epi_packed.dtype == cutlass.BFloat16):
+        llvm.inline_asm(
+            None,
+            [
+                scatter_out_offset.iterator.llvm_ptr,
+                llvm.bitcast(T.i16(), rOut_epi_packed.ir_value()),
+            ],
+            "red.add.noftz.bf16 [$0], $1;",
+            "l,h",
+            has_side_effects=True,
+            loc=loc,
+            ip=ip,
+        )
+
+
+@dsl_user_op
+def griddepcontrol_wait(*, loc=None, ip=None) -> None:
+    """
+    This instruction is used to wait for the previous kernel's grid ending
+    (all blocks of the previous kernel have finished and memflushed), i.e.,
+    the instruction after this instruction will not be issued until the previous
+    grid has finished.
+    """
+    llvm.inline_asm(
+        res=None,
+        operands_=[],
+        asm_string="griddepcontrol.wait;",
+        constraints="",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def griddepcontrol_launch_dependents(*, loc=None, ip=None) -> None:
+    """
+    Issuing the launch_dependents instruction hints a dependent kernel to launch earlier.
+    launch_dependents doesn't impact the functionality but the performance:
+    Launching a dependent kernel too early can compete with current kernels,
+    while launching too late can lead to a long latency.
+    """
+    llvm.inline_asm(
+        res=None,
+        operands_=[],
+        asm_string="griddepcontrol.launch_dependents;",
+        constraints="",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )

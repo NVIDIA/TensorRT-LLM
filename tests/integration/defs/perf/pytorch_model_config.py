@@ -215,6 +215,23 @@ def get_model_yaml_config(model_label: str,
                 }
             }
         },
+        {
+            'patterns': [
+                'qwen3_4b-bench-pytorch-streaming-bfloat16-maxbs:4-kv_frac:0.6-input_output_len:500,100-reqs:200-con:4',
+            ],
+            'config': {
+                'speculative_config': {
+                    'decoding_type': 'Eagle',
+                    'eagle3_one_model': True,
+                    'speculative_model_dir': 'Qwen3-4B_eagle3',
+                    'max_draft_len': 3,
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                },
+                'enable_chunked_prefill': False,
+            }
+        },
         # Llama-v3.3 models with fp8 quantization
         {
             'patterns': [

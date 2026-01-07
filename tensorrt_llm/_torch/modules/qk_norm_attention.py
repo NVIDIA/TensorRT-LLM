@@ -160,6 +160,7 @@ class QKNormRoPEAttention(Attention):
         attn_output_gate: Optional[bool] = None,
         is_qk_norm: bool = True,
         reduce_output: bool = True,
+        rope_fusion: bool = True,
     ):
         self.pretrained_config = config.pretrained_config
 
@@ -170,7 +171,8 @@ class QKNormRoPEAttention(Attention):
 
         # If fuse_qk_norm_rope is true, do not apply fused RoPE in attention OP, and self.rotary_emb
         # will be skipped in the overridden apply_rope.
-        rope_fusion = not self.fuse_qk_norm_rope and not skip_rope and not attn_output_gate and not use_gemma_rms_norm
+        rope_fusion &= (not self.fuse_qk_norm_rope and not skip_rope
+                        and not attn_output_gate and not use_gemma_rms_norm)
         self.is_qk_norm = is_qk_norm
         assert not (fuse_qk_norm_rope and skip_rope
                     ), "Fusing qk norm and skipping rope is not supported"
@@ -229,9 +231,14 @@ class QKNormRoPEAttention(Attention):
     def apply_qk_norm_rope(self, qkv, position_ids):
         factor, low, high, attention_factor = compute_yarn_parameters(
             self.pretrained_config)
+
+        partial_rotary_factor = self.pretrained_config.partial_rotary_factor if hasattr(
+            self.pretrained_config, "partial_rotary_factor") else 1.0
+        rotary_dim = int(self.head_dim * partial_rotary_factor)
+
         torch.ops.trtllm.fused_qk_norm_rope(
             qkv, self.num_heads, self.num_key_value_heads,
-            self.num_key_value_heads, self.head_dim,
+            self.num_key_value_heads, self.head_dim, rotary_dim,
             self.q_norm.variance_epsilon, self.q_norm.weight,
             self.k_norm.weight,
             self.pos_embd_params.rope.theta, self.pos_embd_params.is_neox,

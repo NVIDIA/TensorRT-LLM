@@ -123,8 +123,9 @@ class MambaCacheManager(BaseResourceManager):
                 block = self.mamba_cache_free_blocks.pop()
                 self.mamba_cache_index[r] = block
                 state_indices.append(block)
-        self.state_indices[:len(state_indices)] = torch.as_tensor(
-            state_indices, dtype=torch.int32, device=self.ssm_states.device)
+        self.state_indices[:len(state_indices)].copy_(torch.tensor(
+            state_indices, dtype=torch.int32, pin_memory=True),
+                                                      non_blocking=True)
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         context_ids = [
@@ -196,6 +197,7 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
         dtype: DataType = DataType.HALF,
         spec_config: Optional["DecodingBaseConfig"] = None,
         is_estimating_kv_cache: bool = False,
+        execution_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
 
         # mamba hybrid cache requires block reuse to be disabled in KV cache config
@@ -233,6 +235,7 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
             spec_config=spec_config,
             layer_mask=layer_mask,
             is_estimating_kv_cache=is_estimating_kv_cache,
+            execution_stream=execution_stream,
         )
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):

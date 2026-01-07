@@ -16,6 +16,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 
@@ -25,6 +26,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -46,7 +48,9 @@
 #include <dlfcn.h>
 #endif
 
-namespace tensorrt_llm::common::nccl_util
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common::nccl_util
 {
 
 //==============================================================================
@@ -136,12 +140,13 @@ public:
 
 private:
     NcclCommResourceManager() = default;
-    ~NcclCommResourceManager() = default;
+    ~NcclCommResourceManager();
 
     using ResourceEntry = std::pair<ResourceCleanupFunc, std::string>;
 
     mutable std::mutex mMutex;
     std::unordered_map<ncclComm_t, std::vector<ResourceEntry>> mCommResources;
+    std::atomic<bool> mIsDestroying{false};
 };
 
 // RAII helper to register a resource with a NCCL communicator.
@@ -392,6 +397,8 @@ inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(
     return std::make_pair(tensor, buffer);
 }
 
-} // namespace tensorrt_llm::common::nccl_util
+} // namespace common::nccl_util
+
+TRTLLM_NAMESPACE_END
 
 #endif // ENABLE_MULTI_DEVICE

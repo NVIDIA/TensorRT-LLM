@@ -1,16 +1,21 @@
 import copy
 import os
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
-from typing import List, Optional, Type
+from typing import TYPE_CHECKING, List, Optional, Type
 
 import torch
+from torch import nn
 
 from tensorrt_llm.logger import logger
 
 from ..._utils import get_sm_version
 from ..attention_backend.trtllm import AttentionBackend, TrtllmAttention
 from ..pyexecutor.resource_manager import BaseResourceManager
+
+if TYPE_CHECKING:
+    from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
 
 # Environment variable name for forcing the number of accepted tokens in speculative decoding
 FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR = "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS"
@@ -229,6 +234,13 @@ class SpecMetadata:
     # whether the spec-dec mode is a dynamic tree.
     is_spec_dec_dynamic_tree: bool = False
 
+    # For non-greedy sampling on 1-model.
+    allow_advanced_sampling: bool = False
+    # Sampling parameters for non-greedy sampling (per-request)
+    temperatures: Optional[torch.Tensor] = None
+    top_ks: Optional[torch.Tensor] = None
+    top_ps: Optional[torch.Tensor] = None
+
     def __post_init__(self):
         pass
 
@@ -264,3 +276,145 @@ class SpecMetadata:
         Some spec decode algorithms require hidden states from the target
         model. Use this method to record them. By default, does nothing.
         """
+
+    def populate_sampling_params_for_one_model(
+            self, requests: list["LlmRequest"]) -> None:
+        """
+        Set up topp/topk/temperatures for 1-model sampler.
+        """
+        from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+        from tensorrt_llm.sampling_params import SamplingParams
+
+        if not self.allow_advanced_sampling or not self.spec_dec_mode.use_one_engine(
+        ):
+            return
+
+        if self.temperatures is None:
+            # Ensures determinism across ranks.
+            torch.manual_seed(0)
+
+        temperatures = []
+        top_ks = []
+        top_ps = []
+
+        # Need to use a very small value for temperature when disabled to avoid division by 0
+        DISABLE_TEMP_VAL = 1e-5
+        # Very large values disable topk.
+        DISABLE_TOPK_VAL = torch.iinfo(torch.int32).max
+        DISABLE_TOPP_VAL = 1.0
+
+        for request in requests:
+            sampling_config = request.sampling_config
+            temp = sampling_config.temperature
+            temp_val = temp[0] if temp is not None and len(temp) > 0 else None
+
+            tk = sampling_config.top_k
+            tk_val = tk[0] if tk is not None and len(tk) > 0 else None
+
+            tp = sampling_config.top_p
+            tp_val = tp[0] if tp is not None and len(tp) > 0 else None
+
+            # Context requests have no draft tokens yet.
+            num_tokens = 1 + self.max_draft_len if request.state == LlmRequestState.GENERATION_IN_PROGRESS else 1
+
+            is_greedy = SamplingParams.params_imply_greedy_decoding(
+                temperature=temp_val,
+                top_k=tk_val,
+                top_p=tp_val,
+                use_beam_search=False)
+
+            temp_val = DISABLE_TEMP_VAL if is_greedy or temp_val is None or temp_val == 0 else temp_val
+            tk_val = DISABLE_TOPK_VAL if is_greedy or tk_val is None or tk_val <= 0 else tk_val
+            tp_val = DISABLE_TOPP_VAL if is_greedy or tp_val is None else tp_val
+
+            temperatures.extend(temp_val for _ in range(num_tokens))
+            top_ks.extend(tk_val for _ in range(num_tokens))
+            top_ps.extend(tp_val for _ in range(num_tokens))
+
+        if self.temperatures is None:
+            self.temperatures = torch.ones(
+                (self.max_draft_len + 1) * self.max_num_requests,
+                dtype=torch.float32,
+                device='cuda')
+            self.top_ks = torch.zeros(
+                (self.max_draft_len + 1) * self.max_num_requests,
+                dtype=torch.int32,
+                device='cuda')
+            self.top_ps = torch.ones(
+                (self.max_draft_len + 1) * self.max_num_requests,
+                dtype=torch.float32,
+                device='cuda')
+
+        self.temperatures[:len(temperatures)].copy_(torch.tensor(
+            temperatures, dtype=torch.float32, pin_memory=True),
+                                                    non_blocking=True)
+        self.top_ks[:len(top_ks)].copy_(torch.tensor(top_ks,
+                                                     dtype=torch.int32,
+                                                     pin_memory=True),
+                                        non_blocking=True)
+        self.top_ps[:len(top_ps)].copy_(torch.tensor(top_ps,
+                                                     dtype=torch.float32,
+                                                     pin_memory=True),
+                                        non_blocking=True)
+
+
+class SpecWorkerBase(nn.Module, ABC):
+    """
+    Base class for speculative decoding workers.
+    Provides common functionality for sampling and token handling.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.guided_decoder: Optional["CapturableGuidedDecoder"] = None
+        self.force_num_accepted_tokens = get_force_num_accepted_tokens()
+
+    @property
+    @abstractmethod
+    def max_draft_len(self) -> int:
+        """
+        Returns the maximum draft length for this worker.
+        Subclasses should override this property.
+        """
+
+    def set_guided_decoder(self,
+                           guided_decoder: "CapturableGuidedDecoder") -> bool:
+        self.guided_decoder = guided_decoder
+        return True
+
+    def _sample_tokens_for_batch(
+        self,
+        logits: torch.Tensor,
+        spec_metadata: SpecMetadata,
+        num_contexts: int,
+        batch_size: int,
+    ) -> torch.Tensor:
+        """
+        Sample tokens from logits using per-request sampling parameters.
+        Supports both greedy and non-greedy sampling.
+
+        Args:
+            logits: [num_tokens, vocab_size] - Logits to sample from
+            spec_metadata: Metadata containing sampling parameters
+            num_contexts: Number of context requests in the batch
+            batch_size: Number of requests in the batch
+
+        Returns:
+            sampled_tokens: [num_tokens] - Sampled token ids
+        """
+        if spec_metadata.allow_advanced_sampling:
+            from .one_model_sampler import sampling_batch_spec_dec_one_model
+
+            num_gens = batch_size - num_contexts
+            num_tokens = num_contexts + num_gens * (self.max_draft_len + 1)
+
+            temperatures = spec_metadata.temperatures[:num_tokens]
+            top_ks = spec_metadata.top_ks[:num_tokens]
+            top_ps = spec_metadata.top_ps[:num_tokens]
+
+            sampled_tokens = sampling_batch_spec_dec_one_model(
+                logits, temperatures, top_ks, top_ps)
+        else:
+            sampled_tokens = torch.argmax(logits, dim=-1)
+
+        return sampled_tokens

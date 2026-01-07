@@ -686,13 +686,13 @@ parameters: {
     string_value: "${kv_cache_onboard_blocks}"
   }
 }
-# enable_trt_overlap is deprecated and doesn't have any effect on the runtime
-# parameters: {
-#   key: "enable_trt_overlap"
-#   value: {
-#     string_value: "${enable_trt_overlap}"
-#   }
-# }
+# enable_trt_overlap is an experimental feature used with CUDA Graph Mode.
+parameters: {
+  key: "enable_trt_overlap"
+  value: {
+    string_value: "${enable_trt_overlap}"
+  }
+}
 parameters: {
   key: "exclude_input_in_output"
   value: {

@@ -139,7 +139,7 @@ To do the benchmark, run the following command:
 ```bash
 YOUR_DATA_PATH=<your dataset file following the format>
 
-cat >./extra-llm-api-config.yml<<EOF
+cat >./config.yml<<EOF
 moe_config:
   backend: TRTLLM
 speculative_config:
@@ -157,7 +157,7 @@ trtllm-bench --model nvidia/DeepSeek-R1-FP4 \
     --max_batch_size 1 \
     --tp 8 \
     --ep 2 \
-    --extra_llm_api_options ./extra-llm-api-config.yml
+    --config ./config.yml
 ```
 
 Explanation:
@@ -168,7 +168,7 @@ Explanation:
 - `--max_batch_size`: Max batch size in each rank.
 - `--tp`: Tensor parallel size.
 - `--ep`: Expert parallel size.
-- `--extra_llm_api_options`: Used to specify some extra config. The content of the file is as follows:
+- `--config`: Used to specify extra YAML configuration. The content of the file is as follows:
 
 #### Expected Results
 The perf can be different when using different datasets and different machines.
@@ -195,7 +195,7 @@ We are seeing meaningful speedup using FP8 KV cache, thus refreshing the numbers
 
 #### Benchmark
 ```bash
-cat >./extra-llm-api-config.yml <<EOF
+cat >./config.yml <<EOF
 cuda_graph_config:
   enable_padding: true
   batch_sizes:
@@ -218,7 +218,7 @@ trtllm-bench  --model nvidia/DeepSeek-R1-0528-FP4
      throughput
      --dataset ${YOUR_DATA_PATH}
      --tp 8  --ep 8
-     --extra_llm_api_options ./extra-llm-api-config.yml
+     --config ./config.yml
      --max_batch_size 896
      --max_num_tokens 2048
      --kv_cache_free_gpu_mem_fraction 0.93
@@ -261,7 +261,7 @@ trtllm-bench --model nvidia/DeepSeek-R1-FP4 \
 
 YOUR_DATA_PATH=./dataset.txt
 
-cat >./extra-llm-api-config.yml <<EOF
+cat >./config.yml <<EOF
 cuda_graph_config:
   enable_padding: true
   batch_sizes:
@@ -290,7 +290,7 @@ trtllm-bench -m nvidia/DeepSeek-R1-FP4 \
     --num_requests 49152 \
     --concurrency 3072 \
     --kv_cache_free_gpu_mem_fraction 0.85 \
-    --extra_llm_api_options ./extra-llm-api-config.yml
+    --config ./config.yml
 ```
 
 #### Expected Result Format
@@ -315,7 +315,7 @@ To do the benchmark, run the following command:
 ```bash
 YOUR_DATA_PATH=<your dataset file following the format>
 
-cat >./extra-llm-api-config.yml<<EOF
+cat >./config.yml<<EOF
 speculative_config:
     decoding_type: MTP
     num_nextn_predict_layers: 3
@@ -329,7 +329,7 @@ trtllm-bench --model deepseek-ai/DeepSeek-R1 \
     --tp 8 \
     --ep 4 \
     --concurrency 1 \
-    --extra_llm_api_options ./extra-llm-api-config.yml
+    --config ./config.yml
 ```
 
 #### Expected Result Format
@@ -363,7 +363,7 @@ trtllm-bench --model nvidia/DeepSeek-R1-FP4 \
 
 YOUR_DATA_PATH=./dataset.txt
 
-cat >./extra-llm-api-config.yml<<EOF
+cat >./config.yml<<EOF
 cuda_graph_config:
   batch_sizes:
   - 128
@@ -384,7 +384,7 @@ trtllm-bench -m deepseek-ai/DeepSeek-R1 \
     --num_requests 5120 \
     --concurrency 1024 \
     --kv_cache_free_gpu_mem_fraction 0.8 \
-    --extra_llm_api_options ./extra-llm-api-config.yml
+    --config ./config.yml
 ```
 
 #### Expected Result Format
@@ -408,7 +408,7 @@ Average request latency (ms):                     181540.5739
 To benchmark TensorRT LLM on DeepSeek models with more ISL/OSL combinations, you can use the `trtllm-bench prepare-dataset` subcommand to generate the dataset and use similar commands mentioned in the previous section. TensorRT LLM is working on enhancements that can make the benchmark process smoother.
 ### WIP: Enable more features by default
 
-Currently, there are some features that need to be enabled through a user-defined file `extra-llm-api-config.yml`, such as attention dp. We're working on to enable those features by default, so that users can get good out-of-the-box performance on DeepSeek models.
+Currently, there are some features that need to be enabled through a user-defined file `config.yml`, such as attention dp. We're working on to enable those features by default, so that users can get good out-of-the-box performance on DeepSeek models.
 
 Note that, `max_batch_size` and `max_num_tokens` can easily affect the performance. The default values for them are already carefully designed and should deliver good performance on overall cases, however, you may still need to tune it for peak performance.
 

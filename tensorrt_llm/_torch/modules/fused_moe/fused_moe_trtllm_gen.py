@@ -20,10 +20,10 @@ from .interface import AlltoallMethodType, MoE, MoEWeightLoadingMode
 
 # isort: off
 from .quantization import (
-    DeepSeekFP8BlockScalesFusedMoEMethod, NVFP4TRTLLMGenFusedMoEMethod,
-    UnquantizedFusedMoEMethod, W4A8MXFP4FP8TRTLLMGenFusedMoEMethod,
-    W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod, W4A8NVFP4FP8TRTLLMGenFusedMoEMethod,
-    W4A16MXFP4TRTLLMGenFusedMoEMethod)
+    DeepSeekFP8BlockScalesFusedMoEMethod, NVFP4TRTLLMGenFusedMoEBaseMethod,
+    NVFP4TRTLLMGenFusedMoEMethod, UnquantizedFusedMoEMethod,
+    W4A8MXFP4FP8TRTLLMGenFusedMoEMethod, W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod,
+    W4A8NVFP4FP8TRTLLMGenFusedMoEMethod, W4A16MXFP4TRTLLMGenFusedMoEMethod)
 # isort: on
 from .routing import BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod
 
@@ -214,14 +214,17 @@ class TRTLLMGenFusedMoE(MoE):
             or self.has_w4a8_mxfp4_fp8 or self.has_w4a8_mxfp4_mxfp8, "TRTLLMGenFusedMoE only supports fp8_block_scaling, nvfp4, w4a16_mxfp4, w4a8_mxfp4_fp8 and w4a8_mxfp4_mxfp8 dtypes."
 
         if self.bias or self.swiglu_alpha is not None or self.swiglu_beta is not None or self.swiglu_limit is not None:
-            assert self.has_w4a16_mxfp4 or self.has_w4a8_mxfp4_fp8 or self.has_w4a8_mxfp4_mxfp8, "TRTLLMGenFusedMoE only supports mxfp4 quantization with bias, swiglu_alpha, swiglu_beta and swiglu_limit."
+            assert self.has_nvfp4 or self.has_w4a16_mxfp4 or self.has_w4a8_mxfp4_fp8 or self.has_w4a8_mxfp4_mxfp8, "TRTLLMGenFusedMoE supports bias/swiglu only for nvfp4 and mxfp4 variants."
 
     def _get_quant_method(self):
-        if self.quant_config is not None:
+        if self.quant_config is not None and self.quant_config.layer_quant_mode.has_any_quant(
+                exclude_kv_cache=True):
             if self.quant_config.layer_quant_mode.has_fp8_block_scales():
                 return DeepSeekFP8BlockScalesFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_nvfp4():
-                return NVFP4TRTLLMGenFusedMoEMethod()
+                return NVFP4TRTLLMGenFusedMoEMethod(
+                ) if self.swiglu_alpha is not None else NVFP4TRTLLMGenFusedMoEBaseMethod(
+                )
             elif self.quant_config.layer_quant_mode.has_w4a16_mxfp4():
                 return W4A16MXFP4TRTLLMGenFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_w4a8_nvfp4_fp8():
@@ -323,6 +326,11 @@ class TRTLLMGenFusedMoE(MoE):
                         self,
                         'fc31_act_scale') and self.fc31_act_scale is not None:
                     x = x * self.fc31_act_scale
+
+                pad_size = self.w3_w1_weight.shape[-1] * 2 - x.shape[-1]
+                if pad_size > 0:
+                    x = torch.nn.functional.pad(x, (0, pad_size))
+
                 x_row = x.shape[0]
                 x, x_sf = torch.ops.trtllm.fp4_quantize(
                     x, self.fc31_input_scale, self.scaling_vector_size, False,
@@ -353,6 +361,9 @@ class TRTLLMGenFusedMoE(MoE):
             x_sf = x_sf.view(x_row, -1)
 
         return x, x_sf
+
+    def supports_moe_output_in_alltoall_workspace(self):
+        return self.has_w4a8_mxfp4_mxfp8
 
     def run_moe(
         self,
@@ -442,6 +453,8 @@ class TRTLLMGenFusedMoE(MoE):
                 topk_ids=token_selected_experts,
             )
         elif self.has_nvfp4:
+            intermediate_size_per_partition_padded = self.w3_w1_weight.shape[
+                -2] // 2
 
             outputs = torch.ops.trtllm.fp4_block_scale_moe_runner(
                 router_logits,
@@ -450,8 +463,13 @@ class TRTLLMGenFusedMoE(MoE):
                 x_sf.view(torch.float8_e4m3fn),
                 self.w3_w1_weight,
                 self.w3_w1_weight_scale.view(torch.float8_e4m3fn),
+                self.w3_w1_bias if self.bias else None,
+                self.swiglu_alpha,
+                self.swiglu_beta,
+                self.swiglu_limit,
                 self.w2_weight,
                 self.w2_weight_scale.view(torch.float8_e4m3fn),
+                self.w2_bias if self.bias else None,
                 self.fc31_scale_c.data,
                 self.fc31_alpha.data,
                 self.fc2_alpha.data,
@@ -459,7 +477,7 @@ class TRTLLMGenFusedMoE(MoE):
                 top_k,
                 n_group,
                 topk_group,
-                self.intermediate_size_per_partition,
+                intermediate_size_per_partition_padded,
                 self.slot_start,
                 self.expert_size_per_partition,
                 routed_scaling_factor,
@@ -474,6 +492,11 @@ class TRTLLMGenFusedMoE(MoE):
                 return outputs
             else:
                 final_hidden_states = outputs[0]
+                # Slice output if it was padded
+                if final_hidden_states.shape[1] > self.hidden_size:
+                    final_hidden_states = final_hidden_states[:, :self.
+                                                              hidden_size].contiguous(
+                                                              )
         elif self.has_w4a16_mxfp4:
             assert x.dtype == torch.bfloat16
 

@@ -221,7 +221,7 @@ def create_py_executor(
     tokenizer: Optional[TokenizerBase] = None,
     profiling_stage_data: Optional[dict] = None,
 ) -> PyExecutor:
-
+    torch.cuda.set_per_process_memory_fraction(1.0)
     garbage_collection_gen0_threshold = llm_args.garbage_collection_gen0_threshold
     lora_config = llm_args.lora_config
     kv_connector_config = llm_args.kv_connector_config
@@ -280,6 +280,17 @@ def create_py_executor(
                 f"Disable overlap scheduler for speculation mode {spec_config.spec_dec_mode.name}"
             )
             llm_args.disable_overlap_scheduler = True
+
+    if spec_config is not None and spec_config.spec_dec_mode.use_one_engine():
+        if not spec_config.allow_advanced_sampling:
+            logger.warning(
+                f"Falling back to greedy decoding for {spec_config.decoding_type}. If you "
+                "want to use non-greedy sampling, please set allow_advanced_sampling=True."
+            )
+        elif spec_config.spec_dec_mode.is_mtp_one_model():
+            logger.warning(
+                "Advanced sampling is not supported for MTP yet - this will be added soon."
+            )
 
     if mm_encoder_only:
         llm_args.mm_encoder_only = True
@@ -590,6 +601,13 @@ def create_py_executor(
     resources = {}
     estimating_kv_cache = False
     kv_cache_creator = None
+
+    # Create the execution stream for model forward operations
+    # for proper synchronization with KVCacheTransferManager's onboard/offload operations.
+    execution_stream = torch.cuda.Stream()
+    logger.info(
+        f"[create_py_executor] Created execution_stream: {execution_stream}")
+
     if model_engine.model.model_config.is_generation:
         #NOTE: non-generation models do not have kv cache
         kv_cache_creator = KvCacheCreator(
@@ -608,6 +626,7 @@ def create_py_executor(
             speculative_config=spec_config,
             profiling_stage_data=profiling_stage_data,
             sparse_attention_config=sparse_attention_config,
+            execution_stream=execution_stream,
         )
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
         with allocation_scope(
@@ -665,6 +684,7 @@ def create_py_executor(
             scheduler_config=scheduler_config,
             cache_transceiver_config=cache_transceiver_config,
             virtual_memory_pools=vm_pools if not estimating_kv_cache else None,
+            execution_stream=execution_stream,
         )
         # Originally, peft_cache_config might be mutated inside
         # create_py_executor_instance. Restore it here.
@@ -725,14 +745,13 @@ def create_py_executor(
                 scheduler_config=scheduler_config,
                 cache_transceiver_config=cache_transceiver_config,
                 virtual_memory_pools=vm_pools,
+                execution_stream=execution_stream,
             )
 
     _adjust_torch_mem_fraction()
 
     if mapping.rank == 0:
         logger.info(f"LLM Args:\n{llm_args}")
-
-    logger.info(f"{llm_args}")
 
     py_executor.start_worker()
     return py_executor
