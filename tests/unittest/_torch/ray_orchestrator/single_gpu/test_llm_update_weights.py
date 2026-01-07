@@ -20,14 +20,13 @@ from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
 
 
 class RefHFModelWithIPCHandles(RefHFModel):
-    def __init__(self, model_dir: str, device_id: int = 0, fp8: bool = False):
-        if fp8:
-            super().__init__(model_dir, device_id)
-        else:
-            self.device_id = device_id
-            config = AutoConfig.from_pretrained(model_dir)
-            config.num_hidden_layers = 4
-            self.model = AutoModelForCausalLM.from_config(config=config).to(f"cuda:{device_id}")
+    def __init__(self, model_dir: str, device_id: int = 0, num_hidden_layers: int = 4):
+        self.device_id = device_id
+        config = AutoConfig.from_pretrained(model_dir)
+        config.num_hidden_layers = num_hidden_layers
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_dir, config=config, torch_dtype=torch.bfloat16
+        ).to(f"cuda:{device_id}")
         self.all_weights = {}
         self.device_uuid = [get_device_uuid(i) for i in range(torch.cuda.device_count())]
         self._replicate_weights()
@@ -193,7 +192,7 @@ def run_generate(
     return llm_logits, ref_logits
 
 
-def process_and_copy_folder(src_folder, dst_folder):
+def process_and_copy_folder(src_folder, dst_folder, num_hidden_layers: int = 4):
     if os.path.exists(dst_folder):
         shutil.rmtree(dst_folder)
     os.makedirs(dst_folder)
@@ -205,7 +204,6 @@ def process_and_copy_folder(src_folder, dst_folder):
         if not os.path.exists(dest_dir):
             os.makedirs(dest_dir)
 
-        num_hidden_layers = 4
         for file in files:
             src_path = os.path.join(root, file)
             dest_path = os.path.join(dest_dir, file)
@@ -260,6 +258,7 @@ def process_and_copy_folder(src_folder, dst_folder):
         "Qwen3/Qwen3-8B",
         "Qwen3/Qwen3-30B-A3B",
         "Qwen3/Qwen3-8B-FP8",
+        "Qwen3/Qwen3-30B-A3B-FP8",
     ],
 )
 def test_llm_update_weights(model_dir, use_serialized_handles):
@@ -267,17 +266,17 @@ def test_llm_update_weights(model_dir, use_serialized_handles):
     model_dir = str(llm_models_root() / model_dir)
     with TemporaryDirectory() as tmp_model_dir:
         if "FP8" in model_dir:
-            test_model_dir = model_dir
             fp8 = True
+            num_hidden_layers = 1
         else:
-            process_and_copy_folder(model_dir, tmp_model_dir)
-            test_model_dir = tmp_model_dir
             fp8 = False
-        hf_model = RefHFModelWithIPCHandles(test_model_dir, fp8=fp8)
-        tokenizer = AutoTokenizer.from_pretrained(test_model_dir)
+            num_hidden_layers = 4
+        process_and_copy_folder(model_dir, tmp_model_dir, num_hidden_layers=num_hidden_layers)
+        hf_model = RefHFModelWithIPCHandles(model_dir, num_hidden_layers=num_hidden_layers)
+        tokenizer = AutoTokenizer.from_pretrained(model_dir)
         kv_cache_config = KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.1)
         llm = LLM(
-            model=test_model_dir,
+            model=tmp_model_dir,
             ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
             tensor_parallel_size=1,
             load_format="dummy",
@@ -320,24 +319,25 @@ def test_llm_update_weights(model_dir, use_serialized_handles):
         "Qwen3/Qwen3-8B",
         "Qwen3/Qwen3-30B-A3B",
         "Qwen3/Qwen3-8B-FP8",
+        "Qwen3/Qwen3-30B-A3B-FP8",
     ],
 )
 def test_llm_partial_update_weights(model_dir):
     model_dir = str(llm_models_root() / model_dir)
     with TemporaryDirectory() as tmp_model_dir:
         if "FP8" in model_dir:
-            test_model_dir = model_dir
             fp8 = True
+            num_hidden_layers = 1
         else:
-            process_and_copy_folder(model_dir, tmp_model_dir)
-            test_model_dir = tmp_model_dir
             fp8 = False
-        hf_model = RefHFModelWithIPCHandles(test_model_dir, fp8=fp8)
-        tokenizer = AutoTokenizer.from_pretrained(test_model_dir)
+            num_hidden_layers = 4
+        process_and_copy_folder(model_dir, tmp_model_dir, num_hidden_layers=num_hidden_layers)
+        hf_model = RefHFModelWithIPCHandles(model_dir, num_hidden_layers=num_hidden_layers)
+        tokenizer = AutoTokenizer.from_pretrained(model_dir)
         kv_cache_config = KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.1)
 
         llm = LLM(
-            model=test_model_dir,
+            model=tmp_model_dir,
             ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
             tensor_parallel_size=1,
             load_format="dummy",
@@ -377,7 +377,7 @@ def test_llm_partial_update_weights(model_dir):
         for filter_name in filter_list:
             weight_filter = common_filter(filter_name=filter_name)
             ipc_handles = hf_model.get_weight_ipc_handles([0], weight_filter=weight_filter)
-            llm._collective_rpc("update_weights", (ipc_handles,), non_block=True)
+            llm._collective_rpc("update_weights", (ipc_handles,))
         # Finalize the update weights
         llm._collective_rpc("update_weights", (None,))
 
