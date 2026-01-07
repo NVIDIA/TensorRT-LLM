@@ -279,8 +279,6 @@ class Eagle3DraftModel(DecoderModel):
                                                      False)
         self._use_mla = use_mla
 
-        _ensure_draft_vocab_size(config)
-
         if hasattr(config, "target_hidden_size"):
             self.hidden_size_in = config.target_hidden_size
         else:
