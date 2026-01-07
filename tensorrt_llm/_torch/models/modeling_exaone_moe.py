@@ -540,7 +540,7 @@ class ExaoneMoeForCausalLM(DecoderModelForCausalLM[ExaoneMoeModel, ExaoneMoEConf
         skip_modules: Optional[List[str]] = None,
         allow_partial_loading: bool = False,
     ):
-        # MoE namining pattern.
+        # MoE naming pattern.
         moe_weight_patterns = {
             "gate_proj": "w1",
             "up_proj": "w3",
