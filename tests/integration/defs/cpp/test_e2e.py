@@ -93,8 +93,13 @@ def run_benchmarks(
         )
         return NotImplementedError
 
+    # If local not found, fall back to HuggingFace
+    cnn_dailymail_dir = f"{model_cache}/datasets/ccdv/cnn_dailymail"
+    cnn_dailymail_dataset_name = cnn_dailymail_dir if _os.path.isdir(
+        cnn_dailymail_dir) else "ccdv/cnn_dailymail"
+
     prompt_datasets_args = [{
-        '--dataset-name': "cnn_dailymail",
+        '--dataset-name': cnn_dailymail_dataset_name,
         '--dataset-config-name': "3.0.0",
         '--dataset-split': "validation",
         '--dataset-input-key': "article",
@@ -147,7 +152,7 @@ def run_benchmarks(
         _cpp.run_command(prepare_dataset,
                          cwd=root_dir,
                          timeout=300,
-                         env={'HF_DATASETS_OFFLINE': '0'})
+                         env={'HF_DATASETS_OFFLINE': '1'})
 
         for batching_type in batching_types:
             for api_type in api_types:
@@ -263,7 +268,7 @@ def test_model(build_google_tests, model, prepare_model, run_model_tests,
     run_model_tests(model, run_fp8)
 
 
-@pytest.mark.skip(reason="https://nvbugs/5601670")
+#@pytest.mark.skip(reason="https://nvbugs/5601670")
 @pytest.mark.parametrize("build_google_tests", ["80", "86", "89", "90"],
                          indirect=True)
 @pytest.mark.parametrize("model", ["bart", "gpt", "t5"])

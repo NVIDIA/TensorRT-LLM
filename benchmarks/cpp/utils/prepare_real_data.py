@@ -1,4 +1,5 @@
 import logging
+import os
 import random
 import re
 import tempfile
@@ -122,10 +123,17 @@ def load_dataset_from_hf(dataset_config: DatasetConfig):
         ValueError: When dataset loading fails due to incorrect dataset config setting.
     """
     try:
+
+        # Use streaming mode if not local dataset
+        use_streaming_mode = not os.path.isdir(dataset_config.name)
+        logging.debug(
+            f"Loading dataset: query={dataset_config.query}, split={dataset_config.split}, streaming={use_streaming_mode}"
+        )
+
         dataset = iter(
             load_dataset(*dataset_config.query,
                          split=dataset_config.split,
-                         streaming=True,
+                         streaming=use_streaming_mode,
                          trust_remote_code=True))
     except ValueError as e:
         if "Config" in e:
