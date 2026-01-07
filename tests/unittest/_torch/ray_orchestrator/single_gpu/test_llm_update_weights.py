@@ -25,7 +25,7 @@ class RefHFModelWithIPCHandles(RefHFModel):
         config = AutoConfig.from_pretrained(model_dir)
         config.num_hidden_layers = num_hidden_layers
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_dir, config=config, torch_dtype=torch.bfloat16
+            model_dir, config=config, torch_dtype=torch.bfloat16, attn_implementation="eager"
         ).to(f"cuda:{device_id}")
         self.all_weights = {}
         self.device_uuid = [get_device_uuid(i) for i in range(torch.cuda.device_count())]
@@ -109,40 +109,6 @@ class RefHFModelWithIPCHandles(RefHFModel):
 
         return ret
 
-    def generate_batch_incremental(
-        self, original_prompts: List[List[int]], generated_token_ids_list: List[List[int]]
-    ):
-        """
-        Generate tokens incrementally for each prompt in the batch: [prompt, prompt+token0, prompt+token0+token1, ...]
-        """
-        logits_list = []
-
-        for i in range(len(original_prompts)):
-            base_token_ids = torch.tensor(
-                original_prompts[i], dtype=torch.long, device=f"cuda:{self.device_id}"
-            )
-            cur_logits = []
-            for j in range(len(generated_token_ids_list[i])):
-                if j > 0:
-                    cur_gen_tokens = torch.tensor(generated_token_ids_list[i][:j]).to("cuda")
-                    cur_token_ids = torch.cat([base_token_ids, cur_gen_tokens], dim=-1)
-                else:
-                    cur_token_ids = base_token_ids
-
-                ret = self.model.generate(
-                    input_ids=cur_token_ids.unsqueeze(0).cuda(),
-                    max_new_tokens=1,
-                    do_sample=False,
-                    return_dict_in_generate=True,
-                    output_scores=True,
-                )
-
-                cur_logits.append(ret["scores"][0])
-            cur_logits = torch.stack(cur_logits, dim=0)
-            logits_list.append(cur_logits.squeeze(1))
-
-        return logits_list
-
 
 def compare_logits(
     logits_list: List[torch.Tensor],
@@ -174,7 +140,6 @@ def run_generate(
     hf_model: RefHFModel,
     prompts: List[List[int]],
     sampling_params: SamplingParams,
-    fp8: bool = False,
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     llm_responses = []
     llm_logits = []
@@ -182,13 +147,10 @@ def run_generate(
     for output in outputs:
         llm_logits.append(output.outputs[0].generation_logits)
         llm_responses.append(output.outputs[0].token_ids)
-    if fp8:
-        ref_logits = hf_model.generate_batch_incremental(prompts, llm_responses)
-    else:
-        input_ids, attention_mask, position_ids = RefHFModel.pad_data(prompts, llm_responses)
-        ref_logits = hf_model.generate_batch_with_padding(
-            input_ids, attention_mask, position_ids, llm_responses, return_logits=True
-        )
+    input_ids, attention_mask, position_ids = RefHFModel.pad_data(prompts, llm_responses)
+    ref_logits = hf_model.generate_batch_with_padding(
+        input_ids, attention_mask, position_ids, llm_responses, return_logits=True
+    )
     return llm_logits, ref_logits
 
 
@@ -265,12 +227,7 @@ def test_llm_update_weights(model_dir, use_serialized_handles):
     """Test LLM update_weights with both serialized and direct IPC handle formats."""
     model_dir = str(llm_models_root() / model_dir)
     with TemporaryDirectory() as tmp_model_dir:
-        if "FP8" in model_dir:
-            fp8 = True
-            num_hidden_layers = 1
-        else:
-            fp8 = False
-            num_hidden_layers = 4
+        num_hidden_layers = 1
         process_and_copy_folder(model_dir, tmp_model_dir, num_hidden_layers=num_hidden_layers)
         hf_model = RefHFModelWithIPCHandles(model_dir, num_hidden_layers=num_hidden_layers)
         tokenizer = AutoTokenizer.from_pretrained(model_dir)
@@ -307,7 +264,7 @@ def test_llm_update_weights(model_dir, use_serialized_handles):
         # Finalize the update weights
         llm._collective_rpc("update_weights", (None,))
 
-        llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params, fp8=fp8)
+        llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
         compare_logits(llm_logits, ref_logits)
 
 
@@ -325,12 +282,7 @@ def test_llm_update_weights(model_dir, use_serialized_handles):
 def test_llm_partial_update_weights(model_dir):
     model_dir = str(llm_models_root() / model_dir)
     with TemporaryDirectory() as tmp_model_dir:
-        if "FP8" in model_dir:
-            fp8 = True
-            num_hidden_layers = 1
-        else:
-            fp8 = False
-            num_hidden_layers = 4
+        num_hidden_layers = 1
         process_and_copy_folder(model_dir, tmp_model_dir, num_hidden_layers=num_hidden_layers)
         hf_model = RefHFModelWithIPCHandles(model_dir, num_hidden_layers=num_hidden_layers)
         tokenizer = AutoTokenizer.from_pretrained(model_dir)
@@ -381,5 +333,5 @@ def test_llm_partial_update_weights(model_dir):
         # Finalize the update weights
         llm._collective_rpc("update_weights", (None,))
 
-        llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params, fp8=fp8)
+        llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
         compare_logits(llm_logits, ref_logits)
