@@ -1268,10 +1268,10 @@ class PerfSanityTestConfig:
                     cmd_idx += 1
 
                     if not match_keys:
-                        match_keys.extend(["s_gpu_type", "s_runtime"])
                         if server_config.match_mode == "scenario":
                             match_keys = SCENARIO_MATCH_FIELDS.copy()
                         else:
+                            match_keys.extend(["s_gpu_type", "s_runtime"])
                             match_keys.extend(server_config.to_match_keys())
                             match_keys.extend(client_config.to_match_keys())
 
