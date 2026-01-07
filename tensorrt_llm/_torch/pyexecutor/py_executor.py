@@ -2741,7 +2741,8 @@ class PyExecutor:
             if request.is_finished:
                 # Finalize any remaining logits transfers for the finished request in chunked mode
                 if request.py_use_chunked_generation_logits and request.py_return_generation_logits:
-                    request.py_result.transfer_remaining_device_logits()
+                    with torch.inference_mode():
+                        request.py_result.transfer_remaining_device_logits()
 
             request_done = False
             if request.py_decoding_iter == 1 or request.is_finished or \
