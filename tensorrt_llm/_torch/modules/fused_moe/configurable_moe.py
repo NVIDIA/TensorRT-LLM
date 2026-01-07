@@ -28,7 +28,6 @@ Design Principles:
 4. Unified EPLB integration for backends that support it
 """
 
-import os
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -223,14 +222,6 @@ class ConfigurableMoE(MoE):
         # Validate configuration
         self.validate_config()
 
-        # Debug function for eliminating imbalance during performance analysis.
-        self.enable_dummy_allreduce = os.environ.get("TRTLLM_ENABLE_DUMMY_ALLREDUCE", "0") == "1"
-        if self.enable_dummy_allreduce and self.all_reduce is None:
-            from tensorrt_llm._torch.distributed import AllReduce
-            from tensorrt_llm.functional import AllReduceStrategy
-
-            self.all_reduce = AllReduce(mapping=self.mapping, strategy=AllReduceStrategy.NCCL)
-
         # Mark as _weights_removed to skip ConfigurableMoE's post_load_weights in model_loader
         # The backend's post_load_weights will be called directly by model_loader
         # This avoids duplicate post_load_weights calls (once for ConfigurableMoE, once for backend)
@@ -244,16 +235,6 @@ class ConfigurableMoE(MoE):
         if not hasattr(self, "backend") or self.backend is None:
             return self.use_dp and self.parallel_size > 1
         return self.backend._supports_load_balancer()
-
-    def dummy_allreduce(self):
-        """
-        Debug function for eliminating imbalance during performance analysis.
-        Creates a small dummy tensor and performs allreduce to synchronize processes
-        and eliminate timing imbalances for more accurate profiling measurements.
-        """
-        dummy_tensor = torch.zeros(4, dtype=torch.float32, device="cuda")
-        dummy_tensor = self.all_reduce(dummy_tensor)
-        return dummy_tensor
 
     def validate_config(self):
         """
