@@ -40,7 +40,9 @@ else
     PROFILE_CMD=
 fi
 
+SCRIPT_PATH=$(realpath --relative-to="$(pwd)" "$(dirname -- "$0")"/run.py)
+
 set -x
-$PROFILE_CMD bash -c \
-    "python3 -u run.py \"\$@\" 2>&1 | tee \"$PROFILE_DIR/report_np${WORLD_SIZE}_rank${RANK}.log\"" \
-    bash "$@"
+$PROFILE_CMD bash -o pipefail -c \
+    "python3 -u \"\$1\" \"\${@:3}\" 2>&1 | tee \"\$2/report_np${WORLD_SIZE}_rank${RANK}.log\"" \
+    bash "$SCRIPT_PATH" "$PROFILE_DIR" "$@"

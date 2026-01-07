@@ -148,7 +148,10 @@ l0_h100:
     - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_qwen3[False-False-Qwen3-8B-FP8]
     - unittest/_torch/executor
     - unittest/_torch/ray_orchestrator/single_gpu
-    - unittest/llmapi/test_llm_pytorch.py
+    - unittest/llmapi/test_llm_pytorch.py -m "part0"
+    - unittest/llmapi/test_llm_pytorch.py -m "part1"
+    - unittest/llmapi/test_llm_pytorch.py -m "part2"
+    - unittest/llmapi/test_llm_pytorch.py -m "part3"
     - unittest/llmapi/test_async_llm.py -m "not (gpu2 or gpu4)"
     - examples/test_ray.py::test_llm_inference_async_ray
 - condition:
@@ -288,6 +291,8 @@ l0_h100:
   - examples/test_mistral.py::test_mistral_with_bf16_lora_torch[mistral-7b-v0.1]
   - examples/test_phi.py::test_phi_4_mini_instruct_with_bf16_lora_torch[Phi-4-mini-instruct]
   - examples/test_llama.py::test_llama_3_x_with_bf16_lora_torch[llama-3.2-1b-instruct]
+  - test_e2e.py::test_draft_token_tree_quickstart_advanced_eagle3[Llama-3.1-8b-Instruct-llama-3.1-model/Llama-3.1-8B-Instruct-EAGLE3-LLaMA3.1-Instruct-8B]
+  - test_e2e.py::test_draft_token_tree_quickstart_advanced_eagle3_depth_1_tree[Llama-3.1-8b-Instruct-llama-3.1-model/Llama-3.1-8B-Instruct-EAGLE3-LLaMA3.1-Instruct-8B]
  # https://nvbugs/5563469: Disable Nemotron-Nano-8B-v1 test due to non-deterministic failures, revisit as part of TRTLLM-7885
  # - examples/test_nemotron_nas.py::test_nemotron_nano_8b_lora_torch[Llama-3.1-Nemotron-Nano-8B-v1]
 - condition:

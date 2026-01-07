@@ -1,0 +1,8 @@
+#!/bin/bash
+
+set -euo pipefail
+
+# Clear slurm envs
+unset $(env | awk -F'=' '{print $1}' | (grep -E "SLURM_|SLURMD_|slurm_|MPI_|PMIX_" || true))
+
+"$@"
