@@ -858,7 +858,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         gC_mnl = cute.local_tile(
             mC_mnl, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
         )
-        k_tile_cnt = cute.size(gA_mkl, mode=[3])
+        k_tile_cnt = cutlass.Int32(cute.size(gA_mkl, mode=[3]))
 
         #
         # Partition global tensor for TiledMMA_A/B/C
@@ -2217,6 +2217,111 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         ):
             is_valid = False
         return is_valid
+
+    @cute.jit
+    def wrapper(
+        self,
+        a_ptr: cute.Pointer,
+        b_ptr: cute.Pointer,
+        a_sf_ptr: cute.Pointer,
+        b_sf_ptr: cute.Pointer,
+        alpha_scale_ptr: cute.Pointer,
+        c_ptr: cute.Pointer,
+        m: cutlass.Int64,
+        n: cutlass.Int64,
+        k: cutlass.Int64,
+        l: cutlass.Int64,  # noqa: E741
+        expert_count: cutlass.Constexpr,
+        scaling_vector_size: cutlass.Constexpr,
+        max_active_clusters: cutlass.Constexpr,
+        stream: cuda.CUstream,
+    ):
+        """Wrapper function to create cute.Tensor objects from raw pointers and call the kernel.
+
+        :param a_ptr: Pointer to input tensor A (M, K, L) - K-major
+        :type a_ptr: cute.Pointer
+        :param b_ptr: Pointer to weight tensor B (N, K, L) - K-major
+        :type b_ptr: cute.Pointer
+        :param a_sf_ptr: Pointer to scale factor tensor for A
+        :type a_sf_ptr: cute.Pointer
+        :param b_sf_ptr: Pointer to scale factor tensor for B
+        :type b_sf_ptr: cute.Pointer
+        :param alpha_scale_ptr: Pointer to alpha scale tensor (M, expert_count, L)
+        :type alpha_scale_ptr: cute.Pointer
+        :param c_ptr: Pointer to output tensor C (M, N, L) - N-major
+        :type c_ptr: cute.Pointer
+        :param m: M dimension (number of tokens)
+        :type m: cutlass.Int64
+        :param n: N dimension (output hidden size)
+        :type n: cutlass.Int64
+        :param k: K dimension (weight_per_expert * expert_count)
+        :type k: cutlass.Int64
+        :param l: L dimension (batch, typically 1)
+        :type l: cutlass.Int64
+        :param expert_count: Number of experts
+        :type expert_count: cutlass.Constexpr
+        :param scaling_vector_size: Scale factor vector size
+        :type scaling_vector_size: cutlass.Constexpr
+        :param max_active_clusters: Maximum number of active clusters
+        :type max_active_clusters: cutlass.Constexpr
+        :param stream: CUDA stream
+        :type stream: cuda.CUstream
+        """
+        scale_k = k // scaling_vector_size
+
+        # Create A tensor (M, K, L) - K-major
+        a = cute.make_tensor(
+            a_ptr,
+            layout=cute.make_ordered_layout((m, k, l), order=(1, 0, 2)),
+        )
+
+        # Create B tensor (N, K, L) - K-major
+        b = cute.make_tensor(
+            b_ptr,
+            layout=cute.make_ordered_layout((n, k, l), order=(1, 0, 2)),
+        )
+
+        # Create C tensor (M, N, L) - N-major
+        c = cute.make_tensor(
+            c_ptr,
+            layout=cute.make_ordered_layout((m, n, l), order=(1, 0, 2)),
+        )
+
+        # Create A scale factor tensor (swizzled layout)
+        # Shape: (32, 4, m // 128, 4, scale_k // 4, l)
+        a_sf = cute.make_tensor(
+            a_sf_ptr,
+            layout=cute.make_ordered_layout(
+                (32, 4, m // 128, 4, scale_k // 4, l), order=(2, 1, 4, 0, 3, 5)
+            ),
+        )
+
+        # Create B scale factor tensor (swizzled layout)
+        # Shape: (32, 4, n // 128, 4, scale_k // 4, l)
+        b_sf = cute.make_tensor(
+            b_sf_ptr,
+            layout=cute.make_ordered_layout(
+                (32, 4, n // 128, 4, scale_k // 4, l), order=(2, 1, 4, 0, 3, 5)
+            ),
+        )
+
+        # Create alpha scale tensor (M, expert_count, L) - expert_count-major
+        alpha_scale = cute.make_tensor(
+            alpha_scale_ptr,
+            layout=cute.make_ordered_layout((m, expert_count, l), order=(1, 0, 2)),
+        )
+
+        # Call the kernel
+        self.__call__(
+            a,
+            b,
+            a_sf,
+            b_sf,
+            alpha_scale,
+            c,
+            max_active_clusters,
+            stream,
+        )
 
     @staticmethod
     def can_implement(
