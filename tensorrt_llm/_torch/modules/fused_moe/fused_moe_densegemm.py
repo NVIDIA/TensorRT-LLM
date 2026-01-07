@@ -12,7 +12,7 @@ from ...model_config import ModelConfig
 from ...utils import AuxStreamType, EventType, Fp4QuantizedTensor, swizzle_sf, unswizzle_sf
 from .fused_moe_cutlass import CutlassFusedMoE
 from .interface import AlltoallMethodType
-from .quantization import MoEWeightLoadingMode
+from .quantization import MoEWeightLoadingMode, NVFP4CuteDslFusedMoEMethod
 from .routing import BaseMoeRoutingMethod
 
 
@@ -244,12 +244,13 @@ class DenseGEMMFusedMoE(CutlassFusedMoE):
     def select_alltoall_method_type(self) -> AlltoallMethodType:
         return AlltoallMethodType.NotEnabled
 
-    # def _get_quant_method(self):
-    #     if self.quant_config is not None and self.quant_config.layer_quant_mode.has_any_quant(
-    #             exclude_kv_cache=True):
-    #         if self.quant_config.layer_quant_mode.has_nvfp4():
-    #             return NVFP4CuteDslFusedMoEMethod()
-    #     return super()._get_quant_method()
+    def _get_quant_method(self):
+        if self.quant_config is not None and self.quant_config.layer_quant_mode.has_any_quant(
+            exclude_kv_cache=True
+        ):
+            if self.quant_config.layer_quant_mode.has_nvfp4():
+                return NVFP4CuteDslFusedMoEMethod()
+        return super()._get_quant_method()
 
     def quantize_input(
         self, x: Union[torch.Tensor, Fp4QuantizedTensor], post_quant_comm: bool = True
@@ -305,18 +306,24 @@ class DenseGEMMFusedMoE(CutlassFusedMoE):
         enable_alltoall: bool = False,
     ) -> torch.Tensor:
         assert self.has_nvfp4
-        output_dtype = torch.bfloat16
         num_tokens = x.shape[0]
 
         self.event_dict[EventType.Main].record()
         x_sf = swizzle_sf(x_sf, num_tokens, self.hidden_size)
-        fc1_output = torch.ops.trtllm.cute_dsl_nvfp4_gemm_blackwell(
+
+        # FC1: GEMM + SwiGLU, output is fp4 quantized
+        # weight_per_expert for FC1 = 2 * intermediate_size (gate + up)
+        fc1_output, fc1_output_sf = torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_swiglu_blackwell(
             x,
-            self.w3_w1_weight.view(x.dtype).reshape(-1, x.shape[-1]),
+            self.w3_w1_weight.view(torch.uint8),
             x_sf,
-            self.w3_w1_weight_scale.view(torch.uint8),
-            self.alpha,
-            output_dtype,
+            self.w3_w1_weight_scale,
+            self.fc31_alpha,
+            self.fc2_input_scale,
+            expert_count=self.expert_size_per_partition,
+            weight_per_expert=2 * self.intermediate_size_per_partition,
+            output_dtype=torch.float4_e2m1fn_x2,
+            scaling_vector_size=self.scaling_vector_size,
         )
 
         with torch.cuda.stream(self.aux_stream_dict[AuxStreamType.MoeFc2Alpha]):
@@ -327,33 +334,23 @@ class DenseGEMMFusedMoE(CutlassFusedMoE):
                 token_final_scales,
                 self.fc2_alpha,
             )
-            alpha_normal_factor = self.fc2_alpha_max
-            alpha_normalized = fc2_alpha / alpha_normal_factor
             self.event_dict[EventType.MoeFc2Alpha].record()
 
-        fc1_output = fc1_output.view(
-            [num_tokens, self.expert_size_per_partition, -1]
-        ) * self.fc31_alpha.view([1, -1, 1])
-        fc1_output = fc1_output.to(output_dtype)
-        swiglu_out = swiglu_fused_moe(fc1_output)
-
         self.event_dict[EventType.MoeFc2Alpha].wait()
-        fc2_input = (
-            (swiglu_out * alpha_normalized.view([num_tokens, self.expert_size_per_partition, 1]))
-            .view([num_tokens, -1])
-            .to(output_dtype)
+
+        # FC2: input k = expert_count * intermediate_size (after SwiGLU)
+        final_hidden_states = torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_fc2_blackwell(
+            fc1_output,
+            self.w2_weight.view(torch.uint8).reshape(self.hidden_size, -1),
+            fc1_output_sf,
+            self.w2_weight_scale,
+            fc2_alpha,
+            expert_count=self.expert_size_per_partition,
+            weight_per_expert=self.intermediate_size_per_partition,
+            output_dtype=torch.bfloat16,
+            scaling_vector_size=self.scaling_vector_size,
         )
-        fc2_input, fc2_input_sf = torch.ops.trtllm.fp4_quantize(
-            fc2_input, self.fc2_input_scale, self.scaling_vector_size, False, True
-        )
-        final_hidden_states = torch.ops.trtllm.cute_dsl_nvfp4_gemm_blackwell(
-            fc2_input,
-            self.w2_weight.view(fc2_input.dtype).reshape(-1, fc2_input.shape[-1]),
-            fc2_input_sf,
-            self.w2_weight_scale.view(torch.uint8),
-            alpha_normal_factor.reshape(1),
-            output_dtype,
-        )
+
         return final_hidden_states
 
     def run_moe_fp8_block_scales(

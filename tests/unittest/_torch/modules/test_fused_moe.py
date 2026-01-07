@@ -1373,7 +1373,8 @@ def test_fused_moe_fp8_blockwise_cute_dsl_multi_gpu(ep_size, routing_method,
 @skip_pre_blackwell
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("moe_backend", [
-    pytest.param("TRTLLM", marks=skip_blackwell_geforce), "CUTLASS", "CUTEDSL"
+    pytest.param("TRTLLM", marks=skip_blackwell_geforce), "CUTLASS", "CUTEDSL",
+    "DENSEGEMM"
 ])
 @pytest.mark.parametrize("enable_configurable_moe", [0, 1],
                          ids=lambda x: ""
@@ -1396,7 +1397,7 @@ def test_fused_moe_nvfp4(dtype, moe_backend, enable_configurable_moe, mocker):
 
     if moe_backend == "TRTLLM" and dtype == torch.float16:
         pytest.skip("TRTLLM NVFP4 MoE backend does not support float16 yet")
-    if moe_backend == "CUTEDSL":
+    if moe_backend in ["CUTEDSL", "DENSEGEMM"]:
         if dtype == torch.float16:
             pytest.skip(
                 "CUTEDSL NVFP4 MoE backend does not support float16 yet")
@@ -2914,3 +2915,13 @@ def test_nvfp4_cutlass_get_weights_shapes(hidden_size, intermediate_size,
     assert intermediate_size_expand_aligned % NVFP4_ROW_ALIGNMENT == 0, (
         f"intermediate_size_expand_aligned {intermediate_size_expand_aligned} "
         f"not aligned to {NVFP4_ROW_ALIGNMENT}")
+
+
+if __name__ == "__main__":
+    import os
+    from unittest.mock import MagicMock
+
+    os.environ["ENABLE_CONFIGURABLE_MOE"] = "0"
+
+    mocker = MagicMock()
+    test_fused_moe_nvfp4(torch.bfloat16, "DENSEGEMM", 0, mocker=mocker)
