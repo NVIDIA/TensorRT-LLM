@@ -673,6 +673,8 @@ class LlamaDecoderLayer(DecoderLayer):
         # Disable fusion for small models due to accuracy issues
         self.enable_fusion &= config.hidden_size > 4096
 
+        enable_gemm_allreduce_fusion = (os.environ.get(
+            "TRTLLM_GEMM_ALLREDUCE_FUSION_ENABLED", "1") == "1")
         mpi_enabled = not mpi_disabled()
         dtype_supported = config.torch_dtype in (torch.float16, torch.bfloat16)
         tp_valid = self.mapping.tp_size > 1
@@ -687,8 +689,8 @@ class LlamaDecoderLayer(DecoderLayer):
                 device_supported = True
 
         use_fused_gemm_allreduce = all([
-            mpi_enabled, dtype_supported, tp_valid, quant_valid,
-            device_supported
+            enable_gemm_allreduce_fusion, mpi_enabled, dtype_supported,
+            tp_valid, quant_valid, device_supported
         ])
 
         def check_in_out_features(in_features, out_features):
