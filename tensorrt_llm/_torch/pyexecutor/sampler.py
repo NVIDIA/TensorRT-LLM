@@ -1298,14 +1298,13 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         # Take the longest accepted path as the next new token.
         num_accepted_draft_tokens = 0
         for idx in eagle_paths[longest_match_path_idx][:longest_accepted_len]:
-            add_token(
-                request, new_tokens_list, beam_idx=DEFAULT_BEAM_IDX, step=cast(int, idx.item())
-            )
+            step = cast(int, idx.item())
+            add_token(request, new_tokens_list, beam_idx=DEFAULT_BEAM_IDX, step=step)
             num_accepted_draft_tokens += 1
             if self.finish_if_reason(
                 request,
                 finish_reasons,
-                step=num_accepted_draft_tokens,
+                step=step,
                 beam_idx=DEFAULT_BEAM_IDX,
             ):
                 break
