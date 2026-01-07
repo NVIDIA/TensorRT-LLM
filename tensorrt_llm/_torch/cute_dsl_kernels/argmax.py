@@ -532,6 +532,23 @@ if IS_CUTLASS_DSL_AVAILABLE:
     # ============================================================================
     _argmax_compile_cache = {}
 
+    # Minimum vocab size for the CuTE tiled kernel.
+    _MIN_VOCAB_SIZE_FOR_CUTE_KERNEL = 256
+
+    # The async copy requires 128-byte alignment:
+    # Since we only support float32 currently, use 32.
+    _VOCAB_SIZE_ALIGNMENT = 32
+
+    def _should_use_torch_fallback(N: int, dtype: torch.dtype) -> bool:
+        """Check if we should fall back to torch.max instead of CuTE kernel."""
+        if dtype != torch.float32:
+            return True
+        if N < _MIN_VOCAB_SIZE_FOR_CUTE_KERNEL:
+            return True
+        if N % _VOCAB_SIZE_ALIGNMENT != 0:
+            return True
+        return False
+
     def argmax(x: torch.Tensor) -> torch.Tensor:
         """
         Compute argmax along the last dimension of the input tensor.
@@ -549,6 +566,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
         assert x.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported dtype"
 
         M, N = x.shape
+
+        if _should_use_torch_fallback(N, x.dtype):
+            max_vals, max_indices = torch.max(x, dim=-1, keepdim=True)
+            return torch.cat([max_vals, max_indices.to(x.dtype)], dim=-1)
+
         out = torch.empty((M, 2), dtype=x.dtype, device=x.device)
         dtype = torch2cute_dtype_map[x.dtype]
 
