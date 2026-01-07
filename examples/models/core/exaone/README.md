@@ -91,7 +91,7 @@ Download the HuggingFace checkpoints of the K-EXAONE model:
 
 ```bash
 export HF_MODEL_DIR=hf_models/kexaone
-git clone https://huggingface.co/LGAI-EXAONE/(TODO: FIll this with real URL) $HF_MODEL_DIR
+git clone https://huggingface.co/LGAI-EXAONE/K-EXAONE-236B-A23B $HF_MODEL_DIR
 ```
 
 ## PyTorch flow
@@ -118,8 +118,15 @@ K-EXAONE is a Mixture of Experts model that benefits from multiple parallelism s
 python ../../../llm-api/quickstart_advanced.py \
     --model_dir $HF_MODEL_DIR \
     --tp_size 8 \
-    --ep_size 8 \
-    --enable_attention_dp
+    --moe_ep_size 8 \
+    --enable_attention_dp \
+    --trust_remote_code
+```
+The output will be like:
+```bash
+[0] Prompt: 'Hello, my name is', Generated text: ' John Smith, and I am a 28-year-old software developer. I live in the city of San Francisco, California. I work remotely for a tech startup based in Austin, Texas.\n\nI enjoy hiking, reading, and playing the piano. In my free time, I often explore new neighborhoods in San Francisco, trying out new restaurants and cafes.\n\n'
+[1] Prompt: 'The capital of France is', Generated text: ' Paris, the capital of France is Paris, the capital of France is Paris, the capital of France is Paris, the capital of France is Paris, the capital of France is Paris, the capital of France is Paris, the capital of France is Paris, the capital of France is Paris, the capital of France is Paris'
+[2] Prompt: 'The future of AI is', Generated text: ' bright.\n</think>\n\nThe future of AI holds immense promise across numerous domains. In healthcare, AI is revolutionizing diagnostics, drug discovery, and personalized treatment plans. In education, AI is enabling adaptive learning platforms that cater to individual learning styles and paces. In environmental science, AI is playing a pivotal role in addressing climate change by optimizing'
 ```
 
 #### MoE Backend Options
@@ -138,9 +145,10 @@ You can specify the MoE backend using the `--moe_backend` argument:
 python ../../../llm-api/quickstart_advanced.py \
     --model_dir $HF_MODEL_DIR \
     --tp_size 8 \
-    --ep_size 8 \
+    --moe_ep_size 8 \
     --enable_attention_dp \
-    --moe_backend CUTLASS
+    --moe_backend CUTLASS \
+    --trust_remote_code
 ```
 
 ### PyTorch flow Quantization
