@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import copy
 from enum import IntEnum
 from typing import List
 
@@ -238,9 +237,6 @@ class MappingBase:
     @property
     def dp_size(self):
         return self.tp_size if self.enable_attention_dp else 1
-
-    def clone(self):
-        return copy.deepcopy(self)
 
     def has_cp_ulysses(self):
         return self.cp_size > 1 and self.cp_config.get(

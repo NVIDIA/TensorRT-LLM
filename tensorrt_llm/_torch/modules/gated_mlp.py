@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import Mapping
 
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
@@ -41,14 +42,19 @@ class GatedMLP(nn.Module):
         self.activation = activation
 
         config = config or ModelConfig()
+        self.mapping = config.mapping
         if overridden_tp_size is not None:
             assert config.mapping.tp_size % overridden_tp_size == 0
+            tp_size = overridden_tp_size
             # "Misuse" pp_size here to perform all-reduce within smaller groups
             pp_size = config.mapping.pp_size * config.mapping.tp_size // overridden_tp_size
-            mapping = config.mapping.clone()
-            mapping.world_size = overridden_tp_size * pp_size
-            mapping.tp_size = overridden_tp_size
-            mapping.pp_size = pp_size
+            mapping = Mapping(
+                world_size=tp_size * pp_size,
+                rank=self.mapping.rank,
+                gpus_per_node=self.mapping.gpus_per_node,
+                tp_size=tp_size,
+                pp_size=pp_size,
+            )
         else:
             mapping = config.mapping
 
