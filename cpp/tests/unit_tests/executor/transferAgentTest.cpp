@@ -92,7 +92,7 @@ TEST_P(TransferAgentTest, Basic)
 {
 
     std::string const agent0{"agent0"}, agent1{"agent1"};
-    BaseAgentConfig config0{agent0, true}, config1{agent1, true};
+    BaseAgentConfig config0{agent0, true, false, true, 1}, config1{agent1, true, false, true, 1};
     auto xferAgent0 = makeTransferAgent(config0);
     auto xferAgent1 = makeTransferAgent(config1);
 
@@ -117,10 +117,9 @@ TEST_P(TransferAgentTest, Basic)
 
     TransferRequest writeReq{TransferOp::kWRITE, regMem0.getDescs(), regMem1.getDescs(), agent1};
     auto status = xferAgent0->submitTransferRequests(writeReq);
-    status->wait();
+    TLLM_CHECK(status->wait() == TransferState::kSUCCESS);
 
     TLLM_CHECK(memory0 == memory1);
-
     xferAgent0->invalidateRemoteAgent(agent1);
 }
 
@@ -128,7 +127,7 @@ TEST_P(TransferAgentTest, Basic2)
 {
 
     std::string const agent0{"agent0"}, agent1{"agent1"};
-    BaseAgentConfig config0{agent0, true}, config1{agent1, true};
+    BaseAgentConfig config0{agent0, true, false, true, 1}, config1{agent1, true, false, true, 1};
     auto xferAgent0 = makeTransferAgent(config0);
     auto xferAgent1 = makeTransferAgent(config1);
 
@@ -152,7 +151,7 @@ TEST_P(TransferAgentTest, Basic2)
 
     TransferRequest readReq{TransferOp::kREAD, regMem0.getDescs(), regMem1.getDescs(), agent1};
     auto status = xferAgent0->submitTransferRequests(readReq);
-    status->wait();
+    TLLM_CHECK(status->wait() == TransferState::kSUCCESS);
 
     TLLM_CHECK(memory0 == memory1);
 
@@ -163,7 +162,7 @@ TEST_P(TransferAgentTest, DeviceMemory)
 {
 
     std::string const agent0{"agent0"}, agent1{"agent1"};
-    BaseAgentConfig config0{agent0, true}, config1{agent1, true};
+    BaseAgentConfig config0{agent0, true, false, true, 1}, config1{agent1, true, false, true, 1};
     auto xferAgent0 = makeTransferAgent(config0);
     auto xferAgent1 = makeTransferAgent(config1);
 
@@ -177,8 +176,8 @@ TEST_P(TransferAgentTest, DeviceMemory)
     cudaMalloc(&dev_ptr1, size);
     std::vector<char> memory0(size, 10);
     std::vector<char> memory1(size, 1);
-    cudaMemcpy(dev_ptr0, memory0.data(), size, cudaMemcpyHostToDevice);
-    cudaMemcpy(dev_ptr1, memory1.data(), size, cudaMemcpyHostToDevice);
+    TLLM_CUDA_CHECK(cudaMemcpy(dev_ptr0, memory0.data(), size, cudaMemcpyHostToDevice));
+    TLLM_CUDA_CHECK(cudaMemcpy(dev_ptr1, memory1.data(), size, cudaMemcpyHostToDevice));
     RegisteredHostMemory regMem0(
         MemoryDescs{MemoryType::kVRAM, {MemoryDesc{dev_ptr0, size, deviceId}}}, xferAgent0.get());
     RegisteredHostMemory regMem1(
@@ -194,12 +193,13 @@ TEST_P(TransferAgentTest, DeviceMemory)
     } while (!checked);
     TransferRequest writeReq{TransferOp::kWRITE, regMem0.getDescs(), regMem1.getDescs(), agent1};
     auto status = xferAgent0->submitTransferRequests(writeReq);
-    status->wait();
+    TLLM_CHECK(status->wait() == TransferState::kSUCCESS);
 
-    cudaMemcpy(memory0.data(), dev_ptr0, size, cudaMemcpyDeviceToHost);
-    cudaMemcpy(memory1.data(), dev_ptr1, size, cudaMemcpyDeviceToHost);
+    TLLM_CUDA_CHECK(cudaMemcpy(memory0.data(), dev_ptr0, size, cudaMemcpyDeviceToHost));
+    TLLM_CUDA_CHECK(cudaMemcpy(memory1.data(), dev_ptr1, size, cudaMemcpyDeviceToHost));
 
     TLLM_CHECK(memory0 == memory1);
+
     TLLM_CUDA_CHECK(cudaFree(dev_ptr0));
     TLLM_CUDA_CHECK(cudaFree(dev_ptr1));
     xferAgent0->invalidateRemoteAgent(agent1);
@@ -209,7 +209,8 @@ TEST_P(TransferAgentTest, Connect)
 {
 
     std::string const agent0{"agent0"}, agent1{"agent1"}, agent2{"agent2"};
-    BaseAgentConfig config0{agent0, true}, config1{agent1, true}, config2{agent2, true};
+    BaseAgentConfig config0{agent0, true, false, true, 1}, config1{agent1, true, false, true, 1},
+        config2{agent2, true, false, true, 1};
     auto xferAgent0 = makeTransferAgent(config0);
     auto xferAgent1 = makeTransferAgent(config1);
     auto xferAgent2 = makeTransferAgent(config2);
@@ -236,7 +237,7 @@ TEST_P(TransferAgentTest, Connect)
     } while (!checked);
     TransferRequest writeReq{TransferOp::kWRITE, memDescs0, memDescs1, agent1};
     auto status = xferAgent0->submitTransferRequests(writeReq);
-    status->wait();
+    TLLM_CHECK(status->wait() == TransferState::kSUCCESS);
 
     TLLM_CHECK(memory0 == memory1);
     xferAgent2->loadRemoteAgent(agent1, connectionInfo);
@@ -247,7 +248,7 @@ TEST_P(TransferAgentTest, Connect)
     } while (!checked);
     TransferRequest writeReq2{TransferOp::kWRITE, memDescs0, memDescs1, agent1};
     auto status2 = xferAgent2->submitTransferRequests(writeReq2);
-    status2->wait();
+    TLLM_CHECK(status2->wait() == TransferState::kSUCCESS);
     TLLM_CHECK(memory0 == memory1);
     xferAgent0->invalidateRemoteAgent(agent1);
     xferAgent2->invalidateRemoteAgent(agent1);
@@ -260,7 +261,7 @@ TEST_P(TransferAgentTest, SyncMessage)
 {
     constexpr std::size_t MAX_QUERY_TIMES = std::numeric_limits<size_t>::max();
     std::string const agent0{"agent0"}, agent1{"agent1"};
-    BaseAgentConfig config0{agent0, true}, config1{agent1, true};
+    BaseAgentConfig config0{agent0, true, false, true, 1}, config1{agent1, true, false, true, 1};
     auto xferAgent0 = makeTransferAgent(config0);
     auto xferAgent1 = makeTransferAgent(config1);
 
@@ -294,7 +295,7 @@ TEST_P(TransferAgentTest, SyncMessage)
     {
         notif = xferAgent1->getNotifiedSyncMessages();
     }
-    status->wait();
+    TLLM_CHECK(status->wait() == TransferState::kSUCCESS);
     TLLM_CHECK(status->isCompleted());
     TLLM_CHECK(notif.size() == 1);
     TLLM_CHECK(notif[agent0].size() == 1);
@@ -343,7 +344,7 @@ TEST_P(TransferAgentTest, SyncMessage)
     {
         notif4 = xferAgent0->getNotifiedSyncMessages();
     }
-    status1->wait();
+    TLLM_CHECK(status1->wait() == TransferState::kSUCCESS);
     TLLM_CHECK(status1->isCompleted());
     TLLM_CHECK(notif4.size() == 1);
     TLLM_CHECK(notif4[agent1].size() == 1);

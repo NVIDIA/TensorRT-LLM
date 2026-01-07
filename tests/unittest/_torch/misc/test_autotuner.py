@@ -40,18 +40,21 @@ pytestmark = pytest.mark.threadleak(enabled=False)
 def test_multi_dynamic_dims():
     tuner = autotuner.AutoTuner()
     x = torch.rand([5, 1024])
-    w = torch.rand([7, 19])
+    w = torch.rand([7, 9])
     dynamic_tensor_specs = (
         DynamicTensorSpec(0, 0, [1, 3, 5]),
         DynamicTensorSpec(0, 1, [16, 24, 1024]),
-        DynamicTensorSpec(1, 1, [3, 7, 9], lambda x: x // 2),
+        # map_to_tuning_buckets is only applied at runtime, not during tuning
+        DynamicTensorSpec(1,
+                          1, [3, 7, 9],
+                          map_to_tuning_buckets=lambda x: x // 2),
     )
 
     profiles = tuner._optimization_profiles(
         tuning_config=TuningConfig(dynamic_tensor_specs=dynamic_tensor_specs),
         inputs=[x, w])
     # choice(0, 0) * choice(0, 1) * choice(1, 1)
-    # 3 * 3 * 3 = 27, because 19 is mapped to 9 and already inside the bucket
+    # 3 * 3 * 3 = 27, input value 9 is already inside the bucket
     assert len(profiles) == 27
     sample_0 = OptimizationProfile(shapes=[[
         DynamicDim(min=1, opt=1, max=3),
@@ -171,6 +174,75 @@ def test_autotuner_cache_basic():
             torch.randn(m, 64), w)
         check_gemm_tactic_valid(best_tactic, m)
         m //= 2
+
+
+def test_bucket_mapping():
+    """Test that map_to_tuning_buckets correctly maps runtime sizes to tuning buckets.
+
+    This test demonstrates the single mapper approach:
+    - During tuning: NO mapper is applied, raw bucket values are used as cache keys
+    - During runtime: map_to_tuning_buckets is applied to map buffer size to actual work size
+
+    With sparsity=0.25, the buffer contains 25% actual work:
+    - Tuning stores buckets: 1, 2, 4, 8, 16, 32 as raw cache keys
+    - Runtime buffer 4 -> maps to bucket int(4 * 0.25) = 1
+    - Runtime buffer 16 -> maps to bucket int(16 * 0.25) = 4
+
+    In MoE EP, the input buffer is allocated for worst-case but sparsely filled.
+    Using map_to_tuning_buckets allows us to map buffer size to actual work size at runtime.
+    """
+    w = torch.randn(64, 128)
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+
+    # Sparsity indicates the fraction of buffer containing valid work
+    sparsity = 0.25
+
+    tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        input_idx=0,
+        dim_idx=0,
+        gen_tuning_buckets=get_power_of_2_num_tokens_buckets(M),
+        map_to_tuning_buckets=lambda x: int(x * sparsity)), ), )
+
+    with autotune():
+        tuner.choose_one("test_bucket_mapping", [GemmRunner()], tuning_config,
+                         [torch.randn(1, 64), w])
+
+    # Verify cache entries use raw tuning bucket values
+    cache_entries = tuner.profiling_cache.get_specific_custom_op(
+        "test_bucket_mapping")
+
+    # Extract the first dimension of the first input shape from each cache key
+    assert len(cache_entries) == len(tuning_config.dynamic_tensor_specs[0].gen_tuning_buckets), \
+        f"Expected {len(tuning_config.dynamic_tensor_specs[0].gen_tuning_buckets)} cache entries, got {len(cache_entries)}"
+
+    # Test runtime mapping: buffer size is mapped via map_to_runtime_buckets
+    # to find the correct tuning bucket based on actual work size
+    test_cases = [
+        # size 4 -> valid work size (4*0.25)=1, tactic 0 since 1 <= M//2
+        (4, 1, 0),
+        # size 8 -> valid work size (8*0.25)=2, tactic 0 since 2 <= M//2
+        (8, 2, 0),
+        # size 16 -> valid work size (16*0.25)=4, tactic 0 since 4 <= M//2
+        (16, 4, 0),
+        # size 32 -> valid work size (32*0.25)=8, tactic 0 since 8 <= M//2
+        (32, 8, 0),
+        # size 64 -> valid work size (64*0.25)=16, tactic 0 since 16 <= M//2
+        (64, 16, 0),
+        # size 128 -> valid work size (128*0.25)=32, tactic 1 since 32 > M//2
+        (128, 32, 1),
+        # size 256 -> valid work size (256*0.25)=64, tactic -1 since 64 > M
+        (256, 64, -1),
+    ]
+
+    for buffer_size, valid_size, expected_tactic in test_cases:
+        # Verify cache lookup succeeds with the mapped bucket
+        x = torch.randn(buffer_size, 64)
+        runner, tactic = tuner.choose_one("test_bucket_mapping", [GemmRunner()],
+                                          tuning_config, [x, w])
+        assert (
+            tactic == expected_tactic
+        ), f"buffer size={buffer_size} -> valid work size={valid_size}, expected tactic {expected_tactic} but got {tactic}"
 
 
 def test_autotuner_try_block():

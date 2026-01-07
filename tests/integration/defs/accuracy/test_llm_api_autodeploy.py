@@ -234,8 +234,16 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
 
 
 class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
+    """Accuracy regression tests for Nemotron Super V3.
+
+    Runs the model via AutoDeploy and verifies benchmark performance on MMLU and GSM8K
+    """
+
     MODEL_NAME = "nvidia/Nemotron-Super-V3"
     MODEL_PATH_BF16 = f"{llm_models_root()}/Nemotron-Super-3-120B-A12B-dev"
+    # Set minimum possible seq len + small buffer, for test speed & memory usage
+    MAX_SEQ_LEN = max(MMLU.MAX_INPUT_LEN + MMLU.MAX_OUTPUT_LEN,
+                      GSM8K.MAX_INPUT_LEN + GSM8K.MAX_OUTPUT_LEN)
 
     def get_default_kwargs(self):
         return {
@@ -243,10 +251,10 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
             "trust_remote_code": True,
             "skip_loading_weights": False,
             "compile_backend": "torch-cudagraph",
-            "free_mem_ratio": 0.5,  # maybe we can increase
+            "free_mem_ratio": 0.9,
             "max_batch_size": 128,
-            "max_seq_len": 8192,
-            "max_num_tokens": 8192,
+            "max_seq_len": self.MAX_SEQ_LEN,
+            "max_num_tokens": self.MAX_SEQ_LEN,
             "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
             "transforms": {
                 "detect_sharding": {
