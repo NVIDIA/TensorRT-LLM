@@ -1124,6 +1124,9 @@ private:
                 auto& fc1_alpha = quant_scales.value()[6];
                 auto& fc2_alpha = quant_scales.value()[7];
                 int group_size = TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::int4_group_size;
+                // Whether it is per-expert activation scale
+                bool fc1_use_per_expert_act_scale = fc1_act_scales.numel() > hidden_size;
+                bool fc2_use_per_expert_act_scale = fc2_act_scales.numel() > inter_size;
                 return kernels::QuantParams::GroupWise(group_size,
                     static_cast<void const*>(fc1_weight_scales.data_ptr()),
                     static_cast<void const*>(fc2_weight_scales.data_ptr()),
@@ -1132,7 +1135,8 @@ private:
                     static_cast<void const*>(fc1_weight_zeros.numel() > 0 ? fc1_weight_zeros.data_ptr() : nullptr),
                     static_cast<void const*>(fc2_weight_zeros.numel() > 0 ? fc2_weight_zeros.data_ptr() : nullptr),
                     static_cast<float const*>(fc1_alpha.numel() > 0 ? fc1_alpha.data_ptr() : nullptr),
-                    static_cast<float const*>(fc2_alpha.numel() > 0 ? fc2_alpha.data_ptr() : nullptr));
+                    static_cast<float const*>(fc2_alpha.numel() > 0 ? fc2_alpha.data_ptr() : nullptr),
+                    fc1_use_per_expert_act_scale, fc2_use_per_expert_act_scale);
             }
             else
             {

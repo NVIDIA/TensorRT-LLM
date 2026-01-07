@@ -2244,6 +2244,10 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             cluster_shape_mn[0] * cluster_shape_mn[1] > 16
             or cluster_shape_mn[0] <= 0
             or cluster_shape_mn[1] <= 0
+            # Special cluster shape check for scale factor multicasts.
+            # Due to limited size of scale factors, we can't multicast among more than 4 CTAs.
+            or cluster_shape_mn[0] > 4
+            or cluster_shape_mn[1] > 4
             or not is_power_of_2(cluster_shape_mn[0])
             or not is_power_of_2(cluster_shape_mn[1])
         ):
@@ -2304,8 +2308,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             is_valid = False
         return is_valid
 
-    @staticmethod
+    @classmethod
     def can_implement(
+        cls,
         ab_dtype: Type[cutlass.Numeric],
         sf_dtype: Type[cutlass.Numeric],
         sf_vec_size: int,
@@ -2355,24 +2360,20 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         """
         can_implement = True
         # Skip unsupported types
-        if not Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel.is_valid_dtypes_and_scale_factor_vec_size(
+        if not cls.is_valid_dtypes_and_scale_factor_vec_size(
             ab_dtype, sf_dtype, sf_vec_size, out_dtype
         ):
             can_implement = False
 
         # Skip unsupported layouts
-        if not Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel.is_valid_layouts(
-            ab_dtype, out_dtype, a_major, b_major, out_major
-        ):
+        if not cls.is_valid_layouts(ab_dtype, out_dtype, a_major, b_major, out_major):
             can_implement = False
 
         # Skip invalid mma tile shape and cluster shape
-        if not Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel.is_valid_mma_tiler_and_cluster_shape(
-            mma_tiler_mn, cluster_shape_mn
-        ):
+        if not cls.is_valid_mma_tiler_and_cluster_shape(mma_tiler_mn, cluster_shape_mn):
             can_implement = False
         # Skip illegal problem shape for load/store alignment
-        if not Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel.is_valid_tensor_alignment(
+        if not cls.is_valid_tensor_alignment(
             m, n, k, l, ab_dtype, out_dtype, a_major, b_major, out_major
         ):
             can_implement = False

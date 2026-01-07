@@ -157,6 +157,7 @@ set(UCX_WRAPPER_TARGET tensorrt_llm_ucx_wrapper)
 
 if(NIXL_ROOT)
   set(NIXL_WRAPPER_TARGET tensorrt_llm_nixl_wrapper)
+  set(TRANSFER_AGENT_BINDING_TARGET tensorrt_llm_transfer_agent_binding)
 endif()
 
 if(MOONCAKE_ROOT)

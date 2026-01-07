@@ -2139,7 +2139,6 @@ class PyTorchModelEngine(ModelEngine):
                 # For the target model + tree decoding
                 if not self.is_draft_model and not spec_config.is_linear_tree:
                     assert spec_tree_manager is not None
-                    assert num_draft_tokens == spec_tree_manager.max_total_draft_tokens
                     position_ids.extend(
                         past_seen_token_num +
                         spec_tree_manager.spec_dec_position_offsets[
