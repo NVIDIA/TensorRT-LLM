@@ -72,11 +72,11 @@ def _forward_with_cond(
         inputs_embeds = self.get_input_embeddings()(input_ids)
 
     def _vision_branch(inputs_embeds, pixel_values, input_ids):
+        # Updated to match transformers 4.57.1+ signature
+        # get_image_features now takes: (self, pixel_values, vision_feature_select_strategy, **kwargs)
         image_features = self.get_image_features(
             pixel_values=pixel_values,
-            vision_feature_layer=vision_feature_layer,
             vision_feature_select_strategy=vision_feature_select_strategy,
-            image_sizes=None,
         )
 
         vision_flat = image_features.view(-1, image_features.size(-1))
