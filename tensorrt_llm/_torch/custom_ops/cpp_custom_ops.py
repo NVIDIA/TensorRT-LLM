@@ -842,3 +842,24 @@ def _register_fake():
         # This is a fake implementation for shape inference
         # The actual operation modifies fused_q and q_pe in-place
         return None
+
+    @torch.library.register_fake("trtllm::mxfp8_quantize")
+    def _(input: torch.Tensor,
+          isSfSwizzledLayout: bool = True,
+          alignment: int = 32):
+        output_shape = list(input.shape)
+        padded_k = fp4_utils.pad_up(output_shape[-1], alignment)
+        output_shape[-1] = padded_k
+        output = input.new_empty(output_shape, dtype=torch.float8_e4m3fn)
+
+        sf_vec_size = 32
+        m = 1
+        for i in range(len(output_shape) - 1):
+            m *= output_shape[i]
+        if isSfSwizzledLayout:
+            sf_size = fp4_utils.pad_up(m, 128) * fp4_utils.pad_up(
+                padded_k // sf_vec_size, 4)
+        else:
+            sf_size = m * (padded_k // sf_vec_size)
+        sf = input.new_empty((sf_size, ), dtype=torch.uint8)
+        return output, sf
