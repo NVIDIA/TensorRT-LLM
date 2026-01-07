@@ -100,6 +100,8 @@ MODEL_PATH_DICT = {
     "deepseek_r1_0528_fp8": "DeepSeek-R1/DeepSeek-R1-0528/",
     "deepseek_r1_0528_fp4": "DeepSeek-R1/DeepSeek-R1-0528-FP4/",
     "deepseek_r1_0528_fp4_v2": "DeepSeek-R1/DeepSeek-R1-0528-FP4-v2/",
+    "deepseek_r1_distill_llama_70b":
+    "DeepSeek-R1/DeepSeek-R1-Distill-Llama-70B/",
     "deepseek_v3_lite_fp8": "DeepSeek-V3-Lite/fp8",
     "deepseek_v3_lite_nvfp4": "DeepSeek-V3-Lite/nvfp4_moe_only",
     "qwen2_7b_instruct": "Qwen2-7B-Instruct",
@@ -127,6 +129,10 @@ MODEL_PATH_DICT = {
     "gpt_350m_moe": "gpt2-medium",
     "phi_4_mini_instruct": "Phi-4-mini-instruct",
     "phi_4_multimodal_instruct": "multimodals/Phi-4-multimodal-instruct",
+    "phi_4_multimodal_instruct_fp4":
+    "multimodals/Phi-4-multimodal-instruct-FP4",
+    "phi_4_multimodal_instruct_fp8":
+    "multimodals/Phi-4-multimodal-instruct-FP8",
     "phi_4_multimodal_instruct_image": "multimodals/Phi-4-multimodal-instruct",
     "phi_4_multimodal_instruct_audio": "multimodals/Phi-4-multimodal-instruct",
     "phi_4_multimodal_instruct_fp4_image":
@@ -143,7 +149,21 @@ MODEL_PATH_DICT = {
     "gpt_oss_120b_fp4": "gpt_oss/gpt-oss-120b",
     "gpt_oss_20b_fp4": "gpt_oss/gpt-oss-20b",
     "nemotron_nano_9b_v2": "NVIDIA-Nemotron-Nano-12B-v2",
+    "nvidia_nemotron_nano_9b_v2_nvfp4": "NVIDIA-Nemotron-Nano-9B-v2-NVFP4",
     "starcoder2_7b": "starcoder2-7b",
+    "qwen3_8b": "Qwen3/Qwen3-8B",
+    "qwen3_8b_fp8": "Qwen3/nvidia-Qwen3-8B-FP8",
+    "qwen3_8b_fp4": "Qwen3/nvidia-Qwen3-8B-NVFP4",
+    "qwen3_14b_fp8": "Qwen3/nvidia-Qwen3-14B-FP8",
+    "qwen3_14b_fp4": "Qwen3/nvidia-Qwen3-14B-NVFP4",
+    "qwen3_14b": "Qwen3/Qwen3-14B",
+    "qwen3_30b_a3b": "Qwen3/Qwen3-30B-A3B",
+    "qwen3_30b_a3b_fp4": "Qwen3/saved_models_Qwen3-30B-A3B_nvfp4_hf",
+    "qwen3_32b": "Qwen3/Qwen3-32B",
+    "qwen3_32b_fp4": "Qwen3/nvidia-Qwen3-32B-NVFP4",
+    "phi_4_reasoning_plus": "Phi-4/Phi-4-reasoning-plus",
+    "phi_4_reasoning_plus_fp8": "nvidia-Phi-4-reasoning-plus-FP8",
+    "phi_4_reasoning_plus_fp4": "nvidia-Phi-4-reasoning-plus-NVFP4",
 }
 # Model PATH of HuggingFace
 HF_MODEL_PATH = {
