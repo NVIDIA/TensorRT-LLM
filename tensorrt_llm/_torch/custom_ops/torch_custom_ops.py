@@ -1723,7 +1723,6 @@ class AllReduceRunner(TunableRunner):
     ) -> torch.Tensor:
         input, residual, norm_weight, scale, bias, workspace = inputs
         if tactic == -1:
-            # TODO: Use NCCL instead of NCCL_SYMMETRIC to avoid hanging during tuning process
             tactic = AllReduceStrategy.NCCL_SYMMETRIC.value
 
         return torch.ops.trtllm.allreduce(
