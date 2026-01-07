@@ -1559,8 +1559,7 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type):
             f"K[{chunk.k_token_start}:{chunk.k_token_end}] ({num_k} tokens)")
 
     indexer._update_k_cache(k_fp8, k_scale, metadata_chunked)
-    topk_indices_chunked = indexer.sparse_attn_indexer(metadata_chunked,
-                                                       hidden_states, q_fp8,
+    topk_indices_chunked = indexer.sparse_attn_indexer(metadata_chunked, q_fp8,
                                                        k_fp8, k_scale, weights)
 
     print(f"✓ Chunked execution completed, shape: {topk_indices_chunked.shape}")
@@ -1592,8 +1591,8 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type):
 
     indexer._update_k_cache(k_fp8, k_scale, metadata_baseline)
     topk_indices_baseline = indexer.sparse_attn_indexer(metadata_baseline,
-                                                        hidden_states, q_fp8,
-                                                        k_fp8, k_scale, weights)
+                                                        q_fp8, k_fp8, k_scale,
+                                                        weights)
 
     print(
         f"✓ Non-chunked execution completed, shape: {topk_indices_baseline.shape}"
@@ -1866,7 +1865,6 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk,
 
     try:
         topk_indices_custom = indexer.sparse_attn_indexer(metadata_custom,
-                                                          hidden_states,
                                                           q_fp8,
                                                           k_fp8,
                                                           k_scale,
@@ -1892,7 +1890,6 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk,
     Indexer.prepare(metadata_fallback)
     indexer._update_k_cache(k_fp8, k_scale, metadata_fallback)
     topk_indices_fallback = indexer.sparse_attn_indexer(metadata_fallback,
-                                                        hidden_states,
                                                         q_fp8,
                                                         k_fp8,
                                                         k_scale,
@@ -1921,7 +1918,6 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk,
         try:
             topk_indices_skip = indexer.sparse_attn_indexer(
                 metadata_skip,
-                hidden_states,
                 q_fp8,
                 k_fp8,
                 k_scale,
@@ -2035,7 +2031,6 @@ def test_indexer_prefill_chunked_custom_vs_fallback(batch_size, index_topk,
 
     try:
         topk_indices_custom = indexer.sparse_attn_indexer(metadata_custom,
-                                                          hidden_states,
                                                           q_fp8,
                                                           k_fp8,
                                                           k_scale,
@@ -2055,7 +2050,6 @@ def test_indexer_prefill_chunked_custom_vs_fallback(batch_size, index_topk,
     Indexer.prepare(metadata_fallback)
     indexer._update_k_cache(k_fp8, k_scale, metadata_fallback)
     topk_indices_fallback = indexer.sparse_attn_indexer(metadata_fallback,
-                                                        hidden_states,
                                                         q_fp8,
                                                         k_fp8,
                                                         k_scale,
@@ -2143,7 +2137,6 @@ def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk,
 
     try:
         topk_indices_custom = indexer.sparse_attn_indexer(metadata_custom,
-                                                          hidden_states,
                                                           q_fp8,
                                                           k_fp8,
                                                           k_scale,
@@ -2166,7 +2159,6 @@ def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk,
     metadata_fallback.indexer_prefill_chunks = None
 
     topk_indices_fallback = indexer.sparse_attn_indexer(metadata_fallback,
-                                                        hidden_states,
                                                         q_fp8,
                                                         k_fp8,
                                                         k_scale,
@@ -2191,7 +2183,6 @@ def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk,
 
     try:
         topk_indices_skip = indexer.sparse_attn_indexer(metadata_skip,
-                                                        hidden_states,
                                                         q_fp8,
                                                         k_fp8,
                                                         k_scale,
@@ -2302,7 +2293,6 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip):
 
     # Test custom kernel
     topk_custom = indexer.sparse_attn_indexer(metadata,
-                                              hidden_states,
                                               q_fp8,
                                               k_fp8,
                                               k_scale,
@@ -2311,7 +2301,6 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip):
 
     # Test fallback
     topk_fallback = indexer.sparse_attn_indexer(metadata,
-                                                hidden_states,
                                                 q_fp8,
                                                 k_fp8,
                                                 k_scale,
@@ -2337,7 +2326,6 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip):
         Indexer.prepare(metadata_skip)
         indexer._update_k_cache(k_fp8, k_scale, metadata_skip)
         topk_indices_skip = indexer.sparse_attn_indexer(metadata_skip,
-                                                        hidden_states,
                                                         q_fp8,
                                                         k_fp8,
                                                         k_scale,
