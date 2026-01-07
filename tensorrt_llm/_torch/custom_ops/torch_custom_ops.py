@@ -1690,7 +1690,8 @@ class AllReduceRunner(TunableRunner):
         **kwargs,
     ) -> List[int]:
         valid_strategies = [
-            AllReduceStrategy.NCCL_SYMMETRIC.value,
+            # TODO: NCCL_SYMMETRIC will cause hang during tuning process
+            # AllReduceStrategy.NCCL_SYMMETRIC.value,
             AllReduceStrategy.NCCL.value,
         ]
         # Fallback in allreduceOp is set to NCCL_SYMMETRIC as default
@@ -1719,7 +1720,7 @@ class AllReduceRunner(TunableRunner):
         input, residual, norm_weight, scale, bias, workspace = inputs
         if tactic == -1:
             # TODO: Use NCCL instead of NCCL_SYMMETRIC to avoid hanging during tuning process
-            tactic = AllReduceStrategy.NCCL_SYMMETRIC.value
+            tactic = AllReduceStrategy.NCCL.value
 
         return torch.ops.trtllm.allreduce(
             input,
