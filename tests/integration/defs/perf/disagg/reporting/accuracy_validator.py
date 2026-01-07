@@ -127,6 +127,14 @@ DATASET_DEFAULTS = {
         "num_samples": 198,
         "higher_is_better": True,
     },
+    # Alias for gpqa_diamond (same task, different naming convention)
+    "gpqa_diamond_cot_zeroshot": {
+        "alpha": 0.05,
+        "beta": 0.2,
+        "sigma": 50,
+        "num_samples": 198,
+        "higher_is_better": True,
+    },
     "json_mode_eval": {
         "alpha": 0.05,
         "beta": 0.2,
