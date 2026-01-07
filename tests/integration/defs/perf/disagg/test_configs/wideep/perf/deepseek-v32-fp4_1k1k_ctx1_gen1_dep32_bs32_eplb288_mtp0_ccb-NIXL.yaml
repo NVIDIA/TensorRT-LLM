@@ -46,7 +46,7 @@ accuracy:
   enable_accuracy_test: false  # Set to true to enable accuracy evaluation
   model: local-completions
   tasks: gsm8k
-  model_args_extra: num_concurrent=512,max_retries=3,tokenized_requests=false,timeout=1200,max_gen_toks=256,max_length=4096
+  model_args_extra: num_concurrent=512,max_retries=3,tokenized_requests=false,timeout=1200,max_gen_toks=256,max_length=4096 
 worker_config:
   gen:
     tensor_parallel_size: 32
@@ -78,6 +78,7 @@ worker_config:
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.9
       dtype: fp8
+      tokens_per_block: 64
     moe_config:
       backend: CUTEDSL
       use_low_precision_moe_combine: true
@@ -109,6 +110,7 @@ worker_config:
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.85
       dtype: fp8
+      tokens_per_block: 64
     cache_transceiver_config:
       max_tokens_in_buffer: 4608
       backend: NIXL
