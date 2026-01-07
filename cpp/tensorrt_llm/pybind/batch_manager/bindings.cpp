@@ -170,7 +170,7 @@ void initBindings(pybind11::module_& m)
         .def_property_readonly("prepopulated_prompt_len", &GenLlmReq::getPrepopulatedPromptLen)
         .def_property(
             "guided_decoding_params", &GenLlmReq::getGuidedDecodingParams, &GenLlmReq::setGuidedDecodingParams)
-        .def_property_readonly("context_phase_params", &GenLlmReq::getContextPhaseParams)
+        .def_property("context_phase_params", &GenLlmReq::getContextPhaseParams, &GenLlmReq::setContextPhaseParams)
         .def_property_readonly("is_context_only_request", &GenLlmReq::isContextOnlyRequest)
         .def_property_readonly("is_generation_only_request", &GenLlmReq::isGenerationOnlyRequest)
         .def_property_readonly("is_generation_complete_state", &GenLlmReq::isGenerationCompleteState)

@@ -117,6 +117,9 @@ class DisaggregatedParams(OpenAIBaseModel):
     ctx_request_id: Optional[int] = None
     encoded_opaque_state: Optional[str] = None
     draft_tokens: Optional[List[int]] = None
+    disagg_id: Optional[int] = None
+    ctx_dp_rank: Optional[int] = None
+    ctx_info_endpoint: Optional[str] = None
 
 
 class ErrorResponse(OpenAIBaseModel):
@@ -1000,7 +1003,10 @@ def to_disaggregated_params(
         ctx_request_id=tllm_disagg_params.ctx_request_id,
         encoded_opaque_state=encode_opaque_state(
             tllm_disagg_params.opaque_state),
-        draft_tokens=tllm_disagg_params.draft_tokens)
+        draft_tokens=tllm_disagg_params.draft_tokens,
+        disagg_id=tllm_disagg_params.disagg_id,
+        ctx_dp_rank=tllm_disagg_params.ctx_dp_rank,
+        ctx_info_endpoint=tllm_disagg_params.ctx_info_endpoint)
 
 
 def to_llm_disaggregated_params(
@@ -1013,7 +1019,10 @@ def to_llm_disaggregated_params(
         ctx_request_id=disaggregated_params.ctx_request_id,
         opaque_state=decode_opaque_state(
             disaggregated_params.encoded_opaque_state),
-        draft_tokens=disaggregated_params.draft_tokens)
+        draft_tokens=disaggregated_params.draft_tokens,
+        disagg_id=disaggregated_params.disagg_id,
+        ctx_dp_rank=disaggregated_params.ctx_dp_rank,
+        ctx_info_endpoint=disaggregated_params.ctx_info_endpoint)
 
 
 UCompletionRequest = Union[CompletionRequest, ChatCompletionRequest]
