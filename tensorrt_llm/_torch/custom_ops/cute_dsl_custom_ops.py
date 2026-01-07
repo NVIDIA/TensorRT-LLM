@@ -2254,42 +2254,39 @@ if IS_CUTLASS_DSL_AVAILABLE:
             n = b.shape[0] * b.shape[1]  # num_expert * weight_per_expert
             l = 1  # dense GEMM
 
+            # Define candidates together
+            mma_tiler_mn_candidates = [(128, 128), (128, 256)]
+            cluster_shape_mn_candidates = [(1, 1)]
+
+            # Map torch dtype to cutlass dtype
+            c_cutlass_dtype = {
+                torch.bfloat16: cutlass.BFloat16,
+                torch.float16: cutlass.Float16,
+                torch.float32: cutlass.Float32,
+                torch.float4_e2m1fn_x2: cutlass.Float4E2M1FN,
+            }.get(self.output_dtype, cutlass.BFloat16)
+
             tactics = []
-            # MMA tiler options: (128, 128), (128, 256), (256, 128), (256, 256)
-            for mma_m in [128, 256]:
-                for mma_n in [128, 256]:
-                    mma_tiler_mn = (mma_m, mma_n)
-                    # Cluster shape options
-                    for cluster_m in [1, 2]:
-                        for cluster_n in [1, 2]:
-                            cluster_shape_mn = (cluster_m, cluster_n)
-
-                            # Map torch dtype to cutlass dtype
-                            c_cutlass_dtype = {
-                                torch.bfloat16: cutlass.BFloat16,
-                                torch.float16: cutlass.Float16,
-                                torch.float32: cutlass.Float32,
-                                torch.float4_e2m1fn_x2: cutlass.Float4E2M1FN,
-                            }.get(self.output_dtype, cutlass.BFloat16)
-
-                            if self.kernel_class.can_implement(
-                                    cutlass.Float4E2M1FN,  # ab_dtype
-                                    cutlass.Float8E4M3FN,  # sf_dtype
-                                    self.scaling_vector_size,
-                                    c_cutlass_dtype,  # c_dtype
-                                    mma_tiler_mn,
-                                    cluster_shape_mn,
-                                    m,
-                                    n,
-                                    k,
-                                    l,
-                                    "k",  # a_major
-                                    "k",  # b_major
-                                    "n",  # c_major
-                                    self.expert_count,
-                                    self.weight_per_expert,
-                            ):
-                                tactics.append((mma_tiler_mn, cluster_shape_mn))
+            for mma_tiler_mn, cluster_shape_mn in itertools.product(
+                    mma_tiler_mn_candidates, cluster_shape_mn_candidates):
+                if self.kernel_class.can_implement(
+                        cutlass.Float4E2M1FN,  # ab_dtype
+                        cutlass.Float8E4M3FN,  # sf_dtype
+                        self.scaling_vector_size,
+                        c_cutlass_dtype,  # c_dtype
+                        mma_tiler_mn,
+                        cluster_shape_mn,
+                        m,
+                        n,
+                        k,
+                        l,
+                        "k",  # a_major
+                        "k",  # b_major
+                        "n",  # c_major
+                        self.expert_count,
+                        self.weight_per_expert,
+                ):
+                    tactics.append((mma_tiler_mn, cluster_shape_mn))
 
             return tactics
 
@@ -2298,12 +2295,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if key not in self.tuning_config_cache:
                 self.tuning_config_cache[key] = TuningConfig(
                     dynamic_tensor_specs=(DynamicTensorSpec(
-                        0,
-                        0,
-                        get_last_power_of_2_num_tokens_buckets,
-                        last_positive_power_of_2,
-                    ), ),
+                        0, 0, get_last_power_of_2_num_tokens_buckets,
+                        last_positive_power_of_2), ),
+                    constraint_specs=(ConstraintSpec(2, 0,
+                                                     fp4_scale_infer_shape), ),
                     use_cold_l2_cache=True,
+                    tune_max_num_tokens=2,
                     distributed_tuning_strategy=DistributedTuningStrategy.
                     PARALLEL,
                 )
@@ -2591,41 +2588,38 @@ if IS_CUTLASS_DSL_AVAILABLE:
             n = b.shape[0]
             l = 1  # dense GEMM
 
+            # Define candidates together
+            mma_tiler_mn_candidates = [(128, 128), (128, 256)]
+            cluster_shape_mn_candidates = [(1, 1)]
+
+            # Map torch dtype to cutlass dtype
+            c_cutlass_dtype = {
+                torch.bfloat16: cutlass.BFloat16,
+                torch.float16: cutlass.Float16,
+                torch.float32: cutlass.Float32,
+            }.get(self.output_dtype, cutlass.BFloat16)
+
             tactics = []
-            # MMA tiler options: (128, 128), (128, 256), (256, 128), (256, 256)
-            for mma_m in [128, 256]:
-                for mma_n in [128, 256]:
-                    mma_tiler_mn = (mma_m, mma_n)
-                    # Cluster shape options
-                    for cluster_m in [1, 2]:
-                        for cluster_n in [1, 2]:
-                            cluster_shape_mn = (cluster_m, cluster_n)
-
-                            # Map torch dtype to cutlass dtype
-                            c_cutlass_dtype = {
-                                torch.bfloat16: cutlass.BFloat16,
-                                torch.float16: cutlass.Float16,
-                                torch.float32: cutlass.Float32,
-                            }.get(self.output_dtype, cutlass.BFloat16)
-
-                            if self.kernel_class.can_implement(
-                                    cutlass.Float4E2M1FN,  # ab_dtype
-                                    cutlass.Float8E4M3FN,  # sf_dtype
-                                    self.scaling_vector_size,
-                                    c_cutlass_dtype,  # c_dtype
-                                    mma_tiler_mn,
-                                    cluster_shape_mn,
-                                    m,
-                                    n,
-                                    k,
-                                    l,
-                                    "k",  # a_major
-                                    "k",  # b_major
-                                    "n",  # c_major
-                                    self.expert_count,
-                                    self.weight_per_expert,
-                            ):
-                                tactics.append((mma_tiler_mn, cluster_shape_mn))
+            for mma_tiler_mn, cluster_shape_mn in itertools.product(
+                    mma_tiler_mn_candidates, cluster_shape_mn_candidates):
+                if self.kernel_class.can_implement(
+                        cutlass.Float4E2M1FN,  # ab_dtype
+                        cutlass.Float8E4M3FN,  # sf_dtype
+                        self.scaling_vector_size,
+                        c_cutlass_dtype,  # c_dtype
+                        mma_tiler_mn,
+                        cluster_shape_mn,
+                        m,
+                        n,
+                        k,
+                        l,
+                        "k",  # a_major
+                        "k",  # b_major
+                        "n",  # c_major
+                        self.expert_count,
+                        self.weight_per_expert,
+                ):
+                    tactics.append((mma_tiler_mn, cluster_shape_mn))
 
             return tactics
 
@@ -2634,12 +2628,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if key not in self.tuning_config_cache:
                 self.tuning_config_cache[key] = TuningConfig(
                     dynamic_tensor_specs=(DynamicTensorSpec(
-                        0,
-                        0,
-                        get_last_power_of_2_num_tokens_buckets,
-                        last_positive_power_of_2,
-                    ), ),
+                        0, 0, get_last_power_of_2_num_tokens_buckets,
+                        last_positive_power_of_2), ),
+                    constraint_specs=(
+                        ConstraintSpec(2, 0, fp4_scale_infer_shape),
+                        ConstraintSpec(4, 0, lambda shapes: shapes[0][0]),
+                    ),
                     use_cold_l2_cache=True,
+                    tune_max_num_tokens=2,
                     distributed_tuning_strategy=DistributedTuningStrategy.
                     PARALLEL,
                 )
