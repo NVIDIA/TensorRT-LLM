@@ -827,9 +827,10 @@ class ConfigurableMoE(MoE):
         )
 
         # ========== Padding empty chunk ==========
-        chunked_used = torch.ones(num_chunks, dtype=torch.bool, device=x.device)
+        chunked_used = torch.ones(num_chunks, dtype=torch.bool)
         if self.use_dp:
-            # For empty chunk, will use chunk 0 instead
+            # For empty chunk, will use chunk 0 instead. The current split heuristic
+            # ensures that if an empty chunk exists, Chunk 0 contains exactly one token.
             assert x_list[0].numel() != 0, "chunk 0 shouldn't be empty"
             x_list = list(x_list)
             router_logits_list = list(router_logits_list)
