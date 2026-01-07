@@ -88,13 +88,13 @@ enable_chunked_prefill: false
 
 Run the command with the config file:
 ```bash
-trtllm-bench/trtllm-serve --model <model_path> --extra_llm_api_options extra_config.yaml ...
+trtllm-bench/trtllm-serve --model <model_path> --config extra_config.yaml ...
 ```
 
 For example, users can evaluate a model with trtllm-eval on LongBenchV2 task like this:
 
 ```bash
-trtllm-eval --model <path_to_model> --extra_llm_api_options extra_config.yaml longbench_v2 --max_output_length 1024 ...
+trtllm-eval --model <path_to_model> --config extra_config.yaml longbench_v2 --max_output_length 1024 ...
 ```
 
 ## Developer Guide

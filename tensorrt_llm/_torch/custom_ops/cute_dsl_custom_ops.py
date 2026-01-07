@@ -1518,9 +1518,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     f"{self.__class__.kernel_class.__name__} supports SM 100 (B200) and SM 103 (B300) only, but got SM {sm_version}"
                 )
 
-            if self.tile_size not in (128, ):
+            if self.tile_size not in (128, 256):
                 raise ValueError(
-                    f"{self.__class__.kernel_class.__name__} supports tile_size (MMA tile M dimension) 128 only, but got {self.tile_size}"
+                    f"{self.__class__.kernel_class.__name__} supports tile_size (MMA tile M dimension) 128 and 256 only, but got {self.tile_size}"
                 )
 
         def unique_id(self):
@@ -1864,10 +1864,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
             mma_tiler_mn_candidates = [(self.tile_size, 128),
                                        (self.tile_size, 256)]
             cluster_shape_mn_candidates = [(self.tile_size // 128, 1)]
+            # TODO: Add raster_along_m=True if we find it more performant in some cases.
+            raster_along_m_candidates = [False]
 
             valid_tactics = []
-            for mma_tiler_mn, cluster_shape_mn in itertools.product(
-                    mma_tiler_mn_candidates, cluster_shape_mn_candidates):
+            for mma_tiler_mn, cluster_shape_mn, raster_along_m in itertools.product(
+                    mma_tiler_mn_candidates, cluster_shape_mn_candidates,
+                    raster_along_m_candidates):
                 if self.__class__.kernel_class.can_implement(
                         ab_dtype=cutlass.Float4E2M1FN,
                         sf_dtype=cutlass.Float8E4M3FN,
@@ -1883,7 +1886,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         b_major="k",
                         c_major="n",
                 ):
-                    valid_tactics.append((mma_tiler_mn, cluster_shape_mn))
+                    valid_tactics.append(
+                        (mma_tiler_mn, cluster_shape_mn, raster_along_m))
 
             return valid_tactics
 
@@ -2013,15 +2017,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
             stream = cuda.CUstream(torch_stream.cuda_stream)
 
             if isinstance(tactic, tuple):
-                mma_tiler_mn, cluster_shape_mn = tactic
+                mma_tiler_mn, cluster_shape_mn, raster_along_m = tactic
             else:
                 mma_tiler_mn = (self.tile_size, 128)
                 cluster_shape_mn = (self.tile_size // 128, 1)
+                raster_along_m = False
             assert mma_tiler_mn[
                 0] == self.tile_size, f"Tactic ({tactic}) is incompatible with tile size ({self.tile_size})"
 
             cache_key = (self.scaling_vector_size, self.tile_size, self.top_k,
-                         mma_tiler_mn, cluster_shape_mn)
+                         mma_tiler_mn, cluster_shape_mn, raster_along_m)
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
                     sf_vec_size=self.scaling_vector_size,
@@ -2029,6 +2034,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     cluster_shape_mn=cluster_shape_mn,
                     vectorized_f32=True,
                     topk=self.top_k,
+                    raster_along_m=raster_along_m,
                 )
                 # Compute max active clusters on current device
                 hardware_info = cutlass.utils.HardwareInfo()
