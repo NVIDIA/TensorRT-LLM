@@ -79,8 +79,8 @@ The MoE layers use NVFP4, which is the same as the DeepSeek-R1. Please refer to 
 We evaluated the accuracy of this NVFP4 checkpoint on the same datasets:
 |                    | GSM8k | MMLU  | GPQA-Diamond |
 | :----------------- | :---- | :---- | :----------- |
-| TensorRT LLM FP8   | 95.79 | 88.11 | 84.34        |
-| TensorRT LLM NVFP4 | 95.00 | 87.63 | 84.85        |
+| TensorRT LLM FP8   | 95.91 | 87.84 | 84.34        |
+| TensorRT LLM NVFP4 | 95.26 | 87.54 | 84.85        |
 
 ** Note there are some run-to-run variance for these evaluations. We think the NVFP4 checkpoint has comparable accuracy with FP8 on these datasets.
 
