@@ -5360,7 +5360,8 @@ class TestMiniMaxM2(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
     @pytest.mark.skip_less_device(4)
     @parametrize_with_ids("attention_dp,cuda_graph,overlap_scheduler",
-                          [(False, False, False)])
+                          [(False, True, True), (True, True, True)],
+                          ids=["no_attention_dp", "attention_dp"])
     def test_4gpus(self, tp_size, ep_size, attention_dp, cuda_graph,
                    overlap_scheduler):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
