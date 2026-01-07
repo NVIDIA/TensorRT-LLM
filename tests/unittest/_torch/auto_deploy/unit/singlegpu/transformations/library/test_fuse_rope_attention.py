@@ -172,13 +172,23 @@ def _run_test(
     # Export to graph module
     args = (input_ids, position_ids)
     gm = torch_export_to_gm(model, args=args, dynamic_shapes=dynamic_shapes, clone=True)
+
     # Model config object, include num_attention_heads and hidden_size
-    ModelConfig = namedtuple("ModelConfig", ["num_attention_heads", "hidden_size"])
-    gm.config = ModelConfig(num_attention_heads=num_q_heads, hidden_size=head_dim * num_q_heads)
+    class Factory:
+        def _get_model_config(self):
+            ModelConfig = namedtuple(
+                "ModelConfig", ["num_attention_heads", "hidden_size", "num_key_value_heads"]
+            )
+            return ModelConfig(
+                num_attention_heads=num_q_heads,
+                hidden_size=head_dim * num_q_heads,
+                num_key_value_heads=num_kv_heads,
+            ), None
 
     # Apply fuse_rope_attention transformation
+
     optimizer = InferenceOptimizer(
-        None,
+        Factory(),
         {
             "fuse_rope_attention": {
                 "stage": "pattern_matcher",
