@@ -35,7 +35,7 @@ The open-sourced [DeepSeek-V3.2](https://api-docs.deepseek.com/news/news251201) 
 ## DeepSeek Sparse Attention (DSA)
 <div align="center">
 <figure>
-  <img src="https://github.com/lfr-0531/TensorRT-LLM/tree/user/fanrongl/ds32_tech_blog_preview/docs/source/blogs/media/tech_blog15_dsa_architecture.png" alt="tech_blog15_dsa_architecture" width="1280" height="auto">
+  <img src="https://github.com/lfr-0531/TensorRT-LLM/raw/user/fanrongl/ds32_tech_blog_preview/docs/source/blogs/media/tech_blog15_dsa_architecture.png" alt="tech_blog15_dsa_architecture" width="1280" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 1. The architecture of DSA. The green part illustrates how DSA selects the top-k key-value entries according to the indexer.</em></sub></p>
@@ -44,7 +44,7 @@ DSA serves as the core component of the DeepSeek-v3.2 model, and it is the only 
 
 <div align="center">
 <figure>
-  <img src="https://github.com/lfr-0531/TensorRT-LLM/tree/user/fanrongl/ds32_tech_blog_preview/docs/source/blogs/media/tech_blog15_indexer_topk.png" alt="tech_blog15_indexer_topk" width="1280" height="auto">
+  <img src="https://github.com/lfr-0531/TensorRT-LLM/raw/user/fanrongl/ds32_tech_blog_preview/docs/source/blogs/media/tech_blog15_indexer_topk.png" alt="tech_blog15_indexer_topk" width="1280" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 2. The architecture of the DSA indexer and Top-K logics.</em></sub></p>
@@ -145,7 +145,7 @@ So we decided to use the non‑DE parallel Top‑K algorithm for DeepSeek V3.2.
 ##### Radix-select-based TopK Parallel Algorithm
 <div align="center">
 <figure>
-  <img src="https://github.com/lfr-0531/TensorRT-LLM/tree/user/fanrongl/ds32_tech_blog_preview/docs/source/blogs/media/tech_blog15_radix_select_topk.png" alt="tech_blog15_radix_select_topk" width="1280" height="auto">
+  <img src="https://github.com/lfr-0531/TensorRT-LLM/raw/user/fanrongl/ds32_tech_blog_preview/docs/source/blogs/media/tech_blog15_radix_select_topk.png" alt="tech_blog15_radix_select_topk" width="1280" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 3. Radix-select-based Top-K.</em></sub></p>
