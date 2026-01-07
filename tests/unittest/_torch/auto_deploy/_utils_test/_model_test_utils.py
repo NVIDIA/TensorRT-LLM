@@ -278,8 +278,8 @@ class FakeFP8Linear(nn.Linear):
 def generate_dynamic_shapes(max_batch_size, max_seq_len):
     dynamic_shapes = (
         {
-            0: Dim("batch_size", max=max_batch_size),
-            1: Dim("seq_len", max=max_seq_len),
+            0: Dim.DYNAMIC,
+            1: Dim.DYNAMIC,
         },
     )
     return dynamic_shapes
