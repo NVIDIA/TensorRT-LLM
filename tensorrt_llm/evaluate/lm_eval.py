@@ -52,7 +52,9 @@ class LmEvalWrapper(TemplateLM):
                  llm: Union[LLM, PyTorchLLM],
                  sampling_params: Optional[SamplingParams] = None,
                  streaming: bool = False,
-                 chat_template_kwargs: Optional[dict[str, Any]] = None):
+                 chat_template_kwargs: Optional[dict[str, Any]] = None,
+                 model_type: str | None = None,
+                 is_force_single_image: bool = False):
         super().__init__()
         self.llm = llm
         self.sampling_params = sampling_params
