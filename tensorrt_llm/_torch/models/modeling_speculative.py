@@ -27,7 +27,8 @@ from .modeling_utils import (DecoderModel, DecoderModelForCausalLM, TModel,
 
 
 def _ensure_draft_vocab_size(config: PretrainedConfig) -> None:
-    if hasattr(config, "draft_vocab_size"):
+    if hasattr(config,
+               "draft_vocab_size") and config.draft_vocab_size is not None:
         return
 
     logger.warning(
