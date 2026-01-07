@@ -171,7 +171,7 @@ class QwenDecoderLayer(DecoderLayer):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, **kwargs)
 
         if spec_metadata is not None:
             spec_metadata.maybe_capture_hidden_states(self.layer_idx,
@@ -230,7 +230,8 @@ class QwenModel(DecoderModel):
                                                     attn_metadata=attn_metadata,
                                                     residual=residual,
                                                     mrope_config=mrope_config,
-                                                    spec_metadata=spec_metadata)
+                                                    spec_metadata=spec_metadata,
+                                                    **kwargs)
 
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
@@ -265,7 +266,8 @@ class Qwen2ForCausalLM(DecoderModelForCausalLM[QwenModel, Qwen2Config]):
                             position_ids=position_ids,
                             inputs_embeds=inputs_embeds,
                             mrope_config=mrope_config,
-                            spec_metadata=spec_metadata)
+                            spec_metadata=spec_metadata,
+                            **kwargs)
 
         return self.logits_processor.forward(
             output,
