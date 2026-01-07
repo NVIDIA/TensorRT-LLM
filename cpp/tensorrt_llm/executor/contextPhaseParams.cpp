@@ -27,28 +27,37 @@ namespace su = tensorrt_llm::executor::serialize_utils;
 namespace tensorrt_llm::executor
 {
 
-ContextPhaseParams::ContextPhaseParams(
-    VecTokens firstGenTokens, RequestIdType reqId, void* state, std::optional<VecTokens> draftTokens)
+ContextPhaseParams::ContextPhaseParams(VecTokens firstGenTokens, RequestIdType reqId, void* state,
+    std::optional<VecTokens> draftTokens, std::optional<SizeType32> ctxDpRank,
+    std::optional<std::string> disaggInfoEndpoint)
     : mReqId{reqId}
     , mFirstGenTokens{std::move(firstGenTokens)}
     , mState{StatePtr{state, deleter}}
     , mDraftTokens{std::move(draftTokens)}
-{
-}
-
-ContextPhaseParams::ContextPhaseParams(
-    VecTokens firstGenTokens, RequestIdType reqId, std::optional<VecTokens> draftTokens)
-    : mReqId{reqId}
-    , mFirstGenTokens{std::move(firstGenTokens)}
-    , mDraftTokens{std::move(draftTokens)}
+    , mCtxDpRank{ctxDpRank}
+    , mDisaggInfoEndpoint{std::move(disaggInfoEndpoint)}
 {
 }
 
 ContextPhaseParams::ContextPhaseParams(VecTokens firstGenTokens, RequestIdType reqId,
-    std::vector<char> const& serializedState, std::optional<VecTokens> draftTokens)
+    std::optional<VecTokens> draftTokens, std::optional<SizeType32> ctxDpRank,
+    std::optional<std::string> disaggInfoEndpoint)
     : mReqId{reqId}
     , mFirstGenTokens{std::move(firstGenTokens)}
     , mDraftTokens{std::move(draftTokens)}
+    , mCtxDpRank{ctxDpRank}
+    , mDisaggInfoEndpoint{std::move(disaggInfoEndpoint)}
+{
+}
+
+ContextPhaseParams::ContextPhaseParams(VecTokens firstGenTokens, RequestIdType reqId,
+    std::vector<char> const& serializedState, std::optional<VecTokens> draftTokens, std::optional<SizeType32> ctxDpRank,
+    std::optional<std::string> disaggInfoEndpoint)
+    : mReqId{reqId}
+    , mFirstGenTokens{std::move(firstGenTokens)}
+    , mDraftTokens{std::move(draftTokens)}
+    , mCtxDpRank{ctxDpRank}
+    , mDisaggInfoEndpoint{std::move(disaggInfoEndpoint)}
 {
 
     su::VectorWrapBuf<char> strbuf(const_cast<std::vector<char>&>(serializedState));
@@ -60,12 +69,14 @@ ContextPhaseParams::ContextPhaseParams(VecTokens firstGenTokens, RequestIdType r
 }
 
 ContextPhaseParams::ContextPhaseParams(ContextPhaseParams const& other)
+    : mReqId{other.mReqId}
+    , mFirstGenTokens{other.mFirstGenTokens}
+    , mDraftTokens{other.mDraftTokens}
+    , mCtxDpRank{other.mCtxDpRank}
+    , mDisaggInfoEndpoint{other.mDisaggInfoEndpoint}
 {
     // Since the internal header files implement the destructor while using the declaration of this
     // type, a `unique_ptr` with a custom destructor member is used here.
-    mReqId = other.mReqId;
-    mFirstGenTokens = other.mFirstGenTokens;
-    mDraftTokens = other.mDraftTokens;
     if (other.mState)
     {
         auto* otherState = static_cast<DataTransceiverState*>(other.mState.get());
@@ -90,9 +101,19 @@ VecTokens const& ContextPhaseParams::getFirstGenTokens() const& noexcept
     return mFirstGenTokens;
 }
 
+void ContextPhaseParams::setFirstGenTokens(VecTokens firstGenTokens) noexcept
+{
+    mFirstGenTokens = std::move(firstGenTokens);
+}
+
 std::optional<VecTokens> const& ContextPhaseParams::getDraftTokens() const& noexcept
 {
     return mDraftTokens;
+}
+
+void ContextPhaseParams::setDraftTokens(std::optional<VecTokens> draftTokens) noexcept
+{
+    mDraftTokens = std::move(draftTokens);
 }
 
 VecTokens ContextPhaseParams::popFirstGenTokens() && noexcept
@@ -103,6 +124,11 @@ VecTokens ContextPhaseParams::popFirstGenTokens() && noexcept
 ContextPhaseParams::RequestIdType ContextPhaseParams::getReqId() const noexcept
 {
     return mReqId;
+}
+
+void ContextPhaseParams::setReqId(RequestIdType reqId) noexcept
+{
+    mReqId = reqId;
 }
 
 void const* ContextPhaseParams::getState() const noexcept
@@ -125,6 +151,26 @@ void* ContextPhaseParams::releaseState() noexcept
     return mState.release();
 }
 
+std::optional<SizeType32> ContextPhaseParams::getCtxDpRank() const noexcept
+{
+    return mCtxDpRank;
+}
+
+void ContextPhaseParams::setCtxDpRank(std::optional<SizeType32> ctxDpRank) noexcept
+{
+    mCtxDpRank = ctxDpRank;
+}
+
+std::optional<std::string> const& ContextPhaseParams::getDisaggInfoEndpoint() const noexcept
+{
+    return mDisaggInfoEndpoint;
+}
+
+void ContextPhaseParams::setDisaggInfoEndpoint(std::optional<std::string> disaggInfoEndpoint) noexcept
+{
+    mDisaggInfoEndpoint = std::move(disaggInfoEndpoint);
+}
+
 void ContextPhaseParams::deleter(void const* data)
 {
     using StateT = DataTransceiverState const;
@@ -134,6 +180,7 @@ void ContextPhaseParams::deleter(void const* data)
 bool ContextPhaseParams::operator==(ContextPhaseParams const& other) const noexcept
 {
     if (mFirstGenTokens != other.mFirstGenTokens || mReqId != other.mReqId || mDraftTokens != other.mDraftTokens
+        || mDisaggInfoEndpoint != other.mDisaggInfoEndpoint || mCtxDpRank != other.mCtxDpRank
         || static_cast<bool>(mState) != static_cast<bool>(other.mState))
     {
         return false;

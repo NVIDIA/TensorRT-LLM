@@ -311,4 +311,8 @@ class OpenAIDisaggregatedService(OpenAIService):
                 raise ValueError("Context server did not return disaggregated params")
             if ctx_response.choices[0].disaggregated_params.ctx_request_id is None:
                 raise ValueError("Invalid disaggregated params in context phase response.")
+            if ctx_response.choices[0].disaggregated_params.disagg_request_id is None:
+                raise ValueError(
+                    "Invalid disaggregated params in context phase response. disagg_request_id is None"
+                )
             return ctx_response
