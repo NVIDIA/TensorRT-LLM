@@ -68,8 +68,6 @@ enum class LlmRequestState : int32_t
                                             /// after computation finished
     kDISAGG_CONTEXT_COMPLETE = 22,          ///< Context-only request finished kv cache transmission.
     kDISAGG_GENERATION_WAIT_TOKENS = 23,    ///< Generation-only request waiting for ctx/draft tokens to be received
-    kDISAGG_GENERATION_CANCELLED = 24,      ///< Generation-only request cancelled because context token is EOS
-                                            /// or context request fails
 
     // error states
     kDISAGG_TRANS_ERROR = -1, ///< Error occurred during kv cache transmission
@@ -1526,7 +1524,6 @@ public:
         case batch_manager::LlmRequestState::kDISAGG_GENERATION_INIT:
         case batch_manager::LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS:
         case batch_manager::LlmRequestState::kDISAGG_GENERATION_WAIT_TOKENS:
-        case batch_manager::LlmRequestState::kDISAGG_GENERATION_CANCELLED:
             return executor::RequestStage::kGENERATION_IN_PROGRESS;
         default: TLLM_LOG_ERROR("Unexpected request state."); return executor::RequestStage::kGENERATION_COMPLETE;
         }

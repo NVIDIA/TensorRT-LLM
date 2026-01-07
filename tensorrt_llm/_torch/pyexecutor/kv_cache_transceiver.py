@@ -96,7 +96,7 @@ class KvCacheTransceiver(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def prepare_context_request(self, request: LlmRequest):
+    def prepare_context_request(self, requests: List[LlmRequest]):
         """
         Prepare the context request for the cache transceiver in generation-first mode.
         This method should set the context request state to DISAGG_CONTEXT_WAIT_SCHEDULER
@@ -159,7 +159,7 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
     def cancel_request(self, req: LlmRequest):
         return self.impl.cancel_request(req)
 
-    def prepare_context_request(self, request: LlmRequest):
+    def prepare_context_request(self, requests: List[LlmRequest]):
         raise NotImplementedError
 
     def get_context_state(self):
