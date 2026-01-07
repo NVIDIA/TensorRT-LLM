@@ -1072,9 +1072,7 @@ class AutoTuner:
                 stream.synchronize()
                 if tuning_config.distributed_tuning_strategy == DistributedTuningStrategy.MERGE:
                     # Currently only AllReduce will use this strategy, and only MPI parallel will enable tuning.
-                    # TODO: Unified tp barrier for both MPIDist and TorchDist.
-                    if hasattr(self._dist, "tp_comm"):
-                        self._dist.tp_comm.barrier()
+                    self._dist.tp_barrier()
 
                 # Delay the profiled kernel launch to eliminate affects of host time overhead in profiling.
                 if use_cuda_graph:
@@ -1495,10 +1493,10 @@ class AutoTuner:
         else:
             raise RuntimeError("Unknown error type: {}".format(error))
 
-    def setup_distributed_state(self, mapping: Mapping, dist: Distributed):
+    def setup_distributed_state(self, mapping: Mapping):
         """Setup distributed communication state for autotuning."""
         self.mapping = mapping
-        self._dist = dist
+        self._dist = Distributed.get(mapping)
         self._debug_logger(
             f"[AutoTuner] Whether using distributed tuning: {self._is_distributed()}"
         )

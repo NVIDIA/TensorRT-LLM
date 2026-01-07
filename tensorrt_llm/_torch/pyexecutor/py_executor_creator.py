@@ -303,7 +303,7 @@ def create_py_executor(
             "when only processing vision encoder inputs.")
 
     mapping = _get_mapping(llm_args.parallel_config.to_mapping())
-    dist = Distributed.get(mapping=mapping)
+    dist = Distributed.get(mapping)
 
     vm_pools = {}
     enable_sleep = llm_args.enable_sleep

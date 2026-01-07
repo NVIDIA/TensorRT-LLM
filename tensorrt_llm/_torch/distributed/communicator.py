@@ -157,6 +157,14 @@ class Distributed(ABC):
         return self.mapping.cp_config
 
     @abstractmethod
+    def barrier(self):
+        pass
+
+    @abstractmethod
+    def tp_barrier(self):
+        pass
+
+    @abstractmethod
     def broadcast(self, obj, root=0):
         pass
 
@@ -428,6 +436,9 @@ class MPIDist(Distributed):
     def barrier(self):
         mpi_barrier()
 
+    def tp_barrier(self):
+        self.tp_comm.Barrier()
+
     def isend(self, buf: np.ndarray, dest, tag=0):
         # non-blocking send numpy buffer
         return mpi_isend(buf, dest, tag)
@@ -664,6 +675,10 @@ class TorchDist(Distributed):
     @log_op
     def barrier(self):
         dist.barrier()
+
+    @log_op
+    def tp_barrier(self):
+        dist.barrier(group=self.mapping.tp_group_pg)
 
     @log_op
     def isend(self, buf: np.ndarray, dest, tag=0):

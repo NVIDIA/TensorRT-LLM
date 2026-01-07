@@ -1011,7 +1011,7 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     initialize_or_skip(rank, world_size, port)
 
     # Setup AutoTuner with distributed state for allreduce autotuning
-    AutoTuner.get().setup_distributed_state(dist_mapping, dist)
+    AutoTuner.get().setup_distributed_state(dist_mapping)
 
     # some config
     assert ad_config.max_beam_width <= 1, "_autodeploy + beam_search is not supported"
