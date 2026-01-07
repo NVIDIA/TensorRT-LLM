@@ -58,6 +58,7 @@ MODEL_PATH_DICT = {
 }
 
 SUPPORTED_GPU_TYPE = [
+    "H200",
     "B200",
     "B300",
     "GB200",

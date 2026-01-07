@@ -41,7 +41,7 @@ TEST_LIST_PATH = (
 )
 ITERATIONS = 10
 # Mapping from HuggingFace model IDs to MODEL_PATH_DICT keys used by the test framework
-# in tests/integration/defs/perf/test_perf.py
+# in tests/integration/defs/perf/test_perf_sanity.py
 MODEL_NAME_MAPPING = {
     "deepseek-ai/DeepSeek-R1-0528": "deepseek_r1_0528_fp8",
     "nvidia/DeepSeek-R1-0528-FP4-v2": "deepseek_r1_0528_fp4_v2",
