@@ -201,11 +201,16 @@ class TritonUnquantizedFusedMoEMethod(FusedMoEMethodBase):
             module.intermediate_size_per_partition,
             module.hidden_size,
         )
+        # Bias shapes use the output dimension (last dim) of the transposed weight shapes
+        w3_w1_bias_shape = (w3_w1_weight_shape[0], w3_w1_weight_shape[2])
+        w2_bias_shape = (w2_weight_shape[0], w2_weight_shape[2])
         super().create_weights(module,
                                weight_dtype,
                                w3_w1_weight_shape,
                                w2_weight_shape,
-                               bias_dtype=torch.float32)
+                               bias_dtype=torch.float32,
+                               w3_w1_bias_shape=w3_w1_bias_shape,
+                               w2_bias_shape=w2_bias_shape)
         self.setup_quant_scales(module)
 
     def setup_quant_scales(self, module: torch.nn.Module):
@@ -391,12 +396,17 @@ class TritonFP8QDQFusedMoEMethod(TritonUnquantizedFusedMoEMethod):
             module.intermediate_size_per_partition,
             module.hidden_size,
         )
+        # Bias shapes use the output dimension (last dim) of the transposed weight shapes
+        w3_w1_bias_shape = (w3_w1_weight_shape[0], w3_w1_weight_shape[2])
+        w2_bias_shape = (w2_weight_shape[0], w2_weight_shape[2])
         FusedMoEMethodBase.create_weights(self,
                                           module,
                                           weight_dtype,
                                           w3_w1_weight_shape,
                                           w2_weight_shape,
-                                          bias_dtype=torch.float32)
+                                          bias_dtype=torch.float32,
+                                          w3_w1_bias_shape=w3_w1_bias_shape,
+                                          w2_bias_shape=w2_bias_shape)
 
         fc31_dequant = nn.Parameter(torch.empty(
             module.expert_size_per_partition, dtype=torch.float32),
