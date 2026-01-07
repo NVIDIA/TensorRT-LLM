@@ -106,6 +106,9 @@ deepseek-ai/DeepSeek-V3.2-Exp:
   - quant_algo: NVFP4
     spec_dec_algo: MTP
     accuracy: 95.6
+Qwen3/Qwen3-4B:
+  - spec_dec_algo: Eagle
+    accuracy: 85.823
 Qwen3/Qwen3-8B:
   - accuracy: 87.1114
   - spec_dec_algo: Eagle
