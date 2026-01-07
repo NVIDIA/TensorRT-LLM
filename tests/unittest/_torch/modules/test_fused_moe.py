@@ -626,19 +626,30 @@ def test_fused_moe_fp8(moe_backend, dtype, routing_cls, bias):
         with torch.inference_mode(), autotune():
             fused_moe.forward(x, router_logits)
 
-        # Explicitly capture context for kernel testing
-        with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
-            output = fused_moe.forward(x, router_logits)
-
-        # Test all kernel tactics
-        for tactic in all_tactics:
-            with AutoTuner.get().replay(tactic), torch.inference_mode():
+        # TRITON backend uses Triton kernels which don't register with AutoTuner
+        if moe_backend == "TRITON":
+            with torch.inference_mode():
                 output = fused_moe.forward(x, router_logits)
-                check_accuracy(output,
-                               ref_output,
-                               rtol=0.04,
-                               atol=0.1,
-                               percent=0.99)
+            check_accuracy(output,
+                           ref_output,
+                           rtol=0.04,
+                           atol=0.1,
+                           percent=0.99)
+        else:
+            # Explicitly capture context for kernel testing
+            with AutoTuner.get().capture() as all_tactics, torch.inference_mode(
+            ):
+                output = fused_moe.forward(x, router_logits)
+
+            # Test all kernel tactics
+            for tactic in all_tactics:
+                with AutoTuner.get().replay(tactic), torch.inference_mode():
+                    output = fused_moe.forward(x, router_logits)
+                    check_accuracy(output,
+                                   ref_output,
+                                   rtol=0.04,
+                                   atol=0.1,
+                                   percent=0.99)
 
 
 def set_tensor_value_2(x, num_row, num_cols):
