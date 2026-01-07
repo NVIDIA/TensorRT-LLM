@@ -2727,10 +2727,11 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
             (8, 1, 8, 0, True, True, True, True, 24, "CUTLASS", False),
             (8, 1, 8, 3, False, False, True, True, 1, "TRTLLM", False),
             (8, 1, 8, 1, False, True, True, True, 24, "CUTLASS", True),
+            (1, 4, 1, 1, False, False, True, True, 24, "TRTLLM", False),
         ],
         ids=[
             "baseline", "baseline_mtp1", "baseline_fp8kv", "latency",
-            "disable_skip_indexer"
+            "disable_skip_indexer", "baseline_pp4_mtp1"
         ])
     def test_nvfp4_multi_gpus(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                               attention_dp, cuda_graph, overlap_scheduler,
