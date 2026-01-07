@@ -64,7 +64,7 @@ def nvfp4_dense_gemm_ref(
         # Call nvfp4_gemm for this expert
         ref[:, start_col:end_col] = torch.ops.trtllm.nvfp4_gemm(
             a.view(torch.uint8),
-            b_expert.view(torch.uint8),
+            b_expert,
             a_sf,
             b_sf_expert,
             alpha[expert_idx],
@@ -204,3 +204,168 @@ def test_nvfp4_dense_gemm_swiglu_blackwell(
     assert sf_match_ratio > 0.95, (
         f"Scale factor: only {sf_match_ratio * 100:.2f}% match, expected >= 95%"
     )
+
+
+def nvfp4_dense_gemm_fc2_ref(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_sf: torch.Tensor,
+    b_sf: torch.Tensor,
+    alpha_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+    expert_count: int,
+    weight_per_expert: int,
+    scaling_vector_size: int = 16,
+) -> torch.Tensor:
+    """Reference implementation for FC2 dense GEMM.
+
+    For each expert, compute GEMM with corresponding A slice and B slice,
+    multiply by alpha_scale, then accumulate results.
+
+    C = sum_i(alpha_scale[:, i] * (A[:, i*wpe:(i+1)*wpe] @ B[:, i*wpe:(i+1)*wpe].T))
+
+    Args:
+        a: Input activation (M, K//2) in fp4 packed format, K = expert_count * weight_per_expert
+        b: Weight tensor (N, K//2) in fp4 packed format
+        a_sf: Scale factor for a (swizzled)
+        b_sf: Scale factor for b (swizzled)
+        alpha_scale: Per-token-per-expert scale (M, expert_count)
+        output_dtype: Output data type
+        expert_count: Number of experts
+        weight_per_expert: Number of weights per expert
+        scaling_vector_size: Vector size for block scaling
+
+    Returns:
+        Output tensor (M, N) in output_dtype
+    """
+    assert a.dtype == torch.float4_e2m1fn_x2
+    assert b.dtype == torch.float4_e2m1fn_x2
+
+    m = a.size(0)
+    k = a.size(1) * 2
+    n = b.size(0)
+
+    # Unswizzle scale factors for slicing
+    a_sf_unswizzled = unswizzle_sf(a_sf.view(-1), pad_up(m, 128), k)[:m, :]  # (m, scale_k)
+    b_sf_unswizzled = unswizzle_sf(b_sf.view(-1), n, k)  # (n, scale_k)
+
+    # Initialize output accumulator
+    c_ref = torch.zeros(m, n, dtype=output_dtype, device=a.device)
+
+    # For each expert, compute partial GEMM and accumulate
+    wpe = weight_per_expert
+    scale_wpe = wpe // scaling_vector_size
+    alpha_one = torch.tensor([1.0], dtype=torch.float32, device=a.device)
+
+    for expert_idx in range(expert_count):
+        # Slice A for this expert (in packed fp4 format, so divide by 2)
+        a_expert = a.view(torch.uint8)[
+            :, expert_idx * wpe // 2 : (expert_idx + 1) * wpe // 2
+        ].contiguous()
+        a_sf_expert = a_sf_unswizzled[:, expert_idx * scale_wpe : (expert_idx + 1) * scale_wpe]
+        a_sf_expert_swizzled = swizzle_sf(a_sf_expert.contiguous(), m, wpe)
+
+        # Slice B for this expert
+        b_expert = b.view(torch.uint8)[
+            :, expert_idx * wpe // 2 : (expert_idx + 1) * wpe // 2
+        ].contiguous()
+        b_sf_expert = b_sf_unswizzled[:, expert_idx * scale_wpe : (expert_idx + 1) * scale_wpe]
+        b_sf_expert_swizzled = swizzle_sf(b_sf_expert.contiguous(), n, wpe)
+
+        # Compute GEMM for this expert
+        c_expert = torch.ops.trtllm.nvfp4_gemm(
+            a_expert,
+            b_expert,
+            a_sf_expert_swizzled,
+            b_sf_expert_swizzled,
+            alpha_one,
+            output_dtype,
+        )
+
+        # Apply alpha_scale and accumulate
+        c_ref += c_expert * alpha_scale[:, expert_idx : expert_idx + 1]
+
+    return c_ref
+
+
+@pytest.mark.skipif(
+    get_sm_version() not in (100, 103),
+    reason="This test is only supported on SM 100 and SM 103 GPUs",
+)
+@pytest.mark.parametrize("num_expert", [1, 4])
+@pytest.mark.parametrize("weight_per_expert", [256])
+@pytest.mark.parametrize("num_tokens", [127, 256])
+@pytest.mark.parametrize("output_hidden_size", [256, 512])
+def test_nvfp4_dense_gemm_fc2_blackwell(
+    num_tokens: int, output_hidden_size: int, num_expert: int, weight_per_expert: int
+):
+    """Test Dense GEMM FC2 for MoE second projection.
+
+    This test validates the FC2 dense GEMM kernel which:
+    1. Performs GEMM: C = A @ B.T with per-token-per-expert alpha scaling
+    2. Each token has independent alpha values for each expert
+    """
+    sf_vec_size = 16
+    m = num_tokens
+    k = num_expert * weight_per_expert  # Input dimension from FC1 output
+    n = output_hidden_size  # Output hidden dimension
+
+    # Create input tensors in bfloat16, then quantize to fp4
+    a_bf16 = torch.randint(-5, 5, (m, k), dtype=torch.int32, device="cuda").to(torch.bfloat16)
+    b_bf16 = torch.randint(-5, 5, (n, k), dtype=torch.int32, device="cuda").to(torch.bfloat16)
+
+    # Compute global scale factors
+    a_global_sf = a_bf16.abs().max().float() / (448 * 6)
+    b_global_sf = b_bf16.abs().max().float() / (448 * 6)
+
+    # Quantize to fp4
+    a, a_sf = torch.ops.trtllm.fp4_quantize(a_bf16, 1 / a_global_sf, sf_vec_size, False)
+    a = a.view(torch.float4_e2m1fn_x2)
+
+    b, b_sf = torch.ops.trtllm.fp4_quantize(b_bf16, 1 / b_global_sf, sf_vec_size, False)
+    b = b.view(torch.float4_e2m1fn_x2)
+
+    # Create per-token-per-expert alpha scale (m, expert_count)
+    # Each token has different alpha values for each expert
+    alpha_scale = torch.rand(m, num_expert, dtype=torch.float32, device="cuda") * 2.0
+
+    # Compute reference
+    c_ref = nvfp4_dense_gemm_fc2_ref(
+        a,
+        b,
+        a_sf,
+        b_sf,
+        alpha_scale,
+        output_dtype=torch.bfloat16,
+        expert_count=num_expert,
+        weight_per_expert=weight_per_expert,
+        scaling_vector_size=sf_vec_size,
+    )
+
+    # Call the kernel
+    c = torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_fc2_blackwell(
+        a,
+        b,
+        a_sf,
+        b_sf,
+        alpha_scale,
+        expert_count=num_expert,
+        weight_per_expert=weight_per_expert,
+        output_dtype=torch.bfloat16,
+        scaling_vector_size=sf_vec_size,
+    )
+
+    # Verify output shape
+    assert c.shape == (m, n), f"Expected shape {(m, n)}, got {c.shape}"
+    assert c.dtype == torch.bfloat16, f"Expected dtype bfloat16, got {c.dtype}"
+
+    # Verify output values
+    # Use relative tolerance for floating point comparison
+    rtol = 0.1  # 10% relative tolerance
+    atol = 0.05  # Small absolute tolerance for values near zero
+
+    is_close = torch.isclose(c.float(), c_ref.float(), rtol=rtol, atol=atol)
+    match_ratio = is_close.sum().item() / c.numel()
+
+    print(f"FC2 Output match ratio: {match_ratio * 100:.2f}%")
+    assert match_ratio > 0.90, f"Only {match_ratio * 100:.2f}% elements match, expected >= 90%"
