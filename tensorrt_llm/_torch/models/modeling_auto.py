@@ -24,14 +24,17 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
             vision_encoder_cls, vlm_base_model = vision_encoder_info
             return vision_encoder_cls(config, vlm_base_model)
 
-        if "Eagle3" in model_arch:
-            # Below is a hack to detect eagle3 checkpoints.
-            # Why it exists:
-            # - Community checkpoints append "Eagle3" to architecture names ("LlamaForCausalLMEagle3").
-            # - Even NVIDIA official checkpoints (nvidia/Llama-4-Maverick-17B-128E-Eagle3) use the appended convention.
-            # - But TensorRT-LLM's MODEL_CLASS_MAPPING expects prefixed names like EAGLE3LlamaForCausalLM
-            # - Hence, LlamaForCausalLMEagle3 -> EAGLE3LlamaForCausalLM.
-            # TODO: should we provide our own checkpoints with the correct arch? It would let us avoid nasty stuff like this.
+        # Hack to detect eagle3 checkpoints.
+        # Why it exists:
+        # - Eagle3 checkpoints have draft_vocab_size in config.json (even if None)
+        # - Some community checkpoints append "Eagle3" to architecture names ("LlamaForCausalLMEagle3")
+        # - Some checkpoints don't include "Eagle3" in arch name at all ("LlamaForCausalLM")
+        # - TensorRT-LLM's MODEL_CLASS_MAPPING expects prefixed names like EAGLE3LlamaForCausalLM
+        # - Hence: LlamaForCausalLMEagle3 -> EAGLE3LlamaForCausalLM
+        #         LlamaForCausalLM (with draft_vocab_size) -> EAGLE3LlamaForCausalLM
+        # TODO: should we provide our own checkpoints with the correct arch? It would let us avoid nasty stuff like this.
+        if hasattr(config.pretrained_config, "draft_vocab_size"):
+            # It's an Eagle3 checkpoint - strip "Eagle3" suffix if present, then add prefix
             model_arch = model_arch.replace("Eagle3", "")
             model_arch = "EAGLE3" + model_arch
         if model_arch in (
