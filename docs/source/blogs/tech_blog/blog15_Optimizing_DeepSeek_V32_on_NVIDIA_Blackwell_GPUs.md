@@ -53,7 +53,9 @@ Figure 2 illustrates the DSA indexer and the Top-k selection mechanism. First, t
 $$I_{t} = \sum_{j=1}^{h}P_j^I \cdot \text{ReLU}(L_{t, j}^Q (L_t^{KV})^T)$$
 Finally, a Top-k operation is applied to the index scores to identify the most relevant indices, which are subsequently used for the sparse MLA computation.
  
-For the implementation, unlike the DeepSeek-V3/R1/V3.1 models that alternate between MHA (prefill) and MQA (decoding), as discussed in [Tech Blog 3](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.md), the DSA adopts a unified approach. To achieve better kernel efficiency, it operates in MQA mode for both the prefill and decoding phases. We are continuing to explore further optimizations, including potential support for MHA mode in future iterations.
+Regarding implementation, DSA diverges from the DeepSeek-V3/R1/V3.1 models, which alternate between MHA (prefill) and MQA (decoding) as discussed in [Tech Blog 3](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.md). Instead, DSA adopts a unified approach, operating exclusively in MQA mode for both prefill and decoding phases to maximize kernel efficiency. We are continuing to explore further optimizations, including potential support for MHA mode in future iterations.
+
+The DSA implementation is built upon the TensorRT LLM sparse attention framework, which is designed to provide flexible and extensible support for various sparse attention methods. For more information, please refer to the [sparse attention documentation](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/sparse-attention.md), and a technical blog providing further details will be released soon.
 
 ## Precision Strategy
 Because the DSA is the only architectural modification of DeepSeek-V3.2-Exp from the DeepSeek-R1 model, the mixed precision recipe for other modules is the same as what is used for the DeepSeek-R1. This is the precision strategy used in the DSA module:
@@ -73,10 +75,10 @@ Because the DSA is the only architectural modification of DeepSeek-V3.2-Exp from
 The MoE layers use NVFP4, which is the same as the DeepSeek-R1. Please refer to [Tech Blog 1](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.md) and [Tech Blog 3](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.md) for the MoE precision strategy.
 
 We evaluated the accuracy of this NVFP4 checkpoint on the same datasets:
-|                    | GSM8k | MMLU  | GPQA-Diamond|
-| :----------------- | :---- | :---- | :---------- |
-| TensorRT LLM FP8   | 95.79 | 88.11 | 80.81       |
-| TensorRT LLM NVFP4 | 95.00 | 87.63 | 80.30       |
+|                    | GSM8k | MMLU  | GPQA-Diamond |
+| :----------------- | :---- | :---- | :----------- |
+| TensorRT LLM FP8   | 95.79 | 88.11 | 84.34        |
+| TensorRT LLM NVFP4 | 95.00 | 87.63 | 84.85        |
 
 ** Note there are some run-to-run variance for these evaluations. We think the NVFP4 checkpoint has comparable accuracy with FP8 on these datasets.
 
@@ -89,7 +91,7 @@ To achieve optimal throughput, DeepSeek-V3.2 adopts the same parallel strategy a
 | MoE Shared Experts | DP8                         |
 | Router GEMM        | DP8                         |
  
-To scale DeepSeek-V3.2 inference on high-performance systems such as the GB200 NVL72, the model also leverages the parallel strategy from DeepSeek-R1. Please refer to [Tech Blog 4](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.md) and [Tech Blog 8](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog8_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.md) for more details.
+To scale DeepSeek-V3.2 inference on high-performance systems such as the GB200 NVL72, the model also leverages the parallel strategy from DeepSeek-R1. Please refer to [Tech Blog 4](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.md), [Tech Blog 8](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog8_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.md), and [Tech Blog 14](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.md) for more details.
  
 The difference lies in the DSA indexer. When utilizing Tensor Parallelism (TP) for attention modules, typically in latency-oriented scenarios, TP is not applied to the indexer layers. Instead, it is applied exclusively to the MLA components (i.e., the remaining layers of the attention module).
 
@@ -110,6 +112,9 @@ To address this, [PR-8699](https://github.com/NVIDIA/TensorRT-LLM/pull/8699) int
 ### Chunked Prefill and KV Cache Reuse
 Two additional critical features are chunked prefill and KV cache reuse. Chunked prefill removes input length constraints for long prompts and enables prefill chunks to be batched alongside more decoding requests, boosting throughput. KV cache reuse allows requests sharing common prefixes (e.g., system prompts or multi-turn conversations) to share cached blocks, drastically reducing time-to-first-token (TTFT).
 On the implementation side, kvCacheManager already supports the newly introduced indexer K cache, extending compatibility to both chunked prefill and KV cache reuse. Then [PR-9376](https://github.com/NVIDIA/TensorRT-LLM/pull/9376) enabled DSA to perform prefill computation with past tokens saved in the cache, thereby unlocking chunked prefill support. Building on this, [PR-9383](https://github.com/NVIDIA/TensorRT-LLM/pull/9383) implemented KV cache reuse for DeepSeek-V3.2 by reusing the chunked prefill changes.
+
+### Wide Expert Parallelism (Wide-EP) 
+The Wide-EP is an important feature for boosting inference throughput in large-scale Mixture-of-Experts (MoE) models. For the DeepSeek-V3.2 model, after supporting the disaggregated serving, [PR-9245](https://github.com/NVIDIA/TensorRT-LLM/pull/9245) simply registered the model with the Expert Parallelism Load Balancer (EPLB). This integration allows Wide-EP and EPLB to be enabled, significantly enhancing performance.
 
 ## Key Optimizations
 DeepSeek-V3.2 can inherit the MoE optimizations from DeepSeek-R1. Consequently, this section focuses exclusively on the DSA part, covering both kernel and system-level optimizations.
@@ -249,7 +254,6 @@ trtllm-eval --model ${model_path} \
 trtllm-eval --model ${model_path} \
 	--tp_size 8 \
 	--ep_size 8 \
-	--max_num_tokens 8195 \
 	--kv_cache_free_gpu_memory_fraction 0.8 \
 	--extra_llm_api_options ./config.yml \
 	--custom_tokenizer deepseek_v32 \
@@ -376,6 +380,18 @@ Average time-to-first-token [TTFT] (ms):      	10884.8366
 Average time-per-output-token [TPOT] (ms):    	50.6824
 Per User Output Speed (tps/user):             	21.1586
 ```
+
+### Benchmark with Wide-EP on GB200
+To validate the efficacy of Wide-EP on DeepSeek-V3.2, we evaluated performance using the NVFP4 model on a GB200 NVL72 system. We compared EP16 and EP32 configurations against EP4 and EP8 baselines, with benchmarks conducted at ISL=8K and OSL=1K.
+
+<div align="center">
+<figure>
+  <img src="https://github.com/lfr-0531/TensorRT-LLM/raw/user/fanrongl/ds32_tech_blog_preview/docs/source/blogs/media/tech_blog15_ds32_wide_ep.png" alt="tech_blog15_ds32_wide_ep" width="700" height="auto">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 4. DeepSeek-V3.2 throughput on ISL/OSL 8k/1k. Note that the numbers were collected on November 20th, and more optimizations are still on-going.</em></sub></p>
+
+As illustrated in Figure 4, Wide-EP yields up to a 2.28x improvement in per-GPU output throughput. To reproduce these results, please refer to the [examples/wide_ep/slurm_scripts](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep/slurm_scripts) directory. These scripts demonstrate how to launch disaggregated serving with large-scale EP and associated features on a SLURM cluster.
 
 ## Future Works
 
