@@ -68,7 +68,7 @@ def imageKeyToTag = [:]
 
 def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
 {
-    def targetCould = "kubernetes-cpu"
+    def targetCloud = "kubernetes-cpu"
     def containerConfig = ""
     def selectors = """
                 nodeSelector:
@@ -187,7 +187,7 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
     def buildID = env.BUILD_ID
     def nodeLabel = trtllm_utils.appendRandomPostfix("${nodeLabelPrefix}---tensorrt-${jobName}-${buildID}")
     def podConfig = [
-        cloud: targetCould,
+        cloud: targetCloud,
         namespace: "sw-tensorrt",
         label: nodeLabel,
         yaml: """
@@ -568,10 +568,10 @@ def updateCIImageTag(globalVars) {
     ]
 
     def newImageTags = [
-        "LLM_DOCKER_IMAGE" : imageKeyToTag["Build CI image (x86_64 tritondevel)"],
-        "LLM_SBSA_DOCKER_IMAGE" : imageKeyToTag["Build CI image (SBSA tritondevel)"],
-        "LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE" : imageKeyToTag["Build CI image (RockyLinux8 Python310)"],
-        "LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE" : imageKeyToTag["Build CI image (RockyLinux8 Python312)"],
+        "LLM_DOCKER_IMAGE" : imageKeyToTag["Build CI Image (x86_64 tritondevel)"],
+        "LLM_SBSA_DOCKER_IMAGE" : imageKeyToTag["Build CI Image (SBSA tritondevel)"],
+        "LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE" : imageKeyToTag["Build CI Image (RockyLinux8 Python310)"],
+        "LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE" : imageKeyToTag["Build CI Image (RockyLinux8 Python312)"],
     ]
 
     def emptyKeys = newImageTags.findAll { k, v -> v == null || v.trim().isEmpty() }.keySet()
