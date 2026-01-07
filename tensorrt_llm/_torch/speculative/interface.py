@@ -1,6 +1,7 @@
 import copy
 import os
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Type
@@ -12,13 +13,29 @@ from tensorrt_llm.logger import logger
 
 from ..._utils import get_sm_version
 from ..attention_backend.trtllm import AttentionBackend, TrtllmAttention
-from ..pyexecutor.resource_manager import BaseResourceManager
+from ..pyexecutor.resource_manager import (BaseResourceManager,
+                                           ResourceManagerType)
 
 if TYPE_CHECKING:
     from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
 
 # Environment variable name for forcing the number of accepted tokens in speculative decoding
 FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR = "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS"
+
+
+def should_use_separate_draft_kv_cache(spec_config) -> bool:
+    """
+    Check if separate draft KV cache should be used for one-engine speculative decoding.
+
+    Args:
+        spec_config: The speculative decoding config (e.g., EagleDecodingConfig).
+
+    Returns:
+        bool: True if separate draft KV cache should be used.
+    """
+    if spec_config is None:
+        return False
+    return getattr(spec_config, 'use_separate_draft_kv_cache', False)
 
 
 def get_force_num_accepted_tokens() -> int:
@@ -367,10 +384,11 @@ class SpecWorkerBase(nn.Module, ABC):
     Provides common functionality for sampling and token handling.
     """
 
-    def __init__(self):
+    def __init__(self, use_separate_draft_kv_cache: bool = False):
         super().__init__()
         self.guided_decoder: Optional["CapturableGuidedDecoder"] = None
         self.force_num_accepted_tokens = get_force_num_accepted_tokens()
+        self.use_separate_draft_kv_cache = use_separate_draft_kv_cache
 
     @property
     @abstractmethod
@@ -384,6 +402,44 @@ class SpecWorkerBase(nn.Module, ABC):
                            guided_decoder: "CapturableGuidedDecoder") -> bool:
         self.guided_decoder = guided_decoder
         return True
+
+    def get_draft_kv_cache_manager(self, resource_manager):
+        """
+        Get the draft KV cache manager if using separate KV cache layouts.
+
+        Args:
+            resource_manager: The resource manager containing KV cache managers.
+
+        Returns:
+            The draft KV cache manager, or None if not using separate layouts.
+        """
+        if self.use_separate_draft_kv_cache and resource_manager is not None:
+            return resource_manager.get_resource_manager(
+                ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+        return None
+
+    @contextmanager
+    def draft_kv_cache_context(self, attn_metadata, draft_kv_cache_manager):
+        """
+        Context manager to temporarily switch to draft KV cache manager.
+
+        Args:
+            attn_metadata: The attention metadata containing the KV cache manager.
+            draft_kv_cache_manager: The draft KV cache manager to switch to.
+
+        Yields:
+            None. The attn_metadata.kv_cache_manager is temporarily switched.
+        """
+        if draft_kv_cache_manager is None:
+            yield
+            return
+
+        target_kv_cache_manager = attn_metadata.kv_cache_manager
+        attn_metadata.kv_cache_manager = draft_kv_cache_manager
+        try:
+            yield
+        finally:
+            attn_metadata.kv_cache_manager = target_kv_cache_manager
 
     def _sample_tokens_for_batch(
         self,

@@ -1,6 +1,7 @@
 from .auto_heuristic import suggest_spec_config
 from .eagle3 import Eagle3SpecMetadata
-from .interface import SpecMetadata, SpecWorkerBase
+from .interface import (SpecMetadata, SpecWorkerBase,
+                        should_use_separate_draft_kv_cache)
 from .mtp import MTPEagleWorker, MTPSpecMetadata, MTPWorker
 from .ngram import NGramDrafter, NGramPoolManager
 from .save_hidden_state import SaveHiddenStatesDrafter
@@ -27,6 +28,7 @@ __all__ = [
     "get_spec_metadata",
     "get_spec_resource_manager",
     "get_spec_worker",
+    "should_use_separate_draft_kv_cache",
     "update_spec_config_from_model_config",
     "suggest_spec_config",
     "SpecTreeManager",

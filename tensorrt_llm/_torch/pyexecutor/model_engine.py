@@ -1473,7 +1473,8 @@ class PyTorchModelEngine(ModelEngine):
         else:
             return self._apply_incremental_update_target(
                 scheduled_requests, kv_cache_manager, attn_metadata,
-                spec_metadata, new_tensors_device, num_accepted_tokens_device)
+                spec_metadata, new_tensors_device, num_accepted_tokens_device,
+                resource_manager)
 
     @nvtx_range("_prepare_incremental_update_metadata")
     def _prepare_incremental_update_metadata(
@@ -1739,7 +1740,8 @@ class PyTorchModelEngine(ModelEngine):
             attn_metadata: AttentionMetadata,
             spec_metadata: Optional[SpecMetadata] = None,
             new_tensors_device: Optional[SampleStateTensors] = None,
-            num_accepted_tokens_device: Optional[torch.Tensor] = None):
+            num_accepted_tokens_device: Optional[torch.Tensor] = None,
+            resource_manager: Optional[ResourceManager] = None):
         # Extract tensors from new_tensors_device
         new_tokens_device = new_tensors_device.new_tokens  # [batch, 1 + draft_len]
         new_tokens_lens_device = new_tensors_device.new_tokens_lens  # [batch]
@@ -1873,6 +1875,7 @@ class PyTorchModelEngine(ModelEngine):
             'position_ids': final_position_ids,
             'inputs_embeds': None,
             "multimodal_params": [],
+            'resource_manager': resource_manager,
         }
 
         if bool(lora_params):
@@ -2665,6 +2668,7 @@ class PyTorchModelEngine(ModelEngine):
             'position_ids': final_position_ids,
             'inputs_embeds': None,
             "multimodal_params": multimodal_params_list,
+            'resource_manager': resource_manager,
         }
 
         if bool(lora_params):
@@ -2730,7 +2734,8 @@ class PyTorchModelEngine(ModelEngine):
             self,
             scheduled_requests: ScheduledRequests,
             attn_metadata: AttentionMetadata,
-            spec_metadata: Optional[SpecMetadata] = None):
+            spec_metadata: Optional[SpecMetadata] = None,
+            resource_manager: Optional[ResourceManager] = None):
         """
         Prepare inputs for Pytorch Model.
         """
@@ -2834,7 +2839,8 @@ class PyTorchModelEngine(ModelEngine):
             'position_ids':
             self.position_ids_cuda[:virtual_num_tokens].unsqueeze(0),
             'inputs_embeds': None,
-            "multimodal_params": multimodal_params_list
+            "multimodal_params": multimodal_params_list,
+            'resource_manager': resource_manager,
         }
 
         if bool(lora_params):
@@ -2877,10 +2883,12 @@ class PyTorchModelEngine(ModelEngine):
 
         return inputs, None
 
-    def _prepare_star_attention_inputs(self,
-                                       scheduled_requests: ScheduledRequests,
-                                       kv_cache_manager,
-                                       attn_metadata: AttentionMetadata):
+    def _prepare_star_attention_inputs(
+            self,
+            scheduled_requests: ScheduledRequests,
+            kv_cache_manager,
+            attn_metadata: AttentionMetadata,
+            resource_manager: Optional[ResourceManager] = None):
         """
         Prepare inputs for Pytorch Model.
         """
@@ -3096,7 +3104,8 @@ class PyTorchModelEngine(ModelEngine):
             'attn_metadata': attn_metadata,
             'input_ids': self.input_ids_cuda[:num_tokens],
             'position_ids': self.position_ids_cuda[:num_tokens].unsqueeze(0),
-            'inputs_embeds': None
+            'inputs_embeds': None,
+            'resource_manager': resource_manager,
         }, gather_ids if is_spec_decode else None
 
     def _get_lora_params_from_requests(self,
@@ -3207,7 +3216,8 @@ class PyTorchModelEngine(ModelEngine):
             cp_type = self.mapping.cp_config['cp_type']
             if CpType.STAR == cp_type:
                 return self._prepare_star_attention_inputs(
-                    scheduled_requests, kv_cache_manager, attn_metadata)
+                    scheduled_requests, kv_cache_manager, attn_metadata,
+                    resource_manager)
             elif CpType.HELIX == cp_type:
                 # Take the usual route of _prepare_tp_inputs.
                 pass
@@ -3270,7 +3280,8 @@ class PyTorchModelEngine(ModelEngine):
 
         if kv_cache_manager is None:
             inputs, gather_ids = self._prepare_tp_inputs_no_cache(
-                scheduled_requests, attn_metadata, spec_metadata)
+                scheduled_requests, attn_metadata, spec_metadata,
+                resource_manager)
 
             with MoeLoadBalancerIterContext(moe_load_balancer):
                 # Special handling for multimodal encoder only mode
