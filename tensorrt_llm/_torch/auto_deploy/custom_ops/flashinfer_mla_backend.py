@@ -23,6 +23,7 @@ from .attention_interface import (
 def flashinfer_mla_prepare_metadata(
     input_ids: torch.Tensor,
     position_ids: torch.Tensor,
+    batch_info_host: torch.Tensor,
     seq_len: torch.Tensor,
     input_pos: torch.Tensor,
     cache_loc: torch.Tensor,
@@ -38,9 +39,10 @@ def flashinfer_mla_prepare_metadata(
     # reset the planner
     # _GlobalFlashInferPlanner.reset()
 
-    # retrieve sanitzed metadata
-    seq_len = SequenceInfo._get_sanitized_seq_len(input_ids, seq_len)
-    num_seq = len(seq_len)
+    # retrieve sanitized metadata
+    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    num_seq = num_prefill + num_decode
+    seq_len = seq_len[:num_seq]
 
     # prepare flashinfer-style metadata
     offsets = input_pos[:num_seq].clone()
@@ -82,19 +84,21 @@ def flashinfer_mla_prepare_metadata(
 
 
 # TODO: Move the truncation of seq_len out of this custom op
-# As SequenceInfo._get_sanitized_num_sequences could break in fake mode
 @flashinfer_mla_prepare_metadata.register_fake
 def flashinfer_mla_prepare_metadata_fake(
     input_ids: torch.Tensor,
     position_ids: torch.Tensor,
+    batch_info_host: torch.Tensor,
     seq_len: torch.Tensor,
     input_pos: torch.Tensor,
     cache_loc: torch.Tensor,
     pages_per_seq: torch.Tensor,
     page_size: int,
 ):
-    seq_len = SequenceInfo._get_sanitized_seq_len(input_ids, seq_len)
-    qo_indptr = torch.empty(len(seq_len) + 1, dtype=seq_len.dtype, device=seq_len.device)
+    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    num_seq = num_prefill + num_decode
+    seq_len = seq_len[:num_seq]
+    qo_indptr = torch.empty(num_seq + 1, dtype=seq_len.dtype, device=seq_len.device)
     scalar = torch.empty(1, dtype=torch.int32, device=seq_len.device)
     batch_indices = torch.empty_like(input_ids).flatten()
     positions = torch.empty_like(input_ids).flatten()

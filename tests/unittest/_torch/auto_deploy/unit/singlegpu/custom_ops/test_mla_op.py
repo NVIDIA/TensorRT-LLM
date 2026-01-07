@@ -747,6 +747,21 @@ def test_deepseek_mla_prefill_cache(
     input_ids = hidden_states.reshape(-1, config.hidden_size)  # [num_tokens, hidden_size]
     hidden_states = hidden_states.reshape(1, -1, config.hidden_size)
 
+    # Compute batch_info_host: [num_prefill, num_prefill_tokens, num_decode]
+    if seqlen_q > 1:
+        # Prefill case
+        num_prefill = batch_size
+        num_prefill_tokens = batch_size * seqlen_q
+        num_decode = 0
+    else:
+        # Decode case
+        num_prefill = 0
+        num_prefill_tokens = 0
+        num_decode = batch_size
+    batch_info_host = torch.tensor(
+        [num_prefill, num_prefill_tokens, num_decode], dtype=torch.int32, device="cpu"
+    )
+
     # Currently this operator is not interesting because it is not used. Consider deleting it.
     test_torch_cache_op = False
     if test_torch_cache_op:
@@ -791,7 +806,14 @@ def test_deepseek_mla_prefill_cache(
             page_size,
             position_ids,
         ) = torch.ops.auto_deploy.flashinfer_mla_prepare_metadata(
-            input_ids, position_ids, seq_len, input_pos, cache_loc, pages_per_seq, page_size
+            input_ids,
+            position_ids,
+            batch_info_host,
+            seq_len,
+            input_pos,
+            cache_loc,
+            pages_per_seq,
+            page_size,
         )
 
         flashinfer_output, _, _ = hf_deepseek_attn.ad_forward(
@@ -897,6 +919,15 @@ def _test_deepseek_mla_decode_cache(
     )
     fi_position_ids = fi_position_ids.unsqueeze(0)
 
+    # Compute batch_info_host: [num_prefill, num_prefill_tokens, num_decode]
+    # This is decode case (seqlen_q == 1)
+    num_prefill = 0
+    num_prefill_tokens = 0
+    num_decode = n_preloaded_pages
+    batch_info_host = torch.tensor(
+        [num_prefill, num_prefill_tokens, num_decode], dtype=torch.int32, device="cpu"
+    )
+
     test_torch_cache_op = False
     if test_torch_cache_op:
         seq_len, input_pos, cache_loc, seq_start, position_ids = (
@@ -941,7 +972,14 @@ def _test_deepseek_mla_decode_cache(
             page_size,
             position_ids,
         ) = torch.ops.auto_deploy.flashinfer_mla_prepare_metadata(
-            input_ids, fi_position_ids, seq_len, input_pos, cache_loc, pages_per_seq, page_size
+            input_ids,
+            fi_position_ids,
+            batch_info_host,
+            seq_len,
+            input_pos,
+            cache_loc,
+            pages_per_seq,
+            page_size,
         )
 
         flashinfer_output, _, _ = hf_deepseek_attn.ad_forward(
