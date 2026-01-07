@@ -610,6 +610,7 @@ class MistralLarge3DraftModel(DecoderModel):
 
 
 # We use MistralLarge3 as the base architecture for EAGLE3 draft layers
+# NOTE: Class name says "Eagle" not "Eagle3" to match checkpoint naming (e.g., "Mistral-Large-3-675B-Instruct-2512-Eagle")
 @register_auto_model("MistralLarge3EagleForCausalLM")
 class MistralLarge3EagleForCausalLM(DecoderModelForCausalLM):
 
