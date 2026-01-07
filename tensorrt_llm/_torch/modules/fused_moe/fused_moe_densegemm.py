@@ -22,6 +22,44 @@ def swiglu_fused_moe(x):
     return F.silu(gate) * x
 
 
+@torch.compile(options={"max-autotune": True})
+def gen_fc2_alpha_fused(
+    expert_size: int,
+    token_selected_experts: torch.Tensor,
+    token_final_scales: torch.Tensor,
+    alpha: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Fused kernel to generate fc2 alpha values.
+
+    Instead of:
+        1. zeros() -> scatter_() -> multiply with alpha (operates on large [N, E] tensor)
+
+    We do:
+        1. Gather alpha values for selected experts (small [N, top_k] tensor)
+        2. Multiply scales with gathered alpha (small tensor operation)
+        3. Scatter to output (single write to large tensor)
+
+    This reduces memory bandwidth by avoiding read-modify-write on the large tensor.
+    """
+    num_tokens = token_selected_experts.shape[0]
+
+    # Pre-compute scaled values on small tensor [num_tokens, top_k]
+    if alpha is not None:
+        # Gather alpha for selected experts: alpha[expert_idx] for each selection
+        gathered_alpha = alpha[token_selected_experts.long()]  # [num_tokens, top_k]
+        scaled_values = token_final_scales * gathered_alpha
+    else:
+        scaled_values = token_final_scales
+
+    # Create output and scatter in one fused operation
+    fc2_alpha = torch.zeros(
+        [num_tokens, expert_size],
+        dtype=torch.float32,
+        device=token_selected_experts.device,
+    )
+    return fc2_alpha.scatter_(1, token_selected_experts.long(), scaled_values)
+
+
 def cute_dsl_fp8_group_blockwise_gemm_ref(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -137,7 +175,7 @@ class DenseGEMMFusedMoE(CutlassFusedMoE):
             init_load_balancer=init_load_balancer,
             without_comm=without_comm,
         )
-        # Initialize auxiliary stream and events for gen_fc2_alpha overlap with fc1
+        # Initialize auxiliary stream and events for gen_fc2_alpha_fused overlap with fc1
         if self.aux_stream_dict is None:
             self.aux_stream_dict = aux_stream_dict if aux_stream_dict is not None else {}
         if AuxStreamType.MoeFc2Alpha not in self.aux_stream_dict:
@@ -202,18 +240,6 @@ class DenseGEMMFusedMoE(CutlassFusedMoE):
             w2_weight_scale.view(self.w2_weight_scale.dtype).view(self.w2_weight_scale.shape),
             non_blocking=True,
         )
-
-    def gen_fc2_alpha(self, num_tokens, token_selected_experts, token_final_scales, alpha):
-        # Create a tensor to store the alpha values for each expert
-        fc2_alpha = torch.zeros(
-            [num_tokens, self.expert_size_per_partition],
-            dtype=torch.float32,
-            device=token_selected_experts.device,
-        )
-        fc2_alpha.scatter_(1, token_selected_experts.long(), token_final_scales)
-        if alpha is not None:
-            fc2_alpha = fc2_alpha * alpha
-        return fc2_alpha
 
     def select_alltoall_method_type(self) -> AlltoallMethodType:
         return AlltoallMethodType.NotEnabled
@@ -295,8 +321,11 @@ class DenseGEMMFusedMoE(CutlassFusedMoE):
 
         with torch.cuda.stream(self.aux_stream_dict[AuxStreamType.MoeFc2Alpha]):
             self.event_dict[EventType.Main].wait()
-            fc2_alpha = self.gen_fc2_alpha(
-                num_tokens, token_selected_experts, token_final_scales, self.fc2_alpha
+            fc2_alpha = gen_fc2_alpha_fused(
+                self.expert_size_per_partition,
+                token_selected_experts,
+                token_final_scales,
+                self.fc2_alpha,
             )
             alpha_normal_factor = self.fc2_alpha_max
             alpha_normalized = fc2_alpha / alpha_normal_factor
