@@ -92,6 +92,13 @@ class HypothesisTestingParams:
 # Dataset default parameters for hypothesis testing
 # Extracted from accuracy_core.py AccuracyTask subclasses
 DATASET_DEFAULTS = {
+    "aime25": {
+        "alpha": 0.05,
+        "beta": 0.2,
+        "sigma": 50,
+        "num_samples": 30,  # AIME 2025 full sample size
+        "higher_is_better": True,
+    },
     "gsm8k": {
         "alpha": 0.05,
         "beta": 0.2,
