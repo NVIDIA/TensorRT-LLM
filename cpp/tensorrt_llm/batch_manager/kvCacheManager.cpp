@@ -1579,23 +1579,24 @@ std::pair<SizeType32, std::optional<KVCacheBlock::IdType>> WindowBlockManager::s
             // Protect against blockIds being shorter than blockKeys.
             auto const bid = blockIds.at(blockCnt);
             TLLM_LOG_DEBUG("%s::storeBlocks - Searching match for block %d", mLogPrefix.c_str(), bid);
-            // We set blockId to an invalid value to indicate that a block has been released early for a limited attention layer.
-            // Make sure we don't store an invalid block because of this.
+            // We set blockId to an invalid value to indicate that a block has been released early for a limited
+            // attention layer. Make sure we don't store an invalid block because of this.
             auto& block = mAllBlocksById.at(bid);
             // Protect against blockKeys being shorter than blockIds.
             auto const& blockKey = blockKeys.at(blockCnt);
 
-            // If either of the above error conditions occur, std::vector::at will throw an exception, which is caught further down.
-            // This will prevent an invalid block from being stored for reuse.
-            // The catch clause exits loop early, preventing blocks following an invalid block from being reused.
+            // If either of the above error conditions occur, std::vector::at will throw an exception, which is caught
+            // further down. This will prevent an invalid block from being stored for reuse. The catch clause exits loop
+            // early, preventing blocks following an invalid block from being reused.
 
-            auto [partialMatch, numMatched, matchedBlock]
-                = needMatch ? searchRoot->findMatchingBlock(blockKey, false, false) : std::make_tuple(false, 0, nullptr);
+            auto [partialMatch, numMatched, matchedBlock] = needMatch
+                ? searchRoot->findMatchingBlock(blockKey, false, false)
+                : std::make_tuple(false, 0, nullptr);
             if (matchedBlock != nullptr)
             {
                 // Found match
-                TLLM_LOG_DEBUG(
-                        "%s::storeBlocks - Found matching block %d, traverse", mLogPrefix.c_str(), matchedBlock->getBlockId());
+                TLLM_LOG_DEBUG("%s::storeBlocks - Found matching block %d, traverse", mLogPrefix.c_str(),
+                    matchedBlock->getBlockId());
                 searchRoot = matchedBlock;
                 // TODO possible optimization: if bid != matchedBlock->getBlockId(),
                 // block can be freed and inserted at mFreePrimaryBlocks.begin()
@@ -1603,10 +1604,10 @@ std::pair<SizeType32, std::optional<KVCacheBlock::IdType>> WindowBlockManager::s
             else
             {
                 // No match
-                TLLM_LOG_DEBUG("%s::storeBlocks - No match, inserting block %d into search structure", mLogPrefix.c_str(),
-                        block->getBlockId());
+                TLLM_LOG_DEBUG("%s::storeBlocks - No match, inserting block %d into search structure",
+                    mLogPrefix.c_str(), block->getBlockId());
                 TLLM_CHECK_WITH_INFO(block->getBlockId() == bid,
-                        "Block id mismatch " + std::to_string(block->getBlockId()) + " != " + std::to_string(bid));
+                    "Block id mismatch " + std::to_string(block->getBlockId()) + " != " + std::to_string(bid));
                 needMatch = false; // no matching needed for following blocks
                 block->setBlockKey(blockKey, static_cast<SizeType32>(blockKey.uniqueTokens.size()) == mTokensPerBlock);
                 block->setPrevBlock(searchRoot);
@@ -1618,7 +1619,7 @@ std::pair<SizeType32, std::optional<KVCacheBlock::IdType>> WindowBlockManager::s
 
                 storedBlocks.push_back(block);
                 TLLM_CHECK(block->getPrevBlockInSeq() == nullptr
-                        || block->getPrevBlockInSeq()->getHash() == searchRoot->getHash());
+                    || block->getPrevBlockInSeq()->getHash() == searchRoot->getHash());
                 auto oldHash = block->getHash();
                 auto newHash = BlockKeyHasher()(blockKey, searchRoot->getHash());
                 if (oldHash != newHash)
@@ -1635,7 +1636,7 @@ std::pair<SizeType32, std::optional<KVCacheBlock::IdType>> WindowBlockManager::s
             }
             lastStoredId = searchRoot->getBlockId();
         }
-        catch(const std::out_of_range& ex)
+        catch (std::out_of_range const& ex)
         {
             TLLM_LOG_WARNING("Out of range access, terminating storeBlocks early.");
             // Prevent blocks following an invalid block from being reused.
