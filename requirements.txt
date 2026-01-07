@@ -67,6 +67,9 @@ etcd3 @ git+https://github.com/kragniz/python-etcd3.git@e58a899579ba416449c4e225
 blake3
 soundfile
 triton==3.5.1
+# triton_kernels provides OpenAI's MoE kernels (matmul_ogs, routing, swiglu)
+# NOTE: the version below should be aligned with the triton version above
+triton-kernels @ git+https://github.com/triton-lang/triton.git@v3.5.1#subdirectory=python/triton_kernels
 tiktoken
 blobfile
 openai-harmony==0.0.4

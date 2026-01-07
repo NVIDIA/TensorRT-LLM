@@ -1,32 +1,19 @@
 from __future__ import annotations
 
 import os
-import sys
 from typing import Dict, List, NamedTuple, Optional
 
 import torch
 import torch.nn as nn
 import triton
 import triton.language as tl
-
-IS_TRITON_KERNELS_AVAILABLE = False
-# We expect to find triton_kernels under $TRITON_ROOT/python/triton_kernels
-# Triton upstream commit f3067cd3bd0c29065fa4ecdb724b6f29cbabea5f has been verified.
-triton_root = os.getenv('TRITON_ROOT')
-if triton_root:
-    triton_root = os.path.abspath(
-        os.path.join(triton_root, 'python', 'triton_kernels'))
-    if os.path.exists(triton_root) and triton_root not in sys.path:
-        sys.path.insert(0, triton_root)
-    assert triton.__version__ >= "3.4.0", "Triton kernels are detected but the Triton wheel is too old"
-    import triton_kernels.swiglu
-    from triton_kernels.matmul_ogs import (FlexCtx, FnSpecs, FusedActivation,
-                                           PrecisionConfig, matmul_ogs)
-    from triton_kernels.numerics import InFlexData
-    from triton_kernels.numerics_details.mxfp import downcast_to_mxfp_torch
-    from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
-    from triton_kernels.tensor_details import layout
-    IS_TRITON_KERNELS_AVAILABLE = True
+import triton_kernels.swiglu
+from triton_kernels.matmul_ogs import (FlexCtx, FnSpecs, FusedActivation,
+                                       PrecisionConfig, matmul_ogs)
+from triton_kernels.numerics import InFlexData
+from triton_kernels.numerics_details.mxfp import downcast_to_mxfp_torch
+from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
+from triton_kernels.tensor_details import layout
 
 from ...model_config import ModelConfig
 from ..linear import TensorParallelMode, load_weight_shard
@@ -1295,8 +1282,6 @@ class TritonFusedMoE(MoE):
             weight_loading_mode=weight_loading_mode,
             layer_idx=layer_idx,
         )
-        if not IS_TRITON_KERNELS_AVAILABLE:
-            raise ImportError("Triton kernels are not available.")
         if torch.cuda.get_device_capability()[0] != 9 and self.ep_size > 1:
             raise NotImplementedError(
                 "TritonFusedMoE is only supported on Hopper with EP size > 1.")

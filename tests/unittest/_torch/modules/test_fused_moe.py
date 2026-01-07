@@ -41,8 +41,6 @@ from tensorrt_llm._torch.modules.fused_moe import (
 from tensorrt_llm._torch.modules.fused_moe.quantization import \
     NVFP4CutlassFusedMoEMethod
 # isort: on
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import \
-    IS_TRITON_KERNELS_AVAILABLE
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._utils import get_sm_version, mpi_rank
 from tensorrt_llm.mapping import Mapping
@@ -92,8 +90,6 @@ def test_fused_moe(moe_backend,
                    mapping=None):
 
     if moe_backend == "TRITON":
-        if not IS_TRITON_KERNELS_AVAILABLE:
-            pytest.skip("Triton kernels are not available")
         if dtype != torch.bfloat16:
             pytest.skip("Unsupported for TritonFusedMoE")
         if routing_cls != RenormalizeMoeRoutingMethod:
@@ -522,8 +518,6 @@ def test_fused_moe_alltoall_fp4(alltoall_method_type):
 def test_fused_moe_fp8(moe_backend, dtype, routing_cls, bias):
 
     if moe_backend == "TRITON":
-        if not IS_TRITON_KERNELS_AVAILABLE:
-            pytest.skip("Triton kernels are not available")
         if dtype != torch.bfloat16:
             pytest.skip("Unsupported for TritonFusedMoE")
         if routing_cls != RenormalizeMoeRoutingMethod:
@@ -2542,8 +2536,6 @@ def test_fused_moe_wfp4a16(dtype, hidden_size, moe_backend,
 @pytest.mark.parametrize("dynamic_quant", [True, False])
 def test_fused_moe_triton_mxfp4(experts, hidden_size, intermediate_size,
                                 fp8_activation, bias, dynamic_quant):
-    if not IS_TRITON_KERNELS_AVAILABLE:
-        pytest.skip("Triton kernels are not available")
     if torch.cuda.get_device_capability()[0] < 10 and fp8_activation:
         pytest.skip("Latest Triton requires BF16 activation on Hopper")
     if torch.cuda.get_device_capability()[0] >= 10 and not fp8_activation:
