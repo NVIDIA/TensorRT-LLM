@@ -78,6 +78,7 @@ worker_config:
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.7
       dtype: fp8
+      tokens_per_block: 64
     moe_config:
       backend: CUTEDSL
       use_low_precision_moe_combine: true
