@@ -494,7 +494,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
     ]
     if (MODE == "build_for_ci") {
         buildConfigs = buildConfigs.findAll { key, config ->
-            key.contains("Build CI image")
+            key.contains("Build CI Image")
         }
         // Add NGC devel build configs for CI
         buildConfigs += [
