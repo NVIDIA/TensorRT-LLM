@@ -46,6 +46,7 @@ from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
 from .guided_decoder import GuidedDecoder
 from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
+from .hang_detector import HangDetector
 from .kv_cache_connector import KvCacheConnectorManager
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
@@ -137,6 +138,7 @@ class PyExecutor:
                  max_seq_len: Optional[int] = None,
                  peft_cache_config: Optional[PeftCacheConfig] = None,
                  virtual_memory_pools: Optional[dict] = None,
+                 hang_detection_timeout: Optional[int] = None,
                  execution_stream: Optional[torch.cuda.Stream] = None):
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
@@ -277,6 +279,15 @@ class PyExecutor:
         self.adp_ctx_batching_wait_iters_count = 0
         self.batch_wait_iters_count = 0
 
+        def on_detected():
+            self._handle_errors(
+                f"Hang detected on rank {self.global_rank} in PyExecutor.")
+            self.shutdown_event.set()
+            self.is_shutdown = True
+
+        self.hang_detector = HangDetector(timeout=hang_detection_timeout,
+                                          on_detected=on_detected)
+
         # request fetcher initialization
         self._set_global_steady_clock_offset()
         self.executor_request_queue = ExecutorRequestQueue(
@@ -287,6 +298,7 @@ class PyExecutor:
             max_num_active_requests=self.max_num_active_requests,
             enable_iter_perf_stats=self.enable_iter_perf_stats,
             batch_wait_timeout_ms=self.batch_wait_timeout_ms,
+            hang_detector=self.hang_detector,
         )
         self.executor_request_queue.set_exclude_last_generation_logits(
             self.disable_overlap_scheduler, self.dist.pp_size)
@@ -385,6 +397,7 @@ class PyExecutor:
     def start_worker(self):
         with self.worker_lock:
             if self.worker_started == False:
+                self.hang_detector.start()
                 self.worker_thread = threading.Thread(
                     target=self._event_loop_wrapper, daemon=True)
                 self.worker_thread.start()
@@ -473,6 +486,8 @@ class PyExecutor:
         """
         self.executor_request_queue.enqueue_shutdown_request()
         self.shutdown_event.wait()
+        if self.hang_detector.detected():
+            return
         self.worker_thread.join()
         self.worker_started = False
         for manager in self.resource_manager.resource_managers.values():
@@ -961,6 +976,7 @@ class PyExecutor:
             iter_start_time = time.time()
             iter_stats = None
             while True:
+                self.hang_detector.checkpoint()
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
@@ -968,6 +984,7 @@ class PyExecutor:
                 # Fetch new requests from request queue
                 new_requests = self._fetch_and_activate_new_requests()
                 if self.should_stop_processing:
+                    self.hang_detector.stop()
                     break
 
                 self._handle_control_request()
@@ -1333,6 +1350,7 @@ class PyExecutor:
             iter_start_time = time.time()
             iter_stats = None
             while True:
+                self.hang_detector.checkpoint()
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
@@ -1341,6 +1359,7 @@ class PyExecutor:
                 self._handle_control_request()
 
                 if scheduled_batch is None:
+                    self.hang_detector.stop()
                     break
 
                 self._pause_requests(scheduled_batch.paused_requests)
@@ -1536,6 +1555,7 @@ class PyExecutor:
             previous_tensors_device = None
             can_forward = False if self.benchmark_req_queues_size > 0 and self.kv_cache_transceiver else True
             while True:
+                self.hang_detector.checkpoint()
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
@@ -1544,6 +1564,7 @@ class PyExecutor:
                 self._handle_control_request()
 
                 if scheduled_batch is None:
+                    self.hang_detector.stop()
                     break
                 # In gen-only benchmarking mode, wait until the number of scheduled generation
                 # requests reaches the required threshold before starting forward pass,
