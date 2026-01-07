@@ -16,9 +16,9 @@ import operator
 from typing import List, Tuple
 
 import torch
+import transformers
 from torch.fx import GraphModule, Node
 
-from ...models import hf
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils._graph import add_graph_input, add_graph_output, remove_graph_input
@@ -121,18 +121,62 @@ class FuseRopeAttention(BaseTransform):
         - Removes the position_ids placeholder (no longer needed after fusion)
     """
 
-    def _match_rope_attention_pattern(self, gm: GraphModule) -> List[MatchResult]:
+    def _get_batch_size_and_max_seq_len(self, gm: GraphModule) -> Tuple[int, int]:
+        """Get batch size and max sequence length from the graph.
+
+        Args:
+            gm: The GraphModule to get batch size and max sequence length from.
+
+        Returns:
+            Tuple of (batch_size_dim, max_seq_len_dim, batch_size_sym_node, max_seq_len_sym_node).
+
+        Note:
+            For clarity, we return the symbolic nodes as well, which can be
+            used in operations like view or reshape.
+        """
+        graph = gm.graph
+        input_ids_node = graph.find_nodes(op="placeholder", target="input_ids")[0]
+        position_ids_node = graph.find_nodes(op="placeholder", target="position_ids")[0]
+        input_ids_meta = input_ids_node.meta.get("val")
+        batch_size_dim = input_ids_meta.size(0)
+        max_seq_len_dim = input_ids_meta.size(1)
+
+        # We scan all the sym_size.int nodes to find the symbolic nodes for
+        # batch size and max sequence length. The symbolic nodes has two sources.
+        # 1. The input_ids placeholder.
+        # 2. The position_ids placeholder.
+        # Both of their shapes are (batch_size, max_seq_len).
+        sym_ints = graph.find_nodes(op="call_function", target=torch.ops.aten.sym_size.int)
+        for sym_int in sym_ints:
+            if sym_int.args[0] != input_ids_node and sym_int.args[0] != position_ids_node:
+                continue
+            if sym_int.args[1] == 0:
+                batch_size_sym_node = sym_int
+            elif sym_int.args[1] == 1:
+                max_seq_len_sym_node = sym_int
+        assert batch_size_sym_node is not None and max_seq_len_sym_node is not None
+
+        return batch_size_dim, max_seq_len_dim, batch_size_sym_node, max_seq_len_sym_node
+
+    def _get_config_head_dim(self, model_config: transformers.PretrainedConfig) -> int:
+        """Get head dimension from model config."""
+        if hasattr(model_config, "head_dim"):
+            return model_config.head_dim
+        else:
+            return model_config.hidden_size // model_config.num_attention_heads
+
+    def _match_rope_attention_pattern(
+        self, gm: GraphModule, model_config: transformers.PretrainedConfig
+    ) -> List[MatchResult]:
         """Match RoPE + attention patterns in the computation graph.
 
         Traverses the graph backwards from attention nodes to identify the
         complete pattern of RoPE application followed by attention computation.
 
         Pattern structure (backwards from attention):
-            1. torch_attention(rope_q, rope_k, view_v, attn_mask, ...)
-            2. rope_q = rope[1], rope_k = rope[0]
-            3. rope = torch_rope_with_explicit_cos_sin(cont_q, cont_k, cos, sin, 2)
-            4. cont_q = contiguous(view_q), cont_k = contiguous(view_k)
-            5. view_q = view(q, ...), view_k = view(k, ...), view_v = view(v, ...)
+            1. torch_attention(rope_q, rope_k, bind_v, attn_mask, ...)
+            2. rope_q, rope_k = rope[1], rope[0]
+            3. rope = torch_rope_with_explicit_cos_sin(bind_q, bind_k, cos, sin, 2)
 
         Args:
             gm: The GraphModule to search for patterns.
@@ -143,6 +187,7 @@ class FuseRopeAttention(BaseTransform):
         """
         matches = []
         graph = gm.graph
+        head_dim = self._get_config_head_dim(model_config)
 
         # Iterate through all nodes to find attention ops
         for attn_node in graph.nodes:
@@ -157,14 +202,12 @@ class FuseRopeAttention(BaseTransform):
 
             ad_logger.debug(f"Found attention node: {attn_node.name}")
 
-            # Extract attention inputs: (rope_q, rope_k, view_v, attn_mask, ...)
+            # Extract attention inputs: (rope_q, rope_k, v, attn_mask, ...)
             if len(attn_node.args) < 4:
                 ad_logger.error(f"  Skipping: insufficient args ({len(attn_node.args)})")
                 continue
 
-            rope_q_node, rope_k_node, view_v_node = extract_op_args(
-                attn_node, "query", "key", "value"
-            )
+            rope_q_node, rope_k_node, bind_v = extract_op_args(attn_node, "query", "key", "value")
 
             # Step 1: Match rope_q and rope_k as getitem[1] and getitem[0] from rope output
             if not (is_op(rope_q_node, operator.getitem) and is_op(rope_k_node, operator.getitem)):
@@ -200,83 +243,19 @@ class FuseRopeAttention(BaseTransform):
                 ad_logger.error(f"  Skipping: rope has insufficient args ({len(rope_node.args)})")
                 continue
 
-            cont_k_node = rope_node.args[0]
-            cont_q_node = rope_node.args[1]
+            bind_k = rope_node.args[0]
+            bind_q = rope_node.args[1]
             cos_node = rope_node.args[2]
             sin_node = rope_node.args[3]
 
-            # Step 3: Match contiguous operations
-            if not (
-                is_op(cont_q_node, torch.ops.aten.contiguous)
-                and is_op(cont_k_node, torch.ops.aten.contiguous)
-            ):
-                ad_logger.error("  Skipping: cont_q or cont_k not contiguous")
-                continue
-
-            # Extract inputs to contiguous
-            view_q_node = cont_q_node.args[0]
-            view_k_node = cont_k_node.args[0]
-
-            # Step 4: Match view operations
-            if not (
-                is_op(view_q_node, torch.ops.aten.view)
-                and is_op(view_k_node, torch.ops.aten.view)
-                and is_op(view_v_node, torch.ops.aten.view)
-            ):
-                ad_logger.error("  Skipping: view operations not matched")
-                continue
-
-            # Extract original q, k, v tensors
-            q_node = view_q_node.args[0]
-            k_node = view_k_node.args[0]
-            v_node = view_v_node.args[0]
-
-            # Step 5: Extract head_dim from view operations
-            # view operation: view(input, [batch_size, max_seq_len, -1, head_dim])
-            # args[1] is the new shape list
-            try:
-                view_q_shape = view_q_node.args[1]
-                if not isinstance(view_q_shape, (list, tuple)) or len(view_q_shape) < 4:
-                    ad_logger.error(f"  Skipping: view_q shape format unexpected: {view_q_shape}")
-                    continue
-                head_dim = view_q_shape[3]  # 4th element is head_dim (e.g., 64)
-                if not isinstance(head_dim, int):
-                    ad_logger.error(f"  Skipping: head_dim is not int: {head_dim}")
-                    continue
-            except Exception as e:
-                ad_logger.error(f"  Skipping: failed to extract head_dim: {e}")
-                continue
-
-            # Step 6: Calculate num_q_heads and num_kv_heads from original tensor shapes
-            # q shape: [batch_size, max_seq_len, num_q_heads * head_dim]
-            # k shape: [batch_size, max_seq_len, num_kv_heads * head_dim]
-            try:
-                q_meta = q_node.meta.get("val")
-                k_meta = k_node.meta.get("val")
-                if q_meta is None or k_meta is None:
-                    ad_logger.error("  Skipping: q or k meta['val'] not found")
-                    continue
-
-                q_last_dim = q_meta.size(-1)
-                k_last_dim = k_meta.size(-1)
-
-                # Calculate num_heads
-                num_q_heads = q_last_dim // head_dim
-                num_kv_heads = k_last_dim // head_dim
-
-                ad_logger.debug(
-                    f"  Extracted: head_dim={head_dim}, num_q_heads={num_q_heads}, "
-                    f"num_kv_heads={num_kv_heads}"
-                )
-            except Exception as e:
-                ad_logger.error(f"  Skipping: failed to calculate num_heads: {e}")
-                continue
+            num_q_heads = model_config.num_attention_heads
+            num_kv_heads = model_config.num_key_value_heads
 
             # Successfully matched the pattern!
             match = MatchResult(
-                q=q_node,
-                k=k_node,
-                v=v_node,
+                q=bind_q,
+                k=bind_k,
+                v=bind_v,
                 cos=cos_node,
                 sin=sin_node,
                 attn_node=attn_node,
@@ -323,14 +302,7 @@ class FuseRopeAttention(BaseTransform):
             # Fallback: use first placeholder
             token_ids_node = graph.find_nodes(op="placeholder", sort=True)[0]
 
-        ad_logger.debug(f"Using {token_ids_node.name} to extract batch_size dimension")
-
-        # Get symbolic dimensions from token_ids
-        token_ids_meta = token_ids_node.meta.get("val")
-        assert token_ids_meta is not None, f"token_ids_meta is None for node {token_ids_node.name}"
-        batch_size_dim = token_ids_meta.size(0)
-        max_seq_len_dim = token_ids_meta.size(1)
-
+        batch_size_dim, max_seq_len_dim, _, _ = self._get_batch_size_and_max_seq_len(gm)
         ad_logger.debug(f"Extracted batch_size={batch_size_dim}, max_seq_len={max_seq_len_dim}")
 
         # 1. Add context_lengths placeholder: int32[batch_size]
@@ -342,9 +314,8 @@ class FuseRopeAttention(BaseTransform):
 
         # 2. Add rope_rotary_cos_sin placeholder: float32[rope_batch_size, rope_max_position_length, 64]
         # Create with concrete example tensor
-        assert isinstance(factory, hf.AutoModelFactory)
         model_config, _ = factory._get_model_config()
-        head_dim = model_config.hidden_size // model_config.num_attention_heads
+        head_dim = self._get_config_head_dim(model_config)
         rope_example = torch.zeros(
             batch_size_dim, max_seq_len_dim, head_dim, dtype=torch.float32, device="meta"
         )
@@ -373,11 +344,12 @@ class FuseRopeAttention(BaseTransform):
 
         For each matched pattern, this method:
             1. Creates a past_key_values input placeholder for KV-cache
-            2. Concatenates Q, K, V tensors into a single QKV tensor
-            3. Inserts the fused AttentionPlugin operation
-            4. Creates getitem nodes to extract attention output and present KV-cache
-            5. Replaces the original attention node with the fused output
-            6. Adds present_key_values to graph outputs
+            2. Reshape Q, K, V to (batch_size, seq_len, -1)
+            3. Concatenates reshaped Q, K, V tensors into a single QKV tensor
+            4. Inserts the fused AttentionPlugin operation
+            5. Creates getitem nodes to extract attention output and present KV-cache
+            6. Replaces the original attention node with the fused output
+            7. Adds present_key_values to graph outputs
 
         Args:
             gm: The GraphModule being transformed.
@@ -391,9 +363,12 @@ class FuseRopeAttention(BaseTransform):
             Number of patterns successfully replaced.
         """
         graph = gm.graph
-        embed = matches[0].q.args[0]
-        batch_size_dim = embed.meta.get("val").size(0)
         past_len = 4096  # Does not matter, this value will be replaced by symbolic dimension
+
+        # Get batch size & max sequence length
+        batch_size_dim, _, batch_size_sym_node, max_seq_len_sym_node = (
+            self._get_batch_size_and_max_seq_len(gm)
+        )
 
         # Process each match
         for match_id, match in enumerate(matches):
@@ -416,15 +391,34 @@ class FuseRopeAttention(BaseTransform):
 
             ad_logger.debug(f"Added past_key_values_{match_id} placeholder")
 
-            # 2. Create concatenated qkv tensor
+            # 2. Reshape Q, K, V to (batch_size, seq_len, -1)
+            with graph.inserting_before(match.attn_node):
+                q_node = graph.call_function(
+                    torch.ops.aten.view.default,
+                    args=(match.q, (batch_size_sym_node, max_seq_len_sym_node, -1)),
+                )
+                k_node = graph.call_function(
+                    torch.ops.aten.view.default,
+                    args=(match.k, (batch_size_sym_node, max_seq_len_sym_node, -1)),
+                )
+                v_node = graph.call_function(
+                    torch.ops.aten.view.default,
+                    args=(match.v, (batch_size_sym_node, max_seq_len_sym_node, -1)),
+                )
+
+            ad_logger.debug(
+                f"Reshaped Q, K, V to (batch_size, seq_len, -1): {q_node.name}, {k_node.name}, {v_node.name}"
+            )
+
+            # 3. Concatenate reshaped Q, K, V to (batch_size, seq_len, -1)
             with graph.inserting_before(match.attn_node):
                 qkv_node = graph.call_function(
-                    torch.ops.aten.cat.default, args=([match.q, match.k, match.v], -1)
+                    torch.ops.aten.cat.default, args=([q_node, k_node, v_node], -1)
                 )
 
             ad_logger.debug(f"Created qkv concat node: {qkv_node.name}")
 
-            # 3. Create AttentionPlugin node
+            # 4. Create AttentionPlugin node
             enable_tree_attention = 0
             head_dim = match.head_dim
             num_kv_heads = match.num_kv_heads
@@ -451,7 +445,7 @@ class FuseRopeAttention(BaseTransform):
 
             ad_logger.debug(f"Created AttentionPlugin node: {rope_attn_node.name}")
 
-            # 4. Create getitem nodes for rope_attn outputs
+            # 5. Create getitem nodes for rope_attn outputs
             with graph.inserting_after(rope_attn_node):
                 rope_attn_output = graph.call_function(operator.getitem, args=(rope_attn_node, 0))
                 rope_attn_present_kv = graph.call_function(
@@ -464,15 +458,15 @@ class FuseRopeAttention(BaseTransform):
                 f"Created getitem nodes: {rope_attn_output.name}, {rope_attn_present_kv.name}"
             )
 
-            # 5. Replace all uses of attn_node with rope_attn_output
+            # 6. Replace all uses of attn_node with rope_attn_output
             match.attn_node.replace_all_uses_with(rope_attn_output)
             ad_logger.debug(f"Replaced {match.attn_node.name} with {rope_attn_output.name}")
 
-            # 6. Add present_key_values_<id> to graph outputs using add_graph_output
+            # 7. Add present_key_values_<id> to graph outputs using add_graph_output
             add_graph_output(gm, rope_attn_present_kv, f"present_key_values_{match_id}")
             ad_logger.debug(f"Added present_key_values_{match_id} to graph outputs")
 
-        # 7. Eliminate dead code (remove old pattern nodes)
+        # 8. Eliminate dead code (remove old pattern nodes)
         graph.eliminate_dead_code()
         ad_logger.debug("Eliminated dead code")
 
@@ -519,7 +513,8 @@ class FuseRopeAttention(BaseTransform):
         ad_logger.debug("Fusing rope attention")
 
         # Perform pattern matching
-        matches = self._match_rope_attention_pattern(gm)
+        model_config, _ = factory._get_model_config()
+        matches = self._match_rope_attention_pattern(gm, model_config)
         cnt = len(matches)
 
         ad_logger.info(f"Matched {cnt} rope attention patterns")
