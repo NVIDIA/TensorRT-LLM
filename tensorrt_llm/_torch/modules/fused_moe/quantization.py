@@ -825,9 +825,13 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
 
         self.setup_quant_scales(module)
 
-    def load_weights(self, module: torch.nn.Module, weights: List[Dict],
-                     weight_loading_mode: MoEWeightLoadingMode):
-        super().load_weights(module, weights, weight_loading_mode)
+    def load_weights(self,
+                     module: torch.nn.Module,
+                     weights: List[Dict],
+                     weight_loading_mode: MoEWeightLoadingMode,
+                     allow_partial_loading: bool = False):
+        super().load_weights(module, weights, weight_loading_mode,
+                             allow_partial_loading)
 
     def setup_quant_scales(self, module: torch.nn.Module):
         module.quant_scales = FusedMoEQuantScalesDeepSeekFP8BlockScales(
@@ -953,8 +957,11 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
 class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
         DeepSeekFP8BlockScalesFusedMoEMethod):
 
-    def load_weights(self, module: torch.nn.Module, weights: List[Dict],
-                     weight_loading_mode: MoEWeightLoadingMode):
+    def load_weights(self,
+                     module: torch.nn.Module,
+                     weights: List[Dict],
+                     weight_loading_mode: MoEWeightLoadingMode,
+                     allow_partial_loading: bool = False):
         if is_sm_100f():
             expert_ids = set(module.initial_local_expert_ids)
             if self.need_load_shared_weights(module):
@@ -970,7 +977,8 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
                     scale = weights[name][:]
                     weights[weight_name], weights[name] = resmooth_to_fp8_e8m0(
                         weight, scale)
-        super().load_weights(module, weights, weight_loading_mode)
+        super().load_weights(module, weights, weight_loading_mode,
+                             allow_partial_loading)
 
     def post_load_weights(self, module: torch.nn.Module):
         super().post_load_weights(module)
