@@ -4,7 +4,10 @@ from openai import AsyncOpenAI
 
 from tensorrt_llm.scaffolding import NativeChatController, ScaffoldingLlm, TRTOpenaiWorker
 from tensorrt_llm.scaffolding.benchmark import ScaffoldingBenchRequest, async_scaffolding_benchmark
-from tensorrt_llm.scaffolding.load_generation_strategy import ConcurrentStrategy
+from tensorrt_llm.scaffolding.load_generation_strategy import (
+    ConcurrentStrategy,
+    PoissonWarmupStrategy,
+)
 from tensorrt_llm.scaffolding.task import ChatTask
 from tensorrt_llm.scaffolding.task_collection import TaskMetricsCollector, with_task_collection
 
@@ -48,7 +51,18 @@ async def async_chat_benchmark(args):
 
     task_collection_types = {}
     requests = [ScaffoldingBenchRequest(prompt=prompt) for prompt in prompts]
-    strategy = ConcurrentStrategy(concurrency=args.chat_concurrency)
+
+    # Select strategy based on Poisson arrival flag
+    if getattr(args, "enable_poisson_arrival", False):
+        strategy = PoissonWarmupStrategy(
+            num_requests=len(requests),
+            warmup_window=getattr(args, "poisson_warmup_window", 60.0),
+            max_concurrency=args.chat_concurrency,
+            random_seed=getattr(args, "poisson_arrival_seed", 42),
+        )
+        print(f"  Using Poisson warmup arrival: {strategy}")
+    else:
+        strategy = ConcurrentStrategy(concurrency=args.chat_concurrency)
 
     (
         results,

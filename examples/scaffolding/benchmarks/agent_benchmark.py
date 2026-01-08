@@ -8,7 +8,10 @@ from openai import AsyncOpenAI
 from tensorrt_llm.scaffolding import MCPWorker, QueryCollector, TRTOpenaiWorker
 from tensorrt_llm.scaffolding.benchmark import ScaffoldingBenchRequest, async_scaffolding_benchmark
 from tensorrt_llm.scaffolding.contrib.DeepResearch import create_open_deep_research_scaffolding_llm
-from tensorrt_llm.scaffolding.load_generation_strategy import ConcurrentStrategy
+from tensorrt_llm.scaffolding.load_generation_strategy import (
+    ConcurrentStrategy,
+    PoissonWarmupStrategy,
+)
 
 from .benchmark_utils import (
     load_prompts_from_json,
@@ -33,7 +36,18 @@ async def run_agent_benchmark_core(llm, prompts, concurrency, benchmark_name, ar
     """
     task_collection_types = {}
     requests = [ScaffoldingBenchRequest(prompt=prompt) for prompt in prompts]
-    strategy = ConcurrentStrategy(concurrency=concurrency)
+
+    # Select strategy based on Poisson arrival flag
+    if getattr(args, "enable_poisson_arrival", False):
+        strategy = PoissonWarmupStrategy(
+            num_requests=len(requests),
+            warmup_window=getattr(args, "poisson_warmup_window", 60.0),
+            max_concurrency=concurrency,
+            random_seed=getattr(args, "poisson_arrival_seed", 42),
+        )
+        print(f"  Using Poisson warmup arrival: {strategy}")
+    else:
+        strategy = ConcurrentStrategy(concurrency=concurrency)
 
     (
         results,
