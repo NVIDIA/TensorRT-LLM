@@ -36,6 +36,7 @@
     <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../_static/config_selector.css?v=e17d8078" />
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
@@ -51,6 +52,7 @@
     <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../_static/copybutton.js?v=65e89d2a"></script>
+    <script src="../_static/config_selector.js?v=aaf6cd4a"></script>
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
@@ -61,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc6';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc7';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -76,7 +78,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc6" />
+  <meta name="docsearch:version" content="1.2.0rc7" />
 
 
   </head>
@@ -357,13 +359,13 @@
 </ul>
 </details></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/aiperf_client.html">Aiperf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/aiperf_client_for_multimodal.html">Aiperf Client For Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client.html">Curl Chat Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/curl_completion_client.html">Curl Completion Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/curl_responses_client.html">Curl Responses Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client.html">Genai Perf Client</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client_for_multimodal.html">Genai Perf Client For Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
@@ -393,7 +395,6 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-bench.html">trtllm-bench</a></li>
-
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-eval.html">trtllm-eval</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
@@ -424,7 +425,7 @@
 <li class="toctree-l1"><a class="reference internal" href="guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="checkpoint-loading.html">Checkpoint Loading</a></li>
-<li class="toctree-l1"><a class="reference internal" href="auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="auto_deploy/auto-deploy.html">AutoDeploy (Beta)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="helix.html">Helix Parallelism</a></li>
@@ -528,6 +529,7 @@
 <li><p><a class="reference internal" href="#KV-Cache-Exchange"><span class="xref myst">KV Cache Exchange</span></a></p>
 <ul>
 <li><p><a class="reference internal" href="#Multi-backend-Support"><span class="xref myst">Multi-backend Support</span></a></p></li>
+<li><p><a class="reference internal" href="#nixl-backend-configuration">NIXL Backend Configuration</a></p></li>
 <li><p><a class="reference internal" href="#Overlap-Optimization"><span class="xref myst">Overlap Optimization</span></a></p></li>
 <li><p><a class="reference internal" href="#Cache-Layout-Transformation"><span class="xref myst">Cache Layout Transformation</span></a></p></li>
 </ul>
@@ -577,6 +579,17 @@
 </div>
 <p align="center"><sub><em>Figure 3. KV cache exchange architecture</em></sub></p>
 </section>
+<section id="nixl-backend-configuration">
+<h3>NIXL Backend Configuration<a class="headerlink" href="#nixl-backend-configuration" title="Link to this heading">#</a></h3>
+<p>NIXL supports multiple underlying communication backends for KV cache exchange in disaggregated serving. The backend can be configured using the <code class="docutils literal notranslate"><span class="pre">TRTLLM_NIXL_KVCACHE_BACKEND</span></code> environment variable.</p>
+<p><strong>Supported NIXL backends:</strong></p>
+<ul class="simple">
+<li><p><strong>UCX</strong> (default)</p></li>
+<li><p><strong>LIBFABRIC</strong> (available from v0.16.0)</p></li>
+</ul>
+<p>If an unsupported backend is specified, NIXL will automatically fall back to UCX.</p>
+<p>For detailed setup instructions and configuration examples, please refer to the <span class="xref myst">disaggregated serving examples documentation</span>.</p>
+</section>
 <section id="overlap-optimization">
 <h3>Overlap Optimization<a class="headerlink" href="#overlap-optimization" title="Link to this heading">#</a></h3>
 <p>To optimize the overall performance of disaggregated serving, TensorRT LLM overlaps the KV cache transmission with computation for multiple independent requests. While one request is sending or receiving its KV cache blocks, other requests can proceed with computation, as illustrated in Figure 4. Furthermore, if context and generation instances are using multiple GPUs per instance, KV cache transmission between different sets of GPUs can occur in parallel.</p>
@@ -617,6 +630,11 @@
 <section id="trtllm-serve">
 <h3>trtllm-serve<a class="headerlink" href="#trtllm-serve" title="Link to this heading">#</a></h3>
 <p>The second approach to evaluate disaggregated LLM inference with TensorRT LLM involves launching a separate OpenAI-compatible server per context and generation instance using <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code>. An additional server, referred to as the “disaggregated” server, is also launched with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> and acts as an orchestrator which receives client requests and dispatches them to the appropriate context and generation servers via OpenAI REST API. Figure 6 below illustrates the disaggregated serving workflow when using this approach. When a context instance is done generating the KV blocks associated with the prompt, it returns a response to the disaggregated server. This response includes the prompt tokens, the first generated token and metadata associated with the context request and context instance. This metadata is referred to as context parameters (<code class="docutils literal notranslate"><span class="pre">ctx_params</span></code> in Figure 6). These parameters are then used by the generation instances to establish communication with the context instance and retrieve the KV cache blocks associated with the request.</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p><strong>Non-breaking</strong>: <code class="docutils literal notranslate"><span class="pre">--config</span> <span class="pre">&lt;file.yaml&gt;</span></code> is the preferred flag for passing a <a class="reference internal" href="../commands/trtllm-serve/trtllm-serve.html#configuring-with-yaml-files"><span class="std std-ref">YAML configuration file</span></a>.
+Existing workflows using <code class="docutils literal notranslate"><span class="pre">--extra_llm_api_options</span> <span class="pre">&lt;file.yaml&gt;</span></code> continue to work; it is an equivalent alias.</p>
+</div>
 <div align="center">
 <figure>
   <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog5_Picture3.png" width="800" height="auto">
@@ -630,23 +648,28 @@
 <span class="w">  </span><span class="nt">max_tokens_in_buffer</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">&lt;int&gt;</span>
 </pre></div>
 </div>
-<p><code class="docutils literal notranslate"><span class="pre">backend</span></code> specifies the communication backend for transferring the kvCache, valid options include <code class="docutils literal notranslate"><span class="pre">DEFAULT</span></code>,<code class="docutils literal notranslate"><span class="pre">UCX</span></code>, <code class="docutils literal notranslate"><span class="pre">NIXL</span></code>, and <code class="docutils literal notranslate"><span class="pre">MPI</span></code>, the default backend is NIXL.</p>
+<p><code class="docutils literal notranslate"><span class="pre">backend</span></code> specifies the communication backend for transferring the kvCache, valid options include <code class="docutils literal notranslate"><span class="pre">DEFAULT</span></code>, <code class="docutils literal notranslate"><span class="pre">UCX</span></code>, <code class="docutils literal notranslate"><span class="pre">NIXL</span></code>, and <code class="docutils literal notranslate"><span class="pre">MPI</span></code>. The default backend is NIXL.</p>
+<p>Note: NIXL supports multiple underlying backends configured via the <code class="docutils literal notranslate"><span class="pre">TRTLLM_NIXL_KVCACHE_BACKEND</span></code> environment variable:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">UCX</span></code> (default)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">LIBFABRIC</span></code> (available from v0.16.0)</p></li>
+</ul>
 <p><code class="docutils literal notranslate"><span class="pre">max_tokens_in_buffer</span></code> defines the buffer size for kvCache transfers, it is recommended to set this value greater than or equal to the maximum ISL (Input Sequence Length) of all requests for optimal performance.</p>
 <p>For example, you could launch two context servers and one generation servers as follows:</p>
 <div class="highlight-default notranslate"><div class="highlight"><pre><span></span>
-<span class="c1"># Generate context_extra-llm-api-config.yml</span>
+<span class="c1"># Generate context_config.yml</span>
 <span class="c1"># Overlap scheduler for context servers are disabled because it&#39;s not supported for disaggregated context servers yet</span>
-<span class="n">echo</span> <span class="o">-</span><span class="n">e</span> <span class="s2">&quot;disable_overlap_scheduler: True</span><span class="se">\n</span><span class="s2">cache_transceiver_config:</span><span class="se">\n</span><span class="s2">  backend: UCX</span><span class="se">\n</span><span class="s2">  max_tokens_in_buffer: 2048&quot;</span> <span class="o">&gt;</span> <span class="n">context_extra</span><span class="o">-</span><span class="n">llm</span><span class="o">-</span><span class="n">api</span><span class="o">-</span><span class="n">config</span><span class="o">.</span><span class="n">yml</span>
+<span class="n">echo</span> <span class="o">-</span><span class="n">e</span> <span class="s2">&quot;disable_overlap_scheduler: True</span><span class="se">\n</span><span class="s2">cache_transceiver_config:</span><span class="se">\n</span><span class="s2">  backend: UCX</span><span class="se">\n</span><span class="s2">  max_tokens_in_buffer: 2048&quot;</span> <span class="o">&gt;</span> <span class="n">context_config</span><span class="o">.</span><span class="n">yml</span>
 
 <span class="c1"># Start Context servers</span>
-<span class="n">CUDA_VISIBLE_DEVICES</span><span class="o">=</span><span class="mi">0</span> <span class="n">trtllm</span><span class="o">-</span><span class="n">serve</span> <span class="n">TinyLlama</span><span class="o">/</span><span class="n">TinyLlama</span><span class="o">-</span><span class="mf">1.1</span><span class="n">B</span><span class="o">-</span><span class="n">Chat</span><span class="o">-</span><span class="n">v1</span><span class="mf">.0</span> <span class="o">--</span><span class="n">host</span> <span class="n">localhost</span> <span class="o">--</span><span class="n">port</span> <span class="mi">8001</span> <span class="o">--</span><span class="n">backend</span> <span class="n">pytorch</span> <span class="o">--</span><span class="n">extra_llm_api_options</span> <span class="o">./</span><span class="n">context_extra</span><span class="o">-</span><span class="n">llm</span><span class="o">-</span><span class="n">api</span><span class="o">-</span><span class="n">config</span><span class="o">.</span><span class="n">yml</span> <span class="o">&amp;&gt;</span> <span class="n">log_ctx_0</span> <span class="o">&amp;</span>
-<span class="n">CUDA_VISIBLE_DEVICES</span><span class="o">=</span><span class="mi">1</span> <span class="n">trtllm</span><span class="o">-</span><span class="n">serve</span> <span class="n">TinyLlama</span><span class="o">/</span><span class="n">TinyLlama</span><span class="o">-</span><span class="mf">1.1</span><span class="n">B</span><span class="o">-</span><span class="n">Chat</span><span class="o">-</span><span class="n">v1</span><span class="mf">.0</span> <span class="o">--</span><span class="n">host</span> <span class="n">localhost</span> <span class="o">--</span><span class="n">port</span> <span class="mi">8002</span> <span class="o">--</span><span class="n">backend</span> <span class="n">pytorch</span> <span class="o">--</span><span class="n">extra_llm_api_options</span> <span class="o">./</span><span class="n">context_extra</span><span class="o">-</span><span class="n">llm</span><span class="o">-</span><span class="n">api</span><span class="o">-</span><span class="n">config</span><span class="o">.</span><span class="n">yml</span> <span class="o">&amp;&gt;</span> <span class="n">log_ctx_1</span> <span class="o">&amp;</span>
+<span class="n">CUDA_VISIBLE_DEVICES</span><span class="o">=</span><span class="mi">0</span> <span class="n">trtllm</span><span class="o">-</span><span class="n">serve</span> <span class="n">TinyLlama</span><span class="o">/</span><span class="n">TinyLlama</span><span class="o">-</span><span class="mf">1.1</span><span class="n">B</span><span class="o">-</span><span class="n">Chat</span><span class="o">-</span><span class="n">v1</span><span class="mf">.0</span> <span class="o">--</span><span class="n">host</span> <span class="n">localhost</span> <span class="o">--</span><span class="n">port</span> <span class="mi">8001</span> <span class="o">--</span><span class="n">backend</span> <span class="n">pytorch</span> <span class="o">--</span><span class="n">config</span> <span class="o">./</span><span class="n">context_config</span><span class="o">.</span><span class="n">yml</span> <span class="o">&amp;&gt;</span> <span class="n">log_ctx_0</span> <span class="o">&amp;</span>
+<span class="n">CUDA_VISIBLE_DEVICES</span><span class="o">=</span><span class="mi">1</span> <span class="n">trtllm</span><span class="o">-</span><span class="n">serve</span> <span class="n">TinyLlama</span><span class="o">/</span><span class="n">TinyLlama</span><span class="o">-</span><span class="mf">1.1</span><span class="n">B</span><span class="o">-</span><span class="n">Chat</span><span class="o">-</span><span class="n">v1</span><span class="mf">.0</span> <span class="o">--</span><span class="n">host</span> <span class="n">localhost</span> <span class="o">--</span><span class="n">port</span> <span class="mi">8002</span> <span class="o">--</span><span class="n">backend</span> <span class="n">pytorch</span> <span class="o">--</span><span class="n">config</span> <span class="o">./</span><span class="n">context_config</span><span class="o">.</span><span class="n">yml</span> <span class="o">&amp;&gt;</span> <span class="n">log_ctx_1</span> <span class="o">&amp;</span>
 
-<span class="c1"># Generate gen_extra-llm-api-config.yml</span>
-<span class="n">echo</span> <span class="o">-</span><span class="n">e</span> <span class="s2">&quot;cache_transceiver_config:</span><span class="se">\n</span><span class="s2">  backend: UCX</span><span class="se">\n</span><span class="s2">  max_tokens_in_buffer: 2048&quot;</span> <span class="o">&gt;</span> <span class="n">gen_extra</span><span class="o">-</span><span class="n">llm</span><span class="o">-</span><span class="n">api</span><span class="o">-</span><span class="n">config</span><span class="o">.</span><span class="n">yml</span>
+<span class="c1"># Generate gen_config.yml</span>
+<span class="n">echo</span> <span class="o">-</span><span class="n">e</span> <span class="s2">&quot;cache_transceiver_config:</span><span class="se">\n</span><span class="s2">  backend: UCX</span><span class="se">\n</span><span class="s2">  max_tokens_in_buffer: 2048&quot;</span> <span class="o">&gt;</span> <span class="n">gen_config</span><span class="o">.</span><span class="n">yml</span>
 
 <span class="c1"># Start Generation servers</span>
-<span class="n">CUDA_VISIBLE_DEVICES</span><span class="o">=</span><span class="mi">2</span> <span class="n">trtllm</span><span class="o">-</span><span class="n">serve</span> <span class="n">TinyLlama</span><span class="o">/</span><span class="n">TinyLlama</span><span class="o">-</span><span class="mf">1.1</span><span class="n">B</span><span class="o">-</span><span class="n">Chat</span><span class="o">-</span><span class="n">v1</span><span class="mf">.0</span> <span class="o">--</span><span class="n">host</span> <span class="n">localhost</span> <span class="o">--</span><span class="n">port</span> <span class="mi">8003</span> <span class="o">--</span><span class="n">backend</span> <span class="n">pytorch</span> <span class="o">--</span><span class="n">extra_llm_api_options</span> <span class="o">./</span><span class="n">gen_extra</span><span class="o">-</span><span class="n">llm</span><span class="o">-</span><span class="n">api</span><span class="o">-</span><span class="n">config</span><span class="o">.</span><span class="n">yml</span> <span class="o">&amp;&gt;</span> <span class="n">log_gen_0</span> <span class="o">&amp;</span>
+<span class="n">CUDA_VISIBLE_DEVICES</span><span class="o">=</span><span class="mi">2</span> <span class="n">trtllm</span><span class="o">-</span><span class="n">serve</span> <span class="n">TinyLlama</span><span class="o">/</span><span class="n">TinyLlama</span><span class="o">-</span><span class="mf">1.1</span><span class="n">B</span><span class="o">-</span><span class="n">Chat</span><span class="o">-</span><span class="n">v1</span><span class="mf">.0</span> <span class="o">--</span><span class="n">host</span> <span class="n">localhost</span> <span class="o">--</span><span class="n">port</span> <span class="mi">8003</span> <span class="o">--</span><span class="n">backend</span> <span class="n">pytorch</span> <span class="o">--</span><span class="n">config</span> <span class="o">./</span><span class="n">gen_config</span><span class="o">.</span><span class="n">yml</span> <span class="o">&amp;&gt;</span> <span class="n">log_gen_0</span> <span class="o">&amp;</span>
 </pre></div>
 </div>
 <p>Once the context and generation servers are launched, you can launch the disaggregated
@@ -694,6 +717,13 @@ when routing requests to the generation servers, the disaggregated server will m
 <h2>Environment Variables<a class="headerlink" href="#environment-variables" title="Link to this heading">#</a></h2>
 <p>TRT-LLM uses some environment variables to control the behavior of disaggregated service.</p>
 <ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">TRTLLM_NIXL_KVCACHE_BACKEND</span></code>: When using NIXL as the cache transceiver backend, this variable specifies the underlying communication backend for NIXL. Valid options are:</p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">UCX</span></code> (default)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">LIBFABRIC</span></code> (available from v0.16.0)</p></li>
+<li><p>If an unsupported value is specified, NIXL will automatically fall back to UCX</p></li>
+</ul>
+</li>
 <li><p><code class="docutils literal notranslate"><span class="pre">TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP</span></code>: If set to <code class="docutils literal notranslate"><span class="pre">1</span></code>, generationExecutor will not overlap KV cache transfer with model inference. The default value is <code class="docutils literal notranslate"><span class="pre">0</span></code>.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">TRTLLM_ENABLE_KVCACHE_RECEIVE_PARALLEL</span></code>:  When the generation rank receives KV cache from multiple context ranks within a single context instance, it will receive KV cache from each rank sequentially. If set to <code class="docutils literal notranslate"><span class="pre">1</span></code>, the generation rank will receive KV cache from each rank within one context instance in parallel. The default value is <code class="docutils literal notranslate"><span class="pre">0</span></code>.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">TRTLLM_REQUEST_KV_CACHE_CONCURRENT</span></code>: If set to <code class="docutils literal notranslate"><span class="pre">1</span></code>, generationExecutor prepares independent resources for each context executor to receive KV cache, requests whose KV cache are received from different context executors will be processed concurrently. If set to <code class="docutils literal notranslate"><span class="pre">0</span></code>, the generation executor will reuse the same resource to process KV cache transfer for each request sequentially, reducing the resources used by KV cache transmission and thereby lowering the risk of running out of memory. The default value is <code class="docutils literal notranslate"><span class="pre">0</span></code>.</p></li>
@@ -725,6 +755,13 @@ when routing requests to the generation servers, the disaggregated server will m
 </section>
 <section id="debugging-faqs">
 <h3>Debugging FAQs<a class="headerlink" href="#debugging-faqs" title="Link to this heading">#</a></h3>
+<p><em>Q. Why does NIXL fail to use LIBFABRIC backend even when <code class="docutils literal notranslate"><span class="pre">TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC</span></code> is set?</em></p>
+<p>A: The TensorRT-LLM container doesn’t include the NIXL LIBFABRIC plugin by default. You need to either:</p>
+<ol class="arabic simple">
+<li><p><strong>Rebuild NIXL</strong>: Install libfabric and hwloc first, then rebuild NIXL following the installation instructions above</p></li>
+<li><p><strong>Use a pre-compiled plugin</strong>: If you have a compatible <code class="docutils literal notranslate"><span class="pre">libplugin_LIBFABRIC.so</span></code>, set <code class="docutils literal notranslate"><span class="pre">NIXL_PLUGINS_DIR</span></code> to point to its directory</p></li>
+</ol>
+<p>Please see the <span class="xref myst">disaggregated serving examples documentation</span> for detailed installation and configuration instructions.</p>
 <p><em>Q. How to handle error <code class="docutils literal notranslate"><span class="pre">Disaggregated</span> <span class="pre">serving</span> <span class="pre">is</span> <span class="pre">not</span> <span class="pre">enabled,</span> <span class="pre">please</span> <span class="pre">check</span> <span class="pre">the</span> <span class="pre">configuration?</span></code></em></p>
 <p>A. please set <code class="docutils literal notranslate"><span class="pre">backendType</span></code> of <code class="docutils literal notranslate"><span class="pre">CacheTransceiverConfig</span></code>.</p>
 <div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="n">ExecutorConfig</span><span class="w"> </span><span class="n">executorConfig</span><span class="p">{...};</span>
@@ -799,6 +836,7 @@ when routing requests to the generation servers, the disaggregated server will m
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#motivation">Motivation</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#kv-cache-exchange">KV Cache Exchange</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#multi-backend-support">Multi-backend Support</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#nixl-backend-configuration">NIXL Backend Configuration</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#overlap-optimization">Overlap Optimization</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cache-layout-transformation">Cache Layout Transformation</a></li>
 </ul>
@@ -908,9 +946,9 @@ when routing requests to the generation servers, the disaggregated server will m
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on December 15, 2025.</p>
+  <p>Last updated on January 04, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9ba1426">9ba1426</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a65b0d4">a65b0d4</a>.</p>
   
 </div></div>
       

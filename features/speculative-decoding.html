@@ -36,6 +36,7 @@
     <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../_static/config_selector.css?v=e17d8078" />
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
@@ -51,6 +52,7 @@
     <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../_static/copybutton.js?v=65e89d2a"></script>
+    <script src="../_static/config_selector.js?v=aaf6cd4a"></script>
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
@@ -61,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc6';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc7';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -76,7 +78,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc6" />
+  <meta name="docsearch:version" content="1.2.0rc7" />
 
 
   </head>
@@ -357,13 +359,13 @@
 </ul>
 </details></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/aiperf_client.html">Aiperf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/aiperf_client_for_multimodal.html">Aiperf Client For Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client.html">Curl Chat Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/curl_completion_client.html">Curl Completion Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/curl_responses_client.html">Curl Responses Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client.html">Genai Perf Client</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client_for_multimodal.html">Genai Perf Client For Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
@@ -393,7 +395,6 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-bench.html">trtllm-bench</a></li>
-
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-eval.html">trtllm-eval</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
@@ -424,7 +425,7 @@
 <li class="toctree-l1"><a class="reference internal" href="guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1 current active"><a class="current reference internal" href="#">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="checkpoint-loading.html">Checkpoint Loading</a></li>
-<li class="toctree-l1"><a class="reference internal" href="auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="auto_deploy/auto-deploy.html">AutoDeploy (Beta)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="helix.html">Helix Parallelism</a></li>
@@ -584,7 +585,7 @@ The table below enumerates all of the algorithm/model combinations that are supp
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">DraftTargetDecodingConfig</span>
 
 <span class="n">speculative_config</span> <span class="o">=</span> <span class="n">DraftTargetDecodingConfig</span><span class="p">(</span>
-    <span class="n">max_draft_len</span><span class="o">=</span><span class="mi">3</span><span class="p">,</span> <span class="n">speculative_model</span><span class="o">=</span><span class="s2">&quot;/path/to/draft_model&quot;</span><span class="p">)</span>
+    <span class="n">max_draft_len</span><span class="o">=</span><span class="mi">3</span><span class="p">,</span> <span class="n">speculative_model_dir</span><span class="o">=</span><span class="s2">&quot;/path/to/draft_model&quot;</span><span class="p">)</span>
 
 <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="s2">&quot;/path/to/target_model&quot;</span><span class="p">,</span> <span class="n">speculative_config</span><span class="o">=</span><span class="n">speculative_config</span><span class="p">,</span> <span class="n">disable_overlap_scheduler</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 </pre></div>
@@ -605,7 +606,7 @@ TRT-LLM supports a modified version of the algorithm presented in the paper: tre
 <span class="n">eagle3_one_model</span> <span class="o">=</span> <span class="kc">False</span>
 
 <span class="n">speculative_config</span> <span class="o">=</span> <span class="n">EagleDecodingConfig</span><span class="p">(</span>
-    <span class="n">max_draft_len</span><span class="o">=</span><span class="mi">3</span><span class="p">,</span> <span class="n">speculative_model</span><span class="o">=</span><span class="s2">&quot;/path/to/draft_model&quot;</span><span class="p">,</span> <span class="n">eagle3_one_model</span><span class="o">=</span><span class="n">eagle3_one_model</span><span class="p">)</span>
+    <span class="n">max_draft_len</span><span class="o">=</span><span class="mi">3</span><span class="p">,</span> <span class="n">speculative_model_dir</span><span class="o">=</span><span class="s2">&quot;/path/to/draft_model&quot;</span><span class="p">,</span> <span class="n">eagle3_one_model</span><span class="o">=</span><span class="n">eagle3_one_model</span><span class="p">)</span>
 
 <span class="c1"># Only need to disable overlap scheduler if eagle3_one_model is False.</span>
 <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="s2">&quot;/path/to/target_model&quot;</span><span class="p">,</span> <span class="n">speculative_config</span><span class="o">=</span><span class="n">speculative_config</span><span class="p">,</span> <span class="n">disable_overlap_scheduler</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
@@ -671,7 +672,12 @@ TRT-LLM supports a modified version of the algorithm presented in the paper: tre
 </section>
 <section id="usage-with-trtllm-bench-and-trtllm-serve">
 <h2>Usage with <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> and <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code><a class="headerlink" href="#usage-with-trtllm-bench-and-trtllm-serve" title="Link to this heading">#</a></h2>
-<p>Speculative decoding options must be specified via <code class="docutils literal notranslate"><span class="pre">--extra_llm_api_options</span> <span class="pre">config.yaml</span></code> for both <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> and <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code>. All speculative decoding options can be specified in this YAML file. An additional <code class="docutils literal notranslate"><span class="pre">decoding_type</span></code> option is used to specify the type of speculation to use. The available options are:</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p><strong>Non-breaking</strong>: <code class="docutils literal notranslate"><span class="pre">--config</span> <span class="pre">&lt;file.yaml&gt;</span></code> is the preferred flag for passing a <a class="reference internal" href="../commands/trtllm-serve/trtllm-serve.html#configuring-with-yaml-files"><span class="std std-ref">YAML configuration file</span></a>.
+Existing workflows using <code class="docutils literal notranslate"><span class="pre">--extra_llm_api_options</span> <span class="pre">&lt;file.yaml&gt;</span></code> continue to work; it is an equivalent alias.</p>
+</div>
+<p>Speculative decoding options must be specified via <code class="docutils literal notranslate"><span class="pre">--config</span> <span class="pre">config.yaml</span></code> for both <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> and <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code>. All speculative decoding options can be specified in this YAML file. An additional <code class="docutils literal notranslate"><span class="pre">decoding_type</span></code> option is used to specify the type of speculation to use. The available options are:</p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">MTP</span></code></p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">Eagle</span></code> (for EAGLE 3)</p></li>
@@ -945,9 +951,9 @@ function. In practice, this is very cheap since the blocks are just marked as av
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on December 15, 2025.</p>
+  <p>Last updated on January 04, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9ba1426">9ba1426</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a65b0d4">a65b0d4</a>.</p>
   
 </div></div>
       

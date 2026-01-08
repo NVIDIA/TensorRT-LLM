@@ -35,6 +35,7 @@
     <link rel="stylesheet" type="text/css" href="../../../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../../../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../../../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/config_selector.css?v=e17d8078" />
     <link rel="stylesheet" type="text/css" href="../../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
@@ -50,6 +51,7 @@
     <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../../../_static/copybutton.js?v=65e89d2a"></script>
+    <script src="../../../_static/config_selector.js?v=aaf6cd4a"></script>
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
@@ -60,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc6';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc7';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -73,7 +75,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc6" />
+  <meta name="docsearch:version" content="1.2.0rc7" />
 
 
   </head>
@@ -350,13 +352,13 @@
 </ul>
 </details></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/aiperf_client.html">Aiperf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/aiperf_client_for_multimodal.html">Aiperf Client For Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/curl_chat_client.html">Curl Chat Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/curl_completion_client.html">Curl Completion Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/curl_responses_client.html">Curl Responses Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../examples/genai_perf_client.html">Genai Perf Client</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../examples/genai_perf_client_for_multimodal.html">Genai Perf Client For Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
@@ -386,7 +388,6 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../../../commands/trtllm-bench.html">trtllm-bench</a></li>
-
 <li class="toctree-l1"><a class="reference internal" href="../../../commands/trtllm-eval.html">trtllm-eval</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../../../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
@@ -417,7 +418,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../features/guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../features/auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/auto_deploy/auto-deploy.html">AutoDeploy (Beta)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/helix.html">Helix Parallelism</a></li>
@@ -1271,12 +1272,16 @@
                           <span class="n">is_buffer</span><span class="o">=</span><span class="kc">True</span><span class="p">))</span>
         <span class="k">else</span><span class="p">:</span>
 
-            <span class="k">def</span><span class="w"> </span><span class="nf">register_rope_params</span><span class="p">(</span><span class="n">rotary_base</span><span class="p">,</span> <span class="n">names_to_register</span><span class="p">):</span>
+            <span class="k">def</span><span class="w"> </span><span class="nf">register_rope_params</span><span class="p">(</span><span class="n">rotary_base</span><span class="p">,</span> <span class="n">rotary_embedding_scale</span><span class="p">,</span>
+                                     <span class="n">rotary_embedding_scale_type</span><span class="p">,</span>
+                                     <span class="n">rotary_embedding_scaling</span><span class="p">,</span>
+                                     <span class="n">names_to_register</span><span class="p">):</span>
                 <span class="c1"># Rotary const weights.</span>
                 <span class="n">embed_positions</span> <span class="o">=</span> <span class="n">RopeEmbeddingUtils</span><span class="o">.</span><span class="n">create_sinusoidal_positions</span><span class="p">(</span>
                     <span class="n">max_position_embeddings</span><span class="p">,</span>
                     <span class="n">rotary_embedding_dim</span><span class="p">,</span>
                 <span class="p">)</span>
+
                 <span class="n">rotary_inv_freq</span><span class="p">,</span> <span class="n">embed_positions_for_gpt_attention</span> <span class="o">=</span> <span class="n">RopeEmbeddingUtils</span><span class="o">.</span><span class="n">create_sinusoidal_positions_for_attention_plugin</span><span class="p">(</span>
                     <span class="n">max_position_embeddings</span><span class="p">,</span> <span class="n">rotary_embedding_dim</span><span class="p">,</span> <span class="n">rotary_base</span><span class="p">,</span>
                     <span class="n">rotary_embedding_scale</span><span class="p">,</span> <span class="n">rotary_embedding_scale_type</span><span class="p">,</span>
@@ -1293,11 +1298,15 @@
                               <span class="n">dtype</span><span class="o">=</span><span class="s1">&#39;float32&#39;</span><span class="p">,</span>
                               <span class="n">is_buffer</span><span class="o">=</span><span class="kc">True</span><span class="p">))</span>
 
-            <span class="n">register_rope_params</span><span class="p">(</span><span class="n">rotary_base</span><span class="o">=</span><span class="n">rotary_embedding_base</span><span class="p">,</span>
-                                 <span class="n">names_to_register</span><span class="o">=</span><span class="p">[</span>
-                                     <span class="s1">&#39;embed_positions&#39;</span><span class="p">,</span> <span class="s1">&#39;rotary_inv_freq&#39;</span><span class="p">,</span>
-                                     <span class="s1">&#39;embed_positions_for_gpt_attention&#39;</span>
-                                 <span class="p">])</span>
+            <span class="n">register_rope_params</span><span class="p">(</span>
+                <span class="n">rotary_base</span><span class="o">=</span><span class="n">rotary_embedding_base</span><span class="p">,</span>
+                <span class="n">rotary_embedding_scale</span><span class="o">=</span><span class="n">rotary_embedding_scale</span><span class="p">,</span>
+                <span class="n">rotary_embedding_scale_type</span><span class="o">=</span><span class="n">rotary_embedding_scale_type</span><span class="p">,</span>
+                <span class="n">rotary_embedding_scaling</span><span class="o">=</span><span class="n">rotary_embedding_scaling</span><span class="p">,</span>
+                <span class="n">names_to_register</span><span class="o">=</span><span class="p">[</span>
+                    <span class="s1">&#39;embed_positions&#39;</span><span class="p">,</span> <span class="s1">&#39;rotary_inv_freq&#39;</span><span class="p">,</span>
+                    <span class="s1">&#39;embed_positions_for_gpt_attention&#39;</span>
+                <span class="p">])</span>
 
             <span class="c1"># For models with non-homegeneous attention layers requiring a second set of rope params. e.g. Gemma3.</span>
             <span class="n">rotary_embedding_base_local</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">config</span><span class="p">,</span>
@@ -1305,6 +1314,9 @@
             <span class="k">if</span> <span class="n">rotary_embedding_base_local</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="n">register_rope_params</span><span class="p">(</span>
                     <span class="n">rotary_base</span><span class="o">=</span><span class="n">rotary_embedding_base_local</span><span class="p">,</span>
+                    <span class="n">rotary_embedding_scale</span><span class="o">=</span><span class="mf">1.0</span><span class="p">,</span>
+                    <span class="n">rotary_embedding_scale_type</span><span class="o">=</span><span class="n">RotaryScalingType</span><span class="o">.</span><span class="n">none</span><span class="p">,</span>
+                    <span class="n">rotary_embedding_scaling</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                     <span class="n">names_to_register</span><span class="o">=</span><span class="p">[</span>
                         <span class="s1">&#39;embed_positions_local&#39;</span><span class="p">,</span> <span class="s1">&#39;rotary_inv_freq_local&#39;</span><span class="p">,</span>
                         <span class="s1">&#39;embed_positions_for_gpt_attention_local&#39;</span>
@@ -1716,10 +1728,12 @@
                 <span class="n">rotary_embedding_dim</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_dim</span><span class="p">,</span>
                 <span class="n">rotary_embedding_base</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_base</span>
                 <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_local</span> <span class="k">else</span> <span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_base_local</span><span class="p">,</span>
-                <span class="n">rotary_embedding_scale_type</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_scale_type</span><span class="p">,</span>
+                <span class="n">rotary_embedding_scale_type</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_scale_type</span>
+                <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_local</span> <span class="k">else</span> <span class="n">RotaryScalingType</span><span class="o">.</span><span class="n">none</span><span class="p">,</span>
                 <span class="n">rotary_embedding_short_m_scale</span><span class="o">=</span><span class="n">attention_params</span><span class="o">.</span><span class="n">short_mscale</span><span class="p">,</span>
                 <span class="n">rotary_embedding_long_m_scale</span><span class="o">=</span><span class="n">attention_params</span><span class="o">.</span><span class="n">long_mscale</span><span class="p">,</span>
-                <span class="n">rotary_embedding_scale</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_scale</span><span class="p">,</span>
+                <span class="n">rotary_embedding_scale</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_scale</span>
+                <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_local</span> <span class="k">else</span> <span class="mf">1.0</span><span class="p">,</span>
                 <span class="n">rotary_embedding_max_positions</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">max_position_embeddings</span><span class="p">,</span>
                 <span class="n">rotary_embedding_original_max_positions</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span>
                 <span class="n">original_max_position_embeddings</span><span class="p">,</span>
@@ -3517,9 +3531,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on December 15, 2025.</p>
+  <p>Last updated on January 04, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9ba1426">9ba1426</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a65b0d4">a65b0d4</a>.</p>
   
 </div></div>
       

@@ -36,6 +36,7 @@
     <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../_static/config_selector.css?v=e17d8078" />
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
@@ -51,6 +52,7 @@
     <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../_static/copybutton.js?v=65e89d2a"></script>
+    <script src="../_static/config_selector.js?v=aaf6cd4a"></script>
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
@@ -61,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc6';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc7';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -76,7 +78,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc6" />
+  <meta name="docsearch:version" content="1.2.0rc7" />
 
 
   </head>
@@ -357,13 +359,13 @@
 </ul>
 </details></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/aiperf_client.html">Aiperf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/aiperf_client_for_multimodal.html">Aiperf Client For Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client.html">Curl Chat Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/curl_completion_client.html">Curl Completion Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/curl_responses_client.html">Curl Responses Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client.html">Genai Perf Client</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client_for_multimodal.html">Genai Perf Client For Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
@@ -393,7 +395,6 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-bench.html">trtllm-bench</a></li>
-
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-eval.html">trtllm-eval</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
@@ -424,7 +425,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/checkpoint-loading.html">Checkpoint Loading</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../features/auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/auto_deploy/auto-deploy.html">AutoDeploy (Beta)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/helix.html">Helix Parallelism</a></li>
@@ -523,10 +524,10 @@
                   
   <section class="tex2jax_ignore mathjax_ignore" id="tensorrt-llm-benchmarking">
 <span id="perf-benchmarking"></span><h1>TensorRT LLM Benchmarking<a class="headerlink" href="#tensorrt-llm-benchmarking" title="Link to this heading">#</a></h1>
-<div class="admonition important">
-<p class="admonition-title">Important</p>
-<p>This benchmarking suite is a work in progress.
-Expect breaking API changes.</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p><strong>Non-breaking</strong>: <code class="docutils literal notranslate"><span class="pre">--config</span> <span class="pre">&lt;file.yaml&gt;</span></code> is the preferred flag for passing a <a class="reference internal" href="../commands/trtllm-serve/trtllm-serve.html#configuring-with-yaml-files"><span class="std std-ref">YAML configuration file</span></a>.
+Existing workflows using <code class="docutils literal notranslate"><span class="pre">--extra_llm_api_options</span> <span class="pre">&lt;file.yaml&gt;</span></code> continue to work; it is an equivalent alias.</p>
 </div>
 <p>TensorRT LLM provides the <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> CLI, a packaged benchmarking utility that aims to make it
 easier for users to reproduce our officially published <a class="reference internal" href="perf-overview.html#throughput-measurements"><span class="std std-ref">performance overview</span></a>. <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> provides the follows:</p>
@@ -535,10 +536,51 @@ easier for users to reproduce our officially published <a class="reference inter
 <li><p>An entirely Python workflow for benchmarking.</p></li>
 <li><p>Ability to benchmark various flows and features within TensorRT LLM.</p></li>
 </ul>
-<p><code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> executes all benchmarks using <code class="docutils literal notranslate"><span class="pre">in-flight</span> <span class="pre">batching</span></code> – for more information see
-the <a class="reference internal" href="../features/attention.html#inflight-batching"><span class="std std-ref">in-flight batching section</span></a> that describes the concept
-in further detail.</p>
+<p>TensorRT LLM also provides the OpenAI-compatible API via <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> command, which starts an OpenAI compatible server that supports the following endpoints:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">/v1/models</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">/v1/completions</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">/v1/chat/completions</span></code></p></li>
+</ul>
+<p>The following guidance will mostly focus on benchmarks using <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> CLI. To benchmark the OpenAI-compatible <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code>, please refer to the <a class="reference internal" href="../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html"><span class="std std-doc">run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></span></a> section.</p>
+<section id="table-of-contents">
+<h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><a class="reference internal" href="#tensorrt-llm-benchmarking">TensorRT LLM Benchmarking</a></p>
+<ul>
+<li><p><a class="reference internal" href="#table-of-contents">Table of Contents</a></p></li>
+<li><p><a class="reference internal" href="#before-benchmarking">Before Benchmarking</a></p>
+<ul>
+<li><p><a class="reference internal" href="#persistence-mode">Persistence mode</a></p></li>
+<li><p><a class="reference internal" href="#gpu-clock-management">GPU Clock Management</a></p></li>
+<li><p><a class="reference internal" href="#set-power-limits">Set power limits</a></p></li>
+<li><p><a class="reference internal" href="#boost-settings">Boost settings</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#throughput-benchmarking">Throughput Benchmarking</a></p>
+<ul>
+<li><p><a class="reference internal" href="#limitations-and-caveats">Limitations and Caveats</a></p>
+<ul>
+<li><p><a class="reference internal" href="#validated-networks-for-benchmarking">Validated Networks for Benchmarking</a></p></li>
+<li><p><a class="reference internal" href="#supported-quantization-modes">Supported Quantization Modes</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#preparing-a-dataset">Preparing a Dataset</a></p></li>
+<li><p><a class="reference internal" href="#running-with-the-pytorch-workflow">Running with the PyTorch Workflow</a></p>
+<ul>
+<li><p><a class="reference internal" href="#benchmarking-with-lora-adapters-in-pytorch-workflow">Benchmarking with LoRA Adapters in PyTorch workflow</a></p></li>
+<li><p><a class="reference internal" href="#running-multi-modal-models-in-the-pytorch-workflow">Running multi-modal models in the PyTorch Workflow</a></p></li>
+<li><p><a class="reference internal" href="#quantization-in-the-pytorch-flow">Quantization in the PyTorch Flow</a></p></li>
+</ul>
+</li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#online-serving-benchmarking">Online Serving Benchmarking</a></p></li>
+</ul>
+</li>
+</ul>
 <p>To benchmark the OpenAI-compatible <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code>, please refer to the <a class="reference internal" href="../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html"><span class="std std-doc">run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></span></a> section.</p>
+</section>
 <section id="before-benchmarking">
 <h2>Before Benchmarking<a class="headerlink" href="#before-benchmarking" title="Link to this heading">#</a></h2>
 <p>For rigorous benchmarking where consistent and reproducible results are critical, proper GPU configuration is essential. These settings help maximize GPU utilization, eliminate performance variability, and ensure optimal conditions for accurate measurements. While not strictly required for normal operation, we recommend applying these configurations when conducting performance comparisons or publishing benchmark results.</p>
@@ -700,7 +742,7 @@ directory. For example, to generate a synthetic dataset of 1000 requests with a 
 <section id="running-with-the-pytorch-workflow">
 <h3>Running with the PyTorch Workflow<a class="headerlink" href="#running-with-the-pytorch-workflow" title="Link to this heading">#</a></h3>
 <p>To benchmark the PyTorch backend (<code class="docutils literal notranslate"><span class="pre">tensorrt_llm._torch</span></code>), use the following command with <a class="reference internal" href="#preparing-a-dataset">dataset</a> generated from previous steps. The <code class="docutils literal notranslate"><span class="pre">throughput</span></code> benchmark initializes the backend by tuning against the dataset provided via <code class="docutils literal notranslate"><span class="pre">--dataset</span></code> (or the other build mode settings described above).</p>
-<p>Note that CUDA graph is enabled by default. You can add additional pytorch config with <code class="docutils literal notranslate"><span class="pre">--extra_llm_api_options</span></code> followed by the path to a YAML file. For more details, please refer to the help text by running the command with <code class="docutils literal notranslate"><span class="pre">--help</span></code>.</p>
+<p>Note that CUDA graph is enabled by default. You can add additional pytorch config with <code class="docutils literal notranslate"><span class="pre">--config</span></code> followed by the path to a YAML file. For more details, please refer to the help text by running the command with <code class="docutils literal notranslate"><span class="pre">--help</span></code>.</p>
 <div class="admonition tip">
 <p class="admonition-title">Tip</p>
 <p>The command below specifies the <code class="docutils literal notranslate"><span class="pre">--model_path</span></code> option. The model path is optional and used only when you want to run a locally
@@ -802,7 +844,7 @@ Total<span class="w"> </span>Latency<span class="w"> </span><span class="o">(</s
 </pre></div>
 </div>
 <p><strong>LoRA Configuration</strong></p>
-<p>Create an <code class="docutils literal notranslate"><span class="pre">extra-llm-api-options.yaml</span></code> file with LoRA configuration:</p>
+<p>Create a <code class="docutils literal notranslate"><span class="pre">config.yaml</span></code> file with LoRA configuration:</p>
 <div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">lora_config</span><span class="p">:</span>
 <span class="w">  </span><span class="nt">lora_dir</span><span class="p">:</span>
 <span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/path/to/loras/0</span>
@@ -823,7 +865,7 @@ Total<span class="w"> </span>Latency<span class="w"> </span><span class="o">(</s
 <span class="w">  </span>throughput<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--dataset<span class="w"> </span>synthetic_lora_data.json<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--backend<span class="w"> </span>pytorch<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--extra_llm_api_options<span class="w"> </span>extra-llm-api-options.yaml
+<span class="w">  </span>--config<span class="w"> </span>config.yaml
 </pre></div>
 </div>
 <div class="admonition note">
@@ -947,7 +989,7 @@ checkpoint. For the Llama-3.1 models, TensorRT LLM provides the following checkp
 <li><p><a class="reference external" href="https://huggingface.co/nvidia/Llama-3.1-70B-Instruct-FP8"><code class="docutils literal notranslate"><span class="pre">nvidia/Llama-3.1-70B-Instruct-FP8</span></code></a></p></li>
 <li><p><a class="reference external" href="https://huggingface.co/nvidia/Llama-3.1-405B-Instruct-FP8"><code class="docutils literal notranslate"><span class="pre">nvidia/Llama-3.1-405B-Instruct-FP8</span></code></a></p></li>
 </ul>
-<p>To understand more about how to quantize your own checkpoints, refer to ModelOpt <a class="reference external" href="https://nvidia.github.io/Model-Optimizer/deployment/1_tensorrt_llm.html">documentation</a>.</p>
+<p>To understand more about how to quantize your own checkpoints, refer to ModelOpt <a class="reference external" href="https://nvidia.github.io/Model-Optimizer/deployment/3_unified_hf.html">documentation</a>.</p>
 <p><code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> utilizes the <code class="docutils literal notranslate"><span class="pre">hf_quant_config.json</span></code> file present in the pre-quantized checkpoints above. The configuration
 file is present in checkpoints quantized with <a class="reference external" href="https://github.com/NVIDIA/Model-Optimizer">Model Optimizer</a>
 and describes the compute and KV cache quantization that checkpoint was compiled with. For example, from the checkpoints
@@ -1014,6 +1056,11 @@ when the checkpoint precision is <code class="docutils literal notranslate"><spa
 </section>
 </section>
 </section>
+<section id="online-serving-benchmarking">
+<h2>Online Serving Benchmarking<a class="headerlink" href="#online-serving-benchmarking" title="Link to this heading">#</a></h2>
+<p>TensorRT LLM provides the OpenAI-compatible API via <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> command, and <code class="docutils literal notranslate"><span class="pre">tensorrt_llm.serve.scripts.benchmark_serving</span></code> package to benchmark the online server. Alternatively, <a class="reference external" href="https://github.com/ai-dynamo/aiperf">AIPerf</a> is a comprehensive benchmarking tool that can also measure the performance of the OpenAI-compatible server launched by <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code>.</p>
+<p>To benchmark the OpenAI-compatible <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code>, please refer to the <a class="reference internal" href="../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html"><span class="std std-doc">run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></span></a> section.</p>
+</section>
 </section>
 
 
@@ -1065,6 +1112,7 @@ when the checkpoint precision is <code class="docutils literal notranslate"><spa
   </div>
   <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#table-of-contents">Table of Contents</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#before-benchmarking">Before Benchmarking</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#persistence-mode">Persistence mode</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#gpu-clock-management">GPU Clock Management</a></li>
@@ -1087,6 +1135,7 @@ when the checkpoint precision is <code class="docutils literal notranslate"><spa
 </li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#online-serving-benchmarking">Online Serving Benchmarking</a></li>
 </ul>
   </nav></div>
 
@@ -1178,9 +1227,9 @@ when the checkpoint precision is <code class="docutils literal notranslate"><spa
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on December 15, 2025.</p>
+  <p>Last updated on January 04, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9ba1426">9ba1426</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a65b0d4">a65b0d4</a>.</p>
   
 </div></div>
       

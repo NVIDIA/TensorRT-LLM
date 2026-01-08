@@ -18,6 +18,7 @@ The following is a table of supported models for the PyTorch backend:
 | `MixtralForCausalLM`                 | Mixtral                            | `mistralai/Mixtral-8x7B-v0.1`                |
 | `MllamaForConditionalGeneration`     | Llama 3.2                          | `meta-llama/Llama-3.2-11B-Vision`            |
 | `NemotronForCausalLM`                | Nemotron-3, Nemotron-4, Minitron   | `nvidia/Minitron-8B-Base`                    |
+| `NemotronHForCausalLM`               | Nemotron-3-Nano                    | `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8`  |
 | `NemotronNASForCausalLM`             | NemotronNAS                        | `nvidia/Llama-3_3-Nemotron-Super-49B-v1`     |
 | `Phi3ForCausalLM`                    | Phi-4                              | `microsoft/Phi-4`                            |
 | `Qwen2ForCausalLM`                   | QwQ, Qwen2                         | `Qwen/Qwen2-7B-Instruct`                     |
@@ -41,8 +42,8 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 | `Llama4ForConditionalGeneration` | Yes               | Yes        | Yes                        | Yes                   | Yes             | No  | Yes                       | Yes                       | Yes           | Yes              | Untested       | N/A                      | Yes                   | Yes             |
 | `GptOssForCausalLM`            | Yes              | Yes         | Yes                        | Yes                   | No             | No   | Yes                       | No                        | Yes           | Yes              | No             | N/A                      | Yes                    | Yes             |
 
-[^1]: Chunked Prefill for MLA can only be enabled on SM100.
-[^2]: KV cache reuse for MLA can only be enabled on SM90/SM100 and in BF16/FP8 KV cache dtype.
+[^1]: Chunked Prefill for MLA can only be enabled on SM100/SM103.
+[^2]: KV cache reuse for MLA can only be enabled on SM90/SM100/SM103 and in BF16/FP8 KV cache dtype.
 
 
 # Multimodal Feature Support Matrix (PyTorch Backend)

@@ -296,7 +296,7 @@ API Reference
     :special-members: __init__
     :member-order: groupwise
     :inherited-members:
-    :exclude-members: model_rebuild,model_fields_set,parse_obj,model_post_init,model_fields,validate,from_orm,update_forward_refs,model_dump_json,model_dump,parse_file,model_json_schema,model_parametrized_name,json,model_validate,model_config,model_copy,model_construct,parse_raw,model_validate_json,dict,construct,schema,copy,model_validate_strings,model_computed_fields,model_extra,schema_json
+    :exclude-members: update_forward_refs,schema,model_computed_fields,model_rebuild,validate,schema_json,model_dump_json,model_validate_json,json,dict,model_extra,parse_obj,model_parametrized_name,model_fields,parse_raw,model_copy,model_validate_strings,model_config,copy,model_construct,model_post_init,parse_file,from_orm,model_fields_set,model_json_schema,construct,model_validate,model_dump
 
 .. autoclass:: tensorrt_llm.llmapi.TrtLlmArgs
     :members:
@@ -305,7 +305,7 @@ API Reference
     :special-members: __init__
     :member-order: groupwise
     :inherited-members:
-    :exclude-members: model_rebuild,model_fields_set,parse_obj,model_post_init,model_fields,validate,from_orm,update_forward_refs,model_dump_json,model_dump,parse_file,model_json_schema,model_parametrized_name,json,model_validate,model_config,model_copy,model_construct,parse_raw,model_validate_json,dict,construct,schema,copy,model_validate_strings,model_computed_fields,model_extra,schema_json
+    :exclude-members: update_forward_refs,schema,model_computed_fields,model_rebuild,validate,schema_json,model_dump_json,model_validate_json,json,dict,model_extra,parse_obj,model_parametrized_name,model_fields,parse_raw,model_copy,model_validate_strings,model_config,copy,model_construct,model_post_init,parse_file,from_orm,model_fields_set,model_json_schema,construct,model_validate,model_dump
 
 .. autoclass:: tensorrt_llm.llmapi.AutoDecodingConfig
     :members:
@@ -348,6 +348,14 @@ API Reference
     :inherited-members:
 
 .. autoclass:: tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig
     :members:
     :undoc-members:
     :show-inheritance:
