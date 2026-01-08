@@ -255,7 +255,12 @@ class BaseLLM:
         exception_handler.register(self, 'shutdown')
         atexit.register(LLM._shutdown_wrapper, weakref.ref(self))
 
-    def _apply_model_feature_fallbacks(self) -> None:
+    def _warn_unsupported_features(self) -> None:
+        """Warn or auto-disable features marked unsupported in the model matrix.
+
+        When auto_disable_unsupported_features=False (default): warns only.
+        When auto_disable_unsupported_features=True: auto-disables the feature.
+        """
         cfg = getattr(self, "_hf_model_config", None)
         if cfg is None:
             return
@@ -265,23 +270,31 @@ class BaseLLM:
             return
         arch = archs[0]
 
-        def _disable_if_unsupported(
+        auto_disable = getattr(self.args, "auto_disable_unsupported_features",
+                               False)
+
+        def _check_feature(
             feature: SupportFeature,
             *,
             enabled: bool,
             arg_path: str,
             disable,
         ) -> None:
-            # Preserve behavior: only override when user explicitly enabled it.
             if not enabled:
                 return
             status = get_support_status(arch, feature)
-            # Preserve behavior: unknown/untested/missing status must not disable anything.
             if status not in (SupportStatus.NO, SupportStatus.NA):
                 return
-            logger.warning(
-                f"{arch}: {feature.value} unsupported; disabling {arg_path}")
-            disable()
+
+            if auto_disable:
+                logger.warning(
+                    f"{arch}: {feature.value} not supported; disabling {arg_path}"
+                )
+                disable()
+            else:
+                logger.warning(
+                    f"{arch}: {feature.value} may not be supported. "
+                    f"If you encounter issues, try setting {arg_path}=False.")
 
         kv_cfg = getattr(self.args, "kv_cache_config", None)
 
@@ -289,7 +302,7 @@ class BaseLLM:
             if kv_cfg is not None:
                 kv_cfg.enable_block_reuse = False
 
-        _disable_if_unsupported(
+        _check_feature(
             SupportFeature.KV_CACHE_REUSE,
             enabled=kv_cfg is not None
             and getattr(kv_cfg, "enable_block_reuse", False),
@@ -297,22 +310,21 @@ class BaseLLM:
             disable=_disable_kv_cache_reuse,
         )
 
-        _disable_if_unsupported(
+        _check_feature(
             SupportFeature.CHUNKED_PREFILL,
             enabled=getattr(self.args, "enable_chunked_prefill", False),
             arg_path="enable_chunked_prefill",
             disable=lambda: setattr(self.args, "enable_chunked_prefill", False),
         )
 
-        _disable_if_unsupported(
+        _check_feature(
             SupportFeature.ATTENTION_DP,
             enabled=getattr(self.args, "enable_attention_dp", False),
             arg_path="enable_attention_dp",
             disable=lambda: setattr(self.args, "enable_attention_dp", False),
         )
 
-        # disable_overlap_scheduler is inverted: we only flip it when currently False.
-        _disable_if_unsupported(
+        _check_feature(
             SupportFeature.OVERLAP_SCHEDULER,
             enabled=hasattr(self.args, "disable_overlap_scheduler")
             and getattr(self.args, "disable_overlap_scheduler") is False,
@@ -993,7 +1005,7 @@ class _TrtLLM(BaseLLM):
         # It should also be before bindings ExecutorConfig, which may depend on tokenizer info.
         self._tokenizer = self._try_load_tokenizer()
         self._hf_model_config = self._try_load_hf_model_config()
-        self._apply_model_feature_fallbacks()
+        self._warn_unsupported_features()
         self._generation_config = self._try_load_generation_config()
 
         # Multimodal special handling:
@@ -1188,7 +1200,7 @@ class _TorchLLM(BaseLLM):
         # It should also be before bindings ExecutorConfig, which may depend on tokenizer info.
         self._tokenizer = self._try_load_tokenizer()
         self._hf_model_config = self._try_load_hf_model_config()
-        self._apply_model_feature_fallbacks()
+        self._warn_unsupported_features()
         self._generation_config = self._try_load_generation_config()
 
         # Multimodal special handling:

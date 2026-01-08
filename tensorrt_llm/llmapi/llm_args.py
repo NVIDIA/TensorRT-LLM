@@ -1976,6 +1976,15 @@ class BaseLlmArgs(StrictBaseModel):
     enable_chunked_prefill: bool = Field(default=False,
                                          description="Enable chunked prefill.")
 
+    auto_disable_unsupported_features: bool = Field(
+        default=False,
+        description=(
+            "When True, automatically disable features that the model support "
+            "matrix marks as unsupported (NO or N/A). When False (default), "
+            "only warn about potentially unsupported features but respect "
+            "user's explicit configuration. Set to True if you want the system "
+            "to automatically disable features that may cause runtime errors."))
+
     guided_decoding_backend: Optional[Literal["xgrammar", "llguidance"]] = Field(
         default=None,
         description=

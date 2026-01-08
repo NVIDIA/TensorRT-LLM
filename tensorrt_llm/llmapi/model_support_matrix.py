@@ -469,11 +469,28 @@ def get_cell(architecture: str, feature: Feature) -> Optional[FeatureCell]:
     return None
 
 
-def get_status(architecture: str, feature: Feature) -> Optional[SupportStatus]:
-    cell = get_cell(architecture, feature)
-    if cell is None:
+def get_status(
+    architecture: str,
+    feature: Feature,
+) -> Optional[SupportStatus]:
+    """Get feature support status for the given architecture.
+
+    Returns None if architecture is in both matrices (ambiguous), in neither
+    matrix, or if the feature is not defined for the architecture.
+    """
+    key_model_row = KEY_MODEL_MATRIX.get(architecture)
+    multimodal_row = MULTIMODAL_MATRIX.get(architecture)
+
+    # Ambiguous: model in both matrices, can't determine user intent
+    if key_model_row is not None and multimodal_row is not None:
         return None
-    return cell.status
+
+    row = multimodal_row if multimodal_row is not None else key_model_row
+    if row is None:
+        return None
+
+    cell = row.get(feature)
+    return cell.status if cell is not None else None
 
 
 def _render_md_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
