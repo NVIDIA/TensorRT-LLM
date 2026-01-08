@@ -670,12 +670,12 @@ class FP8QDQFusedMoEMethod(FusedMoEMethodBase):
     def load_expert_w3_w1_weight_scale_fp8_qdq(
             self, w1_weight_scale, w3_weight_scale,
             dst_w3_w1_weight_scale: torch.Tensor):
-        if w1_weight_scale is not None:
+        if w1_weight_scale is not None and w1_weight_scale.shape[0] != 0:
             w1_weight_scale = w1_weight_scale[...].reshape([])
             dst_w3_w1_weight_scale.copy_(
                 w1_weight_scale
             ) if w1_weight_scale > dst_w3_w1_weight_scale[0] else None
-        if w3_weight_scale is not None:
+        if w3_weight_scale is not None and w3_weight_scale.shape[0] != 0:
             w3_weight_scale = w3_weight_scale[...].reshape([])
             dst_w3_w1_weight_scale.copy_(
                 w3_weight_scale
@@ -1001,7 +1001,8 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
                 transfromed_w3_w1_scale, requires_grad=False)
             replace_parameter_and_save_metadata(
                 module, "w3_w1_weight_scaling_factor",
-                transformed_w3_w1_weight_scaling_factor)
+                transformed_w3_w1_weight_scaling_factor,
+                module.rebuild_tensor_metadata)
             transfromed_w2_scale = transform_sf_into_required_layout(
                 module.quant_scales[1],
                 mn=module.w2_weight.shape[1],
@@ -1013,7 +1014,8 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
                 transfromed_w2_scale, requires_grad=False)
             replace_parameter_and_save_metadata(
                 module, "w2_weight_scaling_factor",
-                transformed_w2_weight_scaling_factor)
+                transformed_w2_weight_scaling_factor,
+                module.rebuild_tensor_metadata)
             self.setup_quant_scales(module)
 
 
