@@ -33,19 +33,22 @@ def exec_cmd(*popenargs, timeout: Optional[float] = None, **kwargs) -> int:
     return result.returncode
 
 
-def exec_cmd_with_output(*popenargs, timeout: Optional[float] = None, **kwargs) -> str:
+def exec_cmd_with_output(
+    *popenargs, timeout: Optional[float] = None, check: bool = True, **kwargs
+) -> str:
     """Execute command and return output as string.
 
     Args:
         *popenargs: Command and arguments
         timeout: Timeout in seconds
+        check: If True, raise CalledProcessError on non-zero exit code (default: True)
         **kwargs: Additional subprocess arguments
 
     Returns:
         stdout as string (decoded from bytes)
 
     Raises:
-        subprocess.CalledProcessError: If command returns non-zero exit code
+        subprocess.CalledProcessError: If check=True and command returns non-zero exit code
         subprocess.TimeoutExpired: If timeout is reached
     """
     result = subprocess.run(
@@ -53,11 +56,15 @@ def exec_cmd_with_output(*popenargs, timeout: Optional[float] = None, **kwargs) 
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         timeout=timeout,
-        check=True,
+        check=check,
         **kwargs,
     )
-    # Log stderr if it exists
+    # Log stderr if it exists (as warning if check=False, as error if check=True)
     if result.stderr:
-        stderr_output = result.stderr.decode()
-        logger.error(f"Command stderr: {stderr_output}")
+        stderr_output = result.stderr.decode().strip()
+        if stderr_output:
+            if check:
+                logger.error(f"Command stderr: {stderr_output}")
+            else:
+                logger.warning(f"Command stderr: {stderr_output}")
     return result.stdout.decode()

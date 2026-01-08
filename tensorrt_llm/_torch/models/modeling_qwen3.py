@@ -152,6 +152,7 @@ class Qwen3DecoderLayer(DecoderLayer):
             final_all_reduce_params=AllReduceParams(
                 enable_allreduce=not self.disable_allreduce),
             cutlass_min_latency_mode=False,
+            **kwargs,
         )
         if deepstack_embeds is not None and self.layer_idx in range(
                 len(deepstack_embeds)):
@@ -221,7 +222,10 @@ class Qwen3Model(DecoderModel):
                 residual=residual,
                 spec_metadata=spec_metadata,
                 mrope_config=mrope_config,
-                deepstack_embeds=deepstack_embeds)
+                deepstack_embeds=deepstack_embeds,
+                **kwargs,
+            )
+
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
