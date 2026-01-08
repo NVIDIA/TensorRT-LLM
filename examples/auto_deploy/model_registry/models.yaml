@@ -205,5 +205,5 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml', 'llama4_scout.yaml']
 - name: meta-llama/Llama-4-Maverick-17B-128E-Instruct
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml', 'llama4_maverick_lite.yaml']
-- name: nvidia/Super-phase1-mtp-bf16
-  yaml_extra: ['dashboard_default.yaml', 'super_v3.yaml']
+- name: nvidia/NVIDIA-Nemotron-3-Super-120B-BF16-BF16KV-010726
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml','super_v3.yaml']
