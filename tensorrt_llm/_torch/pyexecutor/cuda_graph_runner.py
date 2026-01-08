@@ -18,7 +18,7 @@ from ..speculative.eagle3 import Eagle3ResourceManager
 from ..speculative.mtp import SampleStateTensorsMTP
 from ..utils import make_weak_ref, piecewise_cuda_graph
 from .llm_request import get_draft_token_length
-from .mamba_cache_manager import MambaCacheManager
+from .mamba_cache_manager import MambaCacheManager, use_cpp_mamba_cache_manager
 from .resource_manager import (BaseResourceManager, ResourceManager,
                                ResourceManagerType)
 from .sampler import SampleStateTensors
@@ -451,8 +451,8 @@ class CUDAGraphRunner:
             if spec_res_mgr:
                 spec_res_mgr.add_dummy_requests([CUDA_GRAPH_DUMMY_REQUEST_ID])
 
-        # handle special cases of padding requests + MambaCacheManager or MambaHybridCacheManager
-        if isinstance(kv_cache_manager, MambaCacheManager):
+        if (isinstance(kv_cache_manager, MambaCacheManager)
+                and not use_cpp_mamba_cache_manager()):
             kv_cache_manager.reorder_state_indices_when_padding_requests(
                 batch_size, padding_size)
 

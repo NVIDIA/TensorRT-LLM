@@ -906,6 +906,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 self.helix_is_inactive_rank_cpu[:batch_size], non_blocking=True)
 
     def prepare(self) -> None:
+        super().prepare()
         extra_attrs = get_model_extra_attrs()
         # If model extra attrs is set, attention_metadata is setup in executor.
         if extra_attrs is None:

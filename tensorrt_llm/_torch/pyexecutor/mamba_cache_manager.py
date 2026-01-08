@@ -13,22 +13,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 import torch
 
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-from tensorrt_llm._torch.pyexecutor.resource_manager import (
-    BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager, get_pp_layers)
-from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
-from tensorrt_llm.logger import logger
-from tensorrt_llm.mapping import Mapping
+import tensorrt_llm.bindings
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import \
         AttentionMetadata
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm._torch.pyexecutor.resource_manager import (
+    BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager, get_pp_layers)
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._utils import torch_dtype_to_binding
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import Mapping
+
+RnnStateManagerCpp = tensorrt_llm.bindings.internal.batch_manager.RnnStateManager
+WorldConfig = tensorrt_llm.bindings.WorldConfig
 
 GB = 1 << 30
 
@@ -42,7 +48,117 @@ def get_tensor_size_bytes(tensor):
     return 0
 
 
-class MambaCacheManager(BaseResourceManager):
+def use_cpp_mamba_cache_manager() -> bool:
+    """Check if C++ MambaCacheManager should be used.
+
+    Returns True if TRTLLM_USE_CPP_MAMBA='1' is set, False otherwise.
+    By default, PythonMambaCacheManager is used.
+    """
+    return os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1'
+
+
+class CppMambaCacheManager(BaseResourceManager):
+    """C++ backed Mamba cache manager using RnnStateManager bindings."""
+
+    def __init__(
+        self,
+        d_state: int,
+        d_conv: int,
+        num_heads: int,
+        n_groups: int,
+        head_dim: int,
+        num_layers: int,
+        max_num_sequences: int,
+        mapping: Mapping,
+        dtype: torch.dtype,
+        ssm_cache_dtype: torch.dtype,
+        layer_mask: Optional[List[bool]] = None,
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
+        self.mamba_ssm_cache_dtype = ssm_cache_dtype
+
+        # get tp size
+        tp_size = mapping.tp_size if not mapping.enable_attention_dp else 1
+        world_config = WorldConfig(
+            tensor_parallelism=tp_size,
+            pipeline_parallelism=mapping.pp_size,
+            rank=mapping.rank,
+            gpus_per_node=mapping.gpus_per_node,
+        )
+
+        dtype_binding = torch_dtype_to_binding(dtype)
+        ssm_cache_dtype_binding = torch_dtype_to_binding(
+            ssm_cache_dtype if ssm_cache_dtype is not None else dtype)
+
+        self._stream = stream if stream is not None else torch.cuda.current_stream(
+        )
+
+        pp_layers, _ = get_pp_layers(num_layers, mapping, layer_mask=layer_mask)
+
+        self.mamba_impl = RnnStateManagerCpp(
+            d_state=d_state,
+            d_conv=d_conv,
+            num_heads=num_heads,
+            n_groups=n_groups,
+            head_dim=head_dim,
+            max_batch_size=max_num_sequences,
+            world_config=world_config,
+            stream=self._stream.cuda_stream,
+            dtype=dtype_binding,
+            ssm_cache_dtype=ssm_cache_dtype_binding,
+            pp_layers=pp_layers,
+        )
+        self._max_num_sequences = max_num_sequences
+
+    def get_max_resource_count(self) -> int:
+        # Return the maximum number of sequences that can be cached.
+        return self._max_num_sequences
+
+    def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
+        # For Mamba cache manager, we always need one slot per request.
+        return 1
+
+    def prepare_resources(self, scheduled_batch: ScheduledRequests):
+        context_ids = [
+            i.py_request_id for i in scheduled_batch.context_requests
+        ]
+        generation_ids = [
+            i.py_request_id for i in scheduled_batch.generation_requests
+        ]
+        request_ids = context_ids + generation_ids
+        self.mamba_impl.allocate_cache_blocks(request_ids)
+
+    def free_resources(self, request: LlmRequest):
+        self.mamba_impl.free_cache_block(request.py_request_id)
+
+    def add_dummy_requests(self, request_ids: List[int], **kwargs):
+        # For CUDA graph dummy requests, the blocks will be allocated
+        # when get_state_indices is called.
+        from .cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
+        request_ids = [
+            rid for rid in request_ids if rid != CUDA_GRAPH_DUMMY_REQUEST_ID
+        ]
+        if request_ids:
+            self.mamba_impl.allocate_cache_blocks(request_ids)
+
+    def get_state_indices(self, request_ids: List[int],
+                          is_padding: List[bool]) -> List[int]:
+        return self.mamba_impl.get_state_indices(request_ids, is_padding)
+
+    def get_conv_states(self, layer_idx: int) -> torch.Tensor:
+        return self.mamba_impl.get_conv_states(layer_idx)
+
+    def get_ssm_states(self, layer_idx: int) -> torch.Tensor:
+        return self.mamba_impl.get_ssm_states(layer_idx)
+
+    def get_mamba_ssm_cache_dtype(self) -> torch.dtype:
+        return self.mamba_ssm_cache_dtype
+
+    def shutdown(self):
+        torch.cuda.empty_cache()
+
+
+class PythonMambaCacheManager(BaseResourceManager):
 
     @dataclass(frozen=True, kw_only=True)
     class State:
@@ -193,6 +309,17 @@ class MambaCacheManager(BaseResourceManager):
                                                        dtype=torch.int32,
                                                        device=device)
 
+        # Store max_batch_size for resource management
+        self._max_batch_size = max_batch_size
+
+    def get_max_resource_count(self) -> int:
+        """Return the maximum number of sequences that can be cached."""
+        return self._max_batch_size
+
+    def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
+        """For Mamba cache manager, we always need one slot per request."""
+        return 1
+
     @torch.inference_mode()
     def _prepare_mamba_cache_blocks(self, request_ids: List[int]):
         self.state_indices_list.clear()
@@ -296,6 +423,9 @@ class MambaCacheManager(BaseResourceManager):
         layer_offset = self.mamba_layer_offsets[layer_idx]
         return self.mamba_cache.at_layer_idx(layer_offset)
 
+    def get_mamba_ssm_cache_dtype(self) -> torch.dtype:
+        return self.mamba_ssm_cache_dtype
+
     def shutdown(self):
         """Release tensor memory."""
         # Clear state indices
@@ -344,6 +474,157 @@ class MambaCacheManager(BaseResourceManager):
                                                              src_state_indices,
                                                              num_accepted_draft_tokens]
         conv_states[:, state_indices_d, :] = accepted_conv_state
+
+
+class MambaCacheManager(BaseResourceManager):
+
+    def __init__(
+        self,
+        d_state: int,
+        d_conv: int,
+        num_heads: int,
+        n_groups: int,
+        head_dim: int,
+        num_layers: int,
+        max_batch_size: int,
+        spec_state_size: int,
+        mapping: Mapping,
+        dtype: torch.dtype,
+        ssm_cache_dtype: torch.dtype,
+        layer_mask: Optional[List[bool]] = None,
+        stream: Optional[torch.cuda.Stream] = None,
+        speculative_num_draft_tokens: Optional[int] = None,
+    ) -> None:
+        max_num_sequences = max_batch_size * mapping.pp_size
+        self._use_cpp = use_cpp_mamba_cache_manager()
+
+        if self._use_cpp:
+            assert speculative_num_draft_tokens is None, \
+                "speculative_num_draft_tokens is not supported in CppMambaCacheManager"
+            self._impl = CppMambaCacheManager(
+                d_state=d_state,
+                d_conv=d_conv,
+                num_heads=num_heads,
+                n_groups=n_groups,
+                head_dim=head_dim,
+                num_layers=num_layers,
+                max_num_sequences=max_num_sequences,
+                mapping=mapping,
+                dtype=dtype,
+                ssm_cache_dtype=ssm_cache_dtype,
+                layer_mask=layer_mask,
+                stream=stream,
+            )
+        else:
+            self._impl = PythonMambaCacheManager(
+                d_state=d_state,
+                d_conv=d_conv,
+                num_heads=num_heads,
+                n_groups=n_groups,
+                head_dim=head_dim,
+                num_layers=num_layers,
+                max_batch_size=max_batch_size,
+                spec_state_size=spec_state_size,
+                mapping=mapping,
+                dtype=dtype,
+                ssm_cache_dtype=ssm_cache_dtype,
+                layer_mask=layer_mask,
+                speculative_num_draft_tokens=speculative_num_draft_tokens,
+            )
+
+    def get_max_resource_count(self) -> int:
+        if self._use_cpp:
+            return self._impl.get_max_resource_count()
+        return self._impl.state_indices.numel()
+
+    def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
+        if self._use_cpp:
+            return self._impl.get_needed_resource_to_completion(request)
+        return 1
+
+    def prepare_resources(self, scheduled_batch: ScheduledRequests):
+        self._impl.prepare_resources(scheduled_batch)
+
+    def free_resources(self, request: LlmRequest):
+        self._impl.free_resources(request)
+
+    def add_dummy_requests(self, request_ids: List[int], **kwargs):
+        if self._use_cpp:
+            self._impl.add_dummy_requests(request_ids, **kwargs)
+
+    def get_state_indices(
+        self,
+        request_ids: Optional[List[int]] = None,
+        is_padding: Optional[List[bool]] = None
+    ) -> Union[torch.Tensor, List[int]]:
+        if self._use_cpp:
+            return self._impl.get_state_indices(request_ids, is_padding)
+        return self._impl.get_state_indices()
+
+    def reorder_state_indices_when_padding_requests(self, request_size: int,
+                                                    padding_size: int):
+        """Reorder state indices when padding requests exist (Python impl only)."""
+        if not self._use_cpp:
+            self._impl.reorder_state_indices_when_padding_requests(
+                request_size, padding_size)
+
+    @property
+    def mamba_cache_free_blocks(self) -> List[int]:
+        """Get mamba cache free blocks (Python impl only)."""
+        if not self._use_cpp and hasattr(self._impl, 'mamba_cache_free_blocks'):
+            return self._impl.mamba_cache_free_blocks
+        return []
+
+    @property
+    def mamba_cache_index(self) -> Dict[int, int]:
+        """Get mamba cache index mapping request_id -> state index (Python impl only)."""
+        if not self._use_cpp and hasattr(self._impl, 'mamba_cache_index'):
+            return self._impl.mamba_cache_index
+        return {}
+
+    def get_conv_states(self, layer_idx: int) -> torch.Tensor:
+        return self._impl.get_conv_states(layer_idx)
+
+    def get_ssm_states(self, layer_idx: int) -> torch.Tensor:
+        return self._impl.get_ssm_states(layer_idx)
+
+    def get_mamba_ssm_cache_dtype(self) -> torch.dtype:
+        return self._impl.get_mamba_ssm_cache_dtype()
+
+    def get_intermediate_ssm_states(self,
+                                    layer_idx: int) -> Optional[torch.Tensor]:
+        if hasattr(self._impl, 'get_intermediate_ssm_states'):
+            return self._impl.get_intermediate_ssm_states(layer_idx)
+        return None
+
+    def get_intermediate_conv_states(self,
+                                     layer_idx: int) -> Optional[torch.Tensor]:
+        if hasattr(self._impl, 'get_intermediate_conv_states'):
+            return self._impl.get_intermediate_conv_states(layer_idx)
+        return None
+
+    def is_speculative(self) -> bool:
+        if hasattr(self._impl, 'is_speculative'):
+            return self._impl.is_speculative()
+        return False
+
+    def mamba_layer_cache(
+        self, layer_idx: int
+    ) -> Union[PythonMambaCacheManager.State,
+               PythonMambaCacheManager.SpeculativeState, None]:
+        """Get mamba layer cache (Python impl only)."""
+        if hasattr(self._impl, 'mamba_layer_cache'):
+            return self._impl.mamba_layer_cache(layer_idx)
+        return None
+
+    def shutdown(self):
+        self._impl.shutdown()
+
+    def update_mamba_states(self, attn_metadata: "AttentionMetadata",
+                            num_accepted_tokens: torch.Tensor):
+        # Only PythonMambaCacheManager supports update_mamba_states
+        if hasattr(self._impl, 'update_mamba_states'):
+            self._impl.update_mamba_states(attn_metadata, num_accepted_tokens)
 
 
 class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
@@ -399,6 +680,7 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
             mamba_cache_dtype,
             mamba_ssm_cache_dtype,
             mamba_layer_mask,
+            execution_stream,
             speculative_num_draft_tokens=spec_config.max_draft_len
             if spec_config is not None else None,
         )
@@ -429,6 +711,10 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
     def free_resources(self, request: LlmRequest):
         MambaCacheManager.free_resources(self, request)
         KVCacheManager.free_resources(self, request)
+
+    def add_dummy_requests(self, request_ids: List[int], **kwargs):
+        MambaCacheManager.add_dummy_requests(self, request_ids)
+        return KVCacheManager.add_dummy_requests(self, request_ids, **kwargs)
 
     def shutdown(self):
         MambaCacheManager.shutdown(self)

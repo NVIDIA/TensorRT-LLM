@@ -415,7 +415,36 @@ void initBindings(nb::module_& m)
 
     nb::class_<tb::rnn_state_manager::RnnStateManager>(m, "RnnStateManager")
         .def(nb::init<tr::SizeType32, tr::ModelConfig, tr::WorldConfig, tr::BufferManager>(),
-            nb::arg("max_num_sequences"), nb::arg("model_config"), nb::arg("world_config"), nb::arg("buffer_manager"));
+            nb::arg("max_num_sequences"), nb::arg("model_config"), nb::arg("world_config"), nb::arg("buffer_manager"),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(nb::init<tr::SizeType32, tr::SizeType32, tr::SizeType32, tr::SizeType32, tr::SizeType32, tr::SizeType32,
+                 tr::WorldConfig const&, int64_t, nvinfer1::DataType, nvinfer1::DataType,
+                 std::vector<tr::SizeType32> const&>(),
+            nb::arg("d_state"), nb::arg("d_conv"), nb::arg("num_heads"), nb::arg("n_groups"), nb::arg("head_dim"),
+            nb::arg("max_batch_size"), nb::arg("world_config"), nb::arg("stream"), nb::arg("dtype"),
+            nb::arg("ssm_cache_dtype"), nb::arg("pp_layers"), nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "get_conv_states",
+            [](tb::rnn_state_manager::RnnStateManager& self, tr::SizeType32 layerIdx) -> at::Tensor
+            {
+                auto tensor = self.getConvStates(layerIdx);
+                return tr::Torch::tensor(tensor);
+            },
+            nb::arg("layer_idx"), nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "get_ssm_states",
+            [](tb::rnn_state_manager::RnnStateManager& self, tr::SizeType32 layerIdx) -> at::Tensor
+            {
+                auto tensor = self.getSsmStates(layerIdx);
+                return tr::Torch::tensor(tensor);
+            },
+            nb::arg("layer_idx"), nb::call_guard<nb::gil_scoped_release>())
+        .def("allocate_cache_blocks", &tb::rnn_state_manager::RnnStateManager::allocateCacheBlocks,
+            nb::arg("request_ids"), nb::call_guard<nb::gil_scoped_release>())
+        .def("free_cache_block", &tb::rnn_state_manager::RnnStateManager::freeCacheBlock, nb::arg("request_id"),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("get_state_indices", &tb::rnn_state_manager::RnnStateManager::getStateIndices, nb::arg("request_ids"),
+            nb::arg("is_padding"), nb::call_guard<nb::gil_scoped_release>());
 
     m.def(
         "add_new_tokens_to_requests",

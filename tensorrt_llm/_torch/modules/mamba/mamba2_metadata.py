@@ -19,6 +19,10 @@ from typing import Tuple
 import torch
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
+    CUDA_GRAPH_DUMMY_REQUEST_ID
+from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
+    use_cpp_mamba_cache_manager
 
 
 def cu_seqlens_to_chunk_indices_offsets(
@@ -107,11 +111,38 @@ class Mamba2Metadata:
         self.chunk_indices: torch.Tensor = None
         self.chunk_offsets: torch.Tensor = None
 
+        self.state_indices_cpu = torch.zeros(max_batch_size,
+                                             dtype=torch.int32,
+                                             pin_memory=True)
+        self.state_indices = torch.zeros(max_batch_size,
+                                         dtype=torch.int32,
+                                         device="cuda")
+
     def prepare(self, attn_metadata: AttentionMetadata):
         batch_size = attn_metadata.seq_lens.shape[0]
         num_contexts = attn_metadata.num_contexts
         context_lens = attn_metadata.seq_lens_cuda[:num_contexts]
         num_ctx_tokens = attn_metadata.num_ctx_tokens
+
+        kv_cache_manager = attn_metadata.kv_cache_manager
+        request_ids = attn_metadata.request_ids
+
+        if (kv_cache_manager is not None
+                and hasattr(kv_cache_manager, 'get_state_indices')
+                and request_ids is not None):
+            if use_cpp_mamba_cache_manager():
+                batch_request_ids = request_ids[:batch_size]
+                is_padding = [
+                    req_id == CUDA_GRAPH_DUMMY_REQUEST_ID
+                    for req_id in batch_request_ids
+                ]
+                indices = kv_cache_manager.get_state_indices(
+                    batch_request_ids, is_padding)
+                for i, idx in enumerate(indices):
+                    self.state_indices_cpu[i] = idx
+                self.state_indices[:batch_size].copy_(
+                    self.state_indices_cpu[:batch_size], non_blocking=True)
+
         if num_contexts > 0:
             torch.cumsum(context_lens,
                          dim=0,
