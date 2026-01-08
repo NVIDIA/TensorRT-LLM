@@ -212,8 +212,6 @@ class AsyncTransferManager:
             )
             return
 
-        should_terminate = False
-
         if transfer_metadata.end_transfer():
             self._requests_in_transfer.pop(request.py_request_id)
             self._request_transfer_metadata.pop(request.py_request_id)
@@ -221,14 +219,14 @@ class AsyncTransferManager:
             if self.should_store_blocks:
                 self.kv_cache_manager.unpin_blocks_by_id(
                     transfer_metadata.block_id)
-            else:
-                should_terminate = True
 
             # We don't want to overwrite any error state.
             if request.state != LlmRequestState.DISAGG_TRANS_ERROR:
                 request.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
 
-        return should_terminate
+            return True
+
+        return False
 
     def has_any_inflight_requests(self) -> bool:
         return len(self._requests_in_transfer) > 0
