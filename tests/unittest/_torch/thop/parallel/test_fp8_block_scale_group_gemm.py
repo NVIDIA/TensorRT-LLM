@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -64,7 +64,7 @@ def test_cute_dsl_fp8_block_scale_group_gemm(dtype, num_experts, k, n, max_token
         b_fp8[i, :, :] = cur_b
         b_scale[i, :, :] = cur_b_scale
 
-    output = torch.ops.trtllm.cute_dsl_fp8_group_gemm_blackwell(
+    output = torch.ops.trtllm.cute_dsl_fp8_group_blockwise_gemm_blackwell(
         input=a_fp8,
         weight=b_fp8,
         input_scale=a_scale,

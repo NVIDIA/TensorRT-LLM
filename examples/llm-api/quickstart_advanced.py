@@ -187,14 +187,6 @@ def add_llm_args(parser):
                         default=None,
                         nargs='+')
 
-    # cute dsl op configs
-    parser.add_argument('--use_cute_dsl_blockscaling_mm',
-                        default=False,
-                        action='store_true')
-    parser.add_argument('--use_cute_dsl_blockscaling_bmm',
-                        default=False,
-                        action='store_true')
-
     return parser
 
 
@@ -302,8 +294,6 @@ def setup_llm(args, **kwargs):
         gather_generation_logits=args.return_generation_logits,
         max_beam_width=args.max_beam_width,
         orchestrator_type=args.orchestrator_type,
-        use_cute_dsl_blockscaling_mm=args.use_cute_dsl_blockscaling_mm,
-        use_cute_dsl_blockscaling_bmm=args.use_cute_dsl_blockscaling_bmm,
         **kwargs)
 
     use_beam_search = args.max_beam_width > 1
