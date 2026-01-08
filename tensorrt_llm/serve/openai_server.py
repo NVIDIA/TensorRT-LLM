@@ -290,6 +290,9 @@ class OpenAIServer:
         self.app.add_api_route("/update_weights",
                                 self.update_weights,
                                 methods=["POST"])
+        self.app.add_api_route("/server_info",
+                                self.get_server_info,
+                                methods=["GET"])
         if self.llm.args.return_perf_metrics:
             # register /prometheus/metrics
             self.mount_metrics()
@@ -1130,6 +1133,9 @@ class OpenAIServer:
         assert isinstance(self.llm, AsyncLLM), "/update_weights endpoint is only supported with AsyncLLM()"
         await self.llm.collective_rpc('update_weights', args=(request.weights,))
         return JSONResponse(content={"status": "success"})
+
+    async def get_server_info(self) -> JSONResponse:
+        return JSONResponse(content=self.llm.llm_info)
 
     async def __call__(self, host, port, sockets: list[socket.socket] | None = None):
         # Store the binding address for server registration

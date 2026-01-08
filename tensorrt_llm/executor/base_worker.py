@@ -654,6 +654,9 @@ class BaseWorker(GenerationExecutor):
             self.engine.shutdown()
             self.engine = None
 
+    def get_disagg_context_state(self) -> dict:
+        return self.engine.kv_cache_transceiver.get_context_state()
+
     # Define a Callable to join iteration and request stats
     @staticmethod
     def _stats_serializer(
