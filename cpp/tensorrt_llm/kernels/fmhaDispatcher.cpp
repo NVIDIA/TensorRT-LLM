@@ -120,8 +120,8 @@ bool FmhaDispatcher::isSupported()
         // the kernel is supported.
         tllmRunnerParams.mChunkedAttentionSize = INT_MAX;
         tllmRunnerParams.mAttentionWindowSize = INT_MAX;
-        // Set the kernel type and mask type if sparseMLA is used.
-        if (mFixedParams.useSparseMLA)
+        // Set the kernel type and mask type if sparse attention is used.
+        if (mFixedParams.useTllmGenSparseAttention)
         {
             tllmRunnerParams.mSparseAttention = true;
             tllmRunnerParams.mKernelType = FmhaKernelType::Generation;

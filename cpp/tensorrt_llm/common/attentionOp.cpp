@@ -2751,6 +2751,10 @@ int AttentionOp::initialize() noexcept
         {
             fmhaParams.attentionInputLayout = AttentionInputLayout::PACKED_QKV;
         }
+        else if (useTllmGenSparseAttention())
+        {
+            fmhaParams.attentionInputLayout = AttentionInputLayout::Q_PAGED_KV;
+        }
         else
         {
             fmhaParams.attentionInputLayout = (mPagedKVCache && mPagedContextFMHA) ? AttentionInputLayout::Q_PAGED_KV

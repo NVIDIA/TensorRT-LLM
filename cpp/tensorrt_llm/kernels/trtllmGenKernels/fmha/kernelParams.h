@@ -39,6 +39,12 @@ namespace kernels
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+enum class SparsityMode : int32_t
+{
+    Token = 0,
+    Block = 1,
+};
+
 struct KernelParams
 {
     // TMA descriptor for Q.
@@ -166,9 +172,9 @@ struct KernelParams
     // The sum of sequence lengths for Q and K/V.
     int32_t mSumOfSeqLensQ, mSumOfSeqLensKv;
     // The top k value for sparse MLA.
-    int32_t mSparseMlaTopK;
-    // The flag to use block sparse attention.
-    bool mUseBlockSparseAttention;
+    int32_t mNumSparseTopk;
+    // Sparsity mode for sparse attention.
+    SparsityMode mSparsityMode;
 
     // Create the TMA shape/stride for Q.
     template <class FmhaOptions>
@@ -845,8 +851,15 @@ struct KernelParams
         // The sparseMlaTopK needs to be a multiple of 4 as we use 16B cpAsync instructions for the indices.
         TLLM_CHECK_WITH_INFO(
             !options.mSparseAttention || (options.mSparseTopK % 4) == 0, "SparseTopK must be a multiple of 4");
-        params.mSparseMlaTopK = options.mSparseTopK;
-        params.mUseBlockSparseAttention = options.mUseBlockSparseAttention;
+        params.mNumSparseTopk = options.mSparseTopK;
+        if (options.mSparseAttention)
+        {
+            params.mSparsityMode = SparsityMode::Token;
+        }
+        else if (options.mUseBlockSparseAttention)
+        {
+            params.mSparsityMode = SparsityMode::Block;
+        }
         params.mSkipSoftmaxThresholdScaleFactor = options.mSkipSoftmaxThresholdScaleFactor;
         return params;
     }

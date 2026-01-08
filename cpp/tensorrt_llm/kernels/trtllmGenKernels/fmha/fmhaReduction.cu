@@ -83,8 +83,7 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(Kerne
     // Consider sparseTopK.
     if (sparseAttention)
     {
-        // TODO(yuhangh): replace with params.mSparseTopK
-        seqLenKv = min(seqLenKv, params.mSparseMlaTopK);
+        seqLenKv = min(seqLenKv, params.mNumSparseTopk);
     }
     // The actual number of CtasKv (TileSizeKv is always 128 for now).
     int32_t numCtasKv{min((seqLenKv + 127) / 128, params.mMaxNumCtasKv)};
@@ -389,7 +388,7 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams 
 
     // Launch the kernel.
     TLLM_CUDA_CHECK(cudaLaunchKernelEx(
-        &config, kernel, params, kernelMeta.mSparseMla, numCtasForReduction, numCtasForAllHeads, numHeadDimCtasV));
+        &config, kernel, params, kernelMeta.mSparseAttn, numCtasForReduction, numCtasForAllHeads, numHeadDimCtasV));
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
