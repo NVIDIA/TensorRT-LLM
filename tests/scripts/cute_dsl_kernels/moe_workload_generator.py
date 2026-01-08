@@ -1,3 +1,7 @@
+import functools
+import json
+import os
+
 import click
 import safetensors.torch
 import torch
@@ -6,12 +10,51 @@ from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import GroupedGemmInputs
 from tensorrt_llm.tools.layer_wise_benchmarks.runner_utils import get_balanced_selection_no_cache
 
 
-def gen_moe_workload_layer_wise_benchmark(
-    num_tokens: int, top_k: int, num_experts: int, ep_size: int, tile_size: int
+def get_balanced_selection_no_cache_legacy(
+    num_tokens, top_k, num_experts, dtype, device, dp_size, dp_rank, ep_size
 ):
+    world_size = ep_size
+    rank = dp_rank
+    # First, each sender selects target rank
+    target_rank_before_mod = torch.arange(num_tokens * world_size * top_k).view(
+        num_tokens, world_size, top_k
+    )
+    target_rank_before_mod += top_k * torch.arange(num_tokens).view(
+        num_tokens, 1, 1
+    )  # Shift `top_k` ranks for the next token on each rank, to balance network traffic
+    target_rank = target_rank_before_mod % world_size
+    # Second, each receiver selects target expert
+    target_expert = torch.empty_like(target_rank)
+    for reciever_rank in range(world_size):
+        mask = target_rank == reciever_rank
+        experts_per_rank = num_experts // world_size
+        local_expert = torch.arange(num_tokens * top_k) % experts_per_rank
+        target_expert[mask] = (reciever_rank * experts_per_rank) + local_expert
+    token_selected_experts = target_expert[:, rank].sort(dim=-1).values
+    return token_selected_experts.contiguous().to(dtype=dtype, device=device)
+
+
+def gen_moe_workload_layer_wise_benchmark(
+    num_tokens: int,
+    top_k: int,
+    num_experts: int,
+    ep_size: int,
+    tile_size: int,
+    legacy: bool = False,
+):
+    get_balanced_selection_impl = (
+        get_balanced_selection_no_cache_legacy if legacy else get_balanced_selection_no_cache
+    )
     token_selected_experts = [
-        get_balanced_selection_no_cache(
-            num_tokens, top_k, num_experts, torch.int32, "cuda", ep_size, i
+        get_balanced_selection_impl(
+            num_tokens=num_tokens,
+            top_k=top_k,
+            num_experts=num_experts,
+            dtype=torch.int32,
+            device="cuda",
+            dp_size=ep_size,
+            dp_rank=i,
+            ep_size=ep_size,
         )
         for i in range(ep_size)
     ]
@@ -77,11 +120,13 @@ def gen_moe_workload_balanced_random(
 @click.option("--tile_size", type=click.Choice([128, 256]), default=128)
 @click.option(
     "--method",
-    type=click.Choice(["balanced_random", "balanced_layer_wise_benchmark"]),
+    type=click.Choice(
+        ["balanced_random", "balanced_layer_wise_benchmark", "balanced_layer_wise_benchmark_legacy"]
+    ),
     default="balanced_random",
 )
 @click.option("--seed", type=int, default=515)
-@click.option("--output_file", type=str, default="./moe_workload.safetensors")
+@click.option("--output_path", type=str, default="./moe_workload")
 def main(
     num_tokens: int,
     top_k: int,
@@ -90,7 +135,7 @@ def main(
     tile_size: int,
     method: str,
     seed: int,
-    output_file: str,
+    output_path: str,
 ):
     torch.manual_seed(seed)
 
@@ -98,6 +143,8 @@ def main(
         generator = gen_moe_workload_balanced_random
     elif method == "balanced_layer_wise_benchmark":
         generator = gen_moe_workload_layer_wise_benchmark
+    elif method == "balanced_layer_wise_benchmark_legacy":
+        generator = functools.partial(gen_moe_workload_layer_wise_benchmark, legacy=True)
     else:
         raise ValueError(f"Invalid method: {method}.")
 
@@ -116,6 +163,21 @@ def main(
         tile_size=tile_size,
     )
 
+    if not os.path.isdir(output_path):
+        os.makedirs(output_path)
+
+    metadata = {
+        "num_tokens": num_tokens,
+        "top_k": top_k,
+        "num_experts": num_experts,
+        "ep_size": ep_size,
+        "tile_size": tile_size,
+        "method": method,
+        "seed": seed,
+    }
+    with open(f"{output_path}/metadata.json", "w") as f:
+        json.dump(metadata, f)
+
     workload = {
         "tile_idx_to_group_idx": tile_idx_to_group_idx,
         "tile_idx_to_mn_limit": tile_idx_to_mn_limit,
@@ -124,7 +186,7 @@ def main(
         "total_num_padded_tokens": total_num_padded_tokens,
         "num_non_exiting_tiles": num_non_exiting_tiles,
     }
-    safetensors.torch.save_file(workload, output_file)
+    safetensors.torch.save_file(workload, f"{output_path}/workload.safetensors")
 
 
 if __name__ == "__main__":
