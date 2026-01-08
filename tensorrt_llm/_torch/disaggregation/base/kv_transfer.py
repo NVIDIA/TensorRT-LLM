@@ -21,6 +21,8 @@ class KVSlice:
 
 
 class SessionStatus(Enum):
+    """Status of a transfer session."""
+
     INIT = "INIT"
     READY = "READY"
     TRANSFERRING = "TRANSFERRING"
@@ -36,63 +38,107 @@ TaskIdType = int
 
 @dataclass
 class SessionState:
+    """State of a transfer session."""
+
     status: SessionStatus
     finished_tasks: List[TaskIdType]
 
 
 @dataclass
 class SessionArgsBase:
-    request_id: int
+    """Base arguments for transfer sessions."""
+
     params: DisaggregatedParams
 
 
-class SenderBase(ABC): ...
+class SenderBase(ABC):
+    """Base class for sending KV cache data."""
+
+    ...
 
 
-class ReceiverBase(ABC): ...
+class ReceiverBase(ABC):
+    """Base class for receiving KV cache data."""
+
+    ...
 
 
 class TxSessionBase(ABC):
     def __init__(self, sender: SenderBase, args: SessionArgsBase):
+        """
+        Initializes the transmission session.
+        :param sender: The sender instance responsible for sending data.
+        :param args: The session arguments.
+        """
         self._base_args = args
 
     @property
     @abstractmethod
-    def state(self) -> SessionState: ...
+    def state(self) -> SessionState:
+        """
+        Returns the current state of the session.
+        """
+        ...
 
     @abstractmethod
-    def poll_task(self, id: TaskIdType) -> SessionStatus: ...
+    def poll_task(self, id: TaskIdType) -> SessionStatus:
+        """
+        Polls the status of a specific task by its ID.
+        :param id: The task ID to poll.
+        """
+        ...
 
     @abstractmethod
-    def send(self, slice: KVSlice) -> TaskIdType: ...
-
-    """
-    Async send slice to the peer. return the task id. Task state can be polled by poll_task().
-    """
+    def send(self, slice: KVSlice) -> TaskIdType:
+        """
+        Sends a slice of KV cache data and returns the task ID.
+        :param slice: The KV slice to send.
+        """
+        ...
 
     @property
     @abstractmethod
-    def exception(self) -> Optional[Exception]: ...
+    def exception(self) -> Optional[Exception]:
+        """
+        Returns any exception that occurred during the session.
+        """
+        ...
 
 
 class RxSessionBase(ABC):
     def __init__(self, receiver: ReceiverBase, args: SessionArgsBase):
+        """
+        Initializes the reception session.
+        :param receiver: The receiver instance responsible for receiving data.
+        """
         self._base_args = args
 
     @property
     @abstractmethod
-    def state(self) -> SessionState: ...
+    def state(self) -> SessionState:
+        """
+        Returns the current state of the session.
+        """
+        ...
 
     @abstractmethod
-    def poll_task(self, id: TaskIdType) -> SessionStatus: ...
+    def poll_task(self, id: TaskIdType) -> SessionStatus:
+        """
+        Polls the status of a specific task by its ID.
+        :param id: The task ID to poll.
+        """
+        ...
 
     @abstractmethod
-    def receive(self, slice: KVSlice) -> TaskIdType: ...
-
-    """
-    Async receive slice from the peer. return the task id. Task state can be polled by poll_task().
-    """
+    def receive(self, slice: KVSlice) -> TaskIdType:
+        """
+        Receives a slice of KV cache data and returns the task ID.
+        :param slice: The KV slice to receive.
+        """
+        ...
 
     @property
     @abstractmethod
-    def exception(self) -> Optional[Exception]: ...
+    def exception(self) -> Optional[Exception]:
+        """Returns any exception that occurred during the session."""
+        ...

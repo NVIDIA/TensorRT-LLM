@@ -71,49 +71,51 @@ class MessengerInterface(ABC):
         ...
 
 
-def decode_message(message: list[bytes], encoding: str = "ascii", errors: str = "strict") -> tuple:
+def decode_message(
+    message: list[bytes], encoding: str = "ascii", err_mode: str = "strict"
+) -> tuple:
     if not isinstance(message, list) or not all(isinstance(m, bytes) for m in message):
         raise ValueError("Input must be a list of bytes")
-    return tuple(m.decode(encoding, errors=errors) for m in message)
+    return tuple(m.decode(encoding, errors=err_mode) for m in message)
 
 
 class ZMQMessenger(MessengerInterface):
-    def __init__(self, mode: str, endpoint: Optional[str] = f"tcp://{get_local_ip()}:*"):
+    SOCKET_MODES = {
+        "ROUTER": zmq.ROUTER,  # Handles multiple connections and routes messages by address.
+        "DEALER": zmq.DEALER,  # Load balances outgoing messages and receives replies fairly.
+        "REQ": zmq.REQ,  # Sends requests and waits for replies (synchronous).
+        "REP": zmq.REP,  # Receives requests and sends replies (synchronous).
+    }
+
+    def __init__(self, mode: str, endpoint: Optional[str] = None):
         self._context = zmq.Context()
         self._mode = mode
-        self._socket = self._initialize_socket(mode)
-        self._closed = False
-        self._listener_thread: Optional[Thread] = None
-        self._stop_event = Event()
+        self._socket = self._context.socket(self.SOCKET_MODES[mode])
+        self._endpoint: Optional[str] = None
         self._lock = Lock()
+        self._closed = False
+        self._stop_event = Event()
+        self._listener_thread: Optional[Thread] = None
+        self._initialize_control_sockets()
 
-        self._internal_socket = self._context.socket(zmq.PAIR)
+        if endpoint is None:
+            endpoint = f"tcp://{get_local_ip()}:*"
+
+        if mode in ["ROUTER", "REP"]:
+            self._socket.bind(endpoint)
+            self._endpoint = self._socket.getsockopt_string(zmq.LAST_ENDPOINT)
+        elif mode in ["DEALER", "REQ"]:
+            self._socket.connect(endpoint)
+            self._endpoint = endpoint
+
+        logger.info(f"Initialized ZMQMessenger(mode={mode}, endpoint={self._endpoint})")
+
+    def _initialize_control_sockets(self):
         self._control_socket = self._context.socket(zmq.PAIR)
+        self._internal_socket = self._context.socket(zmq.PAIR)
         inproc_endpoint = "inproc://stop_listener"
         self._control_socket.bind(inproc_endpoint)
         self._internal_socket.connect(inproc_endpoint)
-
-        if endpoint:
-            if mode in ["ROUTER", "REP"]:
-                self._socket.bind(endpoint)
-                self._endpoint = self._socket.getsockopt_string(zmq.LAST_ENDPOINT)
-            elif mode in ["DEALER", "REQ"]:
-                self._socket.connect(endpoint)
-                self._endpoint = endpoint
-
-        logger.debug(f"Initializing ZMQMessenger, mode={mode}, endpoint={self._endpoint}")
-
-    def _initialize_socket(self, mode):
-        if mode == "ROUTER":
-            return self._context.socket(zmq.ROUTER)
-        elif mode == "DEALER":
-            return self._context.socket(zmq.DEALER)
-        elif mode == "REQ":
-            return self._context.socket(zmq.REQ)
-        elif mode == "REP":
-            return self._context.socket(zmq.REP)
-        else:
-            raise ValueError(f"Unsupported ZeroMQ socket mode: {mode}")
 
     def start(self):
         pass
@@ -131,7 +133,14 @@ class ZMQMessenger(MessengerInterface):
     def receive(self) -> list[bytes]:
         return self._socket.recv_multipart()
 
-    def start_listener(self, on_message: Callable[[list[bytes]], None]):
+    def start_listener(
+        self,
+        on_message: Callable[[list[bytes]], None],
+        on_error: Optional[Callable[[Exception], None]] = None,
+    ):
+        assert self._mode in ["ROUTER", "REP"], (
+            "Listener can only be started in ROUTER or REP modes"
+        )
         if self._listener_thread and self._listener_thread.is_alive():
             raise RuntimeError("Listener already running")
 
@@ -147,32 +156,62 @@ class ZMQMessenger(MessengerInterface):
                         self._stop_event.set()
                     elif self._socket in events:
                         messages = self.receive()
-                        persist = on_message(messages)
-                        if persist is False:
-                            self._stop_event.set()
+                        try:
+                            persist = on_message(messages)
+                            if persist is False:
+                                self._stop_event.set()
+                        except Exception as e:
+                            logger.error(f"Error in on_message callback: {e}")
+                            if on_error:
+                                on_error(e)
+                            else:
+                                self._stop_event.set()
                 except zmq.ZMQError as e:
                     logger.error(f"ZMQ Error in listener: {e}")
-                    continue
+                    if on_error:
+                        on_error(e)
+                    break
                 except Exception as e:
                     logger.error(f"Error in listener: {e}")
-                    continue
+                    if on_error:
+                        on_error(e)
+                    break
+
+            self._stop_event.set()
 
         self._listener_thread = Thread(target=listener, daemon=True)
         self._listener_thread.start()
 
     def stop(self, timeout=5):
+        def _close_socket(socket: zmq.Socket):
+            try:
+                if not socket.closed:
+                    socket.close()
+            except Exception as e:
+                logger.error(f"Error closing socket: {e}")
+
         with self._lock:
             if self._closed:
                 return
             self._closed = True
+            logger.debug("Stopping ZMQMessenger...")
+
             self._stop_event.set()
             self._internal_socket.send(b"STOP")
             if self._listener_thread:
                 self._listener_thread.join(timeout)
-            self._socket.close()
-            self._internal_socket.close()
-            self._control_socket.close()
-            self._context.term()
+                if self._listener_thread.is_alive():
+                    logger.warning("Listener thread did not terminate within timeout")
+
+            _close_socket(self._socket)
+            _close_socket(self._internal_socket)
+            _close_socket(self._control_socket)
+
+            try:
+                if self._context.closed:
+                    self._context.term()
+            except Exception as e:
+                logger.error(f"Error terminating ZMQ context: {e}")
 
     @property
     def endpoint(self) -> str:
