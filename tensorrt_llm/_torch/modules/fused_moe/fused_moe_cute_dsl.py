@@ -573,7 +573,6 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         x_sf: Optional[torch.Tensor] = None,
         enable_alltoall: bool = False,
     ) -> torch.Tensor:
-        print(f"Running into run_moe_fp8_block_scales: {self.use_cute_dsl_fp8}")
         assert self.has_deepseek_fp8_block_scales
         assert x_sf is None
         weight_dtype = self.w3_w1_weight.dtype
