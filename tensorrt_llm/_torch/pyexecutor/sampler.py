@@ -1536,9 +1536,13 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         return num_accepted_draft_tokens - 1
 
     def _is_new_request(self, request: LlmRequest) -> bool:
-        return not request.is_finished and (
-            (request.is_context_init_state and request.is_last_context_chunk)
-            or request.is_disagg_generation_transmission_complete
+        return (
+            not request.is_finished
+            and not request.py_is_draft
+            and (
+                (request.is_context_init_state and request.is_last_context_chunk)
+                or request.is_disagg_generation_transmission_complete
+            )
         )
 
     @override

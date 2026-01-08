@@ -232,6 +232,10 @@ class MTPSampler(TorchSampler):
         def __post_init__(self):
             pass  # finish_reasons has no size to compare against new_tokens in MTPSampler
 
+    def setup_sampler_step(self, scheduled_requests: ScheduledRequests):
+        # MTPSampler does not need to setup additional buffers before the sampler step
+        pass
+
     def __init__(self, args: TorchSampler.Args, *, nextn: int):
         self.mapping = None
         self.draft_len = nextn
