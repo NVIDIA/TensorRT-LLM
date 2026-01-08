@@ -26,7 +26,10 @@ from transformers import AutoTokenizer
 
 from tensorrt_llm.scaffolding import Controller, ScaffoldingLlm, TRTOpenaiWorker, Worker
 from tensorrt_llm.scaffolding.benchmark import ScaffoldingBenchRequest, async_scaffolding_benchmark
-from tensorrt_llm.scaffolding.load_generation_strategy import ConcurrentStrategy
+from tensorrt_llm.scaffolding.load_generation_strategy import (
+    ConcurrentStrategy,
+    PoissonWarmupStrategy,
+)
 from tensorrt_llm.scaffolding.task import ChatTask, SystemMessage, TaskStatus, UserMessage
 from tensorrt_llm.scaffolding.task_collection import (
     DropKVCacheWorkerTag,
@@ -851,12 +854,26 @@ async def async_multiround_chat_benchmark(args):
 
     task_collection_types = {}
     concurrency = args.multiround_concurrency
-    strategy = ConcurrentStrategy(concurrency=concurrency)
+
+    # Select strategy based on Poisson arrival flag
+    if getattr(args, "enable_poisson_arrival", False):
+        strategy = PoissonWarmupStrategy(
+            num_requests=num_requests,
+            warmup_window=getattr(args, "poisson_warmup_window", 60.0),
+            max_concurrency=concurrency,
+            random_seed=getattr(args, "poisson_arrival_seed", 42),
+        )
+    else:
+        strategy = ConcurrentStrategy(concurrency=concurrency)
 
     print("\nStarting multiround chat benchmark:")
     print(f"  Conversations: {num_requests}")
     print(f"  Max rounds: {max_rounds}")
     print(f"  Concurrency: {concurrency}")
+    if getattr(args, "enable_poisson_arrival", False):
+        print(
+            f"  Arrival: Poisson warmup (window={args.poisson_warmup_window}s, seed={args.poisson_arrival_seed})"
+        )
     print(
         f"  User delay: {data_config.user_delay.distribution} "
         f"(enabled={data_config.user_delay.enabled}, lambda={data_config.user_delay.lambda_param})"

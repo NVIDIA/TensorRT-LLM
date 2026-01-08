@@ -280,6 +280,111 @@ class PoissonRateStrategy(LoadGenerationStrategy):
         return f"{self.strategy_type}@{self.rate:.2f}"
 
 
+class PoissonWarmupStrategy(LoadGenerationStrategy):
+    """Poisson warmup strategy: requests arrive with Poisson distribution within a warmup window.
+
+    This strategy generates Poisson-distributed inter-arrival times but ensures all requests
+    arrive within a specified warmup window. The arrival times are scaled to fit within the
+    window while preserving the Poisson distribution shape.
+
+    Characteristics:
+    - All N requests arrive within the warmup_window
+    - Inter-arrival times follow Poisson distribution (scaled to fit window)
+    - Useful for benchmarking where you want controlled arrival patterns
+
+    Args:
+        num_requests: Total number of requests to send
+        warmup_window: Time window (seconds) in which all requests must arrive
+        max_concurrency: Maximum concurrency limit (optional)
+        random_seed: Random seed for reproducibility
+
+    Mathematical principle:
+        1. Generate N-1 exponentially distributed inter-arrival times (Poisson process)
+        2. Compute cumulative arrival times
+        3. Scale all arrival times to fit within [0, warmup_window]
+
+    Example:
+        strategy = PoissonWarmupStrategy(num_requests=100, warmup_window=10.0, random_seed=42)
+        # All 100 requests will arrive within 10 seconds following Poisson arrival pattern
+        # Timeline (example):
+        # t=0.00s: request 0
+        # t=0.08s: request 1
+        # t=0.15s: request 2
+        # ...
+        # t=9.87s: request 99 (all within 10s window)
+    """
+
+    strategy_type: str = "poisson_warmup"
+    num_requests: int = Field(gt=0, description="Total number of requests to send")
+    warmup_window: float = Field(gt=0, description="Time window (seconds) for all arrivals")
+    max_concurrency: Optional[int] = Field(default=None, description="Maximum concurrency limit")
+    random_seed: int = Field(default=42, description="Random seed for reproducibility")
+
+    # Pre-computed arrival times (computed lazily)
+    _arrival_times: Optional[list] = None
+
+    class Config:
+        arbitrary_types_allowed = True
+        underscore_attrs_are_private = True
+
+    def _compute_arrival_times(self) -> list:
+        """Pre-compute all arrival times using Poisson distribution scaled to warmup window."""
+        rand = random.Random(self.random_seed)
+
+        if self.num_requests == 1:
+            # Single request: send at start
+            return [0.0]
+
+        # Generate N-1 exponentially distributed inter-arrival times
+        # Using rate=1.0, we'll scale to fit the window afterward
+        inter_arrival_times = [rand.expovariate(1.0) for _ in range(self.num_requests - 1)]
+
+        # Compute cumulative arrival times (first request at t=0)
+        cumulative_times = [0.0]
+        current_time = 0.0
+        for interval in inter_arrival_times:
+            current_time += interval
+            cumulative_times.append(current_time)
+
+        # Scale to fit within warmup_window
+        # The last arrival should be at warmup_window (or slightly before)
+        max_time = cumulative_times[-1]
+        if max_time > 0:
+            scale_factor = self.warmup_window / max_time
+            arrival_times = [t * scale_factor for t in cumulative_times]
+        else:
+            # All inter-arrival times were 0 (extremely unlikely)
+            arrival_times = cumulative_times
+
+        return arrival_times
+
+    def get_semaphore(self):
+        """Return semaphore with specified concurrency limit if set."""
+        import asyncio
+
+        if self.max_concurrency is not None:
+            return asyncio.Semaphore(self.max_concurrency)
+        return _UnlimitedSemaphore()
+
+    async def _generate_request_times(self) -> AsyncGenerator[float, None]:
+        """Generate send times for all requests within the warmup window."""
+        # Compute arrival times lazily on first call
+        if self._arrival_times is None:
+            self._arrival_times = self._compute_arrival_times()
+
+        # Yield absolute timestamps (start_time + relative arrival time)
+        for relative_time in self._arrival_times:
+            yield self.start_time + relative_time
+
+        # After all pre-computed times are exhausted, continue yielding
+        # (should not happen if num_requests matches actual request count)
+        while True:
+            yield self.start_time + self.warmup_window
+
+    def __str__(self) -> str:
+        return f"{self.strategy_type}[n={self.num_requests}, window={self.warmup_window}s]"
+
+
 # Export all strategies
 __all__ = [
     "LoadGenerationStrategy",
@@ -288,4 +393,5 @@ __all__ = [
     "ThroughputStrategy",
     "ConstantRateStrategy",
     "PoissonRateStrategy",
+    "PoissonWarmupStrategy",
 ]

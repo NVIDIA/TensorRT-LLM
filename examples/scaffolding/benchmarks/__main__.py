@@ -389,6 +389,30 @@ def parse_arguments():
         help="[All benchmarks] Export task metrics to this JSON file",
     )
 
+    # =========================================================================
+    # Poisson Warmup Arrival Rate Configuration
+    # =========================================================================
+    parser.add_argument(
+        "--enable_poisson_arrival",
+        action="store_true",
+        help="[All benchmarks] Enable Poisson-distributed arrival rate within warmup window. "
+        "When enabled, requests arrive following Poisson distribution, "
+        "with all requests arriving within the warmup window.",
+    )
+    parser.add_argument(
+        "--poisson_warmup_window",
+        type=float,
+        default=60.0,
+        help="[All benchmarks] Warmup window (seconds) during which all requests must arrive "
+        "when using Poisson arrival. Default: 60.0 seconds.",
+    )
+    parser.add_argument(
+        "--poisson_arrival_seed",
+        type=int,
+        default=42,
+        help="[All benchmarks] Random seed for Poisson arrival time generation. Default: 42.",
+    )
+
     return parser.parse_args()
 
 
