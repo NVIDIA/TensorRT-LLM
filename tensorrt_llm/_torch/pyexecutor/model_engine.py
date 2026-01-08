@@ -1893,9 +1893,18 @@ class PyTorchModelEngine(ModelEngine):
             cache_indirection_buffer: Optional[torch.Tensor] = None,
             num_accepted_tokens_device: Optional[torch.Tensor] = None,
             req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None,
-            resource_manager: Optional[ResourceManager] = None):
+            resource_manager: Optional[ResourceManager] = None,
+            previous_batch_seq_slots: Optional[set] = None):
         """
         Prepare inputs for Pytorch Model.
+
+        Args:
+            previous_batch_seq_slots: Set of seq_slots that were in the previous batch.
+                Used to adjust position_id for generation requests when overlap scheduler
+                is enabled with NON_MIX_BATCHING. If a generation request was NOT in the
+                previous batch (e.g., the previous batch was context-only), the token in
+                previous_tensors_device is from an earlier batch, but max_beam_num_tokens
+                was already updated. We need to subtract 1 to match the token position.
         """
 
         new_tokens_device, new_tokens_lens_device, next_draft_tokens_device = None, None, None
@@ -2249,7 +2258,17 @@ class PyTorchModelEngine(ModelEngine):
                     first_beam = 0
                     if beam == first_beam:
                         previous_batch_indices.append(request.py_batch_idx)
-                    past_seen_token_num = request.max_beam_num_tokens
+                    # For NON_MIX_BATCHING with overlap scheduler: if the request was NOT
+                    # in the previous batch, the token in previous_tensors_device is from
+                    # an earlier batch. However, max_beam_num_tokens reflects the update
+                    # from that earlier batch's _update_requests (which incremented it).
+                    # We need to use max_beam_num_tokens - 1 to match the token's position.
+                    if (previous_batch_seq_slots is not None
+                            and request.py_seq_slot
+                            not in previous_batch_seq_slots):
+                        past_seen_token_num = request.max_beam_num_tokens - 1
+                    else:
+                        past_seen_token_num = request.max_beam_num_tokens
 
                 position_id = past_seen_token_num
                 if self.mapping.has_cp_helix():
@@ -3202,7 +3221,8 @@ class PyTorchModelEngine(ModelEngine):
             cache_indirection_buffer: Optional[torch.Tensor] = None,
             num_accepted_tokens_device: Optional[torch.Tensor] = None,
             req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None,
-            resource_manager: Optional[ResourceManager] = None):
+            resource_manager: Optional[ResourceManager] = None,
+            previous_batch_seq_slots: Optional[set] = None):
         if self.mapping is not None and 'cp_type' in self.mapping.cp_config:
             cp_type = self.mapping.cp_config['cp_type']
             if CpType.STAR == cp_type:
@@ -3215,12 +3235,11 @@ class PyTorchModelEngine(ModelEngine):
                 raise NotImplementedError(
                     f"Unsupported cp_type {getattr(cp_type, 'name', cp_type)}.")
 
-        return self._prepare_tp_inputs(scheduled_requests, kv_cache_manager,
-                                       attn_metadata, spec_metadata,
-                                       new_tensors_device,
-                                       cache_indirection_buffer,
-                                       num_accepted_tokens_device,
-                                       req_id_to_old_request, resource_manager)
+        return self._prepare_tp_inputs(
+            scheduled_requests, kv_cache_manager, attn_metadata, spec_metadata,
+            new_tensors_device, cache_indirection_buffer,
+            num_accepted_tokens_device, req_id_to_old_request, resource_manager,
+            previous_batch_seq_slots)
 
     @torch.inference_mode()
     @with_model_extra_attrs(lambda self: self.model.extra_attrs)
@@ -3232,7 +3251,8 @@ class PyTorchModelEngine(ModelEngine):
                 cache_indirection_buffer: Optional[torch.Tensor] = None,
                 spec_decoding_tensor: Optional[SpecDecodingTensor] = None,
                 num_accepted_tokens_device: Optional[torch.Tensor] = None,
-                req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None):
+                req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None,
+                previous_batch_seq_slots: Optional[set] = None):
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
 
@@ -3309,7 +3329,7 @@ class PyTorchModelEngine(ModelEngine):
                 padded_requests, kv_cache_manager, attn_metadata, spec_metadata,
                 new_tensors_device, cache_indirection_buffer,
                 num_accepted_tokens_device, req_id_to_old_request,
-                resource_manager)
+                resource_manager, previous_batch_seq_slots)
 
             with with_shared_pool(self.cuda_graph_runner.get_graph_pool()):
                 if not can_run_graph:

@@ -1342,6 +1342,39 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V3-Lite"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
 
+    @parametrize_with_ids("max_batch_size",
+                          [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048])
+    @parametrize_with_ids("max_num_tokens",
+                          [1024, 2048, 4096, 8192, 16384, 32768])
+    def test_cuda_graph_update(self, max_batch_size, max_num_tokens):
+        kv_cache_config = KvCacheConfig(dtype="fp8",
+                                        enable_block_reuse=False,
+                                        free_gpu_memory_fraction=0.75)
+        cuda_graph_config = CudaGraphConfig(enable_padding=True)
+        from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
+                                                  SchedulerConfig)
+        pytorch_config = dict(
+            attn_backend="TRTLLM",
+            moe_config=MoeConfig(backend="DEEPGEMM"),
+            print_iter_log=True,
+            enable_attention_dp=False,
+            max_batch_size=max_batch_size,
+            disable_overlap_scheduler=False,
+            scheduler_config=SchedulerConfig(
+                capacity_scheduler_policy=CapacitySchedulerPolicy.
+                NON_MIX_BATCHING, ),
+        )
+
+        with LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
+                 kv_cache_config=kv_cache_config,
+                 cuda_graph_config=cuda_graph_config,
+                 **pytorch_config) as llm:
+
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
     @pytest.mark.skip_less_device_memory(60000)
     # Chunked Prefill for MLA can only be enabled on SM100
     @parametrize_with_ids("enable_chunked_prefill", [False, True])

@@ -11,12 +11,10 @@ from tensorrt_llm._torch.models.modeling_utils import \
 from tensorrt_llm._utils import (confidential_compute_enabled,
                                  str_dtype_to_binding, torch_dtype_to_str)
 from tensorrt_llm.bindings.executor import DecodingMode
-from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig,
-                                          EagleDecodingConfig, KvCacheConfig,
-                                          MTPDecodingConfig, PeftCacheConfig,
-                                          SamplerType, SchedulerConfig,
-                                          SparseAttentionConfig,
-                                          SpeculativeConfig, TorchLlmArgs)
+from tensorrt_llm.llmapi.llm_args import (
+    CacheTransceiverConfig, CapacitySchedulerPolicy, EagleDecodingConfig,
+    KvCacheConfig, MTPDecodingConfig, PeftCacheConfig, SamplerType,
+    SchedulerConfig, SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
@@ -852,6 +850,11 @@ def create_py_executor_instance(
     if scheduler_capacity == 1 and mapping.enable_attention_dp and kv_cache_manager:
         scheduler_capacity += 1
 
+    # set the capacity scheduler policy to NON_MIX_BATCHING for CI testing
+    scheduler_config.capacity_scheduler_policy = CapacitySchedulerPolicy.NON_MIX_BATCHING
+    logger.info(
+        f"scheduler_config.capacity_scheduler_policy: {scheduler_config.capacity_scheduler_policy}"
+    )
     capacity_scheduler = BindCapacityScheduler(
         scheduler_capacity,
         kv_cache_manager.impl if kv_cache_manager is not None else None,
