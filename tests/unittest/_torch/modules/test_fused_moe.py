@@ -102,6 +102,8 @@ def test_fused_moe(moe_backend,
     if bias and moe_backend not in ["TRITON"]:
         pytest.skip("Bias not supported.")
 
+    mapping = mapping or Mapping()
+    mapping.rank = mpi_rank()
     AutoTuner.get().setup_distributed_state(mapping)
 
     torch.cuda.set_device(mapping.rank)
