@@ -1493,10 +1493,14 @@ class AutoTuner:
         else:
             raise RuntimeError("Unknown error type: {}".format(error))
 
-    def setup_distributed_state(self, mapping: Mapping):
+    def setup_distributed_state(self,
+                                mapping: Mapping,
+                                dist: Optional[Distributed] = ...):
         """Setup distributed communication state for autotuning."""
         self.mapping = mapping
-        self._dist = Distributed.get(mapping)
+        # Create dist only when dist is not provided.
+        # Use the provided dist even if it is None. This is useful for testing.
+        self._dist = Distributed.get(mapping) if dist is ... else dist
         self._debug_logger(
             f"[AutoTuner] Whether using distributed tuning: {self._is_distributed()}"
         )

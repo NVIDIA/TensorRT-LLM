@@ -655,7 +655,7 @@ class PyTorchModelEngine(ModelEngine):
         """Runs a forward pass to populate the autotuner cache."""
         if not self.llm_args.enable_autotuner:
             return
-        AutoTuner.get().setup_distributed_state(self.mapping)
+        AutoTuner.get().setup_distributed_state(self.mapping, self.dist)
         logger.info("Running autotuner warmup...")
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
