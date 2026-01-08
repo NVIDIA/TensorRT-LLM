@@ -111,10 +111,8 @@ class NemotronHMamba2Mixer(nn.Module):
         # S4D real initialization. These are not discretized!
         # The core is to load them, compute the discrete states, then write the updated state. Keeps the memory bounded
         A = torch.arange(1, self.num_heads + 1)
-        # Instead of recomputing `-torch.exp(self.A_log.float())` on every forward pass, we will register a hook
-        # that sets this appropriately when loading weights.
-        self.A_minus = nn.Parameter(-A.float())
-        self.A_minus._no_weight_decay = True
+        self.A_log = nn.Parameter(torch.log(A))
+        self.A_log._no_weight_decay = True
         self.norm = MambaRMSNormGated(
             self.intermediate_size,
             eps=self.layer_norm_epsilon,
@@ -161,9 +159,10 @@ class NemotronHMamba2Mixer(nn.Module):
         )
 
         # 3. SSM transformation
+        A = -torch.exp(self.A_log.float())
         y = torch.ops.auto_deploy.torch_ssm(
             hidden_states=hidden_states.view(batch_size, seq_len, -1, self.head_dim),
-            A=self.A_minus,
+            A=A,
             B=B.view(batch_size, seq_len, -1, self.ssm_state_size),
             C=C.view(batch_size, seq_len, -1, self.ssm_state_size),
             D=self.D,
@@ -480,7 +479,7 @@ class NemotronHPreTrainedModel(PreTrainedModel):
     def _init_weights(self, module):
         """Initialize the weights."""
         if isinstance(module, NemotronHMamba2Mixer):
-            module.A_minus._no_weight_decay = True
+            module.A_log._no_weight_decay = True
             module.D._no_weight_decay = True
 
             dt = torch.exp(
@@ -604,7 +603,6 @@ class NemotronHForCausalLM(NemotronHPreTrainedModel, GenerationMixin):
         self.backbone = NemotronHModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.register_load_state_dict_pre_hook(self._a_log_pre_hook)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -634,24 +632,6 @@ class NemotronHForCausalLM(NemotronHPreTrainedModel, GenerationMixin):
         logits = self.lm_head(hidden_states.to(self.lm_head.weight.dtype)).float()
 
         return NemotronHCausalLMOutput(logits)
-
-    @staticmethod
-    def _a_log_pre_hook(
-        module,
-        state_dict,
-        prefix,
-        local_metadata,
-        strict,
-        missing_keys,
-        unexpected_keys,
-        error_msgs,
-    ) -> None:
-        all_keys = list(state_dict.keys())
-        for key in all_keys:
-            if "A_log" in key:
-                A_log_key = key
-                A_minus_key = key.replace("A_log", "A_minus")
-                state_dict[A_minus_key] = -torch.exp(state_dict.pop(A_log_key).float())
 
 
 AutoModelForCausalLMFactory.register_custom_model_cls("NemotronHConfig", NemotronHForCausalLM)
