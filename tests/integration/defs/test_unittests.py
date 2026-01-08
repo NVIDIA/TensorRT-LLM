@@ -126,7 +126,7 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
                               f'results-sub-unittests-{case_fn}.xml')
 
     command = [
-        '-m', 'pytest', ignore_opt, "-vv", "--tb=long", "-rF", "--timeout=2400",
+        '-m', 'pytest', ignore_opt, "-vv", "--tb=short", "-rF", "--timeout=2400",
         "--timeout-method=thread"
     ]
     if test_prefix:
