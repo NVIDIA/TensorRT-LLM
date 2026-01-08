@@ -80,8 +80,7 @@ class RpcExecutorMixin:
         atexit.register(self.shutdown)
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
-        if request.id is None:
-            request.set_id(self._get_client_id(request))
+        request.set_id(self._get_next_client_id())
         logprob_params = self._get_logprob_params(request)
 
         # submit is a fire-and-forget operation, don't need to wait for response

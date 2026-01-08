@@ -12,7 +12,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import torch
 
 from tensorrt_llm._utils import mpi_disabled, nvtx_range
-from tensorrt_llm.llmapi.disagg_utils import MIN_GLOBAL_ID, get_local_request_id
+from tensorrt_llm.llmapi.disagg_utils import get_local_request_id
 from tensorrt_llm.mapping import CpType
 
 from ..distributed import Distributed
@@ -209,10 +209,12 @@ class ExecutorRequestQueue:
         return False
 
     def _get_request_id(self, request: Optional[ExecutorRequest] = None):
-        # if client id is a global disagg request id, use it
-        if request and isinstance(request.client_id,
-                                  int) and request.client_id >= MIN_GLOBAL_ID:
-            return request.client_id
+        # if request has a disagg_request_id, use it as request id so that
+        # corresponding context and generation requests have the same request id
+        if request and request.disagg_request_id and isinstance(
+                request.disagg_request_id, int):
+            return request.disagg_request_id
+
         current_id = self.next_request_id
         self.next_request_id = get_local_request_id(current_id)
         return current_id

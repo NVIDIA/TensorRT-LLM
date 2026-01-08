@@ -80,7 +80,8 @@ class DisaggServerConfig():
     perf_metrics_max_requests: int = 0
     disagg_cluster_config: Optional[DisaggClusterConfig] = None
     node_id: int = uuid.getnode(
-    ) % 1021  # moding mac by the largest 10-bit prime
+    ) % 1021  # Assuming only one disagg-server is running on a machine, moding mac by the largest 10-bit prime
+    # If this causes collisions, users can set node_id manually within range [0, 1023] in config
 
 
 @dataclass
