@@ -1324,7 +1324,7 @@ class PyTorchModelEngine(ModelEngine):
 
     def _get_all_rank_num_tokens(self, attn_metadata: AttentionMetadata):
         if self.enable_attention_dp:
-            return list(self.dist.tp_allgather(attn_metadata.num_tokens))
+            return list(self.dist.tp_cp_allgather(attn_metadata.num_tokens))
         return None
 
     def _get_all_rank_ctx_requests(self, num_ctx_requests: int):
