@@ -160,11 +160,11 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
     def cancel_request(self, req: LlmRequest):
         return self.impl.cancel_request(req)
 
-    def prepare_context_request(self, requests: List[LlmRequest]):
+    def prepare_context_request(self, request: LlmRequest):
         raise NotImplementedError
 
     def get_context_state(self):
-        raise NotImplementedError
+        return "dummy context state"
 
 
 class CacheTransBufferManager:

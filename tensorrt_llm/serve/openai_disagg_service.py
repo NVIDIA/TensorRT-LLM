@@ -19,9 +19,11 @@ from typing import Any, Callable, Dict, Optional
 from tensorrt_llm.llmapi.disagg_utils import (
     ConditionalDisaggConfig,
     DisaggClusterConfig,
+    DisaggScheduleStyle,
     DisaggServerConfig,
     MetadataServerConfig,
     ServerRole,
+    get_disagg_schedule_style,
     get_global_disagg_request_id,
 )
 from tensorrt_llm.logger import logger
@@ -77,6 +79,14 @@ class OpenAIDisaggregatedService(OpenAIService):
         self._gen_client = None
         self._disagg_cluster_manager = None
 
+        match get_disagg_schedule_style():
+            case DisaggScheduleStyle.GENERATION_FIRST:
+                self._send_disagg_request = self._send_disagg_request_gen_first
+            case DisaggScheduleStyle.CONTEXT_FIRST:
+                self._send_disagg_request = self._send_disagg_request_ctx_first
+            case _:
+                raise ValueError(f"Invalid disagg schedule style: {get_disagg_schedule_style()}")
+
     async def openai_completion(
         self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
     ) -> UCompletionResponseOrGenerator:
@@ -102,7 +112,7 @@ class OpenAIDisaggregatedService(OpenAIService):
             raise RuntimeError("Cluster is not ready")
         return await self._send_disagg_request(request, hooks)
 
-    async def _send_disagg_request(
+    async def _send_disagg_request_ctx_first(
         self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
     ) -> UCompletionResponseOrGenerator:
         if hooks:
@@ -162,16 +172,31 @@ class OpenAIDisaggregatedService(OpenAIService):
     def _get_gen_request(
         self,
         request: UCompletionRequest,
-        ctx_response: UCompletionResponse,
+        ctx_response: Optional[UCompletionResponse],
         disagg_request_id: Optional[int],
+        ctx_server_info: Optional[dict] = None,
     ) -> UCompletionRequest:
-        request.disaggregated_params = ctx_response.choices[0].disaggregated_params
-        request.disaggregated_params.request_type = "generation_only"
-        # Replace the string prompt with prompt_tokens_ids
-        if isinstance(request, CompletionRequest):
-            request.prompt = ctx_response.prompt_token_ids
-        elif isinstance(request, ChatCompletionRequest):
-            request.prompt_token_ids = ctx_response.prompt_token_ids
+        if ctx_response:
+            request.disaggregated_params = ctx_response.choices[0].disaggregated_params
+            request.disaggregated_params.request_type = "generation_only"
+            # Replace the string prompt with prompt_tokens_ids
+            if isinstance(request, CompletionRequest):
+                request.prompt = ctx_response.prompt_token_ids
+            elif isinstance(request, ChatCompletionRequest):
+                request.prompt_token_ids = ctx_response.prompt_token_ids
+        else:
+            # no ctx response, it's either a generation-only request or a generation-first disagg request
+            request.disaggregated_params = DisaggregatedParams(
+                request_type="generation_only",
+                ctx_request_id=disagg_request_id,
+                disagg_request_id=disagg_request_id,
+            )
+        if ctx_server_info and "server_info" in ctx_server_info:
+            request.disaggregated_params.encoded_opaque_state = ctx_server_info["server_info"].get(
+                "encoded_opaque_state", None
+            )
+
+        request.disaggregated_params.disagg_request_id = disagg_request_id
         return request
 
     async def _check_conditional_disagg(self, request: UCompletionRequest) -> bool:
@@ -322,3 +347,37 @@ class OpenAIDisaggregatedService(OpenAIService):
                     "Invalid disaggregated params in context phase response. disagg_request_id is None"
                 )
             return ctx_response
+
+    async def _send_disagg_request_gen_first(
+        self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
+    ) -> UCompletionResponse:
+        if hooks:
+            hooks.on_req_begin(request)
+        # empty server means client decides which server to use
+        need_ctx = not (await self._check_gen_only_disagg(request))
+        ctx_server, gen_server = None, None
+        ctx_server_info = None
+        tasks = []
+        ctx_req, gen_req = None, None
+        disagg_request_id = get_global_disagg_request_id(self._config.node_id)
+        if need_ctx:
+            ctx_server, ctx_server_info = await self._ctx_router.get_next_server(request)
+            ctx_req = self._get_ctx_request(request, disagg_request_id)
+            tasks.append(
+                asyncio.create_task(
+                    self._ctx_client.send_request(ctx_req, server=ctx_server, hooks=hooks)
+                )
+            )
+        gen_req = self._get_gen_request(
+            request,
+            ctx_response=None,
+            disagg_request_id=disagg_request_id,
+            ctx_server_info=ctx_server_info,
+        )
+        tasks.append(
+            asyncio.create_task(
+                self._gen_client.send_request(gen_req, server=gen_server, hooks=hooks)
+            )
+        )
+        responses = await asyncio.gather(*tasks)
+        return responses[-1]

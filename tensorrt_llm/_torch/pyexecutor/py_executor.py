@@ -1416,6 +1416,7 @@ class PyExecutor:
             return None, None
 
         if self.kv_cache_transceiver:
+            self._check_disagg_ctx_schedulable_status(new_requests)
             self._check_disagg_gen_transfer_status()
             self._check_kv_transfer_timeout()
 
@@ -2392,6 +2393,16 @@ class PyExecutor:
             if req.is_disagg_generation_transmission_in_progress:
                 flag_if_kv_transfer_timed_out(req, "generation")
 
+        return
+
+    @nvtx_range("_check_disagg_ctx_schedulable_status")
+    def _check_disagg_ctx_schedulable_status(self, new_requests):
+        if not self.kv_cache_transceiver:
+            return
+        ctx_only_requests = [
+            req for req in self.active_requests if req.is_context_only_request
+        ]
+        self.kv_cache_transceiver.prepare_context_requests(ctx_only_requests)
         return
 
     @nvtx_range("_pad_attention_dp_dummy_request")
