@@ -6,7 +6,6 @@ import re
 import sqlite3
 import subprocess
 import sys
-from collections import defaultdict
 from pathlib import Path
 
 import jinja2
@@ -139,7 +138,7 @@ for start, text in df.itertuples(index=False):
                 "runs": [],
                 "runs_end": [],
                 "ranges": [],
-                "range_in_module": [],
+                "kernel_count_per_range": [],
             }
         )
 
@@ -161,28 +160,7 @@ for start, end, text in df.itertuples(index=False):
         problem_set[problem_id]["runs_end"].append(end)
     else:
         problem_set[problem_id]["ranges"].append((start, end, text))
-
-# Determine whether each range is the first range that matches `args.module`,
-# and store the result in `problem["range_in_module"]`
-for problem in problem_set:
-    if args.module is not None:
-        problem["range_in_module"] = [False] * len(problem["ranges"])
-        run_ids = [bisect.bisect(problem["runs"], start) - 1 for start, _, _ in problem["ranges"]]
-        run2ranges = defaultdict(list)
-        for i, run_id in enumerate(run_ids):
-            run2ranges[run_id].append(i)
-        for run_id, ranges in run2ranges.items():
-            ranges = sorted(ranges, key=lambda i: problem["ranges"][i][0])
-            num_matches = 0
-            for range_id in ranges:
-                if problem["ranges"][range_id][2] == args.module:
-                    problem["range_in_module"][range_id] = True
-                    num_matches += 1
-            if num_matches != 1:
-                raise ValueError(
-                    f'Module "{args.module}" appears {num_matches} times'
-                    f' in "{problem["text"]}"\'s {run_id + 1}-th run'
-                )
+        problem_set[problem_id]["kernel_count_per_range"].append(0)
 
 query = """SELECT name FROM sqlite_master WHERE type = ?"""
 df = pd.read_sql_query(query, conn, params=("table",))
@@ -228,19 +206,17 @@ for (
     problem_id = bisect.bisect(problem_start, start) - 1
     problem = problem_set[problem_id]
     run_id = bisect.bisect(problem["runs"], runtime_start) - 1
-    if (
-        run_id == -1
-        or run_id == len(problem["runs"])
-        or runtime_start >= problem["runs_end"][run_id]
-    ):
-        run_id = -1
+    if run_id == -1 or runtime_start >= problem["runs_end"][run_id]:
+        continue
     ranges = [
         i
         for i, (range_start, range_end, text) in enumerate(problem["ranges"])
         if capture_start >= range_start and capture_end <= range_end
     ]
-    if args.module is None or any(problem["range_in_module"][i] for i in ranges):
-        range_names = [problem["ranges"][i][2] for i in ranges]
+    for range_id in ranges:
+        problem["kernel_count_per_range"][range_id] += 1
+    range_names = [problem["ranges"][i][2] for i in ranges]
+    if args.module is None or args.module in range_names:
         kernel_list.append(
             (
                 problem_id,
@@ -262,6 +238,22 @@ string_ids = dict(zip(df["id"], df["value"]))
 
 conn.close()
 
+# Check ambiguous modules
+if args.module:
+    for problem in problem_set:
+        num_matches_per_run = [0] * (len(problem["runs"]) + 1)
+        for i, ((range_start, _, text), kernel_count) in enumerate(
+            zip(problem["ranges"], problem["kernel_count_per_range"])
+        ):
+            if text == args.module and kernel_count > 0:
+                num_matches_per_run[bisect.bisect(problem["runs"], range_start)] += 1
+        for run_id, num_matches in enumerate(num_matches_per_run):
+            if num_matches > 1:
+                raise ValueError(
+                    f'Module is ambiguous: "{args.module}" appears {num_matches} times'
+                    f' in "{problem["text"]}"\'s {run_id}-th run'
+                )
+
 kernel_list.sort(key=lambda t: (t[6], t[8]))
 kernels = [[[] for _ in problem["runs"]] for problem in problem_set]
 for (
@@ -276,8 +268,7 @@ for (
     capture_start,
     capture_end,
 ) in kernel_list:
-    if run_id != -1:
-        kernels[problem_id][run_id].append((demangledName, start, end, ranges))
+    kernels[problem_id][run_id].append((demangledName, start, end, ranges))
 for problem_id in range(len(kernels)):
     required_seq = [demangledName for demangledName, _, _, _ in kernels[problem_id][0]]
     for run_id in range(len(kernels[problem_id])):
