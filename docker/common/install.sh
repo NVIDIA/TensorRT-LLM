@@ -156,6 +156,14 @@ fi
 
 if [ $constraints -eq 1 ]; then
     echo "Installing dependencies from constraints.txt..."
+    if [ -z "$CONSTRAINTS_FILE" ]; then
+        echo "Error: CONSTRAINTS_FILE environment variable is not set" >&2
+        exit 1
+    fi
+    if [ ! -f "$CONSTRAINTS_FILE" ]; then
+        echo "Error: Constraints file not found: $CONSTRAINTS_FILE" >&2
+        exit 1
+    fi
     pip3 install --no-cache-dir -r $CONSTRAINTS_FILE
 fi
 

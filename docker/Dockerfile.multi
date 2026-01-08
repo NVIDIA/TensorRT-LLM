@@ -32,8 +32,7 @@ FROM base AS devel
 ENV PYTORCH_ALLOC_CONF="garbage_collection_threshold:0.99999"
 
 # Copy all installation scripts at once to reduce layers
-COPY docker/common/install.sh \
-     docker/common/install_base.sh \
+COPY docker/common/install_base.sh \
      docker/common/install_cmake.sh \
      docker/common/install_ccache.sh \
      docker/common/install_cuda_toolkit.sh \
@@ -46,6 +45,9 @@ COPY docker/common/install.sh \
      docker/common/install_etcd.sh \
      constraints.txt \
      ./
+
+# Name install.sh conflicts with UCX installation
+COPY docker/common/install.sh ./install_master.sh
 
 ARG TRT_VER
 ARG CUDA_VER
@@ -63,7 +65,7 @@ RUN GITHUB_MIRROR=${GITHUB_MIRROR} \
     CUBLAS_VER=${CUBLAS_VER} \
     TORCH_INSTALL_TYPE=${TORCH_INSTALL_TYPE} \
     CONSTRAINTS_FILE=${CONSTRAINTS_FILE} \
-    bash ./install.sh --all && \
+    bash ./install_master.sh --all && \
     rm install_base.sh && \
     rm install_cmake.sh && \
     rm install_ccache.sh && \
@@ -75,7 +77,7 @@ RUN GITHUB_MIRROR=${GITHUB_MIRROR} \
     rm install_ucx.sh && \
     rm install_nixl.sh && \
     rm install_etcd.sh && \
-    rm install.sh && \
+    rm install_master.sh && \
     rm constraints.txt
 
 # Generate OSS attribution file for devel image
