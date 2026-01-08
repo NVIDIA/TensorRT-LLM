@@ -117,31 +117,28 @@ def test_get_balanced_selection():
                         raise ValueError("tokens per expert is not balanced")
 
 
-def apply_balance_ratio(imbalanced_experts, num_experts, balance_ratio, dp_size, dp_rank, ep_size):
-    num_tokens, top_k = imbalanced_experts.shape
-    dtype = imbalanced_experts.dtype
-    device = imbalanced_experts.device
-    balanced_experts = get_balanced_selection_no_cache(
-        num_tokens, top_k, num_experts, dtype, device, dp_size, dp_rank, ep_size
-    )
+def get_num_balanced_tokens(num_tokens, top_k, num_experts, dp_size, balance_ratio):
     if balance_ratio == 0.0:
-        num_balanced_tokens = 0
+        return 0
     else:
         # Activate all experts
         min_num_balanced_tokens = min(num_tokens, ceil_div(num_experts, dp_size * top_k))
-        num_balanced_tokens = min_num_balanced_tokens + round(
+        return min_num_balanced_tokens + round(
             (num_tokens - min_num_balanced_tokens) * balance_ratio
         )
-    mixed_experts = torch.cat(
-        [balanced_experts[:num_balanced_tokens], imbalanced_experts[num_balanced_tokens:]]
-    )
-    return mixed_experts
 
 
 @functools.cache
 def get_all_to_one_selection(
     num_tokens, top_k, num_experts, balance_ratio, dtype, device, dp_size, dp_rank, ep_size
 ):
+    num_balanced_tokens = get_num_balanced_tokens(
+        num_tokens, top_k, num_experts, dp_size, balance_ratio
+    )
+    balanced_experts = get_balanced_selection_no_cache(
+        num_balanced_tokens, top_k, num_experts, dtype, device, dp_size, dp_rank, ep_size
+    )
+    num_imbalanced_tokens = num_tokens - num_balanced_tokens
     experts_per_rank = num_experts // ep_size
     if top_k > experts_per_rank:
         raise ValueError(
@@ -149,29 +146,34 @@ def get_all_to_one_selection(
         )
     imbalanced_experts = (
         torch.arange(
-            dp_rank * num_tokens * top_k,
-            (dp_rank + 1) * num_tokens * top_k,
+            dp_rank * num_imbalanced_tokens * top_k,
+            (dp_rank + 1) * num_imbalanced_tokens * top_k,
             dtype=dtype,
             device=device,
-        ).view(num_tokens, top_k)
+        ).view(num_imbalanced_tokens, top_k)
         % experts_per_rank
     )
-    imbalanced_experts = imbalanced_experts.sort(dim=-1).values
-    return apply_balance_ratio(
-        imbalanced_experts, num_experts, balance_ratio, dp_size, dp_rank, ep_size
-    )
+    mixed_experts = torch.cat([balanced_experts, imbalanced_experts])
+    return mixed_experts.sort(dim=-1).values
 
 
 @functools.cache
 def get_balanced_rank_imbalanced_expert_selection(
     num_tokens, top_k, num_experts, balance_ratio, dtype, device, dp_size, dp_rank, ep_size
 ):
+    num_balanced_tokens = get_num_balanced_tokens(
+        num_tokens, top_k, num_experts, dp_size, balance_ratio
+    )
+    balanced_experts = get_balanced_selection_no_cache(
+        num_balanced_tokens, top_k, num_experts, dtype, device, dp_size, dp_rank, ep_size
+    )
+    num_imbalanced_tokens = num_tokens - num_balanced_tokens
     experts_per_rank = num_experts // ep_size
     active_experts_per_rank = ceil_div(top_k, ep_size)
     # Select expert from [0, active_experts_per_rank * ep_size),
     # then scale to [0, experts_per_rank * ep_size)
     narrow_experts = get_balanced_selection_no_cache(
-        num_tokens,
+        num_imbalanced_tokens,
         top_k,
         active_experts_per_rank * ep_size,
         dtype,
@@ -184,9 +186,8 @@ def get_balanced_rank_imbalanced_expert_selection(
         narrow_experts // active_experts_per_rank * experts_per_rank
         + narrow_experts % active_experts_per_rank
     )
-    return apply_balance_ratio(
-        imbalanced_experts, num_experts, balance_ratio, dp_size, dp_rank, ep_size
-    )
+    mixed_experts = torch.cat([balanced_experts, imbalanced_experts])
+    return mixed_experts.sort(dim=-1).values
 
 
 def make_balanced_routing_method(
