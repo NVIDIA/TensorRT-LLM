@@ -13,16 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, List, Optional, Union
+from typing import List, Optional, Union
 
 import torch
 
+import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
-    BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager, get_pp_layers)
+    BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._utils import torch_dtype_to_binding
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
+
+RnnStateManagerCpp = tensorrt_llm.bindings.internal.batch_manager.RnnStateManager
+WorldConfig = tensorrt_llm.bindings.WorldConfig
 
 
 class MambaCacheManager(BaseResourceManager):
@@ -40,128 +45,38 @@ class MambaCacheManager(BaseResourceManager):
         dtype: torch.dtype,
         ssm_cache_dtype: torch.dtype,
         layer_mask: Optional[List[bool]] = None,
+        stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
 
         self.mamba_ssm_cache_dtype = ssm_cache_dtype
 
-        # get tp size
-        tp_size = mapping.tp_size
+        world_config = WorldConfig(
+            tensor_parallelism=mapping.tp_size,
+            pipeline_parallelism=mapping.pp_size,
+            rank=mapping.rank,
+            gpus_per_node=mapping.gpus_per_node,
+        )
 
-        # derive mamba parameters for conv and ssm states
-        d_inner = head_dim * num_heads
-        conv_dim = d_inner + 2 * n_groups * d_state
-        nheads = num_heads
+        dtype_binding = torch_dtype_to_binding(dtype)
+        ssm_cache_dtype_binding = torch_dtype_to_binding(ssm_cache_dtype)
 
-        # check that can be partitioned
-        assert nheads % tp_size == 0, "nheads must be divisible by tp_size"
-        assert conv_dim % tp_size == 0, "conv_dim must be divisible by tp_size"
+        self._stream = stream if stream is not None else torch.cuda.current_stream(
+        )
 
-        # partition conv_dim and nheads
-        conv_dim = conv_dim // tp_size
-        nheads = nheads // tp_size
-
-        # conv and ssm states device
-        device = torch.device("cuda")
-
-        pp_layers, num_layers = get_pp_layers(
-            num_layers,
-            mapping,
+        self.mamba_impl = RnnStateManagerCpp(
+            d_state=d_state,
+            d_conv=d_conv,
+            num_heads=num_heads,
+            n_groups=n_groups,
+            head_dim=head_dim,
+            num_layers=num_layers,
+            max_batch_size=max_batch_size,
+            world_config=world_config,
+            stream=self._stream.cuda_stream,
+            dtype=dtype_binding,
+            ssm_cache_dtype=ssm_cache_dtype_binding,
             layer_mask=layer_mask,
         )
-        num_local_layers = len(pp_layers)
-        self.mamba_layer_offsets = {
-            idx: offset
-            for offset, idx in enumerate(pp_layers)
-        }
-
-        # mamba conv states
-        self.conv_states = torch.empty(
-            size=[
-                num_local_layers,
-                max_batch_size,
-                conv_dim,
-                d_conv - 1,
-            ],
-            dtype=dtype,
-            device=device,
-        )
-
-        # mamba ssm states
-        self.ssm_states = torch.empty(
-            size=[
-                num_local_layers,
-                max_batch_size,
-                nheads,
-                head_dim,
-                d_state,
-            ],
-            dtype=self.mamba_ssm_cache_dtype,
-            device=device,
-        )
-
-        # mamba cache available blocks
-        self.mamba_cache_free_blocks = [i for i in range(max_batch_size)]
-
-        # mamba cache index, maps request_id -> state indices
-        self.mamba_cache_index: Dict[int, int] = {}
-
-        # mamba cache state indices
-        self.state_indices: torch.Tensor = torch.arange(max_batch_size,
-                                                        device=device,
-                                                        dtype=torch.int32)
-        # save mamba state indices for requests
-        self.state_indices_list: List[int] = []
-
-    def _prepare_mamba_cache_blocks(self, request_ids: List[int]):
-        self.state_indices_list.clear()
-        for r in request_ids:
-            # cache hit
-            if r in self.mamba_cache_index:
-                self.state_indices_list.append(self.mamba_cache_index[r])
-            # cache miss
-            else:
-                if len(self.mamba_cache_free_blocks) == 0:
-                    raise Exception("run out of mamba cache blocks")
-                block = self.mamba_cache_free_blocks.pop()
-                self.mamba_cache_index[r] = block
-                self.state_indices_list.append(block)
-        self.state_indices[:len(self.state_indices_list)].copy_(
-            torch.tensor(self.state_indices_list,
-                         dtype=torch.int32,
-                         pin_memory=True),
-            non_blocking=True)
-
-    # When there exists padded requests, the state indices should not be repeated.
-    def reorder_state_indices_when_padding_requests(self, request_size,
-                                                    padding_size):
-        if padding_size == 0:
-            return
-
-        assert request_size + padding_size <= self.state_indices.numel(
-        ), "Padding requests run out of available mamba cache blocks"
-        # we can use mamba_cache_free_blocks for padding_requests
-        if padding_size <= len(self.mamba_cache_free_blocks):
-            self.state_indices[request_size:request_size +
-                               padding_size] = torch.tensor(
-                                   self.mamba_cache_free_blocks[:padding_size],
-                                   dtype=self.state_indices.dtype,
-                                   pin_memory=True).to(
-                                       self.state_indices.device,
-                                       non_blocking=True)
-        # But just finished requests won't free their used resources immediately
-        # In explicit, the running order is self.scheduler.schedule_request, self._forward_step() and self._process_previous_batch() in the PyExecutor.
-        # In this way, the current forward step will remove finished requests but will not remove mamba_cache immediately.
-        else:
-            all_mamba_cache_indices = set(range(self.state_indices.numel()))
-            allocated_indices = set(self.state_indices_list)
-            free_indices = list(all_mamba_cache_indices - allocated_indices)
-            self.state_indices[request_size:request_size +
-                               padding_size] = torch.tensor(
-                                   free_indices[:padding_size],
-                                   dtype=self.state_indices.dtype,
-                                   pin_memory=True).to(
-                                       self.state_indices.device,
-                                       non_blocking=True)
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         context_ids = [
@@ -171,33 +86,31 @@ class MambaCacheManager(BaseResourceManager):
             i.py_request_id for i in scheduled_batch.generation_requests
         ]
         request_ids = context_ids + generation_ids
-        self._prepare_mamba_cache_blocks(request_ids)
+        self.mamba_impl.allocate_cache_blocks(request_ids)
 
     def free_resources(self, request: LlmRequest):
-        request_id = request.py_request_id
-        if request_id in self.mamba_cache_index:
-            block = self.mamba_cache_index.pop(request_id)
-            self.mamba_cache_free_blocks.append(block)
+        self.mamba_impl.free_cache_block(request.py_request_id)
 
-    def get_state_indices(self) -> torch.Tensor:
-        return self.state_indices
+    def add_dummy_requests(self, request_ids: List[int], **kwargs):
+        self.mamba_impl.allocate_cache_blocks(request_ids)
+
+    def get_cache_index(self, request_id: int) -> int:
+        return self.mamba_impl.get_cache_index(request_id)
+
+    def get_state_indices(self, request_ids: List[int],
+                          is_padding: List[bool]) -> List[int]:
+        return self.mamba_impl.get_state_indices(request_ids, is_padding)
 
     def get_conv_states(self, layer_idx: int) -> torch.Tensor:
-        layer_offset = self.mamba_layer_offsets[layer_idx]
-        return self.conv_states[layer_offset]
+        return self.mamba_impl.get_conv_states(layer_idx)
 
     def get_ssm_states(self, layer_idx: int) -> torch.Tensor:
-        layer_offset = self.mamba_layer_offsets[layer_idx]
-        return self.ssm_states[layer_offset]
+        return self.mamba_impl.get_ssm_states(layer_idx)
 
     def get_mamba_ssm_cache_dtype(self) -> torch.dtype:
         return self.mamba_ssm_cache_dtype
 
     def shutdown(self):
-        # release tensor memory, keeping python references as tensors
-        self.conv_states = torch.tensor([])
-        self.ssm_states = torch.tensor([])
-        self.state_indices = torch.tensor([])
         torch.cuda.empty_cache()
 
 
@@ -253,6 +166,7 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
             mamba_cache_dtype,
             mamba_ssm_cache_dtype,
             mamba_layer_mask,
+            execution_stream,
         )
 
         # initialize kv cache manager
@@ -281,6 +195,10 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
     def free_resources(self, request: LlmRequest):
         MambaCacheManager.free_resources(self, request)
         KVCacheManager.free_resources(self, request)
+
+    def add_dummy_requests(self, request_ids: List[int], **kwargs):
+        MambaCacheManager.add_dummy_requests(self, request_ids)
+        return KVCacheManager.add_dummy_requests(self, request_ids, **kwargs)
 
     def shutdown(self):
         MambaCacheManager.shutdown(self)
