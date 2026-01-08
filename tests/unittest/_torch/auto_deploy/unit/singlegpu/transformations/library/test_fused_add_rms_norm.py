@@ -37,8 +37,9 @@ def _run_test(model):
     residual = torch.randn(bsz, seq_len, hidden, device="cuda", dtype=torch.bfloat16)
 
     # Dynamic shapes
-    ds_x = {0: Dim("batch_size", max=8)}
-    ds_res = {0: Dim("batch_size", max=8)}
+    dyn_batch_size = Dim.DYNAMIC
+    ds_x = {0: dyn_batch_size}
+    ds_res = {0: dyn_batch_size}
 
     gm = torch_export_to_gm(model, args=(x, residual), dynamic_shapes=(ds_x, ds_res), clone=True)
 
