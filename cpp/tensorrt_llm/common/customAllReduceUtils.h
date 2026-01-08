@@ -40,50 +40,12 @@ inline size_t getMaxRequiredWorkspaceSize(int worldSize) noexcept
     {
         return common::getEnvAllReduceWorkspaceSize();
     }
-    if (worldSize <= 2)
+    char const* envWorkspaceSize = std::getenv("TRTLLM_ALLREDUCE_FUSION_WORKSPACE_SIZE");
+    if (envWorkspaceSize != nullptr)
     {
-        return 16 * 1000 * 1000;
+        return static_cast<size_t>(std::atoi(envWorkspaceSize));
     }
-    return 8 * 1000 * 1000;
-}
-
-// (SM major_version, TP_size) -> (NCCL_num_token_threshold, TWO_SHOT_numel_threshold)
-inline std::unordered_map<int, std::unordered_map<int, std::pair<size_t, size_t>>> HeuristicThresholdLP{
-    {90,
-        {
-            {2, {4096, 4096 * 4096}},
-            {4, {4096, 1024 * 1024}},
-            {8, {2048, 512 * 512}},
-        }},
-    {100,
-        {
-            {2, {4096, 4096 * 4096}},
-            {4, {4096, 1024 * 2048}},
-            {8, {4096, 1024 * 1024}},
-        }},
-};
-
-inline AllReduceStrategyType SelectStrategyLP(size_t seq_len, size_t hidden_size, int world_size, AllReduceFusionOp op)
-{
-    // The heuristic is based on the following assumptions:
-    //  __________________________________
-    // |              \ TWO-SHOT zone |
-    // | ONE-SHOT zone    \           | NCCL zone
-    // |_______________________\______|___
-    // sm_major is 90 or 100
-
-    auto const sm_major = std::min(100, std::max(90, tensorrt_llm::common::getSMVersion()));
-
-    auto const [nccl_num_token_threshold, two_shot_numel_threshold] = HeuristicThresholdLP[sm_major][world_size];
-    auto const message_size = seq_len * hidden_size;
-    if (message_size >= two_shot_numel_threshold)
-    {
-        return AllReduceStrategyType::TWOSHOT;
-    }
-    else
-    {
-        return AllReduceStrategyType::ONESHOT;
-    }
+    return 67108864; // 64 MiB
 }
 
 // use 1D vector to store the best strategy instead of a map for each sm version

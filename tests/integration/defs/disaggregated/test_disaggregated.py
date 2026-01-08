@@ -30,7 +30,7 @@ except ImportError:
     import tensorrt_llm.ray_stub as ray
 
 import yaml
-from defs.common import (parse_gsm8k_output,
+from defs.common import (get_free_port_in_ci, parse_gsm8k_output,
                          revise_disagg_config_file_with_free_ports,
                          wait_for_server)
 from defs.conftest import (get_sm_version, llm_models_root, skip_arm,
@@ -40,7 +40,7 @@ from defs.trt_test_alternative import (check_call, check_output, popen,
 from test_common.perf_metrics_utils import (get_timing_metrics,
                                             validate_timing_metrics)
 
-from tensorrt_llm._utils import get_free_port, mpi_disabled
+from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.logger import logger
 
 
@@ -1601,7 +1601,7 @@ def get_config_for_benchmark(model_root, backend):
     serve_config = {
         "model": model_root,
         "hostname": "localhost",
-        "port": get_free_port(),
+        "port": get_free_port_in_ci(),
         "backend": "pytorch",
         "context_servers": {
             "num_instances": 1,
@@ -1615,7 +1615,7 @@ def get_config_for_benchmark(model_root, backend):
                 "backend": backend,
                 "max_tokens_in_buffer": 512,
             },
-            "urls": [f"localhost:{get_free_port()}"]
+            "urls": [f"localhost:{get_free_port_in_ci()}"]
         },
         "generation_servers": {
             "num_instances": 1,
@@ -1628,7 +1628,7 @@ def get_config_for_benchmark(model_root, backend):
                 "backend": backend,
                 "max_tokens_in_buffer": 512,
             },
-            "urls": [f"localhost:{get_free_port()}"]
+            "urls": [f"localhost:{get_free_port_in_ci()}"]
         }
     }
     return serve_config

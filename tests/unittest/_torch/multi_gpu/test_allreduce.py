@@ -21,14 +21,17 @@ import cloudpickle
 import pytest
 import torch
 from mpi4py import MPI
-from utils.util import skip_pre_blackwell
+from utils.util import check_accuracy, skip_pre_blackwell
 
 import tensorrt_llm
+from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams, AllReduceStrategy,
-                                             MoEAllReduce, MoEAllReduceParams)
+                                             MoEAllReduce, MoEAllReduceParams,
+                                             MPIDist, TorchDist)
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.mapping import Mapping
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
@@ -62,8 +65,16 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor = None, eps: float = 1e-6):
     return y
 
 
-def run_single_rank(tensor_parallel_size, single_rank_forward_func, input,
-                    residual, weights, hidden_size, dtype, fusion_op):
+def run_single_rank(
+    tensor_parallel_size,
+    single_rank_forward_func,
+    input,
+    residual,
+    weights,
+    hidden_size,
+    dtype,
+    fusion_op,
+):
     rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank)
     try:
@@ -91,10 +102,16 @@ def run_moe_single_rank(tensor_parallel_size, single_rank_forward_func,
 
 
 @torch.inference_mode()
-def run_allreduce_op(x: torch.Tensor, residual: torch.Tensor, hidden_size: int,
-                     dtype: torch.dtype, tensor_parallel_size: int,
-                     tensor_parallel_rank: int, weights: torch.Tensor,
-                     fusion_op: AllReduceFusionOp):
+def run_allreduce_op(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    hidden_size: int,
+    dtype: torch.dtype,
+    tensor_parallel_size: int,
+    tensor_parallel_rank: int,
+    weights: torch.Tensor,
+    fusion_op: AllReduceFusionOp,
+):
 
     def e2m1_and_ufp8sf_scale_to_float_v2(e2m1_tensor,
                                           ufp8_scale_tensor,
@@ -116,6 +133,12 @@ def run_allreduce_op(x: torch.Tensor, residual: torch.Tensor, hidden_size: int,
         tp_size=tensor_parallel_size,
         rank=tensor_parallel_rank,
     )
+    if mpi_disabled():
+        dist = TorchDist(mapping=mapping)
+    else:
+        dist = MPIDist(mapping=mapping)
+
+    AutoTuner.get().setup_distributed_state(mapping, dist)
     linear = Linear(
         in_features=hidden_size,
         out_features=hidden_size,
@@ -128,13 +151,11 @@ def run_allreduce_op(x: torch.Tensor, residual: torch.Tensor, hidden_size: int,
     allreduce = AllReduce(mapping=mapping)
     norm = RMSNorm(hidden_size=hidden_size, eps=eps, dtype=dtype).cuda()
 
+    allreduce = AllReduce(mapping=mapping).cuda()
+
     scale = torch.tensor(1.0, dtype=torch.float32).cuda()
     linear.load_weights([dict(weight=weights[0])])
     norm.weight.data.copy_(norm_weight)
-
-    def calc_allreduce(x, res):
-        linear_out = linear(x)
-        return [linear_out]
 
     def calc_fused_allreduce(x, res):
         linear_out = linear(
@@ -150,7 +171,7 @@ def run_allreduce_op(x: torch.Tensor, residual: torch.Tensor, hidden_size: int,
                 eps=eps,
             ),
         )
-        return output
+        return [output] if fusion_op == AllReduceFusionOp.NONE else output
 
     def calc_residual_rms_norm_quant_fp8(x, res):
         quant_fp8, residual_out = calc_fused_allreduce(x, res)
@@ -215,7 +236,7 @@ def run_allreduce_op(x: torch.Tensor, residual: torch.Tensor, hidden_size: int,
         return norm_out, dequant_fp4, residual_out
 
     fusion_op_to_func = {
-        AllReduceFusionOp.NONE: (calc_allreduce, ref_allreduce),
+        AllReduceFusionOp.NONE: (calc_fused_allreduce, ref_allreduce),
         AllReduceFusionOp.RESIDUAL_RMS_NORM: (calc_fused_allreduce,
                                               ref_residual_rms_norm),
         AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8:
@@ -234,26 +255,19 @@ def run_allreduce_op(x: torch.Tensor, residual: torch.Tensor, hidden_size: int,
 
     # common allreduce path
     xs = torch.chunk(x.clone(), tensor_parallel_size, dim=-1)
-    calc_output = calc_func(xs[tensor_parallel_rank], residual)
+
+    # trigger autotune
+    with autotune():
+        calc_output = calc_func(xs[tensor_parallel_rank], residual)
+
     ref_output = ref_func(xs[tensor_parallel_rank], residual)
 
     for calc_output_tensor, ref_output_tensor in zip(calc_output, ref_output):
-        rtol, atol = 0.05, 0.15
-        try:
-            torch.testing.assert_close(
-                calc_output_tensor,
-                ref_output_tensor,
-                rtol=rtol,
-                atol=atol,
-            )
-        except AssertionError:
-            # Calculate percentage of mismatched elements
-            mismatched = torch.abs(calc_output_tensor - ref_output_tensor) > (
-                rtol * torch.abs(ref_output_tensor) + atol)
-            mismatch_percentage = (mismatched.sum() / mismatched.numel())
-
-            # If more than 1% elements mismatch, raise the error
-            assert mismatch_percentage < 0.01, f"Large mismatched elements encountered"
+        check_accuracy(calc_output_tensor,
+                       ref_output_tensor,
+                       atol=0.05,
+                       rtol=0.15,
+                       percent=0.99)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2,

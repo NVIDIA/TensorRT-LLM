@@ -692,7 +692,6 @@ class AllReduce(nn.Module):
         self._disable_mpi = mpi_disabled()
 
         self.all_reduce_op = torch.ops.trtllm.allreduce_pg if self._disable_mpi else torch.ops.trtllm.allreduce
-
         if self.mapping.tp_size > 1:
             # Initialize Symmetric Memory AllReduce if needed (before workspace allocation)
             if self.strategy == AllReduceStrategy.SYMM_MEM:
@@ -788,6 +787,7 @@ class AllReduce(nn.Module):
         input = input.contiguous()  # Underlying op requires contiguous input
 
         allreduce_strategy = self.strategy
+
         if all_reduce_params is None:
             all_reduce_params = AllReduceParams()
 
@@ -831,21 +831,42 @@ class AllReduce(nn.Module):
                 "pg": pg.boxed(),
             }
 
-        output = self.all_reduce_op(
-            input=input,
-            residual=all_reduce_params.residual,
-            norm_weight=all_reduce_params.norm_weight,
-            scale=all_reduce_params.scale,
-            bias=all_reduce_params.bias,
-            workspace=self.workspace,
-            group=self.mapping.tp_group,
-            strategy=allreduce_strategy,
-            op=all_reduce_params.fusion_op,
-            eps=all_reduce_params.eps,
-            trigger_completion_at_end=all_reduce_params.
-            trigger_completion_at_end,
-            **additional_args,
-        )
+        # In case that AutoTuner brings potential perf regression
+        # TODO: Remove this if no perf regression is observed.
+        disable_allreduce_autotune = os.environ.get(
+            "TLLM_DISABLE_ALLREDUCE_AUTOTUNE", "0") == "1"
+
+        if allreduce_strategy == AllReduceStrategy.AUTO and not disable_allreduce_autotune and not self._disable_mpi:
+            output = torch.ops.trtllm.tunable_allreduce(
+                input=input,
+                residual=all_reduce_params.residual,
+                norm_weight=all_reduce_params.norm_weight,
+                scale=all_reduce_params.scale,
+                bias=all_reduce_params.bias,
+                workspace=self.workspace,
+                group=self.mapping.tp_group,
+                strategy=allreduce_strategy,
+                op=all_reduce_params.fusion_op,
+                eps=all_reduce_params.eps,
+                trigger_completion_at_end=all_reduce_params.
+                trigger_completion_at_end,
+            )
+        else:
+            output = self.all_reduce_op(
+                input=input,
+                residual=all_reduce_params.residual,
+                norm_weight=all_reduce_params.norm_weight,
+                scale=all_reduce_params.scale,
+                bias=all_reduce_params.bias,
+                workspace=self.workspace,
+                group=self.mapping.tp_group,
+                strategy=allreduce_strategy,
+                op=all_reduce_params.fusion_op,
+                eps=all_reduce_params.eps,
+                trigger_completion_at_end=all_reduce_params.
+                trigger_completion_at_end,
+                **additional_args,
+            )
 
         return output if len(output) > 1 else output[0]
 

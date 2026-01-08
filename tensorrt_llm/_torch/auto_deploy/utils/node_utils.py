@@ -304,6 +304,16 @@ def is_any_lin_op(node: Node) -> bool:
     return is_linear_op(node) or is_fake_quantized_linear_op(node)
 
 
+def is_fp4_op(node: Node) -> bool:
+    return is_op(
+        node,
+        [
+            torch.ops.auto_deploy.torch_quant_nvfp4_linear,
+            torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear,
+        ],
+    )
+
+
 def is_any_moe_op(node: Node) -> bool:
     return is_op(
         node,
@@ -607,17 +617,16 @@ def predecessors(
     """
     preds = []
     seen = set()
-    for arg in node.args:
-        if isinstance(arg, Node):
-            if ((not include) or (include and include(arg))) and (not exclude or not exclude(arg)):
-                if arg not in seen:
-                    preds.append(arg)
-                    seen.add(arg)
-            if depth > 1:
-                for p in predecessors(arg, depth - 1, include, exclude):
-                    if p not in seen:
-                        preds.append(p)
-                        seen.add(p)
+    for arg in node.all_input_nodes:
+        if ((not include) or (include and include(arg))) and (not exclude or not exclude(arg)):
+            if arg not in seen:
+                preds.append(arg)
+                seen.add(arg)
+        if depth > 1:
+            for p in predecessors(arg, depth - 1, include, exclude):
+                if p not in seen:
+                    preds.append(p)
+                    seen.add(p)
     return preds
 
 
@@ -688,7 +697,7 @@ def subgraph(
             def boundary_condition(n):
                 return n in sources_set
 
-        attr_next = "args"
+        attr_next = "all_input_nodes"
     elif sources is not None:
         # case 2
         assert boundary_condition is not None, "boundary_condition must be provided for case 2"
@@ -702,7 +711,7 @@ def subgraph(
         # Initialize queue with sinks and mark them as seen
         queue = list(sinks)
         start_nodes = set(sinks)
-        attr_next = "args"
+        attr_next = "all_input_nodes"
     else:
         raise ValueError("Either sinks or sources must be provided")
 
@@ -733,16 +742,20 @@ def subgraph(
     return subgraph_nodes
 
 
-def get_weight_shape(
-    node: Node, dim: Optional[int] = None
-) -> Optional[Union[int, Tuple[int, ...]]]:
+def get_weight_shape(node: Node, dim: Optional[int] = None) -> Optional[Union[int, List[int]]]:
     """Get the shape of the weight node."""
     if not is_any_lin_op(node):
         return None
+    s = list(shape(extract_weight_node(node)))
+    if len(s) == 0:
+        return None
+    if is_fp4_op(node):
+        # FP4 weights are packed as uint8 type with 2 FP4 values per element
+        s[-1] *= 2
     if dim is None:
-        return shape(extract_weight_node(node))
+        return s
     else:
-        return shape(extract_weight_node(node))[dim]
+        return s[dim]
 
 
 def get_layer_after_linear_node(

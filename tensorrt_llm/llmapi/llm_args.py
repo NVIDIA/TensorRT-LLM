@@ -287,9 +287,8 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
                                       description="The topk for the indexer.")
     indexer_max_chunk_size: Optional[int] = Field(
         default=None, description="The maximum chunk size for the indexer.")
-    # TODO: enable this by default once the memory usage in attention metadata is optimized
     skip_indexer_for_short_seqs: bool = Field(
-        default=False,
+        default=True,
         description=
         "Whether to skip the MQA and Top-K in the indexer for short sequences.")
 

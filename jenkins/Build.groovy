@@ -585,7 +585,7 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
     parallelJobs.failFast = enableFailFast
 
     if (cpu_arch == X86_64_TRIPLE && !reuseArtifactPath) {
-        def key = "Build with build type Debug"
+        def key = "Build With Build Type Debug"
         parallelJobs += [
         (key): {
             script {
@@ -628,7 +628,7 @@ pipeline {
         HF_DATASETS_OFFLINE=1
     }
     stages {
-        stage("BuildJob") {
+        stage("Build Job") {
             steps {
                 launchStages(this, params.targetArch, params.enableFailFast, globalVars)
             }

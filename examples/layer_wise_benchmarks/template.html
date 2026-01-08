@@ -313,6 +313,7 @@
     const columnLabels = [];
     let columnTotals = [];
     let totalNode = null; // Special node for the "Total" row
+    let numCols = null;
 
     const fmt = (num) => num.toFixed(1);
 
@@ -332,7 +333,7 @@
         const topLevelTimes = rawData.map(aggregate);
 
         // Calculate Totals
-        const numCols = topLevelTimes[0].length;
+        numCols = topLevelTimes[0].length;
         columnTotals = new Array(numCols).fill(0);
         for (let c = 0; c < numCols; c++) {
             columnTotals[c] = topLevelTimes.reduce((sum, row) => sum + row[c], 0);
@@ -420,7 +421,8 @@
                 const total = columnTotals[colIdx] || 1;
                 const pct = (val / total) * 100;
 
-                html += `<td class="data-cell col-${colIdx}" onclick="handleCellClick('${uniqueId}', ${colIdx})">
+                html += `<td class="data-cell col-${colIdx}" ${val ? "title=\"" + fmt(val) + "\"" : ""}
+                             onclick="handleCellClick('${uniqueId}', ${colIdx})">
                             <div class="progress-bar" style="width: ${pct}%;"></div>
                             <div class="cell-content">${val ? fmt(val) : ""}</div>
                          </td>`;
@@ -717,6 +719,7 @@
     });
 
     window.onload = () => {
+        document.getElementById('kernelTable').style["min-width"] = Math.max(1000, (220 + 60 * numCols)) + "px";
         renderHeader();
         document.getElementById('tableBody').innerHTML = renderTableBody(rawData, 0);
         renderTotalRow();
@@ -741,7 +744,6 @@
         for (let node of rawData) {
             maxDepth = Math.max(maxDepth, getDepth(node));
         }
-        console.log(maxDepth);
 
         const container = document.getElementById('level-buttons');
         if (container) {
