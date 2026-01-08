@@ -40,6 +40,7 @@ from visual_gen.configs.parallel import get_dit_parallel_config
 from visual_gen.configs.pipeline import PipelineConfig
 from visual_gen.utils.auto_tuner import TunableParam
 from visual_gen.utils.logger import get_logger
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 logger = get_logger(__name__)
 
@@ -187,16 +188,17 @@ class DefaultAttn(BaseAttn):
         if tensor_layout == "NHD":
             query, key, value = self._convert_qkv_layout(query, key, value, src_layout="NHD", dst_layout="HND")
 
-        output = F.scaled_dot_product_attention(
-            query,
-            key,
-            value,
-            attn_mask=attn_mask,
-            dropout_p=dropout_p,
-            is_causal=is_causal,
-            scale=scale,
-            enable_gqa=enable_gqa,
-        )
+        with sdpa_kernel(backends=[SDPBackend.CUDNN_ATTENTION]):
+            output = F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+                is_causal=is_causal,
+                scale=scale,
+                enable_gqa=enable_gqa,
+            )
 
         if tensor_layout == "NHD":
             output = self._convert_output_layout(output, src_layout="HND", dst_layout="NHD")

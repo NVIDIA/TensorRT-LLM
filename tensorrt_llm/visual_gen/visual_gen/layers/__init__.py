@@ -22,14 +22,26 @@ from .attention import ditAttnProcessor
 from .linear import ditLinear
 from .norm import ditLayerNorm, ditRMSNorm
 
+import re
+from typing import Callable
+
 __all__ = ["ditAttnProcessor", "ditLinear", "apply_visual_gen_linear"]
 
 
-def apply_visual_gen_linear(model: nn.Module, load_parameters: bool = True, quantize_weights: bool = True):
+def apply_visual_gen_linear(model: nn.Module, 
+                    load_parameters: bool = True, 
+                    quantize_weights: bool = True,
+                    exclude_pattern: str = "",
+                    amax_values: dict[str, float] | None = None,
+                    to_input_scale: Callable | None = None,
+):
+    # check if amax_values and to_input_scale are both None or both not None
+    assert (amax_values is None) == (to_input_scale is None)
+    exclude_pattern_ = re.compile(exclude_pattern)
     # Collect all linear modules to replace first to avoid modifying during iteration
     linear_modules_to_replace = []
     for name, module in model.named_modules():
-        if isinstance(module, nn.Linear):
+        if isinstance(module, nn.Linear) and exclude_pattern_.match(name) is None:
             linear_modules_to_replace.append(name)
 
     # Replace linear modules
@@ -40,6 +52,12 @@ def apply_visual_gen_linear(model: nn.Module, load_parameters: bool = True, quan
             parent = getattr(parent, attr)
         module = getattr(parent, attrs[-1])
         linear = ditLinear.from_linear(module, load_parameters)
+        if amax_values is not None:
+            linear.amax_values = amax_values[name+".input_quantizer"]
+        if to_input_scale is not None:
+            linear.input_scale = to_input_scale(linear.amax_values)
+            print(f"[visual_gen] {name} input_scale: {linear.input_scale}, amax_values: {linear.amax_values}")
+            linear.use_real_input_scale = True
         # must under no_grad to avoid memory leak
         if quantize_weights:
             with torch.no_grad():
