@@ -70,9 +70,12 @@ def _patched_phi3_long_emb_init(
     self,
 ):
     _patched_phi3_emb_init(self)
-    self.ext_factors = torch.tensor(
+    ext_factors_tensor = torch.tensor(
         self.short_factor, dtype=torch.float32, device=torch.device("cpu")
     )
+    if hasattr(self, "ext_factors"):
+        delattr(self, "ext_factors")
+    self.register_buffer("ext_factors", ext_factors_tensor, persistent=False)
 
 
 # Copied from https://huggingface.co/microsoft/Phi-3-mini-4k-instruct/blob/main/modeling_phi3.py#L151
