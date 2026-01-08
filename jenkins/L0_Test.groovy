@@ -3393,7 +3393,7 @@ def launchTestJobs(pipeline, testFilter)
     // Python version and OS for sanity check
     x86SanityCheckConfigs = [
         "PY312-DLFW": [
-            LLM_DOCKER_IMAGE,
+            LLM_DOCKER_IMAGE,  // Workaround ABI incompatibilities between PyTorch 2.9.1 and 2.10.0a0
             "B200_PCIe",
             X86_64_TRIPLE,
             false,
@@ -3422,6 +3422,7 @@ def launchTestJobs(pipeline, testFilter)
     ]
 
     aarch64SanityCheckConfigs = [
+        /* //Disable PY312-UB2404 temporarily since it is currently duplicated with PY312-DLFW.
         "PY312-UB2404": [
             LLM_DOCKER_IMAGE,
             "GH200",
@@ -3430,7 +3431,7 @@ def launchTestJobs(pipeline, testFilter)
             "",
             DLFW_IMAGE,
             false, // Extra PyTorch CUDA 13.0 install
-        ],
+        ],*/
         "PY312-DLFW": [
             LLM_DOCKER_IMAGE,
             "GH200",

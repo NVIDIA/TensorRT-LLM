@@ -120,7 +120,7 @@ install_tensorrt() {
     PARSED_PY_VERSION=$(echo "${PY_VERSION//./}")
 
     TRT_CUDA_VERSION=${CUDA_VER}
-    # No cuda-13.1 version for TensorRT yet, use cuda-13.0 instead
+    # No CUDA 13.1 version for TensorRT yet. Use CUDA 13.0 package instead.
     if [ "$CUDA_VER" = "13.1" ]; then
         TRT_CUDA_VERSION="13.0"
     fi
