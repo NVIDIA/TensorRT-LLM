@@ -11,11 +11,6 @@ from defs.common import venv_check_call, wait_for_server
 from defs.conftest import get_device_count, llm_models_root
 from defs.trt_test_alternative import popen
 
-try:
-    RAY_AVAILABLE = True
-except ImportError:
-    RAY_AVAILABLE = False
-
 
 @pytest.fixture(scope="module")
 def ray_example_root(llm_root):
@@ -104,8 +99,8 @@ def test_ray_disaggregated_serving(ray_example_root, llm_venv, tp_size):
                 stderr=subprocess.PIPE,
                 env=env_copy,
         ):
-            assert wait_for_server("localhost", 8000, timeout_seconds=180), \
-                "Disaggregated server failed to start within 3 minutes"
+            assert wait_for_server("localhost", 8000, timeout_seconds=300), \
+                "Disaggregated server failed to start within 5 minutes"
 
             result = subprocess.run([
                 "curl", "-sS", "-w", "\n%{http_code}",

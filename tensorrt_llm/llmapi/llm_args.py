@@ -20,9 +20,10 @@ from strenum import StrEnum
 from transformers import PreTrainedTokenizerBase
 
 try:
-    from ray.util.placement_group import PlacementGroup
+    from ray.util.placement_group import PlacementGroup, placement_group
 except ImportError:
     PlacementGroup = None
+    placement_group = None
 
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
@@ -1212,6 +1213,18 @@ class RayPlacementConfig(StrictBaseModel):
         "Example: 0.1 means 10 actors can share one GPU. Defaults to 1.0 (one actor per GPU)."
     )
 
+    gpu_per_bundle: int = Field(
+        default=1,
+        description=
+        "Number of GPUs per bundle when creating placement groups from lists. "
+        "Used when placement_groups contains lists of GPU indices (YAML mode).")
+
+    cpu_per_bundle: int = Field(
+        default=1,
+        description=
+        "Number of CPUs per bundle when creating placement groups from lists. "
+        "Used when placement_groups contains lists of GPU indices (YAML mode).")
+
     @model_validator(mode='after')
     def validate_ray_placement(self) -> 'RayPlacementConfig':
         has_pgs = self.placement_groups is not None
@@ -1242,6 +1255,64 @@ class RayPlacementConfig(StrictBaseModel):
                     f"got {self.per_worker_gpu_share}")
 
         return self
+
+    def convert_lists_to_placement_groups(
+            self,
+            master_address: Optional[str] = None,
+            strategy: str = "STRICT_PACK") -> List[Any]:
+        """Convert list-based placement_groups to actual Ray PlacementGroup objects.
+
+        This method handles the case where placement_groups contains lists of GPU indices
+        (from YAML config) and converts them to Ray PlacementGroup objects.
+
+        Args:
+            master_address: Optional master node address for head node affinity.
+            strategy: Ray placement group strategy (default: "STRICT_PACK").
+
+        Returns:
+            List of PlacementGroup objects.
+        """
+        if placement_group is None:
+            raise RuntimeError(
+                "Ray is not available. Cannot convert lists to PlacementGroups."
+            )
+
+        if self.placement_groups is None:
+            raise RuntimeError("placement_groups is None, nothing to convert.")
+
+        try:
+            import ray
+        except ModuleNotFoundError:
+            raise RuntimeError(
+                "Ray is not available. Cannot convert lists to PlacementGroups."
+            )
+
+        converted_pgs = []
+        for i, pg in enumerate(self.placement_groups):
+            if isinstance(pg, list):
+                # List of GPU indices - create PlacementGroup
+                num_bundles = len(pg)
+                bundles = [{
+                    "GPU": self.gpu_per_bundle,
+                    "CPU": self.cpu_per_bundle
+                } for _ in range(num_bundles)]
+
+                # Add node affinity to first bundle of first group (head node)
+                if i == 0 and master_address:
+                    head_tag = f"node:{master_address}"
+                    bundles[0][head_tag] = 0.01
+
+                new_pg = placement_group(bundles, strategy=strategy)
+                ray.get(new_pg.ready())
+                converted_pgs.append(new_pg)
+            elif PlacementGroup is not None and isinstance(pg, PlacementGroup):
+                converted_pgs.append(pg)
+            else:
+                raise TypeError(
+                    f"placement_groups[{i}] must be a Ray PlacementGroup or list, "
+                    f"got {type(pg).__name__}")
+
+        return converted_pgs
 
 
 class PybindMirror(ABC):
