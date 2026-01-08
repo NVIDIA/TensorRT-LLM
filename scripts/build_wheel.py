@@ -370,6 +370,7 @@ def check_missing_libs(lib_name: str) -> list[str]:
 
 def generate_python_stubs_linux(binding_type: str, venv_python: Path,
                                 deep_ep: bool, flash_mla: bool,
+                                transfer_agent_binding: bool,
                                 binding_lib_name: str):
     is_nanobind = binding_type == "nanobind"
     if is_nanobind:
@@ -411,6 +412,16 @@ def generate_python_stubs_linux(binding_type: str, venv_python: Path,
             build_run(
                 f"\"{venv_python}\" -m pybind11_stubgen -o . deep_ep_cpp_tllm --exit-code",
                 env=env_stub_gen)
+        if transfer_agent_binding:
+            # Generate stubs for tensorrt_llm_transfer_agent_binding
+            if is_nanobind:
+                build_run(
+                    f"\"{venv_python}\" -m nanobind.stubgen -m tensorrt_llm_transfer_agent_binding -O .",
+                    env=env_stub_gen)
+            else:
+                build_run(
+                    f"\"{venv_python}\" -m pybind11_stubgen -o . tensorrt_llm_transfer_agent_binding --exit-code",
+                    env=env_stub_gen)
     finally:
         if link_dir:
             rmtree(link_dir)
@@ -458,6 +469,7 @@ def main(*,
          trt_root: str = '/usr/local/tensorrt',
          nccl_root: str = None,
          nixl_root: str = None,
+         mooncake_root: str = None,
          internal_cutlass_kernels_root: str = None,
          clean: bool = False,
          clean_wheel: bool = False,
@@ -558,6 +570,11 @@ def main(*,
 
     if nixl_root is not None:
         cmake_def_args.append(f"-DNIXL_ROOT={nixl_root}")
+
+    if mooncake_root is not None:
+        if on_windows:
+            raise RuntimeError("Mooncake is not supported on Windows.")
+        cmake_def_args.append(f"-DMOONCAKE_ROOT={mooncake_root}")
 
     build_dir = get_build_dir(build_dir, build_type)
     first_build = not Path(build_dir, "CMakeFiles").exists()
@@ -795,17 +812,15 @@ def main(*,
                 build_run(
                     f"find {ucx_dir} -type f -name '*.so*' -exec patchelf --set-rpath \'$ORIGIN:$ORIGIN/ucx:$ORIGIN/../\' {{}} \\;"
                 )
-        if os.path.exists(
-                build_dir /
-                "tensorrt_llm/executor/cache_transmission/nixl_utils/libtensorrt_llm_nixl_wrapper.so"
-        ):
-            install_file(
-                build_dir /
-                "tensorrt_llm/executor/cache_transmission/nixl_utils/libtensorrt_llm_nixl_wrapper.so",
-                lib_dir / "libtensorrt_llm_nixl_wrapper.so")
+        # NIXL wrapper and libraries
+        nixl_utils_dir = build_dir / "tensorrt_llm/executor/cache_transmission/nixl_utils"
+        if os.path.exists(nixl_utils_dir / "libtensorrt_llm_nixl_wrapper.so"):
+            install_file(nixl_utils_dir / "libtensorrt_llm_nixl_wrapper.so",
+                         lib_dir / "libtensorrt_llm_nixl_wrapper.so")
             build_run(
                 f'patchelf --set-rpath \'$ORIGIN/nixl/\' {lib_dir / "libtensorrt_llm_nixl_wrapper.so"}'
             )
+            # Copy NIXL libraries
             if os.path.exists("/opt/nvidia/nvda_nixl"):
                 nixl_dir = lib_dir / "nixl"
                 if nixl_dir.exists():
@@ -819,6 +834,23 @@ def main(*,
                 build_run(
                     f"find {nixl_dir} -type f -name '*.so*' -exec patchelf --set-rpath \'$ORIGIN:$ORIGIN/plugins:$ORIGIN/../:$ORIGIN/../ucx/:$ORIGIN/../../ucx/\' {{}} \\;"
                 )
+        # Install tensorrt_llm_transfer_agent_binding Python module (standalone agent bindings)
+        # This is built when either NIXL or Mooncake is enabled
+        # Install to tensorrt_llm/ (same level as bindings.so)
+        agent_binding_so = list(
+            nixl_utils_dir.glob("tensorrt_llm_transfer_agent_binding*.so"))
+        if agent_binding_so:
+            trtllm_dir = project_dir / "tensorrt_llm"
+            install_file(agent_binding_so[0],
+                         trtllm_dir / agent_binding_so[0].name)
+        if os.path.exists(
+                build_dir /
+                "tensorrt_llm/executor/cache_transmission/mooncake_utils/libtensorrt_llm_mooncake_wrapper.so"
+        ):
+            install_file(
+                build_dir /
+                "tensorrt_llm/executor/cache_transmission/mooncake_utils/libtensorrt_llm_mooncake_wrapper.so",
+                lib_dir / "libtensorrt_llm_mooncake_wrapper.so")
         install_file(
             build_dir /
             "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/libdecoder_attention_0.so",
@@ -932,6 +964,7 @@ def main(*,
                         binding_type, venv_python,
                         bool(deep_ep_cuda_architectures),
                         bool(flash_mla_cuda_architectures),
+                        nixl_root is not None or mooncake_root is not None,
                         binding_lib_file_name)
 
     if not skip_building_wheel:
@@ -1041,6 +1074,10 @@ def add_arguments(parser: ArgumentParser):
                         help="Directory containing NCCL headers and libraries")
     parser.add_argument("--nixl_root",
                         help="Directory containing NIXL headers and libraries")
+    parser.add_argument(
+        "--mooncake_root",
+        help=
+        "Directory containing Mooncake transfer engine headers and libraries")
     parser.add_argument(
         "--internal-cutlass-kernels-root",
         default="",

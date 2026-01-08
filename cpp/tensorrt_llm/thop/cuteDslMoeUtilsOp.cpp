@@ -205,24 +205,26 @@ std::tuple<torch::Tensor, torch::optional<torch::Tensor>> moe_permute(torch::Ten
 
 // Unpermute
 
-torch::Tensor moe_unpermute(torch::Tensor const& permuted_input, torch::Tensor const& expanded_idx_to_permuted_idx,
-    torch::Tensor const& topk_scales)
+void moe_unpermute_inplace(torch::Tensor const& permuted_input, torch::Tensor const& output,
+    torch::Tensor const& expanded_idx_to_permuted_idx, torch::Tensor const& topk_scales)
 {
     TORCH_CHECK(permuted_input.dim() == 2, "permuted_input must be 2D.");
     int64_t const max_num_permuted_tokens = permuted_input.size(0);
     int64_t const hidden_size = permuted_input.size(1);
+    TORCH_CHECK(output.dim() == 2, "output must be 2D.");
+    int64_t const num_tokens = output.size(0);
+    TORCH_CHECK(output.size(1) == hidden_size, "output.size(1) must be hidden_size.");
+
     TORCH_CHECK(expanded_idx_to_permuted_idx.dim() == 2, "expanded_idx_to_permuted_idx must be 2D.");
-    int64_t const num_tokens = expanded_idx_to_permuted_idx.size(0);
+    TORCH_CHECK(
+        expanded_idx_to_permuted_idx.size(0) == num_tokens, "expanded_idx_to_permuted_idx.size(0) must be num_tokens.");
     int64_t const top_k = expanded_idx_to_permuted_idx.size(1);
     TORCH_CHECK(topk_scales.dim() == 2, "topk_scales must be 2D.");
     TORCH_CHECK(topk_scales.size(0) == num_tokens, "topk_scales.size(0) must be num_tokens.");
     TORCH_CHECK(topk_scales.size(1) == top_k, "topk_scales.size(1) must be top_k.");
-
     TORCH_CHECK(max_num_permuted_tokens >= num_tokens * top_k,
         "max_num_permuted_tokens must be greater than or equal to num_tokens * top_k.");
 
-    auto output
-        = torch::empty({num_tokens, hidden_size}, torch::dtype(permuted_input.scalar_type()).device(torch::kCUDA));
     auto const& stream = at::cuda::getCurrentCUDAStream(permuted_input.get_device());
 
 #define DISPATCH_MOE_UNPERMUTE(InputType, TopKScaleType)                                                               \
@@ -253,7 +255,19 @@ torch::Tensor moe_unpermute(torch::Tensor const& permuted_input, torch::Tensor c
     }
 
 #undef DISPATCH_MOE_UNPERMUTE
+}
 
+torch::Tensor moe_unpermute(torch::Tensor const& permuted_input, torch::Tensor const& expanded_idx_to_permuted_idx,
+    torch::Tensor const& topk_scales)
+{
+    TORCH_CHECK(permuted_input.dim() == 2, "permuted_input must be 2D.");
+    int64_t const hidden_size = permuted_input.size(1);
+    TORCH_CHECK(expanded_idx_to_permuted_idx.dim() == 2, "expanded_idx_to_permuted_idx must be 2D.");
+    int64_t const num_tokens = expanded_idx_to_permuted_idx.size(0);
+
+    auto output
+        = torch::empty({num_tokens, hidden_size}, torch::dtype(permuted_input.scalar_type()).device(torch::kCUDA));
+    moe_unpermute_inplace(permuted_input, output, expanded_idx_to_permuted_idx, topk_scales);
     return output;
 }
 
@@ -489,6 +503,9 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "moe_permute(Tensor input, Tensor? input_sf, Tensor tile_idx_to_mn_limit, Tensor permuted_idx_to_expanded_idx, "
         "Tensor num_non_exiting_tiles, int tile_tokens_dim, int top_k) -> (Tensor, Tensor?)");
+    m.def(
+        "moe_unpermute_inplace(Tensor permuted_input, Tensor(a!) output, Tensor expanded_idx_to_permuted_idx, Tensor "
+        "topk_scales) -> ()");
     m.def("moe_unpermute(Tensor permuted_input, Tensor expanded_idx_to_permuted_idx, Tensor topk_scales) -> Tensor");
     m.def(
         "moe_output_memset_inplace(Tensor(a!) input, Tensor tile_idx_to_mn_limit, Tensor expanded_idx_to_permuted_idx, "
@@ -510,6 +527,7 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
     m.impl("moe_topk_sort", &tensorrt_llm::torch_ext::moe_topk_sort);
     m.impl("moe_sort", &tensorrt_llm::torch_ext::moe_sort);
     m.impl("moe_permute", &tensorrt_llm::torch_ext::moe_permute);
+    m.impl("moe_unpermute_inplace", &tensorrt_llm::torch_ext::moe_unpermute_inplace);
     m.impl("moe_unpermute", &tensorrt_llm::torch_ext::moe_unpermute);
     m.impl("moe_output_memset_inplace", &tensorrt_llm::torch_ext::moe_output_memset_inplace);
     m.impl("moe_swiglu", &tensorrt_llm::torch_ext::moe_swiglu);

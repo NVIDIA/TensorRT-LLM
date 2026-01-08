@@ -101,14 +101,8 @@ class MultimodalEncoder(_TorchLLM):
 
         inputs = [prompt_inputs(i) for i in inputs]
 
-        def _item_at(maybe_batched: Union[Any, Sequence[Any]], pos: int) -> Any:
-            if isinstance(maybe_batched, list):
-                return maybe_batched[pos]
-            else:
-                return maybe_batched
-
         futures = []
-        for i, request_inputs in enumerate(inputs):
+        for request_inputs in inputs:
             future = self.generate_async(request_inputs)
             futures.append(future)
 

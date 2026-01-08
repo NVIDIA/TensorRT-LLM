@@ -250,6 +250,10 @@ Qwen3/Qwen3-Next-80B-A3B-Instruct:
 moonshotai/Kimi-K2-Instruct:
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 87.65
+moonshotai/Kimi-K2-Thinking:
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 85.83
 nvidia/Llama-3_3-Nemotron-Super-49B-v1:
   - accuracy: 79.43
   - quant_algo: FP8
@@ -341,4 +345,16 @@ mistralai/Mistral-Nemo-12b-Base:
   - quant_algo: FP8
     accuracy: 69.66
 mistral/Mistral-Large-3-675B:
-  - accuracy: 87.54
+  - accuracy: 85.30
+  - spec_dec_algo: Eagle
+    accuracy: 85.30
+nvidia/Nemotron-Super-V3:
+  - accuracy: 81.07
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 77.56
+nvidia/Nemotron-3-Nano:
+  - accuracy: 73.85
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 74.35

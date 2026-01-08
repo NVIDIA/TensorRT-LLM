@@ -77,6 +77,11 @@ def add_llm_args(parser):
                         choices=["auto", "TorchSampler", "TRTLLMSampler"])
     parser.add_argument('--tp_size', type=int, default=1)
     parser.add_argument('--pp_size', type=int, default=1)
+    parser.add_argument('--orchestrator_type',
+                        type=str,
+                        default=None,
+                        choices=[None, 'rpc', 'ray'],
+                        help='Orchestrator type for multi-GPU execution')
     parser.add_argument('--moe_ep_size', type=int, default=-1)
     parser.add_argument('--moe_tp_size', type=int, default=-1)
     parser.add_argument('--moe_cluster_size', type=int, default=-1)
@@ -151,6 +156,11 @@ def add_llm_args(parser):
     parser.add_argument('--allow_advanced_sampling',
                         default=False,
                         action='store_true')
+    parser.add_argument('--eagle3_model_arch',
+                        type=str,
+                        default="llama3",
+                        choices=["llama3", "mistral_large3"],
+                        help="The model architecture of the eagle3 model.")
 
     # Relaxed acceptance
     parser.add_argument('--use_relaxed_acceptance_for_thinking',
@@ -219,8 +229,8 @@ def setup_llm(args, **kwargs):
             eagle_choices=args.eagle_choices,
             use_dynamic_tree=args.use_dynamic_tree,
             dynamic_tree_max_topK=args.dynamic_tree_max_topK,
-            allow_advanced_sampling=args.allow_advanced_sampling)
-
+            allow_advanced_sampling=args.allow_advanced_sampling,
+            eagle3_model_arch=args.eagle3_model_arch)
     elif spec_decode_algo == "DRAFT_TARGET":
         spec_config = DraftTargetDecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,
@@ -283,6 +293,7 @@ def setup_llm(args, **kwargs):
         trust_remote_code=args.trust_remote_code,
         gather_generation_logits=args.return_generation_logits,
         max_beam_width=args.max_beam_width,
+        orchestrator_type=args.orchestrator_type,
         **kwargs)
 
     use_beam_search = args.max_beam_width > 1
@@ -292,7 +303,7 @@ def setup_llm(args, **kwargs):
             args.n = args.max_beam_width
         assert best_of <= args.max_beam_width, f"beam width: {best_of}, should be less or equal to max_beam_width: {args.max_beam_width}"
 
-    assert best_of >= args.n, f"In sampling mode best_of value: {best_of} should be less or equal to n: {args.n}"
+    assert best_of >= args.n, f"In sampling mode best_of value: {best_of} should be greater than or equal to n: {args.n}"
 
     sampling_params = SamplingParams(
         max_tokens=args.max_tokens,

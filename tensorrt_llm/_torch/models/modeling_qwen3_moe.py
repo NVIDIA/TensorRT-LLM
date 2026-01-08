@@ -327,6 +327,7 @@ class Qwen3MoEModel(DecoderModel):
         self.aux_stream_dict = {
             AuxStreamType.MoeChunkingOverlap: torch.cuda.Stream(),
             AuxStreamType.MoeBalancer: torch.cuda.Stream(),
+            AuxStreamType.MoeOutputMemset: torch.cuda.Stream(),
         }
         self.preload_weight_modules = []
         if config.moe_backend == "TRTLLM":

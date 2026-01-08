@@ -1,11 +1,13 @@
+import json
 import threading
-from typing import Optional
+from typing import List, Optional
 
 from ..llmapi.mpi_session import MpiPoolSession, MpiSession
-from ..llmapi.utils import logger_debug
+from ..llmapi.utils import logger_debug, print_colored
 from ..logger import logger
 from .executor import GenerationExecutor
 from .postproc_worker import PostprocWorkerConfig
+from .result import IterationResult
 from .rpc_proxy_mixin import RpcExecutorMixin
 from .rpc_worker import RpcWorker
 from .utils import create_mpi_comm_session, get_spawn_proxy_process_env
@@ -69,20 +71,110 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
                                 **self.worker_kwargs)
 
     def _setup_mainloop_with_tasks(self):
-        """Setup mainloop with all tasks needed for RpcProxy."""
+        """Setup mainloop with tasks needed for RpcProxy.
+
+        Note: Stats and kv_events are now fetched on-demand via direct RPC calls
+        (get_stats, aget_stats, get_kv_events, aget_kv_events), not via streaming loops.
+        """
         tasks = [
             self._fetch_responses_loop_async,
-            self._fetch_stats_loop_async,
         ]
-        # Only add kv_cache_events loop if it's enabled
-        if self._iter_kv_events_result:
-            tasks.append(self._fetch_kv_cache_events_loop_async)
-
         # Call mixin's setup_mainloop with custom tasks
         self.setup_mainloop(tasks=tasks, thread_name="rpc_proxy_main_loop")
 
-    def fetch_stats_remote(self):
-        return self.rpc_client.fetch_stats().remote()
+    def get_stats(self, timeout: float) -> List[dict]:
+        """Get iteration statistics from the runtime via RPC.
+
+        Args:
+            timeout (float): Max wait time in seconds for the RPC call.
+
+        Returns:
+            List[dict]: A list of runtime stats as dict.
+        """
+        try:
+            stats = self.rpc_client.fetch_stats_wait_async(
+                timeout=timeout).remote()
+            return [json.loads(s) if isinstance(s, str) else s for s in stats]
+        except Exception as e:
+            logger.debug(f"Error fetching stats via RPC: {e}")
+            return []
+
+    def aget_stats(self, timeout: float) -> IterationResult:
+        """Get iteration statistics from the runtime via RPC (async).
+
+        Args:
+            timeout (float): Max wait time in seconds for the RPC call.
+
+        Returns:
+            IterationResult: An async iterable object containing runtime stats.
+        """
+        self._maybe_initialize_iteration_results()
+
+        if self._iter_stats_result is None:
+            print_colored("Iteration statistics are not available yet.\n",
+                          "yellow")
+            from .executor import empty_async_iterable
+            return empty_async_iterable()
+
+        # Fetch stats via RPC and populate the result
+        try:
+            stats = self.rpc_client.fetch_stats_wait_async(
+                timeout=timeout).remote()
+        except Exception:
+            stats = []
+
+        for stat in stats:
+            self._iter_stats_result.queue.put(stat)
+
+        self._iter_stats_result.set_timeout(timeout)
+        return self._iter_stats_result
+
+    def get_kv_events(self, timeout: float) -> List[dict]:
+        """Get iteration KV events from the runtime via RPC.
+
+        Args:
+            timeout (float): Max wait time in seconds for the RPC call.
+
+        Returns:
+            List[dict]: A list of runtime events as dict.
+        """
+        try:
+            # Events are already serialized by the worker's fetch_kv_cache_events_wait_async()
+            events = self.rpc_client.fetch_kv_cache_events_wait_async(
+                timeout=timeout).remote()
+            return [json.loads(e) if isinstance(e, str) else e for e in events]
+        except Exception as e:
+            logger.debug(f"Error fetching kv events via RPC: {e}")
+            return []
+
+    def aget_kv_events(self, timeout: float) -> IterationResult:
+        """Get iteration KV events from the runtime via RPC (async).
+
+        Args:
+            timeout (float): Max wait time in seconds for the RPC call.
+
+        Returns:
+            IterationResult: An async iterable object containing runtime events.
+        """
+        # Initialize iteration result if needed
+        self._maybe_initialize_iteration_results()
+
+        if self._iter_kv_events_result is None:
+            from .executor import empty_async_iterable
+            return empty_async_iterable()
+
+        # Fetch kv events via RPC and populate the result
+        try:
+            events = self.rpc_client.fetch_kv_cache_events_wait_async(
+                timeout=timeout).remote()
+        except Exception:
+            events = []
+
+        for event in events:
+            self._iter_kv_events_result.queue.put(event)
+
+        self._iter_kv_events_result.set_timeout(timeout)
+        return self._iter_kv_events_result
 
     def setup_engine_remote(self):
         return self.rpc_client.setup_engine().remote(need_response=True)

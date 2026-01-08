@@ -12,11 +12,12 @@ from typing import Any, Callable, Dict, Mapping, Tuple, Type, Union, final
 
 import torch.nn as nn
 from pydantic import BaseModel, Field
-from torch.fx import GraphModule
+from torch.fx import GraphModule, Node
 
 from ..models.factory import ModelFactory
 from ..shim.interface import CachedSequenceInterface
 from ..utils._graph import (
+    add_graph_input,
     canonicalize_graph,
     lift_to_meta,
     named_graphmodules,
@@ -504,6 +505,19 @@ class BaseTransform(ABC):
         raise NotImplementedError(
             f"Transform {self.get_transform_key()} only supports `run_per_gm=True`."
         )
+
+    def _add_or_retrieve_input(
+        self, gm: GraphModule, cm: CachedSequenceInterface, name: str
+    ) -> Node:
+        """Add or retrieve an input node from the graph."""
+        input_nodes = gm.graph.find_nodes(op="placeholder", target=name)
+        if len(input_nodes) == 0:
+            cm.info.activate_arg(name)
+            return add_graph_input(gm, name)
+        elif len(input_nodes) == 1:
+            return input_nodes[0]
+        else:
+            raise ValueError(f"Expected exactly one input node for {name=}, got {input_nodes=}")
 
 
 class TransformRegistry:

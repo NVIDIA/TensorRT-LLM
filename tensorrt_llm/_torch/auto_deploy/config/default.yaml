@@ -75,12 +75,15 @@ transforms:
     stage: pattern_matcher
   quantize_mxfp4_moe:
     stage: pattern_matcher
+  detect_hidden_states_for_capture:
+    stage: pattern_matcher
   detect_sharding:
     stage: sharding
     simple_shard_only: false
     sharding_source: ['manual', 'factory', 'heuristic']
     support_partial_config: true
     sharding_dims: ['tp', 'ep', 'bmm']
+    shard_all_unprocessed: true
     allreduce_strategy: 'NCCL'
     dist_backend: auto
     requires_shape_prop: true
@@ -123,6 +126,9 @@ transforms:
     stage: post_load_fusion
     enabled: true
     backend: trtllm
+  fuse_nvfp4_moe:
+    stage: post_load_fusion
+    enabled: false
   fuse_allreduce_residual_rmsnorm:
     stage: post_load_fusion
   # TODO (lucaslie): add backend selection as part of configurable inference optimizers
@@ -134,12 +140,16 @@ transforms:
   fuse_add_rms_norm:
     stage: post_load_fusion
     enabled: true
+  gather_logits_before_lm_head:
+    stage: post_load_fusion
+    # TODO: fix https://github.com/NVIDIA/TensorRT-LLM/issues/9878 to enable by default
+    enabled: false
   ############################################################################################
   # VISUALIZE GRAPH
   ############################################################################################
   visualize_namespace:
     stage: visualize
-    enabled: false # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/8460
+    enabled: false
   ############################################################################################
   # SWITCH TO CACHED+FLATTENED ATTENTION + INITIALIZE CACHES
   ############################################################################################
@@ -158,6 +168,9 @@ transforms:
   insert_cached_delta_rule:
     stage: cache_init
     backend: fla_delta
+  insert_cached_residual_add:
+    stage: cache_init
+    backend: cached_residual_add
   initialize_cache:
     stage: cache_init
     run_per_gm: false

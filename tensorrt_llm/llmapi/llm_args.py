@@ -194,12 +194,17 @@ class BaseSparseAttentionConfig(StrictBaseModel):
         "The sequence length threshold for separating short and long sequences."
     )
 
+    @property
+    def algorithm(self) -> str:
+        raise NotImplementedError("Algorithm must be implemented in subclasses")
+
     @classmethod
     def from_dict(cls, data: dict):
         # dispatch to the correct sparse attention config
         config_classes = {
             "rocket": RocketSparseAttentionConfig,
             "dsa": DeepSeekSparseAttentionConfig,
+            "skip_softmax": SkipSoftmaxAttentionConfig,
         }
 
         algorithm = data.get("algorithm", None)
@@ -282,9 +287,8 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
                                       description="The topk for the indexer.")
     indexer_max_chunk_size: Optional[int] = Field(
         default=None, description="The maximum chunk size for the indexer.")
-    # TODO: enable this by default once the memory usage in attention metadata is optimized
     skip_indexer_for_short_seqs: bool = Field(
-        default=False,
+        default=True,
         description=
         "Whether to skip the MQA and Top-K in the indexer for short sequences.")
 
@@ -302,6 +306,35 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
         """
         self.seq_len_threshold = self.index_topk
         return self.skip_indexer_for_short_seqs
+
+
+class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
+    """
+    Configuration for skip softmax attention.
+    """
+    algorithm: ClassVar[str] = "skip_softmax"
+    threshold_scale_factor: Optional[Union[float, Dict[str, float]]] = Field(
+        default=None,
+        description="The threshold scale factor for skip softmax attention.")
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(**data)
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
+
+    @property
+    def threshold_scale_factor_prefill(self) -> Optional[float]:
+        if isinstance(self.threshold_scale_factor, dict):
+            return self.threshold_scale_factor.get('prefill', None)
+        return self.threshold_scale_factor
+
+    @property
+    def threshold_scale_factor_decode(self) -> Optional[float]:
+        if isinstance(self.threshold_scale_factor, dict):
+            return self.threshold_scale_factor.get('decode', None)
+        return self.threshold_scale_factor
 
 
 class MoeLoadBalancerConfig(StrictBaseModel):
@@ -821,6 +854,9 @@ class EagleDecodingConfig(DecodingBaseConfig):
     max_non_leaves_per_layer: Optional[int] = None
     eagle3_one_model: Optional[bool] = True
     eagle3_layers_to_capture: Optional[Set[int]] = None
+    # The model architecture of the eagle3 model.
+    # choices: llama3, mistral_large3
+    eagle3_model_arch: str = "llama3"
 
     def __init__(self, **kwargs):
         super().__init__()
@@ -844,6 +880,9 @@ class EagleDecodingConfig(DecodingBaseConfig):
             setattr(self, attr_name, attr_value)
 
         assert self.max_draft_len is not None, "max_draft_len is required for Eagle"
+        if self.eagle3_model_arch == "mistral_large3" and self.eagle3_layers_to_capture is None:
+            # FIXME find a better way to setup it.
+            self.eagle3_layers_to_capture = {-1}
 
         # Static tree logic
         # Checks whether the input eagle choices is valid
@@ -1551,6 +1590,7 @@ SpeculativeConfig: TypeAlias = Optional[Union[
 SparseAttentionConfig: TypeAlias = Union[
     RocketSparseAttentionConfig,
     DeepSeekSparseAttentionConfig,
+    SkipSoftmaxAttentionConfig,
 ]
 
 
@@ -1739,10 +1779,11 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
     Configuration for the cache transceiver.
     """
 
-    backend: Optional[Literal["DEFAULT", "UCX", "NIXL", "MPI"]] = Field(
-        default=None,
-        description=
-        "The communication backend type to use for the cache transceiver.")
+    backend: Optional[Literal[
+        "DEFAULT", "UCX", "NIXL", "MOONCAKE", "MPI"]] = Field(
+            default=None,
+            description=
+            "The communication backend type to use for the cache transceiver.")
 
     max_tokens_in_buffer: Optional[int] = Field(
         default=None,
@@ -1836,6 +1877,14 @@ class BaseLlmArgs(StrictBaseModel):
         default='auto',
         description="The mode to initialize the tokenizer.",
         json_schema_extra={"type": "Literal['auto', 'slow']"})
+
+    custom_tokenizer: Optional[str] = Field(
+        default=None,
+        description="Specify a custom tokenizer implementation. Accepts either: "
+        "(1) a built-in alias (e.g., 'deepseek_v32'), or "
+        "(2) a Python import path (e.g., 'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer'). "
+        "The tokenizer class must implement 'from_pretrained(path, **kwargs)' and the TokenizerBase interface.",
+        status="prototype")
 
     skip_tokenizer_init: bool = Field(
         default=False,
@@ -2186,6 +2235,41 @@ class BaseLlmArgs(StrictBaseModel):
         """Initialize tokenizer based on configuration."""
         if self.skip_tokenizer_init:
             self.tokenizer = None
+        elif self.custom_tokenizer:
+            # If tokenizer is already a tokenizer object, custom_tokenizer is not compatible
+            if isinstance(self.tokenizer,
+                          (TokenizerBase, PreTrainedTokenizerBase)):
+                raise ValueError(
+                    "Cannot use custom_tokenizer when tokenizer is already a tokenizer object. "
+                    "Please specify a tokenizer path or leave it as None to load from model path."
+                )
+
+            # Support short aliases for built-in tokenizers
+            TOKENIZER_ALIASES = {
+                'deepseek_v32':
+                'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer',
+            }
+
+            tokenizer_path = TOKENIZER_ALIASES.get(self.custom_tokenizer,
+                                                   self.custom_tokenizer)
+
+            # Dynamically import and use custom tokenizer
+            from importlib import import_module
+            try:
+                module_path, class_name = tokenizer_path.rsplit('.', 1)
+                module = import_module(module_path)
+                tokenizer_class = getattr(module, class_name)
+                # Use tokenizer path if specified, otherwise use model path
+                load_path = self.tokenizer if self.tokenizer else self.model
+                self.tokenizer = tokenizer_class.from_pretrained(
+                    load_path,
+                    trust_remote_code=self.trust_remote_code,
+                    use_fast=self.tokenizer_mode != 'slow')
+            except (ValueError, ImportError, AttributeError) as e:
+                raise ValueError(
+                    f"Failed to load custom tokenizer '{self.custom_tokenizer}': {e}. "
+                    "Expected format: 'module.path.ClassName' or a recognized alias."
+                ) from e
         else:
             self.tokenizer = tokenizer_factory(
                 self.tokenizer,

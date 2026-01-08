@@ -23,10 +23,10 @@ cache_transceiver_config:
   kv_transfer_sender_future_timeout_ms: <int>
 ```
 
-The following is an example, consisting of the `ctx_extra-llm-api-config.yaml` and `gen_extra-llm-api-config.yaml` files needed in the sections below.
+The following is an example, consisting of the `ctx_config.yaml` and `gen_config.yaml` files needed in the sections below.
 
 ```yaml
-# ctx_extra-llm-api-config.yaml
+# ctx_config.yaml
 
 # The overlap scheduler for context servers is currently disabled, as it is
 # not yet supported in disaggregated context server architectures.
@@ -37,11 +37,180 @@ cache_transceiver_config:
 ```
 
 ```yaml
-# gen_extra-llm-api-config.yaml
+# gen_config.yaml
 
 cache_transceiver_config:
   backend: UCX
   max_tokens_in_buffer: 2048
+```
+
+## NIXL Backend Configuration
+
+NIXL supports multiple underlying communication backends for KV cache exchange. The backend can be configured using the `TRTLLM_NIXL_KVCACHE_BACKEND` environment variable.
+
+**Supported NIXL backends:**
+- **UCX** (default)
+- **LIBFABRIC** (available from v0.16.0)
+
+If an unsupported backend is specified, NIXL will automatically fall back to UCX.
+
+### LIBFABRIC Backend Setup
+
+**Important Note:** The TensorRT LLM container does not include libfabric or the NIXL-LIBFABRIC plugin by default. You must either rebuild NIXL with libfabric support or provide a pre-compiled plugin.
+
+#### Prerequisites
+
+##### For LIBFABRIC Backend
+
+**Required Dependencies:**
+
+**Libfabric**
+- Custom libfabric installation is available via [https://ofiwg.github.io/libfabric/](https://ofiwg.github.io/libfabric/)
+- **Minimum required version:** v1.21.0
+- For EFA-enabled AWS instances, install through the [AWS EFA installer](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/efa-start.html) (recommend using the latest version)
+
+**hwloc**
+- hwloc is used to understand the underlying architecture to optimize application performance
+- **Suggested version:** 2.10.0 or newer
+
+**Network Hardware Requirements:**
+- Validated compatibility with AWS EFA (Elastic Fabric Adapter)
+
+##### For UCX Backend
+
+UCX is typically pre-installed in NVIDIA GPU containers. No additional installation is usually required.
+
+#### Installation Options
+
+##### Option 1: Rebuild NIXL with LIBFABRIC Support (Recommended)
+
+1. **Install libfabric dependencies:**
+   - Follow the installation instructions from the links above based on your system
+
+2. **Install hwloc:**
+   - Use your package manager or build from source
+
+3. **Reinstall NIXL after installing libfabric:**
+   - After installing libfabric and hwloc, you must rebuild NIXL to generate the LIBFABRIC plugin
+   - You can base your installation on the TensorRT LLM NIXL installation script located at `docker/common/install_nixl.sh`
+   - Modify the meson setup command in the script to include the libfabric path:
+     ```bash
+     meson setup builddir \
+         ...
+         -Dlibfabric_path=/path/to/libfabric \  # Add this line
+         --buildtype=release
+     ```
+   - For more details, see the [NIXL LIBFABRIC Plugin documentation](https://github.com/ai-dynamo/nixl/tree/6ee64753605b3110f8ef96c7cfc2f1315675c9c7/src/plugins/libfabric#nixl-libfabric-plugin)
+
+##### Option 2: Use Pre-compiled LIBFABRIC Plugin
+
+If you have a pre-compiled `libplugin_LIBFABRIC.so` that matches your NIXL version:
+
+1. Place the plugin file in a directory of your choice
+2. Set the environment variable to point to the plugin directory:
+   ```bash
+   export NIXL_PLUGINS_DIR=/path/to/plugin/directory
+   export TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC
+   ```
+3. Ensure the plugin was built with the same NIXL version as in your container
+
+### NIXL Configuration Examples
+
+To use NIXL for KV cache exchange, configure the `cache_transceiver_config` with `backend: NIXL`. The underlying NIXL backend (UCX or LIBFABRIC) is selected via the `TRTLLM_NIXL_KVCACHE_BACKEND` environment variable.
+
+**Context server configuration:**
+```yaml
+# context_config_nixl.yml
+disable_overlap_scheduler: True
+cache_transceiver_config:
+  backend: NIXL
+  max_tokens_in_buffer: 2048
+```
+
+**Generation server configuration:**
+```yaml
+# gen_config_nixl.yml
+cache_transceiver_config:
+  backend: NIXL
+  max_tokens_in_buffer: 2048
+```
+
+#### Example 1: Using NIXL with UCX backend (default)
+
+```bash
+# UCX is the default, but can be explicitly set
+export TRTLLM_NIXL_KVCACHE_BACKEND=UCX  # Optional, UCX is default
+
+# Start Context servers with NIXL using UCX
+CUDA_VISIBLE_DEVICES=0 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+  --host localhost --port 8001 --backend pytorch \
+  --config ./context_config_nixl.yml &> log_ctx_0 &
+
+CUDA_VISIBLE_DEVICES=1 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+  --host localhost --port 8002 --backend pytorch \
+  --config ./context_config_nixl.yml &> log_ctx_1 &
+
+# Start Generation server with NIXL using UCX
+CUDA_VISIBLE_DEVICES=2 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+  --host localhost --port 8003 --backend pytorch \
+  --config ./gen_config_nixl.yml &> log_gen_0 &
+```
+
+#### Example 2: Using NIXL with LIBFABRIC backend
+
+```bash
+# Configure NIXL to use LIBFABRIC backend
+export TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC
+
+# If using pre-compiled plugin:
+# export NIXL_PLUGINS_DIR=/path/to/plugin/directory
+
+# For AWS EFA (optional):
+# export FI_PROVIDER=efa
+# export FI_EFA_USE_DEVICE_RDMA=1
+# export FI_LOG_LEVEL=warn
+
+# Start Context servers with NIXL using LIBFABRIC
+CUDA_VISIBLE_DEVICES=0 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+  --host localhost --port 8001 --backend pytorch \
+  --config ./context_config_nixl.yml &> log_ctx_0 &
+
+CUDA_VISIBLE_DEVICES=1 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+  --host localhost --port 8002 --backend pytorch \
+  --config ./context_config_nixl.yml &> log_ctx_1 &
+
+# Start Generation server with NIXL using LIBFABRIC
+CUDA_VISIBLE_DEVICES=2 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+  --host localhost --port 8003 --backend pytorch \
+  --config ./gen_config_nixl.yml &> log_gen_0 &
+```
+
+### Environment Variables for NIXL Backends
+
+**NIXL Backend Selection:**
+- `TRTLLM_NIXL_KVCACHE_BACKEND`: Selects the underlying backend for NIXL. Valid options:
+  - `UCX` (default)
+  - `LIBFABRIC` (available from v0.16.0)
+  - If an unsupported value is provided, NIXL automatically falls back to UCX
+
+**Additional Environment Variables by Backend:**
+
+**For UCX backend:**
+- `UCX_MAX_RNDV_RAILS`: Maximum number of InfiniBand NIC devices per GPU. Setting to 1 can reduce contention in multi-GPU scenarios
+- Standard UCX environment variables apply
+
+**For LIBFABRIC backend:**
+- `NIXL_PLUGINS_DIR`: Directory containing the NIXL LIBFABRIC plugin (`libplugin_LIBFABRIC.so`) if using pre-compiled plugin
+- `FI_PROVIDER`: Specifies the libfabric provider to use (e.g., `efa` for AWS EFA)
+- `FI_EFA_USE_DEVICE_RDMA`: Set to `1` to enable GPU Direct RDMA on AWS EFA (if supported)
+- `FI_LOG_LEVEL`: Controls libfabric logging verbosity (e.g., `warn`, `info`, `debug`)
+
+**Example configuration for AWS EFA with LIBFABRIC:**
+```bash
+export TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC
+export FI_PROVIDER=efa
+export FI_EFA_USE_DEVICE_RDMA=1
+export FI_LOG_LEVEL=warn
 ```
 
 ### Basic Usage
@@ -54,16 +223,16 @@ Suppose we have three CUDA devices on the same machine. The first two devices ar
 # Start context servers
 CUDA_VISIBLE_DEVICES=0 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
     --host localhost --port 8001 \
-    --extra_llm_api_options ./ctx_extra-llm-api-config.yaml &> log_ctx_0 &
+    --config ./ctx_config.yaml &> log_ctx_0 &
 
 CUDA_VISIBLE_DEVICES=1 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
     --host localhost --port 8002 \
-    --extra_llm_api_options ./ctx_extra-llm-api-config.yaml &> log_ctx_1 &
+    --config ./ctx_config.yaml &> log_ctx_1 &
 
 # Start generation server
 CUDA_VISIBLE_DEVICES=2 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
     --host localhost --port 8003 \
-    --extra_llm_api_options ./gen_extra-llm-api-config.yaml &> log_gen_0 &
+    --config ./gen_config.yaml &> log_gen_0 &
 ```
 
 Once the context and generation servers are launched, you can launch the disaggregated
@@ -131,16 +300,16 @@ After starting the node and entering interactive mode, you can run the following
 # Start context servers
 CUDA_VISIBLE_DEVICES=0 trtllm-llmapi-launch trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
     --host localhost --port 8001 \
-    --extra_llm_api_options ./ctx_extra-llm-api-config.yaml &> log_ctx_0 &
+    --config ./ctx_config.yaml &> log_ctx_0 &
 
 CUDA_VISIBLE_DEVICES=1 trtllm-llmapi-launch trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
     --host localhost --port 8002 \
-    --extra_llm_api_options ./ctx_extra-llm-api-config.yaml &> log_ctx_1 &
+    --config ./ctx_config.yaml &> log_ctx_1 &
 
 # Start generation server
 CUDA_VISIBLE_DEVICES=2 trtllm-llmapi-launch trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
     --host localhost --port 8003 \
-    --extra_llm_api_options ./gen_extra-llm-api-config.yaml &> log_gen_0 &
+    --config ./gen_config.yaml &> log_gen_0 &
 
 # Start proxy
 trtllm-llmapi-launch trtllm-serve disaggregated -c disagg_config.yaml
@@ -182,7 +351,7 @@ srun -A <account> -p <partition> -t <time> \
     --container-image=<container_image> \
     --container-mounts=<mount_paths> \
     --mpi=pmix \
-    bash -c "trtllm-llmapi-launch trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --tp_size 8 --host 0.0.0.0 --port $PORT --extra_llm_api_options $WORK/ctx_extra-llm-api-config.yaml"
+    bash -c "trtllm-llmapi-launch trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --tp_size 8 --host 0.0.0.0 --port $PORT --config $WORK/ctx_config.yaml"
 
 # Launch a generation with `tp_size=4` using one 4-GPU node.
 srun -A <account> -p <partition> -t <time> \
@@ -190,7 +359,7 @@ srun -A <account> -p <partition> -t <time> \
     --container-image=<container_image> \
     --container-mounts=<mount_paths> \
     --mpi=pmix \
-    bash -c "trtllm-llmapi-launch trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --tp_size 4 --host 0.0.0.0 --port $PORT --extra_llm_api_options $WORK/gen_extra-llm-api-config.yaml"
+    bash -c "trtllm-llmapi-launch trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --tp_size 4 --host 0.0.0.0 --port $PORT --config $WORK/gen_config.yaml"
 
 # Launch a proxy.
 # The above-mentioned value needs to be replaced with the IP address of the host machine accessible to external
@@ -204,6 +373,92 @@ srun -A <account> -p <partition> -t <time> \
 ```
 
 Additionally, we offer a fully executable script—please refer to [Disaggregated SLURM Scripts](./slurm/simple_example/).
+
+### Kubernetes Deployment with AWS EFA
+
+LIBFABRIC backend is particularly useful for Kubernetes deployments on AWS with EFA (Elastic Fabric Adapter) for high-performance networking between pods in disaggregated serving.
+
+#### Prerequisites
+
+- Kubernetes cluster with GPU nodes and EFA support
+- TensorRT-LLM container with wheel package pre-installed
+
+#### Deployment Steps
+
+##### 1. Configure Pod Resources
+
+When deploying on Kubernetes with EFA, ensure proper resource allocation in your pod specification:
+
+```yaml
+resources:
+  limits:
+    nvidia.com/gpu: 2           # Number of GPUs for this pod
+    vpc.amazonaws.com/efa: 4    # Number of EFA network interfaces
+```
+
+##### 2. Install EFA Libraries in Container
+
+AWS EFA library must be installed in the container for LIBFABRIC to work:
+
+```bash
+# Install AWS EFA library (required for LIBFABRIC with EFA)
+curl -O https://efa-installer.amazonaws.com/aws-efa-installer-latest.tar.gz
+tar -xf aws-efa-installer-latest.tar.gz
+cd aws-efa-installer && ./efa_installer.sh --yes --skip-kmod
+```
+
+##### 3. Rebuild NIXL with EFA Support
+
+Follow the NIXL rebuild instructions from the LIBFABRIC Backend Setup section, ensuring the libfabric path points to the EFA installation:
+
+```bash
+meson setup builddir \
+    -Ducx_path=/usr/local/ucx \
+    -Dlibfabric_path=/opt/amazon/efa \  # EFA libfabric installation path
+    -Dcudapath_lib=/usr/local/cuda/lib64 \
+    -Dcudapath_inc=/usr/local/cuda/include \
+    --buildtype=release
+```
+
+##### 4. Configure and Launch Services
+
+Use ConfigMaps to manage configurations for disaggregated serving:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: disagg-config
+data:
+  context.yaml: |
+    disable_overlap_scheduler: true
+    cache_transceiver_config:
+      backend: NIXL
+      max_tokens_in_buffer: 2048
+  generation.yaml: |
+    cache_transceiver_config:
+      backend: NIXL
+      max_tokens_in_buffer: 2048
+```
+
+Launch services:
+
+```bash
+# For context servers
+TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC \
+trtllm-serve <model> \
+    --host localhost --port 8001 \
+    --config /configs/context.yaml
+
+# For generation servers
+TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC \
+trtllm-serve <model> \
+    --host localhost --port 8002 \
+    --config /configs/generation.yaml
+
+# For disaggregated proxy server
+trtllm-serve disaggregated -c disagg_config.yaml
+```
 
 ## Mixed Precision Context and Generation
 
@@ -241,20 +496,20 @@ Verify both checkpoints have the same KV cache dtype by checking `hf_quant_confi
 CUDA_VISIBLE_DEVICES=0 trtllm-serve meta-llama/Llama-3.1-8B-Instruct \
     --host localhost --port 8001 \
     --server_role CONTEXT \
-    --extra_llm_api_options ./ctx_extra-llm-api-config.yaml \
+    --config ./ctx_config.yaml \
     --metadata_server_config_file ./metadata_config.yaml &> log_ctx_0 &
 
 CUDA_VISIBLE_DEVICES=1 trtllm-serve meta-llama/Llama-3.1-8B-Instruct \
     --host localhost --port 8002 \
     --server_role CONTEXT \
-    --extra_llm_api_options ./ctx_extra-llm-api-config.yaml \
+    --config ./ctx_config.yaml \
     --metadata_server_config_file ./metadata_config.yaml &> log_ctx_1 &
 
 # Start generation server with FP8 quantized checkpoint
 CUDA_VISIBLE_DEVICES=2 trtllm-serve ./weights/Llama-3.1-8B-Instruct-FP8-KV-BF16 \
     --host localhost --port 8003 \
     --server_role GENERATION \
-    --extra_llm_api_options ./gen_extra-llm-api-config.yaml \
+    --config ./gen_config.yaml \
     --metadata_server_config_file ./metadata_config.yaml &> log_gen_0 &
 
 # Start disaggregated server
@@ -308,11 +563,11 @@ After this, you can enable the dynamic scaling feature for the use case above as
 
 ```bash
 # Context servers
-CUDA_VISIBLE_DEVICES=0 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8001  --server_role CONTEXT --extra_llm_api_options ./ctx_extra-llm-api-config.yaml --metadata_server_config_file ./metadata_config.yaml &> log_ctx_0 &
-CUDA_VISIBLE_DEVICES=1 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8002  --server_role CONTEXT --extra_llm_api_options ./ctx_extra-llm-api-config.yaml --metadata_server_config_file ./metadata_config.yaml &> log_ctx_1 &
+CUDA_VISIBLE_DEVICES=0 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8001  --server_role CONTEXT --config ./ctx_config.yaml --metadata_server_config_file ./metadata_config.yaml &> log_ctx_0 &
+CUDA_VISIBLE_DEVICES=1 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8002  --server_role CONTEXT --config ./ctx_config.yaml --metadata_server_config_file ./metadata_config.yaml &> log_ctx_1 &
 
 # Generation servers
-CUDA_VISIBLE_DEVICES=2 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8003  --server_role GENERATION --extra_llm_api_options ./gen_extra-llm-api-config.yaml --metadata_server_config_file ./metadata_config.yaml &> log_gen_0 &
+CUDA_VISIBLE_DEVICES=2 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8003  --server_role GENERATION --config ./gen_config.yaml --metadata_server_config_file ./metadata_config.yaml &> log_gen_0 &
 ```
 
 As for the disaggregated server, you should also specify the --metadata_server_config_file like the following
@@ -339,7 +594,7 @@ Users can add servers by directly launching them with trtllm-serve. For example,
 CUDA_VISIBLE_DEVICES=3 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
     --host localhost --port 8004 \
      --server_role GENERATION \
-    --extra_llm_api_options ./gen_extra-llm-api-config.yaml \
+    --config ./gen_config.yaml \
     --metadata_server_config_file ./metadata_config.yaml &> log_gen_0 &
 ```
 TensorRT LLM will automatically register any newly launched server with the ETCD server, allowing the router to send new requests to the added server.
@@ -395,3 +650,14 @@ trtllm-serve disaggregated -c disagg_config.yaml
 ```
 
 The MPI communication backend for KV cache transfer has been deprecated and may not be supported in the future. When using the MPI backend, the environment variable `TRTLLM_USE_MPI_KVCACHE=1` should be set to avoid conflicts between mpi4py and KV cache transfer.
+
+## Troubleshooting
+
+### NIXL LIBFABRIC Backend Issues
+
+**Q: Why does NIXL fail to use LIBFABRIC backend even when `TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC` is set?**
+
+A: The TensorRT-LLM container doesn't include the NIXL LIBFABRIC plugin by default. You need to either:
+
+1. **Rebuild NIXL**: Install libfabric and hwloc first, then rebuild NIXL following the installation instructions above
+2. **Use a pre-compiled plugin**: If you have a compatible `libplugin_LIBFABRIC.so`, set `NIXL_PLUGINS_DIR` to point to its directory

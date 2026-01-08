@@ -603,23 +603,22 @@ using torch_ext::trtllm::attention::Runner;
 using torch_ext::trtllm::attention::AttentionInputType;
 
 void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<torch::Tensor> v, torch::Tensor& output,
-    std::optional<torch::Tensor> output_sf, std::optional<torch::ScalarType> out_dtype,
-    std::optional<torch::Tensor> workspace_, torch::Tensor sequence_length, torch::Tensor host_past_key_value_lengths,
-    torch::Tensor host_total_kv_lens, torch::Tensor context_lengths, torch::Tensor host_context_lengths,
-    torch::Tensor host_request_types, std::optional<torch::Tensor> kv_cache_block_offsets,
-    std::optional<torch::Tensor> host_kv_cache_block_offsets, std::optional<torch::Tensor> host_kv_cache_pool_pointers,
-    std::optional<torch::Tensor> host_kv_cache_pool_mapping, std::optional<torch::Tensor> cache_indirection,
-    std::optional<torch::Tensor> kv_scale_orig_quant, std::optional<torch::Tensor> kv_scale_quant_orig,
-    std::optional<torch::Tensor> out_scale, std::optional<torch::Tensor> rotary_inv_freq,
-    std::optional<torch::Tensor> rotary_cos_sin, std::optional<torch::Tensor> latent_cache,
-    std::optional<torch::Tensor> q_pe, std::optional<torch::Tensor> block_ids_per_seq,
-    std::optional<torch::Tensor> attention_sinks, bool const is_fused_qkv, bool const update_kv_cache,
-    int64_t const predicted_tokens_per_seq, int64_t const layer_idx, int64_t const num_heads,
-    int64_t const num_kv_heads, int64_t const head_size, std::optional<int64_t> const tokens_per_block,
-    int64_t const max_num_requests, int64_t const max_context_length, int64_t const attention_window_size,
-    int64_t const sink_token_length, int64_t const beam_width, int64_t const mask_type, int64_t const quant_mode,
-    double const q_scaling, int64_t const position_embedding_type, int64_t const rotary_embedding_dim,
-    double const rotary_embedding_base, int64_t const rotary_embedding_scale_type,
+    std::optional<torch::Tensor> output_sf, std::optional<torch::Tensor> workspace_, torch::Tensor sequence_length,
+    torch::Tensor host_past_key_value_lengths, torch::Tensor host_total_kv_lens, torch::Tensor context_lengths,
+    torch::Tensor host_context_lengths, torch::Tensor host_request_types,
+    std::optional<torch::Tensor> kv_cache_block_offsets, std::optional<torch::Tensor> host_kv_cache_block_offsets,
+    std::optional<torch::Tensor> host_kv_cache_pool_pointers, std::optional<torch::Tensor> host_kv_cache_pool_mapping,
+    std::optional<torch::Tensor> cache_indirection, std::optional<torch::Tensor> kv_scale_orig_quant,
+    std::optional<torch::Tensor> kv_scale_quant_orig, std::optional<torch::Tensor> out_scale,
+    std::optional<torch::Tensor> rotary_inv_freq, std::optional<torch::Tensor> rotary_cos_sin,
+    std::optional<torch::Tensor> latent_cache, std::optional<torch::Tensor> q_pe,
+    std::optional<torch::Tensor> block_ids_per_seq, std::optional<torch::Tensor> attention_sinks,
+    bool const is_fused_qkv, bool const update_kv_cache, int64_t const predicted_tokens_per_seq,
+    int64_t const layer_idx, int64_t const num_heads, int64_t const num_kv_heads, int64_t const head_size,
+    std::optional<int64_t> const tokens_per_block, int64_t const max_num_requests, int64_t const max_context_length,
+    int64_t const attention_window_size, int64_t const sink_token_length, int64_t const beam_width,
+    int64_t const mask_type, int64_t const quant_mode, double const q_scaling, int64_t const position_embedding_type,
+    int64_t const rotary_embedding_dim, double const rotary_embedding_base, int64_t const rotary_embedding_scale_type,
     std::vector<double> rotary_embedding_scales, std::vector<int64_t> rotary_embedding_max_position_info,
     bool const use_paged_context_fmha, std::optional<int64_t> attention_input_type, bool is_mla_enable,
     std::optional<int64_t> chunked_prefill_buffer_batch_size, std::optional<int64_t> q_lora_rank,
@@ -632,6 +631,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> sparse_kv_indices, std::optional<torch::Tensor> sparse_kv_offsets,
     std::optional<torch::Tensor> sparse_attn_indices, std::optional<torch::Tensor> sparse_attn_offsets,
     int64_t const sparse_attn_indices_block_size, std::optional<int64_t> sparse_mla_topk,
+    std::optional<double> skip_softmax_threshold_scale_factor_prefill,
+    std::optional<double> skip_softmax_threshold_scale_factor_decode, std::optional<torch::Tensor> skip_softmax_stat,
     std::optional<torch::Tensor> cu_q_seqlens, std::optional<torch::Tensor> cu_kv_seqlens,
     std::optional<torch::Tensor> fmha_scheduler_counter, std::optional<torch::Tensor> mla_bmm1_scale,
     std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer)
@@ -656,8 +657,10 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     }
 
     auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(qkv_or_q.scalar_type());
-    bool const is_fp8_out = out_dtype.has_value() && out_dtype.value() == torch::kFloat8_e4m3fn;
-    bool const is_fp4_out = out_dtype.has_value() && out_dtype.value() == torch::kUInt8;
+    auto const out_dtype = output.scalar_type();
+    bool const is_fp8_out = out_dtype == torch::kFloat8_e4m3fn;
+    // Torch does not support native nvfp4 type.
+    bool const is_fp4_out = out_dtype == torch::kUInt8;
 
     RunnerPtr runner;
     if (dtype == nvinfer1::DataType::kHALF)
@@ -672,13 +675,13 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
         }
         else
         {
-            TLLM_CHECK(!out_dtype.has_value() || out_dtype.value() == torch::kFloat16);
+            TLLM_CHECK(out_dtype == torch::kFloat16);
             runner = std::make_shared<Runner<half>>();
         }
     }
     else if (dtype == nvinfer1::DataType::kFLOAT)
     {
-        TLLM_CHECK(!out_dtype.has_value() || out_dtype.value() == torch::kFloat32);
+        TLLM_CHECK(out_dtype == torch::kFloat32);
         runner = std::make_shared<Runner<float>>();
     }
 #ifdef ENABLE_BF16
@@ -694,7 +697,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
         }
         else
         {
-            TLLM_CHECK(!out_dtype.has_value() || out_dtype.value() == torch::kBFloat16);
+            TLLM_CHECK(out_dtype == torch::kBFloat16);
             runner = std::make_shared<Runner<__nv_bfloat16>>();
         }
     }
@@ -742,7 +745,14 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     op->mPagedContextFMHA = use_paged_context_fmha;
 
     op->mAttentionChunkSize = attention_chunk_size;
-
+    op->mSkipSoftmaxThresholdScaleFactorPrefill
+        = static_cast<float>(skip_softmax_threshold_scale_factor_prefill.value_or(0));
+    op->mSkipSoftmaxThresholdScaleFactorDecode
+        = static_cast<float>(skip_softmax_threshold_scale_factor_decode.value_or(0));
+#ifdef SKIP_SOFTMAX_STAT
+    op->mSkipSoftmaxTotalBlocks = reinterpret_cast<uint32_t*>(skip_softmax_stat.value().data_ptr());
+    op->mSkipSoftmaxSkippedBlocks = op->mSkipSoftmaxTotalBlocks + 1;
+#endif
     TORCH_CHECK(spec_decoding_bool_params.size() == 3,
         "Expecting 3 bools for spec-dec mode, is_spec_decoding_enabled, use_spec_decoding, and is_spec_dec_tree.");
     op->mIsSpecDecodingEnabled = spec_decoding_bool_params[0]; // is_spec_decoding_enabled

@@ -1,5 +1,3 @@
-import copy
-
 import pytest
 import torch
 from _model_test_utils import get_small_model_config
@@ -7,8 +5,6 @@ from torch.export import Dim
 
 from tensorrt_llm._torch.auto_deploy.export import apply_export_patches, torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.llm_args import AutoDeployConfig
-from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
-from tensorrt_llm._torch.auto_deploy.models.modeling_nemotron_h import NemotronHForCausalLM
 from tensorrt_llm._torch.auto_deploy.utils._graph import move_to_device
 
 # NOTE: find example inputs with the same tokenization length to avoid seq concat.
@@ -16,37 +12,15 @@ EXAMPLE_INPUT = "Mamba is a snake with the following properties:"
 EXAMPLE_INPUT2 = "Tiger is a cat with the following properties:"
 
 
-@pytest.fixture
-def setup_custom_model_cls_registry(request):
-    # TODO: remove all this when the patches in `bamba.py` and `nemotron_h.py` can be removed.
-    old_mapping = copy.copy(AutoModelForCausalLMFactory._custom_model_mapping)
-    AutoModelForCausalLMFactory._custom_model_mapping = {}
-
-    register_custom_model = request.node.callspec.params.get("register_custom_model", False)
-    if register_custom_model:
-        AutoModelForCausalLMFactory.register_custom_model_cls(
-            config_cls_name="NemotronHConfig",
-            custom_model_cls=NemotronHForCausalLM,
-        )
-    yield
-    AutoModelForCausalLMFactory._custom_model_mapping = old_mapping
-
-
 @pytest.mark.parametrize(
-    "model_dir,run_verify_generation,register_custom_model",
+    "model_dir,run_verify_generation",
     [
-        ("ibm-ai-platform/Bamba-9B-v2", True, False),
-        # This tests the incumbent patching approach.
-        ("nvidia/NVIDIA-Nemotron-Nano-12B-v2", True, False),
-        # This tests the new custom model implementation.
-        ("nvidia/NVIDIA-Nemotron-Nano-12B-v2", True, True),
+        ("ibm-ai-platform/Bamba-9B-v2", True),
     ],
 )
 def test_bamba_patches(
     model_dir: str,
     run_verify_generation: bool,
-    register_custom_model: bool,
-    setup_custom_model_cls_registry,
 ):
     # NOTE: set to False if you want to locally test the full model.
     use_small_config: bool = True
@@ -98,12 +72,11 @@ def test_bamba_patches(
     position_ids = torch.arange(input_ids.shape[1], device=input_ids.device).repeat(
         input_ids.shape[0], 1
     )
+    batch_size_dynamic = Dim.DYNAMIC
+    seq_len_dynamic = Dim.DYNAMIC
     dynamic_shapes = (
-        {0: Dim("batch_size", min=0, max=8), 1: Dim("seq_len", min=0, max=512)},
-        {
-            0: Dim("batch_size", min=0, max=8),
-            1: Dim("seq_len", min=0, max=512),
-        },
+        {0: batch_size_dynamic, 1: seq_len_dynamic},
+        {0: batch_size_dynamic, 1: seq_len_dynamic},
     )
 
     def _run_torch_export_to_gm():
@@ -124,13 +97,14 @@ def test_bamba_patches(
         move_to_device(gm, "cuda")
         factory._to_maybe_random(model, "cuda")
         model.load_state_dict(gm.state_dict())
+        gm.load_state_dict(model.state_dict())
     else:
         factory.load_or_random_init(model, device="cuda")
         gm = _run_torch_export_to_gm()
         move_to_device(gm, "cuda")
 
     if run_verify_generation:
-        _verify_generation(factory, model, tokenizer)
+        _verify_generation(model, tokenizer)
 
     # let's do a comparison of every state dict item between the model and the gm
     torch.testing.assert_close(model.state_dict(), gm.state_dict(), rtol=0.0, atol=0.0)
@@ -157,7 +131,7 @@ def test_bamba_patches(
         )
 
 
-def _verify_generation(factory, model, tokenizer):
+def _verify_generation(model, tokenizer):
     print("====== WITHOUT PATCH ======")
     _generate(tokenizer, model)
     with apply_export_patches(patch_list=["bamba"]):

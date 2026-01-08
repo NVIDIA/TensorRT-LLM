@@ -1,5 +1,5 @@
 metadata:
-  model_name: deepseek-r1-fp4
+  model_name: deepseek_r1_0528_fp4_v2
   precision: fp4
   model_dir_name: DeepSeek-R1-0528-FP4-v2
   supported_gpus:
@@ -7,7 +7,6 @@ metadata:
   - GB300
   script_file: disaggr_torch.slurm
   benchmark_type: 8k1k
-  config_index: 11
 slurm:
   script_file: disaggr_torch.slurm
   partition: <partition>

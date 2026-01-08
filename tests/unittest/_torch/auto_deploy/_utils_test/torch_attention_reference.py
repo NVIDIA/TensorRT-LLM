@@ -40,27 +40,27 @@ class TorchAttentionReference:
             0, batch_size * seq_len, seq_len, device=q.device, dtype=torch.int32
         )
 
-        # Create batch_info: [num_prefill, num_prefill_tokens, num_decode]
+        # Create batch_info_host: [num_prefill, num_prefill_tokens, num_decode]
         # For context phase (seq_len > 1): [batch_size, batch_size * seq_len, 0]
         # For generate phase (seq_len == 1): [0, 0, batch_size]
         if seq_len == 1:
-            batch_info = torch.tensor([0, 0, batch_size], device=q.device, dtype=torch.int32)
+            batch_info_host = torch.tensor([0, 0, batch_size], device=q.device, dtype=torch.int32)
         else:
-            batch_info = torch.tensor(
+            batch_info_host = torch.tensor(
                 [batch_size, batch_size * seq_len, 0], device=q.device, dtype=torch.int32
             )
 
         # Flatten inputs to [1, total_seq_len, ...] format
-        q_flat = q.view(1, batch_size * seq_len, -1)
-        k_flat = k.view(1, batch_size * seq_len, -1)
-        v_flat = v.view(1, batch_size * seq_len, -1)
+        q_flat = q.reshape(1, batch_size * seq_len, -1)
+        k_flat = k.reshape(1, batch_size * seq_len, -1)
+        v_flat = v.reshape(1, batch_size * seq_len, -1)
 
         # Call torch backend via custom op registry
         output_flat = torch.ops.auto_deploy.torch_cached_attention_with_cache(
             q_flat,
             k_flat,
             v_flat,
-            batch_info,
+            batch_info_host,
             seq_len_tensor,
             input_positions,
             cache_loc,
@@ -84,7 +84,7 @@ class TorchAttentionReference:
         q,
         k,
         v,
-        batch_info,
+        batch_info_host,
         seq_len,
         input_positions,
         cache_loc,
@@ -101,7 +101,7 @@ class TorchAttentionReference:
             q,
             k,
             v,
-            batch_info,
+            batch_info_host,
             seq_len,
             input_positions,
             cache_loc,
@@ -144,15 +144,15 @@ class TorchAttentionReference:
         k_flat = k_new.view(1, batch_size, -1)
         v_flat = v_new.view(1, batch_size, -1)
 
-        # Create batch_info for decode phase: [num_prefill, num_prefill_tokens, num_decode]
-        batch_info = torch.tensor([0, 0, batch_size], device=q.device, dtype=torch.int32)
+        # Create batch_info_host for decode phase: [num_prefill, num_prefill_tokens, num_decode]
+        batch_info_host = torch.tensor([0, 0, batch_size], device=q.device, dtype=torch.int32)
 
         # Call torch backend via custom op registry
         output_flat = torch.ops.auto_deploy.torch_cached_attention_with_cache(
             q_flat,
             k_flat,
             v_flat,
-            batch_info,
+            batch_info_host,
             seq_len,
             input_positions,
             cache_loc,
@@ -170,7 +170,7 @@ class TorchAttentionReference:
         q,
         k,
         v,
-        batch_info,
+        batch_info_host,
         seq_len,
         input_positions,
         cache_loc,
@@ -189,7 +189,7 @@ class TorchAttentionReference:
             q,
             k,
             v,
-            batch_info,
+            batch_info_host,
             seq_len,
             input_positions,
             cache_loc,

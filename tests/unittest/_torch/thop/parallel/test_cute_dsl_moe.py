@@ -397,7 +397,7 @@ def test_moe_gelu(dtype: str, num_tokens: int, top_k: int, tile_size: int):
     get_sm_version() not in (100, 103),
     reason="This test is only supported on SM 100 and SM 103 GPUs",
 )
-@pytest.mark.parametrize("tile_size", [128])
+@pytest.mark.parametrize("tile_size", [128, 256])
 @pytest.mark.parametrize("ep_size", [1, 8, 32])
 @pytest.mark.parametrize("top_k", [1, 2, 8])
 @pytest.mark.parametrize("num_tokens", [128, 515, 1024, 8192])
@@ -493,7 +493,7 @@ def test_nvfp4_grouped_gemm_blackwell(num_tokens: int, top_k: int, ep_size: int,
     get_sm_version() not in (100, 103),
     reason="This test is only supported on SM 100 and SM 103 GPUs",
 )
-@pytest.mark.parametrize("tile_size", [128])
+@pytest.mark.parametrize("tile_size", [128, 256])
 @pytest.mark.parametrize("ep_size", [1, 8, 32])
 @pytest.mark.parametrize("top_k", [1, 2, 8])
 @pytest.mark.parametrize("num_tokens", [128, 515, 1024, 8192])
@@ -594,7 +594,7 @@ def test_nvfp4_grouped_gemm_finalize_blackwell(
     get_sm_version() not in (100, 103),
     reason="This test is only supported on SM 100 and SM 103 GPUs",
 )
-@pytest.mark.parametrize("tile_size", [128])
+@pytest.mark.parametrize("tile_size", [128, 256])
 @pytest.mark.parametrize("ep_size", [1, 8, 32])
 @pytest.mark.parametrize("top_k", [1, 2, 8])
 @pytest.mark.parametrize("num_tokens", [128, 515, 1024, 8192])

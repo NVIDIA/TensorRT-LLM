@@ -141,7 +141,8 @@ void AgentConnection::send(DataContext const& ctx, void const* data, size_t size
     NotificationInfo notificationInfo{syncInfo};
     std::stringstream ss;
     NotificationInfo::serialize(notificationInfo, ss);
-    status->wait();
+    TransferState transferState = status->wait();
+    TLLM_CHECK_WITH_INFO(transferState == TransferState::kSUCCESS, "AgentConnection::send failed");
     // TODO: there is a bug in request_with_notify https://github.com/ai-dynamo/nixl/pull/252
     mAgentConnectionManager->getAgent()->notifySyncMessage(mRemoteAgentName, ss.str());
 }
@@ -150,7 +151,7 @@ void AgentConnection::recv(DataContext const& ctx, void* data, size_t size) cons
 {
 
     NotificationSyncInfo syncInfo{mAgentName, ctx};
-    mAgentConnectionManager->waitForSyncInfo(mRemoteAgentName, syncInfo);
+    mAgentConnectionManager->waitForSyncInfo(mRemoteAgentName, syncInfo, ctx.getTransferTerminate());
 }
 
 void AgentConnection::sendRequestAndBufferInfo(batch_manager::RequestInfo& requestInfo,
@@ -230,13 +231,13 @@ void AgentConnection::sendReadySignal(DataContext const& ctx, bool isReady) cons
 bool AgentConnection::recvReadySignal(DataContext const& ctx) const
 {
     ReadySignalInfo readySignalInfo{mAgentName, ctx, false};
-    mAgentConnectionManager->waitForReadySignal(mRemoteAgentName, readySignalInfo);
-    return true;
+    mAgentConnectionManager->waitForReadySignal(mRemoteAgentName, readySignalInfo, ctx.getTransferTerminate());
+    return readySignalInfo.mIsReady;
 }
 
 AgentConnectionManager::AgentConnectionManager(
     std::vector<batch_manager::kv_cache_manager::CacheTransBufferManager*> cacheTransBufferManagers,
-    CacheState cacheState)
+    CacheState cacheState, std::string const& backendType)
     : mCacheState(std::move(cacheState))
     , mCacheTransBufferManagers(std::move(cacheTransBufferManagers))
     , mRegMemDescs(MemoryType::kVRAM, {})
@@ -246,8 +247,8 @@ AgentConnectionManager::AgentConnectionManager(
 
     mAgentName = genUniqueAgentName();
     // Create Agent
-    BaseAgentConfig config{mAgentName, true};
-    m_Agent = makeTransferAgent("nixl", &config);
+    BaseAgentConfig config{mAgentName, true, false, true, 1};
+    m_Agent = makeTransferAgent(backendType, &config);
     TLLM_CHECK(!mCacheTransBufferManagers.empty());
     std::vector<MemoryDesc> memDescs;
     for (auto* cacheTransBufferManager : mCacheTransBufferManagers)
@@ -315,9 +316,10 @@ AgentConnectionManager::AgentConnectionManager(
         " ***** AgentConnectionManager::AgentConnectionManager    mCommState: %s", mCommState.toString().c_str());
 }
 
-AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(batch_manager::RequestInfo& requestInfo)
+AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
+    batch_manager::RequestInfo& requestInfo, std::atomic<bool> const& terminateFlag)
 {
-    while (true)
+    while (!terminateFlag.load())
     {
         if (!mIsRunning)
         {
@@ -490,16 +492,16 @@ int AgentConnectionManager::getDeviceId() const
 }
 
 template <typename NotificationType>
-void AgentConnectionManager::waitForNotification(std::string const& remoteAgentName, NotificationType& expectedInfo)
+void AgentConnectionManager::waitForNotification(
+    std::string const& remoteAgentName, NotificationType& expectedInfo, std::atomic<bool> const& terminateFlag)
 {
-    while (true)
+    while (!terminateFlag.load())
     {
 
         if (!mIsRunning)
         {
             return;
         }
-
         updateUnhandledNotifications();
         std::scoped_lock lock(mNotificationMutex);
         auto it = mUnhandledNotifications.begin();
@@ -575,18 +577,20 @@ void AgentConnectionManager::waitForNotification(std::string const& remoteAgentN
 
 // Explicit template instantiations
 template void AgentConnectionManager::waitForNotification<NotificationSyncInfo>(
-    std::string const& remoteAgentName, NotificationSyncInfo& expectedInfo);
+    std::string const& remoteAgentName, NotificationSyncInfo& expectedInfo, std::atomic<bool> const& terminateFlag);
 template void AgentConnectionManager::waitForNotification<ReadySignalInfo>(
-    std::string const& remoteAgentName, ReadySignalInfo& expectedInfo);
+    std::string const& remoteAgentName, ReadySignalInfo& expectedInfo, std::atomic<bool> const& terminateFlag);
 
-void AgentConnectionManager::waitForSyncInfo(std::string const& remoteAgentName, NotificationSyncInfo& syncInfo)
+void AgentConnectionManager::waitForSyncInfo(
+    std::string const& remoteAgentName, NotificationSyncInfo& syncInfo, std::atomic<bool> const& terminateFlag)
 {
-    waitForNotification(remoteAgentName, syncInfo);
+    waitForNotification(remoteAgentName, syncInfo, terminateFlag);
 }
 
-void AgentConnectionManager::waitForReadySignal(std::string const& remoteAgentName, ReadySignalInfo& readySignalInfo)
+void AgentConnectionManager::waitForReadySignal(
+    std::string const& remoteAgentName, ReadySignalInfo& readySignalInfo, std::atomic<bool> const& terminateFlag)
 {
-    waitForNotification(remoteAgentName, readySignalInfo);
+    waitForNotification(remoteAgentName, readySignalInfo, terminateFlag);
 }
 
 std::string const& AgentConnectionManager::getAgentName() const

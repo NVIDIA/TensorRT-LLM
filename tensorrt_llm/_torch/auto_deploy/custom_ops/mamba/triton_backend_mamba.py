@@ -42,7 +42,7 @@ from ..attention_interface import (
 def _triton_ssm_prepare_metadata(
     # INPUTS
     position_ids: torch.Tensor,
-    batch_info: torch.Tensor,
+    batch_info_host: torch.Tensor,
     seq_len: torch.Tensor,
     cu_seqlen: torch.Tensor,
     # EXTRA METADATA PROVIDED BY THE DESCRIPTOR
@@ -53,7 +53,7 @@ def _triton_ssm_prepare_metadata(
     Returns a tuple of (seq_len_sanitized, seq_start, slot_idx_sanitized).
     """
     device = cu_seqlen.device
-    num_prefill, num_prefill_tokens, num_decode = batch_info.tolist()
+    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
 
     if num_prefill > 0:
         chunk_indices, chunk_offsets = cu_seqlens_to_chunk_indices_offsets(
@@ -74,7 +74,7 @@ def _triton_ssm_prepare_metadata(
 def _triton_ssm_prepare_metadata_fake(
     # INPUTS
     position_ids: torch.Tensor,
-    batch_info: torch.Tensor,
+    batch_info_host: torch.Tensor,
     seq_len: torch.Tensor,
     cu_seqlen: torch.Tensor,
     # EXTRA METADATA PROVIDED BY THE DESCRIPTOR
@@ -110,7 +110,7 @@ def _triton_cached_ssm(
     dt: torch.Tensor,  # [b, s, num_heads]
     dt_bias: torch.Tensor,  # [num_heads]
     # STANDARD METADATA
-    batch_info: torch.Tensor,
+    batch_info_host: torch.Tensor,
     cu_seqlen: torch.Tensor,
     slot_idx: torch.Tensor,
     use_initial_states: torch.Tensor,
@@ -140,7 +140,7 @@ def _triton_cached_ssm(
 
     ssm_state_size = B.shape[3]
 
-    num_prefill, num_prefill_tokens, num_decode = batch_info.tolist()
+    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
     num_seq = num_prefill + num_decode
     num_total_tokens = num_prefill_tokens + num_decode
 
@@ -245,7 +245,7 @@ def _triton_cached_ssm_fake(
     dt: torch.Tensor,  # [b, s, num_heads]
     dt_bias: torch.Tensor,  # [num_heads]
     # STANDARD METADATA
-    batch_info: torch.Tensor,
+    batch_info_host: torch.Tensor,
     cu_seqlen: torch.Tensor,
     slot_idx: torch.Tensor,
     use_initial_states: torch.Tensor,
@@ -294,7 +294,7 @@ class TritonBackendSSM(AttentionDescriptor):
 
     @classmethod
     def get_standard_metadata_args(cls) -> List[str]:
-        return ["batch_info", "cu_seqlen", "slot_idx", "use_initial_states"]
+        return ["batch_info_host", "cu_seqlen", "slot_idx", "use_initial_states"]
 
     @classmethod
     def get_prepare_extra_metadata_info(

@@ -77,6 +77,7 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
         test_prefix = "unittest"
 
     waives_file = request.config.getoption("--waives-file")
+    run_ray = request.config.getoption("--run-ray")
 
     num_workers = 1
 
@@ -125,8 +126,8 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
                               f'results-sub-unittests-{case_fn}.xml')
 
     command = [
-        '-m', 'pytest', ignore_opt, "-v", "--tb=short", "-rF", "--timeout=2400",
-        "--timeout-method=thread"
+        '-m', 'pytest', ignore_opt, "-vv", "--tb=short", "-rF",
+        "--timeout=2400", "--timeout-method=thread"
     ]
     if test_prefix:
         command += [f"--test-prefix={test_prefix}"]
@@ -137,6 +138,9 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     if waives_file:
         waives_file = os.path.abspath(waives_file)
         command += [f"--waives-file={waives_file}"]
+
+    if run_ray:
+        command += ["--run-ray"]
 
     command += arg_list
 

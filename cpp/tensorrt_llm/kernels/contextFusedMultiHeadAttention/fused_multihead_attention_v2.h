@@ -132,7 +132,8 @@ public:
     uint64_t hashID(unsigned int s, unsigned int d, unsigned int dv, bool interleaved, bool unroll, bool force_fp32_acc,
         bool flash_attention, bool warp_specialization, bool is_alibi_supported, int attention_mask_type,
         int input_layout, bool tiled, bool enable_attn_logit_softcapping, unsigned int sage_block_size_q,
-        unsigned int sage_block_size_k, unsigned int sage_block_size_v, bool return_softmax) const;
+        unsigned int sage_block_size_k, unsigned int sage_block_size_v, bool return_softmax,
+        bool enable_skip_softmax) const;
 
     uint64_t hashID(KernelMeta const& kernelMeta) const override;
 
