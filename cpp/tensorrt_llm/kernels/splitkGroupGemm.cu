@@ -21,15 +21,18 @@
 #include "cutlass/gemm/device/gemm_universal.h"
 #include "cutlass/gemm/gemm.h"
 
+#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/cudaUtils.h"
+
+#include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/cutlass_extensions/include/cutlass_extensions/gemm/device/splitk_gemm_grouped.h"
 #include "tensorrt_llm/cutlass_extensions/include/cutlass_extensions/gemm/kernel/default_splitk_gemm_grouped.h"
 #include "tensorrt_llm/cutlass_extensions/include/cutlass_extensions/gemm/kernel/splitk_gemm_grouped.h"
 
-#include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/common/memoryUtils.h"
+TRTLLM_NAMESPACE_BEGIN
 
-namespace tensorrt_llm::kernels
+namespace kernels
 {
 
 int64_t inline getGemmCoordSize(int64_t problemCount)
@@ -288,4 +291,6 @@ void splitkGroupedGemm(std::vector<cutlass::gemm::GemmCoord> const& problemSizes
     }
 }
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

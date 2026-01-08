@@ -14,14 +14,15 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include <cuda_runtime_api.h>
 
 #include "cumsumLastDim.h"
 
 #include <cub/cub.cuh>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -170,4 +171,5 @@ INSTANTIATE_CUMSUM_LastDim_DATA_TYPE(__nv_bfloat16);
 #undef INSTANTIATE_CUMSUM_LastDim_DATA_TYPE
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

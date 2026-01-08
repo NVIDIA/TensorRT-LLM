@@ -4,9 +4,12 @@ This is useful as final optimization step for in-framework deployment of our inf
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional, Tuple, Type
+from typing import Any, Callable, Dict, List, Tuple, Type
 
 import torch.nn as nn
+
+ArgsKwargs = Tuple[List[Any], Dict[str, Any]]
+GetArgsKwargsForBatchSize = Callable[[int], ArgsKwargs]
 
 
 class CompileBackendRegistry:
@@ -32,16 +35,8 @@ class CompileBackendRegistry:
 
 
 class CompilerBackend(ABC):
-    def __init__(
-        self,
-        model: nn.Module,
-        args: Tuple[Any, ...],
-        kwargs: Optional[Dict[str, Any]] = None,
-        **compiler_kwargs,
-    ):
+    def __init__(self, model: nn.Module, **compiler_kwargs):
         self.model = model
-        self.args = args
-        self.kwargs = kwargs or {}
 
     @abstractmethod
     def compile(self) -> nn.Module:

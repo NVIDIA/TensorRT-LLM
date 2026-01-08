@@ -36,7 +36,7 @@ namespace mpi = tensorrt_llm::mpi;
 namespace tr = tensorrt_llm::runtime;
 namespace nccl_util = tensorrt_llm::common::nccl_util;
 
-using ::getComm;
+using tensorrt_llm::getComm;
 
 // Helper function to create a split communicator for testing
 // This allows us to test cleanup behavior explicitly by controlling the lifetime

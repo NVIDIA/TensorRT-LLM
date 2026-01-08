@@ -358,8 +358,15 @@ public:
 
         TransceiverTag::Id id;
         RequestInfo info;
-        auto const* connection = isAgent ? agentConnectionManager->recvConnectionAndRequestInfo(info)
-                                         : mManager->recvConnect(DataContext{TransceiverTag::kID_TAG}, &id, sizeof(id));
+        auto const* connection = isAgent
+            ? agentConnectionManager->recvConnectionAndRequestInfo(info, mTerminate)
+            : mManager->recvConnect(DataContext{TransceiverTag::kID_TAG, mTerminate}, &id, sizeof(id));
+        if (connection == nullptr && !mManager->isRunning())
+        {
+            TLLM_LOG_WARNING(" recvRequestInfo connection is nullptr, maybe the server is terminating");
+            return info;
+        }
+
         if (!isAgent)
         {
             TLLM_CHECK(id == TransceiverTag::Id::REQUEST_SEND);
@@ -389,8 +396,8 @@ public:
             if (it == mRequestToSession.end())
             {
                 auto session = TransferSession(std::vector<Connection const*>(peerRelativeRanks.size(), nullptr),
-                    DataContext{tagFromRequestId(requestId)}, mSelfState, info.getTransState(), mBufferManager,
-                    info.getIndexFromEnd(), info.getLastBlockKey(), nullptr,
+                    DataContext{tagFromRequestId(requestId), mTerminate}, mSelfState, info.getTransState(),
+                    mBufferManager, info.getIndexFromEnd(), info.getLastBlockKey(), nullptr,
                     !common::getEnvKVCacheTimeOutputPath().empty());
                 session.setTime(TransferSession::kTimeRequestInfo);
                 it = mRequestToSession.emplace(requestId, std::move(session)).first;
@@ -616,6 +623,10 @@ private:
                 if (!mReadyResponses.empty())
                 {
                     auto const& requestInfo = recvRequestInfo();
+                    if (mTerminate || !mManager->isRunning())
+                    {
+                        return;
+                    }
                     auto reqId = requestInfo.getRequestId();
 
                     {
@@ -674,6 +685,10 @@ private:
         for (auto& future : mAsyncSendFutures)
         {
             future.get();
+        }
+        if (mResponseFuture.valid())
+        {
+            mResponseFuture.get();
         }
     }
 
@@ -876,9 +891,9 @@ public:
             }
         }
         auto const& resource = getReceiveCacheResource(llmRequest);
-        return TransferSession(std::move(counterPartConnections), DataContext{tagFromRequestId(requestId)}, mSelfState,
-            contextState, resource->mBufferManager, requestInfo.getIndexFromEnd(), requestInfo.getLastBlockKey(),
-            &llmRequest, !common::getEnvKVCacheTimeOutputPath().empty());
+        return TransferSession(std::move(counterPartConnections), DataContext{tagFromRequestId(requestId), mTerminate},
+            mSelfState, contextState, resource->mBufferManager, requestInfo.getIndexFromEnd(),
+            requestInfo.getLastBlockKey(), &llmRequest, !common::getEnvKVCacheTimeOutputPath().empty());
     }
 
     std::unique_ptr<ReceiveCacheResource> const& getReceiveCacheResource(LlmRequest const& llmRequest)
@@ -954,7 +969,7 @@ public:
                 auto* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections.at(i));
                 TLLM_CHECK(agentConnection);
                 isReady = agentConnection->recvReadySignal(
-                    executor::kv_cache::DataContext{TransceiverTag::kREADY_SIGNAL_TAG});
+                    executor::kv_cache::DataContext{TransceiverTag::kREADY_SIGNAL_TAG, mTerminate});
             }
             else
             {
@@ -969,6 +984,7 @@ public:
 
     ~Impl()
     {
+        mTerminate.store(true);
         for (auto&& [processInfo, asyncResource] : mInstanceToAsyncResource)
         {
             asyncResource->mTerminate = true;
@@ -1124,6 +1140,7 @@ private:
     runtime::BufferManager mBufferManager;
     std::ofstream mMeasuresFile;
     std::mutex mMeasuresFileMutex;
+    std::atomic<bool> mTerminate{false};
 };
 
 void CacheSender::ImplDeleter::operator()(Impl* ptr)

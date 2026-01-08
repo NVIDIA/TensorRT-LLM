@@ -7,7 +7,6 @@ metadata:
   - GB300
   script_file: disaggr_torch.slurm
   benchmark_type: 8k1k
-  config_index: 6
   dataset_file: disagg_datasets/deepseek-r1-8192-1024-200000-ratio-1_for_serve.json
 slurm:
   script_file: disaggr_torch.slurm
@@ -23,7 +22,7 @@ benchmark:
   multi_round: 8
   benchmark_ratio: 0.8
   streaming: true
-  concurrency_list: '538'
+  concurrency_list: '512'
   input_length: 8192
   output_length: 1024
   dataset_file: <dataset_file>

@@ -28,7 +28,7 @@ Design Principles:
 4. Unified EPLB integration for backends that support it
 """
 
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -37,6 +37,7 @@ from tensorrt_llm._torch.modules.fused_moe.interface import MoE
 from tensorrt_llm._torch.modules.fused_moe.routing import BaseMoeRoutingMethod
 from tensorrt_llm._torch.utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from tensorrt_llm.logger import logger
+from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from .communication import (
     AllGatherReduceScatter,
@@ -106,6 +107,7 @@ class ConfigurableMoE(MoE):
         weight_loading_mode=None,
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
+        override_quant_config: Optional["QuantConfig"] = None,
         **kwargs,
     ):
         super().__init__(
@@ -131,8 +133,8 @@ class ConfigurableMoE(MoE):
         # ========== Create MoE Backend (Default: Cutlass) ==========
         from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend, get_moe_cls
 
-        # Get MoE backend class based on model_config
-        moe_cls = get_moe_cls(model_config, override_quant_config=None)
+        # Get MoE backend class based on override_quant_config or model_config
+        moe_cls = get_moe_cls(model_config, override_quant_config=override_quant_config)
 
         # Call create_moe_backend with all necessary parameters
         # init_load_balancer=False: Prevents backend from registering itself with load balancer
@@ -145,7 +147,7 @@ class ConfigurableMoE(MoE):
         model_config.skip_create_weights_in_init = True
         model_config._frozen = True
 
-        self.backend = create_moe_backend(
+        backend = create_moe_backend(
             moe_cls=moe_cls,
             routing_method=routing_method,
             num_experts=self.num_experts,
@@ -166,16 +168,14 @@ class ConfigurableMoE(MoE):
             without_comm=True,
         )
 
+        self.validate_backend(backend)
+        self.backend = backend
+
         # Sync critical attributes from ConfigurableMoE to backend
         # ConfigurableMoE's super().__init__() was called with real layer_idx and initialized load balancer.
         # Backend was created with init_load_balancer=False and without_comm=True to avoid
         # duplicate initialization. Now sync all attributes from ConfigurableMoE to backend.
         if self.backend is not None:
-            # Add a check to WAR the issue that the backend is none during torch.compile
-            assert not torch.compiler.is_compiling(), (
-                "Backend should not be none if not in torch.compile"
-            )
-            self.backend.aux_stream_dict = self.aux_stream_dict
             self.backend.layer_idx = self.layer_idx
             self.backend.layer_idx_str = self.layer_idx_str
             self.backend.num_slots = self.num_slots
@@ -196,7 +196,7 @@ class ConfigurableMoE(MoE):
             self.backend.create_weights()
 
         # ========== Create Communication Strategy ==========
-        self._comm = self._create_comm_strategy_auto()
+        self.comm = self._create_comm_strategy_auto()
 
         # ========== Chunking Configuration ==========
         # moe_max_num_tokens is set in ModelConfig.__post_init__ if not specified
@@ -402,6 +402,11 @@ class ConfigurableMoE(MoE):
         3. Execute MoE computation (single or multiple chunks)
         4. Handle output truncation and EPLB repeat
         """
+        # TODO: to clarify whether the output_dtype is needed.
+        if isinstance(x, Fp4QuantizedTensor):
+            assert output_dtype is not None
+        else:
+            output_dtype = x.dtype
         # ========== Step 1: Handle padding ==========
         if all_rank_num_tokens is None:
             all_rank_num_tokens = [x.shape[0]]
@@ -451,6 +456,35 @@ class ConfigurableMoE(MoE):
 
         return outputs
 
+    def _prepare_workspace_deepgemm(
+        self,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        all_rank_num_tokens: List[int],
+    ) -> Optional[torch.Tensor]:
+        """
+        Prepare workspace for DeepGemmFusedMoE backend.
+
+        Args:
+            x: Input tensor
+            all_rank_num_tokens: List of token counts for all ranks (used when use_dp is True)
+
+        Returns:
+            Workspace tensor or None if not using DeepGemmFusedMoE
+        """
+        if not isinstance(self.backend, DeepGemmFusedMoE):
+            return None
+
+        # Calculate the number of rows
+        num_rows = x.shape[0]
+        if self.use_dp and self.comm is not None:
+            # When using communication, dispatch will create tensors with shape:
+            # [ep_size * max_tokens_per_rank, ...] due to padding for balanced distribution
+            # So we need to allocate workspace based on this size
+            num_rows = self.mapping.moe_ep_size * max(all_rank_num_tokens)
+
+        workspaces = self.backend.get_workspaces([num_rows])
+        return workspaces[0]
+
     def _forward_single_chunk(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
@@ -468,6 +502,9 @@ class ConfigurableMoE(MoE):
         is_first_call = self.repeat_idx == 0
         is_last_call = self.repeat_idx == self.repeat_count - 1
 
+        # ========== Create workspace for DeepGemmFusedMoE ==========
+        workspace = self._prepare_workspace_deepgemm(x, all_rank_num_tokens)
+
         # Execute unified flow (handles both separated and fused routing)
         outputs = self._forward_chunk_impl(
             x,
@@ -478,6 +515,7 @@ class ConfigurableMoE(MoE):
             is_first_call,
             is_last_call,
             do_finalize,
+            workspace=workspace,
         )
 
         return outputs
@@ -492,6 +530,7 @@ class ConfigurableMoE(MoE):
         is_first_call: bool,
         is_last_call: bool,
         do_finalize: bool = True,
+        workspace: Optional[dict] = None,
     ) -> torch.Tensor:
         """
         Unified execution flow for all backends
@@ -662,7 +701,7 @@ class ConfigurableMoE(MoE):
             token_final_scales=token_final_scales,
             x_sf=x_sf,
             **self._get_backend_kwargs(
-                router_logits, do_finalize, all_rank_num_tokens, output_dtype
+                router_logits, do_finalize, all_rank_num_tokens, output_dtype, x, workspace
             ),
         )
 
@@ -682,6 +721,50 @@ class ConfigurableMoE(MoE):
         self._load_balancer_done_set_cpu_stage(is_last_call)
 
         return final_hidden_states
+
+    def _prepare_workspaces_for_chunk(
+        self,
+        all_rank_num_tokens_list: List[Optional[List[int]]],
+        chunk_size_list: List[int],
+        use_multi_stream: bool,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Prepare workspaces for chunked execution with DeepGemmFusedMoE backend.
+        This will also be used for alltoall communication in the future.
+
+        Args:
+            all_rank_num_tokens_list: List of token counts per rank for each chunk (None if not using DP)
+            chunk_size_list: List of chunk sizes
+            use_multi_stream: Whether to use multi-stream execution (requires workspace_1)
+
+        Returns:
+            Tuple of (workspace_0, workspace_1), where workspace_1 is None if not using multi-stream
+        """
+        workspace_0 = None
+        workspace_1 = None
+
+        if not isinstance(self.backend, DeepGemmFusedMoE):
+            return workspace_0, workspace_1
+
+        # Always need at least workspace_0
+        chunk_size_0 = (
+            self.mapping.moe_ep_size * max(all_rank_num_tokens_list[0])
+            if self.use_dp and all_rank_num_tokens_list[0] is not None
+            else chunk_size_list[0]
+        )
+        workspace_chunk_sizes = [chunk_size_0]
+
+        # Add workspace_1 if using multi-stream for alternating between streams
+        # Reuse chunk_size_0 since it's always >= chunk_size_1 (first chunk is largest)
+        if use_multi_stream:
+            workspace_chunk_sizes.append(chunk_size_0)
+
+        workspaces = self.backend.get_workspaces(workspace_chunk_sizes)
+        workspace_0 = workspaces[0]
+        if use_multi_stream:
+            workspace_1 = workspaces[1]
+
+        return workspace_0, workspace_1
 
     def _forward_multiple_chunks(
         self,
@@ -729,11 +812,19 @@ class ConfigurableMoE(MoE):
         x_list = x.split(chunk_size_list)
         router_logits_list = router_logits.split(chunk_size_list)
 
+        # Determine if we need multiple streams for overlapped execution
+        use_multi_stream = not use_all_to_all and self.aux_stream is not None
+
         # ========== Setup auxiliary stream ==========
-        if not use_all_to_all and self.aux_stream is not None:
+        if use_multi_stream:
             self.event_dict[EventType.Main].record()
             with torch.cuda.stream(self.aux_stream):
                 self.event_dict[EventType.Main].wait()
+
+        # ========== Create workspace for DeepGemmFusedMoE ==========
+        workspace_0, workspace_1 = self._prepare_workspaces_for_chunk(
+            all_rank_num_tokens_list, chunk_size_list, use_multi_stream
+        )
 
         # ========== Execute chunking with overlap ==========
         outputs_list = []
@@ -742,7 +833,7 @@ class ConfigurableMoE(MoE):
             is_first_call = idx_chunk == 0 and self.repeat_idx == 0
             is_last_call = idx_chunk == num_chunks - 1 and self.repeat_idx == self.repeat_count - 1
 
-            if not use_all_to_all and self.aux_stream is not None:
+            if use_multi_stream:
                 # Alternate between main stream and auxiliary stream
                 # Each stream processes complete chunks (forward + reducescatter)
                 if idx_chunk % 2 == 0:
@@ -757,6 +848,7 @@ class ConfigurableMoE(MoE):
                             is_first_call,
                             is_last_call,
                             do_finalize,
+                            workspace=workspace_0,
                         )
                 else:
                     # Odd chunk: execute on main stream
@@ -769,6 +861,7 @@ class ConfigurableMoE(MoE):
                         is_first_call,
                         is_last_call,
                         do_finalize,
+                        workspace=workspace_1,
                     )
             else:
                 # No overlap
@@ -781,12 +874,13 @@ class ConfigurableMoE(MoE):
                     is_first_call,
                     is_last_call,
                     do_finalize,
+                    workspace=workspace_0,
                 )
 
             outputs_list.append(outputs)
 
         # ========== Wait for auxiliary stream to complete ==========
-        if not use_all_to_all and self.aux_stream is not None:
+        if use_multi_stream:
             # Wait for auxiliary stream to complete all its chunks
             with torch.cuda.stream(self.aux_stream):
                 self.event_dict[EventType.MoeChunkingOverlap].record()
@@ -797,23 +891,13 @@ class ConfigurableMoE(MoE):
 
         return outputs
 
-    # ========== Backend Property with Validation ==========
+    # ========== Backend Validation ==========
 
-    @property
-    def backend(self) -> MoE:
+    def validate_backend(self, backend: MoE):
         """
-        Get the current MoE backend implementation
+        Validate MOE backend.
 
-        Note: Returns a FusedMoE instance (e.g., CutlassFusedMoE, CuteDslFusedMoE)
-        """
-        return self._backend
-
-    @backend.setter
-    def backend(self, backend: MoE):
-        """
-        Set MoE backend with validation
-
-        This setter validates that:
+        It validates that:
         1. Backend is not None
         2. If EPLB is enabled, backend must support routing separation
 
@@ -837,43 +921,59 @@ class ConfigurableMoE(MoE):
                 f"Either disable EPLB or use a backend that supports load balancer."
             )
 
-        # Set backend (validation passed)
-        self._backend = backend
-
-    @property
-    def comm(self) -> Optional[Communication]:
-        """Get the current communication strategy"""
-        return self._comm
-
-    @comm.setter
-    def comm(self, strategy: Optional[Communication]):
-        """
-        Set communication strategy with validation
-
-        This setter validates that the strategy is compatible with the configuration.
-
-        Args:
-            strategy: Communication instance to set (can be None for lazy creation)
-
-        Raises:
-            ValueError: If strategy is incompatible with current configuration
-
-        Note: Unlike backend, comm can be None (will be created lazily).
-              This allows for automatic strategy selection based on hardware.
-        """
-        # comm can be None (lazy creation)
-        if strategy is None:
-            self._comm = None
-            return
-
-        # Set strategy (validation passed)
-        self._comm = strategy
-
     # ========== Helper Methods ==========
 
     def _is_using_nvlink_two_sided(self) -> bool:
         """Check if using NVLinkTwoSided communication strategy"""
         return isinstance(self.comm, NVLinkTwoSided)
+
+    def _get_nvlink_onesided_moe_output(
+        self,
+        all_rank_num_tokens: Optional[List[int]],
+        output_dtype: Optional[torch.dtype],
+    ) -> Optional[torch.Tensor]:
+        """
+        Get workspace output buffer for NVLinkOneSided communication backend.
+
+        This method handles moe_output allocation for both CutlassFusedMoE and TRTLLMGenFusedMoE
+        when using NVLinkOneSided communication strategy.
+
+        Args:
+            all_rank_num_tokens: Token counts per rank
+            output_dtype: Output data type
+
+        Returns:
+            moe_output tensor if NVLinkOneSided is used and backend supports it, None otherwise
+        """
+        if not isinstance(self.comm, NVLinkOneSided):
+            return None
+
+        if not self.backend.supports_moe_output_in_alltoall_workspace():
+            # Ensure payload_in_workspace is False if backend doesn't support it
+            self.comm.payload_in_workspace = False
+            return None
+
+        # Determine workspace dtype and whether backend supports workspace output
+        workspace_dtype = output_dtype
+        if isinstance(self.backend, TRTLLMGenFusedMoE):
+            # TRTLLMGen specific configuration
+            self.comm.invalid_token_expert_id = -1
+            workspace_dtype = torch.bfloat16
+
+        # Calculate runtime max tokens per rank
+        assert all_rank_num_tokens is not None, (
+            "all_rank_num_tokens must be provided for NVLinkOneSided backend"
+        )
+        runtime_max_tokens_per_rank = max(all_rank_num_tokens)
+
+        # Get workspace-backed output tensor
+        moe_output = self.comm.get_combine_payload_tensor_in_workspace(
+            runtime_max_tokens_per_rank, self.hidden_size, workspace_dtype
+        )
+
+        # Dynamically enable payload_in_workspace for this forward pass
+        self.comm.payload_in_workspace = True
+        return moe_output
 
     def _get_backend_kwargs(
         self,
@@ -881,6 +981,8 @@ class ConfigurableMoE(MoE):
         do_finalize: bool = True,
         all_rank_num_tokens: Optional[List[int]] = None,
         output_dtype: Optional[torch.dtype] = None,
+        x: Optional[torch.Tensor] = None,
+        workspace: Optional[dict] = None,
     ) -> Dict:
         """
         Get backend-specific keyword arguments for run_moe
@@ -905,6 +1007,8 @@ class ConfigurableMoE(MoE):
             router_logits: Router logits tensor (for TRTLLMGen backend)
             do_finalize: Whether to finalize output (for TRTLLMGen backend)
             all_rank_num_tokens: Token counts per rank (for TRTLLMGen backend moe_output)
+            output_dtype: Output data type
+            x: Input tensor (for calculating tuner_num_tokens in Cutlass)
 
         Returns:
             Dict: Backend-specific keyword arguments
@@ -917,15 +1021,47 @@ class ConfigurableMoE(MoE):
 
         # Cutlass-specific parameters
         if self.backend.__class__ == CutlassFusedMoE:
-            pass
+            # Determine if scaling factors are swizzled based on communication flow
+            # In post-quant communication (quantize -> dispatch), scaling factors are not swizzled
+            # In pre-quant communication (dispatch -> quantize), scaling factors are swizzled
+            supports_post_quant = self.comm is not None and self.comm.supports_post_quant_dispatch()
+            kwargs["is_sf_swizzled"] = not supports_post_quant
+            kwargs["output_dtype"] = output_dtype
+
+            # Prepare additional information for profiling in case padding is applied when using alltoall.
+            # Only the non-alltoall case is considered for profiling in the warmup phase.
+            # Therefore, to get the correct tactics during the actual inference, the inputs to the tuner
+            # should be the same as when not using alltoall.
+            if self._is_using_alltoall():
+                if all_rank_num_tokens is not None:
+                    kwargs["tuner_num_tokens"] = sum(all_rank_num_tokens)
+                else:
+                    kwargs["tuner_num_tokens"] = (
+                        x.shape[0] * self.mapping.tp_size if x is not None else None
+                    )
+                kwargs["tuner_top_k"] = self.routing_method.top_k
+            else:
+                kwargs["tuner_num_tokens"] = None
+                kwargs["tuner_top_k"] = None
+
+            # Get moe_output for NVLinkOneSided backend
+            kwargs["moe_output"] = self._get_nvlink_onesided_moe_output(
+                all_rank_num_tokens=all_rank_num_tokens, output_dtype=output_dtype
+            )
 
         # CuteDSL-specific parameters
         elif self.backend.__class__ == CuteDslFusedMoE:
             kwargs["enable_alltoall"] = self.enable_alltoall
 
+            # Get moe_output for NVLinkOneSided backend
+            kwargs["moe_output"] = self._get_nvlink_onesided_moe_output(
+                all_rank_num_tokens=all_rank_num_tokens, output_dtype=output_dtype
+            )
+
         # DeepGemm-specific parameters
         elif self.backend.__class__ == DeepGemmFusedMoE:
-            pass
+            if workspace is not None:
+                kwargs["workspace"] = workspace
 
         # TRTLLMGen-specific parameters
         elif self.backend.__class__ == TRTLLMGenFusedMoE:
@@ -940,37 +1076,10 @@ class ConfigurableMoE(MoE):
             kwargs["router_logits"] = router_logits_arg
             kwargs["do_finalize"] = do_finalize
 
-            # moe_output: workspace output buffer for NVLINK one-sided backend
-            # TRTLLMGenFusedMoE only supports workspace output for w4a8_mxfp4_mxfp8 quantization.
-            moe_output = None
-            if isinstance(self.comm, NVLinkOneSided):
-                # Determine dtype for workspace tensor
-                # TRTLLMGenFusedMoE always uses bfloat16, other backends use output_dtype
-                workspace_dtype = output_dtype
-                if isinstance(self.backend, TRTLLMGenFusedMoE):
-                    self.comm.invalid_token_expert_id = -1
-                    workspace_dtype = torch.bfloat16
-
-                # Check if backend supports workspace output for current quantization
-                backend_supports_workspace = (
-                    isinstance(self.backend, TRTLLMGenFusedMoE)
-                    and self.backend.has_w4a8_mxfp4_mxfp8
-                )
-                if backend_supports_workspace:
-                    assert all_rank_num_tokens is not None, (
-                        "all_rank_num_tokens must be provided for NVLinkOneSided backend with workspace output"
-                    )
-                    runtime_max_tokens_per_rank = max(all_rank_num_tokens)
-
-                    moe_output = self.comm.get_combine_payload_tensor_in_workspace(
-                        runtime_max_tokens_per_rank, self.hidden_size, workspace_dtype
-                    )
-                    # Dynamically enable payload_in_workspace for this forward pass
-                    self.comm.payload_in_workspace = True
-                else:
-                    # Ensure payload_in_workspace is False for non-workspace output
-                    self.comm.payload_in_workspace = False
-            kwargs["moe_output"] = moe_output
+            # Get moe_output for NVLinkOneSided backend
+            kwargs["moe_output"] = self._get_nvlink_onesided_moe_output(
+                all_rank_num_tokens=all_rank_num_tokens, output_dtype=output_dtype
+            )
 
         return kwargs
 

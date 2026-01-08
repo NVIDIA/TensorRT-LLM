@@ -13,9 +13,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceWorkspace.h"
 
-namespace tensorrt_llm::kernels::ar_fusion
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::ar_fusion
 {
 
 __global__ void lamport_initialize_kernel(float* ptr, int size)
@@ -94,4 +97,6 @@ void** Workspace::get_workspace()
 {
     return reinterpret_cast<void**>(m_workspace);
 }
-}; // namespace tensorrt_llm::kernels::ar_fusion
+}; // namespace kernels::ar_fusion
+
+TRTLLM_NAMESPACE_END

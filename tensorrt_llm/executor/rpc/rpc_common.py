@@ -75,6 +75,7 @@ class RPCRequest:
     is_streaming: bool = False
     creation_timestamp: Optional[
         float] = None  # Unix timestamp when request was created
+    routing_id: Optional[bytes] = None
 
     def __post_init__(self):
         """Initialize creation_timestamp if not provided."""

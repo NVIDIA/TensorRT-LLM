@@ -159,6 +159,7 @@ class OpenAIHttpClient(OpenAIClient):
         is_stream = request.stream
         for attempt in range(self._max_retries + 1):
             try:
+                lines_yielded = 0
                 start_time = get_steady_clock_now_in_seconds()
                 async with self._session.post(url, json=json_data) as http_response:
                     content_type = http_response.headers.get("Content-Type", "")
@@ -172,6 +173,7 @@ class OpenAIHttpClient(OpenAIClient):
                         async for line in self._response_generator(
                             request, http_response, start_time, server, hooks
                         ):
+                            lines_yielded += 1
                             yield line
                         # don't finish the request here since the response generator is not done yet
                     else:
@@ -181,8 +183,17 @@ class OpenAIHttpClient(OpenAIClient):
                         yield response_dict
                         # finish the request after the successful response
                         await self._finish_request(request)
+                        self._metrics_collector.complete_latency_seconds.observe(
+                            get_steady_clock_now_in_seconds() - start_time
+                        )
                 break  # break and skip retries if the whole response is processed without exception
             except (aiohttp.ClientError, OSError) as e:
+                if lines_yielded > 0:
+                    logger.error(
+                        f"Client error to {url}: {e} - cannot retry since {lines_yielded} lines were yielded",
+                        traceback.format_exc(),
+                    )
+                    raise
                 if attempt == self._max_retries:
                     logger.error(
                         f"Client error to {url}: {e} - last retry {attempt} of {self._max_retries}"
@@ -219,25 +230,24 @@ class OpenAIHttpClient(OpenAIClient):
             i = 0
             async for line in http_response.content.iter_any():
                 now_time = get_steady_clock_now_in_seconds()
-                if i == 0:
-                    if hooks:
-                        hooks.on_first_token(server, request)
-                    self._metrics_collector.first_token_latency_seconds.observe(
-                        now_time - last_token_time
-                    )
-                else:
-                    self._metrics_collector.per_token_latency_seconds.observe(
-                        now_time - last_token_time
-                    )
-                i += 1
                 if line:
+                    if i == 0:
+                        if hooks:
+                            hooks.on_first_token(server, request)
+                        self._metrics_collector.first_token_latency_seconds.observe(
+                            now_time - last_token_time
+                        )
+                    else:
+                        self._metrics_collector.per_token_latency_seconds.observe(
+                            now_time - last_token_time
+                        )
+                    i += 1
                     yield line
                     await asyncio.sleep(0)
                 last_token_time = now_time
 
             if hooks:
                 hooks.on_resp_done(server, request, None)
-            self._metrics_collector.completed_requests.inc()
             self._metrics_collector.complete_latency_seconds.observe(
                 get_steady_clock_now_in_seconds() - start_time
             )
@@ -254,6 +264,7 @@ class OpenAIHttpClient(OpenAIClient):
             await self._finish_request(request)
 
     async def _finish_request(self, request: UCompletionRequest) -> None:
+        self._metrics_collector.completed_requests.inc()
         await self._router.finish_request(request)
 
     async def collect_metrics(self) -> Dict[str, Any]:

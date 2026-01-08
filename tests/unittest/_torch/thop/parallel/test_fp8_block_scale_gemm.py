@@ -134,17 +134,30 @@ def test_fp8_block_scale_bmm(dtype, m, k, n, num_groups):
 
     torch.random.manual_seed(0)
     a = torch.randn((m, num_groups, k), device='cuda', dtype=dtype) / k
-
-    a_fp8, a_scales = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(a)
-
     b = torch.randn((num_groups, n, k), device='cuda', dtype=dtype) / k
-    b_fp8 = torch.zeros_like(b, device='cuda', dtype=torch.float8_e4m3fn)
-    b_scales = torch.zeros((num_groups, (n + 127) // 128, (k + 127) // 128),
-                           device='cuda',
-                           dtype=torch.float)
 
-    for i in range(num_groups):
-        b_fp8[i], b_scales[i] = per_block_cast_to_fp8(b[i])
+    if getSMVersion() == 120:
+        a_fp8, a_scales = fp8_utils.per_token_quant_and_transform(
+            a, need_permute102=True)
+        b_fp8, b_scales = fp8_utils.per_block_cast_to_fp8_e8m0(b)
+        b_scales = fp8_utils.transform_sf_into_required_layout(
+            b_scales,
+            mn=n,
+            k=k,
+            recipe=(1, 128, 128),
+            num_groups=num_groups,
+            is_sfa=False)
+    else:
+        a_fp8, a_scales = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(
+            a)
+
+        b_fp8 = torch.zeros_like(b, device='cuda', dtype=torch.float8_e4m3fn)
+        b_scales = torch.zeros((num_groups, (n + 127) // 128, (k + 127) // 128),
+                               device='cuda',
+                               dtype=torch.float)
+
+        for i in range(num_groups):
+            b_fp8[i], b_scales[i] = per_block_cast_to_fp8(b[i])
 
     output_expected = torch.einsum('mgk,gnk->gmn', a, b)
     output = torch.empty((num_groups, m, n),
@@ -314,9 +327,6 @@ def run_test_in_subprocess(env, test_file):
     {},
     {
         'TRTLLM_DG_JIT_USE_NVCC': '1'
-    },
-    {
-        'TRTLLM_DG_ENABLED': '0'
     },
 ])
 def test_deep_gemm_in_subprocess(env):

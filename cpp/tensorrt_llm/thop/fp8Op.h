@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/quantization.h"
 #include "tensorrt_llm/thop/thUtils.h"
@@ -25,6 +26,8 @@
 #include <cuda_fp16.h>
 
 #include <cstdint>
+
+TRTLLM_NAMESPACE_BEGIN
 
 namespace torch_ext
 {
@@ -83,3 +86,5 @@ torch::Tensor symmetric_dequantize_activation(torch::Tensor activation, torch::T
 torch::Tensor symmetric_dequantize_per_tensor(torch::Tensor input, torch::Tensor scales);
 
 } // namespace torch_ext
+
+TRTLLM_NAMESPACE_END

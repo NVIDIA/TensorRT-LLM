@@ -748,8 +748,8 @@ def test_write_finish_reasons():
                 prompt=[1, 12],
                 stop_words_list=[[12, 13], [14, 15]],
                 new_tokens=[13, 14, 15],
-                # We have an early exit specifically for stop words
-                finish_reasons=[STOP_WORDS, NOT_FINISHED, NOT_FINISHED],
+                # We don't use early exit to avoid stream synchronization for stop words
+                finish_reasons=[STOP_WORDS, NOT_FINISHED, STOP_WORDS],
             ),
             RequestCase(
                 prompt=[1, 12],
@@ -1565,7 +1565,14 @@ class TestBatchedSampling:
                     num_context_logits_prefix_sum,
                     resource_manager,
                 )
-                assert flashinfer_keys_seen
+
+                # Fast greedy path bypasses flashinfer sampling, so flashinfer_keys_seen
+                # will be empty when all requests are greedy
+                all_greedy = all(
+                    _request_strategy(req, vocab_size=2**31) == GREEDY
+                    for req in scheduled_requests.all_requests()
+                )
+                assert flashinfer_keys_seen or all_greedy
                 return res
 
             patch_ctx.setattr(sampler, "sample_async", _sample_async)

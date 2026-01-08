@@ -331,6 +331,11 @@ tk::KVCacheIndex::UnderlyingType KVCacheBlock::getMemoryPoolBlockIndex() const
     return mMemoryPoolBlockIndex.get();
 }
 
+std::vector<MmKey> KVCacheBlock::getExtraKeys() const
+{
+    return mBlockKey.extraKeys;
+}
+
 bool KVCacheBlock::isPrimary() const
 {
     return mMemoryPoolBlockIndex.isPrimary();
@@ -1806,7 +1811,7 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(
         // Check if matchingBlock is still valid for reuse.
         // It is possible that a matching block has been evicted after the last scan of search tree.
         validForReuse = validForReuse && matchingBlock != nullptr && matchingBlock->isValidForReuse();
-        if (validForReuse)
+        if (validForReuse && numMatchedTokens + numMatched <= sequence.getCurrentPrepopulatedPromptLen())
         {
             KVCacheBlock::IdType matchingBlockId = matchingBlock->getBlockId();
 
@@ -1923,6 +1928,7 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(
         ++mMissedBlocks;
     }
 
+    sequence.setCurrentPrepopulatedPromptLen(numMatchedTokens);
     return numMatchedTokens;
 }
 
@@ -2362,12 +2368,25 @@ std::optional<KVCacheBlock::IdType> BlockManager::releaseBlocks(
     GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest, bool pinBlocks)
 {
     std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
-    // Released block will be stored when reuse is enabled.
-    // Reuse is implied to be enabled if llmRequest is provided.
-    auto lastStoredId = notThreadSafeStoreBlocksForReuse(sequence, llmRequest, pinBlocks);
+
+    std::optional<KVCacheBlock::IdType> lastStoredId = std::nullopt;
+    // For now, the attention kernel only accepts a single
+    // "prepopulatedPromptLen", that is, all window sizes will use the same
+    // prepopulated prompt length, so it is meaningless right now to save
+    // blocks only for a certain window size while blocks in the other
+    // window size are not valid for saving for reuse.
+    bool isAllWindowSizesValidForStoreForReuse = true;
     for (auto& [windowSize, manager] : mWindowBlockManagers)
     {
-        manager.releaseBlocks(sequence);
+        isAllWindowSizesValidForStoreForReuse &= manager.isSequenceValidForStoreForReuse(sequence.getRequestId());
+    }
+    bool dontStoreBlocks = !llmRequest.has_value() || llmRequest->isDummyRequest() || sequence.getBeamWidth() > 1 || !isAllWindowSizesValidForStoreForReuse;
+
+    // Released block will be stored when reuse is enabled.
+    // Reuse is implied to be enabled if llmRequest is provided.
+    for (auto& [windowSize, manager] : mWindowBlockManagers)
+    {
+        manager.releaseBlocks(sequence, dontStoreBlocks ? std::nullopt : llmRequest);
     }
     return lastStoredId;
 }

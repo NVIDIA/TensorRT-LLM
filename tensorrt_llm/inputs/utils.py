@@ -24,7 +24,8 @@ from tensorrt_llm.inputs.multimodal import (MultimodalServerConfig,
 from tensorrt_llm.inputs.registry import (MULTIMODAL_PLACEHOLDER_REGISTRY,
                                           MultimodalPlaceholderPlacement)
 from tensorrt_llm.llmapi.llm_utils import ModelLoader
-from tensorrt_llm.llmapi.tokenizer import TokenizerBase, TransformersTokenizer
+from tensorrt_llm.tokenizer import TokenizerBase, TransformersTokenizer
+from tensorrt_llm.tokenizer.deepseek_v32 import DeepseekV32Tokenizer
 
 logger = logging.get_logger(__name__)
 
@@ -373,8 +374,10 @@ NOTE:
     placeholder for the model needs to be added in retrieve_multimodal_placeholder().
 """
 
-HF_CHAT_TEMPLATE_EXCEPTIONS = ["llava_llama"]
-PLACEHOLDER_EXCEPTIONS = ["llava_next", "NemotronH_Nano_VL_V2"]
+HF_CHAT_TEMPLATE_EXCEPTIONS = ["llava_llama", "mistral_large_3"]
+PLACEHOLDER_EXCEPTIONS = [
+    "llava_next", "NemotronH_Nano_VL_V2", "mistral_large_3"
+]
 
 
 # Helpers to always get the latest supported multimodal model types from the registry
@@ -580,6 +583,18 @@ def apply_chat_template(
     if model_type in HF_CHAT_TEMPLATE_EXCEPTIONS:
         # special path for models like llava-llama
         return "".join([conv["content"] for conv in conversation])
+
+    # Handle DeepSeek V32 tokenizer with custom chat template
+    if isinstance(tokenizer, DeepseekV32Tokenizer):
+        prompt = tokenizer.apply_chat_template(
+            messages=conversation,
+            tools=tools,
+            **(chat_template_kwargs or {}),
+        )
+        if enable_tokenize:
+            return tokenizer.encode(prompt)
+        return prompt
+
     if isinstance(tokenizer, TransformersTokenizer):
         tokenizer = tokenizer.tokenizer  # we need the TokenizerBase for apply_chat_template
 
@@ -758,6 +773,7 @@ def default_multimodal_input_loader(
             add_generation_prompt=True,
             mm_placeholder_counts=[mm_placeholder_counts])
         input = {"prompt": prompt}
+
         if mm_placeholder_counts:
             if mm_embeddings is not None:
                 input[

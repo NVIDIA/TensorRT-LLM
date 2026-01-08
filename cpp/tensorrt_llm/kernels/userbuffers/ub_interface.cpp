@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "ub_interface.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
@@ -21,7 +22,7 @@
 #if ENABLE_MULTI_DEVICE
 namespace tensorrt_llm::runtime::ub
 {
-void ub_initialize(tensorrt_llm::runtime::WorldConfig const& world_config)
+void ub_initialize(::tensorrt_llm::runtime::WorldConfig const& world_config)
 {
     UserBufferAllocator::Instance().initialize(world_config);
 }
@@ -30,7 +31,7 @@ void ub_initialize(int tp_size)
 {
     int num_devices;
     TLLM_CUDA_CHECK(cudaGetDeviceCount(&num_devices));
-    tensorrt_llm::runtime::WorldConfig world_config(tp_size, 1, 1, COMM_SESSION.getRank(), num_devices);
+    ::tensorrt_llm::runtime::WorldConfig world_config(tp_size, 1, 1, COMM_SESSION.getRank(), num_devices);
     UserBufferAllocator::Instance().initialize(world_config);
 }
 
@@ -71,9 +72,12 @@ bool ub_supported()
 }
 }; // namespace tensorrt_llm::runtime::ub
 
-namespace tensorrt_llm::kernels::ub
-{
 using namespace tensorrt_llm::runtime::ub;
+
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::ub
+{
 
 void allreduce2_userbuff_inplace_launcher(int const handler, size_t const offset, size_t const elements,
     nvinfer1::DataType dataType, communicator* comm, cudaStream_t stream)
@@ -115,11 +119,14 @@ int allreduce2_userbuff_inplace_rmsnorm_quant_fp4_launcher(int const handler, si
         scale_offset, elements, hidden_size, beta, gamma, eps, scalefactor, residual_in, residual_out, dataType, comm,
         stream);
 }
-} // namespace tensorrt_llm::kernels::ub
+} // namespace kernels::ub
+
+TRTLLM_NAMESPACE_END
+
 #else
 namespace tensorrt_llm::runtime::ub
 {
-void ub_initialize(tensorrt_llm::runtime::WorldConfig const& world_config) {}
+void ub_initialize(::tensorrt_llm::runtime::WorldConfig const& world_config) {}
 
 void ub_initialize(int tp_size) {}
 
@@ -151,10 +158,12 @@ bool ub_supported()
 }
 }; // namespace tensorrt_llm::runtime::ub
 
-namespace tensorrt_llm::kernels::ub
-{
 using namespace tensorrt_llm::runtime::ub;
 
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::ub
+{
 void allreduce2_userbuff_inplace_launcher(int const handler, size_t const offset, size_t const elements,
     nvinfer1::DataType dataType, communicator* comm, cudaStream_t stream)
 {
@@ -182,5 +191,7 @@ int allreduce2_userbuff_inplace_rmsnorm_quant_fp4_launcher(int const handler, si
 {
     return 0;
 }
-} // namespace tensorrt_llm::kernels::ub
+} // namespace kernels::ub
+
+TRTLLM_NAMESPACE_END
 #endif

@@ -16,6 +16,7 @@
  */
 #include "attentionOp.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
@@ -295,7 +296,8 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     // Parameters for sparse attention
     xqaParams.sparse_params = mRuntimeSparseAttentionParams;
     xqaParams.use_sparse_attention = useTllmGenSparseAttention();
-
+    // Skip softmax threshold.
+    xqaParams.skip_softmax_threshold_scale_factor = mSkipSoftmaxThresholdScaleFactorDecode;
     // Cross attention parameters.
     xqaParams.encoder_input_lengths = generationsParams.encoder_input_lengths;
 
@@ -1312,6 +1314,8 @@ int AttentionOp::mlaGeneration(
             fmhaParams.sparse_params = mRuntimeSparseAttentionParams;
         }
 
+        // MLA does not support skip-softmax attention right now
+
         // Run the fmha kernel
         mDecoderFMHARunner->run(fmhaParams);
     }
@@ -1883,6 +1887,18 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         {
             fmhaParams.sparse_params = mRuntimeSparseAttentionParams;
         }
+
+        // Skip-softmax attention parameters
+        fmhaParams.skipSoftmaxThresholdScaleFactor = mSkipSoftmaxThresholdScaleFactorPrefill;
+#ifdef SKIP_SOFTMAX_STAT
+        fmhaParams.skipSoftmaxTotalBlocks = mSkipSoftmaxTotalBlocks;
+        fmhaParams.skipSoftmaxSkippedBlocks = mSkipSoftmaxSkippedBlocks;
+#else
+        if (tensorrt_llm::common::getEnvPrintSkipSoftmaxStat())
+        {
+            TLLM_THROW("To print skip softmax stat, please run build_wheel.py with -DSKIP_SOFTMAX_STAT");
+        }
+#endif
 
         if (mAttentionChunkSize)
         {

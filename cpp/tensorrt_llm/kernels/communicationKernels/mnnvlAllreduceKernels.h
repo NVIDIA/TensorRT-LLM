@@ -16,11 +16,13 @@
 #ifndef TRTLLM_MNNVL_ALLREDUCE_KERNELS_H
 #define TRTLLM_MNNVL_ALLREDUCE_KERNELS_H
 
+#include "tensorrt_llm/common/config.h"
 #include <NvInferRuntime.h>
 #include <cstdint>
 
-namespace tensorrt_llm::kernels::mnnvl
+TRTLLM_NAMESPACE_BEGIN
 
+namespace kernels::mnnvl
 {
 
 /**
@@ -66,6 +68,7 @@ struct AllReduceFusionParams
 
 void oneshotAllreduceFusionOp(AllReduceFusionParams const& params);
 void twoshotAllreduceFusionOp(AllReduceFusionParams const& params);
-} // namespace tensorrt_llm::kernels::mnnvl
+} // namespace kernels::mnnvl
 
+TRTLLM_NAMESPACE_END
 #endif // TRTLLM_MNNVL_ALLREDUCE_KERNELS_H
