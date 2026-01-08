@@ -64,6 +64,9 @@ public:
     [[nodiscard]] TensorPtr getSsmStates(SizeType32 layerIdx) const;
 
 private:
+    static std::vector<SizeType32> getPpLayers(SizeType32 numLayers, runtime::WorldConfig const& worldConfig,
+        std::optional<std::vector<bool>> const& layerMask);
+
     // If we need support beam search, we may need mMaxBeamWidth + 1 slots and use separate input / output states.
     TensorPtr pagedRnnStates;  // [local_nb_layers, max_seq_num * max_beam_width, state_size, rnn_hidden_size] or
                                // [local_nb_layers, max_seq_num * max_beam_width, num_heads, state_size, rnn_head_size]

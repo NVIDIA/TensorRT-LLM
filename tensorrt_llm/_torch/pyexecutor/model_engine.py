@@ -3244,6 +3244,7 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata.kv_cache_manager = kv_cache_manager
 
         attn_metadata.prepare()
+
         if self.enable_attention_dp:
             all_rank_num_tokens = self.dist.tp_allgather(
                 attn_metadata.num_tokens)
