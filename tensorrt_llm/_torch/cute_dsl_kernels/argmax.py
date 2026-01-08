@@ -219,10 +219,30 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
     @cute.jit
     def warp_argmax_redux(current_max: Float32, current_argmax: Int32):
+        """Redux-based warp argmax - only works on sm_100+ (Blackwell)."""
         warp_max = ptx_redux_sync_max_f32(current_max)
         candidate_idx = ptx_select_argmax_candidate(current_max, warp_max, current_argmax)
         winning_idx = ptx_redux_sync_min_u32(candidate_idx)
         return warp_max, winning_idx
+
+    @cute.jit
+    def warp_reduce_argmax(current_max: Float32, current_argmax: Int32):
+        """Shuffle-based warp argmax - works on all architectures (Hopper+)."""
+        warp_max = current_max
+        warp_argmax = current_argmax
+
+        # Use butterfly shuffle pattern for warp reduction
+        for i in cutlass.range_constexpr(int(5)):  # log2(32) = 5 iterations
+            # Get values from other lanes using butterfly pattern
+            other_max = cute.arch.shuffle_sync_bfly(warp_max, offset=1 << i)
+            other_argmax = cute.arch.shuffle_sync_bfly(warp_argmax, offset=1 << i)
+
+            # Inline argmax comparison
+            if other_max > warp_max:
+                warp_max = other_max
+                warp_argmax = other_argmax
+
+        return warp_max, warp_argmax
 
     # ============================================================================
     # Reduction Base class
@@ -302,8 +322,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
     # Argmax Kernel class
     # ============================================================================
     class ArgmaxKernel(ReductionBase):
-        def __init__(self, dtype: Type[cutlass.Numeric], N: int):
+        def __init__(self, dtype: Type[cutlass.Numeric], N: int, use_redux: bool = False):
             super().__init__(dtype, N, stage=1, reduction_dtype=cutlass.Float32)
+            # use_redux=True for Blackwell (sm_100+), False for Hopper (sm_90)
+            self.use_redux = use_redux
 
         def _calculate_threads_per_row(self):
             N = self.N
@@ -441,7 +463,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         current_argmax = Int32(col_idx)
 
             lane_idx, warp_idx = cute.arch.lane_idx(), cute.arch.warp_idx()
-            warp_max, warp_argmax = warp_argmax_redux(current_max, current_argmax)
+            if cutlass.const_expr(self.use_redux):
+                warp_max, warp_argmax = warp_argmax_redux(current_max, current_argmax)
+            else:
+                warp_max, warp_argmax = warp_reduce_argmax(current_max, current_argmax)
 
             if cutlass.const_expr(self.cluster_n == 1):
                 warps_per_row = cute.size(reduction_buffer.shape[1])
@@ -461,7 +486,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         cutlass.Int32
                     )
 
-                warp_max, warp_argmax = warp_argmax_redux(block_reduce_max, block_reduce_argmax)
+                if cutlass.const_expr(self.use_redux):
+                    warp_max, warp_argmax = warp_argmax_redux(block_reduce_max, block_reduce_argmax)
+                else:
+                    warp_max, warp_argmax = warp_reduce_argmax(
+                        block_reduce_max, block_reduce_argmax
+                    )
             else:
                 cute.arch.cluster_wait()
                 warps_per_row, cluster_n = reduction_buffer.shape[1]
@@ -509,7 +539,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             block_reduce_val = element_max
                             block_reduce_argmax = element_argmax
 
-                warp_max, warp_argmax = warp_argmax_redux(block_reduce_val, block_reduce_argmax)
+                if cutlass.const_expr(self.use_redux):
+                    warp_max, warp_argmax = warp_argmax_redux(block_reduce_val, block_reduce_argmax)
+                else:
+                    warp_max, warp_argmax = warp_reduce_argmax(
+                        block_reduce_val, block_reduce_argmax
+                    )
 
             row_idx = tXcX[0][0]
             warps_per_row = tv_layout.shape[0][0] // cute.arch.WARP_SIZE
@@ -583,9 +618,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
         out_tensor = convert_from_dlpack(out)
         current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-        compile_key = (dtype, N)
+        # Detect compute capability: use redux instructions only on Blackwell (sm_100+)
+        # redux.sync.max.f32 is only supported on sm_100+
+        from ..._utils import get_sm_version
+
+        use_redux = get_sm_version() >= 100  # sm_100+ (Blackwell)
+
+        compile_key = (dtype, N, use_redux)
         if compile_key not in _argmax_compile_cache:
-            argmax_kernel = ArgmaxKernel(dtype, N)
+            argmax_kernel = ArgmaxKernel(dtype, N, use_redux=use_redux)
             _argmax_compile_cache[compile_key] = cute.compile(
                 argmax_kernel, x_tensor, out_tensor, current_stream
             )
