@@ -1931,8 +1931,8 @@ class BaseLlmArgs(StrictBaseModel):
 
     # Below are all remaining arguments
 
-    model_kwargs: Dict[str, Any] = Field(
-        default_factory=dict,
+    model_kwargs: Optional[Dict[str, Any]] = Field(
+        default=None,
         description="Optional parameters overriding model config defaults. "
         "Precedence: (1) model_kwargs, (2) model config file, (3) model config class defaults. "
         "Unknown keys are ignored",
