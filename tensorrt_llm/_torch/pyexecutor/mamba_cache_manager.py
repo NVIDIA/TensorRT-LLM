@@ -383,10 +383,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         self._prepare_mamba_cache_blocks(request_ids)
 
     def free_resources(self, request: LlmRequest):
-        request_id = request.py_request_id
-        if request_id in self.mamba_cache_index:
-            block = self.mamba_cache_index.pop(request_id)
-            self.mamba_cache_free_blocks.append(block)
+        self.mamba_impl.free_cache_block(request.py_request_id)
 
     def get_state_indices(self,
                           request_ids: List[int] = None,
