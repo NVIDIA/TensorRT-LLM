@@ -117,7 +117,7 @@ def test_match_llama_attention(config: Dict[str, Any], attn_implementation: str)
         "attn_implementation": attn_implementation,
         **config,
     }
-    dynamic_shapes = {0: Dim("batch_size", max=8), 1: Dim("seq_len", min=2, max=8)}
+    dynamic_shapes = {0: Dim.DYNAMIC, 1: Dim.DYNAMIC}
 
     # Build and export model on meta device
     with init_empty_weights():
