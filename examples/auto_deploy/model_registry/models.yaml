@@ -179,6 +179,19 @@ models:
 # - name: nvidia/Llama-3.1-70B-Instruct-FP8
 #   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
 # DISABLED: FakeTensorMode error in unified_attn export
+# - name: nvidia/Llama-3.1-405B-Instruct-FP8
+#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+- name: nvidia/Llama-3.1-Nemotron-70B-Instruct-HF
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'compile_backend_torch_cudagraph.yaml']
+# DISABLED: Model loading failure - dynamic module registry issue
+# - name: nvidia/Llama-3_1-Nemotron-51B-Instruct
+#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
+- name: nvidia/Llama-3_1-Nemotron-Ultra-253B-v1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
+- name: nvidia/Llama-3_1-Nemotron-Ultra-253B-v1-FP8
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
+- name: nvidia/Llama-3_3-Nemotron-Super-49B-v1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
 - name: Qwen/Qwen3-30B-A3B
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
 - name: Qwen/Qwen3-235B-A22B
