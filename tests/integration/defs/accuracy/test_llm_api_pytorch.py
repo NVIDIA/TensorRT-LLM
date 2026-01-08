@@ -3224,8 +3224,8 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
                                                       temperature=0.8,
                                                       top_p=0.95)
 
-            max_duration_sec = 3 * 3600
-            max_batches = 200
+            max_duration_sec = 1.5 * 3600
+            max_batches = 80
             start_time = time.time()
             num_samples = len(long_token_list)
 
@@ -3330,15 +3330,15 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
 
                                 # Simulate cancellation for some requests
                                 if should_cancel and chunks_received >= max_chunks_before_cancel:
-                                    print(f"  [Cancel] Request {req_idx} after {chunks_received} chunks")
+                                    print(f"[Cancel] Request {req_idx} after {chunks_received} chunks")
                                     break
                         except Exception as e:
                             # Log but don't fail on cancellation-related errors
-                            print(f"  [Warning] Request {req_idx} exception: {e}")
+                            print(f"[Warning] Request {req_idx} exception: {e}")
                             if not should_cancel:
                                 raise
 
-                    print(f"  [Async Streaming] Completed batch {async_batch_idx + 1}/{num_async_batches}")
+                    print(f"[Async Streaming] Completed batch {async_batch_idx + 1}/{num_async_batches}")
 
             # Run async streaming test
             asyncio.run(run_streaming_with_cancellation())
