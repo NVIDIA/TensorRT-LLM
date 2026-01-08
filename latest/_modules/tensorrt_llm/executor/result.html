@@ -35,6 +35,7 @@
     <link rel="stylesheet" type="text/css" href="../../../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../../../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../../../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/config_selector.css?v=e17d8078" />
     <link rel="stylesheet" type="text/css" href="../../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
@@ -50,6 +51,7 @@
     <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../../../_static/copybutton.js?v=65e89d2a"></script>
+    <script src="../../../_static/config_selector.js?v=aaf6cd4a"></script>
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
@@ -60,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc6';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc7';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -73,7 +75,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc6" />
+  <meta name="docsearch:version" content="1.2.0rc7" />
 
 
   </head>
@@ -350,13 +352,13 @@
 </ul>
 </details></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/aiperf_client.html">Aiperf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/aiperf_client_for_multimodal.html">Aiperf Client For Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/curl_chat_client.html">Curl Chat Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/curl_completion_client.html">Curl Completion Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/curl_responses_client.html">Curl Responses Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../examples/genai_perf_client.html">Genai Perf Client</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../examples/genai_perf_client_for_multimodal.html">Genai Perf Client For Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
@@ -386,7 +388,6 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../../../commands/trtllm-bench.html">trtllm-bench</a></li>
-
 <li class="toctree-l1"><a class="reference internal" href="../../../commands/trtllm-eval.html">trtllm-eval</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../../../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
@@ -417,7 +418,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../features/guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../features/auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/auto_deploy/auto-deploy.html">AutoDeploy (Beta)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/helix.html">Helix Parallelism</a></li>
@@ -519,6 +520,7 @@
                   
   <h1>Source code for tensorrt_llm.executor.result</h1><div class="highlight"><pre>
 <span></span><span class="kn">import</span><span class="w"> </span><span class="nn">asyncio</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">dataclasses</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">weakref</span>
@@ -842,7 +844,14 @@
         <span class="k">if</span> <span class="n">response_tensors</span><span class="o">.</span><span class="n">request_perf_metrics</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">output</span><span class="o">.</span><span class="n">request_perf_metrics</span> <span class="o">=</span> <span class="n">response_tensors</span><span class="o">.</span><span class="n">request_perf_metrics</span>
 
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_done</span><span class="p">:</span>
+        <span class="c1"># Check if this specific sequence is finished (not just if the entire request is done)</span>
+        <span class="c1"># This is important for best_of &gt; n sampling where sequences finish at different times</span>
+        <span class="n">sequence_is_finished</span> <span class="o">=</span> <span class="p">(</span><span class="n">finish_reasons</span> <span class="ow">and</span> <span class="n">finish_reasons</span><span class="p">[</span><span class="n">src_idx</span><span class="p">]</span>
+                                <span class="o">!=</span> <span class="n">tllm</span><span class="o">.</span><span class="n">FinishReason</span><span class="o">.</span><span class="n">NOT_FINISHED</span>
+                                <span class="ow">and</span> <span class="n">finish_reasons</span><span class="p">[</span><span class="n">src_idx</span><span class="p">]</span>
+                                <span class="o">!=</span> <span class="n">tllm</span><span class="o">.</span><span class="n">FinishReason</span><span class="o">.</span><span class="n">CANCELLED</span><span class="p">)</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">_done</span>
+
+        <span class="k">if</span> <span class="n">sequence_is_finished</span><span class="p">:</span>
             <span class="k">if</span> <span class="n">finish_reasons</span><span class="p">[</span><span class="n">src_idx</span><span class="p">]</span> <span class="o">==</span> <span class="n">tllm</span><span class="o">.</span><span class="n">FinishReason</span><span class="o">.</span><span class="n">END_ID</span><span class="p">:</span>
                 <span class="n">output</span><span class="o">.</span><span class="n">finish_reason</span> <span class="o">=</span> <span class="s1">&#39;stop&#39;</span>
             <span class="k">elif</span> <span class="n">finish_reasons</span><span class="p">[</span><span class="n">src_idx</span><span class="p">]</span> <span class="o">==</span> <span class="n">tllm</span><span class="o">.</span><span class="n">FinishReason</span><span class="o">.</span><span class="n">STOP_WORDS</span><span class="p">:</span>
@@ -867,6 +876,9 @@
             <span class="k">else</span><span class="p">:</span>
                 <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                     <span class="sa">f</span><span class="s2">&quot;Unknown finish reason: </span><span class="si">{</span><span class="n">finish_reasons</span><span class="p">[</span><span class="n">src_idx</span><span class="p">]</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+        <span class="c1"># Only record stats and do tracing when the entire request is done</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_done</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">record_stats</span><span class="p">(</span><span class="n">output</span><span class="p">,</span> <span class="n">req_perf_metrics_dict</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">do_tracing</span><span class="p">(</span><span class="n">output</span><span class="p">,</span> <span class="n">req_perf_metrics_dict</span><span class="p">)</span>
 
@@ -928,12 +940,19 @@
             <span class="bp">self</span><span class="o">.</span><span class="n">cached_tokens</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">response_result</span><span class="p">,</span> <span class="s1">&#39;cached_tokens&#39;</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">avg_decoded_tokens_per_iter</span> <span class="o">=</span> <span class="n">response_result</span><span class="o">.</span><span class="n">avg_decoded_tokens_per_iter</span>
             <span class="k">if</span> <span class="n">context_phase_params</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">disaggregated_params</span> <span class="o">=</span> <span class="n">DisaggregatedParams</span><span class="p">(</span>
+                <span class="n">existing_disagg_params</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">disaggregated_params</span>
+                <span class="c1"># Use `replace` to preserve things like `mrope_position_ids_handle` and</span>
+                <span class="c1"># `mrope_position_deltas_handle`. However, explicitly set</span>
+                <span class="c1"># `multimodal_embedding_handles=None` since they should no longer be needed.</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">disaggregated_params</span> <span class="o">=</span> <span class="n">dataclasses</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span>
+                    <span class="n">existing_disagg_params</span> <span class="ow">or</span> <span class="n">DisaggregatedParams</span><span class="p">(),</span>
                     <span class="n">request_type</span><span class="o">=</span><span class="s2">&quot;context_only&quot;</span><span class="p">,</span>
                     <span class="n">first_gen_tokens</span><span class="o">=</span><span class="n">context_phase_params</span><span class="o">.</span><span class="n">first_gen_tokens</span><span class="p">,</span>
                     <span class="n">ctx_request_id</span><span class="o">=</span><span class="n">context_phase_params</span><span class="o">.</span><span class="n">req_id</span><span class="p">,</span>
                     <span class="n">opaque_state</span><span class="o">=</span><span class="n">context_phase_params</span><span class="o">.</span><span class="n">opaque_state</span><span class="p">,</span>
-                    <span class="n">draft_tokens</span><span class="o">=</span><span class="n">context_phase_params</span><span class="o">.</span><span class="n">draft_tokens</span><span class="p">)</span>
+                    <span class="n">draft_tokens</span><span class="o">=</span><span class="n">context_phase_params</span><span class="o">.</span><span class="n">draft_tokens</span><span class="p">,</span>
+                    <span class="n">multimodal_embedding_handles</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="p">)</span>
 
             <span class="n">finish_reasons</span> <span class="o">=</span> <span class="n">response_result</span><span class="o">.</span><span class="n">finish_reasons</span>
             <span class="c1"># output_token_ids = (beams, tokens)</span>
@@ -953,6 +972,8 @@
             <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">response_result</span><span class="p">,</span> <span class="s1">&#39;mm_embedding_handle&#39;</span>
                        <span class="p">)</span> <span class="ow">and</span> <span class="n">response_result</span><span class="o">.</span><span class="n">mm_embedding_handle</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_mm_embedding_handle</span> <span class="o">=</span> <span class="n">response_result</span><span class="o">.</span><span class="n">mm_embedding_handle</span>
+                <span class="n">mrope_position_ids_handle</span> <span class="o">=</span> <span class="n">response_result</span><span class="o">.</span><span class="n">mrope_position_ids_handle</span>
+                <span class="n">mrope_position_deltas_handle</span> <span class="o">=</span> <span class="n">response_result</span><span class="o">.</span><span class="n">mrope_position_deltas_handle</span>
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">disaggregated_params</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">disaggregated_params</span><span class="o">.</span><span class="n">multimodal_embedding_handles</span> <span class="o">=</span> <span class="p">[</span>
                         <span class="n">response_result</span><span class="o">.</span><span class="n">mm_embedding_handle</span>
@@ -964,6 +985,8 @@
                             <span class="n">response_result</span><span class="o">.</span><span class="n">mm_embedding_handle</span>
                         <span class="p">],</span>
                         <span class="n">multimodal_hashes</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_multimodal_hashes</span><span class="p">)</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">disaggregated_params</span><span class="o">.</span><span class="n">mrope_position_ids_handle</span> <span class="o">=</span> <span class="n">mrope_position_ids_handle</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">disaggregated_params</span><span class="o">.</span><span class="n">mrope_position_deltas_handle</span> <span class="o">=</span> <span class="n">mrope_position_deltas_handle</span>
 
             <span class="c1"># Processing background errors here ASAF during generation.</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_background_error_handler</span> <span class="ow">and</span> <span class="p">(</span>
@@ -1324,8 +1347,12 @@
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_repr_fields</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="p">[</span>
-            <span class="s1">&#39;request_id&#39;</span><span class="p">,</span> <span class="s1">&#39;prompt_token_ids&#39;</span><span class="p">,</span> <span class="s1">&#39;outputs&#39;</span><span class="p">,</span> <span class="s1">&#39;finished&#39;</span><span class="p">,</span>
-            <span class="s2">&quot;context_logits&quot;</span><span class="p">,</span> <span class="s2">&quot;mm_embedding_handle&quot;</span>
+            <span class="s1">&#39;request_id&#39;</span><span class="p">,</span>
+            <span class="s1">&#39;prompt_token_ids&#39;</span><span class="p">,</span>
+            <span class="s1">&#39;outputs&#39;</span><span class="p">,</span>
+            <span class="s1">&#39;finished&#39;</span><span class="p">,</span>
+            <span class="s2">&quot;context_logits&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;mm_embedding_handle&quot;</span><span class="p">,</span>
         <span class="p">]</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__repr__</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
@@ -1597,9 +1624,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on December 15, 2025.</p>
+  <p>Last updated on January 04, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9ba1426">9ba1426</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a65b0d4">a65b0d4</a>.</p>
   
 </div></div>
       

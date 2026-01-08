@@ -36,6 +36,7 @@
     <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../_static/config_selector.css?v=e17d8078" />
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
@@ -51,6 +52,7 @@
     <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../_static/copybutton.js?v=65e89d2a"></script>
+    <script src="../_static/config_selector.js?v=aaf6cd4a"></script>
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
@@ -61,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc6';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc7';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -76,7 +78,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc6" />
+  <meta name="docsearch:version" content="1.2.0rc7" />
 
 
   </head>
@@ -357,13 +359,13 @@
 </ul>
 </details></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/aiperf_client.html">Aiperf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/aiperf_client_for_multimodal.html">Aiperf Client For Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client.html">Curl Chat Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/curl_completion_client.html">Curl Completion Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/curl_responses_client.html">Curl Responses Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client.html">Genai Perf Client</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client_for_multimodal.html">Genai Perf Client For Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
@@ -393,7 +395,6 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-bench.html">trtllm-bench</a></li>
-
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-eval.html">trtllm-eval</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
@@ -424,7 +425,7 @@
 <li class="toctree-l1"><a class="reference internal" href="guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="checkpoint-loading.html">Checkpoint Loading</a></li>
-<li class="toctree-l1"><a class="reference internal" href="auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="auto_deploy/auto-deploy.html">AutoDeploy (Beta)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1 current active"><a class="current reference internal" href="#">Torch Compile &amp; Piecewise CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="helix.html">Helix Parallelism</a></li>
@@ -572,7 +573,12 @@
 </section>
 <section id="usage">
 <h2>Usage<a class="headerlink" href="#usage" title="Link to this heading">#</a></h2>
-<p>To enable torch.compile and Piecewise CUDA Graph, add the following configuration to <code class="docutils literal notranslate"><span class="pre">extra_config.yml</span></code>. Typically, the <code class="docutils literal notranslate"><span class="pre">extra_config.yml</span></code> can be used by adding launching args <code class="docutils literal notranslate"><span class="pre">--extra_llm_api_options</span> <span class="pre">extra_config.yml</span></code> to <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> or <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code>.</p>
+<p>To enable torch.compile and Piecewise CUDA Graph, add the following configuration to <code class="docutils literal notranslate"><span class="pre">config.yml</span></code>. Typically, the <code class="docutils literal notranslate"><span class="pre">config.yml</span></code> can be used by adding launching args <code class="docutils literal notranslate"><span class="pre">--config</span> <span class="pre">config.yml</span></code> to <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> or <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code>.</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p><strong>Non-breaking</strong>: <code class="docutils literal notranslate"><span class="pre">--config</span> <span class="pre">&lt;file.yaml&gt;</span></code> is the preferred flag for passing a <a class="reference internal" href="../commands/trtllm-serve/trtllm-serve.html#configuring-with-yaml-files"><span class="std std-ref">YAML configuration file</span></a>.
+Existing workflows using <code class="docutils literal notranslate"><span class="pre">--extra_llm_api_options</span> <span class="pre">&lt;file.yaml&gt;</span></code> continue to work; it is an equivalent alias.</p>
+</div>
 <div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nn">...</span><span class="w"> </span><span class="c1"># Other extra config</span>
 <span class="nt">torch_compile_config</span><span class="p">:</span>
 <span class="w">  </span><span class="nt">capture_num_tokens</span><span class="p">:</span><span class="w"> </span><span class="s">&#39;${capture_num_tokens}&#39;</span><span class="w"> </span><span class="c1"># List of num tokens to capture. e.g., [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, ..., 3072]</span>
@@ -588,7 +594,7 @@
 <p>Piecewise CUDA Graph only handles context-only and mixed context+generation iterations, while the generation-only CUDA Graph only handles pure generation iterations. Users need to specify the number of tokens to capture for each type of CUDA Graph separately in the extra config. Currently, the default value for <code class="docutils literal notranslate"><span class="pre">capture_num_tokens</span></code> is <code class="docutils literal notranslate"><span class="pre">[2**i</span> <span class="pre">for</span> <span class="pre">i</span> <span class="pre">in</span> <span class="pre">range(8)]</span> <span class="pre">+</span> <span class="pre">[i</span> <span class="pre">for</span> <span class="pre">i</span> <span class="pre">in</span> <span class="pre">range(256,</span> <span class="pre">3073,</span> <span class="pre">256)]</span></code>. However, this configuration should be tuned based on specific hardware, model, and parallel strategy. For guidance on tuning these values, see the <a class="reference internal" href="#performance-tuning">Performance Tuning</a> section below.</p>
 <div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">cuda_graph_config</span><span class="p">:</span>
 <span class="w">  </span><span class="nt">enable_padding</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
-<span class="w">  </span><span class="nt">max_batch_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1024</span><span class="w"> </span><span class="c1"># Specify max capture batch size for generation only cuda graph. By default, TensorRT LLM will generate a capture list based on it. </span>
+<span class="w">  </span><span class="nt">max_batch_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1024</span><span class="w"> </span><span class="c1"># Specify max capture batch size for generation only cuda graph. By default, TensorRT LLM will generate a capture list based on it.</span>
 
 <span class="nt">torch_compile_config</span><span class="p">:</span>
 <span class="w">  </span><span class="nt">capture_num_tokens</span><span class="p">:</span><span class="w"> </span><span class="s">&#39;${capture_num_tokens}&#39;</span><span class="w"> </span><span class="c1"># Specify capture_num_tokens for piecewise cuda graph</span>
@@ -770,7 +776,7 @@
 <span class="n">call_function</span>  <span class="n">record_stream_1</span>                          <span class="n">trtllm</span><span class="o">.</span><span class="n">record_stream</span>                         <span class="p">(</span><span class="n">mm_1</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>                                                                              <span class="p">{}</span>
 <span class="n">call_function</span>  <span class="n">record_event_4</span>                           <span class="n">trtllm</span><span class="o">.</span><span class="n">record_event</span>                          <span class="p">(</span><span class="mi">2</span><span class="p">,)</span>                                                                                   <span class="p">{}</span>
 <span class="n">call_function</span>  <span class="n">set_stream_1</span>                             <span class="n">trtllm</span><span class="o">.</span><span class="n">set_stream</span>                            <span class="p">(</span><span class="mi">0</span><span class="p">,)</span>                                                                                   <span class="p">{}</span>
-<span class="n">call_function</span>  <span class="n">wait_event_2</span>                             <span class="n">trtllm</span><span class="o">.</span><span class="n">wait_event</span>                            <span class="p">(</span><span class="mi">2</span><span class="p">,)</span>                        
+<span class="n">call_function</span>  <span class="n">wait_event_2</span>                             <span class="n">trtllm</span><span class="o">.</span><span class="n">wait_event</span>                            <span class="p">(</span><span class="mi">2</span><span class="p">,)</span>
 </pre></div>
 </div>
 </li>
@@ -833,7 +839,7 @@
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">Mapping</span><span class="p">(</span><span class="nb">object</span><span class="p">):</span>
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
         <span class="o">...</span>
-      
+
     <span class="k">def</span><span class="w"> </span><span class="nf">has_pp</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span> <span class="c1"># Cannot use this method in torch.compile</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">pp_size</span> <span class="o">&gt;</span> <span class="mi">1</span>
 </pre></div>
@@ -878,7 +884,7 @@
 </li>
 <li><p>For an int argument that would change during runtime, use <code class="docutils literal notranslate"><span class="pre">SymInt</span></code> rather than int in the C++ custom op definition. Otherwise, it will trigger a recompile when the value changes.</p>
 <div class="highlight-c++ notranslate"><div class="highlight"><pre><span></span><span class="n">TORCH_LIBRARY_FRAGMENT</span><span class="p">(</span><span class="n">trtllm</span><span class="p">,</span><span class="w"> </span><span class="n">m</span><span class="p">)</span>
-<span class="p">{</span><span class="w">    </span>
+<span class="p">{</span>
 <span class="w">    </span><span class="n">m</span><span class="p">.</span><span class="n">def</span><span class="p">(</span><span class="s">&quot;allgather(Tensor input, SymInt[]? sizes, int[] group) -&gt; Tensor&quot;</span><span class="p">);</span>
 <span class="w">    </span><span class="n">m</span><span class="p">.</span><span class="n">def</span><span class="p">(</span><span class="s">&quot;allgather_list(Tensor[] input_list, SymInt[]? sizes, int[] group) -&gt; Tensor[]&quot;</span><span class="p">);</span>
 <span class="p">}</span>
@@ -1086,9 +1092,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on December 15, 2025.</p>
+  <p>Last updated on January 04, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9ba1426">9ba1426</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a65b0d4">a65b0d4</a>.</p>
   
 </div></div>
       

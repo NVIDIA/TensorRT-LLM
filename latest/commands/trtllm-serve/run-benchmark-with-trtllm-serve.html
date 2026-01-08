@@ -36,6 +36,7 @@
     <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../../_static/config_selector.css?v=e17d8078" />
     <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
@@ -51,6 +52,7 @@
     <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../../_static/copybutton.js?v=65e89d2a"></script>
+    <script src="../../_static/config_selector.js?v=aaf6cd4a"></script>
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
@@ -63,7 +65,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc6';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc7';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -78,7 +80,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc6" />
+  <meta name="docsearch:version" content="1.2.0rc7" />
 
 
   </head>
@@ -359,13 +361,13 @@
 </ul>
 </details></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/aiperf_client.html">Aiperf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/aiperf_client_for_multimodal.html">Aiperf Client For Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client.html">Curl Chat Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/curl_completion_client.html">Curl Completion Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/curl_responses_client.html">Curl Responses Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../examples/genai_perf_client.html">Genai Perf Client</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../examples/genai_perf_client_for_multimodal.html">Genai Perf Client For Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
@@ -395,7 +397,6 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
 <ul class="current nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../trtllm-bench.html">trtllm-bench</a></li>
-
 <li class="toctree-l1"><a class="reference internal" href="../trtllm-eval.html">trtllm-eval</a></li>
 <li class="toctree-l1 current active has-children"><a class="reference internal" href="index.html">trtllm-serve</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
 <li class="toctree-l2"><a class="reference internal" href="trtllm-serve.html">trtllm-serve</a></li>
@@ -426,7 +427,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../features/auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/auto_deploy/auto-deploy.html">AutoDeploy (Beta)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/helix.html">Helix Parallelism</a></li>
@@ -527,35 +528,81 @@
                 <article class="bd-article">
                   
   <section class="tex2jax_ignore mathjax_ignore" id="run-benchmarking-with-trtllm-serve">
-<h1>Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code><a class="headerlink" href="#run-benchmarking-with-trtllm-serve" title="Link to this heading">#</a></h1>
+<h1><a class="toc-backref" href="#id1" role="doc-backlink">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a><a class="headerlink" href="#run-benchmarking-with-trtllm-serve" title="Link to this heading">#</a></h1>
 <p>TensorRT LLM provides the OpenAI-compatible API via <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> command.
 A complete reference for the API is available in the <a class="reference external" href="https://platform.openai.com/docs/api-reference">OpenAI API Reference</a>.</p>
-<p>This step-by-step tutorial covers the following topics for running online serving benchmarking with Llama 3.1 70B and Qwen2.5-VL-7B for multimodal models:</p>
+<nav class="contents" id="contents">
+<p class="topic-title">Contents</p>
 <ul class="simple">
-<li><p>Methodology Introduction</p></li>
-<li><p>Launch the OpenAI-Compatible Server with NGC container</p></li>
-<li><p>Run the performance benchmark</p></li>
-<li><p>Using <code class="docutils literal notranslate"><span class="pre">extra_llm_api_options</span></code></p></li>
-<li><p>Multimodal Serving and Benchmarking</p></li>
+<li><p><a class="reference internal" href="#run-benchmarking-with-trtllm-serve" id="id1">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></p>
+<ul>
+<li><p><a class="reference internal" href="#methodology-introduction" id="id2">Methodology Introduction</a></p></li>
+<li><p><a class="reference internal" href="#preparation" id="id3">Preparation</a></p>
+<ul>
+<li><p><a class="reference internal" href="#launch-the-ngc-container" id="id4">Launch the NGC container</a></p></li>
+<li><p><a class="reference internal" href="#start-the-trtllm-serve-service" id="id5">Start the trtllm-serve service</a></p></li>
 </ul>
+</li>
+<li><p><a class="reference internal" href="#benchmark-using-tensorrt-llm-serve-scripts-benchmark-serving" id="id6">Benchmark using <code class="docutils literal notranslate"><span class="pre">tensorrt_llm.serve.scripts.benchmark_serving</span></code></a></p>
+<ul>
+<li><p><a class="reference internal" href="#key-metrics" id="id7">Key Metrics</a></p>
+<ul>
+<li><p><a class="reference internal" href="#time-to-first-token-ttft" id="id8">Time to First Token (TTFT)</a></p></li>
+<li><p><a class="reference internal" href="#time-per-output-token-tpot-and-inter-token-latency-itl" id="id9">Time Per Output Token (TPOT) and Inter-Token Latency (ITL)</a></p></li>
+<li><p><a class="reference internal" href="#end-to-end-e2e-latency" id="id10">End-to-End (E2E) Latency</a></p></li>
+<li><p><a class="reference internal" href="#total-token-throughput" id="id11">Total Token Throughput</a></p></li>
+<li><p><a class="reference internal" href="#tokens-per-second-tps-or-output-token-throughput" id="id12">Tokens Per Second (TPS) or Output Token Throughput</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#request-time-breakdown" id="id13">Request Time Breakdown</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#about-config" id="id14">About <code class="docutils literal notranslate"><span class="pre">--config</span></code></a></p>
+<ul>
+<li><p><a class="reference internal" href="#kv-cache-config" id="id15"><code class="docutils literal notranslate"><span class="pre">kv_cache_config</span></code></a></p></li>
+<li><p><a class="reference internal" href="#cuda-graph-config" id="id16"><code class="docutils literal notranslate"><span class="pre">cuda_graph_config</span></code></a></p></li>
+<li><p><a class="reference internal" href="#moe-config" id="id17"><code class="docutils literal notranslate"><span class="pre">moe_config</span></code></a></p></li>
+<li><p><a class="reference internal" href="#attention-backend" id="id18"><code class="docutils literal notranslate"><span class="pre">attention_backend</span></code></a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#multimodal-serving-and-benchmarking" id="id19">Multimodal Serving and Benchmarking</a></p>
+<ul>
+<li><p><a class="reference internal" href="#setting-up-multimodal-serving" id="id20">Setting up Multimodal Serving</a></p></li>
+<li><p><a class="reference internal" href="#multimodal-benchmarking" id="id21">Multimodal Benchmarking</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#benchmark-using-aiperf" id="id22">Benchmark using AIPerf</a></p>
+<ul>
+<li><p><a class="reference internal" href="#installation" id="id23">Installation</a></p></li>
+<li><p><a class="reference internal" href="#running-aiperf-with-trtllm-serve" id="id24">Running AIPerf with trtllm-serve</a></p></li>
+<li><p><a class="reference internal" href="#example-benchmark-a-text-model" id="id25">Example: Benchmark a text model</a></p></li>
+<li><p><a class="reference internal" href="#example-benchmark-a-multimodal-model" id="id26">Example: Benchmark a multimodal model</a></p></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+</nav>
 <section id="methodology-introduction">
-<h2>Methodology Introduction<a class="headerlink" href="#methodology-introduction" title="Link to this heading">#</a></h2>
+<h2><a class="toc-backref" href="#id2" role="doc-backlink">Methodology Introduction</a><a class="headerlink" href="#methodology-introduction" title="Link to this heading">#</a></h2>
 <p>The overall performance benchmarking involves:</p>
 <ol class="arabic simple">
 <li><p>Launch the OpenAI-compatible service with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></p></li>
 <li><p>Run the benchmark with <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/serve/scripts/benchmark_serving.py">benchmark_serving.py</a></p></li>
 </ol>
 </section>
+<section id="preparation">
+<h2><a class="toc-backref" href="#id3" role="doc-backlink">Preparation</a><a class="headerlink" href="#preparation" title="Link to this heading">#</a></h2>
 <section id="launch-the-ngc-container">
-<h2>Launch the NGC container<a class="headerlink" href="#launch-the-ngc-container" title="Link to this heading">#</a></h2>
+<h3><a class="toc-backref" href="#id4" role="doc-backlink">Launch the NGC container</a><a class="headerlink" href="#launch-the-ngc-container" title="Link to this heading">#</a></h3>
 <p>TensorRT LLM distributes the pre-built container on <a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags">NGC Catalog</a>.</p>
 <p>You can launch the container using the following command:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span>run<span class="w"> </span>--rm<span class="w"> </span>-it<span class="w"> </span>--ipc<span class="w"> </span>host<span class="w"> </span>-p<span class="w"> </span><span class="m">8000</span>:8000<span class="w"> </span>--gpus<span class="w"> </span>all<span class="w"> </span>--ulimit<span class="w"> </span><span class="nv">memlock</span><span class="o">=</span>-1<span class="w"> </span>--ulimit<span class="w"> </span><span class="nv">stack</span><span class="o">=</span><span class="m">67108864</span><span class="w"> </span>nvcr.io/nvidia/tensorrt-llm/release:1.2.0rc6
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span>run<span class="w"> </span>--rm<span class="w"> </span>-it<span class="w"> </span>--ipc<span class="w"> </span>host<span class="w"> </span>-p<span class="w"> </span><span class="m">8000</span>:8000<span class="w"> </span>--gpus<span class="w"> </span>all<span class="w"> </span>--ulimit<span class="w"> </span><span class="nv">memlock</span><span class="o">=</span>-1<span class="w"> </span>--ulimit<span class="w"> </span><span class="nv">stack</span><span class="o">=</span><span class="m">67108864</span><span class="w"> </span>nvcr.io/nvidia/tensorrt-llm/release:1.2.0rc7
 </pre></div>
 </div>
 </section>
 <section id="start-the-trtllm-serve-service">
-<h2>Start the trtllm-serve service<a class="headerlink" href="#start-the-trtllm-serve-service" title="Link to this heading">#</a></h2>
+<h3><a class="toc-backref" href="#id5" role="doc-backlink">Start the trtllm-serve service</a><a class="headerlink" href="#start-the-trtllm-serve-service" title="Link to this heading">#</a></h3>
 <blockquote>
 <div><p>[!WARNING]
 The commands and configurations presented in this document are for illustrative purposes only.
@@ -565,9 +612,9 @@ For benchmarking purposes, first create a bash script using the following code a
 </div></blockquote>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="ch">#! /bin/bash</span>
 <span class="nv">model_path</span><span class="o">=</span>/path/to/llama3.1_70B
-<span class="nv">extra_llm_api_file</span><span class="o">=</span>/tmp/extra-llm-api-config.yml
+<span class="nv">config_file</span><span class="o">=</span>/tmp/config.yml
 
-cat<span class="w"> </span><span class="s">&lt;&lt; EOF &gt; ${extra_llm_api_file}</span>
+cat<span class="w"> </span><span class="s">&lt;&lt; EOF &gt; ${config_file}</span>
 <span class="s">enable_attention_dp: false</span>
 <span class="s">print_iter_log: true</span>
 <span class="s">cuda_graph_config:</span>
@@ -585,7 +632,7 @@ trtllm-serve<span class="w"> </span><span class="si">${</span><span class="nv">m
 <span class="w">    </span>--tp_size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--ep_size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--trust_remote_code<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--extra_llm_api_options<span class="w"> </span><span class="si">${</span><span class="nv">extra_llm_api_file</span><span class="si">}</span>
+<span class="w">    </span>--config<span class="w"> </span><span class="si">${</span><span class="nv">config_file</span><span class="si">}</span>
 </pre></div>
 </div>
 <blockquote>
@@ -606,9 +653,10 @@ INFO:<span class="w">     </span>Uvicorn<span class="w"> </span>running<span cla
 </pre></div>
 </div>
 </section>
-<section id="run-the-benchmark">
-<h2>Run the benchmark<a class="headerlink" href="#run-the-benchmark" title="Link to this heading">#</a></h2>
-<p>Similar to starting trtllm-serve, create a script to execute the benchmark using the following code and name it bench.sh.</p>
+</section>
+<section id="benchmark-using-tensorrt-llm-serve-scripts-benchmark-serving">
+<h2><a class="toc-backref" href="#id6" role="doc-backlink">Benchmark using <code class="docutils literal notranslate"><span class="pre">tensorrt_llm.serve.scripts.benchmark_serving</span></code></a><a class="headerlink" href="#benchmark-using-tensorrt-llm-serve-scripts-benchmark-serving" title="Link to this heading">#</a></h2>
+<p>Similar to starting <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code>, create a script to execute the benchmark using the following code and name it bench.sh.</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">concurrency_list</span><span class="o">=</span><span class="s2">&quot;1 2 4 8 16 32 64 128 256&quot;</span>
 <span class="nv">multi_round</span><span class="o">=</span><span class="m">5</span>
 <span class="nv">isl</span><span class="o">=</span><span class="m">1024</span>
@@ -671,15 +719,15 @@ INFO:<span class="w">     </span>Uvicorn<span class="w"> </span>running<span cla
 </pre></div>
 </div>
 <section id="key-metrics">
-<h3>Key Metrics<a class="headerlink" href="#key-metrics" title="Link to this heading">#</a></h3>
+<h3><a class="toc-backref" href="#id7" role="doc-backlink">Key Metrics</a><a class="headerlink" href="#key-metrics" title="Link to this heading">#</a></h3>
 <section id="time-to-first-token-ttft">
-<h4>Time to First Token (TTFT)<a class="headerlink" href="#time-to-first-token-ttft" title="Link to this heading">#</a></h4>
+<h4><a class="toc-backref" href="#id8" role="doc-backlink">Time to First Token (TTFT)</a><a class="headerlink" href="#time-to-first-token-ttft" title="Link to this heading">#</a></h4>
 <ul class="simple">
 <li><p>The typical time elapsed from when a request is sent until the first output token is generated.</p></li>
 </ul>
 </section>
 <section id="time-per-output-token-tpot-and-inter-token-latency-itl">
-<h4>Time Per Output Token (TPOT) and Inter-Token Latency (ITL)<a class="headerlink" href="#time-per-output-token-tpot-and-inter-token-latency-itl" title="Link to this heading">#</a></h4>
+<h4><a class="toc-backref" href="#id9" role="doc-backlink">Time Per Output Token (TPOT) and Inter-Token Latency (ITL)</a><a class="headerlink" href="#time-per-output-token-tpot-and-inter-token-latency-itl" title="Link to this heading">#</a></h4>
 <ul class="simple">
 <li><p>TPOT is the typical time required to generate each token <em>after</em> the first one.</p></li>
 <li><p>ITL is the typical time delay between the completion of one token and the completion of the next.</p></li>
@@ -701,13 +749,13 @@ INFO:<span class="w">     </span>Uvicorn<span class="w"> </span>running<span cla
 \]</div>
 </section>
 <section id="end-to-end-e2e-latency">
-<h4>End-to-End (E2E) Latency<a class="headerlink" href="#end-to-end-e2e-latency" title="Link to this heading">#</a></h4>
+<h4><a class="toc-backref" href="#id10" role="doc-backlink">End-to-End (E2E) Latency</a><a class="headerlink" href="#end-to-end-e2e-latency" title="Link to this heading">#</a></h4>
 <ul class="simple">
 <li><p>The typical total time from when a request is submitted until the final token of the response is received.</p></li>
 </ul>
 </section>
 <section id="total-token-throughput">
-<h4>Total Token Throughput<a class="headerlink" href="#total-token-throughput" title="Link to this heading">#</a></h4>
+<h4><a class="toc-backref" href="#id11" role="doc-backlink">Total Token Throughput</a><a class="headerlink" href="#total-token-throughput" title="Link to this heading">#</a></h4>
 <ul class="simple">
 <li><p>The combined rate at which the system processes both input (prompt) tokens and output (generated) tokens.</p></li>
 </ul>
@@ -717,7 +765,7 @@ INFO:<span class="w">     </span>Uvicorn<span class="w"> </span>running<span cla
 \]</div>
 </section>
 <section id="tokens-per-second-tps-or-output-token-throughput">
-<h4>Tokens Per Second (TPS) or Output Token Throughput<a class="headerlink" href="#tokens-per-second-tps-or-output-token-throughput" title="Link to this heading">#</a></h4>
+<h4><a class="toc-backref" href="#id12" role="doc-backlink">Tokens Per Second (TPS) or Output Token Throughput</a><a class="headerlink" href="#tokens-per-second-tps-or-output-token-throughput" title="Link to this heading">#</a></h4>
 <ul class="simple">
 <li><p>how many output tokens the system generates each second.</p></li>
 </ul>
@@ -728,32 +776,36 @@ INFO:<span class="w">     </span>Uvicorn<span class="w"> </span>running<span cla
 </section>
 </section>
 <section id="request-time-breakdown">
-<h3>Request Time Breakdown<a class="headerlink" href="#request-time-breakdown" title="Link to this heading">#</a></h3>
+<h3><a class="toc-backref" href="#id13" role="doc-backlink">Request Time Breakdown</a><a class="headerlink" href="#request-time-breakdown" title="Link to this heading">#</a></h3>
 <p>To get more detailed metrics besides the key metrics above, there is an <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/serve/scripts/time_breakdown">experimental tool</a> for request time breakdown.</p>
 </section>
 </section>
-<section id="about-extra-llm-api-options">
-<h2>About <code class="docutils literal notranslate"><span class="pre">extra_llm_api_options</span></code><a class="headerlink" href="#about-extra-llm-api-options" title="Link to this heading">#</a></h2>
-<p>trtllm-serve provides <code class="docutils literal notranslate"><span class="pre">extra_llm_api_options</span></code> knob to <strong>overwrite</strong> the parameters specified by trtllm-serve.
-Generally, We create a YAML file that contains various performance switches.
-e.g</p>
-<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="w">  </span><span class="nt">cuda_graph_config</span><span class="p">:</span>
-<span class="w">   </span><span class="nt">padding_enabled</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
-<span class="w">  </span><span class="nt">print_iter_log</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
-<span class="w">  </span><span class="nt">kv_cache_dtype</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">fp8</span>
-<span class="w">  </span><span class="nt">enable_attention_dp</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<section id="about-config">
+<h2><a class="toc-backref" href="#id14" role="doc-backlink">About <code class="docutils literal notranslate"><span class="pre">--config</span></code></a><a class="headerlink" href="#about-config" title="Link to this heading">#</a></h2>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p><strong>Non-breaking</strong>: <code class="docutils literal notranslate"><span class="pre">--config</span> <span class="pre">&lt;file.yaml&gt;</span></code> is the preferred flag for passing a <a class="reference internal" href="trtllm-serve.html#configuring-with-yaml-files"><span class="std std-ref">YAML configuration file</span></a>.
+Existing workflows using <code class="docutils literal notranslate"><span class="pre">--extra_llm_api_options</span> <span class="pre">&lt;file.yaml&gt;</span></code> continue to work; it is an equivalent alias.</p>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> provides <code class="docutils literal notranslate"><span class="pre">--config</span></code> to <strong>overwrite</strong> the parameters specified by <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code>.
+Generally, we create a YAML file that contains various performance switches. For example:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">cuda_graph_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">padding_enabled</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="nt">print_iter_log</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="nt">kv_cache_dtype</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">fp8</span>
+<span class="nt">enable_attention_dp</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
 </pre></div>
 </div>
 <p>The following is a list of common performance switches.</p>
 <section id="kv-cache-config">
-<h3><code class="docutils literal notranslate"><span class="pre">kv_cache_config</span></code><a class="headerlink" href="#kv-cache-config" title="Link to this heading">#</a></h3>
+<h3><a class="toc-backref" href="#id15" role="doc-backlink"><code class="docutils literal notranslate"><span class="pre">kv_cache_config</span></code></a><a class="headerlink" href="#kv-cache-config" title="Link to this heading">#</a></h3>
 <p> <strong>Description</strong>: A section for configuring the Key-Value (KV) cache.</p>
 <p> <strong>Options</strong>:</p>
 <p>  dtype: Sets the data type for the KV cache.</p>
 <p>  <strong>Default</strong>: auto (uses the data type specified in the model checkpoint).</p>
 </section>
 <section id="cuda-graph-config">
-<h3><code class="docutils literal notranslate"><span class="pre">cuda_graph_config</span></code><a class="headerlink" href="#cuda-graph-config" title="Link to this heading">#</a></h3>
+<h3><a class="toc-backref" href="#id16" role="doc-backlink"><code class="docutils literal notranslate"><span class="pre">cuda_graph_config</span></code></a><a class="headerlink" href="#cuda-graph-config" title="Link to this heading">#</a></h3>
 <p> <strong>Description</strong>: A section for configuring CUDA graphs to optimize performance.</p>
 <p> <strong>Options</strong>:</p>
 <p>  enable_padding: If true, input batches are padded to the nearest cuda_graph_batch_size. This can significantly improve performance.</p>
@@ -765,24 +817,24 @@ e.g</p>
 <p>  <strong>Default</strong>: None</p>
 </section>
 <section id="moe-config">
-<h3><code class="docutils literal notranslate"><span class="pre">moe_config</span></code><a class="headerlink" href="#moe-config" title="Link to this heading">#</a></h3>
+<h3><a class="toc-backref" href="#id17" role="doc-backlink"><code class="docutils literal notranslate"><span class="pre">moe_config</span></code></a><a class="headerlink" href="#moe-config" title="Link to this heading">#</a></h3>
 <p> <strong>Description</strong>: Configuration for Mixture-of-Experts (MoE) models.</p>
 <p> <strong>Options</strong>:</p>
 <p>  backend: The backend to use for MoE operations.</p>
 <p>  <strong>Default</strong>: CUTLASS</p>
 </section>
 <section id="attention-backend">
-<h3><code class="docutils literal notranslate"><span class="pre">attention_backend</span></code><a class="headerlink" href="#attention-backend" title="Link to this heading">#</a></h3>
+<h3><a class="toc-backref" href="#id18" role="doc-backlink"><code class="docutils literal notranslate"><span class="pre">attention_backend</span></code></a><a class="headerlink" href="#attention-backend" title="Link to this heading">#</a></h3>
 <p> <strong>Description</strong>: The backend to use for attention calculations.</p>
 <p> <strong>Default</strong>: TRTLLM</p>
-<p>See the <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs">TorchLlmArgs class</a> for the full list of options which can be used in the extra_llm_api_options<code class="docutils literal notranslate"><span class="pre">.</span></code></p>
+<p>See the <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs">TorchLlmArgs class</a> for the full list of options which can be used in the <code class="docutils literal notranslate"><span class="pre">--config</span></code>.</p>
 </section>
 </section>
 <section id="multimodal-serving-and-benchmarking">
-<h2>Multimodal Serving and Benchmarking<a class="headerlink" href="#multimodal-serving-and-benchmarking" title="Link to this heading">#</a></h2>
+<h2><a class="toc-backref" href="#id19" role="doc-backlink">Multimodal Serving and Benchmarking</a><a class="headerlink" href="#multimodal-serving-and-benchmarking" title="Link to this heading">#</a></h2>
 <p>TensorRT-LLM supports multimodal models for both serving and benchmarking. This section covers how to set up multimodal serving and run benchmarks for multimodal models.</p>
 <section id="setting-up-multimodal-serving">
-<h3>Setting up Multimodal Serving<a class="headerlink" href="#setting-up-multimodal-serving" title="Link to this heading">#</a></h3>
+<h3><a class="toc-backref" href="#id20" role="doc-backlink">Setting up Multimodal Serving</a><a class="headerlink" href="#setting-up-multimodal-serving" title="Link to this heading">#</a></h3>
 <p>Here’s an example of setting up multimodal serving with Qwen2.5-VL:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="ch">#!/bin/bash</span>
 <span class="nv">model_path</span><span class="o">=</span>/path/to/qwen2.5vl-7B_model
@@ -799,7 +851,7 @@ trtllm-serve<span class="w"> </span><span class="si">${</span><span class="nv">m
 </div>
 </section>
 <section id="multimodal-benchmarking">
-<h3>Multimodal Benchmarking<a class="headerlink" href="#multimodal-benchmarking" title="Link to this heading">#</a></h3>
+<h3><a class="toc-backref" href="#id21" role="doc-backlink">Multimodal Benchmarking</a><a class="headerlink" href="#multimodal-benchmarking" title="Link to this heading">#</a></h3>
 <p>For multimodal serving benchmarks, you can use the <code class="docutils literal notranslate"><span class="pre">benchmark_serving.py</span></code> script with multimodal datasets:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-m<span class="w"> </span>tensorrt_llm.serve.scripts.benchmark_serving<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--model<span class="w"> </span><span class="si">${</span><span class="nv">model_path</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
@@ -849,6 +901,80 @@ trtllm-serve<span class="w"> </span><span class="si">${</span><span class="nv">m
 <li><p>Use <code class="docutils literal notranslate"><span class="pre">--random-image-width</span></code> and <code class="docutils literal notranslate"><span class="pre">--random-image-height</span></code> to specify image dimensions or <code class="docutils literal notranslate"><span class="pre">--random-image-size</span></code> for squared image dimensions.</p></li>
 <li><p>The <code class="docutils literal notranslate"><span class="pre">random_image</span></code> dataset generates synthetic images for benchmarking</p></li>
 </ul>
+</section>
+</section>
+<section id="benchmark-using-aiperf">
+<h2><a class="toc-backref" href="#id22" role="doc-backlink">Benchmark using AIPerf</a><a class="headerlink" href="#benchmark-using-aiperf" title="Link to this heading">#</a></h2>
+<p>TensorRT-LLM also supports benchmarking <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> using <a class="reference external" href="https://github.com/ai-dynamo/aiperf"><strong>AIPerf</strong></a>, NVIDIA’s
+comprehensive benchmarking tool for LLMs.<br />
+AIPerf provides throughput, latency, TTFT, and concurrency measurements for both
+text and multimodal workloads.</p>
+<p>AIPerf integrates directly with the OpenAI-compatible endpoints exposed by
+<code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code>.</p>
+<section id="installation">
+<h3><a class="toc-backref" href="#id23" role="doc-backlink">Installation</a><a class="headerlink" href="#installation" title="Link to this heading">#</a></h3>
+<p>AIPerf is installed with TensorRT-LLM by default.</p>
+</section>
+<section id="running-aiperf-with-trtllm-serve">
+<h3><a class="toc-backref" href="#id24" role="doc-backlink">Running AIPerf with trtllm-serve</a><a class="headerlink" href="#running-aiperf-with-trtllm-serve" title="Link to this heading">#</a></h3>
+<p>TensorRT-LLM provides example scripts under:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">examples/serve/aiperf_client.sh</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">examples/serve/aiperf_client_for_multimodal.sh</span></code></p></li>
+</ul>
+<p>These scripts demonstrate how to benchmark a running trtllm-serve instance using
+the profile command in AIPerf.</p>
+</section>
+<section id="example-benchmark-a-text-model">
+<h3><a class="toc-backref" href="#id25" role="doc-backlink">Example: Benchmark a text model</a><a class="headerlink" href="#example-benchmark-a-text-model" title="Link to this heading">#</a></h3>
+<p>Once trtllm-serve is running on localhost:8000, run:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>bash<span class="w"> </span>examples/serve/aiperf_client.sh
+</pre></div>
+</div>
+<p>The script issues a profiling run:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>aiperf<span class="w"> </span>profile<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-m<span class="w"> </span>TinyLlama-1.1B-Chat-v1.0<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--tokenizer<span class="w"> </span>TinyLlama/TinyLlama-1.1B-Chat-v1.0<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--endpoint-type<span class="w"> </span>chat<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--random-seed<span class="w"> </span><span class="m">123</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--synthetic-input-tokens-mean<span class="w"> </span><span class="m">128</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--synthetic-input-tokens-stddev<span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--output-tokens-mean<span class="w"> </span><span class="m">128</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--output-tokens-stddev<span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--request-count<span class="w"> </span><span class="m">100</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--request-rate<span class="w"> </span><span class="m">10</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--profile-export-file<span class="w"> </span>my_profile_export.json<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--url<span class="w"> </span>localhost:8000<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--streaming
+</pre></div>
+</div>
+</section>
+<section id="example-benchmark-a-multimodal-model">
+<h3><a class="toc-backref" href="#id26" role="doc-backlink">Example: Benchmark a multimodal model</a><a class="headerlink" href="#example-benchmark-a-multimodal-model" title="Link to this heading">#</a></h3>
+<p>Benchmark multimodal inference using:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>bash<span class="w"> </span>examples/serve/aiperf_client_for_multimodal.sh
+</pre></div>
+</div>
+<p>This runs:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>aiperf<span class="w"> </span>profile<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-m<span class="w"> </span>Qwen2.5-VL-3B-Instruct<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--tokenizer<span class="w"> </span>Qwen/Qwen2.5-VL-3B-Instruct<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--endpoint-type<span class="w"> </span>chat<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--random-seed<span class="w"> </span><span class="m">123</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--image-width-mean<span class="w"> </span><span class="m">64</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--image-height-mean<span class="w"> </span><span class="m">64</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--image-format<span class="w"> </span>png<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--synthetic-input-tokens-mean<span class="w"> </span><span class="m">128</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--synthetic-input-tokens-stddev<span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--output-tokens-mean<span class="w"> </span><span class="m">128</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--output-tokens-stddev<span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--request-count<span class="w"> </span><span class="m">5</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--request-rate<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--profile-export-file<span class="w"> </span>my_profile_export.json<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--url<span class="w"> </span>localhost:8000<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--streaming
+</pre></div>
+</div>
 </section>
 </section>
 </section>
@@ -903,9 +1029,12 @@ trtllm-serve<span class="w"> </span><span class="si">${</span><span class="nv">m
   <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="visible nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#methodology-introduction">Methodology Introduction</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#launch-the-ngc-container">Launch the NGC container</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#start-the-trtllm-serve-service">Start the trtllm-serve service</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#run-the-benchmark">Run the benchmark</a><ul class="nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#preparation">Preparation</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#launch-the-ngc-container">Launch the NGC container</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#start-the-trtllm-serve-service">Start the trtllm-serve service</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#benchmark-using-tensorrt-llm-serve-scripts-benchmark-serving">Benchmark using <code class="docutils literal notranslate"><span class="pre">tensorrt_llm.serve.scripts.benchmark_serving</span></code></a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#key-metrics">Key Metrics</a><ul class="nav section-nav flex-column">
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#time-to-first-token-ttft">Time to First Token (TTFT)</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#time-per-output-token-tpot-and-inter-token-latency-itl">Time Per Output Token (TPOT) and Inter-Token Latency (ITL)</a></li>
@@ -917,7 +1046,7 @@ trtllm-serve<span class="w"> </span><span class="si">${</span><span class="nv">m
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#request-time-breakdown">Request Time Breakdown</a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#about-extra-llm-api-options">About <code class="docutils literal notranslate"><span class="pre">extra_llm_api_options</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#about-config">About <code class="docutils literal notranslate"><span class="pre">--config</span></code></a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#kv-cache-config"><code class="docutils literal notranslate"><span class="pre">kv_cache_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cuda-graph-config"><code class="docutils literal notranslate"><span class="pre">cuda_graph_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#moe-config"><code class="docutils literal notranslate"><span class="pre">moe_config</span></code></a></li>
@@ -927,6 +1056,13 @@ trtllm-serve<span class="w"> </span><span class="si">${</span><span class="nv">m
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#multimodal-serving-and-benchmarking">Multimodal Serving and Benchmarking</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#setting-up-multimodal-serving">Setting up Multimodal Serving</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#multimodal-benchmarking">Multimodal Benchmarking</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#benchmark-using-aiperf">Benchmark using AIPerf</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#installation">Installation</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#running-aiperf-with-trtllm-serve">Running AIPerf with trtllm-serve</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#example-benchmark-a-text-model">Example: Benchmark a text model</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#example-benchmark-a-multimodal-model">Example: Benchmark a multimodal model</a></li>
 </ul>
 </li>
 </ul>
@@ -1020,9 +1156,9 @@ trtllm-serve<span class="w"> </span><span class="si">${</span><span class="nv">m
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on December 15, 2025.</p>
+  <p>Last updated on January 04, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9ba1426">9ba1426</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a65b0d4">a65b0d4</a>.</p>
   
 </div></div>
       

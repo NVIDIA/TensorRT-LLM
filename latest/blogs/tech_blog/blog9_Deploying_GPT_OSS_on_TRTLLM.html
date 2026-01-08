@@ -36,6 +36,7 @@
     <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../../_static/config_selector.css?v=e17d8078" />
     <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
@@ -51,6 +52,7 @@
     <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../../_static/copybutton.js?v=65e89d2a"></script>
+    <script src="../../_static/config_selector.js?v=aaf6cd4a"></script>
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
@@ -61,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc6';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc7';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -76,7 +78,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc6" />
+  <meta name="docsearch:version" content="1.2.0rc7" />
 
 
   </head>
@@ -357,13 +359,13 @@
 </ul>
 </details></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/aiperf_client.html">Aiperf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/aiperf_client_for_multimodal.html">Aiperf Client For Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client.html">Curl Chat Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/curl_completion_client.html">Curl Completion Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/curl_responses_client.html">Curl Responses Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../examples/genai_perf_client.html">Genai Perf Client</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../examples/genai_perf_client_for_multimodal.html">Genai Perf Client For Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
@@ -393,7 +395,6 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-bench.html">trtllm-bench</a></li>
-
 <li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-eval.html">trtllm-eval</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
@@ -424,7 +425,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../features/auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/auto_deploy/auto-deploy.html">AutoDeploy (Beta)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/helix.html">Helix Parallelism</a></li>
@@ -597,7 +598,7 @@ This guide covers both low-latency and max-throughput cases.</p>
 <span class="w">    </span>--backend<span class="w"> </span>pytorch<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--tp<span class="w"> </span><span class="si">${</span><span class="nv">num_gpus</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--ep<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--extra_llm_api_options<span class="w"> </span>low_latency.yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--config<span class="w"> </span>low_latency.yaml<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--dataset<span class="w"> </span>gpt-oss-120b-1k2k.txt<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--max_batch_size<span class="w"> </span><span class="si">${</span><span class="nv">max_batch_size</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--concurrency<span class="w"> </span><span class="si">${</span><span class="nv">max_batch_size</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
@@ -652,7 +653,7 @@ This guide covers both low-latency and max-throughput cases.</p>
 <span class="w">    </span>--backend<span class="w"> </span>pytorch<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--tp<span class="w"> </span><span class="si">${</span><span class="nv">num_gpus</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--ep<span class="w"> </span><span class="si">${</span><span class="nv">num_gpus</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--extra_llm_api_options<span class="w"> </span>max_throughput.yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--config<span class="w"> </span>max_throughput.yaml<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--dataset<span class="w"> </span>gpt-oss-120b-1k2k.txt<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--max_batch_size<span class="w"> </span><span class="si">${</span><span class="nv">max_batch_size</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--concurrency<span class="w"> </span><span class="k">$((</span><span class="nv">max_batch_size</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="nv">num_gpus</span><span class="k">))</span><span class="w"> </span><span class="se">\</span>
@@ -675,7 +676,7 @@ This guide covers both low-latency and max-throughput cases.</p>
 </section>
 <section id="launch-the-tensorrt-llm-server">
 <h2>Launch the TensorRT-LLM Server<a class="headerlink" href="#launch-the-tensorrt-llm-server" title="Link to this heading">#</a></h2>
-<p>We can use <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> to serve the model by translating the benchmark commands above. For low-latency configuration, run:<br />
+<p>We can use <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> to serve the model by translating the benchmark commands above. For low-latency configuration, run:
 <strong>Note:</strong> You can also point to a local path containing the model weights instead of the HF repo (e.g., <code class="docutils literal notranslate"><span class="pre">${local_model_path}</span></code>).</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>mpirun<span class="w"> </span>-n<span class="w"> </span><span class="m">1</span><span class="w"> </span>--oversubscribe<span class="w"> </span>--allow-run-as-root<span class="w"> </span><span class="se">\</span>
 trtllm-serve<span class="w">  </span>openai/gpt-oss-120b<span class="w"> </span><span class="se">\</span>
@@ -686,7 +687,7 @@ trtllm-serve<span class="w">  </span>openai/gpt-oss-120b<span class="w"> </span>
 <span class="w">  </span>--ep_size<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--max_batch_size<span class="w"> </span><span class="m">640</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--trust_remote_code<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--extra_llm_api_options<span class="w"> </span>max_throughput.yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--config<span class="w"> </span>max_throughput.yaml<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--kv_cache_free_gpu_memory_fraction<span class="w"> </span><span class="m">0</span>.9
 </pre></div>
 </div>
@@ -701,7 +702,7 @@ trtllm-serve<span class="w">  </span>openai/gpt-oss-120b<span class="w"> </span>
 <span class="w">  </span>--ep_size<span class="w"> </span><span class="m">4</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--max_batch_size<span class="w"> </span><span class="m">640</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--trust_remote_code<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--extra_llm_api_options<span class="w"> </span>max_throughput.yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--config<span class="w"> </span>max_throughput.yaml<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--kv_cache_free_gpu_memory_fraction<span class="w"> </span><span class="m">0</span>.9
 </pre></div>
 </div>
@@ -721,7 +722,7 @@ trtllm-serve<span class="w">  </span>openai/gpt-oss-120b<span class="w"> </span>
 <p>OpenAI ships a set of Triton kernels optimized for its MoE models. TensorRT LLM can leverage these kernels for Hopper based GPUs like NVIDIA’s H200 for best performance. The NGC TensorRT LLM container image mentioned above already includes the required kernels so you do not need to build or install them. It is highly recommended to enable them with the steps below:</p>
 <section id="selecting-triton-as-the-moe-backend">
 <h3>Selecting Triton as the MoE backend<a class="headerlink" href="#selecting-triton-as-the-moe-backend" title="Link to this heading">#</a></h3>
-<p>To use the Triton MoE backend with <strong>trtllm-serve</strong> (or other similar commands) add this snippet to the YAML file passed via <code class="docutils literal notranslate"><span class="pre">--extra_llm_api_options</span></code>:</p>
+<p>To use the Triton MoE backend with <strong>trtllm-serve</strong> (or other similar commands) add this snippet to the YAML file passed via <code class="docutils literal notranslate"><span class="pre">--config</span></code>:</p>
 <div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">moe_config</span><span class="p">:</span>
 <span class="w">  </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">TRITON</span>
 </pre></div>
@@ -831,7 +832,7 @@ others according to your needs.</p>
 <p>OpenAI ships a set of Triton kernels optimized for its MoE models. TensorRT-LLM can leverage these kernels for Hopper-based GPUs like NVIDIA’s H200 for optimal performance. <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> MoE backend is not supported on Hopper, and <code class="docutils literal notranslate"><span class="pre">CUTLASS</span></code> backend support is still ongoing. Please follow the instructions in this <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/gpt_oss#using-openai-triton-kernels-for-moe">link</a> to install and enable the <code class="docutils literal notranslate"><span class="pre">TRITON</span></code> MoE kernels on Hopper GPUs.</p>
 <section id="id3">
 <h3>Selecting Triton as the MoE backend<a class="headerlink" href="#id3" title="Link to this heading">#</a></h3>
-<p>To use the Triton MoE backend with <strong>trtllm-serve</strong> (or other commands), add this snippet to the YAML file passed via <code class="docutils literal notranslate"><span class="pre">--extra_llm_api_options</span></code>:</p>
+<p>To use the Triton MoE backend with <strong>trtllm-serve</strong> (or other commands), add this snippet to the YAML file passed via <code class="docutils literal notranslate"><span class="pre">--config</span></code>:</p>
 <div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">moe_config</span><span class="p">:</span>
 <span class="w">  </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">TRITON</span>
 </pre></div>
@@ -1016,9 +1017,9 @@ others according to your needs.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on December 15, 2025.</p>
+  <p>Last updated on January 04, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9ba1426">9ba1426</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a65b0d4">a65b0d4</a>.</p>
   
 </div></div>
       
