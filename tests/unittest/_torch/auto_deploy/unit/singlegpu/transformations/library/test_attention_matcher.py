@@ -84,7 +84,7 @@ class RepeatKVModel(torch.nn.Module):
         return output
 
     def get_dynamic_shapes(self):
-        return {0: Dim("batch_size", max=8), 1: Dim("seq_len", min=4, max=16)}
+        return {0: Dim.DYNAMIC, 1: Dim.DYNAMIC}
 
 
 class RepeatKVModel2(RepeatKVModel):
@@ -185,7 +185,7 @@ class EagerAttentionModel(torch.nn.Module):
         return output
 
     def get_dynamic_shapes(self):
-        return {0: Dim("batch_size", max=8), 1: Dim("seq_len", min=4, max=16)}
+        return {0: Dim.DYNAMIC, 1: Dim.DYNAMIC}
 
 
 class ComplexEagerAttentionModel(torch.nn.Module):
@@ -274,7 +274,7 @@ class ComplexEagerAttentionModel(torch.nn.Module):
         return output
 
     def get_dynamic_shapes(self):
-        return {0: Dim("batch_size", max=8), 1: Dim("seq_len", min=4, max=16)}
+        return {0: Dim.DYNAMIC, 1: Dim.DYNAMIC}
 
 
 class CounterExampleModel(torch.nn.Module):
@@ -329,7 +329,7 @@ class CounterExampleModel(torch.nn.Module):
         return features_case1
 
     def get_dynamic_shapes(self):
-        return {0: Dim("batch_size", max=8), 1: Dim("seq_len", min=4, max=16)}
+        return {0: Dim.DYNAMIC, 1: Dim.DYNAMIC}
 
 
 class GroupedAttentionModel(torch.nn.Module):
@@ -403,7 +403,7 @@ class GroupedAttentionModel(torch.nn.Module):
         return output
 
     def get_dynamic_shapes(self):
-        return {0: Dim("batch_size", max=8), 1: Dim("seq_len", min=4, max=16)}
+        return {0: Dim.DYNAMIC, 1: Dim.DYNAMIC}
 
 
 def _get_match_repeat_kv_optimizer() -> Callable:
@@ -907,7 +907,7 @@ class CausalAttentionModel(torch.nn.Module):
         return output
 
     def get_dynamic_shapes(self):
-        return {0: Dim("batch_size", max=8), 1: Dim("seq_len", min=4, max=16)}
+        return {0: Dim.DYNAMIC, 1: Dim.DYNAMIC}
 
 
 class Llama3CausalAttentionModel(torch.nn.Module):
@@ -1013,7 +1013,7 @@ class Llama3CausalAttentionModel(torch.nn.Module):
         return output
 
     def get_dynamic_shapes(self):
-        return {0: Dim("batch_size", max=8), 1: Dim("seq_len", min=4, max=16)}
+        return {0: Dim.DYNAMIC, 1: Dim.DYNAMIC}
 
 
 class AttentionLayoutModel(torch.nn.Module):
@@ -1102,7 +1102,7 @@ class AttentionLayoutModel(torch.nn.Module):
         return output
 
     def get_dynamic_shapes(self):
-        return {0: Dim("batch_size", max=8), 1: Dim("seq_len", min=4, max=16)}
+        return {0: Dim.DYNAMIC, 1: Dim.DYNAMIC}
 
 
 class BsndAttentionModel(AttentionLayoutModel):
