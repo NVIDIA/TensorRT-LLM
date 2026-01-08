@@ -190,13 +190,15 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
                               use_beam_search=beam_width > 1)
 
     @pytest.mark.skip_less_device_memory(32000)
-    def test_bf16(self):
+    @pytest.mark.parametrize("world_size", [1, 4])
+    def test_bf16(self, world_size):
         kwargs = self.get_default_kwargs()
         # TODO: multi-stream MOE seems to increase the memory usage
         kwargs["max_batch_size"] = 32
         kwargs["free_mem_ratio"] = 0.4
         with AutoDeployLLM(model=self.MODEL_PATH_BF16,
                            tokenizer=self.MODEL_PATH_BF16,
+                           world_size=world_size,
                            **kwargs) as llm:
             sampling_params = self.get_default_sampling_params()
             task = MMLU(self.MODEL_NAME)
