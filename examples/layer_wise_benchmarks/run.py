@@ -130,8 +130,6 @@ torch.cuda.set_device(local_rank)
 logger.info("Layer-wise benchmarks: Create KV cache manager")
 Runner = get_runner_cls(args.model)
 mapping = Runner.create_mapping(enable_attention_dp=args.enable_attention_dp)
-dist = TorchDist(mapping=mapping) if mpi_disabled() else MPIDist(mapping=mapping)
-
 kv_cache_manager = Runner.create_kv_cache_manager(
     args.model,
     mapping,
@@ -176,6 +174,7 @@ run_pack = runner.create_run_pack(
 )
 if args.enable_autotuner:
     cache_path = os.getenv("TLLM_AUTOTUNER_CACHE_PATH") or None
+    dist = TorchDist(mapping=mapping) if mpi_disabled() else MPIDist(mapping=mapping)
     AutoTuner.get().setup_distributed_state(mapping, dist)
     with autotune(cache_path=cache_path):
         run_pack()
