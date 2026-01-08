@@ -145,9 +145,14 @@ namespace kernels::moe_comm
 // Helper Functions for Expert-to-Rank Mapping
 // ============================================================================
 
-__device__ int compute_target_rank_id(int expert_id, int num_experts_per_rank)
+__device__ int compute_target_rank_id(int expert_id, int num_experts_per_rank, int ep_size)
 {
     // Compute which rank owns a given expert using contiguous partitioning
+    // Invalid routing result.
+    if (expert_id < 0 || expert_id >= num_experts_per_rank * ep_size)
+    {
+        return -1;
+    }
     // Experts are divided evenly across EP ranks:
     // - Rank 0 gets experts [0, num_experts_per_rank)
     // - Rank 1 gets experts [num_experts_per_rank, 2*num_experts_per_rank)
@@ -404,9 +409,9 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
         {
             int expert_id = token_selected_experts[local_token_idx * TOP_K + k];
             // Use contiguous partitioning to determine target rank
-            int target_rank = compute_target_rank_id(expert_id, num_experts_per_rank);
+            int target_rank = compute_target_rank_id(expert_id, num_experts_per_rank, ep_size);
 
-            if (already_copied & (1ULL << target_rank))
+            if (target_rank == -1 || (already_copied & (1ULL << target_rank)))
             {
                 if (thread_idx == 0)
                 {
