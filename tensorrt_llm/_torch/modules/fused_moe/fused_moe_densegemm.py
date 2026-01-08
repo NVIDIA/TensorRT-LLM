@@ -342,7 +342,7 @@ class DenseGEMMFusedMoE(CutlassFusedMoE):
         final_hidden_states = torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_fc2_blackwell(
             fc1_output,
             self.w2_weight.view(torch.uint8).reshape(self.hidden_size, -1),
-            fc1_output_sf,
+            fc1_output_sf.reshape(-1),
             self.w2_weight_scale,
             fc2_alpha,
             expert_count=self.expert_size_per_partition,
