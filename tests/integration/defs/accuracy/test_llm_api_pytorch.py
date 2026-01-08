@@ -3224,13 +3224,18 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
                                                       temperature=0.8,
                                                       top_p=0.95)
 
-            max_duration_sec = 1.5 * 3600
+            max_duration_sec = 2.5 * 3600
             max_batches = 80
+            min_batches = 10 
             start_time = time.time()
             num_samples = len(long_token_list)
 
+            print(f"\n[Main Loop] Starting stress test: max {max_batches} batches or {max_duration_sec/3600:.1f}h")
+            
             for batch_idx in range(max_batches):
-                if (time.time() - start_time) >= max_duration_sec:
+                elapsed = time.time() - start_time
+                if elapsed >= max_duration_sec and batch_idx >= min_batches:
+                    print(f"[Main Loop] Time limit reached after {batch_idx} batches ({elapsed/60:.1f} min)")
                     break
                 start_idx = (batch_idx * batch_size) % num_samples
 
