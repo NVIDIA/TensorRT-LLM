@@ -64,7 +64,7 @@ def nvfp4_dense_gemm_ref(
         # Call nvfp4_gemm for this expert
         ref[:, start_col:end_col] = torch.ops.trtllm.nvfp4_gemm(
             a.view(torch.uint8),
-            b_expert,
+            b_expert.view(torch.uint8),
             a_sf,
             b_sf_expert,
             alpha[expert_idx],
