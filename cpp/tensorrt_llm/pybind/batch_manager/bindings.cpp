@@ -403,7 +403,39 @@ void initBindings(pybind11::module_& m)
 
     py::classh<tb::rnn_state_manager::RnnStateManager>(m, "RnnStateManager")
         .def(py::init<tr::SizeType32, tr::ModelConfig, tr::WorldConfig, tr::BufferManager>(),
-            py::arg("max_num_sequences"), py::arg("model_config"), py::arg("world_config"), py::arg("buffer_manager"));
+            py::arg("max_num_sequences"), py::arg("model_config"), py::arg("world_config"), py::arg("buffer_manager"),
+            py::call_guard<py::gil_scoped_release>())
+        .def(py::init<tr::SizeType32, tr::SizeType32, tr::SizeType32, tr::SizeType32, tr::SizeType32, tr::SizeType32,
+                 tr::SizeType32, tr::WorldConfig const&, int64_t, nvinfer1::DataType, nvinfer1::DataType,
+                 std::optional<std::vector<bool>> const&>(),
+            py::arg("d_state"), py::arg("d_conv"), py::arg("num_heads"), py::arg("n_groups"), py::arg("head_dim"),
+            py::arg("num_layers"), py::arg("max_batch_size"), py::arg("world_config"), py::arg("stream"),
+            py::arg("dtype"), py::arg("ssm_cache_dtype"), py::arg("layer_mask") = std::nullopt,
+            py::call_guard<py::gil_scoped_release>())
+        .def("get_cache_index", &tb::rnn_state_manager::RnnStateManager::getCacheIndex, py::arg("request_id"),
+            py::call_guard<py::gil_scoped_release>())
+        .def(
+            "get_conv_states",
+            [](tb::rnn_state_manager::RnnStateManager& self, tr::SizeType32 layerIdx) -> at::Tensor
+            {
+                auto tensor = self.getConvStates(layerIdx);
+                return tr::Torch::tensor(tensor);
+            },
+            py::arg("layer_idx"), py::call_guard<py::gil_scoped_release>())
+        .def(
+            "get_ssm_states",
+            [](tb::rnn_state_manager::RnnStateManager& self, tr::SizeType32 layerIdx) -> at::Tensor
+            {
+                auto tensor = self.getSsmStates(layerIdx);
+                return tr::Torch::tensor(tensor);
+            },
+            py::arg("layer_idx"), py::call_guard<py::gil_scoped_release>())
+        .def("allocate_cache_blocks", &tb::rnn_state_manager::RnnStateManager::allocateCacheBlocks,
+            py::arg("request_ids"), py::call_guard<py::gil_scoped_release>())
+        .def("free_cache_block", &tb::rnn_state_manager::RnnStateManager::freeCacheBlock, py::arg("request_id"),
+            py::call_guard<py::gil_scoped_release>())
+        .def("get_state_indices", &tb::rnn_state_manager::RnnStateManager::getStateIndices, py::arg("request_ids"),
+            py::arg("is_padding"), py::call_guard<py::gil_scoped_release>());
 
     m.def(
         "add_new_tokens_to_requests",
