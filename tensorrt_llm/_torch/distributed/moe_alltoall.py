@@ -59,25 +59,24 @@ class MoeAlltoAll:
         workspace_size = MoeAlltoAll.get_aux_data_size(ep_size, max_num_tokens)
 
         # Dispatch needs workspace for [ep_size, max_tokens] tokens,
-        # but due to the variety of quantization recipes, we cannot know the exact size,i
-        # so we conservatively estimate assuming no quantization.
+        # but due to the variety of quantization recipes, we cannot know the exact size, so we conservatively estimate assuming no quantization.
         # Meanwhile, we consider the alignment requirement as in moeA2ADispatchOp and moeA2ACombineOp.
         # (Unquantized) token hidden states
         workspace_size += ep_size * max_num_tokens * hidden_size * element_size
-        pad_up(workspace_size, 128)
+        workspace_size = pad_up(workspace_size, 128)
         # token_selected_experts
         workspace_size += ep_size * max_num_tokens * top_k * 4
-        pad_up(workspace_size, 128)
+        workspace_size = pad_up(workspace_size, 128)
         # token_final_scales
         workspace_size += ep_size * max_num_tokens * top_k * 4
-        pad_up(workspace_size, 128)
+        workspace_size = pad_up(workspace_size, 128)
         # extra payload bytes per token
         workspace_size += ep_size * max_num_tokens * extra_payload_bytes_per_token
-        pad_up(workspace_size, 128)
+        workspace_size = pad_up(workspace_size, 128)
 
         # Required workspace for combine [ep_size, max_tokens] tokens
         workspace_size += ep_size * max_num_tokens * hidden_size * element_size
-        pad_up(workspace_size, 128)
+        workspace_size = pad_up(workspace_size, 128)
 
         return workspace_size
 

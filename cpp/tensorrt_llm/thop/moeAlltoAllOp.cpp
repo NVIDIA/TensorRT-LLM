@@ -423,7 +423,7 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
         " for payload), but got ", sizePerRank);
 
     // Create output tensor (local on current rank), no need for initialization
-    // Typially, newly allocated torch tensors are at least 16-byte aligned.
+    // Typically, newly allocated GPU torch tensors are at least 16-byte aligned.
     torch::Tensor output = torch::empty({localNumTokens, elementsPerToken}, payload.options());
 
     // Setup combine parameters
