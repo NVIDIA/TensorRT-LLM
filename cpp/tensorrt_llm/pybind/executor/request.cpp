@@ -556,7 +556,8 @@ void initRequestBindings(pybind11::module_& m)
             state[27].cast<std::optional<tle::Tensor>>(), state[28].cast<std::optional<SizeType32>>(),
             state[29].cast<std::optional<tle::Tensor>>(), 1, state[30].cast<std::optional<tle::EagleConfig>>(),
             state[31].cast<std::optional<tle::Tensor>>(), state[32].cast<std::optional<tle::GuidedDecodingParams>>(),
-            state[33].cast<std::optional<tle::CacheSaltIDType>>());
+            std::nullopt, std::nullopt, state[33].cast<std::optional<tle::CacheSaltIDType>>(),
+            state[34].cast<std::optional<tle::IdType>>());
     };
 
     py::class_<tle::Request> request(m, "Request", pybind11::dynamic_attr());
@@ -597,7 +598,8 @@ void initRequestBindings(pybind11::module_& m)
                  std::optional<tle::GuidedDecodingParams>,      // guidedDecodingParams
                  std::optional<tle::SizeType32>,                // languageAdapterUid
                  std::optional<tle::MillisecondsType>,          // allottedTimeMs
-                 std::optional<tle::CacheSaltIDType>            // cacheSaltID
+                 std::optional<tle::CacheSaltIDType>,           // cacheSaltID
+                 std::optional<tle::IdType>                     // disaggRequestId
                  >(),
             // clang-format off
         py::arg("input_token_ids"),

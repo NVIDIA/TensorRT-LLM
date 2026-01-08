@@ -578,7 +578,7 @@ void initRequestBindings(nb::module_& m)
             self.getClientId(), self.getReturnAllGeneratedTokens(), self.getPriority(), self.getRequestType(),
             self.getContextPhaseParams(), self.getEncoderInputFeatures(), self.getEncoderOutputLength(),
             self.getCrossAttentionMask(), self.getEagleConfig(), self.getSkipCrossAttnBlocks(),
-            self.getGuidedDecodingParams(), self.getCacheSaltID());
+            self.getGuidedDecodingParams(), self.getCacheSaltID(), self.getDisaggRequestId());
     };
     auto requestSetstate = [](tle::Request& self, nb::tuple const& state)
     {
@@ -606,8 +606,8 @@ void initRequestBindings(nb::module_& m)
             nb::cast<std::optional<tle::Tensor>>(state[27]), nb::cast<std::optional<SizeType32>>(state[28]),
             nb::cast<std::optional<tle::Tensor>>(state[29]), 1, nb::cast<std::optional<tle::EagleConfig>>(state[30]),
             nb::cast<std::optional<tle::Tensor>>(state[31]),
-            nb::cast<std::optional<tle::GuidedDecodingParams>>(state[32]),
-            nb::cast<std::optional<tle::CacheSaltIDType>>(state[33]));
+            nb::cast<std::optional<tle::GuidedDecodingParams>>(state[32]), std::nullopt, std::nullopt,
+            nb::cast<std::optional<tle::CacheSaltIDType>>(state[33]), nb::cast<std::optional<tle::IdType>>(state[34]));
     };
 
     nb::class_<tle::Request> request(m, "Request", nb::dynamic_attr());
@@ -648,7 +648,8 @@ void initRequestBindings(nb::module_& m)
                  std::optional<tle::GuidedDecodingParams>,      // guidedDecodingParams
                  std::optional<tle::SizeType32>,                // languageAdapterUid
                  std::optional<tle::MillisecondsType>,          // allottedTimeMs
-                 std::optional<tle::CacheSaltIDType>            // cacheSaltID
+                 std::optional<tle::CacheSaltIDType>,           // cacheSaltID
+                 std::optional<tle::IdType>                     // disaggRequestId
                  >(),
             // clang-format off
         nb::arg("input_token_ids"),
@@ -688,8 +689,9 @@ void initRequestBindings(nb::module_& m)
         nb::arg("guided_decoding_params") = nb::none(),
         nb::arg("language_adapter_uid") = nb::none(),
         nb::arg("allotted_time_ms") = nb::none(),
-        nb::arg("cache_salt_id") = nb::none()
-    )             // clang-format on
+        nb::arg("cache_salt_id") = nb::none(),
+        nb::arg("disagg_request_id") = nb::none()
+    )         // clang-format on
         .def_prop_ro("input_token_ids", &tle::Request::getInputTokenIds)
         .def_prop_ro("max_tokens", &tle::Request::getMaxTokens)
         .def_prop_rw("streaming", &tle::Request::getStreaming, &tle::Request::setStreaming)
@@ -733,6 +735,7 @@ void initRequestBindings(nb::module_& m)
         .def_prop_rw("allotted_time_ms", &tle::Request::getAllottedTimeMs, &tle::Request::setAllottedTimeMs)
         .def_prop_rw("cache_salt_id", &tle::Request::getCacheSaltID, &tle::Request::setCacheSaltID)
         .def_prop_rw("context_phase_params", &tle::Request::getContextPhaseParams, &tle::Request::setContextPhaseParams)
+        .def_prop_rw("disagg_request_id", &tle::Request::getDisaggRequestId, &tle::Request::setDisaggRequestId)
         .def("__getstate__", requestGetstate)
         .def("__setstate__", requestSetstate);
     request.attr("BATCHED_POST_PROCESSOR_NAME") = tle::Request::kBatchedPostProcessorName;

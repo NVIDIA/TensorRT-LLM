@@ -32,6 +32,8 @@ class DisaggregatedParams:
     ctx_request_id: Optional[int] = None
     opaque_state: Optional[bytes] = None
     draft_tokens: Optional[List[int]] = None
+    # If disagg_request_id is set, both context and generation requests will use it as underlying request id.
+    disagg_request_id: Optional[int] = None
 
     # E-P Disaggregated Params
     multimodal_embedding_handles: Optional[List[Dict[str, Any]]] = (
@@ -44,8 +46,12 @@ class DisaggregatedParams:
     mrope_position_deltas_handle: Optional[Dict[str, Any]] = None
 
     def get_context_phase_params(self) -> tllme.ContextPhaseParams:
+        # Prefer disagg_request_id over ctx_request_id
+        request_id = (
+            self.disagg_request_id if self.disagg_request_id is not None else self.ctx_request_id
+        )
         return tllme.ContextPhaseParams(
-            self.first_gen_tokens, self.ctx_request_id, self.opaque_state, self.draft_tokens
+            self.first_gen_tokens, request_id, self.opaque_state, self.draft_tokens
         )
 
     def get_request_type(self) -> tllme.RequestType:
