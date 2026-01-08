@@ -347,7 +347,7 @@ class DemoGenerationExecutor(GenerationExecutor):
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
         # set request id if necessary
-        client_id = self._get_client_id(request)
+        client_id = self._get_next_client_id()
         if request.id is None:
             request.set_id(client_id)
 
