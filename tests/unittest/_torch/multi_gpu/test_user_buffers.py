@@ -460,7 +460,7 @@ def run_single_rank_ub_pass(
         # 3 AR_NORM replacement
         # 3 Scaled MM Prologue
         # 2 UB Finalize Removal
-        assert backend.match_count == [3, 0, 2, 0, 0, 0, 0, 3, 0, 3, 0, 2, 0]
+        assert backend.match_count == [3, 0, 2, 0, 3, 0, 3, 0, 2, 0]
         torch.cuda.synchronize()
 
         if rank == 0:
@@ -759,7 +759,7 @@ def run_single_rank_ub_mm_add_pass(tensor_parallel_size, num_tokens,
         # 3 AR_NORM replacement
         # 3 Prologue
         # 1 UB Finalize Removal
-        assert backend.match_count == [3, 0, 0, 0, 0, 0, 3, 0, 3, 0, 1, 0]
+        assert backend.match_count == [3, 0, 0, 3, 0, 3, 0, 1, 0]
         torch.cuda.synchronize()
 
         if rank == 0:
@@ -993,7 +993,7 @@ def run_single_rank_ub_pass_fp4(
         # 3 AR_NORM replacement
         # 3 Scaled MM Prologue
         # 2 UB Finalize Removal
-        assert backend.match_count == [3, 0, 2, 0, 0, 0, 0, 3, 0, 3, 0, 2, 0]
+        assert backend.match_count == [3, 0, 2, 0, 3, 0, 3, 0, 2, 0]
         torch.cuda.synchronize()
         torch.testing.assert_close(output_fused,
                                    output_ref,

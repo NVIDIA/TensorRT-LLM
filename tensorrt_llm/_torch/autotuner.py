@@ -19,7 +19,6 @@ from cuda.bindings import driver
 
 import tensorrt_llm
 from tensorrt_llm._torch.distributed import Distributed
-from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.bindings.internal.runtime import delay_kernel
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -872,10 +871,8 @@ class AutoTuner:
                 )
                 if not is_cache_hit:
                     # Initialize runner and tactic as None in case of no valid tactic or runners are found
-                    with nvtx_range(f"{custom_op}, shape {p.get_opt_shapes()}"):
-                        best_runner_id, best_tactic, min_time, has_tuning_failure_occurred = self._profile_runners(
-                            custom_op, runners, tensors, p, tuning_config,
-                            **kwargs)
+                    best_runner_id, best_tactic, min_time, has_tuning_failure_occurred = self._profile_runners(
+                        custom_op, runners, tensors, p, tuning_config, **kwargs)
                     new_tuning_failure_occurred = new_tuning_failure_occurred or has_tuning_failure_occurred
 
         self._maybe_sync_cache_data(tuning_config.distributed_tuning_strategy,
@@ -912,13 +909,6 @@ class AutoTuner:
         tuning_config: TuningConfig,
         **kwargs,
     ) -> float:
-        """Profile runners and select the best tactic.
-
-        For multi-rank profiling, only rank 0 performs the actual profiling
-        to avoid sync issues when different ranks select different tactics.
-        The results are then broadcasted to all other ranks.
-        """
-
         min_time = float('inf')
         has_tuning_failure_occurred = False
         best_runner_id, best_tactic = None, None
@@ -946,15 +936,14 @@ class AutoTuner:
 
             for tac in valid_tactics:
                 try:
-                    with nvtx_range(f"r{runner_id}, tactic {tac}"):
-                        time_measured = self._profile_single_kernel(
-                            runner=runner,
-                            inputs=input_tensors,
-                            tactic=tac,
-                            tuning_config=tuning_config,
-                            use_cuda_graph=tuning_config.use_cuda_graph,
-                            **kwargs,
-                        )
+                    time_measured = self._profile_single_kernel(
+                        runner=runner,
+                        inputs=input_tensors,
+                        tactic=tac,
+                        tuning_config=tuning_config,
+                        use_cuda_graph=tuning_config.use_cuda_graph,
+                        **kwargs,
+                    )
                 except Exception as e:
                     # Handle None tensors for optional inputs
                     shapes = self._get_input_sizes(input_tensors)
@@ -1070,13 +1059,10 @@ class AutoTuner:
                             )
 
                 stream.synchronize()
-                if tuning_config.distributed_tuning_strategy == DistributedTuningStrategy.MERGE:
-                    # Currently only AllReduce will use this strategy, and only MPI parallel will enable tuning.
-                    # TODO: Unified tp barrier for both MPIDist and TorchDist.
-                    if hasattr(self._dist, "tp_comm"):
-                        self._dist.tp_comm.barrier()
 
                 # Delay the profiled kernel launch to eliminate affects of host time overhead in profiling.
+                # TODO: This is build time sensitive, O(tactic_num * impl_num * num_profile * tunable_ops)
+                # Consider apply a preprofiling to estimate the kernel execution time, then decide the necessity.
                 if use_cuda_graph:
                     delay_kernel(self._CUDA_GRAPH_DELAY_MICRO_SECS, stream)
                 else:
@@ -1099,7 +1085,6 @@ class AutoTuner:
 
                 return start.elapsed_time(end) / repeat
 
-        # warm up, no timing
         for _ in range(self.warmup):
             runner(input_tensor_batches[-1], tactic=tactic, **kwargs)
 

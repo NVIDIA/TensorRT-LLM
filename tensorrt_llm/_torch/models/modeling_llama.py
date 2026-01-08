@@ -657,8 +657,7 @@ class LlamaDecoderLayer(DecoderLayer):
                                                 eps=config.rms_norm_eps,
                                                 dtype=config.torch_dtype)
 
-        self.all_reduce = AllReduce(mapping=model_config.mapping,
-                                    strategy=model_config.allreduce_strategy)
+        self.all_reduce = AllReduce(mapping=model_config.mapping)
 
         self.next_layer_layernorm: RMSNorm = None
         self.next_attn: LlamaAttention = None

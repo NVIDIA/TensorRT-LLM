@@ -27,21 +27,17 @@ except ImportError:
 
 import tensorrt_llm as tllm
 from tensorrt_llm import Mapping
-from tensorrt_llm._torch.autotuner import AutoTuner, autotune
-from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
-                                             MPIDist, TorchDist)
+from tensorrt_llm._torch.distributed import AllReduce, AllReduceFusionOp
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._utils import (get_sm_version, local_mpi_rank, local_mpi_size,
-                                 mpi_disabled, nvtx_range)
+                                 nvtx_range)
 from tensorrt_llm.bindings.internal.runtime import delay_kernel
 from tensorrt_llm.functional import AllReduceParams, AllReduceStrategy
-from tensorrt_llm.logger import logger
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 
 
 def profile_allreduce(
     mapping: Mapping,
-    dist: TorchDist | MPIDist,
     enable_cudagraph: bool = False,
     inner_loop=200,
     outer_loop=10,
@@ -53,6 +49,7 @@ def profile_allreduce(
     scale=None,
     bias=None,
 ):
+    tllm.logger.set_level('error')
 
     allreduce_params = AllReduceParams(
         fusion_op=fusion,
@@ -65,8 +62,8 @@ def profile_allreduce(
 
     allreduce = AllReduce(mapping=mapping, strategy=strategy)
 
-    def func(x, loop_num=inner_loop):
-        for _ in range(loop_num):
+    def func(x):
+        for _ in range(inner_loop):
             output = allreduce(x, all_reduce_params=allreduce_params)
         return output if fusion == AllReduceFusionOp.NONE else output[0]
 
@@ -78,17 +75,16 @@ def profile_allreduce(
     with torch.cuda.stream(stream), nvtx_range(
             f"allreudce: shape={input.size(0)}x{input.size(1)} fusion={fusion} strategy={strategy}"
     ):
-        with autotune():
-            func(input, loop_num=1)
-
         if enable_cudagraph:
             # CUDA graph warmup then capture
             for _ in range(2):
-                func(input, loop_num=1)
+                func(input)
             with torch.cuda.graph(graph, stream=stream):
                 output = func(input)
+        # warmup for no cuda graph
+        func(input)
 
-        dist.barrier()
+        tllm.mpi_barrier()
         # add delay to avoid the effect of host time overhead
         delay_kernel(20000, stream)
 
@@ -128,6 +124,7 @@ def allreduce_benchmark(
     save_csv: str = None,
     enable_auto: bool = False,
 ):
+    tllm.logger.set_level('error')
     world_size = tllm.mpi_world_size()
     rank = tllm.mpi_rank()
     local_rank = local_mpi_rank()
@@ -137,15 +134,6 @@ def allreduce_benchmark(
     cudart.cudaSetDevice(local_rank)
 
     mapping = Mapping(world_size, rank, gpus_per_node, tp_size=world_size)
-    if mpi_disabled():
-        dist = TorchDist(mapping=mapping)
-    else:
-        dist = MPIDist(mapping=mapping)
-
-    logger.set_rank(mapping.rank)
-
-    AutoTuner.get().setup_distributed_state(mapping, dist)
-
     sm_version = get_sm_version()
 
     if world_size == 1:
@@ -160,12 +148,11 @@ def allreduce_benchmark(
     shape_list = []
 
     if explore_2d:
-        num_tokens_list = [
+        num_seqs_list = [
             1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384
         ]
         hidden_size_list = [128, 256, 512, 1024, 2048, 4096, 8192]
-        for num_tokens, hidden_size in product(num_tokens_list,
-                                               hidden_size_list):
+        for num_tokens, hidden_size in product(num_seqs_list, hidden_size_list):
             shape_list.append((num_tokens, hidden_size))
     else:
         min_size, max_size, ratio = [int(i) for i in test_range.split(",")]
@@ -227,7 +214,6 @@ def allreduce_benchmark(
 
             median_ms = profile_allreduce(
                 mapping=mapping,
-                dist=dist,
                 enable_cudagraph=enable_cudagraph,
                 inner_loop=inner_loop,
                 outer_loop=outer_loop,
@@ -254,13 +240,6 @@ def allreduce_benchmark(
                     })
                 ])
 
-                # print the new record in a single line instead of a dataframe
-                if mapping.rank == 0:
-                    print(
-                        f"num_tokens: {num_tokens}, hidden_size: {hidden_size}, strategy: {strategy.name}, fusion: {fusion.name}, time (us): {median_ms * 1000}"
-                    )
-
-    AutoTuner.get().print_profiling_cache()
     # print the dataframe
     if mapping.rank == 0:
         pd.set_option('display.max_rows', None)
