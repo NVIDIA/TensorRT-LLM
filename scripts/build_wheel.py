@@ -395,8 +395,13 @@ def generate_python_stubs_linux(binding_type: str, venv_python: Path,
     try:
         if is_nanobind:
             build_run(
-                f"\"{venv_python}\" -m nanobind.stubgen -m bindings -r -O .",
-                env=env_stub_gen)
+                f'"{venv_python}" -m nanobind.stubgen -m bindings -r -O bindings',
+                env=env_stub_gen,
+            )
+            # Root stub needs renaming from bindings.pyi to __init__.pyi
+            bindings_stub = Path("bindings/bindings.pyi")
+            if bindings_stub.exists():
+                bindings_stub.rename("bindings/__init__.pyi")
         else:
             build_run(
                 f"\"{venv_python}\" -m pybind11_stubgen -o . bindings --exit-code",
