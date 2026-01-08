@@ -2494,7 +2494,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     constraint_specs=(ConstraintSpec(2, 0,
                                                      fp4_scale_infer_shape), ),
                     use_cold_l2_cache=True,
-                    tune_max_num_tokens=2,
+                    tune_max_num_tokens=256,
                     distributed_tuning_strategy=DistributedTuningStrategy.
                     PARALLEL,
                 )
@@ -2530,24 +2530,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             else:
                 mma_tiler_mn, cluster_shape_mn = (128, 128), (1, 1)
 
-            # Get or create kernel instance
-            kernel_key = (
-                self.weight_per_expert,
-                mma_tiler_mn,
-                cluster_shape_mn,
-                self.scaling_vector_size,
-            )
-
-            if kernel_key not in self.kernel_cache:
-                self.kernel_cache[kernel_key] = self.kernel_class(
-                    sf_vec_size=self.scaling_vector_size,
-                    mma_tiler_mn=mma_tiler_mn,
-                    cluster_shape_mn=cluster_shape_mn,
-                    weight_per_expert=self.weight_per_expert,
-                )
-
-            kernel = self.kernel_cache[kernel_key]
-
             # Allocate output tensor
             c_dtype = self.output_dtype
             if c_dtype == torch.float4_e2m1fn_x2:
@@ -2579,43 +2561,91 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 torch.float4_e2m1fn_x2: cutlass.Float4E2M1FN,
             }.get(c_dtype, cutlass.BFloat16)
 
-            # Call kernel wrapper
-            kernel.wrapper(
-                make_ptr(cutlass.Float4E2M1FN,
-                         a.data_ptr(),
-                         cute.AddressSpace.gmem,
-                         assumed_align=32),
-                make_ptr(cutlass.Float4E2M1FN,
-                         b.data_ptr(),
-                         cute.AddressSpace.gmem,
-                         assumed_align=32),
-                make_ptr(cutlass.Float8E4M3FN,
-                         a_sf.data_ptr(),
-                         cute.AddressSpace.gmem,
-                         assumed_align=16),
-                make_ptr(cutlass.Float8E4M3FN,
-                         b_sf.data_ptr(),
-                         cute.AddressSpace.gmem,
-                         assumed_align=16),
-                make_ptr(c_cutlass_dtype,
-                         c.data_ptr(),
-                         cute.AddressSpace.gmem,
-                         assumed_align=16),
-                make_ptr(cutlass.Float8E4M3FN,
-                         c_sf.data_ptr(),
-                         cute.AddressSpace.gmem,
-                         assumed_align=16),
-                make_ptr(cutlass.Float32, alpha.data_ptr(),
-                         cute.AddressSpace.gmem),
-                make_ptr(cutlass.Float32, norm_const.data_ptr(),
-                         cute.AddressSpace.gmem),
+            # Create pointers for kernel
+            a_ptr = make_ptr(cutlass.Float4E2M1FN,
+                             a.data_ptr(),
+                             cute.AddressSpace.gmem,
+                             assumed_align=32)
+            b_ptr = make_ptr(cutlass.Float4E2M1FN,
+                             b.data_ptr(),
+                             cute.AddressSpace.gmem,
+                             assumed_align=32)
+            a_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                                a_sf.data_ptr(),
+                                cute.AddressSpace.gmem,
+                                assumed_align=16)
+            b_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                                b_sf.data_ptr(),
+                                cute.AddressSpace.gmem,
+                                assumed_align=16)
+            c_ptr = make_ptr(c_cutlass_dtype,
+                             c.data_ptr(),
+                             cute.AddressSpace.gmem,
+                             assumed_align=16)
+            c_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                                c_sf.data_ptr(),
+                                cute.AddressSpace.gmem,
+                                assumed_align=16)
+            alpha_ptr = make_ptr(cutlass.Float32, alpha.data_ptr(),
+                                 cute.AddressSpace.gmem)
+            norm_const_ptr = make_ptr(cutlass.Float32, norm_const.data_ptr(),
+                                      cute.AddressSpace.gmem)
+
+            # Cache key for compiled kernel
+            cache_key = (
+                self.weight_per_expert,
+                mma_tiler_mn,
+                cluster_shape_mn,
+                self.scaling_vector_size,
+                self.expert_count,
+            )
+
+            if cache_key not in self.__class__.kernel_cache:
+                kernel = self.kernel_class(
+                    sf_vec_size=self.scaling_vector_size,
+                    mma_tiler_mn=mma_tiler_mn,
+                    cluster_shape_mn=cluster_shape_mn,
+                    weight_per_expert=self.weight_per_expert,
+                )
+
+                # Compile the kernel and cache it
+                compiled_gemm = cute.compile(
+                    kernel.wrapper,
+                    a_ptr,
+                    b_ptr,
+                    a_sf_ptr,
+                    b_sf_ptr,
+                    c_ptr,
+                    c_sf_ptr,
+                    alpha_ptr,
+                    norm_const_ptr,
+                    m,
+                    n,
+                    k,
+                    l,
+                    expert_count=self.expert_count,
+                    scaling_vector_size=self.scaling_vector_size,
+                    max_active_clusters=max_active_clusters,
+                    stream=stream,
+                )
+                self.__class__.kernel_cache[cache_key] = compiled_gemm
+            else:
+                compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+            # Call the compiled kernel
+            compiled_gemm(
+                a_ptr,
+                b_ptr,
+                a_sf_ptr,
+                b_sf_ptr,
+                c_ptr,
+                c_sf_ptr,
+                alpha_ptr,
+                norm_const_ptr,
                 m,
                 n,
                 k,
                 l,
-                expert_count=self.expert_count,
-                scaling_vector_size=self.scaling_vector_size,
-                max_active_clusters=max_active_clusters,
                 stream=stream,
             )
 
@@ -2829,7 +2859,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         ConstraintSpec(4, 0, lambda shapes: shapes[0][0]),
                     ),
                     use_cold_l2_cache=True,
-                    tune_max_num_tokens=2,
+                    tune_max_num_tokens=256,
                     distributed_tuning_strategy=DistributedTuningStrategy.
                     PARALLEL,
                 )
@@ -2864,26 +2894,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             else:
                 mma_tiler_mn, cluster_shape_mn = (128, 128), (1, 1)
 
-            # Get or create kernel instance
-            kernel_key = (
-                self.expert_count,
-                self.weight_per_expert,
-                mma_tiler_mn,
-                cluster_shape_mn,
-                self.scaling_vector_size,
-            )
-
-            if kernel_key not in self.kernel_cache:
-                self.kernel_cache[kernel_key] = self.kernel_class(
-                    sf_vec_size=self.scaling_vector_size,
-                    mma_tiler_mn=mma_tiler_mn,
-                    cluster_shape_mn=cluster_shape_mn,
-                    expert_count=self.expert_count,
-                    weight_per_expert=self.weight_per_expert,
-                )
-
-            kernel = self.kernel_cache[kernel_key]
-
             # Allocate output tensor
             c_dtype = self.output_dtype
             c = torch.empty((m, n), dtype=c_dtype, device=a.device)
@@ -2904,39 +2914,84 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 torch.float32: cutlass.Float32,
             }.get(c_dtype, cutlass.BFloat16)
 
-            # Call kernel wrapper
-            kernel.wrapper(
-                make_ptr(cutlass.Float4E2M1FN,
-                         a.data_ptr(),
-                         cute.AddressSpace.gmem,
-                         assumed_align=32),
-                make_ptr(cutlass.Float4E2M1FN,
-                         b.data_ptr(),
-                         cute.AddressSpace.gmem,
-                         assumed_align=32),
-                make_ptr(cutlass.Float8E4M3FN,
-                         a_sf.data_ptr(),
-                         cute.AddressSpace.gmem,
-                         assumed_align=16),
-                make_ptr(cutlass.Float8E4M3FN,
-                         b_sf.data_ptr(),
-                         cute.AddressSpace.gmem,
-                         assumed_align=16),
-                make_ptr(cutlass.Float32,
-                         alpha_scale.data_ptr(),
-                         cute.AddressSpace.gmem,
-                         assumed_align=4),
-                make_ptr(c_cutlass_dtype,
-                         c.data_ptr(),
-                         cute.AddressSpace.gmem,
-                         assumed_align=16),
+            # Create pointers for kernel
+            a_ptr = make_ptr(cutlass.Float4E2M1FN,
+                             a.data_ptr(),
+                             cute.AddressSpace.gmem,
+                             assumed_align=32)
+            b_ptr = make_ptr(cutlass.Float4E2M1FN,
+                             b.data_ptr(),
+                             cute.AddressSpace.gmem,
+                             assumed_align=32)
+            a_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                                a_sf.data_ptr(),
+                                cute.AddressSpace.gmem,
+                                assumed_align=16)
+            b_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                                b_sf.data_ptr(),
+                                cute.AddressSpace.gmem,
+                                assumed_align=16)
+            alpha_scale_ptr = make_ptr(cutlass.Float32,
+                                       alpha_scale.data_ptr(),
+                                       cute.AddressSpace.gmem,
+                                       assumed_align=4)
+            c_ptr = make_ptr(c_cutlass_dtype,
+                             c.data_ptr(),
+                             cute.AddressSpace.gmem,
+                             assumed_align=16)
+
+            # Cache key for compiled kernel
+            cache_key = (
+                self.expert_count,
+                self.weight_per_expert,
+                mma_tiler_mn,
+                cluster_shape_mn,
+                self.scaling_vector_size,
+            )
+
+            if cache_key not in self.__class__.kernel_cache:
+                kernel = self.kernel_class(
+                    sf_vec_size=self.scaling_vector_size,
+                    mma_tiler_mn=mma_tiler_mn,
+                    cluster_shape_mn=cluster_shape_mn,
+                    expert_count=self.expert_count,
+                    weight_per_expert=self.weight_per_expert,
+                )
+
+                # Compile the kernel and cache it
+                compiled_gemm = cute.compile(
+                    kernel.wrapper,
+                    a_ptr,
+                    b_ptr,
+                    a_sf_ptr,
+                    b_sf_ptr,
+                    alpha_scale_ptr,
+                    c_ptr,
+                    m,
+                    n,
+                    k,
+                    l,
+                    expert_count=self.expert_count,
+                    scaling_vector_size=self.scaling_vector_size,
+                    max_active_clusters=max_active_clusters,
+                    stream=stream,
+                )
+                self.__class__.kernel_cache[cache_key] = compiled_gemm
+            else:
+                compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+            # Call the compiled kernel
+            compiled_gemm(
+                a_ptr,
+                b_ptr,
+                a_sf_ptr,
+                b_sf_ptr,
+                alpha_scale_ptr,
+                c_ptr,
                 m,
                 n,
                 k,
                 l,
-                expert_count=self.expert_count,
-                scaling_vector_size=self.scaling_vector_size,
-                max_active_clusters=max_active_clusters,
                 stream=stream,
             )
 
