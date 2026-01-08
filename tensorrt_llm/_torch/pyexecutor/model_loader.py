@@ -290,11 +290,7 @@ class ModelLoader:
 
                     self._call_load_weights(model.load_draft_weights, weights,
                                             draft_weight_mapper)
-                for module in model.modules():
-                    if hasattr(module,
-                               'process_weights_after_loading') and not getattr(
-                                   module, '_weights_removed', False):
-                        module.process_weights_after_loading()
+
             elif load_format == LoadFormat.DUMMY:
                 self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
                     model, config)

@@ -368,6 +368,9 @@ class LinearMethodBase(ABC):
         else:
             raise ValueError(f'unsupported weight mode: {weight_mode}')
 
+        if not allow_partial_loading:
+            self.process_weights_after_loading(module)
+
     def post_load_weights(self, module: Linear):
         pass
 
@@ -653,11 +656,15 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
             module, weights, allow_partial_loading=allow_partial_loading)
         weight_mode = module.weights_loading_config.weight_mode
         if not hasattr(module, "tmp_input_scales"):
-            module.tmp_input_scales = torch.empty(weight_mode.int_value,
-                                                  dtype=torch.float32)
+            module.tmp_input_scales = torch.empty(
+                weight_mode.int_value,
+                dtype=torch.float32,
+                device=module.input_scale.device)
         if not hasattr(module, "tmp_weight_scales"):
-            module.tmp_weight_scales = torch.empty(weight_mode.int_value,
-                                                   dtype=torch.float32)
+            module.tmp_weight_scales = torch.empty(
+                weight_mode.int_value,
+                dtype=torch.float32,
+                device=module.weight_scale.device)
         # Load input_scale and weight_scale to tmp_qkv_input_scales and tmp_qkv_weight_scales
         # q -> index 0, k -> index 1, v -> index 2
         input_scales, weight_scales = self.load_weight_scales(
@@ -702,7 +709,7 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         if getattr(module, "has_static_input_scale", False):
             # Compute max and replace input_scale with a new parameter
             max_input_scale = module.tmp_input_scales.max()
-            module.input_scale.data = max_input_scale
+            module.input_scale.data.copy_(max_input_scale)
             module.inv_input_scale.data = 1.0 / module.input_scale
             delattr(module, "has_static_input_scale")
         else:
@@ -711,7 +718,7 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
 
         # Compute max weight_scale
         max_weight_scale = module.tmp_weight_scales.max()
-        module.weight_scale.data = max_weight_scale
+        module.weight_scale.data.copy_(max_weight_scale)
 
         # Rescale each weight shard: weight * (original_scale / max_scale)
         for shard_key in weight_mode.shard_keys:
@@ -779,11 +786,15 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
             module, weights, allow_partial_loading=allow_partial_loading)
         weight_mode = module.weights_loading_config.weight_mode
         if not hasattr(module, "tmp_input_scales"):
-            module.tmp_input_scales = torch.empty(weight_mode.int_value,
-                                                  dtype=torch.float32)
+            module.tmp_input_scales = torch.empty(
+                weight_mode.int_value,
+                dtype=torch.float32,
+                device=module.input_scale.device)
         if not hasattr(module, "tmp_weight_scales"):
-            module.tmp_weight_scales = torch.empty(weight_mode.int_value,
-                                                   dtype=torch.float32)
+            module.tmp_weight_scales = torch.empty(
+                weight_mode.int_value,
+                dtype=torch.float32,
+                device=module.weight_scale.device)
         # Load input_scale and weight_scale to their designated positions
         # gate -> index 0, up -> index 1
         input_scales, weight_scales = self.load_weight_scales(
