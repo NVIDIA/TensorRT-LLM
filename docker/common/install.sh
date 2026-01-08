@@ -16,6 +16,10 @@ polygraphy=0
 mpi4py=0
 pytorch=0
 opencv=0
+constraints=0
+ucx=0
+nixl=0
+etcd=0
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -55,6 +59,22 @@ while [[ $# -gt 0 ]]; do
             opencv=1
             shift 1
             ;;
+        --constraints)
+            constraints=1
+            shift 1
+            ;;
+        --ucx)
+            ucx=1
+            shift 1
+            ;;
+        --nixl)
+            nixl=1
+            shift 1
+            ;;
+        --etcd)
+            etcd=1
+            shift 1
+            ;;
         --all)
             base=1
             cmake=1
@@ -65,6 +85,10 @@ while [[ $# -gt 0 ]]; do
             mpi4py=1
             pytorch=1
             opencv=1
+            constraints=1
+            ucx=1
+            nixl=1
+            etcd=1
             shift 1
             ;;
         *)
@@ -128,4 +152,24 @@ if [ $opencv -eq 1 ]; then
     bash -c "pip3 uninstall -y opencv"
     rm -rf /usr/local/lib/python3*/dist-packages/cv2/
     bash -c "pip3 install opencv-python-headless --force-reinstall --no-deps --no-cache-dir"
+fi
+
+if [ $constraints -eq 1 ]; then
+    echo "Installing dependencies from constraints.txt..."
+    pip3 install --no-cache-dir -r $CONSTRAINTS_FILE
+fi
+
+if [ $ucx -eq 1 ]; then
+    echo "Installing UCX..."
+    GITHUB_MIRROR=$GITHUB_MIRROR bash $SCRIPT_DIR/install_ucx.sh
+fi
+
+if [ $nixl -eq 1 ]; then
+    echo "Installing NIXL..."
+    GITHUB_MIRROR=$GITHUB_MIRROR bash $SCRIPT_DIR/install_nixl.sh
+fi
+
+if [ $etcd -eq 1 ]; then
+    echo "Installing etcd..."
+    bash $SCRIPT_DIR/install_etcd.sh
 fi
