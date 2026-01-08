@@ -652,12 +652,12 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         super().load_weights_fused_qkv_linear(
             module, weights, allow_partial_loading=allow_partial_loading)
         weight_mode = module.weights_loading_config.weight_mode
-        if not hasattr(module, "tmp_qkv_input_scales"):
-            module.tmp_qkv_input_scales = torch.empty(weight_mode.int_value,
-                                                      dtype=torch.float32)
-        if not hasattr(module, "tmp_qkv_weight_scales"):
-            module.tmp_qkv_weight_scales = torch.empty(weight_mode.int_value,
-                                                       dtype=torch.float32)
+        if not hasattr(module, "tmp_input_scales"):
+            module.tmp_input_scales = torch.empty(weight_mode.int_value,
+                                                  dtype=torch.float32)
+        if not hasattr(module, "tmp_weight_scales"):
+            module.tmp_weight_scales = torch.empty(weight_mode.int_value,
+                                                   dtype=torch.float32)
         # Load input_scale and weight_scale to tmp_qkv_input_scales and tmp_qkv_weight_scales
         # q -> index 0, k -> index 1, v -> index 2
         input_scales, weight_scales = self.load_weight_scales(
@@ -666,12 +666,12 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
 
         for shard_key, scale in input_scales.items():
             idx = shard_key_to_index[shard_key]
-            module.tmp_qkv_input_scales[idx] = scale
+            module.tmp_input_scales[idx] = scale
             setattr(module, "has_static_input_scale", True)
 
         for shard_key, scale in weight_scales.items():
             idx = shard_key_to_index[shard_key]
-            module.tmp_qkv_weight_scales[idx] = scale
+            module.tmp_weight_scales[idx] = scale
 
         # Load k and v scales, used for NVFP4 KV cache
         # Store them temporarily for post-processing
@@ -701,7 +701,7 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         # Handle input_scale
         if getattr(module, "has_static_input_scale", False):
             # Compute max and replace input_scale with a new parameter
-            max_input_scale = module.tmp_qkv_input_scales.max()
+            max_input_scale = module.tmp_input_scales.max()
             module.input_scale.data = max_input_scale
             module.inv_input_scale.data = 1.0 / module.input_scale
             delattr(module, "has_static_input_scale")
@@ -710,13 +710,13 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
             module.inv_input_scale = None
 
         # Compute max weight_scale
-        max_weight_scale = module.tmp_qkv_weight_scales.max()
+        max_weight_scale = module.tmp_weight_scales.max()
         module.weight_scale.data = max_weight_scale
 
         # Rescale each weight shard: weight * (original_scale / max_scale)
         for shard_key in weight_mode.shard_keys:
             idx = shard_key_to_index[shard_key]
-            original_scale = module.tmp_qkv_weight_scales[idx]
+            original_scale = module.tmp_weight_scales[idx]
 
             # Get shard position from mapping
             shard_offset, shard_size = module.fused_weight_shard_indices_mapping[
@@ -730,8 +730,8 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
             module.weight.data[shard_offset:shard_offset +
                                shard_size] = rescaled_weight
 
-        delattr(module, "tmp_qkv_input_scales")
-        delattr(module, "tmp_qkv_weight_scales")
+        delattr(module, "tmp_input_scales")
+        delattr(module, "tmp_weight_scales")
 
     def process_weights_after_loading_fused_qkv_linear(self, module: Linear):
         """
@@ -778,12 +778,12 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         super().load_weights_fused_gate_up_linear(
             module, weights, allow_partial_loading=allow_partial_loading)
         weight_mode = module.weights_loading_config.weight_mode
-        if not hasattr(module, "tmp_gate_up_input_scales"):
-            module.tmp_gate_up_input_scales = torch.empty(weight_mode.int_value,
-                                                          dtype=torch.float32)
-        if not hasattr(module, "tmp_gate_up_weight_scales"):
-            module.tmp_gate_up_weight_scales = torch.empty(
-                weight_mode.int_value, dtype=torch.float32)
+        if not hasattr(module, "tmp_input_scales"):
+            module.tmp_input_scales = torch.empty(weight_mode.int_value,
+                                                  dtype=torch.float32)
+        if not hasattr(module, "tmp_weight_scales"):
+            module.tmp_weight_scales = torch.empty(weight_mode.int_value,
+                                                   dtype=torch.float32)
         # Load input_scale and weight_scale to their designated positions
         # gate -> index 0, up -> index 1
         input_scales, weight_scales = self.load_weight_scales(
@@ -792,12 +792,12 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
 
         for shard_key, scale in input_scales.items():
             idx = shard_key_to_index[shard_key]
-            module.tmp_gate_up_input_scales[idx] = scale
+            module.tmp_input_scales[idx] = scale
             setattr(module, "has_static_input_scale", True)
 
         for shard_key, scale in weight_scales.items():
             idx = shard_key_to_index[shard_key]
-            module.tmp_gate_up_weight_scales[idx] = scale
+            module.tmp_weight_scales[idx] = scale
 
     def process_weights_after_loading_fused_gate_up_linear(
             self, module: Linear):
@@ -1113,11 +1113,13 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                 k=weight.shape[1],
                 recipe=(1, 128, 128),
                 is_sfa=False)
-            replace_parameter_and_save_metadata(module, "weight", weight,
-                                                module.rebuild_tensor_metadata)
-            replace_parameter_and_save_metadata(module, "weight_scale",
-                                                transformed_scale,
-                                                module.rebuild_tensor_metadata)
+            replace_parameter_and_save_metadata(
+                module, "weight", nn.Parameter(weight, requires_grad=False),
+                module.rebuild_tensor_metadata)
+            replace_parameter_and_save_metadata(
+                module, "weight_scale",
+                nn.Parameter(transformed_scale, requires_grad=False),
+                module.rebuild_tensor_metadata)
 
 
 class NVFP4LinearMethod(LinearMethodBase):
