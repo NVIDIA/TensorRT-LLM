@@ -111,14 +111,14 @@ orchestrator_type: "ray"
 max_batch_size: 1
 max_num_tokens: 512
 max_seq_len: 128
-kv_cache_config:
-    free_gpu_memory_fraction: 0.8
 # Ray placement config - specifies which GPUs to use
 # placement_groups: List of GPU index lists (one list per placement group)
 # placement_bundle_indices: Which bundle indices to use from each placement group
 ray_placement_config:
     placement_groups: $CTX_PLACEMENT_GROUPS
     placement_bundle_indices: $CTX_BUNDLE_INDICES
+    gpu_per_bundle: 1
+    cpu_per_bundle: 1
 EOF
 
     # Generation server config
@@ -132,12 +132,12 @@ orchestrator_type: "ray"
 max_batch_size: 1
 max_num_tokens: 512
 max_seq_len: 128
-kv_cache_config:
-    free_gpu_memory_fraction: 0.8
 # Ray placement config - specifies which GPUs to use
 ray_placement_config:
     placement_groups: $GEN_PLACEMENT_GROUPS
     placement_bundle_indices: $GEN_BUNDLE_INDICES
+    gpu_per_bundle: 1
+    cpu_per_bundle: 1
 EOF
 
     # Also create a generic one for backward compatibility
@@ -151,8 +151,6 @@ orchestrator_type: "ray"
 max_batch_size: 1
 max_num_tokens: 512
 max_seq_len: 128
-kv_cache_config:
-    free_gpu_memory_fraction: 0.8
 EOF
 else
     cat > extra_llm_config.yaml << EOF
@@ -166,8 +164,6 @@ disable_overlap_scheduler: true
 max_batch_size: 1
 max_num_tokens: 512
 max_seq_len: 128
-kv_cache_config:
-    free_gpu_memory_fraction: 0.8
 EOF
 fi
 
