@@ -129,7 +129,7 @@ class AsyncTransferManager:
 
         def __init__(self, block_id: Optional[int]):
             self.block_id = block_id
-            self.counter = 1
+            self.counter = 0
 
         def start_transfer(self):
             self.counter += 1
@@ -152,14 +152,14 @@ class AsyncTransferManager:
         self.should_store_blocks = should_store_blocks
 
         # Mapping of request id to the LlmRequest
-        self._requests: Dict[int, LlmRequest] = dict()
+        self._requests_in_transfer: Dict[int, LlmRequest] = dict()
 
         # Mapping of request id to the the request metadata
         self._request_transfer_metadata: Dict[
             int, self.RequestTransferMetadata] = dict()
 
     def requests_in_transfer(self) -> Dict[int, LlmRequest]:
-        return self._requests
+        return self._requests_in_transfer
 
     def start_transfer(self, request: LlmRequest):
         """
@@ -171,7 +171,7 @@ class AsyncTransferManager:
 
         req_id = request.py_request_id
 
-        if req_id not in self._requests:
+        if req_id not in self._requests_in_transfer:
             for resource_mgr_type in (
                     ResourceManagerType.SEQ_SLOT_MANAGER,
                     ResourceManagerType.SPEC_RESOURCE_MANAGER):
@@ -188,11 +188,11 @@ class AsyncTransferManager:
             else:
                 block_id = None
 
-            self._requests[req_id] = request
+            self._requests_in_transfer[req_id] = request
             self._request_transfer_metadata[
                 req_id] = self.RequestTransferMetadata(block_id)
-        else:
-            self._request_transfer_metadata[req_id].start_transfer()
+
+        self._request_transfer_metadata[req_id].start_transfer()
 
     def end_transfer(self, request: LlmRequest) -> bool:
         """
@@ -215,7 +215,7 @@ class AsyncTransferManager:
         should_terminate = False
 
         if transfer_metadata.end_transfer():
-            self._requests.pop(request.py_request_id)
+            self._requests_in_transfer.pop(request.py_request_id)
             self._request_transfer_metadata.pop(request.py_request_id)
 
             if self.should_store_blocks:
@@ -231,7 +231,7 @@ class AsyncTransferManager:
         return should_terminate
 
     def has_any_inflight_requests(self) -> bool:
-        return len(self._requests) > 0
+        return len(self._requests_in_transfer) > 0
 
 
 class PyExecutor:
