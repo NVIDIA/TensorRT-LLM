@@ -5,13 +5,13 @@
 ```bash
 # Generate workload using a balanced random method
 # Per-rank token number 128, EP size 32 (a typical workload for large EP gen phase)
-python moe_workload_generator.py --num_tokens 128 --ep_size 32
+python moe_workload_generator.py --num_tokens 128 --ep_size 32 --tile_size 128
 # Per-rank token number 8192, EP size 4 (a typical workload for ctx phase)
-python moe_workload_generator.py --num_tokens 8192 --ep_size 4
+python moe_workload_generator.py --num_tokens 8192 --ep_size 4 --tile_size 256
 
 # Generate workload using the balanced method from layer-wise benchmarking
 # Per-rank token number 128, EP size 32 (a typical workload for large EP gen phase)
-python moe_workload_generator.py --num_tokens 128 --ep_size 32 --method balanced_layer_wise_benchmark
+python moe_workload_generator.py --num_tokens 128 --ep_size 32 --tile_size 128 --method balanced_layer_wise_benchmark
 # Per-rank token number 8192, EP size 4 (a typical workload for ctx phase)
-python moe_workload_generator.py --num_tokens 8192 --ep_size 4 --method balanced_layer_wise_benchmark
+python moe_workload_generator.py --num_tokens 8192 --ep_size 4 --tile_size 256 --method balanced_layer_wise_benchmark
 ```
