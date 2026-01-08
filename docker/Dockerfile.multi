@@ -44,6 +44,7 @@ COPY docker/common/install.sh \
      docker/common/install_ucx.sh \
      docker/common/install_nixl.sh \
      docker/common/install_etcd.sh \
+     docker/common/install_gnupg.sh \
      ./
 
 ARG TRT_VER
@@ -69,11 +70,15 @@ RUN GITHUB_MIRROR=${GITHUB_MIRROR} \
     rm install_polygraphy.sh && \
     rm install_mpi4py.sh && \
     rm install_pytorch.sh && \
+    rm install_gnupg.sh && \
     rm install.sh
 
 # Copy and install dependencies from constraints.txt
 COPY constraints.txt /tmp/constraints.txt
 RUN pip3 install --no-cache-dir -r /tmp/constraints.txt && rm /tmp/constraints.txt
+
+# Remove nbconvert to avoid the nbconvert vulnerability issue in the base NGC PyTorch image.
+RUN pip3 uninstall -y nbconvert || true
 
 # Install UCX, NIXL, etcd
 # TODO: Combine these into the main install.sh script
