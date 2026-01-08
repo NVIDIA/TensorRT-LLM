@@ -316,6 +316,8 @@ torchrun --nproc_per_node=4 wan_t2v.py --cfg 2 --ulysses 2
 
 **Attention**
 
+In large video diffusion models, >70% of the DiT transformer latency is contributed by the attention layers. Select from a variety of attention optimizations
+
 *1. SageAttention*
 
 By default, we will enable **SageAttention** in our scripts. SageAttention leverages quantization to accelerate the attention operator, which brings good performance but also has impact on accuracy. We find it is good at performance-accuracy tradeoff, so we enable it by default.
@@ -392,7 +394,23 @@ torchrun --nproc_per_node=4  wan_t2v.py --attn_type "sparse-videogen2" --model_p
 
 **Linear**
 
-*1. TRT-LLM FP8 Linear*
+Leverage the accelerated 4 & 8-bit tensor cores on NVIDIA GPUs using the various linear / gemm layer optimizations 
+
+*1. NVFP4 Linear*
+
+* TRT-LLM NVFP4 Linear
+```bash
+python wan_t2v.py --linear_type "trtllm-nvfp4" --linear_recipe static
+```
+
+* FlashInfer NVFP4 Linear
+```bash
+python wan_t2v.py --linear_type "flashinfer-nvfp4-cutlass" --linear_recipe static
+```
+
+If you set `linear_recipe` to `static`, it means we will use a default global scale for NVFP4 gemm. Otherwise, it will use `dynamic` strategy, the global scale is computed on the fly and thus have higher accuracy.
+
+*2. FP8 Linear*
 
 Enable TRT-LLM FP8 Linear for improved performance.
 * TRT-LLM FP8 Blockwise Linear
@@ -402,10 +420,6 @@ python wan_t2v.py --linear_type "trtllm-fp8-blockwise"
 * TRT-LLM FP8 Per-tensor Linear
 ```bash
 python wan_t2v.py --linear_type "trtllm-fp8-per-tensor"
-```
-* TRT-LLM NVFP4 blockwise Linear
-```bash
-python wan_t2v.py --linear_type "trtllm-nvfp4"
 ```
 
 **TeaCache Acceleration:**

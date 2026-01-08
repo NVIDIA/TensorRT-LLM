@@ -1,4 +1,8 @@
-## ✨ Features
+TRT-LLM visual_gen space contains prototype implementation for accelerating large-scale image & video content generation pipelines on NVIDIA Datacenter GPUs in single and multi-GPU configurations.
+
+Given a diffusion model implemented in native PyTorch or HuggingFace Diffusers pipeline, you can accelerate compute heavy components of the pipeline by invoking low-precision kernels for linear and attention layers. 
+
+## ✨ Key Features
 
 <div align="center">
 
@@ -50,10 +54,12 @@
 | Model Name | Resolution | Parameters | Description |
 |------------|------------|------------|-------------|
 | black-forest-labs/FLUX.1-dev | - | 12B | Image generation |
+| black-forest-labs/FLUX.2-dev | - | 32B | Image generation |
 
 ### Cosmos
 | Model Name | Resolution | Parameters | Description |
 |------------|------------|------------|-------------|
+| nvidia/Cosmos-Predict2.5-2B-Base | - | 2B | Text-to-image |
 | nvidia/Cosmos-Predict2-2B-Video2World | - | 2B | Video-to-world |
 | nvidia/Cosmos-Predict2-14B-Video2World | - | 14B | Video-to-world |
 | nvidia/Cosmos-Predict2-2B-Text2Image | - | 2B | Text-to-image |
