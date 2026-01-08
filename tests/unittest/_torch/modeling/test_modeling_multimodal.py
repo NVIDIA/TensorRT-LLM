@@ -186,10 +186,6 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
                 model.load_weights(hf_model_state_dict)
 
             for module in model.modules():
-                if hasattr(module, "process_weights_after_loading") and not getattr(
-                    module, "_weights_removed", False
-                ):
-                    module.process_weights_after_loading()
                 if hasattr(module, "post_load_weights") and not getattr(
                     module, "_weights_removed", False
                 ):

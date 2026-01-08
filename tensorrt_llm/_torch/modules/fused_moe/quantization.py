@@ -333,6 +333,12 @@ class FusedMoEMethodBase(ABC):
                      weights: List[Dict],
                      weight_loading_mode: MoEWeightLoadingMode,
                      allow_partial_loading: bool = False):
+        if allow_partial_loading:
+            assert isinstance(
+                self, (UnquantizedFusedMoEMethod, FP8QDQFusedMoEMethod,
+                       DeepSeekFP8BlockScalesFusedMoEMethod,
+                       DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm)
+            ), "Partial loading is only supported for unquantized and FP8 models"
         additional_kargs = {}
         if "allow_partial_loading" in inspect.getfullargspec(
                 self.load_expert_weights_to_dst).args:
@@ -404,6 +410,9 @@ class FusedMoEMethodBase(ABC):
                 local_shared_w3_w1_bias_tensors if module.bias else None,
                 local_shared_w2_bias_tensors if module.bias else None,
                 **additional_kargs)
+
+        if not allow_partial_loading:
+            self.process_weights_after_loading(module)
 
     def post_load_weights(self, module: torch.nn.Module):
         if self.need_load_shared_weights(module):
@@ -549,8 +558,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
 
 def load_expert_fc31_input_scale_fp8_qdq(w1_input_scale, w3_input_scale,
                                          dst_fc31_input_scale: torch.Tensor):
-    dst_fc31_input_scale.copy_(
-        max(w1_input_scale[...].reshape([]), w3_input_scale[...].reshape([])))
+    if w1_input_scale is not None and w1_input_scale.numel() != 0:
+        w1_input_scale = w1_input_scale[...].reshape([])
+        dst_fc31_input_scale[0].copy_(w1_input_scale)
+    if w3_input_scale is not None and w3_input_scale.numel() != 0:
+        w3_input_scale = w3_input_scale[...].reshape([])
+        dst_fc31_input_scale[1].copy_(w3_input_scale)
 
 
 def load_expert_fc2_input_scale_fp8_qdq(w2_input_scale,
@@ -560,12 +573,16 @@ def load_expert_fc2_input_scale_fp8_qdq(w2_input_scale,
 
 def load_activation_scales_fp8_qdq(module: torch.nn.Module, weights: Dict):
     if not hasattr(module, 'tmp_fc31_input_scale'):
-        module.tmp_fc31_input_scale = torch.zeros(module.num_experts,
-                                                  dtype=torch.float32)
+        module.tmp_fc31_input_scale = torch.empty(
+            (module.num_experts, 2),
+            dtype=torch.float32,
+            device=module.fc31_dequant.device)
     tmp_fc31_input_scale = module.tmp_fc31_input_scale
     if not hasattr(module, 'tmp_fc2_input_scale'):
-        module.tmp_fc2_input_scale = torch.empty(module.num_experts,
-                                                 dtype=torch.float32)
+        module.tmp_fc2_input_scale = torch.empty(
+            module.num_experts,
+            dtype=torch.float32,
+            device=module.fc2_dequant.device)
     tmp_fc2_input_scale = module.tmp_fc2_input_scale
     for expert_id in range(module.num_experts):
         if module.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
@@ -670,16 +687,12 @@ class FP8QDQFusedMoEMethod(FusedMoEMethodBase):
     def load_expert_w3_w1_weight_scale_fp8_qdq(
             self, w1_weight_scale, w3_weight_scale,
             dst_w3_w1_weight_scale: torch.Tensor):
-        if w1_weight_scale is not None and w1_weight_scale.shape[0] != 0:
+        if w1_weight_scale is not None and w1_weight_scale.numel() != 0:
             w1_weight_scale = w1_weight_scale[...].reshape([])
-            dst_w3_w1_weight_scale.copy_(
-                w1_weight_scale
-            ) if w1_weight_scale > dst_w3_w1_weight_scale[0] else None
-        if w3_weight_scale is not None and w3_weight_scale.shape[0] != 0:
+            dst_w3_w1_weight_scale[0].copy_(w1_weight_scale)
+        if w3_weight_scale is not None and w3_weight_scale.numel() != 0:
             w3_weight_scale = w3_weight_scale[...].reshape([])
-            dst_w3_w1_weight_scale.copy_(
-                w3_weight_scale
-            ) if w3_weight_scale > dst_w3_w1_weight_scale[0] else None
+            dst_w3_w1_weight_scale[1].copy_(w3_weight_scale)
 
     def load_expert_w2_weight_scale_fp8(self, w2_weight_scale,
                                         dst_w2_weight_scale: torch.Tensor):
@@ -691,11 +704,15 @@ class FP8QDQFusedMoEMethod(FusedMoEMethodBase):
 
         # Step2: Load weight scales
         if not hasattr(module, 'tmp_w3_w1_weight_scale'):
-            module.tmp_w3_w1_weight_scale = torch.zeros(
-                module.expert_size_per_partition, dtype=torch.float32)
+            module.tmp_w3_w1_weight_scale = torch.empty(
+                (module.expert_size_per_partition, 2),
+                dtype=torch.float32,
+                device=module.fc31_dequant.device)
         if not hasattr(module, 'tmp_w2_weight_scale'):
             module.tmp_w2_weight_scale = torch.empty(
-                module.expert_size_per_partition, dtype=torch.float32)
+                module.expert_size_per_partition,
+                dtype=torch.float32,
+                device=module.fc2_dequant.device)
         tmp_w3_w1_weight_scale = module.tmp_w3_w1_weight_scale
         tmp_w2_weight_scale = module.tmp_w2_weight_scale
 
@@ -741,17 +758,20 @@ class FP8QDQFusedMoEMethod(FusedMoEMethodBase):
         for local_slot_id, _ in enumerate(module.initial_local_expert_ids):
             expert_idx = local_slot_id
             requantize_expert_w3_w1_weight_fp8_qdq(
-                module, module.tmp_w3_w1_weight_scale[expert_idx],
-                module.tmp_w2_weight_scale[expert_idx],
+                module, module.tmp_w3_w1_weight_scale[expert_idx][0],
+                module.tmp_w3_w1_weight_scale[expert_idx][1],
                 module.w3_w1_weight.data[expert_idx])
 
         # Calculate and store final loaded weights
-        module.fc31_dequant.data.copy_(module.tmp_w3_w1_weight_scale *
+        max_w3_w1_weight_scale = module.tmp_w3_w1_weight_scale.max(dim=1).values
+        module.fc31_dequant.data.copy_(max_w3_w1_weight_scale *
                                        max_fc31_input_scale)
         module.fc2_quant.data.copy_(max_fc2_input_scale.reciprocal())
         module.fc2_dequant.data.copy_(module.tmp_w2_weight_scale *
                                       max_fc2_input_scale)
         module.fc31_input_dequant.data.copy_(max_fc31_input_scale)
+
+        self.setup_quant_scales(module)
 
         delattr(module, 'tmp_w3_w1_weight_scale')
         delattr(module, 'tmp_w2_weight_scale')
