@@ -204,15 +204,15 @@ class Mamba2Mixer(nn.Module):
         seqlen_split_size = [num_prefill_tokens, num_decode_tokens]
         batch_split_size = [num_prefills, num_decodes]
 
-        state_indices = attn_metadata.kv_cache_manager.get_state_indices(
-        )[:num_prefills + num_decodes]
-
+        state_indices = mamba_metadata.state_indices[:num_prefills +
+                                                     num_decodes]
         state_indices_p, state_indices_d = torch.split(state_indices,
                                                        batch_split_size)
-        layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(
+
+        conv_states = attn_metadata.kv_cache_manager.get_conv_states(
             self.layer_idx)
-        conv_states = layer_cache.conv
-        ssm_states = layer_cache.temporal
+        ssm_states = attn_metadata.kv_cache_manager.get_ssm_states(
+            self.layer_idx)
 
         # in_proj
         zxbcdt = self.in_proj(hidden_states)
