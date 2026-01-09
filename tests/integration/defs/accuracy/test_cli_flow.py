@@ -14,7 +14,7 @@
 # limitations under the License.
 import pytest
 
-from tensorrt_llm.llmapi import (EagleDecodingConfig, LookaheadDecodingConfig,
+from tensorrt_llm.llmapi import (Eagle3DecodingConfig, LookaheadDecodingConfig,
                                  MedusaDecodingConfig)
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -476,7 +476,7 @@ class TestVicuna7B(CliFlowAccuracyTestHarness):
             extra_summarize_args.extend(
                 ["--eagle_posterior_threshold=0.09", "--temperature=0.7"])
 
-        self.run(spec_dec_algo=EagleDecodingConfig.decoding_type,
+        self.run(spec_dec_algo=Eagle3DecodingConfig.decoding_type,
                  extra_convert_args=[
                      f"--eagle_model_dir={self.EAGLE_MODEL_PATH}",
                      "--max_draft_len=63", "--num_eagle_layers=4",
@@ -503,7 +503,7 @@ class TestVicuna7B(CliFlowAccuracyTestHarness):
         if chunked_context:
             extra_summarize_args.append("--enable_chunked_context")
 
-        self.run(spec_dec_algo=EagleDecodingConfig.decoding_type,
+        self.run(spec_dec_algo=Eagle3DecodingConfig.decoding_type,
                  extra_convert_args=[
                      f"--eagle_model_dir={self.EAGLE_MODEL_PATH}",
                      "--max_draft_len=63", "--num_eagle_layers=4",

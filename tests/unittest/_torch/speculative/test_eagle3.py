@@ -28,15 +28,16 @@ def enforce_single_worker(monkeypatch):
     yield
 
 
-def test_eagle3_defaults_draft_vocab_size_when_missing():
+def test_eagle3_defaults_draft_vocab_size_when_missing(caplog):
     from transformers import LlamaConfig
 
     config = LlamaConfig(vocab_size=128)
     assert not hasattr(config, "draft_vocab_size")
 
-    with pytest.warns(UserWarning, match="Missing 'draft_vocab_size'"):
+    with caplog.at_level("WARNING"):
         _ensure_draft_vocab_size(config)
 
+    assert "Missing 'draft_vocab_size'" in caplog.text
     assert config.draft_vocab_size == config.vocab_size
 
 
@@ -289,7 +290,7 @@ def test_eagle3_spec_decoding_stats(eagle3_one_model):
 
     kv_cache_config = KvCacheConfig(enable_block_reuse=False,
                                     free_gpu_memory_fraction=0.6)
-    spec_config = EagleDecodingConfig(
+    spec_config = Eagle3DecodingConfig(
         max_draft_len=3,
         speculative_model=eagle_model_dir,
         eagle3_one_model=eagle3_one_model,
@@ -604,7 +605,7 @@ def test_deepseek_mla_eagle3():
             load_format="dummy",
         )
 
-        spec_config = EagleDecodingConfig(max_draft_len=max_draft_len,
+        spec_config = Eagle3DecodingConfig(max_draft_len=max_draft_len,
                                           speculative_model=eagle_model_dir,
                                           eagle3_one_model=use_one_model,
                                           load_format="dummy")

@@ -3479,7 +3479,7 @@ def test_eagle3_output_consistency_4gpus(model_dir: str, draft_model_dir: str):
     RCCA: https://nvbugspro.nvidia.com/bug/5575211
     """
     from tensorrt_llm import LLM, SamplingParams
-    from tensorrt_llm.llmapi import (CudaGraphConfig, EagleDecodingConfig,
+    from tensorrt_llm.llmapi import (CudaGraphConfig, Eagle3DecodingConfig,
                                      KvCacheConfig)
 
     models_path = llm_models_root()
@@ -3516,7 +3516,7 @@ def test_eagle3_output_consistency_4gpus(model_dir: str, draft_model_dir: str):
     sampling_params = SamplingParams(max_tokens=1024, temperature=0)
 
     # Run with Eagle3
-    spec_config = EagleDecodingConfig(
+    spec_config = Eagle3DecodingConfig(
         max_draft_len=3,
         speculative_model=eagle_model_dir,
         eagle3_one_model=True,
