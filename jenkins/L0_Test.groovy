@@ -83,7 +83,7 @@ BUILD_CORES_REQUEST = "8"
 BUILD_CORES_LIMIT = "8"
 BUILD_MEMORY_REQUEST = "48Gi"
 BUILD_MEMORY_LIMIT = "96Gi"
-BUILD_JOBS = "8"
+BUILD_JOBS = "4"
 
 SLURM_CORES_REQUEST = "1"
 SLURM_CORES_LIMIT = "1"
@@ -3422,7 +3422,7 @@ def launchTestJobs(pipeline, testFilter)
     ]
 
     aarch64SanityCheckConfigs = [
-        /* //Disable PY312-UB2404 temporarily since it is currently duplicated with PY312-DLFW.
+        /* //Disable PY312-UB2404 temporarily since lack of official PyTorch for CUDA 13.1.
         "PY312-UB2404": [
             LLM_DOCKER_IMAGE,
             "GH200",
@@ -3892,12 +3892,12 @@ pipeline {
                     singleGpuJobs = parallelJobs
                     dgxJobs = [:]
 
-                    /*def testPhase2StageName = env.testPhase2StageName
+                    def testPhase2StageName = env.testPhase2StageName
                     if (testPhase2StageName) {
                         def dgxSigns = ["2_GPUs", "4_GPUs", "8_GPUs"]
                         singleGpuJobs = parallelJobs.findAll{!dgxSigns.any{sign -> it.key.contains(sign)}}
                         dgxJobs = parallelJobs.findAll{dgxSigns.any{sign -> it.key.contains(sign)}}
-                    }*/
+                    }
 
                     if (env.JOB_NAME ==~ /.*Single-GPU.*/) {
                         echo "Only run single-GPU tests."
