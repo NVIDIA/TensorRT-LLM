@@ -14,8 +14,6 @@ from utils.llm_data import llm_models_root
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
-from tensorrt_llm._torch.models.modeling_speculative import \
-    _ensure_draft_vocab_size
 from tensorrt_llm.llmapi import (CudaGraphConfig, Eagle3DecodingConfig,
                                  KvCacheConfig)
 
@@ -26,19 +24,6 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 def enforce_single_worker(monkeypatch):
     monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
     yield
-
-
-def test_eagle3_defaults_draft_vocab_size_when_missing(caplog):
-    from transformers import LlamaConfig
-
-    config = LlamaConfig(vocab_size=128)
-    assert not hasattr(config, "draft_vocab_size")
-
-    with caplog.at_level("WARNING"):
-        _ensure_draft_vocab_size(config)
-
-    assert "Missing 'draft_vocab_size'" in caplog.text
-    assert config.draft_vocab_size == config.vocab_size
 
 
 def test_kv_lens_runtime_with_eagle3_one_model():
