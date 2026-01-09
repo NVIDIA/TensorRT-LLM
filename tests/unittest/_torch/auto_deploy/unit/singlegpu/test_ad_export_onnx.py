@@ -9,7 +9,13 @@ from tensorrt_llm._torch.auto_deploy import LLM, AutoDeployConfig
 @pytest.mark.parametrize(
     "model, max_batch_size, max_seq_len, output_dir, num_attn_ops",
     [
-        ("Qwen/Qwen2.5-0.5B", 13, 4, "/tmp/test_ad_export_onnx_qwen2.5-0.5b", 24),
+        (
+            "/home/scratch.trt_llm_data/llm-models/Qwen2.5-0.5B-Instruct",
+            13,
+            4,
+            "/tmp/test_ad_export_onnx_qwen2.5-0.5b",
+            24,
+        ),
     ],
 )
 def test_ad_export_onnx(
