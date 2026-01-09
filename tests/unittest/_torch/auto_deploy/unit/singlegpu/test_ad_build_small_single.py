@@ -4,7 +4,7 @@ import pytest
 from _model_test_utils import get_small_model_config
 from build_and_run_ad import ExperimentConfig, main
 
-from tensorrt_llm._torch.auto_deploy.llm_args import AutoDeployConfig, LlmArgs, _ParallelConfig
+from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs, _ParallelConfig
 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import ADEngine
 
 
@@ -12,15 +12,12 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
     # Verify that llm_args was captured
     assert llm_args is not None, "llm_args should have been captured"
 
-    # Check that llm_args is an instance of LlmArgs and also an instance of AutoDeployConfig
+    # Check that llm_args is an instance of LlmArgs.
     assert isinstance(llm_args, LlmArgs), f"Expected LlmArgs, got {type(llm_args)}"
-    assert isinstance(llm_args, AutoDeployConfig), (
-        f"Expected AutoDeployConfig, got {type(llm_args)}"
-    )
 
     # check that llm_args and experiment_config have the same args
-    expected_ad_config: AutoDeployConfig = experiment_config.args
-    expected_llm_args: LlmArgs = LlmArgs(**expected_ad_config.to_llm_kwargs())
+    expected_ad_config: LlmArgs = experiment_config.args
+    expected_llm_args: LlmArgs = LlmArgs(**expected_ad_config.model_dump())
     assert expected_llm_args == llm_args, f"Expected llm args {expected_llm_args}, got {llm_args}"
 
     # check expected parallel config
