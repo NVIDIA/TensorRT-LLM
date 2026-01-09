@@ -11,10 +11,6 @@ import yaml
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.distributed import MPIDist, TorchDist
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_wide_ep import WideEPMoE
-from tensorrt_llm._torch.modules.fused_moe.interface import AlltoallMethodType
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 from tensorrt_llm._utils import local_mpi_rank, mpi_disabled, mpi_rank, mpi_world_size
 from tensorrt_llm.logger import logger
@@ -57,7 +53,7 @@ parser.add_argument("--load-format", type=str, choices=["AUTO", "DUMMY"])
 parser.add_argument("--max-num-tokens", type=int)
 parser.add_argument("--moe-backend", type=str)
 parser.add_argument(
-    "--moe-backend-for-prefilling", type=str, choices=["CUTLASS", "DEEPGEMM", "WIDEEP"]
+    "--moe-backend-for-prefill", type=str, choices=["CUTLASS", "DEEPGEMM", "WIDEEP"]
 )
 parser.add_argument("--moe-max-num-tokens", type=int)
 group = parser.add_mutually_exclusive_group()
@@ -128,8 +124,8 @@ if args.load_format is None:
     args.load_format = "DUMMY"
 if args.max_num_tokens is None:
     args.max_num_tokens = args.max_batch_size * max(args.seq_len_q_list)
-if args.moe_backend_for_prefilling is None:
-    args.moe_backend_for_prefilling = "CUTLASS"
+if args.moe_backend_for_prefill is None:
+    args.moe_backend_for_prefill = "CUTLASS"
 if args.use_low_precision_moe_combine is None:
     args.use_low_precision_moe_combine = False
 if args.enable_autotuner is None:
@@ -212,26 +208,12 @@ if args.run_type == "GEN":
         max(1, 20480 // ctx_seq_len_q),
     )
     ctx_attn_workspace = torch.empty((0,), device="cuda", dtype=torch.int8)
-    with (
-        mock.patch.object(
-            CutlassFusedMoE,
-            "select_alltoall_method_type",
-            return_value=AlltoallMethodType.NotEnabled,
-        ),
-        mock.patch.object(
-            DeepGemmFusedMoE,
-            "select_alltoall_method_type",
-            return_value=AlltoallMethodType.NotEnabled,
-        ),
-        mock.patch.object(
-            WideEPMoE, "select_alltoall_method_type", return_value=AlltoallMethodType.NotEnabled
-        ),
-    ):
+    with mock.patch.dict(os.environ, {"TRTLLM_FORCE_ALLTOALL_METHOD": "NotEnabled"}, clear=False):
         ctx_runner = Runner(
             args.model,
             mapping,
             load_format=args.load_format,
-            moe_backend=args.moe_backend_for_prefilling,
+            moe_backend=args.moe_backend_for_prefill,
             layer_indices=args.layer_indices,
             scaled_from=args.scaled_from,
             max_seq_len=args.max_seq_len,

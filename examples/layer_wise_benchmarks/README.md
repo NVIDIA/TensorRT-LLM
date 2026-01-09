@@ -32,7 +32,7 @@ NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --model deepseek-ai/DeepSeek-V3.2-
 
 # Run DeepSeek-V3.2-Exp with 32k context length
 NP=4 ./mpi_launch.sh ./run.sh config_ctx.yaml --model deepseek-ai/DeepSeek-V3.2-Exp --tokens-per-block 64 --moe-backend DEEPGEMM --batch-size 1 --seq-len-q 32769
-NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --model deepseek-ai/DeepSeek-V3.2-Exp --tokens-per-block 64 --moe-backend DEEPGEMM --moe-backend-for-prefilling DEEPGEMM --seq-len-kv-cache 32769
+NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --model deepseek-ai/DeepSeek-V3.2-Exp --tokens-per-block 64 --moe-backend DEEPGEMM --moe-backend-for-prefill DEEPGEMM --seq-len-kv-cache 32769
 
 # Run with attention TP
 NP=4 ./mpi_launch.sh ./run.sh config_ctx.yaml --no-enable-attention-dp
@@ -190,7 +190,7 @@ You will receive three reports, each containing kernel timing statistics grouped
 
 1. Error `fp8 blockscale gemm only support Hopper` on Blackwell.
 
-   The default MoE backend "CUTLASS" does not support FP8 weights. Please choose the same MoE backend as your end-to-end config. A typical choice is adding `--moe-backend DEEPGEMM --moe-backend-for-prefilling DEEPGEMM` (or `WIDEEP`) option.
+   The default MoE backend "CUTLASS" does not support FP8 weights. Please choose the same MoE backend as your end-to-end config. A typical choice is adding `--moe-backend DEEPGEMM --moe-backend-for-prefill DEEPGEMM` (or `WIDEEP`) option.
 
 2. Error `huggingface_hub.errors.HfHubHTTPError: 429 Client Error: Too Many Requests for url: https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4-v2/resolve/main/config.json`.
 
