@@ -32,7 +32,7 @@ l0_rtx_pro_6000:
   - test_e2e.py::test_ptp_quickstart_advanced[Mixtral-8x7B-FP8-Mixtral-8x7B-Instruct-v0.1-fp8]
   - test_e2e.py::test_ptp_quickstart_advanced[Qwen3-30B-A3B-Qwen3/Qwen3-30B-A3B] # 3mins
   - test_e2e.py::test_ptp_quickstart_advanced[Qwen3-30B-A3B_fp8_hf-Qwen3/saved_models_Qwen3-30B-A3B_fp8_hf] # 3mins
-  - test_e2e.py::test_ptp_quickstart_advanced[Qwen3-30B-A3B_nvfp4_hf-Qwen3/saved_models_Qwen3-30B-A3B_nvfp4_hf] # 2mins
+  - test_e2e.py::test_ptp_quickstart_advanced[Qwen3-30B-A3B_nvfp4_hf-Qwen3/nvidia-Qwen3-30B-A3B-NVFP4] # 2mins
   - test_e2e.py::test_ptp_quickstart_advanced[GPT-OSS-20B-gpt_oss/gpt-oss-20b]
   - test_e2e.py::test_ptp_quickstart_advanced[GPT-OSS-120B-gpt_oss/gpt-oss-120b]
   - test_e2e.py::test_ptp_quickstart_multimodal_phi4mm[phi4-multimodal-instruct-fp4-multimodals/Phi-4-multimodal-instruct-FP4-image_audio]

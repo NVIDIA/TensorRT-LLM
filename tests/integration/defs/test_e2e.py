@@ -1877,7 +1877,7 @@ def test_ptp_quickstart(llm_root, llm_venv):
         marks=(skip_pre_hopper, pytest.mark.skip_less_device_memory(40000))),
     pytest.param(
         'Qwen3-30B-A3B_nvfp4_hf',
-        'Qwen3/saved_models_Qwen3-30B-A3B_nvfp4_hf',
+        'Qwen3/nvidia-Qwen3-30B-A3B-NVFP4',
         marks=(skip_pre_blackwell, pytest.mark.skip_less_device_memory(20000))),
     pytest.param(
         'Llama3.3-70B-FP8',
