@@ -3352,7 +3352,24 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
                     print(f"[Async] Completed batch {async_batch_idx + 1}/{num_async_batches}")
 
             asyncio.run(run_streaming_with_cancellation())
-            print("[Async Streaming Test] Completed successfully")
+            print("[Async Streaming Test] Streaming phase completed")
+
+            # Verify LLM still works after cancellations (key check for bug 5661741)
+            # Bug symptom: "model never recovers and continues to repeat token ID 0"
+            print("[Post-Cancel Verification] Checking LLM health after cancellations...")
+            verify_batch_size = 4
+            verify_inputs = [long_token_list[i % num_samples] for i in range(verify_batch_size)]
+            verify_params = SamplingParams(max_tokens=16)
+
+            verify_outputs = llm.generate(verify_inputs, sampling_params=verify_params)
+            for i, output in enumerate(verify_outputs):
+                token_ids = output.outputs[0].token_ids
+                assert len(token_ids) > 0, \
+                    f"[post-cancel] Empty output at request {i} - LLM may be corrupted"
+                assert not all(tid == 0 for tid in token_ids), \
+                    f"[post-cancel] All token IDs are 0 at request {i} - " \
+                    "LLM producing invalid outputs after cancellation (bug 5661741 symptom)"
+            print("[Post-Cancel Verification] LLM health check passed - no corruption detected")
 
 
 class TestMinitron4BBaseInstruct(LlmapiAccuracyTestHarness):
