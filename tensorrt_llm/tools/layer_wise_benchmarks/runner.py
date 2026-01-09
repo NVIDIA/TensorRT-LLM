@@ -402,12 +402,11 @@ class Runner:
         )
 
         with self.scaled_from_ctx(scaled_from, mapping), self.skip_unused_layers_ctx(layer_indices):
-            model, moe_load_balancer = model_loader.load(
+            model, _ = model_loader.load(
                 checkpoint_dir=pretrained_model_name_or_path, checkpoint_loader=checkpoint_loader
             )
 
         self.layers = [model.model.layers[i] for i in layer_indices]
-        self.model = model
         self.model_config = model.model_config
 
     @staticmethod
