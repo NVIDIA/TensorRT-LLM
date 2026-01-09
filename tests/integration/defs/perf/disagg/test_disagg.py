@@ -47,6 +47,11 @@ else:
 @pytest.fixture(scope="session", autouse=True)
 def session_lifecycle():
     """Session lifecycle management."""
+    from utils.job_tracker import JobTracker
+    
+    # Record pytest main process PID for GitLab CI cleanup
+    JobTracker.record_pid()
+    
     session_tracker.start()
     try:
         yield

@@ -212,6 +212,7 @@ class BatchManager:
             batch_num: Batch number to submit (0-indexed)
         """
         from execution.executor import JobManager
+        from utils.job_tracker import JobTracker
         
         # Calculate batch range
         if self.batch_size:
@@ -235,6 +236,7 @@ class BatchManager:
                 success, job_id = JobManager.submit_test_job(config)
                 if success and job_id:
                     self.job_mapping[config.test_id] = job_id
+                    JobTracker.record_job(job_id)  # Record job ID for cleanup
                     success_count += 1
                     # Truncate test_id for display
                     display_id = config.test_id[:60] + "..." if len(config.test_id) > 60 else config.test_id

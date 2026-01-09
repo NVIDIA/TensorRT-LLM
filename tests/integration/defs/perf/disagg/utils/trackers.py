@@ -79,6 +79,8 @@ class SessionTracker:
         Uses the new sbatch-based approach for non-blocking execution.
         Submits the job and waits for completion using JobManager.
         """
+        from utils.job_tracker import JobTracker
+        
         self.end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         logger.info(f"Session ended: {self.end_time}")
 
@@ -88,6 +90,9 @@ class SessionTracker:
         if not success:
             logger.error(f"Failed to submit session collect job: {job_id}")
             return False
+
+        # Record session collect job ID for cleanup
+        JobTracker.record_job(job_id)
 
         # Wait for job completion (reuses wait_for_completion method)
         logger.info(f"Waiting for session collect job {job_id} to complete...")
