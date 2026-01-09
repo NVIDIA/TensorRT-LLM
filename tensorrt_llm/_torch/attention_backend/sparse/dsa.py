@@ -17,7 +17,7 @@ from tensorrt_llm._torch.modules.multi_stream_utils import \
     maybe_execute_in_parallel
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._torch.utils import maybe_compile
+from tensorrt_llm._torch.utils import maybe_compile, maybe_compiled_copy_, maybe_compiled_cat
 from tensorrt_llm._utils import get_size_in_bytes, get_sm_version
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
@@ -1542,7 +1542,7 @@ class Indexer(nn.Module):
 
     def _prep_q_or_k(self, qk_pe: torch.Tensor, qk_nope: torch.Tensor):
         """Concatenate, rotate, and FP8 quantize for Q or K"""
-        q_or_k = torch.cat([qk_pe, qk_nope], dim=-1)
+        q_or_k = maybe_compiled_cat([qk_pe, qk_nope], dim=-1)
         q_or_k = rotate_activation(q_or_k)
         q_or_k = q_or_k.view(-1, self.head_dim)
         q_or_k = fp8_utils.fp8_quantize_1x128_sf_transpose(
