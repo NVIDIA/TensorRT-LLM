@@ -242,16 +242,16 @@ conn.close()
 if args.module:
     for problem in problem_set:
         num_matches_per_run = [0] * (len(problem["runs"]) + 1)
-        for i, ((range_start, _, text), kernel_count) in enumerate(
-            zip(problem["ranges"], problem["kernel_count_per_range"])
+        for (range_start, _, text), kernel_count in zip(
+            problem["ranges"], problem["kernel_count_per_range"]
         ):
             if text == args.module and kernel_count > 0:
                 num_matches_per_run[bisect.bisect(problem["runs"], range_start)] += 1
-        for run_id, num_matches in enumerate(num_matches_per_run):
+        for run_id_plus_one, num_matches in enumerate(num_matches_per_run):
             if num_matches > 1:
                 raise ValueError(
                     f'Module is ambiguous: "{args.module}" appears {num_matches} times'
-                    f' in "{problem["text"]}"\'s {run_id}-th run'
+                    f' in "{problem["text"]}"\'s {run_id_plus_one}-th run'
                 )
 
 kernel_list.sort(key=lambda t: (t[6], t[8]))
