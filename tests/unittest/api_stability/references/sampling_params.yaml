@@ -16,7 +16,7 @@ methods:
         annotation: Optional[int]
         default: null
       logprobs_mode:
-        annotation: Literal["raw", "processed"]
-        default: "raw"
+        annotation: LogprobMode
+        default: LogprobMode.RAW
     return_annotation: None
 properties: {}
