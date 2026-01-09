@@ -1,5 +1,4 @@
 from dataclasses import dataclass, fields
-from functools import partial
 from typing import Dict, List, Optional, Tuple, Union
 
 import flashinfer
@@ -119,7 +118,19 @@ class _FlashInferPlanner:
         for plan_params in self.cached_cuda_graph_decode_wrappers:
             if plan_params.num_seq == num_seq:
                 wrapper = self.cached_cuda_graph_decode_wrappers[plan_params]
-                wrapper.plan = partial(flashinfer.decode.fast_decode_plan, wrapper)
+                flashinfer.decode.fast_decode_plan(
+                    wrapper,
+                    cu_num_pages,
+                    cache_loc,
+                    last_page_len,
+                    plan_params.n_heads,
+                    plan_params.n_kv_heads,
+                    plan_params.head_dim,
+                    plan_params.page_size,
+                    q_data_type=plan_params.q_dtype,
+                    kv_data_type=plan_params.kv_dtype,
+                    sm_scale=plan_params.sm_scale,
+                )
 
     def plan_prefill(
         self,
