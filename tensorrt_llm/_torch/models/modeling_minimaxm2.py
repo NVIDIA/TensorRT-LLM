@@ -318,6 +318,13 @@ class MiniMaxM2DecoderLayer(DecoderLayer):
 class MiniMaxM2Model(DecoderModel):
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__(model_config)
+        # add this for kv cache initialization (if we use bf16 for kv cache)
+        quant_config = model_config.quant_config
+        if quant_config is None or (
+            (not quant_config.quant_mode.has_fp8_kv_cache())
+            and (not quant_config.quant_mode.has_fp4_kv_cache())
+        ):
+            model_config.pretrained_config.torch_dtype = torch.bfloat16
         config = model_config.pretrained_config
         self.vocab_size = config.vocab_size
         self.aux_stream = torch.cuda.Stream()
