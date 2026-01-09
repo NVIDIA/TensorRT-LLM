@@ -35,6 +35,12 @@ from ..utils import AuxStreamType
 from .modeling_utils import DecoderModel, DecoderModelForCausalLM, register_auto_model
 
 
+# MiniMax M2/M2.1 requires the implementation of the following two additional components:
+#  1. MoE routing method: Currently, TRT-LLM does not support
+#     the following routing method: sigmoid -> add bias -> topk -> renorm.
+#  2. QK layer normalization needs to be performed across the head_num * head_size dimension,
+#     which conflicts with the current TP-mode attention logic.
+# For the better performance, we suggest to enable attention DP when using MiniMax M2/M2.1 model.
 class MiniMaxM2MoE(nn.Module):
     def __init__(
         self,
@@ -60,7 +66,6 @@ class MiniMaxM2MoE(nn.Module):
         )
 
         reduce_results = True
-        # TODO: use_routing_bias parameter, torch_dtype is None for now, we also need quant config
         self.experts = create_moe(
             num_experts=self.num_experts,
             routing_method=MiniMaxM2MoeRoutingMethod(
@@ -76,17 +81,6 @@ class MiniMaxM2MoE(nn.Module):
             model_config=model_config,
             layer_idx=layer_idx,
         )
-        # self.experts = create_moe(
-        #     num_experts=self.num_experts,
-        #     routing_method=RenormalizeMoeRoutingMethod(top_k=self.top_k),
-        #     hidden_size=self.hidden_dim,
-        #     intermediate_size=self.ffn_dim,
-        #     aux_stream_dict={AuxStreamType.MoeChunkingOverlap: aux_stream},
-        #     dtype=config.torch_dtype,
-        #     reduce_results=reduce_results,
-        #     model_config=model_config,
-        #     layer_idx=layer_idx,
-        # )
 
     def load_weights(self, weights: List[Dict]):
         assert len(weights) == 1
@@ -121,8 +115,6 @@ class MiniMaxM2MoE(nn.Module):
 #    then we use rms norm on q and k. Finally, we split qkv to each gpus and continue.
 # for better performance, we choose the second strategy here.
 # Most adaptions are from QKNormRoPEAttention.
-
-
 class MiniMaxM2Attention(Attention):
     def __init__(
         self,
@@ -192,14 +184,6 @@ class MiniMaxM2Attention(Attention):
             temp_k = allgather(k, self.qkv_proj.mapping)
             temp_q = self.q_norm(temp_q)
             temp_k = self.k_norm(temp_k)
-            # temp_q, temp_k = maybe_execute_in_parallel(
-            #     self.q_norm(temp_q),
-            #     self.k_norm(temp_k),
-            #     self.ln_events[0],
-            #     self.ln_events[1],
-            # )
-            # split q and k to each gpus
-            # Fixme: tp_size may not be equal to the world size of current mapping
             q = temp_q.reshape(-1, self.tp_size, self.q_size)[:, self.tp_rank, :].reshape(
                 -1, self.q_size
             )
