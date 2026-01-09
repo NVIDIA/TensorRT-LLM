@@ -443,8 +443,12 @@ def _optimize_explicit(
         with graph.inserting_after(q_node):
             sym_batch = graph.call_function(torch.ops.aten.sym_size.int, args=(q_node, 0))
             sym_seq = graph.call_function(torch.ops.aten.sym_size.int, args=(q_node, 1))
+            # Mark these nodes as shared RoPE computation to prevent cross-layer traversal
+            sym_batch.meta["ad_rope_shared"] = True
+            sym_seq.meta["ad_rope_shared"] = True
         with graph.inserting_after(_get_last_node([sym_batch, sym_seq])):
             bs_seq = graph.call_function(operator.mul, args=(sym_batch, sym_seq))
+            bs_seq.meta["ad_rope_shared"] = True
         with graph.inserting_after(_get_last_node([bs_seq, fused_cos_sin])):
             fused_cos_sin_flat = graph.call_function(
                 torch.ops.aten.view, args=(fused_cos_sin, (bs_seq, -1))
@@ -520,8 +524,12 @@ def _optimize_complex(
         with graph.inserting_after(q_node):
             sym_batch = graph.call_function(torch.ops.aten.sym_size.int, args=(q_node, 0))
             sym_seq = graph.call_function(torch.ops.aten.sym_size.int, args=(q_node, 1))
+            # Mark these nodes as shared RoPE computation to prevent cross-layer traversal
+            sym_batch.meta["ad_rope_shared"] = True
+            sym_seq.meta["ad_rope_shared"] = True
         with graph.inserting_after(_get_last_node([sym_batch, sym_seq])):
             bs_seq = graph.call_function(operator.mul, args=(sym_batch, sym_seq))
+            bs_seq.meta["ad_rope_shared"] = True
         with graph.inserting_after(_get_last_node([bs_seq, cos_sin_flash_3d])):
             fused_cos_sin_flat = graph.call_function(
                 torch.ops.aten.view, args=(cos_sin_flash_3d, (bs_seq, -1))
@@ -637,6 +645,10 @@ def _get_position_ids(
     sym_batch = graph.call_function(torch.ops.aten.sym_size.int, args=(q_node, batch_dim))
     sym_seq = graph.call_function(torch.ops.aten.sym_size.int, args=(q_node, seq_dim))
     bs_seq = graph.call_function(operator.mul, args=(sym_batch, sym_seq))
+    # Mark these nodes as shared RoPE computation to prevent cross-layer traversal
+    sym_batch.meta["ad_rope_shared"] = True
+    sym_seq.meta["ad_rope_shared"] = True
+    bs_seq.meta["ad_rope_shared"] = True
 
     # Retrieve device information, ensuring it is a torch.device.
     device = q_node.meta.get("device", "cpu")

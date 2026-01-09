@@ -730,7 +730,7 @@ def subgraph(
             subgraph_nodes.append(node)
 
         # Stop traversal at boundary - don't explore their predecessors
-        print(f"node: {node.name}, boundary_condition: {boundary_condition(node)}, start_nodes: {start_nodes}")
+        # print(f"node: {node.name}, boundary_condition: {boundary_condition(node)}, start_nodes: {start_nodes}")
         if boundary_condition(node) and node not in start_nodes:
             continue
 
@@ -954,3 +954,61 @@ def draw_graph(gm: GraphModule, filename: str):
     drawer = FxGraphDrawer(gm, filename)
     with open(f"{filename}.svg", "wb") as f:
         f.write(drawer.get_dot_graph().create_svg())
+
+
+def get_weight_inputs_between(sources: List[Node], sink: Node) -> List[Node]:
+    """
+    Traverse forward from sources to sink, collecting weight (get_attr) inputs
+    of all visited nodes.
+
+    This is useful for finding intermediate weights that operate on the outputs
+    of source nodes before reaching the sink. Unlike backward traversal,
+    this approach correctly handles graphs with shared dependencies across layers.
+
+    Nodes marked with ad_rope_shared=True in their metadata are skipped to prevent
+    cross-layer traversal through shared RoPE computation nodes.
+
+    Args:
+        sources: List of source nodes to start traversal from (e.g., q/k/v_proj)
+        sink: The sink node to stop at (e.g., o_proj)
+
+    Returns:
+        List of weight nodes (get_attr nodes) found as inputs to visited nodes
+    """
+    from collections import deque
+
+    visited = set()
+    weight_nodes = []
+    queue = deque()
+
+    # Start from users of source nodes
+    for source in sources:
+        for user in source.users:
+            # Skip shared RoPE computation paths to prevent cross-layer traversal
+            if user.meta.get("ad_rope_shared", False):
+                continue
+            if user not in visited:
+                visited.add(user)
+                queue.append(user)
+
+    while queue:
+        node = queue.popleft()
+
+        # Collect weight inputs of this node
+        for inp in node.all_input_nodes:
+            if inp.op == "get_attr" and inp not in weight_nodes:
+                weight_nodes.append(inp)
+
+        # Don't traverse past the sink
+        if node == sink:
+            continue
+
+        for user in node.users:
+            # Skip shared RoPE computation paths to prevent cross-layer traversal
+            if user.meta.get("ad_rope_shared", False):
+                continue
+            if user not in visited:
+                visited.add(user)
+                queue.append(user)
+
+    return weight_nodes
