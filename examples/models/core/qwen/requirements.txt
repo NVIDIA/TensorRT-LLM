@@ -10,7 +10,7 @@ tiktoken
 einops
 
 # optional dependencies
-gradio==4.44.1
+gradio==5.4.0
 mdtex2html
 sse_starlette
 aiohttp_sse_client
