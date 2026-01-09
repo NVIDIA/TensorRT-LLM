@@ -149,10 +149,12 @@ class Distributed(ABC):
         First gathers within CP group, then across TP groups, returning
         a flattened list with tp_size * cp_size entries.
         """
-        cp_responses = self.cp_allgather(obj)
-        responses_list = self.tp_allgather(cp_responses)
-        # Flatten: [[cp0, cp1], [cp0, cp1], ...] -> [tp0_cp0, tp0_cp1, tp1_cp0, ...]
-        return [entry for tp_group in responses_list for entry in tp_group]
+        if self.cp_size > 1:
+            obj = self.cp_allgather(obj)
+        if self.tp_size > 1:
+            obj = self.tp_allgather(obj)
+        # Flatten: [[cp0, cp1], [cp0, cp1], ...] -> [tp0_cp0, tp0_cp1, tp1_cp0, ...].
+        return [entry for tp_group in obj for entry in tp_group]
 
 
 def safe_broadcast(comm, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
