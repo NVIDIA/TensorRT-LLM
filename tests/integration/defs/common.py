@@ -15,6 +15,7 @@
 import copy
 import os
 import platform
+import random
 import re
 import socket
 import tempfile
@@ -1162,28 +1163,33 @@ def get_free_port_in_ci(max_attempts=100):
     Get a free port in the range [CONTAINER_PORT_START, CONTAINER_PORT_START + CONTAINER_PORT_NUM - 1]
     If CONTAINER_PORT_START and CONTAINER_PORT_NUM are not set or all ports are already in use, fallback to get_free_port
     """
+    global PORTS_IN_USE
+
     container_port_start = int(os.environ.get("CONTAINER_PORT_START", -1))
     container_port_num = int(os.environ.get("CONTAINER_PORT_NUM", -1))
     if container_port_start != -1 and container_port_num != -1:
-        for i in range(container_port_num):
-            port = container_port_start + i
-            if port in PORTS_IN_USE:
-                continue
+        available_ports = [
+            port for port in range(container_port_start, container_port_start +
+                                   container_port_num)
+            if port not in PORTS_IN_USE
+        ]
+
+        for _ in range(len(available_ports)):
+            # Get a random port from the available ports
+            port = random.choice(available_ports)
 
             # Check if the port is free
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 try:
                     s.bind(("localhost", port))
-
-                    # Port is free, add it to the set of used ports
                     PORTS_IN_USE.add(port)
                     return port
                 except OSError:
-                    # Port is not free, try the next port
+                    available_ports.remove(port)
                     continue
 
     # No port found in the range, try to get a random free port from the system
-    for i in range(max_attempts):
+    for _ in range(max_attempts):
         port = get_free_port()
         if port not in PORTS_IN_USE:
             PORTS_IN_USE.add(port)
