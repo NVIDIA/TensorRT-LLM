@@ -144,6 +144,7 @@ MODEL_PATH_DICT = {
     "gpt_oss_20b_fp4": "gpt_oss/gpt-oss-20b",
     "nemotron_nano_9b_v2": "NVIDIA-Nemotron-Nano-12B-v2",
     "starcoder2_7b": "starcoder2-7b",
+    "kimi_k2_nvfp4": "Kimi-K2-Thinking-NVFP4",
 }
 # Model PATH of HuggingFace
 HF_MODEL_PATH = {

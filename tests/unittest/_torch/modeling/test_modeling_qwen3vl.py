@@ -237,12 +237,6 @@ class TestQwen3VL(TestModelingMultimodal):
                 chunked_prefill=False,
                 kv_cache_reuse=False,
             ),
-            # ==== Disable fuse rope scenarios ====
-            # TestQwen3VLScenario(modality="image",
-            #                        use_cuda_graph=False,
-            #                        disable_fuse_rope=True,
-            #                        chunked_prefill=False,
-            #                        kv_cache_reuse=False),
             # ==== Chunked Prefill Scenarios ====
             TestQwen3VLScenario(
                 modality="image",
@@ -258,6 +252,14 @@ class TestQwen3VL(TestModelingMultimodal):
                 disable_fuse_rope=False,
                 chunked_prefill=False,
                 kv_cache_reuse=True,
+            ),
+            # ==== Disable fuse rope scenarios ====
+            TestQwen3VLScenario(
+                modality="image",
+                use_cuda_graph=False,
+                disable_fuse_rope=True,
+                chunked_prefill=False,
+                kv_cache_reuse=False,
             ),
         ]
         return scenarios
