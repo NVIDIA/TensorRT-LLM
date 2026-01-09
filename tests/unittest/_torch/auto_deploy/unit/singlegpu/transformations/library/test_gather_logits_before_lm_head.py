@@ -189,7 +189,7 @@ class TestGatherLogitsBeforeLmHeadTransform:
         else:
             # dynamic_shapes should be a tuple matching the number of positional args
             dynamic_shapes = (
-                {0: Dim("batch_size", min=1, max=max_batch_size)},  # hidden_states
+                {0: Dim.DYNAMIC},  # hidden_states
                 None,  # logit_gather_ids (static)
                 None,  # seq_len (static)
             )

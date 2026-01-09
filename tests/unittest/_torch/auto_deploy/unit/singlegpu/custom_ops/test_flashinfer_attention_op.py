@@ -574,6 +574,17 @@ def test_flashinfer_attention_op_context_input_pos(seq, batch_size, n_heads, dty
         (MAX_BATCH_SIZE, MAX_SEQ_LEN, N_HEADS, D_HEAD), dtype=DTYPE, device=device
     )
 
+    # Initialize the prefilled portion of the cache with random data
+    # This simulates a chunked prefill scenario where previous chunks have already
+    # populated the cache at positions 0:PREFILL_SEQ_LEN
+    if PREFILL_SEQ_LEN > 0:
+        k_cache[0:BATCH_SIZE, 0:PREFILL_SEQ_LEN, :, :] = torch.randn(
+            BATCH_SIZE, PREFILL_SEQ_LEN, N_HEADS, D_HEAD, dtype=DTYPE, device=device
+        )
+        v_cache[0:BATCH_SIZE, 0:PREFILL_SEQ_LEN, :, :] = torch.randn(
+            BATCH_SIZE, PREFILL_SEQ_LEN, N_HEADS, D_HEAD, dtype=DTYPE, device=device
+        )
+
     # make sure planner is initialized
     workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
     _GlobalFlashInferPlanner.init_workspace(workspace)

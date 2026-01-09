@@ -132,6 +132,141 @@ poetry run pytest --disagg test_disagg.py -s -vv -m accuracy
 poetry run pytest --disagg test_disagg.py -s -vv -k "deepseek-r1-fp4_1k1k"
 ```
 
+## Batch Job Submission
+
+The framework supports automatic batch job submission to maximize parallelism in SLURM cluster environments. Instead of submitting jobs one-by-one, it groups test cases into batches and submits entire batches when needed.
+
+### Quick Start
+
+**Default batch size (5 jobs per batch):**
+```bash
+# Run all tests with default batching
+poetry run pytest --disagg test_disagg.py -s -vv
+
+# Run with test list
+poetry run pytest --disagg test_disagg.py -s -vv --disagg-test-list=./testlist/all.txt
+```
+
+**Custom batch size:**
+```bash
+# Set batch size via command line
+poetry run pytest --disagg test_disagg.py -s -vv --disagg-batch-size=10
+
+# Set batch size via environment variable
+export DISAGG_BATCH_SIZE=20
+poetry run pytest --disagg test_disagg.py -s -vv
+
+# Submit all jobs at once (unlimited batch)
+poetry run pytest --disagg test_disagg.py -s -vv --disagg-batch-size=0
+```
+
+### How Batch Submission Works
+
+```
+Pytest Collection Phase:
+  - Collects all test cases (e.g., 100 tests)
+  - BatchManager splits them into batches (e.g., 20 batches of 5)
+
+Pytest Execution Phase:
+  Test 0 runs:
+    -> Triggers submission of Batch 0 (jobs 0-4)
+    -> Waits for job 0 to complete
+  
+  Test 1-4 run:
+    -> Batch 0 already submitted, directly wait for completion
+  
+  Test 5 runs:
+    -> Triggers submission of Batch 1 (jobs 5-9)
+    -> Waits for job 5 to complete
+  
+  ... and so on
+```
+
+### Key Benefits
+
+- **Parallel Execution**: All jobs in a batch run simultaneously on SLURM cluster
+- **Reduced Wait Time**: Total time ≈ MAX(job time) instead of SUM(job times)
+- **Automatic Management**: No need to manually split test lists
+- **Lazy Loading**: Only submits batches when needed
+
+### Configuration Options
+
+**Priority**: Command line option > Environment variable > Default (5)
+
+**Examples:**
+
+```bash
+# Small batch for quick testing
+poetry run pytest --disagg test_disagg.py -s -vv --disagg-batch-size=3 \
+  --disagg-test-list=./testlist/debug.txt
+
+# Large batch for production
+poetry run pytest --disagg test_disagg.py -s -vv --disagg-batch-size=50 \
+  --disagg-test-list=./testlist/all.txt
+
+# Submit all at once
+poetry run pytest --disagg test_disagg.py -s -vv --disagg-batch-size=0
+```
+
+### Timeout Configuration
+
+The default timeout for waiting for job completion is **10 hours (36000 seconds)**, which accounts for:
+- SLURM queue wait time
+- Job execution time
+- Buffer for delays
+
+### Performance Comparison
+
+**Before (Sequential Submission):**
+```
+Case 1: submit + wait (1.5h) = 1.5h
+Case 2: submit + wait (1.5h) = 1.5h
+Case 3: submit + wait (1.5h) = 1.5h
+...
+Total: 50 × 1.5h = 75 hours
+```
+
+**After (Batch Submission, batch_size=50):**
+```
+Batch 0 (50 jobs): submitted in parallel
+  Case 1: wait (1.5h)
+  Case 2-50: wait (0s, already done)
+
+Total: ~1.5 hours
+```
+
+**Speedup: 50x**
+
+### Troubleshooting
+
+**Check BatchManager initialization:**
+```
+======================================================================
+Batch Manager Initialized
+Batch size: 5 jobs per batch
+======================================================================
+
+Total test configs: 20
+Total batches: 4
+```
+
+**Monitor batch submission:**
+```
+======================================================================
+Submitting Batch 0
+Range: [0:5] (5 jobs)
+======================================================================
+
+  [  1/5] Job 1234 <- test_config_id_1
+  [  2/5] Job 1235 <- test_config_id_2
+  ...
+```
+
+**If jobs timeout frequently:**
+- Check SLURM queue status
+- Consider reducing batch size to avoid resource contention
+- Verify that timeout (36000s) is sufficient for your workload
+
 ## Test Naming Convention
 
 Tests are automatically named using the format:
@@ -193,6 +328,7 @@ Test results are saved to:
 - `GPU_TYPE`: Current GPU type (default: GB200)
 - `OUTPUT_PATH`: Directory for test results and logs
 - `WORK_DIR`: Working directory for benchmark execution
+- `DISAGG_BATCH_SIZE`: Default batch size for job submission (default: 5)
 - `DEBUG_MODE`: Enable debug mode (set to "1" to skip job submission)
 - `DEBUG_JOB_ID`: Job ID to use in debug mode
 
@@ -212,10 +348,11 @@ The framework consists of:
 
 1. **ConfigLoader**: Scans and loads YAML configurations
 2. **ConfigValidator**: Validates configuration correctness
-3. **JobManager**: Handles SLURM job submission and monitoring
-4. **LogParser**: Extracts metrics from benchmark logs
-5. **TestCaseTracker**: Tracks test execution timing
-6. **ResultSaver**: Saves results to CSV
+3. **BatchManager**: Manages batch job submission for parallel execution
+4. **JobManager**: Handles SLURM job submission and monitoring
+5. **LogParser**: Extracts metrics from benchmark logs
+6. **TestCaseTracker**: Tracks test execution timing
+7. **ResultSaver**: Saves results to CSV
 
 ## Benefits
 

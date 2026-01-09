@@ -774,12 +774,6 @@ def default_multimodal_input_loader(
             mm_placeholder_counts=[mm_placeholder_counts])
         input = {"prompt": prompt}
 
-        # When the tokenizer is a MistralTokenizer, we need to keep the source media to handle in processor later.
-        from tensorrt_llm._torch.models.checkpoints.mistral.tokenizer import \
-            MistralTokenizer
-        if isinstance(tokenizer, MistralTokenizer):
-            input["mm_processor_kwargs"] = {"media": media}
-
         if mm_placeholder_counts:
             if mm_embeddings is not None:
                 input[

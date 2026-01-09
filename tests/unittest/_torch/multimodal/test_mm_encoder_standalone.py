@@ -21,10 +21,12 @@ example_images = [
 
 _LLAVA_DIR = llm_models_root() / "multimodals" / "llava-v1.6-mistral-7b-hf"
 _QWEN_2_5_VL_DIR = llm_models_root() / "Qwen2.5-VL-3B-Instruct"
+_QWEN_3_VL_DIR = llm_models_root() / "Qwen3" / "Qwen3-VL-2B-Instruct"
 
 
 # TODO: Add multi-image in single chat test
-@pytest.mark.parametrize("model_dir", [_LLAVA_DIR, _QWEN_2_5_VL_DIR])
+@pytest.mark.parametrize("model_dir",
+                         [_LLAVA_DIR, _QWEN_2_5_VL_DIR, _QWEN_3_VL_DIR])
 @pytest.mark.parametrize("pd_disagg", [False, True])
 def test_single_image_chat(model_dir, pd_disagg):
     """Test processing single image using encoder (pass mm_embeddings) + LLM API.
@@ -180,6 +182,7 @@ def test_single_image_chat(model_dir, pd_disagg):
         # Qwen2.5 VL's vision encoder seems to output different embeddings based on this value.
         # The test only passes with this set to 1.
         (_QWEN_2_5_VL_DIR, 1),
+        (_QWEN_3_VL_DIR, 3),
     ],
 )
 def test_multi_request_batch_chat(model_dir, encoder_max_batch_size):
