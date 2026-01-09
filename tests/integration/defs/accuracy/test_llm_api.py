@@ -15,7 +15,7 @@
 import pytest
 
 from tensorrt_llm._tensorrt_engine import LLM
-from tensorrt_llm.llmapi import (EagleDecodingConfig,
+from tensorrt_llm.llmapi import (Eagle3DecodingConfig,
                                  ExtendedRuntimePerfKnobConfig, KvCacheConfig,
                                  SamplingParams)
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -469,7 +469,7 @@ class TestEagleVicuna_7B_v1_3(LlmapiAccuracyTestHarness):
     MODEL_NAME = "lmsys/vicuna-7b-v1.3"
     MODEL_PATH = f"{llm_models_root()}/vicuna-7b-v1.3"
 
-    speculative_config = EagleDecodingConfig(
+    speculative_config = Eagle3DecodingConfig(
         max_draft_len=63,
         speculative_model=f"{llm_models_root()}/EAGLE-Vicuna-7B-v1.3",
         num_eagle_layers=4,
@@ -495,7 +495,7 @@ class TestEagle2Vicuna_7B_v1_3(LlmapiAccuracyTestHarness):
     MODEL_NAME = "lmsys/vicuna-7b-v1.3"
     MODEL_PATH = f"{llm_models_root()}/vicuna-7b-v1.3"
 
-    speculative_config = EagleDecodingConfig(
+    speculative_config = Eagle3DecodingConfig(
         max_draft_len=63,
         speculative_model=f"{llm_models_root()}/EAGLE-Vicuna-7B-v1.3",
         num_eagle_layers=4,
