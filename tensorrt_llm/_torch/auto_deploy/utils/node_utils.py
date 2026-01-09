@@ -967,7 +967,9 @@ def get_layer_after_linear_node(
         min_local_shape=min_local_shape,
     )
     assert linear_nodes[start_lin_index] in opening_linear_nodes, (
-        "Linear node not found in opening linear nodes"
+        f"Linear node not found in opening linear nodes - "
+        f"terminating_linear_node:{terminating_linear_node.name}, "
+        f"opening_linear_nodes: {[n.name for n in opening_linear_nodes]}"
     )
 
     # return the index of the terminating linear node
