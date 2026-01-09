@@ -153,7 +153,6 @@ class BindCapacityScheduler(CapacityScheduler):
         self.impl = tb_internal.algorithms.CapacityScheduler(
             max_num_requests=max_num_requests,
             capacity_scheduler_policy=scheduler_policy._to_pybind(),
-            # capacity_scheduler_policy=self.scheduler_policy,
             has_kv_cache_manager=kv_cache_manager is not None,
             two_step_lookahead=two_step_lookahead,
             no_schedule_until_state=LlmRequestState.CONTEXT_INIT,

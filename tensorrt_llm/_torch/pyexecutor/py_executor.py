@@ -142,9 +142,6 @@ class PyExecutor:
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
         self.global_rank = dist.rank
-        logger.info(
-            f"[PyExecutor] disable_overlap_scheduler: {disable_overlap_scheduler}"
-        )
 
         # Store the execution stream for model forward operations.
         # This stream is used for proper synchronization with KVCacheTransferManager.
