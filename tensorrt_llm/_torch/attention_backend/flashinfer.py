@@ -10,6 +10,7 @@ from flashinfer.jit.core import check_cuda_arch
 from typing_extensions import Self
 
 from tensorrt_llm.functional import AttentionMaskType
+from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..utils import get_global_attrs, get_model_extra_attrs
@@ -60,6 +61,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     # expects KV cache in [max_num_pages, 2, num_kv_heads, page_size, head_dim] layout,
     # so set kv_layout as "HND" here
     kv_layout: Literal["NHD", "HND"] = "HND"
+
+    # Draft KV cache manager for one-model speculative decoding.
+    draft_kv_cache_manager: Optional[object] = None
 
     paged_kv_indptr_decode: torch.Tensor = field(init=False)
     paged_kv_indptr_prefill: torch.Tensor = field(init=False)
@@ -127,6 +131,11 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        if self.draft_kv_cache_manager is not None:
+            logger.warning(
+                "draft_kv_cache_manager is not supported in FlashInfer backend. "
+                "One-model speculative decoding with separate KV cache layouts "
+                "may not work correctly.")
         self._post_init_with_buffers(self.cuda_graph_buffers)
 
     def _post_init_with_buffers(self, buffers) -> None:

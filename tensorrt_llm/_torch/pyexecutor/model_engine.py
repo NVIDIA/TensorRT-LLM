@@ -1004,6 +1004,10 @@ class PyTorchModelEngine(ModelEngine):
             self.kv_cache_manager_key)
         spec_resource_manager = resource_manager.get_resource_manager(
             ResourceManagerType.SPEC_RESOURCE_MANAGER)
+        # draft KV cache manager used in one-model speculative decoding
+        draft_kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER
+        ) if not self.is_draft_model else None
 
         available_blocks = kv_cache_manager.get_num_free_blocks(
         ) // self.max_beam_width
@@ -1021,9 +1025,17 @@ class PyTorchModelEngine(ModelEngine):
             max_num_draft_tokens=draft_len,
             use_mrope=self.use_mrope,
             max_beam_width=self.max_beam_width,
-            num_extra_decoding_steps=num_extra_decoding_steps)
+            num_extra_decoding_steps=num_extra_decoding_steps,
+            draft_kv_cache_manager=draft_kv_cache_manager)
 
         available_tokens = kv_cache_manager.get_num_available_tokens(draft_len)
+        # Also consider draft KV cache capacity when it exists
+        # For generation requests, draft KV cache needs 2*draft_len tokens
+        # (once during context setup, once during generation)
+        if draft_kv_cache_manager is not None:
+            draft_available_tokens = draft_kv_cache_manager.get_num_available_tokens(
+                2 * draft_len)
+            available_tokens = min(available_tokens, draft_available_tokens)
 
         # Add one dummy request with the maximum possible sequence length.
         max_seq_len = self.max_seq_len if max_seq_len is None else max_seq_len
@@ -1046,7 +1058,8 @@ class PyTorchModelEngine(ModelEngine):
             max_num_draft_tokens=draft_len,
             use_mrope=self.use_mrope,
             max_beam_width=self.max_beam_width,
-            num_extra_decoding_steps=num_extra_decoding_steps)[0]
+            num_extra_decoding_steps=num_extra_decoding_steps,
+            draft_kv_cache_manager=draft_kv_cache_manager)[0]
 
         # Insert the longest request first to simulate padding for the CUDA graph.
         requests.insert(0, max_seq_len_request)
