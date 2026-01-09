@@ -40,10 +40,11 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 | `Qwen3MoeForCausalLM`            | Yes               | Yes        | Yes                        | Yes                   | Yes             | No  | Yes                       | Yes                       | Yes           | Yes              | Yes            | N/A                      | Yes                   | Yes             |
 | `Qwen3NextForCausalLM`           | Yes                | Yes        | No                         | Untested                    | Yes              | No  | No                        | No                        | Yes            | Yes               | No             | No                       | Untested                    | Untested              |
 | `Llama4ForConditionalGeneration` | Yes               | Yes        | Yes                        | Yes                   | Yes             | No  | Yes                       | Yes                       | Yes           | Yes              | Untested       | N/A                      | Yes                   | Yes             |
-| `GptOssForCausalLM`            | Yes              | Yes         | Yes                        | Yes                   | No             | No   | Yes                       | No                        | Yes           | Yes              | No             | N/A                      | Yes                    | Yes             |
+| `GptOssForCausalLM`            | Yes              | Yes         | Yes                        | Yes                   | Yes             | No   | Yes                       | Yes [^3]                   | Yes           | Yes              | Yes             | N/A                      | Yes                    | Yes             |
 
 [^1]: Chunked Prefill for MLA can only be enabled on SM100/SM103.
 [^2]: KV cache reuse for MLA can only be enabled on SM90/SM100/SM103 and in BF16/FP8 KV cache dtype.
+[^3]: Overlap scheduler isn't supported when using EAGLE-3(Two Model Engine) for GPT-OSS.
 
 
 # Multimodal Feature Support Matrix (PyTorch Backend)

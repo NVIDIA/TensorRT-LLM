@@ -49,7 +49,8 @@ worker_config:
     enable_attention_dp: false
     pipeline_parallel_size: 1
     max_batch_size: 2
-    max_num_tokens: 128
+    # mtp_size=3 ⇒ max_num_tokens = 2 * (3 + 1) = 8
+    max_num_tokens: 8
     max_seq_len: 139296
     cuda_graph_config:
       enable_padding: true
