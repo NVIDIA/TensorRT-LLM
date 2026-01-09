@@ -36,14 +36,14 @@ By NVIDIA TensorRT LLM team
 The open-sourced [DeepSeek-V3.2](https://api-docs.deepseek.com/news/news251201) series models proposed a new architecture with a fine-grained sparse attention mechanism, called DeepSeek Sparse Attention (DSA). It can help the DeepSeek-V3.2 model achieve better efficiency, especially in long sequence scenarios. Although DSA uses a lightweight indexer for prediction, realizing actual speedup from attention sparsity is still challenging. This blog introduces how TensorRT LLM supports key LLM inference features for DeepSeek-v3.2 and optimizes its performance on NVIDIA Blackwell GPUs.
 
 ## DeepSeek Sparse Attention (DSA)
+DSA serves as a core component of the DeepSeek-v3.2 model, and it is the only architectural modification compared to its predecessors (DeepSeek-V3/R1/V3.1). It is a fine-grained sparse attention mechanism that only selects the important key-value entries for attention computation.
+
 <div align="center">
 <figure>
   <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog15_dsa_architecture.png" alt="tech_blog15_dsa_architecture" width="700" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 1. The architecture of DSA. The green part illustrates how DSA selects the Top-K key-value entries according to the indexer.</em></sub></p>
-
-DSA serves as a core component of the DeepSeek-v3.2 model, and it is the only architectural modification compared to its predecessors (DeepSeek-V3/R1/V3.1). It is a fine-grained sparse attention mechanism that only selects the important key-value entries for attention computation.
 
 Figure 1 illustrates the overall architecture: a lightning indexer first determines the importance of all key-value entries for each query token. Subsequently, the Top-K Selector retains only the top-$k$ entries (typically $k=2048$) based on the index scores. Finally, attention is computed exclusively between the query token and these selected entries.
 
