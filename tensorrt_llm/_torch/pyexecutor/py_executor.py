@@ -1656,7 +1656,7 @@ class PyExecutor:
                     else:
                         previous_tensors_device = self.previous_batch and self.previous_batch.sample_state and self.previous_batch.sample_state.device
 
-                    # Extract seq_slots from previous batch to detect if generation requests
+                    # Extract seq_slots from the previous batch to detect if generation requests
                     # were in the previous batch. This is important for NON_MIX_BATCHING:
                     # if a generation request wasn't in the previous batch (e.g., it was context-only),
                     # the position_id calculation needs adjustment.

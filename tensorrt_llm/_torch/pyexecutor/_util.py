@@ -850,7 +850,7 @@ def create_py_executor_instance(
     if scheduler_capacity == 1 and mapping.enable_attention_dp and kv_cache_manager:
         scheduler_capacity += 1
 
-    # set the capacity scheduler policy to NON_MIX_BATCHING for CI testing
+    # Set the capacity scheduler policy to NON_MIX_BATCHING for CI testing
     scheduler_config.capacity_scheduler_policy = CapacitySchedulerPolicy.NON_MIX_BATCHING
     logger.info(
         f"scheduler_config.capacity_scheduler_policy: {scheduler_config.capacity_scheduler_policy}"
