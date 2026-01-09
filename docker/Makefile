@@ -213,14 +213,9 @@ ubuntu22_%: STAGE = tritondevel
 ubuntu22_%: BASE_IMAGE = nvcr.io/nvidia/cuda
 ubuntu22_%: BASE_TAG = 13.1.0-devel-ubuntu22.04
 
-trtllm_%: STAGE = release
+trtllm_%: STAGE = tritonrelease
 trtllm_%: PUSH_TO_STAGING := 0
-trtllm_%: DEVEL_IMAGE = $(shell \
-    if [ "$(PLATFORM)" = "amd64" ]; then \
-        . ../jenkins/current_image_tags.properties && echo $$LLM_DOCKER_IMAGE; \
-    elif [ "$(PLATFORM)" = "arm64" ]; then \
-        . ../jenkins/current_image_tags.properties && echo $$LLM_SBSA_DOCKER_IMAGE; \
-    fi)
+trtllm_%: DEVEL_IMAGE = tritondevel
 trtllm_%: IMAGE_NAME = $(shell . ../jenkins/current_image_tags.properties && echo $$IMAGE_NAME)
 trtllm_%: IMAGE_TAG = $(shell git rev-parse --abbrev-ref HEAD | tr '/' '_')-$(PLATFORM)
 trtllm_run: WORK_DIR = /app/tensorrt_llm
