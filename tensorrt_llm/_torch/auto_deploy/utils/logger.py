@@ -1,6 +1,6 @@
 import os
-from pathlib import Path
 import shutil
+from pathlib import Path
 
 import torch.nn as nn
 
@@ -9,7 +9,7 @@ from ....logger import Logger
 
 def _get_dtype_or_type(val):
     """Get dtype if tensor-like, otherwise return type name for SymInt/SymFloat etc."""
-    if hasattr(val, 'dtype'):
+    if hasattr(val, "dtype"):
         return val.dtype
     else:
         # For SymInt, SymFloat, etc. - return the type name
@@ -19,37 +19,36 @@ def _get_dtype_or_type(val):
 def dump_ssa_with_meta(f, mod):
     for node in mod.graph.nodes:
         # Write out IR in traditional SSA style
-        if node.op == 'placeholder':
-            if 'val' in node.meta:
-                dtype = _get_dtype_or_type(node.meta['val'])
+        if node.op == "placeholder":
+            if "val" in node.meta:
+                dtype = _get_dtype_or_type(node.meta["val"])
             else:
                 dtype = "unknown"
             f.write(f"%{node.name} : {dtype}\n")
-        elif node.op in ('call_function', 'call_method', 'call_module'):
+        elif node.op in ("call_function", "call_method", "call_module"):
             # Build inputs list in SSA format
             input_vars = []
             for arg in node.args:
-                if hasattr(arg, 'name'):
+                if hasattr(arg, "name"):
                     input_vars.append(f"%{arg.name}")
                 else:
                     input_vars.append(str(arg))
-            if 'val' in node.meta:
-                out_dtype = _get_dtype_or_type(node.meta['val'])
+            if "val" in node.meta:
+                out_dtype = _get_dtype_or_type(node.meta["val"])
             else:
                 out_dtype = "N/A"
             # Standard SSA notation: %out = op(args) : out_dtype
             f.write(f"%{node.name} = {node.target}({', '.join(input_vars)}) : {out_dtype}\n")
-        elif node.op == 'output':
+        elif node.op == "output":
             # Output assignment in SSA IR
             outputs = node.args[0] if isinstance(node.args[0], (tuple, list)) else [node.args[0]]
             output_vars = []
             for o in outputs:
-                if hasattr(o, 'name'):
+                if hasattr(o, "name"):
                     output_vars.append(f"%{o.name}")
                 else:
                     output_vars.append(str(o))
             f.write(f"output {', '.join(output_vars)}\n")
-
 
 
 class ADLogger(Logger):
@@ -96,7 +95,6 @@ class ADLogger(Logger):
             f.write(f"# Transform: {transform_name}\n")
             f.write(f"# Stage: {stage}\n\n")
             dump_ssa_with_meta(f, mod)
-            # f.write(str(mod.graph))  # SSA-style: %node : [num_users=N] = op[target=...](args, kwargs)
 
 
 ad_logger = ADLogger()
