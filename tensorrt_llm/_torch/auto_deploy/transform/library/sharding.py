@@ -44,6 +44,7 @@ from ...utils.node_utils import (
     filtered_nodes,
     get_all_layer_subgraphs,
     get_layer_after_linear_node,
+    get_weight_inputs_between,
     is_any_attention_op,
     is_any_lin_op,
     is_any_moe_op,
@@ -749,16 +750,16 @@ class Sharding(BaseTransform):
             if source == ShardingSource.FACTORY:
                 if len(config.factory_config) == 0:
                     ad_logger.debug(
-                        "No factory config found. Skipping sharding from factory config"
+                        f"No factory config found. Skipping sharding from factory config : {transform_container.config}"
                     )
                     continue
-                ad_logger.info("Applying sharding from factory config")
+                ad_logger.info(f"Applying sharding from factory config : {transform_container.config}, {config.factory_config}")
                 info += detect_sharding_from_config(gm, transform_container, ShardingSource.FACTORY)
             elif source == ShardingSource.MANUAL:
                 if len(config.manual_config) == 0:
                     ad_logger.debug("No manual config found. Skipping sharding from manual config")
                     continue
-                ad_logger.info("Applying sharding from manual config")
+                ad_logger.info(f"Applying sharding from manual config : {transform_container.config}")
                 info += detect_sharding_from_config(gm, transform_container, ShardingSource.MANUAL)
 
             elif source == ShardingSource.HEURISTIC:
@@ -1975,6 +1976,96 @@ def _process_column_sharding(
                     )
                 )
         # chunk nodes do not need to be updated
+
+    # ##############################################################
+    # ## shard intermediate weights (e.g. q_norm, k_norm) for ATTN ##
+    # ##############################################################
+    # For attention layers, there may be intermediate weights (like q_norm.weight, k_norm.weight)
+    # that operate element-wise on the sharded output of q_proj/k_proj. These need to be sharded
+    # along the same dimension.
+    if (
+        layer_subgraph.layer_type == LayerType.ATTENTION
+        and layer_subgraph.terminating_node is not None
+    ):
+        gm = linear_nodes[0].graph.owning_module
+
+        # Collect weight keys from the linear nodes to exclude them
+        linear_weight_keys = set()
+        for lin_node in linear_nodes:
+            try:
+                weight_key, bias_key = extract_param_names_from_node(lin_node)
+                linear_weight_keys.add(weight_key)
+                if bias_key:
+                    linear_weight_keys.add(bias_key)
+            except (AssertionError, AttributeError):
+                pass
+
+        # Also exclude the terminating node's weights (o_proj - handled separately as row-sharded)
+        try:
+            weight_key, bias_key = extract_param_names_from_node(layer_subgraph.terminating_node)
+            linear_weight_keys.add(weight_key)
+            if bias_key:
+                linear_weight_keys.add(bias_key)
+        except (AssertionError, AttributeError):
+            pass
+
+        # Find all intermediate weight nodes by traversing forward from linear nodes to sink.
+        # This correctly captures only weights used AFTER the q/k/v projections.
+        intermediate_weight_nodes = get_weight_inputs_between(
+            linear_nodes, layer_subgraph.terminating_node
+        )
+
+        for weight_node in intermediate_weight_nodes:
+            weight_key = weight_node.target
+
+            # Skip if this is a linear weight (already handled)
+            if weight_key in linear_weight_keys:
+                continue
+
+            # Try to get the parameter
+            try:
+                param = gm.get_parameter(weight_key)
+            except AttributeError:
+                ad_logger.debug(f"Could not get parameter for {weight_key}, skipping")
+                continue
+
+            # Only shard 1D weights that match the expected dimension
+            # (e.g., q_norm.weight with shape [num_heads * head_dim])
+            if param.dim() != 1:
+                ad_logger.debug(
+                    f"Skipping intermediate weight {weight_key} with dim={param.dim()} (not 1D)"
+                )
+                continue
+
+            # Check if the weight size is divisible by world_size
+            if param.shape[0] % world_size != 0:
+                ad_logger.debug(
+                    f"Skipping intermediate weight {weight_key} with shape {param.shape} "
+                    f"(not divisible by world_size={world_size})"
+                )
+                continue
+
+            # Get the user node for this weight (for WeightShardingInfo)
+            if len(list(weight_node.users)) == 0:
+                ad_logger.debug(f"Weight node {weight_key} has no users, skipping")
+                continue
+
+            user_node = list(weight_node.users)[0]
+
+            # Add sharding info for this intermediate weight
+            if transform_container.add(
+                WeightShardingInfo.from_node(
+                    user_node,
+                    split_dim=SplitDimension.COLUMN,
+                    config=config,
+                    dist_op=None,  # No dist op needed for intermediate column-sharded weights
+                    min_local_shape=layer_subgraph.min_local_shape,
+                    layer_type=LayerType.ATTENTION,
+                )
+            ):
+                ad_logger.debug(f"Added sharding for intermediate attention weight: {weight_key}")
+                added_nodes += 1
+
     return added_nodes
 
 

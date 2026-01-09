@@ -63,17 +63,25 @@ class ADLogger(Logger):
         super().__init__()
         self._dump_dir = os.environ.get(self.DUMP_GRAPHS_ENV)
         self._transform_counter = 0
-        if self._dump_dir:
-            dump_dir_path = Path(self._dump_dir)
-            if dump_dir_path.exists():
-                shutil.rmtree(dump_dir_path)
-            dump_dir_path.mkdir(parents=True, exist_ok=True)
-            self.info(f"Graph dumping enabled to: {self._dump_dir}")
+        self._dump_dir_initialized = False
 
     def dump_graph(self, mod: nn.Module, transform_name: str, stage: str) -> None:
         """Dump the FX graph (SSA-style) to a file after a transform."""
         if not self._dump_dir:
             return
+
+        # Only dump from main process (rank 0) or single-process mode (rank is None)
+        if self.rank is not None and self.rank != 0:
+            return
+
+        # Lazy directory initialization (only on rank 0 / main process)
+        if not self._dump_dir_initialized:
+            dump_dir_path = Path(self._dump_dir)
+            if dump_dir_path.exists():
+                shutil.rmtree(dump_dir_path)
+            dump_dir_path.mkdir(parents=True, exist_ok=True)
+            self.info(f"Graph dumping enabled to: {self._dump_dir}")
+            self._dump_dir_initialized = True
 
         from torch.fx import GraphModule
 
