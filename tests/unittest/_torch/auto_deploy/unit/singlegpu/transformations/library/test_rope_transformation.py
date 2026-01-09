@@ -135,7 +135,7 @@ class RoPEModel(torch.nn.Module):
         return out.to(torch.float16) if self.mode == "match" else out
 
     def get_dynamic_shapes(self):
-        return {0: Dim("batch_size", max=8), 1: Dim("seq_len", max=16)}
+        return {0: Dim.DYNAMIC, 1: Dim.DYNAMIC}
 
 
 @pytest.mark.parametrize(
@@ -387,7 +387,7 @@ class DSModel(torch.nn.Module):
         return torch.cat([q_out, k_out], dim=-1)
 
     def get_dynamic_shapes(self):
-        return {0: Dim("batch_size", max=8), 1: Dim("seq_len", max=16)}
+        return {0: Dim.DYNAMIC, 1: Dim.DYNAMIC}
 
 
 @pytest.mark.parametrize(

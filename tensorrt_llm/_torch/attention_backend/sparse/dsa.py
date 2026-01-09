@@ -114,7 +114,6 @@ def transform_local_topk_and_prepare_pool_view(
     num_blocks, num_layers, _, _ = all_layer_kv_pool.shape
     tokens_per_block = kv_cache_manager.tokens_per_block
     head_dim = kv_cache_manager.head_dim
-    assert num_layers == kv_cache_manager.num_local_layers, "PP is not enabled yet for DeepSeek V3.2"
     assert all_layer_kv_pool.is_contiguous(
     ), "all_layer_kv_pool should be contiguous"
     all_layer_kv_pool = all_layer_kv_pool.squeeze(2).view(-1, 1, head_dim)
@@ -813,13 +812,14 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 # Expand schedule metadata buffer (only generation)
                 kv_lens_expanded = self.kv_lens_expanded_cuda[:num_tokens]
                 scheduler_metadata_buffer_expanded = get_paged_mqa_logits_metadata(
-                    kv_lens_expanded, tokens_per_block, self.num_sms)
+                    kv_lens_expanded, self.kv_cache_manager.tokens_per_block,
+                    self.num_sms)
                 self.scheduler_metadata_buffer_expanded.copy_(
                     scheduler_metadata_buffer_expanded, non_blocking=True)
             elif self.max_draft_tokens == 3:
                 scheduler_metadata_buffer_mtp3 = get_paged_mqa_logits_metadata(
                     self.kv_lens_cuda[self.num_contexts:self.num_seqs],
-                    tokens_per_block, self.num_sms // 2)
+                    self.kv_cache_manager.tokens_per_block, self.num_sms // 2)
                 self.scheduler_metadata_buffer_mtp3.copy_(
                     scheduler_metadata_buffer_mtp3, non_blocking=True)
         self.prepare_dense_topk_indices(self.kv_lens_cuda, device=True)
@@ -1646,7 +1646,8 @@ class DSATrtllmAttention(TrtllmAttention):
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         # Transform the local topk indices to global topk indices in paged kv cache
         topk_indices_global, _ = transform_local_topk_and_prepare_pool_view(
-            topk_indices, metadata, self.layer_idx, is_generation)
+            topk_indices, metadata, self.get_local_layer_idx(metadata),
+            is_generation)
 
         # TODO: Use sparse_attn_indexer to predict the indices for DSA attention
         # return self.indexer(q, k, metadata, hidden_states, qr, position_ids)
