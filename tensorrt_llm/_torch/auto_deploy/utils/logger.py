@@ -16,29 +16,66 @@ def _get_dtype_or_type(val):
         return type(val).__name__
 
 
+def _get_shape_str(val):
+    """Get shape as 'dim0xdim1x...' string, or '?' if not available."""
+    if hasattr(val, "shape"):
+        # Handle symbolic dimensions (SymInt) by converting to str
+        dims = [str(int(d)) if str(d).isdigit() else str(d) for d in val.shape]
+        return "x".join(dims) if dims else "scalar"
+    return "?"
+
+
+def _get_shape_dtype_str(val):
+    """Return 'shape : dtype' string for a value."""
+    shape = _get_shape_str(val)
+    dtype = _get_dtype_or_type(val)
+    return f"{shape} : {dtype}"
+
+
 def dump_ssa_with_meta(f, mod):
     for node in mod.graph.nodes:
         # Write out IR in traditional SSA style
         if node.op == "placeholder":
             if "val" in node.meta:
-                dtype = _get_dtype_or_type(node.meta["val"])
+                shape_dtype = _get_shape_dtype_str(node.meta["val"])
             else:
-                dtype = "unknown"
-            f.write(f"%{node.name} : {dtype}\n")
+                shape_dtype = "? : unknown"
+            f.write(f"%{node.name} : {shape_dtype}\n")
         elif node.op in ("call_function", "call_method", "call_module"):
-            # Build inputs list in SSA format
+            # Build inputs list in SSA format with shape:dtype info
             input_vars = []
             for arg in node.args:
                 if hasattr(arg, "name"):
-                    input_vars.append(f"%{arg.name}")
+                    # Look up the arg node's metadata for shape/dtype
+                    if hasattr(arg, "meta") and "val" in arg.meta:
+                        arg_shape_dtype = _get_shape_dtype_str(arg.meta["val"])
+                        input_vars.append(f"%{arg.name} : {arg_shape_dtype}")
+                    else:
+                        input_vars.append(f"%{arg.name} : ? : unknown")
                 else:
                     input_vars.append(str(arg))
+
+            # Handle output shape/dtype (including multi-output)
             if "val" in node.meta:
-                out_dtype = _get_dtype_or_type(node.meta["val"])
+                out_val = node.meta["val"]
+                if isinstance(out_val, (tuple, list)):
+                    # Multi-output: (shape1, shape2) : (dtype1, dtype2)
+                    shapes = []
+                    dtypes = []
+                    for v in out_val:
+                        if v is not None:
+                            shapes.append(_get_shape_str(v))
+                            dtypes.append(str(_get_dtype_or_type(v)))
+                        else:
+                            shapes.append("?")
+                            dtypes.append("None")
+                    out_info = f"({', '.join(shapes)}) : ({', '.join(dtypes)})"
+                else:
+                    out_info = _get_shape_dtype_str(out_val)
             else:
-                out_dtype = "N/A"
-            # Standard SSA notation: %out = op(args) : out_dtype
-            f.write(f"%{node.name} = {node.target}({', '.join(input_vars)}) : {out_dtype}\n")
+                out_info = "? : N/A"
+            # Standard SSA notation: %out = op(args) : shape : dtype
+            f.write(f"%{node.name} = {node.target}({', '.join(input_vars)}) : {out_info}\n")
         elif node.op == "output":
             # Output assignment in SSA IR
             outputs = node.args[0] if isinstance(node.args[0], (tuple, list)) else [node.args[0]]
