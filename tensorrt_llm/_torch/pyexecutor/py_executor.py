@@ -2119,7 +2119,8 @@ class PyExecutor:
                         or req.is_generation_to_complete_state)
             ])
 
-        if self.expected_num_active_requests - num_active_request > 0 and num_active_request == 0 and self.dist.world_size > 1:
+        # If we enable tp_size == dp_size
+        if self.expected_num_active_requests - num_active_request > 0 and num_active_request == 0 and self.dist.tp_size > 1:
             llm_request = self.kv_cache_manager.add_dummy_requests(
                 request_ids=[0],
                 is_gen=True,
