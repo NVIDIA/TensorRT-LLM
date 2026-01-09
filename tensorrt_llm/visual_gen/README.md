@@ -18,7 +18,7 @@ Given a diffusion model implemented in native PyTorch or HuggingFace Diffusers p
 | | [**TensorRT-LLM**](https://github.com/NVIDIA/TensorRT-LLM) FP8 Blockwise | DeepSeek-like blockwise FP8 quantization | ✅ |
 | | [**TensorRT-LLM**](https://github.com/NVIDIA/TensorRT-LLM) FP8 Per-Tensor | Per-tensor FP8 quantization | ✅ |
 | | [**TensorRT-LLM**](https://github.com/NVIDIA/TensorRT-LLM) NVFP4 Blockwise | Double quantization + blockise NVFP4 | ✅ |
-| | [**SVDQuant**](https://github.com/nunchaku-tech/nunchaku) NVFP4 Per-Tensor |  SVDQuant: Absorbing Outliers by Low-Rank Components for 4-Bit Diffusion Models | 🚧 |
+| | [**SVDQuant**](https://github.com/nunchaku-tech/nunchaku) NVFP4 |  SVDQuant: Absorbing Outliers by Low-Rank Components for 4-Bit Diffusion Models | 🚧 |
 | **Hybrid Parallel** | **CFG Parallel** | Classifier-free guidance parallelism | ✅ |
 | | **Ulysses Parallel** | Distributes attention heads to minimize communication | ✅ |
 | | **Ring Parallel** | Ring topology for overlapping compute and communication | ✅ |
@@ -28,8 +28,6 @@ Given a diffusion model implemented in native PyTorch or HuggingFace Diffusers p
 | **Memory Optimization** | **CPU Offloading** | Asynchronous block-wise CPU offloading | ✅ |
 | **Others** | **Torch Compile** | JIT compilation for performance optimization | ✅ |
 | | **QKV Fusion** | Fused query-key-value operations | ✅ |
-| | **Auto Tuner** | Automatic operator selection for best performance-accuracy tradeoff | 🚧 |
-| | **Distillation** | Model distillation techniques | 🚧 |
 
 </div>
 

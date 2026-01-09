@@ -37,7 +37,7 @@ class BaseArgumentParser:
         self.parser.add_argument(
             "--attn_type",
             type=str,
-            default="sage-attn",
+            default="default",
             choices=[
                 "default",
                 "auto",

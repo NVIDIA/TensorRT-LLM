@@ -198,7 +198,7 @@ torchrun --nproc_per_node=8 cosmos_t2v.py --model_path "nvidia/Cosmos-1.0-Diffus
 
 | Parameter | Description |
 |-----------|-------------|
-| `--attn_type` | Attention type: `default`, `sage-attn`, `sparse-videogen`, `trtllm-attn`, `flash-attn3`, `flash-attn3-fp8` (default: `sage-attn`) |
+| `--attn_type` | Attention type: `default`, `sage-attn`, `sparse-videogen`, `trtllm-attn`, `flash-attn3`, `flash-attn3-fp8` (default: `default`) |
 | `--linear_type` | Linear type: `default`, `trtllm-fp8-blockwise`, `trtllm-fp8-per-tensor`, `trtllm-nvfp4` (default: `default`) |
 | `--disable_torch_compile` | Disable torch compile (enabled by default) |
 | `--torch_compile_models` | Models to compile with torch compile (default: `transformer`) |
@@ -320,11 +320,10 @@ In large video diffusion models, >70% of the DiT transformer latency is contribu
 
 *1. SageAttention*
 
-By default, we will enable **SageAttention** in our scripts. SageAttention leverages quantization to accelerate the attention operator, which brings good performance but also has impact on accuracy. We find it is good at performance-accuracy tradeoff, so we enable it by default.
+SageAttention leverages quantization to accelerate the attention operator, which brings good performance but also has impact on accuracy. We find it is good at performance-accuracy tradeoff, so we recommend to enable it.
 
-You can fall back to the default Attention to gain higher accuracy but this will slow down the inference and is **not recommended**:
 ```bash
-python wan_t2v.py --attn_type "default"
+python wan_t2v.py --attn_type "sage-attn"
 
 ```
 
