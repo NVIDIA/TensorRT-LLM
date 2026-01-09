@@ -5,7 +5,6 @@ Provides batch job submission capability to improve parallelism.
 """
 
 import os
-
 import pytest
 from utils.logger import logger
 
@@ -126,19 +125,19 @@ def pytest_collection_modifyitems(config, items):
 
 class BatchManager:
     """Batch job submission manager for disagg tests.
-
+    
     Automatically splits test cases into batches and submits them on-demand
     to maximize parallelism in SLURM cluster environments.
-
+    
     Key features:
     - Lazy batch submission: only submits when needed
     - Configurable batch size via CLI or environment variable
     - Maintains job_id mapping for all submitted jobs
     """
-
+    
     def __init__(self, batch_size=5):
         """Initialize batch manager.
-
+        
         Args:
             batch_size: Number of jobs per batch. None or 0 means unlimited (submit all at once).
                        Default is 5 if not specified.
@@ -148,11 +147,11 @@ class BatchManager:
             self.batch_size = None
         else:
             self.batch_size = batch_size
-
+        
         self.submitted_batches = set()  # Track which batch numbers have been submitted
         self.job_mapping = {}  # Map test_id -> SLURM job_id
         self.all_configs = []  # Ordered list of all test configs
-
+        
         logger.info(f"\n{'=' * 70}")
         logger.info("Batch Manager Initialized")
         if self.batch_size:
@@ -160,61 +159,60 @@ class BatchManager:
         else:
             logger.info("Batch size: unlimited (submit all at once)")
         logger.info(f"{'=' * 70}\n")
-
+    
     def add_config(self, test_config):
         """Add a test configuration to the manager.
-
+        
         Called during initialization to build the ordered list of configs.
-
+        
         Args:
             test_config: TestConfig object to add
         """
         self.all_configs.append(test_config)
-
+    
     def get_job_id(self, test_config):
         """Get SLURM job ID for a test config, submitting batch if needed.
-
+        
         This is the main entry point. It:
         1. Determines which batch the test belongs to
         2. Submits the entire batch if not already submitted
         3. Returns the job_id for this specific test
-
+        
         Args:
             test_config: TestConfig object to get job_id for
-
+            
         Returns:
             str: SLURM job ID, or None if submission failed
         """
         # Find the index of this config in the ordered list
         try:
-            idx = next(
-                i for i, c in enumerate(self.all_configs) if c.test_id == test_config.test_id
-            )
+            idx = next(i for i, c in enumerate(self.all_configs) 
+                      if c.test_id == test_config.test_id)
         except StopIteration:
             logger.error(f"Config not found in manager: {test_config.test_id}")
             return None
-
+        
         # Calculate which batch this test belongs to
         if self.batch_size:
             batch_num = idx // self.batch_size
         else:
             batch_num = 0  # All tests in one batch
-
+        
         # Submit the batch if not already submitted
         if batch_num not in self.submitted_batches:
             self._submit_batch(batch_num)
-
+        
         # Return the cached job_id
         return self.job_mapping.get(test_config.test_id)
-
+    
     def _submit_batch(self, batch_num):
         """Submit all jobs in a specific batch.
-
+        
         Args:
             batch_num: Batch number to submit (0-indexed)
         """
         from execution.executor import JobManager
-
+        
         # Calculate batch range
         if self.batch_size:
             start_idx = batch_num * self.batch_size
@@ -222,14 +220,14 @@ class BatchManager:
         else:
             start_idx = 0
             end_idx = len(self.all_configs)
-
+        
         batch_configs = self.all_configs[start_idx:end_idx]
-
+        
         logger.info(f"\n{'=' * 70}")
         logger.info(f"Submitting Batch {batch_num}")
         logger.info(f"Range: [{start_idx}:{end_idx}] ({len(batch_configs)} jobs)")
         logger.info(f"{'=' * 70}\n")
-
+        
         # Submit all jobs in this batch
         success_count = 0
         for i, config in enumerate(batch_configs, 1):
@@ -239,9 +237,7 @@ class BatchManager:
                     self.job_mapping[config.test_id] = job_id
                     success_count += 1
                     # Truncate test_id for display
-                    display_id = (
-                        config.test_id[:60] + "..." if len(config.test_id) > 60 else config.test_id
-                    )
+                    display_id = config.test_id[:60] + "..." if len(config.test_id) > 60 else config.test_id
                     logger.success(f"  [{i:3d}/{len(batch_configs)}] Job {job_id} <- {display_id}")
                 else:
                     self.job_mapping[config.test_id] = None
@@ -249,24 +245,22 @@ class BatchManager:
             except Exception as e:
                 self.job_mapping[config.test_id] = None
                 logger.error(f"  [{i:3d}/{len(batch_configs)}] Error: {e}")
-
+        
         # Mark batch as submitted
         self.submitted_batches.add(batch_num)
-
+        
         logger.info(f"\n{'=' * 70}")
-        logger.success(
-            f"Batch {batch_num} Complete: {success_count}/{len(batch_configs)} succeeded"
-        )
+        logger.success(f"Batch {batch_num} Complete: {success_count}/{len(batch_configs)} succeeded")
         logger.info(f"{'=' * 70}\n")
 
 
 @pytest.fixture(scope="session")
 def batch_manager(request):
     """Provide batch manager fixture for test methods.
-
+    
     This session-scoped fixture creates and initializes the BatchManager
     with all collected test configs.
-
+    
     Returns:
         BatchManager: Initialized batch manager instance
     """
@@ -282,20 +276,20 @@ def batch_manager(request):
                 batch_size = 5
         else:
             batch_size = 5  # Default batch size
-
+    
     # Create batch manager
     manager = BatchManager(batch_size=batch_size)
-
+    
     # Extract all test configs from collected items
     for item in request.session.items:
-        if hasattr(item, "callspec") and "test_config" in item.callspec.params:
-            manager.add_config(item.callspec.params["test_config"])
-
+        if hasattr(item, 'callspec') and 'test_config' in item.callspec.params:
+            manager.add_config(item.callspec.params['test_config'])
+    
     # Log statistics
     logger.info(f"Total test configs: {len(manager.all_configs)}")
     if manager.batch_size:
         total_batches = (len(manager.all_configs) + manager.batch_size - 1) // manager.batch_size
         logger.info(f"Total batches: {total_batches}")
     logger.info("")
-
+    
     return manager

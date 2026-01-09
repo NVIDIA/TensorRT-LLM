@@ -33,9 +33,7 @@ def exec_cmd(*popenargs, timeout: Optional[float] = None, **kwargs) -> int:
     return result.returncode
 
 
-def exec_cmd_with_output(
-    *popenargs, timeout: Optional[float] = None, check: bool = True, **kwargs
-) -> str:
+def exec_cmd_with_output(*popenargs, timeout: Optional[float] = None, check: bool = True, **kwargs) -> str:
     """Execute command and return output as string.
 
     Args:
