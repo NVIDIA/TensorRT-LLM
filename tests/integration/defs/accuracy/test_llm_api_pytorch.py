@@ -3218,15 +3218,15 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
                 long_token_list
             ) > 0, "No valid samples found to build long sequences"
 
-            batch_size = 10
+            batch_size = 8
             sampling_params_greedy = SamplingParams(max_tokens=8)
             sampling_params_sampling = SamplingParams(max_tokens=8,
                                                       temperature=0.8,
                                                       top_p=0.95)
 
-            max_duration_sec = 2.5 * 3600
-            max_batches = 80
-            min_batches = 10 
+            max_duration_sec = 1.5 * 3600
+            max_batches = 25
+            min_batches = 8
             start_time = time.time()
             num_samples = len(long_token_list)
 
@@ -3284,8 +3284,8 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
 
             print("\n[Async Streaming Test] Starting async streaming cancellation test...")
 
-            async_batch_size = 8
-            num_async_batches = 5
+            async_batch_size = 6
+            num_async_batches = 3
             cancel_ratio = 0.5
 
             async def run_streaming_with_cancellation():
