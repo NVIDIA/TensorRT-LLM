@@ -852,6 +852,10 @@ class PyTorchModelEngine(ModelEngine):
         """A context manager to automatically free resources of a dummy batch."""
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
+        # draft KV cache manager used in one-model speculative decoding
+        draft_kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER
+        ) if not self.is_draft_model else None
         spec_resource_manager = resource_manager.get_resource_manager(
             ResourceManagerType.SPEC_RESOURCE_MANAGER)
         try:
@@ -860,6 +864,8 @@ class PyTorchModelEngine(ModelEngine):
             if batch is not None and kv_cache_manager is not None:
                 for req in batch.all_requests():
                     kv_cache_manager.free_resources(req)
+                    if draft_kv_cache_manager is not None:
+                        draft_kv_cache_manager.free_resources(req)
                     if spec_resource_manager is not None:
                         spec_resource_manager.free_resources(req)
 
@@ -882,6 +888,11 @@ class PyTorchModelEngine(ModelEngine):
         """Creates a generic dummy ScheduledRequests object for warmup."""
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
+        # draft KV cache manager used in one-model speculative decoding
+        draft_kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER
+        ) if not self.is_draft_model else None
+
         spec_resource_manager = resource_manager.get_resource_manager(
             ResourceManagerType.SPEC_RESOURCE_MANAGER)
 
@@ -953,7 +964,8 @@ class PyTorchModelEngine(ModelEngine):
                 is_gen=False,
                 max_num_draft_tokens=self.runtime_draft_len,
                 use_mrope=self.use_mrope,
-                num_extra_decoding_steps=num_extra_decoding_steps)
+                num_extra_decoding_steps=num_extra_decoding_steps,
+                draft_kv_cache_manager=draft_kv_cache_manager)
 
             if spec_resource_manager is not None:
                 spec_resource_manager.add_dummy_requests(
@@ -969,7 +981,8 @@ class PyTorchModelEngine(ModelEngine):
                 max_num_draft_tokens=self.max_total_draft_tokens,
                 use_mrope=self.use_mrope,
                 max_beam_width=self.max_beam_width,
-                num_extra_decoding_steps=num_extra_decoding_steps)
+                num_extra_decoding_steps=num_extra_decoding_steps,
+                draft_kv_cache_manager=draft_kv_cache_manager)
             if spec_resource_manager is not None:
                 spec_resource_manager.add_dummy_requests(request_ids=list(
                     range(num_ctx_requests, num_ctx_requests +
@@ -1057,7 +1070,10 @@ class PyTorchModelEngine(ModelEngine):
                     req.py_is_first_draft = True
                     req.py_draft_tokens = []
 
-    def _set_up_attn_metadata(self, kv_cache_manager: KVCacheManager):
+    def _set_up_attn_metadata(
+            self,
+            kv_cache_manager: KVCacheManager,
+            draft_kv_cache_manager: Optional[KVCacheManager] = None):
         enable_context_mla_with_cached_kv = is_mla(
             self.model.model_config.pretrained_config) and (
                 self.attn_runtime_features.cache_reuse
@@ -1106,6 +1122,7 @@ class PyTorchModelEngine(ModelEngine):
             max_num_tokens=self.max_num_tokens,
             max_num_sequences=self.batch_size * self.max_beam_width,
             kv_cache_manager=kv_cache_manager,
+            draft_kv_cache_manager=draft_kv_cache_manager,
             mapping=self.mapping,
             runtime_features=self.attn_runtime_features,
             enable_flash_mla=self.model.model_config.enable_flash_mla,
@@ -3245,8 +3262,14 @@ class PyTorchModelEngine(ModelEngine):
                 req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None):
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
+        # Get draft KV cache manager for one-model speculative decoding
+        # Only needed for target model (not draft model)
+        draft_kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER
+        ) if not self.is_draft_model else None
 
-        attn_metadata = self._set_up_attn_metadata(kv_cache_manager)
+        attn_metadata = self._set_up_attn_metadata(kv_cache_manager,
+                                                   draft_kv_cache_manager)
         if self.enable_spec_decode:
             spec_resource_manager = resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)

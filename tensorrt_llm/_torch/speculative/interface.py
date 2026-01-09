@@ -423,23 +423,39 @@ class SpecWorkerBase(nn.Module, ABC):
         """
         Context manager to temporarily switch to draft KV cache manager.
 
+        This swaps both the kv_cache_manager reference AND the block offset tensors,
+        since the main and draft KV caches have different block layouts.
+
         Args:
             attn_metadata: The attention metadata containing the KV cache manager.
             draft_kv_cache_manager: The draft KV cache manager to switch to.
 
         Yields:
-            None. The attn_metadata.kv_cache_manager is temporarily switched.
+            None. The attn_metadata.kv_cache_manager and block offsets are temporarily switched.
         """
         if draft_kv_cache_manager is None:
             yield
             return
 
+        # Save main KV cache manager and block offsets
         target_kv_cache_manager = attn_metadata.kv_cache_manager
+        target_kv_cache_block_offsets = attn_metadata.kv_cache_block_offsets
+        target_host_kv_cache_block_offsets = attn_metadata.host_kv_cache_block_offsets
+
+        # Switch to draft KV cache manager and its block offsets
         attn_metadata.kv_cache_manager = draft_kv_cache_manager
+        if hasattr(attn_metadata, 'draft_kv_cache_block_offsets'
+                   ) and attn_metadata.draft_kv_cache_block_offsets is not None:
+            attn_metadata.kv_cache_block_offsets = attn_metadata.draft_kv_cache_block_offsets
+            attn_metadata.host_kv_cache_block_offsets = attn_metadata.draft_host_kv_cache_block_offsets
+
         try:
             yield
         finally:
+            # Restore main KV cache manager and block offsets
             attn_metadata.kv_cache_manager = target_kv_cache_manager
+            attn_metadata.kv_cache_block_offsets = target_kv_cache_block_offsets
+            attn_metadata.host_kv_cache_block_offsets = target_host_kv_cache_block_offsets
 
     def _sample_tokens_for_batch(
         self,
