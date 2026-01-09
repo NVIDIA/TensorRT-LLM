@@ -17,7 +17,7 @@ from tensorrt_llm._torch.modules.multi_stream_utils import \
     maybe_execute_in_parallel
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._torch.utils import maybe_compile, maybe_compiled_copy_, maybe_compiled_cat
+from tensorrt_llm._torch.utils import maybe_compile, maybe_compiled_cat
 from tensorrt_llm._utils import get_size_in_bytes, get_sm_version
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
