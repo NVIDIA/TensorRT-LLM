@@ -384,8 +384,7 @@ class ExecutorRequestQueue:
                     f"CP ranks within DP group {dp_group_idx} have mismatched request counts: " \
                     f"{[entry[0] for entry in group_entries]}"
                 # Use token count from cp_rank0.
-                aggregated_responses.append(
-                    [group_entries[0][0], group_entries[0][1]])
+                aggregated_responses.append(group_entries[0])
             responses_list = aggregated_responses
         else:
             responses_list = self.dist.tp_allgather(
