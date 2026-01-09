@@ -13,12 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
-from typing import Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
+from transformers import AutoModelForCausalLM
 
 
 def geglu(x):
@@ -1239,3 +1240,188 @@ class recurrent_ref(nn.Module):
         x = self.linear_out(x)
 
         return x, conv_state, lru_state
+
+
+class RefHFModel:
+
+    def __init__(self,
+                 model_dir: str,
+                 device_id: int = 0,
+                 additional_model_kargs: Optional[Dict[str, Any]] = None):
+        self.device_id = device_id
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_dir, **(additional_model_kargs or {})).to(f"cuda:{device_id}")
+
+    def generate_batch_with_padding(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        responses: List[List[int]],
+        prompt_max_len: int = 1024,
+        micro_batch_size: int = 16,
+        return_logits: bool = False,
+    ):
+        """
+        Synchronous inference on a batch with micro-batching.
+        Directly extracts response logprobs to save memory.
+
+        Args:
+            input_ids: [batch_size, seq_len]
+            attention_mask: [batch_size, seq_len]
+            position_ids: [batch_size, seq_len]
+            responses: List of response token IDs for each sample
+            prompt_max_len: Maximum prompt length (default 1024)
+            micro_batch_size: Size of each micro batch to avoid OOM
+            return_logits: Whether to return logits, If True, return logits, otherwise return logprobs
+        Returns:
+            List of logits or logprobs tensors, one per sample [response_len]
+        """
+        # Move tensors to the correct device
+        input_ids = input_ids.to(f"cuda:{self.device_id}")
+        attention_mask = attention_mask.to(f"cuda:{self.device_id}")
+        position_ids = position_ids.to(f"cuda:{self.device_id}")
+
+        batch_size = input_ids.shape[0]
+        num_micro_batches = (batch_size + micro_batch_size -
+                             1) // micro_batch_size
+
+        ref_results = []
+
+        with torch.no_grad():
+            for micro_idx in range(num_micro_batches):
+                start_idx = micro_idx * micro_batch_size
+                end_idx = min((micro_idx + 1) * micro_batch_size, batch_size)
+
+                # Extract micro batch
+                micro_input_ids = input_ids[start_idx:end_idx]
+                micro_attention_mask = attention_mask[start_idx:end_idx]
+                micro_position_ids = position_ids[start_idx:end_idx]
+
+                # Forward pass
+                outputs = self.model(
+                    input_ids=micro_input_ids,
+                    attention_mask=micro_attention_mask,
+                    position_ids=micro_position_ids,
+                )
+                # Extract response logprobs for each sample in this micro batch
+                for i in range(outputs.logits.shape[0]):
+                    sample_idx = start_idx + i
+                    response = responses[sample_idx]
+                    response_len = len(response)
+
+                    # Extract logits for predicting response tokens
+                    # For predicting response[j], we need logits at position prompt_max_len-1+j
+                    response_logits = outputs.logits[i, prompt_max_len -
+                                                     1:prompt_max_len - 1 +
+                                                     response_len, :]
+                    if return_logits:
+                        ref_results.append(response_logits)
+                    else:
+                        # Convert to logprobs
+                        response_logprobs = torch.log_softmax(response_logits,
+                                                              dim=-1)
+
+                        # Extract logprobs for the actual generated tokens
+                        response_tensor = torch.tensor(
+                            response,
+                            dtype=torch.long,
+                            device=response_logprobs.device)
+                        ref_logprob_for_tokens = torch.gather(
+                            response_logprobs,
+                            dim=-1,
+                            index=response_tensor.unsqueeze(-1)).squeeze(-1)
+
+                        ref_results.append(ref_logprob_for_tokens)
+
+                # Free memory immediately after processing each micro batch
+                del outputs
+                torch.cuda.empty_cache()
+
+        return ref_results
+
+    @staticmethod
+    def pad_data(
+        original_prompts: List[List[int]],
+        generated_token_ids_list: List[List[int]],
+        prompt_max_len: int = 1024,
+        response_max_len: int = 1024,
+        pad_token_id: int = 0,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Pad the data to the maximum length.
+
+        Structure:
+        [left_pad | actual_prompt | actual_response | right_pad]
+        |<--  prompt_max_len=1024  -->|<--  response_max_len=1024  -->|
+
+        Args:
+            original_prompts: List of prompt token IDs, len = batch_size
+            generated_token_ids_list: List of response token IDs, len = batch_size
+            prompt_max_len: Maximum length for prompt section (default 1024)
+            response_max_len: Maximum length for response section (default 1024)
+            pad_token_id: Token ID for padding (default 0)
+        Returns:
+            input_ids: Tensor of shape [batch_size, prompt_max_len + response_max_len]
+            attention_mask: Tensor of shape [batch_size, prompt_max_len + response_max_len]
+            position_ids: Tensor of shape [batch_size, prompt_max_len + response_max_len]
+        """
+        batch_size = len(original_prompts)
+        total_len = prompt_max_len + response_max_len
+
+        for i, (prompt, response) in enumerate(
+                zip(original_prompts, generated_token_ids_list)):
+            assert len(prompt) <= prompt_max_len, (
+                f"Batch {i}: Prompt length {len(prompt)} exceeds max {prompt_max_len}"
+            )
+            assert len(response) <= response_max_len, (
+                f"Batch {i}: Response length {len(response)} exceeds max {response_max_len}"
+            )
+
+        # Build batch tensors [batch_size, total_len]
+        batch_input_ids = torch.full((batch_size, total_len),
+                                     pad_token_id,
+                                     dtype=torch.long,
+                                     device="cuda")
+        batch_attention_mask = torch.zeros((batch_size, total_len),
+                                           dtype=torch.long,
+                                           device="cuda")
+        batch_position_ids = torch.zeros((batch_size, total_len),
+                                         dtype=torch.long,
+                                         device="cuda")
+
+        response_lens = []
+
+        for i in range(batch_size):
+            prompt_tokens = original_prompts[i]
+            response_tokens = generated_token_ids_list[i]
+
+            prompt_len = len(prompt_tokens)
+            response_len = len(response_tokens)
+            response_lens.append(response_len)
+
+            left_pad_len = prompt_max_len - prompt_len
+
+            # Fill input_ids: [left_pad | prompt | response | right_pad]
+            prompt_start = left_pad_len
+            prompt_end = prompt_max_len
+            response_start = prompt_max_len
+            response_end = prompt_max_len + response_len
+
+            batch_input_ids[i, prompt_start:prompt_end] = torch.tensor(
+                prompt_tokens, dtype=torch.long, device="cuda")
+            batch_input_ids[i, response_start:response_end] = torch.tensor(
+                response_tokens, dtype=torch.long, device="cuda")
+
+            # Fill attention_mask: 1 for actual tokens, 0 for padding
+            batch_attention_mask[i, prompt_start:response_end] = 1
+
+            # Fill position_ids: sequential for actual tokens
+            actual_seq_len = prompt_len + response_len
+            batch_position_ids[i, prompt_start:response_end] = torch.arange(
+                actual_seq_len, dtype=torch.long, device="cuda")
+            # Right padding keeps the last position value
+            if response_len < response_max_len:
+                batch_position_ids[i, response_end:] = actual_seq_len - 1
+
+        return batch_input_ids, batch_attention_mask, batch_position_ids
