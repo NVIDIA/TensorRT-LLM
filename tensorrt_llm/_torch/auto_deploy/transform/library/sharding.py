@@ -1862,41 +1862,38 @@ def _determine_fused_weight_dims(
         return None
     linear_node = linear_nodes[0]
     fused_weight_dims = None
-    # check if there are split nodes in the subgraph. They may indicate fused weights (e.g., QKV)
-    split_nodes = list(filtered_nodes(linear_node.users, ops=[torch.ops.aten.split_with_sizes]))
-    if len(split_nodes) > 0:
-        assert len(linear_nodes) == 1
+    if len(linear_nodes) == 1:
         linear_node = linear_nodes[0]
-        assert len(split_nodes) == 1, "Expecting exactly one split node for fused weights"
-        fused_weight_dims = split_nodes[0].args[1]
-
-    slice_nodes = list(filtered_nodes(linear_node.users, ops=[torch.ops.aten.slice]))
-    if len(slice_nodes) > 0:
-        # we are probably in fused QKV case with single linear node and 3 slice nodes
-        assert len(linear_nodes) == 1
-        linear_node = linear_nodes[0]
-        assert all(
-            s.args[1] == 2 for s in filtered_nodes(linear_node.users, ops=torch.ops.aten.slice)
-        ), "Expecting slice nodes to slice tensor over dim=2"
-        fused_weight_dims = [s.args[3] - s.args[2] for s in linear_node.users]
-        weight_dim = shape(linear_node)[2]
-        if sum(fused_weight_dims) != weight_dim:
-            if fused_weight_dims[-1] > weight_dim:
-                fused_weight_dims[-1] = weight_dim - sum(fused_weight_dims[:-1])
-            else:
-                ad_logger.warning(
-                    f"Fused weight dims {fused_weight_dims} do not sum to weight dim {weight_dim}. Skipping."
-                )
-                return
-    chunk_nodes = list(filtered_nodes(linear_node.users, ops=torch.ops.aten.chunk))
-    if len(chunk_nodes) > 0:
-        assert len(linear_nodes) == 1
-        linear_node = linear_nodes[0]
-        assert len(chunk_nodes) == 1, "Expecting exactly one chunk node for fused weights"
-        num_chunks = chunk_nodes[0].args[1]
-        weight_dim = shape(linear_node)[2]
-        fused_weight_dims = [weight_dim // num_chunks] * num_chunks
-    return fused_weight_dims
+        # check if there are split nodes in the subgraph. They may indicate fused weights (e.g., QKV)
+        linear_split_users = list(filtered_nodes(linear_node.users, ops=torch.ops.aten.split_with_sizes))
+        linear_slice_users = list(filtered_nodes(linear_node.users, ops=torch.ops.aten.slice))
+        linear_chunk_users = list(filtered_nodes(linear_node.users, ops=torch.ops.aten.chunk))
+        if len(linear_split_users) > 0:
+            assert len(linear_split_users) == 1, "Expecting exactly one split node for fused weights"
+            fused_weight_dims = linear_split_users[0].args[1]
+        
+        elif len(linear_slice_users) > 0:
+            # we are probably in fused QKV case with single linear node and 3 slice nodes
+            assert all(
+                s.args[1] == 2 for s in linear_slice_users
+            ), "Expecting slice nodes to slice tensor over dim=2"
+            fused_weight_dims = [s.args[3] - s.args[2] for s in linear_slice_users]
+            assert fused_weight_dims, f"fused weight dims cannot be empty - linear_slice_users: {[s.name for s in linear_slice_users]}, linear_node: {linear_node.name}"
+            weight_dim = linear_node.meta["val"].shape[2]
+            if sum(fused_weight_dims) != weight_dim:
+                if fused_weight_dims[-1] > weight_dim:
+                    fused_weight_dims[-1] = weight_dim - sum(fused_weight_dims[:-1])
+                else:
+                    ad_logger.warning(
+                        f"Fused weight dims {fused_weight_dims} do not sum to weight dim {weight_dim}. Skipping."
+                    )
+                    return
+        
+        elif len(linear_chunk_users) > 0:
+            assert len(linear_chunk_users) == 1, "Expecting exactly one chunk node for fused weights"
+            num_chunks = linear_chunk_users[0].args[1]
+            weight_dim = linear_node.meta["val"].shape[2]
+            fused_weight_dims = [weight_dim // num_chunks] * num_chunks
 
 
 def _process_column_sharding(
