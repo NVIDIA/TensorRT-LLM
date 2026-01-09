@@ -397,7 +397,7 @@ Per User Output Speed (tps/user):                 11.2591
 ```
 
 ### Benchmark with Wide-EP on GB200
-To validate the efficacy of Wide-EP on DeepSeek-V3.2, we evaluated performance using the NVFP4 model on a GB200 NVL72 system. We compared EP16 and EP32 configurations against EP4 and EP8 baselines, with benchmarks conducted at ISL=8K and OSL=1K.
+To validate the efficacy of Wide-EP on DeepSeek-V3.2, we evaluated performance using the NVFP4 model on a GB200 NVL72 system. We compared EP16 and EP32 configurations against EP4 and EP8 baselines, with benchmarks conducted at ISL=8K and OSL=1K using the [Rate Matching](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog5_Disaggregated_Serving_in_TensorRT-LLM.md#measurement-methodology) methodology.
 
 <div align="center">
 <figure>
