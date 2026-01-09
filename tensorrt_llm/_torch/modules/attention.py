@@ -811,7 +811,9 @@ class MLA(nn.Module):
         tp_size = self.mapping.tp_size
         pp_size = self.mapping.pp_size
         cp_size = self.mapping.cp_size
+        dp_size = 1
         if self.mapping.enable_attention_dp:
+            dp_size = tp_size
             tp_size = 1
         if self.mapping.has_cp_ulysses():
             raise NotImplementedError("MLA doesn't support CP Ulyssees yet")
@@ -820,9 +822,9 @@ class MLA(nn.Module):
             ), f"CP type must be HELIX for MLA, but got {self.mapping.cp_config['cp_type']}."
 
         mapping = Mapping(
-            world_size=tp_size * pp_size * cp_size,
+            world_size=pp_size * dp_size * tp_size * cp_size,
             tp_size=tp_size,
-            pp_size=pp_size,
+            pp_size=pp_size * dp_size,
             cp_size=cp_size,
             cp_config=self.mapping.cp_config,
             rank=self.mapping.rank,
@@ -920,42 +922,15 @@ class MLA(nn.Module):
             requires_grad=False,
         )
 
-        # For o_proj, we fold CP into TP so all CP ranks do all-reduce together.
-        #
-        # When enable_attention_dp=True:
-        #   - tp_size is forced to 1 (each DP group processes independently).
-        #   - Each DP group has its own independent all-reduce among CP ranks.
-        #   - We use pp_size to represent DP groups (original tp_size), so that
-        #     mapping_o.tp_group contains the correct actual world ranks for each DP group
-        #   Example with original tp=2, cp=2:
-        #     - DP group 0 (ranks 0, 1): tp_group = [0, 1]
-        #     - DP group 1 (ranks 2, 3): tp_group = [2, 3]
-        #
-        # When enable_attention_dp=False:
-        #   - All TP*CP ranks participate in a single all-reduce
-        if self.mapping.enable_attention_dp and cp_size > 1:
-            # Get original TP size (before it was forced to 1 for attention DP)
-            original_tp_size = self.mapping.tp_size
-            mapping_o = Mapping(
-                world_size=original_tp_size * pp_size * cp_size,
-                tp_size=cp_size,  # Only CP ranks all-reduce together
-                pp_size=pp_size *
-                original_tp_size,  # DP groups as separate PP groups
-                cp_size=1,
-                rank=self.mapping.rank,  # Use actual world rank
-                gpus_per_node=self.mapping.gpus_per_node,
-                enable_attention_dp=self.mapping.enable_attention_dp,
-            )
-        else:
-            mapping_o = Mapping(
-                world_size=tp_size * pp_size * cp_size,
-                tp_size=tp_size * cp_size,
-                pp_size=pp_size,
-                cp_size=1,
-                rank=self.mapping.rank,
-                gpus_per_node=self.mapping.gpus_per_node,
-                enable_attention_dp=self.mapping.enable_attention_dp,
-            )
+        mapping_o = Mapping(
+            world_size=pp_size * dp_size * tp_size * cp_size,
+            tp_size=tp_size * cp_size,
+            pp_size=pp_size * dp_size,
+            cp_size=1,
+            rank=self.mapping.rank,
+            gpus_per_node=self.mapping.gpus_per_node,
+            enable_attention_dp=self.mapping.enable_attention_dp,
+        )
         self.o_proj = Linear(
             self.num_key_value_heads * self.v_head_dim,
             self.hidden_size,
