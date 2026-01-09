@@ -1,0 +1,8 @@
+Generate text with guided decoding
+==================================
+Source https://github.com/NVIDIA/TensorRT-LLM/blob/a30d3b7419840e185070b05f67f3d76a2f54c894/examples/llm-api/llm_guided_decoding.py.
+
+.. literalinclude:: ../../../examples/llm-api/llm_guided_decoding.py
+    :lines: 4-47
+    :language: python
+    :linenos:
