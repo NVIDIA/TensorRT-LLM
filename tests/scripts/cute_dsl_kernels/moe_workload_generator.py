@@ -1,4 +1,3 @@
-import functools
 import json
 import os
 
@@ -6,12 +5,21 @@ import click
 import safetensors.torch
 import torch
 
-from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import GroupedGemmInputsHelper
-from tensorrt_llm.tools.layer_wise_benchmarks.runner_utils import get_balanced_selection_no_cache
+from tensorrt_llm.tools.layer_wise_benchmarks.runner_utils import (
+    get_balanced_selection_impl_default,
+    get_balanced_selection_impl_random,
+)
 
 
-def get_balanced_selection_no_cache_legacy(
-    num_tokens, top_k, num_experts, dtype, device, dp_size, dp_rank, ep_size
+def get_balanced_selection_impl_default_legacy(
+    num_tokens: int,
+    top_k: int,
+    num_experts: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    dp_size: int,
+    dp_rank: int,
+    ep_size: int,
 ):
     world_size = ep_size
     rank = dp_rank
@@ -34,17 +42,23 @@ def get_balanced_selection_no_cache_legacy(
     return token_selected_experts.contiguous().to(dtype=dtype, device=device)
 
 
-def gen_moe_workload_layer_wise_benchmark(
+def gen_moe_workload(
     num_tokens: int,
     top_k: int,
     num_experts: int,
     ep_size: int,
     tile_size: int,
-    legacy: bool = False,
+    method: str = "balanced_random",
 ):
-    get_balanced_selection_impl = (
-        get_balanced_selection_no_cache_legacy if legacy else get_balanced_selection_no_cache
-    )
+    if method == "balanced_random":
+        get_balanced_selection_impl = get_balanced_selection_impl_random
+    elif method == "balanced_default":
+        get_balanced_selection_impl = get_balanced_selection_impl_default
+    elif method == "balanced_default_legacy":
+        get_balanced_selection_impl = get_balanced_selection_impl_default_legacy
+    else:
+        raise ValueError(f"Invalid method: {method}.")
+
     token_selected_experts = [
         get_balanced_selection_impl(
             num_tokens=num_tokens,
@@ -59,6 +73,7 @@ def gen_moe_workload_layer_wise_benchmark(
         for i in range(ep_size)
     ]
     token_selected_experts = torch.cat(token_selected_experts, dim=0)
+    assert token_selected_experts.size() == (num_tokens * ep_size, top_k)
     token_final_scales = torch.ones_like(token_selected_experts, dtype=torch.float32)
     return torch.ops.trtllm.moe_sort(
         token_selected_experts=token_selected_experts,
@@ -71,31 +86,6 @@ def gen_moe_workload_layer_wise_benchmark(
     )
 
 
-def gen_moe_workload_balanced_random(
-    num_tokens: int, top_k: int, num_experts: int, ep_size: int, tile_size: int
-):
-    num_local_experts = num_experts // ep_size
-    num_total_tokens = num_tokens * ep_size
-    helper = GroupedGemmInputsHelper(num_experts, top_k, num_local_experts, 0, tile_size)
-    num_tokens_per_expert = helper.generate_num_tokens_per_expert(num_total_tokens)
-    assert sum(num_tokens_per_expert) == num_total_tokens * top_k // ep_size
-    token_selected_experts = helper.generate_token_selected_experts(
-        num_total_tokens, num_tokens_per_expert
-    )
-
-    token_selected_experts = token_selected_experts.cuda()
-    token_final_scales = torch.ones_like(token_selected_experts, dtype=torch.float32)
-    return torch.ops.trtllm.moe_sort(
-        token_selected_experts=token_selected_experts,
-        token_final_scales=token_final_scales,
-        num_experts=num_experts,
-        top_k=top_k,
-        local_expert_offset=0,
-        local_num_experts=num_local_experts,
-        tile_tokens_dim=tile_size,
-    )
-
-
 @click.command("moe_workload_generator")
 @click.option("--num_tokens", type=int, default=128)
 @click.option("--top_k", type=int, default=8)
@@ -104,9 +94,7 @@ def gen_moe_workload_balanced_random(
 @click.option("--tile_size", type=click.Choice([128, 256]), default=128)
 @click.option(
     "--method",
-    type=click.Choice(
-        ["balanced_random", "balanced_layer_wise_benchmark", "balanced_layer_wise_benchmark_legacy"]
-    ),
+    type=click.Choice(["balanced_random", "balanced_default", "balanced_default_legacy"]),
     default="balanced_random",
 )
 @click.option("--seed", type=int, default=515)
@@ -123,15 +111,6 @@ def main(
 ):
     torch.manual_seed(seed)
 
-    if method == "balanced_random":
-        generator = gen_moe_workload_balanced_random
-    elif method == "balanced_layer_wise_benchmark":
-        generator = gen_moe_workload_layer_wise_benchmark
-    elif method == "balanced_layer_wise_benchmark_legacy":
-        generator = functools.partial(gen_moe_workload_layer_wise_benchmark, legacy=True)
-    else:
-        raise ValueError(f"Invalid method: {method}.")
-
     (
         tile_idx_to_group_idx,
         tile_idx_to_mn_limit,
@@ -139,12 +118,13 @@ def main(
         permuted_idx_to_expanded_idx,
         total_num_padded_tokens,
         num_non_exiting_tiles,
-    ) = generator(
+    ) = gen_moe_workload(
         num_tokens=num_tokens,
         top_k=top_k,
         num_experts=num_experts,
         ep_size=ep_size,
         tile_size=tile_size,
+        method=method,
     )
 
     if not os.path.isdir(output_path):
