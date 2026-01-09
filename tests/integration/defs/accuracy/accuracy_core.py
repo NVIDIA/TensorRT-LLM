@@ -402,8 +402,6 @@ class MMMU(AccuracyTask):
                             is_multimodal=True,
                             apply_chat_template=True)
 
-    EVALUATE_KWARGS = dict(model_type=None, is_force_single_image=False)
-
 
 class PassKeyRetrieval64k(AccuracyTask):
     DATASET = "passkey_retrieval_64k"

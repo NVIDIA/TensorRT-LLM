@@ -19,8 +19,7 @@ mpirun -n 1 --allow-run-as-root --oversubscribe python3 examples/llm-api/quickst
     --max_tokens 100 \
     --checkpoint_format mistral \
     --model_type mistral_large_3 \
-    --moe_backend TRTLLM \
-    --image_format pil
+    --moe_backend TRTLLM
 ```
 
 ## LLM-only run

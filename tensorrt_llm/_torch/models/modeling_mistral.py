@@ -46,7 +46,6 @@ from tensorrt_llm.inputs import (BaseMultimodalDummyInputsBuilder,
                                  MultimodalPlaceholderPlacement, TextPrompt,
                                  register_input_processor)
 from tensorrt_llm.inputs.multimodal import MultimodalParams
-from tensorrt_llm.inputs.utils import encode_base64_image
 from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.logger import logger
 
@@ -59,28 +58,16 @@ class MistralAttention(Attention):
         layer_idx: int | None = None,
     ):
         config = model_config.pretrained_config
-        rope_params = RopeParams.from_config(config)
-        rope_params_section = getattr(config, "rope_scaling", None) or getattr(
-            config, "rope_parameters", None)
-        rope_type = getattr(rope_params_section, "rope_type", None)
-        if rope_type == "yarn":
-            pos_embd_params = PositionalEmbeddingParams(
-                type=PositionEmbeddingType.yarn,
-                rope=rope_params,
-                is_neox=False)
-        else:
-            pos_embd_params = PositionalEmbeddingParams(
-                type=PositionEmbeddingType.rope_gpt_neox,
-                rope=rope_params,
-            )
-
         super().__init__(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
             num_key_value_heads=config.num_key_value_heads,
             max_position_embeddings=config.max_position_embeddings,
             bias=False,
-            pos_embd_params=pos_embd_params,
+            pos_embd_params=PositionalEmbeddingParams(
+                type=PositionEmbeddingType.rope_gpt_neox,
+                rope=RopeParams.from_config(config),
+            ),
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             config=model_config,
@@ -279,18 +266,20 @@ class MistralCommonImageProcessor:
         }
 
     def get_num_tokens_per_image(self, image_sizes):
+        # FIXME avoid double loading with custom loader
         h, w = image_sizes
         ncols, nrows = self.image_processor._image_to_num_tokens(
             Image.new("RGB", (w, h)))
         return ncols * nrows + nrows
 
-    def __call__(self, text, images, **kwargs):
-        mm_items = []
-        if images:
-            mm_items = [{
-                "type": "image",
-                "base64": encode_base64_image(image)
-            } for image in images]
+    def __call__(self, text, images, media, **kwargs):
+        assert media is not None
+        if isinstance(media, str):
+            media = [media]
+
+        mm_items = [{"type": "image_url", "image_url": url} for url in media]
+
+        logger.debug(f"text: {text}")
 
         conversation = [{
             "role": "user",
@@ -303,20 +292,19 @@ class MistralCommonImageProcessor:
         encoded = self.tokenizer.transformers_tokenizer.apply_chat_template(
             conversation, tokenize=True, return_dict=True, return_tensors='pt')
 
+        logger.debug(
+            f"encoded.pixel_values.shape: {encoded.pixel_values.shape}, encoded.input_ids: {encoded.input_ids[0][-20:]}"
+        )
+        logger.debug(
+            f"encoded.input_ids list: {self.tokenizer.transformers_tokenizer.apply_chat_template(conversation)}"
+        )
+
         processed = {
             "input_ids": encoded.input_ids,
+            "pixel_values": encoded.pixel_values.to(self.dtype),
+            "attention_mask": encoded.attention_mask,
+            "image_sizes": torch.tensor([encoded.pixel_values.shape[2:]])
         }
-
-        # text-only mode for VLM
-        if "pixel_values" in encoded:
-            processed.update({
-                "pixel_values":
-                encoded.pixel_values.to(self.dtype),
-                "attention_mask":
-                encoded.attention_mask,
-                "image_sizes":
-                torch.tensor([encoded.pixel_values.shape[2:]])
-            })
         return processed
 
 
@@ -388,6 +376,7 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], ExtraProcessedInputs | None]:
         images = inputs.get("multi_modal_data", {}).get("image")
+        mm_processor_kwargs = inputs.get("mm_processor_kwargs", {})
         do_rescale = getattr(self.processor.image_processor, "do_rescale",
                              False)
         if images is not None and isinstance(images[0], torch.Tensor):
@@ -395,15 +384,18 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
             # format is "pt" (pytorch tensors), but not for "pil" (PIL images).
             do_rescale = False
 
-        if images is not None:
+        if mm_processor_kwargs:
+            # Currently, we only support image modality in MistralCommonImageProcessor.
             processed = self.processor(
                 text=inputs["prompt"],
                 images=images,
                 do_rescale=do_rescale,
+                **mm_processor_kwargs,
             )
         else:
             processed = self.text_processor(
                 text=inputs["prompt"],
+                images=images,
                 do_rescale=do_rescale,
             )
         input_ids = processed.pop("input_ids").tolist()[0]

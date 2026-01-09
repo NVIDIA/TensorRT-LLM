@@ -47,7 +47,7 @@ class MLPForExport(ModuleForExport):
         return torch.randn(2, 10)
 
     def get_dynamic_shapes(self):
-        return {0: Dim.DYNAMIC}
+        return {0: Dim("batch_size", max=100)}
 
 
 class MLPDuplicate(ModuleForExport):
@@ -72,7 +72,7 @@ class MLPDuplicate(ModuleForExport):
         return {"fc3.weight"}
 
     def get_dynamic_shapes(self):
-        return {0: Dim.DYNAMIC}
+        return {0: Dim("batch_size", max=100)}
 
 
 class ModuleWithWhere(ModuleForExport):
@@ -90,7 +90,7 @@ class ModuleWithWhere(ModuleForExport):
         return torch.randn(2, 10)
 
     def get_dynamic_shapes(self):
-        return {0: Dim.DYNAMIC}
+        return {0: Dim("batch_size", max=100)}
 
     def check_xfail(self, f_export, use_dynamic_shape, device) -> bool:
         return (
@@ -129,7 +129,7 @@ class ModuleWithRouting(ModuleForExport):
         return torch.randn(self.seq_len, self.num_experts)
 
     def get_dynamic_shapes(self):
-        return {0: Dim.DYNAMIC}
+        return {0: Dim("seq_len", max=100)}
 
     def check_xfail(self, f_export, use_dynamic_shape, device) -> bool:
         return (
@@ -153,7 +153,7 @@ class ModuleWithModuleList(ModuleForExport):
         return torch.randn(2, 10, device=self.fcs[0].weight.device)
 
     def get_dynamic_shapes(self):
-        return {0: Dim.DYNAMIC}
+        return {0: Dim("batch_size", max=100)}
 
     def check_xfail(self, f_export, use_dynamic_shape, device) -> bool:
         # non-strict mode only works with our hack in torch_export_to_gm

@@ -113,6 +113,11 @@ class NemotronHMamba2Mixer(nn.Module):
         A = torch.arange(1, self.num_heads + 1)
         self.A_log = nn.Parameter(torch.log(A))
         self.A_log._no_weight_decay = True
+        # Instead of recomputing `torch.exp(self.A_log.float())` on every forward pass, we will register a hook
+        # that sets this appropriately when loading weights.
+        # NOTE: we explicitly register this as a non-persistent buffer so that it does not appear in the state dict of
+        # this module, or an equivalent graph module trace from it, but still gets included in e.g. `to()` calls.
+        self.register_buffer("_minus_A", -A.float(), persistent=False)
         self.norm = MambaRMSNormGated(
             self.intermediate_size,
             eps=self.layer_norm_epsilon,
@@ -123,6 +128,8 @@ class NemotronHMamba2Mixer(nn.Module):
 
         self.out_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.use_bias)
         self.use_bias = config.use_bias
+
+        self.register_load_state_dict_post_hook(self._load_state_dict_post_hook)
 
     def torch_forward(self, input_states):
         batch_size, seq_len, _ = input_states.shape
@@ -159,7 +166,7 @@ class NemotronHMamba2Mixer(nn.Module):
         )
 
         # 3. SSM transformation
-        A = -torch.exp(self.A_log.float())
+        A = self._minus_A
         y = torch.ops.auto_deploy.torch_ssm(
             hidden_states=hidden_states.view(batch_size, seq_len, -1, self.head_dim),
             A=A,
@@ -185,6 +192,10 @@ class NemotronHMamba2Mixer(nn.Module):
 
     def forward(self, hidden_states):
         return self.torch_forward(hidden_states)
+
+    @staticmethod
+    def _load_state_dict_post_hook(module, incompatible_keys) -> None:
+        module._minus_A.data = -torch.exp(module.A_log.float())
 
 
 class NemotronHRMSNorm(nn.Module):

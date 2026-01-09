@@ -52,9 +52,7 @@ class LmEvalWrapper(TemplateLM):
                  llm: Union[LLM, PyTorchLLM],
                  sampling_params: Optional[SamplingParams] = None,
                  streaming: bool = False,
-                 chat_template_kwargs: Optional[dict[str, Any]] = None,
-                 model_type: str | None = None,
-                 is_force_single_image: bool = False):
+                 chat_template_kwargs: Optional[dict[str, Any]] = None):
         super().__init__()
         self.llm = llm
         self.sampling_params = sampling_params
@@ -165,9 +163,7 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
                  sampling_params: Optional[SamplingParams] = None,
                  streaming: bool = False,
                  max_images: int = 999,
-                 chat_template_kwargs: Optional[dict[str, Any]] = None,
-                 model_type: str | None = None,
-                 is_force_single_image: bool = False):
+                 chat_template_kwargs: Optional[dict[str, Any]] = None):
         """
         Initialize the multimodal wrapper.
 
@@ -183,9 +179,7 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
         self.MULTIMODAL = True
         self.max_images = max_images
         self.chat_template_kwargs = chat_template_kwargs
-        self.model_type = model_type if model_type is not None else self._get_model_type(
-            llm)
-        self.is_force_single_image = is_force_single_image
+        self.model_type = self._get_model_type(llm)
 
         # NOTE: In TRT-LLM, currently we do not support interleaved text and image. Instead, we are adding image placeholders at the end of the text or at the beginning of the text.
         # So, until we support interleaved text and image, we set this to False.
@@ -293,14 +287,9 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
             prompt = prompt_inputs(prompt)
 
             # NOTE: Convert RGBA format to RGB format
-            if self.is_force_single_image:
-                # NOTE: This is a workaround to force single image for models which only support single image.
-                images = [convert_image_mode(media_data["visual"][0], "RGB")]
-            else:
-                images = [
-                    convert_image_mode(img, "RGB")
-                    for img in media_data["visual"]
-                ]
+            images = [
+                convert_image_mode(img, "RGB") for img in media_data["visual"]
+            ]
             prompt["multi_modal_data"] = {"image": images}
 
             sampling_params = self._get_sampling_params(gen_kwargs)
@@ -440,18 +429,14 @@ class LmEvalEvaluator(Evaluator):
                  llm: Union[LLM, PyTorchLLM],
                  sampling_params: Optional[SamplingParams] = None,
                  streaming: bool = False,
-                 scores_filter: str = None,
-                 model_type: str = None,
-                 is_force_single_image: bool = False) -> float:
+                 scores_filter: str = None) -> float:
         import lm_eval
         lm_cls = MultimodalLmEvalWrapper if self.MULTIMODAL else LmEvalWrapper
         results = lm_eval.evaluate(
             lm=lm_cls(llm,
                       sampling_params=sampling_params,
                       streaming=streaming,
-                      chat_template_kwargs=self.chat_template_kwargs,
-                      model_type=model_type,
-                      is_force_single_image=is_force_single_image),
+                      chat_template_kwargs=self.chat_template_kwargs),
             task_dict=self.task_dict,
             limit=self.num_samples,
             apply_chat_template=self.apply_chat_template,

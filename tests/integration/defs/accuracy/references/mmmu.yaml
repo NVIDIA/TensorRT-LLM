@@ -25,5 +25,4 @@ microsoft/Phi-4-multimodal-instruct:
 Qwen/Qwen3-VL-30B-A3B-Instruct:
   - accuracy: 55.33
 mistral/Mistral-Large-3-675B:
-# Mistral Large 3 675B only supports single image input, so accuracy is lower.
-  - accuracy: 47
+  - accuracy: 60.00

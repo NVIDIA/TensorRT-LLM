@@ -808,7 +808,7 @@ def getPytestBaseCommandLine(
         portEnvVars,
         pytestUtil,
         "pytest",
-        "-vv",
+        "-v",
         testFilter[(DETAILED_LOG)] ? "-s" : "",
         "--timeout-method=thread",
         "--apply-test-list-correction",

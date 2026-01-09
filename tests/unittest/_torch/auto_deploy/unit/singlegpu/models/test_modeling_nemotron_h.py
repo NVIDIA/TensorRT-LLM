@@ -184,11 +184,12 @@ def test_custom_model_implementation_can_be_exported(
     position_ids = torch.arange(input_ids.shape[1], device=input_ids.device).repeat(
         input_ids.shape[0], 1
     )
-    batch_size_dynamic = Dim.DYNAMIC
-    seq_len_dynamic = Dim.DYNAMIC
     dynamic_shapes = (
-        {0: batch_size_dynamic, 1: seq_len_dynamic},
-        {0: batch_size_dynamic, 1: seq_len_dynamic},
+        {0: Dim("batch_size", min=0, max=8), 1: Dim("seq_len", min=0, max=512)},
+        {
+            0: Dim("batch_size", min=0, max=8),
+            1: Dim("seq_len", min=0, max=512),
+        },
     )
 
     def _run_torch_export_to_gm():
