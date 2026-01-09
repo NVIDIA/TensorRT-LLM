@@ -62,7 +62,7 @@ class TestDisaggBenchmark:
 
     @pytest.mark.perf
     @pytest.mark.parametrize("test_config", PERF_TEST_CASES)
-    def test_benchmark(self, request, test_config: TestConfig):
+    def test_benchmark(self, request, batch_manager, test_config: TestConfig):
         """Performance benchmark test for YAML configurations."""
         full_test_name = request.node.name
 
@@ -101,15 +101,14 @@ class TestDisaggBenchmark:
                 )
                 job_id = EnvManager.get_debug_job_id()
             else:
-                # Submit job using JobManager
-                success, job_id = JobManager.submit_test_job(test_config)
+                # Get job_id from batch manager (auto-submits batch if needed)
+                job_id = batch_manager.get_job_id(test_config)
 
                 # Validate submission result
-                assert success, f"Job submission failed: {test_config.test_id}"
-                assert job_id, "Unable to get job ID"
+                assert job_id, f"Failed to get job_id for {test_config.test_id}"
 
-                # Wait for completion (timeout/early failure handled inside)
-                JobManager.wait_for_completion(job_id, 7200, test_config, check_early_failure=True)
+                # Wait for completion (timeout: 10 hours = 36000 seconds)
+                JobManager.wait_for_completion(job_id, 36000, test_config, check_early_failure=True)
 
             # End tracking test case
             test_tracker.end_test_case()
@@ -136,7 +135,7 @@ class TestDisaggBenchmark:
 
     @pytest.mark.accuracy
     @pytest.mark.parametrize("test_config", ACCURACY_TEST_CASES)
-    def test_accuracy(self, request, test_config: TestConfig):
+    def test_accuracy(self, request, batch_manager, test_config: TestConfig):
         """Accuracy test for YAML configurations."""
         full_test_name = request.node.name
 
@@ -179,15 +178,14 @@ class TestDisaggBenchmark:
                 )
                 job_id = EnvManager.get_debug_job_id()
             else:
-                # Submit job using JobManager
-                success, job_id = JobManager.submit_test_job(test_config)
+                # Get job_id from batch manager (auto-submits batch if needed)
+                job_id = batch_manager.get_job_id(test_config)
 
                 # Validate submission result
-                assert success, f"Job submission failed: {test_config.test_id}"
-                assert job_id, "Unable to get job ID"
+                assert job_id, f"Failed to get job_id for {test_config.test_id}"
 
-                # Wait for completion (timeout/early failure handled inside)
-                JobManager.wait_for_completion(job_id, 10800, test_config, check_early_failure=True)
+                # Wait for completion (timeout: 10 hours = 36000 seconds)
+                JobManager.wait_for_completion(job_id, 36000, test_config, check_early_failure=True)
 
             # End tracking test case
             test_tracker.end_test_case()
@@ -216,7 +214,7 @@ class TestDisaggBenchmark:
 
     @pytest.mark.stress
     @pytest.mark.parametrize("test_config", STRESS_TEST_CASES)
-    def test_stress(self, request, test_config: TestConfig):
+    def test_stress(self, request, batch_manager, test_config: TestConfig):
         """Stress test combining performance benchmarks and accuracy validation.
 
         This test type is designed for stress testing scenarios where both
@@ -265,15 +263,14 @@ class TestDisaggBenchmark:
                 )
                 job_id = EnvManager.get_debug_job_id()
             else:
-                # Submit job using JobManager
-                success, job_id = JobManager.submit_test_job(test_config)
+                # Get job_id from batch manager (auto-submits batch if needed)
+                job_id = batch_manager.get_job_id(test_config)
 
                 # Validate submission result
-                assert success, f"Job submission failed: {test_config.test_id}"
-                assert job_id, "Unable to get job ID"
+                assert job_id, f"Failed to get job_id for {test_config.test_id}"
 
-                # Wait for completion (longer timeout for stress tests: 4 hours)
-                JobManager.wait_for_completion(job_id, 10800, test_config, check_early_failure=True)
+                # Wait for completion (timeout: 10 hours = 36000 seconds)
+                JobManager.wait_for_completion(job_id, 36000, test_config, check_early_failure=True)
 
             # End tracking test case
             test_tracker.end_test_case()
