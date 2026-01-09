@@ -2088,7 +2088,7 @@ def _process_column_sharding(
                 )
         # chunk nodes do not need to be updated
 
-    # Shard intermediate weights (e.g. q_norm, k_norm) for attention layers
+    # Shard intermediate weights (e.g. q/k/v -> q_norm, k_norm ... -> o_proj) for attention layers
     added_nodes += _shard_intermediate_attention_weights(
         layer_subgraph, linear_nodes, transform_container
     )

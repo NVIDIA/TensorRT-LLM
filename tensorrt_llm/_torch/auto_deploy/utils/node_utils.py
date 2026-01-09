@@ -730,7 +730,6 @@ def subgraph(
             subgraph_nodes.append(node)
 
         # Stop traversal at boundary - don't explore their predecessors
-        # print(f"node: {node.name}, boundary_condition: {boundary_condition(node)}, start_nodes: {start_nodes}")
         if boundary_condition(node) and node not in start_nodes:
             continue
 
