@@ -2,6 +2,7 @@
 
 from collections import defaultdict
 from contextlib import nullcontext
+from enum import unique
 from functools import partial
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -218,6 +219,41 @@ def _clean_up_assertions_and_guards(gm: fx.GraphModule):
         canonicalize_graph(gm)
 
 
+def _rename_nodes_with_module_hierarchy(gm: fx.GraphModule) -> None:
+    """Rename call_function nodes to reflect their module hierarchy.
+
+    Uses nn_module_stack metadata to build hierarchical names like:
+    'model_layers_0_self_attn_simple' instead of 'torch_linear_simple_2'
+    """
+    graph = gm.graph
+
+    for node in graph.nodes:
+        if node.op != "call_function":
+            continue
+
+        nn_stack = node.meta.get("nn_module_stack")
+        if not nn_stack:
+            continue
+
+        # Get innermost module path from the stack
+        # nn_module_stack is dict: {key: (module_path, module_class), ...}
+        # We want the module_path (first element of value tuple) from the innermost entry
+        module_path = list(nn_stack.values())[-1][0] if nn_stack else ""
+        # Skip nodes with empty module path (e.g., root level) or _WrapperModule context
+        if not module_path or "_WrapperModule" in str(nn_stack):
+            continue
+
+        # Get op name from target
+        target = node.target
+        if hasattr(target, "__name__"):
+            op_name = target.__name__
+        elif hasattr(target, "_name"):
+            op_name = target._name
+        else:
+            op_name = str(target).split(".")[-1]
+        unique_name = graph._graph_namespace.create_name(op_name, node)
+        node.name = f"{module_path}_{unique_name}".replace('.', '_')
+
 def run_forward_for_capture(
     model: nn.Module,
     capture_fn: Optional[Callable[..., nn.Module]] = None,
@@ -337,6 +373,9 @@ def torch_export_to_gm(
 
     # clean up checks --> generally the sanity checks are overly conservative and we can remove them
     _clean_up_assertions_and_guards(egm)
+
+    # Rename nodes to reflect module hierarchy
+    _rename_nodes_with_module_hierarchy(egm)
 
     # show exported graph
     ad_logger.debug("exported graph: " + str(egm))
