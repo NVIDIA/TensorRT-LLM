@@ -27,7 +27,7 @@ echo ""
 if [ -f "$PID_FILE" ]; then
     PYTEST_PID=$(cat "$PID_FILE" | tr -d '\n')
     echo "Pytest PID: $PYTEST_PID"
-    
+
     # Check if pytest is still running
     if kill -0 "$PYTEST_PID" 2>/dev/null; then
         echo "Status: Still running"
@@ -73,7 +73,7 @@ echo "Cancelling jobs..."
 while IFS= read -r job_id; do
     if [ -n "$job_id" ]; then
         printf "  %-12s ... " "$job_id"
-        
+
         # Try to cancel the job
         if scancel "$job_id" 2>/dev/null; then
             echo "[OK] Cancelled"

@@ -80,7 +80,7 @@ class SessionTracker:
         Submits the job and waits for completion using JobManager.
         """
         from utils.job_tracker import JobTracker
-        
+
         self.end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         logger.info(f"Session ended: {self.end_time}")
 
