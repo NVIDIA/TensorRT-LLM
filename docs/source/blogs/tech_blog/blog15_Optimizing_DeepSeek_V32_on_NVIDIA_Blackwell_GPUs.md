@@ -38,7 +38,7 @@ The open-sourced [DeepSeek-V3.2](https://api-docs.deepseek.com/news/news251201) 
 ## DeepSeek Sparse Attention (DSA)
 <div align="center">
 <figure>
-  <img src="https://github.com/lfr-0531/TensorRT-LLM/raw/user/fanrongl/ds32_tech_blog_preview/docs/source/blogs/media/tech_blog15_dsa_architecture.png" alt="tech_blog15_dsa_architecture" width="700" height="auto">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog15_dsa_architecture.png" alt="tech_blog15_dsa_architecture" width="700" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 1. The architecture of DSA. The green part illustrates how DSA selects the Top-K key-value entries according to the indexer.</em></sub></p>
@@ -49,7 +49,7 @@ Figure 1 illustrates the overall architecture: a lightning indexer first determi
 
 <div align="center">
 <figure>
-  <img src="https://github.com/lfr-0531/TensorRT-LLM/raw/user/fanrongl/ds32_tech_blog_preview/docs/source/blogs/media/tech_blog15_indexer_topk.png" alt="tech_blog15_indexer_topk" width="900" height="auto">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog15_indexer_topk.png" alt="tech_blog15_indexer_topk" width="900" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 2. The architecture of the DSA indexer and Top-K logics.</em></sub></p>
@@ -163,7 +163,7 @@ So we decided to use the non‑DE parallel Top‑K algorithm for DeepSeek V3.2.
 ##### Radix-select-based Top-K Parallel Algorithm
 <div align="center">
 <figure>
-  <img src="https://github.com/lfr-0531/TensorRT-LLM/raw/user/fanrongl/ds32_tech_blog_preview/docs/source/blogs/media/tech_blog15_radix_select_topk.png" alt="tech_blog15_radix_select_topk" width="1280" height="auto">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog15_radix_select_topk.png" alt="tech_blog15_radix_select_topk" width="1280" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 3. Radix-select-based Top-K.</em></sub></p>
@@ -401,7 +401,7 @@ To validate the efficacy of Wide-EP on DeepSeek-V3.2, we evaluated performance u
 
 <div align="center">
 <figure>
-  <img src="https://github.com/lfr-0531/TensorRT-LLM/raw/user/fanrongl/ds32_tech_blog_preview/docs/source/blogs/media/tech_blog15_ds32_wide_ep.png" alt="tech_blog15_ds32_wide_ep" width="700" height="auto">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog15_ds32_wide_ep.png" alt="tech_blog15_ds32_wide_ep" width="700" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 4. DeepSeek-V3.2 throughput on ISL/OSL 8k/1k. Note that the numbers were collected on November 20th, and more optimizations are still on-going.</em></sub></p>
