@@ -78,25 +78,9 @@ def gen_moe_workload_balanced_random(
     num_total_tokens = num_tokens * ep_size
     helper = GroupedGemmInputsHelper(num_experts, top_k, num_local_experts, 0, tile_size)
     num_tokens_per_expert = helper.generate_num_tokens_per_expert(num_total_tokens)
-    if sum(num_tokens_per_expert) != num_total_tokens * top_k:
-        num_tokens_per_expert[0] -= 1
     assert sum(num_tokens_per_expert) == num_total_tokens * top_k // ep_size
-
-    token_expert_selection = torch.zeros(num_total_tokens, num_local_experts, dtype=torch.int32)
-    token_selected_experts = -torch.ones(num_total_tokens, top_k, dtype=torch.int32)
-    for j, curr_num_tokens in enumerate(num_tokens_per_expert):
-        curr_num_selected_tokens = 0
-        for i in torch.randperm(num_total_tokens).tolist():
-            if (curr_num_selected_experts := token_expert_selection[i].sum()) < top_k:
-                token_selected_experts[i, curr_num_selected_experts] = j
-                token_expert_selection[i, j] = 1
-                curr_num_selected_tokens += 1
-                if curr_num_selected_tokens >= curr_num_tokens:
-                    break
-    assert (
-        ((token_selected_experts >= 0).sum(dim=-1) == token_expert_selection.sum(dim=-1))
-        .all()
-        .item()
+    token_selected_experts = helper.generate_token_selected_experts(
+        num_total_tokens, num_tokens_per_expert
     )
 
     token_selected_experts = token_selected_experts.cuda()

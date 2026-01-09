@@ -1,4 +1,5 @@
 import itertools
+import math
 from typing import List, Optional, Tuple
 
 import torch
@@ -31,13 +32,19 @@ class GroupedGemmInputsHelper:
     IDX_A = 0
     IDX_SHAPE_INFER = IDX_A  # Default: use a tensor for shape inference
 
-    def __init__(self, num_experts: int, top_k: int, num_local_experts: int,
-                 local_expert_offset: int, tile_size: int):
+    def __init__(self,
+                 num_experts: int,
+                 top_k: int,
+                 num_local_experts: int,
+                 local_expert_offset: int,
+                 tile_size: int,
+                 seed: int = 515):
         self.num_experts = num_experts
         self.top_k = top_k
         self.num_local_experts = num_local_experts
         self.local_expert_offset = local_expert_offset
         self.tile_size = tile_size
+        self.seed = seed
         # Padding values should never be accessed.
         # Intentionally use a large padding value to expose issues early.
         self.pad_val = int(2e9)
@@ -88,73 +95,82 @@ class GroupedGemmInputsHelper:
         num_tokens_per_expert = []
         for i in range(self.num_local_experts):
             balance += average_num_tokens_per_expert
-            if balance <= 1e-3:
+            if balance <= 0:
                 continue
-            curr_num_tokens = int(balance) + 1
+            curr_num_tokens = math.ceil(balance)
             num_tokens_per_expert.append(curr_num_tokens)
             balance -= curr_num_tokens
         return num_tokens_per_expert
 
-    def generate_tile_idx_to_group_idx(
-            self, num_tokens_per_expert: List[int]) -> List[int]:
-        tile_idx_to_group_idx = []
-        for i, curr_num_tokens in enumerate(num_tokens_per_expert):
-            curr_num_tiles = (curr_num_tokens + self.tile_size -
-                              1) // self.tile_size
-            tile_idx_to_group_idx.extend([i] * curr_num_tiles)
-        return tile_idx_to_group_idx
-
-    def generate_tile_idx_to_mn_limit(
-            self, num_tokens_per_expert: List[int]) -> List[int]:
-        tile_idx_to_mn_limit = []
-        for i, curr_num_tokens in enumerate(num_tokens_per_expert):
-            curr_num_tiles = (curr_num_tokens + self.tile_size -
-                              1) // self.tile_size
-            prev_mn_limit = len(tile_idx_to_mn_limit) * self.tile_size
-            for j in range(curr_num_tiles):
-                tile_idx_to_mn_limit.append(prev_mn_limit + min(
-                    (j + 1) * self.tile_size, curr_num_tokens))
-        return tile_idx_to_mn_limit
-
-    def generate_permuted_idx_to_expanded_idx(
+    def generate_token_selected_experts(
             self, num_tokens: int,
-            num_tokens_per_expert: List[int]) -> List[int]:
-        permuted_idx_to_expanded_idx = []
-        colmajor_expanded_idx = 0
-        for i, curr_num_tokens in enumerate(num_tokens_per_expert):
-            curr_num_tiles = (curr_num_tokens + self.tile_size -
-                              1) // self.tile_size
-            for j in range(curr_num_tiles * self.tile_size):
-                if j < curr_num_tokens:
-                    token_idx = colmajor_expanded_idx % num_tokens
-                    topk_idx = colmajor_expanded_idx // num_tokens
-                    expanded_idx = token_idx * self.top_k + topk_idx
-                    permuted_idx_to_expanded_idx.append(expanded_idx)
-                    colmajor_expanded_idx += 1
-                else:
-                    permuted_idx_to_expanded_idx.append(self.pad_val)
-        return permuted_idx_to_expanded_idx
+            num_tokens_per_expert: List[int]) -> torch.Tensor:
+        """Balanced random based on rejection sampling.
+        """
+        token_selected_experts = -torch.ones(
+            num_tokens, self.top_k, dtype=torch.int32)
+        num_selected_experts = torch.zeros(num_tokens, dtype=torch.int32)
+
+        with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+            torch.manual_seed(self.seed)
+            selection_orders = [
+                torch.randperm(num_tokens)
+                for _ in range(self.num_local_experts)
+            ]
+
+        for j, num_tokens_j in enumerate(num_tokens_per_expert):
+            selection_order_j = selection_orders[j].tolist()
+            prioritized = torch.nonzero(num_selected_experts <= (
+                self.top_k -
+                (self.num_local_experts - j))).squeeze(-1).tolist()
+            if len(prioritized) > 0:
+                selection_order_j = prioritized + [
+                    i for i in selection_order_j if i not in prioritized
+                ]
+            for i in selection_order_j:
+                if num_selected_experts[i] < self.top_k:
+                    token_selected_experts[
+                        i,
+                        num_selected_experts[i]] = j + self.local_expert_offset
+                    num_selected_experts[i] += 1
+                    num_tokens_j -= 1
+                    if num_tokens_j <= 0:
+                        break
+
+        assert ((token_selected_experts
+                 >= 0).sum(dim=-1) == num_selected_experts).all().item()
+        if self.num_local_experts == self.num_experts:
+            assert (num_selected_experts == self.top_k).all().item()
+        else:
+            assert (num_selected_experts <= self.top_k).all().item()
+        return token_selected_experts
 
     def inputs_pre_hook(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
         a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx, num_non_exiting_tiles, *others = inputs
         num_tokens = self.infer_num_tokens(a.size(0))
         num_tokens_per_expert = self.generate_num_tokens_per_expert(num_tokens)
-        tile_idx_to_group_idx_list = self.generate_tile_idx_to_group_idx(
-            num_tokens_per_expert)
-        num_non_exiting_tiles_val = len(tile_idx_to_group_idx_list)
-        num_padding_tiles_val = tile_idx_to_group_idx.size(
-            0) - num_non_exiting_tiles_val
-        assert num_non_exiting_tiles_val > 0
-        assert num_padding_tiles_val >= 0
+        token_selected_experts = self.generate_token_selected_experts(
+            num_tokens, num_tokens_per_expert)
 
-        tile_idx_to_group_idx = torch.tensor(
-            tile_idx_to_group_idx_list + [self.pad_val] * num_padding_tiles_val,
-            dtype=tile_idx_to_group_idx.dtype,
-            device=tile_idx_to_group_idx.device)
-        num_non_exiting_tiles = torch.tensor(
-            [num_non_exiting_tiles_val],
-            dtype=num_non_exiting_tiles.dtype,
-            device=num_non_exiting_tiles.device)
+        token_selected_experts = token_selected_experts.cuda()
+        token_final_scales = torch.ones_like(token_selected_experts,
+                                             dtype=torch.float32)
+        (
+            tile_idx_to_group_idx,
+            tile_idx_to_mn_limit,
+            expanded_idx_to_permuted_idx,
+            permuted_idx_to_expanded_idx,
+            total_num_padded_tokens,
+            num_non_exiting_tiles,
+        ) = torch.ops.trtllm.moe_sort(
+            token_selected_experts=token_selected_experts,
+            token_final_scales=token_final_scales,
+            num_experts=self.num_experts,
+            top_k=self.top_k,
+            local_expert_offset=self.local_expert_offset,
+            local_num_experts=self.num_local_experts,
+            tile_tokens_dim=self.tile_size,
+        )
         return a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx, num_non_exiting_tiles, *others
 
     def inputs_pre_hook_finalize_fusion(
@@ -162,38 +178,28 @@ class GroupedGemmInputsHelper:
         a, b, a_sf, b_sf, alpha, output, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales = inputs
         num_tokens = self.infer_num_tokens(a.size(0))
         num_tokens_per_expert = self.generate_num_tokens_per_expert(num_tokens)
-        tile_idx_to_group_idx_list = self.generate_tile_idx_to_group_idx(
-            num_tokens_per_expert)
-        tile_idx_to_mn_limit_list = self.generate_tile_idx_to_mn_limit(
-            num_tokens_per_expert)
-        permuted_idx_to_expanded_idx_list = self.generate_permuted_idx_to_expanded_idx(
+        token_selected_experts = self.generate_token_selected_experts(
             num_tokens, num_tokens_per_expert)
-        num_non_exiting_tiles_val = len(tile_idx_to_group_idx_list)
-        num_padding_tiles_val = tile_idx_to_group_idx.size(
-            0) - num_non_exiting_tiles_val
-        assert num_non_exiting_tiles_val > 0
-        assert num_padding_tiles_val >= 0
-        assert len(tile_idx_to_mn_limit_list) == num_non_exiting_tiles_val
-        assert len(permuted_idx_to_expanded_idx_list
-                   ) == num_non_exiting_tiles_val * self.tile_size
 
-        tile_idx_to_group_idx = torch.tensor(
-            tile_idx_to_group_idx_list + [self.pad_val] * num_padding_tiles_val,
-            dtype=tile_idx_to_group_idx.dtype,
-            device=tile_idx_to_group_idx.device)
-        tile_idx_to_mn_limit = torch.tensor(
-            tile_idx_to_mn_limit_list + [self.pad_val] * num_padding_tiles_val,
-            dtype=tile_idx_to_mn_limit.dtype,
-            device=tile_idx_to_mn_limit.device)
-        permuted_idx_to_expanded_idx = torch.tensor(
-            permuted_idx_to_expanded_idx_list + [self.pad_val] *
-            (num_padding_tiles_val * self.tile_size),
-            dtype=permuted_idx_to_expanded_idx.dtype,
-            device=permuted_idx_to_expanded_idx.device)
-        num_non_exiting_tiles = torch.tensor(
-            [num_non_exiting_tiles_val],
-            dtype=num_non_exiting_tiles.dtype,
-            device=num_non_exiting_tiles.device)
+        token_selected_experts = token_selected_experts.cuda()
+        token_final_scales = torch.ones_like(token_selected_experts,
+                                             dtype=torch.float32)
+        (
+            tile_idx_to_group_idx,
+            tile_idx_to_mn_limit,
+            expanded_idx_to_permuted_idx,
+            permuted_idx_to_expanded_idx,
+            total_num_padded_tokens,
+            num_non_exiting_tiles,
+        ) = torch.ops.trtllm.moe_sort(
+            token_selected_experts=token_selected_experts,
+            token_final_scales=token_final_scales,
+            num_experts=self.num_experts,
+            top_k=self.top_k,
+            local_expert_offset=self.local_expert_offset,
+            local_num_experts=self.num_local_experts,
+            tile_tokens_dim=self.tile_size,
+        )
         return a, b, a_sf, b_sf, alpha, output, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales
 
 
@@ -221,44 +227,6 @@ class GatherGroupedGemmInputsHelper(GroupedGemmInputsHelper):
     IDX_PERMUTED_IDX_TO_EXPANDED_IDX = 7
     IDX_SHAPE_INFER = IDX_PERMUTED_IDX_TO_EXPANDED_IDX
 
-    def generate_permuted_idx_to_expanded_idx(
-            self, num_tokens: int, num_tokens_per_expert: List[int],
-            max_num_permuted_tokens: int) -> List[int]:
-        """Generate permuted_idx_to_expanded_idx for gather operation.
-
-        Maps permuted index to expanded index (token_idx * top_k + topk_idx).
-
-        Args:
-            num_tokens: Total number of input tokens
-            num_tokens_per_expert: List of token counts per expert
-            max_num_permuted_tokens: Target size of the output list
-
-        Returns:
-            List of expanded IDs with length = max_num_permuted_tokens,
-            where permuted_idx_to_expanded_idx[permuted_idx] = expanded_idx
-            Padding tokens are marked with pad_val
-            Note: In kernel, use expanded_idx // top_k to get original token_idx
-        """
-        permuted_idx_to_expanded_idx = []
-        colmajor_expanded_idx = 0
-        for i, curr_num_tokens in enumerate(num_tokens_per_expert):
-            curr_num_tiles = (curr_num_tokens + self.tile_size -
-                              1) // self.tile_size
-            for j in range(curr_num_tiles * self.tile_size):
-                if j < curr_num_tokens:
-                    token_idx = colmajor_expanded_idx % num_tokens
-                    topk_idx = colmajor_expanded_idx // num_tokens
-                    expanded_idx = token_idx * self.top_k + topk_idx
-                    permuted_idx_to_expanded_idx.append(expanded_idx)
-                    colmajor_expanded_idx += 1
-                else:
-                    permuted_idx_to_expanded_idx.append(
-                        self.pad_val)  # Padding token
-        # Pad to max_num_permuted_tokens
-        while len(permuted_idx_to_expanded_idx) < max_num_permuted_tokens:
-            permuted_idx_to_expanded_idx.append(self.pad_val)
-        return permuted_idx_to_expanded_idx
-
     def inputs_pre_hook(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
         """Pre-hook for gather-based SwiGLU fusion kernel.
 
@@ -276,39 +244,30 @@ class GatherGroupedGemmInputsHelper(GroupedGemmInputsHelper):
             IDX_PERMUTED_IDX_TO_EXPANDED_IDX] is permuted_idx_to_expanded_idx
 
         max_num_permuted_tokens = permuted_idx_to_expanded_idx.size(0)
-        max_num_tiles = max_num_permuted_tokens // self.tile_size
-
         num_tokens = self.infer_num_tokens(max_num_permuted_tokens)
         num_tokens_per_expert = self.generate_num_tokens_per_expert(num_tokens)
-        tile_idx_to_group_idx_list = self.generate_tile_idx_to_group_idx(
-            num_tokens_per_expert)
-        tile_idx_to_mn_limit_list = self.generate_tile_idx_to_mn_limit(
-            num_tokens_per_expert)
-        permuted_idx_to_expanded_idx_list = self.generate_permuted_idx_to_expanded_idx(
-            num_tokens, num_tokens_per_expert, max_num_permuted_tokens)
-        num_non_exiting_tiles_val = len(tile_idx_to_group_idx_list)
-        num_padding_tiles_val = max_num_tiles - num_non_exiting_tiles_val
-        assert num_non_exiting_tiles_val > 0
-        assert num_padding_tiles_val >= 0
-        assert len(tile_idx_to_mn_limit_list) == num_non_exiting_tiles_val
-        assert len(permuted_idx_to_expanded_idx_list) == max_num_permuted_tokens
+        token_selected_experts = self.generate_token_selected_experts(
+            num_tokens, num_tokens_per_expert)
 
-        tile_idx_to_group_idx = torch.tensor(
-            tile_idx_to_group_idx_list + [self.pad_val] * num_padding_tiles_val,
-            dtype=tile_idx_to_group_idx.dtype,
-            device=tile_idx_to_group_idx.device)
-        tile_idx_to_mn_limit = torch.tensor(
-            tile_idx_to_mn_limit_list + [self.pad_val] * num_padding_tiles_val,
-            dtype=tile_idx_to_mn_limit.dtype,
-            device=tile_idx_to_mn_limit.device)
-        permuted_idx_to_expanded_idx = torch.tensor(
-            permuted_idx_to_expanded_idx_list,
-            dtype=permuted_idx_to_expanded_idx.dtype,
-            device=permuted_idx_to_expanded_idx.device)
-        num_non_exiting_tiles = torch.tensor(
-            [num_non_exiting_tiles_val],
-            dtype=num_non_exiting_tiles.dtype,
-            device=num_non_exiting_tiles.device)
+        token_selected_experts = token_selected_experts.cuda()
+        token_final_scales = torch.ones_like(token_selected_experts,
+                                             dtype=torch.float32)
+        (
+            tile_idx_to_group_idx,
+            tile_idx_to_mn_limit,
+            expanded_idx_to_permuted_idx,
+            permuted_idx_to_expanded_idx,
+            total_num_padded_tokens,
+            num_non_exiting_tiles,
+        ) = torch.ops.trtllm.moe_sort(
+            token_selected_experts=token_selected_experts,
+            token_final_scales=token_final_scales,
+            num_experts=self.num_experts,
+            top_k=self.top_k,
+            local_expert_offset=self.local_expert_offset,
+            local_num_experts=self.num_local_experts,
+            tile_tokens_dim=self.tile_size,
+        )
         return (a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx,
                 tile_idx_to_mn_limit, permuted_idx_to_expanded_idx,
                 num_non_exiting_tiles, global_sf)
