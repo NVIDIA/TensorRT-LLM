@@ -26,6 +26,11 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 
 class RefGatedMLPFusedMoE(nn.Module):
+    """
+    RefGatedMLPFusedMoE serves as a reference implementation with Gated MLPs designed for correctness testing.
+    It utilizes derived classes to provide extensible support for various quantization algorithms.
+    """
+
     def __init__(
         self,
         num_experts: int,
@@ -96,6 +101,11 @@ class RefGatedMLPFusedMoE(nn.Module):
 
 
 class FP8RefGatedMLPFusedMoE(RefGatedMLPFusedMoE):
+    """
+    A derived class of RefGatedMLPFusedMoE serves as a reference implementation of FP8 quantization
+    for correctness testing.
+    """
+
     def __init__(
         self,
         num_experts: int,
@@ -135,6 +145,11 @@ class FP8RefGatedMLPFusedMoE(RefGatedMLPFusedMoE):
 
 
 class NVFP4RefGatedMLPFusedMoE(RefGatedMLPFusedMoE):
+    """
+    A derived class of RefGatedMLPFusedMoE serves as a reference implementation of NVFP4 quantization
+    for correctness testing.
+    """
+
     def __init__(
         self,
         num_experts: int,
@@ -179,6 +194,11 @@ class NVFP4RefGatedMLPFusedMoE(RefGatedMLPFusedMoE):
 
 
 class BaseQuantizeUtil(ABC):
+    """
+    BaseQuantizeUtil serves as a base class for MoE correctess testing which provides interface
+    to create quantized weights and reference modules. It can be extended for different quantization algorithms.
+    """
+
     def __init__(
         self,
         num_experts: int,
@@ -231,6 +251,10 @@ class BaseQuantizeUtil(ABC):
 
 
 class FP8QuantizeUtil(BaseQuantizeUtil):
+    """
+    FP8QuantizeUtil inherits from BaseQuantizeUtil to support correctness testing for FP8 quantized MoE modules.
+    """
+
     def __init__(
         self,
         num_experts: int,
@@ -291,10 +315,17 @@ class FP8QuantizeUtil(BaseQuantizeUtil):
         return weights
 
     def create_ref_module(self, routing_method, ref_cls=FP8RefGatedMLPFusedMoE) -> torch.nn.Module:
+        """
+        Create a reference module for correctness testing.
+        """
         return super().create_ref_module(routing_method, ref_cls)
 
 
 class NVFP4QuantizeUtil(BaseQuantizeUtil):
+    """
+    NVFP4QuantizeUtil inherits from BaseQuantizeUtil to support correctness testing for NVFP4 quantized MoE modules.
+    """
+
     def __init__(
         self,
         num_experts: int,
@@ -392,4 +423,7 @@ class NVFP4QuantizeUtil(BaseQuantizeUtil):
     def create_ref_module(
         self, routing_method, ref_cls=NVFP4RefGatedMLPFusedMoE
     ) -> torch.nn.Module:
+        """
+        Create a reference module for correctness testing.
+        """
         return super().create_ref_module(routing_method, ref_cls)
