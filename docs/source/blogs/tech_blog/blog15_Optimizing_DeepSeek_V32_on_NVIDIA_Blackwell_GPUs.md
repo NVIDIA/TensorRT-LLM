@@ -259,7 +259,7 @@ trtllm-eval --model ${model_path} \
 	--tp_size 8 \
 	--ep_size 8 \
 	--kv_cache_free_gpu_memory_fraction 0.8 \
-	--extra_llm_api_options ./config.yml \
+	--config ./config.yml \
 	--custom_tokenizer deepseek_v32 \
 	mmlu
 ```
@@ -269,7 +269,7 @@ trtllm-eval --model ${model_path} \
 	--tp_size 8 \
 	--ep_size 8 \
 	--kv_cache_free_gpu_memory_fraction 0.8 \
-	--extra_llm_api_options ./config.yml \
+	--config ./config.yml \
 	--custom_tokenizer deepseek_v32 \
 	gsm8k
 ```
@@ -279,7 +279,7 @@ trtllm-eval --model ${model_path} \
 	--tp_size 8 \
 	--ep_size 8 \
 	--kv_cache_free_gpu_memory_fraction 0.8 \
-	--extra_llm_api_options ./config.yml \
+	--config ./config.yml \
 	--custom_tokenizer deepseek_v32 \
 	gpqa_diamond \
 	--apply_chat_template \
@@ -296,7 +296,7 @@ To do the benchmark, run the following command:
 data_path=<your dataset file following the format>
 model_path=<your model path>
  
-cat <<EOF > ./extra-llm-api-config.yml
+cat <<EOF > ./config.yml
 cuda_graph_config:
 	enable_padding: true
 	batch_sizes: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,32,64,128]
@@ -320,7 +320,7 @@ trtllm-bench -m deepseek-ai/DeepSeek-V3.2-Exp \
 	--max_num_tokens 8384 \
 	--kv_cache_free_gpu_mem_fraction 0.8 \
 	--concurrency 1 \
-	--extra_llm_api_options ./extra-llm-api-config.yml \
+	--config ./config.yml \
 	--num_requests 10 \
 	--streaming
 ```
@@ -349,7 +349,7 @@ To do the benchmark, run the following command:
 data_path=<your dataset file following the format>
 model_path=<your model path>
  
-cat <<EOF > ./extra-llm-api-config.yml
+cat <<EOF > ./config.yml
 cuda_graph_config:
 	enable_padding: true
     batch_sizes: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,32,64,128]
@@ -375,7 +375,7 @@ trtllm-bench -m deepseek-ai/DeepSeek-V3.2-Exp \
 	--max_num_tokens 8576 \
 	--kv_cache_free_gpu_mem_fraction 0.8 \
 	--concurrency 256 \
-	--extra_llm_api_options ./extra-llm-api-config.yml \
+	--config ./config.yml \
 	--num_requests 768 \
 	--streaming
 ```
