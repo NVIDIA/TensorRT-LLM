@@ -1912,8 +1912,18 @@ def _shard_intermediate_attention_weights(
     Shard intermediate weights (e.g. q_norm, k_norm) for attention layers.
 
     For attention layers, there may be intermediate weights (like q_norm.weight, k_norm.weight)
-    that operate element-wise on the sharded output of q_proj/k_proj. These need to be sharded
-    along the same dimension.
+    that operate directly on q_proj/k_proj output (before reshaping to [batch, seq, num_heads, head_dim]).
+    These need to be sharded along the same head dimension.
+
+    Example1: - Norm on all heads directly on flattened Q/K output [batch, seq, hidden_size] (e.g. MiniMax):
+        self.q_norm = MiniMaxM2RMSNorm(self.head_dim * config.num_attention_heads, eps=config.rms_norm_eps)
+        weight shape: [num_heads * head_dim]
+        Status: Needs qk norm sharding. (will be handled in this function)
+
+    Example2: - Norm per head after reshaping to [batch, seq, num_heads, head_dim] (e.g. GLM 4.7):
+        self.q_norm = Glm4MoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        weight shape: [head_dim]
+        Status: No need to shard/will be skipped.
 
     Args:
         layer_subgraph: The attention layer subgraph
