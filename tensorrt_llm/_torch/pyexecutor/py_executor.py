@@ -797,7 +797,7 @@ class PyExecutor:
                 if prev_device_step_time is None:
                     prev_device_step_time = "N/A"  # Handle first iteration
                 else:
-                    prev_device_step_time = f"{prev_device_step_time:.3f} ms"
+                    prev_device_step_time = f"{prev_device_step_time} ms"
                 host_step_time = (end_time - start_time) * 1000  # milliseconds
                 formatted_timestamp = datetime.datetime.now().strftime(
                     "%Y-%m-%d %H:%M:%S")
