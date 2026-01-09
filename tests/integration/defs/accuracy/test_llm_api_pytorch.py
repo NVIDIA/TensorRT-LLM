@@ -3220,26 +3220,26 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             long_token_list = self._build_long_sequences(llm, config["target_len"])
 
-            batch_size = 8
+            samples_per_batch = 8  # Number of samples per batch
             sampling_params_greedy = SamplingParams(max_tokens=8)
             sampling_params_sampling = SamplingParams(max_tokens=8, temperature=0.8, top_p=0.95)
 
             max_duration_sec = 1.5 * 3600
-            max_batches = 25
-            min_batches = 8
+            max_batch_count = 25   # Maximum number of batches to run
+            min_batch_count = 8    # Minimum batches before allowing early exit
             start_time = time.time()
             num_samples = len(long_token_list)
 
-            print(f"\n[Stress Test] Starting: max {max_batches} batches or {max_duration_sec/3600:.1f}h")
+            print(f"\n[Stress Test] Starting: max {max_batch_count} batches or {max_duration_sec/3600:.1f}h")
 
-            for batch_idx in range(max_batches):
+            for batch_idx in range(max_batch_count):
                 elapsed = time.time() - start_time
-                if elapsed >= max_duration_sec and batch_idx >= min_batches:
+                if elapsed >= max_duration_sec and batch_idx >= min_batch_count:
                     print(f"[Stress Test] Time limit reached after {batch_idx} batches")
                     break
 
-                start_idx = (batch_idx * batch_size) % num_samples
-                indices = [(start_idx + i) % num_samples for i in range(batch_size)]
+                start_idx = (batch_idx * samples_per_batch) % num_samples
+                indices = [(start_idx + i) % num_samples for i in range(samples_per_batch)]
                 batch_inputs = [long_token_list[i] for i in indices]
 
                 # Greedy generation
