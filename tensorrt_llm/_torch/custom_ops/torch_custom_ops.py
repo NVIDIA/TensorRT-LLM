@@ -1656,9 +1656,11 @@ def _(
 
 class AllReduceRunner(TunableRunner):
     tuning_config = TuningConfig(
-        dynamic_tensor_specs=(DynamicTensorSpec(
-            0, 0, get_last_power_of_2_num_tokens_buckets(8192),
-            last_positive_power_of_2), ),
+        dynamic_tensor_specs=(
+            # TODO: change to dynamic shape triggering
+            DynamicTensorSpec(0, 0,
+                              get_last_power_of_2_num_tokens_buckets(8192),
+                              last_positive_power_of_2), ),
         constraint_specs=(ConstraintSpec(1, 0, lambda shapes: shapes[0][0]), ),
         distributed_tuning_strategy=DistributedTuningStrategy.MERGE,
     )
