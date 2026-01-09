@@ -60,7 +60,7 @@ $$I_{t} = \sum_{j=1}^{h}W_j^I \cdot \text{ReLU}(Q_{t, j}^I (K_t^I)^T)$$
 
 Finally, a Top-K operation is applied to the index scores to identify the most relevant indices, which are subsequently used for the sparse MLA computation. To reduce computational overhead, the K tensor $K_t^I$ is stored in the indexer K cache, allowing for reuse in subsequent iterations.
  
-Regarding implementation, DSA diverges from the MLA used in DeepSeek-V3/R1/V3.1 models, which alternates between MHA mode (prefill) and MQA mode (decoding) as discussed in [Tech Blog 3](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.md). Instead, our current DSA implementation operates only  in MQA mode for both prefill and decoding phases to maximize kernel efficiency. We are continuing to explore further optimizations, including potential support for MHA mode in future iterations.
+Regarding implementation, DSA diverges from the MLA used in DeepSeek-V3/R1/V3.1 models, which alternates between MHA mode (prefill) and MQA mode (decoding) as discussed in [Tech Blog 3](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.md). Instead, our current DSA implementation operates only in MQA mode for both prefill and decoding phases to maximize kernel efficiency. We are continuing to explore further optimizations, including potential support for MHA mode in future iterations.
 
 The DSA implementation is built upon the TensorRT LLM sparse attention framework, which is designed to provide flexible and extensible support for various sparse attention methods. For more information, please refer to the [sparse attention documentation](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/sparse-attention.md), and a technical blog providing further details will be released soon.
 
@@ -87,7 +87,7 @@ We evaluated the accuracy of this NVFP4 checkpoint on the same datasets:
 | [deepseek-ai/DeepSeek-V3.2](https://huggingface.co/deepseek-ai/DeepSeek-V3.2)   | 95.91 | 87.84 | 84.34        |
 | nvidia/DeepSeek-V3.2-NVFP4<sup>*</sup> | 95.26 | 87.54 | 84.85        |
 
-<sub><em>\* Currently, there is no NVFP4 DeepSeek-V3.2 model available on Hugging Face. Please refer to the [How to reproduce](#how-to-reproduce) section to learn how to quantize the model to NVFP4.  
+<sub><em>\* Currently, the NVFP4 checkpoint has not yet been published on Hugging Face. Please stay tuned, or refer to the [How to reproduce](#how-to-reproduce) section to learn how to quantize the model to NVFP4.  
 ** Note there are some run-to-run variance for these evaluations. Our experiments indicate that the NVFP4 recipe delivers accuracy on par with FP8 on these datasets.</em></sub>
 
 ## Parallel Strategy
@@ -329,17 +329,18 @@ The expected results:
 ===========================================================
 = PERFORMANCE OVERVIEW
 ===========================================================
-Request Throughput (req/sec):                 	0.2678
-Total Output Throughput (tokens/sec):         	274.1786
-Total Token Throughput (tokens/sec):          	2467.6070
-Total Latency (ms):                           	37347.9238
-Average request latency (ms):                 	3734.7334
+Request Throughput (req/sec):                 	  0.2678
+Total Output Throughput (tokens/sec):         	  274.1786
+Total Token Throughput (tokens/sec):          	  2467.6070
+Total Latency (ms):                           	  37347.9238
+Average request latency (ms):                 	  3734.7334
 Per User Output Throughput [w/ ctx] (tps/user):   276.2231
-Per GPU Output Throughput (tps/gpu):          	68.5446
-Average time-to-first-token [TTFT] (ms):      	425.9885
-Average time-per-output-token [TPOT] (ms):    	3.2344
-Per User Output Speed (tps/user):             	312.0708
+Per GPU Output Throughput (tps/gpu):          	  68.5446
+Average time-to-first-token [TTFT] (ms):      	  425.9885
+Average time-per-output-token [TPOT] (ms):    	  3.2344
+Per User Output Speed (tps/user):             	  312.0708
 ```
+<sub><em>\* Note that `max_num_tokens` is set to a large value to cover the maximum sequence length. Please refer to the [Best Performance Practices](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.md#wip-enable-more-features-by-default) for more details on `max_num_tokens` configuration.</em></sub>
 
 #### Max-throughput
 Our benchmark results are based on Batch = 256, ISL = 8K, OSL = 1K, num_requests = 768 from a synthetic dataset. 
@@ -365,8 +366,8 @@ EOF
  
 trtllm-bench -m deepseek-ai/DeepSeek-V3.2-Exp \
 	--model_path ${model_path} throughput \
-	--tp 4 \
-	--ep 4 \
+	--tp 8 \
+	--ep 8 \
 	--warmup 1 \
 	--dataset ${data_path} \
 	--backend pytorch \
@@ -381,18 +382,18 @@ trtllm-bench -m deepseek-ai/DeepSeek-V3.2-Exp \
 The expected results:
 ```
 ===========================================================
-= PERFORMANCE OVERVIEW
+= PERFORMANCE OVERVIEW 
 ===========================================================
-Request Throughput (req/sec):                 	4.0222
-Total Output Throughput (tokens/sec):         	4118.7134
-Total Token Throughput (tokens/sec):          	37068.4202
-Total Latency (ms):                           	190941.1826
-Average request latency (ms):                 	62732.9495
-Per User Output Throughput [w/ ctx] (tps/user):   18.2658
-Per GPU Output Throughput (tps/gpu):          	1029.6783
-Average time-to-first-token [TTFT] (ms):      	10884.8366
-Average time-per-output-token [TPOT] (ms):    	50.6824
-Per User Output Speed (tps/user):             	21.1586
+Request Throughput (req/sec):                     8.4162
+Total Output Throughput (tokens/sec):             8618.2158
+Total Token Throughput (tokens/sec):              77563.9425
+Total Latency (ms):                               365009.1921
+Average request latency (ms):                     120325.7013
+Per User Output Throughput [w/ ctx] (tps/user):   9.8876
+Per GPU Output Throughput (tps/gpu):              1077.2770
+Average time-to-first-token [TTFT] (ms):          19537.7776
+Average time-per-output-token [TPOT] (ms):        98.5219
+Per User Output Speed (tps/user):                 11.2591
 ```
 
 ### Benchmark with Wide-EP on GB200
