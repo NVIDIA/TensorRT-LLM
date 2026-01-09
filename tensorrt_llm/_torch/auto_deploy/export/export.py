@@ -2,7 +2,6 @@
 
 from collections import defaultdict
 from contextlib import nullcontext
-from enum import unique
 from functools import partial
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -252,7 +251,8 @@ def _rename_nodes_with_module_hierarchy(gm: fx.GraphModule) -> None:
         else:
             op_name = str(target).split(".")[-1]
         unique_name = graph._graph_namespace.create_name(op_name, node)
-        node.name = f"{module_path}_{unique_name}".replace('.', '_')
+        node.name = f"{module_path}_{unique_name}".replace(".", "_")
+
 
 def run_forward_for_capture(
     model: nn.Module,
