@@ -3157,72 +3157,72 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(8)
     @pytest.mark.skip_less_device_memory(120000)
     @pytest.mark.timeout(14400)
-    def test_nvfp4_longseq_trtllm_moe(self, mocker):
-        """
-        Long-sequence MoE regression test with PDL enabled.
+    def _get_kimi_k2_config(self):
+        """Common configuration for Kimi-K2 RCCA tests (bug 5661741)."""
+        return {
+            "model_name": "moonshotai/Kimi-K2-Thinking",
+            "model_path": f"{llm_models_root()}/Kimi-K2-Thinking-NVFP4",
+            "kv_cache_config": KvCacheConfig(
+                dtype="fp8",
+                free_gpu_memory_fraction=0.9,
+                enable_block_reuse=True,
+                enable_partial_reuse=False,
+                event_buffer_max_size=1024,
+            ),
+            "target_len": 250000,
+        }
 
-        Tests long-sequence generation (250K tokens) with TRTLLM MoE backend and PDL.
-        Validates that the model produces valid outputs (non-empty, non-zero tokens)
-        across multiple batches with both greedy and sampling strategies.
-        Also includes async streaming with cancellation test.
-        Finally verifies accuracy with MMLU and GSM8K benchmarks.
-        More info in https://nvbugspro.nvidia.com/bug/5661741
+    def _build_long_sequences(self, llm, target_len):
+        """Build long token sequences from dataset."""
+        tokenizer = llm.tokenizer
+        dataset = load_dataset(
+            "Crystalcareai/Code-feedback-sharegpt-renamed",
+            split="train[:2000]"
+        )
+        long_token_list = []
+        for row in dataset:
+            msg = row["messages"][0]["value"]
+            tokens = tokenizer.encode(msg, add_special_tokens=False)
+            if not tokens:
+                continue
+            repeat = target_len // len(tokens) + 1
+            long_tokens = (tokens * repeat)[:target_len]
+            long_token_list.append(long_tokens)
+        assert len(long_token_list) > 0, "No valid samples found"
+        return long_token_list
+
+    def test_nvfp4_longseq_trtllm_moe_stress(self, mocker):
+        """
+        Long-sequence MoE stress test with PDL enabled.
+
+        Tests 250K token generation with TRTLLM MoE backend using greedy and
+        sampling strategies. Validates non-zero token outputs across batches
+        and verifies accuracy with MMLU + GSM8K benchmarks.
+
+        RCCA: https://nvbugspro.nvidia.com/bug/5661741
         """
         patch_mpi_pool_session_for_env(mocker, {"TRTLLM_ENABLE_PDL": "1"})
-
-        model_name = "moonshotai/Kimi-K2-Thinking"
-        model_path = f"{llm_models_root()}/Kimi-K2-Thinking-NVFP4"
-
-        kv_cache_config = KvCacheConfig(
-            dtype="fp8",
-            free_gpu_memory_fraction=0.9,
-            enable_block_reuse=True,
-            enable_partial_reuse=False,
-            event_buffer_max_size=1024,
-        )
-
-        target_len = 250000
+        config = self._get_kimi_k2_config()
 
         with LLM(
-            model_path,
+            config["model_path"],
             tensor_parallel_size=8,
             moe_expert_parallel_size=4,
             moe_config=MoeConfig(backend="TRTLLM"),
             enable_chunked_prefill=True,
             trust_remote_code=True,
-            kv_cache_config=kv_cache_config,
+            kv_cache_config=config["kv_cache_config"],
             max_num_tokens=8192,
             max_seq_len=262144,
             max_batch_size=32,
             enable_attention_dp=True,
         ) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
-
-            tokenizer = llm.tokenizer
-            dataset = load_dataset(
-                "Crystalcareai/Code-feedback-sharegpt-renamed",
-                split="train[:2000]"
-            )
-
-            long_token_list = []
-            for row in dataset:
-                msg = row["messages"][0]["value"]
-                tokens = tokenizer.encode(msg, add_special_tokens=False)
-                if not tokens:
-                    continue
-                repeat = target_len // len(tokens) + 1
-                long_tokens = (tokens * repeat)[:target_len]
-                long_token_list.append(long_tokens)
-
-            assert len(
-                long_token_list
-            ) > 0, "No valid samples found to build long sequences"
+            long_token_list = self._build_long_sequences(llm, config["target_len"])
 
             batch_size = 8
             sampling_params_greedy = SamplingParams(max_tokens=8)
-            sampling_params_sampling = SamplingParams(max_tokens=8,
-                                                      temperature=0.8,
-                                                      top_p=0.95)
+            sampling_params_sampling = SamplingParams(max_tokens=8, temperature=0.8, top_p=0.95)
 
             max_duration_sec = 1.5 * 3600
             max_batches = 25
@@ -3230,63 +3230,94 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
             start_time = time.time()
             num_samples = len(long_token_list)
 
-            print(f"\n[Main Loop] Starting stress test: max {max_batches} batches or {max_duration_sec/3600:.1f}h")
-            
+            print(f"\n[Stress Test] Starting: max {max_batches} batches or {max_duration_sec/3600:.1f}h")
+
             for batch_idx in range(max_batches):
                 elapsed = time.time() - start_time
                 if elapsed >= max_duration_sec and batch_idx >= min_batches:
-                    print(f"[Main Loop] Time limit reached after {batch_idx} batches ({elapsed/60:.1f} min)")
+                    print(f"[Stress Test] Time limit reached after {batch_idx} batches")
                     break
-                start_idx = (batch_idx * batch_size) % num_samples
 
-                indices = [
-                    (start_idx + i) % num_samples
-                    for i in range(batch_size)
-                ]
+                start_idx = (batch_idx * batch_size) % num_samples
+                indices = [(start_idx + i) % num_samples for i in range(batch_size)]
                 batch_inputs = [long_token_list[i] for i in indices]
 
-                outputs = llm.generate(batch_inputs,
-                                       sampling_params=sampling_params_greedy)
-
+                # Greedy generation
+                outputs = llm.generate(batch_inputs, sampling_params=sampling_params_greedy)
                 for i, output in enumerate(outputs):
                     token_ids = output.outputs[0].token_ids
-                    text = output.outputs[0].text
+                    assert len(token_ids) > 0, f"[greedy] Empty output at batch {batch_idx}"
+                    assert not all(tid == 0 for tid in token_ids), \
+                        f"[greedy] All token IDs are 0 at batch {batch_idx}"
 
-                    assert len(token_ids) > 0, (
-                        f"[greedy] Empty output. "
-                        f"Batch {batch_idx}, Request {i}, "
-                        f"indices={indices[i]}, text_snippet={text[:128]!r}"
-                    )
-
-                    assert not all(tid == 0 for tid in token_ids), (
-                        f"[greedy] All token IDs are 0. "
-                        f"Batch {batch_idx}, Request {i}, "
-                        f"indices={indices[i]}, text_snippet={text[:128]!r}"
-                    )
-
-                outputs_sampling = llm.generate(
-                    batch_inputs, sampling_params=sampling_params_sampling)
-
+                # Sampling generation
+                outputs_sampling = llm.generate(batch_inputs, sampling_params=sampling_params_sampling)
                 for i, output in enumerate(outputs_sampling):
                     token_ids = output.outputs[0].token_ids
-                    text = output.outputs[0].text
+                    assert len(token_ids) > 0, f"[sampling] Empty output at batch {batch_idx}"
+                    assert not all(tid == 0 for tid in token_ids), \
+                        f"[sampling] All token IDs are 0 at batch {batch_idx}"
 
-                    assert len(token_ids) > 0, (
-                        f"[sampling] Empty output. "
-                        f"Batch {batch_idx}, Request {i}, "
-                        f"indices={indices[i]}, text_snippet={text[:128]!r}"
-                    )
+            print("[Stress Test] Completed successfully")
 
-                    assert not all(tid == 0 for tid in token_ids), (
-                        f"[sampling] All token IDs are 0. "
-                        f"Batch {batch_idx}, Request {i}, "
-                        f"indices={indices[i]}, text_snippet={text[:128]!r}")
+            # Accuracy evaluation
+            task = MMLU(config["model_name"])
+            task.evaluate(llm)
+            task = GSM8K(config["model_name"])
+            task.evaluate(llm)
 
-            print("\n[Async Streaming Test] Starting async streaming cancellation test...")
+    def test_nvfp4_longseq_trtllm_moe_async_cancel(self, mocker):
+        """
+        Long-sequence MoE async streaming test with cancellation.
+
+        Tests concurrent async streaming with 50% cancellation rate to simulate
+        production high-concurrency scenarios. Validates non-zero token outputs.
+
+        RCCA: https://nvbugspro.nvidia.com/bug/5661741
+        """
+        patch_mpi_pool_session_for_env(mocker, {"TRTLLM_ENABLE_PDL": "1"})
+        config = self._get_kimi_k2_config()
+
+        with LLM(
+            config["model_path"],
+            tensor_parallel_size=8,
+            moe_expert_parallel_size=4,
+            moe_config=MoeConfig(backend="TRTLLM"),
+            enable_chunked_prefill=True,
+            trust_remote_code=True,
+            kv_cache_config=config["kv_cache_config"],
+            max_num_tokens=8192,
+            max_seq_len=262144,
+            max_batch_size=32,
+            enable_attention_dp=True,
+        ) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            long_token_list = self._build_long_sequences(llm, config["target_len"])
 
             async_batch_size = 6
             num_async_batches = 3
             cancel_ratio = 0.5
+            num_samples = len(long_token_list)
+
+            async def handle_one_request(async_gen, async_batch_idx, req_idx, should_cancel):
+                chunks_received = 0
+                max_chunks_before_cancel = 5
+                try:
+                    async for chunk in async_gen:
+                        chunks_received += 1
+                        if chunk.outputs:
+                            token_ids = chunk.outputs[0].token_ids
+                            assert len(token_ids) > 0, \
+                                f"[async] Empty chunk at batch {async_batch_idx}, req {req_idx}"
+                            assert not all(tid == 0 for tid in token_ids), \
+                                f"[async] All tokens are 0 at batch {async_batch_idx}, req {req_idx}"
+                        if should_cancel and chunks_received >= max_chunks_before_cancel:
+                            print(f"[Cancel] Batch {async_batch_idx}, Request {req_idx}")
+                            break
+                except Exception as e:
+                    print(f"[Warning] Batch {async_batch_idx}, Request {req_idx}: {e}")
+                    if not should_cancel:
+                        raise
 
             async def run_streaming_with_cancellation():
                 for async_batch_idx in range(num_async_batches):
@@ -3294,67 +3325,34 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
                     indices = [(start_idx + i) % num_samples for i in range(async_batch_size)]
                     batch_inputs = [long_token_list[i] for i in indices]
 
-                    sampling_params_streaming = SamplingParams(
-                        max_tokens=50,
-                        temperature=0.8,
-                        top_p=0.95
-                    )
+                    print(f"[Async] Starting batch {async_batch_idx + 1}/{num_async_batches}")
 
-                    # Generate async streaming results
+                    sampling_params = SamplingParams(max_tokens=50, temperature=0.8, top_p=0.95)
                     async_results = llm.generate_async(
-                        batch_inputs,
-                        sampling_params=sampling_params_streaming,
-                        streaming=True
+                        batch_inputs, sampling_params=sampling_params, streaming=True
                     )
 
+                    tasks = []
                     for req_idx, async_gen in enumerate(async_results):
-                        chunks_received = 0
-                        max_chunks_before_cancel = 5
                         should_cancel = (req_idx < async_batch_size * cancel_ratio)
+                        task = asyncio.create_task(
+                            handle_one_request(async_gen, async_batch_idx, req_idx, should_cancel)
+                        )
+                        tasks.append(task)
 
-                        try:
-                            async for chunk in async_gen:
-                                chunks_received += 1
+                    try:
+                        await asyncio.wait_for(asyncio.gather(*tasks), timeout=300)
+                    except asyncio.TimeoutError:
+                        print(f"[Async] WARNING: Batch {async_batch_idx + 1} timed out")
+                        for t in tasks:
+                            if not t.done():
+                                t.cancel()
+                        raise RuntimeError(f"Async batch {async_batch_idx + 1} timed out")
 
-                                # Validate chunk
-                                if chunk.outputs:
-                                    token_ids = chunk.outputs[0].token_ids
-                                    text = chunk.outputs[0].text
+                    print(f"[Async] Completed batch {async_batch_idx + 1}/{num_async_batches}")
 
-                                    assert len(token_ids) > 0, (
-                                        f"[async-streaming] Empty chunk. "
-                                        f"AsyncBatch {async_batch_idx}, Request {req_idx}, "
-                                        f"Chunk {chunks_received}"
-                                    )
-
-                                    assert not all(tid == 0 for tid in token_ids), (
-                                        f"[async-streaming] All tokens are 0. "
-                                        f"AsyncBatch {async_batch_idx}, Request {req_idx}, "
-                                        f"Chunk {chunks_received}"
-                                    )
-
-                                # Simulate cancellation for some requests
-                                if should_cancel and chunks_received >= max_chunks_before_cancel:
-                                    print(f"[Cancel] Request {req_idx} after {chunks_received} chunks")
-                                    break
-                        except Exception as e:
-                            # Log but don't fail on cancellation-related errors
-                            print(f"[Warning] Request {req_idx} exception: {e}")
-                            if not should_cancel:
-                                raise
-
-                    print(f"[Async Streaming] Completed batch {async_batch_idx + 1}/{num_async_batches}")
-
-            # Run async streaming test
             asyncio.run(run_streaming_with_cancellation())
             print("[Async Streaming Test] Completed successfully")
-
-            # Accuracy eval
-            task = MMLU(model_name)
-            task.evaluate(llm)
-
-            task = GSM8K(model_name)
-            task.evaluate(llm)
 
 
 class TestMinitron4BBaseInstruct(LlmapiAccuracyTestHarness):
