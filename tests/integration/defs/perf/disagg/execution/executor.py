@@ -114,7 +114,9 @@ class JobManager:
             logger.debug(f"Script: {script_path}")
             logger.debug(f"Log file: {output_log_file}")
 
-            output = exec_cmd_with_output(sbatch_args, timeout=60)
+            # Use check=False to allow submission even with Kerberos warnings
+            # (mimics submit.py behavior)
+            output = exec_cmd_with_output(sbatch_args, timeout=60, check=False)
             job_id = output.strip()
 
             # Parse job ID (--parsable returns just the job ID)
