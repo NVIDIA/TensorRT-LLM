@@ -646,7 +646,6 @@ class FP8EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
             gm,
             node,
             self.config,
-            self.mlp_type,
             scale_names=self.scale_names(),
         )
 
@@ -664,7 +663,7 @@ class NVFP4EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
         return ["input_scale", "weight_scale", "alpha"]
 
     def apply(self, gm: GraphModule, node: Node) -> None:
-        _insert_sharded_moe(gm, node, self.config, self.mlp_type, scale_names=self.scale_names())
+        _insert_sharded_moe(gm, node, self.config, scale_names=self.scale_names())
 
 
 EP_SHARDING_RULES = [

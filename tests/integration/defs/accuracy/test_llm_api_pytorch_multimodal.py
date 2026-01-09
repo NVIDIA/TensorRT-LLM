@@ -293,8 +293,19 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
         ],
     )
     def test_nvfp4_4gpus(
-        self, tp_size, pp_size, ep_size, attention_dp, cuda_graph, overlap_scheduler, moe_backend
+        self,
+        tp_size,
+        pp_size,
+        ep_size,
+        attention_dp,
+        cuda_graph,
+        overlap_scheduler,
+        moe_backend,
+        mocker,
     ):
+        mocker.patch.dict(
+            MMMU.EVALUATE_KWARGS, {"model_type": "mistral_large_3", "is_force_single_image": True}
+        )
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
@@ -315,4 +326,4 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
             kv_cache_config=kv_cache_config,
         ) as llm:
             task = MMMU(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=self.sampling_params, model_type="mistral_large_3")
+            task.evaluate(llm, sampling_params=self.sampling_params)
