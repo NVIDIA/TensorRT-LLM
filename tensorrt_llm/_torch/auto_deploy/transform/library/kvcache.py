@@ -69,7 +69,7 @@ class InsertCachedAttention(BaseTransform):
     def _process_metadata_std(self, gm: GraphModule, cm: CachedSequenceInterface) -> List[Node]:
         """Process the standard metadata nodes."""
         return [
-            self._add_or_retrieve_input(gm, cm, "arg_" + arg_name)
+            self._add_or_retrieve_input(gm, cm, arg_name)
             for arg_name in self.attn_descriptor.get_standard_metadata_args()
         ]
 
@@ -109,7 +109,7 @@ class InsertCachedAttention(BaseTransform):
 
         # check what inputs the extra metadata op expects
         inputs_for_prep_meta = [
-            self._add_or_retrieve_input(gm, cm, "arg_" + arg.name)
+            self._add_or_retrieve_input(gm, cm, arg.name)
             for arg in prep_meta_op._schema.arguments
             if arg.name in cm.info.available_args
         ]
@@ -137,7 +137,7 @@ class InsertCachedAttention(BaseTransform):
 
     def _process_cache_node(self, gm: GraphModule, cache_name: str) -> Node:
         """Process the cache nodes by inserting a cached attention replacement op."""
-        return add_graph_input(gm, "arg_" + cache_name)
+        return add_graph_input(gm, cache_name)
 
     def _insert_cached_attn_node(
         self,
