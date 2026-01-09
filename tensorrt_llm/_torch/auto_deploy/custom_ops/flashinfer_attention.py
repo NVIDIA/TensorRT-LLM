@@ -581,6 +581,7 @@ def flashinfer_mha_with_cache(
             y[num_prefill_tokens:num_total_tokens] = y_decode
         else:
             y = y_decode
+
     return y.view(q_shape_og)  # [b,s,n*h_d] or [b,s, n, h_d]
 
 

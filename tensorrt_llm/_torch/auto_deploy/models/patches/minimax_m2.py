@@ -45,7 +45,6 @@ def minimax_m2_moe(self, hidden_states: torch.Tensor):
 
     # Step 5: Normalize so weights sum to 1
     top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True)
-    # Cast back to the input dtype
     top_k_weights = top_k_weights.to(hidden_states.dtype)
 
     final_hidden_states = torch.ops.auto_deploy.torch_moe(
@@ -60,7 +59,6 @@ def minimax_m2_moe(self, hidden_states: torch.Tensor):
     return final_hidden_states, router_logits
 
 
-# Save the current from_config (may already be patched by deepseek.py)
 _from_config_previous = AutoModelForCausalLM.from_config
 
 CUSTOM_MODULE_PATCHES: Dict[str, callable] = {
@@ -69,7 +67,6 @@ CUSTOM_MODULE_PATCHES: Dict[str, callable] = {
 
 
 def get_model_from_config_patched(config, **kwargs):
-    # Call the previous from_config (original or DeepSeek-patched)
     model = _from_config_previous(config, **kwargs)
     # Patch modules by class name
     for _, module in model.named_modules():
