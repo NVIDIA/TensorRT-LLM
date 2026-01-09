@@ -30,9 +30,9 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 @pytest.mark.parametrize(
     "quant_algo",
     [
-        "none",
-        "nvfp4",
-        "fp8",
+        None,
+        QuantAlgo.FP8,
+        QuantAlgo.NVFP4,
     ],
     ids=lambda val: f"quant_algo={val}",
 )
@@ -55,7 +55,6 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 def test_moe(dtype, moe_backend, quant_algo, mocker):
     # Enable configurable moe by default
     mocker.patch.dict(os.environ, {"ENABLE_CONFIGURABLE_MOE": "1"})
-
     if moe_backend == "TRTLLM":
         if dtype == torch.float16:
             pytest.skip("TRTLLM NVFP4 MoE backend does not support float16 yet")
@@ -87,15 +86,15 @@ def test_moe(dtype, moe_backend, quant_algo, mocker):
         # Create quant_config
         quant_config = None
         quant_kwargs = {}
-        if quant_algo == "none":
+        if quant_algo is None:
             quantize_util_cls = BaseQuantizeUtil
-        elif quant_algo == "fp8":
+        elif quant_algo == QuantAlgo.FP8:
             quantize_util_cls = FP8QuantizeUtil
             quant_config = QuantConfig(quant_algo=QuantAlgo.FP8)
             _, x_scale = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(x)
             x_scale = x_scale.float().squeeze()
             quant_kwargs["x_scale"] = x_scale
-        elif quant_algo == "nvfp4":
+        elif quant_algo == QuantAlgo.NVFP4:
             quantize_util_cls = NVFP4QuantizeUtil
             quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
             x_sf_global = (448 * 6) / x.abs().max().float()
@@ -147,12 +146,12 @@ def test_moe(dtype, moe_backend, quant_algo, mocker):
             output = fused_moe.forward(x, router_logits)
 
         # Here we use same rtol and atol as test_fused_moe
-        if quant_algo == "nvfp4":
+        if quant_algo == QuantAlgo.NVFP4:
             torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.15)
         else:
-            if quant_algo == "fp8":
+            if quant_algo == QuantAlgo.FP8:
                 rtol, atol, percent = (4e-2, 1e-1, 0.99)
-            elif quant_algo == "none":
+            elif quant_algo is None:
                 rtol, atol, percent = (2e-1, 2e-1, 0.984)
             else:
                 assert False, "unsupported quant_algo to check accuracy"
