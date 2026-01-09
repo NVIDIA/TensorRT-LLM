@@ -393,7 +393,7 @@ _SMALL_MODEL_CONFIGS = {
         },
     },
     "meta-llama/Llama-4-Scout-17B-16E-Instruct": {
-        "llm_models_subdir": "Llama-4-Scout-17B-16E-Instruct",
+        "llm_models_subdir": "llama4-models/Llama-4-Scout-17B-16E-Instruct",
         "model_factory": "AutoModelForImageTextToText",
         "model_kwargs": {
             "text_config": {
