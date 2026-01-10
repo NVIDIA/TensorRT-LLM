@@ -215,8 +215,8 @@ class BatchManager:
             batch_num: Batch number to submit (0-indexed)
         """
         from execution.executor import JobManager
-        from utils.job_tracker import JobTracker
         from utils.config_validator import ConfigValidator
+        from utils.job_tracker import JobTracker
 
         # Calculate batch range
         if self.batch_size:
@@ -260,7 +260,9 @@ class BatchManager:
                     self.job_mapping[config.test_id] = job_id
                     JobTracker.record_job(job_id)  # Record job ID for cleanup
                     success_count += 1
-                    logger.success(f"  [{i:3d}/{len(valid_configs)}] Job {job_id} <- {config.test_id}")
+                    logger.success(
+                        f"  [{i:3d}/{len(valid_configs)}] Job {job_id} <- {config.test_id}"
+                    )
                 else:
                     # Submission failed - mark as None and record error
                     self.job_mapping[config.test_id] = None
@@ -280,9 +282,7 @@ class BatchManager:
             f"Batch {batch_num} Complete: {success_count}/{len(valid_configs)} submitted successfully"
         )
         if len(valid_configs) < len(batch_configs):
-            logger.warning(
-                f"Skipped {len(batch_configs) - len(valid_configs)} invalid config(s)"
-            )
+            logger.warning(f"Skipped {len(batch_configs) - len(valid_configs)} invalid config(s)")
         logger.info(f"{'=' * 70}\n")
 
 
