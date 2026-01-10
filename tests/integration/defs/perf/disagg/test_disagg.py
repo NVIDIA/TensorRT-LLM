@@ -130,13 +130,12 @@ class TestDisaggBenchmark:
             raise e
         finally:
             # Always backup logs, regardless of success or failure
-            if job_id:
-                result_dir = JobManager.get_result_dir(test_config)
-                is_passed = result.get("success", False) if result else False
-                try:
-                    JobManager.backup_logs(job_id, test_config, result_dir, is_passed)
-                except Exception as backup_error:
-                    logger.error(f"Failed to backup logs: {backup_error}")
+            result_dir = JobManager.get_result_dir(test_config)
+            is_passed = result.get("success", False) if result else False
+            try:
+                JobManager.backup_logs(job_id, test_config, result_dir, is_passed)
+            except Exception as backup_error:
+                logger.error(f"Failed to backup logs: {backup_error}")
 
     @pytest.mark.accuracy
     @pytest.mark.parametrize("test_config", ACCURACY_TEST_CASES)
@@ -209,13 +208,12 @@ class TestDisaggBenchmark:
             raise e
         finally:
             # Always backup logs, regardless of success or failure
-            if job_id:
-                result_dir = JobManager.get_result_dir(test_config)
-                is_passed = result.get("success", False) if result else False
-                try:
-                    JobManager.backup_logs(job_id, test_config, result_dir, is_passed)
-                except Exception as backup_error:
-                    logger.error(f"Failed to backup logs: {backup_error}")
+            result_dir = JobManager.get_result_dir(test_config)
+            is_passed = result.get("success", False) if result else False
+            try:
+                JobManager.backup_logs(job_id, test_config, result_dir, is_passed)
+            except Exception as backup_error:
+                logger.error(f"Failed to backup logs: {backup_error}")
 
     @pytest.mark.stress
     @pytest.mark.parametrize("test_config", STRESS_TEST_CASES)
@@ -292,13 +290,12 @@ class TestDisaggBenchmark:
             raise e
         finally:
             # Always backup logs, regardless of success or failure
-            if job_id:
-                result_dir = JobManager.get_result_dir(test_config)
-                is_passed = result.get("success", False) if result else False
-                try:
-                    JobManager.backup_logs(job_id, test_config, result_dir, is_passed)
-                except Exception as backup_error:
-                    logger.error(f"Failed to backup logs: {backup_error}")
+            result_dir = JobManager.get_result_dir(test_config)
+            is_passed = result.get("success", False) if result else False
+            try:
+                JobManager.backup_logs(job_id, test_config, result_dir, is_passed)
+            except Exception as backup_error:
+                logger.error(f"Failed to backup logs: {backup_error}")
 
 
 if __name__ == "__main__":
