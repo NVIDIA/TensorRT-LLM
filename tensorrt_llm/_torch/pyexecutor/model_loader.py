@@ -338,8 +338,8 @@ class ModelLoader:
             self, checkpoint_dir: str,
             checkpoint_loader: BaseCheckpointLoader) -> ModelConfig:
         """Loads and validates the model configuration."""
-        config = checkpoint_loader.load_config(
-            checkpoint_dir,
+        load_config_kwargs = dict(
+            checkpoint_dir=checkpoint_dir,
             trust_remote_code=True,
             mapping=self.mapping,
             enable_min_latency=self.llm_args.enable_min_latency,
@@ -361,8 +361,13 @@ class ModelLoader:
             use_low_precision_moe_combine=self.llm_args.moe_config.
             use_low_precision_moe_combine,
             nvfp4_gemm_allowed_backends=self.llm_args.nvfp4_gemm_config.
-            allowed_backends,
-            model_kwargs=self.llm_args.model_kwargs)
+            allowed_backends)
+
+        # Only pass model_kwargs if it's explicitly set (not None)
+        if self.llm_args.model_kwargs is not None:
+            load_config_kwargs['model_kwargs'] = self.llm_args.model_kwargs
+
+        config = checkpoint_loader.load_config(**load_config_kwargs)
 
         # Store nvfp4 config in extra_attrs for Linear layer access
         config.extra_attrs[
