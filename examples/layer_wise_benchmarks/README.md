@@ -184,7 +184,7 @@ You will receive three reports, each containing kernel timing statistics grouped
 
 ## Trouble shooting
 
-1. Error `fp8 blockscale gemm only supports Hopper` on Blackwell.
+1. Error `fp8 blockscale gemm only support Hopper` on Blackwell.
 
    The default MoE backend "CUTLASS" does not support FP8 weights. Please choose the same MoE backend as your end-to-end config. A typical choice is adding `--moe-backend DEEPGEMM` (or `TRTLLM`, `WIDEEP`) and `--moe-backend-for-prefill DEEPGEMM` (or `WIDEEP`) option.
 
