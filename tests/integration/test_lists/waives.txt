@@ -390,7 +390,6 @@ unittest/executor/test_rpc.py::TestRpcCorrectness::test_incremental_task_async S
 examples/test_phi.py::test_phi_fp8_with_bf16_lora[phi-2] SKIP (https://nvbugs/5744293)
 examples/test_phi.py::test_llm_phi_1node_2gpus_summary[Phi-3.5-MoE-instruct-nb:1] SKIP (https://nvbugs/5744293)
 examples/test_phi.py::test_llm_phi_quantization_1gpu[phi-2-fp8-bfloat16] SKIP (https://nvbugs/5744293)
-test_e2e.py::test_trtllm_bench_llmapi_launch[pytorch_backend-llama-v3-llama3-8b] SKIP (https://nvbugs/5744432)
 test_e2e.py::test_trtllm_serve_multimodal_example SKIP (https://nvbugs/5747920)
 test_e2e.py::test_trtllm_serve_example SKIP (https://nvbugs/5747938)
 triton_server/test_triton.py::test_opt[opt] SKIP (https://nvbugs/5739981)
