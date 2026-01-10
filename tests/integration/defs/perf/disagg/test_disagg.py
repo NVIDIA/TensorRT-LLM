@@ -66,11 +66,8 @@ class TestDisaggBenchmark:
         """Performance benchmark test for YAML configurations."""
         full_test_name = request.node.name
 
-        # Validate configuration first (before any other operations)
-        try:
-            ConfigValidator.validate_test_config(test_config)
-        except Exception as e:
-            pytest.fail(f"Configuration validation failed: {e}")
+        # Note: Configuration validation is done during batch submission (in conftest.py)
+        # If validation failed, job_id will be None and the assert below will fail
 
         # Create test case tracker
         test_tracker = TestCaseTracker()
@@ -104,8 +101,11 @@ class TestDisaggBenchmark:
                 # Get job_id from batch manager (auto-submits batch if needed)
                 job_id = batch_manager.get_job_id(test_config)
 
-                # Validate submission result
-                assert job_id, f"Failed to get job_id for {test_config.test_id}"
+                # Validate submission result (will be None if validation/submission failed)
+                error_msg = batch_manager.submit_errors.get(
+                    test_config.test_id, "Check batch submission logs for details"
+                )
+                assert job_id, f"Failed to submit job for {test_config.test_id}\n{error_msg}"
 
                 # Wait for completion (timeout: 10 hours = 36000 seconds)
                 JobManager.wait_for_completion(job_id, 36000, test_config, check_early_failure=True)
@@ -222,11 +222,8 @@ class TestDisaggBenchmark:
         """
         full_test_name = request.node.name
 
-        # Validate configuration first (before any other operations)
-        try:
-            ConfigValidator.validate_test_config(test_config)
-        except Exception as e:
-            pytest.fail(f"Configuration validation failed: {e}")
+        # Note: Configuration validation is done during batch submission (in conftest.py)
+        # If validation failed, job_id will be None and the assert below will fail
 
         # Create test case tracker
         test_tracker = TestCaseTracker()
@@ -266,8 +263,11 @@ class TestDisaggBenchmark:
                 # Get job_id from batch manager (auto-submits batch if needed)
                 job_id = batch_manager.get_job_id(test_config)
 
-                # Validate submission result
-                assert job_id, f"Failed to get job_id for {test_config.test_id}"
+                # Validate submission result (will be None if validation/submission failed)
+                error_msg = batch_manager.submit_errors.get(
+                    test_config.test_id, "Check batch submission logs for details"
+                )
+                assert job_id, f"Failed to submit job for {test_config.test_id}\n{error_msg}"
 
                 # Wait for completion (timeout: 10 hours = 36000 seconds)
                 JobManager.wait_for_completion(job_id, 36000, test_config, check_early_failure=True)
