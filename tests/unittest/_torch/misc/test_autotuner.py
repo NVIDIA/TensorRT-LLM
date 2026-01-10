@@ -17,6 +17,7 @@ from tensorrt_llm._torch.autotuner import (AutoTuner, DistributedTuningStrategy,
                                            FakeTensor, OptimizationProfile,
                                            StaticDim, TunableRunner,
                                            TuningConfig, autotune)
+from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.utils import (get_power_of_2_num_tokens_buckets,
                                        next_positive_power_of_2)
 from tensorrt_llm.bindings.internal.runtime import delay_kernel
@@ -718,6 +719,7 @@ def _distributed_worker_function(world_size, strategy):
                       rank=rank,
                       tp_size=world_size,
                       pp_size=1)
+    dist = Distributed.get(mapping)
 
     tuner = AutoTuner.get()
     tuner.clear_cache()
