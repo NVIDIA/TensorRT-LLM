@@ -4,6 +4,7 @@ import types
 
 import pytest
 import torch
+from _model_test_utils import get_small_model_kwargs
 from transformers import AutoConfig, AutoModelForCausalLM
 
 # Import to register torch_moe custom op
@@ -19,24 +20,14 @@ def _load_moe_layer_from_glm4():
         module: The Glm4MoeMoE module
     """
     try:
-        # Load the model configuration
-        config = AutoConfig.from_pretrained("zai-org/GLM-4.7", trust_remote_code=True)
+        model_id = "zai-org/GLM-4.7"
 
-        # Override to create a small model for testing
-        config.num_hidden_layers = 5
-        config.use_cache = False
-        config.hidden_size = 32
-        config.intermediate_size = 64
-        config.moe_intermediate_size = 32
-        config.num_attention_heads = 4
-        config.num_key_value_heads = 2
-        config.n_routed_experts = 4
-        config.num_experts_per_tok = 2
-        config.n_shared_experts = 1
-        config.n_group = 1
-        config.topk_group = 1
-        config.first_k_dense_replace = 0  # Make layer 0 use MoE
-        config.max_position_embeddings = 16
+        # Load the model configuration
+        config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+
+        # Apply shared small-config overrides (reusable across unit tests)
+        for k, v in get_small_model_kwargs(model_id).items():
+            setattr(config, k, v)
 
         # Build the model architecture (no weights loaded)
         model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)

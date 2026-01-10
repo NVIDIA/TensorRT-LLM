@@ -13,20 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""GLM4-MoE model patches for auto-deploy compatibility.
+"""GLM4-MoE model patches for auto-deploy compatibility."""
 
-This module patches the GLM4-MoE model to make it compatible with torch.fx export
-by replacing data-dependent operations (torch.where/nonzero) with traceable custom ops.
-"""
-
-import types
+import types  # noqa: F401
 from typing import Dict
 
 import torch
-from transformers import AutoModelForCausalLM
+
+from ...export.interface import BaseExportPatch, ExportPatchRegistry
 
 
-@torch.inference_mode()
 def glm4_moe_forward(self, hidden_states):
     """Glm4MoeMoE forward function rewritten to enable torch export.
 
@@ -65,26 +61,39 @@ def glm4_moe_forward(self, hidden_states):
     return hidden_states
 
 
-# Store original from_config
-_from_config_original = AutoModelForCausalLM.from_config
-
 # Module patches mapping
 CUSTOM_MODULE_PATCHES: Dict[str, callable] = {
     "Glm4MoeMoE": glm4_moe_forward,
 }
 
 
-def get_model_from_config_patched(config, **kwargs):
-    """Patched from_config that applies GLM4-MoE module patches."""
-    model = _from_config_original(config, **kwargs)
+@ExportPatchRegistry.register("hf_glm4_moe")
+class Glm4MoePatch(BaseExportPatch):
+    """Patch for HF GLM4-MoE to make it compatible with torch.export.
 
-    # Patch modules
-    for _, module in model.named_modules():
-        if type(module).__name__ in CUSTOM_MODULE_PATCHES.keys():
-            module.forward = types.MethodType(CUSTOM_MODULE_PATCHES[type(module).__name__], module)
+    This patch temporarily replaces `transformers`' `Glm4MoeMoE.forward` with
+    `glm4_moe_forward` during export, then restores the original afterwards.
+    """
 
-    return model
+    def _apply_patch(self):
+        """Apply the GLM4-MoE export patch."""
+        try:
+            from transformers.models.glm4_moe import modeling_glm4_moe
+        except Exception as e:  # pragma: no cover
+            raise ImportError(
+                "Failed to import GLM4-MoE from transformers. "
+                "Ensure a transformers version with `transformers.models.glm4_moe` is installed."
+            ) from e
 
+        self.original_values["Glm4MoeMoE.forward"] = modeling_glm4_moe.Glm4MoeMoE.forward
+        modeling_glm4_moe.Glm4MoeMoE.forward = glm4_moe_forward
 
-# Apply the patch
-AutoModelForCausalLM.from_config = get_model_from_config_patched
+    def _revert_patch(self):
+        """Revert the GLM4-MoE export patch."""
+        # Only revert if we successfully applied.
+        if "Glm4MoeMoE.forward" not in self.original_values:
+            return
+
+        from transformers.models.glm4_moe import modeling_glm4_moe
+
+        modeling_glm4_moe.Glm4MoeMoE.forward = self.original_values["Glm4MoeMoE.forward"]

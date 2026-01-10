@@ -430,6 +430,25 @@ _SMALL_MODEL_CONFIGS = {
             "q_lora_rank": 128,
         },
     },
+    "zai-org/GLM-4.7": {
+        "llm_models_subdir": "GLM-4.7",
+        "model_kwargs": {
+            "num_hidden_layers": 5,
+            "use_cache": False,
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "moe_intermediate_size": 32,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "n_routed_experts": 4,
+            "num_experts_per_tok": 2,
+            "n_shared_experts": 1,
+            "n_group": 1,
+            "topk_group": 1,
+            "first_k_dense_replace": 0,
+            "max_position_embeddings": 16,
+        },
+    },
     "Qwen/Qwen2.5-3B-Instruct": {
         "llm_models_subdir": "Qwen2.5-3B-Instruct",
         "model_kwargs": {
@@ -509,6 +528,19 @@ _SMALL_MODEL_CONFIGS = {
         },
     },
 }
+
+
+def get_small_model_kwargs(model_hub_id: str) -> Dict[str, Any]:
+    """Get the per-model `model_kwargs` from `_SMALL_MODEL_CONFIGS`.
+
+    This is useful for unit tests that directly construct HF configs/models (e.g. via
+    `AutoConfig.from_pretrained` + `AutoModelForCausalLM.from_config`) and want to share
+    a consistent small configuration across tests.
+    """
+    if model_hub_id not in _SMALL_MODEL_CONFIGS:
+        available_models = list(_SMALL_MODEL_CONFIGS.keys())
+        raise KeyError(f"Model '{model_hub_id}' not found. Available models: {available_models}")
+    return copy.deepcopy(_SMALL_MODEL_CONFIGS[model_hub_id].get("model_kwargs", {}))
 
 
 def get_small_model_config(model_hub_id: str, **llm_args_kwargs) -> Dict[str, Any]:
