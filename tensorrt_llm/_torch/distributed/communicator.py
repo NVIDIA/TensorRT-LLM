@@ -149,11 +149,19 @@ class Distributed(ABC):
         First gathers within CP group, then across TP groups, returning
         a flattened list with tp_size * cp_size entries.
         """
+        # Gather across CP dimension.
         if self.cp_size > 1:
             obj = self.cp_allgather(obj)
+        else:
+            obj = [obj]  # Wrap to match cp_allgather output format.
+
+        # Gather across TP dimension.
         if self.tp_size > 1:
             obj = self.tp_allgather(obj)
-        # Flatten: [[cp0, cp1], [cp0, cp1], ...] -> [tp0_cp0, tp0_cp1, tp1_cp0, ...].
+        else:
+            obj = [obj]  # Wrap to match tp_allgather output format.
+
+        # Flatten: [[cp0, cp1], [cp0, cp1], ...] -> [tp0_cp0, tp0_cp1, tp1_cp0, ...]
         return [entry for tp_group in obj for entry in tp_group]
 
 

@@ -370,6 +370,8 @@ class ExecutorRequestQueue:
             num_active_tokens = sum(
                 [req.py_orig_prompt_len for req in activate_requests])
 
+        # Note: We use tp_allgather even for CP assuming that all CP ranks a
+        # DP group have the same num_active_tokens and num_active_requests.
         responses_list = self.dist.tp_allgather(
             [len(activate_requests), num_active_tokens])
 

@@ -1227,7 +1227,8 @@ class PyExecutor:
     def _can_queue(self, scheduled_batch):
 
         if self.enable_attention_dp:
-            tp_batch_sizes = self.dist.tp_allgather(scheduled_batch.batch_size)
+            tp_batch_sizes = self.dist.tp_cp_allgather(
+                scheduled_batch.batch_size)
             can_queue = 0 not in tp_batch_sizes
         else:
             can_queue = scheduled_batch.batch_size > 0
@@ -1572,7 +1573,7 @@ class PyExecutor:
                     if self.enable_attention_dp:
                         local_can_forward = self.executor_request_queue.num_fetch_requests + \
                             len(scheduled_batch.generation_requests) >= self.benchmark_req_queues_size
-                        all_can_forward = self.dist.tp_allgather(
+                        all_can_forward = self.dist.tp_cp_allgather(
                             local_can_forward)
                         if all(all_can_forward):
                             can_forward = True
@@ -1944,6 +1945,8 @@ class PyExecutor:
         num_scheduled_tokens = sum(
             [len(req.get_tokens(0))
              for req in context_requests]) + num_scheduled_generation_requests
+        # Note: We use tp_allgather instead of tp_cp_allgather because we want to
+        # balance the requests across DP ranks; not CP ranks within those DP ranks.
         responses_list = self.dist.tp_allgather([
             num_scheduled_context_requests, num_scheduled_generation_requests,
             num_scheduled_tokens
