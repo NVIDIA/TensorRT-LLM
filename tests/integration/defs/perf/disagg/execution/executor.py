@@ -271,7 +271,7 @@ class JobManager:
 
     @staticmethod
     def backup_logs(
-        job_id: Optional[str],  
+        job_id: Optional[str],
         test_config,
         result_dir: str,
         is_passed: bool,
@@ -286,7 +286,6 @@ class JobManager:
         Returns:
             Final directory path if successful, None otherwise
         """
-
         if job_id is None:
             logger.warning(f"Job submission failed for {test_config.test_id}")
         else:
