@@ -151,6 +151,7 @@ class BatchManager:
 
         self.submitted_batches = set()  # Track which batch numbers have been submitted
         self.job_mapping = {}  # Map test_id -> SLURM job_id
+        self.submit_errors = {}  # Map test_id -> error message (validation/submission failures)
         self.all_configs = []  # Ordered list of all test configs
 
         logger.info(f"\n{'=' * 70}")
@@ -215,6 +216,7 @@ class BatchManager:
         """
         from execution.executor import JobManager
         from utils.job_tracker import JobTracker
+        from utils.config_validator import ConfigValidator
 
         # Calculate batch range
         if self.batch_size:
@@ -231,34 +233,56 @@ class BatchManager:
         logger.info(f"Range: [{start_idx}:{end_idx}] ({len(batch_configs)} jobs)")
         logger.info(f"{'=' * 70}\n")
 
-        # Submit all jobs in this batch
+        # Pre-validate all configs before submission
+        logger.info("Pre-validating configurations...")
+        valid_configs = []
+        for config in batch_configs:
+            try:
+                ConfigValidator.validate_test_config(config)
+                valid_configs.append(config)
+            except Exception as e:
+                # Validation failed - mark as None and record error
+                self.job_mapping[config.test_id] = None
+                self.submit_errors[config.test_id] = f"Validation failed: {str(e)}"
+                logger.error(f"  [FAILED] Validation failed: {config.test_id}")
+                logger.error(f"     Error: {str(e)[:100]}")
+
+        logger.info(
+            f"Validation complete: {len(valid_configs)}/{len(batch_configs)} configs valid\n"
+        )
+
+        # Submit only valid configs
         success_count = 0
-        for i, config in enumerate(batch_configs, 1):
+        for i, config in enumerate(valid_configs, 1):
             try:
                 success, job_id = JobManager.submit_test_job(config)
                 if success and job_id:
                     self.job_mapping[config.test_id] = job_id
                     JobTracker.record_job(job_id)  # Record job ID for cleanup
                     success_count += 1
-                    # Truncate test_id for display
-                    display_id = (
-                        config.test_id[:60] + "..." if len(config.test_id) > 60 else config.test_id
-                    )
-                    logger.success(f"  [{i:3d}/{len(batch_configs)}] Job {job_id} <- {display_id}")
+                    logger.success(f"  [{i:3d}/{len(valid_configs)}] Job {job_id} <- {config.test_id}")
                 else:
+                    # Submission failed - mark as None and record error
                     self.job_mapping[config.test_id] = None
-                    logger.error(f"  [{i:3d}/{len(batch_configs)}] Failed: {config.test_id[:50]}")
+                    self.submit_errors[config.test_id] = f"Job submission failed: {job_id}"
+                    logger.error(f"  [{i:3d}/{len(valid_configs)}] Failed: {config.test_id}")
             except Exception as e:
+                # Submission exception - mark as None and record error
                 self.job_mapping[config.test_id] = None
-                logger.error(f"  [{i:3d}/{len(batch_configs)}] Error: {e}")
+                self.submit_errors[config.test_id] = f"Submission exception: {str(e)}"
+                logger.error(f"  [{i:3d}/{len(valid_configs)}] Error: {e}")
 
         # Mark batch as submitted
         self.submitted_batches.add(batch_num)
 
         logger.info(f"\n{'=' * 70}")
         logger.success(
-            f"Batch {batch_num} Complete: {success_count}/{len(batch_configs)} succeeded"
+            f"Batch {batch_num} Complete: {success_count}/{len(valid_configs)} submitted successfully"
         )
+        if len(valid_configs) < len(batch_configs):
+            logger.warning(
+                f"Skipped {len(batch_configs) - len(valid_configs)} invalid config(s)"
+            )
         logger.info(f"{'=' * 70}\n")
 
 
