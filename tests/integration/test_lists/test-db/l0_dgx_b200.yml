@@ -17,7 +17,7 @@ l0_dgx_b200:
   tests:
   - unittest/_torch/misc/test_autotuner.py::test_autotuner_distributed_strategy
   - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_alltoall_fp4[DeepEPLowLatency]
-  - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_alltoall_fp4[MNNVL]
+  - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_alltoall_fp4[NVLinkTwoSided]
   - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_nvfp4[enable_configurable_moe-disable_finalize_fusion-TRTLLM-dtype1]
   - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_w4a8_nvfp4_fp8[enable_configurable_moe-TRTLLM]
   - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_mxfp4_mxfp8[enable_configurable_moe-True-8-64-TRTLLM]
