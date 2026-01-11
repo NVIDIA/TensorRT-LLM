@@ -1902,11 +1902,43 @@ def test_ptp_quickstart(llm_root, llm_venv):
                  marks=skip_pre_blackwell),
     pytest.param(
         'GPT-OSS-120B', 'gpt_oss/gpt-oss-120b', marks=skip_pre_blackwell),
+    pytest.param(
+        'Qwen3-8b-fp8',
+        'Qwen3/nvidia-Qwen3-8B-FP8',
+        marks=skip_pre_blackwell),
+    pytest.param(
+        'Qwen3-8b-nvfp4',
+        'Qwen3/nvidia-Qwen3-8B-NVFP4',
+        marks=skip_pre_blackwell),
+    pytest.param(
+        'Qwen3-14b-fp8',
+        'Qwen3/nvidia-Qwen3-14B-FP8',
+        marks=skip_pre_blackwell),
+    pytest.param(
+        'Qwen3-14b-nvfp4',
+        'Qwen3/nvidia-Qwen3-14B-NVFP4',
+        marks=skip_pre_blackwell),
+    pytest.param(
+        'Qwen3-32b-nvfp4',
+        'Qwen3/nvidia-Qwen3-32B-NVFP4',
+        marks=skip_pre_blackwell),
+    pytest.param(
+        'Phi4-Reasoning-Plus-fp8',
+        'nvidia-Phi-4-reasoning-plus-FP8',
+        marks=skip_pre_blackwell),
+    pytest.param(
+        'Phi4-Reasoning-Plus-nvfp4',
+        'nvidia-Phi-4-reasoning-plus-NVFP4',
+        marks=skip_pre_blackwell),
+    pytest.param(
+        'Nemotron-Nano-v2-nvfp4',
+        'NVIDIA-Nemotron-Nano-9B-v2-NVFP4',
+        marks=skip_pre_blackwell),
 ])
 def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
     print(f"Testing {model_name}.")
     example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
-    if model_name == "Nemotron-H-8B":
+    if model_name in ("Nemotron-H-8B", "Nemotron-Nano-v2-nvfp4"):
         llm_venv.run_cmd([
             str(example_root / "quickstart_advanced.py"),
             "--disable_kv_cache_reuse",
