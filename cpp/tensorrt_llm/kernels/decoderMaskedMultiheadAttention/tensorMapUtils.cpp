@@ -64,6 +64,21 @@ CUtensorMapSwizzle getSwizzleMode(uint32_t partBytes)
     }
 };
 
+CUtensorMapDataType_enum getDataTypeFromXqaParams(XQAParams const& xqaParams)
+{
+    if (xqaParams.kv_cache_data_type == DATA_TYPE_BF16)
+    {
+        return CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
+    }
+    else if (xqaParams.kv_cache_data_type == DATA_TYPE_FP16)
+    {
+        return CU_TENSOR_MAP_DATA_TYPE_FLOAT16;
+    }
+    TLLM_CHECK(xqaParams.kv_cache_data_type == DATA_TYPE_E4M3 || xqaParams.kv_cache_data_type == DATA_TYPE_E5M2
+        || xqaParams.kv_cache_data_type == DATA_TYPE_INT8);
+    return CU_TENSOR_MAP_DATA_TYPE_UINT8;
+}
+
 CUtensorMap makeTensorMapForQ(std::shared_ptr<CUDADriverWrapper> const& driver, void const* addr,
     CUtensorMapDataType_enum dataType, uint32_t headElems, uint32_t totalNbHeads, uint32_t partElems, uint32_t boxHeads)
 {
@@ -131,24 +146,26 @@ CUtensorMap makeTensorMapForHopperXqaKVCache(
     if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
     {
         uint32_t const headElems = xqaParams.head_size;
-        uint32_t const elemBytes = getElemBytes(CU_TENSOR_MAP_DATA_TYPE_UINT8);
+        CUtensorMapDataType_enum const dataType = getDataTypeFromXqaParams(xqaParams);
+        uint32_t const elemBytes = getElemBytes(dataType);
         TLLM_CHECK(headElems <= 256);
         uint32_t const paddedHeadElems = headElems <= 64 ? 64 : (headElems <= 128 ? 128 : 256);
         uint32_t const partElems = std::min(elemBytes * paddedHeadElems, 128U) / elemBytes;
-        return makeTensorMapForPagedKVCache(driver, kv_cache_buffer.mPrimaryPoolPtr, CU_TENSOR_MAP_DATA_TYPE_UINT8,
-            xqaParams.head_size, xqaParams.num_kv_heads, xqaParams.tokens_per_block, partElems);
+        return makeTensorMapForPagedKVCache(driver, kv_cache_buffer.mPrimaryPoolPtr, dataType, xqaParams.head_size,
+            xqaParams.num_kv_heads, xqaParams.tokens_per_block, partElems);
     }
     else
     {
         static_assert(std::is_same_v<KVCacheBuffer, KVLinearBuffer>);
         uint32_t const headElems = xqaParams.head_size;
-        uint32_t const elemBytes = getElemBytes(CU_TENSOR_MAP_DATA_TYPE_UINT8);
+        CUtensorMapDataType_enum const dataType = getDataTypeFromXqaParams(xqaParams);
+        uint32_t const elemBytes = getElemBytes(dataType);
         TLLM_CHECK(headElems <= 256);
         uint32_t const paddedHeadElems = headElems <= 64 ? 64 : (headElems <= 128 ? 128 : 256);
         uint32_t const partElems = std::min(elemBytes * paddedHeadElems, 128U) / elemBytes;
-        return makeTensorMapForContiguousKVCache(driver, kv_cache_buffer.data, CU_TENSOR_MAP_DATA_TYPE_UINT8,
-            xqaParams.head_size, xqaParams.num_kv_heads, xqaParams.max_attention_window_size, xqaParams.beam_width,
-            xqaParams.batch_size, partElems);
+        return makeTensorMapForContiguousKVCache(driver, kv_cache_buffer.data, dataType, xqaParams.head_size,
+            xqaParams.num_kv_heads, xqaParams.max_attention_window_size, xqaParams.beam_width, xqaParams.batch_size,
+            partElems);
     }
 }
 
@@ -161,11 +178,12 @@ template <typename KVCacheBuffer>
 CUtensorMap makeTensorMapForXqaMlaKVCache(std::shared_ptr<tensorrt_llm::common::CUDADriverWrapper> const& driver,
     XQAParams const& xqaParams, KVCacheBuffer const& kv_cache_buffer, bool forK)
 {
+    CUtensorMapDataType_enum const dataType = getDataTypeFromXqaParams(xqaParams);
     uint32_t const partElems = (forK ? 64 : 128);
     if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
     {
-        return makeTensorMapForPagedKVCache(driver, kv_cache_buffer.mPrimaryPoolPtr, CU_TENSOR_MAP_DATA_TYPE_UINT8,
-            xqaParams.head_size, xqaParams.num_kv_heads, xqaParams.tokens_per_block, partElems);
+        return makeTensorMapForPagedKVCache(driver, kv_cache_buffer.mPrimaryPoolPtr, dataType, xqaParams.head_size,
+            xqaParams.num_kv_heads, xqaParams.tokens_per_block, partElems);
     }
     else
     {
@@ -183,7 +201,7 @@ CUtensorMap makeTensorMapForXqaMlaQ(
     std::shared_ptr<tensorrt_llm::common::CUDADriverWrapper> const& driver, XQAParams const& xqaParams, void const* q)
 {
     uint32_t const partElems = 64;
-    return makeTensorMapForQ(driver, q, CU_TENSOR_MAP_DATA_TYPE_UINT8, xqaParams.head_size,
+    return makeTensorMapForQ(driver, q, getDataTypeFromXqaParams(xqaParams), xqaParams.head_size,
         xqaParams.num_q_heads * xqaParams.total_num_input_tokens, partElems, xqaParams.num_q_heads);
 }
 } // namespace kernels
