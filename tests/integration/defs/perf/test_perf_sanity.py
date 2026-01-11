@@ -58,6 +58,7 @@ MODEL_PATH_DICT = {
 }
 
 SUPPORTED_GPU_TYPE = [
+    "H200",
     "B200",
     "B300",
     "GB200",
@@ -223,6 +224,7 @@ class ServerConfig:
             "gpus",
             "gpus_per_node",
             "client_configs",
+            "match_mode",
         ]
         self.extra_llm_api_config_data = {
             k: v for k, v in server_config_data.items() if k not in exclude_keys
@@ -517,7 +519,9 @@ class AggrTestCmds(NamedTuple):
                 )
 
             wait_for_endpoint_ready(
-                f"http://{server_hostname}:{server_port}/health", timeout=self.timeout
+                f"http://{server_hostname}:{server_port}/health",
+                timeout=self.timeout,
+                server_proc=server_proc,
             )
 
             # Run all clients for this server
@@ -1265,10 +1269,10 @@ class PerfSanityTestConfig:
                     cmd_idx += 1
 
                     if not match_keys:
-                        match_keys.extend(["s_gpu_type", "s_runtime"])
                         if server_config.match_mode == "scenario":
                             match_keys = SCENARIO_MATCH_FIELDS.copy()
                         else:
+                            match_keys.extend(["s_gpu_type", "s_runtime"])
                             match_keys.extend(server_config.to_match_keys())
                             match_keys.extend(client_config.to_match_keys())
 
