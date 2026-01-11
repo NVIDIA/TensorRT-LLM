@@ -1226,6 +1226,13 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
             : std::make_tuple(false, 0, nullptr);
         if (matchingBlock != nullptr && numMatchedTokens + numMatched <= sequence.getCurrentPrepopulatedPromptLen())
         {
+            // Remove matchingBlock from free queue so it does not get overwritten accidentally.
+            // If block is not in free queue, calling claimBlock is a noop.
+            if (!matchingBlock->hasRefs())
+            {
+                mEvictionPolicy->claimBlock(matchingBlock);
+            }
+
             KVCacheBlock::IdType matchingBlockId = matchingBlock->getBlockId();
 
             numMatchedTokens += numMatched > 0 ? numMatched : blockItr->uniqueTokens.size();
@@ -1253,6 +1260,11 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
                             *blockItr, blockItr->uniqueTokens.size() == static_cast<size_t>(mTokensPerBlock));
                     }
                     matchingBlock->setHash();
+                    if (!matchingBlock->hasRefs())
+                    {
+                        // Return matchingBlock to free queue since we have copied it and won't be using matchingBlock itself
+                        mEvictionPolicy->releaseBlock(matchingBlock);
+                    }
                     TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - Copied partially filled block %d", mLogPrefix.c_str(),
                         matchingBlockId);
                 }
@@ -1260,6 +1272,8 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
                 {
                     // Leaf block that nobody is using. Make block private and reuse
                     freeLeafBlock(matchingBlock);
+                    // It is safe to call claimBlock a second time.
+                    // This call merely sets priority and duration.
                     mEvictionPolicy->claimBlock(
                         matchingBlock, perBlockRetentions[bi].retentionPriority, perBlockRetentions[bi].durationMs);
                     TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - Reused partially filled block %d", mLogPrefix.c_str(),
@@ -1270,6 +1284,8 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
             else
             {
                 // Recover block and reuse
+                // It is safe to call claimBlock a second time.
+                // This call merely sets priority and duration.
                 mEvictionPolicy->claimBlock(
                     matchingBlock, perBlockRetentions[bi].retentionPriority, perBlockRetentions[bi].durationMs);
                 TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - Matched full block %d", mLogPrefix.c_str(), matchingBlockId);
