@@ -1082,7 +1082,9 @@ class Attention(Module):
             if self.cross_attention and (past_key_value is not None):
                 past_key_value = kv_cache_params.past_key_value[1]
             assert self.attention_mask_type in [
-                AttentionMaskType.causal, AttentionMaskType.bidirectional,
+                AttentionMaskType.causal,
+                AttentionMaskType.sliding_window_causal,
+                AttentionMaskType.bidirectional,
                 AttentionMaskType.bidirectionalglm,
                 AttentionMaskType.blocksparse
             ], 'Plugin only support masked MHA.'
@@ -1937,7 +1939,9 @@ class CogVLMAttention(Attention):
             if self.cross_attention and (past_key_value is not None):
                 past_key_value = kv_cache_params.past_key_value[1]
             assert self.attention_mask_type in [
-                AttentionMaskType.causal, AttentionMaskType.bidirectional,
+                AttentionMaskType.causal, 
+                AttentionMaskType.sliding_window_causal,
+                AttentionMaskType.bidirectional,
                 AttentionMaskType.bidirectionalglm
             ], 'Plugin only support masked MHA.'
 
@@ -2284,6 +2288,7 @@ class DeepseekV2Attention(Attention):
                 past_key_value = kv_cache_params.past_key_value[1]
             assert self.attention_mask_type in [
                 AttentionMaskType.causal,
+                AttentionMaskType.sliding_window_causal,
                 AttentionMaskType.bidirectional,
                 AttentionMaskType.bidirectionalglm,
             ], 'Plugin only support masked MHA.'
