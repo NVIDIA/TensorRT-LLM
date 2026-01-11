@@ -7,11 +7,9 @@ from typing import Optional, Tuple
 import torch
 import triton
 import triton.language as tl
-
-from tensorrt_llm._torch.modules.fla.index import (prepare_chunk_indices,
-                                                   prepare_chunk_offsets)
-from tensorrt_llm._torch.modules.fla.op import exp, safe_exp
-from tensorrt_llm._torch.modules.fla.utils import is_nvidia_hopper
+from fla.ops.utils import prepare_chunk_indices, prepare_chunk_offsets
+from fla.ops.utils.op import exp, safe_exp
+from fla.utils import is_nvidia_hopper, use_cuda_graph
 
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
 
@@ -23,16 +21,14 @@ NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
     "SAVE_NEW_VALUE": lambda args: args["v_new"] is not None,
     "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
 })
-# @triton.autotune(
-#     configs=[
-#         triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
-#         for num_warps in [2, 4]
-#         for num_stages in [2, 3, 4]
-#         for BV in [32, 64]
-#     ],
-#     key=["H", "K", "V", "BT", "USE_G"],
-#     use_cuda_graph=use_cuda_graph,
-# )
+@triton.autotune(
+    configs=[
+        triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
+        for num_warps in [2, 4] for num_stages in [2, 3, 4] for BV in [32, 64]
+    ],
+    key=["H", "K", "V", "BT", "USE_G"],
+    use_cuda_graph=use_cuda_graph,
+)
 @triton.jit(do_not_specialize=["T"])
 def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     k,
@@ -47,7 +43,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     chunk_offsets,
     T,
     H: tl.constexpr,
-    Hg: tl.constexpr,
+    Hqk: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
     BT: tl.constexpr,
@@ -83,13 +79,13 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     # calculate offset
     h += (boh * H + i_h) * K * V
     v += (bos * H + i_h) * V
-    k += (bos * Hg + i_h // (H // Hg)) * K
+    k += (bos * Hqk + i_h // (H // Hqk)) * K
     w += (bos * H + i_h) * K
     if SAVE_NEW_VALUE:
         v_new += (bos * H + i_h) * V
     stride_v = H * V
     stride_h = H * K * V
-    stride_k = Hg * K
+    stride_k = Hqk * K
     stride_w = H * K
     if USE_INITIAL_STATE:
         h0 = h0 + i_nh * K * V
@@ -244,7 +240,7 @@ def chunk_gated_delta_rule_fwd_h(
     save_new_value: bool = True,
     cu_seqlens: Optional[torch.LongTensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    B, T, Hg, K, V = *k.shape, u.shape[-1]
+    B, T, Hqk, K, V = *k.shape, u.shape[-1]
     H = u.shape[-2]
     BT = chunk_size
 
@@ -283,12 +279,8 @@ def chunk_gated_delta_rule_fwd_h(
         chunk_offsets=chunk_offsets,
         T=T,
         H=H,
-        Hg=Hg,
+        Hqk=Hqk,
         K=K,
         V=V,
-        BT=BT,
-        BV=32,
-        num_warps=4,
-        num_stages=2,
-    )
+        BT=BT)
     return h, v_new, final_state
