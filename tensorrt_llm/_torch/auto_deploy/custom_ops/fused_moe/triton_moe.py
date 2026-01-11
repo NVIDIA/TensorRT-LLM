@@ -14,6 +14,8 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from tensorrt_llm._torch.utils import ActivationType  # noqa: F401
+
 from ...utils.logger import ad_logger
 
 
@@ -601,15 +603,13 @@ def triton_fused_moe(
     routing_weights: torch.Tensor,
     w1_stacked_weight: torch.Tensor,
     w2_stacked_weight: torch.Tensor,
-    mlp_style: str = "mlp",
-    act_fn: str = "relu2",
+    is_gated_mlp: bool = False,
+    act_fn: int = int(ActivationType.Relu2),
 ) -> torch.Tensor:
     """Triton unquantized MoE with 2-layer MLP and ReLU^2 activation."""
 
-    mlp_style = mlp_style.lower()
-    act_fn = act_fn.lower()
-    assert mlp_style == "mlp", "Triton backend only supports mlp style."
-    assert act_fn == "relu2", "Triton backend only supports relu2 activation."
+    assert not is_gated_mlp, "Triton backend only supports non gated MLP style."
+    assert act_fn == ActivationType.Relu2, "Triton backend only supports relu2 activation."
 
     x_shape = x.shape
     x2d = x.view(-1, x_shape[-1])
@@ -661,12 +661,12 @@ def triton_quant_fp8_moe(
     w1_weight_scale: torch.Tensor,  # [E] stacked weight scales
     w2_weight_scale: torch.Tensor,  # [E] stacked weight scales
     w3_weight_scale: torch.Tensor,  # unused
-    mlp_style: str = "gated_mlp",
-    act_fn: str = "silu",
+    is_gated_mlp: bool = False,
+    act_fn: int = int(ActivationType.Silu),
 ) -> torch.Tensor:
     """Triton FP8 W8A8 MoE with 2-layer MLP and ReLU^2 activation."""
-    if mlp_style != "mlp":
-        raise NotImplementedError("triton_quant_fp8_moe currently supports mlp_style=='mlp' only")
+    if is_gated_mlp:
+        raise NotImplementedError("triton_quant_fp8_moe currently supports mlp only")
 
     x_shape = x.shape
     x2d = x.view(-1, x_shape[-1])
@@ -760,7 +760,7 @@ def triton_quant_fp8_moe(
     w1_weight_scale: torch.Tensor,
     w2_weight_scale: torch.Tensor,
     w3_weight_scale: torch.Tensor,
-    mlp_style: str = "gated_mlp",
-    act_fn: str = "silu",
+    is_gated_mlp: bool = False,
+    act_fn: int = int(ActivationType.Silu),
 ) -> torch.Tensor:
     return torch.empty_like(x)

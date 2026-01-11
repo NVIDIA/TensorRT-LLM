@@ -84,7 +84,7 @@ from ._utils import (default_gpus_per_node, local_mpi_rank, local_mpi_size,
 from .builder import BuildConfig, Builder, BuilderConfig, build
 from .disaggregated_params import DisaggregatedParams
 from .functional import Tensor, constant
-from .llmapi import LLM, MultimodalEncoder
+from .llmapi import LLM, AsyncLLM, MultimodalEncoder
 from .llmapi.llm_args import LlmArgs, TorchLlmArgs, TrtLlmArgs
 from .logger import logger
 from .mapping import Mapping
@@ -136,6 +136,7 @@ __all__ = [
     'quantization',
     'tools',
     'LLM',
+    'AsyncLLM',
     'MultimodalEncoder',
     'LlmArgs',
     'TorchLlmArgs',

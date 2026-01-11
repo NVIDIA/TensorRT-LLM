@@ -17,18 +17,20 @@
 #include "../../include/moe_gemm_kernels.h"
 #include "cutlass_extensions/gemm_configs.h"
 #include "cutlass_extensions/weight_only_quant_op.h"
+#include "tensorrt_llm/common/config.h"
 #include <cuda_runtime_api.h>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace cutlass_kernels_oss
 {
 using tensorrt_llm::kernels::cutlass_kernels::GroupedGemmInput;
 using tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput;
-template <typename T, typename WeightType, typename GemmOutputType, typename EpilogueTag, typename CTAShape,
-    typename ClusterShape, typename MainloopScheduleType, typename EpilogueScheduleType,
+using EpilogueFusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion;
+template <typename T, typename WeightType, typename GemmOutputType, typename EpilogueTag, EpilogueFusion FUSION,
+    typename CTAShape, typename ClusterShape, typename MainloopScheduleType, typename EpilogueScheduleType,
     cutlass::WeightOnlyQuantOp QuantOp>
 void sm90_generic_mixed_moe_gemm_kernelLauncher(
     tensorrt_llm::kernels::cutlass_kernels::GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputType> inputs,
@@ -36,4 +38,5 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(
 
 } // namespace cutlass_kernels_oss
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

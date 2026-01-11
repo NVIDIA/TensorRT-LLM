@@ -27,10 +27,10 @@ done
 
 if [ "${numa_bind}" = "true" ]; then
     numa_bind_cmd="numactl -m 0,1"
-    echo "numactl -m 0,1 - Only allocate memory from nodes on GB200"
+    echo "numactl -m 0,1 - Only allocate memory from nodes on GB200/GB300 NVL72"
 else
     numa_bind_cmd=""
-    echo "Not binding memory. If on GB200, use \"numactl -m 0,1\" to only allocate memory from nodes."
+    echo "Not binding memory. If on GB200/GB300 NVL72, use \"numactl -m 0,1\" to only allocate memory from nodes."
 fi
 
 if [ "${benchmark_mode}" = "gen_only" ]; then
@@ -39,13 +39,6 @@ if [ "${benchmark_mode}" = "gen_only" ]; then
 fi
 
 echo "config_file: ${config_file}"
-
-# if SLURM_NODEID is 0, save the hostname to a file
-if [ "${SLURM_NODEID}" = "0" ]; then
-    mkdir -p ${log_dir}/hostnames/
-    echo $(hostname) > ${log_dir}/hostnames/${role}_${instance_id}.txt
-    echo "hostname saved to ${log_dir}/hostnames/${role}_${instance_id}.txt"
-fi
 
 nsys_prefix=""
 if [ "${enable_nsys}" != "true" ]; then
@@ -63,4 +56,4 @@ fi
 ${nsys_prefix} trtllm-llmapi-launch ${numa_bind_cmd} \
     trtllm-serve ${model_path} \
         --host $(hostname) --port ${port} \
-        --extra_llm_api_options ${config_file}
+        --config ${config_file}

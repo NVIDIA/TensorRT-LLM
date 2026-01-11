@@ -106,7 +106,8 @@ class TestSiglipVisionModel(unittest.TestCase):
             attn_backend=backend,
         )
 
-        tllm_model = SiglipVisionModel(model_config).to(dtype).to(device)
+        tllm_model = SiglipVisionModel(
+            model_config, use_post_layernorm=True).to(dtype).to(device)
         tllm_model.load_weights(hf_model.state_dict())
 
         # Prepare inputs - create random pixel values for images

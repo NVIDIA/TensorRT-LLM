@@ -15,6 +15,7 @@
  */
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplPrecompiled.h"
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/workspace.h"
@@ -33,7 +34,9 @@
 
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
 
 class XQAKernelList
@@ -44,7 +47,7 @@ public:
     XQAKernelList(Data_type type, unsigned int sm)
         : mDriver(tensorrt_llm::common::CUDADriverWrapper::getInstance())
         , mDataType(type)
-        , mKernelMetaCount(sizeof(sXqaKernelMetaInfo) / sizeof(sXqaKernelMetaInfo[0]))
+        , mKernelMetaCount(sXqaKernelMetaInfoSize)
         , mKernelMeta(&sXqaKernelMetaInfo[0])
         , mSM(sm)
     {
@@ -557,4 +560,6 @@ void DecoderXQAImplPrecompiled::runWithKVBlockArray(
     runDispatchBuffer<KVBlockArray>(xqa_params, kv_block_array, stream);
 }
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

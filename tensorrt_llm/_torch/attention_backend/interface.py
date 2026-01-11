@@ -354,6 +354,15 @@ class AttentionMetadata:
         Hook to be called when using TRTLLM attention backend in spec-dec mode.
         """
 
+    def update_helix_param(
+        self,
+        helix_position_offsets: List[int],
+        helix_is_inactive_rank: List[bool],
+    ) -> None:
+        """
+        Hook to be called when using helix parallelism.
+        """
+
     def update_for_spec_dec(self) -> None:
         """
         Hook to be called during forward when using spec-dec one-model mode.
@@ -578,8 +587,9 @@ class PositionalEmbeddingParams:
     rope: Optional[RopeParams] = None
     is_neox: bool = True
 
-    # mRoPE params (currently, Qwen2/2.5-VL uses it)
+    # mRoPE params
     mrope_section: Optional[List[int]] = None
+    mrope_interleaved: bool = False
 
     def __post_init__(self) -> None:
         if self.type.is_deferred():
@@ -695,9 +705,13 @@ class AttentionBackend(Generic[TMetadata]):
     def support_mla(cls) -> bool:
         return False
 
-    @classmethod
-    def support_nvfp4_output(cls) -> bool:
-        return False
+    def create_output(self, q: torch.Tensor, **kwargs) -> List[torch.Tensor]:
+        """
+        Create the output tensors for the attention operation.
+        """
+        num_tokens = q.shape[0]
+        hidden_size = self.num_heads * self.head_dim
+        return [q.new_empty([num_tokens, hidden_size], dtype=q.dtype)]
 
 
 @dataclass(kw_only=True, unsafe_hash=True)

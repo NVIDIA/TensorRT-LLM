@@ -29,11 +29,12 @@
 
 #include "fused_multihead_attention_common.h"
 #include "fused_multihead_attention_v2.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tmaDescriptor.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -102,4 +103,5 @@ private:
 };
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

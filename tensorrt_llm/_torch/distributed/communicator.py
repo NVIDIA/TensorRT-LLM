@@ -116,6 +116,26 @@ class Distributed(ABC):
     def allgather(self, obj, root=0):
         pass
 
+    @abstractmethod
+    def tp_broadcast(self, obj, root=0, **kwargs):
+        pass
+
+    @abstractmethod
+    def cp_broadcast(self, obj, root=0, **kwargs):
+        pass
+
+    def tp_cp_broadcast(self, obj, root=0, **kwargs):
+        """Broadcast object across both TP and CP groups.
+
+        This is used when both TP and CP parallelism are enabled (e.g., helix parallelism).
+        First broadcasts within the TP group, then within the CP group.
+        """
+        if self.tp_size > 1:
+            obj = self.tp_broadcast(obj, root=root, **kwargs)
+        if self.cp_size > 1:
+            obj = self.cp_broadcast(obj, root=root, **kwargs)
+        return obj
+
 
 def safe_broadcast(comm, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
     """
@@ -407,6 +427,14 @@ class MPIDist(Distributed):
     def cp_allgather(self, obj):
         return self.cp_comm.allgather(obj)
 
+    def cp_broadcast(self,
+                     obj,
+                     root=0,
+                     chunk_size: int = 4 * 1024 * 1024,
+                     **kwargs):
+        comm = self.cp_comm
+        return safe_broadcast(comm, obj, root=root, chunk_size=chunk_size)
+
     def tp_allgather(self, obj):
         return self.tp_comm.allgather(obj)
 
@@ -414,7 +442,11 @@ class MPIDist(Distributed):
         comm = self.tp_comm
         return safe_gather(comm, obj, root=root, chunk_size=chunk_size)
 
-    def tp_broadcast(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
+    def tp_broadcast(self,
+                     obj,
+                     root=0,
+                     chunk_size: int = 4 * 1024 * 1024,
+                     **kwargs):
         comm = self.tp_comm
         return safe_broadcast(comm, obj, root=root, chunk_size=chunk_size)
 
@@ -622,8 +654,7 @@ class TorchDist(Distributed):
 
     @log_op
     def send_object(self, obj, dest, tag=0):
-        raise NotImplementedError(
-            "send_object is not implemented for TorchDist")
+        self.isend_object(obj, dest, tag).wait()
 
     @log_op
     def isend_object(self, obj, dest, tag=0):
@@ -639,16 +670,6 @@ class TorchDist(Distributed):
                                     tag=tag))
         works.append(torch.distributed.isend(input_tensor, dst=dest, tag=tag))
         return MultiHandleWrapper(works)
-
-    @log_op
-    def recv_object_from_isend(self, src, tag):
-        size_tensor = torch.tensor([0], dtype=torch.int32)
-        torch.distributed.recv(size_tensor, src=src, tag=tag)
-        bytes_size = size_tensor.item()
-        recv_tensor = torch.empty(bytes_size, dtype=torch.uint8)
-        torch.distributed.recv(recv_tensor, src=src, tag=tag)
-        return _tensor_to_object(recv_tensor, bytes_size,
-                                 torch.distributed.group.WORLD)
 
     @log_op
     def allreduce(self,
@@ -710,7 +731,7 @@ class TorchDist(Distributed):
             return output_list
 
     @log_op
-    def tp_broadcast(self, obj, root=0):
+    def tp_broadcast(self, obj, root=0, **kwargs):
         if isinstance(obj, torch.Tensor):
             dist.broadcast(obj, src=root, group=self.mapping.tp_group_pg)
             return obj
@@ -720,6 +741,20 @@ class TorchDist(Distributed):
                 ret,
                 src=root,
                 group=self.mapping.tp_group_pg,
+                device=torch.device("cpu"))
+            return ret[0]
+
+    @log_op
+    def cp_broadcast(self, obj, root=0, **kwargs):
+        if isinstance(obj, torch.Tensor):
+            dist.broadcast(obj, src=root, group=self.mapping.cp_group_pg)
+            return obj
+        else:
+            ret = [obj]
+            torch.distributed.broadcast_object_list(
+                ret,
+                src=root,
+                group=self.mapping.cp_group_pg,
                 device=torch.device("cpu"))
             return ret[0]
 
@@ -790,11 +825,23 @@ class PPCommNCCL:
             self.mapping.world_size,
             self.mapping.rank,
         )
+        self.tensor_ready_event = torch.cuda.Event()
+        self.send_stream = torch.cuda.Stream()
 
     def send(self, tensor: torch.Tensor, dest: Optional[int] = None):
         if dest is None:
             dest = self.mapping.next_pp_rank()
-        self.nccl_comm.send(tensor, dest)
+
+        # NCCL send kernel in send_stream cannot be captured,
+        # so we send in the current stream instead in CUDA graph cases.
+        if torch.cuda.is_current_stream_capturing():
+            self.nccl_comm.send(tensor, dest)
+            return
+
+        self.tensor_ready_event.record()
+        with torch.cuda.stream(self.send_stream):
+            self.tensor_ready_event.wait()
+            self.nccl_comm.send(tensor, dest)
 
     def recv(self, tensor: torch.Tensor, src: Optional[int] = None):
         if src is None:
@@ -817,13 +864,18 @@ class PPCommTorch:
         if dest is None:
             dest = self.mapping.next_pp_rank()
 
-        self.pg.send([tensor], self._global_to_local_rank(dest), tag=0).wait()
+        work = self.pg.send([tensor], self._global_to_local_rank(dest), tag=0)
+        # Send operation cannot be captured without blocking wait,
+        # so we block the current stream in CUDA graph cases.
+        if torch.cuda.is_current_stream_capturing():
+            work.block_current_stream()
 
     def recv(self, tensor: torch.Tensor, src: Optional[int] = None):
         if src is None:
             src = self.mapping.prev_pp_rank()
 
-        self.pg.recv([tensor], self._global_to_local_rank(src), tag=0).wait()
+        work = self.pg.recv([tensor], self._global_to_local_rank(src), tag=0)
+        work.block_current_stream()
 
 
 _pp_comm = None

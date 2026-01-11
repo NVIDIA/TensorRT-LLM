@@ -21,12 +21,14 @@ Usage: $0 model_name input_seq_len output_seq_len ratio multi_round num_gen_serv
     concurrency_list: List of concurrency values
     streaming      : Enable/disable streaming (true/false)
     log_path       : Path to store logs
+    hostname       : Hostname of the server
+    port           : Port of the server
 EOF
     exit 1
 }
 
 # Validate arguments
-[[ $# -lt 9 ]] && usage
+[[ $# -lt 11 ]] && usage
 
 # Parse arguments
 model_name=$1
@@ -38,16 +40,15 @@ num_gen_servers=$6
 concurrency_list=$7
 streaming=$8
 log_path=$9
+hostname=${10}
+port=${11}
 
-# Exit if not primary process
-[[ ${SLURM_PROCID:-0} != "0" ]] && { echo "Process id is ${SLURM_PROCID} for loadgen, exiting"; exit 0; }
+# check process id is not 0
+if [[ ${SLURM_PROCID} != "0" ]]; then
+    echo "Process id is ${SLURM_PROCID} for loadgen, exiting"
+    exit 0
+fi
 
-config_file="${log_path}/server_config.yaml"
-
-# Extract hostname and port from config file (server is already healthy)
-hostname=$(grep -i "hostname:" "${config_file}" | awk '{print $2}')
-port=$(grep -i "port:" "${config_file}" | awk '{print $2}')
-[[ -z "$hostname" || -z "$port" ]] && { echo "Error: Failed to extract hostname or port from config file"; exit 1; }
 echo "Hostname: ${hostname}, Port: ${port}"
 
 # Clean up and clone benchmark repository
@@ -89,8 +90,3 @@ for concurrency in ${concurrency_list}; do
 
     echo "Benchmark with concurrency ${concurrency} done"
 done
-
-# Save job information
-if [ -n "${SLURM_JOB_ID:-}" ]; then
-    echo "${SLURM_JOB_NODELIST}" > "${log_path}/job_${SLURM_JOB_ID}.txt"
-fi

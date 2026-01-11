@@ -6,9 +6,9 @@ set -u
 trap 'echo "Error occurred at line $LINENO"; exit 1' ERR
 
 # Add parameter validation
-if [ "$#" -lt 7 ]; then
+if [ "$#" -lt 9 ]; then
     echo "Error: Missing required arguments"
-    echo "Usage: $0 model_name dataset_file multi_round concurrency_list streaming log_path"
+    echo "Usage: $0 model_name dataset_file multi_round concurrency_list streaming log_path hostname port"
     exit 1
 fi
 
@@ -19,6 +19,8 @@ num_gen_servers=$4
 concurrency_list=$5
 streaming=$6
 log_path=$7
+hostname=$8
+port=$9
 
 # check process id is not 0
 if [[ ${SLURM_PROCID} != "0" ]]; then
@@ -26,17 +28,7 @@ if [[ ${SLURM_PROCID} != "0" ]]; then
     exit 0
 fi
 
-config_file=${log_path}/server_config.yaml
-
-# Extract hostname and port from config file (server is already healthy)
-hostname=$(grep -i "hostname:" ${config_file} | awk '{print $2}')
-port=$(grep -i "port:" ${config_file} | awk '{print $2}')
-if [ -z "$hostname" ] || [ -z "$port" ]; then
-    echo "Error: Failed to extract hostname or port from config file"
-    exit 1
-fi
 echo "Hostname: ${hostname}, Port: ${port}"
-
 echo "Starting benchmark..."
 for concurrency in ${concurrency_list}; do
     concurrency=$((concurrency * num_gen_servers))
@@ -62,8 +54,3 @@ for concurrency in ${concurrency_list}; do
         $(if [ "${streaming}" = "false" ]; then echo "--non-streaming"; fi)
     echo "Benchmark with concurrency ${concurrency} done"
 done
-
-job_id=${SLURM_JOB_ID}
-if [ -n "${job_id}" ]; then
-    echo "${SLURM_JOB_NODELIST}" > ${log_path}/job_${job_id}.txt
-fi

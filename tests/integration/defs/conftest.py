@@ -16,6 +16,7 @@
 
 import datetime
 import gc
+import logging
 import os
 import platform
 import re
@@ -37,7 +38,6 @@ import tqdm
 import yaml
 from _pytest.mark import ParameterSet
 
-from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
 from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
 
@@ -55,6 +55,9 @@ try:
     from llm import trt_environment
 except ImportError:
     trt_environment = None
+
+# Logger
+logger = logging.getLogger(__name__)
 
 # TODO: turn off this when the nightly storage issue is resolved.
 DEBUG_CI_STORAGE = os.environ.get("DEBUG_CI_STORAGE", False)
@@ -2209,6 +2212,95 @@ def pytest_generate_tests(metafunc: pytest.Metafunc):
     metafunc.parametrize("case", uts, ids=lambda x: x)
 
 
+# Test cases that use enable_configurable_moe parameter and need ID conversion
+TESTS_WITH_CONFIGURABLE_MOE = [
+    "TestDeepSeekV3Lite::test_nvfp4_4gpus[",
+    "TestDeepSeekV3Lite::test_fp8_block_scales[",
+    "TestGPTOSS::test_w4_4gpus[",
+    "TestGPTOSS::test_w4_4gpus_online_eplb[",
+    "TestQwen3_30B_A3B::test_w4a8_mxfp4[",
+]
+
+
+def _convert_clean_to_original_moe_test_id(test_id):
+    """Convert clean MoE test ID back to original format for pytest collection.
+
+    Example: "test_llm_api_pytorch.py::test_foo[param]" -> "test_llm_api_pytorch.py::test_foo[-param]"
+
+    This is needed because the `enable_configurable_moe` parameter uses empty string
+    as ID when value is 0, resulting in test IDs like "test_foo[-param]".
+    We clean these up in pytest_collection_modifyitems, but pytest filters tests
+    during collection using the original IDs. So when user runs with clean test name,
+    we need to convert it back to match the original.
+    """
+    if "test_llm_api_pytorch.py" not in test_id:
+        return test_id
+
+    # Match pattern like "test_name[params]" and add leading dash after "["
+    # But only if params don't already start with "-" or "enable_configurable_moe"
+    match = re.search(r"\[([^\]]+)\]", test_id)
+    if match:
+        params = match.group(1)
+        # Skip if already has leading dash or starts with enable_configurable_moe
+        if not params.startswith("-") and not params.startswith(
+                "enable_configurable_moe"):
+            # Add leading dash to params
+            new_params = "-" + params
+            test_id = test_id.replace(f"[{params}]", f"[{new_params}]")
+
+    return test_id
+
+
+def pytest_sessionstart(session):
+    """Convert clean MoE test IDs in config.args to original format for collection.
+
+    This is needed because pytest filters tests during collection using original IDs.
+    When user runs with clean test name, we convert it back to match the original.
+    """
+    args = session.config.args
+    for i, arg in enumerate(args):
+        if "test_llm_api_pytorch.py" in arg and "[" in arg:
+            # Only apply conversion to specific tests that use enable_configurable_moe
+            should_convert = any(test_name in arg
+                                 for test_name in TESTS_WITH_CONFIGURABLE_MOE)
+            if should_convert:
+                args[i] = _convert_clean_to_original_moe_test_id(arg)
+
+
+def _clean_moe_test_ids(items):
+    """Clean up test IDs by removing leading/trailing dashes from parameter IDs.
+
+    This is needed because `enable_configurable_moe` parameter can be empty,
+    resulting in ugly test IDs like "test_foo[-True]" or "test_foo[--abc]".
+    We clean these up to "test_foo[True]" or "test_foo[abc]" so that:
+    1. Test names in waive files and test lists remain unchanged
+    2. Test reports look cleaner
+    """
+    for item in items:
+        if "test_llm_api_pytorch.py" in item.nodeid and "[" in item.nodeid:
+            # Only apply cleanup to specific tests that use enable_configurable_moe
+            should_cleanup = any(test_name in item.nodeid
+                                 for test_name in TESTS_WITH_CONFIGURABLE_MOE)
+            if should_cleanup:
+                original_nodeid = item.nodeid
+                original_name = item.name
+                nodeid = item.nodeid
+                name = item.name
+
+                # Clean up leading/trailing dashes in nodeid
+                nodeid = nodeid.replace("[-", "[")
+                nodeid = nodeid.replace("-]", "]")
+
+                # Clean up leading/trailing dashes in name
+                name = name.replace("[-", "[")
+                name = name.replace("-]", "]")
+
+                if nodeid != original_nodeid:
+                    item._nodeid = nodeid
+                if name != original_name:
+                    item.name = name
+
+
 @pytest.hookimpl(tryfirst=True, hookwrapper=True)
 def pytest_collection_modifyitems(session, config, items):
     testlist_path = config.getoption("--test-list")
@@ -2216,6 +2308,10 @@ def pytest_collection_modifyitems(session, config, items):
     test_prefix = config.getoption("--test-prefix")
     perf_test = config.getoption("--perf")
     test_model_suites = config.getoption("--test-model-suites")
+
+    # TODO Once the MoE refactor is complete, this should be removed.
+    # This is a temporary WAR to minimize the impact of the MoE refactor on the existing test lists.
+    _clean_moe_test_ids(items)
 
     if perf_test:
         global ALL_PYTEST_ITEMS
@@ -2269,6 +2365,7 @@ def pytest_configure(config):
     tqdm.tqdm.monitor_interval = 0
     if config.getoption("--run-ray"):
         os.environ["TLLM_DISABLE_MPI"] = "1"
+        os.environ["TLLM_RAY_FORCE_LOCAL_CLUSTER"] = "1"
 
     # Initialize PeriodicJUnitXML reporter if enabled
     periodic = config.getoption("--periodic-junit", default=False)
@@ -2588,60 +2685,138 @@ IS_UNDER_CI_ENV = "JENKINS_HOME" in os.environ
 gpu_warning_threshold = 1024 * 1024 * 1024
 
 
+def get_gpu_memory_wo_pynvml():
+    import psutil
+
+    logger.warning(
+        f"pynvml not available, using fallback commands for memory monitoring")
+
+    gpu_memory = {}
+    system_total_mb = 0
+    system_used_mb = 0
+    try:
+        mem_output = check_output("free -m | awk '/^Mem:/ {print $3, $2}'",
+                                  shell=True)
+        parts = mem_output.strip().split()
+        system_used_mb = int(parts[0])
+        system_total_mb = int(parts[1])
+    except Exception:
+        pass
+
+    # Parse nvidia-smi pmon to get GPU memory usage
+    try:
+        gpu_output = check_output("nvidia-smi pmon -s m -c 1", shell=True)
+        lines = gpu_output.strip().split('\n')
+
+        for line in lines:
+            parts = line.split()
+            try:
+                gpu_idx = int(parts[0])
+
+                # Initialize GPU entry if not exists
+                if gpu_idx not in gpu_memory:
+                    gpu_memory[gpu_idx] = {
+                        "total_used": 0,
+                        "total": system_total_mb,
+                        "process": {}
+                    }
+
+                # Skip if no active process (pid is '-')
+                if parts[1] == '-':
+                    continue
+
+                pid = int(parts[1])
+                mem_mb = int(parts[3])
+                gpu_memory[gpu_idx]["total_used"] += mem_mb
+
+                # Get process info (same as pynvml version)
+                try:
+                    p = psutil.Process(pid)
+                    host_memory_in_mbs = p.memory_full_info(
+                    ).uss // 1024 // 1024
+                    gpu_memory[gpu_idx]["process"][pid] = (
+                        mem_mb,
+                        host_memory_in_mbs,
+                        p.cmdline(),
+                    )
+                except Exception:
+                    pass
+            except (ValueError, IndexError):
+                continue
+    except Exception as gpu_err:
+        logging.warning(f"nvidia-smi pmon error: {gpu_err}")
+
+    # Create default entry for GPU 0 if no GPUs detected
+    if not gpu_memory:
+        gpu_memory[0] = {
+            "total_used": system_used_mb,
+            "total": system_total_mb,
+            "process": {}
+        }
+    return gpu_memory
+
+
 def collect_status(item: pytest.Item):
     if not IS_UNDER_CI_ENV:
         return
 
     import psutil
-    import pynvml
-
-    pynvml.nvmlInit()
-
-    handles = {
-        idx: pynvml.nvmlDeviceGetHandleByIndex(idx)
-        for idx in range(pynvml.nvmlDeviceGetCount())
-    }
-
-    deadline = time.perf_counter() + 60  # 1 min
-    observed_used = 0
-    global gpu_warning_threshold
-
-    while time.perf_counter() < deadline:
-        observed_used = max(
-            pynvml.nvmlDeviceGetMemoryInfo(device).used
-            for device in handles.values())
-        if observed_used <= gpu_warning_threshold:
-            break
-        time.sleep(1)
-    else:
-        gpu_warning_threshold = max(observed_used, gpu_warning_threshold)
-        warnings.warn(
-            f"Test {item.name} does not free up GPU memory correctly!")
 
     gpu_memory = {}
-    for idx, device in handles.items():
-        total_used = pynvml.nvmlDeviceGetMemoryInfo(device).used // 1024 // 1024
-        total = pynvml.nvmlDeviceGetMemoryInfo(device).total // 1024 // 1024
-        detail = pynvml.nvmlDeviceGetComputeRunningProcesses(device)
-        process = {}
 
-        for entry in detail:
-            try:
-                p = psutil.Process(entry.pid)
-                host_memory_in_mbs = p.memory_full_info().uss // 1024 // 1024
-                process[entry.pid] = (
-                    entry.usedGpuMemory // 1024 // 1024,
-                    host_memory_in_mbs,
-                    p.cmdline(),
-                )
-            except Exception:
-                pass
+    try:
+        import pynvml
+        pynvml.nvmlInit()
 
-        gpu_memory[idx] = {
-            "total_used": total_used,
-            "total": total,
-            "process": process
+        handles = {
+            idx: pynvml.nvmlDeviceGetHandleByIndex(idx)
+            for idx in range(pynvml.nvmlDeviceGetCount())
         }
+
+        deadline = time.perf_counter() + 60  # 1 min
+        observed_used = 0
+        global gpu_warning_threshold
+
+        while time.perf_counter() < deadline:
+            observed_used = max(
+                pynvml.nvmlDeviceGetMemoryInfo(device).used
+                for device in handles.values())
+            if observed_used <= gpu_warning_threshold:
+                break
+            time.sleep(1)
+        else:
+            gpu_warning_threshold = max(observed_used, gpu_warning_threshold)
+            warnings.warn(
+                f"Test {item.name} does not free up GPU memory correctly!")
+
+        for idx, device in handles.items():
+            total_used = pynvml.nvmlDeviceGetMemoryInfo(
+                device).used // 1024 // 1024
+            total = pynvml.nvmlDeviceGetMemoryInfo(device).total // 1024 // 1024
+            detail = pynvml.nvmlDeviceGetComputeRunningProcesses(device)
+            process = {}
+
+            for entry in detail:
+                try:
+                    p = psutil.Process(entry.pid)
+                    host_memory_in_mbs = p.memory_full_info(
+                    ).uss // 1024 // 1024
+                    process[entry.pid] = (
+                        entry.usedGpuMemory // 1024 // 1024,
+                        host_memory_in_mbs,
+                        p.cmdline(),
+                    )
+                except Exception:
+                    pass
+
+            gpu_memory[idx] = {
+                "total_used": total_used,
+                "total": total,
+                "process": process
+            }
+    except Exception:
+        gpu_memory = get_gpu_memory_wo_pynvml()
+
     print("\nCurrent memory status:")
     print(gpu_memory)
 
@@ -2732,15 +2907,3 @@ def torch_empty_cache() -> None:
         gc.collect()
         torch.cuda.empty_cache()
         gc.collect()
-
-
-@pytest.fixture(autouse=True)
-def ray_cleanup(llm_venv) -> None:
-    yield
-
-    if mpi_disabled():
-        llm_venv.run_cmd([
-            "-m",
-            "ray.scripts.scripts",
-            "stop",
-        ])

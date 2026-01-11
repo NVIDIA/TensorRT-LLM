@@ -1397,11 +1397,7 @@ class TritonFusedMoE(MoE):
         assert len(weights) == 1
         weights = weights[0]
 
-        self.quant_method.load_weights(
-            self,
-            weights,
-            self.weight_loading_mode,
-            allow_partial_loading=allow_partial_loading)
+        self.quant_method.load_weights(self, weights, self.weight_loading_mode)
 
     def post_load_weights(self):
         self.quant_method.post_load_weights(self)

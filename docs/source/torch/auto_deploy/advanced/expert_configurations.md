@@ -190,6 +190,25 @@ Specifies which sharding dimensions to apply during heuristic sharding. The avai
 
 You can enable multiple dimensions simultaneously. For example, `['tp', 'ep']` will apply both tensor parallelism and expert parallelism.
 
+#### `process_grid` (dict, default: `None`)
+
+Specifies a 2D device mesh for hybrid EP+TP parallelism.
+
+- NOTE 1: This grid applies only to the MoE layers. Attention, Mamba, and MLP layers are unaffected.
+- NOTE 2: The order of the keys matters. Process grid's layout is in the generalized column-major order,
+  that is, the last dimension is stride-one.
+- NOTE 3: `ep * tp` must be equal to the provided world size. Otherwise, the mesh will be considered invalid,
+  and 1D ep-only parallelism will be applied.
+
+Example:
+
+```
+    process_grid: {'ep': 2, 'tp': 2}
+```
+
+If `world_size == 4`, ranks \[0,1\] and \[2,3\] will create two EP groups. Experts will be distributed across these two
+groups, and internally, TP=2 column-row sharding will be applied.
+
 #### `requires_shape_prop` (bool, default: `true`)
 
 Whether shape propagation is required before applying this transform. Shape propagation enables the transform to make informed decisions about sharding strategies based on tensor dimensions.

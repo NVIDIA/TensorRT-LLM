@@ -16,6 +16,7 @@
  */
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <stdint.h>
 
 #include <cuda_fp16.h>
@@ -30,8 +31,8 @@
 #include <type_traits>
 #include <vector>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -45,4 +46,5 @@ void apply_per_channel_scale_per_expert_kernel_launcher(T_out* smoothed_act, T_i
     int const num_experts_per_node, int64_t const* num_valid_tokens_ptr, cudaStream_t stream);
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

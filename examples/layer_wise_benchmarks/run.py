@@ -2,6 +2,7 @@ import argparse
 import itertools
 import json
 import os
+from unittest import mock
 
 import numpy as np
 import nvtx
@@ -9,8 +10,11 @@ import torch
 import yaml
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+from tensorrt_llm._torch.distributed import MPIDist, TorchDist
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
+from tensorrt_llm._torch.modules.fused_moe.interface import AlltoallMethodType
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
-from tensorrt_llm._utils import local_mpi_rank, mpi_rank, mpi_world_size
+from tensorrt_llm._utils import local_mpi_rank, mpi_disabled, mpi_rank, mpi_world_size
 from tensorrt_llm.logger import logger
 from tensorrt_llm.tools.layer_wise_benchmarks import BalanceMethod, get_runner_cls, mark_ranges
 
@@ -108,17 +112,6 @@ if args.enable_attention_dp is None:
     args.enable_attention_dp = False
 if args.max_num_tokens is None:
     args.max_num_tokens = args.max_batch_size * max(args.seq_len_q_list)
-    if args.run_type == "GEN":
-        ctx_batch_size = max(1, max(20480, args.max_num_tokens) // max(args.seq_len_kv_cache_list))
-        args.max_num_tokens = max(
-            args.max_num_tokens, ctx_batch_size * max(args.seq_len_kv_cache_list)
-        )
-else:
-    if args.run_type == "GEN":
-        ctx_batch_size = max(1, args.max_num_tokens // max(args.seq_len_kv_cache_list))
-        assert args.max_num_tokens >= ctx_batch_size * max(args.seq_len_kv_cache_list), (
-            "Max_num_tokens is too small to prefill KV cache"
-        )
 if args.use_low_precision_moe_combine is None:
     args.use_low_precision_moe_combine = False
 if args.enable_autotuner is None:
@@ -169,17 +162,77 @@ runner = Runner(
 )
 logger.info("Layer-wise benchmarks: Create runner  ... Done")
 
+# Autotune
+run_pack = runner.create_run_pack(
+    args.run_type,
+    batch_size=max(args.batch_size_list),
+    request_id_begin=0,
+    seq_len_q=max(args.seq_len_q_list),
+    seq_len_kv_cache=args.seq_len_kv_cache_list[0],
+    kv_cache_manager=kv_cache_manager,
+    attn_workspace=attn_workspace,
+)
+if args.enable_autotuner:
+    cache_path = os.getenv("TLLM_AUTOTUNER_CACHE_PATH") or None
+    dist = TorchDist(mapping=mapping) if mpi_disabled() else MPIDist(mapping=mapping)
+    AutoTuner.get().setup_distributed_state(mapping, dist)
+    with autotune(cache_path=cache_path):
+        run_pack()
+else:
+    run_pack()
+
+# Prefill KV cache
+if args.run_type == "GEN":
+    logger.info("Layer-wise benchmarks: Create runner for prefill")
+    ctx_seq_len_q = max(args.seq_len_kv_cache_list)
+    ctx_batch_size = min(
+        args.max_batch_size,
+        max(1, 20480 // ctx_seq_len_q),
+    )
+    ctx_attn_workspace = torch.empty((0,), device="cuda", dtype=torch.int8)
+    with mock.patch.object(
+        CutlassFusedMoE, "select_alltoall_method_type", return_value=AlltoallMethodType.NotEnabled
+    ):
+        ctx_runner = Runner(
+            args.model,
+            mapping,
+            moe_backend="CUTLASS",
+            layer_indices=args.layer_indices,
+            scaled_from=args.scaled_from,
+            max_seq_len=args.max_seq_len,
+            max_num_tokens=ctx_batch_size * ctx_seq_len_q,
+            moe_max_num_tokens=16384,
+            use_low_precision_moe_combine=args.use_low_precision_moe_combine,
+            use_cuda_graph=False,
+        )
+    logger.info("Layer-wise benchmarks: Create runner for prefill  ... Done")
+
+    logger.info("Layer-wise benchmarks: Prefill KV cache")
+    assert ctx_batch_size <= args.max_batch_size
+    assert ctx_seq_len_q + 0 <= args.max_seq_len
+    num_requests = max(args.batch_size_list)
+    for request_id_begin in range(0, num_requests, ctx_batch_size):
+        run_pack = ctx_runner.create_run_pack(
+            "CTX",
+            batch_size=min(ctx_batch_size, num_requests - request_id_begin),
+            request_id_begin=request_id_begin,
+            seq_len_q=ctx_seq_len_q,
+            seq_len_kv_cache=0,
+            kv_cache_manager=kv_cache_manager,
+            attn_workspace=ctx_attn_workspace,
+        )
+        with ctx_runner.replace_routing_method_ctx(
+            balance_method=BalanceMethod.Balanced, balance_ratio=None
+        ):
+            run_pack(check=True)
+    del ctx_runner
+    del ctx_attn_workspace
+    logger.info("Layer-wise benchmarks: Prefill KV cache  ... Done")
+
 # Warm up
-for autotune_flag, batch_size, seq_len_q, seq_len_kv_cache, balance_ratio in [
-    [
-        True,
-        max(args.batch_size_list),
-        max(args.seq_len_q_list),
-        args.seq_len_kv_cache_list[0],
-        args.balance_ratio_list[0],
-    ],
+logger.info("Layer-wise benchmarks: Warmup")
+for batch_size, seq_len_q, seq_len_kv_cache, balance_ratio in [
     *itertools.product(
-        [False],
         args.batch_size_list,
         args.seq_len_q_list,
         args.seq_len_kv_cache_list,
@@ -203,34 +256,10 @@ for autotune_flag, batch_size, seq_len_q, seq_len_kv_cache, balance_ratio in [
     ):
         capture_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(capture_stream):
-            if autotune_flag:
-                if args.enable_autotuner:
-                    cache_path = os.getenv("TLLM_AUTOTUNER_CACHE_PATH") or None
-                    with autotune(cache_path=cache_path, rank=rank):
-                        run_pack()
-                if args.run_type == "GEN":
-                    logger.info("Layer-wise benchmarks: Prefill KV cache")
-                    ctx_seq_len_q = max(args.seq_len_kv_cache_list)
-                    assert ctx_batch_size <= args.max_batch_size
-                    assert ctx_seq_len_q + 0 <= args.max_seq_len
-                    assert ctx_batch_size * ctx_seq_len_q <= args.max_num_tokens
-                    max_batch_size = max(args.batch_size_list)
-                    for request_id_begin in range(0, max_batch_size, ctx_batch_size):
-                        ctx_run_pack = runner.create_run_pack(
-                            "CTX",
-                            batch_size=min(ctx_batch_size, max_batch_size - request_id_begin),
-                            request_id_begin=request_id_begin,
-                            seq_len_q=ctx_seq_len_q,
-                            seq_len_kv_cache=0,
-                            kv_cache_manager=kv_cache_manager,
-                            attn_workspace=attn_workspace,
-                        )
-                        ctx_run_pack(check=True)
-                    logger.info("Layer-wise benchmarks: Prefill KV cache  ... Done")
-            else:
-                run_pack(check=True)
+            run_pack(check=True)
         torch.cuda.current_stream().wait_stream(capture_stream)
 torch.cuda.synchronize()
+logger.info("Layer-wise benchmarks: Warmup  ... Done")
 
 events = [
     torch.cuda.Event(enable_timing=True) for _ in range(args.warmup_times + args.run_times + 1)
@@ -270,7 +299,7 @@ for batch_size, seq_len_q, seq_len_kv_cache, balance_ratio in itertools.product(
                 with torch.cuda.graph(g, stream=capture_stream, capture_error_mode="global"):
                     run_pack()
 
-        balance_ratio_str = "" if balance_ratio is None else f"  balance={balance_ratio:.2g}"
+        balance_ratio_str = "" if balance_ratio is None else f" balance={balance_ratio:.2g}"
         nvtx_message = f"b={batch_size} s={seq_len_q} past={seq_len_kv_cache}{balance_ratio_str} NP{world_size}"
         for i in range(args.warmup_times + args.run_times):
             events[i].record()

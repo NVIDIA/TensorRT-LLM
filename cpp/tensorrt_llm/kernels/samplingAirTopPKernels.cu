@@ -18,10 +18,12 @@
 #error CUDART_VERSION Undefined!
 #elif (CUDART_VERSION >= 11050)
 #include <cub/cub.cuh>
+
 #else
 #include "3rdparty/cub/cub.cuh"
 #endif
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/samplingTopPKernels.h"
@@ -35,8 +37,8 @@
 
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -1466,4 +1468,5 @@ template size_t getAirTopPWorkspaceSize<half>(int32_t batchSize, int32_t vocabSi
 template uint32_t calcAirTopPBlockNum<float>(int batchSize, int len, int smCnt, bool isDeterministic);
 template uint32_t calcAirTopPBlockNum<half>(int batchSize, int len, int smCnt, bool isDeterministic);
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

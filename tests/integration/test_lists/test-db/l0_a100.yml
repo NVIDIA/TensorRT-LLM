@@ -13,9 +13,13 @@ l0_a100:
       stage: pre_merge
       backend: "pytorch"
   tests:
-    - unittest/llmapi/test_llm_pytorch.py
+    - unittest/llmapi/test_llm_pytorch.py -m "part0"
+    - unittest/llmapi/test_llm_pytorch.py -m "part1"
+    - unittest/llmapi/test_llm_pytorch.py -m "part2"
+    - unittest/llmapi/test_llm_pytorch.py -m "part3"
     - unittest/llmapi/test_mpi_session.py ISOLATION
-    - unittest/llmapi/test_memory_profiling.py # profile kvcache for vision encoder
+    - unittest/llmapi/test_memory_profiling.py::test_profile_kvcache # profile kvcache for vision encoder
+    - unittest/llmapi/test_memory_profiling.py::test_pyexecutor_and_kvcache_share_execution_stream # test that PyExecutor and KVCacheManager share the same execution_stream
     - unittest/trt/model_api/test_model_quantization.py
     # executor
     - unittest/executor/test_base_worker.py
@@ -117,4 +121,4 @@ l0_a100:
       stage: post_merge
       backend: fmha
   tests:
-  - test_fmha.py::test_fmha
+  - test_fmha.py::test_fmha TIMEOUT (90)

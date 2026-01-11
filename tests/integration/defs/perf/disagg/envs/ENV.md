@@ -15,7 +15,8 @@ export TRTLLM_WHEEL_PATH="<your_tensorrt_llm_wheel_path>"
 export GPU_TYPE="<your_gpu_type>"
 export SLURM_PARTITION="<your_slurm_cluster_partition>"
 export SLURM_ACCOUNT="<your_slurm_cluster_account>"
-export MODEL_DIR="<your_model_and_dataset_path>"
+export MODEL_DIR="<your_model_path>"
+export DATASET_DIR="<your_dataset_path>"
 export OUTPUT_PATH="<your_html_and_csv_output_path>"
 export PATH="<please_add_poetry_binary_to_your_path>"
 export XDG_CACHE_HOME="<your_xdg_cache_home>"
@@ -70,9 +71,14 @@ SLURM account name for job billing and resource allocation.
 - **Example**: `your_project_account`
 
 ### `MODEL_DIR`
-Base directory containing models and datasets. This path will be used to locate model checkpoints and dataset files.
+Base directory containing models. This path will be used to locate model checkpoints.
 - **Format**: Absolute path
 - **Example**: `/shared/models/common`
+
+### `DATASET_DIR`
+Base directory containing dataset files. This path will be used to locate dataset files.
+- **Format**: Absolute path
+- **Example**: `/shared/datasets/common`
 
 ### `OUTPUT_PATH`
 Directory where test results, HTML reports, and CSV files will be saved.

@@ -688,7 +688,7 @@ For example, you can launch a single context server on port 8001 with:
 ```bash
 export TRTLLM_USE_UCX_KVCACHE=1
 
-cat >./ctx-extra-llm-api-config.yml <<EOF
+cat >./ctx_config.yml <<EOF
 print_iter_log: true
 disable_overlap_scheduler: true
 kv_cache_config:
@@ -705,14 +705,14 @@ trtllm-serve \
   --ep_size 2 \
   --pp_size 1 \
   --kv_cache_free_gpu_memory_fraction 0.95 \
-  --extra_llm_api_options ./ctx-extra-llm-api-config.yml \
+  --config ./ctx_config.yml \
   &> output_ctx_8001 &
 ```
 
 Then launch a single generation server on port 8002 with:
 
 ```bash
-cat >./gen-extra-llm-api-config.yml <<EOF
+cat >./gen_config.yml <<EOF
 print_iter_log: true
 kv_cache_config:
   max_attention_window: [512, 512, 512, 512, 512, 32768]
@@ -728,7 +728,7 @@ trtllm-serve \
   --ep_size 2 \
   --pp_size 1 \
   --kv_cache_free_gpu_memory_fraction 0.95 \
-  --extra_llm_api_options ./gen-extra-llm-api-config.yml \
+  --config ./gen_config.yml \
   &> output_gen_8002 &
 ```
 

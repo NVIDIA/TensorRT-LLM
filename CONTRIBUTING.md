@@ -8,33 +8,9 @@
 
 ## Coding Guidelines
 
-* Coding style for TensorRT-LLM can be found [in this document](CODING_GUIDELINES.md).
+TensorRT-LLM Coding Style can be found [in this document](CODING_GUIDELINES.md).
 
-* All contributed C++ code should be formatted following the rules in TensorRT-LLM's [clang-format](.clang-format) file. The recommended version is clang-format>=14.0.
-
-* Changes can be formatted with the following command:
-
-  ```bash
-  # Commit ID is optional - if unspecified, run format on staged changes.
-  git-clang-format --style file [commit ID/reference]
-  ```
-
-* All contributed Python code should be formatted using the `black` Python package. The recommended version is `black>=23.0`
-
-* Changes can be formatted with the following command:
-
-  ```bash
-  git diff --name-only | grep "*.py" | xargs black -l 120
-  ```
-
-* Try to keep pull requests (PRs) as concise as possible:
-  * Avoid committing commented-out code.
-  * Wherever possible, each PR should address a single concern. If there are several otherwise-unrelated things that should be fixed to reach a desired endpoint, our recommendation is to open several PRs and indicate the dependencies in the description. The more complex the changes are in a single PR, the more time it will take to review those changes.
-
-## Coding Style
-
-We use `pre-commit` for automatic code formatting and validation. Install the `pre-commit` package in your local
-Python environment.
+We use `pre-commit` for automatic code formatting and validation. Install the `pre-commit` package in your local Python environment.
 
 ```bash
 pip install pre-commit
@@ -73,6 +49,9 @@ mdformat.................................................................Passed
 
 If any files were modified by this hook, you will need to stage and commit them again.
 
+In addition, please try to keep pull requests (PRs) as concise as possible:
+* Avoid committing commented-out code.
+* Wherever possible, each PR should address a single concern. If there are several otherwise-unrelated things that should be fixed to reach a desired endpoint, our recommendation is to open several PRs and indicate the dependencies in the description. The more complex the changes are in a single PR, the more time it will take to review those changes.
 
 ## Pull Requests
 

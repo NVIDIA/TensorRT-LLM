@@ -185,6 +185,12 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
             else:
                 model.load_weights(hf_model_state_dict)
 
+            for module in model.modules():
+                if hasattr(module, "post_load_weights") and not getattr(
+                    module, "_weights_removed", False
+                ):
+                    module.post_load_weights()
+
         return model, model_config
 
     def create_hf_model(self, pretrained_config: PretrainedConfig) -> PreTrainedModel:
@@ -457,7 +463,7 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
                 "attn_metadata"
             ].create_cuda_graph_metadata(1)
 
-            # Prepare metadata before capture (like in working Qwen2.5-VL test)
+            # Prepare metadata before capture
             trtllm_inputs["attn_metadata"].prepare()
 
             key = (1, 0, False)

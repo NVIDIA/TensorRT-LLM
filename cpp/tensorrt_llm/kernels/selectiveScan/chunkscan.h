@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <cuda.h>
 #include <cuda_fp8.h>
 #include <mma.h>
@@ -27,8 +28,8 @@
 #include "CudaType.h"
 #include "Poly.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -2285,6 +2286,6 @@ static inline ChunkScanKernelFunc getChunkScanKernel(int B_, int L_, int H_, int
 }
 
 } // namespace kernels
-} // namespace tensorrt_llm
 
+TRTLLM_NAMESPACE_END
 // vim: ts=2 sw=2 sts=2 et sta

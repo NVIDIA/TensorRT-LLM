@@ -1,134 +1,79 @@
-# TensorRT-LLM Benchmark Test System
+# TensorRT-LLM Perf Sanity Test System
 
-Benchmarking scripts for TensorRT-LLM serving performance tests with configuration-driven test cases and CSV report generation.
+Performance sanity testing scripts for TensorRT-LLM with configuration-driven test cases supporting single-node, multi-node aggregated, and multi-node disaggregated architectures.
 
 ## Overview
 
-- Run performance benchmarks across multiple model configurations
-- Manage test cases through YAML configuration files
-- Support selective execution of specific test cases
+- Run performance sanity benchmarks across multiple model configs
+- Support three deployment architectures: single-node, multi-node aggregated, and multi-node disaggregated
+- Manage test cases through YAML config files
+- Automated resource calculation and job submission via SLURM
 
-## Scripts Overview
+## Configuration File Types
 
-### 1. `benchmark_config.yaml` - Test Case Configuration
-**Purpose**: Defines all benchmark test cases in a structured YAML format.
+There are two modes for perf sanity tests: aggregated (aggr) and disaggregated (disagg).
 
-**Structure**:
-```yaml
-server_configs:
-  - name: "r1_fp4_dep4"
-    model_name: "deepseek_r1_0528_fp4"
-    tp: 4
-    ep: 4
-    pp: 1
-    attention_backend: "TRTLLM"
-    moe_backend: "CUTLASS"
-    moe_max_num_tokens: ""
-    enable_attention_dp: true
-    enable_chunked_prefill: false
-    max_num_tokens: 2176
-    disable_overlap_scheduler: false
-    kv_cache_dtype: "fp8"
-    enable_block_reuse: false
-    free_gpu_memory_fraction: 0.8
-    max_batch_size: 256
-    enable_padding: true
-    client_configs:
-      - name: "con1_iter1_1024_1024"
-        concurrency: 1
-        iterations: 1
-        isl: 1024
-        osl: 1024
-        random_range_ratio: 0.0
-      - name: "con8_iter1_1024_1024"
-        concurrency: 8
-        iterations: 1
-        isl: 1024
-        osl: 1024
-        random_range_ratio: 0.0
+### Aggregated Mode (aggr)
 
-  - name: "r1_fp4_tep4"
-    model_name: "deepseek_r1_0528_fp4"
-    tp: 4
-    ep: 4
-    pp: 1
-    attention_backend: "TRTLLM"
-    moe_backend: "CUTLASS"
-    moe_max_num_tokens: ""
-    enable_attention_dp: false
-    enable_chunked_prefill: false
-    max_num_tokens: 2176
-    disable_overlap_scheduler: false
-    kv_cache_dtype: "fp8"
-    enable_block_reuse: false
-    free_gpu_memory_fraction: 0.8
-    max_batch_size: 256
-    enable_padding: true
-    client_configs:
-      - name: "con1_iter1_1024_1024"
-        concurrency: 1
-        iterations: 1
-        isl: 1024
-        osl: 1024
-        random_range_ratio: 0.0
-      - name: "con8_iter1_1024_1024"
-        concurrency: 8
-        iterations: 1
-        isl: 1024
-        osl: 1024
-        random_range_ratio: 0.0
+**Config Location**: [`tests/scripts/perf-sanity`](./)
+
+**File Naming**: `xxx.yaml` where words are connected by `_` (underscore), not `-` (hyphen).
+
+**File Examples**:
+- `deepseek_r1_fp4_v2_grace_blackwell.yaml` - Single-node aggregated test
+- `deepseek_r1_fp4_v2_2_nodes_grace_blackwell.yaml` - Multi-node aggregated test
+
+**Use Cases**:
+- Single-node: Performance tests on a single server with multiple GPUs
+- Multi-node: Model runs across multiple nodes with unified execution
+
+**Test Case Names**:
+```
+perf/test_perf_sanity.py::test_e2e[aggr_upload-{config yaml file base name}]
+perf/test_perf_sanity.py::test_e2e[aggr_upload-{config yaml file base name}-{server_config_name}]
 ```
 
-### 2. `run_benchmark_serve.py` - Main Benchmark Runner
-**Purpose**: Executes performance benchmarks based on YAML configuration files.
-
-**Usage**:
-```bash
-python run_benchmark_serve.py --log_folder <log_folder> --config_file <config_file> [--select <select_pattern>] [--timeout 5400]
-```
-
-**Arguments**:
-- `--log_folder`: Directory to store benchmark logs (required)
-- `--config_file`: Path to YAML configuration file (required)
-- `--select`: Select pattern for specific Server and Client Config. (optional, default: all test cases)
-- `--timeout`: Timeout for server setup. (optional, default: 3600 seconds)
+- Without server config name: runs all server configs in the YAML file
+- With server config name: runs only the specified server config (the `name` field in `server_configs`)
 
 **Examples**:
-```bash
-# Select
-python run_benchmark_serve.py --log_folder ./results --config_file benchmark_config.yaml --select "r1_fp4_dep4:con8_iter1_1024_1024,r1_fp4_tep4:con1_iter1_1024_1024"
-
+```
+perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp4_v2_grace_blackwell]
+perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp4_v2_grace_blackwell-r1_fp4_v2_dep4_mtp1_1k1k]
+perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp4_v2_grace_blackwell-r1_fp4_v2_tep4_mtp3_1k1k]
 ```
 
-### 3. `parse_benchmark_results.py` - Results Parser
-**Purpose**: Print log's perf.
+### Disaggregated Mode (disagg)
 
-**Arguments**:
-- `--log_folder`: Directory to store benchmark logs (required)
+**Config Location**: [`tests/integration/defs/perf/disagg/test_configs/disagg/perf`](../../integration/defs/perf/disagg/test_configs/disagg/perf)
 
-**Usage**:
-```bash
-python parse_benchmark_results.py --log_folder <log_folder>
+**File Naming**: `xxx.yaml` (can contain `-` hyphen).
+
+**File Example**: `deepseek-r1-fp4_1k1k_ctx1_gen1_dep8_bs768_eplb0_mtp0_ccb-UCX.yaml`
+
+**Use Case**: Disaggregated architecture where model runs across multiple nodes with separate context (prefill) and generation (decode) servers.
+
+**Test Case Name**:
+```
+perf/test_perf_sanity.py::test_e2e[disagg_upload-{config yaml file base name}]
 ```
 
-
-### 4. `benchmark-serve.sh` - SLURM Job Script
-**Usage**:
-```bash
-sbatch benchmark-serve.sh [IMAGE] [bench_dir] [log_folder] [select_pattern]
+**Example**:
+```
+perf/test_perf_sanity.py::test_e2e[disagg_upload-deepseek-r1-fp4_1k1k_ctx1_gen1_dep8_bs768_eplb0_mtp0_ccb-UCX]
 ```
 
-**Parameters**:
-- `IMAGE`: Docker image (default: tensorrt-llm-staging/release:main-x86_64)
-- `bench_dir`: Directory containing config file and benchmark scripts (default: current directory)
-- `log_folder`: Directory containing output logs and csv. (default: current directory)
-- `select_pattern`: Select pattern (default: default - all test cases)
+## Running Tests
 
-**Examples**:
+**Important**: Do NOT add `--perf` flag when running pytest. Perf sanity tests are static test cases and do not use perf mode.
+
 ```bash
+# Run all server configs in an aggregated test
+pytest perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp4_v2_grace_blackwell]
 
-bench_dir="/path/to/benchmark/scripts"
-log_folder="/path/to/store/output/files"
-sbatch --reservation=RES--COM-3970 --qos=reservation -D ${log_folder} ${bench_dir}/benchmark-serve.sh urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/release:main-x86_64 ${bench_dir} ${log_folder} "r1_fp4_dep4:con8_iter1_1024_1024,r1_fp4_tep4:con1_iter1_1024_1024"
+# Run a specific server config in an aggregated test
+pytest perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp4_v2_grace_blackwell-r1_fp4_v2_dep4_mtp1_1k1k]
 
+# Run a specific disaggregated test
+pytest perf/test_perf_sanity.py::test_e2e[disagg_upload-deepseek-r1-fp4_1k1k_ctx1_gen1_dep8_bs768_eplb0_mtp0_ccb-UCX]
 ```

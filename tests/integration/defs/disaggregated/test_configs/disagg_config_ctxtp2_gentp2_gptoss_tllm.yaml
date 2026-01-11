@@ -1,0 +1,58 @@
+model: gpt_oss/gpt-oss-120b
+hostname: localhost
+port: 8100
+backend: pytorch
+
+context_servers:
+  num_instances: 1
+  tensor_parallel_size: 2
+  pipeline_parallel_size: 1
+  moe_expert_parallel_size: 2
+  enable_attention_dp: false
+  max_num_tokens: 16640
+  max_seq_len: 8232
+  max_batch_size: 128
+  trust_remote_code: true
+  enable_chunked_prefill: true
+  kv_cache_config:
+    enable_block_reuse: false
+    free_gpu_memory_fraction: 0.80
+    dtype: fp8
+  disable_overlap_scheduler: true
+  moe_config:
+    backend: TRTLLM
+  cuda_graph_config: null
+  print_iter_log: true
+  cache_transceiver_config:
+    backend: DEFAULT
+    max_tokens_in_buffer: 16384
+  urls:
+    - "localhost:8101"
+
+generation_servers:
+  num_instances: 1
+  tensor_parallel_size: 2
+  pipeline_parallel_size: 1
+  moe_expert_parallel_size: 2
+  enable_attention_dp: false
+  max_num_tokens: 10240
+  max_seq_len: 10240
+  max_batch_size: 128
+  trust_remote_code: true
+  enable_chunked_prefill: true
+  kv_cache_config:
+    enable_block_reuse: false
+    free_gpu_memory_fraction: 0.80
+    dtype: fp8
+  disable_overlap_scheduler: true
+  moe_config:
+    backend: TRTLLM
+  cuda_graph_config:
+    enable_padding: true
+    batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 768, 1024]
+  print_iter_log: true
+  cache_transceiver_config:
+    backend: DEFAULT
+    max_tokens_in_buffer: 16384
+  urls:
+    - "localhost:8102"

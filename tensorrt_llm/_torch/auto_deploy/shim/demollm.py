@@ -110,10 +110,15 @@ class DemoEngine(ADEngine):
                     extra_args[k].append(v)
 
         sequence_info.reset()
+        page_assignments = self._assign_pages(total_lens)
+        cache_loc, pages_per_seq = sequence_info._get_cache_locations_and_pages_per_sequence(
+            page_assignments
+        )
         sequence_info.nest_sequences(
             input_ids=input_ids,
             input_pos=0,
-            page_assignments=self._assign_pages(total_lens),
+            cache_loc=cache_loc,
+            pages_per_seq=pages_per_seq,
             slot_idx=list(range(len(input_ids))),
             **extra_args,
         )
@@ -132,7 +137,7 @@ class DemoEngine(ADEngine):
         context_logits: Optional[List[torch.Tensor]] = None
 
         def _generate_single_step(idx: int):
-            logits = self._compute_logits()
+            logits = sequence_info.unnest_sequences(self._compute_logits())
             logits_last = torch.stack([l_one_seq[-1] for l_one_seq in logits]).float().unsqueeze(1)
 
             token_ids, _ = self._decode_tokens(logits_last, sampling_params)  # [b,1]
@@ -142,10 +147,15 @@ class DemoEngine(ADEngine):
             seq_lens_current = sequence_info.seq_len
             input_pos_next = [ip + sl for ip, sl in zip(input_pos_next, seq_lens_current)]
             total_lens_next = [ip + len(t_ids) for ip, t_ids in zip(input_pos_next, token_ids)]
+            page_assignments = self._assign_pages(total_lens_next)
+            cache_loc, pages_per_seq = sequence_info._get_cache_locations_and_pages_per_sequence(
+                page_assignments
+            )
             sequence_info.nest_sequences(
                 token_ids,
                 input_pos=input_pos_next,
-                page_assignments=self._assign_pages(total_lens_next),
+                cache_loc=cache_loc,
+                pages_per_seq=pages_per_seq,
             )
 
             # nest new tokens and run stop check

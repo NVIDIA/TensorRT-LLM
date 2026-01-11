@@ -73,7 +73,7 @@ docker run -d --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \
         trtllm-serve /config/models/maverick \
             --host 0.0.0.0 --port 8000 \
             --tp_size 8 --ep_size 1 \
-            --trust_remote_code --extra_llm_api_options c.yaml \
+            --trust_remote_code --config c.yaml \
             --kv_cache_free_gpu_memory_fraction 0.75"
 ```
 

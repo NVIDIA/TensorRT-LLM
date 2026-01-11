@@ -8,20 +8,11 @@ accuracy_tasks=${3}
 model_path=${4}
 model_args_extra=${5}
 output_dir=${6}
+hostname=${7}
+port=${8}
 
 echo "Starting accuracy evaluation..."
 echo "Log directory: ${full_logdir}"
-
-# Parse hostname and port from server_config.yaml (server is already healthy)
-config_file="${full_logdir}/server_config.yaml"
-
-hostname=$(grep -i "hostname:" ${config_file} | awk '{print $2}')
-port=$(grep -i "port:" ${config_file} | awk '{print $2}')
-
-if [ -z "$hostname" ] || [ -z "$port" ]; then
-    echo "Error: Failed to extract hostname or port from config file"
-    exit 1
-fi
 
 echo "Hostname: ${hostname}, Port: ${port}"
 base_url="http://${hostname}:${port}/v1/completions"

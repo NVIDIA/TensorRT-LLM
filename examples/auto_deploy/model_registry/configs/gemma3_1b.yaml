@@ -1,0 +1,3 @@
+# Configuration for Gemma 3 1B model
+# Specific sequence length requirement due to small attention window
+max_seq_len: 511

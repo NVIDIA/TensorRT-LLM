@@ -728,6 +728,7 @@ class CustomDataset(BenchmarkDataset):
         # Collect all prompts and metadata
         prompts = []
         max_tokens_list = []
+        prompt_lengths = []
 
         for i, entry in enumerate(self.data):
             if len(prompts) >= num_requests:
@@ -736,10 +737,18 @@ class CustomDataset(BenchmarkDataset):
             max_tokens = entry["input"]["max_tokens"]
             prompts.append(prompt)
             max_tokens_list.append(max_tokens)
+            if "num_tokens" in entry["input"] and isinstance(
+                    entry["input"]["num_tokens"],
+                    int) and entry["input"]["num_tokens"] > 0:
+                prompt_lengths.append(entry["input"]["num_tokens"])
 
-        # Use batch tokenization utility
-        prompt_lengths, _ = batch_tokenize_prompts(
-            prompts, tokenizer, progress_name="custom dataset prompts")
+        if len(prompt_lengths) > 0 and len(prompt_lengths) == len(prompts):
+            print(
+                f"skipping batch tokenization because prompt_lengths are already available"
+            )
+        else:
+            prompt_lengths, _ = batch_tokenize_prompts(
+                prompts, tokenizer, progress_name="custom dataset prompts")
 
         # Create SampleRequest objects
         samples = []

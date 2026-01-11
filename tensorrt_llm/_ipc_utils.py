@@ -47,7 +47,9 @@ def can_access_peer(mapping: Mapping) -> bool:
 
         # Early exit if devices are on different nodes
         if mapping.get_node_rank(rank) != mapping.node_rank:
-            logger.info(f"Detect inter-node TP between rank {mapping.rank} and rank {rank}")
+            logger.info(
+                f"Detect inter-node TP between rank {mapping.rank} and rank {rank}, fail to access peer GPU memory"
+            )
             return False
 
         # Skip if same device

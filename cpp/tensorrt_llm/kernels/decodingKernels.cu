@@ -15,6 +15,7 @@
  */
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/kernels/decodingKernels.h"
@@ -30,8 +31,7 @@
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::runtime;
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels
 {
@@ -712,7 +712,9 @@ void invokeTransposeLogProbs(float* outputLogProbs, float* outputLogProbsTiled, 
 
 } // namespace kernels
 
-namespace runtime::kernels
+TRTLLM_NAMESPACE_END
+
+namespace tensorrt_llm::runtime::kernels
 {
 // Must be similar to [cpp/tensorrt_llm/thop/gatherTreeOp.cpp] gatherTree
 void gatherTree(DecodingOutput const& decodingOutput, DecodingInput const& decodingInput,
@@ -802,6 +804,4 @@ void gatherTree(DecodingOutput const& decodingOutput, DecodingInput const& decod
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-} // namespace runtime::kernels
-
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::runtime::kernels

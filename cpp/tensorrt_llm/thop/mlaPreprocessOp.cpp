@@ -28,6 +28,8 @@ namespace tk = tensorrt_llm::kernels;
 namespace tc = tensorrt_llm::common;
 using tk::KVBlockArray;
 
+TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -468,6 +470,8 @@ void mergeChunkedAttentionForMLA(torch::Tensor& merged_attn, torch::Tensor const
 }
 } // namespace torch_ext
 
+TRTLLM_NAMESPACE_END
+
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
@@ -496,7 +500,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("load_paged_kv_cache_for_mla", &torch_ext::loadPagedKVCacheForMLA);
+    m.impl("load_paged_kv_cache_for_mla", &tensorrt_llm::torch_ext::loadPagedKVCacheForMLA);
 }
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
@@ -527,7 +531,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("load_chunked_kv_cache_for_mla", &torch_ext::loadChunkedKVCacheForMLA);
+    m.impl("load_chunked_kv_cache_for_mla", &tensorrt_llm::torch_ext::loadChunkedKVCacheForMLA);
 }
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
@@ -562,7 +566,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("mla_rope_append_paged_kv_assign_q", &torch_ext::MLARopeAppendPagedKVAssignQ);
+    m.impl("mla_rope_append_paged_kv_assign_q", &tensorrt_llm::torch_ext::MLARopeAppendPagedKVAssignQ);
 }
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
@@ -584,5 +588,5 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("merge_chunked_attention_for_mla", &torch_ext::mergeChunkedAttentionForMLA);
+    m.impl("merge_chunked_attention_for_mla", &tensorrt_llm::torch_ext::mergeChunkedAttentionForMLA);
 }

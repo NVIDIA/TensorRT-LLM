@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from collections import namedtuple
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 from strenum import StrEnum
@@ -53,6 +54,70 @@ class RequestScheduler(ABC):
         """
         # to be aligned with RequestScheduler::scheduleRequests in cpp/tensorrt_llm/batch_manager/requestScheduler.h
         raise NotImplementedError
+
+    @abstractmethod
+    def can_schedule(self, requests: RequestList) -> bool:
+        """
+        Check if current rank can schedule the requests.
+        :param requests: list of requests to be scheduled
+        :return: True if current rank can schedule the requests, False otherwise
+        """
+        raise NotImplementedError
+
+
+@dataclass
+class SerializableSchedulerOutput:
+    """
+    Serializable version of SchedulerOutput, used for sending schedule result to other ranks. Need this class because LlmRequest is not serializable by pickle.
+    """
+    context_requests: list[int]  # request ids of context requests
+    generation_requests: list[int]  # request ids of generation requests
+    paused_requests: list[int]  # request ids of paused requests
+    fitting_disagg_gen_init_requests: list[
+        int]  # request ids of fitting disaggregated generation initialization requests
+    num_fitting_requests: int  # number of fitting requests
+
+    @classmethod
+    def from_scheduler_result(
+            cls, scheduled_requests: ScheduledRequests,
+            fitting_disagg_gen_init_requests: RequestList,
+            num_fitting_requests: int) -> "SerializableSchedulerOutput":
+        return cls(context_requests=[
+            req.request_id for req in scheduled_requests.context_requests
+        ],
+                   generation_requests=[
+                       req.request_id
+                       for req in scheduled_requests.generation_requests
+                   ],
+                   paused_requests=[
+                       req.request_id
+                       for req in scheduled_requests.paused_requests
+                   ],
+                   fitting_disagg_gen_init_requests=[
+                       req.request_id
+                       for req in fitting_disagg_gen_init_requests
+                   ],
+                   num_fitting_requests=num_fitting_requests)
+
+    def to_scheduler_result(
+        self, active_requests: RequestList
+    ) -> Tuple[ScheduledRequests, RequestList, int]:
+        id_to_request = {req.request_id: req for req in active_requests}
+        scheduled_requests = ScheduledRequests()
+        scheduled_requests.context_requests = [
+            id_to_request[req_id] for req_id in self.context_requests
+        ]
+        scheduled_requests.generation_requests = [
+            id_to_request[req_id] for req_id in self.generation_requests
+        ]
+        scheduled_requests.paused_requests = [
+            id_to_request[req_id] for req_id in self.paused_requests
+        ]
+        fitting_disagg_gen_init_requests = [
+            id_to_request[req_id]
+            for req_id in self.fitting_disagg_gen_init_requests
+        ]
+        return scheduled_requests, fitting_disagg_gen_init_requests, self.num_fitting_requests
 
 
 class CapacityScheduler(ABC):
@@ -216,3 +281,8 @@ class SimpleScheduler(RequestScheduler):
                                list(generation_requests), list(paused_requests),
                                list(fitting_disagg_gen_init_requests),
                                len(fitting_requests))
+
+    def can_schedule(self, requests: RequestList) -> bool:
+        fitting_requests, _, _ = self.capacity_scheduler.schedule_request(
+            requests)
+        return len(fitting_requests) == len(requests)

@@ -14,15 +14,18 @@
  * limitations under the License.
  */
 #pragma once
+#include "tensorrt_llm/common/assert.h"
 #include <NvInferRuntime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <map>
 
-#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 
-namespace tensorrt_llm::kernels::group_rms_norm
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::group_rms_norm
 {
 
 template </*number of inputs*/ int n>
@@ -73,4 +76,6 @@ void GroupRMSNormKernelLargeBatchLauncher(GroupRMSParams<n>& params);
 template <int n>
 void GroupRMSNormKernelLauncherWithHeuristic(GroupRMSParams<n>& params);
 
-} // namespace tensorrt_llm::kernels::group_rms_norm
+} // namespace kernels::group_rms_norm
+
+TRTLLM_NAMESPACE_END

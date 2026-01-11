@@ -52,7 +52,9 @@ class LmEvalWrapper(TemplateLM):
                  llm: Union[LLM, PyTorchLLM],
                  sampling_params: Optional[SamplingParams] = None,
                  streaming: bool = False,
-                 chat_template_kwargs: Optional[dict[str, Any]] = None):
+                 chat_template_kwargs: Optional[dict[str, Any]] = None,
+                 model_type: str | None = None,
+                 is_force_single_image: bool = False):
         super().__init__()
         self.llm = llm
         self.sampling_params = sampling_params
@@ -100,10 +102,23 @@ class LmEvalWrapper(TemplateLM):
             "max_gen_toks": "max_tokens",
             "until": "stop",
         }
+        # IMPORTANT:
+        # lm-evaluation-harness controls generation primarily via per-task gen_kwargs.
+        # For example, the `local-completions` model wrapper uses:
+        #   max_tokens <- gen_kwargs["max_tokens"] or gen_kwargs["max_gen_toks"] or _max_gen_toks
+        #   temperature <- gen_kwargs.get("temperature", 0)
+        #   stop <- gen_kwargs.get("until", ...)
+        # See: https://github.com/EleutherAI/lm-evaluation-harness/blob/main/lm_eval/models/openai_completions.py
+
         if self.sampling_params is None:
-            sampling_params = SamplingParams()
+            sampling_params = SamplingParams(
+                max_tokens=gen_kwargs.get("max_gen_toks", 256),
+                temperature=gen_kwargs.get("temperature", 0),
+                stop=gen_kwargs.get("until", None),
+            )
         else:
             sampling_params = copy.deepcopy(self.sampling_params)
+
         for lm_eval_key, trtllm_key in params_mapping.items():
             value = gen_kwargs.pop(lm_eval_key, None)
             if value is not None:
@@ -150,7 +165,9 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
                  sampling_params: Optional[SamplingParams] = None,
                  streaming: bool = False,
                  max_images: int = 999,
-                 chat_template_kwargs: Optional[dict[str, Any]] = None):
+                 chat_template_kwargs: Optional[dict[str, Any]] = None,
+                 model_type: str | None = None,
+                 is_force_single_image: bool = False):
         """
         Initialize the multimodal wrapper.
 
@@ -166,7 +183,9 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
         self.MULTIMODAL = True
         self.max_images = max_images
         self.chat_template_kwargs = chat_template_kwargs
-        self.model_type = self._get_model_type(llm)
+        self.model_type = model_type if model_type is not None else self._get_model_type(
+            llm)
+        self.is_force_single_image = is_force_single_image
 
         # NOTE: In TRT-LLM, currently we do not support interleaved text and image. Instead, we are adding image placeholders at the end of the text or at the beginning of the text.
         # So, until we support interleaved text and image, we set this to False.
@@ -274,9 +293,14 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
             prompt = prompt_inputs(prompt)
 
             # NOTE: Convert RGBA format to RGB format
-            images = [
-                convert_image_mode(img, "RGB") for img in media_data["visual"]
-            ]
+            if self.is_force_single_image:
+                # NOTE: This is a workaround to force single image for models which only support single image.
+                images = [convert_image_mode(media_data["visual"][0], "RGB")]
+            else:
+                images = [
+                    convert_image_mode(img, "RGB")
+                    for img in media_data["visual"]
+                ]
             prompt["multi_modal_data"] = {"image": images}
 
             sampling_params = self._get_sampling_params(gen_kwargs)
@@ -367,23 +391,43 @@ class LmEvalEvaluator(Evaluator):
 
     @contextmanager
     def _patch_lm_eval(self):
-        if self.dataset_path is None:
-            yield
-            return
+        from pathlib import Path
 
         import lm_eval
-        self._task_config_post_init = lm_eval.api.task.TaskConfig.__post_init__
+        import lm_eval.tasks
 
-        def _patched(task_config, *args, **kwargs):
-            task_config.dataset_path = self.dataset_path
-            self._task_config_post_init(task_config, *args, **kwargs)
+        # Patch Path.relative_to to handle custom task paths outside lm_eval/tasks
+        # This is needed with lm_eval>=0.4.9.2 with new function pretty_print_task (a local function inside
+        # get_task_dict) calls yaml_path.relative_to(lm_eval_tasks_path) which fails
+        # when the yaml is from tensorrt_llm/evaluate/lm_eval_tasks
+        original_relative_to = Path.relative_to
 
-        lm_eval.api.task.TaskConfig.__post_init__ = _patched
+        def _patched_relative_to(self, other, *args, **kwargs):
+            try:
+                return original_relative_to(self, other, *args, **kwargs)
+            except ValueError:
+                # Return absolute path if relative_to fails (path not under base)
+                return self
+
+        Path.relative_to = _patched_relative_to
+
+        # Optionally patch dataset_path if provided
+        original_post_init = None
+        if self.dataset_path is not None:
+            original_post_init = lm_eval.api.task.TaskConfig.__post_init__
+
+            def _patched_post_init(task_config, *args, **kwargs):
+                task_config.dataset_path = self.dataset_path
+                original_post_init(task_config, *args, **kwargs)
+
+            lm_eval.api.task.TaskConfig.__post_init__ = _patched_post_init
 
         try:
             yield
         finally:
-            lm_eval.api.task.TaskConfig.__post_init__ = self._task_config_post_init
+            Path.relative_to = original_relative_to
+            if original_post_init is not None:
+                lm_eval.api.task.TaskConfig.__post_init__ = original_post_init
 
     def generate_samples(self) -> Iterable[tuple]:
         raise NotImplementedError()
@@ -396,14 +440,18 @@ class LmEvalEvaluator(Evaluator):
                  llm: Union[LLM, PyTorchLLM],
                  sampling_params: Optional[SamplingParams] = None,
                  streaming: bool = False,
-                 scores_filter: str = None) -> float:
+                 scores_filter: str = None,
+                 model_type: str = None,
+                 is_force_single_image: bool = False) -> float:
         import lm_eval
         lm_cls = MultimodalLmEvalWrapper if self.MULTIMODAL else LmEvalWrapper
         results = lm_eval.evaluate(
             lm=lm_cls(llm,
                       sampling_params=sampling_params,
                       streaming=streaming,
-                      chat_template_kwargs=self.chat_template_kwargs),
+                      chat_template_kwargs=self.chat_template_kwargs,
+                      model_type=model_type,
+                      is_force_single_image=is_force_single_image),
             task_dict=self.task_dict,
             limit=self.num_samples,
             apply_chat_template=self.apply_chat_template,
@@ -714,3 +762,156 @@ class MMMU(LmEvalEvaluator):
         kwargs[
             "stop"] = "<|endoftext|>"  # NOTE: https://github.com/EleutherAI/lm-evaluation-harness/blob/main/lm_eval/tasks/mmmu/_template_yaml#L10
         MMMU.command_harness(ctx, **kwargs)
+
+
+class LongBenchV1(LmEvalEvaluator):
+    """
+    LongBench v1 evaluation via lm-evaluation-harness.
+
+    Notes:
+      - In lm-eval, `longbench` is typically a *group task* that expands into many
+        subtasks. The base `LmEvalEvaluator.evaluate()` assumes a single task
+        key exists in `results["results"][task_name]`, so we override evaluation
+        to aggregate over subtasks.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__("longbench", **kwargs)
+
+    @staticmethod
+    def _flatten_task_dict(task_dict: dict) -> List[str]:
+        names: List[str] = []
+        for k, v in task_dict.items():
+            if isinstance(v, dict):
+                names.extend(LongBenchV1._flatten_task_dict(v))
+            else:
+                names.append(k)
+        return names
+
+    @staticmethod
+    def _get_group_score(metrics: Dict[str, Any],
+                         *,
+                         preferred_filter: str = "none") -> Optional[float]:
+        """
+        lm-eval stores group metrics as "<metric>,<filter>" (e.g., "score,none").
+        Prefer "score,none" (matches printed table), otherwise accept any
+        "score,<filter>" key.
+        """
+        if not isinstance(metrics, dict):
+            return None
+
+        preferred_key = f"score,{preferred_filter}"
+        v = metrics.get(preferred_key, None)
+        if isinstance(v, (int, float)):
+            return float(v)
+
+        return None
+
+    def evaluate(self,
+                 llm: Union[LLM, PyTorchLLM],
+                 sampling_params: Optional[SamplingParams] = None,
+                 streaming: bool = False) -> float:
+        import lm_eval
+
+        lm_cls = MultimodalLmEvalWrapper if self.MULTIMODAL else LmEvalWrapper
+        results = lm_eval.evaluate(
+            lm=lm_cls(llm,
+                      sampling_params=sampling_params,
+                      streaming=streaming,
+                      chat_template_kwargs=self.chat_template_kwargs),
+            task_dict=self.task_dict,
+            limit=self.num_samples,
+            apply_chat_template=self.apply_chat_template,
+            fewshot_as_multiturn=self.fewshot_as_multiturn,
+            system_instruction=self.system_prompt)
+
+        logger.info(
+            f"lm-eval {self.task_name} results:\n{lm_eval.utils.make_table(results)}"
+        )
+
+        # LongBench is a group task in lm-eval. lm-eval already computes subgroup
+        # "score" values (e.g., `longbench_fewshot`, `longbench_single`, ...).
+        # To keep this implementation simple and aligned with the printed table,
+        # we compute the final LongBench score as the unweighted mean of subgroup
+        # scores.
+        group_results: Dict[str, Dict[str, Any]] = results.get("groups", {})
+        subgroup_names = results.get("group_subtasks",
+                                     {}).get(self.task_name, [])
+        if not subgroup_names:
+            raise KeyError(
+                f"lm-eval did not provide subgroup list for group '{self.task_name}'. "
+                "Expected `results['group_subtasks'][task_name]` to exist.")
+
+        subgroup_scores: List[float] = []
+        missing: List[str] = []
+        for name in subgroup_names:
+            m = group_results.get(name, None)
+            score = self._get_group_score(m)
+            if score is None:
+                missing.append(name)
+            else:
+                subgroup_scores.append(score)
+
+        if not subgroup_scores:
+            raise KeyError(
+                f"lm-eval did not provide subgroup 'score' metrics for '{self.task_name}'. "
+                f"Missing subgroups: {missing[:10]}")
+
+        result_acc = float(np.mean(subgroup_scores)) * 100
+        logger.info(
+            f"lm-eval {self.task_name} average 'score' across {len(subgroup_scores)} subgroups: {result_acc:.2f}"
+        )
+        return result_acc
+
+    @click.command("longbench_v1")
+    @click.option(
+        "--dataset_path",
+        type=str,
+        default=None,
+        help=
+        "The path to LongBench dataset. If unspecified, the dataset is downloaded from HF hub."
+    )
+    @click.option(
+        "--num_samples",
+        type=int,
+        default=None,
+        help="Number of samples to run the evaluation; None means full dataset."
+    )
+    @click.option("--random_seed",
+                  type=int,
+                  default=0,
+                  help="Random seed for dataset processing.")
+    @click.option("--apply_chat_template",
+                  type=click.BOOL,
+                  default=True,
+                  show_default=True,
+                  help="Whether to apply chat template.")
+    @click.option(
+        "--chat_template_kwargs",
+        type=str,
+        default=None,
+        callback=lambda ctx, param, value: json.loads(value) if value else None,
+        help=
+        'Chat template kwargs as JSON string, e.g., \'{"thinking_budget": 0}\'')
+    @click.option("--system_prompt",
+                  type=str,
+                  default=None,
+                  help="System prompt.")
+    @click.pass_context
+    @staticmethod
+    def command(ctx, **kwargs) -> None:
+        llm: Union[LLM, PyTorchLLM] = ctx.obj
+
+        evaluator = LongBenchV1(
+            dataset_path=kwargs.pop("dataset_path", None),
+            num_samples=kwargs.pop("num_samples", None),
+            random_seed=kwargs.pop("random_seed", 0),
+            apply_chat_template=kwargs.pop("apply_chat_template", True),
+            system_prompt=kwargs.pop("system_prompt", None),
+            chat_template_kwargs=kwargs.pop("chat_template_kwargs", None))
+
+        # Let lm-eval task configs control sampling via gen_kwargs.
+        sampling_params = None
+
+        evaluator.evaluate(llm, sampling_params)
+        llm.shutdown()

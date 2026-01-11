@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/topkLastDim.h" // Air TopK
@@ -22,8 +23,8 @@
 
 #define BEAM_SEARCH_DEBUG 0
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 static size_t constexpr kMaxBeamWidth = 1024;           // Max beam width supported in TRT-LLM now
@@ -88,7 +89,7 @@ struct BeamHypotheses
     // Pointers related to beam search process, they are initialized in those two functions:
     // [gptDecoder.cpp] GptDecoder<T>::forward or [dynamicDecodeOp.cpp] FtDynamicDecode<T>::forward
     bool* batchDones{nullptr};                      // [BS]             %% self.beam_hyps_is_done               whether a whole batch is finished
-    FinishedState* finished{nullptr};               // [BS*BM], uint8   %% self.finished                        whether and how a beam is finished
+    ::tensorrt_llm::kernels::FinishedState* finished{nullptr};               // [BS*BM], uint8   %% self.finished                        whether and how a beam is finished
 
     // Pointers for backtrack of the beams, they are relocated in [dynamicDecodeLayer.cpp] DynamicDecodeLayer<T>::prepareIdsPtrs
     int** outputIdsPtr{nullptr};                    // [BS][BM, MSL]    %% self.output_ids
@@ -131,11 +132,11 @@ void invokeUpdateCacheIndirection(int* tgtCI, int const* srcCI, BeamHypotheses& 
     runtime::SizeType32 const maxAttentionWindow, runtime::SizeType32 sinkTokenLength, cudaStream_t stream);
 
 __global__ void addCumLogProbs(float* __restrict pStage1LogProbs, float const* __restrict cumLogProbs,
-    FinishedState const* finished, int const* endIds, float const* diversityRates,
+    ::tensorrt_llm::kernels::FinishedState const* finished, int const* endIds, float const* diversityRates,
     runtime::SizeType32 const* batchSlots, size_t const nBS, size_t const nBMIn, size_t const nBMOut, size_t const nBM);
 
 __global__ void addCumLogProbs(half* __restrict pStage1LogProbs, float const* __restrict cumLogProbs,
-    FinishedState const* finished, int const* endIds, float const* diversityRates,
+    ::tensorrt_llm::kernels::FinishedState const* finished, int const* endIds, float const* diversityRates,
     runtime::SizeType32 const* batchSlots, size_t const nBS, size_t const nBMIn, size_t const nBMOut, size_t const nBM);
 
 __global__ void gatherId(int const* __restrict pStage1Id, int* __restrict pStage2Id, size_t const nBS,
@@ -219,4 +220,5 @@ void printLogProbs(float const* x, int const nBS, int const nBMIn, int const nBM
 #endif
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

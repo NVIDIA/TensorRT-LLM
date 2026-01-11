@@ -587,9 +587,10 @@ class ExecutorRequestQueue:
         if not self.dist.has_pp:
             return self.dist.broadcast(payloads, root=0)
 
-        # Broadcast within first tp group before send/recv chain to other tp groups
-        if self.dist.tp_size > 1 and self.dist.is_first_pp_rank:
-            payloads = self.dist.tp_broadcast(payloads, root=0)
+        # Broadcast within first PP stage before send/recv chain to other PP stages.
+        # This needs to cover both TP and CP ranks within the first PP stage.
+        if self.dist.is_first_pp_rank:
+            payloads = self.dist.tp_cp_broadcast(payloads, root=0)
 
         # Tag for communication
         tag = self.dist.pp_size  # Use pp_size as tag to avoid conflicts
@@ -694,6 +695,7 @@ class ExecutorRequestQueue:
                 position_ids=position_ids_this_rank,
             )
             req.total_input_len_cp = input_len
+            req.seqlen_this_rank_cp = len(input_ids_this_rank)
             req_with_children.append(req)
             if req.child_requests:
                 req_with_children.extend(req.child_requests)

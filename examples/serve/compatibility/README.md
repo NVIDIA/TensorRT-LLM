@@ -34,17 +34,27 @@ python examples/serve/compatibility/chat_completions/example_01_basic_chat.py
 
 ### 📋 Complete Example List
 
-All examples demonstrate the `/v1/chat/completions` endpoint:
+#### Chat Completions (`/v1/chat/completions`)
 
 | Example | File | Description |
 |---------|------|-------------|
-| **01** | `example_01_basic_chat.py` | Basic non-streaming chat completion |
-| **02** | `example_02_streaming_chat.py` | Streaming responses with real-time delivery |
-| **03** | `example_03_multi_turn_conversation.py` | Multi-turn conversation with context |
-| **04** | `example_04_streaming_with_usage.py` | Streaming with continuous token usage stats |
-| **05** | `example_05_json_mode.py` | Structured output with JSON schema |
-| **06** | `example_06_tool_calling.py` | Function/tool calling with tools |
-| **07** | `example_07_advanced_sampling.py` | TensorRT-LLM extended sampling parameters |
+| **01** | `chat_completions/example_01_basic_chat.py` | Basic non-streaming chat completion |
+| **02** | `chat_completions/example_02_streaming_chat.py` | Streaming responses with real-time delivery |
+| **03** | `chat_completions/example_03_multi_turn_conversation.py` | Multi-turn conversation with context |
+| **04** | `chat_completions/example_04_streaming_with_usage.py` | Streaming with continuous token usage stats |
+| **05** | `chat_completions/example_05_json_mode.py` | Structured output with JSON schema |
+| **06** | `chat_completions/example_06_tool_calling.py` | Function/tool calling with tools |
+| **07** | `chat_completions/example_07_advanced_sampling.py` | TensorRT-LLM extended sampling parameters |
+
+#### Responses (`/v1/responses`)
+
+| Example | File | Description |
+|---------|------|-------------|
+| **01** | `responses/example_01_basic_chat.py` | Basic non-streaming response |
+| **02** | `responses/example_02_streaming_chat.py` | Streaming with event handling |
+| **03** | `responses/example_03_multi_turn_conversation.py` | Multi-turn using `previous_response_id` |
+| **04** | `responses/example_04_json_mode.py` | Structured output with JSON schema |
+| **05** | `responses/example_05_tool_calling.py` | Function/tool calling with tools |
 
 ## Configuration
 
@@ -68,8 +78,8 @@ client = OpenAI(
 
 Some examples require specific model capabilities:
 
-| Example | Model Requirement |
+| Feature | Model Requirement |
 |---------|------------------|
-| 05 (JSON Mode) | xgrammar support |
-| 06 (Tool Calling) | Tool-capable model (Qwen3, GPT OSS) |
+| JSON Mode | xgrammar support |
+| Tool Calling | Tool-capable model (Qwen3, GPT-OSS, Kimi K2) |
 | Others | Any model |

@@ -17,7 +17,7 @@ from torch.fx.passes.shape_prop import _extract_tensor_metadata
 from torch.utils._pytree import _LEAF_SPEC
 
 from .logger import ad_logger
-from .node_utils import is_op
+from .node_utils import get_weight_tensor, is_op
 
 _NoValType = type("_NoValType", (), {})
 _NO_VAL = _NoValType()
@@ -344,3 +344,112 @@ def placeholders_on_meta(mod: nn.Module) -> bool:
                 return True
 
     return False
+
+
+def get_input_embeddings(model: nn.Module) -> torch.Tensor:
+    """Find the unique embedding node across all graph modules."""
+    embedding_weights = []
+    for _, gm in named_graphmodules(model):
+        found_nodes = gm.graph.find_nodes(
+            op="call_function", target=torch.ops.aten.embedding.default
+        )
+        for node in found_nodes:
+            embedding_weights.append(get_weight_tensor(gm, node))
+
+    if hasattr(model, "get_input_embeddings"):
+        embedding_weights.append(model.get_input_embeddings())
+
+    for _, gm in named_graphmodules(model):
+        if hasattr(gm, "get_input_embeddings"):
+            embedding_weights.append(gm.get_input_embeddings())
+
+    assert len(embedding_weights) > 0, "No embedding weights found"
+    unique_embedding_weights = [embedding_weights[0]]
+    for weight in embedding_weights:
+        if weight is not unique_embedding_weights[0]:
+            unique_embedding_weights.append(weight)
+
+    assert len(unique_embedding_weights) == 1, (
+        f"Expected exactly 1 unique embedding weight, but found {len(unique_embedding_weights)}."
+    )
+
+    return unique_embedding_weights[0]
+
+
+def get_output_node(model: nn.Module) -> tuple[GraphModule, Node]:
+    """Find the unique output node across all graph modules."""
+    output_nodes = []
+    for _, gm in named_graphmodules(model):
+        output_nodes.extend([(gm, node) for node in gm.graph.find_nodes(op="output")])
+
+    assert len(output_nodes) == 1, f"Expected exactly 1 output node, but found {len(output_nodes)}."
+    return output_nodes[0]
+
+
+def get_lm_head_node(gm: GraphModule, output_node: Optional[Node] = None) -> Node:
+    if output_node is None:
+        output_node = gm.graph.find_nodes(op="output")[0]
+
+    lm_head_node = output_node.all_input_nodes[0]
+    if is_op(lm_head_node, torch.ops.aten.to):
+        lm_head_node = lm_head_node.all_input_nodes[0]
+
+    return lm_head_node
+
+
+def get_lm_head_weights(model: nn.Module) -> torch.Tensor:
+    gm, output_node = get_output_node(model)
+    lm_head_node = get_lm_head_node(gm, output_node)
+    return get_weight_tensor(gm, lm_head_node)
+
+
+def get_attr_by_name(obj, name):
+    """Get an attribute specified by a dot-separated path on an object.
+
+    Args:
+        obj: The root object from which to resolve the attribute path.
+        name (str): Dot-separated attribute path (e.g., "a.b.c").
+
+    Returns:
+        The value of the resolved attribute.
+
+    Raises:
+        AttributeError: If any component in the path does not exist.
+    """
+    for part in name.split("."):
+        obj = getattr(obj, part)
+    return obj
+
+
+def set_attr_by_name(obj, name, value):
+    """Set an attribute specified by a dot-separated path on an object.
+
+    Args:
+        obj: The root object on which to set the attribute.
+        name (str): Dot-separated attribute path (e.g., "a.b.c").
+        value: The value to assign to the target attribute.
+
+    Raises:
+        AttributeError: If any intermediate component in the path does not exist.
+    """
+    parts = name.split(".")
+    for part in parts[:-1]:
+        obj = getattr(obj, part)
+    setattr(obj, parts[-1], value)
+
+
+def del_attr_by_name(obj, name):
+    """Delete an attribute specified by a dot-separated path from an object.
+
+    Args:
+        obj: The root object from which to delete the attribute.
+        name (str): Dot-separated attribute path (e.g., "a.b.c").
+
+    Raises:
+        AttributeError: If any intermediate component in the path does not exist
+            or if the final attribute does not exist.
+    """
+    parts = name.split(".")
+    for part in parts[:-1]:
+        obj = getattr(obj, part)
+    delattr(obj, parts[-1])

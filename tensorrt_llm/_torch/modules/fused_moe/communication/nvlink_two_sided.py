@@ -65,6 +65,10 @@ class NVLinkTwoSided(Communication):
             os.environ.get("TRTLLM_MOE_POST_QUANT_ALLTOALLV", "1") == "1"
         )
 
+        # Invalid token expert ID (default to -1), the kernels in TRTLLM-gen is hard-coded to support -1 only.
+        # CutlassFusedMoE kernels support any invalid value.
+        self.invalid_token_expert_id: int = -1
+
         # Initialize NVLINK workspaces
         MnnvlMemory.initialize()
         self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(mapping)
@@ -168,7 +172,7 @@ class NVLinkTwoSided(Communication):
             alltoall_info.recv_rank_count_cumsum,
             all_rank_max_num_tokens,
             top_k,
-            self.num_slots,
+            self.invalid_token_expert_id,
             self.ep_size,
         )
 

@@ -34,7 +34,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     steps:
       - name: Update commit status
-        uses: actions/github-script@v6
+        uses: actions/github-script@v8
         with:
           script: |
             state = 'pending'
@@ -60,7 +60,7 @@ jobs:
         with:
           paths: results/**/results*.xml
       - name: Update commit status
-        uses: actions/github-script@v6
+        uses: actions/github-script@v8
         with:
           script: |
             github.rest.repos.createCommitStatus({

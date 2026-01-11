@@ -382,6 +382,13 @@ class WideEPMoE(MoE):
         else:
             return False
 
+    def is_low_precision_combine_supported(self):
+        if not self.use_low_precision_combine:
+            return False
+        if self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
+            return self.has_fp8_qdq or self.has_nvfp4 or self.has_w4afp8
+        return False
+
     def forward_chunk(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
@@ -671,8 +678,7 @@ class WideEPMoE(MoE):
                 final_hidden_states = final_hidden_states.view(
                     self.expert_size_per_partition,
                     num_tokens_per_expert_for_fused_moe, self.hidden_size)
-                if self.use_low_precision_combine:
-                    assert self.has_nvfp4 or self.has_w4afp8 or self.has_fp8_qdq, "Low precision combine only supports nvfp4, w4afp8 and fp8 qdq"
+                if self.is_low_precision_combine_supported():
                     precision = "fp8"
                     global_scales = None
                     if self.has_nvfp4:

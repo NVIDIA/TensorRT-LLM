@@ -512,6 +512,7 @@ class TestEagle2Vicuna_7B_v1_3(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+@pytest.mark.skip_device_not_contain(["A100", "H100"])
 class TestStarCoder2_7B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "bigcode/starcoder2-7b"
     MODEL_PATH = f"{llm_models_root()}/starcoder2-7b"

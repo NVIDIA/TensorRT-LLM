@@ -13,13 +13,16 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
 #include <cooperative_groups.h>
 
-namespace tensorrt_llm::kernels::ar_fusion
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::ar_fusion
 {
 template <int NRanks>
 struct SyncComm
@@ -134,11 +137,17 @@ public:
             // corresponding CTA has not been launched.
             for (int flag_idx = blockIdx.x; flag_idx < kBarrierFlagCount; flag_idx += gridDim.x)
             {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
                 asm volatile(
                     "st.global.relaxed.sys.b32 [%1], %0;" ::"r"(m_flag_value), "l"(m_target_flag + flag_idx * NRanks));
+#else
+                st_flag(m_target_flag + flag_idx * NRanks, m_flag_value);
+#endif
             }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
             // Single release fence
             asm volatile("fence.release.sys;");
+#endif
 
             while (ld_flag(m_current_flag) == prev_flag(m_flag_value))
             {
@@ -818,4 +827,6 @@ void allreduce_fusion_op(AllReduceFusionParams const& params)
     DISPATCH_RANKS(16);
     TLLM_CHECK_WITH_INFO(false, "allreduce_fusion_kernel: unsupported ranks number!");
 }
-}; // namespace tensorrt_llm::kernels::ar_fusion
+}; // namespace kernels::ar_fusion
+
+TRTLLM_NAMESPACE_END

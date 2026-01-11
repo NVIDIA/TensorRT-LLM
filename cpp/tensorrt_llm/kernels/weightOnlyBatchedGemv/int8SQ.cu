@@ -14,10 +14,11 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/weightOnlyBatchedGemv/int8SQ.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace smooth_quant
@@ -172,4 +173,5 @@ template void int8_sq_launcher<__nv_bfloat16>(Params& params, cudaStream_t s);
 #endif
 } // namespace smooth_quant
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

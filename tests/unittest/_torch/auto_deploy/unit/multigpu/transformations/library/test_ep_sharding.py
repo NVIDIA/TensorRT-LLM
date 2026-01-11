@@ -10,13 +10,15 @@ from _model_test_utils import MoEOpModel
 
 import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
-from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
-from tensorrt_llm._torch.auto_deploy.utils.sharding_utils import (
+from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
     EPShardingInfo,
     FP8EPShardingInfo,
+    MLPType,
     NVFP4EPShardingInfo,
+    ShardingTransformConfig,
 )
+from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
+from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 from tensorrt_llm.functional import AllReduceStrategy
 
 
@@ -87,35 +89,36 @@ def _run_pattern_detection_job(num_experts: int, rank: int, world_size: int) -> 
     expected_transformations = []
     # if world_size == 1, no sharding transformations should be detected
     if world_size > 1:
+        config = ShardingTransformConfig(
+            rank=rank,
+            world_size=world_size,
+            stage="sharding",
+            allreduce_strategy=AllReduceStrategy.AUTO,
+            dist_backend="auto",
+        )
         for node in gm.graph.nodes:
             if is_op(node, torch.ops.auto_deploy.torch_moe):
                 expected_transformations.append(
                     EPShardingInfo(
                         target_node=node.name,
-                        rank=rank,
-                        world_size=world_size,
-                        allreduce_strategy=AllReduceStrategy.AUTO,
-                        dist_backend="auto",
+                        config=config,
+                        mlp_type=MLPType.GATED_MLP,
                     )
                 )
             elif is_op(node, torch.ops.auto_deploy.torch_quant_fp8_moe):
                 expected_transformations.append(
                     FP8EPShardingInfo(
                         target_node=node.name,
-                        rank=rank,
-                        world_size=world_size,
-                        allreduce_strategy=AllReduceStrategy.AUTO,
-                        dist_backend="auto",
+                        config=config,
+                        mlp_type=MLPType.GATED_MLP,
                     )
                 )
             elif is_op(node, torch.ops.auto_deploy.torch_quant_nvfp4_moe):
                 expected_transformations.append(
                     NVFP4EPShardingInfo(
                         target_node=node.name,
-                        rank=rank,
-                        world_size=world_size,
-                        allreduce_strategy=AllReduceStrategy.AUTO,
-                        dist_backend="auto",
+                        config=config,
+                        mlp_type=MLPType.GATED_MLP,
                     )
                 )
 
@@ -183,7 +186,7 @@ def test_llama4_stacked_moe_pattern_detection():
         moe_node = graph.call_function(
             torch.ops.auto_deploy.torch_moe,
             args=(x, selected_experts, routing_weights, w1_list, w2_list, w3_list),
-            kwargs={"mlp_style": "gated_mlp", "apply_routing_on_input": True},
+            kwargs={"is_gated_mlp": True, "apply_routing_on_input": True},
         )
         graph.output(moe_node)
 

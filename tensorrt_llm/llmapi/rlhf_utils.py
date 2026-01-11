@@ -1,3 +1,5 @@
+import base64
+import pickle  # nosec B403
 from typing import Optional
 
 import torch
@@ -56,12 +58,20 @@ class WorkerExtension:
                     raise ValueError(f"Device UUID {device_uuid} not found in ipc_handles")
 
                 weights = {}
-                all_handles = ipc_handles[device_uuid]
+
+                serialized_handles = ipc_handles[device_uuid]
+                if isinstance(serialized_handles, str):
+                    # Data is base64-encoded pickled bytes - deserialize it
+                    logger.info("Deserializing base64-encoded weight handles")
+                    all_handles = pickle.loads(base64.b64decode(serialized_handles))  # nosec B301
+                else:
+                    # Data is already in the correct format (backward compatibility)
+                    all_handles = serialized_handles
 
                 for param_name, tensor_handle in all_handles:
                     func, args = tensor_handle
                     list_args = list(args)
-                    list_args[6] = self.device_id  # Set target device
+                    list_args[6] = self.device_id
                     tensor = func(*list_args)
                     weights[param_name] = tensor
 
@@ -88,7 +98,7 @@ class WorkerExtension:
             logger.error("Encountered an error in update_weights")
             raise e
 
-    def check_weights_updated(self):
+    def check_weights_updated(self) -> bool:
         """Check if the weights are updated to 0."""
         weights_updated = True
         for name, p in self.engine.model_engine.model.named_parameters():

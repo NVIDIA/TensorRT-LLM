@@ -380,12 +380,15 @@ def _per_token_quant_and_transform_kernel(
     input_ptr,
     stride_input_0,
     stride_input_1,
+    stride_input_2,
     output_ptr,
     stride_output_0,
     stride_output_1,
+    stride_output_2,
     output_scale_ptr,
     stride_output_scale_0,
     stride_output_scale_1,
+    stride_output_scale_2,
     token_num_cur_expert,
     size_k,
     fp8_max,
@@ -394,7 +397,7 @@ def _per_token_quant_and_transform_kernel(
     NUM_STAGE: tl.constexpr,
     SCALE_UE8M0: tl.constexpr,
 ):
-    tl.program_id(2)
+    batch_id = tl.program_id(2)
     token_id = tl.program_id(1)
     hidden_dim_block_index = tl.program_id(0)
 
@@ -402,14 +405,19 @@ def _per_token_quant_and_transform_kernel(
 
     stride_input_0 = tl.cast(stride_input_0, dtype=tl.int64)
     stride_output_0 = tl.cast(stride_output_0, dtype=tl.int64)
+    stride_output_scale_0 = tl.cast(stride_output_scale_0, dtype=tl.int64)
     stride_input_1 = tl.cast(stride_input_1, dtype=tl.int64)
     stride_output_1 = tl.cast(stride_output_1, dtype=tl.int64)
+    stride_output_scale_1 = tl.cast(stride_output_scale_1, dtype=tl.int64)
+    stride_input_2 = tl.cast(stride_input_2, dtype=tl.int64)
+    stride_output_2 = tl.cast(stride_output_2, dtype=tl.int64)
+    stride_output_scale_2 = tl.cast(stride_output_scale_2, dtype=tl.int64)
 
     offs_in_d = hidden_dim_block_index * BLOCK + tl.arange(0, BLOCK // 4)
-    input_ptr_offs = input_ptr + offs_in_d
-    output_ptr_offs = output_ptr + offs_in_d
-    output_scale_offs = (output_scale_ptr +
-                         hidden_dim_block_index * stride_output_scale_0)
+    input_ptr_offs = input_ptr + batch_id * stride_input_0 + offs_in_d
+    output_ptr_offs = output_ptr + batch_id * stride_output_0 + offs_in_d
+    output_scale_offs = (output_scale_ptr + batch_id * stride_output_scale_0 +
+                         hidden_dim_block_index * stride_output_scale_1)
 
     for token_index in tl.range(token_id,
                                 token_num_cur_expert,
@@ -419,7 +427,7 @@ def _per_token_quant_and_transform_kernel(
         for pack_index in tl.range(4):
             local_mask = offs_in_d + pack_index * 128
             act = tl.load(
-                input_ptr_offs + token_index * stride_input_0 +
+                input_ptr_offs + token_index * stride_input_1 +
                 pack_index * 128,
                 mask=local_mask < size_k,
                 other=0.0,
@@ -433,13 +441,13 @@ def _per_token_quant_and_transform_kernel(
             output_s_int32 += ((output_s.to(tl.int32, bitcast=True) >> 23) <<
                                (8 * pack_index))
             tl.store(
-                output_ptr_offs + token_index * stride_output_0 +
+                output_ptr_offs + token_index * stride_output_1 +
                 pack_index * 128,
                 output_q,
                 mask=local_mask < size_k,
             )
         tl.store(
-            output_scale_offs + token_index * stride_output_scale_1,
+            output_scale_offs + token_index * stride_output_scale_2,
             output_s_int32,
         )
 
@@ -448,6 +456,7 @@ def per_token_quant_and_transform(
     input: torch.Tensor,
     quant_group_size: int = 128,
     scale_ue8m0: bool = True,
+    need_permute102: bool = False,
 ):
     """
     input shape [g, m, k]
@@ -457,8 +466,6 @@ def per_token_quant_and_transform(
     masked_m shape [g]
     """
 
-    assert input.is_contiguous()
-    assert len(input.shape) == 2
     assert input.shape[-1] % 2 == 0
 
     # FP8 quantization parameters
@@ -466,17 +473,29 @@ def per_token_quant_and_transform(
     fp8_max = finfo.max
     fp8_min = -fp8_max
 
-    m, k = input.shape
+    b = 1
+    original_input_rank = len(input.shape)
+    if (original_input_rank == 2):
+        assert input.is_contiguous()
+        input = input.unsqueeze(0)
+        b, m, k = input.shape
+    elif (original_input_rank == 3):
+        if need_permute102:
+            input = input.transpose(0, 1)
+        b, m, k = input.shape
+    else:
+        raise AssertionError(
+            f"Unsupported input shape rank: {original_input_rank}")
 
     # Create output
-    output = torch.empty((m, k), dtype=torch.float8_e4m3fn, device="cuda")
+    output = torch.empty((b, m, k), dtype=torch.float8_e4m3fn, device="cuda")
 
     # Create output scale
     alignment = 4
     scale_k = ceil_div(k, quant_group_size)
     m_padded = align(m, alignment)
     scale_k_padded = align(scale_k, alignment)
-    output_scale = torch.empty((scale_k_padded // 4, m_padded),
+    output_scale = torch.empty((b, scale_k_padded // 4, m_padded),
                                dtype=torch.int32,
                                device='cuda')
 
@@ -490,7 +509,7 @@ def per_token_quant_and_transform(
     grid = (
         hidden_dim_split_block_num,
         BLOCK_NUM_PER_EXPERT,
-        1,
+        b,
     )
     _per_token_quant_and_transform_kernel[grid](
         input,
@@ -508,13 +527,19 @@ def per_token_quant_and_transform(
         num_warps=num_warps,
         SCALE_UE8M0=scale_ue8m0,
     )
-    output_scale = output_scale.transpose(0, 1)[:m, :]
+    if (original_input_rank == 2):
+        output = output.squeeze(0)
+        output_scale = output_scale.squeeze(0)
+        output_scale = output_scale.transpose(0, 1)[:m, :]
+    else:
+        output_scale = output_scale.transpose(1, 2)[:, :m, :]
+
     check_sf_layout(
         output_scale,
         m,
         k,
         (1, 128),
-        num_groups=None,
+        num_groups=b if original_input_rank == 3 else None,
         tma_stride_check=True,
     )
     return output, output_scale

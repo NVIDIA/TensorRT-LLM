@@ -7,8 +7,8 @@ import torch
 from pydantic import Field
 from torch.fx import GraphModule
 
+from ...custom_ops.rms_norm import gated_rms_norm_ref
 from ...models.factory import ModelFactory
-from ...models.patches.nemotron_h import _rms_norm_ref
 from ...shim.interface import CachedSequenceInterface
 
 # It is important to import ADPatternMatcherPass from pattern_matcher.py, not from torch._inductor.pattern_matcher
@@ -225,7 +225,7 @@ def _gated_rmsnorm_pattern_ref(
     eps: float = 1e-5,
     group_size: int = 512,
 ) -> torch.Tensor:
-    y = _rms_norm_ref(
+    y = gated_rms_norm_ref(
         x,
         weight,
         bias=None,

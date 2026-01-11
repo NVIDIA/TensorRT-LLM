@@ -65,7 +65,6 @@ public:
 
     //!
     //! \brief Returns the tensor n-th dimension. If n is negative, returns the (nbDims - n)th dimension.
-    //! TODO: replace with constexpr parameter when moving to C++20.
     //!
     template <SizeType32 n>
     [[nodiscard]] DimType64 getDimension() const

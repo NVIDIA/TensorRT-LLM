@@ -1,29 +1,29 @@
-from typing import Callable, List, Optional
+from typing import Callable, List
 
 import torch
 import torch.nn.functional as F
 
+from tensorrt_llm._torch.utils import ActivationType
 
-def _resolve_activation(name: Optional[str]) -> Callable[[torch.Tensor], torch.Tensor]:
-    """
-    Returns an elementwise activation callable matching the given name.
-    Supported: "silu", "relu2".
-    Defaults to SiLU when name is None or empty.
-    """
-    if not name:
-        name = "silu"
-    key = name.lower()
 
-    if key == "silu":
-        return F.silu
-    elif key == "relu2":
+def _resolve_torch_fn(act_fn: ActivationType) -> Callable[[torch.Tensor], torch.Tensor]:
+    """
+    Returns an elementwise activation callable matching the given activation function.
+    Supported: ActivationType.Silu, ActivationType.Swiglu, ActivationType.Relu2
+    """
+    assert act_fn in [ActivationType.Silu, ActivationType.Swiglu, ActivationType.Relu2], (
+        f"Unsupported activation '{ActivationType(act_fn).name}'. Use 'silu', 'swiglu' or 'relu2'."
+    )
+    torch_fn = None
+    if act_fn == ActivationType.Silu or act_fn == ActivationType.Swiglu:
+        torch_fn = F.silu
+    elif act_fn == ActivationType.Relu2:
 
         def relu2(x: torch.Tensor) -> torch.Tensor:
             return torch.square(F.relu(x))
 
-        return relu2
-    else:
-        raise ValueError(f"Unsupported activation '{name}'. Use one of: silu, relu2.")
+        torch_fn = relu2
+    return torch_fn
 
 
 def _template_moe(
@@ -94,17 +94,13 @@ def torch_moe(
     w1_weight: List[torch.Tensor],
     w2_weight: List[torch.Tensor],
     w3_weight: List[torch.Tensor],
-    mlp_style: str = "gated_mlp",
-    act_fn: str = "silu",
+    is_gated_mlp: bool = True,
+    act_fn: int = int(ActivationType.Silu),
     apply_routing_on_input: bool = False,
 ) -> torch.Tensor:
     """
     Unified Mixture-of-Experts (MoE) operator that uses a Mixtral-style dispatch
     (token routing + index_add_ accumulation) and a selectable per-expert MLP.
-
-    Supports both:
-    - Standard MoE with per-expert weight lists (apply_routing_on_input=False)
-    - Llama4 MoE with stacked weight tensors (apply_routing_on_input=True)
 
     Parameters:
         x (torch.Tensor): Input tensor of shape (B, H) or (B, S, H), where B is the batch size,
@@ -113,90 +109,42 @@ def torch_moe(
             of the selected experts for each token. Only experts within range [0,num_experts) is processed
         routing_weights (torch.Tensor): A tensor of shape (B, TOP_K) or (B*S, TOP_K) containing the normalized
             routing weights for the selected experts.
-            - Standard MoE: softmax normalized weights
-            - Llama4 MoE: sigmoid activated weights
-        w1_weight:
-            For per-expert lists:
-              • mlp_style=="gated_mlp": List of W1 with shape (I, H)  — "gate" projection.
-              • mlp_style=="mlp":       List of W_up with shape (I, H) — up projection.
-            For stacked tensors (Llama4):
-              • Single-element list containing stacked w3_w1 tensor with shape (E, 2*I, H) in TRT-LLM format
-        w2_weight:
-            For per-expert lists:
-              • List of W2/W_down with shape (H, I) — down projection.
-            For stacked tensors (Llama4):
-              • Single-element list containing stacked w2 tensor with shape (E, H, I) in TRT-LLM format
-        w3_weight:
-            For per-expert lists with gated_mlp:
-              • List of W3 with shape (I, H) — "up" (second) projection in gated MLP.
-            For mlp style or stacked tensors:
-              • pass an empty list []; ignored.
-        mlp_style:
-            Selects the per-expert MLP computation:
-              • "gated_mlp" (default, Mixtral/DeepSeek/Llama4-style):
-                    y = W2( act(W1 x) * (W3 x) )
-              • "mlp" (NemotronH-style 2-layer MLP):
-                    y = W_down( act(W_up x) )
-        act_fn:
-            Elementwise activation applied inside the expert MLP.
-            Supported: "silu" (default), "relu2" (ReLU then square).
-        apply_routing_on_input:
-            If True (Llama4 pattern): multiply routing weights with INPUT before MLP
-                Result: act(input * routing_weight) - routing affects activation
-            If False (standard pattern): multiply routing weights with OUTPUT after MLP
-                Result: act(input) * routing_weight - routing scales output
+        w1_weight: List of per-expert weight tensors of up projection.
+        w2_weight: List of per-expert weight tensors of down projection.
+        w3_weight: List of per-expert weight tensors of gate projection.
+        is_gated_mlp: If True, use a gated MLP. If False, use a simple MLP.
+        act_fn: Activation function applied inside the expert MLP.
+            Supported: ActivationType.Silu (default), ActivationType.Relu2 (ReLU then square).
+        apply_routing_on_input: If True, multiply routing weights with INPUT before MLP
+                                This means: silu(input * routing_weight)
+                                If False, multiply routing weights with OUTPUT after MLP
+                                This means: silu(input) * routing_weight
     Returns:
         torch.Tensor: Output tensor with the same shape as the input x.
     """
-    act_fn = _resolve_activation(act_fn)
-    style = mlp_style.lower()
+    torch_act_fn = _resolve_torch_fn(act_fn)
 
-    # Detect if using stacked tensor format (Llama4) vs per-expert lists (standard)
-    is_stacked = len(w1_weight) == 1 and w1_weight[0].ndim == 3
-
-    if is_stacked:
-        # Llama4 stacked tensor format - only supports gated_mlp
-        if style != "gated_mlp":
-            raise ValueError("Stacked tensor format only supports 'gated_mlp' style")
-
-        w3_w1_stacked = w1_weight[0]  # (E, 2*I, H)
-        w2_stacked = w2_weight[0]  # (E, H, I)
-
-        def make_mlp(i: int):
-            gate_up = w3_w1_stacked[i]  # (2*I, H)
-            intermediate_size = gate_up.shape[0] // 2
-            W3 = gate_up[:intermediate_size, :]  # (I, H)
-            W1 = gate_up[intermediate_size:, :]  # (I, H)
-            W2 = w2_stacked[i]  # (H, I)
-            weight_dtype = W1.dtype
-            return lambda inp: F.linear(
-                act_fn(F.linear(inp.to(weight_dtype), W1)) * F.linear(inp.to(weight_dtype), W3),
-                W2,
-            )
-
-        mlps = [make_mlp(i) for i in range(w3_w1_stacked.shape[0])]
-
-    elif style == "gated_mlp":
+    mlps = []
+    if is_gated_mlp:
         # Standard per-expert list format with gated MLP
         def make_mlp(i: int):
             W1 = w1_weight[i]  # (I, H)
             W2 = w2_weight[i]  # (H, I)
             W3 = w3_weight[i]  # (I, H)
-            return lambda inp: F.linear(act_fn(F.linear(inp, W1)) * F.linear(inp, W3), W2)
-
-        mlps = [make_mlp(i) for i in range(len(w1_weight))]
-
-    elif style == "mlp":
-        # Standard per-expert list format with simple MLP
-        def make_mlp(i: int):
-            W_up = w1_weight[i]  # (I, H)
-            W_down = w2_weight[i]  # (H, I)
-            return lambda inp: F.linear(act_fn(F.linear(inp, W_up)), W_down)
+            return lambda inp: F.linear(
+                torch_act_fn(F.linear(inp.to(W1.dtype), W1)) * F.linear(inp.to(W3.dtype), W3), W2
+            )
 
         mlps = [make_mlp(i) for i in range(len(w1_weight))]
 
     else:
-        raise ValueError(f"Unknown mlp_style '{mlp_style}'. Use 'gated_mlp' or 'mlp'.")
+        # Standard per-expert list format with simple MLP
+        def make_mlp(i: int):
+            W_up = w1_weight[i]  # (I, H)
+            W_down = w2_weight[i]  # (H, I)
+            return lambda inp: F.linear(torch_act_fn(F.linear(inp, W_up)), W_down)
+
+        mlps = [make_mlp(i) for i in range(len(w1_weight))]
 
     return _template_moe(x, selected_experts, routing_weights, mlps, apply_routing_on_input)
 
@@ -209,8 +157,8 @@ def torch_moe_fake(
     w1_weight: List[torch.Tensor],
     w2_weight: List[torch.Tensor],
     w3_weight: List[torch.Tensor],
-    mlp_style: str = "gated_mlp",
-    act_fn: str = "silu",
+    is_gated_mlp: bool = True,
+    act_fn: int = int(ActivationType.Silu),
     apply_routing_on_input: bool = False,
 ) -> torch.Tensor:
     return torch.empty_like(x)
@@ -296,23 +244,20 @@ def torch_quant_fp8_moe(
     w1_weight_scale: List[torch.Tensor],
     w2_weight_scale: List[torch.Tensor],
     w3_weight_scale: List[torch.Tensor],
-    mlp_style: str = "gated_mlp",  # "gated_mlp" (default) or "mlp"
-    act_fn: str = "silu",  # silu or relu2
+    is_gated_mlp: bool = True,
+    act_fn: int = int(ActivationType.Silu),
 ) -> torch.Tensor:
     """
-    FP8 MoE op using quantized linear operations.
-
-    Computes a Mixture-of-Experts layer similar to the reference auto_deploy::torch_moe op, but uses the
-    quantized FP8 linear op for expert computations.
+    FP8 MoE op using quantized linear operations. Computes a Mixture-of-Experts layer similar to the reference
+    auto_deploy::torch_moe op, but uses the quantized FP8 linear op for expert computations.
 
     Args:
         x: Input tensor of shape (B, H) or (B, S, H).
-        selected_experts: Tensor (B, TOP_K) or (B*S, TOP_K) containing expert indices.
-        routing_weights: Tensor of normalized routing weights.
-        w1_weight:
-            List of per-expert weight tensors:
-              • mlp_style=="gated_mlp": W1 with shape (I, H)  — "gate" projection.
-              • mlp_style=="mlp":       W_up with shape (I, H) — up projection.
+        selected_experts: Tensor (B, TOP_K) or (B*S, TOP_K)
+         containing expert indices.routing_weights: Tensor of normalized routing weights.
+        w1_weight: List of per-expert weight tensors:
+              • is_gated_mlp==True: W1 with shape (I, H)  — "gate" projection.
+              • is_gated_mlp==False: W_up with shape (I, H) — up projection.
         w2_weight:
             List of per-expert weight tensors:
               • gated_mlp: W2 with shape (H, I) — down projection.
@@ -323,21 +268,20 @@ def torch_quant_fp8_moe(
               • mlp:       pass an empty list []; ignored.
         w1_input_scale, w2_input_scale, w3_input_scale: Lists of input scale tensors for the corresponding ops.
         w1_weight_scale, w2_weight_scale, w3_weight_scale: Lists of weight scale tensors for the corresponding ops.
-        mlp_style:
+        is_gated_mlp:
             Selects the per-expert MLP computation:
-              • "gated_mlp" (default, Mixtral/DeepSeek-style):
+              • is_gated_mlp==True (default, Mixtral/DeepSeek-style):
                     y = W2( act(W1 x) * (W3 x) )
-              • "mlp" (NemotronH-style 2-layer MLP):
+              • is_gated_mlp==False (NemotronH-style 2-layer MLP):
                     y = W_down( act(W_up x) )
         act_fn:
             Elementwise activation applied inside the expert MLP.
-            Supported: "silu" (default), "relu2" (ReLU then square).
+            Supported: ActivationType.Silu (default), ActivationType.Relu2 (ReLU then square).
     """
 
-    act_fn = _resolve_activation(act_fn)
-    style = mlp_style.lower()
+    torch_act_fn = _resolve_torch_fn(act_fn)
 
-    if style == "gated_mlp":
+    if is_gated_mlp:
 
         def make_fp8_mlp(i):
             def mlp(inp):
@@ -355,7 +299,7 @@ def torch_quant_fp8_moe(
                     input_scale=w3_input_scale[i],
                     weight_scale=w3_weight_scale[i],
                 )
-                prod = act_fn(gate_out) * up_out
+                prod = torch_act_fn(gate_out) * up_out
                 return torch.ops.auto_deploy.torch_quant_fp8_linear(
                     prod,
                     w2_weight[i],
@@ -368,7 +312,7 @@ def torch_quant_fp8_moe(
 
         mlps = [make_fp8_mlp(i) for i in range(len(w1_weight))]
 
-    elif style == "mlp":
+    else:
 
         def make_fp8_mlp(i):
             def mlp(inp):
@@ -380,7 +324,7 @@ def torch_quant_fp8_moe(
                     weight_scale=w1_weight_scale[i],
                 )
                 return torch.ops.auto_deploy.torch_quant_fp8_linear(
-                    act_fn(up_out),
+                    torch_act_fn(up_out),
                     w2_weight[i],
                     bias=None,
                     input_scale=w2_input_scale[i],
@@ -390,9 +334,6 @@ def torch_quant_fp8_moe(
             return mlp
 
         mlps = [make_fp8_mlp(i) for i in range(len(w1_weight))]
-
-    else:
-        raise ValueError(f"Unknown mlp_style '{mlp_style}'. Use 'gated_mlp' or 'mlp'.")
 
     return _template_moe(x, selected_experts, routing_weights, mlps)
 
@@ -411,8 +352,8 @@ def torch_quant_fp8_moe_fake(
     w1_weight_scale: List[torch.Tensor],
     w2_weight_scale: List[torch.Tensor],
     w3_weight_scale: List[torch.Tensor],
-    mlp_style: str = "gated_mlp",
-    act_fn: str = "silu",
+    is_gated_mlp: bool = True,
+    act_fn: int = int(ActivationType.Silu),
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -434,8 +375,8 @@ def torch_quant_nvfp4_moe(
     w1_alpha: List[torch.Tensor],
     w2_alpha: List[torch.Tensor],
     w3_alpha: List[torch.Tensor],
-    mlp_style: str = "gated_mlp",  # "gated_mlp" (default) or "mlp"
-    act_fn: str = "silu",  # silu or relu2
+    is_gated_mlp: bool = True,
+    act_fn: int = int(ActivationType.Silu),
 ) -> torch.Tensor:
     """
     FP4 MoE op using quantized linear operations.
@@ -449,8 +390,8 @@ def torch_quant_nvfp4_moe(
         routing_weights: Tensor of normalized routing weights.
         w1_weight:
             List of per-expert weight tensors:
-              • mlp_style=="gated_mlp": W1 with shape (I, H)  — "gate" projection.
-              • mlp_style=="mlp":       W_up with shape (I, H) — up projection.
+              • is_gated_mlp==True: W1 with shape (I, H)  — "gate" projection.
+              • is_gated_mlp==False: W_up with shape (I, H) — up projection.
         w2_weight:
             List of per-expert weight tensors:
               • gated_mlp: W2 with shape (H, I) — down projection.
@@ -462,21 +403,20 @@ def torch_quant_nvfp4_moe(
         w1_input_scale, w2_input_scale, w3_input_scale: Lists of input scale tensors.
         w1_weight_scale, w2_weight_scale, w3_weight_scale: Lists of weight scale tensors.
         w1_alpha, w2_alpha, w3_alpha: Lists of alpha scale tensors for FP4 quantization.
-        mlp_style:
+        is_gated_mlp:
             Selects the per-expert MLP computation:
-              • "gated_mlp" (default, Mixtral/DeepSeek-style):
+              • is_gated_mlp==True (default, Mixtral/DeepSeek-style):
                     y = W2( act(W1 x) * (W3 x) )
-              • "mlp" (NemotronH-style 2-layer MLP):
+              • is_gated_mlp==False (NemotronH-style 2-layer MLP):
                     y = W_down( act(W_up x) )
         act_fn:
             Elementwise activation applied inside the expert MLP.
-            Supported: "silu" (default), "relu2" (ReLU then square).
+            Supported: ActivationType.Silu (default), ActivationType.Relu2 (ReLU then square).
     """
 
-    act_fn = _resolve_activation(act_fn)
-    style = mlp_style.lower()
+    torch_act_fn = _resolve_torch_fn(act_fn)
 
-    if style == "gated_mlp":
+    if is_gated_mlp:
 
         def make_fp4_mlp(i):
             def mlp(inp):
@@ -498,7 +438,7 @@ def torch_quant_nvfp4_moe(
                     weight_scale=w3_weight_scale[i],
                     alpha=w3_alpha[i],
                 )
-                prod = act_fn(gate_out) * up_out
+                prod = torch_act_fn(gate_out) * up_out
                 return torch.ops.auto_deploy.torch_quant_nvfp4_linear(
                     prod,
                     w2_weight[i],
@@ -512,7 +452,7 @@ def torch_quant_nvfp4_moe(
 
         mlps = [make_fp4_mlp(i) for i in range(len(w1_weight))]
 
-    elif style == "mlp":
+    else:
 
         def make_fp4_mlp(i):
             def mlp(inp):
@@ -527,7 +467,7 @@ def torch_quant_nvfp4_moe(
                     alpha=w1_alpha[i],
                 )
                 return torch.ops.auto_deploy.torch_quant_nvfp4_linear(
-                    act_fn(up_out),
+                    torch_act_fn(up_out),
                     w2_weight[i],
                     bias=None,
                     input_scale=w2_input_scale[i],
@@ -538,9 +478,6 @@ def torch_quant_nvfp4_moe(
             return mlp
 
         mlps = [make_fp4_mlp(i) for i in range(len(w1_weight))]
-
-    else:
-        raise ValueError(f"Unknown mlp_style '{mlp_style}'. Use 'gated_mlp' or 'mlp'.")
 
     return _template_moe(x, selected_experts, routing_weights, mlps)
 
@@ -562,8 +499,8 @@ def torch_quant_nvfp4_moe_fake(
     w1_alpha: List[torch.Tensor],
     w2_alpha: List[torch.Tensor],
     w3_alpha: List[torch.Tensor],
-    mlp_style: str = "gated_mlp",
-    act_fn: str = "silu",
+    is_gated_mlp: bool = True,
+    act_fn: int = int(ActivationType.Silu),
 ) -> torch.Tensor:
     return torch.empty_like(x)
 

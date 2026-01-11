@@ -16,6 +16,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/executor.h"
 
 #include <cstdint>
@@ -29,7 +30,9 @@
 
 #pragma once
 
-namespace tensorrt_llm::benchmark
+TRTLLM_NAMESPACE_BEGIN
+
+namespace benchmark
 {
 
 // using namespace tensorrt_llm::batch_manager;
@@ -237,4 +240,6 @@ std::vector<double> generateRandomExponentialValues(int count, float lambda, int
 
 std::vector<double> computeTimeDelays(BenchmarkParams const& benchmarkParams, int numDelays);
 
-} // namespace tensorrt_llm::benchmark
+} // namespace benchmark
+
+TRTLLM_NAMESPACE_END

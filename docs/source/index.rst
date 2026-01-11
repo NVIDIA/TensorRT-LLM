@@ -71,11 +71,14 @@ Welcome to TensorRT LLM's Documentation!
    features/quantization.md
    features/sampling.md
    features/additional-outputs.md
+   features/guided-decoding.md
    features/speculative-decoding.md
    features/checkpoint-loading.md
    features/auto_deploy/auto-deploy.md
    features/ray-orchestrator.md
    features/torch_compile_and_piecewise_cuda_graph.md
+   features/helix.md
+   features/kv-cache-connector.md
 
 
 .. toctree::

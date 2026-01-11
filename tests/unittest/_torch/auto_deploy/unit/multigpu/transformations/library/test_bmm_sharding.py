@@ -10,9 +10,13 @@ from _graph_test_helpers import run_sharding_pattern_detection_test, run_test_tr
 
 import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.transform.library.sharding import BMMShardingInfo
+from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
+    BMMShardingInfo,
+    ShardingTransformConfig,
+)
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
+from tensorrt_llm.functional import AllReduceStrategy
 
 
 class BMM(nn.Module):
@@ -108,6 +112,12 @@ def _run_pattern_detection_job(
     # Test pattern detection - create expected transformations for validation
     gm = torch_export_to_gm(model, args=(x,), clone=True)
     expected_transformations = []
+    config = ShardingTransformConfig(
+        rank=rank,
+        world_size=world_size,
+        stage="sharding",
+        allreduce_strategy=AllReduceStrategy.AUTO,
+    )
     # if world_size == 1, no sharding transformations should be detected
     if world_size > 1:
         for node in gm.graph.nodes:
@@ -115,8 +125,7 @@ def _run_pattern_detection_job(
                 expected_transformations.append(
                     BMMShardingInfo(
                         target_node=node.name,
-                        rank=rank,
-                        world_size=world_size,
+                        config=config,
                         start_idx=start_idx,
                         end_idx=end_idx,
                         dist_backend="auto",

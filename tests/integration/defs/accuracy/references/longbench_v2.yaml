@@ -8,5 +8,5 @@ DeepSeek-R1-0528:
     spec_dec_algo: MTP
     accuracy: 52.093
 meta-llama/Llama-3.1-8B-Instruct:
-  - accuracy: 26.48
+  - accuracy: 26.00
     sigma: 25.8

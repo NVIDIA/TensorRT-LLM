@@ -6,6 +6,8 @@ from typing import Any, Callable, Dict, List, Tuple
 import torch
 from torch.fx import GraphModule
 
+from tensorrt_llm._torch.utils import ActivationType
+
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.logger import ad_logger
@@ -123,8 +125,8 @@ def trtllm_moe_fused_aux(
     routing_weights: torch.Tensor,
     w3_w1_stacked_weight: torch.Tensor,
     w2_stacked_weight: torch.Tensor,
-    mlp_style: str = "gated_mlp",
-    act_fn: str = "silu",
+    is_gated_mlp: bool = True,
+    act_fn: int = int(ActivationType.Silu),
 ) -> torch.Tensor:
     device = torch.cuda.current_device()
     with torch.cuda.stream(
@@ -137,7 +139,7 @@ def trtllm_moe_fused_aux(
             routing_weights,
             w3_w1_stacked_weight,
             w2_stacked_weight,
-            mlp_style,
+            is_gated_mlp,
             act_fn,
         )
         torch.ops.auto_deploy.record_event(device, cuda_stream_manager.AUX_STREAM_NAME)
@@ -152,8 +154,8 @@ def trtllm_moe_fused_aux_fake(
     routing_weights: torch.Tensor,
     w3_w1_stacked_weight: torch.Tensor,
     w2_stacked_weight: torch.Tensor,
-    mlp_style: str = "gated_mlp",
-    act_fn: str = "silu",
+    is_gated_mlp: bool = True,
+    act_fn: int = int(ActivationType.Silu),
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -195,26 +197,19 @@ def triton_moe_fused_aux_fake(
     return torch.empty_like(x)
 
 
-# trtllm fp8
 @torch.library.custom_op("auto_deploy::trtllm_quant_fp8_moe_fused_aux", mutates_args=())
 def trtllm_quant_fp8_moe_fused_aux(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
-    w1_weight: torch.Tensor,  # [E, I, H] stacked FP8 weights
-    w2_weight: torch.Tensor,  # [E, H, I] stacked FP8 weights
-    w3_weight: torch.Tensor,  # [E, I, H] for gated_mlp, unused for mlp
-    w1_input_scale: torch.Tensor,  # [E] stacked input scales
-    w2_input_scale: torch.Tensor,  # [E] stacked input scales
-    w3_input_scale: torch.Tensor,  # [E] or unused
-    w1_weight_scale: torch.Tensor,  # [E] stacked weight scales
-    w2_weight_scale: torch.Tensor,  # [E] stacked weight scales
-    w3_weight_scale: torch.Tensor,  # [E] or unused
-    gemm1_dequant: torch.Tensor,  # [E]
-    gemm2_act_quant: torch.Tensor,  # [E]
-    gemm2_dequant: torch.Tensor,  # [E]
-    mlp_style: str = "gated_mlp",
-    act_fn: str = "silu",
+    fc1_expert_weights: torch.Tensor,
+    fc2_expert_weights: torch.Tensor,
+    fc1_act_scale: torch.Tensor,
+    fc1_dequant_scale: torch.Tensor,
+    fc2_act_scale_reciprocal: torch.Tensor,
+    fc2_dequant_scale: torch.Tensor,
+    is_gated_mlp: bool = True,
+    act_fn: int = int(ActivationType.Silu),
 ) -> torch.Tensor:
     device = torch.cuda.current_device()
     with torch.cuda.stream(
@@ -225,19 +220,13 @@ def trtllm_quant_fp8_moe_fused_aux(
             x,
             selected_experts,
             routing_weights,
-            w1_weight,
-            w2_weight,
-            w3_weight,
-            w1_input_scale,
-            w2_input_scale,
-            w3_input_scale,
-            w1_weight_scale,
-            w2_weight_scale,
-            w3_weight_scale,
-            gemm1_dequant,
-            gemm2_act_quant,
-            gemm2_dequant,
-            mlp_style,
+            fc1_expert_weights,
+            fc2_expert_weights,
+            fc1_act_scale,
+            fc1_dequant_scale,
+            fc2_act_scale_reciprocal,
+            fc2_dequant_scale,
+            is_gated_mlp,
             act_fn,
         )
         torch.ops.auto_deploy.record_event(device, cuda_stream_manager.AUX_STREAM_NAME)
@@ -250,20 +239,14 @@ def trtllm_quant_fp8_moe_fused_aux_fake(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
-    w1_weight: torch.Tensor,
-    w2_weight: torch.Tensor,
-    w3_weight: torch.Tensor,
-    w1_input_scale: torch.Tensor,
-    w2_input_scale: torch.Tensor,
-    w3_input_scale: torch.Tensor,
-    w1_weight_scale: torch.Tensor,
-    w2_weight_scale: torch.Tensor,
-    w3_weight_scale: torch.Tensor,
-    gemm1_dequant: torch.Tensor,
-    gemm2_act_quant: torch.Tensor,
-    gemm2_dequant: torch.Tensor,
-    mlp_style: str = "gated_mlp",
-    act_fn: str = "silu",
+    fc1_expert_weights: torch.Tensor,
+    fc2_expert_weights: torch.Tensor,
+    fc1_act_scale: torch.Tensor,
+    fc1_dequant_scale: torch.Tensor,
+    fc2_act_scale_reciprocal: torch.Tensor,
+    fc2_dequant_scale: torch.Tensor,
+    is_gated_mlp: bool = True,
+    act_fn: int = int(ActivationType.Silu),
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -283,6 +266,14 @@ def _execute_op_in_aux_stream(
             if input_node.target == torch.ops.aten.view.default:
                 target_input_node = input_node
                 break
+            # Look through dtype cast nodes (aten.to) to find the view node
+            if input_node.target == torch.ops.aten.to:
+                for nested_input in input_node.all_input_nodes:
+                    if nested_input.target == torch.ops.aten.view.default:
+                        target_input_node = nested_input
+                        break
+                if target_input_node is not None:
+                    break
 
         assert target_input_node is not None, f"Target input node not found for node {n}"
         with graph.inserting_before(target_input_node):

@@ -16,11 +16,14 @@
 
 #pragma once
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
 #include "tensorrt_llm/runtime/ipcUtils.h"
 
-namespace tensorrt_llm::kernels::ar_fusion
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::ar_fusion
 {
 
 class Workspace
@@ -41,4 +44,6 @@ private:
 };
 
 void lamport_initialize(void* ptr, int bytes, cudaStream_t stream);
-} // namespace tensorrt_llm::kernels::ar_fusion
+} // namespace kernels::ar_fusion
+
+TRTLLM_NAMESPACE_END

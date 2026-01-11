@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
+
 #include <algorithm>
 #include <initializer_list>
 #include <string>
@@ -24,7 +26,9 @@
 #include <pthread.h>
 #endif
 
-namespace tensorrt_llm::common
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common
 {
 
 inline bool setThreadName(std::string const& name)
@@ -43,4 +47,6 @@ bool contains(std::initializer_list<T> const& c, T const& v)
     return std::find(c.begin(), c.end(), v) != c.end();
 }
 
-} // namespace tensorrt_llm::common
+} // namespace common
+
+TRTLLM_NAMESPACE_END

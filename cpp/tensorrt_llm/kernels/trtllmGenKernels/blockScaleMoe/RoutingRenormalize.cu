@@ -25,7 +25,7 @@ static constexpr int NumExpertsLimit = 512;
 
 static constexpr int NumThreads = 1024;
 static constexpr int NumWarps = NumThreads / WarpSize;
-static constexpr int MaxNumTopExperts = 10;
+static constexpr int MaxSupportedTopExperts = 10;
 
 static constexpr int MaxNumTokensSingleCluster = NumBlocksPerCluster * NumThreads;
 static constexpr int MaxNumTokensSingleClusterScores = NumBlocksPerCluster * NumWarps;
@@ -34,8 +34,8 @@ static constexpr int BlockKernelMaxNumTokens = 4;
 
 template <typename DataType, typename InputType, int VecSize, bool DoSoftmaxBeforeTopK>
 __forceinline__ __device__ void routingTopKExperts(cg::thread_block_tile<WarpSize> const& warp,
-    DataType (&score)[VecSize], int32_t (&idx)[VecSize], DataType (&warpTopKScore)[MaxNumTopExperts],
-    int32_t (&warpTopKExpertIdx)[MaxNumTopExperts], int32_t const laneIdx, int32_t const numExperts, int32_t topK,
+    DataType (&score)[VecSize], int32_t (&idx)[VecSize], DataType (&warpTopKScore)[MaxSupportedTopExperts],
+    int32_t (&warpTopKExpertIdx)[MaxSupportedTopExperts], int32_t const laneIdx, int32_t const numExperts, int32_t topK,
     InputType const* ptrScores, bool const normTopkProb, bool const applySoftmaxAfterTopK = true)
 {
     DataType minScore = DataType{-INFINITY};
@@ -149,8 +149,8 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts) routingIndicesBlo
         BaseType score[VecSize];
         int32_t idx[VecSize];
 
-        BaseType warpTopKScore[MaxNumTopExperts];
-        int32_t warpTopKExpertIdx[MaxNumTopExperts];
+        BaseType warpTopKScore[MaxSupportedTopExperts];
+        int32_t warpTopKExpertIdx[MaxSupportedTopExperts];
 
         BaseType minScore = BaseType{-INFINITY};
         if (validToken)
@@ -306,7 +306,7 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Nu
 
     static constexpr int VecSize = KernelParams::MaxNumExperts / WarpSize;
 
-    __shared__ TypePacked __attribute((aligned(128))) smemPackedScoreIdx[NumWarps * MaxNumTopExperts];
+    __shared__ TypePacked __attribute((aligned(128))) smemPackedScoreIdx[NumWarps * MaxSupportedTopExperts];
 
     uint32_t const clusterBlockRank = blockIdx.x;
 
@@ -332,8 +332,8 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Nu
         BaseType score[VecSize];
         int32_t idx[VecSize];
 
-        BaseType warpTopKScore[MaxNumTopExperts];
-        int32_t warpTopKExpertIdx[MaxNumTopExperts];
+        BaseType warpTopKScore[MaxSupportedTopExperts];
+        int32_t warpTopKExpertIdx[MaxSupportedTopExperts];
 
         BaseType minScore = BaseType{-INFINITY};
         if (validToken)
@@ -356,12 +356,12 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Nu
 
     if (params.mPtrScores != nullptr)
     {
-        routingPermutation<KernelParams, BaseType, NumThreads, NumWarps, MaxNumTopExperts,
+        routingPermutation<KernelParams, BaseType, NumThreads, NumWarps, MaxSupportedTopExperts,
             /*LoadExpertIdxFromGlobal=*/false>(params, smemPackedScoreIdx, warpIdx, clusterBlockRank);
     }
     else
     {
-        routingPermutation<KernelParams, BaseType, NumThreads, NumWarps, MaxNumTopExperts,
+        routingPermutation<KernelParams, BaseType, NumThreads, NumWarps, MaxSupportedTopExperts,
             /*LoadExpertIdxFromGlobal=*/true>(params, smemPackedScoreIdx, warpIdx, clusterBlockRank);
     }
 }
@@ -417,8 +417,8 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts) routingIndicesHis
     // over all warps/tokens
     BaseType allScores[VecSize];
     int32_t allExpertIdx[VecSize];
-    BaseType warpTopKScore[MaxNumTopExperts];
-    int32_t warpTopKExpertIdx[MaxNumTopExperts];
+    BaseType warpTopKScore[MaxSupportedTopExperts];
+    int32_t warpTopKExpertIdx[MaxSupportedTopExperts];
     for (int tokenIdx = globalWarpIdx; tokenIdx < params.mNumTokens; tokenIdx += globalWarpStride)
     {
         auto scoreOffset = tokenIdx * params.mNumExperts;
@@ -486,8 +486,8 @@ void run(Data const& data, void* stream)
     TLLM_CHECK_WITH_INFO(data.mPtrPermutedIdxSize != nullptr && data.mPtrCtaIdxXyToBatchIdx != nullptr
             && data.mPtrCtaIdxXyToMnLimit != nullptr && data.mPtrNumNonExitingCtas != nullptr,
         "Llama4 routing kernel expects permuted idx and grouped Gemm launch config buffers");
-    TLLM_CHECK_WITH_INFO(data.mTopK <= MaxNumTopExperts, "Routing kernel expects topK experts <= %d, got %d",
-        MaxNumTopExperts, data.mTopK);
+    TLLM_CHECK_WITH_INFO(data.mTopK <= MaxSupportedTopExperts, "Routing kernel expects topK experts <= %d, got %d",
+        MaxSupportedTopExperts, data.mTopK);
     TLLM_CHECK_WITH_INFO(data.mNumExperts <= NumExpertsLimit,
         "Routing kernel expects #experts %d to be no more than %d", data.mNumExperts, NumExpertsLimit);
     // static_assert(MaxNumExperts <= NumThreads, "#experts must be bounded by #threads");

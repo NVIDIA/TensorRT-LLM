@@ -35,7 +35,7 @@ namespace cg = cooperative_groups;
 
 static constexpr int WarpSize = 32;
 static constexpr int MaxNumExpertsUnit = 128;
-static constexpr int MaxNumTopK = 10;
+static constexpr int MaxSupportedTopExperts = 22;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

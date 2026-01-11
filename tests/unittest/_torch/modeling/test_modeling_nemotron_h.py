@@ -1,12 +1,12 @@
 import pytest
 import torch
 from utils.llm_data import llm_models_root
-from utils.util import similar, skip_gpu_memory_less_than
+from utils.util import skip_fp8_pre_ada, skip_gpu_memory_less_than
 
 from tensorrt_llm import LLM
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.llmapi.llm import RequestOutput
-from tensorrt_llm.llmapi.llm_args import CudaGraphConfig
+from tensorrt_llm.llmapi.llm_args import CudaGraphConfig, LoadFormat
 from tensorrt_llm.sampling_params import SamplingParams
 
 
@@ -37,9 +37,15 @@ def create_nemotron_h_llm(model_folder,
                           max_batch_size,
                           mamba_ssm_cache_dtype=None,
                           enable_chunked_prefill=False,
-                          max_num_tokens=8192):
+                          max_num_tokens=8192,
+                          load_format=None):
     """Create LLM with specific overlap scheduler setting"""
     model_dir = f"{llm_models_root(check=True)}/{model_folder}"
+    kwargs = {}
+    if max_num_tokens is not None:
+        kwargs["max_num_tokens"] = max_num_tokens
+    if load_format is not None:
+        kwargs["load_format"] = load_format
     return LLM(
         model=model_dir,
         tensor_parallel_size=1,
@@ -52,10 +58,64 @@ def create_nemotron_h_llm(model_folder,
             if mamba_ssm_cache_dtype is None else mamba_ssm_cache_dtype),
         sampler_type="TRTLLMSampler",
         enable_chunked_prefill=enable_chunked_prefill,
-        **({} if max_num_tokens is None else {
-            "max_num_tokens": max_num_tokens
-        }),
+        **kwargs,
     )
+
+
+@pytest.mark.parametrize("mamba_ssm_cache_dtype", [None, "float32"],
+                         ids=lambda n: f"mamba_ssm_cache_dtype:{n}")
+@pytest.mark.parametrize("model_folder", [
+    pytest.param("NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+                 marks=skip_gpu_memory_less_than((2 * 30 + 1) * 2**30)),
+    pytest.param("NVIDIA-Nemotron-3-Nano-30B-A3B-FP8",
+                 marks=skip_gpu_memory_less_than((30 + 1) * 2**30)),
+])
+def test_nemotron_h_sanity(mamba_ssm_cache_dtype, model_folder):
+    # Skip test if FP8 is not supported on the current architecture.
+    use_fp8 = model_folder == "NVIDIA-Nemotron-3-Nano-30B-A3B-FP8"
+    skip_fp8_pre_ada(use_fp8)
+
+    torch.cuda.empty_cache()
+
+    text_prompts = [
+        "The future of AI is",
+        "The president of the United States is",
+    ]
+    num_prompts = len(text_prompts)
+
+    with create_nemotron_h_llm(
+            model_folder=model_folder,
+            use_cuda_graph=False,
+            disable_overlap_scheduler=False,
+            max_batch_size=num_prompts,
+            mamba_ssm_cache_dtype=mamba_ssm_cache_dtype,
+            load_format=LoadFormat.DUMMY,
+    ) as nemotron_h:
+        sampling_params = SamplingParams(max_tokens=9,
+                                         temperature=0.0,
+                                         add_special_tokens=False,
+                                         return_context_logits=True,
+                                         return_generation_logits=True)
+
+        # Non-batching prefill sanity check.
+        _ = [
+            nemotron_h.generate(text_prompt, sampling_params)
+            for text_prompt in text_prompts
+        ]
+
+        # Batching prefill sanity check.
+        results_batching = nemotron_h.generate(text_prompts, sampling_params)
+        completions_batching = [
+            result.outputs[0].text for result in results_batching
+        ]
+
+        # Decoding sanity check.
+        text_prompts_with_completions = [
+            f"{text_prompts[i]}{completions_batching[i]}"
+            for i in range(num_prompts)
+        ]
+        sampling_params.max_tokens = 1
+        nemotron_h.generate(text_prompts_with_completions, sampling_params)
 
 
 @pytest.mark.parametrize("mamba_ssm_cache_dtype", [None, "float32"],
@@ -63,8 +123,6 @@ def create_nemotron_h_llm(model_folder,
 @pytest.mark.parametrize("model_folder", [
     pytest.param("Nemotron-H-8B-Base-8K",
                  marks=skip_gpu_memory_less_than((2 * 8 + 1) * 2**30)),
-    pytest.param("Nemotron-Nano-3-30B-A3.5B-dev-1024",
-                 marks=skip_gpu_memory_less_than((2 * 30 + 1) * 2**30)),
 ])
 def test_nemotron_h_correctness(mamba_ssm_cache_dtype, model_folder):
     torch.cuda.empty_cache()
@@ -152,50 +210,6 @@ def test_nemotron_h_correctness(mamba_ssm_cache_dtype, model_folder):
                 -0.04291720315814018
             ])
         ]
-    elif model_folder == "Nemotron-Nano-3-30B-A3.5B-dev-1024":
-
-        expected_completions = [
-            " bright, with endless possibilities for innovation and growth",
-            " the head of state and head of government of",
-        ]
-
-        # Copied from prefill_logprobs_no_batching[0] directly.
-        prefill_logprobs_ref_mcore = torch.tensor(
-            [-8.5145, -0.8952, -2.3531, -1.6690])
-
-        # reference logprobs from initial implementation (commit e4e42e0ec30227866ce30fc9c93d5e49352bb79c on single H200).
-        initial_impl_atol = 2.0
-        batching_atol = 2.0
-
-        prefill_logprobs_ref_initial_no_batching = [
-            torch.tensor([-8.5145, -0.8952, -2.3531, -1.6690]),
-            torch.tensor([-9.9306, -1.4935, -0.4787, -1.4945, -0.0195, -1.5253])
-        ]
-        prefill_logprobs_ref_initial_with_batching = [
-            torch.tensor([-8.5221, -0.8114, -2.4334, -1.6909]),
-            torch.tensor([-9.9466, -1.5095, -0.5282, -1.4701, -0.0185, -1.4108])
-        ]
-
-        decode_logprobs_ref_initial_no_batching = [
-            torch.tensor([
-                -9.2718e-01, -9.7786e-01, -7.5823e-01, -3.3243e-01, -8.7978e-01,
-                -3.2046e-02, -9.5047e-01, -9.2678e-01, -2.5973e-04
-            ]),
-            torch.tensor([
-                -1.6836, -0.8289, -0.0063, -0.5166, -0.1798, -0.6075, -1.0987,
-                -0.9075, -0.0025
-            ])
-        ]
-        decode_logprobs_ref_initial_with_batching = [
-            torch.tensor([
-                -9.0849e-01, -9.3238e-01, -8.2788e-01, -3.5542e-01, -9.0881e-01,
-                -3.4794e-02, -9.4975e-01, -9.2631e-01, -2.4041e-04
-            ]),
-            torch.tensor([
-                -1.6331, -0.7666, -0.0063, -0.5110, -0.1617, -0.6578, -1.1073,
-                -1.1447, -0.0024
-            ])
-        ]
     else:
         raise ValueError(f"Invalid model folder: {model_folder}")
 
@@ -255,14 +269,9 @@ def test_nemotron_h_correctness(mamba_ssm_cache_dtype, model_folder):
                 atol=initial_impl_atol,
                 rtol=0.0)
 
-            if model_folder == "Nemotron-H-8B-Base-8K":
-                # compare expected completion
-                assert completions_batching[i] == expected_completions[i]
-                assert completions_no_batching[i] == expected_completions[i]
-            else:
-                assert similar(completions_batching[i],
-                               completions_no_batching[i],
-                               threshold=0.5)
+            # compare expected completion
+            assert completions_batching[i] == expected_completions[i]
+            assert completions_no_batching[i] == expected_completions[i]
 
             # compare decode logprobs with initial implementation
             torch.testing.assert_close(

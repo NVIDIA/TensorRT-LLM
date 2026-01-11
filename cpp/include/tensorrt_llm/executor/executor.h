@@ -47,6 +47,12 @@ class BaseKVCacheManager;
 namespace tensorrt_llm::executor
 {
 
+using SizeType32 = tensorrt_llm::runtime::SizeType32;
+// Mmkey is used in KVCacheBlock when multimodal data presents in a block.
+// Type alias for hash array + start offset at per-block granularity.
+// This differs from the per-request level multimodal hash in MultimodalInput.
+using MmKey = std::pair<std::array<uint8_t, 32>, SizeType32>;
+
 /// @brief Version of TRT-LLM
 char const* version() noexcept;
 
@@ -1462,7 +1468,8 @@ public:
         DEFAULT = 0,
         MPI = 1,
         UCX = 2,
-        NIXL = 3
+        NIXL = 3,
+        MOONCAKE = 4
     };
     explicit CacheTransceiverConfig(std::optional<BackendType> backendType = std::nullopt,
         std::optional<size_t> maxNumTokens = std::nullopt, std::optional<int> kvTransferTimeoutMs = std::nullopt,
@@ -1691,12 +1698,14 @@ struct KVCacheStoredBlockData
 {
 
     KVCacheStoredBlockData(IdType blockHash, tensorrt_llm::runtime::VecUniqueTokens tokens,
-        std::optional<tensorrt_llm::runtime::LoraTaskIdType> loraId, SizeType32 cacheLevel, SizeType32 priority)
+        std::optional<tensorrt_llm::runtime::LoraTaskIdType> loraId, SizeType32 cacheLevel, SizeType32 priority,
+        std::vector<MmKey> mmKeys = {})
         : blockHash{blockHash}
         , tokens{std::move(tokens)}
         , loraId{loraId}
         , cacheLevel{cacheLevel}
         , priority{priority}
+        , mmKeys{std::move(mmKeys)}
     {
     }
 
@@ -1710,6 +1719,8 @@ struct KVCacheStoredBlockData
     SizeType32 cacheLevel;
     /// @brief The priority of the block
     SizeType32 priority;
+    /// @brief The multimodal keys of the block
+    std::vector<MmKey> mmKeys;
 };
 
 struct KVCacheStoredData

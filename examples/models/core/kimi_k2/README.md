@@ -56,7 +56,7 @@ The next section is an example that deploys the K2 model using TensorRT-LLM and 
 First, launch a server using trtllm-serve:
 
 ```bash
-cat > ./extra_llm_api_options.yaml <<EOF
+cat > ./config.yaml <<EOF
 # define your extra parameters here
 cuda_graph_config:
   batch_sizes:
@@ -70,7 +70,7 @@ trtllm-serve  \
     --backend pytorch \
     --tp_size 8 \
     --ep_size 8 \
-    --extra_llm_api_options extra_llm_api_options.yaml
+    --config config.yaml
 ```
 
 Run the script [kimi_k2_tool_calling_example.py](./kimi_k2_tool_calling_example.py), which performs the following steps:

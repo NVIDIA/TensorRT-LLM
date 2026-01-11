@@ -564,8 +564,11 @@ class TestMoEAlltoAll:
             (4, [16, 32, 64, 48], 2),
             (2, [100, 50], 2),
             (4, [32, 32, 32, 32], 4),
+            (4, [32, 32, 32, 32], 10),  # (top_k=10 is used by Qwen3-next)
+            (4, [32, 32, 32, 32], 22),
             (4, [1, 1, 1, 1], 2),
             (8, [640, 640, 640, 640, 640, 640, 640, 640], 4),
+            (4, [32, 0, 16, 0], 2),
         ],
         indirect=["mpi_pool_executor"])
     def test_combine(self, mpi_pool_executor, all_num_tokens, top_k):

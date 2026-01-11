@@ -52,7 +52,12 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
-from .utils import is_power_of_2
+from .utils import (
+    TRTLLM_ENABLE_PDL,
+    griddepcontrol_launch_dependents,
+    griddepcontrol_wait,
+    is_power_of_2,
+)
 
 
 class Sm100BlockScaledContiguousGroupedGemmKernel:
@@ -99,8 +104,6 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
     def __init__(
         self,
         sf_vec_size: int,
-        acc_dtype: Type[cutlass.Numeric],
-        use_2cta_instrs: bool,
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
     ):
@@ -111,30 +114,24 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
         1.  MMA Instruction Settings (tcgen05):
             - acc_dtype: Data types for MMA accumulator.
             - mma_tiler_mn: The (M, N) shape of the MMA instruction tiler.
-            - use_2cta_instrs: Boolean indicating if the tcgen05 MMA variant
-              with cta_group=2 should be used.
 
         2.  Cluster Shape:
             - cluster_shape_mn: The (ClusterM, ClusterN) shape of the CTA cluster.
 
-        :param acc_dtype: Data type of the accumulator.
-        :type acc_dtype: type[cutlass.Numeric]
         :param mma_tiler_mn: Tuple (M, N) shape of the MMA instruction.
         :type mma_tiler_mn: Tuple[int, int]
-        :param use_2cta_instrs: Boolean, True to use cta_group=2 MMA variant.
-        :type use_2cta_instrs: bool
         :param cluster_shape_mn: Tuple (ClusterM, ClusterN) shape of the cluster.
         :type cluster_shape_mn: Tuple[int, int]
         """
 
         self.sf_vec_size = sf_vec_size
-        self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
-        self.use_2cta_instrs = use_2cta_instrs
+        self.acc_dtype = cutlass.Float32
+        self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
         # K dimension is deferred in _setup_attributes
         self.mma_tiler = (*mma_tiler_mn, 1)
 
-        self.cta_group = tcgen05.CtaGroup.TWO if use_2cta_instrs else tcgen05.CtaGroup.ONE
+        self.cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
 
         self.occupancy = 1
         self.epilog_warp_id = (0, 1, 2, 3)
@@ -249,6 +246,12 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
             self.mma_tiler[2],
         )
 
+        self.cta_tile_shape_mnk_sfb = (
+            self.mma_tiler_sfb[0] // cute.size(tiled_mma.thr_id.shape),
+            self.mma_tiler_sfb[1],
+            self.mma_tiler_sfb[2],
+        )
+
         # Compute cluster layout
         self.cluster_layout_vmnk = cute.tiled_divide(
             cute.make_layout((*self.cluster_shape_mn, 1)),
@@ -273,6 +276,8 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
             self.c_layout,
             self.c_dtype,
         )
+
+        self.epi_tile_n = cute.size(self.epi_tile[1])
 
         # Setup A/B/C/Scale stage count in shared memory and ACC stage count in tensor memory
         (
@@ -326,6 +331,23 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
             self.epi_tile,
             self.num_c_stage,
         )
+
+        # Overlap and double buffer accumulator when num_acc_stage == 1 for cta_tile_n = 256 case
+        self.overlapping_accum = self.num_acc_stage == 1
+
+        # Compute number of TMEM columns for SFA/SFB/Accumulator
+        sf_atom_mn = 32
+        self.num_sfa_tmem_cols = (self.cta_tile_shape_mnk[0] // sf_atom_mn) * mma_inst_tile_k
+        self.num_sfb_tmem_cols = (self.cta_tile_shape_mnk_sfb[1] // sf_atom_mn) * mma_inst_tile_k
+        self.num_sf_tmem_cols = self.num_sfa_tmem_cols + self.num_sfb_tmem_cols
+        self.num_accumulator_tmem_cols = (
+            self.cta_tile_shape_mnk[1] * self.num_acc_stage
+            if not self.overlapping_accum
+            else self.cta_tile_shape_mnk[1] * 2 - self.num_sf_tmem_cols
+        )
+
+        # Only when overlapping_accum is enabled, we need to release accumulator buffer early in epilogue
+        self.iter_acc_early_release_in_epilogue = self.num_sf_tmem_cols // self.epi_tile_n
 
         # Compute the number of tensor memory allocation columns
         self.num_tmem_alloc_cols = 512
@@ -597,6 +619,7 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
             smem=self.shared_storage.size_in_bytes(),
             stream=stream,
             min_blocks_per_mp=1,
+            use_pdl=TRTLLM_ENABLE_PDL,
         )
         return
 
@@ -837,7 +860,7 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
         gC_mnl = cute.local_tile(
             mC_mnl, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
         )
-        k_tile_cnt = cute.size(gA_mkl, mode=[3])
+        k_tile_cnt = cutlass.Int32(cute.size(gA_mkl, mode=[3]))
 
         #
         # Partition global tensor for TiledMMA_A/B/C
@@ -922,8 +945,28 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
         tCrB = tiled_mma.make_fragment_B(sB)
         # (MMA, MMA_M, MMA_N)
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
-        # (MMA, MMA_M, MMA_N, STAGE)
-        tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, self.num_acc_stage))
+
+        if cutlass.const_expr(self.overlapping_accum):
+            num_acc_stage_overlapped = 2
+            tCtAcc_fake = tiled_mma.make_fragment_C(
+                cute.append(acc_shape, num_acc_stage_overlapped)
+            )
+            # (MMA, MMA_M, MMA_N, STAGE)
+            tCtAcc_fake = cute.make_tensor(
+                tCtAcc_fake.iterator,
+                cute.make_layout(
+                    tCtAcc_fake.shape,
+                    stride=(
+                        tCtAcc_fake.stride[0],
+                        tCtAcc_fake.stride[1],
+                        tCtAcc_fake.stride[2],
+                        (256 - self.num_sf_tmem_cols) * tCtAcc_fake.stride[0][1],
+                    ),
+                ),
+            )
+        else:
+            # (MMA, MMA_M, MMA_N, STAGE)
+            tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, self.num_acc_stage))
 
         #
         # Cluster wait before tensor memory alloc
@@ -932,6 +975,8 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
             cute.arch.cluster_wait()
         else:
             self.cta_sync_barrier.arrive_and_wait()
+
+        griddepcontrol_wait()
 
         #
         # Specialized Schedule warp
@@ -951,16 +996,21 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
                 pipeline.PipelineUserType.Producer, self.num_tile_stage
             )
 
+            num_valid_tiles = num_non_exiting_tiles[0]
+
             while work_tile.is_valid_tile:
                 cur_tile_coord = work_tile.tile_idx
-                if cur_tile_coord[0] < num_non_exiting_tiles[0]:
+                mma_tile_coord_m = cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape)
+
+                expert_idx = tile_idx_to_group_idx[mma_tile_coord_m]
+                tile_idx = mma_tile_coord_m
+
+                if tile_idx < num_valid_tiles:
                     tile_info_pipeline.producer_acquire(tile_info_producer_state)
-                    cur_tile_coord = work_tile.tile_idx
-                    group_idx = tile_idx_to_group_idx[cur_tile_coord[0]]
                     with cute.arch.elect_one():
                         sInfo[(0, tile_info_producer_state.index)] = cur_tile_coord[0]
                         sInfo[(1, tile_info_producer_state.index)] = cur_tile_coord[1]
-                        sInfo[(2, tile_info_producer_state.index)] = group_idx
+                        sInfo[(2, tile_info_producer_state.index)] = expert_idx
                         sInfo[(3, tile_info_producer_state.index)] = cutlass.Int32(
                             work_tile.is_valid_tile
                         )
@@ -1239,7 +1289,13 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
                     tile_info[2],
                 )
 
-                tCtAcc = tCtAcc_base[(None, None, None, acc_producer_state.index)]
+                # Get accumulator stage index
+                if cutlass.const_expr(self.overlapping_accum):
+                    acc_stage_index = acc_producer_state.phase ^ 1
+                else:
+                    acc_stage_index = acc_producer_state.index
+
+                tCtAcc = tCtAcc_base[(None, None, None, acc_stage_index)]
 
                 tCtSFB_mma = tCtSFB
                 if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 192):
@@ -1408,7 +1464,7 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
             #
             # Partition for epilogue
             #
-            epi_tidx = tidx
+            epi_tidx = tidx % 128
             (
                 tiled_copy_t2r,
                 tTR_tAcc_base,
@@ -1432,14 +1488,6 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
                 bSG_sC,
                 bSG_gC_partitioned,
             ) = self.epilog_gmem_copy_and_partition(epi_tidx, tma_atom_c, tCgC, epi_tile, sC)
-
-            #
-            # Persistent tile scheduling loop
-            #
-            tile_sched = utils.StaticPersistentTileScheduler.create(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
-            )
-            work_tile = tile_sched.initial_work_tile_info()
 
             acc_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_acc_stage
@@ -1474,6 +1522,8 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
             tile_info_pipeline.consumer_release(tile_info_consumer_state)
             tile_info_consumer_state.advance()
 
+            num_prev_subtiles = cutlass.Int32(0)
+
             while is_valid_tile:
                 mma_tile_coord_mnl = (
                     tile_info[0] // cute.size(tiled_mma.thr_id.shape),
@@ -1484,8 +1534,8 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
                 # Get alpha for current group
                 #
 
-                group_idx = mma_tile_coord_mnl[2]
-                alpha_val = alpha[group_idx]
+                expert_idx = mma_tile_coord_mnl[2]
+                alpha_val = alpha[expert_idx]
 
                 #
                 # Slice to per mma tile index
@@ -1503,9 +1553,18 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
                     )
                 ]
 
+                # Get accumulator stage index
+                if cutlass.const_expr(self.overlapping_accum):
+                    acc_stage_index = acc_consumer_state.phase
+                    reverse_subtile = (
+                        cutlass.Boolean(True) if acc_stage_index == 0 else cutlass.Boolean(False)
+                    )
+                else:
+                    acc_stage_index = acc_consumer_state.index
+
                 # Set tensor memory buffer for current tile
                 # (T2R, T2R_M, T2R_N, EPI_M, EPI_M)
-                tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None, acc_consumer_state.index)]
+                tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None, acc_stage_index)]
 
                 #
                 # Wait for accumulator buffer full
@@ -1516,17 +1575,33 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
                 bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
 
                 #
-                # Store accumulator to global memory in sub-tiles
+                # Store accumulator to global memory in subtiles
                 #
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
-                num_prev_subtiles = tile_sched.num_tiles_executed * subtile_cnt
 
                 for subtile_idx in cutlass.range(subtile_cnt):
+                    real_subtile_idx = subtile_idx
+                    if cutlass.const_expr(self.overlapping_accum):
+                        if reverse_subtile:
+                            real_subtile_idx = (
+                                self.cta_tile_shape_mnk[1] // self.epi_tile_n - 1 - subtile_idx
+                            )
                     #
                     # Load accumulator from tensor memory buffer to register
                     #
-                    tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
+                    tTR_tAcc_mn = tTR_tAcc[(None, None, None, real_subtile_idx)]
                     cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
+
+                    #
+                    # Async arrive accumulator buffer empty earlier when overlapping_accum is enabled
+                    #
+                    if cutlass.const_expr(self.overlapping_accum):
+                        if subtile_idx == self.iter_acc_early_release_in_epilogue:
+                            # Fence for TMEM load
+                            cute.arch.fence_view_async_tmem_load()
+                            with cute.arch.elect_one():
+                                acc_pipeline.consumer_release(acc_consumer_state)
+                            acc_consumer_state.advance()
 
                     #
                     # Apply alpha and convert to C type
@@ -1534,18 +1609,17 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
                     acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
                     acc_vec = epilogue_op((alpha_val * acc_vec).to(self.c_dtype))
                     tRS_rC.store(acc_vec)
-
                     #
                     # Store C to shared memory
                     #
-                    c_buffer = (num_prev_subtiles + subtile_idx) % self.num_c_stage
+                    num_prev_subtiles = num_prev_subtiles + 1
+                    c_buffer = num_prev_subtiles % self.num_c_stage
 
                     cute.copy(
                         tiled_copy_r2s,
                         tRS_rC,
                         tRS_sC[(None, None, None, c_buffer)],
                     )
-
                     # Fence and barrier to make sure shared memory store is visible to TMA store
                     cute.arch.fence_proxy(
                         cute.arch.ProxyKind.async_shared,
@@ -1559,7 +1633,7 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
                         cute.copy(
                             tma_atom_c,
                             bSG_sC[(None, c_buffer)],
-                            bSG_gC[(None, subtile_idx)],
+                            bSG_gC[(None, real_subtile_idx)],
                         )
                         # Fence and barrier to make sure shared memory store is visible to TMA store
                         c_pipeline.producer_commit()
@@ -1569,9 +1643,10 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
                 #
                 # Async arrive accumulator buffer empty
                 #
-                with cute.arch.elect_one():
-                    acc_pipeline.consumer_release(acc_consumer_state)
-                acc_consumer_state.advance()
+                if cutlass.const_expr(not self.overlapping_accum):
+                    with cute.arch.elect_one():
+                        acc_pipeline.consumer_release(acc_consumer_state)
+                    acc_consumer_state.advance()
 
                 #
                 # Advance to next tile
@@ -1596,6 +1671,8 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
             # Wait for C store complete
             #
             c_pipeline.producer_tail()
+
+        griddepcontrol_launch_dependents()
 
     def epilog_tmem_copy_and_partition(
         self,
@@ -1934,7 +2011,6 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
         ab_dtype: Type[cutlass.Numeric],
         sf_dtype: Type[cutlass.Numeric],
         sf_vec_size: int,
-        acc_dtype: Type[cutlass.Numeric],
         c_dtype: Type[cutlass.Numeric],
     ) -> bool:
         """
@@ -1976,8 +2052,6 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
         if ab_dtype in {cutlass.Float8E5M2, cutlass.Float8E4M3FN} and sf_vec_size == 16:
             is_valid = False
 
-        if acc_dtype not in {cutlass.Float32}:
-            is_valid = False
         if c_dtype not in {cutlass.Float32, cutlass.Float16, cutlass.BFloat16}:
             is_valid = False
 
@@ -2018,22 +2092,16 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
 
     @staticmethod
     def is_valid_mma_tiler_and_cluster_shape(
-        use_2cta_instrs: bool,
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
-        m_aligned: int,
     ) -> bool:
         """
         Check if the mma tiler and cluster shape are valid
 
-        :param use_2cta_instrs: Whether to use 2 CTA groups
-        :type use_2cta_instrs: bool
         :param mma_tiler_mn: The (M, N) shape of the MMA instruction tiler
         :type mma_tiler_mn: Tuple[int, int]
         :param cluster_shape_mn: The (ClusterM, ClusterN) shape of the CTA cluster
         :type cluster_shape_mn: Tuple[int, int]
-        :param m_aligned: The alignment requirement for group M dimension (default: 128)
-        :type m_aligned: int
 
         :return: True if the mma tiler and cluster shape are valid, False otherwise
         :rtype: bool
@@ -2041,55 +2109,33 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
         is_valid = True
 
         # Skip invalid mma tile shape
-        if not (
-            (not use_2cta_instrs and mma_tiler_mn[0] in [64, 128])
-            or (use_2cta_instrs and mma_tiler_mn[0] in [128, 256])
-        ):
+        if mma_tiler_mn[0] not in (128, 256):
             is_valid = False
         # Skip invalid mma tile n
         if mma_tiler_mn[1] not in (64, 128, 192, 256):
             is_valid = False
+
         # Skip illegal cluster shape
-        if cluster_shape_mn[0] % (2 if use_2cta_instrs else 1) != 0:
+        if (mma_tiler_mn[0] // cluster_shape_mn[0]) != 128:
             is_valid = False
 
-        # Skip invalid cluster shape
         if (
             cluster_shape_mn[0] * cluster_shape_mn[1] > 16
             or cluster_shape_mn[0] <= 0
             or cluster_shape_mn[1] <= 0
-            # Special cluster shape check for scale factor multicasts.
-            # Due to limited size of scale factors, we can't multicast among more than 4 CTAs.
-            or cluster_shape_mn[0] > 4
-            or cluster_shape_mn[1] > 4
             or not is_power_of_2(cluster_shape_mn[0])
             or not is_power_of_2(cluster_shape_mn[1])
         ):
-            is_valid = False
-        cluster_tiler_m = (cluster_shape_mn[0] // (2 if use_2cta_instrs else 1)) * mma_tiler_mn[0]
-
-        # Skip invalid cluster tiler shape since contiguous layout can't handle oob access
-        # The contiguous layout means the aligned data is stored in a contiguous manner.
-        # It can't handle runtime oob when alignment is not align with the tile_M,
-        # since the problem shape of TMA store can't be changed at runtime.
-        if cluster_tiler_m not in [64, 128, 256]:
-            is_valid = False
-
-        # Check if m_aligned is a multiple of cluster_tiler_m
-        # This ensures that each group's M dimension (which is a multiple of m_aligned)
-        # won't be split across tiles, preventing a single tile from loading data
-        # from multiple groups (which would access wrong B matrix data)
-        if m_aligned % mma_tiler_mn[0] != 0:
             is_valid = False
 
         return is_valid
 
     @staticmethod
     def is_valid_tensor_alignment(
-        m: int,
-        n: int,
-        k: int,
-        l: int,  # noqa: E741
+        m: cutlass.Int64,
+        n: cutlass.Int64,
+        k: cutlass.Int64,
+        l: cutlass.Int64,  # noqa: E741
         ab_dtype: Type[cutlass.Numeric],
         c_dtype: Type[cutlass.Numeric],
         a_major: str,
@@ -2100,13 +2146,13 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
         Check if the tensor alignment is valid
 
         :param m: The number of rows in the A tensor
-        :type m: int
+        :type m: cutlass.Int64
         :param n: The number of columns in the B tensor
-        :type n: int
+        :type n: cutlass.Int64
         :param k: The number of columns in the A tensor
-        :type k: int
+        :type k: cutlass.Int64
         :param l: The number of columns in the C tensor
-        :type l: int
+        :type l: cutlass.Int64
         :param ab_dtype: The data type of the A and B operands
         :type ab_dtype: Type[cutlass.Numeric]
         :param c_dtype: The data type of the output tensor
@@ -2137,15 +2183,12 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
             is_valid = False
         return is_valid
 
-    @classmethod
+    @staticmethod
     def can_implement(
-        cls,
         ab_dtype: Type[cutlass.Numeric],
         sf_dtype: Type[cutlass.Numeric],
         sf_vec_size: int,
-        acc_dtype: Type[cutlass.Numeric],
         c_dtype: Type[cutlass.Numeric],
-        use_2cta_instrs: bool,
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
         m: int,
@@ -2155,7 +2198,6 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
         a_major: str,
         b_major: str,
         c_major: str,
-        m_aligned: int,
     ) -> bool:
         """
         Check if the gemm can be implemented
@@ -2166,12 +2208,8 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
         :type sf_dtype: Type[cutlass.Numeric]
         :param sf_vec_size: The vector size of the scale factor
         :type sf_vec_size: int
-        :param acc_dtype: The data type of the accumulator
-        :type acc_dtype: Type[cutlass.Numeric]
         :param c_dtype: The data type of the output tensor
         :type c_dtype: Type[cutlass.Numeric]
-        :param use_2cta_instrs: Whether to use 2 CTA groups
-        :type use_2cta_instrs: bool
         :param mma_tiler_mn: The (M, N) shape of the MMA instruction tiler
         :type mma_tiler_mn: Tuple[int, int]
         :param cluster_shape_mn: The (ClusterM, ClusterN) shape of the CTA cluster
@@ -2190,35 +2228,37 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
         :type b_major: str
         :param c_major: The major axis of the C tensor
         :type c_major: str
-        :param m_aligned: The alignment requirement for group M dimension (default: 128)
-        :type m_aligned: int
 
         :return: True if the gemm can be implemented, False otherwise
         :rtype: bool
         """
         can_implement = True
+
+        # Skip unsupported A/B layout
+        if not (a_major == "k" and b_major == "k"):
+            can_implement = False
+
         # Skip unsupported types
-        if not cls.is_valid_dtypes_and_scale_factor_vec_size(
-            ab_dtype, sf_dtype, sf_vec_size, acc_dtype, c_dtype
+        if not Sm100BlockScaledContiguousGroupedGemmKernel.is_valid_dtypes_and_scale_factor_vec_size(
+            ab_dtype, sf_dtype, sf_vec_size, c_dtype
         ):
             can_implement = False
 
         # Skip unsupported layouts
-        if not cls.is_valid_layouts(ab_dtype, c_dtype, a_major, b_major, c_major):
+        if not Sm100BlockScaledContiguousGroupedGemmKernel.is_valid_layouts(
+            ab_dtype, c_dtype, a_major, b_major, c_major
+        ):
             can_implement = False
 
-        # Skip invalid mma tile shape and cluster shape
-        if not cls.is_valid_mma_tiler_and_cluster_shape(
-            use_2cta_instrs, mma_tiler_mn, cluster_shape_mn, m_aligned
+        if not Sm100BlockScaledContiguousGroupedGemmKernel.is_valid_mma_tiler_and_cluster_shape(
+            mma_tiler_mn,
+            cluster_shape_mn,
         ):
             can_implement = False
         # Skip illegal problem shape for load/store alignment
-        if not cls.is_valid_tensor_alignment(
+        if not Sm100BlockScaledContiguousGroupedGemmKernel.is_valid_tensor_alignment(
             m, n, k, l, ab_dtype, c_dtype, a_major, b_major, c_major
         ):
-            can_implement = False
-        # Skip unsupported A/B layout
-        if not (a_major == "k" and b_major == "k"):
             can_implement = False
         return can_implement
 
@@ -2233,10 +2273,10 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
         alpha_ptr: cute.Pointer,
         tile_idx_to_group_idx_ptr: cute.Pointer,
         num_non_exiting_tiles_ptr: cute.Pointer,
-        m: int,
-        n: int,
-        k: int,
-        l: int,  # noqa: E741
+        m: cutlass.Int64,
+        n: cutlass.Int64,
+        k: cutlass.Int64,
+        l: cutlass.Int64,  # noqa: E741
         tile_size: cutlass.Constexpr,
         scaling_vector_size: cutlass.Constexpr,
         max_active_clusters: cutlass.Constexpr,
@@ -2280,3 +2320,18 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
             stream=stream,
             epilogue_op=epilogue_op,
         )
+
+
+@cute.jit
+def cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
+    sf_ref_tensor: cute.Tensor,
+    sf_mma_tensor: cute.Tensor,
+):
+    """Convert scale factor tensor from MKL layout to mma specification M(32x4xrest_m)xK(4xrest_k)xL layout"""
+    # sf_mma_tensor has flatten shape (32, 4, rest_m, 4, rest_k, l)
+    # group to ((32, 4, rest_m), (4, rest_k), l)
+    sf_mma_tensor = cute.group_modes(sf_mma_tensor, 0, 3)
+    sf_mma_tensor = cute.group_modes(sf_mma_tensor, 1, 3)
+    for i in cutlass.range(cute.size(sf_ref_tensor)):
+        mkl_coord = sf_ref_tensor.layout.get_hier_coord(i)
+        sf_mma_tensor[mkl_coord] = sf_ref_tensor[mkl_coord]

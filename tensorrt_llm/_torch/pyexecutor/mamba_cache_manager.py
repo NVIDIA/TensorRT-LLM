@@ -109,22 +109,59 @@ class MambaCacheManager(BaseResourceManager):
         self.state_indices: torch.Tensor = torch.arange(max_batch_size,
                                                         device=device,
                                                         dtype=torch.int32)
+        # save mamba state indices for requests
+        self.state_indices_list: List[int] = []
 
     def _prepare_mamba_cache_blocks(self, request_ids: List[int]):
-        state_indices = []
+        self.state_indices_list.clear()
         for r in request_ids:
             # cache hit
             if r in self.mamba_cache_index:
-                state_indices.append(self.mamba_cache_index[r])
+                self.state_indices_list.append(self.mamba_cache_index[r])
             # cache miss
             else:
                 if len(self.mamba_cache_free_blocks) == 0:
                     raise Exception("run out of mamba cache blocks")
                 block = self.mamba_cache_free_blocks.pop()
                 self.mamba_cache_index[r] = block
-                state_indices.append(block)
-        self.state_indices[:len(state_indices)] = torch.as_tensor(
-            state_indices, dtype=torch.int32, device=self.ssm_states.device)
+                self.state_indices_list.append(block)
+        self.state_indices[:len(self.state_indices_list)].copy_(
+            torch.tensor(self.state_indices_list,
+                         dtype=torch.int32,
+                         pin_memory=True),
+            non_blocking=True)
+
+    # When there exists padded requests, the state indices should not be repeated.
+    def reorder_state_indices_when_padding_requests(self, request_size,
+                                                    padding_size):
+        if padding_size == 0:
+            return
+
+        assert request_size + padding_size <= self.state_indices.numel(
+        ), "Padding requests run out of available mamba cache blocks"
+        # we can use mamba_cache_free_blocks for padding_requests
+        if padding_size <= len(self.mamba_cache_free_blocks):
+            self.state_indices[request_size:request_size +
+                               padding_size] = torch.tensor(
+                                   self.mamba_cache_free_blocks[:padding_size],
+                                   dtype=self.state_indices.dtype,
+                                   pin_memory=True).to(
+                                       self.state_indices.device,
+                                       non_blocking=True)
+        # But just finished requests won't free their used resources immediately
+        # In explicit, the running order is self.scheduler.schedule_request, self._forward_step() and self._process_previous_batch() in the PyExecutor.
+        # In this way, the current forward step will remove finished requests but will not remove mamba_cache immediately.
+        else:
+            all_mamba_cache_indices = set(range(self.state_indices.numel()))
+            allocated_indices = set(self.state_indices_list)
+            free_indices = list(all_mamba_cache_indices - allocated_indices)
+            self.state_indices[request_size:request_size +
+                               padding_size] = torch.tensor(
+                                   free_indices[:padding_size],
+                                   dtype=self.state_indices.dtype,
+                                   pin_memory=True).to(
+                                       self.state_indices.device,
+                                       non_blocking=True)
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         context_ids = [
@@ -196,6 +233,7 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
         dtype: DataType = DataType.HALF,
         spec_config: Optional["DecodingBaseConfig"] = None,
         is_estimating_kv_cache: bool = False,
+        execution_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
 
         # mamba hybrid cache requires block reuse to be disabled in KV cache config
@@ -233,6 +271,7 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
             spec_config=spec_config,
             layer_mask=layer_mask,
             is_estimating_kv_cache=is_estimating_kv_cache,
+            execution_stream=execution_stream,
         )
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):

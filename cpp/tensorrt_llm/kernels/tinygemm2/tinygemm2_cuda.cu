@@ -61,7 +61,7 @@ void launch_tinygemm2(__nv_bfloat16* gA, __nv_bfloat16* gB, __nv_bfloat16* gC, _
     int smem_size
         = STAGES * STAGE_UNROLL * (TILE_M * TILE_K * sizeof(__nv_bfloat16) + TILE_N * TILE_K * sizeof(__nv_bfloat16));
 
-    gpuErrChk(cudaFuncSetAttribute(kernel<WARP_TILE_M, TILE_M, TILE_N, TILE_K, STAGES, STAGE_UNROLL, PROFILE>,
+    gpuErrChk(cudaFuncSetAttribute(tinygemm_kernel<WARP_TILE_M, TILE_M, TILE_N, TILE_K, STAGES, STAGE_UNROLL, PROFILE>,
         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
     int tiles_m = (output_features + TILE_M - 1) / TILE_M;
@@ -82,8 +82,8 @@ void launch_tinygemm2(__nv_bfloat16* gA, __nv_bfloat16* gB, __nv_bfloat16* gC, _
     attrs[0].val.programmaticStreamSerializationAllowed = 1;
     config.numAttrs = 1;
 
-    cudaLaunchKernelEx(&config, &kernel<WARP_TILE_M, TILE_M, TILE_N, TILE_K, STAGES, STAGE_UNROLL, PROFILE>, gC, gA, gB,
-        bias, output_features, batch_size, input_features, weight_map, activation_map, nullptr);
+    cudaLaunchKernelEx(&config, &tinygemm_kernel<WARP_TILE_M, TILE_M, TILE_N, TILE_K, STAGES, STAGE_UNROLL, PROFILE>,
+        gC, gA, gB, bias, output_features, batch_size, input_features, weight_map, activation_map, nullptr);
 }
 
 torch::Tensor tinygemm2_cuda_forward(torch::Tensor input, torch::Tensor weight, torch::Tensor bias)

@@ -15,11 +15,14 @@
  */
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/ncclCommunicator.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include <memory>
 
 namespace th = torch;
+
+TRTLLM_NAMESPACE_BEGIN
 
 namespace torch_ext
 {
@@ -38,3 +41,5 @@ private:
 };
 
 } // namespace torch_ext
+
+TRTLLM_NAMESPACE_END

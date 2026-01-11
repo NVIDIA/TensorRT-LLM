@@ -527,6 +527,8 @@ class LlavaNextModel(PreTrainedModel):
             return
         if not DISAGG:
             self.mm_encoder = LlavaNextVisionModel(model_config)
+        else:
+            self.mm_encoder = None
 
         llm_model_config = copy.deepcopy(model_config)
         llm_model_config.pretrained_config = model_config.pretrained_config.text_config
@@ -545,7 +547,8 @@ class LlavaNextModel(PreTrainedModel):
         if isinstance(weight_mapper, LlavaNextHfWeightMapper):
             weights = weight_mapper.preprocess_weights(weights)
 
-        self.mm_encoder.load_weights(weights)
+        if self.mm_encoder is not None:
+            self.mm_encoder.load_weights(weights)
 
         def filter_weights(weights: Dict):
             transformed_weights = {}

@@ -3,6 +3,7 @@ This file contains test functions copied from:
 https://github.com/flashinfer-ai/flashinfer/blob/main/tests/moe/test_trtllm_cutlass_fused_moe.py
 """
 
+import math
 from typing import Callable
 
 import pytest
@@ -12,12 +13,17 @@ from torch.nn import functional as F
 from utils.util import skip_pre_hopper
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
+from tensorrt_llm._torch.auto_deploy.custom_ops.quant import (
+    TRTLLM_NVFP4_COLUMN_SIZE,
+    TRTLLM_NVFP4_ROW_SIZE,
+    TRTLLM_NVFP4_SCALING_VECTOR_SIZE,
+)
 from tensorrt_llm._torch.utils import ActivationType
 
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 FLOAT4_E2M1_MAX = 6.0
 FP8_DTYPE = torch.float8_e4m3fn
-NVFP4_BLOCK_SIZE = 16
+NVFP4_BLOCK_SIZE = TRTLLM_NVFP4_SCALING_VECTOR_SIZE
 
 
 def dynamic_per_tensor_fp8_quant(x: torch.tensor) -> tuple[torch.tensor, torch.tensor]:
@@ -82,7 +88,7 @@ def compute_with_experts(
     alpha=None,
     beta=None,
     limit=None,
-    activation_func="silu",
+    activation_func: ActivationType = ActivationType.Silu,
 ):
     def relu2(x: torch.Tensor) -> torch.Tensor:
         return torch.square(F.relu(x))
@@ -110,7 +116,7 @@ def compute_with_experts(
 
             inter = x1_scaled * x2
         else:
-            if activation_func == "swiglu" or activation_func == "silu":
+            if activation_func == ActivationType.Swiglu or activation_func == ActivationType.Silu:
                 inter = F.silu(expert_inputs @ w1_expert.t()) * (expert_inputs @ w3_expert.t())
             else:
                 inter = relu2(expert_inputs @ w1_expert.t())
@@ -136,10 +142,6 @@ def _get_test_data(
     return x, router_logits, w31_weight, w2_weight, w31_empty_scales, w2_empty_scales
 
 
-def _activation_type_from_str(activation_func: str) -> ActivationType:
-    return ActivationType.Swiglu if activation_func in ["swiglu", "silu"] else ActivationType.Relu2
-
-
 def _print_diff_if(
     condition: Callable[[torch.Tensor], bool],
     diff: torch.Tensor,
@@ -156,20 +158,13 @@ def _print_diff_if(
 
 
 # Test configurations
-BATCH_SIZES = [
-    1,
-]
-HIDDEN_SIZES = [
-    128,
-]
+BATCH_SIZES = [1]
+HIDDEN_SIZES = [128]
 NUM_EXPERTS = [2]
 TOP_K_VALUES = [2]
-INTERMEDIATE_SIZES = [
-    128,
-]
+INTERMEDIATE_SIZES = [128]
 EP_NUM_EXPERTS = [8]
 EP_TOP_K = [2]
-
 
 F16_TEST_DTYPES = [
     (torch.float16, torch.float16, torch.float16),
@@ -183,7 +178,7 @@ F16_TEST_DTYPES = [
 @pytest.mark.parametrize("top_k", TOP_K_VALUES)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
 @pytest.mark.parametrize("itype, otype, wtype", F16_TEST_DTYPES)
-@pytest.mark.parametrize("activation_func", ["silu", "relu2"])
+@pytest.mark.parametrize("activation_func", [ActivationType.Silu, ActivationType.Relu2])
 @skip_pre_hopper
 def test_trtllm_fused_moe(
     batch_size,
@@ -201,13 +196,13 @@ def test_trtllm_fused_moe(
         pytest.skip(f"top_k ({top_k}) cannot be greater than num_experts ({num_experts})")
 
     torch.manual_seed(42)
-    if activation_func in ["swiglu", "silu"]:
+    if activation_func in [ActivationType.Swiglu, ActivationType.Silu]:
         X_GEN_SCALE = 1.0
     else:
         X_GEN_SCALE = 0.5
     W_GEN_SCALE = 0.1
 
-    x, router_logits, w31_weight, w2_weight, w31_scales, w2_scales = _get_test_data(
+    x, router_logits, w31_weight, w2_weight, _, _ = _get_test_data(
         otype,
         wtype,
         batch_size,
@@ -239,19 +234,17 @@ def test_trtllm_fused_moe(
         "F16 test only supports bfloat16 or float16"
     )
 
-    activation_type = _activation_type_from_str(activation_func)
-
     def get_fc1_expert_weights(
-        activation_func: str, w31_weight: torch.Tensor, w1_weight: torch.Tensor
+        activation_func: ActivationType, w31_weight: torch.Tensor, w1_weight: torch.Tensor
     ) -> torch.Tensor:
-        if activation_func == "relu2":
+        if activation_func == ActivationType.Relu2:
             return w1_weight.contiguous()
         else:
             return w31_weight
 
     # (num_experts, 2 * intermediate_size, hidden_size) => (num_experts, intermediate_size, hidden_size)
     _, w1_weight = torch.chunk(w31_weight, 2, dim=1)
-    mlp_style = "mlp" if activation_func == "relu2" else "gated_mlp"
+    is_gated_mlp = False if activation_func == ActivationType.Relu2 else True
 
     torch.cuda.synchronize()
     ad_test_output = torch.ops.auto_deploy.trtllm_moe_fused(
@@ -260,8 +253,12 @@ def test_trtllm_fused_moe(
         routing_weights,
         w3_w1_stacked_weight=get_fc1_expert_weights(activation_func, w31_weight, w1_weight),
         w2_stacked_weight=w2_weight,
-        mlp_style=mlp_style,
+        is_gated_mlp=is_gated_mlp,
         act_fn=activation_func,
+    )
+    # Convert ActivationType.Silu to ActivationType.Swiglu for C++ op compatibility
+    cpp_activation_type = (
+        ActivationType.Swiglu if activation_func == ActivationType.Silu else activation_func
     )
     trtllm_test_output = torch.ops.trtllm.fused_moe(
         x,
@@ -273,11 +270,11 @@ def test_trtllm_fused_moe(
         fc2_expert_biases=None,
         output_dtype=otype,
         quant_scales=[],
-        activation_type=activation_type,
+        activation_type=cpp_activation_type,
     )[0].view(x.shape)
 
     torch.cuda.synchronize()
-    if mlp_style == "mlp":
+    if not is_gated_mlp:
         with torch.inference_mode():
             output_triton_moe = torch.ops.auto_deploy.triton_moe_fused(
                 x,
@@ -285,6 +282,7 @@ def test_trtllm_fused_moe(
                 routing_weights,
                 w1_weight.contiguous(),
                 w2_weight.contiguous(),
+                is_gated_mlp=False,
             )[0].view(x.shape)
             torch.testing.assert_close(output_triton_moe, ad_test_output, rtol=1e-2, atol=1e-2)
 
@@ -308,7 +306,9 @@ FP8_TEST_DTYPES = [
 @pytest.mark.parametrize("top_k", TOP_K_VALUES)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
 @pytest.mark.parametrize("itype, otype, wtype", FP8_TEST_DTYPES)
-@pytest.mark.parametrize("activation_func", ["silu", "relu2"])
+@pytest.mark.parametrize(
+    "activation_func", [ActivationType.Silu, ActivationType.Swiglu, ActivationType.Relu2]
+)
 @pytest.mark.skipif(
     not fp8_compatible() or not trtllm_ops_available(),
     reason="Requires fp8 and trtllm support",
@@ -336,7 +336,7 @@ def test_trtllm_fused_moe_fp8(
     )
 
     torch.manual_seed(42)
-    if activation_func in ["swiglu", "silu"]:
+    if activation_func in [ActivationType.Swiglu, ActivationType.Silu]:
         X_GEN_SCALE = 1.0
     else:
         X_GEN_SCALE = 0.5
@@ -399,7 +399,7 @@ def test_trtllm_fused_moe_fp8(
 
     # (num_experts, 2 * intermediate_size, hidden_size) => (num_experts, intermediate_size, hidden_size)
     w3_weight, w1_weight = torch.chunk(w31_weight, 2, dim=1)
-    mlp_style = "mlp" if activation_func == "relu2" else "gated_mlp"
+    is_gated_mlp = False if activation_func == ActivationType.Relu2 else True
 
     # compute quant_scales
     gemm1_dequant = (w1_scales * hidden_states_scale).contiguous().squeeze().to(torch.float32)
@@ -412,25 +412,19 @@ def test_trtllm_fused_moe_fp8(
         x,  # Note! unquantized input is expected
         selected_experts.to(torch.int),
         routing_weights,
-        w1_weight=w1_weight.contiguous(),
-        w2_weight=w2_weight.contiguous(),
-        w3_weight=w3_weight.contiguous(),
-        w1_input_scale=hidden_states_scale.unsqueeze(0),
-        w2_input_scale=w2_input_scale,
-        w3_input_scale=w3_input_scale,
-        w1_weight_scale=w1_scales,
-        w2_weight_scale=w2_scales,
-        w3_weight_scale=w3_scales,
-        gemm1_dequant=gemm1_dequant,
-        gemm2_act_quant=gemm2_act_quant,
-        gemm2_dequant=gemm2_dequant,
-        mlp_style=mlp_style,
+        fc1_expert_weights=w31_weight.contiguous() if is_gated_mlp else w1_weight.contiguous(),
+        fc2_expert_weights=w2_weight.contiguous(),
+        fc1_act_scale=hidden_states_scale.unsqueeze(0),
+        fc1_dequant_scale=gemm1_dequant,
+        fc2_act_scale_reciprocal=gemm2_act_quant,
+        fc2_dequant_scale=gemm2_dequant,
+        is_gated_mlp=is_gated_mlp,
         act_fn=activation_func,
     )
 
     torch.cuda.synchronize()
 
-    if mlp_style == "mlp":
+    if not is_gated_mlp:
         with torch.inference_mode():
             output_triton_fp8_moe = torch.ops.auto_deploy.triton_quant_fp8_moe(
                 x,
@@ -445,7 +439,7 @@ def test_trtllm_fused_moe_fp8(
                 w1_scales,
                 w2_scales,
                 w3_scales,
-                mlp_style=mlp_style,
+                is_gated_mlp=is_gated_mlp,
                 act_fn=activation_func,
             )
             torch.testing.assert_close(output_triton_fp8_moe, ref_output, rtol=1e-1, atol=1e-1)
@@ -509,12 +503,12 @@ def dequantize_nvfp4_to_dtype(tensor_fp4, tensor_sf, global_scale, dtype, device
     """Dequantize the fp4 tensor back to high precision."""
 
     def convert_swizzled_to_linear(a_sf_swizzled: torch.Tensor, m, k, block_size):
-        m_tiles = (m + 128 - 1) // 128
+        m_tiles = (m + TRTLLM_NVFP4_ROW_SIZE - 1) // TRTLLM_NVFP4_ROW_SIZE
         f = block_size * 4
         k_tiles = (k + f - 1) // f
         tmp = torch.reshape(a_sf_swizzled, (1, m_tiles, k_tiles, 32, 4, 4))
         tmp = torch.permute(tmp, (0, 1, 4, 3, 2, 5))
-        out = tmp.reshape(m_tiles * 128, k_tiles * f // block_size)
+        out = tmp.reshape(m_tiles * TRTLLM_NVFP4_ROW_SIZE, k_tiles * f // block_size)
         return out[0:m, 0:k]
 
     # Originally from https://github.com/flashinfer-ai/flashinfer/blob/main/tests/moe/test_trtllm_cutlass_fused_moe.py
@@ -557,19 +551,24 @@ def dequantize_nvfp4_to_dtype(tensor_fp4, tensor_sf, global_scale, dtype, device
     return out.to(dtype=dtype)
 
 
-NVFP4_TEST_DTYPES = [
-    (torch.float16, torch.float8_e4m3fn),
-    (torch.bfloat16, torch.float8_e4m3fn),
+NVFP4_TEST_DTYPES = [torch.float16, torch.bfloat16]
+
+FP4_TEST_SHAPES = [
+    (128, 128),  # Trivial test case (no padding required)
+    (2688, 1856),  # Nemotron-Nano-3-30B-A3 sizes (padding required)
 ]
+
+# Scale the input and weights to prevent large absolute values.
+FP4_X_GEN_SCALE = 0.5
+FP4_W_GEN_SCALE = 0.1
 
 
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
-@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
+@pytest.mark.parametrize("hidden_size, intermediate_size", FP4_TEST_SHAPES)
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS)
 @pytest.mark.parametrize("top_k", TOP_K_VALUES)
-@pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
-@pytest.mark.parametrize("otype, wtype", NVFP4_TEST_DTYPES)
-@pytest.mark.parametrize("activation_func", ["silu", "relu2"])
+@pytest.mark.parametrize("otype", NVFP4_TEST_DTYPES)
+@pytest.mark.parametrize("activation_func", [ActivationType.Silu, ActivationType.Relu2])
 @pytest.mark.skipif(
     not fp4_compatible() or not trtllm_ops_available(),
     reason="Requires fp4 and trtllm support",
@@ -581,12 +580,17 @@ def test_trtllm_fused_moe_nvfp4(
     top_k,
     intermediate_size,
     otype,
-    wtype,
     activation_func,
 ):
+    # Skip known failing configuration
+    if activation_func == ActivationType.Relu2 and intermediate_size == 1856:
+        pytest.skip(
+            "test fails for Relu2 with intermediate_size=1856; see https://github.com/NVIDIA/TensorRT-LLM/issues/10331"
+        )
+
     # In the code below:
     #   sf := block scale factors for NVFP4
-    #   blockscale := block scale factor for NVFP4
+    #   blockscale := block scale factors for NVFP4
     #   gs := global scale for NVFP4
 
     # Skip invalid configurations
@@ -601,121 +605,167 @@ def test_trtllm_fused_moe_nvfp4(
         num_experts,
         intermediate_size,
     ):
-        x = gen_tensor((batch_size, hidden_size), otype)
-        w1_shape = (num_experts, intermediate_size, hidden_size)
-        w3_shape = w1_shape
-        w1 = gen_tensor(w1_shape, otype, scale=0.1)
-        w2 = gen_tensor((num_experts, hidden_size, intermediate_size), otype, scale=0.1)
-        w3 = gen_tensor(w3_shape, otype, scale=0.1)
+        x = gen_tensor((batch_size, hidden_size), otype) * FP4_X_GEN_SCALE
         router_logits = torch.randn(batch_size, num_experts, dtype=otype).cuda()
-        return x, w1, w2, w3, router_logits
 
-    def _quantize_weights(w1, w2, w3):
+        if is_gated_mlp:
+            # For gated MLP, concatenate w1 and w3 as [w3, w1]
+            fc1_weights_shape = (num_experts, intermediate_size * 2, hidden_size)
+        else:
+            fc1_weights_shape = (num_experts, intermediate_size, hidden_size)
+
+        fc1_weights = gen_tensor(fc1_weights_shape, otype, scale=FP4_W_GEN_SCALE)
+        fc2_weights = gen_tensor(
+            (num_experts, hidden_size, intermediate_size), otype, scale=FP4_W_GEN_SCALE
+        )
+
+        return x, fc1_weights, fc2_weights, router_logits
+
+    def _quantize_weights(fc1_weights, fc2_weights, is_gated_mlp):
         def round_up(x, y):
-            return (x + y - 1) // y * y
+            return math.ceil(x / y) * y
 
-        w1_n = w1.shape[1]
-        w3_n = w3.shape[1]
-        sf_w1_n = round_up(w1_n, 128)
-        sf_w3_n = round_up(w3_n, 128)
-        sf_w1_k = round_up(hidden_size // NVFP4_BLOCK_SIZE, 4)
-        w1_blockscale = torch.empty(
-            (num_experts, sf_w1_n, sf_w1_k), device="cuda", dtype=torch.float8_e4m3fn
+        fc1_weights_n = fc1_weights.shape[1]
+        sf_fc1_weights_n = round_up(fc1_weights_n, TRTLLM_NVFP4_ROW_SIZE)
+        sf_fc1_weights_k = round_up(hidden_size // NVFP4_BLOCK_SIZE, TRTLLM_NVFP4_COLUMN_SIZE)
+        fc1_weights_blockscale = torch.empty(
+            (num_experts, sf_fc1_weights_n, sf_fc1_weights_k),
+            device="cuda",
+            dtype=torch.float8_e4m3fn,
         )
-        sf_w2_k = round_up(hidden_size, 128)
-        sf_w2_n = round_up(intermediate_size // NVFP4_BLOCK_SIZE, 4)
-        w2_blockscale = torch.empty(
-            (num_experts, sf_w2_k, sf_w2_n), device="cuda", dtype=torch.float8_e4m3fn
+        sf_fc2_weights_k = round_up(hidden_size, TRTLLM_NVFP4_ROW_SIZE)
+        sf_fc2_weights_n = round_up(intermediate_size // NVFP4_BLOCK_SIZE, TRTLLM_NVFP4_COLUMN_SIZE)
+        fc2_weights_blockscale = torch.empty(
+            (num_experts, sf_fc2_weights_k, sf_fc2_weights_n),
+            device="cuda",
+            dtype=torch.float8_e4m3fn,
         )
-        w3_blockscale = torch.empty(
-            (num_experts, sf_w3_n, sf_w1_k), device="cuda", dtype=torch.float8_e4m3fn
+
+        fc1_weights_q = torch.empty(
+            (num_experts, fc1_weights_n, hidden_size // 2), device="cuda", dtype=torch.uint8
         )
-        w1_q = torch.empty((num_experts, w1_n, hidden_size // 2), device="cuda", dtype=torch.uint8)
-        w2_q = torch.empty(
+        fc2_weights_q = torch.empty(
             (num_experts, hidden_size, intermediate_size // 2), device="cuda", dtype=torch.uint8
         )
-        w3_q = torch.empty((num_experts, w3_n, hidden_size // 2), device="cuda", dtype=torch.uint8)
 
-        w1_gs = torch.empty((num_experts,), device="cuda", dtype=torch.float32)
-        w2_gs = torch.empty((num_experts,), device="cuda", dtype=torch.float32)
-        w3_gs = torch.empty((num_experts,), device="cuda", dtype=torch.float32)
+        fc1_weights_gs = torch.empty((num_experts,), device="cuda", dtype=torch.float32)
+        fc2_weights_gs = torch.empty((num_experts,), device="cuda", dtype=torch.float32)
 
         for expert in range(num_experts):
-            w1_amax = torch.abs(w1[expert]).max().to(torch.float32)
-            w2_amax = torch.abs(w2[expert]).max().to(torch.float32)
-            w3_amax = torch.abs(w3[expert]).max().to(torch.float32)
-            w1_gs[expert] = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w1_amax
-            w2_gs[expert] = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w2_amax
-            w3_gs[expert] = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w3_amax
+            fc1_weights_amax = torch.abs(fc1_weights[expert]).max().to(torch.float32)
+            fc2_weights_amax = torch.abs(fc2_weights[expert]).max().to(torch.float32)
+            fc1_weights_gs[expert] = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / fc1_weights_amax
+            fc2_weights_gs[expert] = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / fc2_weights_amax
+
+            # Quantize the weights to NVFP4 and ask for swizzled block scale factors because the
+            # MoE operator expects pre-swizzled block scale factors. Swizzling also flattens the
+            # block scale factors to a 1D tensor.
+            # Note that swizzling might create padded block scales
+            # because the block-scales are required to be padded to the nearest multiple of 128x4.
+            nvfp4_vals, fp8_block_scales = torch.ops.trtllm.fp4_quantize(
+                fc1_weights[expert],
+                fc1_weights_gs[expert],
+                NVFP4_BLOCK_SIZE,
+                isSfSwizzledLayout=True,
+            )
+            fc1_weights_q[expert] = nvfp4_vals
+            fc1_weights_blockscale[expert] = fp8_block_scales.reshape(
+                fc1_weights_blockscale[expert].shape
+            )
 
             nvfp4_vals, fp8_block_scales = torch.ops.trtllm.fp4_quantize(
-                w1[expert], w1_gs[expert], NVFP4_BLOCK_SIZE, isSfSwizzledLayout=True
+                fc2_weights[expert],
+                fc2_weights_gs[expert],
+                NVFP4_BLOCK_SIZE,
+                isSfSwizzledLayout=True,
             )
-            w1_q[expert] = nvfp4_vals
-            w1_blockscale[expert] = fp8_block_scales.reshape(w1_blockscale[expert].shape)
-
-            nvfp4_vals, fp8_block_scales = torch.ops.trtllm.fp4_quantize(
-                w2[expert], w2_gs[expert], NVFP4_BLOCK_SIZE, isSfSwizzledLayout=True
+            fc2_weights_q[expert] = nvfp4_vals
+            fc2_weights_blockscale[expert] = fp8_block_scales.reshape(
+                fc2_weights_blockscale[expert].shape
             )
-            w2_q[expert] = nvfp4_vals
-            w2_blockscale[expert] = fp8_block_scales.reshape(w2_blockscale[expert].shape)
+        return (
+            fc1_weights_q,
+            fc2_weights_q,
+            fc1_weights_blockscale,
+            fc2_weights_blockscale,
+            fc1_weights_gs,
+            fc2_weights_gs,
+        )
 
-            nvfp4_vals, fp8_block_scales = torch.ops.trtllm.fp4_quantize(
-                w3[expert], w3_gs[expert], NVFP4_BLOCK_SIZE, isSfSwizzledLayout=True
+    def compute_ref_output(fc1_weights_gs, fc2_weights_gs):
+        # Quantize then dequantize the input to emulate the precision loss.
+        a_fp4, a_scale_interleaved = torch.ops.trtllm.fp4_quantize(
+            x, fc1_activation_gs, NVFP4_BLOCK_SIZE
+        )
+        x_dq = dequantize_nvfp4_to_dtype(
+            a_fp4,
+            a_scale_interleaved,
+            fc1_activation_gs,
+            dtype=otype,
+            device=x.device,
+            block_size=NVFP4_BLOCK_SIZE,
+        )
+        fc1_weights_dq = torch.empty(fc1_expert_weights.shape, device="cuda", dtype=otype)
+        fc2_weights_dq = torch.empty(fc2_expert_weights.shape, device="cuda", dtype=otype)
+
+        # Dequantize the weights to emulate the precision loss.
+        for idx in range(0, num_experts):
+            fc1_weights_dq[idx] = dequantize_nvfp4_to_dtype(
+                fc1_expert_weights_fp4[idx],
+                fc1_weight_blockscale_fp8[idx],
+                fc1_weights_gs[idx],
+                dtype=fc1_expert_weights.dtype,
+                device=fc1_expert_weights.device,
+                block_size=NVFP4_BLOCK_SIZE,
             )
-            w3_q[expert] = nvfp4_vals
-            w3_blockscale[expert] = fp8_block_scales.reshape(w3_blockscale[expert].shape)
+            fc2_weights_dq[idx] = dequantize_nvfp4_to_dtype(
+                fc2_expert_weights_fp4[idx],
+                fc2_weight_blockscale_fp8[idx],
+                fc2_weights_gs[idx],
+                dtype=fc2_expert_weights.dtype,
+                device=fc2_expert_weights.device,
+                block_size=NVFP4_BLOCK_SIZE,
+            )
 
-        return w1_q, w2_q, w3_q, w1_blockscale, w2_blockscale, w3_blockscale, w1_gs, w2_gs, w3_gs
+        # Convert ActivationType.Silu to ActivationType.Swiglu for reference op compatibility
+        resolved_activation_type = (
+            ActivationType.Swiglu if activation_func == ActivationType.Silu else activation_func
+        )
+        ref_output = torch_moe_nvfp4(
+            x_dq,
+            fc1_weights_dq,
+            fc2_weights_dq,
+            top_k,
+            routing_weights,
+            selected_experts,
+            resolved_activation_type,
+        )
+        return ref_output
 
-    x, w1, w2, w3, router_logits = _get_test_data(
+    # Begin test
+    is_gated_mlp = False if activation_func == ActivationType.Relu2 else True
+
+    x, fc1_expert_weights, fc2_expert_weights, router_logits = _get_test_data(
         otype, batch_size, hidden_size, num_experts, intermediate_size
     )
 
     (
-        w1_q_fp4,
-        w2_q_fp4,
-        w3_q_fp4,
-        w1_blockscale,
-        w2_blockscale,
-        w3_blockscale,
-        w1_gs,
-        w2_gs,
-        w3_gs,
-    ) = _quantize_weights(w1, w2, w3)
+        fc1_expert_weights_fp4,
+        fc2_expert_weights_fp4,
+        fc1_weight_blockscale_fp8,
+        fc2_weight_blockscale_fp8,
+        fc1_weights_gs,
+        fc2_weights_gs,
+    ) = _quantize_weights(fc1_expert_weights, fc2_expert_weights, is_gated_mlp)
 
+    # Simplify by assuming a scale of 1.0 for the activations
     fc1_activation_gs = torch.tensor(1.0, device="cuda", dtype=torch.float32)
     fc2_activation_gs = torch.tensor(1.0, device="cuda", dtype=torch.float32)
 
     routing_weights, selected_experts = compute_routing(router_logits, top_k)
 
-    fc1_weight_gs = torch.max(w3_gs, w1_gs)
-    fc1_alpha = 1.0 / (fc1_activation_gs * fc1_weight_gs)
-    fc2_alpha = 1.0 / (fc2_activation_gs * w2_gs)
-
-    mlp_style = "mlp" if activation_func == "relu2" else "gated_mlp"
-    if mlp_style == "gated_mlp":
-        # For gated MLP, concatenate w1 and w3 as [w3, w1]
-        fc1_expert_weights_fp4 = torch.cat([w3_q_fp4, w1_q_fp4], dim=1).contiguous()
-        fc1_weight_blockscale_fp8 = torch.cat([w3_blockscale, w1_blockscale], dim=1)
-        fc1_weight_gs = torch.max(w3_gs, w1_gs)
-        if activation_func != "silu":
-            raise ValueError(
-                f"Unsupported activation '{activation_func}' for gated_mlp. Use 'silu'."
-            )
-    elif mlp_style == "mlp":
-        # For non-gated MLP with ReLU^2
-        fc1_expert_weights_fp4 = w1_q_fp4
-        fc1_weight_blockscale_fp8 = w1_blockscale.view(torch.long)
-        fc1_weight_gs = w1_gs
-        if activation_func != "relu2":
-            raise ValueError(f"Unsupported activation '{activation_func}' for mlp. Use 'relu2'.")
-    else:
-        raise ValueError(f"Unknown mlp_style '{mlp_style}'. Use 'gated_mlp' or 'mlp'.")
-
-    fc2_expert_weights_fp4 = w2_q_fp4.view(torch.long)
-    fc2_weight_blockscale_fp8 = w2_blockscale.view(torch.long)
-    fc1_expert_weights_fp4 = fc1_expert_weights_fp4.view(torch.long)
+    fc1_alpha = 1.0 / (fc1_activation_gs * fc1_weights_gs)
+    fc2_alpha = 1.0 / (fc2_activation_gs * fc2_weights_gs)
 
     trtllm_output = torch.ops.auto_deploy.trtllm_quant_nvfp4_moe_fused(
         x,
@@ -729,73 +779,16 @@ def test_trtllm_fused_moe_nvfp4(
         fc2_activation_gs,
         fc1_alpha,
         fc2_alpha,
-        mlp_style=mlp_style,
+        is_gated_mlp=is_gated_mlp,
         act_fn=activation_func,
     )
 
-    def compute_ref_output(w1_gs, w3_gs):
-        # Quantize then dequantize the input to emulate the precision loss.
-        a_fp4, a_scale_interleaved = torch.ops.trtllm.fp4_quantize(
-            x, fc1_activation_gs, NVFP4_BLOCK_SIZE
-        )
-        x_dq = dequantize_nvfp4_to_dtype(
-            a_fp4,
-            a_scale_interleaved,
-            fc1_activation_gs,
-            dtype=otype,
-            device=x.device,
-            block_size=NVFP4_BLOCK_SIZE,
-        )
-
-        concat_w3_w1 = mlp_style == "gated_mlp"
-        if concat_w3_w1:
-            w1_gs = w3_gs = torch.max(w1_gs, w3_gs)
-
-        w1_dq = torch.empty(w1.shape, device="cuda", dtype=otype)
-        w3_dq = torch.empty(w3.shape, device="cuda", dtype=otype)
-        w2_dq = torch.empty(w2.shape, device="cuda", dtype=otype)
-
-        # Dequantize the weights to emulate the precision loss.
-        for idx in range(0, num_experts):
-            w1_dq[idx] = dequantize_nvfp4_to_dtype(
-                w1_q_fp4[idx],
-                w1_blockscale[idx],
-                w1_gs[idx],
-                dtype=w1.dtype,
-                device=w1.device,
-                block_size=NVFP4_BLOCK_SIZE,
-            )
-            w2_dq[idx] = dequantize_nvfp4_to_dtype(
-                w2_q_fp4[idx],
-                w2_blockscale[idx],
-                w2_gs[idx],
-                dtype=w2.dtype,
-                device=w2.device,
-                block_size=NVFP4_BLOCK_SIZE,
-            )
-            w3_dq[idx] = dequantize_nvfp4_to_dtype(
-                w3_q_fp4[idx],
-                w3_blockscale[idx],
-                w3_gs[idx],
-                dtype=w3.dtype,
-                device=w3.device,
-                block_size=NVFP4_BLOCK_SIZE,
-            )
-
-        ref_output = torch_moe_nvfp4(
-            x_dq,
-            torch.cat([w3_dq, w1_dq], dim=1) if concat_w3_w1 else w1_dq,
-            w2_dq,
-            top_k,
-            routing_weights,
-            selected_experts,
-            _activation_type_from_str(activation_func),
-        )
-        return ref_output
-
-    ref_output = compute_ref_output(w1_gs, w3_gs)
-    print(f"max diff: {(ref_output - trtllm_output).abs().max()}")
-    print(f"diff = {ref_output - trtllm_output}")
-    print(f"ref_output = {ref_output}")
-    print(f"flash_output = {trtllm_output}")
+    ref_output = compute_ref_output(fc1_weights_gs, fc2_weights_gs)
+    diff = ref_output - trtllm_output
+    print(f"max diff: {diff.abs().max()}")
+    # torch.set_printoptions(profile="full")
+    print(f"{diff=}")
+    print(f"{ref_output=}")
+    print(f"{trtllm_output=}")
+    # print(f"{diff.abs()>=2e-1=}")
     torch.testing.assert_close(ref_output, trtllm_output, rtol=2e-1, atol=2e-1)

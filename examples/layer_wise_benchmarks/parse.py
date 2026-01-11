@@ -5,6 +5,7 @@ import json
 import re
 import sqlite3
 import subprocess
+import sys
 from collections import defaultdict
 from pathlib import Path
 
@@ -14,8 +15,9 @@ import pandas as pd
 
 # Parse cmdline
 parser = argparse.ArgumentParser()
+parser.add_argument("--file-path", type=str)
 parser.add_argument("--profile-dir", type=str, default="profiles")
-parser.add_argument("--world-size", "--np", type=int, required=True)
+parser.add_argument("--world-size", "--np", type=int)
 parser.add_argument("--rank", type=int, default=0)
 parser.add_argument("--warmup-times", type=int)
 parser.add_argument("--module", type=str)
@@ -27,6 +29,8 @@ group.add_argument(
 )
 parser.set_defaults(error_on_unknown_kernel=False)
 args = parser.parse_args()
+if (args.file_path is None) == (args.world_size is None):
+    parser.error("Please specify exactly one of --file-path and --world-size.")
 print(args)
 
 
@@ -89,11 +93,20 @@ def shortest_common_supersequence(a, b):
     return res
 
 
-profile_dir = Path(args.profile_dir)
-nsys_rep_file_path = profile_dir / f"report_np{args.world_size}_rank{args.rank}.nsys-rep"
-sqlite_file_path = profile_dir / f"report_np{args.world_size}_rank{args.rank}.sqlite"
-csv_file_path = profile_dir / f"report_np{args.world_size}_rank{args.rank}.csv"
-html_file_path = profile_dir / f"report_np{args.world_size}_rank{args.rank}.html"
+if args.file_path is not None:
+    nsys_rep_file_path = Path(args.file_path)
+    if not nsys_rep_file_path.name.endswith(".nsys-rep"):
+        raise ValueError("Expect a .nsys-rep file")
+else:
+    profile_dir = Path(args.profile_dir)
+    nsys_rep_file_path = profile_dir / f"report_np{args.world_size}_rank{args.rank}.nsys-rep"
+sqlite_file_path = nsys_rep_file_path.parent / (
+    nsys_rep_file_path.name[: -len(".nsys-rep")] + ".sqlite"
+)
+csv_file_path = nsys_rep_file_path.parent / (nsys_rep_file_path.name[: -len(".nsys-rep")] + ".csv")
+html_file_path = nsys_rep_file_path.parent / (
+    nsys_rep_file_path.name[: -len(".nsys-rep")] + ".html"
+)
 lazy_convert_sqlite(nsys_rep_file_path, sqlite_file_path)
 
 conn = sqlite3.connect(f"file:{sqlite_file_path}?mode=ro", uri=True)
@@ -196,7 +209,8 @@ if "CUDA_GRAPH_NODE_EVENTS" in tables:
            R.start AS runtime_start, R.end AS runtime_end,
            CGE2.start AS capture_start, CGE2.end AS capture_end
     FROM ({unified_subquery}) AS unified
-    JOIN CUPTI_ACTIVITY_KIND_RUNTIME AS R ON unified.correlationId = R.correlationId
+    JOIN CUPTI_ACTIVITY_KIND_RUNTIME AS R ON unified.graphNodeId IS NOT NULL AND
+                                             unified.correlationId = R.correlationId
     LEFT JOIN CUDA_GRAPH_NODE_EVENTS AS CGE1 ON unified.graphNodeId = CGE1.graphNodeId AND
                                                 CGE1.originalGraphNodeId IS NOT NULL
     LEFT JOIN CUDA_GRAPH_NODE_EVENTS AS CGE2 ON CGE1.originalGraphNodeId = CGE2.graphNodeId"""
@@ -318,6 +332,7 @@ parser_keywords = [
     ("routingInitExpertCounts", "routingInitExpertCounts"),
     ("routingIndicesCluster", "routingIndicesClusterKernel"),
     ("routingIndicesCoop", "routingIndicesCoopKernel"),
+    ("router_gemm", "router_gemm_kernel"),
     ("bmm_4_44_32", "bmm_E2m1_E2m1E2m1_Fp32_t"),
     ("finalize", "finalize::finalizeKernel"),
     ("bmm_16_44_32", "bmm_Bfloat16_E2m1E2m1_Fp32_"),
@@ -381,7 +396,7 @@ def parse_kernel_name(demangledName):
         if all(keyword in name for keyword in src):
             return dst
     if name not in warned_names:
-        print(f"Unknown kernel name: {name}")
+        print(f"Unknown kernel name: {name}", file=sys.stderr)
         warned_names.add(name)
         if args.error_on_unknown_kernel:
             raise NotImplementedError(f"Unknown kernel name: {name}")
@@ -491,11 +506,33 @@ with csv_file_path.open("w", newline="") as f:
     for row in csv_data:
         csv_writer.writerow(row)
 js_header_config = [{"name": problem["text"]} for problem in problem_set]
+js_header_config = []
+for problem in problem_set:
+    innermost_children = js_header_config
+    for k, msg_prefix in [
+        ("batch_size", "b="),
+        ("seq_len_q", "q="),
+        ("seq_len_kv_cache", "past="),
+    ]:
+        if len(run_args[k + "_list"]) > 1:
+            if len(innermost_children) == 0 or problem["spec"][k] != innermost_children[-1][k]:
+                innermost_children.append(
+                    {
+                        "name": msg_prefix + str(problem["spec"][k]),
+                        "children": [],
+                        k: problem["spec"][k],
+                    }
+                )
+            innermost_children = innermost_children[-1]["children"]
+    innermost_children.append({"name": problem["text"]})
 loader = jinja2.FileSystemLoader(Path(__file__).parent)
 template = jinja2.Environment(loader=loader).get_template("template.html")
 with html_file_path.open("w") as f:
     configText = (
-        "Run:\n" + json.dumps(run_args, indent=4) + "\n\nParse:\n" + json.dumps(args.__dict__)
+        "Run:\n"
+        + json.dumps(run_args, indent=4)
+        + "\n\nParse:\n"
+        + json.dumps(args.__dict__, indent=4)
     )
     f.write(template.render(headerConfig=js_header_config, rawData=js_data, configText=configText))
 

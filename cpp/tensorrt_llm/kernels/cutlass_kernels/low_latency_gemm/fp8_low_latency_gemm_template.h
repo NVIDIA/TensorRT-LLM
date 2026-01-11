@@ -51,6 +51,7 @@
 #pragma GCC diagnostic pop
 #endif          // __GNUC__
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.h"
@@ -64,8 +65,7 @@
 namespace tk = tensorrt_llm::common;
 namespace tkc = tensorrt_llm::cutlass_extensions;
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels
 {
@@ -554,4 +554,4 @@ std::vector<ConfigType> CutlassLowLatencyFp8GemmRunner<T>::getConfigs() const
 }; // namespace cutlass_kernels
 }; // namespace kernels
 
-}; // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

@@ -22,7 +22,7 @@ python examples/llm-api/quickstart_multimodal.py --model_dir <model_folder_path>
 
 ### TRTLLM-serve
 ```
-cat > lora-extra-llm-api-config.yml<<EOF
+cat > lora_llmapi_config.yml<<EOF
 kv_cache_config:
     free_gpu_memory_fraction: 0.6
 lora_config:
@@ -46,7 +46,7 @@ trtllm-serve  \
 <model_folder_path> \
 --backend pytorch \
 --trust_remote_code \
---extra_llm_api_options lora-extra-llm-api-config.yml
+--config lora_llmapi_config.yml
 ```
 
 ```

@@ -1,0 +1,18 @@
+max_batch_size: 720 # Depends on max_sequence_length
+max_num_tokens: 16384
+kv_cache_free_gpu_memory_fraction: 0.9
+tensor_parallel_size: 2
+moe_expert_parallel_size: 2
+trust_remote_code: true
+enable_attention_dp: true
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 720
+moe_config:
+  backend: TRTLLM
+stream_interval: 20
+num_postprocess_workers: 4
+attention_dp_config:
+  enable_balance: true
+  batching_wait_iters: 50
+  timeout_iters: 1

@@ -4,7 +4,7 @@ TensorRT-LLM's Wide Expert Parallelism (Wide-EP) feature enables efficient infer
 
 ## Overview
 
-Large-scale MoE models like DeepSeek-V3/R1, LLaMA4, and Qwen3 use fine-grained expert designs that introduce new challenges for inference systems:
+Large-scale MoE models like DeepSeek-V3/R1, Kimi K2 Thinking, LLaMA4, and Qwen3 use fine-grained expert designs that introduce new challenges for inference systems:
 
 - **High memory demands** for expert weights
 - **Inherent expert-level workload imbalance** due to sparse execution patterns
@@ -21,72 +21,78 @@ Wide-EP solves these challenges through:
 
 ### Prerequisites
 
-* GPU: GB200 NVL72, H20, or RTX 6000D.
+* GPU: GB200 NVL72, GB300 NVL72, H20, or RTX 6000D.
 * OS: Linux
 * Drivers: CUDA Driver 575 or Later
 * Docker with NVIDIA Container Toolkit installed
 * Python3 and python3-pip (Optional, for accuracy evaluation only)
 
-For GB200 NVL72, to make sure that Multi-Node NVLink (MNNVL) is correctly setup, check if the path `/dev/nvidia-caps-imex-channels` exists in the container. If the path doesn't exist, mount it when launching the Docker container.
+For GB200/GB300 NVL72, to make sure that Multi-Node NVLink (MNNVL) is correctly setup, check if the path `/dev/nvidia-caps-imex-channels` exists in the container. If the path doesn't exist, mount it when launching the Docker container.
 
 For more information on NVIDIA IMEX service for NVLink networks, refer to https://docs.nvidia.com/multi-node-nvlink-systems/imex-guide/overview.html.
 
 #### Coherent Driver-Based Memory Management (CDMM)
 
-Starting from R580 Driver, [Coherent Driver-Based Memory Management (CDMM)](https://docs.nvidia.com/datacenter/tesla/tesla-release-notes-580-65-06/index.html#hardware-software-support) for GB200 platforms is introduced. With CDMM, the driver manages GPU memory instead of the OS. CDMM avoids OS onlining of the GPU memory and the exposing of the GPU memory as a NUMA node to the OS. In Wide-EP, online EPLB need host threads be able to access the GPU memory to do the weights update.
+Starting from R580 Driver, [Coherent Driver-Based Memory Management (CDMM)](https://docs.nvidia.com/datacenter/tesla/tesla-release-notes-580-65-06/index.html#hardware-software-support) for GB200 platforms is introduced. With CDMM, the driver manages GPU memory instead of the OS. CDMM avoids OS onlining of the GPU memory and the exposing of the GPU memory as a NUMA node to the OS. In Wide-EP, online EPLB needs host threads to be able to access the GPU memory to do the weights update.
 
-When CDMM mode is off, GPU memory are exposed as NUMA nodes, so no additional prerequisites is required.
+When CDMM mode is off, GPU memory is exposed as NUMA nodes, so no additional prerequisites are required.
 
-When CDMM mode is on, GPU memory doesn't exist in NUMA nodes, in that case, if online EPLB is needed, [GDRCopy](https://github.com/NVIDIA/gdrcopy?tab=readme-ov-file#build-and-installation) needs to be installed. 
+When CDMM mode is on, GPU memory doesn't exist in NUMA nodes. In that case, if online EPLB is needed, [GDRCopy](https://github.com/NVIDIA/gdrcopy?tab=readme-ov-file#build-and-installation) needs to be installed.
 
 When GDRCopy is installed and the kernel module is loaded, you should be able to see the device file `/dev/gdrdrv` and kernel module `gdrdrv` by `lsmod`. The device file needs to be mapped into the container.
 
 * For docker, this can be done by adding a device mapping like `--device=/dev/gdrdrv:/dev/gdrdrv`.
 * For slurm with enroot, `--container-mounts="/dev/gdrdrv:/dev/gdrdrv"` needs to be added when starting containers and environment variable `export ENROOT_ALLOW_DEV=yes` needs to be set.
 
-### Configurations
+### Online Load Balancer Configurations
 
 An example yaml file to enable wide EP:
 ```yaml
 moe_config:
     backend: WIDEEP
     max_num_tokens: 9216
-    load_balancer: moe_load_balancer.yaml # (optional) enable load balancer
-```
-
-| Parameter | Description | Default | Notes |
-|-----------|-------------|---------|-------|
-| `backend` | MoE backend type | `CUTLASS` | Set to `WIDEEP` to enable wide EP |
-| `max_num_tokens` | If set, at most max_num_tokens tokens will be sent to torch.ops.trtllm.fused_moe at the same time.  | `None` | If the number of tokens exceeds max_num_tokens, the input tensors will be split into chunks and a for loop will be used. |
-| `load_balancer` | Configuration for MoE load balancing | `None` | Set path to the yaml file |
-
-#### Online Load Balancer Configuration
-
-```yaml
-moe_config:
-    backend: WIDEEP
-    max_num_tokens: 9216
     load_balancer:
-        num_slots: 288
-        layer_updates_per_iter: 1
+      num_slots: 288
+      layer_updates_per_iter: 1 # (optional) enable online load balancer
 ```
 
-| Parameter | Description | Default | Notes |
-|-----------|-------------|---------|-------|
-| `num_slots` | Total number of expert slots | `None` | Must be ≥ total experts |
-| `layer_updates_per_iter` | Number of layers updated per iteration | `0` | `0` = offline, `>0` = online |
+#### `backend`
 
-#### Offline Load Balancer Configuration
+ - MoE backend type, defaults to `CUTLASS`.
+ - Currently, TensorRT LLM has multiple MoE backends that support wide EP, including `WIDEEP`, `CUTLASS`, `TRTLLM` and `CUTEDSL`. There are on-going efforts to refactor the backends so that we don't necessarily need a specific `WIDEEP` backend, and each other backend will support wide EP functionality.
+
+#### `max_num_tokens`
+
+If set, at most `max_num_tokens` tokens will be sent to `torch.ops.trtllm.fused_moe` at the same time. If the number of tokens exceeds `max_num_tokens`, the input tensors will be split into chunks and a for loop will be used.
+
+#### `load_balancer`
+
+Configuration for MoE load balancing, users can directly set `num_slots` and `layer_updates_per_iter` as online EPLB settings, while set path to a YAML file that also includes `initial_global_assignments` for offline EPLB.
+
+#### `num_slots`
+
+Total number of expert slots, must be ≥ total experts. Three typical settings:
+
+1. Set to 0. MoE load balancing is disabled.
+2. Set to number of total experts, such as 256 for DeepSeek R1.
+3. Set to number of total experts + EP size, such as 288 for DeepSeek R1, 32-way EP.
+   * This means there is 1 extra expert on each EP rank, so that there is more room for the per-rank token distribution to be more balanced.
+
+#### `layer_updates_per_iter`
+
+Number of layers updated per iteration, defaults to `0`. `0` means offline, while `>0` means online EPLB.
+
+### Offline Load Balancer Configuration
 
 Refer to the [Offline EP Load Balancer](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep/ep_load_balancer#offline-ep-load-balancer) documentation.
 
-*Online EP Load Balancer is more suitable for production deployment needs to react timely to the online traffic changes.*
+*Note: Online EP Load Balancer is more suitable for production deployments that need to react timely to online traffic changes.*
 
 ### Execute Wide-EP on SLURM Clusters
 
-Refer to the [slurm_scripts](./slurm_scripts/) directory, which reuses [disaggregated slurm scripts](../disaggregated/slurm/) to automatically generate configuration files and submit jobs to SLURM clusters.
+Refer to the [slurm_scripts](./slurm_scripts/) directory, which reuses [disaggregated slurm scripts](../disaggregated/slurm/) for submitting jobs to SLURM clusters.
 
-## Trouble shooting
+## Troubleshooting
 
 ### Transparent HugePages failure
 
@@ -102,16 +108,16 @@ If `never` is highlighted, enable Transparent HugePages by the following command
 echo madvise > /sys/kernel/mm/transparent_hugepage/enabled
 ```
 
-### GB200 NUMA binding
+### GB200/GB300 NVL72 NUMA binding
 
-GPU memory are also on NUMA nodes on GB200 and system can also use that. Bind memory to CPU nodes to avoid GPU memory being used as host memory.
+GPU memory is also on NUMA nodes on GB200/GB300 NVL72 and the system can also use that. Bind memory to CPU nodes to avoid GPU memory being used as host memory.
 ```bash
 numactl -m 0,1 <command>
 ```
 
 ### Shared Memory on EPLB
 
-To achieve online load balancing, all expert weights are stored in shared host memory. Four ranks on the same GB200 node share the same expert weights to save memory.
+To achieve online load balancing, all expert weights are stored in shared host memory. Four ranks on the same GB200/GB300 NVL72 node share the same expert weights to save memory.
 
 There is one environment variable `TRTLLM_EPLB_SHM_NAME` to specify the base name of the shared memory. This environment variable may need to be specified if there are multiple instances on one node. If not, you can ignore it.
 
@@ -138,13 +144,20 @@ rm -f /dev/shm/moe_shared_l0_lr0_all
 
 **Warning:** Be careful when removing shared memory manually, as this may affect running processes that depend on these shared memory segments.
 
-### Hang issue caused by `UnpicklingError`
+### Host OOM
 
-It's possible to see hang issue that is caused by an `UnpicklingError`, we've noticed that and recorded it as a known issue. The issue seems to be existing in MPI, because we are not reproducing again after by-passing the MPI route by implementing customized InfiniBand communicator and replacing MPI API calls with that. We did not proceed because:
-1. The implementation only works on InfiniBand, hence not general enough.
-2. The implementation largely duplicated with InfiniBand communicator implementation in NCCL, which is hard to maintain.
+Since EPLB requires all experts to be loaded on host memory, when some models (such as Kimi K2 Thinking) have larger weights size, it's possible seeing host OOM issues, as the following:
 
-That being said, we are aware of the `UnpicklingError`, but instead of pushing further, we decided to keep observing for a while to see if it would be gone with further 3rd-party dependency upgrade. Please let us know if it's a blocker in your workload, and we will do necessary adjustment based on the feedback.
+```log
+Loading weights: 100%|█████████████████████| 1408/1408 [03:43<00:00,  6.30it/s]
+ 0: [12/04/2025-18:38:28] [TRT-LLM] [RANK 0] [I] moe_load_balancer finalizing model...
+ 1: [nvl72136-T14:452151:0:452151] Caught signal 7 (Bus error: nonexistent physical address)
+ 1: ==== backtrace (tid: 452151) ====
+ 1:  0  /usr/local/ucx//lib/libucs.so.0(ucs_handle_error+0x2cc) [0xffff9638274c]
+ 1:  1  /usr/local/ucx//lib/libucs.so.0(+0x328fc) [0xffff963828fc]
+ 1:  2  /usr/local/ucx//lib/libucs.so.0(+0x32c78) [0xffff96382c78]
+```
+This can be addressed by mounting `tmpfs:/dev/shm:size=640G` when launching the Docker container, to increase the shm size that the container can access.
 
 ### Disaggregated serving related issues
 
@@ -152,9 +165,14 @@ Refer to the [Troubleshooting and FAQ](https://github.com/NVIDIA/TensorRT-LLM/bl
 
 ## References
 
-- Technical Blog: Scaling Expert Parallelism in TensorRT-LLM
+To understand more details on wide EP and the optimizations we've added, refer to the technical blog series: Scaling Expert Parallelism in TensorRT-LLM
   - [Part 1: Design and Implementation of Large-scale EP](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.md)
   - [Part 2: Performance Status and Optimization](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog8_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.md)
+  - [Part 3: Pushing the Performance Boundary](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.md)
+
+To review how wide EP helps with Blackwell's leading inference benchmarks, also read these recent blog posts:
+* [NVIDIA Blackwell Leads on SemiAnalysis InferenceMAX™ v1 Benchmarks](https://developer.nvidia.com/blog/nvidia-blackwell-leads-on-new-semianalysis-inferencemax-benchmarks/)
+* [NVIDIA Blackwell Raises Bar in New InferenceMAX Benchmarks, Delivering Unmatched Performance and Efficiency](https://blogs.nvidia.com/blog/blackwell-inferencemax-benchmark-results/)
 
 For detailed implementation examples and advanced usage, see the subdirectories:
 - [`ep_load_balancer/`](ep_load_balancer/): Load balancing tools and examples

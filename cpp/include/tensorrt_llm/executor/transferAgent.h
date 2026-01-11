@@ -274,13 +274,20 @@ private:
     std::optional<SyncMessage> mSyncMessage;
 };
 
+enum class TransferState : uint8_t
+{
+    kIN_PROGRESS,
+    kSUCCESS,
+    kFAILURE,
+};
+
 // Data structure for checking the status of active transfer operations.
 class TransferStatus
 {
 public:
     virtual ~TransferStatus() = default;
     [[nodiscard]] virtual bool isCompleted() const = 0;
-    virtual void wait() const = 0;
+    virtual TransferState wait(int64_t timeout_ms = -1) const = 0;
 };
 
 struct BaseAgentConfig
@@ -288,6 +295,8 @@ struct BaseAgentConfig
     std::string mName;
     bool useProgThread;
     bool multiThread;
+    bool useListenThread;
+    unsigned int numWorkers;
 };
 
 class BaseTransferAgent
@@ -389,6 +398,14 @@ template <typename... Args>
         using CreateNixlFuncType = std::unique_ptr<BaseTransferAgent> (*)(BaseAgentConfig const*);
         auto* func = loader.getFunctionPointer<CreateNixlFuncType>(
             "libtensorrt_llm_nixl_wrapper.so", "createNixlTransferAgent");
+        return func(std::forward<Args>(args)...);
+    }
+    if (backend == "mooncake")
+    {
+        auto& loader = DynLibLoader::getInstance();
+        using CreateMooncakeFuncType = std::unique_ptr<BaseTransferAgent> (*)(BaseAgentConfig const*);
+        auto* func = loader.getFunctionPointer<CreateMooncakeFuncType>(
+            "libtensorrt_llm_mooncake_wrapper.so", "createMooncakeTransferAgent");
         return func(std::forward<Args>(args)...);
     }
     TLLM_THROW("Unknown backend name.");

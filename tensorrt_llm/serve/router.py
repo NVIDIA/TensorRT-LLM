@@ -1,7 +1,7 @@
 import asyncio
 import heapq
 from abc import ABC, abstractmethod
-from typing import Dict, Iterable, List, Optional, Union
+from typing import Awaitable, Callable, Dict, Iterable, List, Optional, Union
 
 import aiohttp
 from transformers import AutoTokenizer
@@ -145,9 +145,15 @@ class KvCacheAwareServerState(ServerState):
 
 class Router(ABC):
 
-    def __init__(self, server_role: ServerRole, servers: List[str],
-                 metadata_server_cfg: Optional[MetadataServerConfig],
-                 metadata_server: Optional[JsonDictionary]):
+    def __init__(
+            self,
+            server_role: ServerRole,
+            servers: List[str],
+            metadata_server_cfg: Optional[MetadataServerConfig],
+            metadata_server: Optional[JsonDictionary],
+            server_preparation_func: Optional[Callable[[str],
+                                                       Awaitable[None]]] = None,
+            **kwargs):
         self._servers = servers or []
         self._metadata_server = metadata_server
         self._server_role = server_role
@@ -155,6 +161,7 @@ class Router(ABC):
         self._monitor_task = None
         self._session = None
         self._health_check_timeout = metadata_server_cfg.health_check_timeout if metadata_server_cfg else None
+        self._server_preparation_func = server_preparation_func
 
     @abstractmethod
     def _on_servers_updated(self, old_servers, new_servers):
@@ -169,16 +176,26 @@ class Router(ABC):
     def servers(self) -> List[str]:
         return self._servers
 
+    async def _prepare_server(self, server: str):
+        if self._server_preparation_func:
+            await self._server_preparation_func(server)
+
+    async def prepare_servers(self, servers: Optional[List[str]] = None):
+        for server in servers or self._servers:
+            await self._prepare_server(server)
+
     async def add_server(self, server: str):
         if server in self._servers:
             logger.warning(f"Server {server} already exists")
             return
+        await self._prepare_server(server)
         async with self._lock:
             old_servers = self._servers.copy()
             self._servers = [*old_servers, server]
             self._on_servers_updated(old_servers, self._servers)
         logger.debug(
-            f"Added server {server}, current server list: {self._servers}")
+            f"Added server {server}, {self._server_role.name} current server list: {self._servers}"
+        )
 
     async def remove_server(self, server: str):
         if server not in self._servers:
@@ -275,6 +292,7 @@ class Router(ABC):
                         # Log added servers
                         for server in final_servers:
                             if server not in old_servers:
+                                await self._prepare_server(server)
                                 logger.info(f"Server {server} is added")
                     else:
                         logger.debug(
@@ -419,7 +437,7 @@ class RoundRobinRouter(Router):
                  metadata_server: JsonDictionary = None,
                  **kwargs):
         super().__init__(server_role, servers, metadata_server_cfg,
-                         metadata_server)
+                         metadata_server, **kwargs)
         self._server_idx = 0
 
     def _on_servers_updated(self, old_servers, new_servers):
@@ -463,7 +481,7 @@ class LoadBalancingRouter(Router):
                  use_tokens: bool = False,
                  **kwargs):
         super().__init__(server_role, servers, metadata_server_cfg,
-                         metadata_server)
+                         metadata_server, **kwargs)
         # Load map between servers and their number of tokens processed
         self._server_state = {}
         self._server_load_heap = []
@@ -550,7 +568,7 @@ class KvCacheAwareRouter(Router):
                  tokens_per_block: int = 32,
                  **kwargs):
         super().__init__(server_role, servers, metadata_server_cfg,
-                         metadata_server)
+                         metadata_server, **kwargs)
         self._lock = asyncio.Lock()
         self._use_tokens = use_tokens
 
@@ -647,10 +665,13 @@ class KvCacheAwareRouter(Router):
             self._server_state.pop(old_server, None)
 
 
-def create_router(router_config: Optional[RouterConfig],
-                  servers: Optional[List[str]],
-                  metadata_server_cfg: Optional[MetadataServerConfig] = None,
-                  metadata_server: Optional[JsonDictionary] = None) -> Router:
+def create_router(
+    router_config: Optional[RouterConfig],
+    servers: Optional[List[str]],
+    metadata_server_cfg: Optional[MetadataServerConfig] = None,
+    metadata_server: Optional[JsonDictionary] = None,
+    server_preparation_func: Optional[Callable[[str], Awaitable[None]]] = None
+) -> Router:
     """
     Factory function to create different types of router instances.
 
@@ -681,5 +702,8 @@ def create_router(router_config: Optional[RouterConfig],
     extra_args = router_config.args if router_config else {}
 
     return router_class(router_config.server_role if router_config else None,
-                        servers, metadata_server_cfg, metadata_server,
+                        servers,
+                        metadata_server_cfg,
+                        metadata_server,
+                        server_preparation_func=server_preparation_func,
                         **extra_args)

@@ -16,11 +16,15 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/tllmException.h"
+
 #include <NvInferRuntime.h>
 #include <map>
 
-namespace tensorrt_llm::common
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common
 {
 
 constexpr static size_t getDTypeSize(nvinfer1::DataType type)
@@ -84,4 +88,6 @@ constexpr static size_t getDTypeSizeInBits(nvinfer1::DataType type)
     return "";
 }
 
-} // namespace tensorrt_llm::common
+} // namespace common
+
+TRTLLM_NAMESPACE_END

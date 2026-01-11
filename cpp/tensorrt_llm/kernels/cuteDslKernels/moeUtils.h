@@ -15,11 +15,14 @@
  */
 
 #pragma once
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h"
 #include <cstdint>
 #include <cuda_runtime.h>
 
-namespace tensorrt_llm::kernels::cute_dsl
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::cute_dsl
 {
 template <typename InputType, typename SFType>
 void moePermute(InputType const* input, InputType* permuted_output, SFType const* input_sf, SFType* permuted_sf,
@@ -32,10 +35,18 @@ void moeUnpermute(InputType const* permuted_input, InputType* output, int32_t co
     TopKScaleType const* topk_scales, int32_t const num_tokens, int32_t const hidden_size, int32_t const top_k,
     cudaStream_t stream);
 
+template <typename InputType>
+void moeOutputMemset(InputType* input, int32_t const* tile_idx_to_mn_limit, int32_t const* expanded_idx_to_permuted_idx,
+    int32_t const* permuted_idx_to_expanded_idx, int32_t const* num_non_exiting_tiles,
+    int32_t const max_num_permuted_tokens, int32_t const hidden_size, int32_t const top_k, int32_t const tile_size,
+    cudaStream_t stream);
+
 template <typename InputType, typename OutputType, typename SFType>
 void moeActivation(InputType const* input, OutputType* output, float const* global_sf, SFType* output_sf,
     int32_t const* tile_idx_to_mn_limit, int32_t const* num_non_exiting_tiles,
     cutlass_kernels::ActivationParams activation_params, int32_t const max_num_permuted_tokens,
     int32_t const interm_size, int32_t const tile_size, cudaStream_t stream);
 
-} // namespace tensorrt_llm::kernels::cute_dsl
+} // namespace kernels::cute_dsl
+
+TRTLLM_NAMESPACE_END

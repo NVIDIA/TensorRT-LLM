@@ -17,13 +17,14 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 
 #include <limits>
 #include <string>
 #include <unordered_map>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -56,4 +57,5 @@ inline std::pair<float, float> getLimitsPenalty(DecodingPenaltyType penaltyType)
     return std::make_pair(fltMin, fltMax);
 }
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

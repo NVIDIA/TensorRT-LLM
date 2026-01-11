@@ -178,6 +178,7 @@ void testSendMRecv()
     }
     else if (rank == 1)
     {
+#if ENABLE_MULTI_DEVICE
         MPI_Message msg;
         MPI_Status status;
         comm.mprobe(0, tag, &msg, &status);
@@ -190,6 +191,7 @@ void testSendMRecv()
         MPICHECK(
             MPI_Mrecv(&value, count, getMpiDtype(mpi::MpiTypeConverter<std::remove_cv_t<T>>::value), &msg, &status));
         EXPECT_EQ(value, expectedValue);
+#endif // ENABLE_MULTI_DEVICE
     }
 }
 

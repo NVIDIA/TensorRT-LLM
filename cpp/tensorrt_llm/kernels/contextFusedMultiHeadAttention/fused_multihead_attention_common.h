@@ -16,16 +16,16 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
+#include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
+#include "tensorrt_llm/kernels/sparseAttentionKernels.h"
 #include "tmaDescriptor.h"
 #include <limits.h>
 #include <stdint.h>
 
-#include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
-#include "tensorrt_llm/kernels/sparseAttentionKernels.h"
+TRTLLM_NAMESPACE_BEGIN
 
-namespace tensorrt_llm
-{
 namespace kernels
 {
 
@@ -312,6 +312,14 @@ struct MHARunnerParams
     int vMaxNBlock;
     // sparse attention parameters
     SparseAttentionParams sparse_params;
+
+    // Skip-softmax attention parameters
+    float skipSoftmaxThresholdScaleFactor = 0;
+#ifdef SKIP_SOFTMAX_STAT
+    // Statistics of skip-softmax, pointers of device memory for output
+    uint32_t* skipSoftmaxTotalBlocks;
+    uint32_t* skipSoftmaxSkippedBlocks;
+#endif
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -457,6 +465,15 @@ struct Fused_multihead_attention_params_v2
             float* scales;
         } q, k, v;
     } sage;
+
+    // Skip softmax when exp(local_max - global_max) < skip_softmax_threshold_scale_factor / seqlen.
+    // A positive value means skip-softmax is enabled.
+    float skip_softmax_threshold_scale_factor = 0;
+#ifdef SKIP_SOFTMAX_STAT
+    // Statistics of skip-softmax, pointers of device memory for output
+    uint32_t* skip_softmax_total_blocks;
+    uint32_t* skip_softmax_skipped_blocks;
+#endif
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -515,7 +532,10 @@ struct Launch_params
     int sage_block_size_v = 0;
     // if we use a kernel that supports returning softmax statistics
     bool supportReturnSoftmaxStats;
+    // enable skip softmax attention feature
+    bool enableSkipSoftmax = false;
 };
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

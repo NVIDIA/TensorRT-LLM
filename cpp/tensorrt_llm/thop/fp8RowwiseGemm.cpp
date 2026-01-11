@@ -34,6 +34,8 @@
 using tensorrt_llm::kernels::cutlass_kernels::CutlassFp8RowwiseGemmRunner;
 using tensorrt_llm::kernels::cutlass_kernels::CutlassFp8RowwiseGemmRunnerInterface;
 
+TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -183,10 +185,12 @@ private:
 };
 } // namespace torch_ext
 
+TRTLLM_NAMESPACE_END
+
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.class_<torch_ext::FP8RowwiseGemmRunner>("FP8RowwiseGemmRunner")
+    m.class_<tensorrt_llm::torch_ext::FP8RowwiseGemmRunner>("FP8RowwiseGemmRunner")
         .def(torch::init<at::ScalarType>())
-        .def("run_gemm", &torch_ext::FP8RowwiseGemmRunner::runGemm)
-        .def("get_num_configs", &torch_ext::FP8RowwiseGemmRunner::getNumConfigs);
+        .def("run_gemm", &tensorrt_llm::torch_ext::FP8RowwiseGemmRunner::runGemm)
+        .def("get_num_configs", &tensorrt_llm::torch_ext::FP8RowwiseGemmRunner::getNumConfigs);
 }

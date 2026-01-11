@@ -155,7 +155,10 @@ class RpcWorker(RpcWorkerMixin, BaseWorker):
                 color="yellow")
             # Step 2: Create the RPC service, it will expose all the APIs of the worker as remote call to the client
             # Set num_workers to larger than 1 since there are some streaming tasks runs infinitely, such as await_responses_async.
-            rpc_server = RPCServer(worker, num_workers=worker.num_workers)
+            hmac_key = kwargs.get("hmac_key")
+            rpc_server = RPCServer(worker,
+                                   num_workers=worker.num_workers,
+                                   hmac_key=hmac_key)
             rpc_server.bind(rpc_addr)
             rpc_server.start()
             logger_debug(f"[worker] RPC server {mpi_rank()} is started",

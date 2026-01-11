@@ -217,8 +217,9 @@ class HarmonyStreamState:
 
                 # Check if tool is allowed
                 if self.should_filter_tools and func_name not in self.available_tools:
-                    logger.debug("Request %s: tool %s not in available tools",
-                                 self.request_id, func_name)
+                    logger.debug(
+                        f"Request {self.request_id}: tool {func_name} not in available tools"
+                    )
                     return None
 
                 # Get or create tool call
@@ -273,8 +274,9 @@ class HarmonyStreamState:
             else:
                 return {"content": self.parser.last_content_delta}
         else:
-            logger.debug("Request %s: no delta generated for channel=%s",
-                         self.request_id, self.parser.current_channel)
+            logger.debug(
+                f"Request {self.request_id}: no delta generated for channel={self.parser.current_channel}"
+            )
             return None
 
     def _get_or_create_tool_call(self, func_name: str) -> str:
@@ -295,8 +297,9 @@ class HarmonyStreamState:
             "active": True
         }
         self.tool_call_index += 1
-        logger.debug("Request %s: created new tool call %s for function %s",
-                     self.request_id, tool_id, func_name)
+        logger.debug(
+            f"Request {self.request_id}: created new tool call {tool_id} for function {func_name}"
+        )
         return tool_id
 
     def get_debug_info(self) -> dict[str, Any]:
@@ -896,8 +899,8 @@ class HarmonyAdapter:
                 }
             except json.JSONDecodeError:
                 logger.warning(
-                    "Failed to parse tool call arguments as JSON: %s",
-                    function_call_args)
+                    f"Failed to parse tool call arguments as JSON: {function_call_args}"
+                )
                 return None
         elif msg_content_type and "code" in msg_content_type:
             function_name = str(msg_recipient)
@@ -1023,10 +1026,11 @@ class HarmonyAdapter:
             except (HarmonyError, UnicodeDecodeError,
                     ValueError) as parse_error:
                 logger.warning(
-                    "Failed to parse harmony messages from tokens: %s",
-                    parse_error)
-                logger.debug("Problematic clean tokens (%d): %s",
-                             len(clean_tokens), clean_tokens)
+                    f"Failed to parse harmony messages from tokens: {parse_error}"
+                )
+                logger.debug(
+                    f"Problematic clean tokens ({len(clean_tokens)}): {clean_tokens}"
+                )
                 # Fallback to raw text parsing
                 raise RuntimeError(f"Harmony parsing failed: {parse_error}"
                                    )  # This will be caught by outer try-catch
@@ -1103,9 +1107,9 @@ class HarmonyAdapter:
         except Exception as e:
             raw_text = self._safe_decode_utf8(harmony_output_tokens,
                                               "HARMONY _OUTPUT: ")
-            logger.warning("Failed to parse harmony output: %s. Raw output: %s",
-                           e, raw_text)
-            logger.debug("Detailed error: %s", traceback.format_exc())
+            logger.warning(
+                f"Failed to parse harmony output: {e}. Raw output: {raw_text}")
+            logger.debug(f"Detailed error: {traceback.format_exc()}")
 
             # Check if raw_text contains a decode error (fallback content)
             if "HARMONY_OUTPUT:" in raw_text:
@@ -1276,9 +1280,9 @@ class HarmonyAdapter:
             return deltas
         except (HarmonyError, UnicodeDecodeError, ValueError):
             logger.error(
-                f"Streaming: Failed to process token batch of {len(tokens)} tokens for request {request_id}",
+                f"Streaming: Failed to process token batch of {len(tokens)} tokens for request {request_id}"
             )
-            logger.debug("Problematic streaming tokens: %s", tokens)
+            logger.debug(f"Problematic streaming tokens: {tokens}")
 
             # Return empty deltas to continue processing
             return []
@@ -1457,8 +1461,8 @@ class HarmonyAdapter:
         """
         if request_id in self._stream_states:
             logger.warning(
-                "Stream state already exists for request %s, replacing",
-                request_id)
+                f"Stream state already exists for request {request_id}, replacing"
+            )
 
         stream_state = HarmonyStreamState(
             request_id=request_id,
@@ -1494,7 +1498,7 @@ class HarmonyAdapter:
 
             # Filter unavailable external tools
             if should_filter_external_tools and func_name not in external_tools:
-                logger.debug("Filtered unavailable tool call: %s", func_name)
+                logger.debug(f"Filtered unavailable tool call: {func_name}")
                 continue
 
             filtered.append(tool_call)
@@ -1644,7 +1648,7 @@ def handle_non_streaming_response(tools: List[ChatCompletionToolsParam],
         output.token_ids, tools_for_parser, tool_choice)
 
     # CONVERTED OUTPUT (after harmony to openai conversion)
-    logger.debug("✅ CONVERTED OUTPUT: %s", json.dumps(parsed_output, indent=2))
+    logger.debug(f"✅ CONVERTED OUTPUT: {json.dumps(parsed_output, indent=2)}")
 
     # Create response message
     response_message = _create_response_message(parsed_output)

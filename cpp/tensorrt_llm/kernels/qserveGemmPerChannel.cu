@@ -22,11 +22,12 @@
 // }
 
 #include "qserveGemm.h"
+#include "tensorrt_llm/common/config.h"
 #include <cuda_fp16.h>
 #include <cuda_pipeline_primitives.h>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace qserve
@@ -605,4 +606,5 @@ void QServeGemmRunner::gemmPerChannel(ParamsPerChannel const& params, cudaStream
 
 } // namespace qserve
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

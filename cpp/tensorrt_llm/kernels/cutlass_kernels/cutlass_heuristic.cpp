@@ -15,6 +15,7 @@
  */
 
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaBf16Wrapper.h"
 
 #ifdef __GNUC__ // Check if the compiler is GCC or Clang
@@ -36,8 +37,8 @@
 
 using namespace tensorrt_llm::cutlass_extensions;
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace cutlass_kernels
@@ -408,14 +409,14 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm100_dynamic_cluster_shape
     }
 
     std::vector<std::pair<CutlassTileConfigSM100, ClusterShape>> tile_configs{
-        {CutlassTileConfigSM100::CtaShape128x128x128B, cluster1sm},
-        {CutlassTileConfigSM100::CtaShape128x256x128B, cluster1sm},
-        {CutlassTileConfigSM100::CtaShape128x32x128B, cluster1sm},
-        {CutlassTileConfigSM100::CtaShape64x64x128B, cluster1sm},
         {CutlassTileConfigSM100::CtaShape64x32x128B, cluster1sm},
+        {CutlassTileConfigSM100::CtaShape64x64x128B, cluster1sm},
         {CutlassTileConfigSM100::CtaShape64x128x128B, cluster1sm},
         {CutlassTileConfigSM100::CtaShape64x256x128B, cluster1sm},
+        {CutlassTileConfigSM100::CtaShape128x32x128B, cluster1sm},
         {CutlassTileConfigSM100::CtaShape128x64x128B, cluster1sm},
+        {CutlassTileConfigSM100::CtaShape128x128x128B, cluster1sm},
+        {CutlassTileConfigSM100::CtaShape128x256x128B, cluster1sm},
     };
 
     if (supports_2sm)
@@ -476,6 +477,30 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm100(
                 sm, config, schedule, ClusterShape::Undefined, ClusterShape::Undefined);
             candidate_configs.insert(candidate_configs.end(), configs.begin(), configs.end());
         }
+        return candidate_configs;
+    }
+    else if (config & CutlassGemmConfig::WEIGHT_ONLY)
+    {
+        std::vector<CutlassTileConfigSM100> tile_configs{
+            CutlassTileConfigSM100::CtaShape64x128x128B,
+            CutlassTileConfigSM100::CtaShape128x128x128B,
+        };
+        std::vector<CutlassGemmConfig> candidate_configs;
+        for (auto const& tile_config : tile_configs)
+        {
+            CutlassGemmConfig cutlassKernelConfig(tile_config, MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
+                ClusterShape::ClusterShape_1x1x1, ClusterShape::Undefined, ClusterShape::Undefined, sm);
+            candidate_configs.push_back(cutlassKernelConfig);
+        }
+
+        // add cuda kernel profiler to tactics for weight-only plugins
+        CutlassGemmConfig cudaKernelConfig(CutlassTileConfigSM100::CtaShape64x128x128B, MainloopScheduleType::AUTO,
+            EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1, ClusterShape::Undefined,
+            ClusterShape::Undefined, sm);
+
+        cudaKernelConfig.enableCudaKernel = true;
+        candidate_configs.push_back(cudaKernelConfig);
+
         return candidate_configs;
     }
     else
@@ -693,4 +718,5 @@ CutlassGemmConfig estimate_best_config_from_occupancies(std::vector<CutlassGemmC
 
 } // namespace cutlass_kernels
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

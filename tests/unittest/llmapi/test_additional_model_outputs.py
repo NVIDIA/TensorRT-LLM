@@ -135,7 +135,7 @@ class DummyConfigLoader(BaseConfigLoader):
         return ModelConfig(pretrained_config=DummyConfig())
 
 
-@pytest.mark.part0
+@pytest.mark.gpu1
 def test_additional_model_outputs_sampling_params():
     """Test that additional_model_outputs can be configured in SamplingParams."""
     # Create sampling params with additional outputs
@@ -153,7 +153,7 @@ def test_additional_model_outputs_sampling_params():
     assert sampling_params.additional_model_outputs[1] == "generation_output"
 
 
-@pytest.mark.part0
+@pytest.mark.gpu1
 def test_additional_model_outputs_no_outputs():
     """Test that no additional outputs are returned when not requested."""
     # Create sampling params without additional outputs
@@ -166,8 +166,7 @@ def test_additional_model_outputs_no_outputs():
     assert sampling_params.additional_model_outputs is None
 
 
-@pytest.mark.part0
-def test_additional_model_outputs_integration():
+def _test_additional_model_outputs_integration(pp_size: int):
     """Integration test for additional_model_outputs.
 
     This test uses a dummy model to test the additional_model_outputs feature.
@@ -186,6 +185,7 @@ def test_additional_model_outputs_integration():
     # Create LLM with the provided model
     llm = LLM(model=_pl.Path("dummy_path"),
               backend='pytorch',
+              pipeline_parallel_size=pp_size,
               max_batch_size=2,
               max_seq_len=128,
               max_num_tokens=5,
@@ -278,5 +278,11 @@ def test_additional_model_outputs_integration():
                                expected_generation_output.unsqueeze(1))
 
 
-if __name__ == "__main__":
-    pytest.main([__file__])
+@pytest.mark.gpu1
+def test_additional_model_outputs_integration():
+    _test_additional_model_outputs_integration(1)
+
+
+@pytest.mark.gpu2
+def test_additional_model_outputs_integration_pp2():
+    _test_additional_model_outputs_integration(2)

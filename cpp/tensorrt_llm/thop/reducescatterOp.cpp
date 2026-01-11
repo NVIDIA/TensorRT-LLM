@@ -34,6 +34,8 @@
 
 using tensorrt_llm::pg_utils::PgHelper;
 
+TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 #if ENABLE_MULTI_DEVICE
@@ -287,6 +289,8 @@ extern std::vector<torch::Tensor> reducescatter_list_pg(torch::TensorList input_
 }
 } // namespace torch_ext
 
+TRTLLM_NAMESPACE_END
+
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def("reducescatter(Tensor input, SymInt[]? sizes, int[] group) -> Tensor");
@@ -301,8 +305,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("reducescatter", &torch_ext::reducescatter);
-    m.impl("reducescatter_pg", &torch_ext::reducescatter_pg);
-    m.impl("reducescatter_list", &torch_ext::reducescatter_list);
-    m.impl("reducescatter_list_pg", &torch_ext::reducescatter_list_pg);
+    m.impl("reducescatter", &tensorrt_llm::torch_ext::reducescatter);
+    m.impl("reducescatter_pg", &tensorrt_llm::torch_ext::reducescatter_pg);
+    m.impl("reducescatter_list", &tensorrt_llm::torch_ext::reducescatter_list);
+    m.impl("reducescatter_list_pg", &tensorrt_llm::torch_ext::reducescatter_list_pg);
 }

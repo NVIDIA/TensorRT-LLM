@@ -68,6 +68,7 @@ option(USING_OSS_CUTLASS_MOE_GEMM "Using open sourced Cutlass moe gemm kernel"
        ON)
 option(USING_OSS_CUTLASS_ALLREDUCE_GEMM
        "Using open sourced Cutlass AR gemm kernel" ON)
+option(SKIP_SOFTMAX_STAT "Enable Statistics of Skip-Softmax" OFF)
 
 message(STATUS "ENABLE_NVSHMEM is ${ENABLE_NVSHMEM}")
 
@@ -358,6 +359,11 @@ if(ENABLE_NVSHMEM)
 else()
   add_compile_definitions($<$<COMPILE_LANGUAGE:CXX>:ENABLE_NVSHMEM=0>
                           $<$<COMPILE_LANGUAGE:CUDA>:ENABLE_NVSHMEM=0>)
+endif()
+
+if(SKIP_SOFTMAX_STAT)
+  add_compile_definitions("SKIP_SOFTMAX_STAT")
+  message(STATUS "SKIP_SOFTMAX_STAT is enabled")
 endif()
 
 # Fix linking issue with TRT 10, the detailed description about `--mcmodel` can

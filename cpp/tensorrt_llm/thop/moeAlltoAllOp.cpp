@@ -25,6 +25,8 @@
 #include <torch/types.h>
 #include <vector>
 
+TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -184,7 +186,6 @@ std::tuple<std::vector<torch::Tensor>, int64_t> moeA2ADispatchOp(torch::Tensor c
     MoeA2ADataOffsets const& offsets = *reinterpret_cast<MoeA2ADataOffsets const*>(metainfo.data_ptr<int64_t>());
 
     int64_t localNumTokens = tokenSelectedExperts.size(0);
-    TORCH_CHECK(localNumTokens > 0, "localNumTokens must be positive");
     TORCH_CHECK(runtimeMaxTokensPerRank > 0, "runtimeMaxTokensPerRank must be positive");
     TORCH_CHECK(epRank >= 0 && epRank < epSize, "epRank must be in the range [0, epSize)");
     TORCH_CHECK(topK > 0 && topK <= kMaxTopK, "topK must be in the range (0, kMaxTopK]");
@@ -521,6 +522,8 @@ int64_t moeA2AGetAuxDataSizeOp(int64_t epSize, int64_t maxNumTokens)
 
 } // namespace torch_ext
 
+TRTLLM_NAMESPACE_END
+
 // PyTorch bindings
 TORCH_LIBRARY_FRAGMENT(trtllm, module)
 {
@@ -546,14 +549,15 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
         "runtime_max_tokens_per_rank, "
         "int combine_payload_offset, ScalarType out_dtype, int hidden_size) -> Tensor(a)");
     module.def("moe_a2a_get_aux_data_size(int ep_size, int max_num_tokens) -> int",
-        &torch_ext::moe_comm::moeA2AGetAuxDataSizeOp);
+        &tensorrt_llm::torch_ext::moe_comm::moeA2AGetAuxDataSizeOp);
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, module)
 {
-    module.impl("moe_a2a_dispatch", &torch_ext::moe_comm::moeA2ADispatchOp);
-    module.impl("moe_a2a_combine", &torch_ext::moe_comm::moeA2ACombineOp);
-    module.impl("moe_a2a_initialize", &torch_ext::moe_comm::moeA2AInitializeOp);
-    module.impl("moe_a2a_sanitize_expert_ids", &torch_ext::moe_comm::moeA2ASanitizeExpertIdsOp);
-    module.impl("moe_a2a_get_combine_payload_tensor", &torch_ext::moe_comm::moeA2AGetCombinePayloadTensorOp);
+    module.impl("moe_a2a_dispatch", &tensorrt_llm::torch_ext::moe_comm::moeA2ADispatchOp);
+    module.impl("moe_a2a_combine", &tensorrt_llm::torch_ext::moe_comm::moeA2ACombineOp);
+    module.impl("moe_a2a_initialize", &tensorrt_llm::torch_ext::moe_comm::moeA2AInitializeOp);
+    module.impl("moe_a2a_sanitize_expert_ids", &tensorrt_llm::torch_ext::moe_comm::moeA2ASanitizeExpertIdsOp);
+    module.impl(
+        "moe_a2a_get_combine_payload_tensor", &tensorrt_llm::torch_ext::moe_comm::moeA2AGetCombinePayloadTensorOp);
 }

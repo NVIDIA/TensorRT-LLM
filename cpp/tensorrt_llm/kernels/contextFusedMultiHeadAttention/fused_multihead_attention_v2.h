@@ -21,6 +21,7 @@
 #include "cubin/fmha_cubin.h"
 #include "cuda_runtime_api.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tmaDescriptor.h"
 
@@ -33,7 +34,9 @@
 #include <set>
 #include <unordered_map>
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -129,7 +132,8 @@ public:
     uint64_t hashID(unsigned int s, unsigned int d, unsigned int dv, bool interleaved, bool unroll, bool force_fp32_acc,
         bool flash_attention, bool warp_specialization, bool is_alibi_supported, int attention_mask_type,
         int input_layout, bool tiled, bool enable_attn_logit_softcapping, unsigned int sage_block_size_q,
-        unsigned int sage_block_size_k, unsigned int sage_block_size_v, bool return_softmax) const;
+        unsigned int sage_block_size_k, unsigned int sage_block_size_v, bool return_softmax,
+        bool enable_skip_softmax) const;
 
     uint64_t hashID(KernelMeta const& kernelMeta) const override;
 
@@ -153,4 +157,6 @@ using FusedMHAKernelFactoryV2 = TFusedMHAKernelFactory<FusedMultiHeadAttentionXM
 
 FusedMultiHeadAttentionXMMAKernelV2 const* getXMMAKernelsV2(Data_type inputType, Data_type outputType, unsigned int sm);
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

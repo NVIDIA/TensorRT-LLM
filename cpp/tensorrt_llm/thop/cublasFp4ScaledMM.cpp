@@ -27,6 +27,8 @@
 
 using torch::Tensor;
 
+TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -230,7 +232,7 @@ public:
         else
         {
             // Fall back to default (no algorithm specified)
-            TLLM_LOG_WARNING(
+            TLLM_LOG_DEBUG(
                 "CublasLtFP4GemmRunner: No valid algorithm found (tactic=%ld, available=%zu), falling back to default "
                 "for shape (m=%d, n=%d, k=%d)",
                 tactic, cache.heuristics.size(), m, n, k);
@@ -427,10 +429,12 @@ private:
 
 } // namespace torch_ext
 
+TRTLLM_NAMESPACE_END
+
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.class_<torch_ext::CublasLtFP4GemmRunner>("CublasLtFP4GemmRunner")
+    m.class_<tensorrt_llm::torch_ext::CublasLtFP4GemmRunner>("CublasLtFP4GemmRunner")
         .def(torch::init<at::ScalarType>())
-        .def("run_gemm", &torch_ext::CublasLtFP4GemmRunner::runGemm)
-        .def("get_num_heuristic_algos", &torch_ext::CublasLtFP4GemmRunner::getNumHeuristicAlgos);
+        .def("run_gemm", &tensorrt_llm::torch_ext::CublasLtFP4GemmRunner::runGemm)
+        .def("get_num_heuristic_algos", &tensorrt_llm::torch_ext::CublasLtFP4GemmRunner::getNumHeuristicAlgos);
 }

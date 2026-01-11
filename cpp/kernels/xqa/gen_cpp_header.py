@@ -127,7 +127,9 @@ TEMPLATE_PROLOGUE = '''/*
  */
 
 #pragma once
-namespace tensorrt_llm {
+#include "tensorrt_llm/common/config.h"
+
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels {
 '''
 
@@ -136,7 +138,8 @@ inline constexpr const char* {fname_var_name} = "{fname}";
 '''
 
 TEMPLATE_EPILOGUE = '''}
-}
+TRTLLM_NAMESPACE_END
+
 '''
 
 D = defaultdict(list)

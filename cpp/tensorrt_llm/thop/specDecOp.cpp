@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/kernels/speculativeDecoding/draftTokenTreeKernels.h"
@@ -24,6 +25,8 @@
 namespace th = torch;
 namespace tl = tensorrt_llm;
 namespace tk = tensorrt_llm::kernels;
+
+TRTLLM_NAMESPACE_BEGIN
 
 namespace torch_ext
 {
@@ -336,6 +339,8 @@ void extract_real_draft_tokens_op(th::Tensor newDraftTokens, th::Tensor draftTok
 
 } // end namespace torch_ext
 
+TRTLLM_NAMESPACE_END
+
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
@@ -348,7 +353,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("mtp_prepare_drafter_inputs_op", &torch_ext::mtp_prepare_drafter_inputs_op);
+    m.impl("mtp_prepare_drafter_inputs_op", &tensorrt_llm::torch_ext::mtp_prepare_drafter_inputs_op);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -363,7 +368,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("mtp_sampling_and_accepted_draft_tokens_op", &torch_ext::mtp_sampling_and_accepted_draft_tokens_op);
+    m.impl("mtp_sampling_and_accepted_draft_tokens_op",
+        &tensorrt_llm::torch_ext::mtp_sampling_and_accepted_draft_tokens_op);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -378,7 +384,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("mtp_update_hidden_states_op", &torch_ext::mtp_update_hidden_states_op);
+    m.impl("mtp_update_hidden_states_op", &tensorrt_llm::torch_ext::mtp_update_hidden_states_op);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -394,7 +400,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("mtp_relaxed_acceptance_op", &torch_ext::mtp_relaxed_acceptance_op);
+    m.impl("mtp_relaxed_acceptance_op", &tensorrt_llm::torch_ext::mtp_relaxed_acceptance_op);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -409,5 +415,5 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("extract_real_draft_tokens_op", &torch_ext::extract_real_draft_tokens_op);
+    m.impl("extract_real_draft_tokens_op", &tensorrt_llm::torch_ext::extract_real_draft_tokens_op);
 }
