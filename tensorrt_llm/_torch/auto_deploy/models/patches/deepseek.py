@@ -3,11 +3,15 @@ import warnings
 from typing import Dict, Optional
 
 import torch
-import torch.utils.checkpoint
 from transformers import AutoModelForCausalLM
 from transformers.cache_utils import Cache
 
 
+# The model is in
+# /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_modelopt/autodeploy_data/
+# hf_home/modules/transformers_modules/56d4cbbb4d29f4355bab4b9a39ccb717a14ad5ad/
+# modeling_deepseek.py
+@torch.inference_mode()
 def deepseek_v3_attention(
     self,
     hidden_states: torch.Tensor,
@@ -18,7 +22,12 @@ def deepseek_v3_attention(
     use_cache: bool = False,
     **kwargs,
 ):
-    """DeepSeekV3Attention forward function rewritten to wrap MultiheadLatentAttention as a custom op."""
+    """DeepSeekV3Attention forward function rewritten to wrap MultiheadLatentAttention as a custom op.
+
+    TODO: explain what I'm doing here
+
+
+    """
     if "padding_mask" in kwargs:
         warnings.warn(
             "Passing `padding_mask` is deprecated and will be removed in v4.37. "
@@ -26,50 +35,50 @@ def deepseek_v3_attention(
         )
     bsz, q_len, _ = hidden_states.size()
 
-    # If else paths are determined by config.json
-    if self.q_lora_rank is None:
-        q = self.q_proj(hidden_states)
-    else:
-        q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
-    q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
-    q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+    assert self.q_lora_rank is not None, "q_lora_rank must be set"
 
-    compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
+    # x * W_DQ (i.e. q down projection)
+    q_normed_dn = self.q_a_layernorm(self.q_a_proj(hidden_states))  # (bsz, q_len, self.q_lora_rank)
+
+    wq_b = self.q_b_proj.weight  # (self.num_heads * self.q_head_dim, self.q_lora_rank)
+
+    # c_KV = x * W_DKV (i.e. kv down projection)
+    compressed_kv = self.kv_a_proj_with_mqa(hidden_states)  # [bsz, q_len, 512 + 64]
+    # Separates the compressed kv into the low-rank part and the positional encoding part
     compressed_kv, k_pe = torch.split(
         compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-    )
+    )  # compressed_kv ~ [bsz, q_len, 512 ], k_pe ~ [bsz, q_len, 64]
+    compressed_kv = self.kv_a_layernorm(compressed_kv)
     k_pe = k_pe.view(bsz, q_len, 1, self.qk_rope_head_dim).transpose(1, 2)
-    kv = (
-        self.kv_b_proj(self.kv_a_layernorm(compressed_kv))
-        .view(bsz, q_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
-        .transpose(1, 2)
-    )
-    _, value_states = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-    kv_seq_len = value_states.shape[-2]
-    if past_key_value is not None:
-        raise ValueError("past_key_value is not supported")
-    cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+
+    cos_cache, sin_cache = self.rotary_emb.cos_cached, self.rotary_emb.sin_cached
+
+    wkv_b = self.kv_b_proj.weight  # [128 * 256, 512]
+    wo_proj = self.o_proj.weight
 
     # Use custom op to capture mla. This does not handle KV cache
     # as passing transformers Cache into a custom op is throwing an error.
-    # Would not be an issue, cause we intend to replace mla op with our implementation further along the pipeline
-    attn_output = torch.ops.auto_deploy.torch_attention_deepseek_fused_mla(
-        q_nope,
-        q_pe,
-        kv,
+    # Is not an issue, because we intend to replace mla op with our implementation further along the pipeline
+    args = (
+        q_normed_dn,
+        compressed_kv,
         k_pe,
-        cos,
-        sin,
-        position_ids,
-        attention_mask,
-        self.softmax_scale,
+        sin_cache,
+        cos_cache,
+        wkv_b,  # CONSTANTS
+        wq_b,
+        None,  # w_uq_ukv
+        wo_proj,
+        None,  # w_uv_o
+        position_ids,  # METADATA
+        self.softmax_scale,  # CONSTANTS
     )
 
-    attn_output = attn_output.transpose(1, 2).contiguous()
-    attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
-    attn_output = self.o_proj(attn_output)
+    attn_output = torch.ops.auto_deploy.torch_deepseek_mla_no_cache(*args)
+    if not output_attentions:
+        attn_weights = None
 
-    return attn_output, None, past_key_value
+    return attn_output, attn_weights, past_key_value
 
 
 # This patched module matches exactly with HF generate
@@ -168,6 +177,7 @@ CUSTOM_MODULE_PATCHES: Dict[str, callable] = {
     "DeepseekV3YarnRotaryEmbedding": deepseek_v3_rope,
     "DeepseekV2RotaryEmbedding": deepseek_v3_rope,
     "DeepseekV2YarnRotaryEmbedding": deepseek_v3_rope,
+    "DeepseekV3Attention": deepseek_v3_attention,
 }
 
 
