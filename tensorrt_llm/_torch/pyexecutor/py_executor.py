@@ -141,7 +141,8 @@ class PyExecutor:
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
         self.global_rank = dist.rank
-
+        self.max_stats_len = int(os.environ.get("TLLM_MAX_STATS_LEN", 1000))
+        self.max_stats_len = self.max_stats_len if self.max_stats_len > 0 else 1
         # Store the execution stream for model forward operations.
         # This stream is used for proper synchronization with KVCacheTransferManager.
         # execution_stream can be provided by create_py_executor
@@ -846,6 +847,8 @@ class PyExecutor:
                            req_stats: Optional[List[RequestStats]] = None):
 
         with self.stats_lock:
+            if len(self.stats) > self.max_stats_len:
+                self.stats.pop(0)
             self.stats.append((stats, req_stats))
 
     def _process_iter_stats(
