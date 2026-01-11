@@ -16,6 +16,7 @@ try:
 except Exception:
     MPI = None  # deferred; functions will error if used when ENABLE_MULTI_DEVICE is True
 
+from tensorrt_llm._mnnvl_utils import init_helix_cp_comm
 from tensorrt_llm._utils import (mpi_allgather, mpi_barrier, mpi_comm,
                                  mpi_disabled, mpi_isend, mpi_isend_object,
                                  mpi_recv, mpi_recv_object, mpi_send,
@@ -888,6 +889,7 @@ def init_pp_comm(mapping):
         _pp_comm = PPCommTorch(mapping)
     else:
         _pp_comm = PPCommNCCL(mapping)
+    init_helix_cp_comm(mapping)
 
 
 @TorchDist.log_op
