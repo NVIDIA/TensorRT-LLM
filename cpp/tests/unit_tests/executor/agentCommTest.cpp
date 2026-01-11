@@ -193,7 +193,7 @@ TEST_P(AgentCommTest, AgentConnectionManagerConnect)
     auto cacheState1 = *mCacheState;
     tensorrt_llm::executor::DataTransceiverState dataTransceiverState0{cacheState0, commState0};
     tensorrt_llm::executor::DataTransceiverState dataTransceiverState1{cacheState1, commState1};
-    tensorrt_llm::batch_manager::RequestInfo sendRequestInfo{requestId, dataTransceiverState0};
+    tensorrt_llm::batch_manager::RequestInfo sendRequestInfo{requestId, dataTransceiverState0, 0};
     std::vector<std::optional<size_t>> cacheBufferIds{std::optional<size_t>{0}};
     int validConnectionIdx = 0;
     // convert to AgentConnection
@@ -203,7 +203,7 @@ TEST_P(AgentCommTest, AgentConnectionManagerConnect)
 
     tensorrt_llm::batch_manager::RequestInfo recvRequestInfo;
     auto connection1 = connectionManager1->recvConnectionAndRequestInfo(recvRequestInfo, std::atomic<bool>(false));
-    ASSERT_EQ(recvRequestInfo.getRequestId(), requestId);
+    ASSERT_EQ(recvRequestInfo.getContextRequestId(), requestId);
 
     auto sendBuffer = mTransBufferManager->getSendBuffer(cacheBufferIds[0].value());
     auto sendSize = 1024;
