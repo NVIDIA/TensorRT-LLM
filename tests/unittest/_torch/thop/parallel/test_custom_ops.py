@@ -96,7 +96,6 @@ def test_register_fake(custom_ops):
         "trtllm::bf16_mxe2m1_block_scale_moe_runner",
         "trtllm::e4m3_mxe2m1_block_scale_moe_runner",
         "trtllm::mxe4m3_mxe2m1_block_scale_moe_runner",
-        "trtllm::mxfp8_quantize",
         "trtllm::moe_a2a_dispatch",
         "trtllm::moe_a2a_combine",
         "trtllm::moe_a2a_initialize",
