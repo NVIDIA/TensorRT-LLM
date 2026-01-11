@@ -328,6 +328,39 @@ class MappingBase:
             return torch.tensor_split(torch.arange(num_layers),
                                       self.pp_size)[self.pp_rank].tolist()
 
+    def pp_rank_of_layer(self, layer_idx: int, num_layers: int) -> int:
+        """Return pipeline-parallel rank that owns `layer_idx` for a model with `num_layers` layers.
+        Mirrors the partitioning behavior in `pp_layers()`.
+        """
+        if layer_idx < 0 or layer_idx >= num_layers:
+            raise ValueError(f"{layer_idx=} is out of range for {num_layers=}.")
+        if not self.has_pp():
+            return 0
+
+        if self.pp_partition is not None:
+            if len(self.pp_partition) != self.pp_size:
+                raise ValueError(
+                    f"{len(self.pp_partition)=} does not match {self.pp_size=}."
+                )
+            if sum(self.pp_partition) != num_layers:
+                raise ValueError(
+                    f"{sum(self.pp_partition)=} does not match {num_layers=}.")
+            end = 0
+            for pp_rank, n in enumerate(self.pp_partition):
+                end += n
+                if layer_idx < end:
+                    return pp_rank
+            raise RuntimeError("Unreachable: invalid pp_partition.")
+
+        base, rem = divmod(num_layers, self.pp_size)
+        if base == 0:
+            # Matches torch.tensor_split: first `num_layers` ranks get one layer.
+            return layer_idx
+        cutoff = (base + 1) * rem
+        if layer_idx < cutoff:
+            return layer_idx // (base + 1)
+        return rem + (layer_idx - cutoff) // base
+
     def ep_experts(self, num_experts: int) -> List[int]:
         assert self.cp_size == 1
         experts_per_rank = num_experts // self.moe_ep_size
