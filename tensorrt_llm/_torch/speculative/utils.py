@@ -219,14 +219,19 @@ def get_num_spec_layers(spec_config):
     return 0
 
 
-def get_spec_worker(spec_config, model_config, mapping):
+def get_spec_worker(spec_config,
+                    model_config,
+                    mapping,
+                    use_separate_draft_kv_cache: bool = False):
     spec_dec_mode = spec_config.spec_dec_mode
     if spec_dec_mode.is_mtp_vanilla():
-        return MTPWorker(spec_config, model_config)
+        return MTPWorker(spec_config, model_config, use_separate_draft_kv_cache)
     if spec_dec_mode.is_mtp_eagle_one_model():
-        return MTPEagleWorker(spec_config, model_config)
+        return MTPEagleWorker(spec_config, model_config,
+                              use_separate_draft_kv_cache)
     if spec_dec_mode.is_eagle3_one_model():
-        return Eagle3OneModelWorker(spec_config, mapping)
+        return Eagle3OneModelWorker(spec_config, mapping,
+                                    use_separate_draft_kv_cache)
     return None
 
 

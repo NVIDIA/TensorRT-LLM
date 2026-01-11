@@ -358,8 +358,11 @@ class Eagle3OneModelSampler(MTPSampler):
 
 class Eagle3OneModelWorker(SpecWorkerBase):
 
-    def __init__(self, spec_config: "EagleDecodingConfig", mapping: Mapping):
-        super().__init__()
+    def __init__(self,
+                 spec_config: "EagleDecodingConfig",
+                 mapping: Mapping,
+                 use_separate_draft_kv_cache: bool = False):
+        super().__init__(use_separate_draft_kv_cache)
         self.spec_config = spec_config
         self.mapping = mapping
 
@@ -369,8 +372,15 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
     # Skip torch.compile for now since current Torch is not compatible with Triton 3.4
     # @torch.compile(options={"max-autotune": True})
-    def forward(self, input_ids, position_ids, hidden_states, logits,
-                attn_metadata, spec_metadata, draft_model):
+    def forward(self,
+                input_ids,
+                position_ids,
+                hidden_states,
+                logits,
+                attn_metadata,
+                spec_metadata,
+                draft_model,
+                resource_manager=None):
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
@@ -401,6 +411,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # Predict draft tokens
         next_draft_tokens = []
         original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+
+        # Get the draft KV cache manager if using separate layouts
+        draft_kv_cache_manager = self.get_draft_kv_cache_manager(
+            resource_manager)
+
         for i in range(self.max_draft_len):
             if i == 0:
                 start_ids_gen = (spec_metadata.batch_indices_cuda[:num_gens] *
@@ -428,7 +443,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 elif spec_metadata.all_rank_num_seqs is not None:
                     attn_metadata.all_rank_num_tokens = spec_metadata.all_rank_num_seqs
 
-            hidden_states, hidden_states_to_save = draft_model.model(**inputs)
+            with self.draft_kv_cache_context(attn_metadata,
+                                             draft_kv_cache_manager):
+                inputs["attn_metadata"] = attn_metadata
+                hidden_states, hidden_states_to_save = draft_model.model(
+                    **inputs)
 
             # FIXME (jhaotingc): Currently we disable use_spec_decoding mode for Eagle engine nth steps except 1st step.
             # Eagle engine takes in draft_len tokens from the previous step, run spec-dec mode with those tokens,

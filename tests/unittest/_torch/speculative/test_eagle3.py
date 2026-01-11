@@ -92,39 +92,72 @@ def test_kv_lens_runtime_with_eagle3_one_model():
 
 
 @pytest.mark.parametrize(
-    "use_cuda_graph,attn_backend,disable_overlap_scheduler,enable_block_reuse,use_one_model,enable_chunked_prefill,use_chain_drafter,multi_batch,attention_dp",
+    "use_cuda_graph,attn_backend,disable_overlap_scheduler,enable_block_reuse,use_one_model,enable_chunked_prefill,use_chain_drafter,multi_batch,attention_dp,use_separate_draft_kv_cache",
     [
-        [True, "TRTLLM", True, False, False, False, True, False, False],
-        [True, "TRTLLM", True, False, False, False, False, False, False],
-        [False, "TRTLLM", True, False, False, False, True, False, False],
-        [False, "TRTLLM", True, False, False, False, False, False, False],
-        [True, "FLASHINFER", True, False, False, False, True, False, False],
-        [False, "FLASHINFER", True, False, False, False, True, False, False],
-        [False, "TRTLLM", False, True, True, False, True, False, False],
-        [True, "TRTLLM", False, True, True, False, True, False, False],
-        [True, "TRTLLM", True, False, True, True, True, False, False],
-        [True, "TRTLLM", True, False, True, False, True, False, False],
-        [True, "TRTLLM", True, False, False, True, True, False, False],
-        [True, "TRTLLM", False, False, False, False, True, False, False],
-        [False, "TRTLLM", False, False, False, False, True, False, False],
-        [True, "TRTLLM", False, False, False, False, False, True, False],
-        [True, "TRTLLM", False, False, False, False, False, True, True],
-        [False, "TRTLLM", False, False, False, False, False, True, False],
-        [True, "TRTLLM", False, False, False, False, True, True, False],
-        [False, "TRTLLM", False, False, False, False, True, True, False],
-        [True, "TRTLLM", False, False, False, False, False, False, False],
-        [False, "TRTLLM", False, False, False, False, False, False, False],
-        [True, "TRTLLM", False, False, False, True, True, False, False],
-        [True, "TRTLLM", False, False, False, True, False, False, False],
-        [True, "FLASHINFER", False, False, False, False, True, False, False],
-        [False, "FLASHINFER", False, False, False, False, True, False, False],
+        [True, "TRTLLM", True, False, False, False, True, False, False, False],
+        [True, "TRTLLM", True, False, False, False, False, False, False, False],
+        [False, "TRTLLM", True, False, False, False, True, False, False, False],
+        [
+            False, "TRTLLM", True, False, False, False, False, False, False,
+            False
+        ],
+        [
+            True, "FLASHINFER", True, False, False, False, True, False, False,
+            False
+        ],
+        [
+            False, "FLASHINFER", True, False, False, False, True, False, False,
+            False
+        ],
+        [False, "TRTLLM", False, True, True, False, True, False, False, False],
+        [True, "TRTLLM", False, True, True, False, True, False, False, False],
+        [True, "TRTLLM", True, False, True, True, True, False, False, False],
+        [True, "TRTLLM", True, False, True, False, True, False, False, False],
+        [True, "TRTLLM", True, False, False, True, True, False, False, False],
+        [True, "TRTLLM", False, False, False, False, True, False, False, False],
+        [
+            False, "TRTLLM", False, False, False, False, True, False, False,
+            False
+        ],
+        [True, "TRTLLM", False, False, False, False, False, True, False, False],
+        [True, "TRTLLM", False, False, False, False, False, True, True, False],
+        [
+            False, "TRTLLM", False, False, False, False, False, True, False,
+            False
+        ],
+        [True, "TRTLLM", False, False, False, False, True, True, False, False],
+        [False, "TRTLLM", False, False, False, False, True, True, False, False],
+        [
+            True, "TRTLLM", False, False, False, False, False, False, False,
+            False
+        ],
+        [
+            False, "TRTLLM", False, False, False, False, False, False, False,
+            False
+        ],
+        [True, "TRTLLM", False, False, False, True, True, False, False, False],
+        [True, "TRTLLM", False, False, False, True, False, False, False, False],
+        [
+            True, "FLASHINFER", False, False, False, False, True, False, False,
+            False
+        ],
+        [
+            False, "FLASHINFER", False, False, False, False, True, False, False,
+            False
+        ],
+        # Test use_separate_draft_kv_cache with one-model mode
+        [True, "TRTLLM", False, True, True, False, False, True, False, True],
+        [True, "TRTLLM", True, False, True, False, False, False, False, True],
+        [False, "TRTLLM", False, True, True, True, False, True, False, True],
+        [False, "TRTLLM", True, False, True, False, False, True, False, True],
     ])
 @pytest.mark.high_cuda_memory
 def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
                       disable_overlap_scheduler: bool, enable_block_reuse: bool,
                       use_one_model: bool, enable_chunked_prefill: bool,
                       use_chain_drafter: bool, multi_batch: bool,
-                      attention_dp: bool, request):
+                      attention_dp: bool, use_separate_draft_kv_cache: bool,
+                      request):
     # Eagle3 one model works with overlap scheduler and block reuse.
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 35:
@@ -168,6 +201,7 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
         speculative_model_dir=eagle_model_dir,
         # Llama 3 does not support one model eagle.
         eagle3_one_model=use_one_model,
+        use_separate_draft_kv_cache=use_separate_draft_kv_cache,
     )
     spec_config._allow_chain_drafter = use_chain_drafter
 

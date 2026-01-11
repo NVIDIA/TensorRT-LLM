@@ -857,6 +857,8 @@ class EagleDecodingConfig(DecodingBaseConfig):
     # The model architecture of the eagle3 model.
     # choices: llama3, mistral_large3
     eagle3_model_arch: str = "llama3"
+    # Whether to use a separate KV cache manager for the draft model in one-model mode.
+    use_separate_draft_kv_cache: bool = False
 
     def __init__(self, **kwargs):
         super().__init__()
@@ -1090,6 +1092,8 @@ class MTPDecodingConfig(DecodingBaseConfig):
     relaxed_delta: float = 0.
     use_mtp_vanilla: bool = False
     mtp_eagle_one_model: bool = True
+    # Whether to use a separate KV cache manager for the draft model in one-model mode.
+    use_separate_draft_kv_cache: bool = False
 
     # TODO: remove this after distinguishing `max_draft_len` and `num_nextn_predict_layers`
     # Now we need a flag when MTPDecodingConfig is updated by PyTorchModelEngine.
