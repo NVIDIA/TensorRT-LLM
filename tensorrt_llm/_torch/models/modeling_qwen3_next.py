@@ -754,8 +754,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         batch_split_size = [num_prefills, num_decodes]
         has_initial_states = mamba_metadata.has_initial_states
 
-        state_indices = attn_metadata.kv_cache_manager.get_state_indices(
-        )[:num_prefills + num_decodes]
+        batch_size = num_prefills + num_decodes
+        state_indices = mamba_metadata.state_indices[:batch_size]
 
         state_indices_p, state_indices_d = torch.split(state_indices,
                                                        batch_split_size)

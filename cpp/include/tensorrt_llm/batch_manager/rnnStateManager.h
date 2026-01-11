@@ -16,10 +16,15 @@
 
 #pragma once
 
+#include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
+
+#include <optional>
+#include <unordered_map>
+#include <vector>
 
 namespace tensorrt_llm::batch_manager::rnn_state_manager
 {
@@ -30,9 +35,15 @@ public:
     using TensorPtr = runtime::ITensor::SharedPtr;
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
     using TensorMap = runtime::StringPtrMap<runtime::ITensor>;
+    using RequestIdType = tensorrt_llm::batch_manager::LlmRequest::RequestIdType;
 
     RnnStateManager(SizeType32 maxNumSequences, tensorrt_llm::runtime::ModelConfig const& modelConfig,
         runtime::WorldConfig const& worldConfig, tensorrt_llm::runtime::BufferManager const& bufferManager);
+
+    RnnStateManager(SizeType32 dState, SizeType32 dConv, SizeType32 numHeads, SizeType32 nGroups, SizeType32 headDim,
+        SizeType32 numLayers, SizeType32 maxBatchSize, runtime::WorldConfig const& worldConfig, int64_t stream,
+        nvinfer1::DataType dtype, nvinfer1::DataType ssmCacheDtype,
+        std::optional<std::vector<bool>> const& layerMask = std::nullopt);
 
     void getPtrBuffers(TensorMap& inputBuffers, runtime::ModelConfig const& modelConfig,
         runtime::WorldConfig const& worldConfig) const;
@@ -40,7 +51,23 @@ public:
     void fillSlotMapping(
         runtime::ITensor& dstPointers, SizeType32 dstSlotOffset, SizeType32 seqSlotIdx, SizeType32 beamWidth) const;
 
+    void allocateCacheBlocks(std::vector<RequestIdType> const& requestIds);
+
+    void freeCacheBlock(RequestIdType requestId);
+
+    [[nodiscard]] SizeType32 getCacheIndex(RequestIdType requestId) const;
+
+    [[nodiscard]] std::vector<SizeType32> getStateIndices(
+        std::vector<RequestIdType> const& requestIds, std::vector<bool> const& isPadding);
+
+    [[nodiscard]] TensorPtr getConvStates(SizeType32 layerIdx) const;
+
+    [[nodiscard]] TensorPtr getSsmStates(SizeType32 layerIdx) const;
+
 private:
+    static std::vector<SizeType32> getPpLayers(SizeType32 numLayers, runtime::WorldConfig const& worldConfig,
+        std::optional<std::vector<bool>> const& layerMask);
+
     // If we need support beam search, we may need mMaxBeamWidth + 1 slots and use separate input / output states.
     TensorPtr pagedRnnStates;  // [local_nb_layers, max_seq_num * max_beam_width, state_size, rnn_hidden_size] or
                                // [local_nb_layers, max_seq_num * max_beam_width, num_heads, state_size, rnn_head_size]
@@ -55,6 +82,11 @@ private:
     SizeType32 mMaxNumSequences = 0;
     SizeType32 mMaxBeamWidth = 0;
     SizeType32 mBeamSlotsPerSequence = 0;
+    std::unordered_map<SizeType32, SizeType32> mLayerOffsets;
+    std::vector<SizeType32> mFreeBlocks;
+    std::vector<SizeType32> mTempBlocks; // Temp blocks allocated for padding requests
+    std::unordered_map<RequestIdType, SizeType32> mCacheIndex;
+    std::optional<runtime::BufferManager> mBufferManager;
 };
 
 } // namespace tensorrt_llm::batch_manager::rnn_state_manager
