@@ -491,7 +491,7 @@ class _StrategyImpls:
                 #     compute unnecessarily softmax also for situations allowing
                 #     flashinfer.sampling...._sampling_from_logits.
                 # indices=group_logit_indices,
-                filter_apply_order="top_k_first",
+                filter_apply_order="joint",
                 deterministic=True,
                 check_nan=self._flashinfer_check_nans(logits),
                 generator=generator,
