@@ -126,11 +126,13 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.parametrize("enable_chunked_prefill", [False, True])
-    def test_auto_dtype(self, enable_chunked_prefill):
+    @pytest.mark.parametrize("world_size", [1, 4])
+    def test_auto_dtype(self, enable_chunked_prefill, world_size):
         kwargs = self.get_default_kwargs(enable_chunked_prefill)
         sampling_params = self.get_default_sampling_params()
         with AutoDeployLLM(model=self.MODEL_PATH,
                            tokenizer=self.MODEL_PATH,
+                           world_size=world_size,
                            **kwargs) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=sampling_params)
@@ -165,8 +167,8 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
             "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
             "transforms": {
                 "detect_sharding": {
-                    "sharding_source": ['factory', 'heuristic'],
-                    "sharding_dims": ['ep', 'bmm'],
+                    "sharding_source": ['heuristic'],
+                    "sharding_dims": ['tp'],
                 },
                 "multi_stream_moe": {
                     "stage": "compile",
