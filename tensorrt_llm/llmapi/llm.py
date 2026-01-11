@@ -44,6 +44,9 @@ from .llm_args import (TORCH_LLMARGS_EXPLICIT_DOCSTRING,
                        PybindMirror, TorchLlmArgs, TrtLlmArgs)
 from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig,
                         LlmBuildStats, ModelLoader, _ModelRuntimeContext)
+from .model_support_matrix import Feature as SupportFeature
+from .model_support_matrix import SupportStatus
+from .model_support_matrix import get_status as get_support_status
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
 from .tokenizer import TokenizerBase, _xgrammar_tokenizer_info
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
@@ -251,6 +254,84 @@ class BaseLLM:
 
         exception_handler.register(self, 'shutdown')
         atexit.register(LLM._shutdown_wrapper, weakref.ref(self))
+
+    def _warn_unsupported_features(self) -> None:
+        """Warn or auto-disable features marked unsupported in the model matrix.
+
+        When auto_disable_unsupported_features=False (default): warns only.
+        When auto_disable_unsupported_features=True: auto-disables the feature.
+        """
+        cfg = getattr(self, "_hf_model_config", None)
+        if cfg is None:
+            return
+        archs = getattr(cfg, "architectures", None)
+        if not (isinstance(archs, (list, tuple)) and archs
+                and isinstance(archs[0], str)):
+            return
+        arch = archs[0]
+
+        auto_disable = getattr(self.args, "auto_disable_unsupported_features",
+                               False)
+
+        def _check_feature(
+            feature: SupportFeature,
+            *,
+            enabled: bool,
+            arg_path: str,
+            disable,
+        ) -> None:
+            if not enabled:
+                return
+            status = get_support_status(arch, feature)
+            if status not in (SupportStatus.NO, SupportStatus.NA):
+                return
+
+            if auto_disable:
+                logger.warning(
+                    f"{arch}: {feature.value} not supported; disabling {arg_path}"
+                )
+                disable()
+            else:
+                logger.warning(
+                    f"{arch}: {feature.value} may not be supported. "
+                    f"If you encounter issues, try setting {arg_path}=False.")
+
+        kv_cfg = getattr(self.args, "kv_cache_config", None)
+
+        def _disable_kv_cache_reuse() -> None:
+            if kv_cfg is not None:
+                kv_cfg.enable_block_reuse = False
+
+        _check_feature(
+            SupportFeature.KV_CACHE_REUSE,
+            enabled=kv_cfg is not None
+            and getattr(kv_cfg, "enable_block_reuse", False),
+            arg_path="kv_cache_config.enable_block_reuse",
+            disable=_disable_kv_cache_reuse,
+        )
+
+        _check_feature(
+            SupportFeature.CHUNKED_PREFILL,
+            enabled=getattr(self.args, "enable_chunked_prefill", False),
+            arg_path="enable_chunked_prefill",
+            disable=lambda: setattr(self.args, "enable_chunked_prefill", False),
+        )
+
+        _check_feature(
+            SupportFeature.ATTENTION_DP,
+            enabled=getattr(self.args, "enable_attention_dp", False),
+            arg_path="enable_attention_dp",
+            disable=lambda: setattr(self.args, "enable_attention_dp", False),
+        )
+
+        _check_feature(
+            SupportFeature.OVERLAP_SCHEDULER,
+            enabled=hasattr(self.args, "disable_overlap_scheduler")
+            and getattr(self.args, "disable_overlap_scheduler") is False,
+            arg_path="disable_overlap_scheduler",
+            disable=lambda: setattr(self.args, "disable_overlap_scheduler", True
+                                    ),
+        )
 
     @property
     @set_api_status("beta")
@@ -810,7 +891,9 @@ class BaseLLM:
 
     def _try_load_hf_model_config(
             self) -> Optional[transformers.PretrainedConfig]:
-        return ModelLoader.load_hf_model_config(self.args.model)
+        model_dir = self._hf_model_dir if self._hf_model_dir is not None else self.args.model
+        return ModelLoader.load_hf_model_config(
+            model_dir, trust_remote_code=self.args.trust_remote_code)
 
     @set_api_status("beta")
     def shutdown(self) -> None:
@@ -922,6 +1005,7 @@ class _TrtLLM(BaseLLM):
         # It should also be before bindings ExecutorConfig, which may depend on tokenizer info.
         self._tokenizer = self._try_load_tokenizer()
         self._hf_model_config = self._try_load_hf_model_config()
+        self._warn_unsupported_features()
         self._generation_config = self._try_load_generation_config()
 
         # Multimodal special handling:
@@ -1116,6 +1200,7 @@ class _TorchLLM(BaseLLM):
         # It should also be before bindings ExecutorConfig, which may depend on tokenizer info.
         self._tokenizer = self._try_load_tokenizer()
         self._hf_model_config = self._try_load_hf_model_config()
+        self._warn_unsupported_features()
         self._generation_config = self._try_load_generation_config()
 
         # Multimodal special handling:
