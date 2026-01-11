@@ -1,34 +1,49 @@
 import contextlib
 import functools
 import itertools
-import os
 import unittest.mock
 import weakref
-from abc import ABC, abstractmethod
+from enum import IntEnum
 from typing import Optional
 
 import torch
 
+import tensorrt_llm._torch.model_config
+import tensorrt_llm.bindings
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_utils import PostInitCaller, skip_forward
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_wide_ep import WideEPMoE
-from tensorrt_llm._torch.modules.linear import Linear, WeightMode
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
-from tensorrt_llm._torch.pyexecutor.config_utils import is_mla, is_qwen3_next
+from tensorrt_llm._torch.pyexecutor.config_utils import (
+    is_mla,
+    is_nemotron_hybrid,
+    is_qwen3_next,
+    load_pretrained_config,
+)
+from tensorrt_llm._torch.pyexecutor.model_loader import (
+    ModelLoader,
+    _construct_checkpoint_loader,
+    validate_and_set_kv_cache_quant,
+    validate_and_set_mamba_ssm_cache_dtype,
+)
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.utils import get_model_extra_attrs, model_extra_attrs
 from tensorrt_llm._utils import local_mpi_size, mpi_rank, mpi_world_size, torch_dtype_to_binding
-from tensorrt_llm.bindings.executor import KvCacheConfig
-from tensorrt_llm.bindings.internal.batch_manager import CacheType
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MoeConfig, TorchLlmArgs
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from .runner_interface import BalanceMethod
+
+class BalanceMethod(IntEnum):
+    NotModified = 1
+    Balanced = 2
+    ImbalancedRanks = 3
+    ImbalancedExperts = 4
 
 
 def ceil_div(a, b):
@@ -102,31 +117,28 @@ def test_get_balanced_selection():
                         raise ValueError("tokens per expert is not balanced")
 
 
-def apply_balance_ratio(imbalanced_experts, num_experts, balance_ratio, dp_size, dp_rank, ep_size):
-    num_tokens, top_k = imbalanced_experts.shape
-    dtype = imbalanced_experts.dtype
-    device = imbalanced_experts.device
-    balanced_experts = get_balanced_selection_no_cache(
-        num_tokens, top_k, num_experts, dtype, device, dp_size, dp_rank, ep_size
-    )
+def get_num_balanced_tokens(num_tokens, top_k, num_experts, dp_size, balance_ratio):
     if balance_ratio == 0.0:
-        num_balanced_tokens = 0
+        return 0
     else:
         # Activate all experts
         min_num_balanced_tokens = min(num_tokens, ceil_div(num_experts, dp_size * top_k))
-        num_balanced_tokens = min_num_balanced_tokens + round(
+        return min_num_balanced_tokens + round(
             (num_tokens - min_num_balanced_tokens) * balance_ratio
         )
-    mixed_experts = torch.cat(
-        [balanced_experts[:num_balanced_tokens], imbalanced_experts[num_balanced_tokens:]]
-    )
-    return mixed_experts
 
 
 @functools.cache
 def get_all_to_one_selection(
     num_tokens, top_k, num_experts, balance_ratio, dtype, device, dp_size, dp_rank, ep_size
 ):
+    num_balanced_tokens = get_num_balanced_tokens(
+        num_tokens, top_k, num_experts, dp_size, balance_ratio
+    )
+    balanced_experts = get_balanced_selection_no_cache(
+        num_balanced_tokens, top_k, num_experts, dtype, device, dp_size, dp_rank, ep_size
+    )
+    num_imbalanced_tokens = num_tokens - num_balanced_tokens
     experts_per_rank = num_experts // ep_size
     if top_k > experts_per_rank:
         raise ValueError(
@@ -134,29 +146,34 @@ def get_all_to_one_selection(
         )
     imbalanced_experts = (
         torch.arange(
-            dp_rank * num_tokens * top_k,
-            (dp_rank + 1) * num_tokens * top_k,
+            dp_rank * num_imbalanced_tokens * top_k,
+            (dp_rank + 1) * num_imbalanced_tokens * top_k,
             dtype=dtype,
             device=device,
-        ).view(num_tokens, top_k)
+        ).view(num_imbalanced_tokens, top_k)
         % experts_per_rank
     )
-    imbalanced_experts = imbalanced_experts.sort(dim=-1).values
-    return apply_balance_ratio(
-        imbalanced_experts, num_experts, balance_ratio, dp_size, dp_rank, ep_size
-    )
+    mixed_experts = torch.cat([balanced_experts, imbalanced_experts])
+    return mixed_experts.sort(dim=-1).values
 
 
 @functools.cache
 def get_balanced_rank_imbalanced_expert_selection(
     num_tokens, top_k, num_experts, balance_ratio, dtype, device, dp_size, dp_rank, ep_size
 ):
+    num_balanced_tokens = get_num_balanced_tokens(
+        num_tokens, top_k, num_experts, dp_size, balance_ratio
+    )
+    balanced_experts = get_balanced_selection_no_cache(
+        num_balanced_tokens, top_k, num_experts, dtype, device, dp_size, dp_rank, ep_size
+    )
+    num_imbalanced_tokens = num_tokens - num_balanced_tokens
     experts_per_rank = num_experts // ep_size
     active_experts_per_rank = ceil_div(top_k, ep_size)
     # Select expert from [0, active_experts_per_rank * ep_size),
     # then scale to [0, experts_per_rank * ep_size)
     narrow_experts = get_balanced_selection_no_cache(
-        num_tokens,
+        num_imbalanced_tokens,
         top_k,
         active_experts_per_rank * ep_size,
         dtype,
@@ -169,9 +186,8 @@ def get_balanced_rank_imbalanced_expert_selection(
         narrow_experts // active_experts_per_rank * experts_per_rank
         + narrow_experts % active_experts_per_rank
     )
-    return apply_balance_ratio(
-        imbalanced_experts, num_experts, balance_ratio, dp_size, dp_rank, ep_size
-    )
+    mixed_experts = torch.cat([balanced_experts, imbalanced_experts])
+    return mixed_experts.sort(dim=-1).values
 
 
 def make_balanced_routing_method(
@@ -339,36 +355,91 @@ def make_forward_impl_check(moe_module, forward_impl_orig):
     return forward_impl
 
 
-class RunnerMixin(ABC):
-    @staticmethod
-    @abstractmethod
-    def has_mamba_metadata() -> bool:
-        pass
+class Runner:
+    def __init__(
+        self,
+        pretrained_model_name_or_path: str,
+        mapping: Mapping,
+        *,
+        load_format: str,
+        moe_backend: str,
+        layer_indices: list[int],
+        scaled_from: Optional[int],
+        max_seq_len: int,
+        max_num_tokens: int,
+        moe_max_num_tokens: int,
+        kv_cache_dtype,
+        mamba_ssm_cache_dtype: str,
+        use_low_precision_moe_combine: bool,
+        use_cuda_graph: bool,
+    ):
+        super().__init__()
+
+        checkpoint_loader = _construct_checkpoint_loader("pytorch", None, "HF")
+        # Please refer to `tensorrt_llm/_torch/pyexecutor/model_loader.py` for effective args
+        llm_args = TorchLlmArgs(
+            model=pretrained_model_name_or_path,
+            load_format=load_format,
+            **{} if use_cuda_graph else {"cuda_graph_config": None},
+            moe_config=MoeConfig(
+                backend=moe_backend,
+                max_num_tokens=moe_max_num_tokens,
+                disable_finalize_fusion=False,
+                use_low_precision_moe_combine=use_low_precision_moe_combine,
+            ),
+            attn_backend="TRTLLM",
+            kv_cache_config=KvCacheConfig(
+                dtype=kv_cache_dtype, mamba_ssm_cache_dtype=mamba_ssm_cache_dtype
+            ),
+        )
+        model_loader = ModelLoader(
+            llm_args=llm_args,
+            mapping=mapping,
+            spec_config=None,
+            sparse_attention_config=None,
+            max_num_tokens=max_num_tokens,
+            max_seq_len=max_seq_len,
+        )
+
+        with self.scaled_from_ctx(scaled_from, mapping), self.skip_unused_layers_ctx(layer_indices):
+            model, _ = model_loader.load(
+                checkpoint_dir=pretrained_model_name_or_path, checkpoint_loader=checkpoint_loader
+            )
+
+        self.layers = [model.model.layers[i] for i in layer_indices]
+        self.model_config = model.model_config
 
     @staticmethod
     @contextlib.contextmanager
-    def scaled_from_ctx(scaled_from, mapping, pretrained_config):
+    def scaled_from_ctx(scaled_from, mapping):
         if scaled_from is None:
             yield
             return
-        # To run the problem size of $B$ GPUs on $A$ GPUs, we need:
-        # (1) Attention: If TP, reduce the number of attention heads; If DP, nothing to change.
-        # (2) MoE: If EP, reduce the number of experts; If TP, reduce head size.
-        #     Maintain the result of AllToAll method selection because it is affected by EP size.
-        if not mapping.enable_attention_dp:
-            if hasattr(pretrained_config, "index_n_heads"):
-                raise NotImplementedError("Not support Indexer TP for weak scaling")
-            pretrained_config.num_attention_heads = (
-                pretrained_config.num_attention_heads // scaled_from * mapping.tp_size
-            )
-            pretrained_config.num_key_value_heads = (
-                pretrained_config.num_key_value_heads // scaled_from * mapping.tp_size
-            )
-        if mapping.moe_ep_size != mapping.world_size:
-            raise NotImplementedError("Not support MoE TP for weak scaling")
-        pretrained_config.n_routed_experts = (
-            pretrained_config.n_routed_experts // scaled_from * mapping.moe_ep_size
-        )
+
+        def make_load_pretrained_config(mapping, load_pretrained_config_orig):
+            # To run the problem size of $B$ GPUs on $A$ GPUs, we need:
+            # (1) Attention: If TP, reduce the number of attention heads; If DP, nothing to change.
+            # (2) MoE: If EP, reduce the number of experts; If TP, reduce head size.
+            #     Maintain the result of AllToAll method selection because it is affected by EP size.
+            def load_pretrained_config(*args, **kwargs):
+                pretrained_config = load_pretrained_config_orig(*args, **kwargs)
+                if not mapping.enable_attention_dp:
+                    if hasattr(pretrained_config, "index_n_heads"):
+                        raise NotImplementedError("Not support Indexer TP for weak scaling")
+                    pretrained_config.num_attention_heads = (
+                        pretrained_config.num_attention_heads // scaled_from * mapping.tp_size
+                    )
+                    pretrained_config.num_key_value_heads = (
+                        pretrained_config.num_key_value_heads // scaled_from * mapping.tp_size
+                    )
+                if mapping.moe_ep_size != mapping.tp_size:
+                    raise NotImplementedError("Not support MoE TP for weak scaling")
+                pretrained_config.n_routed_experts = (
+                    pretrained_config.n_routed_experts // scaled_from * mapping.moe_ep_size
+                )
+                return pretrained_config
+
+            return load_pretrained_config
 
         def make_select_alltoall_method_type(select_alltoall_method_type_orig):
             def select_alltoall_method_type(
@@ -408,6 +479,9 @@ class RunnerMixin(ABC):
         select_alltoall_method_type_cutlass = CutlassFusedMoE.select_alltoall_method_type
         select_alltoall_method_type_trtllm_gen = TRTLLMGenFusedMoE.select_alltoall_method_type
         select_alltoall_method_type_wide_ep = WideEPMoE.select_alltoall_method_type
+        tensorrt_llm._torch.model_config.load_pretrained_config = make_load_pretrained_config(
+            mapping, load_pretrained_config
+        )
         CutlassFusedMoE.select_alltoall_method_type = make_select_alltoall_method_type_2(
             select_alltoall_method_type_cutlass
         )
@@ -420,40 +494,50 @@ class RunnerMixin(ABC):
         try:
             yield
         finally:
+            tensorrt_llm._torch.model_config.load_pretrained_config = load_pretrained_config
             CutlassFusedMoE.select_alltoall_method_type = select_alltoall_method_type_cutlass
             TRTLLMGenFusedMoE.select_alltoall_method_type = select_alltoall_method_type_trtllm_gen
             WideEPMoE.select_alltoall_method_type = select_alltoall_method_type_wide_ep
 
     @staticmethod
-    def apply_quant_config_exclude_modules(layers, quant_config):
-        # Please refer to tensorrt_llm/_torch/models/modeling_utils.py
-        new_quant_config = QuantConfig(kv_cache_quant_algo=quant_config.kv_cache_quant_algo)
-        for layer in layers:
-            for name, module in layer.named_modules():
-                name = f"model.layers.{layer.layer_idx}.{name}"
-                candidates = [name]
-                if isinstance(module, Linear):
-                    weight_mode = module.weights_loading_config.weight_mode
-                    if weight_mode == WeightMode.FUSED_GATE_UP_LINEAR:
-                        # sometimes gate and up proj are not packed in the checkpoint,
-                        # but they still share the same exclusion rule
-                        candidates += [
-                            name.replace("gate_up_proj", "gate_proj"),
-                            name.replace("gate_up_proj", "up_proj"),
-                        ]
-                    elif weight_mode == WeightMode.FUSED_QKV_LINEAR:
-                        # sometimes q_proj, k_proj and v_proj are not packed in the checkpoint,
-                        # but they still share the same exclusion rule
-                        candidates += [
-                            name.replace("qkv_proj", "q_proj"),
-                            name.replace("qkv_proj", "k_proj"),
-                            name.replace("qkv_proj", "v_proj"),
-                        ]
-                is_excluded = any(
-                    quant_config.is_module_excluded_from_quantization(n) for n in candidates
+    @contextlib.contextmanager
+    def skip_unused_layers_ctx(layer_indices):
+        call_orig = PostInitCaller.__call__
+
+        def call_new(cls, *args, **kwargs):
+            model = call_orig(cls, *args, **kwargs)
+            for module in (
+                model.prologue + model.model.prologue + model.model.epilogue + model.epilogue
+            ):
+                skip_forward(module)
+            num_hidden_layers = model.model_config.pretrained_config.num_hidden_layers
+            if hasattr(model.model, "embed_tokens"):
+                skip_forward(model.model.embed_tokens)
+            for layer_idx in range(num_hidden_layers):
+                layer = model.model.layers[layer_idx]
+                if layer_idx not in layer_indices:
+                    # keep next layer's input_layernorm's weights for fusion
+                    skip_forward(
+                        layer,
+                        ignore_modules=[layer.input_layernorm]
+                        if layer_idx - 1 in layer_indices
+                        and hasattr(model.model.layers[layer_idx - 1], "next_layer_layernorm")
+                        else None,
+                    )
+            if hasattr(model.model, "norm"):
+                skip_forward(
+                    model.model.norm,
+                    ignore_modules=[model.model.norm]
+                    if num_hidden_layers - 1 in layer_indices
+                    else None,
                 )
-                if is_excluded and getattr(module, "quant_config", None) is not None:
-                    module.quant_config = new_quant_config
+            return model
+
+        PostInitCaller.__call__ = call_new
+        try:
+            yield
+        finally:
+            PostInitCaller.__call__ = call_orig
 
     def create_run_pack(
         self,
@@ -466,9 +550,8 @@ class RunnerMixin(ABC):
         kv_cache_manager: KVCacheManager,
         attn_workspace: Optional[torch.Tensor] = None,
     ):
-        if self.model_config.moe_backend == "TRTLLM" and os.getenv("TRTLLM_ENABLE_PDL") != "1":
-            raise ValueError("Suggest to set TRTLLM_ENABLE_PDL=1 when moe_backend is TRTLLM")
         world_size = mpi_world_size()
+        pretrained_config = self.model_config.pretrained_config
         AttentionCls = get_attention_backend(
             self.model_config.attn_backend, self.model_config.sparse_attention_config
         )
@@ -499,7 +582,7 @@ class RunnerMixin(ABC):
         )
         attn_metadata.all_rank_num_tokens = [batch_size * seq_len_q] * world_size
         attn_metadata.prepare()
-        hidden_size = self.model_config.pretrained_config.hidden_size
+        hidden_size = pretrained_config.hidden_size
         position_ids = torch.tensor(
             [list(range(seq_len_kv_cache, seq_len_kv_cache + seq_len_q)) * batch_size],
             dtype=torch.int32,
@@ -513,9 +596,14 @@ class RunnerMixin(ABC):
         )
         kwargs = {}
 
-        if self.has_mamba_metadata():
-            # Please refer to `tensorrt_llm/_torch/models/modeling_qwen3_next.py` for `mamba_metadata`
-            mamba_metadata = Mamba2Metadata(attn_metadata.max_num_requests, chunk_size=128)
+        if is_nemotron_hybrid(pretrained_config) or is_qwen3_next(pretrained_config):
+            # Please refer to `tensorrt_llm/_torch/models/modeling_qwen3_next.py` for the magic number chunk_size=128
+            mamba_metadata = Mamba2Metadata(
+                attn_metadata.max_num_requests,
+                chunk_size=128
+                if is_qwen3_next(pretrained_config)
+                else pretrained_config.chunk_size,
+            )
             mamba_metadata.prepare(attn_metadata)
             kwargs["mamba_metadata"] = mamba_metadata
 
@@ -524,8 +612,15 @@ class RunnerMixin(ABC):
             with model_extra_attrs(self.model_config.extra_attrs):
                 get_model_extra_attrs()["attention_metadata"] = weakref.ref(attn_metadata)
                 with torch.inference_mode():
+                    # TODO: to be more general, we should call DecoderModel.forward
                     for layer in self.layers:
-                        output = layer(position_ids, output[0], attn_metadata, output[1], **kwargs)
+                        residual_fusion = hasattr(layer, "next_layer_layernorm")
+                        if residual_fusion:
+                            output = layer(
+                                position_ids, output[0], attn_metadata, output[1], **kwargs
+                            )
+                        else:
+                            output = layer(position_ids, output[0], attn_metadata, **kwargs), None
             if check:
                 if output[0].isnan().any():
                     raise ValueError("Has nan, please fix weights initialization")
@@ -554,12 +649,20 @@ class RunnerMixin(ABC):
                 f' please set balance_method to "NotModified"'
             )
         original_methods = []
-        dp_rank = self.model_config.mapping.rank // (
-            self.model_config.mapping.world_size // self.model_config.mapping.dp_size
+        dp_rank = (
+            self.model_config.mapping.tp_rank
+            if self.model_config.mapping.enable_attention_dp
+            else 0
         )
+        moe_modules = []
         for layer in self.layers:
-            moe_module = layer.mlp.experts
+            if layer.__class__.__name__ == "NemotronHLayer":
+                if layer.layer_type == "E":
+                    moe_modules.append(layer.mixer.experts)
+            else:
+                moe_modules.append(layer.mlp.experts)
 
+        for moe_module in moe_modules:
             # Replace `routing_method.apply` for normal cases
             apply_method_orig = moe_module.routing_method.apply
             moe_module.routing_method.apply = make_balanced_routing_method(
@@ -579,8 +682,8 @@ class RunnerMixin(ABC):
                 moe_module.run_moe = make_balanced_run_moe(
                     moe_module,
                     run_moe_orig,
-                    layer.mlp.experts.routing_method.top_k,
-                    layer.mlp.experts.num_experts,
+                    moe_module.routing_method.top_k,
+                    moe_module.num_experts,
                     balance_method,
                     balance_ratio,
                     self.model_config.mapping.dp_size,
@@ -598,10 +701,9 @@ class RunnerMixin(ABC):
         try:
             yield
         finally:
-            for layer, (apply_method_orig, run_moe_orig, forward_impl_orig) in zip(
-                self.layers, original_methods
+            for moe_module, (apply_method_orig, run_moe_orig, forward_impl_orig) in zip(
+                moe_modules, original_methods
             ):
-                moe_module = layer.mlp.experts
                 moe_module.routing_method.apply = apply_method_orig
                 if isinstance(moe_module, TRTLLMGenFusedMoE):
                     moe_module.run_moe = run_moe_orig
@@ -614,10 +716,14 @@ class RunnerMixin(ABC):
         tokens_per_block,
         max_batch_size,
         max_seq_len,
+        kv_cache_dtype,
+        mamba_ssm_cache_dtype,
         layer_indices,
     ):
         # Please refer to `tensorrt_llm/_torch/pyexecutor/py_executor_creator.py` for `tokens_per_block`
         model_config = ModelConfig.from_pretrained(pretrained_model_name_or_path)
+        validate_and_set_kv_cache_quant(model_config, kv_cache_dtype)
+        validate_and_set_mamba_ssm_cache_dtype(model_config, mamba_ssm_cache_dtype)
         if model_config.enable_flash_mla:
             assert tokens_per_block == 64
 
@@ -628,18 +734,17 @@ class RunnerMixin(ABC):
             max_tokens=max_batch_size * round_up(max_seq_len, tokens_per_block),
             enable_block_reuse=False,
         )
-        kv_cache_dtype = torch_dtype_to_binding(
-            {
-                None: torch.bfloat16,
-                "FP8": torch.float8_e4m3fn,
-            }[model_config.quant_config.kv_cache_quant_algo]
-        )
+        kv_cache_dtype = {
+            "FP8": tensorrt_llm.bindings.DataType.FP8,
+            "NVFP4": tensorrt_llm.bindings.DataType.NVFP4,
+            None: torch_dtype_to_binding(config.torch_dtype),
+        }[model_config.quant_config.kv_cache_quant_algo]
         if is_mla(config):
             layer_mask = [i in layer_indices for i in range(config.num_hidden_layers)]
             num_layers = sum(layer_mask)
             kv_cache_manager = kv_cache_manager_cls(
                 kv_cache_config,
-                CacheType.SELFKONLY,
+                tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
                 num_layers=num_layers,
                 num_kv_heads=1,
                 head_dim=model_config.pretrained_config.kv_lora_rank
@@ -649,8 +754,45 @@ class RunnerMixin(ABC):
                 max_batch_size=max_batch_size,
                 mapping=mapping,
                 dtype=kv_cache_dtype,
+                spec_config=None,
                 layer_mask=layer_mask,
                 sparse_attn_config=model_config.sparse_attention_config,
+            )
+        elif is_nemotron_hybrid(config):
+            mamba_layer_mask = [
+                i in layer_indices and char == "M"
+                for i, char in enumerate(config.hybrid_override_pattern)
+            ]
+            layer_mask = [
+                i in layer_indices and char == "*"
+                for i, char in enumerate(config.hybrid_override_pattern)
+            ]
+            num_mamba_layers = sum(mamba_layer_mask)
+            num_layers = sum(layer_mask)
+            kv_cache_manager = kv_cache_manager_cls(
+                # mamba cache parameters
+                config.ssm_state_size,
+                config.conv_kernel,
+                config.mamba_num_heads,
+                config.n_groups,
+                config.mamba_head_dim,
+                num_mamba_layers,
+                mamba_layer_mask,
+                config.torch_dtype,
+                model_config.quant_config.mamba_ssm_cache_dtype,
+                # kv cache parameters
+                kv_cache_config,
+                tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+                num_layers=num_layers,
+                layer_mask=layer_mask,
+                num_kv_heads=config.num_key_value_heads,
+                head_dim=config.head_dim,
+                tokens_per_block=tokens_per_block,
+                max_seq_len=max_seq_len,
+                max_batch_size=max_batch_size,
+                mapping=mapping,
+                dtype=kv_cache_dtype,
+                spec_config=None,
             )
         elif is_qwen3_next(config):
             mamba_layer_mask = [
@@ -680,7 +822,7 @@ class RunnerMixin(ABC):
                 model_config.quant_config.mamba_ssm_cache_dtype,
                 # kv cache parameters
                 kv_cache_config,
-                CacheType.SELF,
+                tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
                 num_layers=num_layers,
                 layer_mask=layer_mask,
                 num_kv_heads=config.num_key_value_heads,
