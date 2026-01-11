@@ -2393,7 +2393,8 @@ def test_llm_chunked_prefill():
                   enable_chunked_prefill=False,
                   fast_build=True)
 
-        with pytest.raises(ValueError):
+        # max_num_tokens validation now raises RequestError consistently
+        with pytest.raises(RequestError):
             output = llm.generate_async(
                 "A " * build_config.max_num_tokens,
                 sampling_params=sampling_params,
@@ -2436,13 +2437,9 @@ def _test_llm_capture_request_error(pytorch_backend: bool, tp_size: int = 1):
     )
 
     prompt = 'A ' * 65  # the minimum max_num_tokens is 64
-    if pytorch_backend:
-        # pytorch backend will raise ValueError for max_num_tokens
-        with pytest.raises(ValueError):
-            llm.generate(prompt)
-    else:
-        with pytest.raises(RequestError):
-            llm.generate(prompt)
+    # Both backends now consistently raise RequestError for max_num_tokens validation
+    with pytest.raises(RequestError):
+        llm.generate(prompt)
 
 
 def test_llm_capture_request_error():
