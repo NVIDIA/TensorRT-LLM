@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# ruff: noqa: E501
 
 """Unified MoE communication microbenchmark (MPI).
 
@@ -27,14 +29,18 @@ Timing method:
 Launch (examples):
 
 ```bash
-# Spawn 8 MPI ranks without using mpirun directly (same mechanism as our unit tests)
-python tests/microbenchmarks/bench_moe_comm.py --ep-size 8 --strategy allgather --profile gpt_oss
+# Run backend AllGather/ReduceScatter
+ python tests/microbenchmarks/bench_moe_comm.py --ep-size 8 --backend ALLGATHER --profile gpt_oss
 
-# NVLink one-sided (requires MNNVL/NVLink support)
-python tests/microbenchmarks/bench_moe_comm.py --ep-size 8 --strategy nvlink_one_sided --profile deepseek_v3
+# Run backend NVLinkOneSided
+ python tests/microbenchmarks/bench_moe_comm.cpy --ep-size 8 --backend NVLINK_ONE_SIDED --profile deepseek_v3
+
+# With batch size sweeping
+ /scratch/projects/tekit/tests/microbenchmarks/bench_moe_comm.py --ep-size 8 --backend NVLINK_ONE_SIDED -b 1 -e 1024 -f 2
 
 # Run all supported strategies for the given profile
-python tests/microbenchmarks/bench_moe_comm.py --ep-size 8 --strategy all --profile deepseek_v3
+ python tests/microbenchmarks/bench_moe_comm.py --ep-size 8 --profile deepseek_v3
+
 ```
 """
 
@@ -45,6 +51,7 @@ import json
 import os
 import pickle
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -73,12 +80,8 @@ class _DummyPretrainedConfig:
 class Profile:
     name: str
     hidden_size: int
-    local_batch_size: int
     top_k: int
-    # Note: EP size comes from MPI world size; this is just documentation / sanity-check.
-    recommended_ep_size: Optional[int] = None
-    # Routing model params (benchmark needs a total expert id space).
-    experts_per_rank: int = 32
+    num_experts: int
 
 
 PROFILES: Dict[str, Profile] = {
@@ -86,23 +89,21 @@ PROFILES: Dict[str, Profile] = {
     "deepseek_v3": Profile(
         name="deepseek_v3",
         hidden_size=7168,
-        local_batch_size=1024,
         top_k=8,
-        recommended_ep_size=8,
-        experts_per_rank=32,
+        # Previously: experts_per_rank=32 with recommended ep_size=8 => 256 total experts.
+        num_experts=256,
     ),
     # Repo already references "gpt-oss" hidden_size=2880 in the MoE A2A unit test.
     "gpt_oss": Profile(
         name="gpt_oss",
         hidden_size=2880,
-        local_batch_size=640,
         top_k=2,
-        recommended_ep_size=8,
-        experts_per_rank=8,
+        num_experts=64,
     ),
 }
 
 
+# TODO: Support tensorrt-llm quantization!
 def _torch_dtype(s: str) -> torch.dtype:
     s = s.lower()
     if s in ("bf16", "bfloat16"):
@@ -148,7 +149,8 @@ def _make_inputs(
         device=device,
     )
     # Router weights/scales.
-    token_final_scales = torch.rand(local_num_tokens, top_k, dtype=act_dtype, device=device)
+    # DeepEP expects router weights/topk_weights to be float32.
+    token_final_scales = torch.rand(local_num_tokens, top_k, dtype=torch.float32, device=device)
     return hidden_states, hidden_states_sf, token_selected_slots, token_final_scales
 
 
@@ -194,6 +196,23 @@ def _profile_stop(enabled: bool):
     torch.cuda.profiler.stop()
 
 
+@contextmanager
+def _nvtx_range(msg: str, enabled: bool) -> None:
+    """Best-effort NVTX range helper for Nsight Systems timelines."""
+    if not enabled:
+        yield
+        return
+    try:
+        torch.cuda.nvtx.range_push(msg)
+        yield
+    finally:
+        # Avoid masking the original exception if NVTX isn't available for some reason.
+        try:
+            torch.cuda.nvtx.range_pop()
+        except Exception:
+            pass
+
+
 def _time_dispatch_and_combine(
     strategy: Any,
     *,
@@ -205,26 +224,31 @@ def _time_dispatch_and_combine(
     warmup: int,
     iters: int,
     profile_wrap: bool,
+    nvtx: bool,
+    nvtx_prefix: str,
 ) -> Tuple[float, float]:
-    # Returns: (dispatch_ms_per_iter, combine_ms_per_iter)
+    # Returns: (dispatch_us_per_iter, combine_us_per_iter)
 
     # Some strategies require prepare_dispatch() before dispatch() (e.g., NVLinkTwoSided).
     # We intentionally exclude prepare_dispatch() from timing as requested.
     _ = strategy.prepare_dispatch(token_selected_slots, all_rank_num_tokens, None)
 
     # Warmup
-    for _ in range(warmup):
-        hs, hs_sf, tss, tfs = strategy.dispatch(
-            hidden_states,
-            hidden_states_sf,
-            token_selected_slots,
-            token_final_scales,
-            all_rank_num_tokens,
-        )
-        _ = strategy.combine(
-            hs,
-            all_rank_max_num_tokens=max(all_rank_num_tokens),
-        )
+    with _nvtx_range(f"{nvtx_prefix}:warmup", enabled=nvtx):
+        for _ in range(warmup):
+            with _nvtx_range("dispatch", enabled=nvtx):
+                hs, hs_sf, tss, tfs = strategy.dispatch(
+                    hidden_states,
+                    hidden_states_sf,
+                    token_selected_slots,
+                    token_final_scales,
+                    all_rank_num_tokens,
+                )
+            with _nvtx_range("combine", enabled=nvtx):
+                _ = strategy.combine(
+                    hs,
+                    all_rank_max_num_tokens=max(all_rank_num_tokens),
+                )
 
     torch.cuda.synchronize()
     mpi_barrier()
@@ -238,32 +262,37 @@ def _time_dispatch_and_combine(
     combine_total_ms = 0.0
 
     _profile_start_stop(profile_wrap)
-    for _ in range(iters):
-        start.record()
-        hs, hs_sf, tss, tfs = strategy.dispatch(
-            hidden_states,
-            hidden_states_sf,
-            token_selected_slots,
-            token_final_scales,
-            all_rank_num_tokens,
-        )
-        mid.record()
-        _ = strategy.combine(
-            hs,
-            all_rank_max_num_tokens=max(all_rank_num_tokens),
-        )
-        end.record()
+    with _nvtx_range(f"{nvtx_prefix}:timed", enabled=nvtx):
+        for _ in range(iters):
+            start.record()
+            with _nvtx_range("dispatch", enabled=nvtx):
+                hs, hs_sf, tss, tfs = strategy.dispatch(
+                    hidden_states,
+                    hidden_states_sf,
+                    token_selected_slots,
+                    token_final_scales,
+                    all_rank_num_tokens,
+                )
+            mid.record()
+            with _nvtx_range("combine", enabled=nvtx):
+                _ = strategy.combine(
+                    hs,
+                    all_rank_max_num_tokens=max(all_rank_num_tokens),
+                )
+            end.record()
 
-        end.synchronize()
-        dispatch_total_ms += start.elapsed_time(mid)
-        combine_total_ms += mid.elapsed_time(end)
+            end.synchronize()
+            dispatch_total_ms += start.elapsed_time(mid)
+            combine_total_ms += mid.elapsed_time(end)
     _profile_stop(profile_wrap)
 
-    return dispatch_total_ms / iters, combine_total_ms / iters
+    dispatch_ms = dispatch_total_ms / iters
+    combine_ms = combine_total_ms / iters
+    return dispatch_ms * 1e3, combine_ms * 1e3
 
 
-def _gather_stats_ms(x_ms: float) -> Dict[str, float]:
-    xs = mpi_allgather(float(x_ms))
+def _gather_stats_us(x_us: float) -> Dict[str, float]:
+    xs = mpi_allgather(float(x_us))
     xs_sorted = sorted(xs)
     n = len(xs_sorted)
     return {
@@ -283,35 +312,61 @@ def parse_args() -> argparse.Namespace:
         help="Number of MPI worker ranks to spawn via MPIPoolExecutor.",
     )
     parser.add_argument(
-        "--strategy",
-        type=str,
-        default="all",
+        "--backend",
+        type=lambda s: str(s).upper(),
+        default=None,
         choices=[
-            "all",
-            "allgather",
-            "nvlink_one_sided",
-            "nvlink_two_sided",
-            "deep_ep_low_latency",
+            "ALLGATHER",
+            "NVLINK_ONE_SIDED",
+            "NVLINK_TWO_SIDED",
+            "DEEPEPLOWLATENCY",
         ],
-        help="Which communication strategy to benchmark.",
+        help="Which communication backend to benchmark (default: run all backends).",
     )
     parser.add_argument(
         "--profile",
         type=str,
-        default="gpt_oss",
-        choices=sorted(PROFILES.keys()) + ["custom"],
-        help="Named profile (hidden_size + local_batch_size + top_k).",
+        default="deepseek_v3",
+        choices=sorted(PROFILES.keys()),
+        help="Optional named profile to provide defaults for hidden_size/top_k/num_experts.",
     )
     parser.add_argument("--hidden-size", type=int, default=None, help="Custom hidden size.")
+    # Sizes to scan (NCCL-tests style, adapted from bytes -> local_batch_size in tokens).
     parser.add_argument(
-        "--local-batch-size", type=int, default=None, help="Custom local token count per rank."
+        "-b",
+        "--minbatch",
+        type=int,
+        default=640,
+        help="Minimum local_batch_size (tokens) to start with. Default: 640. For single size, pass -b N (or -e N).",
+    )
+    parser.add_argument(
+        "-e",
+        "--maxbatch",
+        type=int,
+        default=None,
+        help="Maximum local_batch_size (tokens) to end at. For single size, pass -e N (or -b N).",
+    )
+    # Increments can be either fixed or a multiplication factor. Only one should be used.
+    parser.add_argument(
+        "-i",
+        "--stepbatch",
+        type=int,
+        default=None,
+        help="Fixed increment between local_batch_size values (tokens). Default: 128.",
+    )
+    parser.add_argument(
+        "-f",
+        "--stepfactor",
+        type=float,
+        default=None,
+        help="Multiplication factor between local_batch_size values. Default: disabled.",
     )
     parser.add_argument("--top-k", type=int, default=None, help="Custom router top-k.")
     parser.add_argument(
-        "--experts-per-rank",
+        "--num-experts",
         type=int,
         default=None,
-        help="Experts per rank (total experts = ep_size * experts_per_rank).",
+        help="Total number of experts.",
     )
     parser.add_argument(
         "--dtype",
@@ -326,78 +381,120 @@ def parse_args() -> argparse.Namespace:
         "--max-num-tokens-per-rank",
         type=int,
         default=None,
-        help="Max tokens per rank for workspace allocation (defaults to local_batch_size).",
-    )
-    parser.add_argument(
-        "--nvlink-two-sided-do-sum",
-        action="store_true",
-        help="Enable reduction inside NVLinkTwoSided combine (typical path).",
+        help="Max tokens per rank for workspace allocation (defaults to max scanned local_batch_size).",
     )
     parser.add_argument(
         "--no-profiler-wrap",
         action="store_true",
         help="Disable cudaProfilerStart/Stop wrapping (useful when profiler is unavailable).",
     )
+    parser.add_argument(
+        "--no-nvtx",
+        action="store_true",
+        help="Disable NVTX ranges (useful to minimize profiler overhead).",
+    )
     return parser.parse_args()
 
 
-def _resolve_profile_args(args: argparse.Namespace, ep_size: int) -> Tuple[int, int, int, int]:
-    if args.profile != "custom":
-        prof = PROFILES[args.profile]
-        hidden_size = prof.hidden_size
-        local_batch_size = prof.local_batch_size
-        top_k = prof.top_k
-        experts_per_rank = prof.experts_per_rank
-        if prof.recommended_ep_size is not None and prof.recommended_ep_size != ep_size:
-            _maybe_warn_rank0(
-                f"[bench_moe_comm] WARNING: profile {prof.name} recommends ep_size={prof.recommended_ep_size}, "
-                f"but current ep_size is ep_size={ep_size}. Continuing."
-            )
-        return hidden_size, local_batch_size, top_k, experts_per_rank
+def _iter_local_batch_sizes(args: argparse.Namespace) -> List[int]:
+    scanning_enabled = any(
+        x is not None for x in (args.minbatch, args.maxbatch, args.stepbatch, args.stepfactor)
+    )
+    if not scanning_enabled:
+        raise ValueError("Must specify -b/--minbatch and/or -e/--maxbatch (tokens).")
 
-    if args.hidden_size is None or args.local_batch_size is None or args.top_k is None:
-        raise ValueError("--profile custom requires --hidden-size, --local-batch-size, --top-k")
+    if args.stepbatch is not None and args.stepfactor is not None:
+        raise ValueError("Only one of -i/--stepbatch or -f/--stepfactor should be used.")
+
+    if args.minbatch is None and args.maxbatch is None:
+        raise ValueError("Must specify at least one of -b/--minbatch or -e/--maxbatch.")
+
+    # For single-size mode, allowing -b N or -e N (or both).
+    minb = int(args.minbatch) if args.minbatch is not None else int(args.maxbatch)
+    if minb <= 0:
+        raise ValueError("--minbatch must be > 0")
+
+    maxb = int(args.maxbatch) if args.maxbatch is not None else minb
+    if maxb < minb:
+        raise ValueError("--maxbatch must be >= --minbatch")
+
+    if args.stepfactor is not None:
+        factor = float(args.stepfactor)
+        if factor <= 1.0:
+            raise ValueError("--stepfactor must be > 1.0")
+        out: List[int] = []
+        cur = float(minb)
+        while True:
+            v = int(cur)
+            if v > maxb:
+                break
+            if v > 0 and (not out or out[-1] != v):
+                out.append(v)
+            cur *= factor
+        return out
+
+    step = int(args.stepbatch or 128)
+    if step <= 0:
+        raise ValueError("--stepbatch must be > 0")
+    return list(range(minb, maxb + 1, step))
+
+
+def _resolve_profile_args(args: argparse.Namespace) -> Tuple[int, int, int, int]:
+    """Returns (hidden_size, local_num_tokens, top_k, num_experts_total)."""
+    local_num_tokens = _iter_local_batch_sizes(args)[0]
+
+    # If a profile is provided, it supplies defaults; any explicit CLI values override.
+    if args.profile is not None:
+        prof = PROFILES[args.profile]
+        hidden_size = int(args.hidden_size or prof.hidden_size)
+        top_k = int(args.top_k or prof.top_k)
+        num_experts_total = int(args.num_experts or prof.num_experts)
+        return hidden_size, local_num_tokens, top_k, num_experts_total
+
+    # No profile: all fields must be provided explicitly.
+    if args.hidden_size is None or args.top_k is None or args.num_experts is None:
+        raise ValueError(
+            "No --profile specified; must provide --hidden-size, --top-k, --num-experts."
+        )
     hidden_size = int(args.hidden_size)
-    local_batch_size = int(args.local_batch_size)
     top_k = int(args.top_k)
-    experts_per_rank = int(args.experts_per_rank or 32)
-    return hidden_size, local_batch_size, top_k, experts_per_rank
+    num_experts_total = int(args.num_experts)
+    return hidden_size, local_num_tokens, top_k, num_experts_total
 
 
 def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace) -> None:
     # Keep benchmark output clean.
     tllm.logger.set_level("error")
+    # MPI-spawned workers may not inherit the parent's mutated environment reliably.
+    # Opt-in to DeepEP backends by default (does not override an explicit user setting).
+    os.environ.setdefault("TRTLLM_CAN_USE_DEEP_EP", "1")
 
     ep_size = mpi_world_size()
     rank = mpi_rank()
     _ = _set_device_from_local_rank()
     device = torch.device("cuda")
 
-    hidden_size, local_batch_size, top_k, experts_per_rank = _resolve_profile_args(args, ep_size)
-    experts_per_rank = int(args.experts_per_rank or experts_per_rank)
+    hidden_size, _, top_k, num_experts_total = _resolve_profile_args(args)
+    local_batch_sizes = _iter_local_batch_sizes(args)
     act_dtype = _torch_dtype(args.dtype)
+    nvtx = not bool(args.no_nvtx)
 
-    if args.strategy in ("deep_ep_low_latency", "all") and act_dtype != torch.bfloat16:
+    if (args.backend is None or args.backend == "DEEPEPLOWLATENCY") and act_dtype != torch.bfloat16:
         _maybe_warn_rank0("[bench_moe_comm] DeepEP low latency requires bf16; will be skipped.")
 
-    max_num_tokens_per_rank = int(args.max_num_tokens_per_rank or local_batch_size)
-    if max_num_tokens_per_rank < local_batch_size:
+    max_scanned_tokens = max(local_batch_sizes)
+    max_num_tokens_per_rank = int(args.max_num_tokens_per_rank or max_scanned_tokens)
+    if max_num_tokens_per_rank < max_scanned_tokens:
         raise ValueError("--max-num-tokens-per-rank must be >= --local-batch-size")
 
-    all_rank_num_tokens = mpi_allgather(int(local_batch_size))
     mapping = _create_mapping(ep_size)
 
-    num_experts_total = ep_size * experts_per_rank
+    if num_experts_total % ep_size != 0:
+        raise ValueError(
+            f"num_experts ({num_experts_total}) must be divisible by ep_size ({ep_size})"
+        )
+    experts_per_rank = num_experts_total // ep_size
     num_slots = num_experts_total
-
-    hidden_states, hidden_states_sf, token_selected_slots, token_final_scales = _make_inputs(
-        local_batch_size,
-        hidden_size,
-        top_k,
-        num_experts_total,
-        act_dtype,
-        device,
-    )
 
     if rank == 0:
         print(
@@ -406,10 +503,10 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace) -> None:
                     "bench": "bench_moe_comm",
                     "launcher": "spawn",
                     "profile": args.profile,
-                    "strategy": args.strategy,
+                    "backend": args.backend,
                     "ep_size": ep_size,
                     "hidden_size": hidden_size,
-                    "local_batch_size": local_batch_size,
+                    "local_batch_size": local_batch_sizes,
                     "top_k": top_k,
                     "dtype": str(act_dtype),
                     "experts_per_rank": experts_per_rank,
@@ -422,17 +519,14 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace) -> None:
             flush=True,
         )
 
-    strategies = (
-        ["allgather", "nvlink_one_sided", "nvlink_two_sided", "deep_ep_low_latency"]
-        if args.strategy == "all"
-        else [args.strategy]
+    backends = (
+        ["ALLGATHER", "NVLINK_ONE_SIDED", "NVLINK_TWO_SIDED", "DEEPEPLOWLATENCY"]
+        if args.backend is None
+        else [args.backend]
     )
 
-    mpi_barrier()
-    torch.cuda.synchronize()
-
-    for strat in strategies:
-        if strat == "deep_ep_low_latency" and act_dtype != torch.bfloat16:
+    for backend in backends:
+        if backend == "DEEPEPLOWLATENCY" and act_dtype != torch.bfloat16:
             continue
 
         try:
@@ -443,77 +537,91 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace) -> None:
                 max_num_tokens_per_rank=max_num_tokens_per_rank,
             )
 
-            # Select the desired comm strategy via the same mechanism used in production code.
-            forced = "DEEPEPLOWLATENCY" if strat == "deep_ep_low_latency" else strat.upper()
-            old_forced = os.environ.get("TRTLLM_FORCE_COMM_METHOD")
-            os.environ["TRTLLM_FORCE_COMM_METHOD"] = forced
-            try:
-                strategy = CommunicationFactory.create_strategy(
-                    model_config,
-                    num_experts=num_experts_total,
-                    num_slots=num_slots,
-                    top_k=top_k,
-                    expert_size_per_partition=experts_per_rank,
-                    payload_in_workspace=False,
-                    alltoall_result_do_sum=bool(args.nvlink_two_sided_do_sum),
-                )
-            finally:
-                if old_forced is None:
-                    os.environ.pop("TRTLLM_FORCE_COMM_METHOD", None)
-                else:
-                    os.environ["TRTLLM_FORCE_COMM_METHOD"] = old_forced
-
-            if strategy is None:
-                _maybe_warn_rank0(f"[bench_moe_comm] Skipping {strat}: factory returned None.")
-                mpi_barrier()
-                continue
-        except Exception as e:
-            _maybe_warn_rank0(f"[bench_moe_comm] Skipping {strat}: {type(e).__name__}: {e}")
-            mpi_barrier()
-            continue
-
-        try:
-            if not strategy.is_workload_feasible(all_rank_num_tokens, num_chunks=1):
-                _maybe_warn_rank0(f"[bench_moe_comm] Skipping {strat}: workload not feasible.")
-                mpi_barrier()
-                continue
-        except Exception as e:
-            _maybe_warn_rank0(f"[bench_moe_comm] Skipping {strat}: feasibility check failed: {e}")
-            mpi_barrier()
-            continue
-
-        mpi_barrier()
-        torch.cuda.synchronize()
-
-        dispatch_ms, combine_ms = _time_dispatch_and_combine(
-            strategy,
-            hidden_states=hidden_states,
-            hidden_states_sf=hidden_states_sf,
-            token_selected_slots=token_selected_slots,
-            token_final_scales=token_final_scales,
-            all_rank_num_tokens=all_rank_num_tokens,
-            warmup=int(args.warmup),
-            iters=int(args.iters),
-            profile_wrap=(not args.no_profiler_wrap),
-        )
-
-        dispatch_stats = _gather_stats_ms(dispatch_ms)
-        combine_stats = _gather_stats_ms(combine_ms)
-
-        if rank == 0:
-            print(
-                json.dumps(
-                    {
-                        "strategy": strat,
-                        "dispatch_ms": dispatch_stats,
-                        "combine_ms": combine_stats,
-                    },
-                    indent=2,
-                ),
-                flush=True,
+            # Avoid env-var indirection: directly construct the requested backend.
+            strategy = CommunicationFactory._create_forced_method(  # pylint: disable=protected-access
+                backend,
+                model_config,
+                num_experts_total,
+                num_slots,
+                top_k,
+                experts_per_rank,
+                payload_in_workspace=False,
+                alltoall_result_do_sum=True,
             )
 
-        mpi_barrier()
+            if strategy is None:
+                _maybe_warn_rank0(f"[bench_moe_comm] Skipping {backend}: factory returned None.")
+                mpi_barrier()
+                continue
+        except Exception as e:
+            _maybe_warn_rank0(f"[bench_moe_comm] Skipping {backend}: {type(e).__name__}: {e}")
+            mpi_barrier()
+            continue
+
+        for local_num_tokens in local_batch_sizes:
+            all_rank_num_tokens = mpi_allgather(int(local_num_tokens))
+            try:
+                if not strategy.is_workload_feasible(all_rank_num_tokens, num_chunks=1):
+                    _maybe_warn_rank0(
+                        f"[bench_moe_comm] Skipping {backend} @ local_batch_size={local_num_tokens}: workload not feasible."
+                    )
+                    mpi_barrier()
+                    continue
+            except Exception as e:
+                _maybe_warn_rank0(
+                    f"[bench_moe_comm] Skipping {backend} @ local_batch_size={local_num_tokens}: feasibility check failed: {e}"
+                )
+                mpi_barrier()
+                continue
+
+            hidden_states, hidden_states_sf, token_selected_slots, token_final_scales = (
+                _make_inputs(
+                    local_num_tokens,
+                    hidden_size,
+                    top_k,
+                    num_experts_total,
+                    act_dtype,
+                    device,
+                )
+            )
+
+            mpi_barrier()
+            torch.cuda.synchronize()
+
+            with _nvtx_range(f"{backend}:local_batch_size={int(local_num_tokens)}", enabled=nvtx):
+                nvtx_prefix = f"{backend}:local_batch_size={int(local_num_tokens)}"
+                dispatch_us, combine_us = _time_dispatch_and_combine(
+                    strategy,
+                    hidden_states=hidden_states,
+                    hidden_states_sf=hidden_states_sf,
+                    token_selected_slots=token_selected_slots,
+                    token_final_scales=token_final_scales,
+                    all_rank_num_tokens=all_rank_num_tokens,
+                    warmup=int(args.warmup),
+                    iters=int(args.iters),
+                    profile_wrap=(not args.no_profiler_wrap),
+                    nvtx=nvtx,
+                    nvtx_prefix=nvtx_prefix,
+                )
+
+            dispatch_stats = _gather_stats_us(dispatch_us)
+            combine_stats = _gather_stats_us(combine_us)
+
+            if rank == 0:
+                print(
+                    json.dumps(
+                        {
+                            "backend": backend,
+                            "local_batch_size": int(local_num_tokens),
+                            "dispatch_us": dispatch_stats,
+                            "combine_us": combine_stats,
+                        },
+                        indent=2,
+                    ),
+                    flush=True,
+                )
+
+            mpi_barrier()
 
     return
 
@@ -544,10 +652,7 @@ def main() -> None:
         pickle.HIGHEST_PROTOCOL,
     )
 
-    default_ep_size = (
-        PROFILES.get(args.profile).recommended_ep_size if args.profile in PROFILES else None
-    )
-    ep_size = int(args.ep_size or default_ep_size or 8)
+    ep_size = int(args.ep_size or 8)
     if ep_size <= 0:
         raise ValueError("--ep-size must be > 0")
 
@@ -562,7 +667,7 @@ def main() -> None:
                     "launcher": "spawn",
                     "ep_size": ep_size,
                     "profile": args.profile,
-                    "strategy": args.strategy,
+                    "backend": args.backend,
                 },
                 indent=2,
             ),
@@ -579,4 +684,6 @@ def main() -> None:
 if __name__ == "__main__":
     # Make sure ranks don't accidentally serialize execution.
     os.environ.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "1")
+    # Opt-in to DeepEP backends by default. This does not override an explicit user setting.
+    os.environ.setdefault("TRTLLM_CAN_USE_DEEP_EP", "1")
     main()
