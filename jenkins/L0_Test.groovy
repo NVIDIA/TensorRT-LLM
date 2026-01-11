@@ -1768,6 +1768,15 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     nvidia.com/driver_version: '${driverVersion}'
                     tensorrt/test_type: perf"""
         }
+        else if (type.contains("6000d"))
+        {
+            selectors = """
+                    kubernetes.io/arch: ${arch}
+                    kubernetes.io/os: linux
+                    nvidia.com/gpu_type: ${gpuType}
+                    kubernetes.io/hostname: 4u8g-gen-0237.ipp3a2.colossus
+                    nvidia.com/driver_version: '${driverVersion}'"""
+        }
         else
         {
             selectors = """
@@ -1854,8 +1863,6 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                         requiredDuringSchedulingIgnoredDuringExecution:
                             nodeSelectorTerms:
                             - matchExpressions:
-                              - key: "tensorrt/taints"
-                                operator: DoesNotExist
                               - key: "tensorrt/affinity"
                                 operator: NotIn
                                 values:
