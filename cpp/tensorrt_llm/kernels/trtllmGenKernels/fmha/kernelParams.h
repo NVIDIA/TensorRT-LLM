@@ -39,6 +39,46 @@ namespace kernels
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+//
+// CCCL >= 3.1.0 (CUDA CTK 13.1) introduces the fast_mod_div math operations.
+// The following code makes sure that the host initialization works with older CUDA CTK versions.
+//
+
+// Refer to https://github.com/NVIDIA/cccl/blob/main/libcudacxx/include/cuda/__cmath/fast_modulo_division.h#L76-L81
+// about how to compute the fast modulo division.
+struct FastModDivInt32
+{
+public:
+    FastModDivInt32(int32_t divisor)
+        : mDivisor(divisor)
+    {
+        // Explicitly initialize the unused member variable to avoid compiler warnings.
+        mAdd = 0;
+        mShift = std::max(0, ceilLog2(mDivisor) - 1);
+        mMultiplier = static_cast<uint32_t>(ceilDiv(uint64_t(1) << (32 + mShift), static_cast<uint64_t>(mDivisor)));
+    }
+
+private:
+    template <typename T>
+    T ceilDiv(T a, T b)
+    {
+        return (a + b - 1) / b;
+    }
+
+    int32_t ceilLog2(int32_t value) const
+    {
+        return static_cast<int32_t>(std::ceil(std::log2(value)));
+    }
+
+private:
+    int32_t mDivisor = 1;
+    uint32_t mMultiplier = 0;
+    uint32_t mAdd = 0;
+    int32_t mShift = 0;
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 struct KernelParams
 {
     // TMA descriptor for Q.
@@ -144,10 +184,14 @@ struct KernelParams
     int32_t mNumHeadsQ;
     // The number of Q heads per K/V head (i.e. mNumHeadsQ / mNumHeadsKv).
     int32_t mNumHeadsQPerKv;
+    // The number of headsQ per K/V head as a fast_mod_div divisor.
+    FastModDivInt32 mNumHeadsQPerKvDivisor{1};
     // The hidden size of O.
     int64_t mNumHiddenEltsO;
     // The total number of pages in the paged-kv memory pool.
     int32_t mNumPagesInMemPool;
+    // The number of tokensQ per CTA (used for groupsHeadsTokensQ generation kernel).
+    int32_t mNumTokensPerCtaQ;
     // The number of tokens per page (used if dynamic numTokensPerPage is enabled).
     int32_t mNumTokensPerPageLog2;
     // The output scale for FP8 quantization.
@@ -172,8 +216,8 @@ struct KernelParams
 
     // Create the TMA shape/stride for Q.
     template <class FmhaOptions>
-    static auto makeTmaShapeStrideQ(
-        FmhaOptions const& options, bool groupsHeadsQ, int32_t tileSizeQ, int32_t numEltsInClampedHeadDimQ)
+    static auto makeTmaShapeStrideQ(FmhaOptions const& options, bool groupsHeadsQ, bool groupsTokensHeadsQ,
+        int32_t tileSizeQ, int32_t numEltsInClampedHeadDimQ)
     {
 
         //
@@ -232,22 +276,29 @@ struct KernelParams
         // The tile shape for TMA.
         auto tileShapes = std::vector<uint32_t>{
             static_cast<uint32_t>(numEltsInClampedHeadDimQ), 1, 1, static_cast<uint32_t>(tileSizeQ)};
+        // The number of tokensQ per CTA.
+        int32_t numTokensPerCtaQ{tileSizeQ};
+        // Re-compute the number of tokensQ per CTA if groupsHeadsQ is enabled.
         if (groupsHeadsQ)
         {
-            if (isSpecDecodingGenerationKernel(options.mKernelType))
+            if (groupsTokensHeadsQ)
             {
-                TLLM_CHECK_WITH_INFO((tileSizeQ % numGroupedHeads == 0), "internal error");
-                tileShapes = std::vector<uint32_t>{static_cast<uint32_t>(numEltsInClampedHeadDimQ),
-                    static_cast<uint32_t>(numGroupedHeads), 1, static_cast<uint32_t>(tileSizeQ / numGroupedHeads)};
+                // Currently, it requires each CTA to process complete headsQ (i.e. numGroupedHeads) at a
+                // time, so it allows paddings in the end. Removing paddings needs re-organizing the Q
+                // tensor to [numTokensQ, numGroupedHeads, numHeads, headDimQ] and we might want to revisit
+                // this in the future.
+                numTokensPerCtaQ = static_cast<int32_t>(numTokensPerCtaQ / numGroupedHeads);
             }
             else
             {
-                tileShapes = std::vector<uint32_t>{
-                    static_cast<uint32_t>(numEltsInClampedHeadDimQ), static_cast<uint32_t>(tileSizeQ), 1, 1};
+                numGroupedHeads = tileSizeQ;
+                numTokensPerCtaQ = 1;
             }
+            tileShapes = std::vector<uint32_t>{static_cast<uint32_t>(numEltsInClampedHeadDimQ),
+                static_cast<uint32_t>(numGroupedHeads), 1, static_cast<uint32_t>(numTokensPerCtaQ)};
         }
 
-        return std::make_tuple(shape, stride, tileShapes);
+        return std::make_tuple(shape, stride, tileShapes, numTokensPerCtaQ);
     }
 
     // Create the TMA shape/stride for O.
@@ -628,6 +679,9 @@ struct KernelParams
         {
             char const* err_str;
             cuGetErrorString(result, &err_str);
+            // Note that the error is thrown out before launching fmha kernels, so it is highly possible that
+            // the errors are broadcasted by previous kernels. Please enable CUDA_LAUNCH_BLOCKING or use cuda-gdb
+            // for more details.
             std::cerr << "Error: Failed to initialize the TMA descriptor due to " << err_str << std::endl;
             std::cerr << "tmaFormat: " << static_cast<int>(tmaDataFormat) << " dim: " << dim << " gmem: " << gmemAddr
                       << std::endl;
@@ -676,8 +730,8 @@ struct KernelParams
         int32_t numEltsInClampedHeadDimQ = std::min(numEltsIn128BQ, options.mHeadDimQk);
 
         // Shape/stride for gmem tensor Q.
-        auto [shapeQ, strideQ, tileShapeQ]
-            = makeTmaShapeStrideQ(options, kernelMeta.mGroupsHeadsQ, kernelMeta.mTileSizeQ, numEltsInClampedHeadDimQ);
+        auto [shapeQ, strideQ, tileShapeQ, numTokensPerCtaQ] = makeTmaShapeStrideQ(options, kernelMeta.mGroupsHeadsQ,
+            kernelMeta.mGroupsTokensHeadsQ, kernelMeta.mTileSizeQ, numEltsInClampedHeadDimQ);
         // Build tma descriptor for Q.
         params.tmaQ_ = buildNdTmaDescriptor(
             options, kernelMeta.mDataTypeQ, shapeQ, strideQ, tileShapeQ, const_cast<void*>(qPtr));
@@ -831,7 +885,9 @@ struct KernelParams
         params.mNumHeadsQ = options.mNumHeadsQ;
         params.mNumHeadsKv = options.mNumHeadsKv;
         params.mNumHeadsQPerKv = options.mNumHeadsQPerKv;
+        params.mNumHeadsQPerKvDivisor = FastModDivInt32{options.mNumHeadsQPerKv};
         params.mNumHiddenEltsO = options.mNumHeadsQ * options.mHeadDimQk;
+        params.mNumTokensPerCtaQ = numTokensPerCtaQ;
         params.mNumTokensPerPageLog2 = 0;
         if (isPagedKv(options.mQkvLayout))
         {
