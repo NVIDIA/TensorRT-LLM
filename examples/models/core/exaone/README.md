@@ -1,9 +1,6 @@
 # EXAONE
 
-This document shows how to build and run a [EXAONE](https://huggingface.co/LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct) model in TensorRT-LLM.
-
-The TensorRT LLM EXAONE implementation is based on the LLaMA model. The implementation can be found in [llama/model.py](../../../../tensorrt_llm/models/llama/model.py).
-See the LLaMA example [`examples/models/core/llama`](../llama) for details.
+This document shows how to build and run [EXAONE](https://huggingface.co/LGAI-EXAONE) models in TensorRT-LLM.
 
 - [EXAONE](#exaone)
   - [Support Matrix](#support-matrix)
@@ -11,31 +8,51 @@ See the LLaMA example [`examples/models/core/llama`](../llama) for details.
     - [EXAONE-3.0](#exaone-30)
     - [EXAONE-Deep](#exaone-deep)
     - [EXAONE-4.0](#exaone-40)
-  - [Usage](#usage)
-    - [PyTorch flow](#pytorch-flow)
-        -[PyTorch flow Quantization](#pytorch-flow-quantization)
-    - [TRT Flow](#trt-flow)
+    - [K-EXAONE](#k-exaone)
+  - [PyTorch flow](#pytorch-flow)
+    - [Running EXAONE-4.0](#running-exaone-40)
+    - [Running K-EXAONE](#running-k-exaone)
+      - [MoE Backend Options](#moe-backend-options)
+    - [PyTorch flow Quantization](#pytorch-flow-quantization)
+      - [FP8 Quantization](#fp8-quantization)
+      - [NVFP4 Quantization](#nvfp4-quantization)
+  - [Running the TensorRT LLM Server](#running-the-tensorrt-llm-server)
+    - [Running Aggregated TensorRT LLM Server](#running-aggregated-tensorrt-llm-server)
+      - [Creating the Extra Options Configuration](#creating-the-extra-options-configuration)
+      - [Launch trtllm-serve OpenAI-compatible API server](#launch-trtllm-serve-openai-compatible-api-server)
+    - [Running Disaggregated TensorRT LLM Server](#running-disaggregated-tensorrt-llm-server)
+      - [Step 1: Set Environment Variables](#step-1-set-environment-variables)
+      - [Step 2: Create Configuration Files](#step-2-create-configuration-files)
+      - [Step 3: Launch the Disaggregated Server](#step-3-launch-the-disaggregated-server)
+  - [TRT flow](#trt-flow)
     - [Convert checkpoint and build TensorRT engine(s)](#convert-checkpoint-and-build-tensorrt-engines)
     - [FP8 Post-Training Quantization](#fp8-post-training-quantization)
     - [SmoothQuant](#smoothquant)
     - [Groupwise quantization (AWQ)](#groupwise-quantization-awq)
-        - [W4A16 AWQ with FP8 GEMM (W4A8 AWQ)](#w4a16-awq-with-fp8-gemm-w4a8-awq)
+      - [W4A16 AWQ with FP8 GEMM (W4A8 AWQ)](#w4a16-awq-with-fp8-gemm-w4a8-awq)
     - [Run Engine](#run-engine)
+  - [Troubleshootings](#troubleshootings)
+    - [Troubleshootings for EXAONE-4.0](#troubleshootings-for-exaone-40)
+    - [Troubleshootings for K-EXAONE](#troubleshootings-for-k-exaone)
 
 ## Support Matrix
   * FP16
   * BF16
-  * Tensor Parallel
+  * Tensor Parallel (TP)
+  * Expert Parallel (EP) (K-EXAONE only)
+  * Attention Data Parallel (ADP) (K-EXAONE only)
+  * Disaggregated Serving
   * FP8
   * INT8 & INT4 Weight-Only
   * INT8 SmoothQuant
   * INT4 AWQ & W4A8 AWQ
+  * NVFP4 (K-EXAONE only)
 
 ## Supported Models
 
-**Note:**  
-- **EXAONE-3.0** and **EXAONE-Deep** are supported using the [TRT Flow](#trt-flow).  
-- **EXAONE-4.0** is supported using the [PyTorch flow](#pytorch-flow).  
+**Note:**
+- **EXAONE-3.0** & **EXAONE-Deep** are supported using the [TRT Flow](#trt-flow).
+- **EXAONE-4.0** & **K-EXAONE** are supported using the [PyTorch flow](#pytorch-flow).
 
 Please refer to the corresponding sections below for usage instructions and examples for each model.
 
@@ -59,22 +76,32 @@ git clone https://huggingface.co/LGAI-EXAONE/EXAONE-Deep-2.4B $HF_MODEL_DIR
 
 ### EXAONE-4.0
 
-Download he HuggingFace checkpoints of EXAONE-4.0 model. Here, we only use the `EXAONE-4.0-32B` model for the example. From EXAONE-4.0 model, we support only on PyTorch flow.
+Download the HuggingFace checkpoints of the EXAONE-4.0 model. Here, we use the `EXAONE-4.0-32B` model as an example. EXAONE-4.0 is supported only via the PyTorch flow.
 
 ```bash
 export HF_MODEL_DIR=hf_models/exaone4
 git clone https://huggingface.co/LGAI-EXAONE/EXAONE-4.0-32B $HF_MODEL_DIR
 ```
 
-### Pytorch flow
+### K-EXAONE
 
+K-EXAONE is a Mixture of Experts (MoE) model based on the EXAONE architecture. It features a hybrid architecture with both dense and MoE layers, sliding window attention, and supports FP8 and NVFP4 quantization for efficient inference.
+
+Download the HuggingFace checkpoints of the K-EXAONE model:
+
+```bash
+export HF_MODEL_DIR=hf_models/kexaone
+git clone https://huggingface.co/LGAI-EXAONE/K-EXAONE-236B-A23B $HF_MODEL_DIR
+```
+
+## PyTorch flow
+
+### Running EXAONE-4.0
 To quickly run EXAONE-4.0 models, you can use [examples/llm-api/quickstart_advanced.py](../../../llm-api/quickstart_advanced.py):
 
 ```bash
-python ../../../llm-api/quickstart_advanced.py --model_dir hf_models/$MODEL_NAME --disable_kv_cache_reuse
+python ../../../llm-api/quickstart_advanced.py --model_dir $HF_MODEL_DIR
 ```
-
-SWA currently does not support kv_cache_reuse. Please make sure to disable KV cache reuse when running with SWA.
 
 The output will be like:
 ```bash
@@ -83,47 +110,239 @@ The output will be like:
 [2] Prompt: 'The future of AI is', Generated text: ' not just about technology but also about how we choose to use it. We must ensure that AI is developed and deployed in a way that benefits all of humanity, not just a select few. This means prioritizing ethical considerations, transparency, and accountability in AI development. It also means involving diverse stakeholders in the conversation about AI'
 ```
 
-#### PyTorch flow Quantization
+### Running K-EXAONE
 
-For PyTorch flow, TRT-LLM supports quantized format generated by [Model Optimizer](https://github.com/NVIDIA/Model-Optimizer).
-
-You can either do pre-quantized models in HF model hub, or can generate quantized model by yourself and then run models with below command:
+K-EXAONE is a Mixture of Experts model that benefits from multiple parallelism strategies. You can run it with tensor parallelism (TP), expert parallelism (EP), and attention data parallelism (ADP):
 
 ```bash
-git clone https://github.com/NVIDIA/Model-Optimizer.git
+python ../../../llm-api/quickstart_advanced.py \
+    --model_dir $HF_MODEL_DIR \
+    --tp_size 8 \
+    --moe_ep_size 8 \
+    --enable_attention_dp \
+    --trust_remote_code
+```
+The output will be like:
+```bash
+[0] Prompt: 'Hello, my name is', Generated text: ' John Smith, and I am a 28-year-old software developer. I live in the city of San Francisco, California. I work remotely for a tech startup based in Austin, Texas.\n\nI enjoy hiking, reading, and playing the piano. In my free time, I often explore new neighborhoods in San Francisco, trying out new restaurants and cafes.\n\n'
+[1] Prompt: 'The capital of France is', Generated text: ' Paris, the capital of France is Paris, the capital of France is Paris, the capital of France is Paris, the capital of France is Paris, the capital of France is Paris, the capital of France is Paris, the capital of France is Paris, the capital of France is Paris, the capital of France is Paris'
+[2] Prompt: 'The future of AI is', Generated text: ' bright.\n</think>\n\nThe future of AI holds immense promise across numerous domains. In healthcare, AI is revolutionizing diagnostics, drug discovery, and personalized treatment plans. In education, AI is enabling adaptive learning platforms that cater to individual learning styles and paces. In environmental science, AI is playing a pivotal role in addressing climate change by optimizing'
+```
+
+#### MoE Backend Options
+
+K-EXAONE supports the following MoE backends:
+
+| Backend | Description |
+|---------|-------------|
+| `CUTLASS` | Default backend, optimized for general use cases |
+| `TRTLLM` | TensorRT-LLM backend using TRT-LLM Gen kernels, optimized for low-latency inference |
+| `WIDEEP` | Wide expert parallelism backend for cases where EP size exceeds the number of experts |
+
+You can specify the MoE backend using the `--moe_backend` argument:
+
+```bash
+python ../../../llm-api/quickstart_advanced.py \
+    --model_dir $HF_MODEL_DIR \
+    --tp_size 8 \
+    --moe_ep_size 8 \
+    --enable_attention_dp \
+    --moe_backend CUTLASS \
+    --trust_remote_code
+```
+
+### PyTorch flow Quantization
+
+For PyTorch flow, TRT-LLM supports quantized formats generated by [Model Optimizer](https://github.com/NVIDIA/Model-Optimizer). You can either use pre-quantized models from the HuggingFace model hub, or generate quantized models yourself using the instructions below.
+
+First, clone the [Model Optimizer](https://github.com/NVIDIA/Model-Optimizer) repository:
+
+```bash
+git clone https://github.com/NVIDIA/Model-Optimizer
 cd Model-Optimizer/examples/llm_ptq
-scripts/huggingface_example.sh --model  hf_models/$MODEL_NAME --quant fp8 --export_fmt hf
 ```
 
-For more information, please refer to official [docs](https://github.com/NVIDIA/Model-Optimizer) or [Model Optimizer](https://github.com/NVIDIA/Model-Optimizer).
+For more information, please refer to the official [Model Optimizer documentation](https://github.com/NVIDIA/Model-Optimizer).
 
-Troubleshooting
+#### FP8 Quantization
 
-The following error may occur during quantization:
+FP8 quantization provides a good balance between model accuracy and inference performance. To quantize a model to FP8 format:
+
 ```bash
-torch._dynamo.exc.Unsupported: Graph break under GenericContextWrappingVariable
-Explanation: Attempted to graph break in an active context manager(s) that doesn't support graph breaking.
-Hint: Move the offending context manager(s) to outside the compiled region.
-Hint: This graph break may have been caused by an earlier graph break. Resolving the earlier graph break may resolve this one.
+python3 hf_ptq.py --model $HF_MODEL_DIR --quant fp8 --export_fmt hf
 ```
 
-This error may indicate an incompatibility between `torch.compile()` and the `HybridCache` module of the transformers library. As a result, [Model Optimizer](https://github.com/NVIDIA/Model-Optimizer) (ModelOpt) cannot perform PTQ with HybridCache.
+#### NVFP4 Quantization
 
-Temporarily switching to `DynamicCache` when creating PTQ models could help address the issue. This can be done by updating the `cache_implementation` field in the `generation_config.json` file located in the model checkpoint directory, for example:
-```json
-# generation_config.json
-{
-    // Change "hybrid" to "dynamic" to run PTQ.
-    // Revert this to "hybrid" after quantization is complete.
-    "cache_implementation": "hybrid",
-    ...
-}
+NVFP4 (4-bit floating point) quantization enables memory-efficient inference with reduced GPU memory footprint. To quantize a model to NVFP4 format:
+
+```bash
+python3 hf_ptq.py --model $HF_MODEL_DIR --quant nvfp4 --export_fmt hf
 ```
-For models with sliding window attention, DynamicCache is less memory-efficient than HybridCache because it retains the entire key-value cache. However, this does not break the model's attention logic, as the cache implementation is separated from the attention computation itself. This trade-off is acceptable for the PTQ process, which is a one-time procedure. Our tests confirm that this workaround does not degrade accuracy on MMLU or GSM8K benchmarks with the default ModelOpt settings.
 
-### TRT flow
+## Running the TensorRT LLM Server
 
-The next section describe how to convert the weights from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT LLM format. We will use llama's [convert_checkpoint.py](../llama/convert_checkpoint.py) for EXAONE model and then we build the model with `trtllm-build`.
+This section describes how to deploy the K-EXAONE model using the TensorRT LLM server with an OpenAI-compatible API endpoint.
+Make sure `HF_MODEL_DIR` points to your EXAONE checkpoint directory.
+
+The examples in this section are intended as a minimal, runnable demonstration and are not fully performance-optimized. For more features and performance tuning, please refer the documents below.
+- [Disaggregated Serving examples](../../../disaggregated/README.md)
+- [Disaggregated Serving feature guide](../../../../docs/source/features/disagg-serving.md)
+- [Recommended LLM API configuration settings](../../../configs/README.md) (see also `examples/configs/curated/`)
+
+### Running Aggregated TensorRT LLM Server
+
+The aggregated server runs all components (context and generation phases) on the same set of GPUs, which is suitable for single-node deployments.
+
+#### Creating the Extra Options Configuration
+
+Create a YAML configuration file to specify advanced options such as attention data parallelism, CUDA graph settings, and MoE backend configuration:
+
+```bash
+cat <<EOF > configs.yaml
+enable_attention_dp: true
+trust_remote_code: true
+cuda_graph_config:
+  max_batch_size: 2048
+  enable_padding: true
+moe_config:
+  backend: CUTLASS  # The TRTLLM backend is recommended for the Blackwell architecture.
+kv_cache_config:
+  enable_block_reuse: true  # Please disable the block reuse feature when conducting performance benchmarking.
+  max_attention_window: [128, 128, 128, 131072]  # This allows KV cache manager to possibly improve memory efficiency.
+  free_gpu_memory_fraction: 0.9
+  dtype: "auto"
+attention_dp_config:
+  enable_balance: true
+  batching_wait_iters: 50
+  timeout_iters: 1
+num_postprocess_workers: 4  # Can mitigate the postprocessing overhead (e.g. detokenization)
+EOF
+```
+
+#### Launch trtllm-serve OpenAI-compatible API server
+
+Start the server using `trtllm-serve` with the PyTorch backend. This launches an OpenAI-compatible API server that can handle chat completions and text generation requests:
+
+```bash
+trtllm-serve \
+  $HF_MODEL_DIR \
+  --host localhost \
+  --port 8000 \
+  --backend pytorch \
+  --max_batch_size 2048 \
+  --max_num_tokens 8192 \
+  --tp_size 8 \
+  --ep_size 8 \
+  --pp_size 1 \
+  --config ./configs.yaml
+```
+
+Once the server is running, you can send requests to `http://localhost:8000/v1/completions` using the OpenAI API format.
+
+### Running Disaggregated TensorRT LLM Server
+
+Disaggregated serving separates the context (prefill) and generation (decode) phases onto different GPU sets, enabling better resource utilization and improved throughput. This example demonstrates a single-node disaggregated deployment using 8 GPUs (4 for context, 4 for generation). For more details, see the [Disaggregated Serving documentation](../../../disaggregated/README.md).
+
+#### Step 1: Set Environment Variables
+
+Configure the parallelism and buffer settings:
+
+```bash
+# Buffer size for KV cache transfer between context and generation servers
+export MAX_TOKENS_IN_BUFFER=8192
+
+# Model parallelism configuration
+export TP_SIZE=4
+export MOE_EP_SIZE=4
+export ENABLE_ATTENTION_DP=true
+```
+
+#### Step 2: Create Configuration Files
+
+**Context server configuration (`ctx_extra-llm-api-config.yaml`):**
+
+```bash
+cat > ctx_extra-llm-api-config.yaml << EOF
+backend: pytorch
+trust_remote_code: true
+disable_overlap_scheduler: true
+enable_chunked_prefill: true
+
+tensor_parallel_size: $TP_SIZE
+moe_expert_parallel_size: $MOE_EP_SIZE
+pipeline_parallel_size: 1
+enable_attention_dp: $ENABLE_ATTENTION_DP
+
+cache_transceiver_config:
+  backend: UCX
+  max_tokens_in_buffer: $MAX_TOKENS_IN_BUFFER
+EOF
+```
+
+**Generation server configuration (`gen_extra-llm-api-config.yaml`):**
+
+```bash
+cat > gen_extra-llm-api-config.yaml << EOF
+backend: pytorch
+trust_remote_code: true
+disable_overlap_scheduler: false
+enable_chunked_prefill: true
+
+tensor_parallel_size: $TP_SIZE
+moe_expert_parallel_size: $MOE_EP_SIZE
+pipeline_parallel_size: 1
+enable_attention_dp: $ENABLE_ATTENTION_DP
+
+cache_transceiver_config:
+  backend: UCX
+  max_tokens_in_buffer: $MAX_TOKENS_IN_BUFFER
+EOF
+```
+
+**Disaggregated orchestrator configuration (`disagg_config.yaml`):**
+
+```bash
+cat > disagg_config.yaml << EOF
+hostname: localhost
+port: 8000
+backend: pytorch
+context_servers:
+  num_instances: 1
+  urls:
+    - "localhost:8001"
+generation_servers:
+  num_instances: 1
+  urls:
+    - "localhost:8002"
+EOF
+```
+
+#### Step 3: Launch the Disaggregated Server
+
+Start all components in the following order:
+
+```bash
+# 1. Start context server (GPUs 0-3)
+CUDA_VISIBLE_DEVICES=0,1,2,3 trtllm-serve $HF_MODEL_DIR \
+    --host localhost --port 8001 --enable_chunked_prefill \
+    --extra_llm_api_options ./ctx_extra-llm-api-config.yaml &> log_ctx.log &
+
+# 2. Start generation server (GPUs 4-7)
+CUDA_VISIBLE_DEVICES=4,5,6,7 trtllm-serve $HF_MODEL_DIR \
+    --host localhost --port 8002 --enable_chunked_prefill \
+    --extra_llm_api_options ./gen_extra-llm-api-config.yaml &> log_gen.log &
+
+# 3. Start disaggregated orchestrator
+trtllm-serve disaggregated -c disagg_config.yaml -t 360 -r 1200 &> log_disagg.log &
+```
+
+Once all servers are running, you can send requests to `http://localhost:8000/v1/completions` using the OpenAI API format.
+
+
+## TRT flow
+
+The next section describes how to convert weights from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT LLM format. We will use LLaMA's [convert_checkpoint.py](../llama/convert_checkpoint.py) for EXAONE models and then build the model with `trtllm-build`.
 
 ### Convert checkpoint and build TensorRT engine(s)
 
@@ -141,7 +360,7 @@ trtllm-build \
     --output_dir trt_engines/exaone/fp16/1-gpu \
     --gemm_plugin auto
 
-# Build the EXAONE model using a single GPU and and apply INT8 weight-only quantization.
+# Build the EXAONE model using a single GPU and apply INT8 weight-only quantization.
 python ../llama/convert_checkpoint.py \
     --model_dir $HF_MODEL_DIR \
     --output_dir trt_models/exaone/int8_wq/1-gpu \
@@ -154,7 +373,7 @@ trtllm-build \
     --output_dir trt_engines/exaone/int8_wq/1-gpu \
     --gemm_plugin auto
 
-# Build the EXAONE model using a single GPU and and apply INT4 weight-only quantization.
+# Build the EXAONE model using a single GPU and apply INT4 weight-only quantization.
 python ../llama/convert_checkpoint.py \
     --model_dir $HF_MODEL_DIR \
     --output_dir trt_models/exaone/int4_wq/1-gpu \
@@ -183,18 +402,18 @@ trtllm-build \
 
 ### FP8 Post-Training Quantization
 
-The examples below uses the NVIDIA Modelopt (AlgorithMic Model Optimization) toolkit for the model quantization process.
+The examples below use the NVIDIA ModelOpt (AlgorithMic Model Optimization) toolkit for the model quantization process.
 
 First make sure Modelopt toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
 
 ```bash
-# Build the EXAONE model using a single GPU and and apply FP8 quantization.
+# Build the EXAONE model using a single GPU and apply FP8 quantization.
 python ../../../quantization/quantize.py \
     --model_dir $HF_MODEL_DIR \
     --dtype float16 \
     --qformat fp8 \
     --kv_cache_dtype fp8 \
-    --output_dir trt_models/exaone/fp8/1-gpu \
+    --output_dir trt_models/exaone/fp8/1-gpu
 
 trtllm-build \
     --checkpoint_dir trt_models/exaone/fp8/1-gpu \
@@ -204,12 +423,12 @@ trtllm-build \
 
 ### SmoothQuant
 
-The examples below uses the NVIDIA Modelopt (AlgorithMic Model Optimization) toolkit for the model quantization process.
+The examples below use the NVIDIA ModelOpt (AlgorithMic Model Optimization) toolkit for the model quantization process.
 
 First make sure Modelopt toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
 
 ```bash
-# Build the EXAONE model using a single GPU and and apply INT8 SmoothQuant.
+# Build the EXAONE model using a single GPU and apply INT8 SmoothQuant.
 python ../../../quantization/quantize.py \
     --model_dir $HF_MODEL_DIR \
     --dtype float16 \
@@ -224,12 +443,12 @@ trtllm-build \
 
 ### Groupwise quantization (AWQ)
 
-The examples below uses the NVIDIA Modelopt (AlgorithMic Model Optimization) toolkit for the model quantization process.
+The examples below use the NVIDIA ModelOpt (AlgorithMic Model Optimization) toolkit for the model quantization process.
 
 First make sure Modelopt toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
 
 ```bash
-# Build the EXAONE model using a single GPU and and apply INT4 AWQ.
+# Build the EXAONE model using a single GPU and apply INT4 AWQ.
 python ../../../quantization/quantize.py \
     --model_dir $HF_MODEL_DIR \
     --dtype float16 \
@@ -248,7 +467,7 @@ For Hopper GPUs, TRT-LLM also supports employing FP8 GEMM for accelerating linea
 Please make sure your system contains a Hopper GPU before trying the commands below.
 
 ```bash
-# Build the EXAONE model using a single GPU and and apply W4A8 AWQ.
+# Build the EXAONE model using a single GPU and apply W4A8 AWQ.
 python ../../../quantization/quantize.py \
     --model_dir $HF_MODEL_DIR \
     --dtype float16 \
@@ -287,4 +506,50 @@ python ../../../summarize.py \
     --engine_dir trt_engines/exaone/fp16/1-gpu
 ```
 
-For more examples see [`examples/models/core/llama/README.md`](../llama/README.md)
+For more examples regarding EXAONE-3.0 & EXAONE-Deep's TRT flow, see [`examples/models/core/llama/README.md`](../llama/README.md)
+
+
+
+## Troubleshootings
+
+### Troubleshootings for EXAONE-4.0
+
+The following error may occur during quantization:
+```bash
+torch._dynamo.exc.Unsupported: Graph break under GenericContextWrappingVariable
+Explanation: Attempted to graph break in an active context manager(s) that doesn't support graph breaking.
+Hint: Move the offending context manager(s) to outside the compiled region.
+Hint: This graph break may have been caused by an earlier graph break. Resolving the earlier graph break may resolve this one.
+```
+
+This error may indicate an incompatibility between `torch.compile()` and the `HybridCache` module of the transformers library. As a result, [Model Optimizer](https://github.com/NVIDIA/Model-Optimizer) (ModelOpt) cannot perform PTQ with HybridCache.
+
+Temporarily switching to `DynamicCache` when creating PTQ models could help address the issue. This can be done by updating the `cache_implementation` field in the `generation_config.json` file located in the model checkpoint directory, for example:
+```json
+# generation_config.json
+{
+    // Change "hybrid" to "dynamic" to run PTQ.
+    // Revert this to "hybrid" after quantization is complete.
+    "cache_implementation": "hybrid",
+    ...
+}
+```
+For models with sliding window attention, DynamicCache is less memory-efficient than HybridCache because it retains the entire key-value cache. However, this does not break the model's attention logic, as the cache implementation is separated from the attention computation itself. This trade-off is acceptable for the PTQ process, which is a one-time procedure. Our tests confirm that this workaround does not degrade accuracy on MMLU or GSM8K benchmarks with the default ModelOpt settings.
+
+### Troubleshootings for K-EXAONE
+
+K-EXAONE is a Mixture of Experts (MoE) model which activates 8 experts per token. When not enough tokens are given during the PTQ, some experts on some layers might not be activated and will not produce proper weights.
+
+To address this issue, provide enough data samples during calibration by increasing `calib_size` and `calib_seq` parameters:
+
+**FP8 Quantization:**
+```bash
+cd Model-Optimizer/examples/llm_ptq
+python3 hf_ptq.py --model hf_models/$MODEL_NAME --quant fp8 --export_fmt hf --calib_size 8192 --calib_seq 1024
+```
+
+**NVFP4 Quantization:**
+```bash
+cd Model-Optimizer/examples/llm_ptq
+python3 hf_ptq.py --model hf_models/$MODEL_NAME --quant nvfp4 --export_fmt hf --calib_size 8192 --calib_seq 1024
+```
