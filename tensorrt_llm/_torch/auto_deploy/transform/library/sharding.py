@@ -39,8 +39,8 @@ from ...utils.node_utils import (
     LayerSubgraph,
     LayerType,
     bfs,
-    extract_param_names_from_node,
-    extract_weight_node,
+    extract_weight_name,
+    extract_weight_nodes,
     filtered_nodes,
     get_all_layer_subgraphs,
     get_layer_after_linear_node,
@@ -49,7 +49,6 @@ from ...utils.node_utils import (
     is_any_moe_op,
     is_any_ssm_op,
     is_op,
-    num_users_of_weight_node,
     shape,
     subgraph,
 )
@@ -268,7 +267,7 @@ class WeightShardingInfo(ShardingTransformInfo):
     min_local_shape: int = 1
     layer_type: LayerType = LayerType.MLP
     # used for TP sharding of fused weights
-    fused_weight_dims: Optional[list] = None
+    fused_weight_dims: Optional[tuple] = None
 
     def quantization_cb(
         self,
@@ -437,7 +436,7 @@ class FP8WeightShardingInfo(QuantizationShardingMixin, WeightShardingInfo):
 
 
 def _shard_fp4_weight_scale(weight_scale, sharded_uint8_weight_shape, dim, rank, world_size):
-    assert weight_scale.dim() == 1
+    # assert weight_scale.dim() == 1
     weight_shape_original = list(sharded_uint8_weight_shape)
     weight_shape_original[dim] = weight_shape_original[dim] * world_size
     weight_shape_original[-1] *= 2
@@ -895,13 +894,10 @@ def _load_hook(
     # This is quite a hacky solution. A better solution would be to store extra_state in
     # the state_dict to identify whether the state_dict is sharded or not.
     key = prefix + param_key
-    ad_logger.debug(f"Sharder LOAD hook is called for '{key}'")
     if key not in state_dict:
         return
     p_to_load = state_dict[key]
-
     p_to_load = p_to_load if param_shape == p_to_load.shape else f_split(p_to_load)
-
     state_dict[key] = p_to_load
 
 
@@ -1124,6 +1120,7 @@ def init_process_grid_from_config(
         ShardingDim.EP: {"p": ep_rank, "w": ep_size},
         ShardingDim.TP: {"p": tp_rank, "w": tp_size},
     }
+    ad_logger.info(f"EP + TP sharding process grid: {process_grid}")
     config.process_grid = process_grid
     return process_grid
 
@@ -1187,10 +1184,6 @@ def shard_weight_tensor(
             fused_dims: list = fused_weight_dims,
             d: int = dim,
         ) -> torch.Tensor:
-            # dim_d = t.shape[d]
-            # num_parts = 1
-            # part_size = dim_d // num_parts
-            # fused_dims = [part_size] * num_parts
             return torch.cat(
                 [split_tensor(w) for w in torch.split(t, fused_dims, dim=d)],
                 dim=d,
@@ -1229,7 +1222,7 @@ def _shard_parameter_node(
     config: ShardingTransformConfig,
     add_dist: bool = False,
     min_local_shape: int = 1,
-    fused_weight_dims: Optional[list] = None,
+    fused_weight_dims: Optional[tuple] = None,
     quantization_cb: Optional[
         Callable[[GraphModule, nn.Module, Node, str, torch.Size, int, int, int], None]
     ] = None,
@@ -1243,67 +1236,58 @@ def _shard_parameter_node(
 
     rank, world_size = config.rank, config.world_size
     allreduce_strategy = config.allreduce_strategy.name
-    num_users = num_users_of_weight_node(node)
-    if num_users > 1 or num_users == 0:
-        ad_logger.warning(
-            f"Weight node {node} has {num_users} users. This is not supported for sharding. Skipping."
-        )
-        return
-    # get weight and bias key
-    weight_key, bias_key = extract_param_names_from_node(node)
-
-    modname = weight_key.rpartition(".")[0]
-    submod = gm.get_submodule(modname)
 
     # Shard weight using the unified function (also updates the parameter)
-    original_weight = gm.get_parameter(weight_key)
-    _, weight_new_shape = shard_weight_tensor(
-        gm=gm,
-        weight_tensor=original_weight,
-        param_key=weight_key,
-        dim=dim,
-        rank=rank,
-        world_size=world_size,
-        min_local_shape=min_local_shape,
-        fused_weight_dims=fused_weight_dims,
-    )
-
-    if bias_key is not None and dim == 0:
-        # update bias for dim 0 --> we can handle it like the weight
-        original_bias = gm.get_parameter(bias_key)
-        shard_weight_tensor(
+    weight_nodes = extract_weight_nodes(node)
+    for weight_node in weight_nodes.weights:
+        _, weight_new_shape = shard_weight_tensor(
             gm=gm,
-            weight_tensor=original_bias,
-            param_key=bias_key,
+            weight_tensor=weight_node.tensor,
+            param_key=weight_node.node_key,
             dim=dim,
             rank=rank,
             world_size=world_size,
             min_local_shape=min_local_shape,
             fused_weight_dims=fused_weight_dims,
         )
-    elif bias_key is not None and rank != world_size - 1:
-        # update the bias for dim 1 --> in this case only the last rank gets the bias to avoid
-        # double counting it. For all other we will delete the bias.
-        args = list(node.args)
-        node_bias = args[2]
-        args[2] = None
-        node.args = tuple(args)
-        gm.graph.erase_node(node_bias)
-        bias_param_name = bias_key.rpartition(".")[-1]
-        setattr(submod, bias_param_name, None)
-        gm._register_load_state_dict_pre_hook(partial(_load_hook_remove, param_key=bias_key))
+        if quantization_cb is not None:
+            quantization_cb(
+                gm=gm,
+                submod=weight_node.submod,
+                node=node,
+                weight_key=weight_node.node_key,
+                weight_new_shape=weight_new_shape,
+                dim=dim,
+                rank=rank,
+                world_size=world_size,
+            )
 
-    if quantization_cb is not None:
-        quantization_cb(
-            gm=gm,
-            submod=submod,
-            node=node,
-            weight_key=weight_key,
-            weight_new_shape=weight_new_shape,
-            dim=dim,
-            rank=rank,
-            world_size=world_size,
-        )
+    for bias_node in weight_nodes.biases:
+        if dim == 0:
+            # update bias for dim 0 --> we can handle it like the weight
+            shard_weight_tensor(
+                gm=gm,
+                weight_tensor=bias_node.tensor,
+                param_key=bias_node.node_key,
+                dim=dim,
+                rank=rank,
+                world_size=world_size,
+                min_local_shape=min_local_shape,
+                fused_weight_dims=fused_weight_dims,
+            )
+        elif bias_node is not None and rank != world_size - 1:
+            # update the bias for dim 1 --> in this case only the last rank gets the bias to avoid
+            # double counting it. For all other we will delete the bias.
+            args = list(node.args)
+            node_bias = args[2]
+            args[2] = None
+            node.args = tuple(args)
+            gm.graph.erase_node(node_bias)
+            bias_param_name = bias_node.node_key.rpartition(".")[-1]
+            setattr(bias_node.submod, bias_param_name, None)
+            gm._register_load_state_dict_pre_hook(
+                partial(_load_hook_remove, param_key=bias_node.node_key)
+            )
 
     # # # column shard with no gather: the output is sharded
     if not add_dist:
@@ -1633,7 +1617,7 @@ def _process_ssm_sharding(
             config=config,
             dist_op=None,
             min_local_shape=1,
-            fused_weight_dims=fused_weight_dims["in_proj"],
+            fused_weight_dims=tuple(fused_weight_dims["in_proj"]),
             layer_type=LayerType.SSM,
         )
     ):
@@ -1702,7 +1686,7 @@ def _process_ssm_sharding(
         fused_dims = None
         for k, v in fused_weight_dims.items():
             if k in weight_key:
-                fused_dims = v
+                fused_dims = tuple(v)
                 break
 
         # Shard the weight tensor (also updates the parameter in the module)
@@ -1887,7 +1871,7 @@ def _determine_fused_weight_dims(
                 ad_logger.warning(
                     f"Fused weight dims {fused_weight_dims} do not sum to weight dim {weight_dim}. Skipping."
                 )
-                return
+                return None
     chunk_nodes = list(filtered_nodes(linear_node.users, ops=torch.ops.aten.chunk))
     if len(chunk_nodes) > 0:
         assert len(linear_nodes) == 1
@@ -1896,6 +1880,8 @@ def _determine_fused_weight_dims(
         num_chunks = chunk_nodes[0].args[1]
         weight_dim = shape(linear_node)[2]
         fused_weight_dims = [weight_dim // num_chunks] * num_chunks
+    if fused_weight_dims is not None:
+        fused_weight_dims = tuple(fused_weight_dims)
     return fused_weight_dims
 
 
@@ -2046,9 +2032,9 @@ def detect_sharding_from_config(
 
     for lin_node in linear_nodes:
         # use node's weight name to get the module name
-        module_name = extract_weight_node(lin_node).target
+        weight_name = extract_weight_name(lin_node)
 
-        if any(attn_name in module_name for attn_name in attn_names):
+        if any(attn_name in weight_name for attn_name in attn_names):
             # find the next attention node and infer the head_dim
             next_attention_node, _ = bfs(
                 lin_node, is_any_attention_op, attr_next="users", include_root=False
@@ -2072,7 +2058,7 @@ def detect_sharding_from_config(
             # Then we escape dots, and finally we replace @ with .*
             pattern_string = pattern_string.replace("*", "@")
             pattern_regex = re.escape(pattern_string).replace("@", ".*")
-            if re.match(pattern_regex, module_name):
+            if re.match(pattern_regex, weight_name):
                 # we have a match. Get the config for this layer
                 config = tp_plan[key]
 
@@ -2111,7 +2097,7 @@ def detect_sharding_from_config(
                 elif "local" in config:
                     # Check if this applies to shared experts in EP parallelism.
                     # If yes, apply the TP col-row shard.
-                    if "shared" in module_name:
+                    if "shared" in weight_name:
                         col_row_action = config.replace("local_", "")
                         if col_row_action == "colwise":
                             transform_container.add(
@@ -2235,7 +2221,6 @@ def detect_column_row_shard(
     min_local_shape is the minimum size of the local tensor shard, to prevent TP parallelism
     splitting, e.g., the individual heads into smaller shards.
     """
-    # test_moe_variants()
     ad_logger.debug("Before sharding graph: " + str(gm))
     config = transform_container.config
     world_size = config.world_size
@@ -2340,7 +2325,7 @@ def detect_column_row_shard(
     # simple shard remaining linear nodes
     if config.shard_all_unprocessed:
         num_simple_shards += _process_simple_shard(unprocessed_linear_nodes, transform_container)
-    num_column_row_shards += num_ssm_shards
+    num_column_row_shards += num_ssm_shards + num_mla_shards
     num_shards = num_simple_shards + num_column_row_shards
     ad_logger.info(
         f"Heuristics found {num_shards} TP shards. Simple: {num_simple_shards}, "
