@@ -1,3 +1,4 @@
+import os
 import weakref
 from abc import abstractmethod
 from enum import Enum, IntEnum
@@ -200,11 +201,19 @@ class MoE(nn.Module):
         self.intermediate_size_per_partition = intermediate_size // self.tp_size
 
         self.all_reduce = None
+        # Debug function for eliminating imbalance during performance analysis.
+        self.enable_dummy_allreduce = os.environ.get(
+            "TRTLLM_ENABLE_DUMMY_ALLREDUCE", "0") == "1"
         if not self.use_dp and self.mapping.tp_size > 1:
             self.all_reduce = AllReduce(
                 mapping=self.mapping,
                 strategy=model_config.allreduce_strategy,
                 dtype=self.dtype)
+        elif self.enable_dummy_allreduce:
+            from tensorrt_llm.functional import AllReduceStrategy
+            self.all_reduce = AllReduce(mapping=self.mapping,
+                                        strategy=AllReduceStrategy.NCCL,
+                                        dtype=self.dtype)
 
         # Initialize load balancer related attributes
         if init_load_balancer:
@@ -748,3 +757,14 @@ class MoE(nn.Module):
             elif self.reduce_results:
                 outputs = self.all_reduce(inputs)
         return outputs
+
+    def dummy_allreduce(self):
+        assert self.enable_dummy_allreduce and self.all_reduce is not None, "Dummy allreduce is not enabled"
+        """
+        Debug function for eliminating imbalance during performance analysis.
+        Creates a small dummy tensor and performs allreduce to synchronize processes
+        and eliminate timing imbalances for more accurate profiling measurements.
+        """
+        dummy_tensor = torch.zeros(4, dtype=torch.float32, device="cuda")
+        dummy_tensor = self.all_reduce(dummy_tensor)
+        return dummy_tensor
