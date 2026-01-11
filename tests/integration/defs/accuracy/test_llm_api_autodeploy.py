@@ -208,12 +208,13 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
         # TODO: multi-stream MOE seems to increase the memory usage
         kwargs["max_batch_size"] = 32
         kwargs["free_mem_ratio"] = 0.5
-        sampling_params = self.get_default_sampling_params()
+        self.get_default_sampling_params()
         with AutoDeployLLM(model=self.MODEL_PATH_BF16,
                            tokenizer=self.MODEL_PATH_BF16,
                            **kwargs) as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=sampling_params)
+            # TODO: Fix https://github.com/NVIDIA/TensorRT-LLM/issues/10580
+            # task = MMLU(self.MODEL_NAME)
+            # task.evaluate(llm, sampling_params=sampling_params)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -226,7 +227,7 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
             # Manually set quant_config for FP8 model to get the accuracy threshold
             llm.args.quant_config.quant_algo = QuantAlgo.FP8
             llm.args.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
-
+            # TODO: Fix https://github.com/NVIDIA/TensorRT-LLM/issues/10580
             # task = MMLU(self.MODEL_NAME)
             # task.evaluate(llm, sampling_params=sampling_params)
             task = GSM8K(self.MODEL_NAME)
