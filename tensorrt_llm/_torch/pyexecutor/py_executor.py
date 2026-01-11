@@ -371,6 +371,12 @@ class PyExecutor:
             logger.error(traceback.format_exc())
             raise e
         finally:
+            if self.kv_cache_manager is not None:
+                found_nan = self.kv_cache_manager.check_nan_in_buffers()
+                if found_nan:
+                    raise ValueError(
+                        "Found NaN in KV Cache Manager buffers when finalizing event loop"
+                    )
             self._executor_loop_cleanup()
 
     @property
