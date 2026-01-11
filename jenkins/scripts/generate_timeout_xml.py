@@ -1,0 +1,107 @@
+import argparse
+import os
+import sys
+from html import escape
+
+
+def parse_xml_classname_name_file_from_testname(testname, stage_name):
+    classname, name, file = "", "", ""
+
+    # Remove stage_name prefix if present
+    if testname.startswith(stage_name + "/"):
+        testname = testname[len(stage_name) + 1 :]
+
+    # Get file name
+    if testname.startswith("unittest/"):
+        file = "test_unittests.py"
+    else:
+        file = testname.split("::")[0]
+
+    # Get test name
+    if testname.startswith("unittest/"):
+        name = "test_unittests_v2[" + testname + "]"
+    else:
+        name = testname.split("::")[-1]
+
+    # Get class name
+    if testname.startswith("unittest/"):
+        classname = stage_name + ".test_unittests"
+    elif len(testname.split("::")) == 3:
+        classname = (
+            stage_name
+            + "."
+            + testname.split("::")[0].replace(".py", "").replace("/", ".")
+            + "."
+            + testname.split("::")[1]
+        )
+    else:
+        classname = stage_name + "." + testname.split("::")[0].replace(".py", "").replace("/", ".")
+        if testname.startswith("accuracy/") or (
+            testname.startswith("examples/") and "[" not in testname
+        ):
+            classname = ""
+
+    return classname, name, file
+
+
+def generate_timeout_xml(stage_name, testList, outputFilePath):
+    num_tests = len(testList)
+    # Escape stage_name for XML safety
+    stage_name_escaped = escape(stage_name, quote=True)
+    xmlContent = (
+        f'<?xml version="1.0" encoding="UTF-8"?><testsuites>\n'
+        f'        <testsuite name="{stage_name_escaped}" errors="{num_tests}" '
+        f'failures="0" skipped="0" tests="{num_tests}" time="1.00">'
+    )
+
+    for test in testList:
+        classname, name, file = parse_xml_classname_name_file_from_testname(test, stage_name)
+        # Escape all XML attribute values
+        classname_escaped = escape(classname, quote=True)
+        name_escaped = escape(name, quote=True)
+        file_escaped = escape(file, quote=True)
+        xmlContent += (
+            f'<testcase classname="{classname_escaped}" name="{name_escaped}" '
+            f'file="{file_escaped}" time="1.0">\n'
+            f'        <error message="Test terminated unexpectedly">'
+            f" Test terminated unexpectedly\n"
+            f"        </error></testcase>"
+        )
+    xmlContent += "</testsuite></testsuites>"
+
+    with open(outputFilePath, "w", encoding="utf-8") as f:
+        f.write(xmlContent)
+
+
+def main():
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--stage-name", required=True, help="Stage name")
+    parser.add_argument("--test-file-path", required=True, help="Test list file path")
+    parser.add_argument("--output-file", required=True, help="Output file path")
+    args = parser.parse_args(sys.argv[1:])
+    stageName = args.stage_name
+    testFilePath = args.test_file_path
+    outputFilePath = args.output_file
+
+    full_path = os.path.join(stageName, testFilePath)
+    if not os.path.exists(full_path):
+        print(f"No {full_path} found, skipping timeout XML generation")
+        return
+
+    try:
+        with open(full_path, "r", encoding="utf-8") as f:
+            timeoutTests = [line.strip() for line in f if line.strip()]
+    except IOError as e:
+        print(f"Error reading {full_path}: {e}")
+        return
+
+    if len(timeoutTests) == 0:
+        print(f"No timeout tests found in {full_path}, skipping timeout XML generation")
+        return
+
+    generate_timeout_xml(stageName, timeoutTests, outputFilePath)
+
+
+if __name__ == "__main__":
+    main()
