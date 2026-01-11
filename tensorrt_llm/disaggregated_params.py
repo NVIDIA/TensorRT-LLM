@@ -32,7 +32,9 @@ class DisaggregatedParams:
     ctx_request_id: Optional[int] = None
     opaque_state: Optional[bytes] = None
     draft_tokens: Optional[List[int]] = None
-
+    disagg_id: Optional[int] = None
+    ctx_dp_rank: Optional[int] = None
+    ctx_info_endpoint: Optional[List[str]] = None
     # E-P Disaggregated Params
     multimodal_embedding_handles: Optional[List[Dict[str, Any]]] = (
         None  # multimodal embedding handles should be a list of cudaIPC handles for each mm_embedding
@@ -45,7 +47,13 @@ class DisaggregatedParams:
 
     def get_context_phase_params(self) -> tllme.ContextPhaseParams:
         return tllme.ContextPhaseParams(
-            self.first_gen_tokens, self.ctx_request_id, self.opaque_state, self.draft_tokens
+            self.first_gen_tokens,
+            self.ctx_request_id,
+            self.opaque_state,
+            self.draft_tokens,
+            self.disagg_id,
+            self.ctx_dp_rank,
+            self.ctx_info_endpoint,
         )
 
     def get_request_type(self) -> tllme.RequestType:

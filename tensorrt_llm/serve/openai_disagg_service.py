@@ -15,6 +15,7 @@
 import asyncio
 import copy
 import os
+import uuid
 from typing import Any, Callable, Dict, Optional
 
 from tensorrt_llm.llmapi.disagg_utils import (
@@ -142,7 +143,13 @@ class OpenAIDisaggregatedService(OpenAIService):
 
     def _get_ctx_request(self, request: UCompletionRequest) -> UCompletionRequest:
         ctx_request = copy.deepcopy(request)
-        ctx_request.disaggregated_params = DisaggregatedParams(request_type="context_only")
+        unique_disagg_id = (
+            uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
+        )  # Generate positive int64 from uuid
+        ctx_request.disaggregated_params = DisaggregatedParams(
+            request_type="context_only",
+            disagg_id=unique_disagg_id,
+        )
         ctx_request.stream = False
         ctx_request.stream_options = None
         return ctx_request
@@ -304,4 +311,8 @@ class OpenAIDisaggregatedService(OpenAIService):
                 raise ValueError("Context server did not return disaggregated params")
             if ctx_response.choices[0].disaggregated_params.ctx_request_id is None:
                 raise ValueError("Invalid disaggregated params in context phase response.")
+            if ctx_response.choices[0].disaggregated_params.disagg_id is None:
+                raise ValueError(
+                    "Invalid disaggregated params in context phase response. disagg_id is None"
+                )
             return ctx_response

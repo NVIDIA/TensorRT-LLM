@@ -465,10 +465,13 @@ class ExecutorRequestQueue:
                 new_requests, "py_scheduling_params")
             py_num_logprobs = self._collect_py_objects_from_requests(
                 new_requests, "py_num_logprobs")
+            py_disaggregated_params = self._collect_py_objects_from_requests(
+                new_requests, "py_disaggregated_params")
             py_request_objects = tuple(
                 filter(None, [
                     py_logits_post_processors, py_multimodal_data,
-                    py_scheduling_params, py_num_logprobs
+                    py_scheduling_params, py_num_logprobs,
+                    py_disaggregated_params
                 ]))
         else:
             py_request_objects = None
