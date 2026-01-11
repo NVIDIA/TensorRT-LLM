@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,7 +29,6 @@ from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import MiniMaxM2MoeRoutingMethod, create_moe
 from ..modules.linear import Linear
-from ..modules.qk_norm_attention import compute_yarn_parameters
 from ..modules.rms_norm import RMSNorm
 from ..utils import AuxStreamType
 from .modeling_utils import DecoderModel, DecoderModelForCausalLM, register_auto_model
@@ -67,16 +66,12 @@ class MiniMaxM2MoE(nn.Module):
 
         reduce_results = True
         self.experts = create_moe(
-            num_experts=self.num_experts,
             routing_method=MiniMaxM2MoeRoutingMethod(
                 top_k=self.top_k,
                 num_experts=self.num_experts,
                 callable_e_score_correction_bias=lambda: self.e_score_correction_bias,
             ),
-            hidden_size=self.hidden_dim,
-            intermediate_size=self.ffn_dim,
             aux_stream_dict={AuxStreamType.MoeChunkingOverlap: aux_stream},
-            dtype=config.torch_dtype,
             reduce_results=reduce_results,
             model_config=model_config,
             layer_idx=layer_idx,
@@ -120,12 +115,9 @@ class MiniMaxM2Attention(Attention):
         self,
         *,
         model_config: ModelConfig[PretrainedConfig],
-        pos_embd_params: Optional[PositionalEmbeddingParams] = None,
         skip_rope: bool = False,
         fuse_qk_norm_rope: bool = False,
         layer_idx: Optional[int] = None,
-        dtype: torch.dtype = None,
-        use_gemma_rms_norm: bool = False,
         is_qk_norm: bool = True,
     ):
         config = model_config.pretrained_config
@@ -133,14 +125,10 @@ class MiniMaxM2Attention(Attention):
 
         self.fuse_qk_norm_rope = fuse_qk_norm_rope
         self.skip_rope = skip_rope
-        if use_gemma_rms_norm:
-            assert fuse_qk_norm_rope is False, (
-                "fused_qk_norm_rope is not supported for gemma rms norm."
-            )
 
         # If fuse_qk_norm_rope is true, do not apply fused RoPE in attention OP, and self.rotary_emb
         # will be skipped in the overridden apply_rope.
-        rope_fusion = not self.fuse_qk_norm_rope and not skip_rope and not use_gemma_rms_norm
+        rope_fusion = not self.fuse_qk_norm_rope and not skip_rope
         self.is_qk_norm = is_qk_norm
         assert not (fuse_qk_norm_rope and skip_rope), (
             "Fusing qk norm and skipping rope is not supported"
@@ -196,28 +184,6 @@ class MiniMaxM2Attention(Attention):
 
         return q, k
 
-    def apply_qk_norm_rope(self, qkv, position_ids):
-        factor, low, high, attention_factor = compute_yarn_parameters(self.pretrained_config)
-        torch.ops.trtllm.fused_qk_norm_rope(
-            qkv,
-            self.num_heads,
-            self.num_key_value_heads,
-            self.num_key_value_heads,
-            self.head_dim,
-            self.q_norm.variance_epsilon,
-            self.q_norm.weight,
-            self.k_norm.weight,
-            self.pos_embd_params.rope.theta,
-            self.pos_embd_params.is_neox,
-            position_ids.view(-1),
-            factor,
-            low,
-            high,
-            attention_factor,
-            self.is_qk_norm,
-        )
-        return qkv, None, None
-
     def apply_rope(
         self,
         q: torch.Tensor,
@@ -230,18 +196,15 @@ class MiniMaxM2Attention(Attention):
         The apply_rope method is overridden in this class to apply QK norm and RoPE to the input tensor.
         """
         # Apply QK norm before RoPE.
-        if not self.fuse_qk_norm_rope:
-            q, k, v = self.split_qkv(q, k, v)
-            q, k = self.apply_qk_norm(q, k)
-            if not self.skip_rope:
-                return super().apply_rope(q, k, v, position_ids)
-            else:
-                return q, k, v
-
-        qkv = q
-        if k is not None and v is not None:
-            qkv = torch.concat([q, k, v], dim=-1)
-        return self.apply_qk_norm_rope(qkv, position_ids)
+        assert self.fuse_qk_norm_rope is False, (
+            "fused_qk_norm_rope is not supported for Minimax M2."
+        )
+        q, k, v = self.split_qkv(q, k, v)
+        q, k = self.apply_qk_norm(q, k)
+        if not self.skip_rope:
+            return super().apply_rope(q, k, v, position_ids)
+        else:
+            return q, k, v
 
 
 class MiniMaxM2DecoderLayer(DecoderLayer):
@@ -255,7 +218,9 @@ class MiniMaxM2DecoderLayer(DecoderLayer):
         config = model_config.pretrained_config
         self.hidden_size = config.hidden_size
 
-        self.self_attn = MiniMaxM2Attention(model_config=model_config, layer_idx=layer_idx)
+        self.self_attn = MiniMaxM2Attention(
+            model_config=model_config, fuse_qk_norm_rope=False, layer_idx=layer_idx
+        )
 
         self.block_sparse_moe = MiniMaxM2MoE(
             model_config=model_config, aux_stream=aux_stream, layer_idx=layer_idx
