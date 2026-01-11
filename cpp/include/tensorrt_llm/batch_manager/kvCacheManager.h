@@ -63,15 +63,21 @@ static constexpr SizeType32 kSecondaryLevel = 1;
 static constexpr SizeType32 kSWAExtraBlock = 1;
 
 class KVCacheBlock;
+class KVCachePromptLookupNode;
+class KVCachePromptLookup;
 class BlockManager;
 class KVCacheManager;
 class KVCacheTransferManager;
+class WindowBlockManager;
+class GenerationRequest;
 
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
 using TokenIdType = tensorrt_llm::runtime::TokenIdType;
 using VecTokens = std::vector<TokenIdType>;
 using BeamTokens = std::vector<VecTokens>;
 using BlockPtr = std::shared_ptr<KVCacheBlock>;
+using LookupNodePtr = std::shared_ptr<KVCachePromptLookupNode>;
+using LookupPtr = std::shared_ptr<KVCachePromptLookup>;
 using FreeBlocksQueue = std::list<BlockPtr>;
 using UniqueToken = tensorrt_llm::runtime::UniqueToken;
 using VecUniqueTokens = tensorrt_llm::runtime::VecUniqueTokens;
@@ -191,6 +197,32 @@ struct BlockKey
         }
         return numMatched;
     }
+
+    //! \brief Deep copy, optionally reducing number of tokens
+    struct BlockKey clone(int newNumberOfTokens = 0) const
+    {
+        BlockKey blockKey;
+        blockKey.usesExtraIds = usesExtraIds;
+        blockKey.loraTaskId = loraTaskId;
+        if (newNumberOfTokens > 0)
+        {
+            // Reduce token length (for partial matching)
+            TLLM_CHECK_WITH_INFO(newNumberOfTokens <= static_cast<int>(uniqueTokens.size()),
+                "newNumberOfTokens = %d must be <= uniqueTokens.size() = %d", newNumberOfTokens,
+                static_cast<int>(uniqueTokens.size()));
+            blockKey.uniqueTokens.insert(
+                blockKey.uniqueTokens.begin(), uniqueTokens.begin(), uniqueTokens.begin() + newNumberOfTokens);
+        }
+        else
+        {
+            // Copy all tokens
+            blockKey.uniqueTokens.insert(blockKey.uniqueTokens.begin(), uniqueTokens.begin(), uniqueTokens.end());
+        }
+        blockKey.extraKeys.insert(blockKey.extraKeys.begin(), extraKeys.begin(), extraKeys.end());
+        blockKey.cacheSaltID = cacheSaltID;
+        return blockKey;
+        // TODO: Add unit test verifying correct copy of both partial and full token Ids.
+    }
 };
 
 std::vector<BlockKey> buildBlockKeys(std::list<VecUniqueTokens>& blockedUniqueTokens, LlmRequest const& llmRequest);
@@ -208,7 +240,7 @@ struct BlockKeyHasher
     }
 };
 
-using NextBlockMap = std::unordered_map<BlockKey, BlockPtr, BlockKeyHasher>;
+using NextNodeMap = std::unordered_map<BlockKey, LookupNodePtr, BlockKeyHasher>;
 
 struct KvCacheStats
 {
@@ -236,6 +268,179 @@ struct KvCacheStats
     std::size_t allocatedBytes{};
 };
 
+using LookupResult = std::vector<std::tuple<bool, SizeType32, LookupNodePtr>>;
+
+// Vector of LookupResult, one for each BlockKey used during search.
+// If no match was found, vector will be empty.
+// If an exact match was found, vector will have one item.
+// If partial matching is enabled and no exact match was found,
+// vector will list all nodes with at least one matching token.
+// Partially matching nodes are sorted in descending order of number of matching tokens.
+using LookupResults = std::vector<LookupResult>;
+
+// Implement an object that represents a given prompt prefix in search structure.
+// The node contains pointers to all reusable state for the prompt prefix.
+class KVCachePromptLookupNode
+{
+public:
+    explicit KVCachePromptLookupNode(BlockKey const& blockKey, bool isFull, bool isRoot = false);
+
+    void setBlockKey(BlockKey const& blockKey, bool isFull);
+
+    BlockKey getBlockKey() const;
+
+    [[nodiscard]] VecUniqueTokens const& getUniqueTokens() const;
+
+    [[nodiscard]] bool isRoot() const;
+
+    [[nodiscard]] LookupNodePtr const& getPrevNode() const;
+
+    void setPrevNode(LookupNodePtr prevNode);
+
+    [[nodiscard]] NextNodeMap getNextNodes() const;
+
+    void addNextNode(BlockKey const& blockKey, LookupNodePtr block);
+
+    void removeNextNode(BlockKey const& blockKey);
+
+    //! \brief Find block matching blockKey. If allowPartial is true, the returned block may match only a prefix of
+    //! blockKey.
+    //! @return tuple of [partialMatch, numMatched, block], partialMatch is true if not all the tokens of the block were
+    //! matched.
+    [[nodiscard]] LookupResult findMatchingNodes(
+        BlockKey const& blockKey, bool enablePartialReuse, bool ignoreNodesWithoutBlocks) const;
+
+    void setBlock(SizeType32 windowSize, BlockPtr block);
+
+    [[nodiscard]] BlockPtr getBlock(SizeType32 windowSize) const;
+
+    [[nodiscard]] bool hasBlocks() const;
+
+    [[nodiscard]] bool isFull() const;
+
+    [[nodiscard]] bool isLeaf() const;
+
+    [[nodiscard]] bool canBeDeleted() const;
+
+    [[nodiscard]] std::vector<BlockKey> getFullBlockKey() const;
+
+    void deleteNodeIfPossible();
+
+    void printSearchTree(std::ostream& os, SizeType32 indent) const;
+
+private:
+    // Key of this block in mNextBlocks map in block pointed to by mPrevBlock
+    BlockKey mBlockKey;
+    // Flag indicating if block is full
+    bool mIsFull;
+    // Flag indicating if this is root node
+    bool mIsRoot;
+    // Previous node in search structure
+    LookupNodePtr mPrevNode;
+    // Next node(s) in sequence(s)
+    NextNodeMap mNextNodes;
+    // Pointers to blocks holding KV state for this prompt prefix
+    std::unordered_map<SizeType32, BlockPtr> mBlocks;
+};
+
+// Print methods used for debugging.
+std::ostream& operator<<(std::ostream& out, LookupResult const& match);
+std::ostream& operator<<(std::ostream& out, LookupResults const& matches);
+std::ostream& operator<<(std::ostream& out, std::tuple<bool, SizeType32, BlockPtr, LookupNodePtr> const& match);
+std::ostream& operator<<(
+    std::ostream& out, std::vector<std::tuple<bool, SizeType32, BlockPtr, LookupNodePtr>> const& matches);
+std::ostream& operator<<(std::ostream& out,
+    std::unordered_map<SizeType32, std::vector<std::tuple<bool, SizeType32, BlockPtr, LookupNodePtr>>> const& matches);
+
+template <typename T>
+std::string streamPrint(T v)
+{
+    std::stringstream out;
+    out << v;
+    return out.str();
+}
+
+template <typename C, typename... Args>
+std::string streamPrint(C callable, Args... remainingArgs)
+{
+    std::stringstream out;
+    out << callable(out, remainingArgs...);
+    return out.str();
+}
+
+//
+// Basic building block of KV cache.
+//
+// Implements a radix tree that is used to search for blocks containing reusable state for a common prefix.
+// There is only one instance of the search tree, it is owned by BlockManager.
+// Each node in the search tree corresponds to a particular prefix.
+// Each node has a map from window size to KVCacheBlock, if reusable state exists for a given window size,
+// the map will have a pointer to the block containing it.
+// KVCacheBlocks have a pointer back to the node that is referring to them. This makes it easier to remove
+// blocks from the search tree and also allows searches like getPrevBlock().
+//
+// Notes:
+// None of these methods are thread safe. It is up to the caller to ensure thread safety.
+// These methods return values for all window sizes with a single pass through the search tree.
+//
+class KVCachePromptLookup
+{
+public:
+    explicit KVCachePromptLookup(CacheType cacheType, SizeType32 tokensPerBlock);
+
+    //! \brief Return vector of BlockKey for the first inputLength tokens of prompt stored in llmRequest.
+    //! \details If inputLength < 0, effective input length is total number of tokens + inputLength. If you want to skip
+    //! the last token, you can simply do inputLength = -1.
+    [[nodiscard]] std::vector<BlockKey> getBlockKeys(
+        LlmRequest const& llmRequest, SizeType32 inputLength, bool allowPartiallyFilledBlock) const;
+
+    //! \brief Find last valid block for prefix given in blockKey.
+    //! \details Seems like blockKey contains a full prefix, not just key for an individual block. This is very hacky
+    //! and will lead to hilarious bugs. \details Since all KV cache manager bugs eventually gets reassigned to me, THIS
+    //! MUST BE FIXED AT ALL COSTS. \details We should introduce a new data type for full prefix keys (maybe named
+    //! FullPrefixKey?). \details Alternatively, we can introduce a new field that tracks whether BlockKey object
+    //! contains a full prefix or just key for one block.
+    std::unordered_map<SizeType32, std::shared_ptr<KVCacheBlock>> findBlocksInReuseTreeByBlockKey(
+        std::vector<SizeType32> const& windowSizes, BlockKey const& blockKey) const;
+
+    //! \brief Find first new context block for each window block manager.
+    //! \param llmRequest The new request.
+    //! \param inputLength Number of useful prompt tokens. If zero, length of prompt minus 1 is used.
+    //! \param allowPartiallyFilledBlock Allow matching of blocks that are not full.
+    //! \param windowBlockManagers Map of window block managers vs window size. Method will search for a new context
+    //! block for each window size. \return map of BlockKey vs windowSize. The block key is that of first new context
+    //! block for that window size.
+    [[nodiscard]] std::unordered_map<SizeType32, BlockKey> findNewContextBlock(LlmRequest const& llmRequest,
+        SizeType32 inputLength, bool allowPartiallyFilledBlock, std::vector<SizeType32> const& windowSizes) const;
+
+    //! \brief Find matching nodes for a given prompt prefix.
+    //! \details Nodes are created if not found.
+    //! \param allowPartiallyFilledBlock Allow last block in prompt to have less than tokensPerBlock tokens.
+    [[nodiscard]] LookupResults lookup(
+        LlmRequest const& llmRequest, SizeType32 inputLength, bool allowPartiallyFilledBlock);
+
+    //! \brief Find matching blocks for a given prompt prefix for all window sizes.
+    //! \details return map of matching blocks vs window size. Matching blocks is a vector of varying size.
+    std::unordered_map<SizeType32, std::vector<std::tuple<bool, SizeType32, BlockPtr, LookupNodePtr>>> lookupBlocks(
+        std::map<SizeType32, WindowBlockManager> const& windowBlockManagers, LlmRequest const& llmRequest,
+        SizeType32 inputLength, bool allowPartiallyFilledBlock, bool enablePartialReuse) const;
+
+    //! \brief Print input prompt given by llmRequest.
+    //! \details Uses some member variables for formatting, hence cannot be made static.
+    std::string printPrompt(LlmRequest const& llmRequest) const;
+
+    //! \brief Print search tree.
+    std::string printSearchTree() const;
+
+private:
+    // Root of search structure
+    LookupNodePtr mRoot;
+    // KV cache type (self or cross)
+    CacheType mCacheType;
+    // Number of tokens per one block
+    SizeType32 mTokensPerBlock;
+};
+
 // Basic building block of a paged KV cache - a single
 // cache block. This class just holds metadata, no pointers
 // since it is reused across all layers.
@@ -246,13 +451,11 @@ public:
 
     static constexpr IdType kCachedBlocksRootId = -1;
 
-    explicit KVCacheBlock(IdType blockId, kernels::KVCacheIndex blockIdx);
+    explicit KVCacheBlock(IdType blockId, kernels::KVCacheIndex blockIdx, SizeType32 windowSize);
 
     void startScheduling();
 
     [[nodiscard]] IdType getBlockId() const;
-
-    [[nodiscard]] NextBlockMap getNextBlocks() const;
 
     [[nodiscard]] kernels::KVCacheIndex::UnderlyingType getMemoryPoolBlockIndex() const;
 
@@ -270,39 +473,25 @@ public:
 
     [[nodiscard]] bool hasSchedulingRefs() const;
 
+    // This info is duplicated in KVCacheBlock and KVCachePromptLookupNode
+    // because it is needed by the former when KVCacheBlock might not be stored
+    // in lookup structure and therefore cannot get this value from there
     void setBlockKey(BlockKey const& blockKey, bool isFull);
-
-    BlockKey getBlockKey();
-
+    BlockKey getBlockKey() const;
     [[nodiscard]] VecUniqueTokens const& getUniqueTokens() const;
 
-    BlockPtr const& getPrevBlock() const;
-
-    void setPrevBlock(BlockPtr prevBlock);
-
     BlockPtr const& getPrevBlockInSeq() const;
-
     void setPrevBlockInSeq(BlockPtr prevBlock);
 
-    void addNextBlock(BlockKey const& blockKey, BlockPtr block);
-
-    void removeNextBlock(BlockKey const& blockKey);
-
-    //! \brief Find block matching blockKey. If allowPartial is true, the returned block may match only a prefix of
-    //! blockKey.
-    //! @return tuple of [partialMatch, numMatched, block], partialMatch is true if not all the tokens of the block were
-    //! matched.
-    [[nodiscard]] std::tuple<bool, SizeType32, BlockPtr> findMatchingBlock(
-        BlockKey const& blockKey, bool enablePartialReuse, bool copyOnPartialReuse) const;
-
-    //! \brief Free block from previous block if present.
-    void freeLeafBlock();
+    //! \brief Return previous block in search tree if this block is stored in search tree.
+    //! \details Returns nullptr if this block is not in search tree or it is at root level.
+    //! \details Previously this function would have returned pointer to a special 'root' block if already at root
+    //! level.
+    BlockPtr getPrevBlock() const;
 
     [[nodiscard]] bool isFull() const;
 
     [[nodiscard]] bool isShared() const;
-
-    [[nodiscard]] bool isLeaf() const;
 
     void setPriority(executor::RetentionPriority priority);
 
@@ -323,6 +512,21 @@ public:
 
     size_t getHash() const;
 
+    // attach to lookup node (register block for reuse)
+    void attachToLookupNode(LookupNodePtr lookupNode, BlockPtr block);
+
+    // detach from lookup node (unregister block for reuse)
+    void detachFromLookupNode();
+
+    // get lookup node using this block. Can be nullptr
+    [[nodiscard]] LookupNodePtr getLookupNode() const;
+
+    //! \brief Check if block is still valid for reuse.
+    [[nodiscard]] bool isValidForReuse() const
+    {
+        return mLookupNode != nullptr;
+    }
+
     std::vector<MmKey> getExtraKeys() const;
 
 private:
@@ -342,14 +546,8 @@ private:
     // Key of this block in mNextBlocks map in block pointed to by mPrevBlock
     BlockKey mBlockKey;
 
-    // Previous block in reuse tree, or nullptr if not reusing
-    BlockPtr mPrevBlock;
-
     // Previous block in sequence, == nullptr for first block, == mPrevBlock if reusing and not first
     BlockPtr mPrevBlockInSeq;
-
-    // Next block(s) in sequence(s)
-    NextBlockMap mNextBlocks;
 
     // Iterator pointing to this block in mFreeBlocks.
     std::optional<FreeBlocksQueue::iterator> mFreeBlockIterator;
@@ -365,6 +563,11 @@ private:
     std::optional<std::chrono::steady_clock::time_point::duration> mExpirationTime;
     // Hash for the event manager
     size_t mHash;
+
+    // Pointer to search tree lookup node using this block
+    LookupNodePtr mLookupNode;
+    // Window size using this block (0 if not in use)
+    SizeType32 mWindowSize;
 };
 
 class GenerationRequest
@@ -636,8 +839,9 @@ public:
     void startScheduling();
 
     //! \brief Assign blocks for new sequence. Try to reuse blocks.
-    void addSequence(
-        GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks, LlmRequest& llmRequest);
+    void addSequence(GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks,
+        LlmRequest& llmRequest,
+        std::vector<std::tuple<bool, SizeType32, BlockPtr, LookupNodePtr>> const& matchedBlocks);
 
     //! \brief Assign blocks for new sequence. Does not try to reuse blocks.
     void addSequence(GenerationRequest& sequence, SizeType32 numContextBlocks, bool isShareLastContextBlock);
@@ -657,9 +861,7 @@ public:
     void pinBlocks(GenerationRequest& sequence);
 
     //! \brief Release blocks of the sequence.
-    //! \details When llmRequest is provided and reuse is enabled, blocks will be stored.
-    std::optional<KVCacheBlock::IdType> releaseBlocks(
-        GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
+    std::optional<KVCacheBlock::IdType> releaseBlocks(GenerationRequest& sequence);
 
     //! \brief Simulate freeing all blocks for that sequence to check impact on number of free blocks
     void schedulingReleaseBlocks(LlmRequest::RequestIdType requestId);
@@ -831,11 +1033,6 @@ public:
     void offloadBlock(BlockPtr const& block, executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM,
         std::string const& directory = "");
 
-    //! \brief Find first new block that must be allocated for context phase and return it's concatenated token vectors.
-    //! \details Only full blocks are considered.
-    [[nodiscard]] std::optional<BlockKey> findNewContextBlock(
-        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const;
-
     [[nodiscard]] runtime::BufferManager const& getBufferManager() const
     {
         return mBufferManager;
@@ -855,8 +1052,7 @@ public:
     //! \param pinBlocks If true, increment ref count for blocks while storing (pin on store).
     //! \return Pair of (num blocks stored for reuse, id of the last block stored if any).
     [[nodiscard]] std::pair<SizeType32, std::optional<KVCacheBlock::IdType>> storeBlocks(
-        std::vector<BlockKey> const& blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds,
-        bool pinBlocks = false);
+        LookupResults const& lookupNodes, std::vector<KVCacheBlock::IdType> const& blockIds, bool pinBlocks = false);
 
     [[nodiscard]] bool verifyQueueIntegrity();
 
@@ -884,33 +1080,17 @@ public:
         return mIsSWA;
     }
 
-    [[nodiscard]] std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(BlockKey const& blockKey);
-
     //! \brief Unpin blocks by starting from a block id and walking prev pointers.
     void unpinBlocksById(KVCacheBlock::IdType blockId);
 
-    void initializeSequenceStorageValidity(LlmRequest::RequestIdType requestId)
-    {
-        mIsValidStoreForReuseSequence[requestId] = true;
-    }
-
-    void releaseSequenceStorageValidity(LlmRequest::RequestIdType requestId)
-    {
-        mIsValidStoreForReuseSequence.erase(requestId);
-    }
-
-    //! \brief Return whether this sequence is valid for store for reuse
-    [[nodiscard]] bool isSequenceValidForStoreForReuse(LlmRequest::RequestIdType requestId) const
-    {
-        TLLM_CHECK_WITH_INFO(mIsValidStoreForReuseSequence.count(requestId) > 0, "Sequence should be bookkeeped");
-        return mIsValidStoreForReuseSequence.at(requestId);
-    }
+    [[nodiscard]] std::string printFreeQueues() const;
 
     void resetReuseState()
     {
-        std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
-        mCachedBlocksRoot
-            = std::make_shared<KVCacheBlock>(KVCacheBlock::kCachedBlocksRootId, tensorrt_llm::kernels::KVCacheIndex{0});
+        for (auto const& block : mAllBlocksById)
+        {
+            block->detachFromLookupNode();
+        }
     }
 
 private:
@@ -924,22 +1104,18 @@ private:
     //! \param blockKeys Key of each block.
     //! \param sequence Sequence to which blocks are assigned.
     //! \return Number of matched tokens from loaded blocks.
-    SizeType32 loadOrAllocateBlocks(std::vector<BlockKey> const& blockKeys, SizeType32 numContextBlocks,
-        GenerationRequest& sequence, std::vector<executor::RetentionPriorityAndDuration> const& perBlockRetentions,
+    SizeType32 loadOrAllocateBlocks(
+        std::vector<std::tuple<bool, SizeType32, BlockPtr, LookupNodePtr>> const& matchedBlocks,
+        SizeType32 numContextBlocks, GenerationRequest& sequence,
+        std::vector<executor::RetentionPriorityAndDuration> const& perBlockRetentions,
         executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "");
-
-    //! \brief Free block and all it's descendants. This makes block a claimed leaf block.
-    void freeChildren(BlockPtr const& block);
 
     //! \brief Find block least likely to be reused, free it if necessary and return.
     //! \param sequence Sequence which the free block is allocated for
-    [[nodiscard]] BlockPtr getFreeBlock(GenerationRequest& sequence,
+    [[nodiscard]] BlockPtr getFreeBlock(
         executor::RetentionPriority = executor::KvCacheRetentionConfig::kDefaultRetentionPriority,
         std::optional<std::chrono::milliseconds> durationMs = std::nullopt,
         executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "");
-
-    //! \brief Calls KVCacheBlock::freeLeafBlock to remove block from search tree.
-    void freeLeafBlock(BlockPtr const& block);
 
     //! \brief For FP4 quantization. Creates pool objects for FP4 block scalars.
     void createBlockScalePools(SizeType32 blockSize);
@@ -977,8 +1153,6 @@ private:
     bool mIsSWA;
     // List of all blocks by idx
     std::vector<BlockPtr> mAllBlocksById;
-    // Dummy block acting as root for BlockToken searches
-    BlockPtr mCachedBlocksRoot;
     // KV cache type (self or cross)
     CacheType mCacheType;
     // Eviction Policy
@@ -1016,17 +1190,6 @@ private:
     bool mCopyOnPartialReuse;
     // The kv cache connector manager
     std::shared_ptr<kv_connector::KvCacheConnectorManager> mKvCacheConnectorManager;
-
-    // Mutex for the cached blocks root
-    std::mutex mCachedBlocksRootMutex;
-
-    // Record which sequence is using the block
-    std::map<KVCacheBlock::IdType, LlmRequest::RequestIdType> mBlockToSequence;
-    // Record whether a sequence has all blocks held valid.
-    // The boolean value is set to true upon first encounter of a new sequence.
-    // It may be invalidated to false when other sequence acquires a block that
-    // is used by another sequence.
-    std::map<LlmRequest::RequestIdType, bool> mIsValidStoreForReuseSequence;
 
     // Whether to enable indexer K cache
     bool mEnableIndexerKCache;
@@ -1134,10 +1297,10 @@ public:
         executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "");
 
     [[nodiscard]] std::pair<SizeType32, std::optional<KVCacheBlock::IdType>> storeBlocks(
-        std::vector<BlockKey> const& blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds,
-        SizeType32 windowSize, bool pinBlocks = false)
+        LookupResults const& lookupNodes, std::vector<KVCacheBlock::IdType> const& blockIds, SizeType32 windowSize,
+        bool pinBlocks = false)
     {
-        return mWindowBlockManagers.at(windowSize).storeBlocks(blockKeys, blockIds, pinBlocks);
+        return mWindowBlockManagers.at(windowSize).storeBlocks(lookupNodes, blockIds, pinBlocks);
     }
 
     [[nodiscard]] bool verifyQueueIntegrity(SizeType32 windowSize);
@@ -1312,10 +1475,7 @@ public:
     }
 
     [[nodiscard]] std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(
-        BlockKey const& blockKey, SizeType32 windowSize)
-    {
-        return mWindowBlockManagers.at(windowSize).findBlocksInReuseTreeByBlockKey(blockKey);
-    }
+        BlockKey const& blockKey, SizeType32 windowSize) const;
 
     [[nodiscard]] SizeType32 getNumPrimaryBlocks() const
     {
@@ -1365,46 +1525,17 @@ public:
     //! context block that goes OOW.
     void adjustBlocksIfNeeded(GenerationRequest& sequence);
 
-    //! \brief Return whether the sequence is already managed by the block manager
-    [[nodiscard]] bool isSequenceHeld(LlmRequest::RequestIdType requestId) const
+    //! \brief Print free queues maintained by eviction policy
+    //! \details This method is meant for debugging
+    [[nodiscard]] std::string printFreeQueues(SizeType32 windowSize) const
     {
-        return mManagedSequences.count(requestId) > 0;
+        return mWindowBlockManagers.at(windowSize).printFreeQueues();
     }
 
-    //! \brief Add a sequence to the managed sequences
-    //! \details Take the sequence into account for the manager. Initialize
-    //! sequence storage validity under all window sizes.
-    void holdSequence(LlmRequest::RequestIdType requestId)
+    //! \brief Print search tree.
+    [[nodiscard]] std::string printSearchTree() const
     {
-        mManagedSequences.insert(requestId);
-        for (auto const& [windowSize, metadata] : mWindowSizeToMetadata)
-        {
-            mWindowBlockManagers.at(windowSize).initializeSequenceStorageValidity(requestId);
-        }
-    }
-
-    //! \brief Remove a sequence from the managed sequences.
-    //! \details Remove sequence from the managed sequences and remove sequence
-    //! storage
-    void releaseSequence(LlmRequest::RequestIdType requestId)
-    {
-        mManagedSequences.erase(requestId);
-        for (auto const& [windowSize, metadata] : mWindowSizeToMetadata)
-        {
-            mWindowBlockManagers.at(windowSize).releaseSequenceStorageValidity(requestId);
-        }
-    }
-
-    //! \brief Return whether the sequence is still valid for store-for-reuse
-    //! regarding the specific window size.
-    //! \details Currently this utility function is only used under
-    //! kvCacheManagerTest.cpp. Checking for store-for-reuse for each window
-    //! size is done in an iterating fashion under BlockManager::releaseBlocks.
-    bool isSequenceValidForStoreForReuse(LlmRequest::RequestIdType requestId, SizeType32 windowSize) const
-    {
-        TLLM_CHECK_WITH_INFO(
-            mWindowBlockManagers.count(windowSize) > 0, "Querying window size is not found under mWindowBlockManager");
-        return mWindowBlockManagers.at(windowSize).isSequenceValidForStoreForReuse(requestId);
+        return mLookup->printSearchTree();
     }
 
     void resetReuseState()
@@ -1433,6 +1564,9 @@ private:
         return getWindowSizeMetadata(windowSize).absolutePoolsOffset;
     }
 
+    std::optional<KVCacheBlock::IdType> notThreadSafeStoreBlocksForReuse(
+        GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest, bool pinBlocks);
+
 private:
     SizeType32 mNumLayers;
     SizeType32 mTokensPerBlock;
@@ -1449,6 +1583,12 @@ private:
     std::vector<SizeType32> mLayerToWindowSize;
     std::vector<SizeType32> mAbsolutePoolToWindowSize;
     std::vector<SizeType32> mAbsolutePoolToRelativePoolIndex;
+
+    bool mEnablePartialReuse;
+    // Mutex for the cached blocks root
+    mutable std::mutex mCachedBlocksRootMutex;
+    LookupPtr mLookup;
+
     // Record what sequences are currently managed by the block manager
     std::set<LlmRequest::RequestIdType> mManagedSequences;
 
