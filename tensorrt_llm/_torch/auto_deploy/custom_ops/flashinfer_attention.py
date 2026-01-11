@@ -508,7 +508,7 @@ def flashinfer_mha_with_cache(
 
     # check if we need to re-combine outputs
     if num_prefill > 0 and num_decode > 0:
-        y = torch.empty_like(q)
+        y = torch.empty(q.shape, dtype=q.dtype, device=q.device)
     else:
         y = None
 

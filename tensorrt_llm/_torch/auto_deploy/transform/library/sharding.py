@@ -1862,41 +1862,160 @@ def _determine_fused_weight_dims(
         return None
     linear_node = linear_nodes[0]
     fused_weight_dims = None
-    # check if there are split nodes in the subgraph. They may indicate fused weights (e.g., QKV)
-    split_nodes = list(filtered_nodes(linear_node.users, ops=[torch.ops.aten.split_with_sizes]))
-    if len(split_nodes) > 0:
-        assert len(linear_nodes) == 1
+    if len(linear_nodes) == 1:
         linear_node = linear_nodes[0]
-        assert len(split_nodes) == 1, "Expecting exactly one split node for fused weights"
-        fused_weight_dims = split_nodes[0].args[1]
+        # check if there are split nodes in the subgraph. They may indicate fused weights (e.g., QKV)
+        linear_split_users = list(
+            filtered_nodes(linear_node.users, ops=torch.ops.aten.split_with_sizes)
+        )
+        linear_slice_users = list(filtered_nodes(linear_node.users, ops=torch.ops.aten.slice))
+        linear_chunk_users = list(filtered_nodes(linear_node.users, ops=torch.ops.aten.chunk))
+        if len(linear_split_users) > 0:
+            assert len(linear_split_users) == 1, (
+                "Expecting exactly one split node for fused weights"
+            )
+            fused_weight_dims = linear_split_users[0].args[1]
 
-    slice_nodes = list(filtered_nodes(linear_node.users, ops=[torch.ops.aten.slice]))
-    if len(slice_nodes) > 0:
-        # we are probably in fused QKV case with single linear node and 3 slice nodes
-        assert len(linear_nodes) == 1
-        linear_node = linear_nodes[0]
-        assert all(
-            s.args[1] == 2 for s in filtered_nodes(linear_node.users, ops=torch.ops.aten.slice)
-        ), "Expecting slice nodes to slice tensor over dim=2"
-        fused_weight_dims = [s.args[3] - s.args[2] for s in linear_node.users]
-        weight_dim = shape(linear_node)[2]
-        if sum(fused_weight_dims) != weight_dim:
-            if fused_weight_dims[-1] > weight_dim:
-                fused_weight_dims[-1] = weight_dim - sum(fused_weight_dims[:-1])
-            else:
-                ad_logger.warning(
-                    f"Fused weight dims {fused_weight_dims} do not sum to weight dim {weight_dim}. Skipping."
-                )
-                return
-    chunk_nodes = list(filtered_nodes(linear_node.users, ops=torch.ops.aten.chunk))
-    if len(chunk_nodes) > 0:
-        assert len(linear_nodes) == 1
-        linear_node = linear_nodes[0]
-        assert len(chunk_nodes) == 1, "Expecting exactly one chunk node for fused weights"
-        num_chunks = chunk_nodes[0].args[1]
-        weight_dim = shape(linear_node)[2]
-        fused_weight_dims = [weight_dim // num_chunks] * num_chunks
-    return fused_weight_dims
+        elif len(linear_slice_users) > 0:
+            # we are probably in fused QKV case with single linear node and 3 slice nodes
+            assert all(s.args[1] == 2 for s in linear_slice_users), (
+                "Expecting slice nodes to slice tensor over dim=2"
+            )
+            fused_weight_dims = [s.args[3] - s.args[2] for s in linear_slice_users]
+            assert fused_weight_dims, "fused weight dims cannot be empty"
+            weight_dim = linear_node.meta["val"].shape[2]
+            if sum(fused_weight_dims) != weight_dim:
+                if fused_weight_dims[-1] > weight_dim:
+                    fused_weight_dims[-1] = weight_dim - sum(fused_weight_dims[:-1])
+                else:
+                    ad_logger.warning(
+                        f"Fused weight dims {fused_weight_dims} do not sum to weight dim {weight_dim}. Skipping."
+                    )
+                    return
+
+        elif len(linear_chunk_users) > 0:
+            assert len(linear_chunk_users) == 1, (
+                "Expecting exactly one chunk node for fused weights"
+            )
+            num_chunks = linear_chunk_users[0].args[1]
+            weight_dim = linear_node.meta["val"].shape[2]
+            fused_weight_dims = [weight_dim // num_chunks] * num_chunks
+
+
+def _shard_intermediate_attention_weights(
+    layer_subgraph: LayerSubgraph,
+    linear_nodes: List[Node],
+    transform_container: ShardingTransformContainer,
+) -> int:
+    """
+    Shard intermediate weights (e.g. q_norm, k_norm) for attention layers.
+
+    For attention layers, there may be intermediate weights (like q_norm.weight, k_norm.weight)
+    that operate directly on q_proj/k_proj output (before reshaping to [batch, seq, num_heads, head_dim]).
+    These need to be sharded along the same head dimension.
+
+    Example1: - Norm on all heads directly on flattened Q/K output [batch, seq, hidden_size] (e.g. MiniMax):
+        self.q_norm = MiniMaxM2RMSNorm(self.head_dim * config.num_attention_heads, eps=config.rms_norm_eps)
+        weight shape: [num_heads * head_dim]
+        Status: Needs qk norm sharding. (will be handled in this function)
+
+    Example2: - Norm per head after reshaping to [batch, seq, num_heads, head_dim] (e.g. GLM 4.7):
+        self.q_norm = Glm4MoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        weight shape: [head_dim]
+        Status: No need to shard/will be skipped.
+
+    Args:
+        layer_subgraph: The attention layer subgraph
+        linear_nodes: The linear nodes (q/k/v projections)
+        transform_container: Container for sharding transformations
+
+    Returns:
+        Number of nodes added for sharding
+    """
+    if layer_subgraph.layer_type != LayerType.ATTENTION or layer_subgraph.terminating_node is None:
+        return 0
+
+    config = transform_container.config
+    world_size = config.world_size
+    gm = linear_nodes[0].graph.owning_module
+    added_nodes = 0
+
+    # Collect valid output dimensions from q/k/v projections
+    # These are the only valid sizes for intermediate weights (e.g., q_norm, k_norm)
+    valid_sizes = set()
+    for lin_node in linear_nodes:
+        try:
+            wkey, _ = extract_param_names_from_node(lin_node)
+            w = gm.get_parameter(wkey)
+            valid_sizes.add(w.shape[0])  # q: num_heads*head_dim, k/v: num_kv_heads*head_dim
+        except (AttributeError, AssertionError):
+            pass
+
+    # Find all intermediate weight nodes between q/k/v projections and o_proj.
+    intermediate_weight_nodes = subgraph(
+        sources=linear_nodes,
+        sinks=[layer_subgraph.terminating_node],
+        include=lambda n: n.op == "get_attr",
+    )
+
+    for weight_node in intermediate_weight_nodes:
+        weight_key = weight_node.target
+
+        # Try to get the parameter
+        try:
+            param = gm.get_parameter(weight_key)
+        except AttributeError:
+            ad_logger.debug(f"Could not get parameter for {weight_key}, skipping")
+            continue
+
+        # Only shard 1D weights that match the expected dimension
+        # TODO: 1D weights are probably more strict (allowing elemwise operations).
+        # Ideally we should detect if head dimension is present in the weight shape.
+        if param.dim() != 1:
+            ad_logger.debug(
+                f"Skipping intermediate weight {weight_key} with dim={param.dim()} (not 1D)"
+            )
+            continue
+
+        # Check if the weight size is divisible by world_size
+        if param.shape[0] % world_size != 0:
+            ad_logger.debug(
+                f"Skipping intermediate weight {weight_key} with shape {param.shape} "
+                f"(not divisible by world_size={world_size})"
+            )
+            continue
+
+        # Check if weight size matches one of the q/k/v projection output dimensions
+        # This filters out unrelated weights like inv_freq
+        if valid_sizes and param.shape[0] not in valid_sizes:
+            ad_logger.debug(
+                f"Skipping intermediate weight {weight_key} with shape {param.shape} "
+                f"(not in valid_sizes={valid_sizes})"
+            )
+            continue
+
+        # Get the user node for this weight (for WeightShardingInfo)
+        if len(list(weight_node.users)) == 0:
+            ad_logger.debug(f"Weight node {weight_key} has no users, skipping")
+            continue
+
+        user_node = list(weight_node.users)[0]
+
+        # Add sharding info for this intermediate weight
+        if transform_container.add(
+            WeightShardingInfo.from_node(
+                user_node,
+                split_dim=SplitDimension.COLUMN,
+                config=config,
+                dist_op=None,  # No dist op needed for intermediate column-sharded weights
+                min_local_shape=layer_subgraph.min_local_shape,
+                layer_type=LayerType.ATTENTION,
+            )
+        ):
+            ad_logger.debug(f"Added sharding for intermediate attention weight: {weight_key}")
+            added_nodes += 1
+
+    return added_nodes
 
 
 def _process_column_sharding(
@@ -1977,6 +2096,12 @@ def _process_column_sharding(
                     )
                 )
         # chunk nodes do not need to be updated
+
+    # Shard intermediate weights (e.g. q/k/v -> q_norm, k_norm ... -> o_proj) for attention layers
+    added_nodes += _shard_intermediate_attention_weights(
+        layer_subgraph, linear_nodes, transform_container
+    )
+
     return added_nodes
 
 
