@@ -30,6 +30,7 @@ from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
                                            update_metadata_for_multimodal)
 from tensorrt_llm.llmapi import CapacitySchedulerPolicy
 from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import CpType
 from tensorrt_llm.sampling_params import SamplingParams
 
 
@@ -203,6 +204,18 @@ from tensorrt_llm.sampling_params import SamplingParams
     type=int,
     default=1,
     help="pipeline parallelism size",
+)
+@optgroup.option(
+    "--cp",
+    type=int,
+    default=1,
+    help="context parallelism size",
+)
+@optgroup.option(
+    "--cp_type",
+    type=click.Choice([member.name for member in CpType]),
+    default='ULYSSES',
+    help="context parallelism type",
 )
 @optgroup.option(
     "--ep",

@@ -196,6 +196,16 @@ def test_llm_pp2():
                      kv_cache_config=global_kv_cache_config)
 
 
+@pytest.mark.gpu2
+@pytest.mark.part2
+def test_llm_cp2():
+    llm_test_harness(llama_model_path,
+                     prompts, ["D E F G H I J K"],
+                     sampling_params=SamplingParams(max_tokens=8),
+                     context_parallel_size=2,
+                     kv_cache_config=global_kv_cache_config)
+
+
 def llm_end2end_tp2_cases():
     yield ({}, )  # Default options
     yield ({'embedding_parallel_mode': 'NONE'}, )
