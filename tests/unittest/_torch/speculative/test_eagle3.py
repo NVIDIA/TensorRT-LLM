@@ -13,7 +13,7 @@ from utils.llm_data import llm_models_root
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
-from tensorrt_llm.llmapi import (CudaGraphConfig, EagleDecodingConfig,
+from tensorrt_llm.llmapi import (CudaGraphConfig, Eagle3DecodingConfig,
                                  KvCacheConfig)
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -163,7 +163,7 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
         # Use a small max_num_tokens so that the chunked prefill path gets exercised.
         llm_common_config['max_num_tokens'] = 64
 
-    spec_config = EagleDecodingConfig(
+    spec_config = Eagle3DecodingConfig(
         max_draft_len=max_draft_len,
         speculative_model_dir=eagle_model_dir,
         # Llama 3 does not support one model eagle.
@@ -239,7 +239,7 @@ def test_eagle3_spec_decoding_stats(eagle3_one_model):
 
     kv_cache_config = KvCacheConfig(enable_block_reuse=False,
                                     free_gpu_memory_fraction=0.6)
-    spec_config = EagleDecodingConfig(
+    spec_config = Eagle3DecodingConfig(
         max_draft_len=3,
         speculative_model_dir=eagle_model_dir,
         eagle3_one_model=eagle3_one_model,
@@ -319,7 +319,7 @@ def test_llama_eagle3_long_prompt(use_cuda_graph):
     eagle_model_dir = f"{models_path}/EAGLE3-LLaMA3.1-Instruct-8B"
     target_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
 
-    spec_config = EagleDecodingConfig(
+    spec_config = Eagle3DecodingConfig(
         max_draft_len=3,
         speculative_model_dir=eagle_model_dir,
         eagle3_one_model=False,
@@ -413,7 +413,7 @@ def test_deepseek_eagle3():
         'transformers_version': '4.52.4',
         'use_cache': True,
         'vocab_size': 129280,
-        'draft_vocab_size': 129280
+        'draft_vocab_size': 129280,
     }
     with tempfile.TemporaryDirectory() as temp_dir:
         eagle_model_dir = Path(temp_dir)
@@ -443,7 +443,7 @@ def test_deepseek_eagle3():
             enable_chunked_prefill=enable_chunked_prefill,
         )
 
-        spec_config = EagleDecodingConfig(
+        spec_config = Eagle3DecodingConfig(
             max_draft_len=max_draft_len,
             speculative_model_dir=eagle_model_dir,
             # Llama 3 does not support one model eagle.
@@ -554,10 +554,11 @@ def test_deepseek_mla_eagle3():
             load_format="dummy",
         )
 
-        spec_config = EagleDecodingConfig(max_draft_len=max_draft_len,
-                                          speculative_model_dir=eagle_model_dir,
-                                          eagle3_one_model=use_one_model,
-                                          load_format="dummy")
+        spec_config = Eagle3DecodingConfig(
+            max_draft_len=max_draft_len,
+            speculative_model_dir=eagle_model_dir,
+            eagle3_one_model=use_one_model,
+            load_format="dummy")
 
         llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
 
@@ -623,7 +624,7 @@ def test_multi_eagle3(use_one_model: bool):
         'transformers_version': '4.52.4',
         'use_cache': True,
         'vocab_size': 128256,
-        'draft_vocab_size': 128256
+        'draft_vocab_size': 128256,
     }
     with tempfile.TemporaryDirectory() as temp_dir:
         eagle_model_dir = Path(temp_dir)
@@ -652,7 +653,7 @@ def test_multi_eagle3(use_one_model: bool):
             load_format="dummy",
         )
 
-        spec_config = EagleDecodingConfig(
+        spec_config = Eagle3DecodingConfig(
             max_draft_len=max_draft_len,
             speculative_model_dir=eagle_model_dir,
             # Llama 3 does not support one model eagle.
@@ -711,7 +712,7 @@ def test_eagle3_cuda_graph_padding(disable_overlap_scheduler: bool):
         enable_chunked_prefill=enable_chunked_prefill,
     )
 
-    spec_config = EagleDecodingConfig(
+    spec_config = Eagle3DecodingConfig(
         max_draft_len=max_draft_len,
         speculative_model_dir=eagle_model_dir,
         eagle3_one_model=use_one_model,
@@ -764,7 +765,7 @@ def test_eagle3_cdl_sampling(disable_overlap_scheduler: bool):
         enable_chunked_prefill=enable_chunked_prefill,
     )
 
-    spec_config = EagleDecodingConfig(
+    spec_config = Eagle3DecodingConfig(
         max_draft_len=max_draft_len,
         speculative_model_dir=eagle_model_dir,
         eagle3_one_model=use_one_model,

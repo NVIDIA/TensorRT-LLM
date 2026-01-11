@@ -96,7 +96,7 @@ speculative_config:
   mtp_eagle_one_model: False # Not supported
 
 speculative_config:
-  decoding_type: "Eagle"
+  decoding_type: "Eagle3"
   eagle3_one_model: False # Not supported
 ```
 
