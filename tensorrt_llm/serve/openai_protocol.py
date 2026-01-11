@@ -37,6 +37,7 @@ from typing_extensions import Annotated, Required, TypeAlias, TypedDict
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import GuidedDecodingParams, SamplingParams
+from tensorrt_llm.llmapi.disagg_utils import MIN_GLOBAL_ID
 
 
 def _logit_bias_to_embedding_bias(logit_bias: Optional[Dict[str, float]],
@@ -1007,13 +1008,19 @@ def to_llm_disaggregated_params(
         disaggregated_params: DisaggregatedParams) -> LlmDisaggregatedParams:
     if disaggregated_params is None:
         return None
+    disagg_request_id = None
+    # If ctx_request_id is greater than or equal to MIN_GLOBAL_ID, use it as disagg_request_id
+    # then both the ctx and gen requests will use it as underlying request id.
+    if disaggregated_params.ctx_request_id is not None and disaggregated_params.ctx_request_id >= MIN_GLOBAL_ID:
+        disagg_request_id = disaggregated_params.ctx_request_id
     return LlmDisaggregatedParams(
         request_type=disaggregated_params.request_type,
         first_gen_tokens=disaggregated_params.first_gen_tokens,
         ctx_request_id=disaggregated_params.ctx_request_id,
         opaque_state=decode_opaque_state(
             disaggregated_params.encoded_opaque_state),
-        draft_tokens=disaggregated_params.draft_tokens)
+        draft_tokens=disaggregated_params.draft_tokens,
+        disagg_request_id=disagg_request_id)
 
 
 UCompletionRequest = Union[CompletionRequest, ChatCompletionRequest]
