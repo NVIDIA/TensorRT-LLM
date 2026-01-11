@@ -47,10 +47,10 @@ from tensorrt_llm.llmapi.llm_args import (
 )
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase
 
-from ...._utils import mpi_rank, mpi_world_size
+from ...._utils import get_free_port, mpi_rank, mpi_world_size
 from ....bindings.internal.batch_manager import CacheType
 from ....mapping import Mapping
-from ...distributed import MPIDist
+from ...distributed import Distributed
 from ...pyexecutor.model_engine import ModelEngine, PyTorchModelEngine
 from ...pyexecutor.py_executor import PyExecutor
 from ...pyexecutor.resource_manager import (
@@ -68,7 +68,7 @@ from ...pyexecutor.scheduler import (
     SimpleScheduler,
 )
 from ..custom_ops.attention_interface import SequenceInfo
-from ..distributed import common as dist
+from ..distributed.common import initialize_or_skip
 from ..llm_args import LlmArgs
 from ..transform.optimizer import InferenceOptimizer
 from ..utils.logger import ad_logger
@@ -880,7 +880,7 @@ def share_target_weights_with_draft(
 
 
 def create_draft_model_engine_maybe(
-    ad_config: LlmArgs, target_engine: ADEngine, dist_mapping: Mapping, mpi_dist: MPIDist
+    ad_config: LlmArgs, target_engine: ADEngine, dist_mapping: Mapping, dist: Distributed
 ) -> Optional[PyTorchModelEngine]:
     """Create a draft model engine for speculative decoding.
 
@@ -888,7 +888,7 @@ def create_draft_model_engine_maybe(
         ad_config: The AutoDeploy LLM configuration
         engine: The target model engine (ADEngine)
         dist_mapping: The distributed mapping configuration
-        mpi_dist: The MPI distribution object
+        dist: The distribution object
 
     Returns:
         PyTorchModelEngine configured as a draft model, or None if not needed
@@ -925,7 +925,7 @@ def create_draft_model_engine_maybe(
         llm_args=draft_llm_args,
         mapping=dist_mapping,
         attn_runtime_features=attn_runtime_features,
-        dist=mpi_dist,
+        dist=dist,
         spec_config=draft_spec_config,
         is_draft_model=True,
         drafting_loop_wrapper=drafting_loop_wrapper,
@@ -1004,14 +1004,14 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     world_size = mpi_world_size()
     rank = mpi_rank()
     dist_mapping = Mapping(rank=rank, world_size=world_size, tp_size=world_size)
-    mpi_dist = MPIDist(dist_mapping)
+    dist = Distributed.get(dist_mapping)
     ad_logger.set_rank(rank)
     torch.cuda.set_device(rank)
-    port = mpi_dist.broadcast(dist.get_free_port())  # use MPI broadcast to pick a free port
-    dist.initialize_or_skip(rank, world_size, port)
+    port = dist.broadcast(get_free_port())  # use MPI broadcast to pick a free port
+    initialize_or_skip(rank, world_size, port)
 
     # Setup AutoTuner with distributed state for allreduce autotuning
-    AutoTuner.get().setup_distributed_state(dist_mapping, mpi_dist)
+    AutoTuner.get().setup_distributed_state(dist_mapping)
 
     # some config
     assert ad_config.max_beam_width <= 1, "_autodeploy + beam_search is not supported"
@@ -1044,7 +1044,7 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
         )
 
     draft_model_engine = create_draft_model_engine_maybe(
-        ad_config=ad_config, target_engine=engine, dist_mapping=dist_mapping, mpi_dist=mpi_dist
+        ad_config=ad_config, target_engine=engine, dist_mapping=dist_mapping, dist=dist
     )
 
     spec_resource_manager = (
@@ -1171,7 +1171,7 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
         scheduler,
         model_engine=engine,
         sampler=sampler,
-        dist=mpi_dist,
+        dist=dist,
         max_num_sequences=max_num_sequences,
         disable_overlap_scheduler=ad_config.disable_overlap_scheduler,
         max_input_len=ad_config.max_input_len,

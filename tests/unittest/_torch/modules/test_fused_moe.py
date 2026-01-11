@@ -24,7 +24,6 @@ from utils.util import (check_accuracy, skip_blackwell, skip_blackwell_geforce,
                         skip_pre_hopper)
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
-from tensorrt_llm._torch.distributed import MPIDist, TorchDist
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import \
     CuteDslFusedMoE
@@ -45,7 +44,7 @@ from tensorrt_llm._torch.modules.fused_moe.quantization import \
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import \
     IS_TRITON_KERNELS_AVAILABLE
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
-from tensorrt_llm._utils import get_sm_version, mpi_disabled, mpi_rank
+from tensorrt_llm._utils import get_sm_version, mpi_rank
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -105,12 +104,7 @@ def test_fused_moe(moe_backend,
 
     mapping = mapping or Mapping()
     mapping.rank = mpi_rank()
-    if mpi_disabled():
-        dist = TorchDist(mapping=mapping)
-    else:
-        dist = MPIDist(mapping=mapping)
-
-    AutoTuner.get().setup_distributed_state(mapping, dist)
+    AutoTuner.get().setup_distributed_state(mapping)
 
     torch.cuda.set_device(mapping.rank)
 

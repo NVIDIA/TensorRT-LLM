@@ -17,10 +17,9 @@ from tensorrt_llm._torch.autotuner import (AutoTuner, DistributedTuningStrategy,
                                            FakeTensor, OptimizationProfile,
                                            StaticDim, TunableRunner,
                                            TuningConfig, autotune)
-from tensorrt_llm._torch.distributed.communicator import MPIDist, TorchDist
+from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.utils import (get_power_of_2_num_tokens_buckets,
                                        next_positive_power_of_2)
-from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.bindings.internal.runtime import delay_kernel
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -720,14 +719,11 @@ def _distributed_worker_function(world_size, strategy):
                       rank=rank,
                       tp_size=world_size,
                       pp_size=1)
-    if mpi_disabled():
-        dist = TorchDist(mapping=mapping)
-    else:
-        dist = MPIDist(mapping=mapping)
+    dist = Distributed.get(mapping)
 
     tuner = AutoTuner.get()
     tuner.clear_cache()
-    tuner.setup_distributed_state(mapping, dist)
+    tuner.setup_distributed_state(mapping)
 
     x = torch.randn(16, 32, device='cuda')
     w = torch.randn(32, 64, device='cuda')

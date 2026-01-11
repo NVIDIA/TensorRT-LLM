@@ -10,7 +10,7 @@ from tensorrt_llm.llmapi.llm_args import (BaseSparseAttentionConfig,
 from tensorrt_llm.mapping import Mapping
 
 from ...inputs.multimodal import MultimodalParams
-from ..distributed import MPIDist
+from ..distributed import Distributed
 from ..expert_statistic import ExpertStatistic
 from ..memory_buffer_utils import get_memory_buffers
 from ..modules.multi_stream_utils import with_multi_stream
@@ -75,7 +75,7 @@ class CUDAGraphRunnerConfig:
     enable_attention_dp: bool
     batch_size: int
     mapping: Optional[Mapping]
-    dist: Optional[MPIDist]
+    dist: Optional[Distributed]
     kv_cache_manager_key: Any
     sparse_attention_config: Optional[BaseSparseAttentionConfig] = None
 
