@@ -48,8 +48,6 @@ from defs.conftest import get_sm_version, is_sm_100f
 
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.model_config import MoeLoadBalancerConfig
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import \
-    IS_TRITON_KERNELS_AVAILABLE
 from tensorrt_llm.llmapi import (AutoDecodingConfig, CudaGraphConfig,
                                  DeepSeekSparseAttentionConfig,
                                  EagleDecodingConfig, KvCacheConfig, MoeConfig,
@@ -3633,8 +3631,6 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
                                        {"ENABLE_CONFIGURABLE_MOE": env_value})
 
         if moe_backend == "TRITON":
-            if not IS_TRITON_KERNELS_AVAILABLE:
-                pytest.skip("TRITON moe backend is not available.")
             if get_sm_version() < 90:
                 pytest.skip("TRITON moe backend requires Hopper or newer.")
         if moe_backend in ["CUTLASS", "TRTLLM"] and get_sm_version() < 100:
@@ -4059,11 +4055,12 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize(
         "kv_cache_dtype",
         ["auto", pytest.param("fp8", marks=skip_pre_blackwell)])
-    @pytest.mark.parametrize(
-        "moe_backend",
-        ["CUTLASS",
-         pytest.param("TRTLLM", marks=skip_pre_blackwell), "TRITON"],
-        ids=["cutlass", "trtllm", "triton"])
+    @pytest.mark.parametrize("moe_backend", [
+        "CUTLASS",
+        pytest.param("TRTLLM", marks=skip_pre_blackwell),
+        pytest.param("TRITON", marks=skip_no_hopper)
+    ],
+                             ids=["cutlass", "trtllm", "triton"])
     @pytest.mark.parametrize("cuda_graph,overlap_scheduler", [
         (True, True),
     ])
@@ -4072,8 +4069,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
                           {"scores_filter": "exact_match,flexible-extract"})
-        if moe_backend == "TRITON" and not IS_TRITON_KERNELS_AVAILABLE:
-            pytest.skip("Triton kernels are not available")
 
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
@@ -4110,11 +4105,12 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize(
         "kv_cache_dtype",
         ["auto", pytest.param("fp8", marks=skip_pre_blackwell)])
-    @pytest.mark.parametrize(
-        "moe_backend",
-        ["CUTLASS",
-         pytest.param("TRTLLM", marks=skip_pre_blackwell), "TRITON"],
-        ids=["cutlass", "trtllm", "triton"])
+    @pytest.mark.parametrize("moe_backend", [
+        "CUTLASS",
+        pytest.param("TRTLLM", marks=skip_pre_blackwell),
+        pytest.param("TRITON", marks=skip_no_hopper)
+    ],
+                             ids=["cutlass", "trtllm", "triton"])
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler", [
             (4, 1, 1, False, True, True),
@@ -4142,10 +4138,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         ] else "0"
         patch_mpi_pool_session_for_env(mocker,
                                        {"ENABLE_CONFIGURABLE_MOE": env_value})
-
-        if moe_backend == "TRITON":
-            if not IS_TRITON_KERNELS_AVAILABLE:
-                pytest.skip("Triton kernels are not available")
 
         MAX_OUTPUT_LEN = 128179
         MAX_INPUT_LEN = 32768
@@ -4221,9 +4213,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
                           {"scores_filter": "exact_match,flexible-extract"})
-        if moe_backend == "TRITON":
-            if not IS_TRITON_KERNELS_AVAILABLE:
-                pytest.skip("Triton kernels are not available")
 
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
@@ -4245,6 +4234,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
     @pytest.mark.skip_less_device(4)
+    @skip_no_hopper
     @pytest.mark.parametrize(
         "kv_cache_dtype",
         ["auto", pytest.param("fp8", marks=skip_pre_blackwell)])
@@ -4259,8 +4249,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
                           {"scores_filter": "exact_match,flexible-extract"})
-        if not IS_TRITON_KERNELS_AVAILABLE:
-            pytest.skip("Triton kernels are not available")
         monkeypatch.setenv("OVERRIDE_QUANT_ALGO", "W4A16_MXFP4")
 
         pytorch_config = dict(
@@ -4303,10 +4291,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     def test_w4_2gpus(self, kv_cache_dtype, moe_backend, tp_size, pp_size,
                       ep_size, attention_dp, cuda_graph, overlap_scheduler,
                       mocker):
-        if moe_backend == "TRITON":
-            if not IS_TRITON_KERNELS_AVAILABLE:
-                pytest.skip("Triton kernels are not available")
-
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
@@ -4381,10 +4365,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
          pytest.param("TRTLLM", marks=skip_pre_blackwell), "TRITON"],
         ids=["cutlass", "trtllm", "triton"])
     def test_w4_chunked_prefill(self, kv_cache_dtype, moe_backend, mocker):
-        if moe_backend == "TRITON":
-            if not IS_TRITON_KERNELS_AVAILABLE:
-                pytest.skip("Triton kernels are not available")
-
         MAX_OUTPUT_LEN = 128179
         MAX_INPUT_LEN = 32768
 
@@ -4451,10 +4431,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         ids=["cutlass", "trtllm", "triton"])
     def test_eagle3_4gpus(self, moe_backend, one_model, overlap_scheduler,
                           mocker):
-        if moe_backend == "TRITON":
-            if not IS_TRITON_KERNELS_AVAILABLE:
-                pytest.skip("Triton kernels are not available")
-
         if get_sm_version() == 90:
             pytest.skip(
                 "https://nvbugs/5636916: Remaining Hopper Eagle Accuracy Issue for only TP=4"
@@ -4643,10 +4619,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         ids=["cutlass", "trtllm", "triton"])
     def test_eagle3_2gpus(self, moe_backend, one_model, overlap_scheduler,
                           mocker):
-        if moe_backend == "TRITON":
-            if not IS_TRITON_KERNELS_AVAILABLE:
-                pytest.skip("Triton kernels are not available")
-
         MAX_OUTPUT_LEN = 128179
         MAX_INPUT_LEN = 32768
 
