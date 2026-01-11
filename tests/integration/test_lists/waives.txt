@@ -394,8 +394,6 @@ test_e2e.py::test_trtllm_bench_llmapi_launch[pytorch_backend-llama-v3-llama3-8b]
 test_e2e.py::test_trtllm_serve_multimodal_example SKIP (https://nvbugs/5747920)
 test_e2e.py::test_trtllm_serve_example SKIP (https://nvbugs/5747938)
 triton_server/test_triton.py::test_opt[opt] SKIP (https://nvbugs/5739981)
-unittest/llmapi/test_llm_pytorch.py::test_tinyllama_logits_processor[False] SKIP (https://nvbugs/5771838)
-unittest/llmapi/test_llm_pytorch.py::test_tinyllama_logits_processor[True] SKIP (https://nvbugs/5771838)
 accuracy/test_cli_flow.py::TestPhi2::test_auto_dtype SKIP (https://nvbugs/5744293)
 accuracy/test_cli_flow.py::TestPhi2::test_tp2 SKIP (https://nvbugs/5744293)
 accuracy/test_cli_flow.py::TestPhi3Mini4kInstruct::test_auto_dtype SKIP (https://nvbugs/5744293)
