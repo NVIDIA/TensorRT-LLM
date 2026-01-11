@@ -1,9 +1,12 @@
-# TRT Backend Tests
-examples/test_llama.py::test_llama_3_x_fp8_with_bf16_lora[llama-3.1-8b]
+# TRT Backend Tests (Llama 3.1/3.3 70B + StarCoder2-7B only)
 examples/test_llama.py::test_llm_llama_v3_1_1node_multi_gpus[enable_gemm_allreduce_plugin-llama-3.1-70b-disable_fp8]
 examples/test_llama.py::test_llm_llama_v3_1_1node_multi_gpus[disable_gemm_allreduce_plugin-llama-3.1-70b-enable_fp8]
-examples/test_llama.py::test_llm_llama_1gpu_fp4[llama-3.1-70b-instruct-enable_norm_quant_fusion-enable_fused_quant-fp4_plugin-bfloat16]
 examples/test_llama.py::test_llm_llama_2gpu_fp4[llama-3.1-70b-instruct-fp4_plugin]
+accuracy/test_cli_flow.py::TestLlama3_3_70BInstruct::test_fp8_prequantized_tp4
+accuracy/test_cli_flow.py::TestLlama3_3_70BInstruct::test_nvfp4_prequantized_tp4
+accuracy/test_llm_api.py::TestStarCoder2_7B::test_auto_dtype
+accuracy/test_llm_api.py::TestStarCoder2_7B::test_fp8
+
 # serve tests
 examples/serve/test_serve.py::test_config_file_loading[--extra_llm_api_options]
 examples/serve/test_serve.py::test_config_file_loading[--config]
@@ -24,24 +27,6 @@ examples/serve/test_serve_negative.py::test_malformed_json_request
 examples/serve/test_serve_negative.py::test_missing_content_type_header
 examples/serve/test_serve_negative.py::test_extremely_large_batch
 
-# Accuracy test list
-accuracy/test_cli_flow.py::TestLlama3_1_8B::test_auto_dtype
-accuracy/test_cli_flow.py::TestLlama3_1_8B::test_fp8
-accuracy/test_cli_flow.py::TestLlama3_1_8B::test_tp4[disable_gemm_allreduce_plugin]
-accuracy/test_cli_flow.py::TestLlama3_1_8B::test_tp4[enable_gemm_allreduce_plugin]
-accuracy/test_cli_flow.py::TestLlama3_1_8B::test_fp8_rowwise_tp4[disable_gemm_allreduce_plugin]
-accuracy/test_cli_flow.py::TestLlama3_1_8B::test_fp8_rowwise_tp4[enable_gemm_allreduce_plugin]
-accuracy/test_cli_flow.py::TestLlama3_1_8B::test_autoq
-accuracy/test_cli_flow.py::TestLlama3_1_8BInstruct::test_auto_dtype
-accuracy/test_cli_flow.py::TestLlama3_1_8BInstruct::test_fp8_prequantized
-accuracy/test_cli_flow.py::TestLlama3_3_70BInstruct::test_fp8_prequantized_tp4
-accuracy/test_cli_flow.py::TestLlama3_3_70BInstruct::test_nvfp4_prequantized_tp4
-
-accuracy/test_llm_api.py::TestLlama3_1_8BInstruct::test_guided_decoding[xgrammar]
-accuracy/test_llm_api.py::TestLlama3_1_8BInstruct::test_guided_decoding_4gpus[xgrammar]
-accuracy/test_llm_api.py::TestLlama3_1_8BInstruct::test_gather_generation_logits_cuda_graph
-accuracy/test_llm_api.py::TestLlama3_1_8B::test_fp8_rowwise
-accuracy/test_llm_api.py::TestLlama3_1_8BInstruct::test_logprobs
 # PyTorch Backend Tests
 accuracy/test_llm_api_pytorch.py::TestLlama3_2_1B::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestLlama3_2_1B::test_fp8_prequantized
@@ -225,9 +210,6 @@ accuracy/test_llm_api_pytorch.py::TestLlama3_1NemotronNano8Bv1::test_fp8_prequan
 accuracy/test_llm_api_pytorch.py::TestNemotronH::test_auto_dtype[cuda_graph=True]
 accuracy/test_llm_api_pytorch.py::TestNemotronH::test_auto_dtype[cuda_graph=False]
 accuracy/test_llm_api_pytorch.py::TestNemotronH::test_reasoning_fp8_prequantized[cuda_graph=True]
-accuracy/test_llm_api_pytorch.py::TestNemotronH_47B_Base::test_auto_dtype[tp8ep4-cuda_graph=True]
-accuracy/test_llm_api_pytorch.py::TestNemotronH_47B_Base::test_reasoning_fp8_prequantized[tp8ep8-cuda_graph=True]
-accuracy/test_llm_api_pytorch.py::TestNemotronH_56B_Base::test_auto_dtype[tp8-cuda_graph=True]
 accuracy/test_llm_api_pytorch.py::TestNemotronUltra::test_auto_dtype[tp8ep4-cuda_graph=True]
 accuracy/test_llm_api_pytorch.py::TestNemotronUltra::test_fp8_prequantized[tp8ep4-cuda_graph=True]
 accuracy/test_llm_api_pytorch.py::TestNemotronUltra::test_fp8_prequantized[tp8-cuda_graph=True]
@@ -276,9 +258,6 @@ test_e2e.py::test_ptp_quickstart_advanced_8gpus_chunked_prefill_sq_22k[Llama-4-M
 test_e2e.py::test_ptp_quickstart_advanced_8gpus_chunked_prefill_sq_22k[Llama-4-Scout-17B-16E-Instruct-FP8-llama4-models/Llama-4-Scout-17B-16E-Instruct-FP8-True]
 test_e2e.py::test_ptp_quickstart_advanced_8gpus_chunked_prefill_sq_22k[Llama-4-Scout-17B-16E-Instruct-FP4-llama4-models/Llama-4-Scout-17B-16E-Instruct-FP4-True]
 test_e2e.py::test_relaxed_acceptance_quickstart_advanced_deepseek_r1_8gpus[DeepSeek-R1-DeepSeek-R1/DeepSeek-R1]
-test_e2e.py::test_ptp_quickstart_multimodal[mistral-small-3.1-24b-instruct-Mistral-Small-3.1-24B-Instruct-2503-image-True]
-test_e2e.py::test_ptp_quickstart_multimodal[mistral-small-3.1-24b-instruct-Mistral-Small-3.1-24B-Instruct-2503-image-False]
-test_e2e.py::test_ptp_quickstart_multimodal[mistral-small-3.1-24b-instruct-Mistral-Small-3.1-24B-Instruct-2503-mixture_text_image-True]
 test_e2e.py::test_ptp_quickstart_multimodal_phi4mm[phi4-multimodal-instruct-multimodals/Phi-4-multimodal-instruct-audio]
 test_e2e.py::test_ptp_quickstart_multimodal_phi4mm[phi4-multimodal-instruct-multimodals/Phi-4-multimodal-instruct-image]
 test_e2e.py::test_ptp_quickstart_multimodal_phi4mm[phi4-multimodal-instruct-multimodals/Phi-4-multimodal-instruct-image_audio]
@@ -294,6 +273,7 @@ llmapi/test_llm_api_qa.py::TestLlmDefaultBackend::test_llm_args_type_tensorrt
 llmapi/test_llm_api_qa.py::TestLlmDefaultBackend::test_llm_args_type_default
 
 # keep test cases associated open bugs
+examples/test_llama.py::test_llm_llama_1gpu_fp4[llama-3.1-70b-instruct-enable_norm_quant_fusion-enable_fused_quant-fp4_plugin-bfloat16]
 examples/test_nemotron.py::test_llm_nemotron_4_15b_2gpus[bfloat16-full_prec]
 examples/test_nemotron.py::test_llm_nemotron_4_15b_2gpus[bfloat16-fp8]
 examples/test_nemotron.py::test_llm_nemotron_4_15b_2gpus[bfloat16-int4_awq]

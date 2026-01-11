@@ -4,6 +4,8 @@ from typing import Optional
 import torch
 from torch import nn
 
+from tensorrt_llm.mapping import Mapping
+
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
@@ -20,7 +22,8 @@ class MLP(nn.Module):
                  dtype: Optional[torch.dtype] = None,
                  config: Optional[ModelConfig] = None,
                  layer_idx: Optional[int] = None,
-                 reduce_output: bool = True):
+                 reduce_output: bool = True,
+                 overridden_tp_size: Optional[int] = None):
 
         super().__init__()
         self.layer_idx = layer_idx
@@ -29,6 +32,22 @@ class MLP(nn.Module):
         self.activation = activation
 
         config = config or ModelConfig()
+        self.mapping = config.mapping
+        if overridden_tp_size is not None:
+            assert config.mapping.tp_size % overridden_tp_size == 0
+            tp_size = overridden_tp_size
+            # "Misuse" pp_size here to perform all-reduce within smaller groups
+            pp_size = config.mapping.pp_size * config.mapping.tp_size // overridden_tp_size
+            mapping = Mapping(
+                world_size=tp_size * pp_size,
+                rank=self.mapping.rank,
+                gpus_per_node=self.mapping.gpus_per_node,
+                tp_size=tp_size,
+                pp_size=pp_size,
+            )
+        else:
+            mapping = config.mapping
+
         self.up_lora = LoraLayer(
             [LoraModuleType.MLP_H_TO_4H],
             [self.intermediate_size // config.mapping.tp_size])
@@ -38,7 +57,7 @@ class MLP(nn.Module):
             self.intermediate_size,
             bias=bias,
             dtype=dtype,
-            mapping=config.mapping,
+            mapping=mapping,
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             weights_loading_config=WeightsLoadingConfig(
                 weight_mode=WeightMode.VANILLA),
@@ -55,7 +74,7 @@ class MLP(nn.Module):
             self.hidden_size,
             bias=bias,
             dtype=dtype,
-            mapping=config.mapping,
+            mapping=mapping,
             tensor_parallel_mode=TensorParallelMode.ROW,
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,

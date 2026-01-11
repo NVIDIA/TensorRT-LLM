@@ -502,8 +502,10 @@ class Qwen2VisionModelBase(nn.Module):
 
 class Qwen2_5_VLVisionAttention(Attention):
 
-    def __init__(self, model_config: ModelConfig[PretrainedConfig],
-                 layer_idx: int) -> None:
+    def __init__(self,
+                 model_config: ModelConfig[PretrainedConfig],
+                 layer_idx: int,
+                 reduce_output: bool = True) -> None:
 
         config = model_config.pretrained_config.vision_config
         super().__init__(
@@ -518,6 +520,7 @@ class Qwen2_5_VLVisionAttention(Attention):
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             config=model_config,
+            reduce_output=reduce_output,
         )
 
     def forward(
