@@ -355,12 +355,33 @@ def submit_job(config, log_dir, dry_run):
         ]
         client_cmds.append(" ".join(client_slurm_prefix + benchmark_cmd))
     if config['accuracy']['enable_accuracy_test']:
-        accuracy_cmd = [
-            f"bash {env_config['work_dir']}/accuracy_eval.sh",
-            f"'{log_dir}' '{config['accuracy']['model']}' '{config['accuracy']['tasks']}' '{env_config['model_path']}' '{config['accuracy']['model_args_extra']}' '{log_dir}/accuracy_eval' {disagg_server_hostname} {disagg_server_port}",
-            f"&> {log_dir}/7_accuracy_eval.log"
-        ]
-        client_cmds.append(" ".join(client_slurm_prefix + accuracy_cmd))
+        install_dep_cmd = "pip3 install lm_eval[api]==0.4.9.2"
+        client_cmds.append(" ".join(client_slurm_prefix) + " " + install_dep_cmd)
+        for task in config['accuracy']['tasks']:
+            extra_kwargs = config['accuracy']['tasks'][task].get('extra_kwargs', {})
+            extra_kwargs_str = ""
+            for key, value in extra_kwargs.items():
+                if isinstance(value, bool):
+                    if value:
+                        extra_kwargs_str += f" --{key}"
+                else:
+                    extra_kwargs_str += f" --{key}='{value}'"
+            end_point_map = {
+                'local-completions': 'v1/completions',
+                'local-chat-completions': 'v1/chat/completions',
+            }
+            model = config['accuracy']['tasks'][task]['model']
+            accuracy_cmd = [
+                'lm_eval',
+                '--model', model,
+                '--tasks', task,
+                '--model_args', f"model={env_config['model_path']},base_url=http://{disagg_server_hostname}:{disagg_server_port}/{end_point_map[model]},{config['accuracy']['tasks'][task]['model_args_extra']}",
+                '--log_samples',
+                '--output_path', f'{log_dir}/accuracy_eval_{task}',
+                extra_kwargs_str,
+                f"&> {log_dir}/7_accuracy_eval_{task}.log"
+            ]
+            client_cmds.append(" ".join(client_slurm_prefix + accuracy_cmd))
     with open(os.path.join(log_dir, "client_cmds.sh"), "w") as f:
         f.write("\n".join(client_cmds) + "\n")
 
