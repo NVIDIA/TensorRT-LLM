@@ -2727,10 +2727,11 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
             (8, 1, 8, 0, True, True, True, True, 24, "CUTLASS", False),
             (8, 1, 8, 3, False, False, True, True, 1, "TRTLLM", False),
             (8, 1, 8, 1, False, True, True, True, 24, "CUTLASS", True),
+            (1, 4, 1, 1, False, False, True, True, 24, "TRTLLM", False),
         ],
         ids=[
             "baseline", "baseline_mtp1", "baseline_fp8kv", "latency",
-            "disable_skip_indexer"
+            "disable_skip_indexer", "baseline_pp4_mtp1"
         ])
     def test_nvfp4_multi_gpus(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                               attention_dp, cuda_graph, overlap_scheduler,
@@ -3325,6 +3326,35 @@ class TestQwen2_7BInstruct(LlmapiAccuracyTestHarness):
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+
+class TestQwen3_4B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "Qwen3/Qwen3-4B"
+
+    def test_eagle3(self):
+        "RCCA: https://nvbugspro.nvidia.com/bug/5698434"
+        pytorch_config = dict(
+            disable_overlap_scheduler=True,
+            cuda_graph_config=CudaGraphConfig(),
+        )
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=False,
+            free_gpu_memory_fraction=0.6,
+        )
+
+        eagle_model_dir = f"{llm_models_root()}/Qwen3/Qwen3-4B_eagle3/"
+        target_model_dir = f"{llm_models_root()}/Qwen3/Qwen3-4B"
+
+        draft_len = 3
+        spec_config = EagleDecodingConfig(max_draft_len=draft_len,
+                                          speculative_model_dir=eagle_model_dir)
+
+        with LLM(model=target_model_dir,
+                 **pytorch_config,
+                 kv_cache_config=kv_cache_config,
+                 speculative_config=spec_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
 
 
 class TestQwen3_8B(LlmapiAccuracyTestHarness):
@@ -4816,10 +4846,12 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
         model_path = f"{self.MODEL_PATH}/Qwen3-Next-80B-A3B-Instruct"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
                                         enable_block_reuse=False)
-        pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
-                              cuda_graph_config=CudaGraphConfig(
-                                  max_batch_size=512, enable_padding=True)
-                              if cuda_graph else None)
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig(
+                enable_padding=True,
+                batch_sizes=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048])
+            if cuda_graph else None)
 
         with LLM(
                 model_path,
@@ -4834,6 +4866,7 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
                                 self.GSM8K_MAX_OUTPUT_LEN)
+            mocker.patch.object(GSM8K, "NUM_SAMPLES", 1319)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 

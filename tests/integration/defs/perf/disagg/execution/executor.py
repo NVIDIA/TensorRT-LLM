@@ -114,7 +114,9 @@ class JobManager:
             logger.debug(f"Script: {script_path}")
             logger.debug(f"Log file: {output_log_file}")
 
-            output = exec_cmd_with_output(sbatch_args, timeout=60)
+            # Use check=False to allow submission even with Kerberos warnings
+            # (mimics submit.py behavior)
+            output = exec_cmd_with_output(sbatch_args, timeout=60, check=False)
             job_id = output.strip()
 
             # Parse job ID (--parsable returns just the job ID)
@@ -269,7 +271,7 @@ class JobManager:
 
     @staticmethod
     def backup_logs(
-        job_id: str,
+        job_id: Optional[str],
         test_config,
         result_dir: str,
         is_passed: bool,
@@ -277,13 +279,18 @@ class JobManager:
         """Backup logs and config files to test_id directory.
 
         Args:
-            job_id: SLURM job ID
+            job_id: SLURM job ID (None if submission failed)
             test_config: TestConfig object
             result_dir: Result directory path (already named as test_id)
             is_passed: Whether the job passed
         Returns:
             Final directory path if successful, None otherwise
         """
+        if job_id is None:
+            logger.warning(f"Job submission failed for {test_config.test_id}")
+        else:
+            logger.info(f"Backing up logs for job {job_id} ({test_config.test_id})")
+
         if not os.path.exists(result_dir):
             logger.warning(f"Result directory does not exist yet: {result_dir}")
             return None
