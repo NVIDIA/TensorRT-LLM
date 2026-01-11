@@ -318,7 +318,8 @@ class NemotronHLayer(DecoderLayer):
                                      layer_idx=layer_idx,
                                      rms_norm_eps=config.rms_norm_eps,
                                      dtype=config.torch_dtype,
-                                     config=model_config)
+                                     config=model_config,
+                                     aux_stream_dict=aux_stream_dict)
         elif layer_type == "-":
             self.mixer = MLPLayer(model_config, layer_idx)
         elif layer_type == "*":
@@ -353,16 +354,16 @@ class NemotronHModel(DecoderModel):
         super().__init__(model_config)
         config = self.model_config.pretrained_config
 
-        aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
+        aux_stream_type_list = [
+            # Use attention stream for Mamba2Mixer prefill/decode.
+            AuxStreamType.Attention,
+            AuxStreamType.MoeShared,
+            AuxStreamType.MoeChunkingOverlap,
+            AuxStreamType.MoeBalancer,
+        ]
         self.aux_stream_dict = {
-            # TODO: add attention stream.
-            # AuxStreamType.Attention: aux_stream_list[0],
-            AuxStreamType.MoeShared:
-            aux_stream_list[0],
-            AuxStreamType.MoeChunkingOverlap:
-            aux_stream_list[1],
-            AuxStreamType.MoeBalancer:
-            aux_stream_list[2],
+            aux_stream_type: torch.cuda.Stream()
+            for aux_stream_type in aux_stream_type_list
         }
 
         # calculate embeddings
