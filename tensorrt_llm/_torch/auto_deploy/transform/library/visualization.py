@@ -45,8 +45,9 @@ class VisualizeNamespace(BaseTransform):
             whether visualization was successful or skipped.
         """
         if model_explorer is None:
-            return gm, TransformInfo(
-                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            raise ImportError(
+                "Model Explorer visualization is enabled but 'ai-edge-model-explorer' package is not installed. "
+                "Install with: pip install ai-edge-model-explorer>=0.1.14"
             )
 
         try:
