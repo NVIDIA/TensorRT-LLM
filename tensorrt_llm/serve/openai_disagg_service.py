@@ -15,6 +15,7 @@
 import asyncio
 import copy
 import os
+import uuid
 from typing import Any, Callable, Dict, Optional
 
 from tensorrt_llm.llmapi.disagg_utils import (
@@ -76,6 +77,7 @@ class OpenAIDisaggregatedService(OpenAIService):
         self._ctx_client = None
         self._gen_client = None
         self._disagg_cluster_manager = None
+        self._prealloc_mode = config.enable_prealloc
 
     async def openai_completion(
         self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
@@ -134,6 +136,36 @@ class OpenAIDisaggregatedService(OpenAIService):
                 return done_generator()
             return ctx_response
 
+    async def _send_ctx_request_prealloc(
+        self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
+    ) -> UCompletionResponse:
+        if hooks:
+            hooks.on_req_begin(request)
+        # empty server means client decides which server to use
+        ctx_server, gen_server = None, None
+        # reserve a gen_server if conditional disagg is needed
+        gen_server, need_ctx = await self._check_conditional_disagg(request)
+        need_ctx = need_ctx and not await self._check_gen_only_disagg(request)
+        gen_req = request
+        tasks = []
+        ctx_req, gen_req = None, None
+        if need_ctx:
+            ctx_req = self._get_ctx_request(request)
+            tasks.append(
+                asyncio.create_task(
+                    self._ctx_client.send_request(ctx_req, server=ctx_server, hooks=hooks)
+                )
+            )
+        gen_req = self._get_gen_request_prealloc(request)
+        tasks.append(
+            asyncio.create_task(
+                self._gen_client.send_request(gen_req, server=gen_server, hooks=hooks)
+            )
+        )
+        responses = await asyncio.gather(*tasks)
+        # TODO: handle non-streaming requests
+        return responses[-1]
+
     def _need_gen(self, response: UCompletionResponse) -> bool:
         if response and response.choices[0].finish_reason not in ["length", "not_finished"]:
             del response.choices[0].disaggregated_params
@@ -142,10 +174,20 @@ class OpenAIDisaggregatedService(OpenAIService):
 
     def _get_ctx_request(self, request: UCompletionRequest) -> UCompletionRequest:
         ctx_request = copy.deepcopy(request)
-        ctx_request.disaggregated_params = DisaggregatedParams(request_type="context_only")
+        ctx_request.disaggregated_params = DisaggregatedParams(
+            request_type="context_only", disagg_id=str(uuid.uuid4())
+        )
         ctx_request.stream = False
         ctx_request.stream_options = None
         return ctx_request
+
+    def _get_gen_request_prealloc(
+        self,
+        request: UCompletionRequest,
+    ) -> UCompletionRequest:
+        gen_request = copy.deepcopy(request)
+        gen_request.disaggregated_params = DisaggregatedParams(request_type="generation_only")
+        return gen_request
 
     def _get_gen_request(
         self,
@@ -176,6 +218,9 @@ class OpenAIDisaggregatedService(OpenAIService):
             ):
                 return gen_server, True
             return gen_server, False
+        if self._prealloc_mode:
+            gen_server, _ = await self._gen_router.get_next_server(request)
+            return gen_server, True
         return None, True
 
     async def _check_gen_only_disagg(self, request: UCompletionRequest) -> bool:
