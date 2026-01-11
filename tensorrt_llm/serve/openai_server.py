@@ -63,7 +63,8 @@ from tensorrt_llm.serve.postprocess_handlers import (
     responses_api_streaming_post_processor)
 from tensorrt_llm.serve.responses_utils import (ConversationHistoryStore,
                                                 ResponsesStreamingProcessor,
-                                                ServerArrivalTimeMiddleware)
+                                                ServerArrivalTimeMiddleware,
+                                                create_list_input_response)
 from tensorrt_llm.serve.responses_utils import \
     create_response as responses_api_create_response
 from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
@@ -273,6 +274,9 @@ class OpenAIServer:
         self.app.add_api_route("/v1/responses",
                                self.openai_responses,
                                methods=["POST"])
+        self.app.add_api_route("/v1/responses/{response_id}/input_items",
+                               self.openai_responses_list_inputs,
+                               methods=["GET"])
         # RL-only endpoints
         self.app.add_api_route("/release_memory",
                                 self.release_memory,
@@ -1064,6 +1068,9 @@ class OpenAIServer:
             return self.create_error_response(str(e))
 
         return JSONResponse(content={"detail": "None"})
+
+    async def openai_responses_list_inputs(self, response_id: str) -> JSONResponse:
+        return JSONResponse(content=await create_list_input_response(response_id, self.conversation_store))
 
     async def release_memory(self, request: MemoryUpdateRequest) -> JSONResponse:
         assert isinstance(self.llm, AsyncLLM), "/release_memory endpoint is only supported with AsyncLLM()"
