@@ -313,3 +313,7 @@ nvidia/Nemotron-3-Nano:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 68.73
+MiniMaxAI/MiniMax-M2:
+  - accuracy: 85
+  - quant_algo: FP8_BLOCK_SCALES
+    accuracy: 85

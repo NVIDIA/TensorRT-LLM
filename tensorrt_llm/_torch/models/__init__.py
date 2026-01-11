@@ -14,6 +14,7 @@ from .modeling_hunyuan_moe import HunYuanMoEV1ForCausalLM
 from .modeling_hyperclovax import HCXVisionForCausalLM
 from .modeling_llama import LlamaForCausalLM
 from .modeling_llava_next import LlavaNextModel
+from .modeling_minimaxm2 import MiniMaxM2ForCausalLM
 from .modeling_mistral import Mistral3VLM, MistralForCausalLM
 from .modeling_mixtral import MixtralForCausalLM
 from .modeling_nemotron import NemotronForCausalLM
@@ -78,6 +79,7 @@ __all__ = [
     "SeedOssForCausalLM",
     "Glm4MoeForCausalLM",
     "Qwen3VLModel",
+    "MiniMaxM2ForCausalLM",
 ]
 
 if transformers.__version__ >= "4.45.1":
