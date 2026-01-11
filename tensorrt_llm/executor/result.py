@@ -933,6 +933,21 @@ def compute_logprobs(
             logits = logits[:len(tokens)]
 
         logprobs = F.log_softmax(logits.to("cuda", dtype=torch.float32), dim=-1)
+
+        # only return sampled token
+        if top_k == 0:
+            results: TokenLogprobs = []
+            if tokens is not None:
+                for t in range(logprobs.size(0)):
+                    token_id = tokens[t]
+                    token_logprob = logprobs[t, token_id].item()
+                    rank = (logprobs[t] > token_logprob).sum().item() + 1
+                    token_dict = {
+                        token_id: Logprob(logprob=token_logprob, rank=rank)
+                    }
+                    results.append(token_dict)
+            return results
+
         topk_vals, topk_indices = torch.topk(logprobs, k=top_k, dim=-1)
 
         results: TokenLogprobs = []
@@ -961,7 +976,7 @@ def compute_logprobs(
         None) if k_prompt_logprobs and context_logits is not None else None
     generation_logprobs = _topk_logprobs(
         generation_logits, k_logprobs, output_token_ids
-    ) if k_logprobs and generation_logits is not None else None
+    ) if k_logprobs is not None and generation_logits is not None else None
 
     return LogProbsResult(prompt=prompt_logprobs,
                           generation=generation_logprobs)
