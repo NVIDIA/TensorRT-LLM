@@ -3214,28 +3214,6 @@ files = [
 ]
 
 [[package]]
-name = "nvidia-cutlass-dsl"
-version = "4.3.4"
-description = "NVIDIA CUTLASS Python DSL"
-optional = false
-python-versions = ">=3.10"
-files = [
-    {file = "nvidia_cutlass_dsl-4.3.4-cp310-cp310-manylinux_2_28_aarch64.whl", hash = "sha256:118508bc84f2a55ec7af3affd379bb713edf837d593218329909db67b518e700"},
-    {file = "nvidia_cutlass_dsl-4.3.4-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:3fdf0603ab7ec1bf6a499fbf72cff65e73b597d6e1359286808317c69aeb7c3d"},
-    {file = "nvidia_cutlass_dsl-4.3.4-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:c5bd21ed877da171f115123a12aae4a920035fc47eb57c807f9fba9f3df97cf4"},
-    {file = "nvidia_cutlass_dsl-4.3.4-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:671936f1df909e7de377d0cc00cb4287a3458c013d34947600423e9deb827e41"},
-    {file = "nvidia_cutlass_dsl-4.3.4-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:57693d87677919572ab9eefa386b3f39e8e888bc4a9db7ab8730a97e8dbe06b4"},
-    {file = "nvidia_cutlass_dsl-4.3.4-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:a48fbff859e44dd548f8f26819d97d0595acea70e3b057c91dfdb47929015c72"},
-    {file = "nvidia_cutlass_dsl-4.3.4-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:36bde25160f461f393beba81868ef9e54d5ba2e0e7666ed3e44b6dbf788af493"},
-    {file = "nvidia_cutlass_dsl-4.3.4-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:be127f0f087028fa498f50a994c49f95b2c6a518e11e2567bc3d71528bf0a504"},
-]
-
-[package.dependencies]
-cuda-python = ">=12.8"
-numpy = "*"
-typing-extensions = "*"
-
-[[package]]
 name = "nvidia-ml-py"
 version = "13.590.44"
 description = "Python Bindings for the NVIDIA Management Library"
@@ -6339,4 +6317,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.0"
 python-versions = ">=3.10,<3.13"
-content-hash = "f17eedd404a2af6728d14710809ea47ad34bc6672c035073bad9e6c709131a08"
+content-hash = "7c2c53dee07ff38461334f55fc46cbcb05770c5c4c6f95f797eb9f9800e76f60"
