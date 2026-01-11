@@ -37,8 +37,13 @@ Draft/target is the simplest form of speculative decoding. In this approach, an 
 ```python
 from tensorrt_llm.llmapi import DraftTargetDecodingConfig
 
+# Option 1: Use a HuggingFace Hub model ID (auto-downloaded)
 speculative_config = DraftTargetDecodingConfig(
-    max_draft_len=3, speculative_model_dir="/path/to/draft_model")
+    max_draft_len=3, speculative_model="yuhuili/EAGLE3-LLaMA3.1-Instruct-8B")
+
+# Option 2: Use a local path
+# speculative_config = DraftTargetDecodingConfig(
+#     max_draft_len=3, speculative_model="/path/to/draft_model")
 
 llm = LLM("/path/to/target_model", speculative_config=speculative_config, disable_overlap_scheduler=True)
 ```
@@ -51,18 +56,23 @@ TRT-LLM supports a modified version of the algorithm presented in the paper: tre
 The following draft model checkpoints can be used for EAGLE 3:
 * Llama 3 variants: [use the checkpoints from the authors of the original EAGLE 3 paper](https://huggingface.co/yuhuili).
 * Llama 4 Maverick: [use the checkpoint from the NVIDIA HuggingFace repository](https://huggingface.co/nvidia/Llama-4-Maverick-17B-128E-Eagle3).
+* Other models, including `gpt-oss-120b` and `Qwen3`: check out the [Speculative Decoding Modules](https://huggingface.co/collections/nvidia/speculative-decoding-modules) collection from NVIDIA.
 
 ```python
 from tensorrt_llm.llmapi import EagleDecodingConfig
 
 # Enable to use the faster one-model implementation for Llama 4.
 eagle3_one_model = False
+model = "meta-llama/Llama-3.1-8B-Instruct"
+speculative_model = "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B"
 
 speculative_config = EagleDecodingConfig(
-    max_draft_len=3, speculative_model_dir="/path/to/draft_model", eagle3_one_model=eagle3_one_model)
+    max_draft_len=3,
+    speculative_model=speculative_model,
+    eagle3_one_model=eagle3_one_model)
 
 # Only need to disable overlap scheduler if eagle3_one_model is False.
-llm = LLM("/path/to/target_model", speculative_config=speculative_config, disable_overlap_scheduler=True)
+llm = LLM(model, speculative_config=speculative_config, disable_overlap_scheduler=True)
 ```
 
 ### NGram
@@ -137,13 +147,33 @@ Speculative decoding options must be specified via `--config config.yaml` for bo
 
 The rest of the argument names/valid values are the same as in their corresponding configuration class described in the Quick Start section. For example, a YAML configuration could look like this:
 
+```yaml
+# Using a HuggingFace Hub model ID (auto-downloaded)
+disable_overlap_scheduler: true
+speculative_config:
+  decoding_type: Eagle
+  max_draft_len: 4
+  speculative_model: yuhuili/EAGLE3-LLaMA3.1-Instruct-8B
 ```
+
+```yaml
+# Or using a local path
 disable_overlap_scheduler: true
 speculative_config:
   decoding_type: Eagle
   max_draft_len: 4
   speculative_model: /path/to/draft/model
 ```
+
+```{note}
+The field name `speculative_model_dir` can also be used as an alias for `speculative_config.speculative_model`. For example:
+
+    speculative_config:
+      decoding_type: Eagle
+      max_draft_len: 4
+      speculative_model_dir: /path/to/draft/model
+```
+
 
 ## Developer Guide
 
