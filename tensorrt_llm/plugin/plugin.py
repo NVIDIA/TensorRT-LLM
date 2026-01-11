@@ -737,14 +737,25 @@ class CustomAllReduceHelper:
                 lamport_buffers.local_ptr,
                 3 * lamport_buffers_size,
             )
-        flag_buffer = torch.tensor([0, 0, 0, lamport_buffers_size, 0],
-                                   dtype=torch.int,
-                                   device="cuda")
-        buffers = [ipc_buffers, ipc_barriers, lamport_buffers, flag_buffer]
+        # flag_buffer[0], atomic flag read counter
+        # flag_buffer[1], non-lamport flag
+        # flag_buffer[2], lamport flag
+        flag_buffer = torch.tensor([0, 0, 0], dtype=torch.int, device="cuda")
+        # layout_buffer[0], clear size for next lamport kernel
+        # layout_buffer[1], triple buffer offset for lamport kernel
+        layout_buffer = torch.tensor([0, lamport_buffers_size],
+                                     dtype=torch.int64,
+                                     device="cuda")
+
+        buffers = [
+            ipc_buffers, ipc_barriers, lamport_buffers, flag_buffer,
+            layout_buffer
+        ]
 
         return buffers, torch.tensor(
             ipc_buffers.serialize() + ipc_barriers.serialize() +
-            lamport_buffers.serialize() + [flag_buffer.data_ptr()],
+            lamport_buffers.serialize() + [flag_buffer.data_ptr()] +
+            [layout_buffer.data_ptr()],
             dtype=torch.int64,
             device="cuda")
 
