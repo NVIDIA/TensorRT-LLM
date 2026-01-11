@@ -148,6 +148,7 @@ class BindCapacityScheduler(CapacityScheduler):
         super(BindCapacityScheduler, self).__init__()
         self.kv_cache_manager = kv_cache_manager
         self.peft_cache_manager = peft_cache_manager
+        self.scheduler_policy = scheduler_policy
 
         self.impl = tb_internal.algorithms.CapacityScheduler(
             max_num_requests=max_num_requests,
@@ -275,6 +276,7 @@ class SimpleScheduler(RequestScheduler):
 
         context_requests, generation_requests = self.micro_batch_scheduler.schedule(
             fitting_requests, inflight_request_ids)
+
         # Convert from binding type RequestVector to list[LlmRequest],
         # so Python fields on LlmRequest won't be stripped away
         return SchedulerOutput(list(context_requests),
