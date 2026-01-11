@@ -16,6 +16,7 @@ import contextlib
 import ctypes
 import os
 import platform
+import threading
 import time
 from functools import wraps
 from pathlib import Path
@@ -34,7 +35,7 @@ if TYPE_CHECKING:
 else:
     Network = None
 
-from ._utils import str_dtype_to_trt
+from ._utils import print_all_stacks, str_dtype_to_trt
 from .bindings import MpiComm
 from .logger import logger
 from .plugin import _load_plugin_lib
@@ -81,6 +82,19 @@ def _init(log_level: object = None) -> None:
         raise ImportError(str(e) + msg)
 
     MpiComm.local_init()
+
+    def _print_stacks():
+        counter = 0
+        while True:
+            time.sleep(print_stacks_period)
+            counter += 1
+            logger.error(f"Printing stacks {counter} times")
+            print_all_stacks()
+
+    print_stacks_period = int(os.getenv("TRTLLM_PRINT_STACKS_PERIOD", "-1"))
+    if print_stacks_period > 0:
+        print_stacks_thread = threading.Thread(target=_print_stacks, daemon=True)
+        print_stacks_thread.start()
 
     logger.info("TensorRT LLM inited.")
 
