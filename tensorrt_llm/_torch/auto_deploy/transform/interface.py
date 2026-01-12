@@ -172,7 +172,8 @@ class TransformConfig(BaseModel):
     )
     debug_visualize_dir: Optional[str] = Field(
         default=None,
-        description="Enable debug visualization.",
+        description="Debug visualization directory. None to disable visualization, "
+        "or a path string to specify the output directory.",
     )
 
     expect_mem_change: bool = Field(
@@ -364,6 +365,7 @@ class BaseTransform(ABC):
             cm: The cached sequence interface defining the sequence interface.
             factory: The model factory used to build the model.
             shared_config: Global info shared between multiple transforms.
+            idx: The index of the transform in the pipeline.
 
         Returns:
             nn.Module: The transformed model.
@@ -490,7 +492,14 @@ class BaseTransform(ABC):
 
     @final
     def _visualize_graph(self, mod: nn.Module, idx: int) -> None:
-        """Visualize the graph if debug visualization is enabled."""
+        """Visualize the graph if debug visualization is enabled.
+        Args:
+            mod: The graph module to visualize.
+            idx: The index of the transform in the pipeline.
+        Note:
+            we may want to consider doing this for each subgraph.
+            See https://github.com/NVIDIA/TensorRT-LLM/issues/10203
+        """
         if not isinstance(mod, torch.fx.GraphModule):
             return
         visualize_dir = self.config.debug_visualize_dir

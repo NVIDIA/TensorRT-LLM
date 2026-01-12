@@ -159,11 +159,8 @@ class AdaptToDriveOSLLM(BaseTransform):
         num_attn_casts = self._insert_cast_after_attn_reshape(gm)
         num_bfloat16_casts = self._change_cast_bfloat16_to_float16(gm)
         ad_logger.info(f"Changed {num_bfloat16_casts} bfloat16 casts to float16")
-        gm.graph.eliminate_dead_code()
-        gm.graph.lint()
-        gm.recompile()
         ad_logger.info(f"Adapted DriveOS LLM model (inserted {num_attn_casts} attention casts)")
 
         return gm, TransformInfo(
-            skipped=False, num_matches=num_attn_casts, is_clean=True, has_valid_shapes=True
+            skipped=False, num_matches=num_attn_casts, is_clean=False, has_valid_shapes=True
         )
