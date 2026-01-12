@@ -328,7 +328,7 @@ def parse_arguments():
         "--multiround_user_delay_distribution",
         type=str,
         default="exponential",
-        choices=["exponential", "poisson", "constant", "uniform"],
+        choices=["exponential", "poisson", "constant", "uniform", "lognormal"],
         help="[Multiround] Distribution for user delay (default: exponential)",
     )
     parser.add_argument(
@@ -360,6 +360,18 @@ def parse_arguments():
         type=float,
         default=10.0,
         help="[Multiround] Maximum cap for any delay in seconds (default: 10.0)",
+    )
+    parser.add_argument(
+        "--multiround_user_delay_mean",
+        type=float,
+        default=1.0,
+        help="[Multiround] Mean (mu) for lognormal delay distribution (default: 1.0)",
+    )
+    parser.add_argument(
+        "--multiround_user_delay_sigma",
+        type=float,
+        default=0.5,
+        help="[Multiround] Sigma for lognormal delay distribution (default: 0.5)",
     )
     # KV cache hint settings (per-benchmark)
     parser.add_argument(

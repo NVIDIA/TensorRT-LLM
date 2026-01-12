@@ -220,6 +220,31 @@ class LognormalDistribution(Distribution):
         return f"Lognormal[mean={self.mean}, sigma={self.sigma}, max={self.max_val}]"
 
 
+class LognormalDelayDistribution(Distribution):
+    """Lognormal distribution for delay times (returns floats, not integers)."""
+
+    def __init__(
+        self,
+        mean: float,
+        sigma: float,
+        max_val: Optional[float] = None,
+    ) -> None:
+        if sigma < 0:
+            raise ValueError("Lognormal sigma must be non-negative")
+        self.mean = mean
+        self.sigma = sigma
+        self.max_val = max_val
+
+    def sample(self, size: int = 1) -> np.ndarray:
+        samples = np.random.lognormal(mean=self.mean, sigma=self.sigma, size=size)
+        if self.max_val:
+            samples = np.minimum(samples, self.max_val)
+        return samples
+
+    def __repr__(self) -> str:
+        return f"LognormalDelay[mean={self.mean}, sigma={self.sigma}, max={self.max_val}]"
+
+
 # =============================================================================
 # Configuration Classes
 # =============================================================================
@@ -240,13 +265,16 @@ class UserDelayConfig:
     """Configuration for user response delay distribution."""
 
     enabled: bool = True
-    distribution: str = "exponential"  # exponential, poisson, constant, uniform
+    distribution: str = "exponential"  # exponential, poisson, constant, uniform, lognormal
     # Parameters based on distribution type
     lambda_param: float = 1.0  # For exponential/poisson (mean delay in seconds)
     constant_value: float = 1.0  # For constant
     min_val: float = 0.5  # For uniform
     max_val: float = 2.0  # For uniform
     cap: Optional[float] = 10.0  # Maximum delay cap
+    # For lognormal distribution
+    mean: float = 1.0  # Mean (mu) for lognormal
+    sigma: float = 0.5  # Sigma for lognormal
 
     def get_distribution(self) -> Distribution:
         """Create the distribution object based on config."""
@@ -258,6 +286,8 @@ class UserDelayConfig:
             return ConstantDistribution(self.constant_value)
         elif self.distribution == "uniform":
             return UniformDistribution(self.min_val, self.max_val, is_integer=False)
+        elif self.distribution == "lognormal":
+            return LognormalDelayDistribution(self.mean, self.sigma, self.cap)
         else:
             return ExponentialDistribution(self.lambda_param, self.cap)
 
@@ -760,6 +790,8 @@ async def async_multiround_chat_benchmark(args):
         min_val=args.multiround_user_delay_min,
         max_val=args.multiround_user_delay_max,
         cap=args.multiround_user_delay_cap,
+        mean=args.multiround_user_delay_mean,
+        sigma=args.multiround_user_delay_sigma,
     )
 
     # Build synthetic data config from CLI args
