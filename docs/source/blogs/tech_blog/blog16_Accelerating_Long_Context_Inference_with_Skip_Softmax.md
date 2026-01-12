@@ -2,7 +2,7 @@
 
 In the previous [tech blog](https://github.com/heyuhhh/TensorRT-LLM/blob/user/yuhangh/add_sprase_attention_tech_blog/docs/source/blogs/tech_blog/blog15_Sparse_Attention_in_TensorRT-LLM.md) (TODO: Update link), we introduced the framework to support sparse attention in TensorRT-LLM. The methods we covered, no matter KV cache compression after the context phase, or the sparse tokens prediction in the generation phase, all require some **runtime** modifications. Therefore, they are relatively complex to implement and apply. More importantly, the additional operations compared to the full attention brings computational overhead, which would be detrimental to the performance gain of the core attention computation. Whether those methods are beneficial depends on the specific scenarios, e.g., if the context length is not long enough, enabling those methods may result in negative performance impact. On the other hand, Skip Softmax is only an approximation method of the attention kernel computation, making it compatible with nearly all the other features, such as FP8 attention, KV cache reuse, chunked prefill etc.
 
-In this blog, we introduce **Skip Softmax Attention**, a drop-in sparse attention technique that is fully compatible with the Flash Attention algorithm and only requires modifying the existing **attention kernels**. Compared to full attention, the end-to-end performance gain is therefore more predictable.
+In this blog, we introduce **Skip Softmax Attention**, a drop-in sparse attention technique that is designed to accelerate the existing pretrained models that use standard attention mechanisms like MHA, GQA, or MLA. Skip Softmax Attention based on top of the Flash Attention algorithm and only requires modifying the existing **attention kernels**. Due to this simplicity, the end-to-end performance gain is more predictable.
 
 ## Method Overview
 
@@ -13,7 +13,7 @@ $$
 In this way, we can indirectly control the sparsity via the threshold. Note that the threshold is inversely proportional to the context length, i.e., the longer the context, the smaller the threshold is needed to achieve the same sparsity.
 
 The method is fully dynamic, and can be applied to both the prefilling and decoding. The algorithm of Skip Softmax Attention is described in the paper [BLASST: Dynamic Blocked Attention Sparsity via Softmax Thresholding](https://arxiv.org/pdf/2512.12087). We have also published a [Developer Blog](https://developer.nvidia.com/blog/accelerating-long-context-inference-with-skip-softmax-in-nvidia-tensorrt-llm/) for explanation. Please refer to these resources for in-depth dive into the algorithm details. We will focus on the application of Skip Softmax Attention in TensorRT-LLM to accelerate long-context inference.
-![tech_blog16_blasst.jpg](../media/tech_blog16_blasst.jpg)
+<img src="../media/tech_blog16_blasst.jpg" alt="BLASST Illustration" style="width: 50%; min-width: 300px; display: block; margin: auto;" />
 
 ## Example Usage
 
@@ -106,12 +106,12 @@ The evaluation results are summarized in the table below:
 
 | Target Sparsity | LongBench V1 Overall Accuracy | LongBench V2 Overall Accuracy |
 |:---------------:|:----------------------------:|:----------------------------:|
-| 0.0             | 47.36                        | 34.42                        |
-| 0.5             | 47.10                        | 33.48                        |
-| 0.6             | TODO                        | 33.02                        |
-| 0.7             | TODO                        | 33.02                        |
-| 0.8             | TODO                        | 33.02                        |
-| 0.9             | 46.17                        | 33.02                        |
+| 0.0             | 47.77                        | 34.42                        |
+| 0.5             | 47.43                        | 33.48                        |
+| 0.6             | 47.47                       | 33.02                        |
+| 0.7             | 47.21                     | 33.02                        |
+| 0.8             | 46.50                     | 33.02                        |
+| 0.9             | 45.97                       | 33.02                        |
 
 (Note that the number of samples in LongBench V2 is very small (~200), so the result is subject to large variance. You may see non-monotonic situations where higher sparsity results in higher accuracy.)
 
@@ -224,4 +224,4 @@ TODO: Fill data.
 TODO: Compare with MInference.
 
 ## Conclusion
-Skip Softmax Attention is a kernel-based solution for accelerating the attention. Due to the design that BMM1 ($Q \cdot K^T$) in the attention kernel is not skipped, the performance gain is capped to 1.8x at kernel level. Nevertheless, it excels at achieving high sparsity with minimal accuracy degradation, and is especially effective in the medium-to-long context (10k-100k) scenarios where previous methods like MInference cannot well handle. The drop-in nature of Skip Softmax Attention makes it a flexible, easy-to-use method for accelerating long-context inference.
+Skip Softmax Attention is a kernel-based solution for accelerating the attention. Due to the design that BMM1 ($Q \cdot K^T$) in the attention kernel is not skipped, the performance gain is capped to 1.8x at kernel level. Nevertheless, it excels at achieving high sparsity with minimal accuracy degradation, and is especially effective in the medium-to-long context (10k-100k) scenarios where previous methods like MInference cannot well handle. The drop-in nature of Skip Softmax Attention makes it a flexible, easy-to-use method for accelerating long-context inference. MLA support for Skip Softmax Attention will be added in the future, and the Skip Softmax Attention kernels will be available in FlashInfer for adoptions by the open-source community.
