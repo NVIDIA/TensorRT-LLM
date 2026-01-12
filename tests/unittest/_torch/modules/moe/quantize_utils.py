@@ -18,6 +18,7 @@ from typing import Dict, List, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from utils.util import check_accuracy
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe import BaseMoeRoutingMethod
@@ -129,6 +130,10 @@ class RefGatedMLPFusedMoE(nn.Module):
             self.experts[expert].gate_up_proj.load_weights(gate_up_proj_weights)
             self.experts[expert].down_proj.load_weights(down_proj_weights)
 
+    def check_accuracy(self, output, ref_output):
+        # Here we use same rtol and atol as test_fused_moe
+        check_accuracy(output, ref_output, rtol=2e-1, atol=2e-1, percent=0.984)
+
 
 class FP8RefGatedMLPFusedMoE(RefGatedMLPFusedMoE):
     """
@@ -158,6 +163,10 @@ class FP8RefGatedMLPFusedMoE(RefGatedMLPFusedMoE):
             down_proj_weights[0]["input_scale"] = weights[f"{expert}.w2.input_scale"]
             self.experts[expert].gate_up_proj.load_weights(gate_up_proj_weights)
             self.experts[expert].down_proj.load_weights(down_proj_weights)
+
+    def check_accuracy(self, output, ref_output):
+        # Here we use same rtol and atol as test_fused_moe
+        check_accuracy(output, ref_output, rtol=4e-2, atol=1e-1, percent=0.99)
 
 
 class NVFP4RefGatedMLPFusedMoE(RefGatedMLPFusedMoE):
@@ -193,6 +202,10 @@ class NVFP4RefGatedMLPFusedMoE(RefGatedMLPFusedMoE):
             down_proj_weights[0]["weight_scale_2"] = weights[f"{expert}.w2.weight_scale_2"]
             self.experts[expert].gate_up_proj.load_weights(gate_up_proj_weights)
             self.experts[expert].down_proj.load_weights(down_proj_weights)
+
+    def check_accuracy(self, output, ref_output):
+        # Here we use same rtol and atol as test_fused_moe
+        torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.15)
 
 
 class BaseQuantizeUtil(ABC):

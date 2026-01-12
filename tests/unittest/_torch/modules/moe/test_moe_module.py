@@ -18,7 +18,6 @@ import pytest
 import torch
 from _torch.modules.moe.quantize_utils import get_test_quant_params
 from transformers.configuration_utils import PretrainedConfig
-from utils.util import check_accuracy
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe import RenormalizeMoeRoutingMethod, create_moe
@@ -126,14 +125,4 @@ def test_moe(dtype, moe_backend, quant_algo, mocker):
             ref_output = ref_fused_moe.forward(x, router_logits)
             output = fused_moe.forward(x, router_logits)
 
-        # Here we use same rtol and atol as test_fused_moe
-        if quant_algo == QuantAlgo.NVFP4:
-            torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.15)
-        else:
-            if quant_algo == QuantAlgo.FP8:
-                rtol, atol, percent = (4e-2, 1e-1, 0.99)
-            elif quant_algo is None:
-                rtol, atol, percent = (2e-1, 2e-1, 0.984)
-            else:
-                assert False, "unsupported quant_algo to check accuracy"
-            check_accuracy(output, ref_output, rtol=rtol, atol=atol, percent=percent)
+        ref_fused_moe.check_accuracy(output, ref_output)
