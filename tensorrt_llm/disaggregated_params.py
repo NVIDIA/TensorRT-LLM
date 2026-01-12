@@ -21,6 +21,8 @@ class DisaggregatedParams:
         ctx_request_id (int): The context request id
         opaque_state(bytes): Any additional state needing to be exchanged between context and gen instances
         draft_tokens (List[int]): The draft tokens of the generation request
+        disagg_request_id (int): The disaggregated request id, if set, both context and generation requests will use it
+         as underlying request id.
 
         multimodal_embedding_handles (List[Dict[str, Any]]): The resulting multimodal embedding handles from ViT.
         multimodal_hashes (List[List[int]]): The multimodal hashes of each multimodal item in the request.
