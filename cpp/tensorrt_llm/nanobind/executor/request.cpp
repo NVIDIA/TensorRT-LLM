@@ -582,7 +582,7 @@ void initRequestBindings(nb::module_& m)
     };
     auto requestSetstate = [](tle::Request& self, nb::tuple const& state)
     {
-        if (state.size() != 34)
+        if (state.size() != 35)
         {
             throw std::runtime_error("Invalid Request state!");
         }

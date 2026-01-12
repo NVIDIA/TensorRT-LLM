@@ -147,7 +147,7 @@ class OpenAIDisaggregatedService(OpenAIService):
     ) -> UCompletionRequest:
         ctx_request = copy.deepcopy(request)
         ctx_request.disaggregated_params = DisaggregatedParams(
-            request_type="context_only", ctx_request_id=disagg_request_id
+            request_type="context_only", disagg_request_id=disagg_request_id
         )
         ctx_request.stream = False
         ctx_request.stream_options = None
