@@ -116,13 +116,10 @@ class MiniMaxM2Attention(Attention):
         self,
         *,
         model_config: ModelConfig[PretrainedConfig],
-        fuse_qk_norm_rope: bool = False,
         layer_idx: Optional[int] = None,
     ):
         config = model_config.pretrained_config
         self.pretrained_config = config
-
-        self.fuse_qk_norm_rope = fuse_qk_norm_rope
 
         super().__init__(
             hidden_size=config.hidden_size,
@@ -184,9 +181,6 @@ class MiniMaxM2Attention(Attention):
         The apply_rope method is overridden in this class to apply QK norm and RoPE to the input tensor.
         """
         # Apply QK norm before RoPE.
-        assert self.fuse_qk_norm_rope is False, (
-            "fused_qk_norm_rope is not supported for Minimax M2."
-        )
         q, k, v = self.split_qkv(q, k, v)
         q, k = self.apply_qk_norm(q, k)
         return super().apply_rope(q, k, v, position_ids)
@@ -203,9 +197,7 @@ class MiniMaxM2DecoderLayer(DecoderLayer):
         config = model_config.pretrained_config
         self.hidden_size = config.hidden_size
 
-        self.self_attn = MiniMaxM2Attention(
-            model_config=model_config, fuse_qk_norm_rope=False, layer_idx=layer_idx
-        )
+        self.self_attn = MiniMaxM2Attention(model_config=model_config, layer_idx=layer_idx)
 
         self.block_sparse_moe = MiniMaxM2MoE(
             model_config=model_config, aux_stream=aux_stream, layer_idx=layer_idx
