@@ -2667,7 +2667,7 @@ class BlockwiseContiguousGroupedGemmKernel:
         group_size: cutlass.Int32,
         a_ptr: cute.Pointer,
         b_ptr: cute.Pointer,
-        a_sf_tensor: cute.Tensor,
+        sfa_tensor: cute.Tensor,
         b_sf_ptr: cute.Pointer,
         c_ptr: cute.Pointer,
         group_offset_ptr: cute.Pointer,
@@ -2687,7 +2687,7 @@ class BlockwiseContiguousGroupedGemmKernel:
             group_size (int): The group size of the GEMM problem.
             a_ptr (cute.Pointer): Pointer to the A tensor.
             b_ptr (cute.Pointer): Pointer to the B tensor.
-            a_sf_tensor (cute.Tensor): Tensor for the scale factor tensor for A.
+            a_sf_ptr (cute.Pointer): Pointer for the scale factor tensor for A.
             b_sf_ptr (cute.Pointer): Pointer to the scale factor tensor for B.
             c_ptr (cute.Pointer): Pointer to the C tensor.
             group_offset_ptr (cute.Pointer): Tensor for group offset.
@@ -2717,6 +2717,8 @@ class BlockwiseContiguousGroupedGemmKernel:
                 order=(1, 0, 2),
             ),
         )
+        # TODO: sfa_tensor constructed with make_ptr and make_tensor
+        # will cause illegal memory access, need investigation
         # sf_m, sf_k, batch_size
         # sfa_tensor = cute.make_tensor(
         #     a_sf_ptr,
@@ -2745,7 +2747,7 @@ class BlockwiseContiguousGroupedGemmKernel:
             a_tensor,
             b_tensor,
             c_tensor,
-            a_sf_tensor,
+            sfa_tensor,
             sfb_tensor,
             group_offset_tensor,
             max_active_clusters,

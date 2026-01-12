@@ -2502,6 +2502,7 @@ class BlockwiseGemmKernel:
         b_sf_ptr: cute.Pointer,
         c_ptr: cute.Pointer,
         max_active_clusters: cutlass.Constexpr,
+        is_batch_gemm: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
         """Executes the wrapped GEMM kernel with dynamically shaped tensors.
@@ -2550,7 +2551,7 @@ class BlockwiseGemmKernel:
             a_sf_ptr,
             layout=cute.make_ordered_layout(
                 (sf_m, sf_k, batch_size),
-                order=(0, 1, 2),
+                order=(0, 1, 2) if is_batch_gemm else (0, 1, 2),
             ),
         )
         # sf_n, sf_k, batch_size

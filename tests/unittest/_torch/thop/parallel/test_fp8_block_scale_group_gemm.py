@@ -22,6 +22,8 @@ import torch
 from _torch.helpers import calc_diff, per_block_cast_to_fp8
 from utils.util import getSMVersion, isSM100Family
 
+from tensorrt_llm._torch.autotuner import autotune
+
 
 @pytest.mark.skipif(
     not isSM100Family(),
@@ -64,6 +66,14 @@ def test_cute_dsl_fp8_block_scale_group_gemm(dtype, num_experts, k, n, max_token
         b_fp8[i, :, :] = cur_b
         b_scale[i, :, :] = cur_b_scale
 
+    with autotune():
+        output = torch.ops.trtllm.cute_dsl_fp8_group_blockwise_gemm_blackwell(
+            input=a_fp8,
+            weight=b_fp8,
+            input_scale=a_scale,
+            weight_scale=b_scale,
+            group_offset=group_offset,
+        )
     output = torch.ops.trtllm.cute_dsl_fp8_group_blockwise_gemm_blackwell(
         input=a_fp8,
         weight=b_fp8,

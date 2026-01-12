@@ -2204,7 +2204,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             profile: OptimizationProfile,
             **kwargs,
         ) -> List[int]:
-            # Early exit: Check SM version - CuteDSL FP8 is only supported on Blackwell.
             if not is_sm_100f():
                 logger.debug(
                     f"CuteDSL: SM version {get_sm_version()} is not supported. "
@@ -2291,7 +2290,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             sf_m = m
             sf_k = ceil_div(k, 128)
             sf_n = ceil_div(n, 128)
-            # TODO: add the logic of 'to_userbuffers'
             c_tensor = torch.empty(*(m, n),
                                    dtype=torch.bfloat16,
                                    device=a_tensor.device)
@@ -2328,8 +2326,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             )
 
             # get stream
-            torch_stream = torch.cuda.current_stream()
-            stream = cuda.CUstream(torch_stream.cuda_stream)
+            stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
             cache_key = (
                 use_2cta_instrs,
@@ -2363,6 +2360,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     b_sf_ptr,
                     c_ptr,
                     max_active_clusters=max_active_clusters,
+                    is_batch_gemm=False,
                     stream=stream,
                 )
                 self.__class__.kernel_cache[cache_key] = compiled_gemm
@@ -2509,14 +2507,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             Args:
                 inputs (List[torch.Tensor]):
-                    inputs[0]: Input tensor of shape (b, m, k), dtype: fp8.
-                    inputs[1]: Weight tensor of shape (b, n, k), dtype: fp8.
-                    inputs[2]: Input scale tensor of shape (b, pad_up(m, 4), k // 128), dtype: fp32.
-                    inputs[3]: Weight scale tensor of shape (B, n // 128, k // 128), dtype: fp32.
+                    inputs[0]: Input tensor of shape (batch_size, m, k), dtype: fp8.
+                    inputs[1]: Weight tensor of shape (batch_size, n, k), dtype: fp8.
+                    inputs[2]: Input scale tensor of shape (batch_size, pad_up(m, 4), k // 128), dtype: fp32.
+                    inputs[3]: Weight scale tensor of shape (batch_size, n // 128, k // 128), dtype: fp32.
                 tactic: Tiling and cluster strategy, typically a tuple (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn).
 
             Returns:
-                torch.Tensor: Output tensor of shape (b, m, n), dtype: bf16.
+                torch.Tensor: Output tensor of shape (batch_size, m, n), dtype: bf16.
             """
             if isinstance(tactic, tuple):
                 use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = tactic
@@ -2572,7 +2570,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # get stream
             stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-            cache_key = (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn)
+            cache_key = (
+                use_2cta_instrs,
+                mma_tiler_mn,
+                cluster_shape_mn,
+            )
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
                     cutlass.Float32,  # acc_dtype,
@@ -2600,6 +2602,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     b_sf_ptr,
                     c_ptr,
                     max_active_clusters=max_active_clusters,
+                    is_batch_gemm=True,
                     stream=stream,
                 )
                 self.__class__.kernel_cache[cache_key] = compiled_gemm
@@ -2614,7 +2617,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 sf_m,
                 sf_n,
                 sf_k,
-                batch_size,  # batch
+                batch_size,
                 a_ptr,
                 b_ptr,
                 a_sf_ptr,
@@ -2666,11 +2669,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         kernel_class = BlockwiseContiguousGroupedGemmKernel
         kernel_cache = dict()
 
-        tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
-            0, 0, get_last_power_of_2_num_tokens_buckets,
-            last_positive_power_of_2), ),
-                                     constraint_specs=(ConstraintSpec(
-                                         2, 1, fp8_scale_infer_shape), ))
+        tuning_config = TuningConfig()
 
         def __init__(self):
             super().__init__()
@@ -2772,7 +2771,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             sf_m = m
             sf_n = ceil_div(n, 128)
             sf_k = ceil_div(k, 128)
-            c = torch.empty(*(m, n), dtype=torch.bfloat16, device="cuda")
+            c = torch.empty(*(m, n), dtype=torch.bfloat16, device=a.device)
 
             a_ptr = make_ptr(
                 cutlass.Float8E4M3FN,
@@ -2817,8 +2816,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 a_sf_tmp, assumed_align=16).mark_layout_dynamic(leading_dim=0)
 
             # get stream
-            torch_stream = torch.cuda.current_stream()
-            stream = cuda.CUstream(torch_stream.cuda_stream)
+            stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
             cache_key = (
                 use_2cta_instrs,
@@ -2845,7 +2843,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     sf_m,
                     sf_n,
                     sf_k,
-                    1,
+                    1,  # batch
                     group_size,
                     a_ptr,
                     b_ptr,
@@ -2868,7 +2866,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 sf_m,
                 sf_n,
                 sf_k,
-                1,
+                1,  # batch
                 group_size,
                 a_ptr,
                 b_ptr,
