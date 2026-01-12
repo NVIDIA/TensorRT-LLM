@@ -2734,6 +2734,25 @@ static constexpr auto kernel_mha = kernel_mha_impl;
 #endif
 
 #ifndef GENERATE_CUBIN
+uint32_t computeNbSubSeqPerSeqMHA(cudaDeviceProp const& prop, uint32_t batchSize, uint32_t nbKHeads, uint32_t maxSeqLen)
+{
+    if (!allowMultiBlockMode)
+    {
+        return 1;
+    }
+    auto const env = std::getenv("XQA_NB_SUB_SEQ");
+    if (env != nullptr)
+    {
+        int32_t const val = std::stoi(env);
+        if (val > 0)
+        {
+            return val;
+        }
+    }
+    return std::min<uint32_t>(
+        std::max<uint32_t>(1U, prop.multiProcessorCount / (batchSize * nbKHeads)), divUp(maxSeqLen, ctaTile.x));
+}
+
 void launchMHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #if SLIDING_WINDOW
     uint32_t slidingWinSize,
@@ -2772,6 +2791,13 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #if SPEC_DEC
     SpecDecParams const& specDecParams,
 #endif
+#if SKIP_SOFTMAX_ATTN
+    float const skipSoftmaxThresholdScaleFactor, // for compatibility with mha_sm90.cu only
+#if SKIP_SOFTMAX_ATTN_BLOCK_STATS
+    uint32_t* __restrict__ skippedBlockCount,    // for compatibility with mha_sm90.cu only
+    uint32_t* __restrict__ totalBlockCount,      // for compatibility with mha_sm90.cu only
+#endif
+#endif
     uint32_t* semaphores, void* scratch, cudaStream_t stream)
 {
 #if SPEC_DEC
@@ -2793,24 +2819,7 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
     uint32_t const nbQHeads = nbKHeads * headGrpSize;
 
     // const uint32_t nbSubSeqPerSeq = allowMultiBlockMode ? DBG_NB_CTAS_PER_SEQ : 1;
-    uint32_t const nbSubSeqPerSeq = [&]() -> uint32_t
-    {
-        if (!allowMultiBlockMode)
-        {
-            return 1;
-        }
-        auto const env = std::getenv("XQA_NB_SUB_SEQ");
-        if (env != nullptr)
-        {
-            int32_t const val = std::stoi(env);
-            if (val > 0)
-            {
-                return val;
-            }
-        }
-        return std::min<uint32_t>(
-            std::max<uint32_t>(1U, prop.multiProcessorCount / (batchSize * nbKHeads)), divUp(maxSeqLen, ctaTile.x));
-    }();
+    uint32_t const nbSubSeqPerSeq = computeNbSubSeqPerSeqMHA(prop, batchSize, nbKHeads, maxSeqLen);
     // gridDim.z == batchSize && gridDim.y == nbKHeads && gridDim.x == nbSubSeqPerSeq
 #if SPEC_DEC
     const uint32_t nbTokenBlocksPerGrp = divUp(qSeqLen * headGrpSize, rowsPerBlock);

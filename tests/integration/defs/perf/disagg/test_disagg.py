@@ -47,6 +47,11 @@ else:
 @pytest.fixture(scope="session", autouse=True)
 def session_lifecycle():
     """Session lifecycle management."""
+    from utils.job_tracker import JobTracker
+
+    # Record pytest main process PID for GitLab CI cleanup
+    JobTracker.record_pid()
+
     session_tracker.start()
     try:
         yield
@@ -62,15 +67,12 @@ class TestDisaggBenchmark:
 
     @pytest.mark.perf
     @pytest.mark.parametrize("test_config", PERF_TEST_CASES)
-    def test_benchmark(self, request, test_config: TestConfig):
+    def test_benchmark(self, request, batch_manager, test_config: TestConfig):
         """Performance benchmark test for YAML configurations."""
         full_test_name = request.node.name
 
-        # Validate configuration first (before any other operations)
-        try:
-            ConfigValidator.validate_test_config(test_config)
-        except Exception as e:
-            pytest.fail(f"Configuration validation failed: {e}")
+        # Note: Configuration validation is done during batch submission (in conftest.py)
+        # If validation failed, job_id will be None and the assert below will fail
 
         # Create test case tracker
         test_tracker = TestCaseTracker()
@@ -101,15 +103,17 @@ class TestDisaggBenchmark:
                 )
                 job_id = EnvManager.get_debug_job_id()
             else:
-                # Submit job using JobManager
-                success, job_id = JobManager.submit_test_job(test_config)
+                # Get job_id from batch manager (auto-submits batch if needed)
+                job_id = batch_manager.get_job_id(test_config)
 
-                # Validate submission result
-                assert success, f"Job submission failed: {test_config.test_id}"
-                assert job_id, "Unable to get job ID"
+                # Validate submission result (will be None if validation/submission failed)
+                error_msg = batch_manager.submit_errors.get(
+                    test_config.test_id, "Check batch submission logs for details"
+                )
+                assert job_id, f"Failed to submit job for {test_config.test_id}\n{error_msg}"
 
-                # Wait for completion (timeout/early failure handled inside)
-                JobManager.wait_for_completion(job_id, 7200, test_config, check_early_failure=True)
+                # Wait for completion (timeout: 10 hours = 36000 seconds)
+                JobManager.wait_for_completion(job_id, 36000, test_config, check_early_failure=True)
 
             # End tracking test case
             test_tracker.end_test_case()
@@ -126,17 +130,16 @@ class TestDisaggBenchmark:
             raise e
         finally:
             # Always backup logs, regardless of success or failure
-            if job_id:
-                result_dir = JobManager.get_result_dir(test_config)
-                is_passed = result.get("success", False) if result else False
-                try:
-                    JobManager.backup_logs(job_id, test_config, result_dir, is_passed)
-                except Exception as backup_error:
-                    logger.error(f"Failed to backup logs: {backup_error}")
+            result_dir = JobManager.get_result_dir(test_config)
+            is_passed = result.get("success", False) if result else False
+            try:
+                JobManager.backup_logs(job_id, test_config, result_dir, is_passed)
+            except Exception as backup_error:
+                logger.error(f"Failed to backup logs: {backup_error}")
 
     @pytest.mark.accuracy
     @pytest.mark.parametrize("test_config", ACCURACY_TEST_CASES)
-    def test_accuracy(self, request, test_config: TestConfig):
+    def test_accuracy(self, request, batch_manager, test_config: TestConfig):
         """Accuracy test for YAML configurations."""
         full_test_name = request.node.name
 
@@ -179,15 +182,14 @@ class TestDisaggBenchmark:
                 )
                 job_id = EnvManager.get_debug_job_id()
             else:
-                # Submit job using JobManager
-                success, job_id = JobManager.submit_test_job(test_config)
+                # Get job_id from batch manager (auto-submits batch if needed)
+                job_id = batch_manager.get_job_id(test_config)
 
                 # Validate submission result
-                assert success, f"Job submission failed: {test_config.test_id}"
-                assert job_id, "Unable to get job ID"
+                assert job_id, f"Failed to get job_id for {test_config.test_id}"
 
-                # Wait for completion (timeout/early failure handled inside)
-                JobManager.wait_for_completion(job_id, 10800, test_config, check_early_failure=True)
+                # Wait for completion (timeout: 10 hours = 36000 seconds)
+                JobManager.wait_for_completion(job_id, 36000, test_config, check_early_failure=True)
 
             # End tracking test case
             test_tracker.end_test_case()
@@ -206,17 +208,16 @@ class TestDisaggBenchmark:
             raise e
         finally:
             # Always backup logs, regardless of success or failure
-            if job_id:
-                result_dir = JobManager.get_result_dir(test_config)
-                is_passed = result.get("success", False) if result else False
-                try:
-                    JobManager.backup_logs(job_id, test_config, result_dir, is_passed)
-                except Exception as backup_error:
-                    logger.error(f"Failed to backup logs: {backup_error}")
+            result_dir = JobManager.get_result_dir(test_config)
+            is_passed = result.get("success", False) if result else False
+            try:
+                JobManager.backup_logs(job_id, test_config, result_dir, is_passed)
+            except Exception as backup_error:
+                logger.error(f"Failed to backup logs: {backup_error}")
 
     @pytest.mark.stress
     @pytest.mark.parametrize("test_config", STRESS_TEST_CASES)
-    def test_stress(self, request, test_config: TestConfig):
+    def test_stress(self, request, batch_manager, test_config: TestConfig):
         """Stress test combining performance benchmarks and accuracy validation.
 
         This test type is designed for stress testing scenarios where both
@@ -224,11 +225,8 @@ class TestDisaggBenchmark:
         """
         full_test_name = request.node.name
 
-        # Validate configuration first (before any other operations)
-        try:
-            ConfigValidator.validate_test_config(test_config)
-        except Exception as e:
-            pytest.fail(f"Configuration validation failed: {e}")
+        # Note: Configuration validation is done during batch submission (in conftest.py)
+        # If validation failed, job_id will be None and the assert below will fail
 
         # Create test case tracker
         test_tracker = TestCaseTracker()
@@ -265,15 +263,17 @@ class TestDisaggBenchmark:
                 )
                 job_id = EnvManager.get_debug_job_id()
             else:
-                # Submit job using JobManager
-                success, job_id = JobManager.submit_test_job(test_config)
+                # Get job_id from batch manager (auto-submits batch if needed)
+                job_id = batch_manager.get_job_id(test_config)
 
-                # Validate submission result
-                assert success, f"Job submission failed: {test_config.test_id}"
-                assert job_id, "Unable to get job ID"
+                # Validate submission result (will be None if validation/submission failed)
+                error_msg = batch_manager.submit_errors.get(
+                    test_config.test_id, "Check batch submission logs for details"
+                )
+                assert job_id, f"Failed to submit job for {test_config.test_id}\n{error_msg}"
 
-                # Wait for completion (longer timeout for stress tests: 4 hours)
-                JobManager.wait_for_completion(job_id, 10800, test_config, check_early_failure=True)
+                # Wait for completion (timeout: 10 hours = 36000 seconds)
+                JobManager.wait_for_completion(job_id, 36000, test_config, check_early_failure=True)
 
             # End tracking test case
             test_tracker.end_test_case()
@@ -290,13 +290,12 @@ class TestDisaggBenchmark:
             raise e
         finally:
             # Always backup logs, regardless of success or failure
-            if job_id:
-                result_dir = JobManager.get_result_dir(test_config)
-                is_passed = result.get("success", False) if result else False
-                try:
-                    JobManager.backup_logs(job_id, test_config, result_dir, is_passed)
-                except Exception as backup_error:
-                    logger.error(f"Failed to backup logs: {backup_error}")
+            result_dir = JobManager.get_result_dir(test_config)
+            is_passed = result.get("success", False) if result else False
+            try:
+                JobManager.backup_logs(job_id, test_config, result_dir, is_passed)
+            except Exception as backup_error:
+                logger.error(f"Failed to backup logs: {backup_error}")
 
 
 if __name__ == "__main__":

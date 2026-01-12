@@ -65,7 +65,7 @@ models:
 - name: bigcode/starcoder2-7b
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: bigcode/starcoder2-15b-instruct-v0.1
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'attn_backend_triton.yaml']
 - name: deepseek-ai/DeepSeek-Prover-V1.5-SFT
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'compile_backend_torch_cudagraph.yaml']
 - name: deepseek-ai/DeepSeek-Prover-V2-7B
@@ -118,8 +118,6 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
 - name: google/gemma-3-27b-it
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
-- name: google/gemma-3-2b-it
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: deepseek-ai/DeepSeek-V2.5
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 # DISABLED: Network timeout downloading from Hugging Face
@@ -145,8 +143,6 @@ models:
 # DISABLED: Graph transformation error in auto-deploy
 # - name: neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8
 #   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
-- name: TheBloke/falcon-40b-instruct-GPTQ
-  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
 - name: Qwen/QwQ-32B
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'compile_backend_torch_cudagraph.yaml']
 - name: google/gemma-2-27b-it
@@ -159,7 +155,7 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
 - name: Qwen/QwQ-32B-Preview
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'compile_backend_torch_cudagraph.yaml']
-- name: Qwen/Qwen3-Coder-32B-Instruct
+- name: Qwen/Qwen3-Coder-30B-A3B-Instruct
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
 - name: Qwen/Qwen3-235B-A22B-Instruct-2507
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
@@ -222,3 +218,5 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml', 'llama4_scout.yaml']
 - name: meta-llama/Llama-4-Maverick-17B-128E-Instruct
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml', 'llama4_maverick_lite.yaml']
+- name: nvidia/NVIDIA-Nemotron-3-Super-120B-BF16-BF16KV-010726
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml','super_v3.yaml']

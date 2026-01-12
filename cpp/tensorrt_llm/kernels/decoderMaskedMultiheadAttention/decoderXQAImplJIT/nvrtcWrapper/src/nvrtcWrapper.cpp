@@ -215,6 +215,10 @@ tllmXqaJitStatus getMacroFlags(tllmXqaJitContext const* context, std::vector<std
     macros["USE_INPUT_KV"] = context->use_input_kv ? "1" : "0";
     macros["ROPE_STYLE"] = std::to_string(int(context->rope_style));
     macros["IS_SPEC_DEC_TREE"] = context->is_spec_dec_tree ? "1" : "0";
+    macros["SKIP_SOFTMAX_ATTN"] = context->use_skip_softmax_attn ? "1" : "0";
+#ifdef SKIP_SOFTMAX_STAT
+    macros["SKIP_SOFTMAX_ATTN_BLOCK_STATS"] = context->use_skip_softmax_attn ? "1" : "0";
+#endif
 
     // Without these macros, NVRTC uses precompiled headers for cuda_fp16.h etc.
     // Linking might fail due to ABI incompatibility.
