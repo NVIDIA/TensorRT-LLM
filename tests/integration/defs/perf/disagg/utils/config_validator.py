@@ -88,7 +88,7 @@ class ConfigValidator:
         gen_max_seq_len = extracted_config["gen_max_seq_len"]
         assert ctx_max_seq_len > isl, "config error: ctx_max_seq_len > isl"
         assert gen_max_seq_len > (isl + osl), "config error: gen_max_seq_len <= (isl + osl)"
-    
+
     @staticmethod
     def _validate_concurrency_list(extracted_config: dict) -> None:
         """Validate concurrency list.
@@ -107,9 +107,10 @@ class ConfigValidator:
             gen_batch_size = extracted_config["gen_batch_size"]
             if gen_enable_dp:
                 gen_tp_size = extracted_config["gen_tp_size"]
-                assert concurrency <= gen_batch_size * gen_tp_size, "config error: concurrency exceeds gen_batch_size * gen_tp_size"
+                assert concurrency <= gen_batch_size * gen_tp_size, (
+                    "config error: concurrency exceeds gen_batch_size * gen_tp_size"
+                )
             else:
-                assert concurrency <= gen_batch_size, "config error: concurrency exceeds gen_batch_size"
-
-
-
+                assert concurrency <= gen_batch_size, (
+                    "config error: concurrency exceeds gen_batch_size"
+                )
