@@ -270,16 +270,6 @@ class FP8QuantizeUtil(BaseQuantizeUtil):
     FP8QuantizeUtil inherits from BaseQuantizeUtil to support correctness testing for FP8 quantized MoE modules.
     """
 
-    def __init__(
-        self,
-        num_experts: int,
-        dtype: torch.dtype,
-        intermediate_size: int,
-        hidden_size: int,
-        quant_config: QuantConfig,
-    ):
-        super().__init__(num_experts, dtype, intermediate_size, hidden_size, quant_config)
-
     def create_weights(self, **quant_kwargs) -> Dict[str, torch.Tensor]:
         """
         Create quantized weights for MoE experts.
@@ -340,16 +330,6 @@ class NVFP4QuantizeUtil(BaseQuantizeUtil):
     """
     NVFP4QuantizeUtil inherits from BaseQuantizeUtil to support correctness testing for NVFP4 quantized MoE modules.
     """
-
-    def __init__(
-        self,
-        num_experts: int,
-        dtype: torch.dtype,
-        intermediate_size: int,
-        hidden_size: int,
-        quant_config: QuantConfig,
-    ):
-        super().__init__(num_experts, dtype, intermediate_size, hidden_size, quant_config)
 
     def create_weights(self, **quant_kwargs) -> Dict[str, torch.Tensor]:
         """
