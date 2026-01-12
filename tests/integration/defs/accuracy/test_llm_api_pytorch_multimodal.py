@@ -345,3 +345,28 @@ class TestQwen3VL(LlmapiAccuracyTestHarness):
         ) as llm:
             task = MMMU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=self.sampling_params)
+
+
+class TestMistralSmall24B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "mistralai/Mistral-Small-3.1-24B-Instruct-2503"
+    MODEL_PATH = f"{llm_models_root()}/Mistral-Small-3.1-24B-Instruct-2503"
+    MAX_NUM_TOKENS = 16384
+
+    # NOTE: MMMU adds <|endoftext|> to the stop token.
+    sampling_params = SamplingParams(
+        max_tokens=MMMU.MAX_OUTPUT_LEN,
+        truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
+        stop="<|endoftext|>",
+    )
+
+    @pytest.mark.skip_less_device_memory(80000)
+    def test_auto_dtype(self):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        with LLM(
+            self.MODEL_PATH,
+            kv_cache_config=kv_cache_config,
+            enable_chunked_prefill=True,
+            max_num_tokens=self.MAX_NUM_TOKENS,
+        ) as llm:
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=self.sampling_params)

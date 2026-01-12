@@ -106,6 +106,7 @@ __device__ inline MatDesc makeMatDesc(void const* data, uint32_t dimKByteOffset,
         asm volatile("trap;\n");
         return 0;
     }();
+    assert(__cvta_generic_to_shared(data) % baseAlign == 0);
     uint32_t const baseOffset = ((patternAddr % baseAlign == 0) ? 0U : ((patternAddr >> 0x7) & 0x7));
     return MatDesc{
         /*addr=*/MatDesc::encode(__cvta_generic_to_shared(data)),
