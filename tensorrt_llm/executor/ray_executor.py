@@ -374,33 +374,13 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
                     f"Total bundle indices ({total_workers}) must equal world_size ({self.world_size})"
                 )
 
-            # Convert lists to PlacementGroups if needed (handles both YAML and Python API modes)
-            first_elem = placement_config.placement_groups[0]
-            is_yaml_mode = isinstance(first_elem, list)
+            logger.info(
+                f"Creating {self.world_size} workers with external placement groups"
+            )
 
-            if is_yaml_mode:
-                logger.info(
-                    f"Creating {self.world_size} workers with placement config from YAML"
-                )
-            else:
-                logger.info(
-                    f"Creating {self.world_size} workers with external placement groups"
-                )
-
-            # Use RayPlacementConfig method to convert lists to PlacementGroups
-            converted_pgs = placement_config.convert_lists_to_placement_groups(
-                master_address=self.master_address)
-
-            if is_yaml_mode:
-                for i, pg in enumerate(converted_pgs):
-                    logger.info(
-                        f"Created placement group {i} with {len(placement_config.placement_groups[i])} bundles (GPUs auto-assigned by Ray)"
-                    )
-
-            # Flatten PGs and bundle indices for worker assignment
             flat_pgs = []
             flat_indices = []
-            for pg, indices in zip(converted_pgs,
+            for pg, indices in zip(placement_config.placement_groups,
                                    placement_config.placement_bundle_indices):
                 for idx in indices:
                     flat_pgs.append(pg)
