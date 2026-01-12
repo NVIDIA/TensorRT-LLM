@@ -3588,13 +3588,14 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
             torch_compile_config=torch_compile_config,
         )
 
-        with LLM(f"{llm_models_root()}/Qwen3/nvidia-Qwen3-30B-A3B-NVFP4",
-                 tensor_parallel_size=tp_size,
-                 pipeline_parallel_size=pp_size,
-                 moe_expert_parallel_size=ep_size,
-                 **pytorch_config,
-                 enable_attention_dp=attention_dp,
-                 max_batch_size=32) as llm:
+        with LLM(
+                f"{llm_models_root()}/Qwen3/saved_models_Qwen3-30B-A3B_nvfp4_hf",
+                tensor_parallel_size=tp_size,
+                pipeline_parallel_size=pp_size,
+                moe_expert_parallel_size=ep_size,
+                **pytorch_config,
+                enable_attention_dp=attention_dp,
+                max_batch_size=32) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)

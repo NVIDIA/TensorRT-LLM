@@ -120,7 +120,7 @@ MODEL_PATH_DICT = {
     "qwen3_14b_fp8": "Qwen3/nvidia-Qwen3-14B-FP8",
     "qwen3_14b_fp4": "Qwen3/nvidia-Qwen3-14B-NVFP4",
     "qwen3_30b_a3b": "Qwen3/Qwen3-30B-A3B",
-    "qwen3_30b_a3b_fp4": "Qwen3/nvidia-Qwen3-30B-A3B-NVFP4",
+    "qwen3_30b_a3b_fp4": "Qwen3/saved_models_Qwen3-30B-A3B_nvfp4_hf",
     "qwen3_32b": "Qwen3/Qwen3-32B",
     "qwen3_32b_fp4": "Qwen3/nvidia-Qwen3-32B-NVFP4",
     "qwen3_235b_a22b_fp8": "Qwen3/saved_models_Qwen3-235B-A22B_fp8_hf",
