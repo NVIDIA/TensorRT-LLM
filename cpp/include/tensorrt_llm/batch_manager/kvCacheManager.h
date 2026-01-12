@@ -288,6 +288,8 @@ public:
 
     void removeNextBlock(BlockKey const& blockKey);
 
+    void freeDescendantsRecursively();
+
     //! \brief Find block matching blockKey. If allowPartial is true, the returned block may match only a prefix of
     //! blockKey.
     //! @return tuple of [partialMatch, numMatched, block], partialMatch is true if not all the tokens of the block were

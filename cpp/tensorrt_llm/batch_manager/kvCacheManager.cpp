@@ -477,6 +477,16 @@ void KVCacheBlock::removeNextBlock(BlockKey const& blockKey)
     mNextBlocks.erase(blockKey);
 }
 
+void KVCacheBlock::freeDescendantsRecursively()
+{
+    for (auto it = mNextBlocks.begin(); it != mNextBlocks.end();)
+    {
+        it->second->freeDescendantsRecursively();
+        mPrevBlock = nullptr;
+        it = mNextBlocks.erase(it);
+    }
+}
+
 bool KVCacheBlock::isFull() const
 {
     return mIsFull;
@@ -956,19 +966,14 @@ void WindowBlockManager::freeLeafBlock(BlockPtr const& block)
 
 void WindowBlockManager::freeChildren(BlockPtr const& block)
 {
-    // Free all descendants of block
-    for (auto const& p : block->getNextBlocks())
-    {
-        auto childBlock = p.second;
-        freeChildren(childBlock);
-    }
-
-    // Free block
+    // Tell event manager we are freeing block
     if (mEventManager && blockInRadixTree(block))
     {
         mEventManager->enqueueRemovedEvent(block, mWindowSize);
     }
-    freeLeafBlock(block);
+
+    // Free block and all it's descendants from radix tree
+    block->freeDescendantsRecursively();
 }
 
 BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor::RetentionPriority priority,
