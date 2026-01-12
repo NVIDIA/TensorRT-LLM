@@ -444,6 +444,7 @@ class KVCacheManager(BaseResourceManager):
             self.impl.sync_transfer_manager_with_buffer_manager()
 
             # allocate KV Cache
+            self.impl.sync_transfer_manager_with_buffer_manager()
             for req in context_batch:
                 req_beam_width = req.sampling_config.beam_width
                 if 'cp_type' in self.mapping.cp_config and CpType.STAR == self.mapping.cp_config[
@@ -471,6 +472,7 @@ class KVCacheManager(BaseResourceManager):
                             block_ids = self.get_cache_indices(req)
                             self.kv_connector_manager.update_state_after_alloc(
                                 req, block_ids)
+            self.impl.refresh_blocks()
 
             for req in generation_batch:
                 if self.mapping.has_cp_helix():
