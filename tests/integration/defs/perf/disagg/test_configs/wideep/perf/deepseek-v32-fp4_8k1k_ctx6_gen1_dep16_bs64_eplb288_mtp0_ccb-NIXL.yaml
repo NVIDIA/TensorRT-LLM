@@ -49,7 +49,6 @@ accuracy:
   model_args_extra: num_concurrent=512,max_retries=3,tokenized_requests=false,timeout=1200,max_gen_toks=256,max_length=4096
 worker_config:
   gen:
-    enable_layerwise_nvtx_marker: true
     tensor_parallel_size: 16
     moe_expert_parallel_size: 16
     enable_attention_dp: true
@@ -80,17 +79,23 @@ worker_config:
       free_gpu_memory_fraction: 0.7
       dtype: fp8
     moe_config:
-      backend: WIDEEP
+      backend: CUTEDSL
+      use_low_precision_moe_combine: true
       load_balancer:
         num_slots: 288
         layer_updates_per_iter: 1
+    nvfp4_gemm_config:
+      allowed_backends:
+      - cutlass
+      - cublaslt
+      - cutedsl
+      - cuda_core
     cache_transceiver_config:
       max_tokens_in_buffer: 8448
       backend: NIXL
     stream_interval: 20
     num_postprocess_workers: 4
   ctx:
-    enable_layerwise_nvtx_marker: true
     max_batch_size: 1
     max_num_tokens: 8448
     max_seq_len: 9419
@@ -105,6 +110,8 @@ worker_config:
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.75
       dtype: fp8
+    moe_config:
+      backend: TRTLLM
     cache_transceiver_config:
       max_tokens_in_buffer: 8448
       backend: NIXL
