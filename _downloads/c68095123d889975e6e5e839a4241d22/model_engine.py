@@ -1070,7 +1070,12 @@ class PyTorchModelEngine(ModelEngine):
         num_attention_heads = getattr(config, 'num_attention_heads', None)
         num_key_value_heads = getattr(config, 'num_key_value_heads', None)
 
-        if num_attention_heads is not None and num_key_value_heads is not None:
+        # Calculate the number of attention heads per KV head (GQA ratio)
+        if isinstance(num_key_value_heads, (list, tuple)):
+            # Filter out invalid KV heads, default to 0 if no valid KV heads are found
+            num_key_value_heads = min(
+                (kv for kv in num_key_value_heads if kv and kv > 0), default=0)
+        if num_attention_heads and num_key_value_heads:
             num_heads_per_kv = num_attention_heads // num_key_value_heads
         else:
             num_heads_per_kv = 1
@@ -1138,6 +1143,11 @@ class PyTorchModelEngine(ModelEngine):
         return self.spec_metadata
 
     def __del__(self) -> None:
+        self.model = None
+        self.model_loader = None
+        self._release_cuda_graphs()
+        self.input_processor = None
+        self.input_processor_with_hash = None
         if getattr(self, 'ub_buffers', None):
             for u in self.ub_buffers:
                 ub.ub_deallocate(u.addr)
@@ -2129,7 +2139,6 @@ class PyTorchModelEngine(ModelEngine):
                 # For the target model + tree decoding
                 if not self.is_draft_model and not spec_config.is_linear_tree:
                     assert spec_tree_manager is not None
-                    assert num_draft_tokens == spec_tree_manager.max_total_draft_tokens
                     position_ids.extend(
                         past_seen_token_num +
                         spec_tree_manager.spec_dec_position_offsets[

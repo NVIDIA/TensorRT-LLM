@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc7';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc8';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -76,7 +76,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc7" />
+  <meta name="docsearch:version" content="1.2.0rc8" />
 
 
   </head>
@@ -446,6 +446,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
@@ -605,6 +606,27 @@
 
 </dd></dl>
 
+<dl class="cpp enum-class">
+<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm8executor8kv_cache13TransferStateE">
+<span id="_CPPv3N12tensorrt_llm8executor8kv_cache13TransferStateE"></span><span id="_CPPv2N12tensorrt_llm8executor8kv_cache13TransferStateE"></span><span class="target" id="transferAgent_8h_1ade23929065795399b6a4345b230a14e2"></span><span class="k"><span class="pre">enum</span></span><span class="w"> </span><span class="k"><span class="pre">class</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">TransferState</span></span></span><span class="w"> </span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">uint8_t</span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm8executor8kv_cache13TransferStateE" title="Link to this definition">#</a><br /></dt>
+<dd><p><em>Values:</em></p>
+<dl class="cpp enumerator">
+<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm8executor8kv_cache13TransferState12kIN_PROGRESSE">
+<span id="_CPPv3N12tensorrt_llm8executor8kv_cache13TransferState12kIN_PROGRESSE"></span><span id="_CPPv2N12tensorrt_llm8executor8kv_cache13TransferState12kIN_PROGRESSE"></span><span class="target" id="transferAgent_8h_1ade23929065795399b6a4345b230a14e2a6f4fb48f5136b1de62df95430e63895d"></span><span class="k"><span class="pre">enumerator</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">kIN_PROGRESS</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm8executor8kv_cache13TransferState12kIN_PROGRESSE" title="Link to this definition">#</a><br /></dt>
+<dd></dd></dl>
+
+<dl class="cpp enumerator">
+<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm8executor8kv_cache13TransferState8kSUCCESSE">
+<span id="_CPPv3N12tensorrt_llm8executor8kv_cache13TransferState8kSUCCESSE"></span><span id="_CPPv2N12tensorrt_llm8executor8kv_cache13TransferState8kSUCCESSE"></span><span class="target" id="transferAgent_8h_1ade23929065795399b6a4345b230a14e2ac4b67917e88068716be9d96ab74529ab"></span><span class="k"><span class="pre">enumerator</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">kSUCCESS</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm8executor8kv_cache13TransferState8kSUCCESSE" title="Link to this definition">#</a><br /></dt>
+<dd></dd></dl>
+
+<dl class="cpp enumerator">
+<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm8executor8kv_cache13TransferState8kFAILUREE">
+<span id="_CPPv3N12tensorrt_llm8executor8kv_cache13TransferState8kFAILUREE"></span><span id="_CPPv2N12tensorrt_llm8executor8kv_cache13TransferState8kFAILUREE"></span><span class="target" id="transferAgent_8h_1ade23929065795399b6a4345b230a14e2ab3ad1804c4ef60e2bdb43d280c0fbe63"></span><span class="k"><span class="pre">enumerator</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">kFAILURE</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm8executor8kv_cache13TransferState8kFAILUREE" title="Link to this definition">#</a><br /></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
 </div>
 <div class="breathe-sectiondef docutils container">
 <p class="breathe-sectiondef-title rubric" id="breathe-section-title-functions">Functions</p>
@@ -677,6 +699,16 @@
 <dl class="cpp var">
 <dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm8executor8kv_cache15BaseAgentConfig11multiThreadE">
 <span id="_CPPv3N12tensorrt_llm8executor8kv_cache15BaseAgentConfig11multiThreadE"></span><span id="_CPPv2N12tensorrt_llm8executor8kv_cache15BaseAgentConfig11multiThreadE"></span><span id="tensorrt_llm::executor::kv_cache::BaseAgentConfig::multiThread__b"></span><span class="target" id="structtensorrt__llm_1_1executor_1_1kv__cache_1_1BaseAgentConfig_1a4ccd5e49c707f8d7cc3e8cd95e2136ad"></span><span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">multiThread</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm8executor8kv_cache15BaseAgentConfig11multiThreadE" title="Link to this definition">#</a><br /></dt>
+<dd></dd></dl>
+
+<dl class="cpp var">
+<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm8executor8kv_cache15BaseAgentConfig15useListenThreadE">
+<span id="_CPPv3N12tensorrt_llm8executor8kv_cache15BaseAgentConfig15useListenThreadE"></span><span id="_CPPv2N12tensorrt_llm8executor8kv_cache15BaseAgentConfig15useListenThreadE"></span><span id="tensorrt_llm::executor::kv_cache::BaseAgentConfig::useListenThread__b"></span><span class="target" id="structtensorrt__llm_1_1executor_1_1kv__cache_1_1BaseAgentConfig_1af8883b627dadc185969661d784fd2508"></span><span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">useListenThread</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm8executor8kv_cache15BaseAgentConfig15useListenThreadE" title="Link to this definition">#</a><br /></dt>
+<dd></dd></dl>
+
+<dl class="cpp var">
+<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm8executor8kv_cache15BaseAgentConfig10numWorkersE">
+<span id="_CPPv3N12tensorrt_llm8executor8kv_cache15BaseAgentConfig10numWorkersE"></span><span id="_CPPv2N12tensorrt_llm8executor8kv_cache15BaseAgentConfig10numWorkersE"></span><span id="tensorrt_llm::executor::kv_cache::BaseAgentConfig::numWorkers__unsigned-i"></span><span class="target" id="structtensorrt__llm_1_1executor_1_1kv__cache_1_1BaseAgentConfig_1aaa7a552b0c70719c0fddc38d179e7a1a"></span><span class="kt"><span class="pre">unsigned</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">numWorkers</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm8executor8kv_cache15BaseAgentConfig10numWorkersE" title="Link to this definition">#</a><br /></dt>
 <dd></dd></dl>
 
 </div>
@@ -1284,8 +1316,8 @@
 <dd></dd></dl>
 
 <dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm8executor8kv_cache14TransferStatus4waitEv">
-<span id="_CPPv3NK12tensorrt_llm8executor8kv_cache14TransferStatus4waitEv"></span><span id="_CPPv2NK12tensorrt_llm8executor8kv_cache14TransferStatus4waitEv"></span><span id="tensorrt_llm::executor::kv_cache::TransferStatus::waitC"></span><span class="target" id="classtensorrt__llm_1_1executor_1_1kv__cache_1_1TransferStatus_1a3295b58ae616e14c205b802e719c8b15"></span><span class="k"><span class="pre">virtual</span></span><span class="w"> </span><span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">wait</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="m"><span class="pre">0</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm8executor8kv_cache14TransferStatus4waitEv" title="Link to this definition">#</a><br /></dt>
+<dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm8executor8kv_cache14TransferStatus4waitE7int64_t">
+<span id="_CPPv3NK12tensorrt_llm8executor8kv_cache14TransferStatus4waitE7int64_t"></span><span id="_CPPv2NK12tensorrt_llm8executor8kv_cache14TransferStatus4waitE7int64_t"></span><span id="tensorrt_llm::executor::kv_cache::TransferStatus::wait__int64_tC"></span><span class="target" id="classtensorrt__llm_1_1executor_1_1kv__cache_1_1TransferStatus_1a14cd3864188301da856a72afe280a973"></span><span class="k"><span class="pre">virtual</span></span><span class="w"> </span><a class="reference internal" href="#_CPPv4N12tensorrt_llm8executor8kv_cache13TransferStateE" title="tensorrt_llm::executor::kv_cache::TransferState"><span class="n"><span class="pre">TransferState</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">wait</span></span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">int64_t</span></span><span class="w"> </span><span class="n sig-param"><span class="pre">timeout_ms</span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="o"><span class="pre">-</span></span><span class="m"><span class="pre">1</span></span></em><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="m"><span class="pre">0</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm8executor8kv_cache14TransferStatus4waitE7int64_t" title="Link to this definition">#</a><br /></dt>
 <dd></dd></dl>
 
 </div>
@@ -12181,6 +12213,12 @@
 <li class="toc-h7 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor8kv_cache10TransferOp6kWRITEE"><code class="docutils literal notranslate"><span class="pre">kWRITE</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor8kv_cache13TransferStateE"><code class="docutils literal notranslate"><span class="pre">TransferState</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h7 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor8kv_cache13TransferState12kIN_PROGRESSE"><code class="docutils literal notranslate"><span class="pre">kIN_PROGRESS</span></code></a></li>
+<li class="toc-h7 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor8kv_cache13TransferState8kSUCCESSE"><code class="docutils literal notranslate"><span class="pre">kSUCCESS</span></code></a></li>
+<li class="toc-h7 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor8kv_cache13TransferState8kFAILUREE"><code class="docutils literal notranslate"><span class="pre">kFAILURE</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4IDpEN12tensorrt_llm8executor8kv_cache17makeTransferAgentENSt10unique_ptrI17BaseTransferAgentEERKNSt6stringEDpRR4Args"><code class="docutils literal notranslate"><span class="pre">makeTransferAgent()</span></code></a></li>
 <li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4IDpEN12tensorrt_llm8executor8kv_cache17makeLoopbackAgentENSt10shared_ptrI17BaseLoopbackAgentEERKNSt6stringEDpRR4Args"><code class="docutils literal notranslate"><span class="pre">makeLoopbackAgent()</span></code></a></li>
 <li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor8kv_cache9AgentDescE"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm::executor::kv_cache::AgentDesc</span></code></a><ul class="nav section-nav flex-column">
@@ -12193,6 +12231,8 @@
 <li class="toc-h7 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor8kv_cache15BaseAgentConfig5mNameE"><code class="docutils literal notranslate"><span class="pre">mName</span></code></a></li>
 <li class="toc-h7 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor8kv_cache15BaseAgentConfig13useProgThreadE"><code class="docutils literal notranslate"><span class="pre">useProgThread</span></code></a></li>
 <li class="toc-h7 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor8kv_cache15BaseAgentConfig11multiThreadE"><code class="docutils literal notranslate"><span class="pre">multiThread</span></code></a></li>
+<li class="toc-h7 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor8kv_cache15BaseAgentConfig15useListenThreadE"><code class="docutils literal notranslate"><span class="pre">useListenThread</span></code></a></li>
+<li class="toc-h7 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor8kv_cache15BaseAgentConfig10numWorkersE"><code class="docutils literal notranslate"><span class="pre">numWorkers</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor8kv_cache17BaseLoopbackAgentE"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm::executor::kv_cache::BaseLoopbackAgent</span></code></a><ul class="nav section-nav flex-column">
@@ -12287,7 +12327,7 @@
 <li class="toc-h6 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor8kv_cache14TransferStatusE"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm::executor::kv_cache::TransferStatus</span></code></a><ul class="nav section-nav flex-column">
 <li class="toc-h7 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor8kv_cache14TransferStatusD0Ev"><code class="docutils literal notranslate"><span class="pre">~TransferStatus()</span></code></a></li>
 <li class="toc-h7 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm8executor8kv_cache14TransferStatus11isCompletedEv"><code class="docutils literal notranslate"><span class="pre">isCompleted()</span></code></a></li>
-<li class="toc-h7 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm8executor8kv_cache14TransferStatus4waitEv"><code class="docutils literal notranslate"><span class="pre">wait()</span></code></a></li>
+<li class="toc-h7 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm8executor8kv_cache14TransferStatus4waitE7int64_t"><code class="docutils literal notranslate"><span class="pre">wait()</span></code></a></li>
 </ul>
 </li>
 </ul>
@@ -14051,9 +14091,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on January 04, 2026.</p>
+  <p>Last updated on January 11, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a65b0d4">a65b0d4</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/80649a8">80649a8</a>.</p>
   
 </div></div>
       

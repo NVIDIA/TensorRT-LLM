@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc7';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc8';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -78,7 +78,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc7" />
+  <meta name="docsearch:version" content="1.2.0rc8" />
 
 
   </head>
@@ -448,6 +448,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
@@ -930,6 +931,7 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 </section>
 <section id="syntax">
 <h2>Syntax<a class="headerlink" href="#syntax" title="Link to this heading">#</a></h2>
+<p>This syntax section lists all command line arguments for <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code>’s subcommands. Some of the arguments are accompanied with a stability tag indicating their development status. Refer to our <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html">API Reference</a> for details</p>
 <section id="trtllm-serve">
 <h3>trtllm-serve<a class="headerlink" href="#trtllm-serve" title="Link to this heading">#</a></h3>
 <p class="rubric">Usage</p>
@@ -1100,31 +1102,31 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-tokenizer">
 <span class="sig-name descname"><span class="pre">--tokenizer</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;tokenizer&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-tokenizer" title="Link to this definition">#</a></dt>
-<dd><p>Path | Name of the tokenizer.Specify this value only if using TensorRT engine as model.</p>
+<dd><p><code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> Path | Name of the tokenizer.</p>
 </dd></dl>
 
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-custom_tokenizer">
 <span class="sig-name descname"><span class="pre">--custom_tokenizer</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;custom_tokenizer&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-custom_tokenizer" title="Link to this definition">#</a></dt>
-<dd><p>Custom tokenizer type: alias (e.g., ‘deepseek_v32’) or Python import path (e.g., ‘tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer’). [Experimental]</p>
+<dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Custom tokenizer type: alias (e.g., ‘deepseek_v32’) or Python import path (e.g., ‘tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer’).</p>
 </dd></dl>
 
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-host">
 <span class="sig-name descname"><span class="pre">--host</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;host&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-host" title="Link to this definition">#</a></dt>
-<dd><p>Hostname of the server.</p>
+<dd><p><code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> Hostname of the server.</p>
 </dd></dl>
 
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-port">
 <span class="sig-name descname"><span class="pre">--port</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;port&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-port" title="Link to this definition">#</a></dt>
-<dd><p>Port of the server.</p>
+<dd><p><code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> Port of the server.</p>
 </dd></dl>
 
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-backend">
 <span class="sig-name descname"><span class="pre">--backend</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;backend&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-backend" title="Link to this definition">#</a></dt>
-<dd><p>The backend to use to serve the model. Default is pytorch backend.</p>
+<dd><p><code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> The backend to use to serve the model. Default is pytorch backend.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Options<span class="colon">:</span></dt>
 <dd class="field-odd"><p>pytorch | tensorrt | _autodeploy</p>
@@ -1135,13 +1137,13 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-custom_module_dirs">
 <span class="sig-name descname"><span class="pre">--custom_module_dirs</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;custom_module_dirs&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-custom_module_dirs" title="Link to this definition">#</a></dt>
-<dd><p>Paths to custom module directories to import.</p>
+<dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Paths to custom module directories to import.</p>
 </dd></dl>
 
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-log_level">
 <span class="sig-name descname"><span class="pre">--log_level</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;log_level&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-log_level" title="Link to this definition">#</a></dt>
-<dd><p>The logging level.</p>
+<dd><p><code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> The logging level.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Options<span class="colon">:</span></dt>
 <dd class="field-odd"><p>internal_error | error | warning | info | verbose | debug | trace</p>
@@ -1152,97 +1154,97 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-max_beam_width">
 <span class="sig-name descname"><span class="pre">--max_beam_width</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;max_beam_width&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-max_beam_width" title="Link to this definition">#</a></dt>
-<dd><p>Maximum number of beams for beam search decoding.</p>
+<dd><p><code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> Maximum number of beams for beam search decoding.</p>
 </dd></dl>
 
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-max_batch_size">
 <span class="sig-name descname"><span class="pre">--max_batch_size</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;max_batch_size&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-max_batch_size" title="Link to this definition">#</a></dt>
-<dd><p>Maximum number of requests that the engine can schedule.</p>
+<dd><p><code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> Maximum number of requests that the engine can schedule.</p>
 </dd></dl>
 
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-max_num_tokens">
 <span class="sig-name descname"><span class="pre">--max_num_tokens</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;max_num_tokens&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-max_num_tokens" title="Link to this definition">#</a></dt>
-<dd><p>Maximum number of batched input tokens after padding is removed in each batch.</p>
+<dd><p><code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> Maximum number of batched input tokens after padding is removed in each batch.</p>
 </dd></dl>
 
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-max_seq_len">
 <span class="sig-name descname"><span class="pre">--max_seq_len</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;max_seq_len&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-max_seq_len" title="Link to this definition">#</a></dt>
-<dd><p>Maximum total length of one request, including prompt and outputs. If unspecified, the value is deduced from the model config.</p>
+<dd><p><code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> Maximum total length of one request, including prompt and outputs. If unspecified, the value is deduced from the model config.</p>
 </dd></dl>
 
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-tensor_parallel_size">
 <span id="cmdoption-trtllm-serve-serve-tp_size"></span><span class="sig-name descname"><span class="pre">--tensor_parallel_size</span></span><span class="sig-prename descclassname"></span><span class="sig-prename descclassname"><span class="pre">,</span> </span><span class="sig-name descname"><span class="pre">--tp_size</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;tensor_parallel_size&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-tensor_parallel_size" title="Link to this definition">#</a></dt>
-<dd><p>Tensor parallelism size.</p>
+<dd><p><code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> Tensor parallelism size.</p>
 </dd></dl>
 
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-pipeline_parallel_size">
 <span id="cmdoption-trtllm-serve-serve-pp_size"></span><span class="sig-name descname"><span class="pre">--pipeline_parallel_size</span></span><span class="sig-prename descclassname"></span><span class="sig-prename descclassname"><span class="pre">,</span> </span><span class="sig-name descname"><span class="pre">--pp_size</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;pipeline_parallel_size&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-pipeline_parallel_size" title="Link to this definition">#</a></dt>
-<dd><p>Pipeline parallelism size.</p>
+<dd><p><code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> Pipeline parallelism size.</p>
 </dd></dl>
 
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-context_parallel_size">
 <span id="cmdoption-trtllm-serve-serve-cp_size"></span><span class="sig-name descname"><span class="pre">--context_parallel_size</span></span><span class="sig-prename descclassname"></span><span class="sig-prename descclassname"><span class="pre">,</span> </span><span class="sig-name descname"><span class="pre">--cp_size</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;context_parallel_size&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-context_parallel_size" title="Link to this definition">#</a></dt>
-<dd><p>Context parallelism size.</p>
+<dd><p><code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> Context parallelism size.</p>
 </dd></dl>
 
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-moe_expert_parallel_size">
 <span id="cmdoption-trtllm-serve-serve-ep_size"></span><span class="sig-name descname"><span class="pre">--moe_expert_parallel_size</span></span><span class="sig-prename descclassname"></span><span class="sig-prename descclassname"><span class="pre">,</span> </span><span class="sig-name descname"><span class="pre">--ep_size</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;moe_expert_parallel_size&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-moe_expert_parallel_size" title="Link to this definition">#</a></dt>
-<dd><p>expert parallelism size</p>
+<dd><p><code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> expert parallelism size</p>
 </dd></dl>
 
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-moe_cluster_parallel_size">
 <span id="cmdoption-trtllm-serve-serve-cluster_size"></span><span class="sig-name descname"><span class="pre">--moe_cluster_parallel_size</span></span><span class="sig-prename descclassname"></span><span class="sig-prename descclassname"><span class="pre">,</span> </span><span class="sig-name descname"><span class="pre">--cluster_size</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;moe_cluster_parallel_size&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-moe_cluster_parallel_size" title="Link to this definition">#</a></dt>
-<dd><p>expert cluster parallelism size</p>
+<dd><p><code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> expert cluster parallelism size</p>
 </dd></dl>
 
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-gpus_per_node">
 <span class="sig-name descname"><span class="pre">--gpus_per_node</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;gpus_per_node&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-gpus_per_node" title="Link to this definition">#</a></dt>
-<dd><p>Number of GPUs per node. Default to None, and it will be detected automatically.</p>
+<dd><p><code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> Number of GPUs per node. Default to None, and it will be detected automatically.</p>
 </dd></dl>
 
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-free_gpu_memory_fraction">
 <span id="cmdoption-trtllm-serve-serve-kv_cache_free_gpu_memory_fraction"></span><span class="sig-name descname"><span class="pre">--free_gpu_memory_fraction</span></span><span class="sig-prename descclassname"></span><span class="sig-prename descclassname"><span class="pre">,</span> </span><span class="sig-name descname"><span class="pre">--kv_cache_free_gpu_memory_fraction</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;free_gpu_memory_fraction&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-free_gpu_memory_fraction" title="Link to this definition">#</a></dt>
-<dd><p>Free GPU memory fraction reserved for KV Cache, after allocating model weights and buffers.</p>
+<dd><p><code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> Free GPU memory fraction reserved for KV Cache, after allocating model weights and buffers.</p>
 </dd></dl>
 
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-num_postprocess_workers">
 <span class="sig-name descname"><span class="pre">--num_postprocess_workers</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;num_postprocess_workers&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-num_postprocess_workers" title="Link to this definition">#</a></dt>
-<dd><p>[Experimental] Number of workers to postprocess raw responses to comply with OpenAI protocol.</p>
+<dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Number of workers to postprocess raw responses to comply with OpenAI protocol.</p>
 </dd></dl>
 
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-trust_remote_code">
 <span class="sig-name descname"><span class="pre">--trust_remote_code</span></span><span class="sig-prename descclassname"></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-trust_remote_code" title="Link to this definition">#</a></dt>
-<dd><p>Flag for HF transformers.</p>
+<dd><p><code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> Flag for HF transformers.</p>
 </dd></dl>
 
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-revision">
 <span class="sig-name descname"><span class="pre">--revision</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;revision&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-revision" title="Link to this definition">#</a></dt>
-<dd><p>The revision to use for the HuggingFace model (branch name, tag name, or commit id).</p>
+<dd><p><code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> The revision to use for the HuggingFace model (branch name, tag name, or commit id).</p>
 </dd></dl>
 
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-config">
 <span id="cmdoption-trtllm-serve-serve-extra_llm_api_options"></span><span class="sig-name descname"><span class="pre">--config</span></span><span class="sig-prename descclassname"></span><span class="sig-prename descclassname"><span class="pre">,</span> </span><span class="sig-name descname"><span class="pre">--extra_llm_api_options</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;extra_llm_api_options&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-config" title="Link to this definition">#</a></dt>
-<dd><p>Path to a YAML file that overwrites the parameters specified by trtllm-serve. Can be specified as either –config or –extra_llm_api_options.</p>
+<dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Path to a YAML file that overwrites the parameters specified by trtllm-serve. Can be specified as either –config or –extra_llm_api_options.</p>
 </dd></dl>
 
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-reasoning_parser">
 <span class="sig-name descname"><span class="pre">--reasoning_parser</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;reasoning_parser&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-reasoning_parser" title="Link to this definition">#</a></dt>
-<dd><p>[Experimental] Specify the parser for reasoning models.</p>
+<dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Specify the parser for reasoning models.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Options<span class="colon">:</span></dt>
 <dd class="field-odd"><p>deepseek-r1 | qwen3 | nano-v3</p>
@@ -1253,7 +1255,7 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-tool_parser">
 <span class="sig-name descname"><span class="pre">--tool_parser</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;tool_parser&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-tool_parser" title="Link to this definition">#</a></dt>
-<dd><p>[Experimental] Specify the parser for tool models.</p>
+<dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Specify the parser for tool models.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Options<span class="colon">:</span></dt>
 <dd class="field-odd"><p>qwen3 | qwen3_coder | kimi_k2 | deepseek_v3 | deepseek_v31 | deepseek_v32</p>
@@ -1264,49 +1266,49 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-metadata_server_config_file">
 <span class="sig-name descname"><span class="pre">--metadata_server_config_file</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;metadata_server_config_file&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-metadata_server_config_file" title="Link to this definition">#</a></dt>
-<dd><p>Path to metadata server config file</p>
+<dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Path to metadata server config file</p>
 </dd></dl>
 
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-server_role">
 <span class="sig-name descname"><span class="pre">--server_role</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;server_role&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-server_role" title="Link to this definition">#</a></dt>
-<dd><p>Server role. Specify this value only if running in disaggregated mode.</p>
+<dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Server role. Specify this value only if running in disaggregated mode.</p>
 </dd></dl>
 
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-fail_fast_on_attention_window_too_large">
 <span class="sig-name descname"><span class="pre">--fail_fast_on_attention_window_too_large</span></span><span class="sig-prename descclassname"></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-fail_fast_on_attention_window_too_large" title="Link to this definition">#</a></dt>
-<dd><p>Exit with runtime error when attention window is too large to fit even a single sequence in the KV cache.</p>
+<dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Exit with runtime error when attention window is too large to fit even a single sequence in the KV cache.</p>
 </dd></dl>
 
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-otlp_traces_endpoint">
 <span class="sig-name descname"><span class="pre">--otlp_traces_endpoint</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;otlp_traces_endpoint&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-otlp_traces_endpoint" title="Link to this definition">#</a></dt>
-<dd><p>Target URL to which OpenTelemetry traces will be sent.</p>
+<dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Target URL to which OpenTelemetry traces will be sent.</p>
 </dd></dl>
 
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-disagg_cluster_uri">
 <span class="sig-name descname"><span class="pre">--disagg_cluster_uri</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;disagg_cluster_uri&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-disagg_cluster_uri" title="Link to this definition">#</a></dt>
-<dd><p>URI of the disaggregated cluster.</p>
+<dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> URI of the disaggregated cluster.</p>
 </dd></dl>
 
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-enable_chunked_prefill">
 <span class="sig-name descname"><span class="pre">--enable_chunked_prefill</span></span><span class="sig-prename descclassname"></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-enable_chunked_prefill" title="Link to this definition">#</a></dt>
-<dd><p>Enable chunked prefill</p>
+<dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Enable chunked prefill</p>
 </dd></dl>
 
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-media_io_kwargs">
 <span class="sig-name descname"><span class="pre">--media_io_kwargs</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;media_io_kwargs&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-media_io_kwargs" title="Link to this definition">#</a></dt>
-<dd><p>Keyword arguments for media I/O.</p>
+<dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Keyword arguments for media I/O.</p>
 </dd></dl>
 
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-chat_template">
 <span class="sig-name descname"><span class="pre">--chat_template</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;chat_template&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-chat_template" title="Link to this definition">#</a></dt>
-<dd><p>[Experimental] Specify a custom chat template. Can be a file path or one-liner template string</p>
+<dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Specify a custom chat template. Can be a file path or one-liner template string</p>
 </dd></dl>
 
 <p class="rubric">Arguments</p>
@@ -1487,9 +1489,9 @@ Please refer to <cite>Performance Benchmarking with `trtllm-serve</cite> &lt;<a 
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on January 04, 2026.</p>
+  <p>Last updated on January 11, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a65b0d4">a65b0d4</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/80649a8">80649a8</a>.</p>
   
 </div></div>
       

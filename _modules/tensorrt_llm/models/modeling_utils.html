@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc7';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc8';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -75,7 +75,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc7" />
+  <meta name="docsearch:version" content="1.2.0rc8" />
 
 
   </head>
@@ -441,6 +441,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
@@ -1331,10 +1332,11 @@
 
         <span class="n">rank</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">rank</span>
         <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">cp_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
-            <span class="c1"># tp_cp_pp rank -&gt; tp_pp rank: because different cp ranks share the same ckpt</span>
-            <span class="n">tp_size</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span>
+            <span class="c1"># cp_tp_pp rank -&gt; tp_pp rank: because different cp ranks share the same ckpt.</span>
             <span class="n">cp_size</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">cp_size</span>
-            <span class="n">rank</span> <span class="o">=</span> <span class="n">rank</span> <span class="o">%</span> <span class="n">tp_size</span> <span class="o">+</span> <span class="n">rank</span> <span class="o">//</span> <span class="p">(</span><span class="n">tp_size</span> <span class="o">*</span> <span class="n">cp_size</span><span class="p">)</span> <span class="o">*</span> <span class="n">tp_size</span>
+            <span class="c1"># rank = pp_rank × tp_size × cp_size + tp_rank × cp_size + cp_rank.</span>
+            <span class="c1"># rank // cp_size is equivalent to pp_rank × tp_size + tp_rank.</span>
+            <span class="n">rank</span> <span class="o">=</span> <span class="n">rank</span> <span class="o">//</span> <span class="n">cp_size</span>
         <span class="n">weights_path</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">ckpt_dir</span><span class="p">,</span> <span class="sa">f</span><span class="s1">&#39;rank</span><span class="si">{</span><span class="n">rank</span><span class="si">}</span><span class="s1">.safetensors&#39;</span><span class="p">)</span>
 
         <span class="k">assert</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">isfile</span><span class="p">(</span><span class="n">weights_path</span><span class="p">)</span>
@@ -2686,9 +2688,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on January 04, 2026.</p>
+  <p>Last updated on January 11, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a65b0d4">a65b0d4</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/80649a8">80649a8</a>.</p>
   
 </div></div>
       
