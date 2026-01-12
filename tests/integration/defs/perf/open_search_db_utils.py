@@ -78,6 +78,7 @@ PRE_MERGE_THRESHOLD = 0.1
 # scenario, allowing the underlying config to change while still comparing against baselines
 # for the same scenario.
 SCENARIO_MATCH_FIELDS = [
+    "s_gpu_type",
     "s_runtime",
     "s_model_name",
     "l_isl",
