@@ -22,7 +22,7 @@ import sys
 import time
 from datetime import datetime
 
-from defs.trt_test_alternative import print_error, print_info, print_warning
+from defs.trt_test_alternative import print_info, print_warning
 
 _project_root = os.path.abspath(
     os.path.join(os.path.dirname(__file__), '../../../..'))
@@ -282,28 +282,27 @@ def query_history_data(common_values_dict):
                 f"Failed to query from {TEST_INFO_PROJECT_NAME}, returned no response"
             )
             return None
-        else:
-            payload = res.json().get("hits", {}).get("hits", [])
-            if len(payload) == 0:
-                # No history data found in database, return empty list
-                print_info(
-                    f"No history data found in {TEST_INFO_PROJECT_NAME}, returned empty list"
-                )
-                return []
-            for hit in payload:
-                data_dict = hit.get("_source", {})
-                data_dict["_id"] = hit.get("_id", "")
-                if data_dict["_id"] == "":
-                    print_info(
-                        f"Failed to query from {TEST_INFO_PROJECT_NAME}, returned data with no _id"
-                    )
-                    # Invalid data, return None
-                    return None
-                data_list.append(data_dict)
+        payload = res.json().get("hits", {}).get("hits", [])
+        if len(payload) == 0:
+            # No history data found in database, return empty list
             print_info(
-                f"Successfully queried from {TEST_INFO_PROJECT_NAME}, queried {len(data_list)} entries"
+                f"No history data found in {TEST_INFO_PROJECT_NAME}, returned empty list"
             )
-            return data_list
+            return []
+        for hit in payload:
+            data_dict = hit.get("_source", {})
+            data_dict["_id"] = hit.get("_id", "")
+            if data_dict["_id"] == "":
+                print_info(
+                    f"Failed to query from {TEST_INFO_PROJECT_NAME}, returned data with no _id"
+                )
+                # Invalid data, return None
+                return None
+            data_list.append(data_dict)
+        print_info(
+            f"Successfully queried from {TEST_INFO_PROJECT_NAME}, queried {len(data_list)} entries"
+        )
+        return data_list
     except Exception as e:
         print_info(
             f"Failed to query from {TEST_INFO_PROJECT_NAME}, returned error: {e}"
@@ -522,7 +521,7 @@ def prepare_regressive_test_cases(history_baseline_dict, new_data_dict):
             # Add metric info to s_regression_info
             metric_info = (f"{metric}'s value: {new_value} "
                            f"baseline value: {baseline_value} "
-                           f"threshold: {threshold} "
+                           f"threshold: {threshold * 100:.2f}% "
                            f"diff: {diff:+.2f}%")
             info_parts.append(metric_info)
 
@@ -643,65 +642,19 @@ def _get_metric_keys():
     return metric_keys
 
 
-def _print_perf_data(data):
-    """Print performance metrics and config for a single data entry."""
-    print_info("=== Metrics ===")
-    for metric in MAXIMIZE_METRICS + MINIMIZE_METRICS:
-        if metric in data:
-            value = data.get(metric, "N/A")
-            print_info(f'"{metric}": {value}')
-
-    metric_keys = _get_metric_keys()
-    print_info("\n=== Config ===")
-    config_keys = sorted([key for key in data.keys() if key not in metric_keys])
-    for key in config_keys:
-        value = data[key]
-        print_info(f'"{key}": {value}')
-
-
 def _print_regression_data(data, print_func=None):
     """
-    Print regression info, metrics with baselines/thresholds, and config.
+    Print regression info and config.
     """
     if print_func is None:
         print_func = print_info
 
     if "s_regression_info" in data:
         print_func("=== Regression Info ===")
-        print_func(f"{data['s_regression_info']}")
+        for item in data["s_regression_info"].split(","):
+            print_func(item.strip())
 
     metric_keys = _get_metric_keys()
-    is_post_merge = data.get("b_is_post_merge", False)
-
-    print_func("=== Metrics ===")
-    for metric in MAXIMIZE_METRICS + MINIMIZE_METRICS:
-        metric_suffix = metric[2:]  # Strip "d_" prefix
-        baseline_key = f"d_baseline_{metric_suffix}"
-        if is_post_merge:
-            threshold_key = f"d_threshold_post_merge_{metric_suffix}"
-        else:
-            threshold_key = f"d_threshold_pre_merge_{metric_suffix}"
-        # Only print if at least one of the keys exists
-        if metric in data or baseline_key in data or threshold_key in data:
-            value = data.get(metric, "N/A")
-            baseline = data.get(baseline_key, "N/A")
-            threshold = data.get(threshold_key, "N/A")
-            # Calculate percentage difference between value and baseline
-            # Positive percentage means better perf, negative means regression
-            if (isinstance(value, (int, float))
-                    and isinstance(baseline, (int, float)) and baseline != 0):
-                if metric in MAXIMIZE_METRICS:
-                    # Larger is better: value > baseline is positive (better)
-                    percentage = (value - baseline) / baseline * 100
-                else:
-                    # Smaller is better: value < baseline is positive (better)
-                    percentage = (baseline - value) / baseline * 100
-                percentage_str = f"{percentage:+.2f}%"
-            else:
-                percentage_str = "N/A"
-            print_func(
-                f'"{metric}": {value}, "{baseline_key}": {baseline}, '
-                f'"{threshold_key}": {threshold}, "diff": {percentage_str}')
 
     print_func("\n=== Config ===")
     config_keys = sorted([key for key in data.keys() if key not in metric_keys])
@@ -712,16 +665,17 @@ def _print_regression_data(data, print_func=None):
         print_func(f'"{key}": {value}')
 
 
-def check_perf_regression(new_data_dict):
+def check_perf_regression(new_data_dict, fail_on_regression=False):
     """
     Check performance regression by printing regression data from new_data_dict.
+    If fail_on_regression is True, raises RuntimeError when regressions are found.
+    (This is a temporary feature to fail regression tests. We are observing the stability and will fail them by default soon.)
     """
     # Filter regression data from new_data_dict
     regressive_data_list = [
         data for data in new_data_dict.values()
         if data.get("b_is_regression", False)
     ]
-
     # Split regression data into post-merge and pre-merge
     post_merge_regressions = [
         data for data in regressive_data_list
@@ -735,24 +689,34 @@ def check_perf_regression(new_data_dict):
     # Print pre-merge regression data with print_warning
     if len(pre_merge_regressions) > 0:
         print_warning(
-            f"Found {len(pre_merge_regressions)} pre-merge regression data")
+            f"Found {len(pre_merge_regressions)} pre-merge perf regression data"
+        )
         for i, data in enumerate(pre_merge_regressions):
             print_warning(f"\n{'=' * 60}")
             print_warning(f"Pre-merge Regression Data #{i + 1}")
             print_warning("=" * 60)
             _print_regression_data(data, print_func=print_warning)
 
-    # Print post-merge regression data with print_error
+        if fail_on_regression:
+            raise RuntimeError(
+                f"Found {len(pre_merge_regressions)} pre-merge perf regression data"
+            )
+
+    # Print post-merge regression data with print_warning
     if len(post_merge_regressions) > 0:
+        print_warning(
+            f"Found {len(post_merge_regressions)} post-merge perf regression data"
+        )
         for i, data in enumerate(post_merge_regressions):
-            print_error(f"\n{'=' * 60}")
-            print_error(f"Post-merge Regression Data #{i + 1}")
-            print_error("=" * 60)
-            _print_regression_data(data, print_func=print_error)
-        print_error(
-            f"Found {len(post_merge_regressions)} post-merge regression data")
-        raise RuntimeError(
-            f"Found {len(post_merge_regressions)} post-merge regression data")
+            print_warning(f"\n{'=' * 60}")
+            print_warning(f"Post-merge Regression Data #{i + 1}")
+            print_warning("=" * 60)
+            _print_regression_data(data, print_func=print_warning)
+
+        if fail_on_regression:
+            raise RuntimeError(
+                f"Found {len(post_merge_regressions)} post-merge perf regression data"
+            )
 
     # Print summary if no regressions
     if len(regressive_data_list) == 0:
