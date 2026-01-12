@@ -493,6 +493,10 @@ bool DecoderXQAImplPrecompiled::shouldUse(XQAParams const& xqaParams, bool forCo
     {
         SUPPORT_RETURN_FALSE("streaming-llm");
     }
+    if (xqaParams.skip_softmax_threshold_scale_factor != 0)
+    {
+        SUPPORT_RETURN_FALSE("skip_softmax_threshold_scale_factor");
+    }
 
     // OPTIMIZE: For the standard generation-phase MHA, there are still extra limitations.
     // NOTE: Medusa mode = Multi_query_tokens > 1.
