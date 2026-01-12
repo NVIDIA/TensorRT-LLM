@@ -34,6 +34,10 @@ class LoraModuleType(IntEnum):
     MLP_ROUTER = 17  # MLP router
     MLP_GATE_UP = 18  # Combined gate and up projections
 
+    # Mamba module types
+    MAMBA_IN_PROJ = 19  # Mamba input projection
+    MAMBA_OUT_PROJ = 20  # Mamba output projection
+
     def __str__(self):
         """Return the name of the enum value."""
         return self.name
@@ -81,6 +85,11 @@ class LoraModuleType(IntEnum):
             self.MOE_H_TO_4H, self.MOE_4H_TO_H, self.MOE_GATE, self.MOE_ROUTER
         }
 
+    @property
+    def is_mamba(self) -> bool:
+        """Check if this is a Mamba module type."""
+        return self in {self.MAMBA_IN_PROJ, self.MAMBA_OUT_PROJ}
+
 
 class LoraLayer(torch.nn.Module):
 
@@ -100,6 +109,11 @@ class LoraLayer(torch.nn.Module):
     ) -> Optional[torch.Tensor]:
 
         if bool(lora_params):
+            # Check if this layer has any LoRA weights
+            # For hybrid models, only some attention layers may have LoRA
+            if layer_idx not in lora_params:
+                return None
+
             lora_ranks = []
             lora_weight_pointers = []
             active_lora_module_ids = []

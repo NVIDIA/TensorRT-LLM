@@ -1449,7 +1449,8 @@ class PeftCacheManager(BaseResourceManager):
                  lora_config: LoraConfig,
                  model_config: ModelConfigCpp,
                  world_config: WorldConfig | None = None,
-                 execution_stream: Optional[torch.cuda.Stream] = None):
+                 execution_stream: Optional[torch.cuda.Stream] = None,
+                 layer_index_map: Optional[Dict[int, int]] = None):
         import tensorrt_llm.bindings as _tb
 
         peft_cache_config = peft_cache_config._to_pybind()
@@ -1487,9 +1488,11 @@ class PeftCacheManager(BaseResourceManager):
         self._lora_config = lora_config
         self._lora_model_config = LoraModelConfig(
             lora_config.lora_target_modules,
-            lora_config.trtllm_modules_to_hf_modules, model_config.hidden_size,
+            lora_config.trtllm_modules_to_hf_modules,
+            model_config.hidden_size,
             binding_to_str_dtype(model_config.data_type),
-            lora_config.swap_gate_up_proj_lora_b_weight)
+            lora_config.swap_gate_up_proj_lora_b_weight,
+            layer_index_map=layer_index_map)
         mapping = Mapping(
             world_size=world_config.size,
             rank=world_config.rank,
@@ -1520,6 +1523,8 @@ class PeftCacheManager(BaseResourceManager):
                     uids=[request.lora_task_id],
                     ckpt_source=self._lora_config.lora_ckpt_source)
                 request.lora_weights = self._lora_manager.cpp_lora_weights[
+                    request.lora_task_id]
+                request.lora_config = self._lora_manager.cpp_lora_config[
                     request.lora_task_id]
 
             # PeftCacheManager CPP implementation expects an extra dim at index 0

@@ -23,6 +23,7 @@ from transformers import AutoConfig, PretrainedConfig
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+from tensorrt_llm._torch.peft.lora.layer import LoraModuleType
 from tensorrt_llm._torch.utils import ActivationType, relu2
 
 from ..attention_backend import AttentionMetadata
@@ -103,11 +104,13 @@ class TransformerLayer(Attention):
         self,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         return super().forward(position_ids=None,
                                hidden_states=hidden_states,
-                               attn_metadata=attn_metadata)
+                               attn_metadata=attn_metadata,
+                               lora_params=lora_params)
 
 
 # Ref code: https://huggingface.co/nvidia/Nemotron-Nano-3-30B-A3.5B-dev-1024/blob/main/modeling_nemotron_h.py#L818
@@ -163,6 +166,8 @@ class NemotronHMOE(nn.Module):
                 config=model_config,
                 layer_idx=self.layer_idx,
                 reduce_output=False,
+                lora_up_module_type=LoraModuleType.MOE_H_TO_4H,
+                lora_down_module_type=LoraModuleType.MOE_4H_TO_H,
             )
         # Setup MoE gate.
         self.gate = DeepseekV3Gate(
@@ -235,6 +240,7 @@ class NemotronHMOE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         assert hidden_states.shape[-1] == self.hidden_dim
@@ -244,7 +250,8 @@ class NemotronHMOE(nn.Module):
 
         def _compute_shared_output():
             if self.shared_experts is not None:
-                shared_expert_output = self.shared_experts(hidden_states)
+                shared_expert_output = self.shared_experts(
+                    hidden_states, lora_params=lora_params)
             else:
                 shared_expert_output = 0
             return shared_expert_output
@@ -397,6 +404,7 @@ class NemotronHModel(DecoderModel):
         input_ids: Optional[torch.IntTensor] = None,
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -419,7 +427,8 @@ class NemotronHModel(DecoderModel):
             hidden_states = layer(position_ids,
                                   hidden_states,
                                   attn_metadata,
-                                  mamba_metadata=self.mamba_metadata)
+                                  mamba_metadata=self.mamba_metadata,
+                                  lora_params=lora_params)
 
         hidden_states = self.norm_f(hidden_states)
 

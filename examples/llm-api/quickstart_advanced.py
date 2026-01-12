@@ -3,11 +3,13 @@ import json
 import time
 
 from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.llmapi import (AttentionDpConfig, AutoDecodingConfig,
                                  CudaGraphConfig, DraftTargetDecodingConfig,
                                  EagleDecodingConfig, KvCacheConfig, MoeConfig,
                                  MTPDecodingConfig, NGramDecodingConfig,
                                  TorchCompileConfig)
+from tensorrt_llm.lora_helper import LoraConfig
 
 example_prompts = [
     "Hello, my name is",
@@ -187,6 +189,16 @@ def add_llm_args(parser):
                         default=None,
                         nargs='+')
 
+    # LoRA arguments
+    parser.add_argument('--lora_dir',
+                        type=str,
+                        default=None,
+                        help="LoRA adapter directory.")
+    parser.add_argument('--max_lora_rank',
+                        type=int,
+                        default=64,
+                        help="Maximum LoRA rank.")
+
     return parser
 
 
@@ -259,6 +271,14 @@ def setup_llm(args, **kwargs):
         batching_wait_iters=args.attention_dp_batching_wait_iters,
     )
 
+    # LoRA configuration
+    lora_config = None
+    if args.lora_dir is not None:
+        lora_config = LoraConfig(
+            lora_dir=[args.lora_dir],
+            max_lora_rank=args.max_lora_rank,
+        )
+
     llm = LLM(
         model=args.model_dir,
         backend='pytorch',
@@ -294,6 +314,7 @@ def setup_llm(args, **kwargs):
         gather_generation_logits=args.return_generation_logits,
         max_beam_width=args.max_beam_width,
         orchestrator_type=args.orchestrator_type,
+        lora_config=lora_config,
         **kwargs)
 
     use_beam_search = args.max_beam_width > 1
@@ -335,7 +356,18 @@ def main():
                                                   tokenize=False,
                                                   add_generation_prompt=True))
         prompts = new_prompts
-    outputs = llm.generate(prompts, sampling_params)
+
+    # Create LoRA request if lora_dir is provided
+    lora_request = None
+    if args.lora_dir is not None:
+        lora_request = LoRARequest(
+            lora_name="default_lora",
+            lora_int_id=1,
+            lora_path=args.lora_dir,
+        )
+        print(f"[LoRA] Using LoRA adapter from: {args.lora_dir}")
+
+    outputs = llm.generate(prompts, sampling_params, lora_request=lora_request)
 
     for i, output in enumerate(outputs):
         prompt = output.prompt
