@@ -478,8 +478,8 @@ class ModelConfig(Generic[TConfig]):
         return model_config
 
     def get_bindings_model_config(self,
-                                  tokens_per_block: Optional[int] = None
-                                  ) -> "ModelConfigCpp":
+                                  tokens_per_block: Optional[int] = None,
+                                  for_lora: bool = False) -> "ModelConfigCpp":
         """
         This method is used to construct the bindings config for the model.
         Currently it adheres to gptJsonConfig.cpp::createModelConfig, which assumes
@@ -487,6 +487,11 @@ class ModelConfig(Generic[TConfig]):
 
         Args:
             tokens_per_block: The number of tokens per block. Please note that in PyTorch flow tokens_per_block is not available in the model config, instead it is defined in the executor config.
+            for_lora: If True, uses get_num_lora_layers() for num_attention_layers.
+                This is needed because C++ PeftCacheManager uses num_attention_layers
+                for LoRA layer validation and buffer indexing. For hybrid models,
+                LoRA can be applied to multiple layer types (attention, MoE, Mamba),
+                so we need to report the total LoRA-capable layer count.
 
         Returns:
             The bindings model config.
@@ -505,10 +510,16 @@ class ModelConfig(Generic[TConfig]):
 
         hidden_size = self.pretrained_config.hidden_size // attn_tp_size
 
+        # For LoRA, set num_attention_layers = num_hidden_layers so C++ accepts
+        # global layer indices [0, num_hidden_layers). This allows LoRA on any
+        # layer type (attention, MoE, Mamba) using their natural layer indices.
+        num_attention_layers = (self.pretrained_config.num_hidden_layers
+                                if for_lora else self.get_num_attention_layers())
+
         model_config_cpp = ModelConfigCpp(
             vocab_size=self.pretrained_config.vocab_size,
             num_layers=self.pretrained_config.num_hidden_layers,
-            num_attention_layers=self.get_num_attention_layers(),
+            num_attention_layers=num_attention_layers,
             num_rnn_layers=0,
             num_heads=num_heads,
             hidden_size=hidden_size,
@@ -621,8 +632,11 @@ class ModelConfig(Generic[TConfig]):
             return None
 
     def get_num_attention_layers(self):
+        """Returns the number of actual attention layers (for KV cache, memory calculations, etc.)."""
         if is_nemotron_hybrid(self.pretrained_config):
-            return self.pretrained_config.hybrid_override_pattern.count("*")
+            # For Nemotron-H, return only actual attention layers ("*")
+            pattern = self.pretrained_config.hybrid_override_pattern
+            return pattern.count("*")
         elif hasattr(
                 self.pretrained_config, "architectures"
         ) and self.pretrained_config.architectures is not None and self.pretrained_config.architectures[

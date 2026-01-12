@@ -772,8 +772,9 @@ def create_py_executor_instance(
                 lora_config.trtllm_modules_to_hf_modules = get_default_trtllm_modules_to_hf_modules(
                 )
 
+        # Use for_lora=True to report LoRA-capable layer count to C++ for validation
         model_binding_config = model_engine.model.model_config.get_bindings_model_config(
-        )
+            for_lora=True)
 
         num_experts = _try_infer_num_experts(model_engine.model.model_config)
 
@@ -822,6 +823,7 @@ def create_py_executor_instance(
             rank=dist.mapping.rank,
             gpus_per_node=dist.mapping.gpus_per_node,
         )
+
         peft_cache_manager = PeftCacheManager(
             peft_cache_config=peft_cache_config_model,
             lora_config=lora_config,

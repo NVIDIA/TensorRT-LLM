@@ -40,7 +40,11 @@ def get_missing_qkv_modules_from_lora_modules(
 
 
 def get_default_trtllm_modules_to_hf_modules():
-    """Get default mapping from TensorRT-LLM module names to HuggingFace module names."""
+    """Get default mapping from TensorRT-LLM module names to HuggingFace module names.
+
+    Note: Values can be either a single string or a list of strings to support
+    multiple HF module names mapping to the same TRT-LLM module.
+    """
     return {
         "attn_q": "q_proj",
         "attn_k": "k_proj",
@@ -51,10 +55,14 @@ def get_default_trtllm_modules_to_hf_modules():
         "mlp_4h_to_h": "down_proj",
         "mlp_gate": "up_proj",
         "mlp_gate_up": "gate_up_proj",
-        "moe_h_to_4h": "w1",
-        "moe_4h_to_h": "w2",
+        # MoE expert mappings (including shared_experts for Nemotron-H)
+        "moe_h_to_4h": ["w1", "mixer.shared_experts.up_proj"],
+        "moe_4h_to_h": ["w2", "mixer.shared_experts.down_proj"],
         "moe_gate": "w3",
         "moe_router": "gate",
+        # Mamba mixer mappings (for Nemotron-H hybrid models)
+        "mamba_in_proj": "mixer.in_proj",
+        "mamba_out_proj": "mixer.out_proj",
     }
 
 

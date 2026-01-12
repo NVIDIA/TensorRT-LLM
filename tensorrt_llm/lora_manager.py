@@ -658,6 +658,9 @@ class LoraManager(object):
         "moe_router": 16,
         "mlp_router": 17,
         "mlp_gate_up": 18,
+        # Mamba module types
+        "mamba_in_proj": 19,
+        "mamba_out_proj": 20,
     }
 
     def __init__(
@@ -1156,9 +1159,16 @@ class LoraManager(object):
                         weights_to_concat.append(t_mag_cpu)
 
                     self._cpp_lora_weights[uid].append(torch.cat(weights_to_concat))
+                    # Use global layer index directly - C++ ModelConfig.num_attention_layers
+                    # is set to num_hidden_layers for LoRA to accept all layer indices
                     self._cpp_lora_config[uid].append(
                         torch.tensor(
-                            [self.LORA_MODULE_IDS[lora_module], layer_idx, effective_rank, is_dora],
+                            [
+                                self.LORA_MODULE_IDS[lora_module],
+                                layer_idx,
+                                effective_rank,
+                                is_dora,
+                            ],
                             dtype=torch.int32,
                         )
                     )

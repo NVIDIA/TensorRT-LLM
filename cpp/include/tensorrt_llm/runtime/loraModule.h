@@ -50,6 +50,9 @@ public:
         kMOE_ROUTER = 16,
         kMLP_ROUTER = 17,
         kMLP_GATE_UP = 18,
+        // Mamba module types
+        kMAMBA_IN_PROJ = 19,
+        kMAMBA_OUT_PROJ = 20,
     };
 
     explicit constexpr LoraModule(ModuleType const& t, SizeType32 inDim, SizeType32 outDim, bool inDimFirst,
@@ -234,6 +237,10 @@ public:
             return ModuleType::kMLP_ROUTER;
         else if (name == "mlp_gate_up")
             return ModuleType::kMLP_GATE_UP;
+        else if (name == "mamba_in_proj")
+            return ModuleType::kMAMBA_IN_PROJ;
+        else if (name == "mamba_out_proj")
+            return ModuleType::kMAMBA_OUT_PROJ;
         else
             return ModuleType::kINVALID;
     }
@@ -261,6 +268,8 @@ public:
         case ModuleType::kMOE_ROUTER: return "moe_router";
         case ModuleType::kMLP_ROUTER: return "mlp_router";
         case ModuleType::kMLP_GATE_UP: return "mlp_gate_up";
+        case ModuleType::kMAMBA_IN_PROJ: return "mamba_in_proj";
+        case ModuleType::kMAMBA_OUT_PROJ: return "mamba_out_proj";
         case ModuleType::kINVALID: return "INVALID";
         }
         return "INVALID";

@@ -23,6 +23,7 @@ from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 
 from ...attention_backend import AttentionMetadata
 from ...model_config import ModelConfig
+from ...peft.lora.layer import LoraLayer, LoraModuleType
 from ..linear import Linear, TensorParallelMode
 from .causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from .layernorm_gated import RMSNorm as RMSNormGated
@@ -88,6 +89,10 @@ class Mamba2Mixer(nn.Module):
         self.slot_mapping = None
         self.is_paged_state = False
 
+        # LoRA for in_proj
+        self.in_proj_lora = LoraLayer([LoraModuleType.MAMBA_IN_PROJ],
+                                      [d_in_proj // tp_size])
+
         # in_proj
         self.in_proj = Linear(
             d_model,
@@ -98,7 +103,8 @@ class Mamba2Mixer(nn.Module):
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
-            allreduce_strategy=config.allreduce_strategy)
+            allreduce_strategy=config.allreduce_strategy,
+            lora=self.in_proj_lora)
 
         # conv1d, reuse Linear to store weights since it has support for TP > 1 already
         self.conv1d = Linear(
@@ -139,6 +145,10 @@ class Mamba2Mixer(nn.Module):
             dtype=dtype,
         )
 
+        # LoRA for out_proj
+        self.out_proj_lora = LoraLayer([LoraModuleType.MAMBA_OUT_PROJ],
+                                       [d_model])
+
         # out_proj
         self.out_proj = Linear(
             d_inner,
@@ -149,7 +159,8 @@ class Mamba2Mixer(nn.Module):
             tensor_parallel_mode=TensorParallelMode.ROW,
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
-            allreduce_strategy=config.allreduce_strategy)
+            allreduce_strategy=config.allreduce_strategy,
+            lora=self.out_proj_lora)
 
         self._mamba_ssm_cache_dtype = config.quant_config.mamba_ssm_cache_dtype
 
@@ -158,6 +169,7 @@ class Mamba2Mixer(nn.Module):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         mamba_metadata: Mamba2Metadata,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
 
@@ -179,8 +191,10 @@ class Mamba2Mixer(nn.Module):
         ssm_states = attn_metadata.kv_cache_manager.get_ssm_states(
             self.layer_idx)
 
-        # in_proj
-        zxbcdt = self.in_proj(hidden_states)
+        # in_proj with LoRA support
+        zxbcdt = self.in_proj(hidden_states,
+                              lora_params=lora_params,
+                              layer_idx=self.layer_idx)
         z, xbc, dt = torch.split(
             zxbcdt,
             [self.tp_d_inner, self.tp_conv_dim, self.tp_nheads],
@@ -305,7 +319,9 @@ class Mamba2Mixer(nn.Module):
         # norm
         out = self.norm(out)
 
-        # out_proj
-        out = self.out_proj(out)
+        # out_proj with LoRA support
+        out = self.out_proj(out,
+                            lora_params=lora_params,
+                            layer_idx=self.layer_idx)
 
         return out
