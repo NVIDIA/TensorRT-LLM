@@ -35,10 +35,7 @@ if [[ $(echo $NVCC_VERSION_OUTPUT | grep -oP "\d+\.\d+" | head -n 1) != ${CUDA_V
 fi
 
 install_ubuntu_requirements() {
-    apt-get update && apt-get install -y --no-install-recommends curl ca-certificates
-    # Reinstall GnuPG to avoid the gpg vulnerability issue in the base NGC PyTorch image.
-    bash ./install_gnupg.sh
-
+    apt-get update && apt-get install -y --no-install-recommends gnupg2 curl ca-certificates
     ARCH=$(uname -m)
     if [ "$ARCH" = "amd64" ];then ARCH="x86_64";fi
     if [ "$ARCH" = "aarch64" ];then ARCH="sbsa";fi
