@@ -86,7 +86,7 @@ if [ -n "${trtllm_wheel_path}" ]; then
     if ! srun --container-name=${container_name} \
         --container-mounts=${container_mount} --no-container-mount-home \
         --mpi=pmix --overlap -N $SLURM_NNODES --ntasks-per-node=1 \
-        bash -c "pip install ${trtllm_wheel_path}" \
+        bash -c "pip install ${trtllm_wheel_path}[devel]" \
         &> ${full_logdir}/2_install.log; then
         cleanup_on_failure "TensorRT-LLM wheel installation failed. Check ${full_logdir}/2_install.log for details"
     fi
@@ -117,7 +117,7 @@ elif [ -d "${trtllm_repo}" ]; then
     if ! srun --container-name=${container_name} \
         --container-mounts=${container_mount} --no-container-mount-home \
         --mpi=pmix --overlap -N $SLURM_NNODES --ntasks-per-node=1 \
-        bash -c "cd ${trtllm_repo} && pip install -e ." \
+        bash -c "cd ${trtllm_repo} && pip install -e .[devel]" \
         &> ${full_logdir}/2_install.log; then
         cleanup_on_failure "TensorRT-LLM installation failed. Check ${full_logdir}/2_install.log for details"
     fi
