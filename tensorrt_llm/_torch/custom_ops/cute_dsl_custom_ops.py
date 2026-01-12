@@ -6,7 +6,7 @@ import torch
 from tensorrt_llm.logger import logger
 
 from ..._utils import get_sm_version
-from ...math_utils import pad_up
+from ...math_utils import ceil_div, pad_up
 from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
                          DynamicTensorSpec, OptimizationProfile, TunableRunner,
                          TuningConfig)
@@ -314,6 +314,16 @@ class GatherGroupedGemmInputsHelper(GroupedGemmInputsHelper):
                 num_non_exiting_tiles, global_sf)
 
 
+def get_dense_gemm_approximate_cta_nums(
+        M: int, N: int, tile_mn: Tuple[int, int],
+        cluster_shape_mn: Tuple[int, int]) -> int:
+    tile_m, tile_n = tile_mn
+    cluster_m, cluster_n = cluster_shape_mn
+    clustered_ctas_m = pad_up(ceil_div(M, tile_m), cluster_m)
+    clustered_ctas_n = pad_up(ceil_div(N, tile_n), cluster_n)
+    return clustered_ctas_m * clustered_ctas_n
+
+
 if IS_CUTLASS_DSL_AVAILABLE:
 
     import cutlass
@@ -359,15 +369,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         def unique_id(self):
             return (self.output_dtype, self.to_userbuffers, self.use_tvm_ffi)
-
-        def __hash__(self):
-            return hash(
-                (self.output_dtype, self.to_userbuffers, self.use_tvm_ffi))
-
-        def __eq__(self, other):
-            if not isinstance(other, self.__class__):
-                return False
-            return self.output_dtype == other.output_dtype and self.to_userbuffers == other.to_userbuffers and self.use_tvm_ffi == other.use_tvm_ffi
 
         def get_valid_tactics(
             self,
@@ -454,6 +455,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 (4, 4),
             ]
             swap_ab_candidates = [True, False]
+            # prune: prefetch is beneficial only when K is large enough
             use_prefetch_candidates = [True, False]
 
             valid_tactics = []
@@ -484,6 +486,19 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         b_major,
                         c_major,
                 ):
+                    # Prefetch pruning to save tuning time
+                    cta_nums = get_dense_gemm_approximate_cta_nums(
+                        m, n, mma_tiler_mn, cluster_shape_mn)
+                    cta_wave_ratio = cta_nums / torch.cuda.get_device_properties(
+                    ).multi_processor_count
+                    if use_prefetch and not any((
+                            # CTA waves ratio between 0.5 and 1.0
+                            0.5 < cta_wave_ratio < 1.0,
+                            # K is large enough
+                            real_k >= 8192,
+                    )):
+                        continue
+
                     valid_tactics.append(
                         (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch))
 
