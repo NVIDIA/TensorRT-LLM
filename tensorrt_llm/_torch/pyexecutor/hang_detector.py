@@ -1,5 +1,6 @@
 import asyncio
 import threading
+from contextlib import contextmanager
 from typing import Callable, Optional
 
 from tensorrt_llm._utils import print_all_stacks
@@ -11,6 +12,7 @@ class HangDetector:
         self, timeout: Optional[int] = None, on_detected: Optional[Callable[[], None]] = None
     ):
         self.timeout = timeout or 300
+        assert self.timeout > 0, "timeout must be greater than 0"
         self.on_detected = on_detected or (lambda: None)
         self.task = None
         self.loop = None
@@ -19,8 +21,8 @@ class HangDetector:
         self.active = False
         self._detected = False
 
-    def start(self):
-        """Start monitoring for hangs"""
+    def enable(self):
+        """Enable hang detection."""
 
         def run_loop():
             asyncio.set_event_loop(self.loop)
@@ -40,26 +42,35 @@ class HangDetector:
             self.on_detected()
 
     def detected(self):
-        """Return True if hang is detected"""
+        """Return True if hang is detected."""
         with self.lock:
             return self._detected
 
     def checkpoint(self):
-        """Call this periodically in your code"""
-        self.pause()
+        """Reset hang detection timer."""
+        self.cancel_task()
         if self.active:
             self.task = asyncio.run_coroutine_threadsafe(self._detect_hang(), self.loop)
 
-    def pause(self):
-        """Pause monitoring"""
+    def cancel_task(self):
+        """Cancel the hang detection task."""
         if self.task is not None and not self.task.done():
             self.task.cancel()
             self.task = None
 
+    @contextmanager
+    def pause(self):
+        """Pause hang detection in scope."""
+        try:
+            self.cancel_task()
+            yield
+        finally:
+            self.checkpoint()
+
     def stop(self):
-        """Stop monitoring"""
+        """Stop hang detection."""
         self.active = False
-        self.pause()
+        self.cancel_task()
         if self.loop is not None:
             # Cancel all pending tasks before stopping the loop
             def cancel_all_tasks():

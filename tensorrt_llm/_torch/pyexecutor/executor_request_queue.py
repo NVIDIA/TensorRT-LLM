@@ -312,9 +312,8 @@ class ExecutorRequestQueue:
                 self.request_accumulated.clear()
                 # Reset timeout to 0 to avoid hanging when no new requests are available
                 timeout = datetime.timedelta(0)
-            self.hang_detector.pause()
-            new_requests.extend(self._get_from_request_queue(timeout))
-            self.hang_detector.checkpoint()
+            with self.hang_detector.pause():
+                new_requests.extend(self._get_from_request_queue(timeout))
 
         # Broadcast requests and handle Python objects
         new_requests, py_request_objects = self._handle_request_broadcasting(
@@ -488,10 +487,9 @@ class ExecutorRequestQueue:
             # Preserve original `new_requests` on rank 0
             _ = self._broadcast_new_requests(new_requests, py_request_objects)
         else:
-            self.hang_detector.pause()
-            new_requests, py_request_objects = self._broadcast_new_requests(
-                new_requests, py_request_objects)
-            self.hang_detector.checkpoint()
+            with self.hang_detector.pause():
+                new_requests, py_request_objects = self._broadcast_new_requests(
+                    new_requests, py_request_objects)
 
         return new_requests, py_request_objects
 

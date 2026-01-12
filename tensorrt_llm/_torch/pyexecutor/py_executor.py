@@ -397,7 +397,7 @@ class PyExecutor:
     def start_worker(self):
         with self.worker_lock:
             if self.worker_started == False:
-                self.hang_detector.start()
+                self.hang_detector.enable()
                 self.worker_thread = threading.Thread(
                     target=self._event_loop_wrapper, daemon=True)
                 self.worker_thread.start()
