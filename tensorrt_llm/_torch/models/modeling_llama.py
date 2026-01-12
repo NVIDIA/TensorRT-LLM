@@ -681,12 +681,8 @@ class LlamaDecoderLayer(DecoderLayer):
         quant_valid = self.is_nvfp4 is not None and self.is_nvfp4
 
         device_supported = False
-        if torch.cuda.is_available():
-            capability = torch.cuda.get_device_capability(
-                torch.device('cuda:0'))
-            sm_version = capability[0] * 10 + capability[1]
-            if sm_version >= 100:
-                device_supported = True
+        if get_sm_version() >= 100:
+            device_supported = True
 
         from tensorrt_llm.bindings import ipc_nvls_supported
         nvls_supported = ipc_nvls_supported()
