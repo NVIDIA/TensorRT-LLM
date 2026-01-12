@@ -15,6 +15,7 @@ from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
 from tensorrt_llm._utils import get_sm_version, mpi_disabled
+from tensorrt_llm.bindings import ipc_nvls_supported
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger
@@ -680,11 +681,7 @@ class LlamaDecoderLayer(DecoderLayer):
         tp_valid = self.mapping.tp_size > 1
         quant_valid = self.is_nvfp4 is not None and self.is_nvfp4
 
-        device_supported = False
-        if get_sm_version() >= 100:
-            device_supported = True
-
-        from tensorrt_llm.bindings import ipc_nvls_supported
+        device_supported = get_sm_version() >= 100
         nvls_supported = ipc_nvls_supported()
 
         use_fused_gemm_allreduce = all([

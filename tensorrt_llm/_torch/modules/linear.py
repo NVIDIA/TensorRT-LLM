@@ -15,6 +15,7 @@ from torch.nn.parameter import Parameter
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm._utils import is_device_integrated, mpi_disabled
+from tensorrt_llm.bindings import ipc_nvls_supported
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
                                      AllReduceStrategy)
 from tensorrt_llm.logger import logger
@@ -2164,11 +2165,7 @@ class Linear(nn.Module):
         quant_valid = self.quant_config is not None and self.quant_config.layer_quant_mode.has_nvfp4(
         )
 
-        device_supported = False
-        if get_sm_version() >= 100:
-            device_supported = True
-
-        from tensorrt_llm.bindings import ipc_nvls_supported
+        device_supported = get_sm_version() >= 100
         nvls_supported = ipc_nvls_supported()
 
         self.use_fused_gemm_allreduce = all([

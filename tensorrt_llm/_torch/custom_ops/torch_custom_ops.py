@@ -1922,7 +1922,7 @@ class Fp4GemmAllreduceRunner(TunableRunner):
 @torch.library.custom_op("trtllm::nvfp4_gemm_allreduce", mutates_args=())
 def nvfp4_gemm_allreduce(
     act_fp4: torch.Tensor,
-    weight: torch.Tensor,
+    weight_fp4: torch.Tensor,
     act_sf: torch.Tensor,
     weight_scale: torch.Tensor,
     alpha: torch.Tensor,
@@ -1948,14 +1948,14 @@ def nvfp4_gemm_allreduce(
     best_tactic = -1
 
     return nvfp4_gemm_allreduce_runner(
-        inputs=[act_fp4, weight, act_sf, weight_scale, alpha],
+        inputs=[act_fp4, weight_fp4, act_sf, weight_scale, alpha],
         tactic=best_tactic)
 
 
 @nvfp4_gemm_allreduce.register_fake
 def _(
     act_fp4: torch.Tensor,
-    weight: torch.Tensor,
+    weight_fp4: torch.Tensor,
     act_sf: torch.Tensor,
     weight_scale: torch.Tensor,
     alpha: torch.Tensor,
@@ -1963,5 +1963,5 @@ def _(
     tp_rank: int,
     tp_group: List[int],
 ) -> torch.Tensor:
-    return act_fp4.new_empty((act_fp4.size(0), weight.size(0)),
+    return act_fp4.new_empty((act_fp4.size(0), weight_fp4.size(0)),
                              dtype=output_dtype)

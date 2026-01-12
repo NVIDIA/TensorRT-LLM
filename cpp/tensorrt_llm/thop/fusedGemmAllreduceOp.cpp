@@ -141,12 +141,12 @@ class GemmAllreduceNvlsMemoryManager
 public:
     GemmAllreduceNvlsMemoryManager()
     {
-        TLLM_LOG_INFO("GemmAllreduceNvlsMemoryManager constructor");
+        TLLM_LOG_DEBUG("GemmAllreduceNvlsMemoryManager constructor");
     }
 
     ~GemmAllreduceNvlsMemoryManager()
     {
-        TLLM_LOG_INFO("GemmAllreduceNvlsMemoryManager destructor");
+        TLLM_LOG_DEBUG("GemmAllreduceNvlsMemoryManager destructor");
     }
 
     std::pair<PersistentWorkspaceInterface*, tensorrt_llm::runtime::IpcNvlsHandle*> getWorkspace(
@@ -161,13 +161,13 @@ public:
         {
             std::stringstream ss;
             ss << "Please set TRTLLM_GEMM_ALLREDUCE_WORKSPACE_SIZE to at least " << requiredSize << " bytes";
-            C10_THROW_ERROR(ErrorAlwaysShowCppStacktrace, ss.str().c_str());
+            TLLM_THROW("%s", ss.str().c_str());
         }
 
         auto handle = mHandles[key];
         if (handle == nullptr)
         {
-            TLLM_LOG_INFO("Creating allreduce workspace for %s", key.toString().c_str());
+            TLLM_LOG_DEBUG("Creating allreduce workspace for %s", key.toString().c_str());
             handle = std::make_shared<IpcNvlsHandleWrapper>(preferredWorkspaceSize, key.group);
             GemmAllReduceImplInterface::ProblemArgs tmpArgs;
             int maxN = 16384;
@@ -243,7 +243,7 @@ public:
         }
         else
         {
-            C10_THROW_ERROR(NotImplementedError, "Unsupported input or output dtype");
+            TLLM_THROW("Unsupported output dtype: %s", torch::toString(outputDtype));
         }
 
         mConfigs = mRunner->getSupportedLaunchConfigs();
