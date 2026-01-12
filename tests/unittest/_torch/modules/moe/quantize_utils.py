@@ -38,7 +38,7 @@ class RefGatedMLPFusedMoE(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         dtype: Optional[torch.dtype] = None,
-        model_config: ModelConfig = ModelConfig(),
+        model_config: Optional[ModelConfig] = None,
         bias=False,
     ):
         super().__init__()
@@ -48,6 +48,8 @@ class RefGatedMLPFusedMoE(nn.Module):
         self.intermediate_size = intermediate_size
         self.bias = bias
         self.dtype = dtype
+        if model_config is None:
+            model_config = ModelConfig()
         self.quant_config = model_config.quant_config
         self.experts = nn.ModuleList(
             [
@@ -113,7 +115,7 @@ class FP8RefGatedMLPFusedMoE(RefGatedMLPFusedMoE):
         hidden_size: int,
         intermediate_size: int,
         dtype: Optional[torch.dtype] = None,
-        model_config: ModelConfig = ModelConfig(),
+        model_config: Optional[ModelConfig] = None,
         bias=False,
     ):
         super().__init__(
@@ -157,7 +159,7 @@ class NVFP4RefGatedMLPFusedMoE(RefGatedMLPFusedMoE):
         hidden_size: int,
         intermediate_size: int,
         dtype: Optional[torch.dtype] = None,
-        model_config: ModelConfig = ModelConfig(),
+        model_config: Optional[ModelConfig] = None,
         bias=False,
     ):
         super().__init__(
@@ -217,7 +219,7 @@ class BaseQuantizeUtil(ABC):
         """
         Create quantized weights for MoE experts.
         """
-        assert self.quant_config is None, "quant_config should be None for NoQuantizeUtil"
+        assert self.quant_config is None, "quant_config should be None for BaseQuantizeUtil"
         weights = {}
         for expert_id in range(self.num_experts):
             w1_weight = torch.randn(

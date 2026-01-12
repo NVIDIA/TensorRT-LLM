@@ -56,7 +56,7 @@ def test_moe(dtype, moe_backend, quant_algo, mocker):
     # Enable configurable moe by default
     mocker.patch.dict(os.environ, {"ENABLE_CONFIGURABLE_MOE": "1"})
     if moe_backend == "TRTLLM":
-        if dtype == torch.float16:
+        if dtype == torch.float16 and quant_algo == QuantAlgo.NVFP4:
             pytest.skip("TRTLLM NVFP4 MoE backend does not support float16 yet")
 
     # Hardcode some parameters for testing
