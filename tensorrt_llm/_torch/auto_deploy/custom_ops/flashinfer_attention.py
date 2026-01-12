@@ -373,7 +373,7 @@ def flashinfer_mha_with_cache(
             num_seq=num_prefill,
             page_size=k_cache.shape[1],
             q_dtype=q_prefill.dtype,
-            kv_dtype=k_cache.dtype,
+            kv_dtype=q_prefill.dtype if k_cache.dtype == torch.float8_e4m3fn else k_cache.dtype,
             sm_scale=scale,
         )
 
@@ -385,10 +385,17 @@ def flashinfer_mha_with_cache(
             kv_lens_arr_host=seq_len_with_cache_host[:num_prefill],
             plan_params=pp_prefill,
         )
+        # Convert FP8 KV cache to BF16 for compute (FlashInfer 0.6.0 doesn't support mixed Q=BF16, KV=FP8)
+        if k_cache.dtype == torch.float8_e4m3fn:
+            k_cache_compute = k_cache.to(q.dtype)
+            v_cache_compute = v_cache.to(q.dtype)
+            kv_cache_for_run = (k_cache_compute, v_cache_compute)
+        else:
+            kv_cache_for_run = (k_cache, v_cache)
 
         y_prefill = wrapper_prefill.run(
             q_prefill,
-            (k_cache, v_cache),
+            kv_cache_for_run,
             k_scale=k_scale,
             v_scale=v_scale,
             enable_pdl=get_env_enable_pdl(),
@@ -408,7 +415,7 @@ def flashinfer_mha_with_cache(
             num_seq=num_decode,
             page_size=k_cache.shape[1],
             q_dtype=q_decode.dtype,
-            kv_dtype=k_cache.dtype,
+            kv_dtype=q_decode.dtype if k_cache.dtype == torch.float8_e4m3fn else k_cache.dtype,
             sm_scale=scale,
         )
 
@@ -420,9 +427,17 @@ def flashinfer_mha_with_cache(
             plan_params=pp_decode,
         )
 
+        # Convert FP8 KV cache to BF16 for compute (FlashInfer 0.6.0 doesn't support mixed Q=BF16, KV=FP8)
+        if k_cache.dtype == torch.float8_e4m3fn:
+            k_cache_compute = k_cache.to(q.dtype)
+            v_cache_compute = v_cache.to(q.dtype)
+            kv_cache_for_run = (k_cache_compute, v_cache_compute)
+        else:
+            kv_cache_for_run = (k_cache, v_cache)
+
         y_decode = wrapper_decode.run(
             q_decode,
-            (k_cache, v_cache),
+            kv_cache_for_run,
             k_scale=k_scale,
             v_scale=v_scale,
             enable_pdl=get_env_enable_pdl(),
