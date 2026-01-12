@@ -58,91 +58,12 @@ fi
 # Generate extra_llm_config.yaml based on executor type
 echo "Generating extra_llm_config.yaml for executor: $BACKEND"
 if [[ "$BACKEND" == "ray" ]]; then
-    # Ray backend generates per-server configs with placement_groups (GPU indices)
-    # Context server uses GPUs 0 to (TP_SIZE-1)
-    # Generation server uses GPUs TP_SIZE to (2*TP_SIZE-1)
+    # Ray backend: Both servers share the same Ray cluster
+    # Ray scheduler handles GPU allocation automatically
+    # Each server requests tp_size GPUs via placement groups
 
-    # Generate placement groups array for context server: [[0, 1, ..., TP_SIZE-1]]
-    # Format: List of placement groups, each group is a list of GPU indices
-    CTX_PLACEMENT_GROUPS="[["
-    for ((i=0; i<TP_SIZE; i++)); do
-        if [[ $i -gt 0 ]]; then CTX_PLACEMENT_GROUPS+=", "; fi
-        CTX_PLACEMENT_GROUPS+="$i"
-    done
-    CTX_PLACEMENT_GROUPS+="]]"
-
-    # Generate bundle indices for context server: [[0, 1, ..., TP_SIZE-1]]
-    CTX_BUNDLE_INDICES="[["
-    for ((i=0; i<TP_SIZE; i++)); do
-        if [[ $i -gt 0 ]]; then CTX_BUNDLE_INDICES+=", "; fi
-        CTX_BUNDLE_INDICES+="$i"
-    done
-    CTX_BUNDLE_INDICES+="]]"
-
-    # Generate placement groups array for generation server: [[TP_SIZE, TP_SIZE+1, ..., 2*TP_SIZE-1]]
-    GEN_PLACEMENT_GROUPS="[["
-    for ((i=TP_SIZE; i<2*TP_SIZE; i++)); do
-        if [[ $i -gt TP_SIZE ]]; then GEN_PLACEMENT_GROUPS+=", "; fi
-        GEN_PLACEMENT_GROUPS+="$i"
-    done
-    GEN_PLACEMENT_GROUPS+="]]"
-
-    # Generate bundle indices for generation server: [[0, 1, ..., TP_SIZE-1]]
-    GEN_BUNDLE_INDICES="[["
-    for ((i=0; i<TP_SIZE; i++)); do
-        if [[ $i -gt 0 ]]; then GEN_BUNDLE_INDICES+=", "; fi
-        GEN_BUNDLE_INDICES+="$i"
-    done
-    GEN_BUNDLE_INDICES+="]]"
-
-    echo "Context server placement_groups: $CTX_PLACEMENT_GROUPS"
-    echo "Context server placement_bundle_indices: $CTX_BUNDLE_INDICES"
-    echo "Generation server placement_groups: $GEN_PLACEMENT_GROUPS"
-    echo "Generation server placement_bundle_indices: $GEN_BUNDLE_INDICES"
-
-    # Context server config
-    cat > extra_llm_config_ctx.yaml << EOF
-# extra_llm_config.yaml for context server with Ray placement
-cache_transceiver_config:
-    backend: "UCX"
-    max_tokens_in_buffer: 1024
-disable_overlap_scheduler: true
-orchestrator_type: "ray"
-max_batch_size: 1
-max_num_tokens: 512
-max_seq_len: 128
-# Ray placement config - specifies which GPUs to use
-# placement_groups: List of GPU index lists (one list per placement group)
-# placement_bundle_indices: Which bundle indices to use from each placement group
-ray_placement_config:
-    placement_groups: $CTX_PLACEMENT_GROUPS
-    placement_bundle_indices: $CTX_BUNDLE_INDICES
-    gpu_per_bundle: 1
-    cpu_per_bundle: 1
-EOF
-
-    # Generation server config
-    cat > extra_llm_config_gen.yaml << EOF
-# extra_llm_config.yaml for generation server with Ray placement
-cache_transceiver_config:
-    backend: "UCX"
-    max_tokens_in_buffer: 1024
-disable_overlap_scheduler: true
-orchestrator_type: "ray"
-max_batch_size: 1
-max_num_tokens: 512
-max_seq_len: 128
-# Ray placement config - specifies which GPUs to use
-ray_placement_config:
-    placement_groups: $GEN_PLACEMENT_GROUPS
-    placement_bundle_indices: $GEN_BUNDLE_INDICES
-    gpu_per_bundle: 1
-    cpu_per_bundle: 1
-EOF
-
-    # Also create a generic one for backward compatibility
     cat > extra_llm_config.yaml << EOF
-# extra_llm_config.yaml when launching disaggregated server instances.
+# extra_llm_config.yaml for Ray orchestrator
 cache_transceiver_config:
     backend: "UCX"
     max_tokens_in_buffer: 1024
@@ -222,43 +143,29 @@ fi
 
 # Launching context servers
 echo "Launching context servers..."
-if [[ "$BACKEND" == "mpi" ]]; then
-    CTX_GPUS=$(seq -s, 0 $((TP_SIZE - 1)))
-    echo "Context server using GPUs: $CTX_GPUS (via CUDA_VISIBLE_DEVICES)"
-    (
+CTX_GPUS=$(seq -s, 0 $((TP_SIZE - 1)))
+echo "Context server using GPUs: $CTX_GPUS (via CUDA_VISIBLE_DEVICES)"
+(
+    if [[ "$BACKEND" == "mpi" ]]; then
         export CUDA_VISIBLE_DEVICES=$CTX_GPUS
-        trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port 8001 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --extra_llm_api_options extra_llm_config.yaml
-    ) &> output_ctx0 &
-elif [[ "$BACKEND" == "ray" ]]; then
-    echo "Context server using GPUs: 0 to $((TP_SIZE - 1)) (via ray_placement_config.gpu_indices)"
-    (
-        # Ray backend uses ray_placement_config.gpu_indices from YAML instead of CUDA_VISIBLE_DEVICES
-        trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port 8001 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --extra_llm_api_options extra_llm_config_ctx.yaml
-    ) &> output_ctx0 &
-else
-    trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port 8001 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --extra_llm_api_options extra_llm_config.yaml &> output_ctx0 &
-fi
+    fi
+
+    trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port 8001 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --extra_llm_api_options extra_llm_config.yaml
+) &> output_ctx0 &
 CTX_PID=$!
 echo "Context server started with PID: $CTX_PID"
 
 # Launching generation servers
 echo "Launching generation servers..."
-if [[ "$BACKEND" == "mpi" ]]; then
-    GEN_GPUS=$(seq -s, $TP_SIZE $((2 * TP_SIZE - 1)))
-    echo "Generation server using GPUs: $GEN_GPUS (via CUDA_VISIBLE_DEVICES)"
-    (
+GEN_GPUS=$(seq -s, $TP_SIZE $((2 * TP_SIZE - 1)))
+echo "Generation server using GPUs: $GEN_GPUS (via CUDA_VISIBLE_DEVICES)"
+(
+    if [[ "$BACKEND" == "mpi" ]]; then
         export CUDA_VISIBLE_DEVICES=$GEN_GPUS
-        trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port 8002 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --extra_llm_api_options extra_llm_config.yaml
-    ) &> output_gen0 &
-elif [[ "$BACKEND" == "ray" ]]; then
-    echo "Generation server using GPUs: $TP_SIZE to $((2 * TP_SIZE - 1)) (via ray_placement_config.gpu_indices)"
-    (
-        # Ray backend uses ray_placement_config.gpu_indices from YAML instead of CUDA_VISIBLE_DEVICES
-        trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port 8002 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --extra_llm_api_options extra_llm_config_gen.yaml
-    ) &> output_gen0 &
-else
-    trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port 8002 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --extra_llm_api_options extra_llm_config.yaml &> output_gen0 &
-fi
+    fi
+
+    trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port 8002 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --extra_llm_api_options extra_llm_config.yaml
+) &> output_gen0 &
 GEN_PID=$!
 echo "Generation server started with PID: $GEN_PID"
 
@@ -273,4 +180,4 @@ if [[ "$RAY_STARTED" == "true" && "$ATTACH_MODE" != "true" ]]; then
 fi
 
 echo "Cleaning up generated config files..."
-rm -f extra_llm_config.yaml extra_llm_config_ctx.yaml extra_llm_config_gen.yaml
+rm -f extra_llm_config.yaml
