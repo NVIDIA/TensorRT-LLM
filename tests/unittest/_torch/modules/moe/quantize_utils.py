@@ -108,20 +108,6 @@ class FP8RefGatedMLPFusedMoE(RefGatedMLPFusedMoE):
     for correctness testing.
     """
 
-    def __init__(
-        self,
-        num_experts: int,
-        routing_method: BaseMoeRoutingMethod,
-        hidden_size: int,
-        intermediate_size: int,
-        dtype: Optional[torch.dtype] = None,
-        model_config: Optional[ModelConfig] = None,
-        bias=False,
-    ):
-        super().__init__(
-            num_experts, routing_method, hidden_size, intermediate_size, dtype, model_config, bias
-        )
-
     def load_weights(self, weights: List[Dict]):
         assert len(weights) == 1
         weights = weights[0]
@@ -151,20 +137,6 @@ class NVFP4RefGatedMLPFusedMoE(RefGatedMLPFusedMoE):
     A derived class of RefGatedMLPFusedMoE serves as a reference implementation of NVFP4 quantization
     for correctness testing.
     """
-
-    def __init__(
-        self,
-        num_experts: int,
-        routing_method: BaseMoeRoutingMethod,
-        hidden_size: int,
-        intermediate_size: int,
-        dtype: Optional[torch.dtype] = None,
-        model_config: Optional[ModelConfig] = None,
-        bias=False,
-    ):
-        super().__init__(
-            num_experts, routing_method, hidden_size, intermediate_size, dtype, model_config, bias
-        )
 
     def load_weights(self, weights: List[Dict]):
         assert len(weights) == 1
