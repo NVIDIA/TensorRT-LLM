@@ -339,7 +339,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel
     from ..cute_dsl_kernels.blackwell.blockwise_gemm.blockwise_gemm import \
         BlockwiseGemmKernel
-    from ..cute_dsl_kernels.blackwell.blockwise_gemm.contiguous_grouped_gemm import \
+    from ..cute_dsl_kernels.blackwell.blockwise_gemm.contiguous_offset_grouped_gemm import \
         BlockwiseContiguousGroupedGemmKernel
     from ..cute_dsl_kernels.blackwell.dense_blockscaled_gemm_persistent import \
         Sm100BlockScaledPersistentDenseGemmKernel
@@ -2207,7 +2207,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # Early exit: Check SM version - CuteDSL FP8 is only supported on Blackwell.
             if not is_sm_100f():
                 logger.debug(
-                    f"CuteDSL: SM version {sm_version} is not supported. "
+                    f"CuteDSL: SM version {get_sm_version()} is not supported. "
                     f"CuteDSL FP8 GEMM only supports SM 100 family. Skipping all tactics."
                 )
                 return []
@@ -2270,8 +2270,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 inputs (List[torch.Tensor]):
                     inputs[0]: Input tensor of shape (m, k), dtype: fp8.
                     inputs[1]: Weight tensor of shape (n, k), dtype: fp8.
-                    inputs[2]: Input scale factor tensor of shape (k//128, m), dtype: fp32.
-                    inputs[3]: Weight scale factor tensor of shape (n//128, k//128), dtype: fp32.
+                    inputs[2]: Input scale factor tensor of shape (k // 128, m), dtype: fp32.
+                    inputs[3]: Weight scale factor tensor of shape (n // 128, k // 128), dtype: fp32.
                 tactic: Tiling and cluster strategy, typically a tuple (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn).
 
             Returns:
@@ -2448,7 +2448,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             if not is_sm_100f():
                 logger.debug(
-                    f"CuteDSL: SM version {sm_version} is not supported. "
+                    f"CuteDSL: SM version {get_sm_version()} is not supported. "
                     f"CuteDSL FP8 BMM only supports SM 100 family. Skipping all tactics."
                 )
                 return []
@@ -2511,8 +2511,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 inputs (List[torch.Tensor]):
                     inputs[0]: Input tensor of shape (b, m, k), dtype: fp8.
                     inputs[1]: Weight tensor of shape (b, n, k), dtype: fp8.
-                    inputs[2]: Input scale tensor of shape (b, pad_up(m, 4), ceil_div(k, 128)), dtype: fp32.
-                    inputs[3]: Weight scale tensor of shape (B, Wn, Wk), dtype: fp32.
+                    inputs[2]: Input scale tensor of shape (b, pad_up(m, 4), k // 128), dtype: fp32.
+                    inputs[3]: Weight scale tensor of shape (B, n // 128, k // 128), dtype: fp32.
                 tactic: Tiling and cluster strategy, typically a tuple (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn).
 
             Returns:
@@ -2658,10 +2658,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
     ) -> None:
         batch_size, m, k = mat_a.shape[0], mat_a.shape[1], mat_a.shape[2]
         n = mat_b.shape[1]
-        if out.dtype != torch.bfloat16:
-            assert False, "out.dtype != bf16"
-        if out.shape != (batch_size, m, n):
-            assert False, "out.shape != (batch_size, m, n)"
+        assert out.dtype == torch.bfloat16, "CuTe DSL fp8 bmm output dtype must be bf16"
+        assert out.shape == (batch_size, m,
+                             n), "CuTe DSL fp8 bmm output shape is incorrect"
 
     class CuteDSLFp8BlackwellGroupGemm(TunableRunner):
         kernel_class = BlockwiseContiguousGroupedGemmKernel
@@ -2688,14 +2687,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
         ) -> List[int]:
             if not is_sm_100f():
                 logger.debug(
-                    f"CuteDSL: SM version {sm_version} is not supported. "
+                    f"CuteDSL: SM version {get_sm_version()} is not supported. "
                     f"CuteDSL FP8 Group Gemm only supports SM 100 family. Skipping all tactics."
                 )
                 return []
             # [m, k]
             m, k = inputs[0].shape[0], inputs[0].shape[1]
-            # [group_num, n, k]
-            group_num, n, k = inputs[1].shape[0], inputs[1].shape[1], inputs[
+            # [group_size, n, k]
+            group_size, n, k = inputs[1].shape[0], inputs[1].shape[1], inputs[
                 1].shape[2]
             # m,k
             a_major = "k"
@@ -2705,8 +2704,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             c_major = "n"
 
             use_2cta_instrs_candi = [False, True]
-            # mma_tiler_m == 256 is always not supported for grouped gemm
-            mma_tiler_mn_candi = [(64, 128), (128, 128)]
+            mma_tiler_mn_candi = [(64, 128), (128, 128), (256, 128)]
             cluster_shape_mn_candi = [
                 (1, 1),
                 (1, 2),
@@ -2751,9 +2749,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             Args:
                 inputs (List[torch.Tensor]):
                     inputs[0]: Input tensor of shape (m, k), dtype: fp8.
-                    inputs[1]: Weight tensor of shape (group_num, n, k), dtype: fp8.
+                    inputs[1]: Weight tensor of shape (group_size, n, k), dtype: fp8.
                     inputs[2]: Input scale tensor of shape (k // 128, m), dtype: fp32.
-                    inputs[3]: Weight scale tensor of shape (group_num, n // 128, k // 128), dtype: fp32.
+                    inputs[3]: Weight scale tensor of shape (group_size, n // 128, k // 128), dtype: fp32.
                     inputs[4]: Group offset tensor of shape (m), dtype: int32.
                 tactic: Tiling and cluster strategy, typically a tuple (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn).
 
@@ -2773,7 +2771,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             a, b, a_sf, b_sf, group_offset = inputs
             m, k, n = a.shape[0], a.shape[1], b.shape[1]
-            group_num = b.shape[0]
+            group_size = b.shape[0]
             sf_m = m
             sf_n = ceil_div(n, 128)
             sf_k = ceil_div(k, 128)
@@ -2813,8 +2811,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cutlass.Int32,
                 group_offset.data_ptr(),
                 cute.AddressSpace.gmem,
-                assumed_align=16,
             )
+
+            a_sf_tmp = a_sf.reshape((1, sf_k, sf_m))
+            a_sf_tmp = a_sf_tmp.permute(2, 1, 0)
+
+            mSFA = cute.runtime.from_dlpack(
+                a_sf_tmp, assumed_align=16).mark_layout_dynamic(leading_dim=0)
 
             # get stream
             torch_stream = torch.cuda.current_stream()
@@ -2846,10 +2849,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     sf_n,
                     sf_k,
                     1,
-                    group_num,
+                    group_size,
                     a_ptr,
                     b_ptr,
-                    a_sf_ptr,
+                    mSFA,
                     b_sf_ptr,
                     c_ptr,
                     group_offset_ptr,
@@ -2869,10 +2872,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 sf_n,
                 sf_k,
                 1,
-                group_num,
+                group_size,
                 a_ptr,
                 b_ptr,
-                a_sf_ptr,
+                mSFA,
                 b_sf_ptr,
                 c_ptr,
                 group_offset_ptr,
