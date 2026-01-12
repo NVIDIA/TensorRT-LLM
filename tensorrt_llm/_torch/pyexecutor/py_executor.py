@@ -486,6 +486,12 @@ class PyExecutor:
         self.executor_request_queue.enqueue_shutdown_request()
         self.shutdown_event.wait()
         if self.hang_detector.detected():
+            # Early return here to avoid waiting for hanging threads.
+            # Since `on_detected` has sent the error message as response,
+            # this worker will be asked to shutdown immediately.
+            # Since the whole process will shutdown after this `shutdown` call,
+            # All threads and memory pools will be freed properly.
+            logger.error("Hang detected, shutting down immediately.")
             return
         self.worker_thread.join()
         self.worker_started = False
