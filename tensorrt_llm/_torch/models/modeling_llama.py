@@ -688,9 +688,12 @@ class LlamaDecoderLayer(DecoderLayer):
             if sm_version >= 100:
                 device_supported = True
 
+        from tensorrt_llm.bindings import ipc_nvls_supported
+        nvls_supported = ipc_nvls_supported()
+
         use_fused_gemm_allreduce = all([
             enable_gemm_allreduce_fusion, mpi_enabled, dtype_supported,
-            tp_valid, quant_valid, device_supported
+            tp_valid, quant_valid, device_supported, nvls_supported
         ])
 
         def check_in_out_features(in_features, out_features):

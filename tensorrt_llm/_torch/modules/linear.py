@@ -2172,10 +2172,13 @@ class Linear(nn.Module):
             if sm_version >= 100:
                 device_supported = True
 
+        from tensorrt_llm.bindings import ipc_nvls_supported
+        nvls_supported = ipc_nvls_supported()
+
         self.use_fused_gemm_allreduce = all([
             self.reduce_output, mpi_enabled, dtype_supported,
             in_features_aligned, out_features_aligned, tp_valid, quant_valid,
-            device_supported
+            device_supported, nvls_supported
         ])
 
         self.enable_cuda_core = False
