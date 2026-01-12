@@ -1167,7 +1167,8 @@ class PyExecutor:
                             for req in previous_batch.scheduled_ctx_reqs:
                                 if req.is_context_only_request and (
                                         req.is_context_finished
-                                        or req.is_finished_due_to_length):
+                                        or req.is_finished_due_to_length
+                                ) and not req.is_finished_due_to_cancellation:
                                     block_id = self.kv_cache_manager.store_blocks_for_reuse(
                                         req, True)
                                     self.ctx_in_transmission_requests[
@@ -1436,7 +1437,8 @@ class PyExecutor:
                         for req in scheduled_batch.context_requests:
                             if req.is_context_only_request and (
                                     req.is_context_finished
-                                    or req.is_finished_due_to_length):
+                                    or req.is_finished_due_to_length
+                            ) and not req.is_finished_due_to_cancellation:
                                 block_id = self.kv_cache_manager.store_blocks_for_reuse(
                                     req, True)
                                 self.ctx_in_transmission_requests[
@@ -1686,7 +1688,8 @@ class PyExecutor:
                         for req in self.previous_batch.sample_state.scheduled_requests.context_requests:
                             if req.is_context_only_request and (
                                     req.is_context_finished
-                                    or req.is_finished_due_to_length):
+                                    or req.is_finished_due_to_length
+                            ) and not req.is_finished_due_to_cancellation:
                                 block_id = self.kv_cache_manager.store_blocks_for_reuse(
                                     req, True)
                                 self.ctx_in_transmission_requests[
@@ -2196,8 +2199,9 @@ class PyExecutor:
         if (scheduled_ctx_requests is None or len(scheduled_ctx_requests) == 0):
             return []
         for req in scheduled_ctx_requests:
-            if req.is_context_only_request and (req.is_context_finished or
-                                                req.is_finished_due_to_length):
+            if req.is_context_only_request and (
+                    req.is_context_finished or req.is_finished_due_to_length
+            ) and not req.is_finished_due_to_cancellation:
                 self.kv_cache_transceiver.respond_and_send_async(req)
                 for resource_mgr_type in (
                         ResourceManagerType.SEQ_SLOT_MANAGER,
