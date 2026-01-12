@@ -25,6 +25,34 @@ from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 
+def get_test_quant_params(quant_algo, x):
+    """
+    Create quantization configuration and corresponding kwargs for testing.
+    """
+    quantize_util_cls = None
+    quant_config = None
+    quant_kwargs = {}
+    if quant_algo is None:
+        quantize_util_cls = BaseQuantizeUtil
+    elif quant_algo == QuantAlgo.FP8:
+        quantize_util_cls = FP8QuantizeUtil
+        quant_config = QuantConfig(quant_algo=QuantAlgo.FP8)
+        _, x_scale = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(x)
+        x_scale = x_scale.float().squeeze()
+        quant_kwargs["x_scale"] = x_scale
+    elif quant_algo == QuantAlgo.NVFP4:
+        quantize_util_cls = NVFP4QuantizeUtil
+        quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+        x_sf_global = (448 * 6) / x.abs().max().float()
+        scaling_vector_size = 16
+        quant_kwargs["scaling_vector_size"] = scaling_vector_size
+        quant_kwargs["x_sf_global"] = x_sf_global
+    else:
+        assert False, "unsupported quant_algo"
+
+    return quantize_util_cls, quant_config, quant_kwargs
+
+
 class RefGatedMLPFusedMoE(nn.Module):
     """
     RefGatedMLPFusedMoE serves as a reference implementation with Gated MLPs designed for correctness testing.
