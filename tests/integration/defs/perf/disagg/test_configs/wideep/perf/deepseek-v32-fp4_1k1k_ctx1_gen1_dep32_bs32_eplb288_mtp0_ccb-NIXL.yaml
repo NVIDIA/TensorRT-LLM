@@ -89,7 +89,7 @@ worker_config:
       - cuda_core
     cache_transceiver_config:
       max_tokens_in_buffer: 4608
-      backend: NIXLf
+      backend: NIXL
     stream_interval: 20
     num_postprocess_workers: 4
   ctx:
