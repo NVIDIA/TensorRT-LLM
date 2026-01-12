@@ -1,15 +1,15 @@
 metadata:
-  model_name: deepseek_r1_0528_fp8
+  model_name: deepseek_v32_fp4
   supported_gpus:
-  - B200
+  - GB200
 server_configs:
-  # 1k1k configs - TP8 with TRTLLM, MTP3
-  - name: "r1_fp8_tp8_mtp3_1k1k"
-    model_name: "deepseek_r1_0528_fp8"
-    tensor_parallel_size: 8
-    moe_expert_parallel_size: 1
+  # 1k1k configs - TEP4 with TRTLLM, MTP3
+  - name: "v32_fp4_tep4_mtp3_1k1k"
+    model_name: "deepseek_v32_fp4"
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 4
     pipeline_parallel_size: 1
-    max_batch_size: 8
+    max_batch_size: 32
     max_num_tokens: 8192
     attn_backend: "TRTLLM"
     enable_attention_dp: false
@@ -17,7 +17,7 @@ server_configs:
       backend: 'TRTLLM'
     cuda_graph_config:
       enable_padding: true
-      max_batch_size: 8
+      max_batch_size: 32
     kv_cache_config:
       dtype: 'fp8'
       enable_block_reuse: false
@@ -26,19 +26,19 @@ server_configs:
       decoding_type: 'MTP'
       num_nextn_predict_layers: 3
     client_configs:
-      - name: "con4_iter10_1k1k"
-        concurrency: 4
+      - name: "con2_iter10_1k1k"
+        concurrency: 2
         iterations: 10
         isl: 1024
         osl: 1024
         random_range_ratio: 0.2
         backend: "openai"
 
-  # 1k1k configs - DEP8 with DEEPGEMM, MTP1
-  - name: "r1_fp8_dep8_mtp1_1k1k"
-    model_name: "deepseek_r1_0528_fp8"
-    tensor_parallel_size: 8
-    moe_expert_parallel_size: 8
+  # 1k1k configs - DEP4 with CUTLASS, MTP1
+  - name: "v32_fp4_dep4_mtp1_1k1k"
+    model_name: "deepseek_v32_fp4"
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 4
     pipeline_parallel_size: 1
     max_batch_size: 512
     max_num_tokens: 8192
@@ -49,7 +49,7 @@ server_configs:
       enable_balance: true
       timeout_iters: 60
     moe_config:
-      backend: 'DEEPGEMM'
+      backend: 'CUTLASS'
     cuda_graph_config:
       enable_padding: true
       max_batch_size: 512
@@ -69,13 +69,13 @@ server_configs:
         random_range_ratio: 0.2
         backend: "openai"
 
-  # 8k1k configs - TP8 with TRTLLM, MTP3
-  - name: "r1_fp8_tp8_mtp3_8k1k"
-    model_name: "deepseek_r1_0528_fp8"
-    tensor_parallel_size: 8
-    moe_expert_parallel_size: 1
+  # 8k1k configs - TEP4 with TRTLLM, MTP3
+  - name: "v32_fp4_tep4_mtp3_8k1k"
+    model_name: "deepseek_v32_fp4"
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 4
     pipeline_parallel_size: 1
-    max_batch_size: 8
+    max_batch_size: 32
     max_num_tokens: 12288
     attn_backend: "TRTLLM"
     enable_attention_dp: false
@@ -83,7 +83,7 @@ server_configs:
       backend: 'TRTLLM'
     cuda_graph_config:
       enable_padding: true
-      max_batch_size: 8
+      max_batch_size: 32
     kv_cache_config:
       dtype: 'fp8'
       enable_block_reuse: false
@@ -92,19 +92,19 @@ server_configs:
       decoding_type: 'MTP'
       num_nextn_predict_layers: 3
     client_configs:
-      - name: "con4_iter10_8k1k"
-        concurrency: 4
+      - name: "con2_iter10_8k1k"
+        concurrency: 2
         iterations: 10
         isl: 8192
         osl: 1024
         random_range_ratio: 0.2
         backend: "openai"
 
-  # 8k1k configs - DEP8 with DEEPGEMM, MTP1
-  - name: "r1_fp8_dep8_mtp1_8k1k"
-    model_name: "deepseek_r1_0528_fp8"
-    tensor_parallel_size: 8
-    moe_expert_parallel_size: 8
+  # 8k1k configs - DEP4 with CUTLASS, MTP1
+  - name: "v32_fp4_dep4_mtp1_8k1k"
+    model_name: "deepseek_v32_fp4"
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 4
     pipeline_parallel_size: 1
     max_batch_size: 512
     max_num_tokens: 12288
@@ -115,7 +115,7 @@ server_configs:
       enable_balance: true
       timeout_iters: 60
     moe_config:
-      backend: 'DEEPGEMM'
+      backend: 'CUTLASS'
     cuda_graph_config:
       enable_padding: true
       max_batch_size: 512
