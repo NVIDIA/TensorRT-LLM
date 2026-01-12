@@ -22,6 +22,7 @@ import sys
 import time
 from datetime import datetime
 
+import yaml
 from defs.trt_test_alternative import print_info, print_warning
 
 _project_root = os.path.abspath(
@@ -666,11 +667,14 @@ def _print_regression_data(data, print_func=None):
         print_func(f'"{key}": {value}')
 
 
-def check_perf_regression(new_data_dict, fail_on_regression=False):
+def check_perf_regression(new_data_dict,
+                          fail_on_regression=False,
+                          output_dir=None):
     """
     Check performance regression by printing regression data from new_data_dict.
     If fail_on_regression is True, raises RuntimeError when regressions are found.
     (This is a temporary feature to fail regression tests. We are observing the stability and will fail them by default soon.)
+    If output_dir is provided, saves regression data to regression_data.yaml.
     """
     # Filter regression data from new_data_dict
     regressive_data_list = [
@@ -686,6 +690,15 @@ def check_perf_regression(new_data_dict, fail_on_regression=False):
         data for data in regressive_data_list
         if not data.get("b_is_post_merge", False)
     ]
+
+    # Save regression data to yaml file if output_dir is provided
+    if output_dir is not None and len(regressive_data_list) > 0:
+        regression_data_file = os.path.join(output_dir, "regression_data.yaml")
+        with open(regression_data_file, 'w') as f:
+            yaml.dump(regressive_data_list, f, default_flow_style=False)
+        print_info(
+            f"Saved {len(regressive_data_list)} regression data to {regression_data_file}"
+        )
 
     # Print pre-merge regression data with print_warning
     if len(pre_merge_regressions) > 0:

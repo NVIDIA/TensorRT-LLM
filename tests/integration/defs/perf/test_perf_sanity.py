@@ -1068,13 +1068,13 @@ class PerfSanityTestConfig:
 
     def get_commands(self):
         """Get commands based on runtime."""
-        perf_sanity_output_dir = os.path.join(self._output_dir, self._test_param_labels)
-        os.makedirs(perf_sanity_output_dir, exist_ok=True)
+        self.perf_sanity_output_dir = os.path.join(self._output_dir, self._test_param_labels)
+        os.makedirs(self.perf_sanity_output_dir, exist_ok=True)
 
         if self.runtime == "aggr_server":
-            return self._get_aggr_commands(perf_sanity_output_dir)
+            return self._get_aggr_commands(self.perf_sanity_output_dir)
         elif self.runtime == "multi_node_disagg_server":
-            return self._get_disagg_commands(perf_sanity_output_dir)
+            return self._get_disagg_commands(self.perf_sanity_output_dir)
 
     def _get_aggr_commands(self, output_dir: str):
         """Get commands for aggregated server."""
@@ -1440,7 +1440,11 @@ class PerfSanityTestConfig:
             # Upload the new perf data and baseline data to database
             post_new_perf_data(new_baseline_data_dict, new_data_dict)
 
-        check_perf_regression(new_data_dict, fail_on_regression=is_scenario_mode)
+        check_perf_regression(
+            new_data_dict,
+            fail_on_regression=is_scenario_mode,
+            output_dir=self.perf_sanity_output_dir,
+        )
 
 
 # Perf sanity test case parameters
