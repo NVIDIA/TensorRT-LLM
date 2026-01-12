@@ -15,6 +15,7 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
 
 from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_disagg
 from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.mapping import Mapping
 
 from ..._utils import nvtx_range, nvtx_range_debug
 from ...inputs import (
@@ -25,6 +26,7 @@ from ...inputs import (
     MultimodalPlaceholderPlacement,
     TextPrompt,
     register_input_processor,
+    support_multimodal_disaggregated,
 )
 from ...inputs.multimodal import MultimodalParams
 from ...logger import logger
@@ -350,6 +352,85 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
             "multimodal_data": multimodal_data,
         }
 
+    def get_prompt_token_ids(
+        self, inputs: TextPrompt, mm_handles: List[Dict[str, Any]]
+    ) -> Tuple[List[int], List[int], List[int]]:
+        """
+        Build input token ids with multimodal placeholders expanded to the number of MM tokens.
+
+        Args:
+            inputs: Text prompt input container. Must contain a non-empty prompt string.
+            mm_handles: List of multimodal embedding handles. Currently only a single handle is supported.
+
+        Returns:
+            Tuple[List[int], List[int], List[int]]:
+                - expanded_ids: token ids with each image token expanded to a placeholder repeated per MM token
+                - mm_token_length: per-image MM token lengths
+                - mm_token_offsets: start offsets (positions) for each image's MM tokens within expanded_ids
+        """
+        # TODO: Move this function to the base input processor class when extending for more models
+        text_prompt = inputs.get("prompt")
+        if not text_prompt:
+            raise ValueError("Text prompt is required but not provided")
+
+        if not isinstance(mm_handles, list):
+            raise TypeError("mm_handles must be a list")
+
+        if len(mm_handles) > 1:
+            # TODO: only support single multimodal item within a request for now
+            raise NotImplementedError("Only one mm_handle is supported for Qwen3 VL for now")
+
+        hidden_size = mm_handles[0]["tensor_size"][1]
+        num_deepstack_levels = len(self.config.vision_config.deepstack_visual_indexes)
+        # This is because, unlike previous Qwen VL models, the embeddings are concatenated with
+        # feature maps from deepstack layers.
+        expected_size = self.config.text_config.hidden_size * (1 + num_deepstack_levels)
+        if hidden_size != expected_size:
+            raise RuntimeError(
+                f"Expected multimodal embedding to have hidden size {expected_size}, got {hidden_size}."
+            )
+
+        input_ids = self.tokenizer(text_prompt, return_tensors="pt").input_ids[0]
+
+        # TODO: what about `video_token_id`?
+        image_token_index = self.config.image_token_id
+
+        image_mask = input_ids == image_token_index
+        image_positions = torch.where(image_mask)[0]
+        num_images = len(image_positions)
+        assert num_images == len(mm_handles), "Number of images must match number of mm_handles"
+        total_mm_tokens = sum(mm_handle["tensor_size"][0] for mm_handle in mm_handles)
+        final_length = len(input_ids) - num_images + total_mm_tokens
+        # Create output tensor
+        expanded_ids = torch.empty(final_length, dtype=input_ids.dtype)
+        placeholder_id = self.tllm_multimodal_token_id
+
+        # Fill the expanded sequence
+        write_pos = 0
+        image_cnt = 0
+        mm_token_length = []
+        mm_token_offsets = []
+        for read_pos in range(len(input_ids)):
+            if input_ids[read_pos] == image_token_index:
+                # Replace with placeholder id
+                mm_token_num = mm_handles[image_cnt]["tensor_size"][0]
+                expanded_ids[write_pos : write_pos + mm_token_num] = placeholder_id
+                mm_token_offsets.append(write_pos)
+                mm_token_length.append(mm_token_num)
+                write_pos += mm_token_num
+                image_cnt += 1
+            else:
+                # Copy text token as-is
+                expanded_ids[write_pos] = input_ids[read_pos]
+                write_pos += 1
+
+        assert write_pos == final_length, f"Write position mismatch: {write_pos} != {final_length}"
+        assert mm_token_length[-1] + mm_token_offsets[-1] <= final_length, (
+            f"mm_token_length[-1] + mm_token_offsets[-1] ({mm_token_length[-1] + mm_token_offsets[-1]}) should be less "
+            f"than or equal to final_length ({final_length})"
+        )
+        return expanded_ids.to(torch.int32).tolist(), mm_token_length, mm_token_offsets
+
 
 class Qwen3VLVisionAttention(Qwen2_5_VLVisionAttention):
     def __init__(self, model_config, layer_idx):
@@ -359,7 +440,13 @@ class Qwen3VLVisionAttention(Qwen2_5_VLVisionAttention):
         model_config.pretrained_config.vision_config.torch_dtype = (
             model_config.pretrained_config.text_config.dtype
         )
-        super().__init__(model_config, layer_idx)
+        super().__init__(
+            model_config,
+            layer_idx=layer_idx,
+            reduce_output=(
+                not model_config.mapping.enable_attention_dp and model_config.mapping.tp_size > 1
+            ),
+        )
 
 
 class Qwen3VLVisionMLP(MLP):
@@ -373,12 +460,14 @@ class Qwen3VLVisionMLP(MLP):
             dtype=model_config.pretrained_config.text_config.dtype,
             config=model_config,
             layer_idx=layer_idx,
+            overridden_tp_size=1 if model_config.mapping.enable_attention_dp else None,
         )
 
 
 class Qwen3VLVisionBlock(torch.nn.Module):
     def __init__(self, model_config: ModelConfig[PretrainedConfig], layer_idx: int):
         super().__init__()
+        self.model_config = model_config
         config = model_config.pretrained_config.vision_config
 
         self.norm1 = LayerNorm(
@@ -430,11 +519,29 @@ class Qwen3VLVisionPatchMerger(torch.nn.Module):
             eps=model_config.pretrained_config.text_config.rms_norm_eps,
             dtype=model_config.pretrained_config.text_config.dtype,
         )
+
+        self.mapping = model_config.mapping
+        overridden_tp_size = 1 if model_config.mapping.enable_attention_dp else None
+        if overridden_tp_size is not None:
+            assert self.mapping.tp_size % overridden_tp_size == 0
+            tp_size = overridden_tp_size
+            # "Misuse" pp_size here to perform all-reduce within smaller groups
+            pp_size = self.mapping.pp_size * self.mapping.tp_size // overridden_tp_size
+            mapping = Mapping(
+                world_size=tp_size * pp_size,
+                rank=self.mapping.rank,
+                gpus_per_node=self.mapping.gpus_per_node,
+                tp_size=tp_size,
+                pp_size=pp_size,
+            )
+        else:
+            mapping = self.mapping
+
         self.linear_fc1 = Linear(
             in_features=self.hidden_size,
             out_features=self.hidden_size,
             bias=True,
-            mapping=model_config.mapping,
+            mapping=mapping,
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             allreduce_strategy=model_config.allreduce_strategy,
         )
@@ -443,7 +550,7 @@ class Qwen3VLVisionPatchMerger(torch.nn.Module):
             in_features=self.hidden_size,
             out_features=config.out_hidden_size,
             bias=True,
-            mapping=model_config.mapping,
+            mapping=mapping,
             tensor_parallel_mode=TensorParallelMode.ROW,
             allreduce_strategy=model_config.allreduce_strategy,
         )
@@ -625,8 +732,8 @@ class Qwen3VisionModel(torch.nn.Module):
 
     @torch.inference_mode()
     def forward(
-        self, hidden_states: torch.Tensor, grid_thw: torch.Tensor, **kwargs
-    ) -> torch.Tensor:
+        self, pixel_values: torch.Tensor, grid_thw: torch.Tensor, **kwargs
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         seq_lens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).tolist()
         attn_metadata = self.prepare_attn_metadata(seq_lens, self.attn_metadata)
 
@@ -634,7 +741,7 @@ class Qwen3VisionModel(torch.nn.Module):
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
 
         # From this point, pure GPU operation
-        hidden_states = self.patch_embed(hidden_states)
+        hidden_states = self.patch_embed(pixel_values)
         seq_len, _ = hidden_states.size()
         hidden_states = hidden_states.reshape(seq_len, -1)
 
@@ -825,6 +932,7 @@ class Qwen3VLModelBase(PreTrainedModel):
             llm_model_config.pretrained_config.architectures = ["Qwen3MoeForCausalLM"]
         else:
             raise ValueError(f"Unsupported architecture: {self.original_arch}")
+        # Qwen3ForCausalLM.
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 
         if not _is_disagg():
@@ -953,22 +1061,16 @@ class Qwen3VLModelBase(PreTrainedModel):
 
         # NOTE: Qwen*-VL series has mrope_config even on the text-only prompts,
         # so we need to separate the mm_multimodal_params from the text-only prompts.
-        mm_multimodal_params = [
-            multimodal_param
-            for multimodal_param in multimodal_params
-            if multimodal_param.multimodal_data.get("image", {}).get("pixel_values") is not None
-            or multimodal_param.multimodal_data.get("video", {}).get("pixel_values_videos")
-            is not None
-        ]
+        mm_multimodal_params = self._get_requests_with_mm_data(multimodal_params)
         if len(mm_multimodal_params) > 0:
             if not _is_disagg():
                 mm_embeds = get_multimodal_embeddings(
                     encoder_forward_fn=self.mm_encoder.forward,
                     multimodal_params=mm_multimodal_params,
                 )
-            else:
+            elif not getattr(self, "support_mm_disagg", False):
                 raise NotImplementedError(
-                    "Qwen3VLModel does not support disaggregated inference yet. Please unset "
+                    f"{type(self)} does not support disaggregated inference yet. Please unset "
                     "the TLLM_MULTIMODAL_DISAGGREGATED environment variable, or set it to '0'."
                 )
             mm_embeds = find_input_mm_embeds(mm_embeds, mm_multimodal_params)
@@ -1008,7 +1110,24 @@ class Qwen3VLModelBase(PreTrainedModel):
         logger.debug(f"output shape: {output_prob.shape}")
         return output_prob
 
+    def _get_requests_with_mm_data(self, multimodal_params):
+        mm_multimodal_params = []
+        for multimodal_param in multimodal_params:
+            data = multimodal_param.multimodal_data
+            if (
+                # The first 2 conditions check whether there is input on which inference should be run.
+                data.get("image", {}).get("pixel_values") is not None
+                or data.get("video", {}).get("pixel_values_videos") is not None
+                # This condition corresponds to when the embeddings are already populated, as is e.g.
+                # the case in EPD disagg in the prefill worker.
+                or data.get("multimodal_embedding")
+            ):
+                mm_multimodal_params.append(multimodal_param)
 
+        return mm_multimodal_params
+
+
+@support_multimodal_disaggregated
 @register_vision_encoder(Qwen3VisionModelBase, vlm_base_model=Qwen3VisionModel)
 @register_auto_model("Qwen3VLForConditionalGeneration")
 @register_input_processor(
