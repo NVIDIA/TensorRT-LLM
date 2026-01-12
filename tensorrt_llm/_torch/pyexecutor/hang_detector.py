@@ -21,7 +21,7 @@ class HangDetector:
         self.active = False
         self._detected = False
 
-    def enable(self):
+    def start(self):
         """Enable hang detection."""
 
         def run_loop():
@@ -86,3 +86,9 @@ class HangDetector:
 
             self.loop = None
             self.loop_thread = None
+
+    def __enter__(self):
+        self.start()
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.stop()

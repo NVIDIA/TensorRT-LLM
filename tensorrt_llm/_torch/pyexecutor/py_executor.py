@@ -397,7 +397,6 @@ class PyExecutor:
     def start_worker(self):
         with self.worker_lock:
             if self.worker_started == False:
-                self.hang_detector.enable()
                 self.worker_thread = threading.Thread(
                     target=self._event_loop_wrapper, daemon=True)
                 self.worker_thread.start()
@@ -972,7 +971,7 @@ class PyExecutor:
         # ensure the context is created, otherwise, some MPI calls will fail.
         CUASSERT(cudart.cudaSetDevice(self.device_id))
         microbatch_id = 0
-        with self._profiler() as profile_step:
+        with self._profiler() as profile_step, self.hang_detector:
             iter_start_time = time.time()
             iter_stats = None
             while True:
@@ -984,7 +983,6 @@ class PyExecutor:
                 # Fetch new requests from request queue
                 new_requests = self._fetch_and_activate_new_requests()
                 if self.should_stop_processing:
-                    self.hang_detector.stop()
                     break
 
                 self._handle_control_request()
@@ -1345,7 +1343,7 @@ class PyExecutor:
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
         CUASSERT(cudart.cudaSetDevice(self.device_id))
-        with self._profiler() as profile_step:
+        with self._profiler() as profile_step, self.hang_detector:
             sample_state = None
             iter_start_time = time.time()
             iter_stats = None
@@ -1359,7 +1357,6 @@ class PyExecutor:
                 self._handle_control_request()
 
                 if scheduled_batch is None:
-                    self.hang_detector.stop()
                     break
 
                 self._pause_requests(scheduled_batch.paused_requests)
@@ -1548,7 +1545,7 @@ class PyExecutor:
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
         CUASSERT(cudart.cudaSetDevice(self.device_id))
-        with self._profiler() as profile_step:
+        with self._profiler() as profile_step, self.hang_detector:
             iter_start_time = time.time()
             iter_stats = None
             target_inputs = None
@@ -1564,7 +1561,6 @@ class PyExecutor:
                 self._handle_control_request()
 
                 if scheduled_batch is None:
-                    self.hang_detector.stop()
                     break
                 # In gen-only benchmarking mode, wait until the number of scheduled generation
                 # requests reaches the required threshold before starting forward pass,
