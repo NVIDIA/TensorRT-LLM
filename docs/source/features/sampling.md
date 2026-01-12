@@ -50,6 +50,8 @@ Note: The `enable_trtllm_sampler` option is not currently supported when using s
     of highest-probability tokens with total probability greater than `top_p` ("nucleus sampling").
     In particular, the probability of the lowest-probability token in the selected
     subset is greater or equal than the probability of any not selected token.
+    When combined with `top_k`, the probabilities of the tokens selected by `top_k` are rescaled
+    such that they sum to one before `top_p` is applied.
 
   * The implementation does not guarantee any particular treatment of tied probabilities.
 
