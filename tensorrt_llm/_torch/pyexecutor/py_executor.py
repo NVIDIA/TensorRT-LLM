@@ -361,6 +361,8 @@ class PyExecutor:
                     module.register_forward_hook(
                         self.kv_connector_manager.layer_post_hook)
 
+            self.kv_connector_manager.wait_for_initialization()
+
     def _event_loop_wrapper(self):
         try:
             with customized_gc_thresholds(
@@ -613,7 +615,7 @@ class PyExecutor:
                 if prev_device_step_time is None:
                     prev_device_step_time = "N/A"  # Handle first iteration
                 else:
-                    prev_device_step_time = f"{prev_device_step_time}ms"
+                    prev_device_step_time = f"{prev_device_step_time} ms"
                 host_step_time = (end_time - start_time) * 1000  # milliseconds
                 formatted_timestamp = datetime.datetime.now().strftime(
                     "%Y-%m-%d %H:%M:%S")
@@ -623,7 +625,7 @@ class PyExecutor:
                     f"rank = {self.dist.rank}, "
                     f"currank_total_requests = {self.executor_request_queue.num_fetch_requests_cur_rank}/"
                     f"{self.executor_request_queue.num_fetch_requests}, "
-                    f"host_step_time = {host_step_time}ms, "
+                    f"host_step_time = {host_step_time:.3f} ms, "
                     f"prev_device_step_time = {prev_device_step_time}, "
                     f"timestamp = {formatted_timestamp}, "
                     f"num_scheduled_requests: {self.num_scheduled_requests}, "
@@ -1322,7 +1324,6 @@ class PyExecutor:
         if self.kv_connector_manager:
             self.kv_connector_manager.take_scheduled_requests_pending_load(
                 scheduled_batch)
-            self.kv_connector_manager.handle_metadata()
             self.kv_connector_manager.worker.start_load_kv(
                 torch.cuda.current_stream())
 
@@ -1368,6 +1369,10 @@ class PyExecutor:
                 finished_requests = []
 
                 can_queue = self._can_queue(scheduled_batch)
+
+                if self.kv_connector_manager:
+                    self.kv_connector_manager.handle_metadata()
+
                 if can_queue:
                     if self.kv_cache_transceiver:
                         # For generation requests which have completed KV cache transfer
@@ -1597,6 +1602,9 @@ class PyExecutor:
                             can_forward = True
 
                 self._pause_requests(scheduled_batch.paused_requests)
+
+                if self.kv_connector_manager:
+                    self.kv_connector_manager.handle_metadata()
 
                 can_queue = self._can_queue(scheduled_batch)
                 if can_queue:
@@ -2654,6 +2662,9 @@ class PyExecutor:
                                  self.ctx_in_transmission_counter))
                     else:
                         requests_to_terminate.append(request)
+
+                if self.kv_connector_manager is not None:
+                    self.resource_manager.free_slot_only(request)
             else:
                 new_active_requests.append(request)
 
