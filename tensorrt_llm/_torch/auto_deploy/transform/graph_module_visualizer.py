@@ -486,7 +486,11 @@ def to_dot(
         # val can be FakeTensor, Tensor, or other types with .shape attribute
         if val is not None and include_shapes and hasattr(val, "shape"):
             shape_str = str(tuple(val.shape))
-            edge_attrs["xlabel"] = shape_str
+            # Add dtype if available
+            dtype_str = ""
+            if hasattr(val, "dtype"):
+                dtype_str = str(val.dtype).replace("torch.", "")
+            edge_attrs["xlabel"] = f"{shape_str}\n{dtype_str}" if dtype_str else shape_str
             edge_attrs["fontsize"] = "10"
             edge_attrs["fontcolor"] = "blue"
 
