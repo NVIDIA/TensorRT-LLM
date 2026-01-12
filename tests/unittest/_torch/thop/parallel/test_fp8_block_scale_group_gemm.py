@@ -75,7 +75,3 @@ def test_cute_dsl_fp8_block_scale_group_gemm(dtype, num_experts, k, n, max_token
     diff = calc_diff(output, output_expected)
     assert diff < 1e-3
     torch.testing.assert_close(output, output_expected, atol=1e-3, rtol=1e-3)
-
-
-if __name__ == "__main__":
-    test_cute_dsl_fp8_block_scale_group_gemm(72, 1536, 2560, 1024)

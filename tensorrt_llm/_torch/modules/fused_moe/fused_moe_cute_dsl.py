@@ -308,7 +308,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         dtype (Optional[torch.dtype]): Data type for the weights.
         reduce_results (bool): Whether to reduce the results across devices.
         model_config (ModelConfig): Configuration object for the model.
-        use_cute_dsl_fp8 (bool): Whether to use CuteDSL FP8 or CuteDSL FP8 ref.
+        use_cute_dsl_fp8 (bool): Whether to use CuteDSL FP8 blockwise gemm.
     """
 
     def __init__(
@@ -604,23 +604,12 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         )
         x, x_sf = torch.ops.trtllm.fp8_quantize_1x128(x)
         if is_sm_100f() and self.use_cute_dsl_fp8:
-            # TODO: Need to pad to 128 for each group to ensure accuracy
-            group_offset = torch.empty(x.shape[0] * x.shape[1],
-                                       dtype=torch.int32,
-                                       device="cuda")
-            for i in range(self.num_slots):
-                start = expert_first_token_offset[i]
-                end = expert_first_token_offset[
-                    i +
-                    1] if i < self.num_slots - 1 else x.shape[0] * x.shape[1]
-                group_offset[start:end] = i
-        if is_sm_100f() and self.use_cute_dsl_fp8:
             x = torch.ops.trtllm.cute_dsl_fp8_group_blockwise_gemm_blackwell(
                 input=x,
                 weight=self.w3_w1_weight.view(weight_dtype),
                 input_scale=x_sf,
                 weight_scale=self.quant_scales[0],
-                group_offset=group_offset,
+                group_offset=expert_first_token_offset,
             )
         else:
             x = cute_dsl_fp8_group_blockwise_gemm_ref(
@@ -638,7 +627,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 weight=self.w2_weight.view(weight_dtype),
                 input_scale=x_sf,
                 weight_scale=self.quant_scales[1],
-                group_offset=group_offset,
+                group_offset=expert_first_token_offset,
             )
         else:
             x = cute_dsl_fp8_group_blockwise_gemm_ref(

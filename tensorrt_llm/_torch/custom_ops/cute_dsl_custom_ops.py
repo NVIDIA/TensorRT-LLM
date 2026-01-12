@@ -2669,12 +2669,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
             0, 0, get_last_power_of_2_num_tokens_buckets,
             last_positive_power_of_2), ),
-                                     constraint_specs=(
-                                         ConstraintSpec(2, 1,
-                                                        fp8_scale_infer_shape),
-                                         ConstraintSpec(
-                                             4, 0, lambda shapes: shapes[0][0]),
-                                     ))
+                                     constraint_specs=(ConstraintSpec(
+                                         2, 1, fp8_scale_infer_shape), ))
 
         def __init__(self):
             super().__init__()
@@ -2696,6 +2692,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # [group_size, n, k]
             group_size, n, k = inputs[1].shape[0], inputs[1].shape[1], inputs[
                 1].shape[2]
+            batch_size = 1
             # m,k
             a_major = "k"
             # n, k
@@ -2752,7 +2749,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     inputs[1]: Weight tensor of shape (group_size, n, k), dtype: fp8.
                     inputs[2]: Input scale tensor of shape (k // 128, m), dtype: fp32.
                     inputs[3]: Weight scale tensor of shape (group_size, n // 128, k // 128), dtype: fp32.
-                    inputs[4]: Group offset tensor of shape (m), dtype: int32.
+                    inputs[4]: Group offset tensor of shape (group_size + 1), dtype: int32.
                 tactic: Tiling and cluster strategy, typically a tuple (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn).
 
             Returns:

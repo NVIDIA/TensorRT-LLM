@@ -302,6 +302,8 @@ def fp4_unswizzled_scale_infer_shape(input_shapes: List[List[int]]):
 
 
 def fp8_scale_infer_shape(input_shapes: List[List[int]]):
+    """Calculate the dimensions of the fp8 scale tensor.
+    """
     input_shape = input_shapes[0]
     assert len(input_shape) == 2 or len(input_shape) == 3
     has_batch = len(input_shape) == 3
