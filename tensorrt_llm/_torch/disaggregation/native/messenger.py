@@ -150,7 +150,7 @@ class ZMQMessenger(MessengerInterface):
             poller.register(self._control_socket, zmq.POLLIN)
 
             while not self._stop_event.is_set():
-                events = dict(poller.poll())
+                events = dict(poller.poll(timeout=100))
                 try:
                     if self._control_socket in events:
                         self._stop_event.set()
