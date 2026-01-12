@@ -32,7 +32,7 @@ from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.executor import (GenerationExecutorWorker, GenerationRequest,
                                    GenerationResult, LoRARequest,
                                    PromptAdapterRequest, RequestError)
-from tensorrt_llm.llmapi import (BuildCacheConfig, Eagle3DecodingConfig,
+from tensorrt_llm.llmapi import (BuildCacheConfig, EagleDecodingConfig,
                                  KvCacheConfig, KvCacheRetentionConfig,
                                  LookaheadDecodingConfig, MedusaDecodingConfig,
                                  RequestOutput)
@@ -1293,7 +1293,7 @@ def test_llm_api_eagle(**llm_kwargs):
 
     kv_cache_config = KvCacheConfig(enable_block_reuse=True)
 
-    speculative_config = Eagle3DecodingConfig(
+    speculative_config = EagleDecodingConfig(
         max_draft_len=63,
         speculative_model=get_model_path("EAGLE-Vicuna-7B-v1.3"),
         num_eagle_layers=4,
@@ -1340,7 +1340,7 @@ def test_llm_api_eagle2(**llm_kwargs):
 
     kv_cache_config = KvCacheConfig(enable_block_reuse=True)
 
-    speculative_config = Eagle3DecodingConfig(
+    speculative_config = EagleDecodingConfig(
         max_draft_len=63,
         speculative_model=get_model_path("EAGLE-Vicuna-7B-v1.3"),
         num_eagle_layers=4,
