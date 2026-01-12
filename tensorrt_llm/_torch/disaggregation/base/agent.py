@@ -1,123 +1,80 @@
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Enum, List, Tuple, Union
+from typing import List, Tuple, Union
 
-from tensorrt_llm.logger import logger
-
-# Try to import C++ bindings for zero-copy performance
-try:
-    from tensorrt_llm.tensorrt_llm_transfer_agent_binding import (
-        BaseTransferAgent,
-        MemoryDesc,
-        MemoryDescs,
-        MemoryType,
-        TransferOp,
-        TransferRequest,
-        TransferStatus,
-    )
-
-    _CPP_BINDING_AVAILABLE = True
-except ImportError:
-    _CPP_BINDING_AVAILABLE = False
-    logger.warning(
-        "C++ transfer agent bindings not available. "
-        "Falling back to Python implementations which may have lower performance."
-    )
+from tensorrt_llm import logger
 
 
-def is_cpp_binding_available() -> bool:
-    """Check if C++ transfer agent bindings are available."""
-    return _CPP_BINDING_AVAILABLE
+# We deliberately use a non-enum data structure here. This choice ensures that
+# members are directly equivalent to the plain strings.
+class TransferOp:
+    READ = "READ"
+    WRITE = "WRITE"
 
 
-# Fallback Python implementations when C++ bindings not available
-if not _CPP_BINDING_AVAILABLE:
+class MemoryType:
+    DRAM = "DRAM"
+    VRAM = "VRAM"
+    BLK = "BLK"
+    OBJ = "OBJ"
+    FILE = "FILE"
 
-    class TransferOp(Enum):
-        READ = "READ"
-        WRITE = "WRITE"
 
-    class MemoryType(Enum):
-        DRAM = "DRAM"
-        VRAM = "VRAM"
-        BLK = "BLK"
-        OBJ = "OBJ"
-        FILE = "FILE"
+@dataclass
+class MemoryDesc:
+    ptr: int
+    size: int
+    device_id: int
 
-    @dataclass
-    class MemoryDesc:
-        ptr: int
-        size: int
-        device_id: int
 
-    @dataclass
-    class MemoryDescs:
-        type: str
-        descs: List[Union[Tuple[int, int, int], MemoryDesc]]
+@dataclass
+class MemoryDescs:
+    type: str
+    descs: List[Union[Tuple[int, int, int], MemoryDesc]]
 
-    @dataclass
-    class TransferRequest:
-        op: TransferOp
-        src_descs: MemoryDescs
-        dst_descs: MemoryDescs
-        remote_name: str
-        sync_message: str
 
-    class TransferStatus(ABC):
-        @abstractmethod
-        def is_completed(self) -> bool: ...
+@dataclass
+class TransferRequest:
+    op: TransferOp
+    src_descs: MemoryDescs
+    dst_descs: MemoryDescs
+    remote_name: str
+    sync_message: str
 
-        @abstractmethod
-        def wait(self, timeout: float | None = None) -> None: ...
 
-    class BaseTransferAgent(ABC):
-        @abstractmethod
-        def register_memory(self, descs: MemoryDescs) -> None:
-            """Register a set of memory descriptors on the agent."""
-            ...
+class TransferStatus(ABC):
+    @abstractmethod
+    def is_completed(self) -> bool: ...
 
-        @abstractmethod
-        def deregister_memory(self, descs: MemoryDescs) -> None:
-            """De-register a set of memory descriptors on the agent."""
-            ...
+    @abstractmethod
+    def wait(self, timeout: float | None = None) -> None: ...
 
-        @abstractmethod
-        def load_remote_agent(self, name: str, agent_desc: str) -> None:
-            """
-            Load information about a remote agent specified by name.
 
-            Args:
-                name (str): The remote agent's identifier.
-                agent_desc (str): A serialized description of the agent.
-            """
-            ...
+class BaseTransferAgent(ABC):
+    @abstractmethod
+    def register_memory(self, descs: MemoryDescs) -> None: ...
 
-        @abstractmethod
-        def get_local_agent_desc(self) -> str:
-            """Return the serialized description of this agent."""
-            ...
+    @abstractmethod
+    def deregister_memory(self, descs: MemoryDescs) -> None: ...
 
-        @abstractmethod
-        def invalidate_remote_agent(self, name: str) -> None:
-            """Invalidate any cached information about the specified remote agent."""
-            ...
+    @abstractmethod
+    def load_remote_agent(self, name: str, agent_desc: str) -> None: ...
 
-        @abstractmethod
-        def submit_transfer_requests(self, request: TransferRequest) -> TransferStatus:
-            """Submit transfer tasks to the agent based on a request."""
-            ...
+    @abstractmethod
+    def get_local_agent_desc(self) -> str: ...
 
-        @abstractmethod
-        def notify_sync_message(self, name: str, sync_message: str) -> None:
-            """Send a synchronization message to the specified remote agent."""
-            ...
+    @abstractmethod
+    def invalidate_remote_agent(self, name: str) -> None: ...
 
-        @abstractmethod
-        def check_remote_descs(self, name: str, memory_descs: List[int]) -> bool:
-            """
-            Verify the remote agent's memory descriptors.
-            """
-            ...
+    @abstractmethod
+    def submit_transfer_requests(self, request: TransferRequest) -> TransferStatus: ...
+
+    @abstractmethod
+    def notify_sync_message(self, name: str, sync_message: str) -> None: ...
+
+    @abstractmethod
+    def check_remote_descs(self, name: str, memory_descs: List[int]) -> bool: ...
 
 
 # RegMemoryDescs is Python-only (used for registration with name field)
@@ -125,3 +82,45 @@ if not _CPP_BINDING_AVAILABLE:
 class RegMemoryDescs:
     type: str
     descs: List[Tuple[int, int, int, str]]
+
+
+def _force_py_nixl_kv_transfer() -> bool:
+    res = os.getenv("TRTLLM_USE_PY_NIXL_KVCACHE", "0") == "1"
+    if res:
+        logger.info("Forcing use of pure Python NIXL KV Transfer Agent implementation.")
+    return res
+
+
+def _try_load_cpp_binding():
+    try:
+        import tensorrt_llm.tensorrt_llm_transfer_agent_binding as _cpp_binding
+
+        required_attributes = [
+            "MemoryType",
+            "TransferOp",
+            "MemoryDesc",
+            "MemoryDescs",
+            "TransferRequest",
+            "TransferStatus",
+            "BaseTransferAgent",
+        ]
+        if all(hasattr(_cpp_binding, attr) for attr in required_attributes):
+            return _cpp_binding
+    except ImportError:
+        logger.info("tensorrt_llm_transfer_agent_binding module not found.")
+    return None
+
+
+_cpp_binding = _try_load_cpp_binding()
+
+if _cpp_binding and not _force_py_nixl_kv_transfer():
+    MemoryType = _cpp_binding.MemoryType
+    TransferOp = _cpp_binding.TransferOp
+    MemoryDesc = _cpp_binding.MemoryDesc
+    MemoryDescs = _cpp_binding.MemoryDescs
+    TransferRequest = _cpp_binding.TransferRequest
+    TransferStatus = _cpp_binding.TransferStatus
+    BaseTransferAgent = _cpp_binding.BaseTransferAgent
+    logger.info("Using Pybind transfer agent binding for Transfer Agent implementation.")
+else:
+    logger.info("Failed to import Pybind transfer agent binding, using pure Python implementation.")
