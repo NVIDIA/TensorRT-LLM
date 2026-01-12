@@ -3351,7 +3351,6 @@ def update_llm_args_with_extra_dict(
         "attention_dp_config": AttentionDpConfig,
         "sparse_attention_config": BaseSparseAttentionConfig,
         "kv_cache_config": KvCacheConfig,
-        "ray_placement_config": RayPlacementConfig,
     }
     for field_name, field_type in field_mapping.items():
         if field_name in llm_args_dict:
