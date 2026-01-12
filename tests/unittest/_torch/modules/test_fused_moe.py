@@ -2531,7 +2531,7 @@ def test_fused_moe_wfp4a16(dtype, hidden_size, moe_backend,
         check_accuracy(output, ref_output, rtol=1e-2, atol=0.1, percent=0.99)
 
 
-@skip_pre_hopper
+@skip_non_hopper_unittest
 @pytest.mark.parametrize("experts", [8, 128])
 @pytest.mark.parametrize(
     "hidden_size, intermediate_size",
@@ -2547,10 +2547,8 @@ def test_fused_moe_wfp4a16(dtype, hidden_size, moe_backend,
 @pytest.mark.parametrize("dynamic_quant", [True, False])
 def test_fused_moe_triton_mxfp4(experts, hidden_size, intermediate_size,
                                 fp8_activation, bias, dynamic_quant):
-    if torch.cuda.get_device_capability()[0] < 10 and fp8_activation:
+    if fp8_activation:
         pytest.skip("Latest Triton requires BF16 activation on Hopper")
-    if torch.cuda.get_device_capability()[0] >= 10 and not fp8_activation:
-        pytest.skip("Latest Triton requires FP8 activation on Blackwell")
 
     mapping = Mapping()
     mapping.rank = mpi_rank()
