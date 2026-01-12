@@ -212,7 +212,7 @@ def submit_job(config, log_dir, dry_run):
         # Create base log directory path
         date_prefix = datetime.now().strftime("%Y%m%d")
         log_base = os.path.join(env_config['work_dir'],
-                                f"{date_prefix}/{isl}-{osl}")
+                                f"logs/{date_prefix}/{isl}-{osl}")
 
         # Get eplb num_slots for gen worker
         load_balancer_config = worker_config['gen'].get('moe_config', {}).get(
@@ -340,23 +340,25 @@ def submit_job(config, log_dir, dry_run):
         f"--container-mounts={env_config['container_mount']}",
         f"--mpi=pmix --overlap -N 1 -n 1",
     ]
+    env_var = config['benchmark'].get('env_var', '')
+    benchmark_prefix = client_slurm_prefix + [f"--export \"{env_var}\""]
     if benchmark_config['use_nv_sa_benchmark']:
         benchmark_cmd = [
             f"bash {env_config['work_dir']}/run_benchmark_nv_sa.sh",
             f"'{env_config['model_path']}' {isl} {osl} {benchmark_config['benchmark_ratio']} {benchmark_config['multi_round']} {gen_num} '{benchmark_config['concurrency_list']}' {benchmark_config['streaming']} '{log_dir}' {disagg_server_hostname} {disagg_server_port}",
             f"&> {log_dir}/6_bench.log"
         ]
-        client_cmds.append(" ".join(client_slurm_prefix + benchmark_cmd))
+        client_cmds.append(" ".join(benchmark_prefix + benchmark_cmd))
     else:
         benchmark_cmd = [
             f"bash {env_config['work_dir']}/run_benchmark.sh",
             f"'{env_config['model_path']}' '{benchmark_config['dataset_file']}' {benchmark_config['multi_round']} {gen_num} '{benchmark_config['concurrency_list']}' {benchmark_config['streaming']} '{log_dir}' {disagg_server_hostname} {disagg_server_port}",
             f"&> {log_dir}/6_bench.log"
         ]
-        client_cmds.append(" ".join(client_slurm_prefix + benchmark_cmd))
+        client_cmds.append(" ".join(benchmark_prefix + benchmark_cmd))
     if config['accuracy']['enable_accuracy_test']:
-        install_dep_cmd = "pip3 install lm_eval[api]==0.4.9.2"
-        client_cmds.append(" ".join(client_slurm_prefix) + " " + install_dep_cmd)
+        env_var = config['accuracy'].get('env_var', '')
+        accuracy_prefix = client_slurm_prefix + [f"--export \"{env_var}\""]
         for task in config['accuracy']['tasks']:
             extra_kwargs = config['accuracy']['tasks'][task].get('extra_kwargs', {})
             extra_kwargs_str = ""
@@ -381,7 +383,7 @@ def submit_job(config, log_dir, dry_run):
                 extra_kwargs_str,
                 f"&> {log_dir}/7_accuracy_eval_{task}.log"
             ]
-            client_cmds.append(" ".join(client_slurm_prefix + accuracy_cmd))
+            client_cmds.append(" ".join(accuracy_prefix + accuracy_cmd))
     with open(os.path.join(log_dir, "client_cmds.sh"), "w") as f:
         f.write("\n".join(client_cmds) + "\n")
 
