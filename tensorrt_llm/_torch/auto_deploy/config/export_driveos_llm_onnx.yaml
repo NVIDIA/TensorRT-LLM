@@ -28,6 +28,8 @@ transforms:
     stage: pattern_matcher
   match_dense_moe_pattern:
     stage: pattern_matcher
+  match_bmm_moe_pattern:
+    stage: pattern_matcher
   match_repeat_kv:
     stage: pattern_matcher
     run_shape_prop: true
@@ -94,7 +96,13 @@ transforms:
     stage: post_load_fusion
     enabled: true
     backend: trtllm
-
+  fuse_fp8_moe:
+    stage: post_load_fusion
+    enabled: true
+    backend: trtllm
+  fuse_nvfp4_moe:
+    stage: post_load_fusion
+    enabled: false
   ############################################################################################
   # VISUALIZE GRAPH
   ############################################################################################
@@ -112,7 +120,6 @@ transforms:
     stage: export_onnx
   adapt_to_driveos_llm:
     stage: export_onnx
-    requires_clean_graph: true
   export_to_onnx:
     stage: export_onnx
     output_dir: "."
