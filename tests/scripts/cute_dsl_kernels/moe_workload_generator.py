@@ -1,10 +1,12 @@
 import json
 import os
+from typing import List, Optional
 
 import click
 import safetensors.torch
 import torch
 
+from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import GroupedGemmInputsHelper
 from tensorrt_llm.tools.layer_wise_benchmarks.runner_utils import (
     get_balanced_selection_impl_default,
     get_balanced_selection_impl_random,
@@ -47,32 +49,43 @@ def gen_moe_workload(
     top_k: int,
     num_experts: int,
     ep_size: int,
+    num_tokens_per_expert: Optional[List[int]],
     tile_size: int,
     method: str = "balanced_random",
 ):
-    if method == "balanced_random":
-        get_balanced_selection_impl = get_balanced_selection_impl_random
-    elif method == "balanced_default":
-        get_balanced_selection_impl = get_balanced_selection_impl_default
-    elif method == "balanced_default_legacy":
-        get_balanced_selection_impl = get_balanced_selection_impl_default_legacy
-    else:
-        raise ValueError(f"Invalid method: {method}.")
-
-    token_selected_experts = [
-        get_balanced_selection_impl(
-            num_tokens=num_tokens,
-            top_k=top_k,
-            num_experts=num_experts,
-            dtype=torch.int32,
-            device="cuda",
-            dp_size=ep_size,
-            dp_rank=i,
-            ep_size=ep_size,
+    if num_tokens_per_expert is not None:
+        num_local_experts = len(num_tokens_per_expert)
+        assert num_local_experts * ep_size == num_experts
+        helper = GroupedGemmInputsHelper(num_experts, top_k, num_local_experts, 0, tile_size)
+        token_selected_experts = helper.generate_token_selected_experts(
+            num_tokens * ep_size, num_tokens_per_expert
         )
-        for i in range(ep_size)
-    ]
-    token_selected_experts = torch.cat(token_selected_experts, dim=0)
+        token_selected_experts = token_selected_experts.cuda()
+    else:
+        if method == "balanced_random":
+            get_balanced_selection_impl = get_balanced_selection_impl_random
+        elif method == "balanced_default":
+            get_balanced_selection_impl = get_balanced_selection_impl_default
+        elif method == "balanced_default_legacy":
+            get_balanced_selection_impl = get_balanced_selection_impl_default_legacy
+        else:
+            raise ValueError(f"Invalid method: {method}.")
+
+        token_selected_experts = [
+            get_balanced_selection_impl(
+                num_tokens=num_tokens,
+                top_k=top_k,
+                num_experts=num_experts,
+                dtype=torch.int32,
+                device="cuda",
+                dp_size=ep_size,
+                dp_rank=i,
+                ep_size=ep_size,
+            )
+            for i in range(ep_size)
+        ]
+        token_selected_experts = torch.cat(token_selected_experts, dim=0)
+
     assert token_selected_experts.size() == (num_tokens * ep_size, top_k)
     token_final_scales = torch.ones_like(token_selected_experts, dtype=torch.float32)
     return torch.ops.trtllm.moe_sort(
@@ -91,6 +104,7 @@ def gen_moe_workload(
 @click.option("--top_k", type=int, default=8)
 @click.option("--num_experts", type=int, default=256)
 @click.option("--ep_size", type=int, default=32)
+@click.option("--num_tokens_per_expert", type=str, default=None)
 @click.option("--tile_size", type=click.Choice([128, 256]), default=128)
 @click.option(
     "--method",
@@ -104,12 +118,16 @@ def main(
     top_k: int,
     num_experts: int,
     ep_size: int,
+    num_tokens_per_expert: str,
     tile_size: int,
     method: str,
     seed: int,
     output_path: str,
 ):
     torch.manual_seed(seed)
+
+    if num_tokens_per_expert is not None:
+        num_tokens_per_expert = [int(x) for x in num_tokens_per_expert.split(",")]
 
     (
         tile_idx_to_group_idx,
@@ -123,6 +141,7 @@ def main(
         top_k=top_k,
         num_experts=num_experts,
         ep_size=ep_size,
+        num_tokens_per_expert=num_tokens_per_expert,
         tile_size=tile_size,
         method=method,
     )

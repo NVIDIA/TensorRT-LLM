@@ -121,8 +121,7 @@ class GroupedGemmInputsHelper:
         for j, num_tokens_j in enumerate(num_tokens_per_expert):
             selection_order_j = selection_orders[j].tolist()
             prioritized = torch.nonzero(num_selected_experts <= (
-                self.top_k -
-                (self.num_local_experts - j))).squeeze(-1).tolist()
+                self.top_k - (self.num_experts - j))).squeeze(-1).tolist()
             if len(prioritized) > 0:
                 selection_order_j = prioritized + [
                     i for i in selection_order_j if i not in prioritized
