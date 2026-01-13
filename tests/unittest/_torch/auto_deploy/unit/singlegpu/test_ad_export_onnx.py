@@ -2,30 +2,27 @@ import os
 
 import onnx
 import pytest
+from _model_test_utils import get_small_model_config
 
 from tensorrt_llm._torch.auto_deploy import LLM, AutoDeployConfig
 
 
 @pytest.mark.parametrize(
-    "model, max_batch_size, max_seq_len, output_dir, num_attn_ops",
+    "model, output_dir, num_attn_ops",
     [
         (
-            "/home/scratch.trt_llm_data/llm-models/Qwen2.5-0.5B-Instruct",
-            13,
-            4,
-            "/tmp/test_ad_export_onnx_qwen2.5-0.5b",
-            24,
+            "Qwen/Qwen2.5-3B-Instruct",
+            "/tmp/test_ad_export_onnx_qwen2.5-3b",
+            36,
         ),
     ],
 )
-def test_ad_export_onnx(
-    model: str, max_batch_size: int, max_seq_len: int, output_dir: str, num_attn_ops: int
-):
+def test_ad_export_onnx(model: str, output_dir: str, num_attn_ops: int):
     ad_config = AutoDeployConfig(
-        model=model,
+        model=get_small_model_config(model)["args"]["model"],
         mode="export_driveos_llm_onnx",
-        max_batch_size=max_batch_size,
-        max_seq_len=max_seq_len,
+        max_batch_size=13,
+        max_seq_len=4,
     )
     ad_config.transforms["export_to_onnx"]["output_dir"] = output_dir
     _ = LLM(**ad_config.to_llm_kwargs())
