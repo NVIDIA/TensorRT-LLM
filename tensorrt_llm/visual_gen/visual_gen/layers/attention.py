@@ -98,7 +98,6 @@ class ditAttnProcessor:
     @ulysses_wrapper
     @cp_wrapper
     @joint_sequence_wrapper
-    # @torch.cuda.nvtx.range("ditAttn.visual_gen_attn")
     def visual_gen_attn(
         self,
         query,

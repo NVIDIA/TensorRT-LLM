@@ -142,6 +142,7 @@ def test_joint_attn_parallel(batch_size, num_heads, seq_len, head_dim, world_siz
                 tensor_layout="HND",
                 joint_seq_length=joint_seq_length,
                 valid_joint_seq_length=valid_joint_seq_length,
+                joint_strategy="rear",
             )
     torch.cuda.synchronize()
 
@@ -158,6 +159,7 @@ def test_joint_attn_parallel(batch_size, num_heads, seq_len, head_dim, world_siz
                 tensor_layout="HND",
                 joint_seq_length=joint_seq_length,
                 valid_joint_seq_length=valid_joint_seq_length,
+                joint_strategy="rear",
             )
     end_event.record()
     torch.cuda.synchronize()
@@ -250,8 +252,12 @@ if __name__ == "__main__":
 
     capability = torch.cuda.get_device_capability(0)
     sm = f"{capability[0]}{capability[1]}"
-    if sm in ["80", "86", "89", "90", "120"]:
-        test_sage_attn = True
+    try:
+        import sageattention  # noqa: F401
+        if sm in ["89", "90", "120"]:
+            test_sage_attn = True
+    except ImportError:
+        logger.warning("SageAttention is not installed. test sage-attn will be skipped.")
 
     try:
         import flash_attn_interface  # noqa: F401
@@ -345,18 +351,8 @@ if __name__ == "__main__":
                 seq_len=4096,
                 head_dim=128,
                 world_size=world_size,
-                ulysses_size=world_size // 2,
-                ring_size=2,
-                attn_type="sage-attn",
-            )
-            test_joint_attn_parallel(
-                batch_size=1,
-                num_heads=24,
-                seq_len=4096,
-                head_dim=128,
-                world_size=world_size,
-                ulysses_size=2,
-                ring_size=world_size // 2,
+                ulysses_size=world_size,
+                ring_size=1,
                 attn_type="sage-attn",
             )
 

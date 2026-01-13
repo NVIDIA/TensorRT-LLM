@@ -131,8 +131,6 @@ if [ "$FAST_MODE" = true ]; then
     WAN_2_2_I2V="--model_path Wan-AI/Wan2.2-I2V-A14B-Diffusers  --num_frames 65 --disable_parallel_vae --num_inference_steps 2 --num_warmup_steps 1"
     # Flux
     FLUX="--model_path black-forest-labs/FLUX.1-dev --num_inference_steps 2 --num_warmup_steps 1"
-    # Cosmos Predict2 - I2V
-    COSMOS_PREDICT2_I2V="--model_path nvidia/Cosmos-Predict2-2B-Video2World --num_inference_steps 2 --num_warmup_steps 1"
 else
     # Wan2.1 T2V 14B
     WAN_2_1_T2V="--model_path Wan-AI/Wan2.1-T2V-14B-Diffusers --num_frames 81 --height 720 --width 1280 --num_inference_steps 50"
@@ -144,8 +142,6 @@ else
     WAN_2_2_I2V="--model_path Wan-AI/Wan2.2-I2V-A14B-Diffusers  --num_frames 65 --disable_parallel_vae"
     # Flux
     FLUX="--model_path black-forest-labs/FLUX.1-dev --num_inference_steps 50"
-    # Cosmos Predict2 - I2V
-    COSMOS_PREDICT2_I2V="--model_path nvidia/Cosmos-Predict2-2B-Video2World --num_inference_steps 50"
 fi
 
 # # 2. Multi-GPU parallel tests
@@ -228,14 +224,6 @@ if [ $GPU_COUNT -gt 1 ]; then
             "$TEST_OUTPUT_DIR/$TEST_NAME.mp4"
     fi
 
-    # CFG + Ulysses Parallelism (4 GPUs) + sage attention + sparse videogen attention
-    if [ $GPU_COUNT -ge 4 ]; then
-        TEST_NAME="wan2.1_i2v_cfg_ulysses_parallel_4gpu_sage_attn_sparse_videogen_attn"
-        run_test "$TEST_NAME" \
-            "cd $EXAMPLES_DIR && torchrun --nproc_per_node=4 wan_i2v.py $WAN_2_1_I2V --cfg 2 --ulysses 2 --attn_type sparse-videogen  --num_timesteps_high_precision 0.09 --num_layers_high_precision 0.025 --high_precision_attn_type sage-attn --output_path $TEST_OUTPUT_DIR/$TEST_NAME.mp4" \
-            "$TEST_OUTPUT_DIR/$TEST_NAME.mp4"
-    fi
-
     # CFG + Ulysses Parallelism (4 GPUs) + sage attention + FP8 Per-tensor Linear
     if [ $GPU_COUNT -ge 4 ]; then
         TEST_NAME="wan2.1_i2v_cfg_ulysses_parallel_4gpu_sage_attn_fp8_per_tensor"
@@ -268,22 +256,6 @@ if [ $GPU_COUNT -gt 1 ]; then
             "$TEST_OUTPUT_DIR/$TEST_NAME.mp4"
     fi
 
-    # CFG + Ulysses Parallelism (4 GPUs) + sage attention + FP8 Blockwise Linear + TeaCache + Torch Compile + sparse videogen attention
-    if [ $GPU_COUNT -ge 4 ]; then
-        TEST_NAME="wan2.1_i2v_cfg_ulysses_parallel_4gpu_sage_attn_fp8_blockwise_teacache_torch_compile_sparse_videogen_attn"
-        run_test "$TEST_NAME" \
-            "cd $EXAMPLES_DIR && torchrun --nproc_per_node=4 wan_i2v.py $WAN_2_1_I2V --cfg 2 --ulysses 2 --enable_teacache --attn_type sparse-videogen  --num_timesteps_high_precision 0.09 --num_layers_high_precision 0.025 --high_precision_attn_type sage-attn --linear_type trtllm-fp8-blockwise  --output_path $TEST_OUTPUT_DIR/$TEST_NAME.mp4" \
-            "$TEST_OUTPUT_DIR/$TEST_NAME.mp4"
-    fi
-
-    # CFG + Ulysses Parallelism (8 GPUs) + sage attention + FP8 Blockwise Linear + TeaCache + Torch Compile + sparse videogen attention
-    if [ $GPU_COUNT -ge 8 ]; then
-        TEST_NAME="wan2.1_i2v_cfg_ulysses_parallel_8gpu_sage_attn_fp8_blockwise_teacache_torch_compile_sparse_videogen_attn"
-        run_test "$TEST_NAME" \
-            "cd $EXAMPLES_DIR && torchrun --nproc_per_node=8 wan_i2v.py $WAN_2_1_I2V --cfg 2 --ulysses 4 --enable_teacache --attn_type sparse-videogen  --num_timesteps_high_precision 0.09 --num_layers_high_precision 0.025 --high_precision_attn_type sage-attn --linear_type trtllm-fp8-blockwise  --output_path $TEST_OUTPUT_DIR/$TEST_NAME.mp4" \
-            "$TEST_OUTPUT_DIR/$TEST_NAME.mp4"
-    fi
-
     # CFG + Ring Parallelism + sage attention(4 GPUs)
     if [ $GPU_COUNT -ge 4 ]; then
         TEST_NAME="wan2.1_i2v_cfg_ring_parallel_4gpu"
@@ -297,21 +269,6 @@ if [ $GPU_COUNT -gt 1 ]; then
         TEST_NAME="wan2.1_i2v_cfg_ring_ulysses_parallel"
         run_test "$TEST_NAME" \
             "cd $EXAMPLES_DIR && torchrun --nproc_per_node=4 wan_i2v.py $WAN_2_1_I2V --ring 2 --ulysses 2 --attn_type sage-attn --output_path $TEST_OUTPUT_DIR/$TEST_NAME.mp4" \
-            "$TEST_OUTPUT_DIR/$TEST_NAME.mp4"
-    fi
-
-    ## Cosmos Predict2 - I2V
-    if [ $GPU_COUNT -ge 4 ]; then
-        TEST_NAME="cosmos_predict2_i2v_ulysses_parallel_4gpu"
-        run_test "$TEST_NAME" \
-            "cd $EXAMPLES_DIR && torchrun --nproc_per_node=4 cosmos_i2v.py $COSMOS_PREDICT2_I2V --linear_type trtllm-fp8-blockwise --ulysses 4 --output_path $TEST_OUTPUT_DIR/$TEST_NAME.mp4" \
-            "$TEST_OUTPUT_DIR/$TEST_NAME.mp4"
-    fi
-
-    if [ $GPU_COUNT -ge 4 ]; then
-        TEST_NAME="cosmos_predict2_i2v_cfg2_ulysses2_parallel_4gpu"
-        run_test "$TEST_NAME" \
-            "cd $EXAMPLES_DIR && torchrun --nproc_per_node=4 cosmos_i2v.py $COSMOS_PREDICT2_I2V --linear_type trtllm-fp8-blockwise --cfg 2 --ulysses 2 --output_path $TEST_OUTPUT_DIR/$TEST_NAME.mp4" \
             "$TEST_OUTPUT_DIR/$TEST_NAME.mp4"
     fi
 

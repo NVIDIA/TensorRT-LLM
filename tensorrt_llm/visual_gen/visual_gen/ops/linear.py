@@ -52,6 +52,7 @@ except ImportError:
     logger.warning("TensorRT-LLM nvfp4 kernel dependency import failed.")
 
 try:
+    import transformer_engine  # noqa: F401
     import transformer_engine.pytorch.cpp_extensions as ext
     import transformer_engine_torch as tex
     from transformer_engine.pytorch import MXFP8Quantizer
@@ -63,8 +64,8 @@ try:
         Float8CurrentScalingQuantizer,
         Float8Tensor,
     )
-except ImportError:
-    logger.warning("Transformer_engine is not installed")
+except ImportError as e:
+    logger.warning(f"Transformer_engine is not installed: {e}")
 
 
 try:
@@ -778,11 +779,11 @@ class DeepgemmFp8Linear(BaseLinear):
         n = weight.shape[0]
         output = torch.empty((b * m, n), device=input.device, dtype=input.dtype).contiguous()
 
-        input = input.reshape(b * m, k) 
+        input = input.reshape(b * m, k)
         input_fp8, input_scale = quant_and_transform_ue8m0(input)
         fp8_gemm_nt(
             (input_fp8, input_scale),
-            (weight, weight_scale),       
+            (weight, weight_scale),
             output,
             None, # bias
             disable_ue8m0_cast=False,

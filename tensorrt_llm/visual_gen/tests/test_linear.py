@@ -94,12 +94,12 @@ class TestditLinearPerformance:
 
         # Available linear implementations
         self.linear_impls = ["default"]
+        sm_version = get_compute_capability()
 
         # Add trtllm Linear layers if TensorRT-LLM is available
         try:
             import tensorrt_llm  # noqa: F401
 
-            sm_version = get_compute_capability()
             self.linear_impls.append("trtllm-fp8-per-tensor")
             if sm_version == "90":
                 self.linear_impls.append("trtllm-fp8-blockwise")
@@ -112,14 +112,15 @@ class TestditLinearPerformance:
         # Add transformer_engine layers
         try:
             import transformer_engine  # noqa: F401
-
-            sm_version = get_compute_capability()
-            self.linear_impls.append("te-fp8-per-tensor")
-            if sm_version == "90":
-                self.linear_impls.append("te-fp8-blockwise")
-            if sm_version == "100":
-                self.linear_impls.append("te-MXFP8-blockwise-32")
-            print("TransformerEngine available, adding TE fp8 implementation")
+            if "2.10.0" not in transformer_engine.__version__:
+                print("TransformerEngine 2.10.0 is required for TE fp8 tests")
+            else:
+                self.linear_impls.append("te-fp8-per-tensor")
+                if sm_version == "90":
+                    self.linear_impls.append("te-fp8-blockwise")
+                if sm_version == "100":
+                    self.linear_impls.append("te-MXFP8-blockwise-32")
+                print("TransformerEngine available, adding TE fp8 implementation")
         except ImportError:
             print("TransformerEngine not available, skipping TE fp8 tests")
 
@@ -135,10 +136,12 @@ class TestditLinearPerformance:
         # Add flashinfer layers
         try:
             import flashinfer  # noqa: F401
-
-            self.linear_impls.append("flashinfer-nvfp4-trtllm")
-            self.linear_impls.append("flashinfer-nvfp4-cudnn")
-            self.linear_impls.append("flashinfer-nvfp4-cutlass")
+            if sm_version in ["100", "103", "120"]:
+                self.linear_impls.append("flashinfer-nvfp4-trtllm")
+                self.linear_impls.append("flashinfer-nvfp4-cudnn")
+                self.linear_impls.append("flashinfer-nvfp4-cutlass")
+            else:
+                print(f"Flashinfer NVFP4 is not supported on SM {sm_version}")
         except ImportError:
             print("Flashinfer not available, skipping its tests")
 

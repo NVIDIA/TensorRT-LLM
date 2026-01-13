@@ -13,10 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+try:
+    from hyimage.models.vae import load_vae
+except ImportError:
+    print("HyImage is not found, skipping test")
+    exit(0)
+
 import torch
 import torch.distributed as dist
 from huggingface_hub import hf_hub_download
-from hyimage.models.vae import load_vae
 
 from visual_gen.models.vaes.Hunyuan_vae import ditHunyuanVAE2D
 

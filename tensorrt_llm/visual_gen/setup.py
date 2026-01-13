@@ -165,10 +165,20 @@ def svd_extension():
 
     return svd_extension
 
+def load_requirements(fname="requirements.txt"):
+    with open(fname, encoding="utf-8") as f:
+        lines = []
+        for line in f.read().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            lines.append(line)
+        return lines
 
 ext_modules = []
 if compile_svd:
     ext_modules.append(svd_extension())
+requirements = load_requirements()
 setup(
     name="visual_gen",
     version=get_version(),
@@ -177,24 +187,7 @@ setup(
     long_description_content_type="text/markdown",
     packages=find_packages(include=["visual_gen*"]),
     python_requires=">=3.8",
-    install_requires=[
-        "diffusers==0.36.0",
-        "transformers>=4.52.1",
-        "sentencepiece",
-        "accelerate>=1.7.0",
-        "ftfy>=6.3.1",
-        "imageio>=2.37.0",
-        "imageio-ffmpeg>=0.6.0",
-        "flashinfer-python>=0.4.1",
-        "packaging",
-        "torch>=1.13.0",
-        "torchao",
-        "einops",
-        "termcolor",
-        "ninja",
-        "pre-commit",
-        "nvidia-cutlass-dsl==4.3.0.dev0",
-    ],
+    install_requires=requirements,
     extras_require={
         "dev": [],
     },

@@ -64,9 +64,18 @@ Given a diffusion model implemented in native PyTorch or HuggingFace Diffusers p
 | nvidia/Cosmos-Predict2-14B-Text2Image | - | 14B | Text-to-image |
 | nvidia/Cosmos-1.0-Diffusion-7B-Text2World | - | 7B | Text-to-world |
 
+## 📚 Supported GPUs
+
+GPUs with arch `sm_89`, `sm_90`, `sm_100`, `sm_120` are supported. Other GPUs may work as well, but they have not been validated.
+
+You can run this CML to know your GPU's sm arch:
+```bash
+nvidia-smi --query-gpu=name,compute_cap
+```
+
 ## 🚀 Installation
 
-Recommended docker: `nvcr.io/nvidia/tensorrt-llm/release:1.1.0rc5`
+Recommended docker: `nvcr.io/nvidia/tensorrt-llm/release:1.1.0rc4`
 
 ### Install
 ```bash

@@ -13,14 +13,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pynvml
 import torch
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
 
 from visual_gen.layers.linear import ditLinear
-from visual_gen.utils.ops import LinearOpManager
+from visual_gen.configs.op_manager import LinearOpManager
+
+
+def get_compute_capability():
+    pynvml.nvmlInit()
+    handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+    cc = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
+    pynvml.nvmlShutdown()
+    return str(cc[0]) + str(cc[1])
+
 
 if __name__ == "__main__":
+    sm_version = get_compute_capability()
+    if sm_version != "120":
+        print(f"SVDQuant is only supported on SM 120, skipping test")
+        exit(0)
+
     hf_hub_download(
         repo_id="mit-han-lab/nunchaku-flux.1-dev",
         filename="svdq-fp4_r32-flux.1-dev.safetensors",
