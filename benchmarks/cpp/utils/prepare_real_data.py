@@ -30,7 +30,7 @@ def validate_output_len_dist(ctx, param, value):
 class DatasetConfig(BaseModel):
     """Dataset configurations."""
     """Name of the dataset on HuggingFace."""
-    name: str
+    name: Optional[str] = None
     """Config name of the dataset if existing."""
     config_name: Optional[str] = None
     """Split of the dataset. Typical values: train, validation, test. Setting to None will include all splits."""
@@ -57,6 +57,17 @@ class DatasetConfig(BaseModel):
             raise AssertionError("Either --prompt-key or --prompt must be set.")
         return self
 
+    @model_validator(mode='after')
+    def check_name_and_local_path(self) -> 'DatasetConfig':
+        if self.name and self.local_path:
+            raise AssertionError(
+                "--dataset-name and --dataset-local-path cannot be set at the same time."
+            )
+        if (not self.name) and (not self.local_path):
+            raise AssertionError(
+                "Either --dataset-name or --dataset-local-path must be set.")
+        return self
+
     @property
     def query(self):
         """Generate the query for HuggingFace `datasets.load_dataset()`"""
@@ -67,11 +78,19 @@ class DatasetConfig(BaseModel):
         else:
             return [first_arg]
 
+    @property
+    def display_name(self) -> str:
+        """Returns a human-readable identifier for error messages."""
+        # model_validator ensures exactly one of name or local_path is set
+        if self.name is not None:
+            return self.name
+        return self.local_path
+
     def get_prompt(self, req):
         """Get the prompt sentence from the given request."""
         if self.prompt_key:
             assert self.prompt_key in req, (
-                f"Dataset {self.name} does not have key '{self.prompt_key}'. "
+                f"Dataset {self.display_name} does not have key '{self.prompt_key}'. "
                 "Please set --prompt-key to one of the available keys: "
                 f"{req.keys()}")
             return req[self.prompt_key]
@@ -81,7 +100,7 @@ class DatasetConfig(BaseModel):
     def get_input(self, req):
         """Get the input sentence from the given request."""
         assert self.input_key in req, (
-            f"Dataset {self.name} does not have key '{self.input_key}'. "
+            f"Dataset {self.display_name} does not have key '{self.input_key}'. "
             "Please set --input-key to one of the available keys: "
             f"{req.keys()}")
         return req[self.input_key]
@@ -91,7 +110,7 @@ class DatasetConfig(BaseModel):
         image_keys = [self.image_key
                       ] + [f"{self.image_key}_{i}" for i in range(1, 8)]
         assert any(key in req for key in image_keys), (
-            f"Dataset {self.name} does not have key '{self.image_key}'. "
+            f"Dataset {self.display_name} does not have key '{self.image_key}'. "
             "Please set --dataset-image-key to one of the available keys: "
             f"{req.keys()}")
         images = []
@@ -106,11 +125,11 @@ class DatasetConfig(BaseModel):
             raise RuntimeError(
                 "--output-key is not set. Please either:\n"
                 "1. Define output length through --output-len-dist.\n"
-                f"2. If the dataset {self.name} has key for golden output and "
+                f"2. If the dataset {self.display_name} has key for golden output and "
                 "you wish to set output length to the length of the golden "
                 "output, set --output-key.")
         assert self.output_key in req, (
-            f"Dataset {self.name} does not have key '{self.output_key}'. "
+            f"Dataset {self.display_name} does not have key '{self.output_key}'. "
             "Please set --output-key to one of the available keys: "
             f"{req.keys()}")
         return req[self.output_key]
@@ -215,10 +234,7 @@ def load_dataset_from_local(dataset_config: DatasetConfig):
 
 
 @click.command()
-@click.option("--dataset-name",
-              required=True,
-              type=str,
-              help=f"Dataset name in HuggingFace.")
+@click.option("--dataset-name", type=str, help=f"Dataset name in HuggingFace.")
 @click.option("--dataset-config-name",
               type=str,
               default=None,

@@ -93,8 +93,9 @@ def run_benchmarks(
         )
         return NotImplementedError
 
+    dataset_names = ["ccdv/cnn_dailymail", "Open-Orca/1million-gpt-4"]
+
     prompt_datasets_args = [{
-        '--dataset-name': "ccdv/cnn_dailymail",
         '--dataset-local-path': f"{model_cache}/datasets/ccdv/cnn_dailymail",
         '--dataset-config-name': "3.0.0",
         '--dataset-split': "validation",
@@ -102,7 +103,6 @@ def run_benchmarks(
         '--dataset-prompt': "Summarize the following article:",
         '--dataset-output-key': "highlights"
     }, {
-        '--dataset-name': "Open-Orca/1million-gpt-4",
         '--dataset-local-path':
         "/datasets/1million-gpt-4/1M-GPT4-Augmented.parquet",
         '--dataset-split': "train",
@@ -112,9 +112,10 @@ def run_benchmarks(
     }]
 
     token_files = [
-        "prepared_" + s['--dataset-name'].replace('/', '_')
-        for s in prompt_datasets_args
+        "prepared_" + dataset_name.replace('/', '_')
+        for dataset_name in dataset_names
     ]
+
     max_input_lens = ["256", "20"]
     num_reqs = ["50", "10"]
     if model_name == "gpt":
