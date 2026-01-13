@@ -272,6 +272,9 @@ public:
     /// @param isReady Whether the request is ready to be received.
     virtual void sendReadySignal(LlmRequest::RequestIdType requestId, bool isReady);
 
+    /// @brief Check if the context request is ready to be received.
+    virtual bool checkContextRequestReady(LlmRequest const& llmRequest);
+
     /// @brief Destructor.
     virtual ~CacheSender();
 

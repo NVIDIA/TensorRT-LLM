@@ -481,6 +481,8 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .value("DISAGG_GENERATION_TRANS_IN_PROGRESS", tb::LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS)
         .value("DISAGG_GENERATION_TRANS_COMPLETE", tb::LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE)
         .value("DISAGG_CONTEXT_INIT_AND_TRANS", tb::LlmRequestState::kDISAGG_CONTEXT_INIT_AND_TRANS)
+        .value("DISAGG_CONTEXT_WAIT_SCHEDULE", tb::LlmRequestState::kDISAGG_CONTEXT_WAIT_SCHEDULE)
+        .value("DISAGG_GENERATION_WAIT_TOKENS", tb::LlmRequestState::kDISAGG_GENERATION_WAIT_TOKENS)
         .value("DISAGG_TRANS_ERROR", tb::LlmRequestState::kDISAGG_TRANS_ERROR);
 
     nb::class_<tr::MemoryCounters>(m, "MemoryCounters")
