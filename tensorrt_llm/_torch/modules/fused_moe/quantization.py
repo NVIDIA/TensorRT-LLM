@@ -531,9 +531,13 @@ class FusedMoEMethodBase(ABC):
 
     def pre_reload_weights(self, module: torch.nn.Module):
         for param_name, metadata in module.rebuild_tensor_metadata.items():
-            param = torch.nn.Parameter(torch.empty_like(metadata),
+            logger.warning(
+                f"Pre-reloading weight '{param_name}' requires tensor re-creation, which will invalidate existing CUDA graphs."
+            )
+            param = torch.nn.Parameter(torch.empty_like(metadata,
+                                                        device="cuda"),
                                        requires_grad=False)
-            setattr(module, param_name, param)
+            module.register_parameter(param_name, param)
 
 
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
