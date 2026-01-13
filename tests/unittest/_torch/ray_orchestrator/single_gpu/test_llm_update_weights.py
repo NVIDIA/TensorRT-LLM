@@ -1,4 +1,7 @@
 from typing import Callable, List, Optional
+import base64
+import io
+import pickle
 
 import pytest
 import torch
@@ -8,6 +11,7 @@ from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM
 from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
+from tensorrt_llm.llmapi.rlhf_utils import RestrictedUnpickler
 
 
 class HFModel:
@@ -68,6 +72,40 @@ class HFModel:
                 handle = reduce_tensor(p)
                 all_handles.append((name, handle))
             ret[self.device_uuid[device]] = all_handles
+
+        return ret
+
+    def get_weight_ipc_handles_serialized(
+        self,
+        cuda_device: Optional[List[int]] = None,
+        weight_filter: Optional[Callable[[str], bool]] = None,
+    ):
+        """
+        Get base64-encoded serialized IPC handles for model weights.
+
+        Args:
+            cuda_device: List of CUDA device indices to get weights from
+            weight_filter: Optional function that takes weight name and returns True if weight should be included
+
+        Returns:
+            ret: Dictionary mapping device UUIDs to base64-encoded pickled handles
+        """
+        ret = {}
+        device_list = list(range(torch.cuda.device_count())) if cuda_device is None else cuda_device
+
+        for device in device_list:
+            all_handles = []
+            for item in self.all_weights[device]:
+                name, p = item
+                # Apply filter if provided
+                if weight_filter is not None and not weight_filter(name):
+                    continue
+                handle = reduce_tensor(p)
+                all_handles.append((name, handle))
+            
+            # Serialize with base64-encoded pickle
+            serialized = base64.b64encode(pickle.dumps(all_handles)).decode('utf-8')
+            ret[self.device_uuid[device]] = serialized
 
         return ret
 
@@ -151,6 +189,57 @@ def run_generate(llm, hf_model, prompts, sampling_params):
     generated_token_ids_list = extract_tokens_from_outputs(outputs)
     ref_logits = hf_model.generate_batch_incremental(prompts, generated_token_ids_list)
     return llm_logits, ref_logits
+
+
+@pytest.mark.parametrize(
+    "model_dir",
+    ["Qwen2.5-0.5B-Instruct"],
+)
+def test_llm_update_weights_with_serialized_handles(model_dir):
+    """Test LLM update_weights with base64-encoded serialized handles (RestrictedUnpickler)."""
+    model_dir = str(llm_models_root() / model_dir)
+    kv_cache_config = KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.1)
+
+    hf_model = HFModel(model_dir)
+
+    llm = LLM(
+        model=model_dir,
+        ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
+        tensor_parallel_size=1,
+        load_format="dummy",
+        pipeline_parallel_size=1,
+        kv_cache_config=kv_cache_config,
+    )
+
+    prompts = [
+        "Hello, my name is",
+        "The president of the United States is",
+    ]
+
+    sampling_params = SamplingParams(temperature=0, return_generation_logits=True)
+
+    # Use the serialized format (base64-encoded pickle)
+    ipc_handles_serialized = hf_model.get_weight_ipc_handles_serialized([0])
+    
+    # Verify the format is correct (should be base64-encoded strings)
+    for device_uuid, serialized_data in ipc_handles_serialized.items():
+        assert isinstance(serialized_data, str), "Should be base64-encoded string"
+        # Verify it can be decoded
+        decoded = base64.b64decode(serialized_data)
+        # Verify it can be deserialized with RestrictedUnpickler
+        deserialized = RestrictedUnpickler(io.BytesIO(decoded)).load()
+        assert isinstance(deserialized, list), "Should deserialize to list"
+
+    # Update weights using the serialized format
+    llm._collective_rpc("update_weights", (ipc_handles_serialized,))
+    # Finalize the update weights
+    llm._collective_rpc("update_weights", (None,))
+
+    # Verify generation works with updated weights
+    llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
+    compare_logits(llm_logits, ref_logits)
+    
+    print("✓ LLM update_weights with serialized handles (RestrictedUnpickler) works!")
 
 
 @pytest.mark.parametrize(
