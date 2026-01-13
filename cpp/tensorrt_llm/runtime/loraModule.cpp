@@ -65,6 +65,10 @@ std::vector<LoraModule> LoraModule::createLoraModules(std::vector<std::string> c
         case ModuleType::kMOE_ROUTER: modules.emplace_back(t, hidden, numExperts, false, true, -1, -1); break;
         case ModuleType::kMLP_ROUTER: modules.emplace_back(t, hidden, 1, false, true, -1, -1); break;
         case ModuleType::kMLP_GATE_UP: modules.emplace_back(t, hidden, 2 * mlpHidden, false, true, -1, 0); break;
+        // Mamba module types - in_proj projects to a larger dimension (column parallel)
+        // out_proj projects back to hidden size (row parallel)
+        case ModuleType::kMAMBA_IN_PROJ: modules.emplace_back(t, hidden, mlpHidden, false, true, -1, 0); break;
+        case ModuleType::kMAMBA_OUT_PROJ: modules.emplace_back(t, mlpHidden, hidden, false, true, 1, -1); break;
         case ModuleType::kINVALID: throw std::runtime_error("Invalid LoRA module " + moduleName);
         }
     }

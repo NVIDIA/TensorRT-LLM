@@ -640,7 +640,14 @@ class ModelConfig(Generic[TConfig]):
 
     def get_num_attention_layers(self):
         if is_nemotron_hybrid(self.pretrained_config):
-            return self.pretrained_config.hybrid_override_pattern.count("*")
+            # For Nemotron-H, return count of attention + MoE + Mamba layers for LoRA support
+            # This is needed because C++ PeftCacheManager validates layer IDs against this count
+            # Attention ("*"), MoE ("E"), and Mamba ("M") layers can have LoRA adapters
+            pattern = self.pretrained_config.hybrid_override_pattern
+            num_attention = pattern.count("*")
+            num_moe = pattern.count("E")
+            num_mamba = pattern.count("M")
+            return num_attention + num_moe + num_mamba
         elif hasattr(
                 self.pretrained_config, "architectures"
         ) and self.pretrained_config.architectures is not None and self.pretrained_config.architectures[

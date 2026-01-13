@@ -245,6 +245,9 @@ class LoraModelConfig:
     hidden_size: int
     dtype: str
     swap_gate_up_proj_lora_b_weight: bool = True
+    # For hybrid models (e.g., Nemotron-H), maps global layer indices to attention-layer indices
+    # This is needed because C++ PeftCacheManager validates layer IDs against num_attention_layers
+    layer_index_map: Optional[Dict[int, int]] = None
 
 
 class HfLoraLoader:
@@ -658,6 +661,9 @@ class LoraManager(object):
         "moe_router": 16,
         "mlp_router": 17,
         "mlp_gate_up": 18,
+        # Mamba module types
+        "mamba_in_proj": 19,
+        "mamba_out_proj": 20,
     }
 
     def __init__(
@@ -1156,9 +1162,29 @@ class LoraManager(object):
                         weights_to_concat.append(t_mag_cpu)
 
                     self._cpp_lora_weights[uid].append(torch.cat(weights_to_concat))
+                    # For hybrid models, remap global layer index to attention-layer index
+                    # since C++ PeftCacheManager validates against num_attention_layers
+                    config_layer_idx = layer_idx
+                    if (
+                        hasattr(model_config, "layer_index_map")
+                        and model_config.layer_index_map is not None
+                    ):
+                        if layer_idx in model_config.layer_index_map:
+                            config_layer_idx = model_config.layer_index_map[layer_idx]
+                        else:
+                            raise ValueError(
+                                f"Layer index {layer_idx} not found in layer_index_map. "
+                                f"This LoRA adapter targets a layer type not supported for LoRA in this hybrid model. "
+                                f"Supported layer types: attention ('*'), MoE ('E'), and Mamba ('M')."
+                            )
                     self._cpp_lora_config[uid].append(
                         torch.tensor(
-                            [self.LORA_MODULE_IDS[lora_module], layer_idx, effective_rank, is_dora],
+                            [
+                                self.LORA_MODULE_IDS[lora_module],
+                                config_layer_idx,
+                                effective_rank,
+                                is_dora,
+                            ],
                             dtype=torch.int32,
                         )
                     )

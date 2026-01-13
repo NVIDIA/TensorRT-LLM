@@ -822,18 +822,51 @@ def create_py_executor_instance(
             rank=dist.mapping.rank,
             gpus_per_node=dist.mapping.gpus_per_node,
         )
+
+        # Create layer_index_map for hybrid models (e.g., Nemotron-H)
+        # This maps global layer indices to attention-layer indices for LoRA
+        pretrained_config = model_engine.model.model_config.pretrained_config
+        layer_index_map = None
+        if is_nemotron_hybrid(pretrained_config):
+            # For hybrid models, C++ PeftCacheManager validates layer IDs against num_lora_layers
+            # We need to map global layer indices to sequential LoRA-layer indices
+            # This includes attention layers ("*"), MoE layers ("E"), and Mamba layers ("M")
+            pattern = pretrained_config.hybrid_override_pattern
+            lora_layer_idx = 0
+            layer_index_map = {}
+
+            # First pass: map attention layers (they get indices 0 to num_attention-1)
+            for global_idx, layer_type in enumerate(pattern):
+                if layer_type == "*":  # Attention layer
+                    layer_index_map[global_idx] = lora_layer_idx
+                    lora_layer_idx += 1
+
+            # Second pass: map MoE layers (they get indices after attention layers)
+            for global_idx, layer_type in enumerate(pattern):
+                if layer_type == "E":  # MoE layer (for shared_experts LoRA support)
+                    layer_index_map[global_idx] = lora_layer_idx
+                    lora_layer_idx += 1
+
+            # Third pass: map Mamba layers (they get indices after MoE layers)
+            for global_idx, layer_type in enumerate(pattern):
+                if layer_type == "M":  # Mamba layer (for in_proj/out_proj LoRA support)
+                    layer_index_map[global_idx] = lora_layer_idx
+                    lora_layer_idx += 1
+
         peft_cache_manager = PeftCacheManager(
             peft_cache_config=peft_cache_config_model,
             lora_config=lora_config,
             model_config=model_binding_config,
             world_config=world_config,
             execution_stream=execution_stream,
+            layer_index_map=layer_index_map,
         )
         resources[ResourceManagerType.PEFT_CACHE_MANAGER] = peft_cache_manager
         model_engine.set_lora_model_config(
             lora_config.lora_target_modules,
             lora_config.trtllm_modules_to_hf_modules,
-            lora_config.swap_gate_up_proj_lora_b_weight)
+            lora_config.swap_gate_up_proj_lora_b_weight,
+            layer_index_map=layer_index_map)
 
     resources[ResourceManagerType.SEQ_SLOT_MANAGER] = SeqSlotManager(
         max_num_sequences)

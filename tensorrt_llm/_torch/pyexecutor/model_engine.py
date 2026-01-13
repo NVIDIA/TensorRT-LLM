@@ -485,13 +485,15 @@ class PyTorchModelEngine(ModelEngine):
     def set_lora_model_config(self,
                               lora_target_modules: list[str],
                               trtllm_modules_to_hf_modules: dict[str, str],
-                              swap_gate_up_proj_lora_b_weight: bool = True):
+                              swap_gate_up_proj_lora_b_weight: bool = True,
+                              layer_index_map: dict[int, int] | None = None):
         self.lora_model_config = LoraModelConfig(
             lora_target_modules=lora_target_modules,
             trtllm_modules_to_hf_modules=trtllm_modules_to_hf_modules,
             hidden_size=self.model.config.hidden_size,
             dtype=torch_dtype_to_str(self.model.config.torch_dtype),
-            swap_gate_up_proj_lora_b_weight=swap_gate_up_proj_lora_b_weight)
+            swap_gate_up_proj_lora_b_weight=swap_gate_up_proj_lora_b_weight,
+            layer_index_map=layer_index_map)
 
     def set_guided_decoder(self,
                            guided_decoder: CapturableGuidedDecoder) -> bool:
@@ -3118,6 +3120,16 @@ class PyTorchModelEngine(ModelEngine):
         lora_params = {}
         tmp_lora_params = {}
 
+        # For hybrid models, we need to remap layer IDs from attention-layer index back to global index
+        # The C++ PeftCacheManager uses attention-layer indices, but Python model uses global indices
+        reverse_layer_index_map = None
+        if self.lora_model_config is not None and self.lora_model_config.layer_index_map is not None:
+            # Create reverse mapping: attention_layer_idx -> global_layer_idx
+            reverse_layer_index_map = {
+                v: k
+                for k, v in self.lora_model_config.layer_index_map.items()
+            }
+
         request_list = scheduled_requests.context_requests + scheduled_requests.generation_requests
 
         # trace all requests to get the union set of the lora params
@@ -3128,6 +3140,10 @@ class PyTorchModelEngine(ModelEngine):
             for module in request.py_lora_task_layer_module_configs:
                 module_id = module.module_id
                 layer_id = module.layer_id
+
+                # Remap layer_id from attention-layer index to global index for hybrid models
+                if reverse_layer_index_map is not None and layer_id in reverse_layer_index_map:
+                    layer_id = reverse_layer_index_map[layer_id]
 
                 if layer_id not in lora_params:
                     lora_params[layer_id] = {}
