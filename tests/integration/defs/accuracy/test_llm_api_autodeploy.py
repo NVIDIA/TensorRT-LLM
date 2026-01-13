@@ -14,7 +14,7 @@
 # limitations under the License.
 
 import pytest
-from test_common.llm_data import hf_model_dir_or_hub_id, llm_models_root
+from test_common.llm_data import hf_id_to_local_model_dir, llm_models_root
 
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 from tensorrt_llm.quantization import QuantAlgo
@@ -25,7 +25,7 @@ from .accuracy_core import GSM8K, MMLU, CnnDailymail, LlmapiAccuracyTestHarness
 
 class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.1-8B"
-    MODEL_PATH = hf_model_dir_or_hub_id(MODEL_NAME)
+    MODEL_PATH = hf_id_to_local_model_dir(MODEL_NAME)
 
     def get_default_kwargs(self, enable_chunked_prefill=False):
         config = {

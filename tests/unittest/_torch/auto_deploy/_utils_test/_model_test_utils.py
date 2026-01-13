@@ -3,7 +3,7 @@ from typing import Any, Dict, Optional
 
 import torch
 import torch.nn.functional as F
-from test_common.llm_data import hf_model_dir_or_hub_id
+from test_common.llm_data import hf_id_to_local_model_dir
 from torch import nn
 from torch.export import Dim
 
@@ -506,8 +506,8 @@ def get_small_model_config(model_hub_id: str, **llm_args_kwargs) -> Dict[str, An
 
     llm_args = copy.deepcopy(_SMALL_MODEL_CONFIGS[model_hub_id])
 
-    # check if should use llm_models_root or hf_hub_id
-    llm_args["model"] = hf_model_dir_or_hub_id(model_hub_id)
+    # convert HF ID to local model directory
+    llm_args["model"] = hf_id_to_local_model_dir(model_hub_id)
 
     # add some defaults to llm_args
     llm_args["skip_loading_weights"] = True  # No weight loading to speed up things

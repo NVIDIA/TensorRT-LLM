@@ -23,8 +23,8 @@ from unittest.mock import patch
 
 # Mapping from HuggingFace Hub ID to local subdirectory under LLM_MODELS_ROOT.
 # NOTE: hf_id_to_llm_models_subdir below will fall back to checking if the model name exists
-# in LLM_MODELS_ROOT if not present here, so it's not required to exhaustively list all
-# models here.
+# in LLM_MODELS_ROOT if not present here, so it's not required to list models that already
+# exist as a top-level directory in LLM_MODELS_ROOT.
 HF_ID_TO_LLM_MODELS_SUBDIR = {
     "meta-llama/Meta-Llama-3.1-8B-Instruct": "llama-3.1-model/Llama-3.1-8B-Instruct",
     "meta-llama/Llama-3.1-8B-Instruct": "llama-3.1-model/Llama-3.1-8B-Instruct",
@@ -68,7 +68,11 @@ def llm_datasets_root() -> str:
 
 
 def hf_id_to_local_model_dir(hf_hub_id: str) -> str | None:
-    """Return the local model directory under LLM_MODELS_ROOT for a given HuggingFace Hub ID, or None if not found."""
+    """Return the local model directory under LLM_MODELS_ROOT for a given HuggingFace Hub ID.
+
+    Raises ValueError if the model is not found in LLM_MODELS_ROOT. This is meant to ensure that tests do not download
+    models from HuggingFace.
+    """
     root = llm_models_root()
     if root is None:
         return None
@@ -81,12 +85,7 @@ def hf_id_to_local_model_dir(hf_hub_id: str) -> str | None:
     if os.path.isdir(root / model_name):
         return str(root / model_name)
 
-    return None
-
-
-def hf_model_dir_or_hub_id(hf_hub_id: str) -> str:
-    """Resolve a HuggingFace Hub ID to local path if available, otherwise return the Hub ID."""
-    return hf_id_to_local_model_dir(hf_hub_id) or hf_hub_id
+    raise ValueError(f"HuggingFace model '{hf_hub_id}' not found in LLM_MODELS_ROOT")
 
 
 def mock_snapshot_download(repo_id: str, **kwargs) -> str:
