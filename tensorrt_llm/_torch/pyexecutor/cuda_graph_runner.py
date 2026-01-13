@@ -247,7 +247,7 @@ class CUDAGraphRunner:
         can_run_cuda_graph = batch.can_run_cuda_graph
         batch_size = batch.batch_size
         if self.enabled and self.config.enable_attention_dp and self.config.mapping.tp_size > 1:
-            all_can_graph_batch = self.config.dist.tp_cp_allgather(
+            all_can_graph_batch = self.config.dist.tp_allgather(
                 [can_run_cuda_graph, batch_size])
             is_all_gen_only = all(all_can_graph[0]
                                   for all_can_graph in all_can_graph_batch)
@@ -409,7 +409,7 @@ class CUDAGraphRunner:
         new_batch_size = batch_size
 
         if self.enabled and self.config.enable_attention_dp and self.config.mapping.tp_size > 1:
-            graph_batch_size = self.config.dist.tp_cp_allgather(
+            graph_batch_size = self.config.dist.tp_allgather(
                 [can_run_cuda_graph, batch_size])
             all_can_graph = all(graph_batch[0]
                                 for graph_batch in graph_batch_size)

@@ -133,19 +133,8 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
 
     if (worldConfig.isTensorParallel())
     {
-        if (worldConfig.isContextParallel())
-        {
-            // When CP is enabled, group ranks with same (ppRank, cpRank) to exclude both PP and CP.
-            auto const tpGroupId = worldConfig.getContextParallelRank()
-                + worldConfig.getContextParallelism() * worldConfig.getPipelineParallelRank();
-            mGroupTensorParaComm
-                = std::make_shared<CacheTransceiverComm>(mGroupComm->split(tpGroupId, worldConfig.getRank()));
-        }
-        else
-        {
-            mGroupTensorParaComm = std::make_shared<CacheTransceiverComm>(
-                mGroupComm->split(worldConfig.getPipelineParallelRank(), worldConfig.getTensorParallelRank()));
-        }
+        mGroupTensorParaComm = std::make_shared<CacheTransceiverComm>(
+            mGroupComm->split(worldConfig.getPipelineParallelRank(), worldConfig.getTensorParallelRank()));
     }
     int kvFactor = 2;
     if (cacheManager->getCacheType() == kv_cache_manager::CacheType::kSELFKONLY)
@@ -159,8 +148,6 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
 
     if (mCacheState->getParallelConfig().mEnableAttentionDP)
     {
-        int TPSizeInDPGroup
-            = mCacheState->getParallelConfig().mTensorParallelism / mCacheState->getParallelConfig().mDPsize;
         int DPSize = mCacheState->getParallelConfig().mDPsize;
 
         // DPRank is derived from the tensor parallel rank, which already accounts for CP.
