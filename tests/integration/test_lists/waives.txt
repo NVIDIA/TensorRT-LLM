@@ -283,8 +283,6 @@ test_e2e.py::test_trtllm_bench_llmapi_launch[pytorch_backend-llama-v3-llama3-8b]
 test_e2e.py::test_trtllm_serve_multimodal_example SKIP (https://nvbugs/5747920)
 test_e2e.py::test_trtllm_serve_example SKIP (https://nvbugs/5747938)
 triton_server/test_triton.py::test_opt[opt] SKIP (https://nvbugs/5739981)
-unittest/llmapi/test_llm_pytorch.py::test_tinyllama_logits_processor[False] SKIP (https://nvbugs/5771838)
-unittest/llmapi/test_llm_pytorch.py::test_tinyllama_logits_processor[True] SKIP (https://nvbugs/5771838)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus_online_eplb[fp8kv=True-moe_backend=TRTLLM] SKIP (https://nvbugs/5740377)
 cpp/test_multi_gpu.py::TestDisagg::test_symmetric_executor[gpt-2proc-mpi_kvcache-90] SKIP (https://nvbugs/5755941)
 examples/test_granite.py::test_llm_granite[granite-3.0-1b-a400m-instruct-bfloat16] SKIP (https://nvbugs/5608979)
