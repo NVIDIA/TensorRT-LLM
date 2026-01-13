@@ -365,6 +365,11 @@ def run_disaggregated_test(example_dir,
     """Run disaggregated test with given configuration."""
     cleanup_output_files()
     run_env = env.copy()
+
+    # on some CI nodes , we set UCX_TLS to "^ib" to avoid the issue that IB equipped but not available.
+    # we set UCX_MM_ERROR_HANDLING to "y" to avoid the issue that NIXL cannot use IB or TCP for notify on some CI nodes,
+    # setting it to "y" will enable NIXL to use system memory for notify.
+
     run_env["UCX_TLS"] = "^ib"
     run_env["UCX_MM_ERROR_HANDLING"] = "y"
     num_ranks, config_file = get_test_config(test_desc, example_dir,
