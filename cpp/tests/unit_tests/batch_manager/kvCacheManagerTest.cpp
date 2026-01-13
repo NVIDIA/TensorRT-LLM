@@ -4066,11 +4066,13 @@ TEST_F(KVCacheManagerTest, PinAndUnpinBlocksById)
     kvCacheManager.pinBlocks(requestId);
     auto lastBlockIdOpt = kvCacheManager.getLastBlockId(requestId);
     ASSERT_TRUE(lastBlockIdOpt.has_value());
+    auto const& allBlockIds = kvCacheManager.getCacheBlockIds(requestId, maxAttentionWindow)[0];
+    std::vector<SizeType32> pinnedBlockIds(allBlockIds.begin(), allBlockIds.end());
     (void) kvCacheManager.removeSequence(requestId, llmRequest);
     auto const freeAfterRemovePinned = kvCacheManager.getNumFreeBlocks();
     EXPECT_LT(freeAfterRemovePinned, totalBlocks);
 
-    kvCacheManager.unpinBlocksById(lastBlockIdOpt.value());
+    kvCacheManager.unpinBlocksById(pinnedBlockIds);
     auto const freeAfterUnpin = kvCacheManager.getNumFreeBlocks();
     EXPECT_EQ(freeAfterUnpin, totalBlocks);
 }
