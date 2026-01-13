@@ -147,7 +147,7 @@ def _torch_cached_causal_conv1d(
     weight: torch.Tensor,  # [c_out, c_in/groups, k]
     bias: Optional[torch.Tensor],
     # STANDARD METADATA
-    batch_info: torch.Tensor,
+    batch_info_host: torch.Tensor,
     seq_len: torch.Tensor,
     cu_seqlen: torch.Tensor,
     slot_idx: torch.Tensor,
@@ -174,7 +174,7 @@ def _torch_cached_causal_conv1d(
     num_seq = seq_len.shape[0]
 
     # get cleaned up metadata
-    num_prefill, num_prefill_tokens, num_decode = batch_info.tolist()
+    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
     num_seq = num_prefill + num_decode
     seq_len = seq_len[:num_seq]
     seq_start = cu_seqlen[:num_seq]
@@ -247,7 +247,7 @@ def _torch_cached_causal_conv1d_fake(
     weight: torch.Tensor,  # [c_out, c_in/groups, k]
     bias: Optional[torch.Tensor],
     # STANDARD METADATA
-    batch_info: torch.Tensor,
+    batch_info_host: torch.Tensor,
     seq_len: torch.Tensor,
     cu_seqlen: torch.Tensor,
     slot_idx: torch.Tensor,
@@ -296,7 +296,7 @@ class TorchBackendCausalConv(AttentionDescriptor):
 
     @classmethod
     def get_standard_metadata_args(cls) -> List[str]:
-        return ["batch_info", "seq_len", "cu_seqlen", "slot_idx", "use_initial_states"]
+        return ["batch_info_host", "seq_len", "cu_seqlen", "slot_idx", "use_initial_states"]
 
     @classmethod
     def get_cache_initializers(

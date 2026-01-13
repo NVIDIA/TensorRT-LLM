@@ -17,6 +17,7 @@ l0_a10:
   - unittest/_torch/sampler/test_torch_sampler.py
   - unittest/_torch/sampler/test_torch_multi_arange.py
   - unittest/utils/test_util.py
+  - unittest/_torch/test_model_config.py
   - unittest/_torch/modeling/test_modeling_mistral.py
   - unittest/_torch/modeling/test_modeling_pixtral.py
   - unittest/_torch/sampler/test_trtllm_sampler.py
@@ -65,6 +66,7 @@ l0_a10:
   - test_e2e.py::test_openai_misc_example[pytorch]
   - test_e2e.py::test_openai_reasoning[pytorch]
   - test_e2e.py::test_openai_tool_call
+  - test_e2e.py::test_openai_responses_entrypoint
   - test_e2e.py::test_openai_completions_example[pytorch]
   - test_e2e.py::test_openai_chat_example[pytorch] TIMEOUT (90)
   - test_e2e.py::test_trtllm_bench_request_rate_and_concurrency[enable_concurrency-]

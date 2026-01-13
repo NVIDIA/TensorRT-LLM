@@ -207,7 +207,7 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
         kwargs = self.get_default_kwargs()
         # TODO: multi-stream MOE seems to increase the memory usage
         kwargs["max_batch_size"] = 32
-        kwargs["free_mem_ratio"] = 0.5
+        kwargs["free_mem_ratio"] = 0.4
         sampling_params = self.get_default_sampling_params()
         with AutoDeployLLM(model=self.MODEL_PATH_BF16,
                            tokenizer=self.MODEL_PATH_BF16,
@@ -220,14 +220,13 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(32000)
     def test_fp8(self):
         kwargs = self.get_default_kwargs()
-        sampling_params = self.get_default_sampling_params()
         with AutoDeployLLM(model=self.MODEL_PATH_FP8,
                            tokenizer=self.MODEL_PATH_FP8,
                            **kwargs) as llm:
             # Manually set quant_config for FP8 model to get the accuracy threshold
             llm.args.quant_config.quant_algo = QuantAlgo.FP8
             llm.args.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
-
+            sampling_params = self.get_default_sampling_params()
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=sampling_params)
             task = GSM8K(self.MODEL_NAME)
@@ -235,8 +234,16 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
 
 
 class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
+    """Accuracy regression tests for Nemotron Super V3.
+
+    Runs the model via AutoDeploy and verifies benchmark performance on MMLU and GSM8K
+    """
+
     MODEL_NAME = "nvidia/Nemotron-Super-V3"
-    MODEL_PATH_BF16 = "/scratch/models/super-v3-iter_0440000/hf"  # add to llm_models_root? I don't have permissions
+    MODEL_PATH_BF16 = f"{llm_models_root()}/Nemotron-Super-3-120B-A12B-dev"
+    # Set minimum possible seq len + small buffer, for test speed & memory usage
+    MAX_SEQ_LEN = max(MMLU.MAX_INPUT_LEN + MMLU.MAX_OUTPUT_LEN,
+                      GSM8K.MAX_INPUT_LEN + GSM8K.MAX_OUTPUT_LEN)
 
     def get_default_kwargs(self):
         return {
@@ -244,10 +251,10 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
             "trust_remote_code": True,
             "skip_loading_weights": False,
             "compile_backend": "torch-cudagraph",
-            "free_mem_ratio": 0.5,  # maybe we can increase
+            "free_mem_ratio": 0.9,
             "max_batch_size": 128,
-            "max_seq_len": 8192,
-            "max_num_tokens": 8192,
+            "max_seq_len": self.MAX_SEQ_LEN,
+            "max_num_tokens": self.MAX_SEQ_LEN,
             "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
             "transforms": {
                 "detect_sharding": {
@@ -265,15 +272,15 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
                               n=beam_width,
                               use_beam_search=beam_width > 1)
 
-    @pytest.mark.skip_less_device_memory(
-        32000)  # might need to require more memory
-    @pytest.mark.skip_less_device(8)
+    # 180GB works, might be able to go lower
+    @pytest.mark.skip_less_device_memory(180000)
+    @pytest.mark.skip_less_device(4)
     def test_bf16(self):
         kwargs = self.get_default_kwargs()
         sampling_params = self.get_default_sampling_params()
         with AutoDeployLLM(model=self.MODEL_PATH_BF16,
                            tokenizer=self.MODEL_PATH_BF16,
-                           world_size=8,
+                           world_size=4,
                            **kwargs) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=sampling_params)

@@ -3,7 +3,7 @@ import pytest
 from tensorrt_llm import LLM
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MoeConfig, SamplingParams
 
-from ..conftest import llm_models_root, skip_pre_blackwell
+from ..conftest import llm_models_root, skip_post_blackwell, skip_pre_blackwell, skip_pre_hopper
 from .accuracy_core import MMMU, LlmapiAccuracyTestHarness
 
 
@@ -216,9 +216,12 @@ class TestPhi4MMFusedVisionLora(LlmapiAccuracyTestHarness):
             task.evaluate(llm, sampling_params=self.sampling_params)
 
 
+@skip_pre_hopper
+@skip_post_blackwell
 class TestGemma3_27BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "google/gemma-3-27b-it"
-    MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-27b-it/"
+    # Note: This has only the LLM part quantized. Vision part is in bfloat16.
+    MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-27b-it-fp8/"
     MAX_NUM_TOKENS = 12800
 
     sampling_params = SamplingParams(
@@ -230,9 +233,10 @@ class TestGemma3_27BInstruct(LlmapiAccuracyTestHarness):
         enable_block_reuse=False,
         enable_partial_reuse=False,
         free_gpu_memory_fraction=0.4,
+        dtype="fp8",
     )
 
-    def test_auto_dtype(self):
+    def test_fp8_prequantized(self):
         # Gemma3 VLM needs FlashInfer attention backend for custom mask support.
         with LLM(
             self.MODEL_PATH,
@@ -256,6 +260,7 @@ class TestQwen3VL_MOE(LlmapiAccuracyTestHarness):
         max_tokens=MAX_NUM_TOKENS, truncate_prompt_tokens=MMMU.MAX_INPUT_LEN, stop="<|endoftext|>"
     )
 
+    @pytest.mark.skip_less_device_memory(140000)
     def test_auto_dtype(self):
         with LLM(
             self.MODEL_PATH,
@@ -289,8 +294,19 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
         ],
     )
     def test_nvfp4_4gpus(
-        self, tp_size, pp_size, ep_size, attention_dp, cuda_graph, overlap_scheduler, moe_backend
+        self,
+        tp_size,
+        pp_size,
+        ep_size,
+        attention_dp,
+        cuda_graph,
+        overlap_scheduler,
+        moe_backend,
+        mocker,
     ):
+        mocker.patch.dict(
+            MMMU.EVALUATE_KWARGS, {"model_type": "mistral_large_3", "is_force_single_image": True}
+        )
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
@@ -311,4 +327,47 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
             kv_cache_config=kv_cache_config,
         ) as llm:
             task = MMMU(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=self.sampling_params, model_type="mistral_large_3")
+            task.evaluate(llm, sampling_params=self.sampling_params)
+
+
+class TestQwen3VL(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "Qwen/Qwen3-VL-8B-Instruct"
+    MODEL_PATH = f"{llm_models_root()}/Qwen3/Qwen3-VL-8B-Instruct"
+    MAX_NUM_TOKENS = 16384
+
+    sampling_params = SamplingParams(
+        max_tokens=MAX_NUM_TOKENS, truncate_prompt_tokens=MMMU.MAX_INPUT_LEN, stop="<|endoftext|>"
+    )
+
+    def test_auto_dtype(self):
+        with LLM(
+            self.MODEL_PATH,
+            max_num_tokens=self.MAX_NUM_TOKENS,
+        ) as llm:
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=self.sampling_params)
+
+
+class TestMistralSmall24B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "mistralai/Mistral-Small-3.1-24B-Instruct-2503"
+    MODEL_PATH = f"{llm_models_root()}/Mistral-Small-3.1-24B-Instruct-2503"
+    MAX_NUM_TOKENS = 16384
+
+    # NOTE: MMMU adds <|endoftext|> to the stop token.
+    sampling_params = SamplingParams(
+        max_tokens=MMMU.MAX_OUTPUT_LEN,
+        truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
+        stop="<|endoftext|>",
+    )
+
+    @pytest.mark.skip_less_device_memory(80000)
+    def test_auto_dtype(self):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        with LLM(
+            self.MODEL_PATH,
+            kv_cache_config=kv_cache_config,
+            enable_chunked_prefill=True,
+            max_num_tokens=self.MAX_NUM_TOKENS,
+        ) as llm:
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=self.sampling_params)

@@ -5,6 +5,7 @@ from .modeling_bert import BertForSequenceClassification
 from .modeling_clip import CLIPVisionModel
 from .modeling_deepseekv3 import DeepseekV3ForCausalLM
 from .modeling_exaone4 import Exaone4ForCausalLM
+from .modeling_exaone_moe import ExaoneMoeForCausalLM
 from .modeling_gemma3 import Gemma3ForCausalLM
 from .modeling_gemma3vl import Gemma3VLM
 from .modeling_glm import Glm4MoeForCausalLM
@@ -28,6 +29,7 @@ from .modeling_qwen2vl import Qwen2_5_VLModel, Qwen2VLModel
 from .modeling_qwen3 import Qwen3ForCausalLM
 from .modeling_qwen3_moe import Qwen3MoeForCausalLM
 from .modeling_qwen3_next import Qwen3NextForCausalLM
+from .modeling_qwen3vl import Qwen3VLModel
 from .modeling_qwen3vl_moe import Qwen3MoeVLModel
 from .modeling_qwen_moe import Qwen2MoeForCausalLM
 from .modeling_seedoss import SeedOssForCausalLM
@@ -43,6 +45,7 @@ __all__ = [
     "CLIPVisionModel",
     "DeepseekV3ForCausalLM",
     "Exaone4ForCausalLM",
+    "ExaoneMoeForCausalLM",
     "Gemma3ForCausalLM",
     "Gemma3VLM",
     "HCXVisionForCausalLM",
@@ -76,6 +79,7 @@ __all__ = [
     "GptOssForCausalLM",
     "SeedOssForCausalLM",
     "Glm4MoeForCausalLM",
+    "Qwen3VLModel",
 ]
 
 if transformers.__version__ >= "4.45.1":

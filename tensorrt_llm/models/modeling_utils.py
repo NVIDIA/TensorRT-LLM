@@ -740,10 +740,11 @@ class PretrainedModel(Module,
 
         rank = config.mapping.rank
         if config.mapping.cp_size > 1:
-            # tp_cp_pp rank -> tp_pp rank: because different cp ranks share the same ckpt
-            tp_size = config.mapping.tp_size
+            # cp_tp_pp rank -> tp_pp rank: because different cp ranks share the same ckpt.
             cp_size = config.mapping.cp_size
-            rank = rank % tp_size + rank // (tp_size * cp_size) * tp_size
+            # rank = pp_rank × tp_size × cp_size + tp_rank × cp_size + cp_rank.
+            # rank // cp_size is equivalent to pp_rank × tp_size + tp_rank.
+            rank = rank // cp_size
         weights_path = os.path.join(ckpt_dir, f'rank{rank}.safetensors')
 
         assert os.path.isfile(weights_path)

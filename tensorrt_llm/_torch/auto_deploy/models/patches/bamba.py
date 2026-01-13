@@ -49,15 +49,15 @@ def _bamba_mixer_torch_forward(
         )
         slot_idx_t = torch.arange(batch_size, device=input_states.device, dtype=torch.long)
         use_initial_states_t = torch.zeros(batch_size, device=input_states.device, dtype=torch.bool)
-        # batch_info: [num_prefill, num_prefill_tokens, num_decode]
+        # batch_info_host: [num_prefill, num_prefill_tokens, num_decode]
         # For context phase (seq_len > 1): [batch_size, batch_size * seq_len, 0]
         # For generate phase (seq_len == 1): [0, 0, batch_size]
         if seq_len == 1:
-            batch_info_t = torch.tensor(
+            batch_info_host_t = torch.tensor(
                 [0, 0, batch_size], device=input_states.device, dtype=torch.int32
             )
         else:
-            batch_info_t = torch.tensor(
+            batch_info_host_t = torch.tensor(
                 [batch_size, batch_size * seq_len, 0], device=input_states.device, dtype=torch.int32
             )
     if use_caching:
@@ -68,7 +68,7 @@ def _bamba_mixer_torch_forward(
                 self.conv1d.weight,
                 self.conv1d.bias,
                 # STANDARD METADATA
-                batch_info_t,
+                batch_info_host_t,
                 seq_len_t,
                 cu_seqlen_t,
                 slot_idx_t,
@@ -123,7 +123,7 @@ def _bamba_mixer_torch_forward(
             dt=dt,
             dt_bias=self.dt_bias,
             # STANDARD METADATA
-            batch_info=batch_info_t,
+            batch_info_host=batch_info_host_t,
             seq_len=seq_len_t,
             cu_seqlen=cu_seqlen_t,
             slot_idx=slot_idx_t,

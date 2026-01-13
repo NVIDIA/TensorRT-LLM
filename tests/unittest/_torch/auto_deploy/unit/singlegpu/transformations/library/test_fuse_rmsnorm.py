@@ -59,11 +59,14 @@ def _run_test(model, op, variant):
         return any(is_op(n, op) for n in gm.graph.nodes)
 
     x = torch.randn(2, 1024, device="cuda", dtype=torch.float16)
-    dynamic_shapes = {0: Dim("batch_size", max=8)}
+    dynamic_shapes = {0: Dim.DYNAMIC}
     gm = torch_export_to_gm(model, args=(x,), dynamic_shapes=(dynamic_shapes,), clone=True)
     gm_transformed = InferenceOptimizer(
         None,
         {
+            "match_rmsnorm_pattern": {
+                "stage": "pattern_matcher",
+            },
             "fuse_rmsnorm": {
                 "stage": "post_load_fusion",
                 "gated_rmsnorm_backend": "triton",

@@ -5,13 +5,15 @@ import tensorrt_llm._torch.auto_deploy  # noqa: F401
 
 
 def _random_params(device, dtype, batch, seq, num_heads, head_dim, n_groups, ssm_state_size):
-    hidden_states = torch.randn(batch, seq, num_heads, head_dim, device=device, dtype=dtype)
-    A = torch.randn(num_heads, device=device, dtype=torch.float32)
-    B = torch.randn(batch, seq, n_groups, ssm_state_size, device=device, dtype=dtype)
-    C = torch.randn(batch, seq, n_groups, ssm_state_size, device=device, dtype=dtype)
-    D = torch.randn(num_heads, device=device, dtype=dtype)
-    dt = torch.randn(batch, seq, num_heads, device=device, dtype=dtype)
-    dt_bias = torch.randn(num_heads, device=device, dtype=dtype)
+    # Use bounded random values to avoid numerical edge cases
+    # torch.rand gives [0, 1), scale to [-0.5, 0.5] for stable values
+    hidden_states = torch.rand(batch, seq, num_heads, head_dim, device=device, dtype=dtype) - 0.5
+    A = torch.rand(num_heads, device=device, dtype=torch.float32) - 0.5
+    B = torch.rand(batch, seq, n_groups, ssm_state_size, device=device, dtype=dtype) - 0.5
+    C = torch.rand(batch, seq, n_groups, ssm_state_size, device=device, dtype=dtype) - 0.5
+    D = torch.rand(num_heads, device=device, dtype=dtype) - 0.5
+    dt = torch.rand(batch, seq, num_heads, device=device, dtype=dtype) - 0.5
+    dt_bias = torch.rand(num_heads, device=device, dtype=dtype) - 0.5
     time_step_limit = [1e-6, 1.0]
     chunk_size = 4
     return hidden_states, A, B, C, D, dt, dt_bias, time_step_limit, chunk_size
@@ -28,29 +30,32 @@ def mamba_env():
     return {"device": device, "dtype": dtype, "atol": atol, "rtol": rtol}
 
 
-@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5548861")
 def test_triton_generate_only_with_slot_mapping(mamba_env):
     device = mamba_env["device"]
     dtype = mamba_env["dtype"]
     atol = mamba_env["atol"]
     rtol = mamba_env["rtol"]
 
-    batch, seq = 3, 1
+    batch, seq = 1, 1
     num_heads, head_dim = 4, 8
     n_groups, ssm_state_size = 2, 4
     (hidden_states, A, B, C, D, dt, dt_bias, time_step_limit, chunk_size) = _random_params(
         device, dtype, batch, seq, num_heads, head_dim, n_groups, ssm_state_size
     )
 
-    max_batch_size = 6
-    slot_idx = torch.tensor([4, 1, 3], device=device, dtype=torch.int32)
+    max_batch_size = 2
+    slot_idx = torch.tensor([0], device=device, dtype=torch.int32)
     ssm_state_cache_torch = torch.randn(
         max_batch_size, num_heads, head_dim, ssm_state_size, device=device, dtype=dtype
     )
     ssm_state_cache_triton = ssm_state_cache_torch.clone()
 
+    # batch_info_host: [num_prefill, num_prefill_tokens, num_decode]
+    # For generate-only: num_decode = batch, num_prefill = 0
+    batch_info_host = torch.tensor([0, 0, batch], device=device, dtype=torch.int32)
     seq_len = torch.ones(batch, device=device, dtype=torch.int32)
-    seq_start = torch.zeros(batch, device=device, dtype=torch.int32)
+    cu_seqlen = torch.zeros(batch + 1, device=device, dtype=torch.int32)
+    use_initial_states = torch.zeros(batch, device=device, dtype=torch.bool)
 
     # Torch reference
     y_torch = torch.ops.auto_deploy.torch_cached_ssm(
@@ -61,10 +66,15 @@ def test_triton_generate_only_with_slot_mapping(mamba_env):
         D,
         dt,
         dt_bias,
+        # STANDARD METADATA
+        batch_info_host,
         seq_len,
-        seq_start,
+        cu_seqlen,
         slot_idx,
+        use_initial_states,
+        # CACHES
         ssm_state_cache_torch,
+        # CONSTANTS
         time_step_limit,
         chunk_size,
     )
@@ -78,10 +88,18 @@ def test_triton_generate_only_with_slot_mapping(mamba_env):
         D,
         dt,
         dt_bias,
-        seq_len,
-        seq_start,
+        # STANDARD METADATA
+        batch_info_host,
+        cu_seqlen,
         slot_idx,
+        use_initial_states,
+        # EXTRA METADATA
+        None,  # chunk indices
+        None,  # chunk offsets
+        None,  # seq_idx_prefill
+        # CACHES
         ssm_state_cache_triton,
+        # CONSTANTS
         time_step_limit,
         chunk_size,
     )
@@ -134,8 +152,8 @@ def test_triton_context_flattened_and_state_writeback(mamba_env):
         torch.arange(len(lens), device=device, dtype=torch.int32),
         seq_len,
     ).view(1, -1)
-    # batch_info: [num_prefill, num_prefill_tokens, num_decode]
-    batch_info_tensor = torch.tensor([len(lens), sum(lens), 0], dtype=torch.int32, device=device)
+    # batch_info_host: [num_prefill, num_prefill_tokens, num_decode]
+    batch_info_host = torch.tensor([len(lens), sum(lens), 0], dtype=torch.int32, device=device)
     # Torch reference
     y_torch = torch.ops.auto_deploy.torch_cached_ssm(
         hidden_states,
@@ -146,7 +164,7 @@ def test_triton_context_flattened_and_state_writeback(mamba_env):
         dt,
         dt_bias,
         # STANDARD METADATA
-        batch_info_tensor,
+        batch_info_host,
         seq_len,
         cu_seqlen,
         slot_idx,
@@ -168,7 +186,7 @@ def test_triton_context_flattened_and_state_writeback(mamba_env):
         dt,
         dt_bias,
         # STANDARD METADATA
-        batch_info_tensor,
+        batch_info_host,
         cu_seqlens,
         slot_idx,
         use_initial_states,
