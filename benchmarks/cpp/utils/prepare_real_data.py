@@ -135,6 +135,22 @@ class DatasetConfig(BaseModel):
         return req[self.output_key]
 
 
+def _create_dataset_load_error(e: ValueError) -> ValueError:
+    """Create a more informative ValueError from a dataset loading error.
+
+    Args:
+        e: The original ValueError from datasets.load_dataset().
+    Returns:
+        A new ValueError with additional context.
+    """
+    error_msg = str(e)
+    if "Config" in error_msg:
+        error_msg += "\n Please add the config name to the dataset config yaml."
+    elif "split" in error_msg:
+        error_msg += "\n Please specify supported split in the dataset config yaml."
+    return ValueError(error_msg)
+
+
 def load_dataset(dataset_config: DatasetConfig):
     """Load dataset from local path or HuggingFace.
     Args:
@@ -160,23 +176,18 @@ def load_dataset_from_hf(dataset_config: DatasetConfig):
     Raises:
         ValueError: When dataset loading fails due to incorrect dataset config setting.
     """
-    try:
+    logging.debug(
+        f"Loading dataset from HF: query={dataset_config.query}, split={dataset_config.split}"
+    )
 
-        logging.debug(
-            f"Loading dataset from HF: query={dataset_config.query}, split={dataset_config.split}"
-        )
+    try:
         dataset = iter(
             datasets.load_dataset(*dataset_config.query,
                                   split=dataset_config.split,
                                   streaming=True,
                                   trust_remote_code=True))
     except ValueError as e:
-        error_msg = str(e)
-        if "Config" in error_msg:
-            error_msg += "\n Please add the config name to the dataset config yaml."
-        elif "split" in error_msg:
-            error_msg += "\n Please specify supported split in the dataset config yaml."
-        raise ValueError(error_msg)
+        raise _create_dataset_load_error(e)
 
     logging.debug("Finished loading HF dataset")
 
@@ -208,8 +219,11 @@ def load_dataset_from_local(dataset_config: DatasetConfig):
     # If it's a directory we can use the normal loader, otherwise custom loader
     # depends on the file extension
     if local_path.is_dir():
-        dataset = datasets.load_dataset(*dataset_config.query,
-                                        split=dataset_config.split)
+        try:
+            dataset = datasets.load_dataset(*dataset_config.query,
+                                            split=dataset_config.split)
+        except ValueError as e:
+            raise _create_dataset_load_error(e)
     else:
         format_map = {
             ".json": "json",
@@ -224,9 +238,12 @@ def load_dataset_from_local(dataset_config: DatasetConfig):
         if dataset_type is None:
             raise ValueError(f"Unsupported file extension: {file_extension}")
 
-        dataset = datasets.load_dataset(dataset_type,
-                                        data_files=str(local_path),
-                                        split=dataset_config.split)
+        try:
+            dataset = datasets.load_dataset(dataset_type,
+                                            data_files=str(local_path),
+                                            split=dataset_config.split)
+        except ValueError as e:
+            raise _create_dataset_load_error(e)
 
     logging.debug("Finished loading local dataset")
 
