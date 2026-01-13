@@ -2179,6 +2179,16 @@ class PyExecutor:
                 else:
                     self._enqueue_responses([])
 
+                # Call set_exclude_last_generation_logits after _process_previous_batch.
+                # If set before, the response of a request may be incorrect, as it will
+                # use the wrong indices for generation logits when streaming is enabled.
+                for request in scheduled_batch.generation_requests:
+                    if request.state != LlmRequestState.GENERATION_COMPLETE:
+                        if not self.disable_overlap_scheduler and request.will_complete_next_iteration(
+                        ):
+                            request.set_exclude_last_generation_logits(False)
+                            request.state = LlmRequestState.GENERATION_TO_COMPLETE
+
                 if can_queue:
                     if self.enable_iter_perf_stats:
                         iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
@@ -3024,13 +3034,6 @@ class PyExecutor:
                     request.state = LlmRequestState.GENERATION_TO_COMPLETE
                 else:
                     request.state = LlmRequestState.GENERATION_IN_PROGRESS
-
-        for request in scheduled_requests.generation_requests:
-            if request.state != LlmRequestState.GENERATION_COMPLETE:
-                if not self.disable_overlap_scheduler and request.will_complete_next_iteration(
-                ):
-                    request.set_exclude_last_generation_logits(False)
-                    request.state = LlmRequestState.GENERATION_TO_COMPLETE
 
     def _update_request_states_star_attention(
             self, scheduled_requests: ScheduledRequests):
