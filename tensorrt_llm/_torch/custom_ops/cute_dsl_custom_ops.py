@@ -882,6 +882,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                           5, 0,
                                           helper.infer_shape_max_num_tiles)),
                     inputs_pre_hook=helper.inputs_pre_hook,
+                    use_cold_l2_cache=True,
                 )
             return self.__class__.tuning_config_cache[key]
 
@@ -1180,6 +1181,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             8, 0, helper.infer_shape_max_num_permuted_tokens),
                         ConstraintSpec(10, 0, helper.infer_shape_num_tokens)),
                     inputs_pre_hook=helper.inputs_pre_hook_finalize_fusion,
+                    use_cold_l2_cache=True,
                 )
             return self.__class__.tuning_config_cache[key]
 
@@ -1560,6 +1562,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                           5, 0,
                                           helper.infer_shape_max_num_tiles)),
                     inputs_pre_hook=helper.inputs_pre_hook,
+                    use_cold_l2_cache=True,
                 )
             return self.__class__.tuning_config_cache[key]
 
@@ -1889,6 +1892,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                           6, 0,
                                           helper.infer_shape_max_num_tiles)),
                     inputs_pre_hook=helper.inputs_pre_hook,
+                    use_cold_l2_cache=True,
                 )
             return self.__class__.tuning_config_cache[key]
 
