@@ -648,7 +648,7 @@ public:
 
     void replaceSharedBlock(GenerationRequest& sequence, SizeType32 blockIdx);
 
-    [[nodiscard]] std::optional<KVCacheBlock::IdType> storeBlocksForReuse(
+    [[nodiscard]] std::vector<KVCacheBlock::IdType> storeBlocksForReuse(
         GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest, bool pinBlocks = false);
 
     void storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
@@ -853,8 +853,8 @@ public:
     //! \param blockKeys Key of each block.
     //! \param blockIds Id of each block.
     //! \param pinBlocks If true, increment ref count for blocks while storing (pin on store).
-    //! \return Pair of (num blocks stored for reuse, id of the last block stored if any).
-    [[nodiscard]] std::pair<SizeType32, std::optional<KVCacheBlock::IdType>> storeBlocks(
+    //! \return Pair of (num blocks stored for reuse, vector of pinned block IDs).
+    [[nodiscard]] std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> storeBlocks(
         std::vector<BlockKey> const& blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds,
         bool pinBlocks = false);
 
@@ -886,8 +886,8 @@ public:
 
     [[nodiscard]] std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(BlockKey const& blockKey);
 
-    //! \brief Unpin blocks by starting from a block id and walking prev pointers.
-    void unpinBlocksById(KVCacheBlock::IdType blockId);
+    //! \brief Unpin blocks by block ids directly
+    void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
 
     void initializeSequenceStorageValidity(LlmRequest::RequestIdType requestId)
     {
@@ -1103,7 +1103,7 @@ public:
     std::optional<KVCacheBlock::IdType> releaseBlocks(
         GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest = std::nullopt, bool pinBlocks = false);
 
-    [[nodiscard]] std::optional<KVCacheBlock::IdType> storeBlocksForReuse(
+    [[nodiscard]] std::vector<KVCacheBlock::IdType> storeBlocksForReuse(
         GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest = std::nullopt, bool pinBlocks = false);
 
     void schedulingReleaseBlocks(LlmRequest::RequestIdType requestId);
@@ -1112,7 +1112,7 @@ public:
     /// @param sequence The generation request whose blocks should be pinned.
     void pinBlocks(GenerationRequest& sequence);
 
-    void unpinBlocksById(KVCacheBlock::IdType blockId);
+    void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
 
     void releaseLastBlock(GenerationRequest& sequence, SizeType32 windowSize);
 
@@ -1133,7 +1133,7 @@ public:
     void offloadBlock(BlockPtr const& block, SizeType32 windowSize,
         executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "");
 
-    [[nodiscard]] std::pair<SizeType32, std::optional<KVCacheBlock::IdType>> storeBlocks(
+    [[nodiscard]] std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> storeBlocks(
         std::vector<BlockKey> const& blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds,
         SizeType32 windowSize, bool pinBlocks = false)
     {
@@ -1584,7 +1584,7 @@ public:
     virtual void storeNewBlock(LlmRequest const& llmRequest) = 0;
 
     /// \brief Store blocks for reuse for a given request id
-    [[nodiscard]] virtual std::optional<KVCacheBlock::IdType> storeBlocksForReuse(
+    [[nodiscard]] virtual std::vector<KVCacheBlock::IdType> storeBlocksForReuse(
         LlmRequest::RequestIdType requestId, OptionalRef<LlmRequest const> llmRequest, bool pinBlocks = false)
         = 0;
 
@@ -1678,7 +1678,7 @@ public:
         BlockKey const& blockKey, SizeType32 windowSize)
         = 0;
 
-    virtual void unpinBlocksById(KVCacheBlock::IdType blockId) = 0;
+    virtual void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) = 0;
 };
 
 class KVCacheManager : public BaseKVCacheManager
@@ -1939,7 +1939,7 @@ public:
     //! \brief Store newest blocks for reuse
     void storeNewBlock(LlmRequest const& llmRequest) override;
 
-    [[nodiscard]] std::optional<KVCacheBlock::IdType> storeBlocksForReuse(
+    [[nodiscard]] std::vector<KVCacheBlock::IdType> storeBlocksForReuse(
         LlmRequest::RequestIdType requestId, OptionalRef<LlmRequest const> llmRequest, bool pinBlocks = false) override;
 
     [[nodiscard]] static SizeType32 getSinkBubbleLength(SizeType32 sinkTokenLen, SizeType32 tokensPerBlock);
@@ -1960,7 +1960,7 @@ public:
 
     void pinBlocks(LlmRequest::RequestIdType requestId) override;
 
-    void unpinBlocksById(KVCacheBlock::IdType blockId) override;
+    void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) override;
 
     std::optional<KVCacheBlock::IdType> getLastBlockId(LlmRequest::RequestIdType requestId) const override;
 

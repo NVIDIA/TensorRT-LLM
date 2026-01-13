@@ -454,13 +454,13 @@ test = ["pytest (>=6)"]
 
 [[package]]
 name = "filelock"
-version = "3.20.2"
+version = "3.20.3"
 description = "A platform independent file lock."
 optional = false
 python-versions = ">=3.10"
 files = [
-    {file = "filelock-3.20.2-py3-none-any.whl", hash = "sha256:fbba7237d6ea277175a32c54bb71ef814a8546d8601269e1bfc388de333974e8"},
-    {file = "filelock-3.20.2.tar.gz", hash = "sha256:a2241ff4ddde2a7cebddf78e39832509cb045d18ec1a09d7248d6bfc6bfbbe64"},
+    {file = "filelock-3.20.3-py3-none-any.whl", hash = "sha256:4b0dda527ee31078689fc205ec4f1c1bf7d56cf88b6dc9426c4f230e46c2dce1"},
+    {file = "filelock-3.20.3.tar.gz", hash = "sha256:18c57ee915c7ec61cff0ecf7f0f869936c7c30191bb0cf406f1341778d0834e1"},
 ]
 
 [[package]]
@@ -736,13 +736,13 @@ zstd = ["zstandard (>=0.18.0)"]
 
 [[package]]
 name = "huggingface-hub"
-version = "1.2.4"
+version = "1.3.1"
 description = "Client library to download and publish models, datasets and other repos on the huggingface.co hub"
 optional = false
 python-versions = ">=3.9.0"
 files = [
-    {file = "huggingface_hub-1.2.4-py3-none-any.whl", hash = "sha256:2db69b91877d9d34825f5cd2a63b94f259011a77dcf761b437bf510fbe9522e9"},
-    {file = "huggingface_hub-1.2.4.tar.gz", hash = "sha256:7a1d9ec4802e64372d1d152d69fb8e26d943f15a2289096fbc8e09e7b90c21a5"},
+    {file = "huggingface_hub-1.3.1-py3-none-any.whl", hash = "sha256:efbc7f3153cb84e2bb69b62ed90985e21ecc9343d15647a419fc0ee4b85f0ac3"},
+    {file = "huggingface_hub-1.3.1.tar.gz", hash = "sha256:e80e0cfb4a75557c51ab20d575bdea6bb6106c2f97b7c75d8490642f1efb6df5"},
 ]
 
 [package.dependencies]

@@ -150,7 +150,8 @@ template <uint32_t nbKHeads>
 #endif
 #endif
 void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, bool verbose = false,
-    bool saveData = false, bool hasAttentionSinks = false, uint32_t ctxLen = ~0U, uint32_t slidingWinSize = 1U << 30)
+    bool saveData = false, bool hasAttentionSinks = false, uint32_t ctxLen = ~0U, uint32_t slidingWinSize = 1U << 30,
+    float skipSoftmaxThresholdScaleFactor = 0.0f)
 {
 #if IS_MLA
     if (nbKHeads != 1)
@@ -224,6 +225,12 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
         seqLen = (16U << 20) / gmemCacheHeadBytes; // 32MB per K+V head.
     }
     ctxLen = std::min(ctxLen, seqLen);
+    uint32_t skippedBlockCount = 0;
+    uint32_t totalBlockCount = 0;
+    if (skipSoftmaxThresholdScaleFactor > 0)
+    {
+        assert(useQGMMA);
+    }
     float const kScale = cacheElemSize == 2 ? 1.f : 1 / 4.f;
     float const vScale = kScale;
     float const qScale = 1.f;
@@ -329,6 +336,17 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
     auto const rcpOutScale = ManagedMemBuf<float>(1);
     auto const seqLenList = ManagedMemBuf<uint32_t[beamWidth]>(batchSize);
     auto const ctxLenList = ManagedMemBuf<uint32_t[beamWidth]>(batchSize);
+#if SKIP_SOFTMAX_ATTN
+#ifdef SKIP_SOFTMAX_ATTN_BLOCK_STATS
+    auto const kernelSkippedBlockCount = ManagedMemBuf<uint32_t>(1);
+    auto const kernelTotalBlockCount = ManagedMemBuf<uint32_t>(1);
+    kernelSkippedBlockCount[0] = 0;
+    kernelTotalBlockCount[0] = 0;
+#endif
+#else
+    EXPECT_EQ(skipSoftmaxThresholdScaleFactor, 0.0f)
+        << "Got non-zero skipSoftmaxThresholdScaleFactor while SKIP_SOFTMAX_ATTN is not enabled.";
+#endif
 #if USE_PAGED_KV_CACHE
     auto const pageListBuf = ManagedMemBuf<std::byte>(pageListBytes);
 #if PAGED_KV_CACHE_LAYOUT == 1
@@ -726,6 +744,11 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
             maxSeqLen, &seqLenList[0][0], batchSize, kvCacheScale.get(), semaphores.get(), scratch, stream);
     };
 #else
+    auto multiBlockNum = [&]()
+    {
+        auto const calcFunc = useQGMMA ? &computeNbSubSeqPerSeqHopperF8MHA : &computeNbSubSeqPerSeqMHA;
+        return calcFunc(prop, batchSize, nbKHeads, maxSeqLen);
+    }();
     auto runKernel = [&]()
     {
         auto const launchFunc = useQGMMA ? &launchHopperF8MHA : &launchMHA;
@@ -777,6 +800,12 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
 #if SPEC_DEC
             specDecParams,
 #endif
+#if SKIP_SOFTMAX_ATTN
+            skipSoftmaxThresholdScaleFactor,
+#if SKIP_SOFTMAX_ATTN_BLOCK_STATS
+            kernelSkippedBlockCount.get(), kernelTotalBlockCount.get(),
+#endif
+#endif
             semaphores.get(), scratch, stream);
         checkCuda(cudaGetLastError());
     };
@@ -813,6 +842,10 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
     checkCuda(cudaEventRecord(toc, stream));
     prefetchToDevice(cudaCpuDeviceId);
     checkCuda(cudaStreamSynchronize(stream));
+#if SKIP_SOFTMAX_ATTN && SKIP_SOFTMAX_ATTN_BLOCK_STATS
+    kernelSkippedBlockCount[0] /= nbIters;
+    kernelTotalBlockCount[0] /= nbIters;
+#endif
     if (testPerf)
     {
         float ms;
@@ -849,6 +882,15 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
             = totalNbCacheLoadBytes + inputBytes + outputBytes; // we ignore page indices and beam search indices.
         float const dramSolTime = totalTraffic / bandwidth * 1E3f;
         float const dramSolRatio = dramSolTime / ms;
+#if SKIP_SOFTMAX_ATTN && SKIP_SOFTMAX_ATTN_BLOCK_STATS
+        size_t const totalNbCacheLoadWithSkip = gmemCacheHeadBytes
+            * (nbKHeads + nbVHeads * (1 - 1.0f * kernelSkippedBlockCount[0] / kernelTotalBlockCount[0]))
+            * nbLoadedCacheTokens;
+        float const totalTrafficWithSkip
+            = totalNbCacheLoadWithSkip + inputBytes + outputBytes; // we ignore page indices and beam search indices.
+        float const dramSolTimeWithSkip = totalTrafficWithSkip / bandwidth * 1E3f;
+        float const dramSolRatioWithSkip = dramSolTimeWithSkip / ms;
+#endif
         if (verbose)
         {
             printf("done\n");
@@ -863,7 +905,13 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
         }
         float const tops = headGrpSize * qSeqLen * float(seqLen) * (validElemsPerKHead + validElemsPerVHead) * 2
             * nbKHeads * batchSize / (ms * 1E-3F) * 1E-12F;
+#if SKIP_SOFTMAX_ATTN && SKIP_SOFTMAX_ATTN_BLOCK_STATS
+        printf("kernel skippedBlockCount: %d/%d (%.2f%%)\n", kernelSkippedBlockCount[0], kernelTotalBlockCount[0],
+            kernelTotalBlockCount[0] == 0 ? 0.0f : 100.0f * kernelSkippedBlockCount[0] / kernelTotalBlockCount[0]);
+        printf("dramSolRatioWithSkip: %f%% (%f ms, TOPS = %f)\n", dramSolRatioWithSkip * 100, ms, tops);
+#else
         printf("dramSolRatio: %f%% (%f ms, TOPS = %f)\n", dramSolRatio * 100, ms, tops);
+#endif
     }
     if (refCheck)
     {
@@ -1084,8 +1132,8 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
                     if (useQGMMA)
                     {
                         refOutput = refFlashAttention<CacheElem, 64>(&qHeads[req][b][headGrpSize * idxKHead], kCacheSeq,
-                            vCacheSeq, seqLen, qScaleForRef, kvCacheScale[0], xScale, slidingWinSize,
-                            refAttentionSinks);
+                            vCacheSeq, seqLen, qScaleForRef, kvCacheScale[0], xScale, slidingWinSize, refAttentionSinks,
+                            skipSoftmaxThresholdScaleFactor, &skippedBlockCount, &totalBlockCount, multiBlockNum);
                         // refOutput = refAttention<CacheElem>(&qHeads[req][b][headGrpSize * idxKHead], kCacheSeq,
                         // vCacheSeq, seqLen, qScaleForRef, kvCacheScale[0], xScale, slidingWinSize);
                     }
@@ -1132,6 +1180,14 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
 #endif
             }
         }
+#if SKIP_SOFTMAX_ATTN
+        printf("host skippedBlockCount: %d/%d (%.2f%%)\n", skippedBlockCount, totalBlockCount,
+            totalBlockCount == 0 ? 0.0f : 100.0f * skippedBlockCount / totalBlockCount);
+#if SKIP_SOFTMAX_ATTN_BLOCK_STATS
+        printf("kernel skippedBlockCount: %d/%d (%.2f%%)\n", kernelSkippedBlockCount[0], kernelTotalBlockCount[0],
+            kernelTotalBlockCount[0] == 0 ? 0.0f : 100.0f * kernelSkippedBlockCount[0] / kernelTotalBlockCount[0]);
+#endif
+#endif
         if (saveData)
         {
             fout_refOutput.close();
@@ -1253,6 +1309,14 @@ TEST(RefCheck, llama_V2_70b)
 #if SLIDING_WINDOW
     runTest<2>(2, 4096, false, true, false, false, false, ~0, 256);
     runTest<2>(2, 400, false, true, false, false, false, ~0U, 256);
+#endif
+#if SKIP_SOFTMAX_ATTN
+    runTest<1>(32, 2048, false, true, false, false, false, ~0U, 1U << 30, 0.f);
+    runTest<4>(32, 1538, false, true, false, false, false, ~0U, 1U << 30, 1280.f);
+    runTest<2>(32, 4096, false, true, false, false, false, ~0U, 1U << 30, 125.f);
+    runTest<4>(32, 300, false, true, false, false, false, ~0U, 1U << 30, 80.f);
+    runTest<4>(32, 500, false, true, false, false, false, ~0U, 1U << 30, 501.0f);
+    runTest<4>(32, 500, false, true, false, false, false, ~0U, 1U << 30, 500.f);
 #endif
     runTest<8>(120, 367, false, true);
     runTest<8>(1792, 2048, false, true);

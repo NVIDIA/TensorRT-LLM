@@ -3203,6 +3203,7 @@ def test_llm_llama_v3_2_smoothquant_1node_single_gpu(
 
 
 @pytest.mark.timeout(7200)
+@pytest.mark.skip_device_not_contain(["A100", "H100"])
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.skip_less_device(4)
 @skip_post_blackwell_ultra

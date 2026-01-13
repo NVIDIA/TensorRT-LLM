@@ -123,7 +123,7 @@ public:
         NB_OVERRIDE_PURE(removeSequence, requestId, llmRequest, pinOnRelease);
     }
 
-    std::optional<tbk::KVCacheBlock::IdType> storeBlocksForReuse(tb::LlmRequest::RequestIdType requestId,
+    std::vector<tbk::KVCacheBlock::IdType> storeBlocksForReuse(tb::LlmRequest::RequestIdType requestId,
         tensorrt_llm::common::OptionalRef<tb::LlmRequest const> llmRequest, bool pinBlocks) override
     {
         NB_OVERRIDE_PURE(storeBlocksForReuse, requestId, llmRequest, pinBlocks);

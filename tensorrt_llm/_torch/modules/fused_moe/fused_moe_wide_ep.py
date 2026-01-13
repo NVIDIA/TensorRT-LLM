@@ -159,10 +159,6 @@ class WideEPMoE(MoE):
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
 
-        # Debug function for eliminating imbalance during performance analysis.
-        self.enable_dummy_allreduce = os.environ.get(
-            "TRTLLM_ENABLE_DUMMY_ALLREDUCE", "0") == "1"
-
         # MoE op will be lazily initialized when first accessed (see moe_op_impl property)
         self._moe_op_impl = None
 
@@ -341,16 +337,6 @@ class WideEPMoE(MoE):
             assert self._weights_created, "Weights must be created before accessing moe_op"
             self._moe_op_impl = MoEOpSelector.select_op(self)
         return self._moe_op_impl
-
-    def dummy_allreduce(self):
-        """
-        Debug function for eliminating imbalance during performance analysis.
-        Creates a small dummy tensor and performs allreduce to synchronize processes
-        and eliminate timing imbalances for more accurate profiling measurements.
-        """
-        dummy_tensor = torch.zeros(4, dtype=torch.float32, device='cuda')
-        dummy_tensor = self.all_reduce(dummy_tensor)
-        return dummy_tensor
 
     def reducescatter_or_allreduce(
         self,
