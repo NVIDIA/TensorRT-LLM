@@ -20,6 +20,19 @@ from html import escape
 
 
 def parse_xml_classname_name_file_from_testname(testname, stage_name):
+    """Parse XML attributes from a test name.
+
+    Args:
+        testname: Test identifier, may be prefixed with stage_name and can have
+        different formats (e.g., "unittest/...", "file.py::class::test")
+        stage_name: Name of the test stage, used for classname construction
+
+    Returns:
+        Tuple of (classname, name, file) where:
+        - classname: Fully qualified class name for the test
+        - name: Test method or case name
+        - file: Source file containing the test
+    """
     classname, name, file = "", "", ""
 
     # Remove stage_name prefix if present
@@ -60,6 +73,13 @@ def parse_xml_classname_name_file_from_testname(testname, stage_name):
 
 
 def generate_timeout_xml(stage_name, testList, outputFilePath):
+    """Generate JUnit XML report for timed-out tests.
+
+    Args:
+        stage_name: Name of the test stage
+        testList: List of test names that timed out
+        outputFilePath: Path where the XML report will be written
+    """
     num_tests = len(testList)
     # Escape stage_name for XML safety
     stage_name_escaped = escape(stage_name, quote=True)
@@ -89,6 +109,11 @@ def generate_timeout_xml(stage_name, testList, outputFilePath):
 
 
 def main():
+    """Parse arguments and generate timeout test XML report.
+
+    Reads a list of timed-out tests from a file and generates a JUnit-compatible
+    XML report marking each test with an error status.
+    """
     # Parse command-line arguments
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage-name", required=True, help="Stage name")
