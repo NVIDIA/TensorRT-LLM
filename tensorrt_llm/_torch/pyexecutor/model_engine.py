@@ -1438,7 +1438,7 @@ class PyTorchModelEngine(ModelEngine):
                                                 max(attn_all_rank_num_tokens)
                                                 <= max_captured_num_tokens)
                 all_ranks_can_run_piecewise_cuda_graph = list(
-                    self.dist.tp_cp_allgather(can_run_piecewise_cuda_graph))
+                    self.dist.tp_allgather(can_run_piecewise_cuda_graph))
                 if all(all_ranks_can_run_piecewise_cuda_graph):
                     padded_num_tokens = get_padded_piecewise_tokens(
                         max(attn_all_rank_num_tokens))
