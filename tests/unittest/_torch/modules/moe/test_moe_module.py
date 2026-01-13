@@ -18,6 +18,7 @@ import pytest
 import torch
 from _torch.modules.moe.quantize_utils import get_test_quant_params
 from transformers.configuration_utils import PretrainedConfig
+from utils.util import getSMVersion
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe import RenormalizeMoeRoutingMethod, create_moe
@@ -57,6 +58,8 @@ def test_moe(dtype, moe_backend, quant_algo, mocker):
     if moe_backend == "TRTLLM":
         if dtype == torch.float16 and quant_algo == QuantAlgo.NVFP4:
             pytest.skip("TRTLLM NVFP4 MoE backend does not support float16 yet")
+    if quant_algo == QuantAlgo.NVFP4 and getSMVersion() < 100:
+        pytest.skip("This test is not supported in pre-Blackwell architecture")
 
     # Hardcode some parameters for testing
     # activation and weight related
