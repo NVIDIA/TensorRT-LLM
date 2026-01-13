@@ -105,8 +105,11 @@ class EagleModel(nn.Module):
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-    def forward(self, input_ids, hidden_states, position_ids, attention_mask, past_key_value=None):
-        # hidden_states: [Batch, Seq, 12288]
+    def forward(
+        self, input_ids, position_ids, hidden_states, attention_mask=None, past_key_value=None
+    ):
+        # before: hidden_states: [Batch, Seq, 3* hidden_size]
+        # after: hidden_states: [Batch, Seq, hidden_size]
         hidden_states = self.fc(hidden_states)
 
         input_embeds = self.embed_tokens(input_ids)
@@ -133,30 +136,8 @@ class EagleModel(nn.Module):
         logits = self.lm_head(self.norm(out))
         return logits
 
-
-class EagleForward(torch.nn.Module):
-    def __init__(self, config: LlamaConfig):
-        super().__init__()
-        self.model = EagleModel(config)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_ids: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        input_ids: torch.Tensor | None = None,
-    ):
-        # hidden_states = self.model.fc(all_hidden_states)
-        out = self.model(
-            input_ids=input_ids,
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-        )
-        return out
-
     def load_weights(self, weights: Dict):
-        missing, unexpected = self.model.load_state_dict(weights, strict=False)
+        missing, unexpected = self.load_state_dict(weights, strict=False)
         if missing:
             print(f"⚠️ Missing keys (initialized randomly): {missing}")
         if unexpected:
@@ -208,7 +189,7 @@ def main():
 
     dtype = torch.float16
 
-    model = EagleForward(cfg)
+    model = EagleModel(cfg)
     model.load_weights(state_dict)
     model.to(device, dtype=dtype)
     model.eval()
@@ -233,7 +214,7 @@ def main():
 
     with torch.inference_mode():
         output_logits = model(
-            input_ids=input_ids, hidden_states=mock_hidden_states, position_ids=position_ids
+            input_ids=input_ids, position_ids=position_ids, hidden_states=mock_hidden_states
         )
 
     print(f"Output shape: {output_logits.shape}")
@@ -254,11 +235,13 @@ def main():
     # Alternatively, use None if you want to trace the 'no mask' path:
     # mock_attention_mask = None
 
+    print(input_ids.shape, position_ids.shape, mock_hidden_states.shape, mock_attention_mask.shape)
+
     example_args = (
-        mock_hidden_states,  # hidden_states
+        input_ids,  # input_ids
         position_ids,  # position_ids
+        mock_hidden_states,  # hidden_states
         mock_attention_mask,  # attention_mask (Optional)
-        input_ids,  # input_ids (Optional)
     )
 
     # 2. Run torch.export
