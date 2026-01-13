@@ -313,6 +313,7 @@ def parse_args() -> argparse.Namespace:
             "ALLGATHER",
             "NVLINK_ONE_SIDED",
             "NVLINK_TWO_SIDED",
+            "DEEPEP",
             "DEEPEPLOWLATENCY",
         ],
         help="Which communication backend to benchmark (default: run all backends).",
@@ -524,7 +525,7 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace) -> None:
         )
 
     backends = (
-        ["ALLGATHER", "NVLINK_ONE_SIDED", "NVLINK_TWO_SIDED", "DEEPEPLOWLATENCY"]
+        ["ALLGATHER", "NVLINK_ONE_SIDED", "NVLINK_TWO_SIDED", "DEEPEP", "DEEPEPLOWLATENCY"]
         if args.backend is None
         else [args.backend]
     )
