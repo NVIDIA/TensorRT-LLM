@@ -81,7 +81,7 @@ class BaseTransferAgent(ABC):
 @dataclass
 class RegMemoryDescs:
     type: str
-    descs: List[Tuple[int, int, int, str]]
+    descs: List[Tuple[int, int, int, str]]  # (ptr, size, device_id, name)
 
 
 def _force_py_nixl_kv_transfer() -> bool:
@@ -123,4 +123,6 @@ if _cpp_binding and not _force_py_nixl_kv_transfer():
     BaseTransferAgent = _cpp_binding.BaseTransferAgent
     logger.info("Using Pybind transfer agent binding for Transfer Agent implementation.")
 else:
-    logger.info("Failed to import Pybind transfer agent binding, using pure Python implementation.")
+    logger.warning(
+        "Failed to import Pybind transfer agent binding, using pure Python implementation."
+    )
