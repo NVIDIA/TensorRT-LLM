@@ -58,15 +58,11 @@ fi
 # Generate extra_llm_config.yaml based on executor type
 echo "Generating extra_llm_config.yaml for executor: $BACKEND"
 if [[ "$BACKEND" == "ray" ]]; then
-    # Ray backend: Both servers share the same Ray cluster
-    # Ray scheduler handles GPU allocation automatically
-    # Each server requests tp_size GPUs via placement groups
-
     cat > extra_llm_config.yaml << EOF
-# extra_llm_config.yaml for Ray orchestrator
+# extra_llm_config.yaml when launching disaggregated server instances.
 cache_transceiver_config:
     backend: "UCX"
-    max_tokens_in_buffer: 1024
+    max_tokens_in_buffer: 2048
 disable_overlap_scheduler: true
 orchestrator_type: "ray"
 max_batch_size: 1
@@ -78,7 +74,7 @@ else
 # extra_llm_config.yaml when launching disaggregated server instances.
 cache_transceiver_config:
     backend: "UCX"
-    max_tokens_in_buffer: 1024
+    max_tokens_in_buffer: 2048
 disable_overlap_scheduler: true
 # Using default executor MPI (no orchestrator_type specified)
 # Memory-saving parameters
@@ -94,7 +90,7 @@ cat > disagg_config_local.yaml << EOF
 hostname: localhost
 port: 8000
 model: $MODEL_DIR
-free_gpu_memory_fraction: 0.8
+free_gpu_memory_fraction: 0.25
 backend: "pytorch"
 disable_overlap_scheduler: True
 context_servers:
@@ -105,7 +101,7 @@ context_servers:
   max_num_tokens: 512
   max_seq_len: 128
   kv_cache_config:
-    free_gpu_memory_fraction: 0.8
+    free_gpu_memory_fraction: 0.2
   cache_transceiver_config:
     backend: "UCX"
   urls:
@@ -117,8 +113,6 @@ generation_servers:
   max_batch_size: 1
   max_num_tokens: 512
   max_seq_len: 128
-  kv_cache_config:
-    free_gpu_memory_fraction: 0.8
   cache_transceiver_config:
     backend: "UCX"
   urls:
@@ -179,5 +173,5 @@ if [[ "$RAY_STARTED" == "true" && "$ATTACH_MODE" != "true" ]]; then
     ray stop
 fi
 
-echo "Cleaning up generated config files..."
+echo "Cleaning up generated extra_llm_config.yaml..."
 rm -f extra_llm_config.yaml
