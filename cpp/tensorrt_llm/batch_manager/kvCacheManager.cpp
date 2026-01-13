@@ -479,12 +479,28 @@ void KVCacheBlock::removeNextBlock(BlockKey const& blockKey)
 
 void KVCacheBlock::freeDescendantsRecursively()
 {
-    for (auto it = mNextBlocks.begin(); it != mNextBlocks.end();)
+    bool hasChildren = !mNextBlocks.empty();
+    if (hasChildren)
     {
-        it->second->freeDescendantsRecursively();
-        mPrevBlock = nullptr;
-        it = mNextBlocks.erase(it);
+	for (auto it = mNextBlocks.begin(); it != mNextBlocks.end();)
+	{
+	    it->second->freeDescendantsRecursively();
+	    TLLM_LOG_DEBUG("KVCacheBlock::freeDescendantsRecursively - Freeing block %d",it->second->getBlockId());
+	    it = mNextBlocks.erase(it);
+	}
     }
+    mPrevBlock = nullptr;
+}
+
+void KVCacheBlock::freeBlockAndAllDescendants()
+{
+    // free from previous block
+    if (mPrevBlock != nullptr)
+    {
+        mPrevBlock->removeNextBlock(mBlockKey);
+        mPrevBlock = nullptr;
+    }
+    freeDescendantsRecursively();
 }
 
 bool KVCacheBlock::isFull() const
@@ -973,7 +989,7 @@ void WindowBlockManager::freeChildren(BlockPtr const& block)
     }
 
     // Free block and all it's descendants from radix tree
-    block->freeDescendantsRecursively();
+    block->freeBlockAndAllDescendants();
 }
 
 BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor::RetentionPriority priority,

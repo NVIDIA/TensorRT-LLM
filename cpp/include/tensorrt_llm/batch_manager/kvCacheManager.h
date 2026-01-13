@@ -289,6 +289,7 @@ public:
     void removeNextBlock(BlockKey const& blockKey);
 
     void freeDescendantsRecursively();
+    void freeBlockAndAllDescendants();
 
     //! \brief Find block matching blockKey. If allowPartial is true, the returned block may match only a prefix of
     //! blockKey.
