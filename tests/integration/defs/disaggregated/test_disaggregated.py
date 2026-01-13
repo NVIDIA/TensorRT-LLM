@@ -200,6 +200,10 @@ def get_test_config(test_desc, example_dir, test_root):
         "gpt_oss_120b_stress":
         (4,
          f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_tllm.yaml"),
+        "cancel_stress_test":
+        (2, f"{test_configs_root}/disagg_config_cancel_stress_test.yaml"),
+        "cancel_stress_test_large":
+        (8, f"{test_configs_root}/disagg_config_cancel_stress_test_large.yaml"),
     }
 
     if test_desc not in config_map:
@@ -2098,3 +2102,211 @@ def test_disaggregated_stress_test(disaggregated_test_root,
                              threshold=test_config.accuracy_threshold,
                              env=llm_venv._new_env,
                              cwd=llm_venv.get_working_directory())
+
+
+def run_cancel_stress_test(server_url: str,
+                           num_bursts: int = 5,
+                           requests_per_burst: int = 32,
+                           prompt_len_range: tuple = (2000, 8000),
+                           cancel_after_range: tuple = (0.01, 0.1)):
+    """
+    Stress test that sends requests with large contexts and cancels them
+    during prefill to test resource cleanup under cancellation.
+
+    Args:
+        server_url: The server URL (e.g., "http://localhost:8000")
+        num_bursts: Number of request bursts to send
+        requests_per_burst: Number of concurrent requests per burst
+        prompt_len_range: (min, max) prompt length in tokens
+        cancel_after_range: (min, max) seconds to wait before cancelling
+    """
+    import asyncio
+    import random
+    import time
+
+    import aiohttp
+
+    async def spam_and_cancel(session, req_id, url, prompt_len_range,
+                              cancel_after_range):
+        """Send a request and cancel it during prefill."""
+        prompt_len = random.randint(prompt_len_range[0], prompt_len_range[1])
+        prompt = "test " * (prompt_len // 5)
+
+        payload = {
+            "model": "test-model",
+            "prompt": prompt,
+            "max_tokens": 10,
+            "stream": True
+        }
+
+        try:
+            cancel_after = random.uniform(cancel_after_range[0],
+                                          cancel_after_range[1])
+            start = time.time()
+            async with session.post(
+                    f"{url}/v1/completions",
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                async for line in resp.content:
+                    if time.time() - start > cancel_after:
+                        # Force disconnect during prefill
+                        break
+        except Exception:
+            pass  # Connection abort is expected
+
+    async def run_bursts():
+        async with aiohttp.ClientSession() as session:
+            for burst_idx in range(num_bursts):
+                tasks = [
+                    spam_and_cancel(session, i, server_url, prompt_len_range,
+                                    cancel_after_range)
+                    for i in range(requests_per_burst)
+                ]
+                await asyncio.gather(*tasks)
+                logger.info(
+                    f"Completed burst {burst_idx + 1}/{num_bursts} ({requests_per_burst} requests)"
+                )
+                await asyncio.sleep(0.05)
+
+    asyncio.run(run_bursts())
+
+
+def run_disaggregated_cancel_test(example_dir,
+                                  test_desc,
+                                  env=None,
+                                  cwd=None,
+                                  num_bursts=64,
+                                  requests_per_burst=64):
+    """Run disaggregated test with request cancellation stress test."""
+    cleanup_output_files()
+    run_env = env.copy()
+    run_env["UCX_TLS"] = "^ib"
+
+    num_ranks, config_file = get_test_config(test_desc, example_dir,
+                                             os.path.dirname(__file__))
+
+    workers_cmd = [
+        'mpirun', '--allow-run-as-root', '--oversubscribe', '-n',
+        str(num_ranks), 'trtllm-serve', 'disaggregated_mpi_worker', '-c',
+        config_file
+    ]
+
+    server_start_timeout = 1200
+    server_cmd = [
+        'trtllm-serve', 'disaggregated', '--server_start_timeout',
+        str(server_start_timeout), '-c', config_file
+    ]
+    server_host, server_port = get_disagg_server_url_from_cfg(config_file)
+    server_url = f"http://{server_host}:{server_port}"
+
+    try:
+        with (open('output_workers.log', 'w') as output_workers,
+              popen(workers_cmd,
+                    stdout=output_workers,
+                    stderr=subprocess.STDOUT,
+                    env=run_env,
+                    cwd=cwd) as workers_proc, open('output_disagg.log', 'w') as
+              output_disagg,
+              popen(server_cmd,
+                    stdout=output_disagg,
+                    stderr=subprocess.STDOUT,
+                    env=run_env,
+                    cwd=cwd) as server_proc):
+
+            # Wait for server to be ready
+            if not wait_for_server(server_host,
+                                   server_port,
+                                   timeout_seconds=server_start_timeout):
+                raise RuntimeError(
+                    f"Disaggregated server did not become ready within {server_start_timeout} seconds"
+                )
+
+            # Run the cancel stress test
+            run_cancel_stress_test(server_url,
+                                   num_bursts=num_bursts,
+                                   requests_per_burst=requests_per_burst)
+
+            # Verify server is still healthy after stress test by sending a normal request
+            client_dir = f"{example_dir}/clients"
+            client_cmd = [
+                'python3', f'{client_dir}/disagg_client.py', '-c', config_file,
+                '-p', f'{client_dir}/prompts.json', '--ignore-eos',
+                '--server-start-timeout',
+                str(server_start_timeout)
+            ]
+            check_call(client_cmd,
+                       env=env,
+                       poll_procs=[workers_proc, server_proc])
+
+    except Exception:
+        logger.error("-------- Workers output --------")
+        with open('output_workers.log', 'r') as f:
+            logger.error(f.read())
+
+        logger.error("-------- Disagg server output --------")
+        with open('output_disagg.log', 'r') as f:
+            logger.error(f.read())
+        raise
+    finally:
+        if 'server_proc' in locals() and 'workers_proc' in locals():
+            server_proc.terminate()
+            workers_proc.terminate()
+            server_proc.wait()
+            workers_proc.wait()
+
+
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
+                         indirect=True)
+def test_disaggregated_cancel_large_context_requests(disaggregated_test_root,
+                                                     disaggregated_example_root,
+                                                     llm_venv,
+                                                     deepseek_v3_model_root):
+    """
+    Test that the disaggregated server handles request cancellations gracefully.
+
+    This test sends bursts of requests with large contexts and cancels them
+    during prefill to stress test resource cleanup.
+    """
+    src_dst_dict = {
+        deepseek_v3_model_root:
+        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/bf16",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    run_disaggregated_cancel_test(disaggregated_example_root,
+                                  "cancel_stress_test",
+                                  env=llm_venv._new_env,
+                                  cwd=llm_venv.get_working_directory(),
+                                  num_bursts=5,
+                                  requests_per_burst=32)
+
+
+@pytest.mark.skip_less_device(8)
+@skip_pre_blackwell
+@pytest.mark.parametrize("model_path", ['DeepSeek-V3-0324-FP4'])
+def test_disaggregated_cancel_large_context_requests_long(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        model_path):
+    """Test that disaggregated server handles request cancellations gracefully.
+
+    This test sends bursts of requests with large contexts and cancels them
+    during prefill to stress test resource cleanup.
+    """
+    model_dir = f"{llm_models_root()}/{model_path}"
+    src_dst_dict = {
+        model_dir: f"{llm_venv.get_working_directory()}/{model_path}",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    run_disaggregated_cancel_test(disaggregated_example_root,
+                                  "cancel_stress_test_large",
+                                  env=llm_venv._new_env,
+                                  cwd=llm_venv.get_working_directory(),
+                                  num_bursts=1000,
+                                  requests_per_burst=32)

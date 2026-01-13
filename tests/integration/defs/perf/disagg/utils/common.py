@@ -192,6 +192,9 @@ def extract_config_fields(config_data: dict) -> dict:
     gen_batch_size = config_data["worker_config"]["gen"]["max_batch_size"]
     gen_enable_dp = config_data["worker_config"]["gen"]["enable_attention_dp"]
     streaming = config_data["benchmark"]["streaming"]
+    concurrency_list = [
+        int(x.strip()) for x in config_data["benchmark"]["concurrency_list"].split() if x.strip()
+    ]
     cache_transceiver_backend = config_data["worker_config"]["gen"]["cache_transceiver_config"][
         "backend"
     ]
@@ -226,6 +229,7 @@ def extract_config_fields(config_data: dict) -> dict:
         "gen_max_tokens": gen_max_tokens,
         "gen_max_batch_size": gen_max_batch_size,
         "streaming": streaming,
+        "concurrency_list": concurrency_list,
         "ctx_max_seq_len": ctx_max_seq_len,
         "gen_max_seq_len": gen_max_seq_len,
     }
