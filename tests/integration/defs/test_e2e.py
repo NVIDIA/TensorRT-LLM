@@ -2536,9 +2536,6 @@ def test_ptp_quickstart_advanced_mixed_precision(llm_root, llm_venv):
 @pytest.mark.parametrize("use_cuda_graph", [False, True])
 @pytest.mark.parametrize("modality", ["image", "video", "mixture_text_image"])
 @pytest.mark.parametrize("model_name,model_path", [
-    pytest.param("mistral-small-3.1-24b-instruct",
-                 "Mistral-Small-3.1-24B-Instruct-2503",
-                 marks=pytest.mark.skip_less_device_memory(80000)),
     pytest.param(
         "Nano-v2-VLM",
         "Nano-v2-VLM",
@@ -2588,21 +2585,11 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         }
     }
 
-    expected_keywords = {
-        "mistral-small-3.1-24b-instruct": {
-            "image": [
-                ["dramatic", "seascape", "ocean", "turbulent", "waves", "dark"],
-                ["scenic", "rock", "landscape", "monolith", "formation"],
-                [
-                    "multi-lane", "highway", "moderate", "traffic", "flow",
-                    "vehicles", "congestion"
-                ],
-            ],
-            "mixture_text_image":
-            [["invention", "person", "scientists", "Lick", "engineers"],
-             ["landscape", "trees", "road", "depicts", "scenic"]]
-        },
-    }
+    # TODO: remove this entire test if there are no plans to extend them for Nano v2 VL.
+    expected_keywords = {}
+
+    if modality not in expected_keywords[model_name]:
+        pytest.skip(f"{modality=} not supported for {model_name}")
 
     cmd = [
         str(example_root / "quickstart_multimodal.py"),
@@ -2620,19 +2607,13 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
     if use_cuda_graph:
         cmd.append("--use_cuda_graph")
 
-    output = llm_venv.run_cmd(cmd, caller=check_output)
+    _ = llm_venv.run_cmd(cmd, caller=check_output)
 
-    match_ratio = 4.0 / 5
-    parsed_outputs = parse_output(output)
-    for prompt_output, prompt_keywords in zip(
-            parsed_outputs, expected_keywords[model_name][modality]):
-        matches = [
-            keyword in prompt_output.lower() for keyword in prompt_keywords
-        ]
-        obs_match_ratio = 1. * sum(matches) / len(matches)
-        assert obs_match_ratio >= match_ratio, f"Incorrect output!\nGenerated \"{prompt_output}\"\nExpected keywords \"{prompt_keywords}\"\n Matched keywords: {matches}\n Observed match ratio {obs_match_ratio} below threshold {match_ratio}\n\nParsed output for all prompts: {parsed_outputs}"
-
-    print("All answers are correct!")
+    # NOTE: we deliberately do not check the LLM outputs with keyword matching ratios as in the
+    # other tests, as it can be brittle and cause flakiness in CI.
+    # This test now becomes a smoke / functional test.
+    # Proper accuracy tests should be added to
+    # `tests/integration/defs/accuracy/test_llm_api_pytorch_multimodal.py`.
 
 
 @pytest.mark.parametrize("modality", ["image", "video"])

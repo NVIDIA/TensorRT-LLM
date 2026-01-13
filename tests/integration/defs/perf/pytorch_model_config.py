@@ -59,7 +59,7 @@ def get_model_yaml_config(model_label: str,
     pattern_configs = [
         # Deepseek default cases
         {
-            'patterns': 'deepseek_r1',
+            'patterns': ['deepseek_r1', 'kimi_k2_nvfp4'],
             'config': {
                 'enable_attention_dp': True,
             }

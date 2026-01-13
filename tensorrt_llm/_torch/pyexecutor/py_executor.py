@@ -250,6 +250,9 @@ class PyExecutor:
         self.send_schedule_handler = None
         self.pp_scheduler_max_retry_count = int(
             os.environ.get("TLLM_PP_SCHEDULER_MAX_RETRY_COUNT", 10))
+        self.sample_stream = torch.cuda.Stream()
+        self.start_sample_event = torch.cuda.Event()
+        self.finish_sample_event = torch.cuda.Event()
 
         # Set of request IDs that are currently in flight across all micro batches.
         # The scheduler will avoid scheduling requests that are already in flight.
@@ -1068,8 +1071,25 @@ class PyExecutor:
                                 guided_decoder_failed_requests = self.guided_decoder.execute(
                                     batch_outputs['logits'])
 
-                            sample_state = self._sample_async(
-                                scheduled_batch, batch_outputs)
+                            if os.environ.get("TRTLLM_PP_MULTI_STREAM_SAMPLE",
+                                              "1") == "1":
+                                # Wait for the previous sample to finish.
+                                self.finish_sample_event.wait()
+                                # Copy the batch outputs as sampler inputs
+                                # to avoid next forward step overwriting them.
+                                batch_outputs_copy = {
+                                    name: tensor.clone()
+                                    for name, tensor in batch_outputs.items()
+                                }
+                                self.start_sample_event.record()
+                                with torch.cuda.stream(self.sample_stream):
+                                    self.start_sample_event.wait()
+                                    sample_state = self._sample_async(
+                                        scheduled_batch, batch_outputs_copy)
+                                    self.finish_sample_event.record()
+                            else:
+                                sample_state = self._sample_async(
+                                    scheduled_batch, batch_outputs)
                             assert sample_state is not None, "Sampling failed"
 
                             # Handle guided decoder errors after _sample_async to avoid state conflicts.
@@ -1147,7 +1167,8 @@ class PyExecutor:
                             for req in previous_batch.scheduled_ctx_reqs:
                                 if req.is_context_only_request and (
                                         req.is_context_finished
-                                        or req.is_finished_due_to_length):
+                                        or req.is_finished_due_to_length
+                                ) and not req.is_finished_due_to_cancellation:
                                     block_id = self.kv_cache_manager.store_blocks_for_reuse(
                                         req, True)
                                     self.ctx_in_transmission_requests[
@@ -1416,7 +1437,8 @@ class PyExecutor:
                         for req in scheduled_batch.context_requests:
                             if req.is_context_only_request and (
                                     req.is_context_finished
-                                    or req.is_finished_due_to_length):
+                                    or req.is_finished_due_to_length
+                            ) and not req.is_finished_due_to_cancellation:
                                 block_id = self.kv_cache_manager.store_blocks_for_reuse(
                                     req, True)
                                 self.ctx_in_transmission_requests[
@@ -1666,7 +1688,8 @@ class PyExecutor:
                         for req in self.previous_batch.sample_state.scheduled_requests.context_requests:
                             if req.is_context_only_request and (
                                     req.is_context_finished
-                                    or req.is_finished_due_to_length):
+                                    or req.is_finished_due_to_length
+                            ) and not req.is_finished_due_to_cancellation:
                                 block_id = self.kv_cache_manager.store_blocks_for_reuse(
                                     req, True)
                                 self.ctx_in_transmission_requests[
@@ -2176,8 +2199,9 @@ class PyExecutor:
         if (scheduled_ctx_requests is None or len(scheduled_ctx_requests) == 0):
             return []
         for req in scheduled_ctx_requests:
-            if req.is_context_only_request and (req.is_context_finished or
-                                                req.is_finished_due_to_length):
+            if req.is_context_only_request and (
+                    req.is_context_finished or req.is_finished_due_to_length
+            ) and not req.is_finished_due_to_cancellation:
                 self.kv_cache_transceiver.respond_and_send_async(req)
                 for resource_mgr_type in (
                         ResourceManagerType.SEQ_SLOT_MANAGER,
