@@ -1,7 +1,7 @@
-from typing import Callable, List, Optional
 import base64
 import io
 import pickle
+from typing import Callable, List, Optional
 
 import pytest
 import torch
@@ -102,9 +102,9 @@ class HFModel:
                     continue
                 handle = reduce_tensor(p)
                 all_handles.append((name, handle))
-            
+
             # Serialize with base64-encoded pickle
-            serialized = base64.b64encode(pickle.dumps(all_handles)).decode('utf-8')
+            serialized = base64.b64encode(pickle.dumps(all_handles)).decode("utf-8")
             ret[self.device_uuid[device]] = serialized
 
         return ret
@@ -220,7 +220,7 @@ def test_llm_update_weights_with_serialized_handles(model_dir):
 
     # Use the serialized format (base64-encoded pickle)
     ipc_handles_serialized = hf_model.get_weight_ipc_handles_serialized([0])
-    
+
     # Verify the format is correct (should be base64-encoded strings)
     for device_uuid, serialized_data in ipc_handles_serialized.items():
         assert isinstance(serialized_data, str), "Should be base64-encoded string"
@@ -238,7 +238,7 @@ def test_llm_update_weights_with_serialized_handles(model_dir):
     # Verify generation works with updated weights
     llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
     compare_logits(llm_logits, ref_logits)
-    
+
     print("✓ LLM update_weights with serialized handles (RestrictedUnpickler) works!")
 
 

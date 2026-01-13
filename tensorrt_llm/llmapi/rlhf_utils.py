@@ -13,21 +13,32 @@ from tensorrt_llm.logger import logger
 
 class RestrictedUnpickler(pickle.Unpickler):
     """Restricted unpickler that only allows safe types.
-    
+
     This prevents arbitrary code execution by restricting what can be deserialized.
     Only allows: list, tuple, str, int, float, bool, bytes, and torch-related types
     needed for tensor reconstruction.
     """
-    
+
     # Allowed modules and their classes
     ALLOWED_TYPES = {
-        'builtins': {'list', 'tuple', 'str', 'int', 'float', 'bool', 'bytes', 'dict', 'NoneType', 'type'},
+        "builtins": {
+            "list",
+            "tuple",
+            "str",
+            "int",
+            "float",
+            "bool",
+            "bytes",
+            "dict",
+            "NoneType",
+            "type",
+        },
     }
-    
+
     def find_class(self, module, name):
         """Override to restrict which classes can be unpickled."""
         # Check if the module is in our allowed list
-        is_torch_module = module.startswith('torch')
+        is_torch_module = module.startswith("torch")
         if is_torch_module or (module in self.ALLOWED_TYPES and name in self.ALLOWED_TYPES[module]):
             return super().find_class(module, name)
 
@@ -93,7 +104,7 @@ class WorkerExtension:
                     logger.info("Deserializing base64-encoded weight handles")
                     decoded_data = base64.b64decode(serialized_handles)
                     all_handles = RestrictedUnpickler(io.BytesIO(decoded_data)).load()
-                    
+
                     # Verify the result is a list as expected
                     if not isinstance(all_handles, list):
                         raise ValueError(
