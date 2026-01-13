@@ -1,52 +1,13 @@
 import base64
-import io
-import pickle  # nosec B403
 from typing import Optional
 
 import torch
 
+from tensorrt_llm import serialization
 from tensorrt_llm._ray_utils import control_action_decorator
 from tensorrt_llm._torch.modules.fused_moe.moe_load_balancer import MoeLoadBalancer
 from tensorrt_llm._torch.utils import get_device_uuid
 from tensorrt_llm.logger import logger
-
-
-class RestrictedUnpickler(pickle.Unpickler):
-    """Restricted unpickler that only allows safe types.
-
-    This prevents arbitrary code execution by restricting what can be deserialized.
-    Only allows: list, tuple, str, int, float, bool, bytes, and torch-related types
-    needed for tensor reconstruction.
-    """
-
-    # Allowed modules and their classes
-    ALLOWED_TYPES = {
-        "builtins": {
-            "list",
-            "tuple",
-            "str",
-            "int",
-            "float",
-            "bool",
-            "bytes",
-            "dict",
-            "NoneType",
-            "type",
-        },
-    }
-
-    def find_class(self, module, name):
-        """Override to restrict which classes can be unpickled."""
-        # Check if the module is in our allowed list
-        is_torch_module = module.startswith("torch")
-        if is_torch_module or (module in self.ALLOWED_TYPES and name in self.ALLOWED_TYPES[module]):
-            return super().find_class(module, name)
-
-        raise pickle.UnpicklingError(
-            f"Global '{module}.{name}' is forbidden for security reasons. "
-            f"Only basic types (list, tuple, str, int, etc.) and torch tensor types are allowed."
-            f"Module: {module}, Name: {name}"
-        )
 
 
 class WorkerExtension:
@@ -100,10 +61,30 @@ class WorkerExtension:
 
                 serialized_handles = ipc_handles[device_uuid]
                 if isinstance(serialized_handles, str):
-                    # Data is base64-encoded pickled bytes - deserialize it using restricted unpickler
+                    # Data is base64-encoded pickled bytes - deserialize it
+                    # using restricted unpickler from tensorrt_llm.serialization
                     logger.info("Deserializing base64-encoded weight handles")
                     decoded_data = base64.b64decode(serialized_handles)
-                    all_handles = RestrictedUnpickler(io.BytesIO(decoded_data)).load()
+                    # Allow basic builtins and all torch modules
+                    approved_imports = {
+                        "builtins": [
+                            "list",
+                            "tuple",
+                            "str",
+                            "int",
+                            "float",
+                            "bool",
+                            "bytes",
+                            "dict",
+                            "NoneType",
+                            "type",
+                        ],
+                    }
+                    all_handles = serialization.loads(
+                        decoded_data,
+                        approved_imports=approved_imports,
+                        approved_module_patterns=[r"^torch.*"],
+                    )
 
                     # Verify the result is a list as expected
                     if not isinstance(all_handles, list):

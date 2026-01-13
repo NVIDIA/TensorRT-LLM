@@ -1,5 +1,4 @@
 import base64
-import io
 import pickle
 from typing import Callable, List, Optional
 
@@ -11,7 +10,6 @@ from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM
 from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
-from tensorrt_llm.llmapi.rlhf_utils import RestrictedUnpickler
 
 
 class HFModel:
@@ -191,62 +189,13 @@ def run_generate(llm, hf_model, prompts, sampling_params):
     return llm_logits, ref_logits
 
 
-@pytest.mark.parametrize(
-    "model_dir",
-    ["Qwen2.5-0.5B-Instruct"],
-)
-def test_llm_update_weights_with_serialized_handles(model_dir):
-    """Test LLM update_weights with base64-encoded serialized handles (RestrictedUnpickler)."""
-    model_dir = str(llm_models_root() / model_dir)
-    kv_cache_config = KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.1)
-
-    hf_model = HFModel(model_dir)
-
-    llm = LLM(
-        model=model_dir,
-        ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
-        tensor_parallel_size=1,
-        load_format="dummy",
-        pipeline_parallel_size=1,
-        kv_cache_config=kv_cache_config,
-    )
-
-    prompts = [
-        "Hello, my name is",
-        "The president of the United States is",
-    ]
-
-    sampling_params = SamplingParams(temperature=0, return_generation_logits=True)
-
-    # Use the serialized format (base64-encoded pickle)
-    ipc_handles_serialized = hf_model.get_weight_ipc_handles_serialized([0])
-
-    # Verify the format is correct (should be base64-encoded strings)
-    for device_uuid, serialized_data in ipc_handles_serialized.items():
-        assert isinstance(serialized_data, str), "Should be base64-encoded string"
-        # Verify it can be decoded
-        decoded = base64.b64decode(serialized_data)
-        # Verify it can be deserialized with RestrictedUnpickler
-        deserialized = RestrictedUnpickler(io.BytesIO(decoded)).load()
-        assert isinstance(deserialized, list), "Should deserialize to list"
-
-    # Update weights using the serialized format
-    llm._collective_rpc("update_weights", (ipc_handles_serialized,))
-    # Finalize the update weights
-    llm._collective_rpc("update_weights", (None,))
-
-    # Verify generation works with updated weights
-    llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
-    compare_logits(llm_logits, ref_logits)
-
-    print("✓ LLM update_weights with serialized handles (RestrictedUnpickler) works!")
-
-
+@pytest.mark.parametrize("use_serialized_handles", [True, False])
 @pytest.mark.parametrize(
     "model_dir",
     ["Qwen2.5-0.5B-Instruct", "Qwen3/Qwen3-8B", "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"],
 )
-def test_llm_update_weights(model_dir):
+def test_llm_update_weights(model_dir, use_serialized_handles):
+    """Test LLM update_weights with both serialized and direct IPC handle formats."""
     model_dir = str(llm_models_root() / model_dir)
     kv_cache_config = KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.1)
 
@@ -271,7 +220,11 @@ def test_llm_update_weights(model_dir):
 
     sampling_params = SamplingParams(temperature=0, return_generation_logits=True)
 
-    ipc_handles = hf_model.get_weight_ipc_handles([0])
+    # Get IPC handles in either serialized or direct format
+    if use_serialized_handles:
+        ipc_handles = hf_model.get_weight_ipc_handles_serialized([0])
+    else:
+        ipc_handles = hf_model.get_weight_ipc_handles([0])
 
     llm._collective_rpc("update_weights", (ipc_handles,))
     # Finalize the update weights
