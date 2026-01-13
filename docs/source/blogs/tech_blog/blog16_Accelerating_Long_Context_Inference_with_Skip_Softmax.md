@@ -109,14 +109,14 @@ The evaluation results are summarized in the table below:
 
 | Target Sparsity | LongBench V1 Overall Accuracy | LongBench V2 Overall Accuracy |
 |:---------------:|:----------------------------:|:----------------------------:|
-| 0.0             | 47.77                        | 34.42                        |
-| 0.5             | 47.43                        | 33.48                        |
-| 0.6             | 47.47                       | 33.02                        |
-| 0.7             | 47.21                     | 33.02                        |
-| 0.8             | 46.50                     | 33.02                        |
-| 0.9             | 45.97                       | 33.02                        |
+| 0.0             | 47.77                        | 36.28                        |
+| 0.5             | 47.43                        | 38.14                        |
+| 0.6             | 47.47                       | 39.53                        |
+| 0.7             | 47.21                     | 39.53                        |
+| 0.8             | 46.50                     | 37.21                        |
+| 0.9             | 45.97                       | 37.21                        |
 
-(Note that the number of samples in LongBench V2 is very small (~200), so the result is subject to large variance. You may see non-monotonic situations where higher sparsity results in higher accuracy.)
+(Note that the number of samples in LongBench V2 is very small (~200), so the result is subject to large variance. You will see non-monotonic relationship between sparsity and accuracy. We recommend to look at LongBench V1 for inspecting the accuracy loss trend.)
 
 These results demonstrate that Skip Softmax Attention is safe to use without significant accuracy degradation. 
 
