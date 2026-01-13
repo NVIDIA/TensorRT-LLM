@@ -13,7 +13,7 @@ slurm_install_setup() {
     llmSrcNode=$resourcePathNode/TensorRT-LLM/src
 
     # Use unique lock file for this job ID
-    lock_file="install_lock_job_${SLURM_JOB_ID:-local}_node_${SLURM_NODEID:-0}.lock"
+    lock_file="install_lock_job_${SLURM_JOB_ID:-local}_restart_${SLURM_RESTART_COUNT:-0}_node_${SLURM_NODEID:-0}.lock"
 
     if [ $SLURM_LOCALID -eq 0 ]; then
         if [ -f "$lock_file" ]; then

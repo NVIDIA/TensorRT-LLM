@@ -129,6 +129,10 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
         '-m', 'pytest', ignore_opt, "-vv", "--tb=short", "-rF",
         "--timeout=2400", "--timeout-method=thread"
     ]
+
+    if os.environ.get("CI_TEST_DETAILED_LOG"):
+        command += ["-s"]
+
     if test_prefix:
         command += [f"--test-prefix={test_prefix}"]
 
