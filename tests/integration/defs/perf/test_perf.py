@@ -143,6 +143,7 @@ MODEL_PATH_DICT = {
     "gpt_oss_120b_fp4": "gpt_oss/gpt-oss-120b",
     "gpt_oss_20b_fp4": "gpt_oss/gpt-oss-20b",
     "nemotron_nano_9b_v2": "NVIDIA-Nemotron-Nano-12B-v2",
+    "nemotron_nano_3_30b_fp8": "Nemotron-Nano-3-30B-A3.5B-FP8-KVFP8-dev",
     "starcoder2_7b": "starcoder2-7b",
     "kimi_k2_nvfp4": "Kimi-K2-Thinking-NVFP4",
 }
@@ -208,6 +209,11 @@ TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=
     "llama_v3.3_nemotron_super_49b_fp8",
     "llama_v3.1_nemotron_ultra_253b",
     "llama_v3.1_nemotron_ultra_253b_fp8",
+}
+
+# Autodeploy model configs - maps model name to config file path (relative to TRT-LLM root)
+AUTODEPLOY_MODEL_CONFIGS = {
+    "nemotron_nano_3_30b_fp8": "examples/auto_deploy/nano_v3.yaml",
 }
 
 
@@ -1373,19 +1379,34 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 os.makedirs(os.path.dirname(autodeploy_config_path),
                             exist_ok=True)
 
-            # Create _autodeploy specific configuration
-            autodeploy_config = {
-                'transforms': {
-                    'compile_model': {
-                        'backend': self._config.ad_compile_backend
+            # Check if model has a specific autodeploy config file
+            if self._config.model_name in AUTODEPLOY_MODEL_CONFIGS:
+                config_file = os.path.join(
+                    self._llm_root,
+                    AUTODEPLOY_MODEL_CONFIGS[self._config.model_name])
+                if os.path.exists(config_file):
+                    with open(config_file, 'r') as f:
+                        autodeploy_config = yaml.safe_load(f)
+                    print_info(
+                        f"Loaded autodeploy config from {config_file}")
+                else:
+                    print_warning(
+                        f"Autodeploy config file not found: {config_file}")
+                    autodeploy_config = {}
+            else:
+                # Create default _autodeploy specific configuration
+                autodeploy_config = {
+                    'transforms': {
+                        'compile_model': {
+                            'backend': self._config.ad_compile_backend
+                        },
+                        'resize_kv_cache': {
+                            'free_mem_ratio': self._config.free_mem_ratio
+                        },
                     },
-                    'resize_kv_cache': {
-                        'free_mem_ratio': self._config.free_mem_ratio
-                    },
-                },
-                'runtime': self._config.extra_runtime,
-                'skip_loading_weights': self._config.skip_loading_weights
-            }
+                    'runtime': self._config.extra_runtime,
+                    'skip_loading_weights': self._config.skip_loading_weights
+                }
 
             print_info(f"_autodeploy model config: {autodeploy_config}")
             with open(autodeploy_config_path, 'w') as f:
