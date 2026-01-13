@@ -38,7 +38,7 @@ from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils._graph import add_graph_input
 from ...utils.cuda_mem_tracker import get_mem_info_in_mb
-from ...utils.node_utils import get_all_input_output_nodes, is_op
+from ...utils.node_utils import is_op
 from ..interface import (
     BaseTransform,
     SharedConfig,
