@@ -144,7 +144,7 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
     MODEL_PATH_FP8 = f"{llm_models_root()}/Nemotron-Nano-3-30B-A3.5B-FP8-KVFP8-dev"
     MODEL_PATH_NVFP4 = f"{llm_models_root()}/Nemotron-3-Nano-30B-A3B-NVFP4"
 
-    def get_default_kwargs(self):
+    def get_default_kwargs(self, world_size=1):
         return {
             "skip_tokenizer_init": False,
             "trust_remote_code": True,
@@ -170,7 +170,8 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
                 },
                 "multi_stream_moe": {
                     "stage": "compile",
-                    "enabled": True,
+                    # multi-stream MOE currently does not work for world_size > 1
+                    "enabled": world_size == 1,
                 },
                 # NOTE: some accuracy benchmarks may require fp32 precision for mamba cache
                 # "insert_cached_ssm_attention": {
@@ -192,7 +193,7 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.parametrize("world_size", [1, 4])
     def test_bf16(self, world_size):
-        kwargs = self.get_default_kwargs()
+        kwargs = self.get_default_kwargs(world_size=world_size)
         # TODO: multi-stream MOE seems to increase the memory usage
         kwargs["max_batch_size"] = 32
         kwargs["free_mem_ratio"] = 0.4
@@ -209,8 +210,7 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.parametrize("world_size", [1, 4])
     def test_fp8(self, world_size):
-        kwargs = self.get_default_kwargs()
-        kwargs["max_batch_size"] = 64
+        kwargs = self.get_default_kwargs(world_size=world_size)
         with AutoDeployLLM(model=self.MODEL_PATH_FP8,
                            tokenizer=self.MODEL_PATH_FP8,
                            world_size=world_size,
