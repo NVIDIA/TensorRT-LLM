@@ -166,7 +166,7 @@ HF_MODEL_PATH = {
 }
 
 LLM_MODELS_ROOT = os.environ.get('LLM_MODELS_ROOT',
-                                 '/home/scratch.trt_llm_data/llm-models')
+                                 '/home/scratch.trt_llm_data_ci/llm-models')
 
 
 # Model path mapping
