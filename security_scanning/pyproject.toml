@@ -33,7 +33,7 @@ nvidia-modelopt = {version = ">=0.37.0,<0.38.0", extras = ["torch"]}
 nvidia-nccl-cu13 = "2.27.7"
 nvidia-cuda-nvrtc = "^13.1.80"
 transformers = "4.57.1"
-prometheus-client = "^0.23.1"
+prometheus-client = "^0.24.0"
 prometheus-fastapi-instrumentator = "^7.1.0"
 pydantic = ">=2.9.1"
 pydantic-settings = {extras = ["yaml"], version = "^2.12.0"}
