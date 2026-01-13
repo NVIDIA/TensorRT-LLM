@@ -2,10 +2,76 @@ import copy
 import logging as _logger
 import os as _os
 import pathlib as _pl
-from typing import List
+from dataclasses import dataclass
+from typing import List, Optional
 
 import defs.cpp.cpp_common as _cpp
 import pytest
+
+
+@dataclass(frozen=True)
+class DatasetConfig:
+    """Configuration for a benchmark dataset."""
+    name: str
+    local_path: str
+    split: str
+    input_key: str
+    output_key: str
+    max_input_len: str
+    num_requests: str
+    config_name: Optional[str] = None
+    prompt: Optional[str] = None
+    prompt_key: Optional[str] = None
+
+    @property
+    def token_file(self) -> str:
+        return "prepared_" + self.name.replace('/', '_')
+
+    def get_dataset_args(self) -> dict[str, str]:
+        """Build the dataset args dict for prepare_dataset.py."""
+        args = {
+            '--dataset-local-path': self.local_path,
+            '--dataset-split': self.split,
+            '--dataset-input-key': self.input_key,
+            '--dataset-output-key': self.output_key,
+        }
+        if self.config_name:
+            args['--dataset-config-name'] = self.config_name
+        if self.prompt:
+            args['--dataset-prompt'] = self.prompt
+        if self.prompt_key:
+            args['--dataset-prompt-key'] = self.prompt_key
+        return args
+
+
+def get_benchmark_dataset_configs(model_cache: str) -> List[DatasetConfig]:
+    """Define dataset configurations for benchmark tests.
+
+    To add a new dataset, add a new DatasetConfig entry to this list.
+    """
+    return [
+        DatasetConfig(
+            name="ccdv/cnn_dailymail",
+            local_path=f"{model_cache}/datasets/ccdv/cnn_dailymail",
+            config_name="3.0.0",
+            split="validation",
+            input_key="article",
+            prompt="Summarize the following article:",
+            output_key="highlights",
+            max_input_len="256",
+            num_requests="50",
+        ),
+        DatasetConfig(
+            name="Open-Orca/1million-gpt-4",
+            local_path="/datasets/1million-gpt-4/1M-GPT4-Augmented.parquet",
+            split="train",
+            input_key="question",
+            prompt_key="system_prompt",
+            output_key="response",
+            max_input_len="20",
+            num_requests="10",
+        ),
+    ]
 
 
 def run_single_gpu_tests(build_dir: _pl.Path,
@@ -93,31 +159,6 @@ def run_benchmarks(
         )
         return NotImplementedError
 
-    dataset_names = ["ccdv/cnn_dailymail", "Open-Orca/1million-gpt-4"]
-
-    prompt_datasets_args = [{
-        '--dataset-local-path': f"{model_cache}/datasets/ccdv/cnn_dailymail",
-        '--dataset-config-name': "3.0.0",
-        '--dataset-split': "validation",
-        '--dataset-input-key': "article",
-        '--dataset-prompt': "Summarize the following article:",
-        '--dataset-output-key': "highlights"
-    }, {
-        '--dataset-local-path':
-        "/datasets/1million-gpt-4/1M-GPT4-Augmented.parquet",
-        '--dataset-split': "train",
-        '--dataset-input-key': "question",
-        '--dataset-prompt-key': "system_prompt",
-        '--dataset-output-key': "response"
-    }]
-
-    token_files = [
-        "prepared_" + dataset_name.replace('/', '_')
-        for dataset_name in dataset_names
-    ]
-
-    max_input_lens = ["256", "20"]
-    num_reqs = ["50", "10"]
     if model_name == "gpt":
         model_engine_path = model_engine_dir / "fp16_plugin_packed_paged" / "tp1-pp1-cp1-gpu"
 
@@ -131,20 +172,17 @@ def run_benchmarks(
         # model_engine_path = model_engine_dir / model_spec_obj.get_model_path(
         # ) / "tp1-pp1-cp1-gpu"
 
-    for prompt_ds_args, tokens_f, len, num_req in zip(prompt_datasets_args,
-                                                      token_files,
-                                                      max_input_lens, num_reqs):
-
+    for config in get_benchmark_dataset_configs(model_cache):
         benchmark_src_dir = _pl.Path("benchmarks") / "cpp"
         data_dir = resources_dir / "data"
         prepare_dataset = [
             python_exe,
             str(benchmark_src_dir / "prepare_dataset.py"), "--tokenizer",
             str(tokenizer_dir), "--output",
-            str(data_dir / tokens_f), "dataset", "--max-input-len", len,
-            "--num-requests", num_req
+            str(data_dir / config.token_file), "dataset", "--max-input-len",
+            config.max_input_len, "--num-requests", config.num_requests
         ]
-        for k, v in prompt_ds_args.items():
+        for k, v in config.get_dataset_args().items():
             prepare_dataset += [k, v]
 
         # Use environment variable to force HuggingFace to use offline cached dataset
@@ -161,7 +199,7 @@ def run_benchmarks(
                     str(model_engine_path), "--type",
                     str(batching_type), "--api",
                     str(api_type), "--dataset",
-                    str(data_dir / tokens_f)
+                    str(data_dir / config.token_file)
                 ]
                 if model_name == "enc_dec":
                     benchmark += [
@@ -184,7 +222,8 @@ def run_benchmarks(
             benchmark = [
                 str(benchmark_exe_dir / "gptManagerBenchmark"), "--engine_dir",
                 str(model_engine_path), "--type", "IFB", "--dataset",
-                str(data_dir / tokens_f), "--api", "executor", "--streaming"
+                str(data_dir / config.token_file), "--api", "executor",
+                "--streaming"
             ]
             if model_name == "enc_dec":
                 benchmark += [
