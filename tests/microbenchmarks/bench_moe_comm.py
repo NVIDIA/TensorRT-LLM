@@ -30,16 +30,16 @@ Launch (examples):
 
 ```bash
 # Run backend AllGather/ReduceScatter
- python tests/microbenchmarks/bench_moe_comm.py --ep-size 8 --backend ALLGATHER --profile gpt_oss
+ python tests/microbenchmarks/bench_moe_comm.py --ep_size 8 --backend ALLGATHER --profile gpt_oss
 
 # Run backend NVLinkOneSided
- python tests/microbenchmarks/bench_moe_comm.cpy --ep-size 8 --backend NVLINK_ONE_SIDED --profile deepseek_v3
+ python tests/microbenchmarks/bench_moe_comm.cpy --ep_size 8 --backend NVLINK_ONE_SIDED --profile deepseek_v3
 
 # With batch size sweeping
- /scratch/projects/tekit/tests/microbenchmarks/bench_moe_comm.py --ep-size 8 --backend NVLINK_ONE_SIDED -b 1 -e 1024 -f 2
+ /scratch/projects/tekit/tests/microbenchmarks/bench_moe_comm.py --ep_size 8 --backend NVLINK_ONE_SIDED -b 1 -e 1024 -f 2
 
 # Run all supported strategies for the given profile
- python tests/microbenchmarks/bench_moe_comm.py --ep-size 8 --profile deepseek_v3
+ python tests/microbenchmarks/bench_moe_comm.py --ep_size 8 --profile deepseek_v3
 
 ```
 """
@@ -51,6 +51,7 @@ import json
 import os
 import pickle
 import sys
+import traceback
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -62,11 +63,13 @@ from mpi4py.futures import MPIPoolExecutor
 
 import tensorrt_llm as tllm
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modules.fused_moe.communication.communication_factory import (
-    CommunicationFactory,
-)
+from tensorrt_llm._torch.modules.fused_moe import CutlassFusedMoE, MoE
+from tensorrt_llm._torch.modules.fused_moe.communication import Communication, CommunicationFactory
+from tensorrt_llm._torch.modules.fused_moe.routing import DefaultMoeRoutingMethod
 from tensorrt_llm._utils import local_mpi_rank, mpi_allgather, mpi_barrier, mpi_rank, mpi_world_size
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 
 @dataclass(frozen=True)
@@ -82,6 +85,7 @@ class Profile:
     hidden_size: int
     top_k: int
     num_experts: int
+    quant_algo: QuantAlgo
 
 
 PROFILES: Dict[str, Profile] = {
@@ -92,27 +96,17 @@ PROFILES: Dict[str, Profile] = {
         top_k=8,
         # Previously: experts_per_rank=32 with recommended ep_size=8 => 256 total experts.
         num_experts=256,
+        quant_algo=QuantAlgo.FP8_BLOCK_SCALES,
     ),
     # Repo already references "gpt-oss" hidden_size=2880 in the MoE A2A unit test.
     "gpt_oss": Profile(
         name="gpt_oss",
         hidden_size=2880,
-        top_k=2,
-        num_experts=64,
+        top_k=4,
+        num_experts=128,
+        quant_algo=QuantAlgo.W4A8_MXFP4_MXFP8,
     ),
 }
-
-
-# TODO: Support tensorrt-llm quantization!
-def _torch_dtype(s: str) -> torch.dtype:
-    s = s.lower()
-    if s in ("bf16", "bfloat16"):
-        return torch.bfloat16
-    if s in ("fp16", "float16", "half"):
-        return torch.float16
-    if s in ("fp32", "float32"):
-        return torch.float32
-    raise ValueError(f"Unsupported dtype: {s}")
 
 
 def _maybe_warn_rank0(msg: str):
@@ -135,11 +129,18 @@ def _make_inputs(
     num_experts_total: int,
     act_dtype: torch.dtype,
     device: torch.device,
+    quant_algo: QuantAlgo,
+    backend: Communication,
+    moe: Optional[MoE] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
     # Hidden states: payload we want to communicate.
     hidden_states = torch.randn(local_num_tokens, hidden_size, dtype=act_dtype, device=device)
     # We keep scaling factors optional; most strategies can ignore it.
     hidden_states_sf = None
+    # Post-quant communication: Quantize → Dispatch (mirrors ConfigurableMoE ordering),
+    # using Cutlass' quantize_input() (outside the timed comm region).
+    if quant_algo != QuantAlgo.NO_QUANT and backend.supports_post_quant_dispatch():
+        hidden_states, hidden_states_sf = moe.quantize_input(hidden_states, post_quant_comm=True)
     # Routing IDs: global expert IDs in [0, num_experts_total).
     token_selected_slots = torch.randint(
         0,
@@ -171,11 +172,13 @@ def _create_model_config(
     hidden_size: int,
     act_dtype: torch.dtype,
     max_num_tokens_per_rank: int,
+    quant_config: Optional[QuantConfig],
 ) -> ModelConfig:
     # Keep it minimal: just enough fields for CommunicationFactory.
     return ModelConfig(
         pretrained_config=_DummyPretrainedConfig(hidden_size=hidden_size, torch_dtype=act_dtype),
         mapping=mapping,
+        quant_config=(quant_config or QuantConfig()),
         max_num_tokens=int(max_num_tokens_per_rank),
         moe_max_num_tokens=int(max_num_tokens_per_rank),
         use_cuda_graph=False,
@@ -183,7 +186,7 @@ def _create_model_config(
     )
 
 
-def _profile_start_stop(enabled: bool):
+def _profile_start(enabled: bool):
     # Use cudaProfilerStart/Stop (torch calls cudart under the hood).
     if not enabled:
         return
@@ -214,13 +217,14 @@ def _nvtx_range(msg: str, enabled: bool) -> None:
 
 
 def _time_dispatch_and_combine(
-    strategy: Any,
+    backend: Communication,
     *,
     hidden_states: torch.Tensor,
     hidden_states_sf: Optional[torch.Tensor],
     token_selected_slots: torch.Tensor,
     token_final_scales: Optional[torch.Tensor],
     all_rank_num_tokens: List[int],
+    hidden_size: int,
     warmup: int,
     iters: int,
     profile_wrap: bool,
@@ -229,62 +233,52 @@ def _time_dispatch_and_combine(
 ) -> Tuple[float, float]:
     # Returns: (dispatch_us_per_iter, combine_us_per_iter)
 
-    # Some strategies require prepare_dispatch() before dispatch() (e.g., NVLinkTwoSided).
+    # Some backends require prepare_dispatch() before dispatch() (e.g., NVLinkTwoSided).
     # We intentionally exclude prepare_dispatch() from timing as requested.
-    _ = strategy.prepare_dispatch(token_selected_slots, all_rank_num_tokens, None)
+    _ = backend.prepare_dispatch(token_selected_slots, all_rank_num_tokens, None)
 
-    # Warmup
-    with _nvtx_range(f"{nvtx_prefix}:warmup", enabled=nvtx):
-        for _ in range(warmup):
-            with _nvtx_range("dispatch", enabled=nvtx):
-                hs, hs_sf, tss, tfs = strategy.dispatch(
-                    hidden_states,
-                    hidden_states_sf,
-                    token_selected_slots,
-                    token_final_scales,
-                    all_rank_num_tokens,
-                )
-            with _nvtx_range("combine", enabled=nvtx):
-                _ = strategy.combine(
-                    hs,
-                    all_rank_max_num_tokens=max(all_rank_num_tokens),
-                )
+    # TODO: warmup
 
-    torch.cuda.synchronize()
-    mpi_barrier()
-
-    # Timed loop: use 3 events so we can isolate dispatch vs combine without extra sync.
-    start = torch.cuda.Event(enable_timing=True)
-    mid = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
+    start_dispatch = torch.cuda.Event(enable_timing=True)
+    end_dispatch = torch.cuda.Event(enable_timing=True)
+    start_combine = torch.cuda.Event(enable_timing=True)
+    end_combine = torch.cuda.Event(enable_timing=True)
 
     dispatch_total_ms = 0.0
     combine_total_ms = 0.0
 
-    _profile_start_stop(profile_wrap)
     with _nvtx_range(f"{nvtx_prefix}:timed", enabled=nvtx):
         for _ in range(iters):
-            start.record()
+            start_dispatch.record()
             with _nvtx_range("dispatch", enabled=nvtx):
-                hs, hs_sf, tss, tfs = strategy.dispatch(
+                recv_hidden_states, _, _, _ = backend.dispatch(
                     hidden_states,
                     hidden_states_sf,
                     token_selected_slots,
                     token_final_scales,
                     all_rank_num_tokens,
                 )
-            mid.record()
+            end_dispatch.record()
+
+            # Simulate the output of MoE computation
+            # TODO: Support payload in workspace.
+            shape = list(recv_hidden_states.shape)
+            shape[-1] = hidden_size
+            recv_hidden_states_moe = torch.empty(
+                tuple(shape), dtype=torch.bfloat16, device=recv_hidden_states.device
+            )
+
+            start_combine.record()
             with _nvtx_range("combine", enabled=nvtx):
-                _ = strategy.combine(
-                    hs,
+                _ = backend.combine(
+                    recv_hidden_states_moe,
                     all_rank_max_num_tokens=max(all_rank_num_tokens),
                 )
-            end.record()
+            end_combine.record()
+            end_combine.synchronize()
 
-            end.synchronize()
-            dispatch_total_ms += start.elapsed_time(mid)
-            combine_total_ms += mid.elapsed_time(end)
-    _profile_stop(profile_wrap)
+            dispatch_total_ms += start_dispatch.elapsed_time(end_dispatch)
+            combine_total_ms += start_combine.elapsed_time(end_combine)
 
     dispatch_ms = dispatch_total_ms / iters
     combine_ms = combine_total_ms / iters
@@ -306,7 +300,7 @@ def _gather_stats_us(x_us: float) -> Dict[str, float]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Unified MoE communication microbenchmark (MPI).")
     parser.add_argument(
-        "--ep-size",
+        "--ep_size",
         type=int,
         default=None,
         help="Number of MPI worker ranks to spawn via MPIPoolExecutor.",
@@ -330,7 +324,7 @@ def parse_args() -> argparse.Namespace:
         choices=sorted(PROFILES.keys()),
         help="Optional named profile to provide defaults for hidden_size/top_k/num_experts.",
     )
-    parser.add_argument("--hidden-size", type=int, default=None, help="Custom hidden size.")
+    parser.add_argument("--hidden_size", type=int, default=None, help="Custom hidden size.")
     # Sizes to scan (NCCL-tests style, adapted from bytes -> local_batch_size in tokens).
     parser.add_argument(
         "-b",
@@ -361,35 +355,37 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Multiplication factor between local_batch_size values. Default: disabled.",
     )
-    parser.add_argument("--top-k", type=int, default=None, help="Custom router top-k.")
+    parser.add_argument("--top_k", type=int, default=None, help="Custom router top-k.")
     parser.add_argument(
-        "--num-experts",
+        "--num_experts",
         type=int,
         default=None,
         help="Total number of experts.",
     )
     parser.add_argument(
-        "--dtype",
-        type=str,
-        default="bf16",
-        choices=["bf16", "fp16"],
-        help="Activation dtype for the benchmark payload.",
+        "--quant",
+        type=lambda s: str(s).upper(),
+        default=None,
+        choices=[q.name for q in QuantAlgo],
+        help="Override quantization algo (defaults to profile.quant_algo).",
     )
     parser.add_argument("--iters", type=int, default=200, help="Timed iterations.")
-    parser.add_argument("--warmup", type=int, default=20, help="Warmup iterations.")
     parser.add_argument(
-        "--max-num-tokens-per-rank",
+        "--warmup", type=int, default=20, help="Warmup iterations. (Currently ignored.)"
+    )
+    parser.add_argument(
+        "--max_num_tokens_per_rank",
         type=int,
         default=None,
         help="Max tokens per rank for workspace allocation (defaults to max scanned local_batch_size).",
     )
     parser.add_argument(
-        "--no-profiler-wrap",
+        "--no_profiler_wrap",
         action="store_true",
         help="Disable cudaProfilerStart/Stop wrapping (useful when profiler is unavailable).",
     )
     parser.add_argument(
-        "--no-nvtx",
+        "--no_nvtx",
         action="store_true",
         help="Disable NVTX ranges (useful to minimize profiler overhead).",
     )
@@ -439,8 +435,8 @@ def _iter_local_batch_sizes(args: argparse.Namespace) -> List[int]:
     return list(range(minb, maxb + 1, step))
 
 
-def _resolve_profile_args(args: argparse.Namespace) -> Tuple[int, int, int, int]:
-    """Returns (hidden_size, local_num_tokens, top_k, num_experts_total)."""
+def _resolve_profile_args(args: argparse.Namespace) -> Tuple[int, int, int, int, QuantAlgo]:
+    """Returns (hidden_size, local_num_tokens, top_k, num_experts_total, quant_algo)."""
     local_num_tokens = _iter_local_batch_sizes(args)[0]
 
     # If a profile is provided, it supplies defaults; any explicit CLI values override.
@@ -449,17 +445,18 @@ def _resolve_profile_args(args: argparse.Namespace) -> Tuple[int, int, int, int]
         hidden_size = int(args.hidden_size or prof.hidden_size)
         top_k = int(args.top_k or prof.top_k)
         num_experts_total = int(args.num_experts or prof.num_experts)
-        return hidden_size, local_num_tokens, top_k, num_experts_total
+        quant_algo = prof.quant_algo
+        return hidden_size, local_num_tokens, top_k, num_experts_total, quant_algo
 
     # No profile: all fields must be provided explicitly.
     if args.hidden_size is None or args.top_k is None or args.num_experts is None:
         raise ValueError(
-            "No --profile specified; must provide --hidden-size, --top-k, --num-experts."
+            "No --profile specified; must provide --hidden_size, --top_k, --num_experts."
         )
     hidden_size = int(args.hidden_size)
     top_k = int(args.top_k)
     num_experts_total = int(args.num_experts)
-    return hidden_size, local_num_tokens, top_k, num_experts_total
+    return hidden_size, local_num_tokens, top_k, num_experts_total, QuantAlgo.NO_QUANT
 
 
 def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace) -> None:
@@ -474,18 +471,24 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace) -> None:
     _ = _set_device_from_local_rank()
     device = torch.device("cuda")
 
-    hidden_size, _, top_k, num_experts_total = _resolve_profile_args(args)
+    hidden_size, _, top_k, num_experts_total, profile_quant_algo = _resolve_profile_args(args)
     local_batch_sizes = _iter_local_batch_sizes(args)
-    act_dtype = _torch_dtype(args.dtype)
+    act_dtype = torch.bfloat16
     nvtx = not bool(args.no_nvtx)
-
-    if (args.backend is None or args.backend == "DEEPEPLOWLATENCY") and act_dtype != torch.bfloat16:
-        _maybe_warn_rank0("[bench_moe_comm] DeepEP low latency requires bf16; will be skipped.")
+    quant_algo = QuantAlgo[args.quant] if args.quant is not None else profile_quant_algo
+    quant_config = (
+        QuantConfig(quant_algo=None)
+        if quant_algo == QuantAlgo.NO_QUANT
+        else QuantConfig(quant_algo=quant_algo)
+    )
 
     max_scanned_tokens = max(local_batch_sizes)
     max_num_tokens_per_rank = int(args.max_num_tokens_per_rank or max_scanned_tokens)
     if max_num_tokens_per_rank < max_scanned_tokens:
-        raise ValueError("--max-num-tokens-per-rank must be >= --local-batch-size")
+        raise ValueError(
+            "--max_num_tokens_per_rank must be >= the maximum scanned local_batch_size "
+            "(from -b/--minbatch..-e/--maxbatch)."
+        )
 
     mapping = _create_mapping(ep_size)
 
@@ -509,6 +512,7 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace) -> None:
                     "local_batch_size": local_batch_sizes,
                     "top_k": top_k,
                     "dtype": str(act_dtype),
+                    "quant_algo": quant_algo.name,
                     "experts_per_rank": experts_per_rank,
                     "num_experts_total": num_experts_total,
                     "max_num_tokens_per_rank": max_num_tokens_per_rank,
@@ -525,21 +529,19 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace) -> None:
         else [args.backend]
     )
 
-    for backend in backends:
-        if backend == "DEEPEPLOWLATENCY" and act_dtype != torch.bfloat16:
-            continue
-
+    _profile_start(not args.no_profiler_wrap)
+    for backend_name in backends:
         try:
             model_config = _create_model_config(
                 mapping=mapping,
                 hidden_size=hidden_size,
                 act_dtype=act_dtype,
                 max_num_tokens_per_rank=max_num_tokens_per_rank,
+                quant_config=quant_config,
             )
 
-            # Avoid env-var indirection: directly construct the requested backend.
-            strategy = CommunicationFactory._create_forced_method(  # pylint: disable=protected-access
-                backend,
+            backend = CommunicationFactory._create_forced_method(  # pylint: disable=protected-access
+                backend_name,
                 model_config,
                 num_experts_total,
                 num_slots,
@@ -549,27 +551,48 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace) -> None:
                 alltoall_result_do_sum=True,
             )
 
-            if strategy is None:
-                _maybe_warn_rank0(f"[bench_moe_comm] Skipping {backend}: factory returned None.")
+            if backend is None:
+                _maybe_warn_rank0(
+                    f"[bench_moe_comm] Skipping {backend_name}: factory returned None."
+                )
                 mpi_barrier()
                 continue
         except Exception as e:
-            _maybe_warn_rank0(f"[bench_moe_comm] Skipping {backend}: {type(e).__name__}: {e}")
+            _maybe_warn_rank0(f"[bench_moe_comm] Skipping {backend_name}: {type(e).__name__}: {e}")
             mpi_barrier()
             continue
+
+        # Post-quant communication: Quantize → Dispatch (mirrors ConfigurableMoE ordering),
+        # using Cutlass' quantize_input() (outside the timed comm region).
+        moe = None
+        if quant_algo != QuantAlgo.NO_QUANT and backend.supports_post_quant_dispatch():
+            routing_method = DefaultMoeRoutingMethod(top_k=top_k)
+            moe = CutlassFusedMoE(
+                routing_method=routing_method,
+                num_experts=num_experts_total,
+                hidden_size=hidden_size,
+                intermediate_size=hidden_size * 4,
+                dtype=torch.bfloat16,
+                reduce_results=False,
+                model_config=model_config,
+                init_load_balancer=False,
+                without_comm=True,
+            )
+            # Ensure quantization params (e.g., NVFP4 global scale) live on CUDA.
+            moe = moe.to(device)
 
         for local_num_tokens in local_batch_sizes:
             all_rank_num_tokens = mpi_allgather(int(local_num_tokens))
             try:
-                if not strategy.is_workload_feasible(all_rank_num_tokens, num_chunks=1):
+                if not backend.is_workload_feasible(all_rank_num_tokens, num_chunks=1):
                     _maybe_warn_rank0(
-                        f"[bench_moe_comm] Skipping {backend} @ local_batch_size={local_num_tokens}: workload not feasible."
+                        f"[bench_moe_comm] Skipping {backend_name} @ local_batch_size={local_num_tokens}: workload not feasible."
                     )
                     mpi_barrier()
                     continue
             except Exception as e:
                 _maybe_warn_rank0(
-                    f"[bench_moe_comm] Skipping {backend} @ local_batch_size={local_num_tokens}: feasibility check failed: {e}"
+                    f"[bench_moe_comm] Skipping {backend_name} @ local_batch_size={local_num_tokens}: feasibility check failed: {e}"
                 )
                 mpi_barrier()
                 continue
@@ -582,21 +605,27 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace) -> None:
                     num_experts_total,
                     act_dtype,
                     device,
+                    quant_algo,
+                    backend,
+                    moe,
                 )
             )
 
-            mpi_barrier()
             torch.cuda.synchronize()
+            mpi_barrier()
 
-            with _nvtx_range(f"{backend}:local_batch_size={int(local_num_tokens)}", enabled=nvtx):
-                nvtx_prefix = f"{backend}:local_batch_size={int(local_num_tokens)}"
+            with _nvtx_range(
+                f"{backend_name}:local_batch_size={int(local_num_tokens)}", enabled=nvtx
+            ):
+                nvtx_prefix = f"{backend_name}:local_batch_size={int(local_num_tokens)}"
                 dispatch_us, combine_us = _time_dispatch_and_combine(
-                    strategy,
+                    backend,
                     hidden_states=hidden_states,
                     hidden_states_sf=hidden_states_sf,
                     token_selected_slots=token_selected_slots,
                     token_final_scales=token_final_scales,
                     all_rank_num_tokens=all_rank_num_tokens,
+                    hidden_size=hidden_size,
                     warmup=int(args.warmup),
                     iters=int(args.iters),
                     profile_wrap=(not args.no_profiler_wrap),
@@ -611,7 +640,7 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace) -> None:
                 print(
                     json.dumps(
                         {
-                            "backend": backend,
+                            "backend": backend_name,
                             "local_batch_size": int(local_num_tokens),
                             "dispatch_us": dispatch_stats,
                             "combine_us": combine_stats,
@@ -622,6 +651,8 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace) -> None:
                 )
 
             mpi_barrier()
+
+    _profile_stop(not args.no_profiler_wrap)
 
     return
 
@@ -635,7 +666,24 @@ def _spawn_worker_main(args_blob: bytes) -> List[Dict[str, Any]]:
     """
     args = pickle.loads(args_blob)
     # In spawned workers, we are already inside an MPI world of size == ep_size.
-    _run_benchmark_worker_under_current_mpi(args)
+    try:
+        _run_benchmark_worker_under_current_mpi(args)
+    except Exception as e:
+        # Make worker-side stack trace visible at the parent.
+        rank = mpi_rank()
+        size = mpi_world_size()
+        msg = (
+            "[bench_moe_comm worker] uncaught exception:\n"
+            f"rank={rank}/{size} local_rank={local_mpi_rank()} pid={os.getpid()}\n"
+            "Worker traceback:\n"
+            f"{traceback.format_exc()}"
+        )
+        try:
+            sys.stderr.write(msg + "\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+        raise RuntimeError(msg) from e
     return []
 
 
@@ -654,7 +702,7 @@ def main() -> None:
 
     ep_size = int(args.ep_size or 8)
     if ep_size <= 0:
-        raise ValueError("--ep-size must be > 0")
+        raise ValueError("--ep_size must be > 0")
 
     if mpi_world_size() != 1:
         raise RuntimeError("bench_moe_comm should be run from a non-MPI parent (world_size==1).")
