@@ -3055,7 +3055,6 @@ class TestGLM4_5Air(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
-@pytest.mark.timeout(7200)
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.timeout(10800)
 @pytest.mark.skip_less_device_memory(100000)
