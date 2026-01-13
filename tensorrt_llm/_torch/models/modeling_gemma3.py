@@ -8,7 +8,8 @@ from transformers import Gemma3TextConfig
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
 from tensorrt_llm._torch.modules.qk_norm_attention import QKNormRoPEAttention
-from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
+from tensorrt_llm.functional import (AllReduceStrategy, PositionEmbeddingType,
+                                     RotaryScalingType)
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata, FlashInferAttentionMetadata
@@ -35,6 +36,7 @@ class Gemma3TextScaledWordEmbedding(Embedding):
         mapping: Optional[Mapping] = None,
         tensor_parallel_mode: Optional[TensorParallelMode] = None,
         gather_output: bool = False,
+        allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
     ):
         super().__init__(
             num_embeddings=vocab_size,
@@ -43,6 +45,7 @@ class Gemma3TextScaledWordEmbedding(Embedding):
             mapping=mapping,
             tensor_parallel_mode=tensor_parallel_mode,
             gather_output=gather_output,
+            allreduce_strategy=allreduce_strategy,
         )
         self.embed_scale = torch.sqrt(torch.tensor(hidden_size)).to(self.dtype)
 
@@ -207,6 +210,7 @@ class Gemma3TextModel(DecoderModel):
             mapping=config.mapping,
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             gather_output=True,
+            allreduce_strategy=config.allreduce_strategy,
         )
         self.layers = nn.ModuleList([
             Gemma3DecoderLayer(

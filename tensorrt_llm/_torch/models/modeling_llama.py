@@ -876,6 +876,7 @@ class Llama4Model(DecoderModel):
                 mapping=model_config.mapping,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 gather_output=True,
+                allreduce_strategy=model_config.allreduce_strategy,
             )
 
         # If enable_min_latency is True, we will use min-latency mode.
@@ -971,6 +972,7 @@ class LlamaModel(DecoderModel):
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 gather_output=True,
                 use_custom_cublas_mm=self.use_custom_cublas_mm,
+                allreduce_strategy=model_config.allreduce_strategy,
             )
 
         if self.has_custom_embed_tokens:

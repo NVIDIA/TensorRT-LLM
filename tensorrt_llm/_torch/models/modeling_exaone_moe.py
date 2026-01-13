@@ -463,6 +463,7 @@ class ExaoneMoeModel(DecoderModel):
             mapping=model_config.mapping,
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             gather_output=True,
+            allreduce_strategy=model_config.allreduce_strategy,
         )
 
         aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
