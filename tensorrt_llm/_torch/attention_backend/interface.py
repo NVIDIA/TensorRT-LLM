@@ -457,9 +457,10 @@ class RopeParams:
         rope_params = RopeParams()
 
         hf_rope_parameters = getattr(config, 'rope_parameters', {})
-        assert not set(hf_rope_parameters.keys()).issubset(
-            ALLOWED_ATTENTION_LAYER_TYPES), (
-                "Per-layer-type RoPE configuration is not supported yet.")
+        assert not set(hf_rope_parameters.keys()) or not set(
+            hf_rope_parameters.keys()).issubset(
+                ALLOWED_ATTENTION_LAYER_TYPES), (
+                    "Per-layer-type RoPE configuration is not supported yet.")
         config.update(hf_rope_parameters)
 
         # get rotary parameters.
