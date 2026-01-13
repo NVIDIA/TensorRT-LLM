@@ -66,6 +66,7 @@ add_library(
   fp8Quantize.cpp
   dsv3FusedAGemmOp.cpp
   fusedQKNormRopeOp.cpp
+  fusedAddRMSNormQuant.cpp
   fusedTopkSoftmax.cpp
   gatherTreeOp.cpp
   groupRmsNormOp.cpp
