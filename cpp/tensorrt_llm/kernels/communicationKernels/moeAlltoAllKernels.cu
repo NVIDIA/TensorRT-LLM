@@ -555,7 +555,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 void moe_a2a_prepare_dispatch_launch(MoeA2ADispatchParams const& params)
 {
     launchWithPdlWhenEnabled("moeA2APrepareDispatchKernel", moeA2APrepareDispatchKernel, 1, params.ep_size, 0,
-        params.stream, params.send_counters, params.local_token_counter, params.flag_val);
+        params.stream, params.send_counters, params.local_token_counter, params.ep_size, params.flag_val);
 }
 
 // ============================================================================
