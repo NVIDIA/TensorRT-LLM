@@ -1,6 +1,6 @@
 server_configs:
 - name: nvidia_DeepSeek_R1_0528_FP4_v2_1024_1024_conc4_gpu4
-  model_name: nvidia/DeepSeek-R1-0528-FP4-v2
+  model_name: deepseek_r1_0528_fp4_v2
   gpus: 4
   match_mode: scenario
   cuda_graph_config:
@@ -31,7 +31,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: nvidia_DeepSeek_R1_0528_FP4_v2_1024_1024_conc32_gpu4
-  model_name: nvidia/DeepSeek-R1-0528-FP4-v2
+  model_name: deepseek_r1_0528_fp4_v2
   gpus: 4
   match_mode: scenario
   cuda_graph_config:
@@ -62,7 +62,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: nvidia_DeepSeek_R1_0528_FP4_v2_1024_1024_conc256_gpu4
-  model_name: nvidia/DeepSeek-R1-0528-FP4-v2
+  model_name: deepseek_r1_0528_fp4_v2
   gpus: 4
   match_mode: scenario
   cuda_graph_config:
@@ -97,7 +97,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: nvidia_DeepSeek_R1_0528_FP4_v2_1024_1024_conc4_gpu8
-  model_name: nvidia/DeepSeek-R1-0528-FP4-v2
+  model_name: deepseek_r1_0528_fp4_v2
   gpus: 8
   match_mode: scenario
   cuda_graph_config:
@@ -128,7 +128,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: nvidia_DeepSeek_R1_0528_FP4_v2_1024_1024_conc32_gpu8
-  model_name: nvidia/DeepSeek-R1-0528-FP4-v2
+  model_name: deepseek_r1_0528_fp4_v2
   gpus: 8
   match_mode: scenario
   cuda_graph_config:
@@ -159,7 +159,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: nvidia_DeepSeek_R1_0528_FP4_v2_1024_1024_conc256_gpu8
-  model_name: nvidia/DeepSeek-R1-0528-FP4-v2
+  model_name: deepseek_r1_0528_fp4_v2
   gpus: 8
   match_mode: scenario
   cuda_graph_config:
@@ -194,7 +194,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: nvidia_DeepSeek_R1_0528_FP4_v2_8192_1024_conc4_gpu4
-  model_name: nvidia/DeepSeek-R1-0528-FP4-v2
+  model_name: deepseek_r1_0528_fp4_v2
   gpus: 4
   match_mode: scenario
   cuda_graph_config:
@@ -225,7 +225,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: nvidia_DeepSeek_R1_0528_FP4_v2_8192_1024_conc32_gpu4
-  model_name: nvidia/DeepSeek-R1-0528-FP4-v2
+  model_name: deepseek_r1_0528_fp4_v2
   gpus: 4
   match_mode: scenario
   cuda_graph_config:
@@ -256,7 +256,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: nvidia_DeepSeek_R1_0528_FP4_v2_8192_1024_conc256_gpu4
-  model_name: nvidia/DeepSeek-R1-0528-FP4-v2
+  model_name: deepseek_r1_0528_fp4_v2
   gpus: 4
   match_mode: scenario
   cuda_graph_config:
@@ -291,7 +291,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: nvidia_DeepSeek_R1_0528_FP4_v2_8192_1024_conc4_gpu8
-  model_name: nvidia/DeepSeek-R1-0528-FP4-v2
+  model_name: deepseek_r1_0528_fp4_v2
   gpus: 8
   match_mode: scenario
   cuda_graph_config:
@@ -322,7 +322,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: nvidia_DeepSeek_R1_0528_FP4_v2_8192_1024_conc32_gpu8
-  model_name: nvidia/DeepSeek-R1-0528-FP4-v2
+  model_name: deepseek_r1_0528_fp4_v2
   gpus: 8
   match_mode: scenario
   cuda_graph_config:
@@ -353,7 +353,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: nvidia_DeepSeek_R1_0528_FP4_v2_8192_1024_conc256_gpu8
-  model_name: nvidia/DeepSeek-R1-0528-FP4-v2
+  model_name: deepseek_r1_0528_fp4_v2
   gpus: 8
   match_mode: scenario
   cuda_graph_config:
@@ -388,7 +388,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: deepseek_ai_DeepSeek_R1_0528_1024_1024_conc4_gpu8
-  model_name: deepseek-ai/DeepSeek-R1-0528
+  model_name: deepseek_r1_0528_fp8
   gpus: 8
   match_mode: scenario
   cuda_graph_config:
@@ -419,7 +419,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: deepseek_ai_DeepSeek_R1_0528_1024_1024_conc16_gpu8
-  model_name: deepseek-ai/DeepSeek-R1-0528
+  model_name: deepseek_r1_0528_fp8
   gpus: 8
   match_mode: scenario
   cuda_graph_config:
@@ -450,7 +450,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: deepseek_ai_DeepSeek_R1_0528_1024_1024_conc64_gpu8
-  model_name: deepseek-ai/DeepSeek-R1-0528
+  model_name: deepseek_r1_0528_fp8
   gpus: 8
   match_mode: scenario
   cuda_graph_config:
@@ -481,7 +481,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: deepseek_ai_DeepSeek_R1_0528_8192_1024_conc4_gpu8
-  model_name: deepseek-ai/DeepSeek-R1-0528
+  model_name: deepseek_r1_0528_fp8
   gpus: 8
   match_mode: scenario
   cuda_graph_config:
@@ -512,7 +512,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: deepseek_ai_DeepSeek_R1_0528_8192_1024_conc16_gpu8
-  model_name: deepseek-ai/DeepSeek-R1-0528
+  model_name: deepseek_r1_0528_fp8
   gpus: 8
   match_mode: scenario
   cuda_graph_config:
@@ -543,7 +543,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: deepseek_ai_DeepSeek_R1_0528_8192_1024_conc64_gpu8
-  model_name: deepseek-ai/DeepSeek-R1-0528
+  model_name: deepseek_r1_0528_fp8
   gpus: 8
   match_mode: scenario
   cuda_graph_config:
@@ -578,7 +578,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: openai_gpt_oss_120b_1024_1024_conc4_gpu1
-  model_name: openai/gpt-oss-120b
+  model_name: gpt_oss_120b_fp4
   gpus: 1
   match_mode: scenario
   env_overrides:
@@ -613,7 +613,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: openai_gpt_oss_120b_1024_1024_conc16_gpu1
-  model_name: openai/gpt-oss-120b
+  model_name: gpt_oss_120b_fp4
   gpus: 1
   match_mode: scenario
   env_overrides:
@@ -648,7 +648,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: openai_gpt_oss_120b_1024_1024_conc64_gpu1
-  model_name: openai/gpt-oss-120b
+  model_name: gpt_oss_120b_fp4
   gpus: 1
   match_mode: scenario
   env_overrides:
@@ -683,7 +683,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: openai_gpt_oss_120b_1024_1024_conc4_gpu2
-  model_name: openai/gpt-oss-120b
+  model_name: gpt_oss_120b_fp4
   gpus: 2
   match_mode: scenario
   env_overrides:
@@ -718,7 +718,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: openai_gpt_oss_120b_1024_1024_conc16_gpu2
-  model_name: openai/gpt-oss-120b
+  model_name: gpt_oss_120b_fp4
   gpus: 2
   match_mode: scenario
   env_overrides:
@@ -753,7 +753,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: openai_gpt_oss_120b_1024_1024_conc64_gpu2
-  model_name: openai/gpt-oss-120b
+  model_name: gpt_oss_120b_fp4
   gpus: 2
   match_mode: scenario
   env_overrides:
@@ -788,7 +788,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: openai_gpt_oss_120b_1024_1024_conc4_gpu4
-  model_name: openai/gpt-oss-120b
+  model_name: gpt_oss_120b_fp4
   gpus: 4
   match_mode: scenario
   env_overrides:
@@ -823,7 +823,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: openai_gpt_oss_120b_1024_1024_conc16_gpu4
-  model_name: openai/gpt-oss-120b
+  model_name: gpt_oss_120b_fp4
   gpus: 4
   match_mode: scenario
   env_overrides:
@@ -858,7 +858,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: openai_gpt_oss_120b_1024_1024_conc64_gpu4
-  model_name: openai/gpt-oss-120b
+  model_name: gpt_oss_120b_fp4
   gpus: 4
   match_mode: scenario
   env_overrides:
@@ -893,7 +893,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: openai_gpt_oss_120b_1024_1024_conc4_gpu8
-  model_name: openai/gpt-oss-120b
+  model_name: gpt_oss_120b_fp4
   gpus: 8
   match_mode: scenario
   env_overrides:
@@ -928,7 +928,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: openai_gpt_oss_120b_1024_1024_conc16_gpu8
-  model_name: openai/gpt-oss-120b
+  model_name: gpt_oss_120b_fp4
   gpus: 8
   match_mode: scenario
   env_overrides:
@@ -963,7 +963,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: openai_gpt_oss_120b_1024_1024_conc64_gpu8
-  model_name: openai/gpt-oss-120b
+  model_name: gpt_oss_120b_fp4
   gpus: 8
   match_mode: scenario
   env_overrides:
@@ -998,7 +998,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: openai_gpt_oss_120b_1024_8192_conc4_gpu1
-  model_name: openai/gpt-oss-120b
+  model_name: gpt_oss_120b_fp4
   gpus: 1
   match_mode: scenario
   env_overrides:
@@ -1033,7 +1033,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: openai_gpt_oss_120b_1024_8192_conc16_gpu1
-  model_name: openai/gpt-oss-120b
+  model_name: gpt_oss_120b_fp4
   gpus: 1
   match_mode: scenario
   env_overrides:
@@ -1068,7 +1068,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: openai_gpt_oss_120b_1024_8192_conc64_gpu1
-  model_name: openai/gpt-oss-120b
+  model_name: gpt_oss_120b_fp4
   gpus: 1
   match_mode: scenario
   env_overrides:
@@ -1103,7 +1103,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: openai_gpt_oss_120b_1024_8192_conc4_gpu2
-  model_name: openai/gpt-oss-120b
+  model_name: gpt_oss_120b_fp4
   gpus: 2
   match_mode: scenario
   env_overrides:
@@ -1138,7 +1138,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: openai_gpt_oss_120b_1024_8192_conc16_gpu2
-  model_name: openai/gpt-oss-120b
+  model_name: gpt_oss_120b_fp4
   gpus: 2
   match_mode: scenario
   env_overrides:
@@ -1173,7 +1173,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: openai_gpt_oss_120b_1024_8192_conc64_gpu2
-  model_name: openai/gpt-oss-120b
+  model_name: gpt_oss_120b_fp4
   gpus: 2
   match_mode: scenario
   env_overrides:
@@ -1208,7 +1208,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: openai_gpt_oss_120b_1024_8192_conc4_gpu4
-  model_name: openai/gpt-oss-120b
+  model_name: gpt_oss_120b_fp4
   gpus: 4
   match_mode: scenario
   env_overrides:
@@ -1243,7 +1243,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: openai_gpt_oss_120b_1024_8192_conc16_gpu4
-  model_name: openai/gpt-oss-120b
+  model_name: gpt_oss_120b_fp4
   gpus: 4
   match_mode: scenario
   env_overrides:
@@ -1278,7 +1278,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: openai_gpt_oss_120b_1024_8192_conc64_gpu4
-  model_name: openai/gpt-oss-120b
+  model_name: gpt_oss_120b_fp4
   gpus: 4
   match_mode: scenario
   env_overrides:
@@ -1313,7 +1313,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: openai_gpt_oss_120b_1024_8192_conc4_gpu8
-  model_name: openai/gpt-oss-120b
+  model_name: gpt_oss_120b_fp4
   gpus: 8
   match_mode: scenario
   env_overrides:
@@ -1348,7 +1348,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: openai_gpt_oss_120b_1024_8192_conc16_gpu8
-  model_name: openai/gpt-oss-120b
+  model_name: gpt_oss_120b_fp4
   gpus: 8
   match_mode: scenario
   env_overrides:
@@ -1383,7 +1383,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: openai_gpt_oss_120b_1024_8192_conc64_gpu8
-  model_name: openai/gpt-oss-120b
+  model_name: gpt_oss_120b_fp4
   gpus: 8
   match_mode: scenario
   env_overrides:
@@ -1418,7 +1418,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: openai_gpt_oss_120b_8192_1024_conc4_gpu1
-  model_name: openai/gpt-oss-120b
+  model_name: gpt_oss_120b_fp4
   gpus: 1
   match_mode: scenario
   env_overrides:
@@ -1453,7 +1453,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: openai_gpt_oss_120b_8192_1024_conc16_gpu1
-  model_name: openai/gpt-oss-120b
+  model_name: gpt_oss_120b_fp4
   gpus: 1
   match_mode: scenario
   env_overrides:
@@ -1488,7 +1488,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: openai_gpt_oss_120b_8192_1024_conc64_gpu1
-  model_name: openai/gpt-oss-120b
+  model_name: gpt_oss_120b_fp4
   gpus: 1
   match_mode: scenario
   env_overrides:
@@ -1523,7 +1523,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: openai_gpt_oss_120b_8192_1024_conc4_gpu2
-  model_name: openai/gpt-oss-120b
+  model_name: gpt_oss_120b_fp4
   gpus: 2
   match_mode: scenario
   env_overrides:
@@ -1558,7 +1558,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: openai_gpt_oss_120b_8192_1024_conc16_gpu2
-  model_name: openai/gpt-oss-120b
+  model_name: gpt_oss_120b_fp4
   gpus: 2
   match_mode: scenario
   env_overrides:
@@ -1593,7 +1593,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: openai_gpt_oss_120b_8192_1024_conc64_gpu2
-  model_name: openai/gpt-oss-120b
+  model_name: gpt_oss_120b_fp4
   gpus: 2
   match_mode: scenario
   env_overrides:
@@ -1628,7 +1628,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: openai_gpt_oss_120b_8192_1024_conc4_gpu4
-  model_name: openai/gpt-oss-120b
+  model_name: gpt_oss_120b_fp4
   gpus: 4
   match_mode: scenario
   env_overrides:
@@ -1663,7 +1663,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: openai_gpt_oss_120b_8192_1024_conc16_gpu4
-  model_name: openai/gpt-oss-120b
+  model_name: gpt_oss_120b_fp4
   gpus: 4
   match_mode: scenario
   env_overrides:
@@ -1698,7 +1698,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: openai_gpt_oss_120b_8192_1024_conc64_gpu4
-  model_name: openai/gpt-oss-120b
+  model_name: gpt_oss_120b_fp4
   gpus: 4
   match_mode: scenario
   env_overrides:
@@ -1733,7 +1733,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: openai_gpt_oss_120b_8192_1024_conc4_gpu8
-  model_name: openai/gpt-oss-120b
+  model_name: gpt_oss_120b_fp4
   gpus: 8
   match_mode: scenario
   env_overrides:
@@ -1768,7 +1768,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: openai_gpt_oss_120b_8192_1024_conc16_gpu8
-  model_name: openai/gpt-oss-120b
+  model_name: gpt_oss_120b_fp4
   gpus: 8
   match_mode: scenario
   env_overrides:
@@ -1803,7 +1803,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: openai_gpt_oss_120b_8192_1024_conc64_gpu8
-  model_name: openai/gpt-oss-120b
+  model_name: gpt_oss_120b_fp4
   gpus: 8
   match_mode: scenario
   env_overrides:

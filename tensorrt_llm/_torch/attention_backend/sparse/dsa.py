@@ -17,7 +17,7 @@ from tensorrt_llm._torch.modules.multi_stream_utils import \
     maybe_execute_in_parallel
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._torch.utils import maybe_compile
+from tensorrt_llm._torch.utils import maybe_compile, maybe_compiled_cat
 from tensorrt_llm._utils import get_size_in_bytes, get_sm_version
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
@@ -114,7 +114,6 @@ def transform_local_topk_and_prepare_pool_view(
     num_blocks, num_layers, _, _ = all_layer_kv_pool.shape
     tokens_per_block = kv_cache_manager.tokens_per_block
     head_dim = kv_cache_manager.head_dim
-    assert num_layers == kv_cache_manager.num_local_layers, "PP is not enabled yet for DeepSeek V3.2"
     assert all_layer_kv_pool.is_contiguous(
     ), "all_layer_kv_pool should be contiguous"
     all_layer_kv_pool = all_layer_kv_pool.squeeze(2).view(-1, 1, head_dim)
@@ -813,13 +812,14 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 # Expand schedule metadata buffer (only generation)
                 kv_lens_expanded = self.kv_lens_expanded_cuda[:num_tokens]
                 scheduler_metadata_buffer_expanded = get_paged_mqa_logits_metadata(
-                    kv_lens_expanded, tokens_per_block, self.num_sms)
+                    kv_lens_expanded, self.kv_cache_manager.tokens_per_block,
+                    self.num_sms)
                 self.scheduler_metadata_buffer_expanded.copy_(
                     scheduler_metadata_buffer_expanded, non_blocking=True)
             elif self.max_draft_tokens == 3:
                 scheduler_metadata_buffer_mtp3 = get_paged_mqa_logits_metadata(
                     self.kv_lens_cuda[self.num_contexts:self.num_seqs],
-                    tokens_per_block, self.num_sms // 2)
+                    self.kv_cache_manager.tokens_per_block, self.num_sms // 2)
                 self.scheduler_metadata_buffer_mtp3.copy_(
                     scheduler_metadata_buffer_mtp3, non_blocking=True)
         self.prepare_dense_topk_indices(self.kv_lens_cuda, device=True)
@@ -1047,12 +1047,11 @@ class Indexer(nn.Module):
             # Indexer should just process the current MLA chunk as a single chunk
             has_mla_chunked_prefill = (
                 metadata.enable_context_mla_with_cached_kv
-                and host_cached_tokens.sum().item() > 0
                 and metadata.runtime_features.chunked_prefill)
 
             if has_mla_chunked_prefill:
-                # The MLA has already split the sequence, here just process what's given (as a single chunk)
-                # Cached token info is derived from metadata.host_ctx_cached_token_indptr in prepare_one_prefill_chunk
+                # MLA chunked prefill is active - use single-chunk pattern for
+                # indexer prefill chunks.
                 chunk_specs = [(i, 0, host_seq_lens[i].item(),
                                 host_seq_lens[:i].sum().item() if i > 0 else 0)
                                for i in range(num_contexts)]
@@ -1063,7 +1062,8 @@ class Indexer(nn.Module):
                     )
                 ]
             else:
-                # Normal mode: use indexer's own chunking logic to prevent L^2 complexity when long-sequence is used.
+                # Use indexer's own chunking logic to prevent L^2 complexity of indexer MQA logits computation for long sequences.
+                # This is only used when MLA chunked prefill is not enabled.
                 chunk_groups = split_prefill_chunks(
                     host_seq_lens,
                     metadata.indexer_max_chunk_size,
@@ -1541,7 +1541,7 @@ class Indexer(nn.Module):
 
     def _prep_q_or_k(self, qk_pe: torch.Tensor, qk_nope: torch.Tensor):
         """Concatenate, rotate, and FP8 quantize for Q or K"""
-        q_or_k = torch.cat([qk_pe, qk_nope], dim=-1)
+        q_or_k = maybe_compiled_cat([qk_pe, qk_nope], dim=-1)
         q_or_k = rotate_activation(q_or_k)
         q_or_k = q_or_k.view(-1, self.head_dim)
         q_or_k = fp8_utils.fp8_quantize_1x128_sf_transpose(
@@ -1646,7 +1646,8 @@ class DSATrtllmAttention(TrtllmAttention):
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         # Transform the local topk indices to global topk indices in paged kv cache
         topk_indices_global, _ = transform_local_topk_and_prepare_pool_view(
-            topk_indices, metadata, self.layer_idx, is_generation)
+            topk_indices, metadata, self.get_local_layer_idx(metadata),
+            is_generation)
 
         # TODO: Use sparse_attn_indexer to predict the indices for DSA attention
         # return self.indexer(q, k, metadata, hidden_states, qr, position_ids)

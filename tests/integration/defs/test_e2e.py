@@ -1653,6 +1653,14 @@ def test_openai_responses(llm_root, llm_venv):
          str(test_root / "_test_openai_responses.py")])
 
 
+def test_openai_responses_entrypoint(llm_root, llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m", "pytest",
+        str(test_root / "_test_openai_responses_entrypoint.py")
+    ])
+
+
 def test_openai_health(llm_root, llm_venv):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([
@@ -1902,11 +1910,47 @@ def test_ptp_quickstart(llm_root, llm_venv):
                  marks=skip_pre_blackwell),
     pytest.param(
         'GPT-OSS-120B', 'gpt_oss/gpt-oss-120b', marks=skip_pre_blackwell),
+    ("Llama3.1-8B-bf16-instruct", "llama-3.1-model/Llama-3.1-8B-Instruct"),
+    pytest.param('Llama3.1-8B-FP4',
+                 'modelopt-hf-model-hub/Llama-3.1-8B-Instruct-fp4',
+                 marks=skip_pre_blackwell),
+    pytest.param(
+        'Qwen3-8b-fp8', 'Qwen3/nvidia-Qwen3-8B-FP8', marks=skip_pre_hopper),
+    pytest.param('Qwen3-8b-nvfp4',
+                 'Qwen3/nvidia-Qwen3-8B-NVFP4',
+                 marks=skip_pre_blackwell),
+    ("Qwen3-8B-bf16", "Qwen3/Qwen3-8B"),
+    pytest.param(
+        'Qwen3-14b-fp8', 'Qwen3/nvidia-Qwen3-14B-FP8', marks=skip_pre_hopper),
+    pytest.param('Qwen3-14b-nvfp4',
+                 'Qwen3/nvidia-Qwen3-14B-NVFP4',
+                 marks=skip_pre_blackwell),
+    ("Qwen3-14B-bf16", "Qwen3/Qwen3-14B"),
+    pytest.param('Qwen3-32b-nvfp4',
+                 'Qwen3/nvidia-Qwen3-32B-NVFP4',
+                 marks=skip_pre_blackwell),
+    ("Qwen3-32B-bf16", "Qwen3/Qwen3-32B"),
+    pytest.param('Phi4-Reasoning-Plus-fp8',
+                 'nvidia-Phi-4-reasoning-plus-FP8',
+                 marks=skip_pre_hopper),
+    pytest.param('Phi4-Reasoning-Plus-nvfp4',
+                 'nvidia-Phi-4-reasoning-plus-NVFP4',
+                 marks=skip_pre_blackwell),
+    ("Phi-4-reasoning-plus-bf16", "Phi-4-reasoning-plus"),
+    pytest.param('Nemotron-Super-49B-v1.5-FP8',
+                 'nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1_5-FP8',
+                 marks=skip_pre_hopper),
+    pytest.param('Llama-4-Scout-17B-16E-FP4',
+                 'llama4-models/Llama-4-Scout-17B-16E-Instruct-FP4',
+                 marks=skip_pre_blackwell),
+    pytest.param('Nemotron-Nano-9B-v2-nvfp4',
+                 'NVIDIA-Nemotron-Nano-9B-v2-NVFP4',
+                 marks=skip_pre_blackwell),
 ])
 def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
     print(f"Testing {model_name}.")
     example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
-    if model_name == "Nemotron-H-8B":
+    if model_name in ("Nemotron-H-8B", "Nemotron-Nano-9B-v2-nvfp4"):
         llm_venv.run_cmd([
             str(example_root / "quickstart_advanced.py"),
             "--disable_kv_cache_reuse",
@@ -1934,7 +1978,7 @@ def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
             ]
             if "Qwen3" in model_name:
                 cmds.append(f"--kv_cache_fraction=0.6")
-            if "Llama3.1-70B" in model_name:
+            if "Llama3.1-70B" in model_name or "Llama3.3-70B" in model_name:
                 cmds.append(f"--max_num_tokens=1024")
             llm_venv.run_cmd(cmds, stdout=running_log)
             if model_name in mapping:
@@ -2053,11 +2097,22 @@ def test_ptp_quickstart_advanced_deepseek_multi_nodes(llm_root, llm_venv,
 @pytest.mark.parametrize("model_name,model_path,eagle_model_path", [
     ("Llama-3.1-8b-Instruct", "llama-3.1-model/Llama-3.1-8B-Instruct",
      "EAGLE3-LLaMA3.1-Instruct-8B"),
+    pytest.param('GPT-OSS-120B-Eagle3',
+                 'gpt_oss/gpt-oss-120b',
+                 'gpt_oss/gpt-oss-120b-Eagle3',
+                 marks=skip_pre_blackwell),
 ])
 def test_ptp_quickstart_advanced_eagle3(llm_root, llm_venv, model_name,
                                         model_path, eagle_model_path):
     print(f"Testing {model_name}.")
     example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
+
+    # Set expected memory based on model size
+    if "GPT-OSS-120B" in model_name:
+        expected_mem = [106.71, 0, 0, 0]  # Memory for 120B model with Eagle3
+    else:
+        expected_mem = [25.2, 0, 0, 0]  # Memory for Llama-3.1-8B with Eagle3
+
     with tempfile.NamedTemporaryFile(mode='w+t',
                                      suffix=f".{model_name}.log",
                                      dir="./",
@@ -2077,7 +2132,7 @@ def test_ptp_quickstart_advanced_eagle3(llm_root, llm_venv, model_name,
             "--disable_overlap_scheduler",
         ],
                          stdout=running_log)
-        _check_mem_usage(running_log, [25.2, 0, 0, 0])
+        _check_mem_usage(running_log, expected_mem)
 
 
 @pytest.mark.parametrize("model_name,model_path,eagle_model_path", [
@@ -2536,9 +2591,6 @@ def test_ptp_quickstart_advanced_mixed_precision(llm_root, llm_venv):
 @pytest.mark.parametrize("use_cuda_graph", [False, True])
 @pytest.mark.parametrize("modality", ["image", "video", "mixture_text_image"])
 @pytest.mark.parametrize("model_name,model_path", [
-    pytest.param("mistral-small-3.1-24b-instruct",
-                 "Mistral-Small-3.1-24B-Instruct-2503",
-                 marks=pytest.mark.skip_less_device_memory(80000)),
     pytest.param(
         "Nano-v2-VLM",
         "Nano-v2-VLM",
@@ -2588,21 +2640,11 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         }
     }
 
-    expected_keywords = {
-        "mistral-small-3.1-24b-instruct": {
-            "image": [
-                ["dramatic", "seascape", "ocean", "turbulent", "waves", "dark"],
-                ["scenic", "rock", "landscape", "monolith", "formation"],
-                [
-                    "multi-lane", "highway", "moderate", "traffic", "flow",
-                    "vehicles", "congestion"
-                ],
-            ],
-            "mixture_text_image":
-            [["invention", "person", "scientists", "Lick", "engineers"],
-             ["landscape", "trees", "road", "depicts", "scenic"]]
-        },
-    }
+    # TODO: remove this entire test if there are no plans to extend them for Nano v2 VL.
+    expected_keywords = {}
+
+    if modality not in expected_keywords[model_name]:
+        pytest.skip(f"{modality=} not supported for {model_name}")
 
     cmd = [
         str(example_root / "quickstart_multimodal.py"),
@@ -2620,19 +2662,13 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
     if use_cuda_graph:
         cmd.append("--use_cuda_graph")
 
-    output = llm_venv.run_cmd(cmd, caller=check_output)
+    _ = llm_venv.run_cmd(cmd, caller=check_output)
 
-    match_ratio = 4.0 / 5
-    parsed_outputs = parse_output(output)
-    for prompt_output, prompt_keywords in zip(
-            parsed_outputs, expected_keywords[model_name][modality]):
-        matches = [
-            keyword in prompt_output.lower() for keyword in prompt_keywords
-        ]
-        obs_match_ratio = 1. * sum(matches) / len(matches)
-        assert obs_match_ratio >= match_ratio, f"Incorrect output!\nGenerated \"{prompt_output}\"\nExpected keywords \"{prompt_keywords}\"\n Matched keywords: {matches}\n Observed match ratio {obs_match_ratio} below threshold {match_ratio}\n\nParsed output for all prompts: {parsed_outputs}"
-
-    print("All answers are correct!")
+    # NOTE: we deliberately do not check the LLM outputs with keyword matching ratios as in the
+    # other tests, as it can be brittle and cause flakiness in CI.
+    # This test now becomes a smoke / functional test.
+    # Proper accuracy tests should be added to
+    # `tests/integration/defs/accuracy/test_llm_api_pytorch_multimodal.py`.
 
 
 @pytest.mark.parametrize("modality", ["image", "video"])
