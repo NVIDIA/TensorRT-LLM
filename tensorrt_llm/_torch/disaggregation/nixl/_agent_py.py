@@ -37,19 +37,33 @@ class NixlTransferStatus(TransferStatus):
 class NixlTransferAgent(BaseTransferAgent):
     """NixlTransferAgent using Python nixl library."""
 
-    def __init__(self, name: str, use_prog_thread: bool, num_workers: int = 1):
+    def __init__(self, name: str, use_prog_thread: bool = True, num_workers: int = 1):
+        """
+        Initialize NixlTransferAgent.
+        :param name: Name of the agent.
+        :param use_prog_thread: Whether to enable the progress thread, if available.
+        :param num_workers: Specify number of threads for the supported multi-threaded backends.
+        """
         self.name = name
+        self.backends = ["UCX"]
         agent_config = nixl_agent_config(
-            enable_prog_thread=use_prog_thread, backends=["UCX"], num_threads=num_workers
+            enable_prog_thread=use_prog_thread, backends=self.backends, num_threads=num_workers
         )
         self.agent = nixl_agent(name, agent_config)
 
     def register_memory(self, descs: RegMemoryDescs):
+        if isinstance(descs.descs[0], tuple):
+            assert len(descs.descs[0]) == 4, f"Expected 4 elements per desc, got {descs.descs[0]}"
         reg_descs = self.agent.get_reg_descs(descs.descs, descs.type)
+        assert reg_descs is not None, "Failed to get reg_descs"
         self.agent.register_memory(reg_descs)
 
     def deregister_memory(self, descs: RegMemoryDescs):
-        self.agent.deregister_memory(descs.descs, descs.type)
+        if isinstance(descs.descs[0], tuple):
+            assert len(descs.descs[0]) == 4, f"Expected 4 elements per desc, got {descs.descs[0]}"
+        reg_descs = self.agent.get_reg_descs(descs.descs, descs.type)
+        assert reg_descs is not None, "Failed to get reg_descs"
+        self.agent.deregister_memory(reg_descs)
 
     def load_remote_agent(self, name: str, agent_desc: bytes):
         self.agent.add_remote_agent(agent_desc)
@@ -70,6 +84,8 @@ class NixlTransferAgent(BaseTransferAgent):
     def submit_transfer_requests(self, request: TransferRequest) -> TransferStatus:
         src_xfer_descs = self.agent.get_xfer_descs(request.src_descs.descs, request.src_descs.type)
         dst_xfer_descs = self.agent.get_xfer_descs(request.dst_descs.descs, request.dst_descs.type)
+        assert src_xfer_descs is not None, "Failed to get src_xfer_descs"
+        assert dst_xfer_descs is not None, "Failed to get dst_xfer_descs"
         sync_message = "" if request.sync_message is None else request.sync_message
         handle = self.agent.initialize_xfer(
             request.op,
