@@ -93,13 +93,9 @@ def run_benchmarks(
         )
         return NotImplementedError
 
-    # If local not found, fall back to HuggingFace
-    cnn_dailymail_dir = f"{model_cache}/datasets/ccdv/cnn_dailymail"
-    cnn_dailymail_dataset_name = cnn_dailymail_dir if _os.path.isdir(
-        cnn_dailymail_dir) else "ccdv/cnn_dailymail"
-
     prompt_datasets_args = [{
-        '--dataset-name': cnn_dailymail_dataset_name,
+        '--dataset-name': "ccdv/cnn_dailymail",
+        '--dataset-local-path': f"{model_cache}/datasets/ccdv/cnn_dailymail",
         '--dataset-config-name': "3.0.0",
         '--dataset-split': "validation",
         '--dataset-input-key': "article",
@@ -107,18 +103,20 @@ def run_benchmarks(
         '--dataset-output-key': "highlights"
     }, {
         '--dataset-name': "Open-Orca/1million-gpt-4",
+        '--dataset-local-path':
+        "/datasets/1million-gpt-4/1M-GPT4-Augmented.parquet",
         '--dataset-split': "train",
         '--dataset-input-key': "question",
         '--dataset-prompt-key': "system_prompt",
         '--dataset-output-key': "response"
     }]
+
     token_files = [
         "prepared_" + s['--dataset-name'].replace('/', '_')
         for s in prompt_datasets_args
     ]
     max_input_lens = ["256", "20"]
     num_reqs = ["50", "10"]
-
     if model_name == "gpt":
         model_engine_path = model_engine_dir / "fp16_plugin_packed_paged" / "tp1-pp1-cp1-gpu"
 
@@ -147,8 +145,8 @@ def run_benchmarks(
         ]
         for k, v in prompt_ds_args.items():
             prepare_dataset += [k, v]
-        # https://nvbugs/4658787
-        # WAR before the prepare dataset can use offline cached dataset
+
+        # Use environment variable to force HuggingFace to use offline cached dataset
         _cpp.run_command(prepare_dataset,
                          cwd=root_dir,
                          timeout=300,

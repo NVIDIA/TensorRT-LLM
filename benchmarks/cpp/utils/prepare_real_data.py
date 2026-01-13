@@ -1,12 +1,12 @@
 import logging
-import os
 import random
 import re
 import tempfile
+from pathlib import Path
 from typing import Optional
 
 import click
-from datasets import load_dataset
+import datasets
 from PIL import Image
 from pydantic import BaseModel, model_validator
 from utils.utils import (get_norm_dist_lengths, multimodal_dataset_dump,
@@ -45,6 +45,8 @@ class DatasetConfig(BaseModel):
     prompt: Optional[str] = None
     """The dataset dictionary key used to derive the output sequence length. Set to None if the dataset does not have a key for output."""
     output_key: Optional[str]
+    """The local path to the dataset to be loaded when using a local cache."""
+    local_path: Optional[str] = None
 
     @model_validator(mode='after')
     def check_prompt(self) -> 'DatasetConfig':
@@ -58,10 +60,12 @@ class DatasetConfig(BaseModel):
     @property
     def query(self):
         """Generate the query for HuggingFace `datasets.load_dataset()`"""
+        first_arg = self.local_path if self.local_path else self.name
+
         if self.config_name:
-            return [self.name, self.config_name]
+            return [first_arg, self.config_name]
         else:
-            return [self.name]
+            return [first_arg]
 
     def get_prompt(self, req):
         """Get the prompt sentence from the given request."""
@@ -112,6 +116,21 @@ class DatasetConfig(BaseModel):
         return req[self.output_key]
 
 
+def load_dataset(dataset_config: DatasetConfig):
+    """Load dataset from local path or HuggingFace.
+    Args:
+        dataset_config: A `DatasetConfig` object that defines the dataset to load.
+    Returns:
+        Dataset iterator.
+    Raises:
+        ValueError: When dataset loading fails due to incorrect dataset config setting.
+    """
+    if dataset_config.local_path:
+        return load_dataset_from_local(dataset_config)
+    else:
+        return load_dataset_from_hf(dataset_config)
+
+
 def load_dataset_from_hf(dataset_config: DatasetConfig):
     """Load dataset from HuggingFace.
 
@@ -124,25 +143,75 @@ def load_dataset_from_hf(dataset_config: DatasetConfig):
     """
     try:
 
-        # Use streaming mode if not local dataset
-        use_streaming_mode = not os.path.isdir(dataset_config.name)
         logging.debug(
-            f"Loading dataset: query={dataset_config.query}, split={dataset_config.split}, streaming={use_streaming_mode}"
+            f"Loading dataset from HF: query={dataset_config.query}, split={dataset_config.split}"
         )
-
         dataset = iter(
-            load_dataset(*dataset_config.query,
-                         split=dataset_config.split,
-                         streaming=use_streaming_mode,
-                         trust_remote_code=True))
+            datasets.load_dataset(*dataset_config.query,
+                                  split=dataset_config.split,
+                                  streaming=True,
+                                  trust_remote_code=True))
     except ValueError as e:
-        if "Config" in e:
-            e += "\n Please add the config name to the dataset config yaml."
-        elif "split" in e:
-            e += "\n Please specify supported split in the dataset config yaml."
-        raise ValueError(e)
+        error_msg = str(e)
+        if "Config" in error_msg:
+            error_msg += "\n Please add the config name to the dataset config yaml."
+        elif "split" in error_msg:
+            error_msg += "\n Please specify supported split in the dataset config yaml."
+        raise ValueError(error_msg)
+
+    logging.debug("Finished loading HF dataset")
 
     return dataset
+
+
+def load_dataset_from_local(dataset_config: DatasetConfig):
+    """Load dataset from local path.
+
+    Args:
+        dataset_config: A `DatasetConfig` object that defines the dataset to load.
+    Returns:
+        Dataset iterator.
+    Raises:
+        FileNotFoundError: When local dataset path does not exist.
+        ValueError: When dataset loading fails due to incorrect dataset config setting.
+    """
+
+    local_path = Path(dataset_config.local_path)
+
+    if not local_path.exists():
+        raise FileNotFoundError(
+            f"Local dataset path {local_path} does not exist.")
+
+    logging.debug(
+        f"Loading dataset from local path: path={local_path}, query={dataset_config.query}, split={dataset_config.split}"
+    )
+
+    # If it's a directory we can use the normal loader, otherwise custom loader
+    # depends on the file extension
+    if local_path.is_dir():
+        dataset = datasets.load_dataset(*dataset_config.query,
+                                        split=dataset_config.split)
+    else:
+        format_map = {
+            ".json": "json",
+            ".jsonl": "json",
+            ".csv": "csv",
+            ".parquet": "parquet",
+        }
+
+        file_extension = local_path.suffix
+        dataset_type = format_map.get(file_extension)
+
+        if dataset_type is None:
+            raise ValueError(f"Unsupported file extension: {file_extension}")
+
+        dataset = datasets.load_dataset(dataset_type,
+                                        data_files=str(local_path),
+                                        split=dataset_config.split)
+
+    logging.debug("Finished loading local dataset")
+
+    return iter(dataset)
 
 
 @click.command()
@@ -169,6 +238,12 @@ def load_dataset_from_hf(dataset_config: DatasetConfig):
               type=str,
               default=None,
               help=f"The dataset dictionary key for prompt (if exists).")
+@click.option(
+    "--dataset-local-path",
+    type=str,
+    default=None,
+    help=
+    f"The local path to the dataset to be loaded when using an offline cache.")
 @click.option(
     "--dataset-prompt",
     type=str,
@@ -216,7 +291,7 @@ def dataset(root_args, **kwargs):
     modality = None
     multimodal_texts = []
     multimodal_image_paths = []
-    for req in load_dataset_from_hf(dataset_config):
+    for req in load_dataset(dataset_config):
         if any(key in req for key in ['image', 'image_1', 'video']):
             # multimodal input
             if 'video' in req and req['video'] is not None:
