@@ -6,9 +6,10 @@ import torch
 import torch.nn as nn
 
 from tensorrt_llm import SamplingParams
-from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import SequenceInfo
 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import ADEngine
 from tensorrt_llm._torch.auto_deploy.shim.demollm import DemoEngine
+from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
 
 class TransformerLikeModelwithFakeCachePool(nn.Module):
@@ -38,12 +39,13 @@ def get_inference_model(cache_seq_interface):
 
     model = TransformerLikeModelwithFakeCachePool(vocab_size, embed_dim, hidden_dim)
     model.eval().to(device)
+
     return model
 
 
 @pytest.mark.parametrize("engine_cls", [ADEngine, DemoEngine])
-@pytest.mark.parametrize("attn_page_size", [0, 2, 0])
-def test_engine(engine_cls: Type[ADEngine], attn_page_size: int):
+@pytest.mark.parametrize("tokens_per_block", [0, 2, 0])
+def test_engine(engine_cls: Type[ADEngine], tokens_per_block: int):
     """Test the SimpleEngine functionality."""
 
     seed = 42  # Set random seed for model param init
@@ -55,21 +57,24 @@ def test_engine(engine_cls: Type[ADEngine], attn_page_size: int):
     max_seq_len = 64
     max_batch_size = 8
 
-    sequence_info = SequenceInfo(
+    # Create KvCacheConfig with specified tokens_per_block (use 32 as default if 0)
+    kv_cache_config = KvCacheConfig(tokens_per_block=tokens_per_block or max_seq_len)
+    cache_seq_interface = CachedSequenceInterface(
         max_seq_len=max_seq_len,
         max_batch_size=max_batch_size,
-        page_size=attn_page_size,
+        device=device,
+        kv_cache_config=kv_cache_config,
     )
-    sequence_info.to(device)
+    cache_seq_interface.to(device)
 
-    engine = engine_cls(get_inference_model, sequence_info, device)
+    engine = engine_cls(get_inference_model, cache_seq_interface)
 
     # Test basic token generation
     with torch.inference_mode():
         # Test logits
         input_ids = [torch.tensor([0, 1, 2], device=device)]
-        sequence_info.reset()
-        sequence_info.nest_sequences(input_ids)
+        cache_seq_interface.info.reset()
+        cache_seq_interface.info.nest_sequences(input_ids)
         logits = engine._compute_logits()
         assert logits is not None, "Logits are None"
 
@@ -78,8 +83,8 @@ def test_engine(engine_cls: Type[ADEngine], attn_page_size: int):
         assert torch.allclose(logits, original_logits, atol=1e-5), "Generated Token ID mismatch"
 
 
-@pytest.mark.parametrize("attn_page_size", [0, 2])
-def test_demo_engine_sampling(attn_page_size: int):
+@pytest.mark.parametrize("tokens_per_block", [0, 2])
+def test_demo_engine_sampling(tokens_per_block: int):
     """Test sampling logic specific to DemoEngine."""
     seed = 0
     torch.manual_seed(seed)
@@ -90,19 +95,22 @@ def test_demo_engine_sampling(attn_page_size: int):
     max_seq_len = 64
     max_batch_size = 8
 
-    sequence_info = SequenceInfo(
+    # Create KvCacheConfig with specified tokens_per_block (use 32 as default if 0)
+    kv_cache_config = KvCacheConfig(tokens_per_block=tokens_per_block or 32)
+    cache_seq_interface = CachedSequenceInterface(
         max_seq_len=max_seq_len,
         max_batch_size=max_batch_size,
-        page_size=attn_page_size,
+        device=device,
+        kv_cache_config=kv_cache_config,
     )
-    sequence_info.to(device)
+    cache_seq_interface.to(device)
 
-    engine = DemoEngine(get_inference_model, sequence_info, device)
+    engine = DemoEngine(get_inference_model, cache_seq_interface)
 
     with torch.inference_mode():
         input_ids = [torch.tensor([1, 2, 3, 4], device=device)]
-        sequence_info.reset()
-        sequence_info.nest_sequences(input_ids)
+        cache_seq_interface.info.reset()
+        cache_seq_interface.info.nest_sequences(input_ids)
         logits = engine._compute_logits()
 
         vocab_size = logits.size(-1)
@@ -163,8 +171,8 @@ class _DummyRequest:
         return self._tokens
 
 
-@pytest.mark.parametrize("attn_page_size", [256, 2])
-def test_ad_engine_chunked_prefill_equivalence(attn_page_size: int):
+@pytest.mark.parametrize("tokens_per_block", [256, 2])
+def test_ad_engine_chunked_prefill_equivalence(tokens_per_block: int):
     """Verify ADEngine logits match between chunked and non-chunked prefill.
 
     We simulate chunking by splitting a single context request into two chunks and
@@ -179,19 +187,22 @@ def test_ad_engine_chunked_prefill_equivalence(attn_page_size: int):
     max_seq_len = 64
     max_batch_size = 8
 
-    sequence_info = SequenceInfo(
+    # Create KvCacheConfig with specified tokens_per_block
+    kv_cache_config = KvCacheConfig(tokens_per_block=tokens_per_block)
+    cache_seq_interface = CachedSequenceInterface(
         max_seq_len=max_seq_len,
         max_batch_size=max_batch_size,
-        page_size=attn_page_size,
+        device=device,
+        kv_cache_config=kv_cache_config,
     )
-    sequence_info.to(device)
+    cache_seq_interface.to(device)
 
-    engine = ADEngine(get_inference_model, sequence_info, device)
+    engine = ADEngine(get_inference_model, cache_seq_interface)
 
     # A simple prompt; model is position-wise so last token dominates the last logit
     tokens = [1, 2, 3, 4, 5, 6]
 
-    kv_manager = _DummyKVCacheManager(tokens_per_block=attn_page_size)
+    kv_manager = _DummyKVCacheManager(tokens_per_block=tokens_per_block)
     resource_manager = _DummyResourceManager(kv_manager)
 
     # No-chunk: whole prompt in one request

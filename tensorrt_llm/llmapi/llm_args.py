@@ -1702,6 +1702,16 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             "The data type to use for the Mamba SSM cache. If set to 'auto', the data type will be inferred from the model config."
         )
 
+    # This is a pure python field, not a pybind field. It is only for the AutoDeploy backend.
+    causal_conv_cache_dtype: str = Field(
+        default="auto",
+        description="The data type to use for the causal conv cache.")
+
+    # This is a pure python field, not a pybind field. It is only for the AutoDeploy backend.
+    delta_net_cache_dtype: str = Field(
+        default="auto",
+        description="The data type to use for the delta net cache.")
+
     tokens_per_block: int = Field(default=32,
                                   description="The number of tokens per block.")
 

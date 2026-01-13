@@ -6,7 +6,6 @@ import torch.nn as nn
 from _model_test_utils import GQA
 from _torch_test_utils import all_close
 
-from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import CacheConfig, SequenceInfo
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.factory import (
     FullModelExportInfo,
@@ -15,14 +14,15 @@ from tensorrt_llm._torch.auto_deploy.models.factory import (
 )
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
 
 class DummyFactory(ModelFactory):
-    """Dummy factory to pass cache_config for testing."""
+    """Dummy factory to pass cache_config_updates for testing."""
 
-    def __init__(self, model, cache_config):
+    def __init__(self, model, cache_config_updates):
         self._model = model
-        self.cache_config = cache_config
+        self.cache_config_updates = cache_config_updates
 
     def build_model(self, device: str):
         return self._model.to(device=device)
@@ -33,8 +33,8 @@ class DummyFactory(ModelFactory):
     def _load_checkpoint(self, model, device):
         return
 
-    def get_cache_config(self):
-        return self.cache_config
+    def get_cache_config_updates(self):
+        return self.cache_config_updates
 
     def get_export_infos(self, model: nn.Module) -> List[SubModuleExportInfo]:
         return [FullModelExportInfo()]
@@ -151,12 +151,19 @@ def test_sdpa_with_kv_cache(dtype, attn_backend, gqa_config):
     max_position_embeddings = 128
     vocab_size = 1000
 
-    # set up sequence+cache objects using standard SequenceInfo
-    ci = SequenceInfo(
+    # set up sequence+cache objects using CachedSequenceInterface
+    # Use tokens_per_block=max_position_embeddings so each sequence fits in 1 page for the test
+    kv_cache_config = KvCacheConfig(
+        tokens_per_block=max_position_embeddings,
+        max_tokens=batch_size * max_position_embeddings,
+        free_gpu_memory_fraction=0.0,  # Disable dynamic resizing for test
+    )
+    cm = CachedSequenceInterface(
         max_seq_len=max_position_embeddings,
         max_batch_size=batch_size,
+        device="cuda",
+        kv_cache_config=kv_cache_config,
     )
-    cm = CachedSequenceInterface(sequence_info=ci, device="cuda")
 
     # Create the model with embedding layer and SDPA, wrap it in a fake factory
     model = GQAWithSdpaAndEmbedding(
@@ -175,7 +182,7 @@ def test_sdpa_with_kv_cache(dtype, attn_backend, gqa_config):
 
     # Apply the transformation
     optimizer = InferenceOptimizer(
-        DummyFactory(model, CacheConfig()),
+        DummyFactory(model, cache_config_updates={}),
         {
             "build_model": {
                 "stage": "factory",
@@ -204,7 +211,7 @@ def test_sdpa_with_kv_cache(dtype, attn_backend, gqa_config):
     gm = optimizer(cm)
 
     gm.to("cuda")
-    num_caches = cm.initialize_caches()
+    num_caches = cm.initialize_resources()
     print(f"num_caches: {num_caches}")
 
     # Helper function to call the model with proper sequence nesting

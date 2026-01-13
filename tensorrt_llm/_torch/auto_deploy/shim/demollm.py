@@ -71,14 +71,15 @@ class DemoEngine(ADEngine):
         currently available token slots in the assigned pages and assign a new, previously
         unassigned page if needed.
         """
-        si = self.cache_seq_interface.info
-        page_assignments = si.page_assignments
+        page_assignments = self.cache_seq_interface.info.page_assignments
+        num_pages = self.cache_seq_interface.kv_cache_manager.blocks_in_primary_pool
+        tokens_per_block = self.cache_seq_interface.kv_cache_manager.tokens_per_block
 
-        free_pages = set(range(si.num_pages)) - {i for pages in page_assignments for i in pages}
+        free_pages = set(range(num_pages)) - {i for pages in page_assignments for i in pages}
         updated_assignments = []
         for t_l, pages in zip(total_lens, page_assignments):
-            extra_tokens = t_l - len(pages) * si.page_size
-            num_extra_pages = (extra_tokens // si.page_size) + (extra_tokens > 0)
+            extra_tokens = t_l - len(pages) * tokens_per_block
+            num_extra_pages = (extra_tokens // tokens_per_block) + (extra_tokens > 0)
             updated_assignments.append(pages + [free_pages.pop() for _ in range(num_extra_pages)])
         return updated_assignments
 
