@@ -80,7 +80,7 @@ class Scenario:
     rope_original_max_position_embeddings: int = 4096
     rope_type: str = "yarn"
     model_type: str = "deepseek_v3"
-    kv_cache_tokens_per_block: int = 64
+    kv_cache_tokens_per_block: int = 32
     # TODO only 1 is supported for now here
     predicted_tokens_per_seq: int = 1
     bias: bool = False
@@ -99,6 +99,8 @@ class Scenario:
 
 
 all_scenarios = [
+    Scenario(batch=1, ctx_len=64),
+    Scenario(batch=1, ctx_len=512),
     Scenario(batch=1, ctx_len=1024),
     Scenario(batch=1, ctx_len=2048),
     Scenario(batch=1, ctx_len=4096),
@@ -129,14 +131,14 @@ all_scenarios = [
 
 # limit the number of test scenarios to avoid taking too long
 test_scenarios = [
-    # note: tests with ctx_len=1024 (or less) are currently failing, most likely due to
-    # bad numerics especially with bf16. We ignore those tests for now.
-    all_scenarios[2],
-    all_scenarios[5],
-    all_scenarios[12],
-    all_scenarios[15],
-    all_scenarios[21],
-    all_scenarios[22],
+    all_scenarios[0],
+    all_scenarios[1],
+    all_scenarios[4],
+    all_scenarios[7],
+    all_scenarios[14],
+    all_scenarios[17],
+    all_scenarios[23],
+    all_scenarios[24],
 ]
 
 
@@ -457,7 +459,7 @@ def _run_mla_distributed(
         layer_idx=0,
         dtype=scenario.dtype,
         config=config,
-        enable_unit_test=True,
+        enable_helix_test=True,
     ).cuda()
     # above should have the same config as the reference MLA except for the mapping
     # we update the weights accordingly and should be able to load them
@@ -501,9 +503,16 @@ def _run_mla_distributed(
     start = time.time()
 
     for step in range(gen_steps):
+        helix_is_inactive_rank = []
         for req_id in range(scenario.batch):
             kv_cache_manager.impl.add_token(req_id)
-        cache_add = step if rank == world_size - 1 else 0
+            # Assume last rank is active for all gen steps.
+            if rank == world_size - 1:
+                helix_is_inactive_rank.append(False)
+                cache_add = step
+            else:
+                helix_is_inactive_rank.append(True)
+                cache_add = 0
         cached_tokens_per_seq = [ctx_len_per_gpu + cache_add for _ in range(scenario.batch)]
         if step == 0:
             attn_metadata = get_attention_backend("TRTLLM").Metadata(
@@ -520,10 +529,26 @@ def _run_mla_distributed(
                 ),
                 enable_context_mla_with_cached_kv=True,
             )
+            attn_metadata.enable_helix = True
+            attn_metadata.helix_is_inactive_rank = torch.tensor(
+                helix_is_inactive_rank, dtype=torch.bool, device="cuda"
+            )
+            attn_metadata.helix_is_inactive_rank_cpu = attn_metadata.helix_is_inactive_rank.to(
+                device="cpu"
+            ).pin_memory()
+            attn_metadata.helix_position_offsets = torch.tensor(
+                position_ids_gen, dtype=torch.int, device="cuda"
+            )
+            attn_metadata.helix_position_offsets_cpu = attn_metadata.helix_position_offsets.to(
+                device="cpu"
+            ).pin_memory()
         else:
             attn_metadata.kv_cache_params = KVCacheParams(
                 use_cache=True,
                 num_cached_tokens_per_seq=cached_tokens_per_seq,
+            )
+            attn_metadata.helix_is_inactive_rank = torch.tensor(
+                helix_is_inactive_rank, dtype=torch.bool, device="cuda"
             )
         attn_metadata.prepare()
         extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
@@ -619,7 +644,13 @@ def _run_mla_distributed(
 
 
 @torch.inference_mode
-def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario, gen_steps: int):
+def _full_test_multi_gpu(
+    rank: int,
+    world_size: int,
+    scenario: Scenario,
+    gen_steps: int,
+    comms_medium: str = False,
+):
     if scenario.rope_scaling:
         rope_scaling = {
             "beta_fast": scenario.rope_beta_fast,
@@ -679,7 +710,7 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario, gen_ste
         pos_embd_params=pos_embd_params,
         layer_idx=0,
         dtype=scenario.dtype,
-        enable_unit_test=True,
+        enable_helix_test=True,
     ).cuda()
     _generate_random_weights(mla)
     weights = mla.state_dict()
@@ -789,7 +820,13 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario, gen_ste
 
     # Distributed mapping for helix
     mapping = Mapping(
-        world_size=world_size, rank=rank, cp_size=world_size, cp_config={"cp_type": CpType.HELIX}
+        world_size=world_size,
+        rank=rank,
+        cp_size=world_size,
+        cp_config={
+            "cp_type": CpType.HELIX,
+            "use_nccl_for_alltoall": comms_medium == "nccl",
+        },
     )
     # we use cp_allgather here because there is no broadcast op across CP group
     ref_output_all = cp_allgather(ref_output, mapping=mapping, dim=0)
@@ -822,21 +859,26 @@ def _run_single_rank(func, *args, **kwargs):
         raise Exception(f"\n\nError occurred. Original traceback is\n{tb}\n")
 
 
-# note: due to bad numerics with smaller context sizes, we allow up to 2% mismatches
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs to run this test")
 @pytest.mark.parametrize("scenario", test_scenarios, ids=lambda x: f"scenario: {x}")
+@pytest.mark.parametrize("comms_medium", ["nccl", "fifo"])
 def test_mla_helix_distributed(
     scenario: Scenario,
+    comms_medium: str,
     gen_steps: Optional[int] = None,
     max_mismatch_ratio: float = 0.02,
     mismatch_ratios: Optional[List[float]] = None,
 ):
     world_size = 2
+    print(f"Testing with comms_medium={comms_medium}.")
     gen_steps = scenario.ref_steps if gen_steps is None else gen_steps
     with MPIPoolExecutor(max_workers=world_size) as executor:
         results = executor.map(
             _run_single_rank,
-            *zip(*[(_full_test_multi_gpu, world_size, scenario, gen_steps)] * world_size),
+            *zip(
+                *[(_full_test_multi_gpu, world_size, scenario, gen_steps, comms_medium == "nccl")]
+                * world_size
+            ),
         )
         if mismatch_ratios is None:
             for ratio_mismatch in results:
@@ -846,13 +888,22 @@ def test_mla_helix_distributed(
 
 
 if __name__ == "__main__":
-    for scenario in all_scenarios[:11]:
-        timing_steps = 256
-        gen_steps = scenario.ref_steps + timing_steps
-        print(f"Running scenario: {scenario} and timing {timing_steps} steps")
-        mismatch_ratios = []
-        test_mla_helix_distributed(scenario, gen_steps=gen_steps, mismatch_ratios=mismatch_ratios)
-        if any(mismatch > 0 for mismatch in mismatch_ratios):
-            print(f"Numerical test failed with mismatch ratios: {mismatch_ratios}")
-        else:
-            print("Numerical test passed")
+    for comms_medium in ["fifo", "nccl"]:
+        print(f"\n{'=' * 60}")
+        print(f"Testing with comms_medium={comms_medium}")
+        print(f"{'=' * 60}\n")
+        for scenario in all_scenarios[:11]:
+            timing_steps = 256
+            gen_steps = scenario.ref_steps + timing_steps
+            print(f"Running scenario: {scenario} and timing {timing_steps} steps")
+            mismatch_ratios = []
+            test_mla_helix_distributed(
+                scenario,
+                comms_medium=comms_medium,
+                gen_steps=gen_steps,
+                mismatch_ratios=mismatch_ratios,
+            )
+            if any(mismatch > 0 for mismatch in mismatch_ratios):
+                print(f"Numerical test failed with mismatch ratios: {mismatch_ratios}")
+            else:
+                print("Numerical test passed")

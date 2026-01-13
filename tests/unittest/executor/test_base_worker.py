@@ -23,6 +23,30 @@ default_model_name = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 model_path = llm_models_root() / default_model_name
 
 
+def create_fake_executor_config(engine_path, tp_size: int = 1):
+    """Create TorchLlmArgs and executor_config for testing.
+
+    Args:
+        engine_path: Path to the model
+        tp_size: Tensor parallel size
+
+    Returns:
+        Tuple of (llm_args, executor_config)
+    """
+    llm_args = TorchLlmArgs(
+        model=engine_path,
+        tensor_parallel_size=tp_size,
+        backend='pytorch',
+        enable_iter_perf_stats=True,
+        max_seq_len=2048,  # Set reasonable max sequence length
+        max_batch_size=8,  # Set reasonable batch size for tests
+        max_num_tokens=2048,  # Set reasonable max tokens
+    )
+    # executor_config is not needed for PyTorch backend
+    executor_config = None
+    return llm_args, executor_config
+
+
 class FakeWorker(BaseWorker):
 
     def __init__(self, engine: str, tp_size: int = 1):

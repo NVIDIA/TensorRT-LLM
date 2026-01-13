@@ -25,6 +25,7 @@ class RuntimeConfig(BaseModel):
     model: str
     model_path: Optional[Path] = None
     engine_dir: Optional[Path] = None
+    revision: Optional[str] = None
     sw_version: str
     settings_config: ExecutorSettingsConfig
     # TODO: this is a dict corresponding to the Mapping class, the type should be

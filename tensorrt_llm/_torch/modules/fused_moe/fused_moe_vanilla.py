@@ -10,7 +10,9 @@ from tensorrt_llm.quantization.utils import fp4_utils
 
 from ...distributed import allgather, reducescatter
 from ...model_config import ModelConfig
+from ...utils import ActivationType, is_gated_activation, relu2
 from ..gated_mlp import GatedMLP
+from ..mlp import MLP
 from .interface import MoEWeightLoadingMode
 from .routing import BaseMoeRoutingMethod
 
@@ -31,6 +33,8 @@ class VanillaMoE(nn.ModuleList):
         VANILLA,
         apply_router_weight_on_input: bool = False,
         pack_weights: bool = False,
+        layer_idx: Optional[int] = None,
+        activation_type: ActivationType = ActivationType.Swiglu,
     ):
         from ...distributed import AllReduce
 
@@ -41,6 +45,20 @@ class VanillaMoE(nn.ModuleList):
         self.intermediate_size = intermediate_size
         self.weight_loading_mode = weight_loading_mode
         self.pack_weights = pack_weights
+        self.layer_idx = layer_idx
+
+        self.activation_type = activation_type
+        self.is_gated_activation = is_gated_activation(activation_type)
+        # Limit support for VanillaMoE to non-gated activations for now.
+        if not self.is_gated_activation:
+            if pack_weights:
+                raise ValueError(
+                    "pack_weights must be False for non-gated activations. Otherwise please update `create_weights`."
+                )
+            if self.activation_type != ActivationType.Relu2:
+                raise ValueError(
+                    f"Unsupported activation type: {self.activation_type} for non-gated activations. Only Relu2 is supported."
+                )
 
         self.dtype = dtype
         self.reduce_results = reduce_results
@@ -81,9 +99,9 @@ class VanillaMoE(nn.ModuleList):
             self.num_experts)
         self.expert_size_per_partition = self.expert_end - self.expert_start
 
-        # The maximum number of tokens in MoE are multiplied by DP size when attention DP is enabled
-        moe_max_num_tokens = model_config.max_num_tokens * model_config.mapping.dp_size
-        self.moe_max_num_tokens = model_config.moe_max_num_tokens or moe_max_num_tokens
+        # moe_max_num_tokens is set in ModelConfig.__post_init__ if not specified
+        # The default value is max_num_tokens * dp_size
+        self.moe_max_num_tokens = model_config.moe_max_num_tokens
 
         self._weights_created = False
         if not model_config.skip_create_weights_in_init:
@@ -107,14 +125,26 @@ class VanillaMoE(nn.ModuleList):
         )
         for expert_idx in range(self.num_experts):
             if self.expert_start <= expert_idx < self.expert_end:
-                module_list[expert_idx] = GatedMLP(
-                    hidden_size=self.hidden_size,
-                    intermediate_size=self.intermediate_size,
-                    bias=False,
-                    dtype=self.dtype,
-                    config=model_config,
-                    reduce_output=False,
-                )
+                if self.activation_type == ActivationType.Relu2:
+                    module_list[expert_idx] = MLP(
+                        hidden_size=self.hidden_size,
+                        intermediate_size=self.intermediate_size,
+                        bias=False,
+                        activation=relu2,
+                        dtype=self.dtype,
+                        config=model_config,
+                        layer_idx=self.layer_idx,
+                    )
+                else:
+                    module_list[expert_idx] = GatedMLP(
+                        hidden_size=self.hidden_size,
+                        intermediate_size=self.intermediate_size,
+                        bias=False,
+                        dtype=self.dtype,
+                        config=model_config,
+                        reduce_output=False,
+                        layer_idx=self.layer_idx,
+                    )
             else:
                 # use identity as placeholder for unused experts
                 module_list[expert_idx] = nn.Identity()
@@ -416,9 +446,12 @@ class VanillaMoE(nn.ModuleList):
         packed_weight = packed_weight.view(len(weights), *weights_data[0].shape)
         getattr(self, f"{module_name}_{weight_name}").data = packed_weight
 
-    def load_weights(self, weights: List[Dict]):
+    def load_weights(self,
+                     weights: List[Dict],
+                     allow_partial_loading: bool = False):
         from ...models.modeling_utils import filter_weights
 
+        assert not allow_partial_loading, "Partial loading is not supported for vanilla MoE now"
         assert self._weights_created
         assert len(weights) == 1
         weights = weights[0]

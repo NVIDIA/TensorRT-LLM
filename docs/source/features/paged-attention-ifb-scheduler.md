@@ -46,7 +46,7 @@ Use default `max_seq_len` (which is `max_position_embeddings`), no need to tune 
 
 `max_num_tokens` defines the maximum number of batched input tokens after padding is removed in each batch.​
 
-`max_num_tokens` is set to 8192 by default starting from v0.11. You can tune it using the runtime `max_num_tokens` without re-buliding the engine. It is recommended to tune `--max_num_tokens` for better performance.
+`max_num_tokens` is set to 8192 by default starting from v0.11. It is recommended to tune --max_num_tokens for optimal performance.
 
 The maximum number of tokens will not take effect when input padding is not removed. When input padding is removed, the tokens from different sequences are
 packed together and the maximum number of the tokens can be set to a different
@@ -58,14 +58,13 @@ sequence batching is enabled, requests in context phase will be executed with
 requests in generation phase. Those latter requests produce a lot fewer tokens
 than `max_input_len` (at most, `beam_width` tokens).
 
-Using a more realistic value for `max_num_tokens` allows TensorRT LLM to
+max_num_tokens affects workspace buffer sizes to be allocated as well as one of the matrix multiplication(s) dimension. Hence, Using a more realistic value for `max_num_tokens` allows TensorRT LLM to
 allocate more memory to store the KV cache and execute more requests together.
-It leads to an increased efficiency.
+It leads to an increased efficiency. 
 
-Increasing `max_num_tokens` appropriately will be beneficial to performance.
-When increasing `--max_num_tokens` to some point, GPU utilization will plateau,
+GPUs yield higher utilization with larger matrix multiplications. Hence, Increasing `max_num_tokens` appropriately will be beneficial to performance. At some point, GPU utilization will plateau,
 going beyond that saturation point may hurt both first token latency as well as
-total end-to-end latency.
+total end-to-end latency. In summary, One should select reasonably high max_num_tokens for high token throughput/good GPU math utilization  but not very high in order to meet SLO TTFT (time to first token) and TPOT (Time per output token)
 
 
 ## Chunked Context (a.k.a Chunked Prefill)
@@ -135,10 +134,10 @@ Overall, the max batch size and max num tokens limits play a key role in determi
 
 ## Revisiting Paged Context Attention and Context Chunking
 
-Previously we recommended enabling paged context attention even though in our case study it didn't affect performance significantly. Now that we understand the TensorRT LLM scheduler, we can explain why this is beneficial. In short, we recommend enabling it because it enables context chunking, which allows the context phase of a request to be broken up into pieces and processed over several execution iterations, allowing the engine to provide a more stable balance of context and generation phase execution.
+Previously we recommended enabling paged context attention even though in our case study it didn't affect performance significantly. Now that we understand the TensorRT LLM scheduler, we can explain why this is beneficial. In short, we recommend enabling it because it enables context chunking, which allows the context phase of a request to be broken up into pieces and processed over several execution iterations, allowing the engine to provide a more stable balance of context and generation phase execution. Enabling chunking results in lower TTFTs on average across requests but it may increase TTFT for small number of "lucky" requests that would have been processed in a single iteration in absence of chunking.
 
 The [visualization](#the-schedulers) of the TensorRT LLM scheduler showed that initially Request 3 couldn't be scheduled because it would put the scheduler over the max-num tokens limit. However, with context chunking, this is no longer the case, and the first chunk of Request 3 can be scheduled.
 
 ![TRT-LLM Scheduler Visualization Chunked Context 1](../media/TRTLLM_Scheduler_Vis_Chunked_Context_1.svg)
 
-This is extremely beneficial for several reasons. First, it eliminates the possibility of requests with large prompts (relative to max num tokens) not being scheduled due to other requests already in-flight. In production workloads, this can help improve worst case TTFT numbers. Second, it allows for setting smaller values of max num tokens, since you no longer need max num tokens to be at least as large as the longest prompt you want to support. For long-context cases this is extremely important, because setting extremely large values of max-num tokens takes away from memory available to be used as kv-cache. Given that, in the worst-case scenario, chunked context has minimal impact on performance but can significantly benefit it in many situations, NVIDIA recommends that you always enable it.
+This is extremely beneficial for several reasons. First, it eliminates the possibility of requests with large prompts (relative to max num tokens) not being scheduled due to other requests already in-flight. In production workloads, this can mitigate queuing effects and worst case TTFT numbers. Second, it allows for setting smaller values of max num tokens, since you no longer need max num tokens to be at least as large as the longest prompt you want to support. For long-context cases this is extremely important, because setting extremely large values of max-num tokens takes away from memory available to be used as kv-cache. Given that, in the worst-case scenario, chunked context has minimal impact on performance but can significantly benefit it in many situations, NVIDIA recommends that you always enable it.

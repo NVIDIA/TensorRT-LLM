@@ -351,8 +351,8 @@ def test_disaggregated_llama_context_capacity(model, enable_cuda_graph,
             max_tokens = 25
 
             requests = []
-            # Send 256 requests to make sure the context worker is saturated
-            for _ in range(256):
+            # Send 32 requests to make sure the context worker is saturated
+            for _ in range(32):
                 requests.append(
                     (prompt, SamplingParams(max_tokens=1, ignore_eos=True),
                      DisaggregatedParams(request_type="context_only")))
@@ -419,8 +419,9 @@ def test_disaggregated_spec_dec_batch_slot_limit(model, spec_dec_model_path,
              max_batch_size=1))
 
     kv_cache_configs = [
-        KvCacheConfig(max_tokens=128, enable_block_reuse=False)
-        for _ in range(2)
+        KvCacheConfig(max_tokens=128,
+                      enable_block_reuse=False,
+                      free_gpu_memory_fraction=0.4) for _ in range(2)
     ]
     cache_transceiver_configs = [
         CacheTransceiverConfig(backend="DEFAULT") for _ in range(2)

@@ -23,6 +23,10 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionToolsParam,
                                                 FunctionDefinition)
 from tensorrt_llm.serve.tool_parser.base_tool_parser import BaseToolParser
 from tensorrt_llm.serve.tool_parser.core_types import StructureInfo
+from tensorrt_llm.serve.tool_parser.deepseekv3_parser import DeepSeekV3Parser
+from tensorrt_llm.serve.tool_parser.deepseekv31_parser import DeepSeekV31Parser
+from tensorrt_llm.serve.tool_parser.deepseekv32_parser import DeepSeekV32Parser
+from tensorrt_llm.serve.tool_parser.kimi_k2_tool_parser import KimiK2ToolParser
 from tensorrt_llm.serve.tool_parser.qwen3_coder_parser import \
     Qwen3CoderToolParser
 from tensorrt_llm.serve.tool_parser.qwen3_tool_parser import Qwen3ToolParser
@@ -35,42 +39,42 @@ def sample_tools():
     return [
         ChatCompletionToolsParam(
             type="function",
-            function=FunctionDefinition(name="get_weather",
-                                        description="Get the current weather",
-                                        parameters={
-                                            "type": "object",
-                                            "properties": {
-                                                "location": {
-                                                    "type":
-                                                    "string",
-                                                    "description":
-                                                    "The city and state"
-                                                },
-                                                "unit": {
-                                                    "type":
-                                                    "string",
-                                                    "enum":
-                                                    ["celsius", "fahrenheit"]
-                                                }
-                                            },
-                                            "required": ["location"]
-                                        })),
+            function=FunctionDefinition(
+                name="get_weather",
+                description="Get the current weather",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "location": {
+                            "type": "string",
+                            "description": "The city and state",
+                        },
+                        "unit": {
+                            "type": "string",
+                            "enum": ["celsius", "fahrenheit"],
+                        },
+                    },
+                    "required": ["location"],
+                },
+            ),
+        ),
         ChatCompletionToolsParam(
             type="function",
-            function=FunctionDefinition(name="search_web",
-                                        description="Search the web",
-                                        parameters={
-                                            "type": "object",
-                                            "properties": {
-                                                "query": {
-                                                    "type":
-                                                    "string",
-                                                    "description":
-                                                    "The search query"
-                                                }
-                                            },
-                                            "required": ["query"]
-                                        })),
+            function=FunctionDefinition(
+                name="search_web",
+                description="Search the web",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "The search query",
+                        }
+                    },
+                    "required": ["query"],
+                },
+            ),
+        ),
     ]
 
 
@@ -469,6 +473,149 @@ class BaseToolParserTestClass:
         assert len(result.calls) == 0
 
 
+class TestKimiK2ToolParser(BaseToolParserTestClass):
+    """Test suite for KimiK2ToolParser class."""
+
+    def make_parser(self):
+        return KimiK2ToolParser()
+
+    def make_tool_parser_test_cases(self):
+        return ToolParserTestCases(
+            has_tool_call_true=
+            'Some text <|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"location": "NYC"}<|tool_call_end|><|tool_calls_section_end|>',
+            detect_and_parse_single_tool=(
+                # Input text.
+                ('Normal text'
+                 '<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"location": "NYC"}<|tool_call_end|><|tool_calls_section_end|>'
+                 ),
+                # Expected `normal_text`.
+                "Normal text",
+                # Expected `name`.
+                "get_weather",
+                # Expected `parameters`.
+                {
+                    "location": "NYC"
+                },
+            ),
+            detect_and_parse_multiple_tools=(
+                # Input text.
+                ('<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"location":"LA"}<|tool_call_end|>\n'
+                 '<|tool_call_begin|>functions.search_web:0<|tool_call_argument_begin|>{"query":"AI"}<|tool_call_end|><|tool_calls_section_end|>'
+                 ),
+                # Expected names.
+                ("get_weather", "search_web"),
+            ),
+            detect_and_parse_malformed_tool=
+            ('<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>MALFORMED<|tool_call_end|><|tool_calls_section_end|>'
+             ),
+            detect_and_parse_with_parameters_key=(
+                # Input text.
+                ('<|tool_calls_section_begin|><|tool_call_begin|>functions.search_web:0<|tool_call_argument_begin|>{"query":"test"}<|tool_call_end|><|tool_calls_section_end|>'
+                 ),
+                # Expected `name`.
+                "search_web",
+                # Expected `parameters`.
+                {
+                    "query": "test"
+                },
+            ),
+            parse_streaming_increment_partial_bot_token=
+            "<|tool_calls_section_begin|><|tool_call_be",
+            undefined_tool=
+            '<|tool_calls_section_begin|><|tool_call_begin|>functions.undefined_func:0<|tool_call_argument_begin|>{"arg":"any value"}<|tool_call_end|><|tool_calls_section_end|>',
+        )
+
+    def test_initialization(self, parser):
+        """Test that Qwen3ToolParser initializes correctly."""
+        assert parser.bot_token == "<|tool_calls_section_begin|>"
+        assert parser.eot_token == "<|tool_calls_section_end|>"
+
+    def test_parse_streaming_increment_complete_tool_call(
+            self, sample_tools, parser):
+        """Test streaming parser with complete tool call in chunks."""
+
+        # Send bot token
+        parser.parse_streaming_increment("<|tool_calls_section_begin|>",
+                                         sample_tools)
+
+        # Send partial tool call with name
+        result = parser.parse_streaming_increment(
+            '<|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{',
+            sample_tools)
+
+        # Should send tool name
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_weather"
+        assert result.calls[0].parameters == ""
+
+        # Send arguments
+        result = parser.parse_streaming_increment(
+            '"location":"SF"}<|tool_call_end|>', sample_tools)
+
+        # Should stream arguments
+        assert len(result.calls) == 1
+        assert json.loads(result.calls[0].parameters) == {"location": "SF"}
+
+    def test_parse_streaming_increment_multiple_tools_streaming(
+            self, sample_tools, parser):
+        """Test streaming parser handles multiple tool calls."""
+
+        # First tool
+        parser.parse_streaming_increment('<|tool_calls_section_begin|>',
+                                         sample_tools)
+        parser.parse_streaming_increment(
+            '<|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"location":"NYC"}<|tool_call_end|>',
+            sample_tools)
+
+        # Second tool
+        parser.parse_streaming_increment(
+            '<|tool_call_begin|>functions.search_web:0<|tool_call_argument_begin|>{"arg": "any value"}<|tool_call_end|>',
+            sample_tools)
+
+        result = parser.parse_streaming_increment('<|tool_calls_section_end|>',
+                                                  sample_tools)
+        # Should have started second tool
+        assert result.calls[0].name == "search_web"
+        assert result.calls[0].parameters == ""
+        assert result.calls[0].tool_index == 1
+
+    def test_structure_info_function(self):
+        """Test structure_info returns correct lambda function."""
+        parser = KimiK2ToolParser()
+        func = parser.structure_info()
+
+        info = func("test_function")
+
+        assert isinstance(info, StructureInfo)
+        assert info.begin == '<|tool_calls_section_begin|><|tool_call_begin|>functions.test_function:0<|tool_call_argument_begin|>'
+        assert info.end == "<|tool_call_end|><|tool_calls_section_end|>"
+        assert info.trigger == "<|tool_calls_section_begin|>"
+
+    def test_structure_info_different_names(self):
+        """Test structure_info works with different function names."""
+        parser = KimiK2ToolParser()
+        func = parser.structure_info()
+
+        info1 = func("get_weather")
+        info2 = func("search_web")
+
+        assert "get_weather" in info1.begin
+        assert "search_web" in info2.begin
+        assert info1.end == info2.end == "<|tool_call_end|><|tool_calls_section_end|>"
+
+    def test_kimi_k2_format_compliance(self, sample_tools, parser):
+        """Test that KimiK2ToolParser follows the documented format structure."""
+
+        # Test the exact format from the docstring
+        text = '<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"location":"Tokyo"}<|tool_call_end|><|tool_calls_section_end|>'
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_weather"
+        assert json.loads(result.calls[0].parameters) == {"location": "Tokyo"}
+
+
 class TestQwen3ToolParser(BaseToolParserTestClass):
     """Test suite for Qwen3ToolParser class."""
 
@@ -780,26 +927,50 @@ class TestQwen3CoderToolParser(BaseToolParserTestClass):
                 name="multi_param_func",
                 description="Function with multiple parameters",
                 parameters={
-                    "type": "object",
+                    "type":
+                    "object",
                     "properties": {
                         "param1": {
                             "type": "string"
                         },
                         "param2": {
-                            "type": "string"
+                            "type": "float"
                         },
                         "param3": {
                             "type": "integer"
+                        },
+                        "param4": {
+                            "type": "boolean"
+                        },
+                        "param5": {
+                            "type": "object"
+                        },
+                        "param6": {
+                            "type": "array"
+                        },
+                        "param7": {
+                            "type": "null"
+                        },
+                        "param8": {
+                            "type": "other_type"
                         }
                     },
-                    "required": ["param1", "param2", "param3"]
+                    "required": [
+                        "param1", "param2", "param3", "param4", "param5",
+                        "param6", "param7", "param8"
+                    ]
                 }))
 
         text = ("<tool_call>\n"
                 "<function=multi_param_func>\n"
-                "<parameter=param1>value1</parameter>\n"
-                "<parameter=param2>value2</parameter>\n"
+                "<parameter=param1>42</parameter>\n"
+                "<parameter=param2>41.9</parameter>\n"
                 "<parameter=param3>42</parameter>\n"
+                "<parameter=param4>true</parameter>\n"
+                "<parameter=param5>{\"key\": \"value\"}</parameter>\n"
+                "<parameter=param6>[1, 2, 3]</parameter>\n"
+                "<parameter=param7>null</parameter>\n"
+                "<parameter=param8>{'arg1': 3, 'arg2': [1, 2]}</parameter>\n"
                 "</function>\n"
                 "</tool_call>")
 
@@ -808,9 +979,19 @@ class TestQwen3CoderToolParser(BaseToolParserTestClass):
         assert len(result.calls) == 1
         assert result.calls[0].name == "multi_param_func"
         assert json.loads(result.calls[0].parameters) == {
-            "param1": "value1",
-            "param2": "value2",
-            "param3": 42
+            "param1": "42",
+            "param2": 41.9,
+            "param3": 42,
+            "param4": True,
+            "param5": {
+                "key": "value"
+            },
+            "param6": [1, 2, 3],
+            "param7": None,
+            "param8": {
+                "arg1": 3,
+                "arg2": [1, 2]
+            }
         }
 
     def test_qwen3_coder_format_compliance(
@@ -855,6 +1036,283 @@ class TestQwen3CoderToolParser(BaseToolParserTestClass):
         assert json.loads(result.calls[0].parameters) == {
             "command": "pwd && ls"
         }
+
+
+# ============================================================================
+# DeepSeek Parser Tests
+# ============================================================================
+
+
+class TestDeepSeekV3Parser(BaseToolParserTestClass):
+    """Test suite for DeepSeekV3Parser class."""
+
+    def make_parser(self):
+        return DeepSeekV3Parser()
+
+    def make_tool_parser_test_cases(self):
+        calls_begin = "<｜tool▁calls▁begin｜>"
+        calls_end = "<｜tool▁calls▁end｜>"
+        call_begin = "<｜tool▁call▁begin｜>"
+        call_end = "<｜tool▁call▁end｜>"
+        sep = "<｜tool▁sep｜>"
+
+        single_text = (
+            f"Lead {calls_begin}{call_begin}function{sep}get_weather\n```json\n"
+            f"{json.dumps({'location': 'Tokyo'})}\n```{call_end}{calls_end}")
+        single_expected_normal = "Lead"  # the text is stripped
+        single_expected_name = "get_weather"
+        single_expected_params = {"location": "Tokyo"}
+
+        # Provide one tool to satisfy type hints (tuple[str, tuple[str]])
+        multiple_text = (
+            f"{calls_begin}{call_begin}function{sep}get_weather\n```json\n"
+            f"{json.dumps({'location': 'Paris'})}\n```{call_end}"
+            f"{calls_begin}{call_begin}function{sep}search_web\n```json\n"
+            f"{json.dumps({'query': 'AI'})}\n```{call_end}{calls_end}")
+        multiple_names = ("get_weather", "search_web")
+
+        malformed_text = (
+            f"{calls_begin}{call_begin}function{sep}get_weather\n```json\n"
+            "{'location': 'Paris'}\n```"
+            f"{call_end}{calls_end}")
+
+        with_parameters_key_text = (
+            f"{calls_begin}{call_begin}function{sep}search_web\n```json\n"
+            f"{json.dumps({'parameters': {'query': 'TensorRT'}})}\n```{call_end}{calls_end}"
+        )
+        with_parameters_key_name = "search_web"
+        with_parameters_key_params = {"parameters": {"query": "TensorRT"}}
+
+        partial_bot_token = "<｜tool▁cal"
+
+        undefined_tool_text = (
+            f"{calls_begin}{call_begin}function{sep}unknown\n```json\n"
+            f"{json.dumps({'x': 1})}\n```{call_end}{calls_end}")
+
+        return ToolParserTestCases(
+            has_tool_call_true=f"Hello {calls_begin}",
+            detect_and_parse_single_tool=(
+                single_text,
+                single_expected_normal,
+                single_expected_name,
+                single_expected_params,
+            ),
+            detect_and_parse_multiple_tools=(multiple_text, multiple_names),
+            detect_and_parse_malformed_tool=malformed_text,
+            detect_and_parse_with_parameters_key=(
+                with_parameters_key_text,
+                with_parameters_key_name,
+                with_parameters_key_params,
+            ),
+            parse_streaming_increment_partial_bot_token=partial_bot_token,
+            undefined_tool=undefined_tool_text,
+        )
+
+
+class TestDeepSeekV31Parser(BaseToolParserTestClass):
+    """Test suite for DeepSeekV31Parser class."""
+
+    def make_parser(self):
+        return DeepSeekV31Parser()
+
+    def make_tool_parser_test_cases(self):
+        calls_begin = "<｜tool▁calls▁begin｜>"
+        calls_end = "<｜tool▁calls▁end｜>"
+        call_begin = "<｜tool▁call▁begin｜>"
+        call_end = "<｜tool▁call▁end｜>"
+        sep = "<｜tool▁sep｜>"
+
+        single_text = (
+            f"Intro {calls_begin}{call_begin}get_weather{sep}"
+            f"{json.dumps({'location': 'Tokyo'})}{call_end}{calls_end}")
+        single_expected_normal = "Intro"  # the text is stripped
+        single_expected_name = "get_weather"
+        single_expected_params = {"location": "Tokyo"}
+
+        multiple_text = (f"{calls_begin}{call_begin}get_weather{sep}"
+                         f"{json.dumps({'location': 'Paris'})}{call_end}"
+                         f"{calls_begin}{call_begin}search_web{sep}"
+                         f"{json.dumps({'query': 'AI'})}{call_end}{calls_end}")
+        multiple_names = ("get_weather", "search_web")
+
+        malformed_text = (
+            f"{calls_begin}{call_begin}get_weather{sep}{{'location':'Paris'}}"
+            f"{call_end}{calls_end}")
+
+        with_parameters_key_text = (
+            f"{calls_begin}{call_begin}search_web{sep}"
+            f"{json.dumps({'parameters': {'query': 'TensorRT'}})}{call_end}{calls_end}"
+        )
+        with_parameters_key_name = "search_web"
+        with_parameters_key_params = {"parameters": {"query": "TensorRT"}}
+
+        partial_bot_token = "<｜tool▁cal"
+
+        undefined_tool_text = (
+            f"{calls_begin}{call_begin}unknown{sep}{json.dumps({'x': 1})}{call_end}{calls_end}"
+        )
+
+        return ToolParserTestCases(
+            has_tool_call_true=f"Hi {calls_begin}",
+            detect_and_parse_single_tool=(
+                single_text,
+                single_expected_normal,
+                single_expected_name,
+                single_expected_params,
+            ),
+            detect_and_parse_multiple_tools=(multiple_text, multiple_names),
+            detect_and_parse_malformed_tool=malformed_text,
+            detect_and_parse_with_parameters_key=(
+                with_parameters_key_text,
+                with_parameters_key_name,
+                with_parameters_key_params,
+            ),
+            parse_streaming_increment_partial_bot_token=partial_bot_token,
+            undefined_tool=undefined_tool_text,
+        )
+
+
+# ============================================================================
+# DeepSeekV32Parser Tests
+# ============================================================================
+
+
+class TestDeepSeekV32Parser(BaseToolParserTestClass):
+    """Test suite for DeepSeekV32Parser class."""
+
+    def make_parser(self):
+        return DeepSeekV32Parser()
+
+    def make_tool_parser_test_cases(self):
+        return ToolParserTestCases(
+            has_tool_call_true=
+            'Some text <｜DSML｜function_calls> <｜DSML｜invoke name="get_weather"> <｜DSML｜parameter name="location" string="true">NYC</｜DSML｜parameter> </｜DSML｜invoke> </｜DSML｜function_calls>',
+            detect_and_parse_single_tool=(
+                # Input text.
+                ('Normal text'
+                 '<｜DSML｜function_calls> <｜DSML｜invoke name="get_weather"> <｜DSML｜parameter name="location" string="true">NYC</｜DSML｜parameter> </｜DSML｜invoke> </｜DSML｜function_calls>'
+                 ),
+                # Expected `normal_text`.
+                "Normal text",
+                # Expected `name`.
+                "get_weather",
+                # Expected `parameters`.
+                {
+                    "location": "NYC"
+                },
+            ),
+            detect_and_parse_multiple_tools=(
+                # Input text.
+                ('<｜DSML｜function_calls> <｜DSML｜invoke name="get_weather"> <｜DSML｜parameter name="location" string="true">NYC</｜DSML｜parameter> </｜DSML｜invoke> <｜DSML｜invoke name="search_web"> { "query": "AI" } </｜DSML｜invoke> </｜DSML｜function_calls>'
+                 ),
+                # Expected names.
+                ("get_weather", "search_web"),
+            ),
+            detect_and_parse_malformed_tool=(
+                # Format error: using "|" instead of "｜"
+                '<|DSML|function_calls> <|DSML|invoke name="get_weather"> <|DSML|parameter name="location" string="true">NYC</|DSML|parameter> </|DSML|invoke> </|DSML|function_calls>'
+            ),
+            detect_and_parse_with_parameters_key=(
+                # Input text.
+                ('<｜DSML｜function_calls> <｜DSML｜invoke name="search_web"> { "query": "test" } </｜DSML｜invoke> </｜DSML｜function_calls>'
+                 ),
+                # Expected `name`.
+                "search_web",
+                # Expected `parameters`.
+                {
+                    "query": "test"
+                },
+            ),
+            parse_streaming_increment_partial_bot_token="<｜DSML｜function_calls>",
+            undefined_tool=
+            ('<｜DSML｜function_calls> <｜DSML｜invoke name="undefined_func"> <｜DSML｜parameter name="arg" string="true">value</｜DSML｜parameter> </｜DSML｜invoke> </｜DSML｜function_calls>'
+             ),
+        )
+
+    def test_initialization(self, parser):
+        """Test that DeepSeekV32Parser initializes correctly."""
+        assert parser.bot_token == "<｜DSML｜function_calls>"
+        assert parser.eot_token == "</｜DSML｜function_calls>"
+        assert parser.invoke_end_token == "</｜DSML｜invoke>"
+        assert parser._last_arguments == ""
+
+    def test_parse_streaming_increment_complete_tool_call(
+            self, sample_tools, parser):
+        """Test streaming parser with complete tool call in chunks."""
+        parser.parse_streaming_increment('<｜DSML｜function_calls> ',
+                                         sample_tools)
+        result = parser.parse_streaming_increment(
+            '<｜DSML｜invoke name="get_weather"> ', sample_tools)
+        assert len(result.calls) == 0
+
+        parser.parse_streaming_increment(
+            '<｜DSML｜parameter name="location" string="true">NYC</｜DSML｜parameter> ',
+            sample_tools)
+        result = parser.parse_streaming_increment(
+            '</｜DSML｜invoke> </｜DSML｜function_calls>', sample_tools)
+
+        assert result.calls[0].name == "get_weather"
+        assert json.loads(result.calls[1].parameters) == {"location": "NYC"}
+
+    def test_parse_streaming_increment_multiple_tools_streaming(
+            self, sample_tools, parser):
+        """Test streaming parser handles end token correctly."""
+        # First tool
+        parser.parse_streaming_increment("<｜DSML｜function_calls> ",
+                                         sample_tools)
+        parser.parse_streaming_increment("<｜DSML｜invoke name=\"get_weather\"> ",
+                                         sample_tools)
+        parser.parse_streaming_increment(
+            "<｜DSML｜parameter name=\"location\" string=\"true\">NYC</｜DSML｜parameter> ",
+            sample_tools)
+        parser.parse_streaming_increment("</｜DSML｜invoke> ", sample_tools)
+
+        # Second tool
+        parser.parse_streaming_increment("<｜DSML｜invoke name=\"search_web\"> ",
+                                         sample_tools)
+        parser.parse_streaming_increment(
+            "<｜DSML｜parameter name=\"query\" string=\"true\">AI</｜DSML｜parameter> ",
+            sample_tools)
+        result = parser.parse_streaming_increment(
+            "</｜DSML｜invoke> <｜DSML｜function_calls>", sample_tools)
+
+        assert result.calls[0].name == "search_web"
+        assert json.loads(result.calls[1].parameters) == {"query": "AI"}
+        assert result.calls[1].tool_index == 1
+
+    def test_structure_info_function(self):
+        """Test that DeepSeekV32Parser structure_info returns correct lambda function."""
+        parser = DeepSeekV32Parser()
+        func = parser.structure_info()
+
+        info = func("get_weather")
+
+        assert info.begin == "<｜DSML｜invoke name=\"get_weather\">"
+        assert info.end == "</｜DSML｜invoke>"
+        assert info.trigger == "<｜DSML｜invoke name=\"get_weather\">"
+
+    def test_structure_info_different_names(self):
+        """Test that DeepSeekV32Parser structure_info returns correct lambda function."""
+        parser = DeepSeekV32Parser()
+        func = parser.structure_info()
+
+        info1 = func("get_weather")
+        info2 = func("search_web")
+
+        assert "get_weather" in info1.begin
+        assert "search_web" in info2.begin
+        assert info1.end == info2.end == "</｜DSML｜invoke>"
+
+    def test_deepseek_v32_format_compliance(self, sample_tools, parser):
+        """Test that DeepSeekV32Parser follows the documented format structure."""
+
+        # Test the exact format from the docstring
+        text = "<｜DSML｜function_calls> <｜DSML｜invoke name=\"get_weather\"> <｜DSML｜parameter name=\"location\" string=\"true\">NYC</｜DSML｜parameter> </｜DSML｜invoke> </｜DSML｜function_calls>"
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_weather"
+        assert json.loads(result.calls[0].parameters) == {"location": "NYC"}
 
 
 # ============================================================================

@@ -62,6 +62,7 @@ def inplace_info():
         },
         torch.ops.trtllm.attn_custom_op_inplace.default: {
             1: "output",
+            2: "output_sf"
         },
         torch.ops.trtllm.mla_custom_op_inplace.default: {
             1: "output"
@@ -76,6 +77,22 @@ def inplace_info():
         },
         torch.ops.trtllm.logits_bitmask.default: {
             1: "logits"
+        },
+        torch.ops.trtllm.moe_unpermute_inplace.default: {
+            2: "output"
+        },
+        torch.ops.trtllm.moe_output_memset_inplace.default: {
+            1: "input"
+        },
+        torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell.default:
+        {
+            6: "output"
+        },
+        torch.ops.trtllm.pp_recv_tensors.default: {
+            1: "tensors"
+        },
+        torch.ops.trtllm.pp_send_tensors.default: {
+            1: "tensors"
         }
     }
     return inplace_map

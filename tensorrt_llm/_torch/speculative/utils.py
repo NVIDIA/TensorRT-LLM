@@ -76,6 +76,7 @@ def get_spec_metadata(spec_config,
             hidden_size=model_config.hidden_size,
             max_num_tokens=max_num_tokens,
             layers_to_capture=spec_config.eagle3_layers_to_capture,
+            allow_advanced_sampling=spec_config.allow_advanced_sampling,
         )
     if spec_config.spec_dec_mode.is_save_hidden_states():
         if spec_config.eagle3_layers_to_capture is None:
@@ -236,7 +237,7 @@ def get_num_extra_kv_tokens(spec_config):
     """
     if spec_config is None:
         return 0
-    if spec_config.spec_dec_mode.is_eagle3_one_model():
+    if spec_config.spec_dec_mode.use_one_engine():
         return spec_config.max_draft_len - 1
     return 0
 

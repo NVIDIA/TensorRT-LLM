@@ -445,19 +445,6 @@ class TestTorchLlmArgs:
             args = TorchLlmArgs(model=llama_model_path)
             args.invalid_arg = 1
 
-    def test_from_build_config(self):
-        build_config = BuildConfig(
-            max_beam_width=4,
-            max_batch_size=8,
-            max_num_tokens=256,
-        )
-        args = TorchLlmArgs.from_kwargs(model=llama_model_path,
-                                        build_config=build_config)
-
-        assert args.max_batch_size == build_config.max_batch_size
-        assert args.max_num_tokens == build_config.max_num_tokens
-        assert args.max_beam_width == build_config.max_beam_width
-
 
 class TestTrtLlmArgs:
 

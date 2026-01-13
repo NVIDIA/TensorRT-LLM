@@ -39,7 +39,7 @@ run_sqsh:
 		--container-image "$(SQSH_PATH)" \
 		--container-mounts "$(SOURCE_DIR):$(CODE_DIR)" --container-workdir $(CODE_DIR) \
 		--container-mount-home --container-remap-root \
-		--export PYTORCH_CUDA_ALLOC_CONF=garbage_collection_threshold:0.99999 \
+		--export PYTORCH_ALLOC_CONF=garbage_collection_threshold:0.99999 \
 		$(RUN_CMD)
 
 endif

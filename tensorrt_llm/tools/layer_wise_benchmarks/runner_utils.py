@@ -1,5 +1,8 @@
 import contextlib
+import functools
+import itertools
 import os
+import unittest.mock
 import weakref
 from abc import ABC, abstractmethod
 from typing import Optional
@@ -9,6 +12,8 @@ import torch
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_wide_ep import WideEPMoE
 from tensorrt_llm._torch.modules.linear import Linear, WeightMode
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
@@ -19,6 +24,7 @@ from tensorrt_llm._torch.utils import get_model_extra_attrs, model_extra_attrs
 from tensorrt_llm._utils import local_mpi_size, mpi_rank, mpi_world_size, torch_dtype_to_binding
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -31,6 +37,306 @@ def ceil_div(a, b):
 
 def round_up(a, b):
     return ceil_div(a, b) * b
+
+
+def get_balanced_selection_no_cache(
+    num_tokens, top_k, num_experts, dtype, device, dp_size, dp_rank, ep_size
+):
+    token_id = torch.arange(dp_rank * num_tokens * top_k, (dp_rank + 1) * num_tokens * top_k).view(
+        num_tokens, top_k
+    )
+    experts_per_rank = num_experts // ep_size
+    token_selected_experts = (token_id % ep_size) * experts_per_rank + (
+        token_id // ep_size
+    ) % experts_per_rank
+    token_selected_experts = token_selected_experts.sort(dim=-1).values
+    return token_selected_experts.contiguous().to(dtype=dtype, device=device)
+
+
+get_balanced_selection = functools.cache(get_balanced_selection_no_cache)
+
+
+def test_get_balanced_selection():
+    dtype = torch.long
+    for num_tokens, num_experts, enable_attention_dp in itertools.product(
+        range(1, 35), range(1, 35), [False, True]
+    ):
+        print(f"{num_tokens=} {num_experts=} {enable_attention_dp=}")
+        for top_k in range(1, min(10, num_experts) + 1):
+            for world_size in range(1, 35):
+                dp_size = world_size if enable_attention_dp else 1
+                ep_size = world_size
+                if num_experts % ep_size == 0:
+                    tokens_per_expert = torch.zeros(num_experts)
+                    for dp_rank in range(dp_size):
+                        token_selected_experts = get_balanced_selection_no_cache(
+                            num_tokens, top_k, num_experts, dtype, "cpu", dp_size, dp_rank, ep_size
+                        )
+                        sorted_selection = token_selected_experts.sort(dim=-1).values
+                        if (sorted_selection[:, :-1] == sorted_selection[:, 1:]).any():
+                            raise ValueError(f"duplicated experts on rank {dp_rank}")
+                        experts_per_rank = num_experts // ep_size
+                        tokens_per_rank = (
+                            (token_selected_experts // experts_per_rank)
+                            .view(-1)
+                            .bincount(minlength=ep_size)
+                        )
+                        if tokens_per_rank.max() - tokens_per_rank.min() > 1:
+                            raise ValueError(f"tokens sent from rank {dp_rank} is not balanced")
+                        unique_tokens_per_rank = (
+                            (
+                                torch.arange(ep_size).view(ep_size, 1, 1)
+                                == token_selected_experts // experts_per_rank
+                            )
+                            .any(dim=2)
+                            .sum(dim=1)
+                        )
+                        if unique_tokens_per_rank.max() - unique_tokens_per_rank.min() > 1:
+                            raise ValueError(
+                                f"tokens sent from rank {dp_rank} is not balanced after removing duplicates"
+                            )
+                        tokens_per_expert += token_selected_experts.view(-1).bincount(
+                            minlength=num_experts
+                        )
+                    if tokens_per_expert.max() - tokens_per_expert.min() > 1:
+                        raise ValueError("tokens per expert is not balanced")
+
+
+def apply_balance_ratio(imbalanced_experts, num_experts, balance_ratio, dp_size, dp_rank, ep_size):
+    num_tokens, top_k = imbalanced_experts.shape
+    dtype = imbalanced_experts.dtype
+    device = imbalanced_experts.device
+    balanced_experts = get_balanced_selection_no_cache(
+        num_tokens, top_k, num_experts, dtype, device, dp_size, dp_rank, ep_size
+    )
+    if balance_ratio == 0.0:
+        num_balanced_tokens = 0
+    else:
+        # Activate all experts
+        min_num_balanced_tokens = min(num_tokens, ceil_div(num_experts, dp_size * top_k))
+        num_balanced_tokens = min_num_balanced_tokens + round(
+            (num_tokens - min_num_balanced_tokens) * balance_ratio
+        )
+    mixed_experts = torch.cat(
+        [balanced_experts[:num_balanced_tokens], imbalanced_experts[num_balanced_tokens:]]
+    )
+    return mixed_experts
+
+
+@functools.cache
+def get_all_to_one_selection(
+    num_tokens, top_k, num_experts, balance_ratio, dtype, device, dp_size, dp_rank, ep_size
+):
+    experts_per_rank = num_experts // ep_size
+    if top_k > experts_per_rank:
+        raise ValueError(
+            "Cannot send all tokens to a single rank because `top_k > experts_per_rank`"
+        )
+    imbalanced_experts = (
+        torch.arange(
+            dp_rank * num_tokens * top_k,
+            (dp_rank + 1) * num_tokens * top_k,
+            dtype=dtype,
+            device=device,
+        ).view(num_tokens, top_k)
+        % experts_per_rank
+    )
+    imbalanced_experts = imbalanced_experts.sort(dim=-1).values
+    return apply_balance_ratio(
+        imbalanced_experts, num_experts, balance_ratio, dp_size, dp_rank, ep_size
+    )
+
+
+@functools.cache
+def get_balanced_rank_imbalanced_expert_selection(
+    num_tokens, top_k, num_experts, balance_ratio, dtype, device, dp_size, dp_rank, ep_size
+):
+    experts_per_rank = num_experts // ep_size
+    active_experts_per_rank = ceil_div(top_k, ep_size)
+    # Select expert from [0, active_experts_per_rank * ep_size),
+    # then scale to [0, experts_per_rank * ep_size)
+    narrow_experts = get_balanced_selection_no_cache(
+        num_tokens,
+        top_k,
+        active_experts_per_rank * ep_size,
+        dtype,
+        device,
+        dp_size,
+        dp_rank,
+        ep_size,
+    )
+    imbalanced_experts = (
+        narrow_experts // active_experts_per_rank * experts_per_rank
+        + narrow_experts % active_experts_per_rank
+    )
+    return apply_balance_ratio(
+        imbalanced_experts, num_experts, balance_ratio, dp_size, dp_rank, ep_size
+    )
+
+
+def make_balanced_routing_method(
+    moe_module,
+    apply_method_orig,
+    num_experts,
+    balance_method,
+    balance_ratio,
+    dp_size,
+    dp_rank,
+    ep_size,
+):
+    def balanced_routing_method(router_logits):
+        token_selected_experts, token_final_scales = apply_method_orig(router_logits)
+        assert moe_module._routing_results_replaced_at in [None, "make_balanced_routing_method"]
+        if balance_method == BalanceMethod.Balanced:
+            token_selected_experts = get_balanced_selection(
+                token_selected_experts.shape[0],
+                token_selected_experts.shape[1],
+                num_experts,
+                token_selected_experts.dtype,
+                token_selected_experts.device,
+                dp_size,
+                dp_rank,
+                ep_size,
+            )
+        elif balance_method == BalanceMethod.ImbalancedRanks:
+            token_selected_experts = get_all_to_one_selection(
+                token_selected_experts.shape[0],
+                token_selected_experts.shape[1],
+                num_experts,
+                balance_ratio,
+                token_selected_experts.dtype,
+                token_selected_experts.device,
+                dp_size,
+                dp_rank,
+                ep_size,
+            )
+        elif balance_method == BalanceMethod.ImbalancedExperts:
+            token_selected_experts = get_balanced_rank_imbalanced_expert_selection(
+                token_selected_experts.shape[0],
+                token_selected_experts.shape[1],
+                num_experts,
+                balance_ratio,
+                token_selected_experts.dtype,
+                token_selected_experts.device,
+                dp_size,
+                dp_rank,
+                ep_size,
+            )
+        else:
+            raise NotImplementedError(f"Not support balance_method {balance_method}")
+        moe_module._routing_results_replaced_at = "make_balanced_routing_method"
+        return token_selected_experts, token_final_scales
+
+    return balanced_routing_method
+
+
+@functools.cache
+def get_token_final_scales(shape, device):
+    return torch.full(shape, 1.0 / shape[-1], dtype=torch.bfloat16, device=device)
+
+
+def make_balanced_run_moe(
+    moe_module,
+    run_moe_orig,
+    top_k,
+    num_experts,
+    balance_method,
+    balance_ratio,
+    dp_size,
+    dp_rank,
+    ep_size,
+):
+    def balanced_run_moe(
+        x, token_selected_experts, token_final_scales, x_sf, router_logits, do_finalize, moe_output
+    ):
+        if moe_module._routing_results_replaced_at is not None:
+            return run_moe_orig(
+                x,
+                token_selected_experts,
+                token_final_scales,
+                x_sf,
+                router_logits,
+                do_finalize,
+                moe_output,
+            )
+        logger.warning_once(
+            'Layer-wise benchmarks: Specifying routing results of "TRTLLM" MoE backend in TEP cases leads to different'
+            " execution path around the topk kernel",
+            key="replace_routing_method_ctx_trtllm_tp",
+        )
+        if balance_method == BalanceMethod.Balanced:
+            token_selected_experts = get_balanced_selection(
+                x.shape[0],
+                top_k,
+                num_experts,
+                torch.int32,
+                x.device,
+                dp_size,
+                dp_rank,
+                ep_size,
+            )
+        elif balance_method == BalanceMethod.ImbalancedRanks:
+            token_selected_experts = get_all_to_one_selection(
+                x.shape[0],
+                top_k,
+                num_experts,
+                balance_ratio,
+                torch.int32,
+                x.device,
+                dp_size,
+                dp_rank,
+                ep_size,
+            )
+        elif balance_method == BalanceMethod.ImbalancedExperts:
+            token_selected_experts = get_balanced_rank_imbalanced_expert_selection(
+                x.shape[0],
+                top_k,
+                num_experts,
+                balance_ratio,
+                torch.int32,
+                x.device,
+                dp_size,
+                dp_rank,
+                ep_size,
+            )
+        else:
+            raise NotImplementedError(f"Not support balance_method {balance_method}")
+        token_final_scales = get_token_final_scales(
+            token_selected_experts.shape, token_selected_experts.device
+        )
+        router_logits = None
+        final_hidden_states = run_moe_orig(
+            x,
+            token_selected_experts,
+            token_final_scales,
+            x_sf,
+            router_logits,
+            do_finalize,
+            moe_output,
+        )
+        if not do_finalize:
+            final_hidden_states = (
+                final_hidden_states[0],
+                token_final_scales,  # WAR for TRTLLMGenFusedMoE bug that it returns wrong `token_final_scales`
+                final_hidden_states[2],
+            )
+        moe_module._routing_results_replaced_at = "make_balanced_run_moe"
+        return final_hidden_states
+
+    return balanced_run_moe
+
+
+def make_forward_impl_check(moe_module, forward_impl_orig):
+    def forward_impl(*args, **kwargs):
+        moe_module._routing_results_replaced_at = None
+        res = forward_impl_orig(*args, **kwargs)
+        assert moe_module._routing_results_replaced_at is not None, (
+            "Routing results are not replaced"
+        )
+        del moe_module._routing_results_replaced_at
+        return res
+
+    return forward_impl
 
 
 class RunnerMixin(ABC):
@@ -63,23 +369,60 @@ class RunnerMixin(ABC):
         pretrained_config.n_routed_experts = (
             pretrained_config.n_routed_experts // scaled_from * mapping.moe_ep_size
         )
-        select_alltoall_method_type_orig = WideEPMoE.select_alltoall_method_type
 
-        def select_alltoall_method_type(cls: type, mapping: Mapping, top_k: int, *args, **kwargs):
-            # Replace the condition `mapping.moe_ep_size <= top_k` with `scaled_from <= top_k`
-            # by replacing `top_k` with `fake_top_k`
-            if scaled_from <= top_k:
-                fake_top_k = mapping.moe_ep_size + 1
-            else:
-                fake_top_k = mapping.moe_ep_size - 1
-            assert (mapping.moe_ep_size <= fake_top_k) == (scaled_from <= top_k)
-            return select_alltoall_method_type_orig(mapping, fake_top_k, *args, **kwargs)
+        def make_select_alltoall_method_type(select_alltoall_method_type_orig):
+            def select_alltoall_method_type(
+                cls: type, mapping: Mapping, top_k: int, *args, **kwargs
+            ):
+                # Replace the condition `mapping.moe_ep_size <= top_k` with `scaled_from <= top_k`
+                # by replacing `top_k` with `fake_top_k`
+                if scaled_from <= top_k:
+                    fake_top_k = mapping.moe_ep_size + 1
+                else:
+                    fake_top_k = mapping.moe_ep_size - 1
+                assert (mapping.moe_ep_size <= fake_top_k) == (scaled_from <= top_k)
+                return select_alltoall_method_type_orig(mapping, fake_top_k, *args, **kwargs)
 
-        WideEPMoE.select_alltoall_method_type = select_alltoall_method_type
+            return select_alltoall_method_type
+
+        def make_select_alltoall_method_type_2(select_alltoall_method_type_orig):
+            def select_alltoall_method_type(self):
+                # Replace the condition `mapping.moe_ep_size <= top_k` with `scaled_from <= top_k`
+                # by replacing `top_k` with `fake_top_k`
+                top_k = self.routing_method.experts_per_token
+                if scaled_from <= top_k:
+                    fake_top_k = mapping.moe_ep_size + 1
+                else:
+                    fake_top_k = mapping.moe_ep_size - 1
+                assert (mapping.moe_ep_size <= fake_top_k) == (scaled_from <= top_k)
+                with unittest.mock.patch.object(
+                    self.routing_method.__class__,
+                    "experts_per_token",
+                    new_callable=unittest.mock.PropertyMock,
+                ) as mock_top_k:
+                    mock_top_k.return_value = fake_top_k
+                    return select_alltoall_method_type_orig(self)
+
+            return select_alltoall_method_type
+
+        select_alltoall_method_type_cutlass = CutlassFusedMoE.select_alltoall_method_type
+        select_alltoall_method_type_trtllm_gen = TRTLLMGenFusedMoE.select_alltoall_method_type
+        select_alltoall_method_type_wide_ep = WideEPMoE.select_alltoall_method_type
+        CutlassFusedMoE.select_alltoall_method_type = make_select_alltoall_method_type_2(
+            select_alltoall_method_type_cutlass
+        )
+        TRTLLMGenFusedMoE.select_alltoall_method_type = make_select_alltoall_method_type_2(
+            select_alltoall_method_type_trtllm_gen
+        )
+        WideEPMoE.select_alltoall_method_type = make_select_alltoall_method_type(
+            select_alltoall_method_type_wide_ep
+        )
         try:
             yield
         finally:
-            WideEPMoE.select_alltoall_method_type = select_alltoall_method_type_orig
+            CutlassFusedMoE.select_alltoall_method_type = select_alltoall_method_type_cutlass
+            TRTLLMGenFusedMoE.select_alltoall_method_type = select_alltoall_method_type_trtllm_gen
+            WideEPMoE.select_alltoall_method_type = select_alltoall_method_type_wide_ep
 
     @staticmethod
     def apply_quant_config_exclude_modules(layers, quant_config):
@@ -115,7 +458,9 @@ class RunnerMixin(ABC):
     def create_run_pack(
         self,
         run_type: str,
+        *,
         batch_size: int,
+        request_id_begin: int,
         seq_len_q: int,
         seq_len_kv_cache: int,
         kv_cache_manager: KVCacheManager,
@@ -129,7 +474,7 @@ class RunnerMixin(ABC):
         )
         attn_metadata = AttentionCls.Metadata(
             seq_lens=torch.tensor([seq_len_q] * batch_size, dtype=torch.int),
-            request_ids=list(range(batch_size)),
+            request_ids=list(range(request_id_begin, request_id_begin + batch_size)),
             max_num_requests=kv_cache_manager.max_batch_size,
             num_contexts={
                 "CTX": batch_size,
@@ -154,8 +499,6 @@ class RunnerMixin(ABC):
         )
         attn_metadata.all_rank_num_tokens = [batch_size * seq_len_q] * world_size
         attn_metadata.prepare()
-        with model_extra_attrs(self.model_config.extra_attrs):
-            get_model_extra_attrs()["attention_metadata"] = weakref.ref(attn_metadata)
         hidden_size = self.model_config.pretrained_config.hidden_size
         position_ids = torch.tensor(
             [list(range(seq_len_kv_cache, seq_len_kv_cache + seq_len_q)) * batch_size],
@@ -176,19 +519,93 @@ class RunnerMixin(ABC):
             mamba_metadata.prepare(attn_metadata)
             kwargs["mamba_metadata"] = mamba_metadata
 
-        def run_pack():
+        def run_pack(*, check=False):
             output = hidden_states, residual
             with model_extra_attrs(self.model_config.extra_attrs):
+                get_model_extra_attrs()["attention_metadata"] = weakref.ref(attn_metadata)
                 with torch.inference_mode():
                     for layer in self.layers:
                         output = layer(position_ids, output[0], attn_metadata, output[1], **kwargs)
+            if check:
+                if output[0].isnan().any():
+                    raise ValueError("Has nan, please fix weights initialization")
+                if output[0].isinf().any():
+                    raise ValueError("Has inf, please fix weights initialization")
+                if (output[0] == 0).sum() > 0.5 * output[0].numel():
+                    raise ValueError("Too many zeros, please fix weights initialization")
             return output
 
         return run_pack
 
-    def replace_routing_method(self, balance_method: BalanceMethod, balance_ratio: float):
-        if balance_method != BalanceMethod.NotModified:
-            raise NotImplementedError("not support replacing routing method for this runner")
+    @contextlib.contextmanager
+    def replace_routing_method_ctx(self, balance_method: BalanceMethod, balance_ratio: float):
+        if balance_method == BalanceMethod.NotModified:
+            yield
+            return
+        if self.model_config.moe_backend not in [
+            "CUTEDSL",
+            "CUTLASS",
+            "DEEPGEMM",
+            "TRTLLM",
+            "WIDEEP",
+        ]:
+            raise NotImplementedError(
+                f'Not support replace routing method for moe_backend "{self.model_config.moe_backend}",'
+                f' please set balance_method to "NotModified"'
+            )
+        original_methods = []
+        dp_rank = self.model_config.mapping.rank // (
+            self.model_config.mapping.world_size // self.model_config.mapping.dp_size
+        )
+        for layer in self.layers:
+            moe_module = layer.mlp.experts
+
+            # Replace `routing_method.apply` for normal cases
+            apply_method_orig = moe_module.routing_method.apply
+            moe_module.routing_method.apply = make_balanced_routing_method(
+                moe_module,
+                apply_method_orig,
+                moe_module.num_experts,
+                balance_method,
+                balance_ratio,
+                self.model_config.mapping.dp_size,
+                dp_rank,
+                self.model_config.mapping.moe_ep_size,
+            )
+
+            # Replace `run_moe` for TRTLLMGenFusedMoE TEP because it does not call `routing_method.apply`
+            if isinstance(moe_module, TRTLLMGenFusedMoE):
+                run_moe_orig = moe_module.run_moe
+                moe_module.run_moe = make_balanced_run_moe(
+                    moe_module,
+                    run_moe_orig,
+                    layer.mlp.experts.routing_method.top_k,
+                    layer.mlp.experts.num_experts,
+                    balance_method,
+                    balance_ratio,
+                    self.model_config.mapping.dp_size,
+                    dp_rank,
+                    self.model_config.mapping.moe_ep_size,
+                )
+            else:
+                run_moe_orig = None
+
+            # Replace `forward_impl` to ensure that routing results are replaced
+            forward_impl_orig = moe_module.forward_impl
+            moe_module.forward_impl = make_forward_impl_check(moe_module, forward_impl_orig)
+
+            original_methods.append((apply_method_orig, run_moe_orig, forward_impl_orig))
+        try:
+            yield
+        finally:
+            for layer, (apply_method_orig, run_moe_orig, forward_impl_orig) in zip(
+                self.layers, original_methods
+            ):
+                moe_module = layer.mlp.experts
+                moe_module.routing_method.apply = apply_method_orig
+                if isinstance(moe_module, TRTLLMGenFusedMoE):
+                    moe_module.run_moe = run_moe_orig
+                moe_module.forward_impl = forward_impl_orig
 
     @staticmethod
     def create_kv_cache_manager(
@@ -223,7 +640,7 @@ class RunnerMixin(ABC):
             kv_cache_manager = kv_cache_manager_cls(
                 kv_cache_config,
                 CacheType.SELFKONLY,
-                num_layers=sum(layer_mask),
+                num_layers=num_layers,
                 num_kv_heads=1,
                 head_dim=model_config.pretrained_config.kv_lora_rank
                 + model_config.pretrained_config.qk_rope_head_dim,

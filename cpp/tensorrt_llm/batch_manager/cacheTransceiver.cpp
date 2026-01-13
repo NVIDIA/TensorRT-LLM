@@ -81,6 +81,11 @@ std::unique_ptr<BaseCacheTransceiver> CacheTransceiverFactory::createCacheTransc
             backendType = executor::CacheTransceiverConfig::BackendType::NIXL;
             TLLM_LOG_INFO("Enable NIXL KV cache transport.");
         }
+        else if (common::getEnvUseMooncakeKvCache())
+        {
+            backendType = executor::CacheTransceiverConfig::BackendType::MOONCAKE;
+            TLLM_LOG_INFO("Enable MOONCAKE KV cache transport.");
+        }
         else if (common::getEnvUseMPIKvCache())
         {
             backendType = executor::CacheTransceiverConfig::BackendType::MPI;
@@ -203,8 +208,14 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     else if (backendType.value() == executor::CacheTransceiverConfig::BackendType::NIXL)
     {
         mManager = std::make_unique<tensorrt_llm::executor::kv_cache::AgentConnectionManager>(
-            mCacheTransBufferManagerPtrs, *mCacheState);
+            mCacheTransBufferManagerPtrs, *mCacheState, "nixl");
         TLLM_LOG_INFO("NIXL Connection Manager created");
+    }
+    else if (backendType.value() == executor::CacheTransceiverConfig::BackendType::MOONCAKE)
+    {
+        mManager = std::make_unique<tensorrt_llm::executor::kv_cache::AgentConnectionManager>(
+            mCacheTransBufferManagerPtrs, *mCacheState, "mooncake");
+        TLLM_LOG_INFO("MOONCAKE Connection Manager created");
     }
     else if (backendType.value() == executor::CacheTransceiverConfig::BackendType::MPI)
     {
@@ -493,8 +504,8 @@ void CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLe
                 }
                 else if (status == std::future_status::timeout)
                 {
-                    TLLM_LOG_WARNING("Timed out waiting for context transfer for request %ld after %d milliseconds.",
-                        request->mRequestId, senderFutureTimeoutMs.value());
+                    TLLM_LOG_WARNING("Timed out waiting for context KV cache transfer after %d milliseconds.",
+                        senderFutureTimeoutMs.value());
                     ++it;
                 }
                 else

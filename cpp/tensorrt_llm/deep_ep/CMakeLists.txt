@@ -1,4 +1,4 @@
-set(DEEP_EP_COMMIT 5be51b228a7c82dbdb213ea58e77bffd12b38af8)
+get_property(DEEP_EP_COMMIT GLOBAL PROPERTY DEEP_EP_COMMIT)
 set(NVSHMEM_URL_HASH
     SHA256=eb2c8fb3b7084c2db86bd9fd905387909f1dfd483e7b45f7b3c3d5fcf5374b5a)
 
@@ -58,15 +58,6 @@ find_library(MLX5_lib NAMES mlx5 REQUIRED)
 
 # Download DeepEP
 include(FetchContent)
-if(DEFINED ENV{GITHUB_MIRROR} AND NOT "$ENV{GITHUB_MIRROR}" STREQUAL "")
-  set(GITHUB_URL "$ENV{GITHUB_MIRROR}")
-else()
-  set(GITHUB_URL "https://github.com")
-endif()
-set(DEEP_EP_URL
-    "${GITHUB_URL}/deepseek-ai/DeepEP/archive/${DEEP_EP_COMMIT}.tar.gz")
-message(STATUS "deep_ep DEEP_EP_URL: ${DEEP_EP_URL}")
-FetchContent_Declare(deep_ep_download URL ${DEEP_EP_URL})
 FetchContent_MakeAvailable(deep_ep_download)
 set(DEEP_EP_SOURCE_DIR ${deep_ep_download_SOURCE_DIR})
 

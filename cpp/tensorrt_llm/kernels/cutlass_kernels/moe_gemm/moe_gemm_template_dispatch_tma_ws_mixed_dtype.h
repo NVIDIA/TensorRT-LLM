@@ -37,6 +37,7 @@
 #include "cutlass/tensor_ref.h"
 
 #include "cutlass_extensions/compute_occupancy.h"
+#include "cutlass_extensions/detail/collective/mixed_input_utils.hpp"
 #include "cutlass_extensions/epilogue_helpers.h"
 #include "cutlass_extensions/gemm/kernel/default_fpA_intB_traits.h"
 #include "cutlass_extensions/gemm/kernel/moe_cutlass_kernel.h"
@@ -49,6 +50,7 @@
 #include "../include/moe_gemm_kernels.h"
 #include "launchers/moe_gemm_tma_ws_mixed_input_launcher.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.h"
 
@@ -57,18 +59,21 @@
 #include <math.h>
 #include <sstream>
 
-namespace tensorrt_llm::kernels::cutlass_kernels_oss
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::cutlass_kernels_oss
 {
 
 using tensorrt_llm::kernels::cutlass_kernels::GroupedGemmInput;
 using tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput;
 namespace tk = tensorrt_llm::common;
 namespace tkc = tensorrt_llm::cutlass_extensions;
+using EpilogueFusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion;
 
 using namespace cute;
 
-template <typename T, typename WeightType, typename GemmOutputType, typename EpilogueTag, typename CTAShape,
-    typename ClusterShape>
+template <typename T, typename WeightType, typename GemmOutputType, typename EpilogueTag, EpilogueFusion FUSION,
+    typename CTAShape, typename ClusterShape>
 void sm90_dispatch_mainloop_schedules(GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputType> inputs,
     TmaWarpSpecializedGroupedGemmInput hopper_inputs, int sm_count_, size_t* workspace_size)
 {
@@ -85,7 +90,7 @@ void sm90_dispatch_mainloop_schedules(GroupedGemmInput<T, WeightType, GemmOutput
         {
             if constexpr ((get<0>(CTAShape{}) == 128) && get<1>(CTAShape{}) == 128)
             {
-                sm90_generic_mixed_moe_gemm_kernelLauncher<T, WeightType, GemmOutputType, EpilogueTag, CTAShape,
+                sm90_generic_mixed_moe_gemm_kernelLauncher<T, WeightType, GemmOutputType, EpilogueTag, FUSION, CTAShape,
                     ClusterShape, cutlass::gemm::KernelTmaWarpSpecializedPingpong,
                     cutlass::epilogue::TmaWarpSpecializedCooperative,
                     cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY>(
@@ -93,7 +98,7 @@ void sm90_dispatch_mainloop_schedules(GroupedGemmInput<T, WeightType, GemmOutput
             }
             else
             {
-                sm90_generic_mixed_moe_gemm_kernelLauncher<T, WeightType, GemmOutputType, EpilogueTag, CTAShape,
+                sm90_generic_mixed_moe_gemm_kernelLauncher<T, WeightType, GemmOutputType, EpilogueTag, FUSION, CTAShape,
                     ClusterShape, cutlass::gemm::KernelTmaWarpSpecializedCooperative,
                     cutlass::epilogue::TmaWarpSpecializedCooperative,
                     cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY>(
@@ -103,9 +108,10 @@ void sm90_dispatch_mainloop_schedules(GroupedGemmInput<T, WeightType, GemmOutput
 
         break;
     case tkc::MainloopScheduleType::PINGPONG:
-        sm90_generic_mixed_moe_gemm_kernelLauncher<T, WeightType, GemmOutputType, EpilogueTag, CTAShape, ClusterShape,
-            cutlass::gemm::KernelTmaWarpSpecializedPingpong, cutlass::epilogue::TmaWarpSpecializedCooperative,
-            cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY>(inputs, hopper_inputs, sm_count_, workspace_size);
+        sm90_generic_mixed_moe_gemm_kernelLauncher<T, WeightType, GemmOutputType, EpilogueTag, FUSION, CTAShape,
+            ClusterShape, cutlass::gemm::KernelTmaWarpSpecializedPingpong,
+            cutlass::epilogue::TmaWarpSpecializedCooperative, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY>(
+            inputs, hopper_inputs, sm_count_, workspace_size);
         break;
     default:
         TLLM_THROW(
@@ -119,7 +125,8 @@ void sm90_dispatch_mainloop_schedules(GroupedGemmInput<T, WeightType, GemmOutput
 #endif
 }
 
-template <typename T, typename WeightType, typename GemmOutputType, typename EpilogueTag, typename CTAShape>
+template <typename T, typename WeightType, typename GemmOutputType, typename EpilogueTag, EpilogueFusion FUSION,
+    typename CTAShape>
 void sm90_dispatch_moe_mixed_dtype_gemm_config(GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputType> inputs,
     TmaWarpSpecializedGroupedGemmInput hopper_inputs, int sm_count_, size_t* workspace_size)
 {
@@ -127,26 +134,27 @@ void sm90_dispatch_moe_mixed_dtype_gemm_config(GroupedGemmInput<T, WeightType, G
     switch (inputs.gemm_config.cluster_shape)
     {
     case tkc::ClusterShape::ClusterShape_1x1x1:
-        sm90_dispatch_mainloop_schedules<T, WeightType, GemmOutputType, EpilogueTag, CTAShape, Shape<_1, _1, _1>>(
-            inputs, hopper_inputs, sm_count_, workspace_size);
+        sm90_dispatch_mainloop_schedules<T, WeightType, GemmOutputType, EpilogueTag, FUSION, CTAShape,
+            Shape<_1, _1, _1>>(inputs, hopper_inputs, sm_count_, workspace_size);
         break;
     case tkc::ClusterShape::ClusterShape_2x1x1:
-        sm90_dispatch_mainloop_schedules<T, WeightType, GemmOutputType, EpilogueTag, CTAShape, Shape<_2, _1, _1>>(
-            inputs, hopper_inputs, sm_count_, workspace_size);
+        sm90_dispatch_mainloop_schedules<T, WeightType, GemmOutputType, EpilogueTag, FUSION, CTAShape,
+            Shape<_2, _1, _1>>(inputs, hopper_inputs, sm_count_, workspace_size);
         break;
     case tkc::ClusterShape::ClusterShape_1x2x1:
-        sm90_dispatch_mainloop_schedules<T, WeightType, GemmOutputType, EpilogueTag, CTAShape, Shape<_1, _2, _1>>(
-            inputs, hopper_inputs, sm_count_, workspace_size);
+        sm90_dispatch_mainloop_schedules<T, WeightType, GemmOutputType, EpilogueTag, FUSION, CTAShape,
+            Shape<_1, _2, _1>>(inputs, hopper_inputs, sm_count_, workspace_size);
         break;
     case tkc::ClusterShape::ClusterShape_2x2x1:
-        sm90_dispatch_mainloop_schedules<T, WeightType, GemmOutputType, EpilogueTag, CTAShape, Shape<_2, _2, _1>>(
-            inputs, hopper_inputs, sm_count_, workspace_size);
+        sm90_dispatch_mainloop_schedules<T, WeightType, GemmOutputType, EpilogueTag, FUSION, CTAShape,
+            Shape<_2, _2, _1>>(inputs, hopper_inputs, sm_count_, workspace_size);
         break;
     default: TLLM_THROW("[Mixed dtype MoE GEMM][dispatch_CGA_config] Config is invalid for mixed type GEMM."); break;
     }
 }
 
-template <typename T, typename WeightType, typename GemmOutputType, typename EpilogueTag, int PackedScalesNum>
+template <typename T, typename WeightType, typename GemmOutputType, typename EpilogueTag, EpilogueFusion FUSION,
+    int PackedScalesNum>
 void sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass(
     GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputType> inputs,
     TmaWarpSpecializedGroupedGemmInput hopper_inputs, int sm_count_, size_t* workspace_size)
@@ -165,49 +173,49 @@ void sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass(
     switch (inputs.gemm_config.tile_config_sm90)
     {
     case tkc::CutlassTileConfigSM90::CtaShape64x16x128B:
-        sm90_dispatch_moe_mixed_dtype_gemm_config<T, WeightType, GemmOutputType, EpilogueTag, Shape<_64, _16, _Ktile>>(
-            inputs, hopper_inputs, sm_count_, workspace_size);
+        sm90_dispatch_moe_mixed_dtype_gemm_config<T, WeightType, GemmOutputType, EpilogueTag, FUSION,
+            Shape<_64, _16, _Ktile>>(inputs, hopper_inputs, sm_count_, workspace_size);
         break;
     case tkc::CutlassTileConfigSM90::CtaShape64x32x128B:
-        sm90_dispatch_moe_mixed_dtype_gemm_config<T, WeightType, GemmOutputType, EpilogueTag, Shape<_64, _32, _Ktile>>(
-            inputs, hopper_inputs, sm_count_, workspace_size);
+        sm90_dispatch_moe_mixed_dtype_gemm_config<T, WeightType, GemmOutputType, EpilogueTag, FUSION,
+            Shape<_64, _32, _Ktile>>(inputs, hopper_inputs, sm_count_, workspace_size);
         break;
     case tkc::CutlassTileConfigSM90::CtaShape64x64x128B:
-        sm90_dispatch_moe_mixed_dtype_gemm_config<T, WeightType, GemmOutputType, EpilogueTag, Shape<_64, _64, _Ktile>>(
-            inputs, hopper_inputs, sm_count_, workspace_size);
+        sm90_dispatch_moe_mixed_dtype_gemm_config<T, WeightType, GemmOutputType, EpilogueTag, FUSION,
+            Shape<_64, _64, _Ktile>>(inputs, hopper_inputs, sm_count_, workspace_size);
         break;
     case tkc::CutlassTileConfigSM90::CtaShape64x128x128B:
-        sm90_dispatch_moe_mixed_dtype_gemm_config<T, WeightType, GemmOutputType, EpilogueTag,
+        sm90_dispatch_moe_mixed_dtype_gemm_config<T, WeightType, GemmOutputType, EpilogueTag, FUSION,
             Shape<_64, _Ntile, _Ktile>>(inputs, hopper_inputs, sm_count_, workspace_size);
         break;
     // case tkc::CutlassTileConfigSM90::CtaShape64x256x128B:
     //     sm90_dispatch_moe_mixed_dtype_gemm_config<T, WeightType, GemmOutputType, EpilogueTag, Shape<_64, _256,
     //     _Ktile>>(inputs, hopper_inputs, sm_count_, workspace_size); break;
     case tkc::CutlassTileConfigSM90::CtaShape128x16x128B:
-        sm90_dispatch_moe_mixed_dtype_gemm_config<T, WeightType, GemmOutputType, EpilogueTag, Shape<_128, _16, _Ktile>>(
-            inputs, hopper_inputs, sm_count_, workspace_size);
+        sm90_dispatch_moe_mixed_dtype_gemm_config<T, WeightType, GemmOutputType, EpilogueTag, FUSION,
+            Shape<_128, _16, _Ktile>>(inputs, hopper_inputs, sm_count_, workspace_size);
         break;
     case tkc::CutlassTileConfigSM90::CtaShape128x32x128B:
-        sm90_dispatch_moe_mixed_dtype_gemm_config<T, WeightType, GemmOutputType, EpilogueTag, Shape<_128, _32, _Ktile>>(
-            inputs, hopper_inputs, sm_count_, workspace_size);
+        sm90_dispatch_moe_mixed_dtype_gemm_config<T, WeightType, GemmOutputType, EpilogueTag, FUSION,
+            Shape<_128, _32, _Ktile>>(inputs, hopper_inputs, sm_count_, workspace_size);
         break;
     case tkc::CutlassTileConfigSM90::CtaShape128x64x128B:
-        sm90_dispatch_moe_mixed_dtype_gemm_config<T, WeightType, GemmOutputType, EpilogueTag, Shape<_128, _64, _Ktile>>(
-            inputs, hopper_inputs, sm_count_, workspace_size);
+        sm90_dispatch_moe_mixed_dtype_gemm_config<T, WeightType, GemmOutputType, EpilogueTag, FUSION,
+            Shape<_128, _64, _Ktile>>(inputs, hopper_inputs, sm_count_, workspace_size);
         break;
     case tkc::CutlassTileConfigSM90::CtaShape128x128x128B:
-        sm90_dispatch_moe_mixed_dtype_gemm_config<T, WeightType, GemmOutputType, EpilogueTag,
+        sm90_dispatch_moe_mixed_dtype_gemm_config<T, WeightType, GemmOutputType, EpilogueTag, FUSION,
             Shape<_128, _128, _Ktile>>(inputs, hopper_inputs, sm_count_, workspace_size);
         break;
     // case tkc::CutlassTileConfigSM90::CtaShape128x256x128B:
-    //     sm90_dispatch_moe_mixed_dtype_gemm_config<T, WeightType, GemmOutputType, EpilogueTag, Shape<_128, _256,
-    //     _Ktile>>(inputs, hopper_inputs, sm_count_, workspace_size); break;
+    //     sm90_dispatch_moe_mixed_dtype_gemm_config<T, WeightType, GemmOutputType, EpilogueTag, FUSION, Shape<_128,
+    //     _256, _Ktile>>(inputs, hopper_inputs, sm_count_, workspace_size); break;
     // case tkc::CutlassTileConfigSM90::CtaShape256x128x128B:
-    //     sm90_dispatch_moe_mixed_dtype_gemm_config<T, WeightType, GemmOutputType, EpilogueTag, Shape<_128, _256,
-    //     _Ktile>>(inputs, hopper_inputs, sm_count_, workspace_size); break;
+    //     sm90_dispatch_moe_mixed_dtype_gemm_config<T, WeightType, GemmOutputType, EpilogueTag, FUSION, Shape<_128,
+    //     _256, _Ktile>>(inputs, hopper_inputs, sm_count_, workspace_size); break;
     // case tkc::CutlassTileConfigSM90::CtaShape256x256x128B:
-    //     sm90_dispatch_moe_mixed_dtype_gemm_config<T, WeightType, GemmOutputType, EpilogueTag, Shape<_256, _256,
-    //     _Ktile>>(inputs, hopper_inputs, sm_count_, workspace_size); break;
+    //     sm90_dispatch_moe_mixed_dtype_gemm_config<T, WeightType, GemmOutputType, EpilogueTag, FUSION, Shape<_256,
+    //     _256, _Ktile>>(inputs, hopper_inputs, sm_count_, workspace_size); break;
     case tkc::CutlassTileConfigSM90::Undefined:
         TLLM_THROW("[Mixed dtype MoE GEMM][sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass] gemm config undefined.");
         break;
@@ -233,15 +241,20 @@ size_t calcMaxWorkspaceSizeTmaWarpSpecializedMixedInput(int num_experts, int sm_
     using _Ktile = Int<Ktile>;
 
 #ifdef COMPILE_HOPPER_TMA_GROUPED_GEMMS
-    GroupedGemmInput<T, WeightType, OutputType, OutputType> inputs{};
+    constexpr bool use_wfp4a16 = std::is_same_v<WeightType, cutlass::float_e2m1_t>;
+    constexpr int group_size = use_wfp4a16 ? cutlass::gemm::collective::detail::mxfp4_group_size
+                                           : cutlass::gemm::collective::detail::int4_group_size;
+    GroupedGemmInput<T, WeightType, OutputType, OutputType> inputs{.groupwise_quant_group_size = group_size};
     inputs.num_experts = num_experts;
     sm90_generic_mixed_moe_gemm_kernelLauncher<T, WeightType, OutputType,
-        tensorrt_llm::cutlass_extensions::EpilogueOpDefault, Shape<_128, _64, _Ktile>, Shape<_1, _1, _1>,
-        cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::TmaWarpSpecializedCooperative,
-        cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY>(
+        tensorrt_llm::cutlass_extensions::EpilogueOpDefault, EpilogueFusion::NONE, Shape<_128, _64, _Ktile>,
+        Shape<_1, _1, _1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative,
+        cutlass::epilogue::TmaWarpSpecializedCooperative, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY>(
         inputs, TmaWarpSpecializedGroupedGemmInput{}, sm_count_, &count);
 #endif
     return count;
 }
 
-} // namespace tensorrt_llm::kernels::cutlass_kernels_oss
+} // namespace kernels::cutlass_kernels_oss
+
+TRTLLM_NAMESPACE_END

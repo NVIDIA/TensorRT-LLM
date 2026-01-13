@@ -163,13 +163,16 @@ def export_onnx(model,
     logger.log(trt.Logger.INFO, f"Exporting onnx to {onnx_dir}/{onnx_name}")
     os.makedirs(onnx_dir, exist_ok=True)
 
-    torch.onnx.export(model,
-                      input,
-                      f'{onnx_dir}/{onnx_name}',
-                      opset_version=17,
-                      input_names=input_names,
-                      output_names=output_names,
-                      dynamic_axes=dynamic_axes)
+    torch.onnx.export(
+        model,
+        input,
+        f'{onnx_dir}/{onnx_name}',
+        opset_version=17,
+        input_names=input_names,
+        output_names=output_names,
+        dynamic_axes=dynamic_axes,
+        # Required for pytorch>=2.9.0 as dynamo becomes the default and introduces bugs as it does not support opset_version=17 natively
+        dynamo=False)
 
 
 def build_trt_engine(model_type,
@@ -587,7 +590,7 @@ def build_llava_engine(args):
         model = LlavaOnevisionForConditionalGeneration.from_pretrained(
             args.model_path, dtype=torch.float16)
         wrapper = LlavaOnevisionVisionWrapper(
-            model.vision_tower.vision_model.to(args.device),
+            model.vision_tower.to(args.device),
             model.multi_modal_projector.to(args.device), model.config)
 
     export_onnx(wrapper, image, f'{args.output_dir}/onnx')

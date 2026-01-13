@@ -5,28 +5,36 @@ import unittest
 import torch
 from utils.llm_data import llm_models_root
 
-from tensorrt_llm import SamplingParams
-from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
-                                                        SamplingConfig)
-from tensorrt_llm._torch.pyexecutor.sampler import TorchSampler
+from tensorrt_llm._torch.speculative.drafting_loops import \
+    TreeDraftingLoopWrapper
 from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
 from tensorrt_llm.llmapi import EagleDecodingConfig
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 
+class DummyModel(torch.nn.Module):
+
+    def __init__(self):
+        super().__init__()
+        self.model_config = None
+        self.config = None
+        self.model = {}
+
+    def forward(self, *args, **kwargs) -> torch.Tensor:
+        pass
+
+
 def test_draft_token_static_tree_sampling():
     # Fix parameters
     models_path = llm_models_root()
     eagle_model_dir = f"{models_path}/EAGLE3-LLaMA3.1-Instruct-8B"  # It will not actually be used.
-    beam_width = 1
     use_dynamic_tree = False
-    max_new_tokens = 128
 
     # Create related object and run test
     def run_test(max_batch_size, draft_layer_id, max_total_draft_tokens,
-                 max_draft_len, eagle_choices, logits, ref_new_tokens,
-                 num_new_draft_tokens):
+                 max_draft_len, eagle_choices, logits, use_cuda_graph,
+                 ref_new_tokens):
         spec_config = EagleDecodingConfig(
             max_draft_len=max_draft_len,
             max_total_draft_tokens=max_total_draft_tokens,
@@ -43,57 +51,38 @@ def test_draft_token_static_tree_sampling():
             eagle_choices=spec_config.eagle_choices,
             dynamic_tree_max_topK=spec_config.dynamic_tree_max_topK,
         )
-        spec_tree_manager.cur_draft_layer_idx = draft_layer_id
-        torch_sampler = TorchSampler(
-            TorchSampler.Args(
-                max_draft_len=spec_config.max_draft_len,
-                max_seq_len=1024,
-                max_total_draft_tokens=spec_config.max_total_draft_tokens,
-                max_num_sequences=max_batch_size,
-                max_beam_width=beam_width))
 
-        # Prepare tree sampling inputs
-        scheduled_requests = []
-        for req_id in range(max_batch_size):
-            req = LlmRequest(
-                request_id=req_id,
-                max_new_tokens=max_new_tokens,
-                input_tokens=range(req_id * 10, (req_id + 1) * 10),
-                sampling_config=SamplingConfig(
-                    SamplingParams()._get_sampling_config()),
-                is_streaming=False,
-            )
-            scheduled_requests.append(req)
-        seq_slots = torch.tensor(range(max_batch_size),
-                                 dtype=torch.int64,
-                                 device='cuda')
-        new_tokens = torch.zeros((spec_config.max_total_draft_tokens + 1,
-                                  max_batch_size, beam_width),
-                                 dtype=torch.int,
-                                 device='cuda')
-
-        model_outputs = {
-            "logits": logits,
-        }
-
-        new_tokens_host = torch_sampler._tree_sampling_batch(
-            requests=scheduled_requests,
-            max_num_sequences=max_batch_size,
-            seq_slots=seq_slots,
-            model_outputs=model_outputs,
-            spec_tree_manager=spec_tree_manager)
-        new_tokens_host = new_tokens_host.squeeze(dim=-1).transpose(
-            0, 1)  # shape: [max_batch_size, max_total_draft_tokens + 1]
-
-        print(
-            f"new_tokens_host.shape: {new_tokens_host.shape}, new_tokens_host: {new_tokens_host}"
+        # Create the chain drafter
+        tree_drafter = TreeDraftingLoopWrapper(
+            max_batch_size=max_batch_size,
+            max_draft_len=spec_config.max_draft_len,
+            max_total_draft_tokens=spec_config.max_total_draft_tokens,
+            draft_model=DummyModel(),
         )
+
+        sampled_tokens = tree_drafter.sample(
+            logits=logits,
+            max_top_k=spec_tree_manager.max_top_k,
+        )
+
+        tree_drafter.extract_real_draft_tokens(
+            cur_draft_idx=draft_layer_id,
+            batch_size=max_batch_size,
+            new_draft_tokens=sampled_tokens,
+            use_cuda_graph=use_cuda_graph,  # use torch op or not
+            spec_tree_manager=spec_tree_manager,
+        )
+
+        real_new_draft_tokens = tree_drafter.draft_tokens_buffer[:
+                                                                 max_batch_size, :]
+
         print(
             f"ref_new_tokens.shape: {ref_new_tokens.shape}, ref_new_tokens: {ref_new_tokens}"
         )
-
-        assert torch.all(new_tokens_host[:, :num_new_draft_tokens] ==
-                         ref_new_tokens[:, :num_new_draft_tokens])
+        print(
+            f"real_new_draft_tokens.shape: {real_new_draft_tokens.shape}, output_tokens: {real_new_draft_tokens}"
+        )
+        assert torch.all(real_new_draft_tokens == ref_new_tokens)
 
     ################## CASE 1 static tree, batch size = 1, draft_layer_id = 0 ##########################
     max_batch_size = 1
@@ -112,11 +101,12 @@ def test_draft_token_static_tree_sampling():
     ref_new_tokens = torch.tensor(
         [
             [4, 1, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        ], device='cpu')  # shape: [max_batch_size, max_total_draft_tokens + 1]
-    num_new_draft_tokens = 3
+        ], device='cuda')  # shape: [max_batch_size, max_total_draft_tokens + 1]
     run_test(max_batch_size, draft_layer_id, max_total_draft_tokens,
-             max_draft_len, eagle_choices, logits, ref_new_tokens,
-             num_new_draft_tokens)
+             max_draft_len, eagle_choices, logits, False, ref_new_tokens)
+
+    run_test(max_batch_size, draft_layer_id, max_total_draft_tokens,
+             max_draft_len, eagle_choices, logits, True, ref_new_tokens)
 
     ################## CASE 2 static tree, batch size = 1, draft_layer_id = 1 ##########################
     max_batch_size = 1
@@ -126,7 +116,10 @@ def test_draft_token_static_tree_sampling():
     eagle_choices = [[0], [1], [2], [0, 0], [0, 1], [0, 2], [1, 0], [1, 1],
                      [2, 0], [0, 0, 0], [0, 1, 1], [1, 0, 0]]
 
-    logits = torch.tensor(
+    logits = torch.empty((max_batch_size, max_total_draft_tokens + 1, 10),
+                         device='cuda')
+    set_indices = torch.tensor([0, 1, 2], device='cuda')
+    logits[:, set_indices, :] = torch.tensor(
         [
             [0.1, 1.1, 0.3, 0.4, 1.2, 0.6, 0.7, 0.8, 0.9, 1.0
              ],  # top3 indices = [4, 1, 9]
@@ -138,12 +131,13 @@ def test_draft_token_static_tree_sampling():
         device='cuda')
     ref_new_tokens = torch.tensor(
         [
-            [4, 1, 9, 7, 1, 9, 0, 0, 0, 0, 0, 0, 0],
-        ], device='cpu')  # shape: [max_batch_size, max_total_draft_tokens + 1]
-    num_new_draft_tokens = 6
+            [0, 0, 0, 4, 1, 9, 7, 1, 9, 0, 0, 0, 0],
+        ], device='cuda')  # shape: [max_batch_size, max_total_draft_tokens + 1]
     run_test(max_batch_size, draft_layer_id, max_total_draft_tokens,
-             max_draft_len, eagle_choices, logits, ref_new_tokens,
-             num_new_draft_tokens)
+             max_draft_len, eagle_choices, logits, False, ref_new_tokens)
+
+    run_test(max_batch_size, draft_layer_id, max_total_draft_tokens,
+             max_draft_len, eagle_choices, logits, True, ref_new_tokens)
 
     ################## CASE 3 static tree, batch size = 1, draft_layer_id = 2 ##########################
     max_batch_size = 1
@@ -152,7 +146,10 @@ def test_draft_token_static_tree_sampling():
     max_draft_len = 3
     eagle_choices = [[0], [1], [2], [0, 0], [0, 1], [0, 2], [1, 0], [1, 1],
                      [2, 0], [0, 0, 0], [0, 1, 1], [1, 0, 0]]
-    logits = torch.tensor(
+    logits = torch.empty((max_batch_size, max_total_draft_tokens + 1, 10),
+                         device='cuda')
+    set_indices = torch.tensor([3, 4, 6], device='cuda')
+    logits[:, set_indices, :] = torch.tensor(
         [
             [0.1, 1.1, 0.3, 0.4, 1.2, 0.6, 0.7, 0.8, 0.9, 1.0
              ],  # top1 indices = [4]
@@ -164,12 +161,13 @@ def test_draft_token_static_tree_sampling():
         device='cuda')
     ref_new_tokens = torch.tensor(
         [
-            [4, 7, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        ], device='cpu')  # shape: [max_batch_size, max_total_draft_tokens + 1]
-    num_new_draft_tokens = 3
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 7, 9, 0],
+        ], device='cuda')  # shape: [max_batch_size, max_total_draft_tokens + 1]
     run_test(max_batch_size, draft_layer_id, max_total_draft_tokens,
-             max_draft_len, eagle_choices, logits, ref_new_tokens,
-             num_new_draft_tokens)
+             max_draft_len, eagle_choices, logits, False, ref_new_tokens)
+
+    run_test(max_batch_size, draft_layer_id, max_total_draft_tokens,
+             max_draft_len, eagle_choices, logits, True, ref_new_tokens)
 
     ################## CASE 4 static tree, batch size = 2, draft_layer_id = 0 ##########################
     max_batch_size = 2
@@ -191,11 +189,12 @@ def test_draft_token_static_tree_sampling():
             [4, 1, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             [4, 2, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         ],
-        device='cpu')  # shape: [max_batch_size, max_total_draft_tokens + 1]
-    num_new_draft_tokens = 3
+        device='cuda')  # shape: [max_batch_size, max_total_draft_tokens + 1]
     run_test(max_batch_size, draft_layer_id, max_total_draft_tokens,
-             max_draft_len, eagle_choices, logits, ref_new_tokens,
-             num_new_draft_tokens)
+             max_draft_len, eagle_choices, logits, False, ref_new_tokens)
+
+    run_test(max_batch_size, draft_layer_id, max_total_draft_tokens,
+             max_draft_len, eagle_choices, logits, True, ref_new_tokens)
 
     ################## CASE 5 static tree, batch size = 2, draft_layer_id = 1 ##########################
     max_batch_size = 2
@@ -204,7 +203,11 @@ def test_draft_token_static_tree_sampling():
     max_draft_len = 3
     eagle_choices = [[0], [1], [2], [0, 0], [0, 1], [0, 2], [1, 0], [1, 1],
                      [2, 0], [0, 0, 0], [0, 1, 1], [1, 0, 0]]
-    logits = torch.tensor(
+    logits = torch.empty((max_batch_size, max_total_draft_tokens + 1, 10),
+                         device='cuda')
+    set_indices = torch.tensor([0, 1, 2], device='cuda')
+
+    logits[0, set_indices, :] = torch.tensor(
         [
             [0.1, 1.1, 0.3, 0.4, 1.2, 0.6, 0.7, 0.8, 0.9, 1.0
              ],  # top3 indices = [4, 1, 9]
@@ -212,6 +215,11 @@ def test_draft_token_static_tree_sampling():
              ],  # top2 indices = [7, 1]
             [0.1, 1.1, 0.3, 0.4, 0.6, 0.7, 0.8, 0.9, 1.0, 1.2
              ],  # top1 indices = [9]
+        ],
+        device='cuda')
+
+    logits[1, set_indices, :] = torch.tensor(
+        [
             [0.1, 1.1, 0.3, 0.4, 0.6, 1.2, 0.7, 0.8, 1.0, 0.9
              ],  # top3 indices = [5, 1, 8]
             [0.1, 1.1, 0.3, 0.4, 0.6, 0.7, 1.2, 0.8, 0.9, 1.0
@@ -222,14 +230,15 @@ def test_draft_token_static_tree_sampling():
         device='cuda')
     ref_new_tokens = torch.tensor(
         [
-            [4, 1, 9, 7, 1, 9, 0, 0, 0, 0, 0, 0, 0],
-            [5, 1, 8, 6, 1, 8, 0, 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 4, 1, 9, 7, 1, 9, 0, 0, 0, 0],
+            [0, 0, 0, 5, 1, 8, 6, 1, 8, 0, 0, 0, 0],
         ],
-        device='cpu')  # shape: [max_batch_size, max_total_draft_tokens + 1]
-    num_new_draft_tokens = 6
+        device='cuda')  # shape: [max_batch_size, max_total_draft_tokens + 1]
     run_test(max_batch_size, draft_layer_id, max_total_draft_tokens,
-             max_draft_len, eagle_choices, logits, ref_new_tokens,
-             num_new_draft_tokens)
+             max_draft_len, eagle_choices, logits, False, ref_new_tokens)
+
+    run_test(max_batch_size, draft_layer_id, max_total_draft_tokens,
+             max_draft_len, eagle_choices, logits, True, ref_new_tokens)
 
     ################## CASE 6 static tree, batch size = 2, draft_layer_id = 2 ##########################
     max_batch_size = 2
@@ -238,7 +247,11 @@ def test_draft_token_static_tree_sampling():
     max_draft_len = 3
     eagle_choices = [[0], [1], [2], [0, 0], [0, 1], [0, 2], [1, 0], [1, 1],
                      [2, 0], [0, 0, 0], [0, 1, 1], [1, 0, 0]]
-    logits = torch.tensor(
+    logits = torch.empty((max_batch_size, max_total_draft_tokens + 1, 10),
+                         device='cuda')
+    set_indices = torch.tensor([3, 4, 6], device='cuda')
+
+    logits[0, set_indices, :] = torch.tensor(
         [
             [0.1, 1.1, 0.3, 0.4, 1.2, 0.6, 0.7, 0.8, 0.9, 1.0
              ],  # top1 indices = [4]
@@ -246,6 +259,11 @@ def test_draft_token_static_tree_sampling():
              ],  # top1 indices = [7]
             [0.1, 1.1, 0.3, 0.4, 0.6, 0.7, 0.8, 0.9, 1.0, 1.2
              ],  # top1 indices = [9]
+        ],
+        device='cuda')
+
+    logits[1, set_indices, :] = torch.tensor(
+        [
             [0.1, 1.1, 0.3, 0.4, 0.6, 1.2, 0.7, 0.8, 0.9, 1.0
              ],  # top1 indices = [5]
             [0.1, 1.1, 0.3, 0.4, 0.6, 0.7, 0.8, 0.9, 1.2, 1.0
@@ -254,16 +272,18 @@ def test_draft_token_static_tree_sampling():
              ],  # top1 indices = [0]
         ],
         device='cuda')
+
     ref_new_tokens = torch.tensor(
         [
-            [4, 7, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [5, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 7, 9, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 8, 0, 0],
         ],
-        device='cpu')  # shape: [max_batch_size, max_total_draft_tokens + 1]
-    num_new_draft_tokens = 3
+        device='cuda')  # shape: [max_batch_size, max_total_draft_tokens + 1]
     run_test(max_batch_size, draft_layer_id, max_total_draft_tokens,
-             max_draft_len, eagle_choices, logits, ref_new_tokens,
-             num_new_draft_tokens)
+             max_draft_len, eagle_choices, logits, False, ref_new_tokens)
+
+    run_test(max_batch_size, draft_layer_id, max_total_draft_tokens,
+             max_draft_len, eagle_choices, logits, True, ref_new_tokens)
 
     ################## CASE 7 static tree, batch size = 1, draft_layer_id = 0, bigger tree ##########################
     max_batch_size = 1
@@ -286,22 +306,21 @@ def test_draft_token_static_tree_sampling():
         2.0, 3.0, 1.8, 2.3, 4.2, 1.3
     ]],
                           device='cuda')
-    ref_new_tokens = torch.tensor(
-        [
-            [
-                6, 9, 4, 5, 18, 8, 12, 15, 11, 17, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0
-            ],
-        ],
-        device='cpu')  # shape: [max_batch_size, max_total_draft_tokens + 1]
-    num_new_draft_tokens = 10
-    run_test(max_batch_size, draft_layer_id, max_total_draft_tokens,
-             max_draft_len, eagle_choices, logits, ref_new_tokens,
-             num_new_draft_tokens)
 
-    ################## CASE 8 static tree, batch size = 1, draft_layer_id = 0, bigger tree ##########################
+    ref_new_tokens = torch.zeros((max_batch_size, max_total_draft_tokens + 1),
+                                 device='cuda')
+
+    ref_new_tokens[0, :10] = torch.tensor(
+        [
+            [6, 9, 4, 5, 18, 8, 12, 15, 11, 17],
+        ], device='cuda')  # shape: [max_batch_size, max_total_draft_tokens + 1]
+    run_test(max_batch_size, draft_layer_id, max_total_draft_tokens,
+             max_draft_len, eagle_choices, logits, False, ref_new_tokens)
+
+    run_test(max_batch_size, draft_layer_id, max_total_draft_tokens,
+             max_draft_len, eagle_choices, logits, True, ref_new_tokens)
+
+    ################## CASE 8 static tree, batch size = 1, draft_layer_id = 1, bigger tree ##########################
     max_batch_size = 1
     draft_layer_id = 1
     max_total_draft_tokens = 63
@@ -317,7 +336,11 @@ def test_draft_token_static_tree_sampling():
                      [8, 0], [0, 5, 0], [1, 5], [1, 0, 1], [0, 2, 1], [9, 0],
                      [0, 6, 0], [0, 0, 0, 1], [1, 6], [0, 7, 0]]  # mc_sim_7b_63
 
-    logits = torch.tensor([
+    logits = torch.empty((max_batch_size, max_total_draft_tokens + 1, 20),
+                         device='cuda')
+    set_indices = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, 8, 9], device='cuda')
+
+    logits[0, set_indices, :] = torch.tensor([
         [
             3.8, 2.5, 1.9, 0.2, 4.5, 0.9, 0.5, 3.9, 4.0, 2.9, 2.7, 0.7, 2.8,
             2.1, 1.2, 1.4, 3.3, 3.7, 2.4, 5.4
@@ -359,8 +382,11 @@ def test_draft_token_static_tree_sampling():
             0.9, 4.0, 5.4, 1.1, 2.7, 5.3, 3.4
         ],
     ],
-                          device='cuda')
-    ref_new_tokens = torch.tensor(
+                                             device='cuda')
+
+    ref_new_tokens = torch.zeros((max_batch_size, max_total_draft_tokens + 1),
+                                 device='cuda')
+    ref_new_tokens[0, 10:38] = torch.tensor(
         [[
             19,
             4,
@@ -390,48 +416,13 @@ def test_draft_token_static_tree_sampling():
             11,  # top-1
             14,  # top-1
             10,  # top-1
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0
         ]],
-        device='cpu')  # shape: [max_batch_size, max_total_draft_tokens + 1]
-    num_new_draft_tokens = 28
+        device='cuda')  # shape: [max_batch_size, num_new_draft_tokens]
     run_test(max_batch_size, draft_layer_id, max_total_draft_tokens,
-             max_draft_len, eagle_choices, logits, ref_new_tokens,
-             num_new_draft_tokens)
+             max_draft_len, eagle_choices, logits, False, ref_new_tokens)
+
+    run_test(max_batch_size, draft_layer_id, max_total_draft_tokens,
+             max_draft_len, eagle_choices, logits, True, ref_new_tokens)
 
 
 if __name__ == "__main__":

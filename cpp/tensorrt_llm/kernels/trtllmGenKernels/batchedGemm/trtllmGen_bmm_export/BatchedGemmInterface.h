@@ -16,6 +16,7 @@
  */
 #pragma once
 
+#include <functional>
 #include <numeric>
 #include <optional>
 #include <unordered_map>
@@ -101,7 +102,7 @@ struct BatchedGemmData
         // The matrix A. The data type is controlled by options.mDtypeA.
         //
         // If (routeAct == true && batchM), the shape is [M, K]
-        // Else
+        // Elseif (batchStrideInTokens > 0)
         //   If batchM:
         //      Logical shape is [sum(divUpMul(M[bi], tileM) for bi in B), K].
         //      Logical strides are [K, 1].
@@ -117,6 +118,14 @@ struct BatchedGemmData
         //         Logical shape is [B, K / blockK, divUpMul(M, tileM), blockK].
         //         Logical strides are [K * divUpMul(M, tileM), divUpMul(M, tileM) * blockK, blockK, 1].
         //         where blockK is 128B.
+        // Else // batchStrideInTokens == 0
+        //   If batchM:
+        //      Logical shape is [M, K].
+        //      Logical strides are [K, 1].
+        //
+        //   If batchN:
+        //      Logical shape is [B, divUpMul(M, tileM), K].
+        //      Logical strides are [divUpMul(M, tileM) * K, K, 1].
         void const* mPtrA{nullptr};
 
         // The block scaling factors to dequantize A.
@@ -128,7 +137,7 @@ struct BatchedGemmData
         //      Otherwise, shape is [M / 128, K / 128].
         //    The rightmost dimension is contiguous in memory.
         //
-        //   If DeepSeek FP8 recipe is not used, but for MxFp{4,8} and NvFp4 formats:
+        //   If DeepSeek FP8 recipe is not used, but for MxFp{4,8}, MxInt4 and NvFp4 formats:
         //      The layout of scaling factors for A is always R128c4
         //      M must be a multiple of 128.
         //      K must be a multiple of 64.
@@ -138,7 +147,8 @@ struct BatchedGemmData
         //  Where paddedM is M if (routeAct == true && batchM), or
         //  sum(divUpMul(M[bi], tileM) for bi in B) if batchM,
         //  otherwise divUpMul(M, tileM) * B.
-        //  Dtype is Dtype::Fp32 if DeepSeek FP8 recipe is used, otherwise Dtype::E4m3.
+        //  Dtype is Dtype::Fp32 if DeepSeek FP8 recipe is used, otherwise Dtype is Dtype::E4m3 for
+        //  NvFp4, Dtype::UE8m0 for MxFp{4,8} formats, Dtype::Bfloat16 for MxInt4.
         //
         // Otherwise should be set to nullptr.
         void const* mPtrSfA{nullptr};
@@ -163,7 +173,7 @@ struct BatchedGemmData
         //
         // If (routeAct == true && batchN), the shape is [N, K]
         //
-        // Else
+        // Else if (batchStrideInTokens > 0)
         //   If batchN:
         //      Logical shape is [sum(divUpMul(N[bi], tileN) for bi in B), K].
         //      Logical strides are [K, 1].
@@ -179,6 +189,15 @@ struct BatchedGemmData
         //         Logical shape is [B, K / blockK, divUpMul(N, tileN), blockK].
         //         Logical strides are [K * divUpMul(N, tileN), divUpMul(N, tileN) * blockK, blockK, 1].
         //         where blockK is 128B.
+        //
+        // Else // batchStrideInTokens == 0
+        //   If batchN:
+        //      Logical shape is [N, K].
+        //      Logical strides are [K, 1].
+        //
+        //   If batchM:
+        //      Logical shape is [B, divUpMul(N, tileN), K].
+        //      Logical strides are [divUpMul(N, tileN) * K, K, 1].
         void const* mPtrB{nullptr};
 
         // The scaling factors to dequantize B.

@@ -702,12 +702,16 @@ class Attention(Module):
                           is_buffer=True))
         else:
 
-            def register_rope_params(rotary_base, names_to_register):
+            def register_rope_params(rotary_base, rotary_embedding_scale,
+                                     rotary_embedding_scale_type,
+                                     rotary_embedding_scaling,
+                                     names_to_register):
                 # Rotary const weights.
                 embed_positions = RopeEmbeddingUtils.create_sinusoidal_positions(
                     max_position_embeddings,
                     rotary_embedding_dim,
                 )
+
                 rotary_inv_freq, embed_positions_for_gpt_attention = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
                     max_position_embeddings, rotary_embedding_dim, rotary_base,
                     rotary_embedding_scale, rotary_embedding_scale_type,
@@ -724,11 +728,15 @@ class Attention(Module):
                               dtype='float32',
                               is_buffer=True))
 
-            register_rope_params(rotary_base=rotary_embedding_base,
-                                 names_to_register=[
-                                     'embed_positions', 'rotary_inv_freq',
-                                     'embed_positions_for_gpt_attention'
-                                 ])
+            register_rope_params(
+                rotary_base=rotary_embedding_base,
+                rotary_embedding_scale=rotary_embedding_scale,
+                rotary_embedding_scale_type=rotary_embedding_scale_type,
+                rotary_embedding_scaling=rotary_embedding_scaling,
+                names_to_register=[
+                    'embed_positions', 'rotary_inv_freq',
+                    'embed_positions_for_gpt_attention'
+                ])
 
             # For models with non-homegeneous attention layers requiring a second set of rope params. e.g. Gemma3.
             rotary_embedding_base_local = getattr(config,
@@ -736,6 +744,9 @@ class Attention(Module):
             if rotary_embedding_base_local is not None:
                 register_rope_params(
                     rotary_base=rotary_embedding_base_local,
+                    rotary_embedding_scale=1.0,
+                    rotary_embedding_scale_type=RotaryScalingType.none,
+                    rotary_embedding_scaling=None,
                     names_to_register=[
                         'embed_positions_local', 'rotary_inv_freq_local',
                         'embed_positions_for_gpt_attention_local'
@@ -1141,10 +1152,12 @@ class Attention(Module):
                 rotary_embedding_dim=self.rotary_embedding_dim,
                 rotary_embedding_base=self.rotary_embedding_base
                 if not self.is_local else self.rotary_embedding_base_local,
-                rotary_embedding_scale_type=self.rotary_embedding_scale_type,
+                rotary_embedding_scale_type=self.rotary_embedding_scale_type
+                if not self.is_local else RotaryScalingType.none,
                 rotary_embedding_short_m_scale=attention_params.short_mscale,
                 rotary_embedding_long_m_scale=attention_params.long_mscale,
-                rotary_embedding_scale=self.rotary_embedding_scale,
+                rotary_embedding_scale=self.rotary_embedding_scale
+                if not self.is_local else 1.0,
                 rotary_embedding_max_positions=self.max_position_embeddings,
                 rotary_embedding_original_max_positions=self.
                 original_max_position_embeddings,

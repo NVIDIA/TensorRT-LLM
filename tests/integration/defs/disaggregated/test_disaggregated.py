@@ -18,17 +18,42 @@ import os
 import re
 import subprocess
 import tempfile
+import time
+from dataclasses import dataclass
 from typing import Callable
 
 import pytest
+
+try:
+    import ray
+except ImportError:
+    import tensorrt_llm.ray_stub as ray
+
 import yaml
-from defs.common import wait_for_server
+from defs.common import (get_free_port_in_ci, parse_gsm8k_output,
+                         revise_disagg_config_file_with_free_ports,
+                         wait_for_server)
 from defs.conftest import (get_sm_version, llm_models_root, skip_arm,
-                           skip_no_hopper)
-from defs.trt_test_alternative import check_call, check_output, popen
+                           skip_no_hopper, skip_pre_blackwell)
+from defs.trt_test_alternative import (check_call, check_output, popen,
+                                       print_info)
+from test_common.perf_metrics_utils import (get_timing_metrics,
+                                            validate_timing_metrics)
 
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.logger import logger
+
+
+@dataclass
+class TestConfig:
+    """Configuration for disaggregated test."""
+    model_path: str
+    test_desc: str
+    request_count: int
+    accuracy_threshold: float
+
+    def __str__(self):
+        return self.test_desc
 
 
 def cleanup_output_files():
@@ -40,115 +65,12 @@ def cleanup_output_files():
             pass
 
 
-def validate_timing_metrics(perf_metrics_item, request_context=""):
-    """
-    Helper function to validate timing metrics relationships.
-
-    Args:
-        perf_metrics_item: A single performance metrics item from the /perf_metrics endpoint
-        request_context: String context for error messages (e.g., "request 1", "streaming")
-    """
-    # Validate basic structure
-    required_keys = [
-        "ctx_server", "gen_server", "ctx_perf_metrics", "gen_perf_metrics",
-        "disagg_server_arrival_time", "disagg_server_first_token_time"
-    ]
-    for key in required_keys:
-        assert key in perf_metrics_item, f"Missing key: {key} in {request_context}"
-
-    assert perf_metrics_item["ctx_perf_metrics"][
-        "ctx_request_id"] == perf_metrics_item["gen_perf_metrics"][
-            "ctx_request_id"]
-
-    # Extract timing metrics
-    ctx_metrics = perf_metrics_item["ctx_perf_metrics"]["perf_metrics"][
-        "timing_metrics"]
-    gen_metrics = perf_metrics_item["gen_perf_metrics"]["perf_metrics"][
-        "timing_metrics"]
-    disagg_arrival = perf_metrics_item["disagg_server_arrival_time"]
-    disagg_first_token = perf_metrics_item["disagg_server_first_token_time"]
-
-    # Validate disaggregated server timing metrics
-    assert disagg_arrival is not None, f"disagg_server_arrival_time is None in {request_context}"
-    assert disagg_first_token is not None, f"disagg_server_first_token_time is None in {request_context}"
-    assert isinstance(
-        disagg_arrival,
-        (int, float
-         )), f"disagg_server_arrival_time is not numeric in {request_context}"
-    assert isinstance(
-        disagg_first_token, (int, float)
-    ), f"disagg_server_first_token_time is not numeric in {request_context}"
-    assert disagg_arrival > 0, f"disagg_server_arrival_time is not positive in {request_context}"
-    assert disagg_first_token > 0, f"disagg_server_first_token_time is not positive in {request_context}"
-    assert disagg_arrival <= disagg_first_token, f"disagg_server_arrival_time > disagg_server_first_token_time in {request_context}"
-
-    # Validate server-level timing metrics for context server
-    ctx_server_arrival = ctx_metrics.get("server_arrival_time")
-    ctx_server_first_token = ctx_metrics.get("server_first_token_time")
-    assert ctx_server_arrival is not None, f"ctx server_arrival_time is None in {request_context}"
-    assert ctx_server_first_token is not None, f"ctx server_first_token_time is None in {request_context}"
-    assert isinstance(
-        ctx_server_arrival,
-        (int,
-         float)), f"ctx server_arrival_time is not numeric in {request_context}"
-    assert isinstance(
-        ctx_server_first_token,
-        (int, float
-         )), f"ctx server_first_token_time is not numeric in {request_context}"
-    assert ctx_server_arrival <= ctx_server_first_token, f"ctx server_arrival_time > server_first_token_time in {request_context}"
-    assert ctx_metrics["last_token_time"] - ctx_server_first_token < 1e-3
-
-    # Validate server-level timing metrics for generation server
-    gen_server_arrival = gen_metrics.get("server_arrival_time")
-    gen_server_first_token = gen_metrics.get("server_first_token_time")
-    assert gen_server_arrival is not None, f"gen server_arrival_time is None in {request_context}"
-    assert gen_server_first_token is not None, f"gen server_first_token_time is None in {request_context}"
-    assert isinstance(
-        gen_server_arrival,
-        (int,
-         float)), f"gen server_arrival_time is not numeric in {request_context}"
-    assert isinstance(
-        gen_server_first_token,
-        (int, float
-         )), f"gen server_first_token_time is not numeric in {request_context}"
-    assert gen_server_arrival <= gen_server_first_token, f"gen server_arrival_time > server_first_token_time in {request_context}"
-
-    # Validate timing relationships between different levels
-    # Disaggregated server should receive request before individual servers
-    assert disagg_arrival <= ctx_server_arrival, f"disagg_arrival > ctx_server_arrival in {request_context}"
-    assert disagg_arrival <= gen_server_arrival, f"disagg_arrival > gen_server_arrival in {request_context}"
-
-    # Context should complete before generation starts
-    assert ctx_server_first_token <= gen_server_arrival, f"ctx_server_first_token > gen_server_arrival in {request_context}"
-
-    # Validate internal timing consistency
-    ctx_arrival_time = ctx_metrics["arrival_time"]
-    ctx_first_token_time = ctx_metrics["first_token_time"]
-    gen_arrival_time = gen_metrics["arrival_time"]
-    gen_first_token_time = gen_metrics["first_token_time"]
-
-    assert ctx_arrival_time <= ctx_first_token_time, f"ctx arrival_time > first_token_time in {request_context}"
-    assert gen_arrival_time <= gen_first_token_time, f"gen arrival_time > first_token_time in {request_context}"
-
-    # Test KV cache transfer timing (if present)
-    if "kv_cache_transfer_start" in gen_metrics and "kv_cache_transfer_end" in gen_metrics:
-        kv_start = gen_metrics["kv_cache_transfer_start"]
-        kv_end = gen_metrics["kv_cache_transfer_end"]
-        assert gen_metrics["kv_cache_size"] > 0
-        assert kv_start <= kv_end, f"kv_cache_transfer_start > kv_cache_transfer_end in {request_context}"
-        assert gen_arrival_time <= kv_start, f"gen_arrival_time > kv_cache_transfer_start in {request_context}"
-        assert kv_end <= gen_metrics[
-            "first_scheduled_time"], f"kv_cache_transfer_end > first_scheduled_time in {request_context}"
-
-    return True
-
-
-def get_disagg_server_url_from_cfg(config_file: str) -> str:
+def get_disagg_server_url_from_cfg(config_file: str) -> tuple[str, int]:
     with open(config_file, 'r') as file:
         config = yaml.safe_load(file)
     server_host = config.get('hostname', 'localhost')
     server_port = config.get('port', 8000)
-    return f"http://{server_host}:{server_port}"
+    return server_host, server_port
 
 
 def get_test_config(test_desc, example_dir, test_root):
@@ -267,13 +189,29 @@ def get_test_config(test_desc, example_dir, test_root):
          ),
         "llama4_kv_cache_overflow":
         (8, f"{test_configs_root}/disagg_config_llama4_kv_cache_overflow.yaml"),
+        "deepseek_v3_lite_bf16_tllm_gen_helix":
+        (4,
+         f"{test_configs_root}/disagg_config_ctxtp2_gentp1cp2_deepseek_v3_lite_bf16_tllm_gen.yaml"
+         ),
+        "deepseek_r1_v2_fp4_stress":
+        (8,
+         f"{test_configs_root}/disagg_config_ctxtp4_gentp4_deepseek_r1_v2_fp4_tllm.yaml"
+         ),
+        "gpt_oss_120b_stress":
+        (4,
+         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_tllm.yaml"),
+        "cancel_stress_test":
+        (2, f"{test_configs_root}/disagg_config_cancel_stress_test.yaml"),
+        "cancel_stress_test_large":
+        (8, f"{test_configs_root}/disagg_config_cancel_stress_test_large.yaml"),
     }
 
     if test_desc not in config_map:
         raise ValueError(f"Invalid test description: {test_desc}, "
                          f"valid descriptions are: {config_map.keys()}")
 
-    return config_map[test_desc]
+    return (config_map[test_desc][0],
+            revise_disagg_config_file_with_free_ports(config_map[test_desc][1]))
 
 
 def get_extra_llm_config(config, suffix, cwd):
@@ -302,8 +240,8 @@ def generate_worker_commands(model_path, config, server_config,
         host, port = url.split(':')
         cmd = [
             'trtllm-serve', model_path, '--host', host, '--port', port,
-            '--backend', config['backend'], '--extra_llm_api_options',
-            extra_config_file, '--server_role', server_role
+            '--backend', config['backend'], '--config', extra_config_file,
+            '--server_role', server_role
         ]
         worker_commands.append(cmd)
     return worker_commands
@@ -408,6 +346,14 @@ def run_client_tests(example_dir,
                     assert not_expected_string not in content, f"Unexpected string '{not_expected_string}' found in {output_file}"
 
 
+# TODO: add test for disaggregated server prometheus metrics
+def fetch_prometheus_metrics(server_url: str):
+    import requests
+    response = requests.get(f"{server_url}/prometheus/metrics", timeout=10)
+    assert response.status_code == 200
+    return response.text
+
+
 def run_disaggregated_test(example_dir,
                            test_desc,
                            num_iters=5,
@@ -444,8 +390,6 @@ def run_disaggregated_test(example_dir,
 
         extra_config_files = []
         workers_cmds = []
-        subprocess.run(['ray', 'start', '--head', '--disable-usage-stats'],
-                       check=True)
 
         # Generate ctx and gen server worker commands
         ctx_extra_config_file = get_extra_llm_config(config['context_servers'],
@@ -469,7 +413,8 @@ def run_disaggregated_test(example_dir,
         'trtllm-serve', 'disaggregated', '--server_start_timeout',
         str(server_start_timeout), '-c', config_file
     ]
-    server_url = get_disagg_server_url_from_cfg(config_file)
+    server_host, server_port = get_disagg_server_url_from_cfg(config_file)
+    server_url = f"http://{server_host}:{server_port}"
 
     try:
         if not use_ray:
@@ -501,6 +446,21 @@ def run_disaggregated_test(example_dir,
                                  use_ray=False)
 
         else:
+            runtime_env = {
+                "env_vars": {
+                    "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"
+                }
+            }
+            ray.init(address="local",
+                     include_dashboard=False,
+                     ignore_reinit_error=True,
+                     runtime_env=runtime_env)
+            gcs_addr = ray.get_runtime_context().gcs_address
+            ray_port = str(gcs_addr.split(":")[1])
+            run_env.update({
+                "RAY_ADDRESS": f"localhost:{ray_port}",
+                "TLLM_RAY_FORCE_LOCAL_CLUSTER": "0"
+            })
             workers_proc = []
             with contextlib.ExitStack() as stack:
                 workers_log = stack.enter_context(
@@ -526,8 +486,8 @@ def run_disaggregated_test(example_dir,
                           env=run_env,
                           cwd=cwd))
 
-                if not wait_for_server("localhost",
-                                       8000,
+                if not wait_for_server(server_host,
+                                       server_port,
                                        timeout_seconds=server_start_timeout):
                     raise RuntimeError(
                         f"Disaggregated server failed to start within {server_start_timeout} seconds"
@@ -556,16 +516,16 @@ def run_disaggregated_test(example_dir,
             logger.error(f.read())
         raise
     finally:
-        if use_ray:
-            subprocess.run(['ray', 'stop', '--force'], check=False)
-            for extra_file in extra_config_files:
-                if os.path.exists(extra_file):
-                    os.remove(extra_file)
-        elif 'server_proc' in locals() and 'workers_proc' in locals():
+        if 'server_proc' in locals() and 'workers_proc' in locals():
             server_proc.terminate()
             workers_proc.terminate()
             server_proc.wait()
             workers_proc.wait()
+        if use_ray:
+            ray.shutdown()
+            for extra_file in extra_config_files:
+                if os.path.exists(extra_file):
+                    os.remove(extra_file)
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
@@ -810,16 +770,7 @@ def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
             os.symlink(src, dst, target_is_directory=True)
 
     def extra_endpoints_test(server_url: str):
-        import json
-        import urllib.request
-
-        with urllib.request.urlopen(f"{server_url}/perf_metrics",
-                                    timeout=10) as resp:
-            assert resp.status == 200
-            perf_metrics = json.load(resp)
-        assert len(perf_metrics) > 0
-        item = perf_metrics[0]
-
+        item = get_timing_metrics(server_url)
         # Use helper function to validate all timing metrics comprehensively
         validate_timing_metrics(item, "perf_metrics test")
 
@@ -1557,6 +1508,7 @@ def run_disaggregated_benchmark(example_dir,
         'trtllm-serve', 'disaggregated', '--server_start_timeout',
         str(server_start_timeout), '-c', config_file
     ]
+    server_host, server_port = get_disagg_server_url_from_cfg(config_file)
     try:
         with (  # Start workers
                 open('output_workers.log', 'w') as output_workers,
@@ -1575,9 +1527,8 @@ def run_disaggregated_benchmark(example_dir,
             # Ensure the sever has started
             client_dir = f"{example_dir}/clients"
             client_cmd = [
-                'python3', f'{client_dir}/disagg_client.py', '-c',
-                f'{example_dir}/disagg_config.yaml', '-p',
-                f'{client_dir}/prompts.json', '--ignore-eos',
+                'python3', f'{client_dir}/disagg_client.py', '-c', config_file,
+                '-p', f'{client_dir}/prompts.json', '--ignore-eos',
                 '--server-start-timeout',
                 str(server_start_timeout)
             ]
@@ -1610,9 +1561,9 @@ def run_disaggregated_benchmark(example_dir,
                 '--max-concurrency',
                 str(max_concurrency),
                 '--host',
-                'localhost',
+                server_host,
                 '--port',
-                '8000',
+                str(server_port),
                 '--ignore-eos',
                 '--no-test-input',
                 '--percentile-metrics',
@@ -1654,7 +1605,7 @@ def get_config_for_benchmark(model_root, backend):
     serve_config = {
         "model": model_root,
         "hostname": "localhost",
-        "port": 8000,
+        "port": get_free_port_in_ci(),
         "backend": "pytorch",
         "context_servers": {
             "num_instances": 1,
@@ -1668,7 +1619,7 @@ def get_config_for_benchmark(model_root, backend):
                 "backend": backend,
                 "max_tokens_in_buffer": 512,
             },
-            "urls": ["localhost:8001"]
+            "urls": [f"localhost:{get_free_port_in_ci()}"]
         },
         "generation_servers": {
             "num_instances": 1,
@@ -1681,21 +1632,48 @@ def get_config_for_benchmark(model_root, backend):
                 "backend": backend,
                 "max_tokens_in_buffer": 512,
             },
-            "urls": ["localhost:8002"]
+            "urls": [f"localhost:{get_free_port_in_ci()}"]
         }
     }
     return serve_config
 
 
-def run_disaggregated_genai_perf(config_file,
-                                 model_path,
-                                 num_ranks,
-                                 server_start_timeout=1200,
-                                 input_tokens=128000,
-                                 output_tokens=100,
-                                 env=None,
-                                 cwd=None):
-    """Run disaggregated test with genai-perf for performance/stress testing."""
+def run_disaggregated_aiperf(config_file,
+                             model_path,
+                             num_ranks,
+                             server_start_timeout=1200,
+                             input_tokens=128,
+                             output_tokens=100,
+                             concurrency=1,
+                             endpoint_type='chat',
+                             request_count=None,
+                             warmup_request_count=10,
+                             streaming=True,
+                             random_seed=100,
+                             accuracy_test=False,
+                             threshold=0.8,
+                             env=None,
+                             cwd=None):
+    """Run disaggregated test with genai-perf for performance/stress testing.
+
+    Args:
+        config_file: Path to disaggregated server config YAML
+        model_path: Path to model for tokenizer
+        num_ranks: Number of MPI ranks for workers
+        server_start_timeout: Timeout in seconds for server startup
+        input_tokens: Mean synthetic input tokens
+        output_tokens: Mean output tokens to generate
+        concurrency: Number of concurrent requests
+        endpoint_type: 'chat' or 'completions'
+        request_count: Total requests (if None, uses concurrency*1024 or num_dataset_entries)
+        warmup_request_count: Number of warmup requests
+        streaming: Whether to use streaming mode
+        random_seed: Random seed for reproducibility
+        accuracy_test: Whether to run accuracy test
+        threshold: Threshold for accuracy test
+        env: Environment variables dict
+        cwd: Working directory
+    """
     cleanup_output_files()
     run_env = env.copy()
     run_env["UCX_TLS"] = "^ib"
@@ -1712,6 +1690,7 @@ def run_disaggregated_genai_perf(config_file,
     ]
 
     artifact_dir = os.path.join(cwd or ".", "benchmark-results")
+    server_host, server_port = get_disagg_server_url_from_cfg(config_file)
 
     try:
         with (open('output_workers.log', 'w') as output_workers,
@@ -1728,33 +1707,73 @@ def run_disaggregated_genai_perf(config_file,
                     cwd=cwd) as server_proc):
 
             # Wait for server to be ready
-            if not wait_for_server(
-                    "localhost", 8000, timeout_seconds=server_start_timeout):
+            if not wait_for_server(server_host,
+                                   server_port,
+                                   timeout_seconds=server_start_timeout):
                 raise RuntimeError(
                     f"Disaggregated server did not become ready within {server_start_timeout} seconds"
                 )
 
-            # Run genai-perf
-            genai_perf_cmd = [
-                'genai-perf', 'profile', '--model', model_path, '--tokenizer',
-                model_path, '--endpoint-type', 'chat', '--endpoint',
-                '/v1/chat/completions', '--streaming', '--url',
-                'localhost:8000', '--synthetic-input-tokens-mean',
+            # Build base command (using aiperf instead of genai-perf)
+            aiperf_cmd = [
+                'aiperf', 'profile', '--model', model_path, '--tokenizer',
+                model_path, '--endpoint-type', endpoint_type
+            ]
+
+            # Add endpoint path based on type
+            if endpoint_type == 'chat':
+                aiperf_cmd.extend(['--endpoint', '/v1/chat/completions'])
+
+            # Add streaming flag if enabled
+            if streaming:
+                aiperf_cmd.append('--streaming')
+
+            # Add common parameters
+            aiperf_cmd.extend([
+                '--url', f'{server_host}:{server_port}',
+                '--synthetic-input-tokens-mean',
                 str(input_tokens), '--synthetic-input-tokens-stddev', '0',
                 '--output-tokens-mean',
                 str(output_tokens), '--output-tokens-stddev', '0',
                 '--extra-inputs', f'max_tokens:{output_tokens}',
                 '--extra-inputs', f'min_tokens:{output_tokens}',
-                '--extra-inputs', 'ignore_eos:true', '--concurrency', '1',
-                '--warmup-request-count', '8', '--num-dataset-entries', '64',
-                '--random-seed', '100', '--artifact-dir', artifact_dir, '--',
-                '-v', '-H', 'Authorization: Bearer NOT USED', '-H',
-                'Accept: text/event-stream', '-p', '200000'
-            ]
+                '--extra-inputs', 'ignore_eos:true', '--concurrency',
+                str(concurrency), '--warmup-request-count',
+                str(warmup_request_count)
+            ])
 
-            check_call(genai_perf_cmd,
+            # Use request-count or num-dataset-entries
+            if request_count is not None:
+                aiperf_cmd.extend(['--request-count', str(request_count)])
+            else:
+                # Default: use num-dataset-entries for compatibility
+                aiperf_cmd.extend(['--num-dataset-entries', '64'])
+
+            aiperf_cmd.extend([
+                '--random-seed',
+                str(random_seed), '--artifact-dir', artifact_dir
+            ])
+
+            # Run aiperf
+            check_call(aiperf_cmd,
                        env=env,
                        poll_procs=[workers_proc, server_proc])
+
+            if accuracy_test:
+                accuracy_test_result, accuracy_value = run_accuracy_test(
+                    model_path=model_path,
+                    server_url=f"http://{server_host}:{server_port}",
+                    concurrency=concurrency,
+                    max_retries=3,
+                    timeout=1200,
+                    max_gen_toks=256,
+                    max_length=4096)
+
+                # only raise error if accuracy test passed and accuracy value is less than threshold
+                if accuracy_test_result and (accuracy_value < threshold):
+                    raise AssertionError(
+                        f"Accuracy test failed: accuracy value {accuracy_value} is less than test threshold {threshold}"
+                    )
 
     except Exception:
         # Print outputs on error
@@ -1783,6 +1802,105 @@ def run_disaggregated_genai_perf(config_file,
         workers_proc.terminate()
         server_proc.wait()
         workers_proc.wait()
+
+
+def run_accuracy_test(model_path: str, server_url: str, concurrency: int,
+                      max_retries: int, timeout: int, max_gen_toks: int,
+                      max_length: int) -> tuple[bool, float]:
+    """
+    Run accuracy test using lm_eval with GSM8K dataset
+
+    Args:
+        model_path: Path of the model being tested
+        server_config: Server configuration containing URL and port
+        concurrency: Concurrency for accuracy tests
+        max_retries: Max retries for accuracy tests
+        timeout: Timeout for accuracy tests
+        max_gen_toks: Max generation tokens for accuracy tests
+        max_length: Max length for accuracy tests
+
+    Returns:
+        tuple: (Boolean indicating whether the accuracy test completed successfully, accuracy value)
+    """
+    logger.info(f"=== Running ACCURACY TEST (GSM8K) ===")
+
+    tmp_dir = tempfile.TemporaryDirectory()
+    tmp_gsm8k_local_config = os.path.join(tmp_dir.name, "gsm8k_local.yaml")
+
+    gsm8k_local_config_path = os.path.join(
+        os.path.dirname(__file__), '../../lm_eval_configs/gsm8k_local.yaml')
+
+    with open(gsm8k_local_config_path, 'r', encoding='utf-8') as f:
+        config_content = f.read()
+
+    # Replace LLM_MODELS_ROOT with actual path
+    config_content = config_content.replace('LLM_MODELS_ROOT',
+                                            llm_models_root())
+
+    # Write modified config to temp file
+    with open(tmp_gsm8k_local_config, 'w', encoding='utf-8') as f:
+        f.write(config_content)
+
+    # Create lm_eval command
+    lm_eval_cmd = [
+        "lm_eval",
+        "--model",
+        "local-completions",
+        "--tasks",
+        "gsm8k_local",
+        "--include_path",
+        tmp_dir.name,
+        "--model_args",
+        f"model={model_path},base_url={server_url}/v1/completions,"
+        f"num_concurrent={concurrency},"
+        f"max_retries={max_retries},"
+        f"tokenized_requests=False,"
+        f"timeout={timeout},"
+        f"max_gen_toks={max_gen_toks},"
+        f"max_length={max_length}",
+    ]
+
+    test_start_time = time.time()
+    accuracy_value = 0.0
+
+    try:
+        # Run lm_eval process with timeout monitoring
+        print_info(f"Running lm_eval command: {' '.join(lm_eval_cmd)}")
+
+        # Use subprocess.run to capture output directly
+        result = subprocess.run(lm_eval_cmd,
+                                capture_output=True,
+                                text=True,
+                                timeout=timeout)
+
+        print_info(f"Accuracy test result is: {result}")
+
+        # Check if process completed successfully
+        if result.returncode == 0:
+            test_end_time = time.time()
+            duration = int(test_end_time - test_start_time)
+            logger.info(
+                f"Accuracy test completed successfully in {duration} seconds")
+
+            # Parse accuracy value from output
+            output_text = result.stdout
+            accuracy_value = parse_gsm8k_output(output_text)
+            if accuracy_value is not None:
+                return True, accuracy_value
+            else:
+                return False, accuracy_value
+        else:
+            logger.warning(
+                f"lm_eval exited with non-zero code: {result.returncode}")
+            logger.warning(f"stderr: {result.stderr}")
+            return False, accuracy_value
+
+    except subprocess.TimeoutExpired:
+        logger.warning(f"Accuracy test timed out after {timeout} seconds")
+        return False, accuracy_value
+    except Exception as e:
+        logger.warning(f"Error during accuracy test: {str(e)}")
+        return False, accuracy_value
 
 
 @pytest.mark.parametrize("benchmark_model_root", [
@@ -1898,11 +2016,297 @@ def test_llama4_long_context_kv_cache_overflow(disaggregated_test_root,
                                              disaggregated_example_root,
                                              os.path.dirname(__file__))
 
-    run_disaggregated_genai_perf(config_file=config_file,
-                                 model_path=llama4_model_root,
-                                 num_ranks=num_ranks,
-                                 server_start_timeout=1200,
-                                 input_tokens=128000,
-                                 output_tokens=100,
-                                 env=llm_venv._new_env,
-                                 cwd=llm_venv.get_working_directory())
+    run_disaggregated_aiperf(config_file=config_file,
+                             model_path=llama4_model_root,
+                             num_ranks=num_ranks,
+                             server_start_timeout=1200,
+                             input_tokens=128000,
+                             output_tokens=100,
+                             env=llm_venv._new_env,
+                             cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.skip_less_device(4)
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
+                         indirect=True)
+def test_disaggregated_deepseek_v3_lite_bf16_tllm_gen_helix(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        deepseek_v3_model_root):
+    src_dst_dict = {
+        deepseek_v3_model_root:
+        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/bf16",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "deepseek_v3_lite_bf16_tllm_gen_helix",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory(),
+                           prompt_file="long_prompts.json")
+
+
+@pytest.mark.timeout(12600)
+@pytest.mark.parametrize("test_config", [
+    pytest.param(TestConfig(model_path='DeepSeek-R1/DeepSeek-R1-0528-FP4-v2',
+                            test_desc='deepseek_r1_v2_fp4_stress',
+                            request_count=35000,
+                            accuracy_threshold=0.92),
+                 marks=(pytest.mark.skip_less_device(8), skip_pre_blackwell)),
+    pytest.param(TestConfig(model_path='gpt_oss/gpt-oss-120b',
+                            test_desc='gpt_oss_120b_stress',
+                            request_count=60000,
+                            accuracy_threshold=0.42),
+                 marks=(pytest.mark.skip_less_device(4), skip_pre_blackwell)),
+],
+                         ids=lambda x: x.test_desc)
+@pytest.mark.parametrize("concurrency", [512], ids=lambda x: f"conc{x}")
+@pytest.mark.parametrize("output_tokens", [1024],
+                         ids=lambda x: f"output{x//1000}k")
+@pytest.mark.parametrize("input_tokens", [8192],
+                         ids=lambda x: f"input{x//1000}k")
+def test_disaggregated_stress_test(disaggregated_test_root,
+                                   disaggregated_example_root, llm_venv,
+                                   test_config, input_tokens, output_tokens,
+                                   concurrency):
+    # Unpack configuration from dataclass
+    model_path = test_config.model_path
+    test_desc = test_config.test_desc
+    model_dir = f"{llm_models_root()}/{model_path}"
+    src_dst_dict = {
+        model_dir: f"{llm_venv.get_working_directory()}/{model_path}",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    num_ranks, config_file = get_test_config(test_desc,
+                                             disaggregated_example_root,
+                                             os.path.dirname(__file__))
+
+    run_disaggregated_aiperf(config_file=config_file,
+                             model_path=model_dir,
+                             num_ranks=num_ranks,
+                             server_start_timeout=7200,
+                             input_tokens=input_tokens,
+                             output_tokens=output_tokens,
+                             concurrency=concurrency,
+                             endpoint_type='completions',
+                             request_count=test_config.request_count,
+                             warmup_request_count=10,
+                             streaming=False,
+                             accuracy_test=True,
+                             threshold=test_config.accuracy_threshold,
+                             env=llm_venv._new_env,
+                             cwd=llm_venv.get_working_directory())
+
+
+def run_cancel_stress_test(server_url: str,
+                           num_bursts: int = 5,
+                           requests_per_burst: int = 32,
+                           prompt_len_range: tuple = (2000, 8000),
+                           cancel_after_range: tuple = (0.01, 0.1)):
+    """
+    Stress test that sends requests with large contexts and cancels them
+    during prefill to test resource cleanup under cancellation.
+
+    Args:
+        server_url: The server URL (e.g., "http://localhost:8000")
+        num_bursts: Number of request bursts to send
+        requests_per_burst: Number of concurrent requests per burst
+        prompt_len_range: (min, max) prompt length in tokens
+        cancel_after_range: (min, max) seconds to wait before cancelling
+    """
+    import asyncio
+    import random
+    import time
+
+    import aiohttp
+
+    async def spam_and_cancel(session, req_id, url, prompt_len_range,
+                              cancel_after_range):
+        """Send a request and cancel it during prefill."""
+        prompt_len = random.randint(prompt_len_range[0], prompt_len_range[1])
+        prompt = "test " * (prompt_len // 5)
+
+        payload = {
+            "model": "test-model",
+            "prompt": prompt,
+            "max_tokens": 10,
+            "stream": True
+        }
+
+        try:
+            cancel_after = random.uniform(cancel_after_range[0],
+                                          cancel_after_range[1])
+            start = time.time()
+            async with session.post(
+                    f"{url}/v1/completions",
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                async for line in resp.content:
+                    if time.time() - start > cancel_after:
+                        # Force disconnect during prefill
+                        break
+        except Exception:
+            pass  # Connection abort is expected
+
+    async def run_bursts():
+        async with aiohttp.ClientSession() as session:
+            for burst_idx in range(num_bursts):
+                tasks = [
+                    spam_and_cancel(session, i, server_url, prompt_len_range,
+                                    cancel_after_range)
+                    for i in range(requests_per_burst)
+                ]
+                await asyncio.gather(*tasks)
+                logger.info(
+                    f"Completed burst {burst_idx + 1}/{num_bursts} ({requests_per_burst} requests)"
+                )
+                await asyncio.sleep(0.05)
+
+    asyncio.run(run_bursts())
+
+
+def run_disaggregated_cancel_test(example_dir,
+                                  test_desc,
+                                  env=None,
+                                  cwd=None,
+                                  num_bursts=64,
+                                  requests_per_burst=64):
+    """Run disaggregated test with request cancellation stress test."""
+    cleanup_output_files()
+    run_env = env.copy()
+    run_env["UCX_TLS"] = "^ib"
+
+    num_ranks, config_file = get_test_config(test_desc, example_dir,
+                                             os.path.dirname(__file__))
+
+    workers_cmd = [
+        'mpirun', '--allow-run-as-root', '--oversubscribe', '-n',
+        str(num_ranks), 'trtllm-serve', 'disaggregated_mpi_worker', '-c',
+        config_file
+    ]
+
+    server_start_timeout = 1200
+    server_cmd = [
+        'trtllm-serve', 'disaggregated', '--server_start_timeout',
+        str(server_start_timeout), '-c', config_file
+    ]
+    server_host, server_port = get_disagg_server_url_from_cfg(config_file)
+    server_url = f"http://{server_host}:{server_port}"
+
+    try:
+        with (open('output_workers.log', 'w') as output_workers,
+              popen(workers_cmd,
+                    stdout=output_workers,
+                    stderr=subprocess.STDOUT,
+                    env=run_env,
+                    cwd=cwd) as workers_proc, open('output_disagg.log', 'w') as
+              output_disagg,
+              popen(server_cmd,
+                    stdout=output_disagg,
+                    stderr=subprocess.STDOUT,
+                    env=run_env,
+                    cwd=cwd) as server_proc):
+
+            # Wait for server to be ready
+            if not wait_for_server(server_host,
+                                   server_port,
+                                   timeout_seconds=server_start_timeout):
+                raise RuntimeError(
+                    f"Disaggregated server did not become ready within {server_start_timeout} seconds"
+                )
+
+            # Run the cancel stress test
+            run_cancel_stress_test(server_url,
+                                   num_bursts=num_bursts,
+                                   requests_per_burst=requests_per_burst)
+
+            # Verify server is still healthy after stress test by sending a normal request
+            client_dir = f"{example_dir}/clients"
+            client_cmd = [
+                'python3', f'{client_dir}/disagg_client.py', '-c', config_file,
+                '-p', f'{client_dir}/prompts.json', '--ignore-eos',
+                '--server-start-timeout',
+                str(server_start_timeout)
+            ]
+            check_call(client_cmd,
+                       env=env,
+                       poll_procs=[workers_proc, server_proc])
+
+    except Exception:
+        logger.error("-------- Workers output --------")
+        with open('output_workers.log', 'r') as f:
+            logger.error(f.read())
+
+        logger.error("-------- Disagg server output --------")
+        with open('output_disagg.log', 'r') as f:
+            logger.error(f.read())
+        raise
+    finally:
+        if 'server_proc' in locals() and 'workers_proc' in locals():
+            server_proc.terminate()
+            workers_proc.terminate()
+            server_proc.wait()
+            workers_proc.wait()
+
+
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
+                         indirect=True)
+def test_disaggregated_cancel_large_context_requests(disaggregated_test_root,
+                                                     disaggregated_example_root,
+                                                     llm_venv,
+                                                     deepseek_v3_model_root):
+    """
+    Test that the disaggregated server handles request cancellations gracefully.
+
+    This test sends bursts of requests with large contexts and cancels them
+    during prefill to stress test resource cleanup.
+    """
+    src_dst_dict = {
+        deepseek_v3_model_root:
+        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/bf16",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    run_disaggregated_cancel_test(disaggregated_example_root,
+                                  "cancel_stress_test",
+                                  env=llm_venv._new_env,
+                                  cwd=llm_venv.get_working_directory(),
+                                  num_bursts=5,
+                                  requests_per_burst=32)
+
+
+@pytest.mark.skip_less_device(8)
+@skip_pre_blackwell
+@pytest.mark.parametrize("model_path", ['DeepSeek-V3-0324-FP4'])
+def test_disaggregated_cancel_large_context_requests_long(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        model_path):
+    """Test that disaggregated server handles request cancellations gracefully.
+
+    This test sends bursts of requests with large contexts and cancels them
+    during prefill to stress test resource cleanup.
+    """
+    model_dir = f"{llm_models_root()}/{model_path}"
+    src_dst_dict = {
+        model_dir: f"{llm_venv.get_working_directory()}/{model_path}",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    run_disaggregated_cancel_test(disaggregated_example_root,
+                                  "cancel_stress_test_large",
+                                  env=llm_venv._new_env,
+                                  cwd=llm_venv.get_working_directory(),
+                                  num_bursts=1000,
+                                  requests_per_burst=32)

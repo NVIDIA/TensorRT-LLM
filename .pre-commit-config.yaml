@@ -1059,7 +1059,6 @@ common-files: &common_files |
         tests/unittest/_torch/thop/parallel/test_logits_bitmask_op.py |
         tests/unittest/_torch/thop/parallel/test_mamba_conv1d_op.py |
         tests/unittest/_torch/thop/parallel/test_mamba2_chunk_ss_update.py |
-        tests/unittest/_torch/thop/parallel/test_moe.py |
         tests/unittest/_torch/thop/parallel/test_noaux_tc.py |
         tests/unittest/_torch/thop/parallel/test_scaled_mm.py |
         tests/unittest/_torch/thop/parallel/test_selective_scan_op.py |
@@ -1071,6 +1070,7 @@ common-files: &common_files |
         tests/unittest/_torch/thop/parallel/test_weight_only_quant_gemm.py |
         tests/unittest/_torch/thop/parallel/test_weight_only_quant_linear.py |
         tests/unittest/_torch/thop/serial/test_moe_alltoall.py |
+        tests/unittest/_torch/thop/serial/test_moe.py |
         tests/unittest/api_stability/api_stability_core.py |
         tests/unittest/api_stability/test_llm_api.py |
         tests/unittest/bindings/binding_test_utils.py |
@@ -1395,6 +1395,8 @@ repos:
     -   id: check-symlinks
     -   id: detect-private-key
     -   id: end-of-file-fixer
+        exclude: |
+            (?x)^(.*cubin.cpp | .*cubin.h)$
     -   id: check-yaml
         args: [--allow-multiple-documents]
         exclude: ".*/gitlab/.*.yml"
@@ -1439,7 +1441,7 @@ repos:
         additional_dependencies:
         - tomli
         # add ignore words list
-        args: ["-L", "Mor,ans,thirdparty", "--skip", "ATTRIBUTIONS-*.md,*.svg", "--skip", "security_scanning/*"]
+        args: ["-L", "Mor,ans,thirdparty,subtiles", "--skip", "ATTRIBUTIONS-*.md,*.svg", "--skip", "security_scanning/*"]
 -   repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.9.4
     hooks:

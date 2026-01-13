@@ -31,6 +31,8 @@ namespace th = torch;
 namespace tl = tensorrt_llm;
 namespace tk = tensorrt_llm::kernels;
 
+TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -57,7 +59,6 @@ void indexer_topk_decode(
     TORCH_CHECK(indices.is_contiguous(), "indices must be contiguous");
 
     TORCH_CHECK(next_n > 0, "next_n must be greater than 0");
-    TORCH_CHECK(index_topk == 2048, "index_topk must be 2048 for now");
 
     int32_t num_rows = static_cast<int32_t>(numRows64);
     int32_t num_columns = static_cast<int32_t>(numColumns64);
@@ -95,7 +96,6 @@ void indexer_topk_prefill(th::Tensor const& logits, th::Tensor const& row_starts
 
     TORCH_CHECK(indices.dim() == 2, "indices must be a 2D Tensor");
     TORCH_CHECK(logits.dim() == 2, "logits must be a 2D Tensor");
-    TORCH_CHECK(index_topk == 2048, "index_topk must be 2048 for now");
 
     auto const inputSize = logits.sizes();
     auto const numRows64 = inputSize[0];
@@ -120,7 +120,10 @@ void indexer_topk_prefill(th::Tensor const& logits, th::Tensor const& row_starts
         indices.data_ptr<int32_t>(), num_rows, num_columns, static_cast<int32_t>(logits_stride_0),
         static_cast<int32_t>(logits_stride_1), static_cast<int32_t>(index_topk), stream);
 }
+
 } // end namespace torch_ext
+
+TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
@@ -131,7 +134,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("indexer_topk_decode", &torch_ext::indexer_topk_decode);
+    m.impl("indexer_topk_decode", &tensorrt_llm::torch_ext::indexer_topk_decode);
 }
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
@@ -143,5 +146,5 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("indexer_topk_prefill", &torch_ext::indexer_topk_prefill);
+    m.impl("indexer_topk_prefill", &tensorrt_llm::torch_ext::indexer_topk_prefill);
 }

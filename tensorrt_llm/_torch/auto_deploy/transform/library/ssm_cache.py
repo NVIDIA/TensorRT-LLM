@@ -13,3 +13,8 @@ class SSMCacheTransform(InsertCachedAttention):
 @TransformRegistry.register("insert_cached_causal_conv")
 class InitializeCausalConvCache(InsertCachedAttention):
     """A transform to handle causal conv cache operations."""
+
+
+@TransformRegistry.register("insert_cached_delta_rule")
+class InsertCachedDeltaRule(InsertCachedAttention):
+    """A transform to handle delta rule cache operations."""

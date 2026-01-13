@@ -75,8 +75,16 @@ define rewrite_tag
 $(shell echo $(IMAGE_WITH_TAG) | sed "s/\/tensorrt-llm:/\/tensorrt-llm-staging:/g")
 endef
 
+base_pull:
+	@echo "Pulling base image: $(BASE_IMAGE):$(BASE_TAG)"
+	docker pull $(BASE_IMAGE):$(BASE_TAG)
+
 %_build: DEVEL_IMAGE = $(if $(findstring 1,$(JENKINS_DEVEL)),$(shell . ../jenkins/current_image_tags.properties && echo $$LLM_DOCKER_IMAGE))
-%_build:
+%_build: SH_ENV      = $(shell docker inspect --format='{{range .Config.Env}}{{println .}}{{end}}' $(BASE_IMAGE):$(BASE_TAG) \
+				  	   | grep '^ENV=' | sed 's/^[^=]*=//' 2>/dev/null)
+%_build: BASH_ENV    = $(shell docker inspect --format='{{range .Config.Env}}{{println .}}{{end}}' $(BASE_IMAGE):$(BASE_TAG) \
+    				   | grep '^BASH_ENV=' | sed 's/^[^=]*=//' 2>/dev/null)
+%_build: base_pull
 	@echo "Building docker image: $(IMAGE_WITH_TAG)"
 	docker buildx build $(DOCKER_BUILD_OPTS) $(DOCKER_BUILD_ARGS) \
 		--progress $(DOCKER_PROGRESS) \
@@ -97,6 +105,8 @@ endef
 		$(if $(GIT_COMMIT), --build-arg GIT_COMMIT="$(GIT_COMMIT)") \
 		$(if $(GITHUB_MIRROR), --build-arg GITHUB_MIRROR="$(GITHUB_MIRROR)") \
 		$(if $(PYTHON_VERSION), --build-arg PYTHON_VERSION="$(PYTHON_VERSION)") \
+		$(if $(SH_ENV), --build-arg SH_ENV="$(SH_ENV)") \
+		$(if $(BASH_ENV), --build-arg BASH_ENV="$(BASH_ENV)") \
 		$(if $(STAGE), --target $(STAGE)) \
 		--file Dockerfile.multi \
 		--tag $(IMAGE_WITH_TAG) \

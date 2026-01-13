@@ -38,8 +38,8 @@ def stop_triton_server():
 @pytest.mark.parametrize("BATCH_SCHEDULER_POLICY",
                          ["max_utilization", "guaranteed_no_evict"])
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", [""])
-@pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
-                         ids=["disableTrtOverlap"])
+@pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False", "True"],
+                         ids=["disableTrtOverlap", "enableTrtOverlap"])
 @pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["True", "False"],
                          ids=["enableDecoupleMode", "disableDecoupleMode"])

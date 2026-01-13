@@ -60,28 +60,26 @@ def test_overlap_scheduler_consistency(model_path, test_case, sampler_type):
                                      use_beam_search=True)
 
     # Test with overlap scheduler enabled
-    llm = create_llm(model_path,
-                     disable_overlap_scheduler=False,
-                     sampler_type=sampler_type)
-    outputs_with_overlap = llm.generate(prompts,
-                                        sampling_params=sampling_config,
-                                        use_tqdm=True)
-    texts_with_overlap = [[
-        completion.text for completion in request_output.outputs
-    ] for request_output in outputs_with_overlap]
-    llm.shutdown()
+    with create_llm(model_path,
+                    disable_overlap_scheduler=False,
+                    sampler_type=sampler_type) as llm:
+        outputs_with_overlap = llm.generate(prompts,
+                                            sampling_params=sampling_config,
+                                            use_tqdm=True)
+        texts_with_overlap = [[
+            completion.text for completion in request_output.outputs
+        ] for request_output in outputs_with_overlap]
 
     # Test with overlap scheduler disabled
-    llm = create_llm(model_path,
-                     disable_overlap_scheduler=True,
-                     sampler_type=sampler_type)
-    outputs_without_overlap = llm.generate(prompts,
-                                           sampling_params=sampling_config,
-                                           use_tqdm=True)
-    texts_without_overlap = [[
-        completion.text for completion in request_output.outputs
-    ] for request_output in outputs_without_overlap]
-    llm.shutdown()
+    with create_llm(model_path,
+                    disable_overlap_scheduler=True,
+                    sampler_type=sampler_type) as llm:
+        outputs_without_overlap = llm.generate(prompts,
+                                               sampling_params=sampling_config,
+                                               use_tqdm=True)
+        texts_without_overlap = [[
+            completion.text for completion in request_output.outputs
+        ] for request_output in outputs_without_overlap]
 
     # Verify outputs are consistent
     for with_overlap, without_overlap in zip(texts_with_overlap,

@@ -90,4 +90,5 @@ target_compile_definitions(${EXECUTOR_STATIC_TARGET}
                            PUBLIC TOP_LEVEL_DIR="${TOP_LEVEL_DIR}")
 
 add_subdirectory(cache_transmission/ucx_utils)
+add_subdirectory(cache_transmission/mooncake_utils)
 add_subdirectory(cache_transmission/nixl_utils)

@@ -881,8 +881,6 @@ void TrtGptModelInflightBatching::forwardSync()
             }
         }
 
-        (*mPauseRequests)(currRequests.contextRequests, mInflightReqIds, mReqIdsToPause, true, *mSeqSlotManager,
-            mKvCacheManager, mCrossKvCacheManager, mPeftCacheManager);
         (*mPauseRequests)(currRequests.generationRequests, mInflightReqIds, mReqIdsToPause, true, *mSeqSlotManager,
             mKvCacheManager, mCrossKvCacheManager, mPeftCacheManager);
 
@@ -1051,13 +1049,22 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
             {
                 NVTX3_SCOPED_RANGE(updateInflightReqIds);
                 // Add requests to in-flight set, so they can be skipped in other micro batches
-                for (auto const& requests : {currRequests.contextRequests, currRequests.generationRequests})
+                for (auto const& llmReq : currRequests.contextRequests)
                 {
-                    for (auto const& llmReq : requests)
+                    // Context requests that are chunking are not added to inflight set, so they are scheduled in the
+                    // next micro batch.
+                    if (llmReq->isLastContextChunk())
                     {
-                        TLLM_LOG_DEBUG("request with ID %lu added to DECODER model inflight set", llmReq->mRequestId);
+                        TLLM_LOG_DEBUG(
+                            "Context request with ID %lu added to DECODER model inflight set", llmReq->mRequestId);
                         mInflightReqIds.insert(llmReq->mRequestId);
                     }
+                }
+                for (auto const& llmReq : currRequests.generationRequests)
+                {
+                    TLLM_LOG_DEBUG(
+                        "Generation request with ID %lu added to DECODER model inflight set", llmReq->mRequestId);
+                    mInflightReqIds.insert(llmReq->mRequestId);
                 }
             }
 

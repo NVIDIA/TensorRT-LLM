@@ -1,4 +1,5 @@
 import copy
+import gc
 import importlib
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -220,7 +221,7 @@ def create_py_executor(
     tokenizer: Optional[TokenizerBase] = None,
     profiling_stage_data: Optional[dict] = None,
 ) -> PyExecutor:
-
+    torch.cuda.set_per_process_memory_fraction(1.0)
     garbage_collection_gen0_threshold = llm_args.garbage_collection_gen0_threshold
     lora_config = llm_args.lora_config
     kv_connector_config = llm_args.kv_connector_config
@@ -279,6 +280,17 @@ def create_py_executor(
                 f"Disable overlap scheduler for speculation mode {spec_config.spec_dec_mode.name}"
             )
             llm_args.disable_overlap_scheduler = True
+
+    if spec_config is not None and spec_config.spec_dec_mode.use_one_engine():
+        if not spec_config.allow_advanced_sampling:
+            logger.warning(
+                f"Falling back to greedy decoding for {spec_config.decoding_type}. If you "
+                "want to use non-greedy sampling, please set allow_advanced_sampling=True."
+            )
+        elif spec_config.spec_dec_mode.is_mtp_one_model():
+            logger.warning(
+                "Advanced sampling is not supported for MTP yet - this will be added soon."
+            )
 
     if mm_encoder_only:
         llm_args.mm_encoder_only = True
@@ -361,12 +373,23 @@ def create_py_executor(
             if use_chain_drafter:
 
                 def drafting_loop_wrapper(model):
-                    from tensorrt_llm._torch.speculative.drafting_loops import \
-                        ChainDrafter
+                    from tensorrt_llm._torch.speculative.drafting_loops import (
+                        LinearDraftingLoopWrapper, TreeDraftingLoopWrapper)
+                    from tensorrt_llm.llmapi import EagleDecodingConfig
 
-                    return ChainDrafter(spec_config.max_draft_len,
-                                        spec_config.max_total_draft_tokens,
-                                        model)
+                    use_tree_drafter = isinstance(
+                        draft_spec_config, EagleDecodingConfig
+                    ) and not draft_spec_config.is_linear_tree
+
+                    if use_tree_drafter:
+                        return TreeDraftingLoopWrapper(
+                            spec_config.max_draft_len,
+                            spec_config.max_total_draft_tokens, max_batch_size,
+                            model)
+                    else:
+                        return LinearDraftingLoopWrapper(
+                            spec_config.max_draft_len,
+                            spec_config.max_total_draft_tokens, model)
             else:
                 drafting_loop_wrapper = None
 
@@ -413,6 +436,11 @@ def create_py_executor(
     if spec_config is not None:
         model_engine_max_seq_len += get_num_extra_kv_tokens(spec_config)
         model_engine_max_seq_len += spec_config.max_total_draft_tokens
+
+    if has_draft_model_engine and not llm_args.disable_overlap_scheduler:
+        logger.warning(
+            "Overlap scheduler is enabled for two-model speculative decoding. Rejection sampling will fallback to greedy sampling."
+        )
 
     max_seq_len = model_engine_max_seq_len
     max_num_tokens = model_engine.max_num_tokens
@@ -516,7 +544,7 @@ def create_py_executor(
             speculative_config=spec_config,
             decoding_config=decoding_config,
             kv_cache_config=kv_cache_config,
-            disable_flash_infer_sampling=llm_args._disable_flash_infer_sampling,
+            disable_flashinfer_sampling=llm_args.disable_flashinfer_sampling,
         )
         logger.info(f"Using Sampler: {type(sampler).__name__}")
 
@@ -573,6 +601,13 @@ def create_py_executor(
     resources = {}
     estimating_kv_cache = False
     kv_cache_creator = None
+
+    # Create the execution stream for model forward operations
+    # for proper synchronization with KVCacheTransferManager's onboard/offload operations.
+    execution_stream = torch.cuda.Stream()
+    logger.info(
+        f"[create_py_executor] Created execution_stream: {execution_stream}")
+
     if model_engine.model.model_config.is_generation:
         #NOTE: non-generation models do not have kv cache
         kv_cache_creator = KvCacheCreator(
@@ -591,6 +626,7 @@ def create_py_executor(
             speculative_config=spec_config,
             profiling_stage_data=profiling_stage_data,
             sparse_attention_config=sparse_attention_config,
+            execution_stream=execution_stream,
         )
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
         with allocation_scope(
@@ -648,6 +684,7 @@ def create_py_executor(
             scheduler_config=scheduler_config,
             cache_transceiver_config=cache_transceiver_config,
             virtual_memory_pools=vm_pools if not estimating_kv_cache else None,
+            execution_stream=execution_stream,
         )
         # Originally, peft_cache_config might be mutated inside
         # create_py_executor_instance. Restore it here.
@@ -682,6 +719,9 @@ def create_py_executor(
 
         with allocation_scope(ExecutorMemoryType.EXTRA_RESOURCES,
                               RestoreMode.PINNED):
+
+            # run gc.collect() to free memory of the previous py_executor, avoid cudaFree overlap with cuda graph capture
+            gc.collect()
             py_executor = create_py_executor_instance(
                 dist=dist,
                 resources=resources,
@@ -705,6 +745,7 @@ def create_py_executor(
                 scheduler_config=scheduler_config,
                 cache_transceiver_config=cache_transceiver_config,
                 virtual_memory_pools=vm_pools,
+                execution_stream=execution_stream,
             )
 
     _adjust_torch_mem_fraction()

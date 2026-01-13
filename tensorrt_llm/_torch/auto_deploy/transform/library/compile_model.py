@@ -3,7 +3,7 @@ from typing import List, Literal, Optional, Tuple, Type
 import torch.nn as nn
 from pydantic import Field
 
-from ...compile import CompileBackendRegistry
+from ...compile import ArgsKwargs, CompileBackendRegistry
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ..interface import (
@@ -46,18 +46,18 @@ class CompileModel(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[nn.Module, TransformInfo]:
-        cm.info.set_generate_only_batch()
-
-        compiler_cls = CompileBackendRegistry.get(self.config.backend)
-        mod_compiled = compiler_cls(
-            mod,
-            args=(),
-            kwargs=cm.named_args,
-            max_batch_size=cm.info.max_batch_size,
-            **self.config.model_dump(),
-        ).compile()
-
         cm.info.reset()
+
+        def _get_args_kwargs(bs: int) -> ArgsKwargs:
+            cm.info.set_generate_only_batch(bs)
+            return (), cm.named_args
+
+        compiler_backend = CompileBackendRegistry.get(self.config.backend)(
+            mod,
+            get_args_kwargs_for_compile=_get_args_kwargs,
+            **self.config.model_dump(),
+        )
+        mod_compiled = compiler_backend.compile()
 
         # store info object about the transform
         info = TransformInfo(skipped=False, num_matches=1, is_clean=True, has_valid_shapes=True)

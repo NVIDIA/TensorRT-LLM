@@ -1,6 +1,5 @@
 import pytest
 import torch
-import torch.export as te
 from _model_test_utils import get_small_model_config
 from torch.export import Dim
 
@@ -16,17 +15,18 @@ EXAMPLE_INPUT2 = "Tiger is a cat with the following properties:"
 @pytest.mark.parametrize(
     "model_dir,run_verify_generation",
     [
-        pytest.param("ibm-ai-platform/Bamba-9B-v2", True),
-        pytest.param("nvidia/NVIDIA-Nemotron-Nano-12B-v2", False),
+        ("ibm-ai-platform/Bamba-9B-v2", True),
     ],
 )
-def test_bamba_patches(model_dir: str, run_verify_generation: bool):
-    # NOTE: set to False if you want to locally test the full model
+def test_bamba_patches(
+    model_dir: str,
+    run_verify_generation: bool,
+):
+    # NOTE: set to False if you want to locally test the full model.
     use_small_config: bool = True
 
     model_on_meta_during_export = True
     use_cache: bool = True
-    export_func: str = "torch_export_to_gm"
 
     common_kwargs = {
         "world_size": 0,
@@ -62,8 +62,9 @@ def test_bamba_patches(model_dir: str, run_verify_generation: bool):
     tokenizer = factory.init_tokenizer()
 
     # 1. Export wants min batch size of 2 (to avoid specialization during export).
-    # 2. Can't get `padding` / `truncation` to work without other steps so just use the same prompt
-    #    twice in order for the tokenizer not to complain when creating the tensor.
+    # 2. Can't get `padding` / `truncation` to work without other steps so just use the prompts
+    #    with the same tokenized length in order for the tokenizer not to complain when creating
+    #    the tensor.
     message = [EXAMPLE_INPUT] * 2
     inputs = tokenizer(message, return_tensors="pt", return_token_type_ids=False).to("cuda")
 
@@ -71,12 +72,11 @@ def test_bamba_patches(model_dir: str, run_verify_generation: bool):
     position_ids = torch.arange(input_ids.shape[1], device=input_ids.device).repeat(
         input_ids.shape[0], 1
     )
+    batch_size_dynamic = Dim.DYNAMIC
+    seq_len_dynamic = Dim.DYNAMIC
     dynamic_shapes = (
-        {0: Dim("batch_size", min=0, max=8), 1: Dim("seq_len", min=0, max=512)},
-        {
-            0: Dim("batch_size", min=0, max=8),
-            1: Dim("seq_len", min=0, max=512),
-        },
+        {0: batch_size_dynamic, 1: seq_len_dynamic},
+        {0: batch_size_dynamic, 1: seq_len_dynamic},
     )
 
     def _run_torch_export_to_gm():
@@ -91,38 +91,20 @@ def test_bamba_patches(model_dir: str, run_verify_generation: bool):
             ],
         )
 
-    def _run_torch_export():
-        with apply_export_patches(patch_list=["bamba", "autocast_noop"]):
-            with torch.inference_mode():
-                ep = te.export(
-                    model,
-                    args=(),
-                    kwargs={"input_ids": input_ids, "position_ids": position_ids},
-                    dynamic_shapes=dynamic_shapes,
-                    strict=False,
-                )
-            egm = ep.module()
-        return egm
-
-    def _run_export():
-        if export_func == "torch_export_to_gm":
-            return _run_torch_export_to_gm()
-        else:
-            return _run_torch_export()
-
     if model_on_meta_during_export:
-        gm = _run_export()
+        gm = _run_torch_export_to_gm()
         factory.load_or_random_init(gm, device="cuda")
         move_to_device(gm, "cuda")
         factory._to_maybe_random(model, "cuda")
         model.load_state_dict(gm.state_dict())
+        gm.load_state_dict(model.state_dict())
     else:
         factory.load_or_random_init(model, device="cuda")
-        gm = _run_export()
+        gm = _run_torch_export_to_gm()
         move_to_device(gm, "cuda")
 
     if run_verify_generation:
-        _verify_generation(factory, model, tokenizer)
+        _verify_generation(model, tokenizer)
 
     # let's do a comparison of every state dict item between the model and the gm
     torch.testing.assert_close(model.state_dict(), gm.state_dict(), rtol=0.0, atol=0.0)
@@ -149,7 +131,7 @@ def test_bamba_patches(model_dir: str, run_verify_generation: bool):
         )
 
 
-def _verify_generation(factory, model, tokenizer):
+def _verify_generation(model, tokenizer):
     print("====== WITHOUT PATCH ======")
     _generate(tokenizer, model)
     with apply_export_patches(patch_list=["bamba"]):
@@ -167,10 +149,8 @@ def _generate(tokenizer, model):
             msg, return_tensors="pt", return_token_type_ids=False
         ).input_ids.shape[1]
         print(f"{msg=}, {num_tokens=}")
-    inputs = tokenizer(messages, return_tensors="pt", return_token_type_ids=False).to(model.device)
-    response = model.generate(**inputs, max_new_tokens=64)
+    input_ids = tokenizer(messages, return_tensors="pt", return_token_type_ids=False).input_ids.to(
+        model.device
+    )
+    response = model.generate(input_ids, max_new_tokens=64)
     print("\n".join(tokenizer.batch_decode(response, skip_special_tokens=True)))
-
-
-if __name__ == "__main__":
-    test_bamba_patches()

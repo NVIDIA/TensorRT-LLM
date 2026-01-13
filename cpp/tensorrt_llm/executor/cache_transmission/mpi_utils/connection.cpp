@@ -77,4 +77,13 @@ CommState const& MpiConnectionManager::getCommState() const
     return mCommState;
 }
 
+bool MpiConnectionManager::isRunning() const
+{
+    return mIsRunning;
+}
+
+MpiConnectionManager::~MpiConnectionManager()
+{
+    mIsRunning = false;
+}
 } // namespace tensorrt_llm::executor::kv_cache

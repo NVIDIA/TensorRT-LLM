@@ -18,6 +18,7 @@
 #include "cubinObj.h"
 #include "nvrtcWrapper/include/nvrtcWrapper.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/common/tllmException.h"
 #include "tensorrt_llm/common/utils.h"
@@ -44,8 +45,8 @@ void CHECK_TLLM_XQA_JIT_ERROR_(tllmXqaJitStatus result, char const* const func, 
 
 } // anonymous namespace
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace jit
@@ -104,7 +105,8 @@ CubinObj CompileEngine::compile() const
         // scratch in this case.
         /*use_input_kv=*/applyRoPEInXqaKernel,
         /*rope_style=*/ropeStyle,
-        /*is_spec_dec_tree=*/mXqaParams.is_spec_dec_tree};
+        /*is_spec_dec_tree=*/mXqaParams.is_spec_dec_tree,
+        /*use_skip_softmax_attn=*/mXqaParams.skip_softmax_threshold_scale_factor != 0};
     if (context.kernel_type == TLLM_XQA_JIT_MLA)
     {
         auto const& c = context;
@@ -133,4 +135,5 @@ CompileEngine::CompileEngine(int SM, XQAParams const& xqaParams)
 
 } // namespace jit
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

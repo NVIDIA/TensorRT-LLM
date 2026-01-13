@@ -28,7 +28,7 @@ class RunnerBase(ABC):
         pass
 
     @abstractmethod
-    def replace_routing_method(self, balance_method: BalanceMethod, balance_ratio: float):
+    def replace_routing_method_ctx(self, balance_method: BalanceMethod, balance_ratio: float):
         pass
 
     @staticmethod

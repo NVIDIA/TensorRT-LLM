@@ -17,11 +17,14 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/types.h"
 #include <cstdint>
 #include <curand_kernel.h>
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
 
 class FinishedState
@@ -308,4 +311,6 @@ template <typename T>
 void invokeScatterDecodingParams(
     T const* src, T scalar, T* dst, int const* batchSlots, int batchSize, cudaStream_t stream);
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END
