@@ -1656,7 +1656,6 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
                 searchRoot->incRefCount();
                 pinnedBlockIds.push_back(searchRoot->getBlockId());
             }
-            lastStoredId = searchRoot->getBlockId();
         }
         catch (std::out_of_range const& ex)
         {
