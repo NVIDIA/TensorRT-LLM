@@ -39,7 +39,7 @@ from transformers import AutoConfig
 # Import Eagle model from AutoDeploy's custom models
 # This import triggers the registration of EagleConfig and EagleModelForCausalLM
 from tensorrt_llm._torch.auto_deploy.models.custom import EagleModelForCausalLM
-from tensorrt_llm._torch.auto_deploy.models.custom.modeling_eagle import EagleConfig
+from tensorrt_llm._torch.auto_deploy.models.custom.modeling_eagle import EagleConfig, EagleModel
 from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
 from tensorrt_llm.llmapi import KvCacheConfig
 
@@ -231,3 +231,189 @@ def test_eagle_autodeploy_full_pipeline():
                 print(f"   - Output: {output[:50]}..." if output else "   - Output: (empty)")
 
     print("✅ Full AutoDeploy pipeline test passed!")
+
+
+def test_eagle_model_with_weights():
+    """Test EagleModel forward pass with loaded weights.
+
+    This test mirrors the main() function from run_eagle_model.py to validate
+    that modeling_eagle.py is correct. It:
+    1. Loads the Eagle config from checkpoint (using AutoConfig, not EagleConfig)
+    2. Loads weights from pytorch_model.bin
+    3. Runs forward pass with mock hidden states
+    4. Verifies output shape matches expected draft vocabulary size
+    """
+    print("\n" + "=" * 80)
+    print("Test: EagleModel forward pass with loaded weights")
+    print("=" * 80)
+
+    eagle_model_path, _ = get_model_paths()
+    eagle_path = Path(eagle_model_path)
+
+    if not eagle_path.exists():
+        pytest.skip(f"Eagle model not found at {eagle_model_path}")
+
+    # 1. Setup Device & Dtype
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float16
+
+    # 2. Load Config (use AutoConfig like run_eagle_model.py, not EagleConfig)
+    config_path = eagle_path / "config.json"
+    print(f"Loading config from: {config_path}")
+    config = AutoConfig.from_pretrained(config_path, attn_implementation="eager")
+
+    # Patch num_hidden_layers to 1 (Eagle has single transformer layer)
+    if config.num_hidden_layers > 1:
+        print(f"ℹ️  Patching config: num_hidden_layers {config.num_hidden_layers} -> 1")
+        config.num_hidden_layers = 1
+
+    print(f"Config: hidden_size={config.hidden_size}, vocab_size={config.vocab_size}")
+
+    # 3. Load Weights
+    bin_path = eagle_path / "pytorch_model.bin"
+    if not bin_path.exists():
+        pytest.skip(f"Weights not found at {bin_path}")
+
+    print(f"Loading weights from: {bin_path}")
+    state_dict = torch.load(bin_path, map_location="cpu", weights_only=True)
+
+    # 4. Create Model and Load Weights
+    model = EagleModel(config)
+
+    # Load weights (similar to EagleModel.load_weights in run_eagle_model.py)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+
+    for missing_key in missing:
+        if missing_key == "embed_tokens.weight":
+            print(
+                "Embed tokens weight is missing. This is expected - "
+                "it should be loaded from the target model."
+            )
+        else:
+            print(f"⚠️ Unexpected key missing in loaded weights: {missing_key}")
+
+    for unexpected_key in unexpected:
+        print(f"⚠️ Unexpected key: {unexpected_key}")
+
+    model.to(device, dtype=dtype)
+    model.eval()
+
+    # 5. Create Mock Inputs
+    batch_size = 1
+    seq_len = 8
+    hidden_dim = config.hidden_size
+
+    # Mock hidden states (3 layers concatenated from target model)
+    mock_hidden_states = torch.randn(
+        (batch_size, seq_len, hidden_dim * 3), device=device, dtype=dtype
+    )
+
+    # Mock input IDs (using original vocab size before draft vocab patching)
+    original_vocab_size = model._original_vocab_size
+    input_ids = torch.randint(
+        0, original_vocab_size, (batch_size, seq_len), device=device, dtype=torch.long
+    )
+
+    # Position IDs
+    position_ids = torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0)
+
+    print("Input shapes:")
+    print(f"  input_ids: {input_ids.shape}")
+    print(f"  position_ids: {position_ids.shape}")
+    print(f"  hidden_states: {mock_hidden_states.shape}")
+
+    # 6. Run Forward Pass
+    with torch.inference_mode():
+        output_logits = model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            hidden_states=mock_hidden_states,
+        )
+
+    print(f"Output shape: {output_logits.shape}")
+
+    # 7. Verify Output Shape
+    draft_vocab = config.draft_vocab_size or config.vocab_size
+    expected_shape = (batch_size, seq_len, draft_vocab)
+    assert output_logits.shape == expected_shape, (
+        f"Expected shape {expected_shape}, got {output_logits.shape}"
+    )
+
+    print("✅ Forward pass with weights successful!")
+
+
+def test_eagle_model_torch_export():
+    """Test that EagleModel can be exported with torch.export.
+
+    This validates that the model architecture is compatible with
+    torch.export for potential TensorRT compilation.
+    """
+    print("\n" + "=" * 80)
+    print("Test: EagleModel torch.export")
+    print("=" * 80)
+
+    eagle_model_path, _ = get_model_paths()
+    eagle_path = Path(eagle_model_path)
+
+    if not eagle_path.exists():
+        pytest.skip(f"Eagle model not found at {eagle_model_path}")
+
+    # Setup
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float16
+
+    # Load config (use AutoConfig like run_eagle_model.py, not EagleConfig)
+    config_path = eagle_path / "config.json"
+    config = AutoConfig.from_pretrained(config_path, attn_implementation="eager")
+
+    # Patch num_hidden_layers to 1 (Eagle has single transformer layer)
+    if config.num_hidden_layers > 1:
+        config.num_hidden_layers = 1
+
+    model = EagleModel(config)
+
+    # Load weights if available
+    bin_path = eagle_path / "pytorch_model.bin"
+    if bin_path.exists():
+        state_dict = torch.load(bin_path, map_location="cpu", weights_only=True)
+        model.load_state_dict(state_dict, strict=False)
+
+    model.to(device, dtype=dtype)
+    model.eval()
+
+    # Create inputs for export
+    batch_size = 1
+    seq_len = 8
+    hidden_dim = config.hidden_size
+
+    input_ids = torch.randint(
+        0, model._original_vocab_size, (batch_size, seq_len), device=device, dtype=torch.long
+    )
+    position_ids = torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0)
+    mock_hidden_states = torch.randn(
+        (batch_size, seq_len, hidden_dim * 3), device=device, dtype=dtype
+    )
+    mock_attention_mask = torch.ones((batch_size, 1, seq_len, seq_len), device=device, dtype=dtype)
+
+    print("Export input shapes:")
+    print(f"  input_ids: {input_ids.shape}")
+    print(f"  position_ids: {position_ids.shape}")
+    print(f"  hidden_states: {mock_hidden_states.shape}")
+    print(f"  attention_mask: {mock_attention_mask.shape}")
+
+    example_args = (
+        input_ids,
+        position_ids,
+        mock_hidden_states,
+        mock_attention_mask,
+    )
+
+    # Attempt torch.export
+    try:
+        exported_program = torch.export.export(model, args=example_args)
+        print("✅ torch.export successful!")
+        print("Graph module code preview (first 20 lines):")
+        code_lines = exported_program.graph_module.code.split("\n")[:20]
+        print("\n".join(code_lines))
+    except Exception as e:
+        pytest.fail(f"torch.export failed: {e}")
