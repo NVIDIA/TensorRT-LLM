@@ -554,7 +554,7 @@ protected:
 
             // Rank formula must match targetIRanks: ppRank * (tpNum * cpNum) + tpRank * cpNum + cpRank.
             mCpRank = mRankInInstance % mCpSize;
-            mTpRank = (mRankInInstance % (mTpSize * mCpSize)) / mCpSize;
+            mTpRank = (mRankInInstance / mCpSize) % mTpSize;
             mPpRank = mRankInInstance / (mTpSize * mCpSize);
             mContextRankSize = contextRanks;
             mGenRankSize = genRanks;
