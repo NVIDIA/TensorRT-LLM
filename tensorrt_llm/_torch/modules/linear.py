@@ -518,7 +518,11 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
     def pre_reload_weights(self, module: Linear):
         for param_name, metadata in module.rebuild_tensor_metadata.items():
-            param = Parameter(torch.empty_like(metadata), requires_grad=False)
+            logger.warning(
+                f"Pre-reloading weight '{param_name}' requires tensor re-creation, which will invalidate existing CUDA graphs."
+            )
+            param = Parameter(torch.empty_like(metadata, device="cuda"),
+                              requires_grad=False)
             module.register_parameter(param_name, param)
 
 
