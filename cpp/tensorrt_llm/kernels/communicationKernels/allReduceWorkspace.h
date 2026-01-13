@@ -41,9 +41,10 @@ private:
     void* m_workspace;
     std::shared_ptr<tensorrt_llm::runtime::CudaStream> m_cuda_stream;
     void* m_flag_d_ptr;
+    void* m_layout_d_ptr;
 };
 
-void lamport_initialize(void* ptr, int bytes, cudaStream_t stream);
+void lamport_initialize(void* ptr, size_t bytes, cudaStream_t stream);
 } // namespace kernels::ar_fusion
 
 TRTLLM_NAMESPACE_END
