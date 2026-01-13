@@ -2969,7 +2969,7 @@ class TorchLlmArgs(BaseLlmArgs):
         default=None,
         description=
         "Placement config for RayGPUWorker. Only used with AsyncLLM and orchestrator_type='ray'.",
-        exclude=False,
+        exclude=True,
         status="prototype")
 
     enable_sleep: bool = Field(
