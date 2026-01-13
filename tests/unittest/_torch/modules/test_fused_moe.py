@@ -1468,6 +1468,11 @@ def run_fused_moe_nvfp4(dtype,
             pytest.skip(
                 "CUTEDSL NVFP4 MoE backend supports SM 100 (B200) and SM 103 (B300) only"
             )
+    if moe_backend == "DENSEGEMM":
+        if finalize_fusion:
+            pytest.skip(
+                "DENSEGEMM NVFP4 MoE backend does not use finalize_fusion parameter"
+            )
 
     test_all_kernels = True
     if get_sm_version() == 120:
@@ -3075,4 +3080,8 @@ if __name__ == "__main__":
     os.environ["ENABLE_CONFIGURABLE_MOE"] = "0"
 
     mocker = MagicMock()
-    test_fused_moe_nvfp4(torch.bfloat16, "DENSEGEMM", 0, mocker=mocker)
+    test_fused_moe_nvfp4(torch.bfloat16,
+                         "DENSEGEMM",
+                         finalize_fusion=False,
+                         enable_configurable_moe=0,
+                         mocker=mocker)
