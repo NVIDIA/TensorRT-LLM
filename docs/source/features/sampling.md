@@ -65,7 +65,7 @@ whenever possible. This optimization does not compute the complete set of token 
 required for speculative decoding (rejection sampling).
 In case of unexpected problems, the use of FlashInfer in Torch Sampler can
 be disabled via the `disable_flashinfer_sampling` config option (note that this option is likely
-to be removed in a future TensorRT-LLM release).
+to be removed in a future TensorRT LLM release).
 
 Moreover, Torch Sampler internally batches requests with compatible sampling parameters. This
 can greatly reduce the overall latency of the sampling step when request batches are comprised
