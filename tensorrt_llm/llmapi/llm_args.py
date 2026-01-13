@@ -1229,37 +1229,12 @@ class RayPlacementConfig(StrictBaseModel):
                     f"placement_groups length ({len(self.placement_groups)}) must equal "
                     f"placement_bundle_indices length ({len(self.placement_bundle_indices)})"
                 )
-            # Convert lists to PlacementGroups
-            if placement_group is not None:
-                converted_pgs = []
+            if PlacementGroup is not None:
                 for i, pg in enumerate(self.placement_groups):
-                    if isinstance(pg, list):
-                        # List of GPU indices - create PlacementGroup with 1 GPU, 1 CPU per bundle
-                        # If need custom CPU/GPU per bundle can change in PlacementGroup object in Python rather than the bundles list here.
-                        try:
-                            import ray
-                            num_bundles = len(pg)
-                            bundles = [{
-                                "GPU": 1,
-                                "CPU": 1
-                            } for _ in range(num_bundles)]
-                            new_pg = placement_group(bundles,
-                                                     strategy="STRICT_PACK")
-                            ray.get(new_pg.ready())
-                            converted_pgs.append(new_pg)
-                        except Exception as e:
-                            raise RuntimeError(
-                                f"Failed to create PlacementGroup from list {pg}: {e}. "
-                                "Ensure Ray is initialized before creating RayPlacementConfig with list-based placement_groups."
-                            )
-                    elif PlacementGroup is not None and isinstance(
-                            pg, PlacementGroup):
-                        converted_pgs.append(pg)
-                    else:
+                    if not isinstance(pg, PlacementGroup):
                         raise TypeError(
-                            f"placement_groups[{i}] must be a Ray PlacementGroup or list, "
+                            f"placement_groups[{i}] must be a Ray PlacementGroup, "
                             f"got {type(pg).__name__}")
-                self.placement_groups = converted_pgs
 
         if self.per_worker_gpu_share is not None:
             if not (0 < self.per_worker_gpu_share <= 1.0):

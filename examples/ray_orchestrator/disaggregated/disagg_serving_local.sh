@@ -64,6 +64,7 @@ cache_transceiver_config:
     backend: "UCX"
     max_tokens_in_buffer: 2048
 disable_overlap_scheduler: true
+# Ray executor configuration
 orchestrator_type: "ray"
 max_batch_size: 1
 max_num_tokens: 512
