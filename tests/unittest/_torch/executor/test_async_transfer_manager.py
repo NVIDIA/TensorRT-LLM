@@ -65,7 +65,7 @@ def test_start_transfer_single_request():
     manager.start_transfer(request)
 
     # Check request is tracked
-    assert 42 in manager._requests
+    assert 42 in manager._requests_in_transfer
 
     transfer_metadata = manager._request_transfer_metadata[42]
 
@@ -126,7 +126,7 @@ def test_transfer_without_storing_blocks():
     manager.start_transfer(request)
 
     # Check request is tracked
-    assert 42 in manager._requests
+    assert 42 in manager._requests_in_transfer
     transfer_metadata = manager._request_transfer_metadata[42]
     assert transfer_metadata.block_id is None  # No block stored
     assert transfer_metadata.counter == 1
