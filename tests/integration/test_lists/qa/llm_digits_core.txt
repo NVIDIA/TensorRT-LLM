@@ -23,7 +23,7 @@ test_e2e.py::test_ptp_quickstart_advanced[Phi4-Reasoning-Plus-nvfp4-nvidia-Phi-4
 test_e2e.py::test_ptp_quickstart_advanced[Phi-4-reasoning-plus-bf16-Phi-4-reasoning-plus]
 test_e2e.py::test_ptp_quickstart_advanced[Qwen3-32B-bf16-Qwen3/Qwen3-32B]
 test_e2e.py::test_ptp_quickstart_advanced[Qwen3-32b-nvfp4-Qwen3/nvidia-Qwen3-32B-NVFP4]
-test_e2e.py::test_ptp_quickstart_advanced[Nemotron-Nano-v2-nvfp4-NVIDIA-Nemotron-Nano-9B-v2-NVFP4]
+test_e2e.py::test_ptp_quickstart_advanced[Nemotron-Nano-9B-v2-nvfp4-NVIDIA-Nemotron-Nano-9B-v2-NVFP4]
 test_e2e.py::test_ptp_quickstart_advanced[Nemotron-Super-49B-v1.5-FP8-nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1_5-FP8]
 test_e2e.py::test_ptp_quickstart_advanced[Qwen3-30B-A3B-Qwen3/Qwen3-30B-A3B]
 test_e2e.py::test_ptp_quickstart_advanced[Qwen3-30B-A3B_nvfp4_hf-Qwen3/saved_models_Qwen3-30B-A3B_nvfp4_hf]

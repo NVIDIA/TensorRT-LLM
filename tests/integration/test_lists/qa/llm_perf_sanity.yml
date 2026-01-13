@@ -38,7 +38,7 @@ llm_perf_sanity:
   # Ministral-8B
   - perf/test_perf.py::test_perf[ministral_8b-bench-pytorch-bfloat16-input_output_len:500,2000-reqs:500-con:250]
   - perf/test_perf.py::test_perf[phi_4_mini_instruct-bench-pytorch-bfloat16-input_output_len:500,2000]
-  - perf/test_perf.py::test_perf[nemotron_nano_9b_v2-bench-pytorch-bfloat16-input_output_len:512,512]
+  - perf/test_perf.py::test_perf[nemotron_nano_12b_v2-bench-pytorch-bfloat16-input_output_len:512,512]
   - perf/test_perf.py::test_perf[qwen3_4b_eagle3-bench-pytorch-streaming-bfloat16-maxbs:4-kv_frac:0.6-input_output_len:500,100-reqs:200-con:4]
   - perf/test_perf.py::test_perf[llama_v3.1_8b-bench-pytorch-bfloat16-maxbs:256-input_output_len:128,128-gpus:2]
   - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct-bench-pytorch-streaming-bfloat16-input_output_len:128,128-gpus:2]
