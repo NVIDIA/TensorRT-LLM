@@ -204,10 +204,10 @@ class Glm4Attention(QKNormRoPEAttention):
 
 class Glm4AirAttention(Attention):
     def __init__(
-            self,
-            model_config: ModelConfig[PretrainedConfig],
-            layer_idx: int | None = None,
-        ):
+        self,
+        model_config: ModelConfig[PretrainedConfig],
+        layer_idx: Optional[int] = None,
+    ):
         config = model_config.pretrained_config
         pos_embd_params = PositionalEmbeddingParams(
             type=PositionEmbeddingType.yarn,
@@ -463,7 +463,7 @@ class Glm4DecoderLayer(DecoderLayer):
             # KVCacheManager only support 1 layer for separate draft engine
             layer_idx_for_attention = layer_idx - model_config.pretrained_config.num_hidden_layers
 
-        if config.use_qk_norm:
+        if getattr(config, "use_qk_norm", False) and config.use_qk_norm:
             self.self_attn = Glm4Attention(model_config, layer_idx=layer_idx_for_attention)
         else:
             self.self_attn = Glm4AirAttention(model_config, layer_idx=layer_idx_for_attention)
