@@ -369,6 +369,12 @@ jobs:
           ref: ${{ fromJson(needs.Authorization.outputs.args).ref }}
           lfs: 'true'
 
+      - name: Run SonarQube Code Analysis
+        uses: SonarSource/sonarqube-scan-action@v4
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
       - name: Run blossom action
         uses: NVIDIA/blossom-action@main
         env:
