@@ -5367,7 +5367,9 @@ class TestMiniMaxM2(LlmapiAccuracyTestHarness):
 
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
-            cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            moe_config=MoeConfig(
+                backend="DEEPGEMM" if get_sm_version() >= 100 else "CUTLASS"))
 
         with LLM(self.MODEL_PATH,
                  tensor_parallel_size=tp_size,
