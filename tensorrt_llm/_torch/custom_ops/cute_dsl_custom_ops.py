@@ -2360,7 +2360,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     b_sf_ptr,
                     c_ptr,
                     max_active_clusters=max_active_clusters,
-                    is_batch_gemm=False,
                     stream=stream,
                 )
                 self.__class__.kernel_cache[cache_key] = compiled_gemm
@@ -2431,7 +2430,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             dynamic_tensor_specs=(DynamicTensorSpec(
                 0, 1, get_last_power_of_2_num_tokens_buckets,
                 last_positive_power_of_2), ),
-            constraint_specs=(ConstraintSpec(2, 0, fp8_scale_infer_shape), ),
+            constraint_specs=(ConstraintSpec(2, 1, fp8_scale_infer_shape), ),
         )
 
         def __init__(self):
@@ -2509,7 +2508,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 inputs (List[torch.Tensor]):
                     inputs[0]: Input tensor of shape (batch_size, m, k), dtype: fp8.
                     inputs[1]: Weight tensor of shape (batch_size, n, k), dtype: fp8.
-                    inputs[2]: Input scale tensor of shape (batch_size, pad_up(m, 4), k // 128), dtype: fp32.
+                    inputs[2]: Input scale tensor of shape (batch_size, k // 128, pad_up(m, 4)), dtype: fp32.
                     inputs[3]: Weight scale tensor of shape (batch_size, n // 128, k // 128), dtype: fp32.
                 tactic: Tiling and cluster strategy, typically a tuple (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn).
 
@@ -2602,7 +2601,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     b_sf_ptr,
                     c_ptr,
                     max_active_clusters=max_active_clusters,
-                    is_batch_gemm=True,
                     stream=stream,
                 )
                 self.__class__.kernel_cache[cache_key] = compiled_gemm
