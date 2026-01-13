@@ -482,12 +482,12 @@ void KVCacheBlock::freeDescendantsRecursively()
     bool hasChildren = !mNextBlocks.empty();
     if (hasChildren)
     {
-	for (auto it = mNextBlocks.begin(); it != mNextBlocks.end();)
-	{
-	    it->second->freeDescendantsRecursively();
-	    TLLM_LOG_DEBUG("KVCacheBlock::freeDescendantsRecursively - Freeing block %d",it->second->getBlockId());
-	    it = mNextBlocks.erase(it);
-	}
+        for (auto it = mNextBlocks.begin(); it != mNextBlocks.end();)
+        {
+            it->second->freeDescendantsRecursively();
+            TLLM_LOG_DEBUG("KVCacheBlock::freeDescendantsRecursively - Freeing block %d", it->second->getBlockId());
+            it = mNextBlocks.erase(it);
+        }
     }
     mPrevBlock = nullptr;
 }
