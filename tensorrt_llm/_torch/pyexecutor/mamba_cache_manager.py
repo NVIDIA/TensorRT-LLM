@@ -45,7 +45,7 @@ class MambaCacheManager(BaseResourceManager):
         self.mamba_ssm_cache_dtype = ssm_cache_dtype
 
         # get tp size
-        tp_size = mapping.tp_size
+        tp_size = mapping.tp_size if not mapping.enable_attention_dp else 1
 
         # derive mamba parameters for conv and ssm states
         d_inner = head_dim * num_heads
