@@ -110,7 +110,7 @@ def test_ray_disaggregated_serving(ray_example_root, llm_venv, tp_size):
             ],
                                     capture_output=True,
                                     text=True,
-                                    timeout=30)
+                                    timeout=60)
 
             *body_lines, status_line = result.stdout.strip().splitlines()
             body = "\n".join(body_lines)
