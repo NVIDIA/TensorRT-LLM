@@ -20,10 +20,9 @@ from strenum import StrEnum
 from transformers import PreTrainedTokenizerBase
 
 try:
-    from ray.util.placement_group import PlacementGroup, placement_group
+    from ray.util.placement_group import PlacementGroup
 except ImportError:
     PlacementGroup = None
-    placement_group = None
 
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
