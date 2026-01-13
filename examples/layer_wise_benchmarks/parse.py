@@ -6,7 +6,6 @@ import re
 import sqlite3
 import subprocess
 import sys
-from collections import defaultdict
 from pathlib import Path
 
 import jinja2
@@ -139,7 +138,7 @@ for start, text in df.itertuples(index=False):
                 "runs": [],
                 "runs_end": [],
                 "ranges": [],
-                "range_in_module": [],
+                "kernel_count_per_range": [],
             }
         )
 
@@ -161,28 +160,7 @@ for start, end, text in df.itertuples(index=False):
         problem_set[problem_id]["runs_end"].append(end)
     else:
         problem_set[problem_id]["ranges"].append((start, end, text))
-
-# Determine whether each range is the first range that matches `args.module`,
-# and store the result in `problem["range_in_module"]`
-for problem in problem_set:
-    if args.module is not None:
-        problem["range_in_module"] = [False] * len(problem["ranges"])
-        run_ids = [bisect.bisect(problem["runs"], start) - 1 for start, _, _ in problem["ranges"]]
-        run2ranges = defaultdict(list)
-        for i, run_id in enumerate(run_ids):
-            run2ranges[run_id].append(i)
-        for run_id, ranges in run2ranges.items():
-            ranges = sorted(ranges, key=lambda i: problem["ranges"][i][0])
-            num_matches = 0
-            for range_id in ranges:
-                if problem["ranges"][range_id][2] == args.module:
-                    problem["range_in_module"][range_id] = True
-                    num_matches += 1
-            if num_matches != 1:
-                raise ValueError(
-                    f'Module "{args.module}" appears {num_matches} times'
-                    f' in "{problem["text"]}"\'s {run_id + 1}-th run'
-                )
+        problem_set[problem_id]["kernel_count_per_range"].append(0)
 
 query = """SELECT name FROM sqlite_master WHERE type = ?"""
 df = pd.read_sql_query(query, conn, params=("table",))
@@ -228,19 +206,17 @@ for (
     problem_id = bisect.bisect(problem_start, start) - 1
     problem = problem_set[problem_id]
     run_id = bisect.bisect(problem["runs"], runtime_start) - 1
-    if (
-        run_id == -1
-        or run_id == len(problem["runs"])
-        or runtime_start >= problem["runs_end"][run_id]
-    ):
-        run_id = -1
+    if run_id == -1 or runtime_start >= problem["runs_end"][run_id]:
+        continue
     ranges = [
         i
         for i, (range_start, range_end, text) in enumerate(problem["ranges"])
         if capture_start >= range_start and capture_end <= range_end
     ]
-    if args.module is None or any(problem["range_in_module"][i] for i in ranges):
-        range_names = [problem["ranges"][i][2] for i in ranges]
+    for range_id in ranges:
+        problem["kernel_count_per_range"][range_id] += 1
+    range_names = [problem["ranges"][i][2] for i in ranges]
+    if args.module is None or args.module in range_names:
         kernel_list.append(
             (
                 problem_id,
@@ -262,6 +238,22 @@ string_ids = dict(zip(df["id"], df["value"]))
 
 conn.close()
 
+# Check ambiguous modules
+if args.module:
+    for problem in problem_set:
+        num_matches_per_run = [0] * (len(problem["runs"]) + 1)
+        for (range_start, _, text), kernel_count in zip(
+            problem["ranges"], problem["kernel_count_per_range"]
+        ):
+            if text == args.module and kernel_count > 0:
+                num_matches_per_run[bisect.bisect(problem["runs"], range_start)] += 1
+        for run_id_plus_one, num_matches in enumerate(num_matches_per_run):
+            if num_matches > 1:
+                raise ValueError(
+                    f'Module is ambiguous: "{args.module}" appears {num_matches} times'
+                    f' in "{problem["text"]}"\'s {run_id_plus_one}-th run'
+                )
+
 kernel_list.sort(key=lambda t: (t[6], t[8]))
 kernels = [[[] for _ in problem["runs"]] for problem in problem_set]
 for (
@@ -276,8 +268,7 @@ for (
     capture_start,
     capture_end,
 ) in kernel_list:
-    if run_id != -1:
-        kernels[problem_id][run_id].append((demangledName, start, end, ranges))
+    kernels[problem_id][run_id].append((demangledName, start, end, ranges))
 for problem_id in range(len(kernels)):
     required_seq = [demangledName for demangledName, _, _, _ in kernels[problem_id][0]]
     for run_id in range(len(kernels[problem_id])):
@@ -287,86 +278,8 @@ for problem_id in range(len(kernels)):
 
 parser_keywords = [
     ("cuBLASGemm", "nvjet"),
-    ("splitKreduce", "splitKreduce_kernel"),
-    ("fusedAGemm", "fused_a_gemm_kernel"),
-    ("RMSNorm", "RMSNormKernel"),
-    ("torchCat", "CatArrayBatchedCopy"),
-    ("applyMLARope", "applyMLARope"),
-    ("fmhaSm100f", "fmhaSm100fKernel_Qkv"),
-    ("fmhaReduction", "fmhaReductionKernel"),
-    ("quant", "quantize_with_block_size"),
-    ("AllGather", "ncclDevKernel_AllGather_"),
-    ("ReduceScatter", "ncclDevKernel_ReduceScatter_"),
-    ("allreduce_oneshot", "allreduce_fusion_kernel_oneshot_lamport"),
-    ("allreduce_twoshot", "allreduce_fusion_kernel_twoshot_sync"),
-    ("expandInput", "expandInputRowsKernel"),
-    ("computeStrides", "computeStridesTmaWarpSpecializedKernel"),
     ("cutlassGroupGemm", "cutlass::device_kernel<cutlass::gemm::kernel::GemmUniversal"),
-    ("doActivation", "doActivationKernel"),
     ("cutlassGemm", "GemmUniversal"),
-    ("deepseek_v3_topk", "deepseek_v3_topk_kernel"),
-    ("CountAndIndice", "computeCountAndIndiceDevice"),
-    ("Cumsum", "computeCumsumDevice"),
-    ("moveIndice", "moveIndiceDevice"),
-    ("moeAllToAll", "moeAllToAllKernel"),
-    ("moeA2APrepareDispatch", "moe_comm::moeA2APrepareDispatchKernel"),
-    ("moeA2ADispatch", "moe_comm::moeA2ADispatchKernel"),
-    ("moeA2ASanitizeExpertIds", "moe_comm::moeA2ASanitizeExpertIdsKernel"),
-    ("moeA2APrepareCombine", "moe_comm::moeA2APrepareCombineKernel"),
-    ("moeA2ACombine", "moe_comm::moeA2ACombineKernel"),
-    ("memsetExpertIds", "memsetExpertIdsDevice"),
-    ("blockSum", "blockExpertPrefixSumKernel"),
-    ("globalSum", "globalExpertPrefixSumKernel"),
-    ("globalSumLarge", "globalExpertPrefixSumLargeKernel"),
-    ("mergePrefix", "mergeExpertPrefixSumKernel"),
-    ("fusedBuildExpertMaps", "fusedBuildExpertMapsSortFirstTokenKernel"),
-    ("swiglu", "silu_and_mul_kernel"),
-    ("torchAdd", "CUDAFunctor_add"),
-    ("torchFill", "at::native::FillFunctor"),
-    ("triton_fused_add_sum", "triton_red_fused_add_sum_0"),
-    ("torchCopy", "at::native::bfloat16_copy_kernel_cuda"),
-    ("torchDistribution", "distribution_elementwise_grid_stride_kernel"),
-    ("torchArange", "at::native::arange_cuda_out"),
-    ("torchDirectCopy", "at::native::direct_copy_kernel_cuda"),
-    ("torchBitonicSort", "at::native::bitonicSortKVInPlace"),
-    ("routingInitExpertCounts", "routingInitExpertCounts"),
-    ("routingIndicesCluster", "routingIndicesClusterKernel"),
-    ("routingIndicesCoop", "routingIndicesCoopKernel"),
-    ("router_gemm", "router_gemm_kernel"),
-    ("bmm_4_44_32", "bmm_E2m1_E2m1E2m1_Fp32_t"),
-    ("finalize", "finalize::finalizeKernel"),
-    ("bmm_16_44_32", "bmm_Bfloat16_E2m1E2m1_Fp32_"),
-    ("deep_gemm_gemm", "deep_gemm::sm100_fp8_gemm_1d1d_impl<"),
-    ("per_token_quant", "_per_token_quant_and_transform_kernel"),
-    ("triton_fused_layer_norm", "triton_per_fused__to_copy_native_layer_norm_0"),
-    ("flashinferRoPE", "flashinfer::BatchQKApplyRotaryPosIdsCosSinCacheHeadParallelismKernel<"),
-    ("flashinferRoPE", "flashinfer::BatchQKApplyRotaryPosIdsCosSinCacheKernel<"),
-    ("fp8_blockscale_gemm", "tensorrt_llm::kernels::fp8_blockscale_gemm"),
-    ("triton_fused_mul_squeeze", "triton_poi_fused_mul_squeeze_0"),
-    ("indexerKCacheScatter", "tensorrt_llm::kernels::indexerKCacheScatterUnifiedKernel"),
-    ("deep_gemm_mqa_logits", "deep_gemm::sm100_fp8_paged_mqa_logits<"),
-    ("topKPerRowDecode", "tensorrt_llm::kernels::topKPerRowDecode<"),
-    ("torchAdd<int>", "at::native::CUDAFunctorOnSelf_add"),
-    ("convert_req_index", "_convert_req_index_to_global_index_kernel_with_stride_factor"),
-    ("preprocess_after_permute", "_preprocess_after_permute_kernel"),
-    ("masked_index_copy_quant", "_masked_index_copy_group_quant_fp8"),
-    ("swiglu_quant", "_silu_and_mul_post_quant_kernel"),
-    ("masked_index_gather", "masked_index_gather_kernel"),
-    ("finalizeMoeRouting", "tensorrt_llm::kernels::cutlass_kernels::finalizeMoeRoutingKernel<"),
-    ("fused_qkvzba_split", "fused_qkvzba_split_reshape_cat_kernel"),
-    ("causal_conv1d_update", "tensorrt_llm::kernels::causal_conv1d::causal_conv1d_update_kernel<"),
-    ("fused_delta_rule_update", "fused_sigmoid_gating_delta_rule_update_kernel"),
-    ("layer_norm_fwd_1pass", "_layer_norm_fwd_1pass_kernel"),
-    ("torchGatherTopK", "at::native::sbtopk::gatherTopK<"),
-    ("softmax_warp_forward", "softmax_warp_forward<"),
-    ("torchSigmoid", "at::native::sigmoid_kernel_cuda"),
-    ("torchMul", "at::native::binary_internal::MulFunctor<"),
-    ("computeSeqAndPaddingOffsets", "tensorrt_llm::kernels::computeSeqAndPaddingOffsets<"),
-    ("applyBiasRopeUpdateKVCache", "tensorrt_llm::kernels::applyBiasRopeUpdateKVCacheV2<"),
-    ("routingIndicesHistogramScores", "routingRenormalize::routingIndicesHistogramScoresKernel<"),
-    ("routingIndicesHistogram", "routingIndicesHistogramKernel<"),
-    ("routingIndicesOffsets", "routingIndicesOffsetsKernel<"),
-    ("torchReduceSum", ["at::native::reduce_kernel<", "at::native::sum_functor<"]),
     ("CuteDSLMoePermute", "cute_dsl::moePermuteKernel"),
     (
         "CuteDSLGemm",
@@ -380,6 +293,19 @@ parser_keywords = [
         "CuteDSLGroupedGemmFinalize",
         ["cute_dsl_kernels", "blockscaled_contiguous_grouped_gemm_finalize_fusion"],
     ),
+    ("torchAdd", "at::native::CUDAFunctorOnSelf_add"),
+    ("torchAdd", "CUDAFunctor_add"),
+    ("torchClamp", "at::native::<unnamed>::launch_clamp_scalar("),
+    ("torchCompare", "at::native::<unnamed>::CompareFunctor<"),
+    ("torchCopy", "at::native::bfloat16_copy_kernel_cuda"),
+    ("torchCopy", "at::native::direct_copy_kernel_cuda("),
+    ("torchFill", "at::native::FillFunctor"),
+    ("torchIndexPut", "at::native::index_put_kernel_impl<"),
+    ("torchMul", "at::native::binary_internal::MulFunctor<"),
+    ("torchPow", "at::native::<unnamed>::pow_tensor_scalar_kernel_impl<"),
+    ("torchReduceSum", ["at::native::reduce_kernel<", "at::native::sum_functor<"]),
+    ("torchSigmoid", "at::native::sigmoid_kernel_cuda"),
+    ("torchWhere", "at::native::<unnamed>::where_kernel_impl("),
 ]
 warned_names = set()
 
@@ -395,15 +321,19 @@ def parse_kernel_name(demangledName):
             src = [src]
         if all(keyword in name for keyword in src):
             return dst
-    if name not in warned_names:
-        print(f"Unknown kernel name: {name}", file=sys.stderr)
-        warned_names.add(name)
-        if args.error_on_unknown_kernel:
-            raise NotImplementedError(f"Unknown kernel name: {name}")
+    if re.search(r"at::native::.*elementwise_kernel<", name):
+        if name not in warned_names:
+            print(f"Not parsed torch kernel name: {name}", file=sys.stderr)
+            warned_names.add(name)
+    assert "!unnamed!" not in name
+    name = name.replace("<unnamed>", "!unnamed!")
     if "<" in name:
         name = name[: name.index("<")]
     if "(" in name:
         name = name[: name.index("(")]
+    if "::" in name:
+        name = name[name.rindex("::") + 2 :]
+    name = name.replace("!unnamed!", "<unnamed>")
     return name
 
 
@@ -438,6 +368,8 @@ for runs in kernels:
     converted_seq.append((("Space",), np.mean(space_list[warmup_times:]).tolist()))
     converted_seq.append((("Total",), sum(t for _, t in converted_seq)))
     converted_seqs.append(converted_seq)
+if args.error_on_unknown_kernel and warned_names:
+    raise ValueError("Unknown kernel names encountered")
 
 merged_title = []
 for converted_seq in converted_seqs:
@@ -459,7 +391,7 @@ print("Problem set:")
 for problem in problem_set:
     print(
         f'- "{problem["text"]}"    {len(problem["runs"])} runs'
-        f"    Ranges: [{', '.join(text for _, _, text in problem['ranges'])}]"
+        f"    Ranges: [{', '.join(text for _, end, text in problem['ranges'] if end <= problem['runs_end'][0])}]"
     )
 
 stack = []

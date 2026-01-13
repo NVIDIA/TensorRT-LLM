@@ -198,10 +198,13 @@ class ConversationHistoryStore:
         # Map from conversation id to response id, which is the latest response in the conversation.
         self.conversation_to_response: dict[str, str] = {}
 
-    async def load_response(self, resp_id: str) -> ResponsesResponse:
+    async def load_response(self, resp_id: str) -> ResponsesResponse | None:
         _responses_debug_log(
             f"ConversationHistoryStore loading resp: {resp_id}")
         async with self.responses_lock:
+            if resp_id not in self.responses:
+                return None
+
             self.responses.move_to_end(resp_id)
             return self.responses.get(resp_id)
 
@@ -262,6 +265,10 @@ class ConversationHistoryStore:
             self.response_to_conversation[resp_id] = conversation_id
             self.conversation_to_response[conversation_id] = resp_id
             self._update_visited_conversation(conversation_id)
+
+    async def pop_response(self, resp_id: Optional[str] = None) -> bool:
+        async with self.responses_lock:
+            return self._pop_response(resp_id)
 
     async def store_messages(self, resp_id: str,
                              msgs: Union[list[Message],
@@ -398,11 +405,23 @@ class ConversationHistoryStore:
 
         del conversation[start_index:end_index + 1]
 
-    def _pop_response(self) -> None:
-        _responses_debug_log(f"responses type: {type(self.responses)}")
-        resp_id, _ = self.responses.popitem(last=False)
+    def _pop_response(self, resp_id: Optional[str] = None) -> bool:
+        _responses_debug_log(f"pop response {resp_id}")
+
+        if not self.responses:
+            return False
+
+        if resp_id is not None:
+            if resp_id not in self.responses:
+                return False
+            self.responses.pop(resp_id)
+        else:
+            resp_id, _ = self.responses.popitem(last=False)
+
         if resp_id in self.response_to_conversation:
             self.response_to_conversation.pop(resp_id)
+
+        return True
 
 
 def _get_system_message(
