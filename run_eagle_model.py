@@ -138,10 +138,17 @@ class EagleModel(nn.Module):
 
     def load_weights(self, weights: Dict):
         missing, unexpected = self.load_state_dict(weights, strict=False)
-        if missing:
-            print(f"⚠️ Missing keys (initialized randomly): {missing}")
-        if unexpected:
-            print(f"⚠️ Unexpected keys: {unexpected}")
+
+        for missing_key in missing:
+            if missing_key == "embed_tokens.weight":
+                print(
+                    "Embed tokens weight is missing. Initializing random weights. Need to load from target model."
+                )
+            else:
+                print(f"⚠️ Unexpected key missing in loaded weights: {missing_key}")
+
+        for unexpected_key in unexpected:
+            print(f"⚠️ Unexpected key: {unexpected_key}")
 
 
 def main():
