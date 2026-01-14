@@ -692,7 +692,7 @@ class LlamaDecoderLayer(DecoderLayer):
         self.enable_fusion &= config.hidden_size > 4096
 
         enable_gemm_allreduce_fusion = (os.environ.get(
-            "TRTLLM_GEMM_ALLREDUCE_FUSION_ENABLED", "1") == "1")
+            "TRTLLM_GEMM_ALLREDUCE_FUSION_ENABLED", "0") == "1")
         mpi_enabled = not mpi_disabled()
         dtype_supported = config.torch_dtype in (torch.float16, torch.bfloat16)
         tp_valid = self.mapping.tp_size > 1
