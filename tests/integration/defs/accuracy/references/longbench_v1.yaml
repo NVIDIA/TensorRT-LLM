@@ -1,8 +1,8 @@
 Qwen3/Qwen3-30B-A3B-Instruct-2507:
   # Skip Softmax Attention ref accuracy
   - extra_acc_spec: "target_sparsity=0.0"
-    accuracy: 47.22
+    accuracy: 47.357
   - extra_acc_spec: "target_sparsity=0.5"
-    accuracy: 47.22
+    accuracy: 47.102
   - extra_acc_spec: "target_sparsity=0.9"
-    accuracy: 45.90
+    accuracy: 46.169
