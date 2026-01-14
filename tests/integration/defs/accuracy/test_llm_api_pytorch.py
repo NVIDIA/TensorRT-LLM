@@ -3032,6 +3032,7 @@ class TestGLM4_5Air(LlmapiAccuracyTestHarness):
     def test_nvfp4_2_model_mtp(self, tp_size, cuda_graph, overlap_scheduler,
                                chunked_prefill, max_batch_size, moe_backend):
 
+        model_path = f"{llm_models_root()}/GLM-4.5-Air-NVFP4-KV-cache-FP8"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.70)
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
@@ -3042,7 +3043,7 @@ class TestGLM4_5Air(LlmapiAccuracyTestHarness):
                                        mtp_eagle_one_model=False,
                                        speculative_model_dir=model_path)
 
-        with LLM(f"{llm_models_root()}/GLM-4.5-Air-NVFP4-KV-cache-FP8",
+        with LLM(model_path,
                  max_batch_size=max_batch_size,
                  tensor_parallel_size=tp_size,
                  kv_cache_config=kv_cache_config,
