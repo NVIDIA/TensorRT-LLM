@@ -1272,10 +1272,9 @@ class KVCacheManager(BaseResourceManager):
 
     def copy_batch_block_offsets(self, dst_tensor: torch.Tensor,
                                  request_ids: List[int], beam_width: int,
-                                 num_context: int, num_gen: int):
-        num_seqs = num_context + num_gen * beam_width
+                                 num_context: int, num_seqs: int):
         self.impl.copy_batch_block_offsets(self.host_kv_cache_block_offsets,
-                                           request_ids[0:num_context], 1, 0)
+                                           request_ids[:num_context], 1, 0)
         self.impl.copy_batch_block_offsets(self.host_kv_cache_block_offsets,
                                            request_ids[num_context:],
                                            beam_width, num_context)
