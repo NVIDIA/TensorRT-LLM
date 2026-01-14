@@ -19,9 +19,8 @@ from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 from transformers.configuration_utils import PretrainedConfig
 from utils.util import (check_accuracy, skip_blackwell, skip_blackwell_geforce,
-                        skip_neither_ada_nor_hopper_unittest,
-                        skip_non_hopper_unittest, skip_pre_blackwell,
-                        skip_pre_hopper)
+                        skip_neither_ada_nor_hopper_unittest, skip_no_hopper,
+                        skip_pre_blackwell, skip_pre_hopper)
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -90,6 +89,8 @@ def test_fused_moe(moe_backend,
                    mapping=None):
 
     if moe_backend == "TRITON":
+        if get_sm_version() != 90:
+            pytest.skip("TRITON moe backend is only supported on Hopper")
         if dtype != torch.bfloat16:
             pytest.skip("Unsupported for TritonFusedMoE")
         if routing_cls != RenormalizeMoeRoutingMethod:
@@ -510,7 +511,9 @@ def test_fused_moe_alltoall_fp4(alltoall_method_type):
 
 
 @skip_pre_hopper
-@pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRITON"])
+@pytest.mark.parametrize(
+    "moe_backend",
+    ["CUTLASS", pytest.param("TRITON", marks=skip_no_hopper)])
 @pytest.mark.parametrize("routing_cls",
                          [DefaultMoeRoutingMethod, RenormalizeMoeRoutingMethod])
 @pytest.mark.parametrize("bias", [True, False])
@@ -1179,7 +1182,7 @@ def test_fused_moe_fp8_blockwise_cute_dsl(dtype,
     return True
 
 
-@skip_non_hopper_unittest
+@skip_no_hopper
 @pytest.mark.parametrize(
     "dtype, num_experts, seq_len, hidden_size, RoutingMethodCls, WeightLoadingMode",
     product(
@@ -1311,7 +1314,7 @@ def test_fused_moe_fp8_blockwise_cutlass(dtype,
     return True
 
 
-@skip_non_hopper_unittest
+@skip_no_hopper
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
 @pytest.mark.parametrize("ep_size", [1, 2, 4])
@@ -2531,7 +2534,7 @@ def test_fused_moe_wfp4a16(dtype, hidden_size, moe_backend,
         check_accuracy(output, ref_output, rtol=1e-2, atol=0.1, percent=0.99)
 
 
-@skip_non_hopper_unittest
+@skip_no_hopper
 @pytest.mark.parametrize("experts", [8, 128])
 @pytest.mark.parametrize(
     "hidden_size, intermediate_size",

@@ -106,6 +106,9 @@ skip_pre_ada = pytest.mark.skipif(
 skip_pre_hopper = pytest.mark.skipif(
     getSMVersion() < 90,
     reason="This test is not supported in pre-Hopper architecture")
+skip_no_hopper = pytest.mark.skipif(
+    getSMVersion() != 90,
+    reason="This test is only supported in Hopper architecture")
 skip_pre_blackwell = pytest.mark.skipif(
     getSMVersion() < 100,
     reason="This test is not supported in pre-Blackwell architecture")

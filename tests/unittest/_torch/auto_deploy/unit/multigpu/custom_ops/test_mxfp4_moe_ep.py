@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch.distributed as dist
 from _dist_test_utils import get_device_counts
-from utils.util import getSMVersion
+from utils.util import skip_no_hopper
 
 from tensorrt_llm._torch.auto_deploy.distributed.common import spawn_multiprocess_job
 
@@ -107,6 +107,7 @@ def _run_mxfp4_mlp_ep_dtype_test(num_experts: int, topk: int, rank: int, world_s
     torch.testing.assert_close(part_out, ref_out, rtol=5e-2, atol=5e-2, equal_nan=True)
 
 
+@skip_no_hopper
 @pytest.mark.parametrize("num_experts", [6, 8])
 @pytest.mark.parametrize("topk", [4])  # must be <= num_experts
 @pytest.mark.parametrize("device_count", get_device_counts())
