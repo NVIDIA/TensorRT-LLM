@@ -97,7 +97,7 @@ struct communicator
 };
 using communicator = struct communicator;
 
-int create_communicator_grouped2(communicator** comm, tensorrt_llm::runtime::WorldConfig const& world_config);
+int create_communicator_grouped2(communicator** comm, ::tensorrt_llm::runtime::WorldConfig const& world_config);
 /*  creates communicator with
     allreduce1 to happen in datagpus x datanodes groups,
     allreduce2 to happen in tensorgpus x tensor nodes,
@@ -114,9 +114,11 @@ int register_user_buffer_collective(void** gpubuff, size_t bytes, communicator* 
 void destroy_communicator(communicator* comm);
 } // namespace tensorrt_llm::runtime::ub
 
-namespace tensorrt_llm::kernels::ub
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::ub
 {
-using namespace tensorrt_llm::runtime::ub;
+using namespace ::tensorrt_llm::runtime::ub;
 void allreduce2_userbuff_inplace_impl(int const handler, size_t const offset, size_t const elements,
     nvinfer1::DataType dataType, communicator* comm, cudaStream_t stream = 0);
 // for TP-parallelism, only single node is implemented
@@ -137,4 +139,6 @@ int allreduce2_userbuff_inplace_rmsnorm_quant_fp4_impl(int const handler, size_t
     size_t const out_offset, int const scale_handler, size_t const scale_offset, size_t const elements,
     int const hidden_size, void* beta, void* gamma, float eps, float* scalefactor, void* residual_in,
     void* residual_out, nvinfer1::DataType dataType, communicator* comm, cudaStream_t stream);
-} // namespace tensorrt_llm::kernels::ub
+} // namespace kernels::ub
+
+TRTLLM_NAMESPACE_END

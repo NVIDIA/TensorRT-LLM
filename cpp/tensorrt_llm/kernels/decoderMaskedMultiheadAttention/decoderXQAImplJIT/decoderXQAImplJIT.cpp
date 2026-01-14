@@ -17,6 +17,7 @@
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/decoderXQAImplJIT.h"
 #include "compileEngine.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/utils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/cubin/xqa_kernel_cubin.h"
@@ -43,7 +44,9 @@ XQAKernelRuntimeHashKey getRuntimeHashKeyFromKernelMeta(XQAKernelMetaInfo const&
 
 } // anonymous namespace
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
 
 DecoderXQAImplJIT::DecoderXQAImplJIT(DecoderXQARunner* runner)
@@ -124,6 +127,14 @@ bool DecoderXQAImplJIT::shouldUse(XQAParams const& umbrellaXQAParams, bool forCo
         bool hasPerfGain = mayHavePerfGain(xqaParams);
         if (!hasPerfGain)
         {
+            if (!xqaParams.is_fp8_output && xqaParams.kv_cache_data_type == DATA_TYPE_E4M3
+                && (xqaParams.data_type == DATA_TYPE_BF16 || xqaParams.data_type == DATA_TYPE_FP16))
+            {
+                TLLM_LOG_DEBUG(
+                    "JIT XQA is selected in the generation phase for fp16/bf16 input and e4m3 kv cache because MMHA "
+                    "does not support this combination.");
+                return true;
+            }
             TLLM_LOG_DEBUG("JIT XQA is not used: maybe no performance gain");
             return false;
         }
@@ -221,6 +232,7 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
     jit::CubinObj const* const cubinObj = mResource->getCubinObjRegistry()->getCubin(key);
     TLLM_CHECK(cubinObj != nullptr && cubinObj->isInitialized());
     bool const isSpecDec = xqaParams.multi_query_tokens;
+    bool const isSkipSoftmax = xqaParams.skip_softmax_threshold_scale_factor != 0;
     bool const isHMMAKernel = (cubinObj->getKernelType() == XQAKernelType::kAMPERE_WARP_SPECIALIZED);
     bool const isGMMAKernel = (cubinObj->getKernelType() == XQAKernelType::kHOPPER_WARP_SPECIALIZED);
     bool const isMLAKernel = (cubinObj->getKernelType() == XQAKernelType::kSM120_MLA);
@@ -367,7 +379,7 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
             .mask = reinterpret_cast<SpecDecParams::MaskType const*>(xqaParams.spec_decoding_packed_mask)};
     };
 
-    constexpr uint32_t kMAX_NB_KERNEL_PARAMS = 15;
+    constexpr uint32_t kMAX_NB_KERNEL_PARAMS = 19;
     uint32_t idxNextParam = 0;
     void* kernelParams[kMAX_NB_KERNEL_PARAMS];
     auto appendParam = [&](auto* p) mutable
@@ -503,6 +515,16 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
             appendParam(&specDecParams);
             specDecBlocks = divUp(specDecParams.qSeqLen, 64 / num_q_heads_over_kv);
         }
+        if (isSkipSoftmax)
+        {
+            TLLM_CHECK_WITH_INFO(isGMMAKernel, "skip softmax is only supported for GMMA kernel for now.");
+            TLLM_CHECK_WITH_INFO(!isSpecDec, "skip softmax is not supported with spec dec for now.");
+            appendParam(&xqaParams.skip_softmax_threshold_scale_factor);
+#ifdef SKIP_SOFTMAX_STAT
+            appendParam(&xqaParams.skip_softmax_total_blocks);
+            appendParam(&xqaParams.skip_softmax_skipped_blocks);
+#endif
+        }
         appendParam(&launchParams.semaphores);
         appendParam(&launchParams.scratch);
         kernelParams[idxNextParam] = nullptr; // one extra nullptr at end as guard.
@@ -537,4 +559,6 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
     }
 }
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

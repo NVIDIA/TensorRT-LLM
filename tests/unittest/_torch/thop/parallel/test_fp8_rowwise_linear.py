@@ -1,12 +1,12 @@
 import pytest
 import torch
-from utils.util import skip_pre_hopper
+from utils.util import skip_blackwell
 
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 
-@skip_pre_hopper
+@skip_blackwell
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_fp8_rowwise_linear(dtype):
     SEQ_LEN = 10

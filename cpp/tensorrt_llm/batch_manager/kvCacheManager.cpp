@@ -284,6 +284,11 @@ tk::KVCacheIndex::UnderlyingType KVCacheBlock::getMemoryPoolBlockIndex() const
     return mMemoryPoolBlockIndex.get();
 }
 
+std::vector<MmKey> KVCacheBlock::getExtraKeys() const
+{
+    return mBlockKey.extraKeys;
+}
+
 bool KVCacheBlock::isPrimary() const
 {
     return mMemoryPoolBlockIndex.isPrimary();
@@ -551,6 +556,9 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
     , mEventManager{std::move(eventManager)}
     , mStream{stream}
     , mCacheType{cacheType}
+    , mIsEnableIndexerKCache{enableIndexerKCache}
+    , mIndexerKCacheQuantBlockSize{indexerKCacheQuantBlockSize}
+    , mIndexerKCacheIndexHeadDim{indexerKCacheIndexHeadDim}
 {
     if (agentConfig.has_value())
         mLoopbackAgent = makeLoopbackAgent("nixl", &agentConfig.value());
@@ -873,14 +881,7 @@ void WindowBlockManager::allocatePools(bool useUvm)
         }
 
         nvinfer1::Dims cacheShape;
-        if (pool.containsIndexerKCache)
-        {
-            cacheShape = ITensor::makeShape({mNumPrimaryBlocks, pool.numLayers, blockSize});
-        }
-        else
-        {
-            cacheShape = ITensor::makeShape({mNumPrimaryBlocks, pool.numLayers, mKVFactor, blockSize});
-        }
+        cacheShape = ITensor::makeShape({mNumPrimaryBlocks, pool.numLayers, mKVFactor, blockSize});
 
         TLLM_LOG_DEBUG("[%s] Allocating primary pool with %d blocks for %d layers with %d kv heads", mLogPrefix.c_str(),
             mNumPrimaryBlocks, pool.numLayers, pool.numKvHeads);
@@ -1223,7 +1224,7 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
         auto [partialMatch, numMatched, matchingBlock] = searchRoot != nullptr && blockItr != blockKeys.end()
             ? searchRoot->findMatchingBlock(*blockItr, mEnablePartialReuse, mCopyOnPartialReuse)
             : std::make_tuple(false, 0, nullptr);
-        if (matchingBlock != nullptr)
+        if (matchingBlock != nullptr && numMatchedTokens + numMatched <= sequence.getCurrentPrepopulatedPromptLen())
         {
             KVCacheBlock::IdType matchingBlockId = matchingBlock->getBlockId();
 
@@ -1337,7 +1338,21 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
         }
     }
 
+    sequence.setCurrentPrepopulatedPromptLen(numMatchedTokens);
     return numMatchedTokens;
+}
+
+void BlockManager::syncTransferManagerWithBufferManager()
+{
+    for (auto& [_, manager] : mWindowBlockManagers)
+    {
+        manager.syncTransferManagerWithBufferManager();
+    }
+}
+
+void WindowBlockManager::syncTransferManagerWithBufferManager()
+{
+    mTransferManager->syncWithBufferManager();
 }
 
 void BlockManager::refreshBlocks()
@@ -1541,7 +1556,7 @@ void WindowBlockManager::allocateBlock(GenerationRequest& sequence, bool shareAm
     }
 }
 
-std::pair<SizeType32, std::optional<KVCacheBlock::IdType>> WindowBlockManager::storeBlocks(
+std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::storeBlocks(
     std::vector<BlockKey> const& blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds, bool pinBlocks)
 {
     SizeType32 numBlocksStoredForReuse = 0;
@@ -1554,7 +1569,7 @@ std::pair<SizeType32, std::optional<KVCacheBlock::IdType>> WindowBlockManager::s
 
     auto numBlocks = blockKeys.size();
     std::vector<BlockPtr> storedBlocks;
-    std::optional<KVCacheBlock::IdType> lastStoredId = std::nullopt;
+    std::vector<KVCacheBlock::IdType> pinnedBlockIds;
     for (std::size_t blockCnt = 0; blockCnt < numBlocks; ++blockCnt)
     {
         auto const bid = blockIds[blockCnt];
@@ -1605,14 +1620,14 @@ std::pair<SizeType32, std::optional<KVCacheBlock::IdType>> WindowBlockManager::s
         if (pinBlocks)
         {
             searchRoot->incRefCount();
+            pinnedBlockIds.push_back(searchRoot->getBlockId());
         }
-        lastStoredId = searchRoot->getBlockId();
     }
     if (mEventManager)
     {
         mEventManager->enqueueStoredEvent(storedBlocks, mWindowSize);
     }
-    return {numBlocksStoredForReuse, lastStoredId};
+    return {numBlocksStoredForReuse, pinnedBlockIds};
 }
 
 void BlockManager::replaceSharedBlock(GenerationRequest& sequence, SizeType32 windowSize, SizeType32 blockIdx)
@@ -1700,15 +1715,15 @@ std::deque<tle::KVCacheEvent> BlockManager::getLatestEvents(std::optional<std::c
     return mEventManager ? mEventManager->getEvents(timeout) : std::deque<tle::KVCacheEvent>{};
 }
 
-std::optional<KVCacheBlock::IdType> BlockManager::storeBlocksForReuse(
+std::vector<KVCacheBlock::IdType> BlockManager::storeBlocksForReuse(
     GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest, bool pinBlocks)
 {
-    std::optional<KVCacheBlock::IdType> lastStoredId = std::nullopt;
+    std::vector<KVCacheBlock::IdType> pinnedBlockIds;
     for (auto& [_, manager] : mWindowBlockManagers)
     {
-        lastStoredId = manager.storeBlocksForReuse(sequence, llmRequest, pinBlocks);
+        pinnedBlockIds = manager.storeBlocksForReuse(sequence, llmRequest, pinBlocks);
     }
-    return lastStoredId;
+    return pinnedBlockIds;
 }
 
 std::optional<KVCacheBlock::IdType> BlockManager::releaseBlocks(
@@ -1717,9 +1732,22 @@ std::optional<KVCacheBlock::IdType> BlockManager::releaseBlocks(
     // Released block will be stored when reuse is enabled.
     // Reuse is implied to be enabled if llmRequest is provided.
     std::optional<KVCacheBlock::IdType> lastStoredId = std::nullopt;
+
+    // For now, the attention kernel only accepts a single
+    // "prepopulatedPromptLen", that is, all window sizes will use the same
+    // prepopulated prompt length, so it is meaningless right now to save
+    // blocks only for a certain window size while blocks in the other
+    // window size are not valid for saving for reuse.
+    bool isAllWindowSizesValidForStoreForReuse = true;
+    for (auto& [windowSize, manager] : mWindowBlockManagers)
+    {
+        isAllWindowSizesValidForStoreForReuse &= manager.isSequenceValidForStoreForReuse(sequence.getRequestId());
+    }
+
     for (auto& [_, manager] : mWindowBlockManagers)
     {
-        if (!llmRequest.has_value() || llmRequest->isDummyRequest() || sequence.getBeamWidth() > 1)
+        if (!llmRequest.has_value() || llmRequest->isDummyRequest() || sequence.getBeamWidth() > 1
+            || !isAllWindowSizesValidForStoreForReuse)
         {
             lastStoredId = manager.releaseBlocks(sequence, std::nullopt);
         }
@@ -1739,7 +1767,7 @@ void BlockManager::pinBlocks(GenerationRequest& sequence)
     }
 }
 
-void BlockManager::unpinBlocksById(KVCacheBlock::IdType blockId)
+void BlockManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds)
 {
     // Use the first window size
     if (mWindowBlockManagers.empty())
@@ -1747,7 +1775,7 @@ void BlockManager::unpinBlocksById(KVCacheBlock::IdType blockId)
         return;
     }
     auto& firstManager = mWindowBlockManagers.begin()->second;
-    firstManager.unpinBlocksById(blockId);
+    firstManager.unpinBlocksById(blockIds);
 }
 
 void WindowBlockManager::pinBlocks(GenerationRequest& sequence)
@@ -1760,21 +1788,26 @@ void WindowBlockManager::pinBlocks(GenerationRequest& sequence)
     }
 }
 
-void WindowBlockManager::unpinBlocksById(KVCacheBlock::IdType blockId)
+void WindowBlockManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds)
 {
-    if (blockId < 0 || static_cast<size_t>(blockId) >= mAllBlocksById.size())
+    if (blockIds.empty())
     {
         return;
     }
-    auto block = mAllBlocksById[blockId];
-    while (block && block->getBlockId() != KVCacheBlock::kCachedBlocksRootId)
+
+    for (auto const& blockId : blockIds)
     {
-        block->decRefCount();
-        if (!block->hasRefs())
+        TLLM_CHECK_WITH_INFO(blockId >= 0 && static_cast<size_t>(blockId) < mAllBlocksById.size(),
+            "Block id %d is out of range", blockId);
+        auto block = mAllBlocksById[blockId];
+        if (block && block->getBlockId() != KVCacheBlock::kCachedBlocksRootId)
         {
-            mEvictionPolicy->releaseBlock(block);
+            block->decRefCount();
+            if (!block->hasRefs())
+            {
+                mEvictionPolicy->releaseBlock(block);
+            }
         }
-        block = std::move(block->getPrevBlock());
     }
 }
 
@@ -1842,7 +1875,7 @@ void WindowBlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<
     (void) storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
 }
 
-std::optional<KVCacheBlock::IdType> WindowBlockManager::storeBlocksForReuse(
+std::vector<KVCacheBlock::IdType> WindowBlockManager::storeBlocksForReuse(
     GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest, bool pinBlocks)
 {
     auto constexpr beamIdx = 0;
@@ -1855,7 +1888,10 @@ std::optional<KVCacheBlock::IdType> WindowBlockManager::storeBlocksForReuse(
     auto const usableSize = static_cast<runtime::SizeType32>(uniqueTokens.size()) - 1;
     auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, usableSize, mTokensPerBlock, true);
     auto blockKeys = buildBlockKeys(blockedUniqueTokens, *llmRequest);
-    return storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx], pinBlocks).second;
+
+    auto [numStored, pinnedBlockIds] = storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx], pinBlocks);
+
+    return pinnedBlockIds;
 }
 
 std::optional<KVCacheBlock::IdType> WindowBlockManager::releaseBlocks(
@@ -1894,7 +1930,7 @@ std::optional<KVCacheBlock::IdType> WindowBlockManager::releaseBlocks(
             std::transform(allocatedBlocks.begin(), allocatedBlocks.end(), cacheBlockIds.begin(),
                 [](BlockPtr const& block) { return block->getBlockId(); });
 
-            auto [numBlocksStoredForReuse, lastStoredId] = storeBlocks(std::move(blockKeys), cacheBlockIds);
+            auto [numBlocksStoredForReuse, pinnedBlockIds] = storeBlocks(std::move(blockKeys), cacheBlockIds);
             TLLM_LOG_DEBUG("%s::releaseBlocks Request %lu, %d blocks stored for reuse", mLogPrefix.c_str(),
                 sequence.getRequestId(), numBlocksStoredForReuse);
         }
@@ -2142,7 +2178,7 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(
             return 0;
         }
 
-        auto const numCurrTokens = mSequences.at(req.mRequestId).getNumTokens();
+        auto const numCurrTokens = getSequence(req.mRequestId).getNumTokens();
         auto const generatedTokens = numCurrTokens - req.getPromptLen();
         auto const maxTokensToAddToKVCache = req.mMaxNewTokens - generatedTokens;
         auto const tokensPerStep = req.getNumDraftTokens() + 1;
@@ -2406,7 +2442,13 @@ void KVCacheManager::addSequence(
 void KVCacheManager::storeContextBlocks(LlmRequest const& llmRequest)
 {
     auto const requestId = llmRequest.mRequestId;
-    if (mSequences.find(requestId) != mSequences.end())
+    bool found = false;
+    {
+        // protect the mSequences
+        std::scoped_lock lock(mSequencesMtx);
+        found = mSequences.find(requestId) != mSequences.end();
+    }
+    if (found)
     {
         auto& sequence = getSequence(requestId);
         if (mEnableBlockReuse && !llmRequest.isDummyRequest())
@@ -2465,15 +2507,14 @@ std::optional<KVCacheBlock::IdType> KVCacheManager::removeSequence(
     return lastStoredId;
 }
 
-std::optional<KVCacheBlock::IdType> KVCacheManager::storeBlocksForReuse(
+std::vector<KVCacheBlock::IdType> KVCacheManager::storeBlocksForReuse(
     RequestIdType requestId, OptionalRef<LlmRequest const> llmRequest, bool pinBlocks)
 {
     TLLM_LOG_TRACE("[%s]::%s start", isCrossKv() ? "CROSS" : "SELF", __PRETTY_FUNCTION__);
     auto& sequence = getSequence(requestId);
-    std::optional<KVCacheBlock::IdType> lastStoredId
-        = mBlockManager.storeBlocksForReuse(sequence, llmRequest, pinBlocks);
+    auto pinnedBlockIds = mBlockManager.storeBlocksForReuse(sequence, llmRequest, pinBlocks);
     TLLM_LOG_TRACE("[%s]::%s stop", isCrossKv() ? "CROSS" : "SELF", __PRETTY_FUNCTION__);
-    return lastStoredId;
+    return pinnedBlockIds;
 }
 
 void KVCacheManager::schedulingRemoveSequence(RequestIdType requestId)
@@ -2488,9 +2529,9 @@ void KVCacheManager::pinBlocks(RequestIdType requestId)
     mBlockManager.pinBlocks(sequence);
 }
 
-void KVCacheManager::unpinBlocksById(KVCacheBlock::IdType blockId)
+void KVCacheManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds)
 {
-    mBlockManager.unpinBlocksById(blockId);
+    mBlockManager.unpinBlocksById(blockIds);
 }
 
 SizeType32 KVCacheManager::copyBlockOffsets(ITensor& output, SizeType32 outputSlotOffset, RequestIdType requestId) const

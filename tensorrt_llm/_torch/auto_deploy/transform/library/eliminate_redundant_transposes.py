@@ -117,8 +117,8 @@ class EliminateRedundantTransposes(BaseTransform):
         info = TransformInfo(
             skipped=False,
             num_matches=len(nodes_to_eliminate),
-            is_clean=False,
-            has_valid_shapes=False,
+            is_clean=len(nodes_to_eliminate) == 0,
+            has_valid_shapes=len(nodes_to_eliminate) == 0,
         )
 
         return gm, info

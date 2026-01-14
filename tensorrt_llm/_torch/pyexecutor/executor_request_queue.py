@@ -14,10 +14,12 @@ from tensorrt_llm._utils import mpi_disabled, nvtx_range
 from tensorrt_llm.mapping import CpType
 
 from ..distributed import Distributed
+from .hang_detector import HangDetector
 from .llm_request import (ExecutorRequest, LlmRequest,
                           executor_request_to_llm_request)
 
 SHUTDOWN_REQUEST_ID = -1
+CONTROL_REQUEST_ID = -2
 
 
 @dataclasses.dataclass
@@ -35,16 +37,28 @@ class RequestQueueItem:
 
     @property
     def is_normal_request(self):
-        return not (self.is_shutdown_request or self.is_canceled_request)
+        return not (self.is_shutdown_request or self.is_canceled_request
+                    or self.is_control_request)
+
+    @property
+    def is_control_request(self):
+        return self.id == CONTROL_REQUEST_ID
 
 
 class ExecutorRequestQueue:
     """Handles fetching and processing of new requests from the request queue."""
 
-    def __init__(self, dist: Distributed, enable_attention_dp: bool,
-                 max_batch_size: int, max_beam_width: int,
-                 max_num_active_requests: int, enable_iter_perf_stats: bool,
-                 batch_wait_timeout_ms: float, is_disaggregated: bool):
+    def __init__(
+        self,
+        dist: Distributed,
+        enable_attention_dp: bool,
+        max_batch_size: int,
+        max_beam_width: int,
+        max_num_active_requests: int,
+        enable_iter_perf_stats: bool,
+        batch_wait_timeout_ms: float,
+        hang_detector: Optional[HangDetector] = None,
+    ):
         self.dist = dist
         self.request_queue: queue.Queue[RequestQueueItem] = queue.Queue()
         self.waiting_queue: deque[RequestQueueItem] = deque()
@@ -53,13 +67,14 @@ class ExecutorRequestQueue:
         self.max_batch_size = max_batch_size
         self.max_beam_width = max_beam_width
         self.max_num_active_requests = max_num_active_requests
-        self.is_disaggregated = is_disaggregated
         self.enqueue_lock = threading.Lock()
         self.next_request_id = max_batch_size
         self.enable_iter_perf_stats = enable_iter_perf_stats
         self.start_times = {}
         self.active = True
         self.batch_wait_timeout_ms = batch_wait_timeout_ms
+        self.send_requests_handler = None
+        self.hang_detector = hang_detector or HangDetector()
 
         # State tracking
         self.num_fetch_requests = 0
@@ -68,6 +83,8 @@ class ExecutorRequestQueue:
         self.new_active_requests_queue_latency_ms = 0
         self.is_shutdown = False
         self.should_exclude_last_generation_logits = False
+        self.control_requests: List[RequestQueueItem] = []
+        self.request_accumulated: List[RequestQueueItem] = []
 
         self._disable_mpi = mpi_disabled()
 
@@ -251,6 +268,10 @@ class ExecutorRequestQueue:
             self.request_queue.put(
                 RequestQueueItem(req_id, is_canceled_request=True))
 
+    def enqueue_control_request(self):
+        with self.enqueue_lock:
+            self.request_queue.put(RequestQueueItem(id=CONTROL_REQUEST_ID))
+
     def enqueue_shutdown_request(self):
         with self.enqueue_lock:
             self.request_queue.put(RequestQueueItem(SHUTDOWN_REQUEST_ID))
@@ -268,6 +289,10 @@ class ExecutorRequestQueue:
         all_ranks_num_active_requests: Optional[List[int]] = None
     ) -> List[RequestQueueItem]:
         """Common logic for fetching and processing requests from the queue."""
+        # Block new request processing while control requests are pending.
+        # Control requests must be handled exclusively to ensure proper synchronization.
+        if len(self.control_requests) != 0:
+            return []
         # Calculate timeout
         idle = (total_num_active_requests == 0) and len(self.waiting_queue) == 0
         if idle:
@@ -281,21 +306,28 @@ class ExecutorRequestQueue:
         # Fetch requests from rank 0
         new_requests = []
         if self.dist.rank == 0:
-            new_requests = self._get_from_request_queue(timeout)
+            # Process accumulated requests that were queued during control request handling.
+            if len(self.request_accumulated) != 0:
+                new_requests.extend(self.request_accumulated)
+                self.request_accumulated.clear()
+                # Reset timeout to 0 to avoid hanging when no new requests are available
+                timeout = datetime.timedelta(0)
+            with self.hang_detector.pause():
+                new_requests.extend(self._get_from_request_queue(timeout))
 
         # Broadcast requests and handle Python objects
         new_requests, py_request_objects = self._handle_request_broadcasting(
             new_requests)
 
         # Validate and filter requests
-        new_requests = self._validate_and_filter_requests(new_requests)
+        new_requests = self._handle_special_queue_items(new_requests)
 
         # Attach Python objects to requests
-        if py_request_objects and (self.dist.tp_size > 1
-                                   or self.dist.has_pp) and self.dist.rank > 0:
+        if py_request_objects and (self.dist.tp_size > 1 or self.dist.has_pp
+                                   or self.dist.cp_size
+                                   > 1) and self.dist.rank > 0:
             self._attach_py_objects_to_requests(new_requests,
                                                 py_request_objects)
-
         self.waiting_queue.extend(new_requests)
 
         new_requests = self._get_from_waiting_queue(
@@ -441,10 +473,12 @@ class ExecutorRequestQueue:
                 new_requests, "py_multimodal_data")
             py_scheduling_params = self._collect_py_objects_from_requests(
                 new_requests, "py_scheduling_params")
+            py_num_logprobs = self._collect_py_objects_from_requests(
+                new_requests, "py_num_logprobs")
             py_request_objects = tuple(
                 filter(None, [
                     py_logits_post_processors, py_multimodal_data,
-                    py_scheduling_params
+                    py_scheduling_params, py_num_logprobs
                 ]))
         else:
             py_request_objects = None
@@ -453,34 +487,32 @@ class ExecutorRequestQueue:
             # Preserve original `new_requests` on rank 0
             _ = self._broadcast_new_requests(new_requests, py_request_objects)
         else:
-            new_requests, py_request_objects = self._broadcast_new_requests(
-                new_requests, py_request_objects)
+            with self.hang_detector.pause():
+                new_requests, py_request_objects = self._broadcast_new_requests(
+                    new_requests, py_request_objects)
 
         return new_requests, py_request_objects
 
-    def _validate_and_filter_requests(
+    def _handle_special_queue_items(
             self,
             new_requests: List[RequestQueueItem]) -> List[RequestQueueItem]:
-        """Validate and filter requests, handling shutdown signals."""
-        valid_new_requests = []
-        for req_item in new_requests:
+        """Handle special signals."""
+        accepted_new_requests = []
+        for idx, req_item in enumerate(new_requests):
             if req_item.is_shutdown_request:
                 self.is_shutdown = True
                 break
             elif req_item.is_canceled_request:
                 self.canceled_req_ids.append(req_item.id)
+            elif req_item.is_control_request:
+                self.control_requests.append(req_item)
+                if self.dist.rank == 0:
+                    self.request_accumulated.extend(new_requests[idx + 1:])
+                break
             else:
-                valid_new_requests.append(req_item)
+                accepted_new_requests.append(req_item)
 
-        # Check beam width validation
-        for req_item in valid_new_requests:
-            if req_item.request and hasattr(req_item.request,
-                                            'sampling_config'):
-                assert req_item.request.sampling_config.beam_width == self.max_beam_width, \
-                    f"Request beam width {req_item.request.sampling_config.beam_width} " \
-                    f"is not equal to max_beam_width {self.max_beam_width}. This is not supported!"
-
-        return valid_new_requests
+        return accepted_new_requests
 
     def _balance_requests_across_ranks(
             self, new_requests: List[RequestQueueItem],
@@ -566,9 +598,10 @@ class ExecutorRequestQueue:
         if not self.dist.has_pp:
             return self.dist.broadcast(payloads, root=0)
 
-        # Broadcast within first tp group before send/recv chain to other tp groups
-        if self.dist.tp_size > 1 and self.dist.is_first_pp_rank:
-            payloads = self.dist.tp_broadcast(payloads, root=0)
+        # Broadcast within first PP stage before send/recv chain to other PP stages.
+        # This needs to cover both TP and CP ranks within the first PP stage.
+        if self.dist.is_first_pp_rank:
+            payloads = self.dist.tp_cp_broadcast(payloads, root=0)
 
         # Tag for communication
         tag = self.dist.pp_size  # Use pp_size as tag to avoid conflicts
@@ -579,16 +612,12 @@ class ExecutorRequestQueue:
                 payloads = self.dist.recv_object(self.dist.prev_pp_rank, tag)
 
         if not self.dist.is_last_pp_rank:
+            if self.send_requests_handler is not None:
+                with nvtx_range("wait_prev_send_requests_handler"):
+                    self.send_requests_handler.wait()
             with nvtx_range("send_requests_to_next_pp"):
-                if self._disable_mpi:
-                    isend_payload = self.dist.isend_object(
-                        payloads,
-                        self.dist.next_pp_rank,
-                        tag,
-                    )
-                    isend_payload.wait()
-                else:
-                    self.dist.send_object(payloads, self.dist.next_pp_rank, tag)
+                self.send_requests_handler = self.dist.isend_object(
+                    payloads, self.dist.next_pp_rank, tag)
 
         return payloads
 
@@ -676,6 +705,8 @@ class ExecutorRequestQueue:
                 input_token_ids=input_ids_this_rank,
                 position_ids=position_ids_this_rank,
             )
+            req.total_input_len_cp = input_len
+            req.seqlen_this_rank_cp = len(input_ids_this_rank)
             req_with_children.append(req)
             if req.child_requests:
                 req_with_children.extend(req.child_requests)
@@ -690,7 +721,6 @@ class ExecutorRequestQueue:
             if cp_type == CpType.STAR:
                 return self._merge_star_attention_requests(new_requests)
             elif cp_type == CpType.HELIX:
-                # Take the usual route below.
                 return self._merge_helix_requests(
                     new_requests,
                     tokens_per_block=cp_config['tokens_per_block'])

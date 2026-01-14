@@ -133,7 +133,7 @@ private:
     CacheTransBufferManager* mCacheTransBufferManager;
 };
 
-std::unique_ptr<BaseCacheFormatter> createCacheFormatter(
-    BaseKVCacheManager* cacheManager, CacheTransBufferManager* cacheTransBufferManager, bool isMLA = false);
+std::unique_ptr<BaseCacheFormatter> createCacheFormatter(BaseKVCacheManager* cacheManager,
+    std::vector<CacheTransBufferManager*> const& cacheTransBufferManagers, bool isMLA = false);
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

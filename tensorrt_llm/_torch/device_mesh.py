@@ -3,7 +3,7 @@ from typing import TYPE_CHECKING, List
 
 import torch
 import torch.distributed as dist
-from torch.distributed import get_process_group_ranks
+from torch.distributed import ProcessGroup, get_process_group_ranks
 from torch.distributed.device_mesh import init_device_mesh
 
 from tensorrt_llm.logger import logger
@@ -48,27 +48,27 @@ class DeviceMeshTopologyImpl(_MappingBaseForTypeCheck):
     # Access Torch ProcessGroup
     @property
     @require_device_mesh
-    def tp_group_pg(self):
+    def tp_group_pg(self) -> ProcessGroup:
         return self._get_mesh_dim_by_name('tp').get_group()
 
     @property
     @require_device_mesh
-    def pp_group_pg(self):
+    def pp_group_pg(self) -> ProcessGroup:
         return self._get_mesh_dim_by_name('pp').get_group()
 
     @property
     @require_device_mesh
-    def cp_group_pg(self):
+    def cp_group_pg(self) -> ProcessGroup:
         return self._get_mesh_dim_by_name('cp').get_group()
 
     @property
     @require_device_mesh
-    def moe_tp_group_pg(self):
+    def moe_tp_group_pg(self) -> ProcessGroup:
         return self._get_mesh_dim_by_name('moe_tp').get_group()
 
     @property
     @require_device_mesh
-    def moe_ep_group_pg(self):
+    def moe_ep_group_pg(self) -> ProcessGroup:
         return self._get_mesh_dim_by_name('moe_ep').get_group()
 
     # Access rank
@@ -118,8 +118,10 @@ class DeviceMeshTopologyImpl(_MappingBaseForTypeCheck):
                 "DeviceMesh creation requested but torch.distributed process group "
                 "has not been initialised.")
 
-        dims = ["cp", "pp"]
-        shape = [self.cp_size, self.pp_size]
+        # Dimensions go from slowest-varying (outermost) to fastest-varying (innermost).
+        # Layout: pp is outermost, then tp, then cp is innermost (consecutive).
+        dims = ["pp"]
+        shape = [self.pp_size]
 
         if self.moe_ep_size > 1:
             dims += ["moe_tp", "moe_ep"]
@@ -127,6 +129,9 @@ class DeviceMeshTopologyImpl(_MappingBaseForTypeCheck):
         else:
             dims += ["tp"]
             shape += [self.tp_size]
+
+        dims += ["cp"]
+        shape += [self.cp_size]
 
         cls.device_mesh = init_device_mesh(
             "cuda",

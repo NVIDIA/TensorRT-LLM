@@ -59,14 +59,18 @@ def _run_test(model, op, variant):
         return any(is_op(n, op) for n in gm.graph.nodes)
 
     x = torch.randn(2, 1024, device="cuda", dtype=torch.float16)
-    dynamic_shapes = {0: Dim("batch_size", max=8)}
+    dynamic_shapes = {0: Dim.DYNAMIC}
     gm = torch_export_to_gm(model, args=(x,), dynamic_shapes=(dynamic_shapes,), clone=True)
     gm_transformed = InferenceOptimizer(
         None,
         {
+            "match_rmsnorm_pattern": {
+                "stage": "pattern_matcher",
+            },
             "fuse_rmsnorm": {
                 "stage": "post_load_fusion",
-                "backend": variant,
+                "gated_rmsnorm_backend": "triton",
+                "rmsnorm_backend": variant,
             },
         },
     )(None, gm)
@@ -102,4 +106,4 @@ def test_rmsnorm_fusion(eps, variant, op):
 def test_rmsnorm_fusion_nemotron_h():
     # Only the triton backend supports the nemotron h rmsnorm
     model = TestModel(eps=1e-6, use_nemotron_h=True)
-    _run_test(model, torch.ops.auto_deploy.triton_rms_norm, "triton")
+    _run_test(model, torch.ops.auto_deploy.triton_rms_norm, variant="triton")

@@ -17,10 +17,6 @@
 
 #include <gtest/gtest.h>
 
-#include <chrono>
-#include <memory> //@todo check the usage of this
-#include <random> //@todo check the usage of this
-
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
@@ -28,6 +24,10 @@
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 #include "tensorrt_llm/runtime/tllmLogger.h"
+#include <chrono>
+#include <cmath>
+#include <memory> //@todo check the usage of this
+#include <random> //@todo check the usage of this
 
 namespace tensorrt_llm::tests::kernels::routing
 {

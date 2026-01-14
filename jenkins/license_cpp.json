@@ -14,19 +14,7 @@
         },
         {
             "include_re": "^tensorrt_llm/",
-            "exclude_re": [
-                "^tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/src/",
-                "^tensorrt_llm/kernels/internal_cutlass_kernels/src/"
-            ],
             "license_name": "apache"
-        },
-        {
-            "include_re": "^tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/src/",
-            "license_name": "nvidia"
-        },
-        {
-            "include_re": "^tensorrt_llm/kernels/internal_cutlass_kernels/src/",
-            "license_name": "nvidia"
         }
     ],
     "skip": {

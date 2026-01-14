@@ -19,6 +19,8 @@
 #include "tensorrt_llm/thop/thUtils.h"
 #include <ATen/cuda/EmptyTensor.h>
 
+TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -37,6 +39,9 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::optional<torch::Tensor> con
     torch::optional<torch::Tensor> const& topk_weights, torch::optional<torch::Tensor> const& topk_ids)
 {
     TORCH_CHECK(tensorrt_llm::common::isSM100Family(), "Only SM100f is supported by FP8 block scale MOE");
+    TORCH_CHECK(tile_tokens_dim == 8 || tile_tokens_dim == 16 || tile_tokens_dim == 32 || tile_tokens_dim == 64
+            || tile_tokens_dim == 128 || tile_tokens_dim == 192 || tile_tokens_dim == 256,
+        "tile_tokens_dim must be 8, 16, 32, 64, 128, 256");
     if (topk_ids.has_value() && topk_weights.has_value())
     {
         TORCH_CHECK(topk_ids.value().scalar_type() == at::ScalarType::Int, "topk_ids must be int");
@@ -102,7 +107,7 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::optional<torch::Tensor> con
         TORCH_CHECK(routing_bias.value().sizes()[0] == num_experts, "routing_bias has incorrect shape.");
     }
 
-    if (n_group.has_value() && n_group.value() != 0)
+    if (n_group.has_value() && n_group.value() > 1)
     {
         TORCH_CHECK(static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3,
             "Routing kernel with groups implies DeepSeekV3 routing method.");
@@ -115,11 +120,6 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::optional<torch::Tensor> con
         // This check ensures we have enough experts in the selected groups to handle the top_k routing
         TORCH_CHECK(top_k < (topk_group.value() * num_experts / n_group.value()),
             "top_k must be less than total number of experts in selected groups");
-    }
-    else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Renormalize
-        || static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::RenormalizeNaive)
-    {
-        TORCH_CHECK(false, "Don't support routing method type Renormalize(Naive).");
     }
     else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Llama4)
     {
@@ -312,6 +312,8 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::optional<torch::Tensor> con
 }
 } // namespace torch_ext
 
+TRTLLM_NAMESPACE_END
+
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
@@ -341,5 +343,5 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("fp8_per_tensor_scale_moe_runner", &torch_ext::fp8_per_tensor_scale_moe_runner);
+    m.impl("fp8_per_tensor_scale_moe_runner", &tensorrt_llm::torch_ext::fp8_per_tensor_scale_moe_runner);
 }

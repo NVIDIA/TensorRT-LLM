@@ -20,6 +20,7 @@ import numpy as np
 import tensorrt as trt
 import torch
 
+from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm._utils import (get_init_params, str_dtype_to_torch,
                                  str_dtype_to_trt)
 from tensorrt_llm.layers.lora import LoraParams
@@ -49,14 +50,15 @@ from .mlp import MLP, GatedMLP
 
 activation_str_to_int_map = {
     # [WARNING] Keep the below in sync with cpp/tensorrt_llm/kernels/cutlass_kernels/include/common.h
-    "gelu": 0,
-    "gelu_new": 0,
-    "relu": 1,
-    "silu": 2,
-    "swiglu": 3,
-    "geglu": 4,
-    "swiglu_bias": 5,
-    "identity": 6,
+    "gelu": int(ActivationType.Gelu),
+    "gelu_new": int(ActivationType.Gelu),
+    "relu": int(ActivationType.Relu),
+    "silu": int(ActivationType.Silu),
+    "swiglu": int(ActivationType.Swiglu),
+    "geglu": int(ActivationType.Geglu),
+    "swiglu_bias": int(ActivationType.SwigluBias),
+    "identity": int(ActivationType.Identity),
+    "relu2": int(ActivationType.Relu2),
 }
 
 

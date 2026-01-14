@@ -21,11 +21,13 @@
 namespace tensorrt_llm::executor
 {
 
-CacheTransceiverConfig::CacheTransceiverConfig(
-    std::optional<BackendType> backendType, std::optional<size_t> maxNumTokens, std::optional<int> kvTransferTimeoutMs)
+CacheTransceiverConfig::CacheTransceiverConfig(std::optional<BackendType> backendType,
+    std::optional<size_t> maxNumTokens, std::optional<int> kvTransferTimeoutMs,
+    std::optional<int> kvTransferSenderFutureTimeoutMs)
     : mBackendType(backendType)
     , mMaxTokensInBuffer(maxNumTokens)
     , mKvTransferTimeoutMs(kvTransferTimeoutMs)
+    , mKvTransferSenderFutureTimeoutMs(kvTransferSenderFutureTimeoutMs)
 {
 }
 
@@ -54,6 +56,15 @@ void CacheTransceiverConfig::setKvTransferTimeoutMs(std::optional<int> kvTransfe
     mKvTransferTimeoutMs = kvTransferTimeoutMs;
 }
 
+void CacheTransceiverConfig::setKvTransferSenderFutureTimeoutMs(std::optional<int> kvTransferSenderFutureTimeoutMs)
+{
+    if (kvTransferSenderFutureTimeoutMs.has_value() && kvTransferSenderFutureTimeoutMs.value() <= 0)
+    {
+        TLLM_THROW("kvTransferSenderFutureTimeoutMs must be positive");
+    }
+    mKvTransferSenderFutureTimeoutMs = kvTransferSenderFutureTimeoutMs;
+}
+
 std::optional<CacheTransceiverConfig::BackendType> CacheTransceiverConfig::getBackendType() const
 {
     return mBackendType;
@@ -69,4 +80,8 @@ std::optional<int> CacheTransceiverConfig::getKvTransferTimeoutMs() const
     return mKvTransferTimeoutMs;
 }
 
+std::optional<int> CacheTransceiverConfig::getKvTransferSenderFutureTimeoutMs() const
+{
+    return mKvTransferSenderFutureTimeoutMs;
+}
 } // namespace tensorrt_llm::executor

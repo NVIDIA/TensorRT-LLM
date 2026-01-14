@@ -18,6 +18,7 @@
 #include <pybind11/functional.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <tensorrt_llm/kernels/helixAllToAll.h>
 #include <tensorrt_llm/thop/attentionOp.h>
 #include <tensorrt_llm/thop/moeAlltoAllMeta.h>
 #include <torch/extension.h>
@@ -30,7 +31,7 @@ namespace tensorrt_llm::pybind::thop
 void initBindings(pybind11::module_& m)
 {
     // Export MoE A2A constants
-    for (auto const& kv : torch_ext::getMoeA2AMetaInfoIndexPairs())
+    for (auto const& kv : torch_ext::moe_comm::getMoeA2AMetaInfoIndexPairs())
     {
         m.attr(kv.first) = py::int_(kv.second);
     }
@@ -38,9 +39,9 @@ void initBindings(pybind11::module_& m)
     m.def("attention", &torch_ext::attention,
         // Parameters with default values using std::nullopt for optional arguments
         py::arg("q"), py::arg("k") = std::nullopt, py::arg("v") = std::nullopt, py::arg("output"),
-        py::arg("output_sf") = std::nullopt, py::arg("out_dtype") = std::nullopt, py::arg("workspace_") = std::nullopt,
-        py::arg("sequence_length"), py::arg("host_past_key_value_lengths"), py::arg("host_total_kv_lens"),
-        py::arg("context_lengths"), py::arg("host_context_lengths"), py::arg("host_request_types"),
+        py::arg("output_sf") = std::nullopt, py::arg("workspace_") = std::nullopt, py::arg("sequence_length"),
+        py::arg("host_past_key_value_lengths"), py::arg("host_total_kv_lens"), py::arg("context_lengths"),
+        py::arg("host_context_lengths"), py::arg("host_request_types"),
         py::arg("kv_cache_block_offsets") = std::nullopt, py::arg("host_kv_cache_block_offsets") = std::nullopt,
         py::arg("host_kv_cache_pool_pointers") = std::nullopt, py::arg("host_kv_cache_pool_mapping") = std::nullopt,
         py::arg("cache_indirection") = std::nullopt, py::arg("kv_scale_orig_quant") = std::nullopt,
@@ -64,7 +65,19 @@ void initBindings(pybind11::module_& m)
         py::arg("softmax_stats_tensor") = std::nullopt, py::arg("spec_decoding_bool_params"),
         py::arg("spec_decoding_tensor_params"), py::arg("sparse_kv_indices") = std::nullopt,
         py::arg("sparse_kv_offsets") = std::nullopt, py::arg("sparse_attn_indices") = std::nullopt,
-        py::arg("sparse_attn_offsets") = std::nullopt, py::arg("sparse_mla_topk") = std::nullopt,
-        "Multi-head attention operation", py::call_guard<py::gil_scoped_release>());
+        py::arg("sparse_attn_offsets") = std::nullopt, py::arg("sparse_attn_indices_block_size"),
+        py::arg("sparse_mla_topk") = std::nullopt,
+        py::arg("skip_softmax_threshold_scale_factor_prefill") = std::nullopt,
+        py::arg("skip_softmax_threshold_scale_factor_decode") = std::nullopt,
+        py::arg("skip_softmax_stat") = std::nullopt, py::arg("cu_q_seqlens") = std::nullopt,
+        py::arg("cu_kv_seqlens") = std::nullopt, py::arg("fmha_scheduler_counter") = std::nullopt,
+        py::arg("mla_bmm1_scale") = std::nullopt, py::arg("mla_bmm2_scale") = std::nullopt,
+        py::arg("quant_q_buffer") = std::nullopt, "Multi-head attention operation",
+        py::call_guard<py::gil_scoped_release>());
+
+    m.def(
+        "get_helix_workspace_size_per_rank",
+        [](int cp_size) { return tensorrt_llm::kernels::computeHelixWorkspaceSizePerRank(cp_size); },
+        py::arg("cp_size"), "Get helix all-to-all workspace size per rank in bytes");
 }
 } // namespace tensorrt_llm::pybind::thop

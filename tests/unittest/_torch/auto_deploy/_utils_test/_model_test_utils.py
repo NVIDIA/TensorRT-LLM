@@ -278,8 +278,8 @@ class FakeFP8Linear(nn.Linear):
 def generate_dynamic_shapes(max_batch_size, max_seq_len):
     dynamic_shapes = (
         {
-            0: Dim("batch_size", max=max_batch_size),
-            1: Dim("seq_len", max=max_seq_len),
+            0: Dim.DYNAMIC,
+            1: Dim.DYNAMIC,
         },
     )
     return dynamic_shapes
@@ -393,7 +393,7 @@ _SMALL_MODEL_CONFIGS = {
         },
     },
     "meta-llama/Llama-4-Scout-17B-16E-Instruct": {
-        "llm_models_subdir": "Llama-4-Scout-17B-16E-Instruct",
+        "llm_models_subdir": "llama4-models/Llama-4-Scout-17B-16E-Instruct",
         "model_factory": "AutoModelForImageTextToText",
         "model_kwargs": {
             "text_config": {
@@ -500,6 +500,12 @@ _SMALL_MODEL_CONFIGS = {
         "llm_models_subdir": "llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
         "model_kwargs": {
             "num_hidden_layers": 2,
+        },
+    },
+    "nvidia/Nemotron-Nano-3-30B-A3.5B-dev-1024": {
+        "llm_models_subdir": "Nemotron-Nano-3-30B-A3.5B-dev-1024",
+        "model_kwargs": {
+            "num_hidden_layers": 8,
         },
     },
 }

@@ -62,6 +62,7 @@ class MockPyExecutor:
     max_total_draft_tokens: int
     max_beam_width: int
     guided_decoder: Any
+    drafter: Any
 
 
 @dataclass

@@ -1,0 +1,2 @@
+test_disagg.py::TestDisaggBenchmark::test_benchmark[disagg_perf_deepseek-r1-fp4_1k1k_ctx1_gen4_tep8_bs32_eplb0_mtp0_ccb-UCX]
+test_disagg.py::TestDisaggBenchmark::test_benchmark[disagg_perf_deepseek-r1-fp4_1k1k_ctx1_gen4_tep8_bs32_eplb0_mtp0_ccb-NIXL]

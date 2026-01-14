@@ -18,7 +18,7 @@ from ..modules.fused_moe import (BaseMoeRoutingMethod, CutlassFusedMoE,
                                  RenormalizeNaiveMoeRoutingMethod,
                                  RoutingMethodType, TRTLLMGenFusedMoE,
                                  create_moe, get_moe_cls)
-from ..modules.fused_moe.interface import MoE
+from ..modules.fused_moe.interface import MoE, MoEWeightLoadingMode
 from ..modules.linear import TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
@@ -58,10 +58,15 @@ class Qwen3Gate(nn.Module):
             hidden_states, self.weight.t(), bias=None, out_dtype=self.out_dtype)
         return logits
 
-    def load_weights(self, weights: List[Dict]):
+    def load_weights(self,
+                     weights: List[Dict],
+                     allow_partial_loading: bool = False):
         assert len(weights) == 1
-
-        self.weight.copy_(weights[0]["weight"][:])
+        w = weights[0].get("weight")
+        if not allow_partial_loading:
+            assert w is not None, "Qwen3Gate expects weight when partial loading is disabled"
+        if w is not None:
+            self.weight.copy_(w[:])
 
     @property
     def routing_method(self) -> BaseMoeRoutingMethod:
@@ -94,8 +99,10 @@ class Qwen3MoE(nn.Module):
         self.top_k = config.num_experts_per_tok
         self.enable_attention_dp = model_config.mapping.enable_attention_dp
         self.mapping = model_config.mapping
-        self.allreduce = AllReduce(mapping=model_config.mapping,
-                                   strategy=model_config.allreduce_strategy)
+        self.allreduce = None
+        if not self.enable_attention_dp and self.mapping.tp_size > 1:
+            self.allreduce = AllReduce(mapping=model_config.mapping,
+                                       strategy=model_config.allreduce_strategy)
 
         self.gate = Qwen3Gate(
             hidden_size=self.hidden_dim,
@@ -107,6 +114,7 @@ class Qwen3MoE(nn.Module):
             moe_backend_cls=get_moe_cls(model_config),
         )
 
+        self.weight_loading_mode = MoEWeightLoadingMode.FUSED_GATE_UP_PROJ if config.model_type == "qwen3_vl_moe_text" else MoEWeightLoadingMode.VANILLA
         self.experts = create_moe(
             num_experts=self.num_experts,
             routing_method=self.gate.routing_method,
@@ -117,6 +125,7 @@ class Qwen3MoE(nn.Module):
             reduce_results=False,
             model_config=model_config,
             layer_idx=layer_idx,
+            weight_loading_mode=self.weight_loading_mode,
         )
 
     def forward(
@@ -162,13 +171,14 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
         super().__init__()
         self.model_config = model_config
         config = model_config.pretrained_config
+        self.mapping = model_config.mapping
+        self.enable_attention_dp = self.mapping.enable_attention_dp
         self.self_attn = Qwen3Attention(
             model_config,
             layer_idx=layer_idx,
             disable_deep_gemm=True,
-        )
-        self.mapping = model_config.mapping
-        self.enable_attention_dp = self.mapping.enable_attention_dp
+            reduce_output=not self.enable_attention_dp
+            and self.mapping.tp_size > 1)
 
         self.mlp = Qwen3MoE(model_config, aux_stream_dict, layer_idx=layer_idx)
 
@@ -181,8 +191,10 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
                                                 dtype=config.torch_dtype)
         self.layer_idx = layer_idx
 
-        self.allreduce = AllReduce(mapping=model_config.mapping,
-                                   strategy=model_config.allreduce_strategy)
+        self.allreduce = None
+        if not self.enable_attention_dp and self.mapping.tp_size > 1:
+            self.allreduce = AllReduce(mapping=model_config.mapping,
+                                       strategy=model_config.allreduce_strategy)
         self.next_layer_layernorm: RMSNorm = None
 
         self.is_p2p_supported = can_access_peer(model_config.mapping)
@@ -200,7 +212,9 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
         self.disable_attn_allreduce = (self.fusion_config.PRE_MOE_FUSION
                                        or self.mapping.tp_size == 1
                                        or self.enable_attention_dp)
-        self.moe_allreduce = MoEAllReduce(mapping=model_config.mapping)
+        self.moe_allreduce = None
+        if not self.enable_attention_dp and self.mapping.tp_size > 1:
+            self.moe_allreduce = MoEAllReduce(mapping=model_config.mapping)
 
     def forward(
         self,
@@ -209,6 +223,8 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
         spec_metadata: Optional[SpecMetadata] = None,
+        mrope_config: Optional[Dict[str, torch.Tensor]] = None,
+        deepstack_embeds: Optional[List[torch.Tensor]] = None,
         **kwargs,
     ) -> torch.Tensor:
         if residual is None:
@@ -224,6 +240,7 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
             attn_metadata=attn_metadata,
             all_reduce_params=AllReduceParams(
                 enable_allreduce=not self.disable_attn_allreduce),
+            mrope_config=mrope_config,
             **kwargs,
         )
 
@@ -243,8 +260,8 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
 
         # Note: this fusion pattern is only supported for TRTLLM-nvfp4 backend now
         do_finalize = not (
-            hidden_states.shape[0] <= self.moe_allreduce.max_token
-            and self.fusion_config.POST_MOE_FUSION
+            self.fusion_config.POST_MOE_FUSION
+            and hidden_states.shape[0] <= self.moe_allreduce.max_token
             and self.model_config.moe_backend == 'TRTLLM'
             and self.mlp.experts.has_nvfp4 and self.is_p2p_supported)
 
@@ -256,6 +273,10 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
                                       or self.mapping.tp_size == 1)),
             do_finalize=do_finalize,
         )
+
+        if deepstack_embeds is not None and self.layer_idx in range(
+                len(deepstack_embeds)):
+            residual = residual + deepstack_embeds[self.layer_idx]
 
         if self.fusion_config.POST_MOE_FUSION:
             if do_finalize:
@@ -306,6 +327,7 @@ class Qwen3MoEModel(DecoderModel):
         self.aux_stream_dict = {
             AuxStreamType.MoeChunkingOverlap: torch.cuda.Stream(),
             AuxStreamType.MoeBalancer: torch.cuda.Stream(),
+            AuxStreamType.MoeOutputMemset: torch.cuda.Stream(),
         }
         self.preload_weight_modules = []
         if config.moe_backend == "TRTLLM":
@@ -322,7 +344,8 @@ class Qwen3MoEModel(DecoderModel):
             self.embed_tokens = Embedding(
                 config.pretrained_config.vocab_size,
                 config.pretrained_config.hidden_size,
-                dtype=config.pretrained_config.torch_dtype)
+                dtype=config.pretrained_config.torch_dtype,
+            )
         else:
             self.embed_tokens = Embedding(
                 config.pretrained_config.vocab_size,
@@ -352,6 +375,8 @@ class Qwen3MoEModel(DecoderModel):
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         spec_metadata: Optional[SpecMetadata] = None,
+        mrope_config: Optional[Dict[str, torch.Tensor]] = None,
+        deepstack_embeds: Optional[List[torch.Tensor]] = None,
         **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -366,11 +391,14 @@ class Qwen3MoEModel(DecoderModel):
 
         residual = None
         for decoder_layer in self.layers:
-            hidden_states, residual = decoder_layer(position_ids=position_ids,
-                                                    hidden_states=hidden_states,
-                                                    attn_metadata=attn_metadata,
-                                                    residual=residual,
-                                                    spec_metadata=spec_metadata)
+            hidden_states, residual = decoder_layer(
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attn_metadata=attn_metadata,
+                residual=residual,
+                spec_metadata=spec_metadata,
+                mrope_config=mrope_config,
+                deepstack_embeds=deepstack_embeds)
         return hidden_states
 
 

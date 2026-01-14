@@ -16,6 +16,7 @@
 
 #include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 
 #include <cerrno>
 #include <cstdarg>
@@ -23,7 +24,9 @@
 #include <iostream>
 #include <string>
 
-namespace tensorrt_llm::common
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common
 {
 
 void fmtstr_(char const* format, fmtstr_allocator alloc, void* target, va_list args)
@@ -73,4 +76,6 @@ std::unordered_set<std::string> str2set(std::string const& input, char delimiter
     return values;
 };
 
-} // namespace tensorrt_llm::common
+} // namespace common
+
+TRTLLM_NAMESPACE_END

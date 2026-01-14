@@ -1,5 +1,5 @@
 # Sampling
-The PyTorch backend supports most of the sampling features that are supported on the C++ backend, such as temperature, top-k and top-p sampling, beam search, stop words, bad words, penalty, context and generation logits, log probability, guided decoding and logits processors
+The PyTorch backend supports most of the sampling features that are supported on the C++ backend, such as temperature, top-k and top-p sampling, beam search, stop words, bad words, penalty, context and generation logits, log probability and logits processors
 
 ## General usage
 
@@ -24,6 +24,52 @@ llm.generate(["Hello, my name is",
 ```
 
 Note: The `enable_trtllm_sampler` option is not currently supported when using speculative decoders, such as MTP or Eagle-3, so there is a smaller subset of sampling options available.
+
+### LLM API sampling behavior when using Torch Sampler
+
+* The sampling is controlled via `SamplingParams`.
+
+* By default (`temperature = top_p = top_k = None`), greedy sampling is used.
+
+* If either `temperature = 0`, `top_p = 0`, and/or `top_k = 1`, is specified, sampling is greedy,
+  irrespective of the values of the remaining parameters.
+
+* Otherwise, sampling proceeds according to the specified sampling parameter values and any
+  unspecified parameters default to `top_k = 0`, `top_p = 1`, `temperature = 1.0`:
+
+  * The logits are scaled by `1/temperature` before applying softmax to compute probabilities.
+    Sampling is performed according to these probabilities.
+
+  * If `top_k = 0` (or `top_k = vocab_size`) and `top_p = 1`, the output tokens are sampled
+    from the entire vocabulary.
+
+  * If `1 < top_k < vocab_size` is specified, the sampling is restricted to
+    the `top_k` highest-probability tokens.
+
+  * If `0 < top_p < 1.0` is specified, the sampling is further restricted to a minimal subset
+    of highest-probability tokens with total probability greater than `top_p` ("nucleus sampling").
+    In particular, the probability of the lowest-probability token in the selected
+    subset is greater or equal than the probability of any not selected token.
+    When combined with `top_k`, the probabilities of the tokens selected by `top_k` are rescaled
+    such that they sum to one before `top_p` is applied.
+
+  * The implementation does not guarantee any particular treatment of tied probabilities.
+
+### Performance
+
+The Torch Sampler leverages the optimized sampling kernels provided by
+[FlashInfer](https://docs.flashinfer.ai/api/sampling.html). The sampler
+also uses the [sorting-free implementations](https://flashinfer.ai/2025/03/10/sampling.html)
+whenever possible. This optimization does not compute the complete set of token sampling probabilities
+(after top-k / top-p masking etc.), which typically can be omitted unless requested by the user or
+required for speculative decoding (rejection sampling).
+In case of unexpected problems, the use of FlashInfer in Torch Sampler can
+be disabled via the `disable_flashinfer_sampling` config option (note that this option is likely
+to be removed in a future TensorRT LLM release).
+
+Moreover, Torch Sampler internally batches requests with compatible sampling parameters. This
+can greatly reduce the overall latency of the sampling step when request batches are comprised
+of requests with very heterogeneous sampling strategies (e.g. a mix of requests using greedy and top-p-after-top-k sampling).
 
 ## Beam search
 
@@ -59,42 +105,6 @@ sampling_params = SamplingParams(
 llm.generate(["Hello, my name is",
             "Hello, my name is"], sampling_params)
 ```
-
-## Guided decoding
-
-Guided decoding controls the generation outputs to conform to pre-defined structured formats, ensuring outputs follow specific schemas or patterns.
-
-The PyTorch backend supports guided decoding with the XGrammar and Low-level Guidance (llguidance) backends and the following formats:
-- JSON schema
-- JSON object
-- Regular expressions
-- Extended Backus-Naur form (EBNF) grammar
-- Structural tags
-
-To enable guided decoding, you must:
-
-1. Set the `guided_decoding_backend` parameter to `'xgrammar'` or `'llguidance'` in the `LLM` class
-2. Create a [`GuidedDecodingParams`](source:tensorrt_llm/sampling_params.py#L14) object with the desired format specification
-    * Note: Depending on the type of format, a different parameter needs to be chosen to construct the object (`json`, `regex`, `grammar`, `structural_tag`).
-3. Pass the `GuidedDecodingParams` object to the `guided_decoding` parameter of the `SamplingParams` object
-
-The following example demonstrates guided decoding with a JSON schema:
-
-```python
-from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import GuidedDecodingParams
-
-llm = LLM(model='nvidia/Llama-3.1-8B-Instruct-FP8',
-          guided_decoding_backend='xgrammar')
-structure = '{"title": "Example JSON", "type": "object", "properties": {...}}'
-guided_decoding_params = GuidedDecodingParams(json=structure)
-sampling_params = SamplingParams(
-        guided_decoding=guided_decoding_params,
-    )
-llm.generate("Generate a JSON response", sampling_params)
-```
-
-You can find a more detailed example on guided decoding [here](source:examples/llm-api/llm_guided_decoding.py).
 
 ## Logits processor
 

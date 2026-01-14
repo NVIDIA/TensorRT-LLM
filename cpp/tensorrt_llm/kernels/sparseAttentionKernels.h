@@ -15,14 +15,15 @@
  */
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <sstream>
 #include <string>
 #include <tuple>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -35,6 +36,9 @@ struct SparseAttentionParams
     int32_t sparse_mla_topk{0};              // for DSA attention
     void* sparse_mla_kv_cache_pool{nullptr}; // for DSA attention
 
+    int32_t sparse_attn_indices_block_size{1};
+    int32_t sparse_attn_indices_stride{0};
+
     std::string toString() const
     {
         std::stringstream ss;
@@ -43,7 +47,9 @@ struct SparseAttentionParams
            << "sparse_kv_offsets: " << this->sparse_kv_offsets << std::endl
            << "sparse_attn_offsets: " << this->sparse_attn_offsets << std::endl
            << "sparse_mla_topk: " << this->sparse_mla_topk << std::endl
-           << "sparse_mla_kv_cache_pool: " << this->sparse_mla_kv_cache_pool << std::endl;
+           << "sparse_mla_kv_cache_pool: " << this->sparse_mla_kv_cache_pool << std::endl
+           << "sparse_attn_indices_block_size: " << this->sparse_attn_indices_block_size << std::endl
+           << "sparse_attn_indices_stride: " << this->sparse_attn_indices_stride << std::endl;
         return ss.str();
     }
 };
@@ -77,4 +83,5 @@ void invokeGatherKvPageOffsets(int32_t* output_kv_page_offsets, // [num_head_kv,
     int32_t const tokens_per_page, int32_t const max_num_pages_per_seq, cudaStream_t stream);
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

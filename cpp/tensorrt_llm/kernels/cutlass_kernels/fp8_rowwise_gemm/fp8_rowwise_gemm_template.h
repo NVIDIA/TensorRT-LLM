@@ -26,6 +26,7 @@
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wstrict-aliasing"
 #endif // __GNUC__
+#include "tensorrt_llm/common/config.h"
 
 #include "cute/tensor.hpp"
 #include "cutlass/conv/convolution.h"
@@ -49,8 +50,8 @@
 #include <algorithm>
 #include <vector>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace cutlass_kernels
@@ -686,7 +687,7 @@ size_t CutlassFp8RowwiseGemmRunner<T>::dispatchToArch(void* D, void const* A, vo
         return dispatchGemmToCutlassSm90<T>(D, A, B, C_bias, quantOption, m, n, k, scale_d0, scale_d1, gemmConfig,
             workspace, workspaceBytes, stream, occupancy);
     }
-    else if (mSm == 100)
+    else if (mSm == 100 || mSm == 103)
     {
         return dispatchGemmToCutlassSm100<T>(D, A, B, C_bias, quantOption, m, n, k, scale_d0, scale_d1, gemmConfig,
             workspace, workspaceBytes, stream, occupancy);
@@ -758,7 +759,7 @@ std::vector<tkc::CutlassGemmConfig> CutlassFp8RowwiseGemmRunner<T>::getConfigs()
             }
         }
     }
-    else if (mSm == 100)
+    else if (mSm == 100 || mSm == 103)
     {
         std::vector<tkc::CutlassTileConfigSM100> tilesSm100 = {
             tkc::CutlassTileConfigSM100::CtaShape64x32x128B,
@@ -865,4 +866,5 @@ size_t CutlassFp8RowwiseGemmRunner<T>::getWorkspaceSize(int const m, int const n
 
 } // namespace cutlass_kernels
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

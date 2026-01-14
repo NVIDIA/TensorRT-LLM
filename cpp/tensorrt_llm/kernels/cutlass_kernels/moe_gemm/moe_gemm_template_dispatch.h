@@ -53,6 +53,7 @@
 #endif
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 
@@ -73,7 +74,9 @@
 #include <sstream>
 #include <type_traits>
 
-namespace tensorrt_llm::kernels::cutlass_kernels_oss
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::cutlass_kernels_oss
 {
 
 // ============================= Variable batched Gemm things ===========================
@@ -473,9 +476,9 @@ void dispatchMoeGemmToCutlass(GroupedGemmInput<T, WeightType, GemmOutputType, Ge
     }
 }
 
-} // namespace tensorrt_llm::kernels::cutlass_kernels_oss
+} // namespace kernels::cutlass_kernels_oss
 
-namespace tensorrt_llm::kernels::cutlass_kernels
+namespace kernels::cutlass_kernels
 {
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
@@ -789,25 +792,37 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
             TLLM_CHECK_WITH_INFO(
                 inputs.gemm_config.is_tma_warp_specialized, "w4afp8 is only supported for TMA warp specialization");
             // EpilogueTag is ignored
+#define SM90_DISPATCH_MOE_MIXED_GEMM_TO_CUTLASS_SELECT_FINALIZE(SCALE_FACTOR)                                          \
+    if (hopper_inputs.fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE)                          \
+    {                                                                                                                  \
+        cutlass_kernels_oss::sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass<T, WeightType, ScaleBiasType,               \
+            cutlass_extensions::EpilogueOpDefault, TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE,       \
+            SCALE_FACTOR>(inputs, hopper_inputs, multi_processor_count_, nullptr);                                     \
+    }                                                                                                                  \
+    else                                                                                                               \
+    {                                                                                                                  \
+        cutlass_kernels_oss::sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass<T, WeightType, ScaleBiasType,               \
+            cutlass_extensions::EpilogueOpDefault, TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE,           \
+            SCALE_FACTOR>(inputs, hopper_inputs, multi_processor_count_, nullptr);                                     \
+    }
+
             if (inputs.k % 512 == 0)
             {
-                cutlass_kernels_oss::sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass<T, WeightType, ScaleBiasType,
-                    cutlass_extensions::EpilogueOpDefault, 4>(inputs, hopper_inputs, multi_processor_count_, nullptr);
+                SM90_DISPATCH_MOE_MIXED_GEMM_TO_CUTLASS_SELECT_FINALIZE(4)
             }
             else if (inputs.k % 256 == 0)
             {
-                cutlass_kernels_oss::sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass<T, WeightType, ScaleBiasType,
-                    cutlass_extensions::EpilogueOpDefault, 2>(inputs, hopper_inputs, multi_processor_count_, nullptr);
+                SM90_DISPATCH_MOE_MIXED_GEMM_TO_CUTLASS_SELECT_FINALIZE(2)
             }
             else if (inputs.k % 128 == 0)
             {
-                cutlass_kernels_oss::sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass<T, WeightType, ScaleBiasType,
-                    cutlass_extensions::EpilogueOpDefault, 1>(inputs, hopper_inputs, multi_processor_count_, nullptr);
+                SM90_DISPATCH_MOE_MIXED_GEMM_TO_CUTLASS_SELECT_FINALIZE(1)
             }
             else
             {
                 TLLM_THROW("Invalid GEMM K size %d", (int) inputs.k);
             }
+#undef SM90_DISPATCH_MOE_MIXED_GEMM_TO_CUTLASS_SELECT_FINALIZE
             return;
         }
 
@@ -817,7 +832,8 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
                 inputs.gemm_config.is_tma_warp_specialized, "wfp4a16 is only supported for TMA warp specialization");
             // EpilogueTag is ignored
             cutlass_kernels_oss::sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass<T, WeightType, ScaleBiasType,
-                cutlass_extensions::EpilogueOpDefault, 1>(inputs, hopper_inputs, multi_processor_count_, nullptr);
+                cutlass_extensions::EpilogueOpDefault, TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE, 1>(
+                inputs, hopper_inputs, multi_processor_count_, nullptr);
             return;
         }
 #endif
@@ -954,6 +970,7 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::moeGemmBiasAct(
     case ActivationType::Identity: runGemm<cutlass_extensions::EpilogueOpDefault>(inputs, hopper_inputs); break;
     case ActivationType::Swiglu: runGemm<cutlass_extensions::EpilogueOpDefaultSilu>(inputs, hopper_inputs); break;
     case ActivationType::Geglu: runGemm<cutlass_extensions::EpilogueOpDefaultFtGelu>(inputs, hopper_inputs); break;
+    case ActivationType::Relu2: runGemm<cutlass_extensions::EpilogueOpDefaultRelu2>(inputs, hopper_inputs); break;
     case ActivationType::InvalidType: TLLM_THROW("Activation type for fpA_intB must be valid."); break;
     default: TLLM_THROW("Invalid activation type."); break;
     }
@@ -966,4 +983,6 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::moeGemm(
     runGemm<cutlass_extensions::EpilogueOpDefault>(inputs, hopper_inputs);
 }
 
-} // namespace tensorrt_llm::kernels::cutlass_kernels
+} // namespace kernels::cutlass_kernels
+
+TRTLLM_NAMESPACE_END

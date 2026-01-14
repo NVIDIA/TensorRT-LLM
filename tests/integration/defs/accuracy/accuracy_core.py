@@ -402,6 +402,8 @@ class MMMU(AccuracyTask):
                             is_multimodal=True,
                             apply_chat_template=True)
 
+    EVALUATE_KWARGS = dict(model_type=None, is_force_single_image=False)
+
 
 class PassKeyRetrieval64k(AccuracyTask):
     DATASET = "passkey_retrieval_64k"
@@ -431,6 +433,57 @@ class PassKeyRetrieval128k(AccuracyTask):
     MAX_BATCH_SIZE = 1
     MAX_INPUT_LEN = 128 * 1024
     MAX_OUTPUT_LEN = 50
+
+
+class LongBenchV2(AccuracyTask):
+    DATASET = "longbench_v2"
+    DATASET_DIR = f"{llm_models_root()}/zai-org/LongBench-v2"
+
+    ALPHA = 0.05
+    BETA = 0.2
+    SIGMA = 50.0
+    NUM_SAMPLES = 215
+
+    MAX_BATCH_SIZE = 32
+    MAX_INPUT_LEN = 1280000
+    MAX_OUTPUT_LEN = 32000
+
+    EVALUATOR_CLS = tensorrt_llm.evaluate.LongBenchV2
+    EVALUATOR_KWARGS = dict(
+        dataset_path=DATASET_DIR,
+        length="medium",
+        max_len=120000,
+        apply_chat_template=True,
+        random_seed=0,
+    )
+
+
+class LongBenchV1(AccuracyTask):
+    DATASET = "longbench_v1"
+    # Keep the dataset local like other accuracy tasks (avoid HF hub traffic).
+    # Expected to be populated in CI image / test environment.
+    DATASET_DIR = f"{llm_models_root()}/datasets/Xnhyacinth/LongBench"
+
+    # NOTE: LongBench v1 is driven by lm-evaluation-harness task configs.
+    # We intentionally do not pin dataset_path here (it can be resolved by lm-eval
+    # via HF Hub or local cache).
+    ALPHA = 0.05
+    BETA = 0.2
+    SIGMA = 50.0
+
+    # Full sample
+    NUM_SAMPLES = 4750
+
+    # These are used by AccuracyTask to construct SamplingParams defaults.
+    # LongBench v1 tasks provide per-task gen_kwargs, so these are mainly a safe fallback.
+    MAX_BATCH_SIZE = 256
+    MAX_INPUT_LEN = 128000
+    MAX_OUTPUT_LEN = 1024
+
+    EVALUATOR_CLS = tensorrt_llm.evaluate.LongBenchV1
+    EVALUATOR_KWARGS = dict(dataset_path=DATASET_DIR,
+                            random_seed=0,
+                            apply_chat_template=True)
 
 
 class CliFlowAccuracyTestHarness:

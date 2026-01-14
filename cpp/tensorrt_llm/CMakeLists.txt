@@ -157,6 +157,11 @@ set(UCX_WRAPPER_TARGET tensorrt_llm_ucx_wrapper)
 
 if(NIXL_ROOT)
   set(NIXL_WRAPPER_TARGET tensorrt_llm_nixl_wrapper)
+  set(TRANSFER_AGENT_BINDING_TARGET tensorrt_llm_transfer_agent_binding)
+endif()
+
+if(MOONCAKE_ROOT)
+  set(MOONCAKE_WRAPPER_TARGET tensorrt_llm_mooncake_wrapper)
 endif()
 
 add_subdirectory(executor)
@@ -189,6 +194,7 @@ set(TRTLLM_LINK_LIBS
     fb_gemm_src
     gemm_swiglu_sm90_src
     cutlass_src
+    cute_dsl_src
     layers_src
     runtime_src
     testing_src
@@ -269,6 +275,11 @@ endif()
 if(TARGET ${NIXL_WRAPPER_TARGET})
   target_link_libraries(${NIXL_WRAPPER_TARGET} INTERFACE ${SHARED_TARGET})
   add_dependencies(${SHARED_TARGET} ${NIXL_WRAPPER_TARGET})
+endif()
+
+if(TARGET ${MOONCAKE_WRAPPER_TARGET})
+  target_link_libraries(${MOONCAKE_WRAPPER_TARGET} INTERFACE ${SHARED_TARGET})
+  add_dependencies(${SHARED_TARGET} ${MOONCAKE_WRAPPER_TARGET})
 endif()
 
 if(NOT WIN32)

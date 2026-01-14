@@ -6,8 +6,8 @@ from torch import nn
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.qwen2_moe_weight_mapper import \
     Qwen2MoeHfWeightMapper
-from tensorrt_llm._torch.models.modeling_nemotron_h import split
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
+from tensorrt_llm._torch.utils import split
 from tensorrt_llm.models.modeling_utils import DecoderModelForCausalLM
 
 

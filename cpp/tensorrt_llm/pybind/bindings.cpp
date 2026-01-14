@@ -28,6 +28,8 @@
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/pybind/batch_manager/algorithms.h"
 #include "tensorrt_llm/pybind/batch_manager/bindings.h"
+#include "tensorrt_llm/pybind/batch_manager/buffers.h"
+
 #include "tensorrt_llm/pybind/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/pybind/batch_manager/kvCacheConnector.h"
 #include "tensorrt_llm/pybind/batch_manager/kvCacheManager.h"
@@ -478,6 +480,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_property_readonly("uvm", &tr::MemoryCounters::getUVM);
 
     tensorrt_llm::pybind::process_group::initBindings(mInternalProcessGroup);
+    tpb::Buffers::initBindings(mInternalBatchManager);
     tensorrt_llm::pybind::runtime::initBindings(mInternalRuntime);
     tensorrt_llm::pybind::testing::initBindings(mInternalTesting);
     tpb::initBindings(mInternalBatchManager);

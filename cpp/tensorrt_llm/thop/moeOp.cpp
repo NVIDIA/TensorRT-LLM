@@ -23,6 +23,7 @@
 // Always include the public header for moe_gemm_kernels.h
 #include "tensorrt_llm/kernels/cutlass_kernels/include/moe_gemm_kernels.h"
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/workspace.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/include/cutlass_kernel_selector.h"
@@ -41,6 +42,8 @@
         oss << __VA_ARGS__;                                                                                            \
         C10_THROW_ERROR(ErrorType, oss.str());                                                                         \
     } while (0)
+
+TRTLLM_NAMESPACE_BEGIN
 
 namespace torch_ext
 {
@@ -234,6 +237,7 @@ public:
         mProfiler = std::make_shared<kernels::GemmProfilerBackend>();
         mGemm1Profiles = mKernelRunner->getTactics(MoeGemmId::GEMM_1);
         mGemm2Profiles = mKernelRunner->getTactics(MoeGemmId::GEMM_2);
+        cuInit(0);
     }
 
     ~FusedMoeRunner()
@@ -259,8 +263,8 @@ public:
         torch::optional<torch::Tensor> const& swiglu_limit, int64_t const tp_size, int64_t const tp_rank,
         int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size, int64_t const cluster_rank,
         bool const enable_alltoall, bool min_latency_mode, torch::optional<c10::ArrayRef<int64_t>> const& profile_ids,
-        torch::optional<int64_t> const& unpadded_hidden_size, torch::optional<int64_t> const& num_valid_tokens,
-        torch::optional<torch::Tensor> const& out_tensor)
+        torch::optional<int64_t> const& activation_type, torch::optional<int64_t> const& unpadded_hidden_size,
+        torch::optional<int64_t> const& num_valid_tokens, torch::optional<torch::Tensor> const& out_tensor)
     {
         std::lock_guard<std::mutex> lock(mMutex);
         // Free the profile workspace to save memory
@@ -328,6 +332,9 @@ public:
         TORCH_CHECK(fc1_expert_weights.sizes()[0] == fc2_expert_weights.sizes()[0],
             "fc1_expert_weights and fc2_expert_weights must have the same number of experts.");
 
+        ActivationType base_activation_type = activation_type.has_value()
+            ? static_cast<ActivationType>(activation_type.value())
+            : ActivationType::Swiglu;
         if (mUseINT8WoqPerChannel)
         {
             // Note: The weight shape for INT8 weight only quantization is different, e.g., fc2_expert_weights:
@@ -337,8 +344,16 @@ public:
         }
         else
         {
-            TORCH_CHECK(fc1_expert_weights.sizes()[1] == fc2_expert_weights.sizes()[2] * mInnerDimMultiplier * 2,
-                "fc1_expert_weights inter size must be fc2_expert_weights inter size.");
+            if (isGatedActivation(base_activation_type))
+            {
+                TORCH_CHECK(fc1_expert_weights.sizes()[1] == fc2_expert_weights.sizes()[2] * mInnerDimMultiplier * 2,
+                    "fc1_expert_weights inter size must be 2 times fc2_expert_weights inter size.");
+            }
+            else
+            {
+                TORCH_CHECK(fc1_expert_weights.sizes()[1] == fc2_expert_weights.sizes()[2] * mInnerDimMultiplier,
+                    "fc1_expert_weights inter size must be equal to fc2_expert_weights inter size.");
+            }
         }
 
         int experts_per_token = token_selected_experts.sizes()[1];
@@ -375,7 +390,7 @@ public:
         int const num_experts_on_rank = fc2_expert_weights.sizes()[0];
         auto const num_experts_total = static_cast<int>(num_experts_on_rank * ep_size);
         auto parallelism_config = kernels::MOEParallelismConfig(tp_size, tp_rank, ep_size, ep_rank);
-        ActivationType base_activation_type = ActivationType::Swiglu;
+
         if (swiglu_alpha.has_value())
         {
             CHECK_INPUT(swiglu_alpha.value(), at::ScalarType::Float);
@@ -424,7 +439,8 @@ public:
         WorkspaceInfo const& workspace_info = getWorkspaceInfo(num_rows, hidden_size, inter_size, num_experts_total,
             static_cast<int>(experts_per_token), base_activation_type, parallelism_config, min_latency_mode, stream);
 
-        auto const quant_params = getQuantParams(num_experts_on_rank, hidden_size, inter_size, quant_scales);
+        auto const quant_params
+            = getQuantParams(num_experts_on_rank, hidden_size, inter_size, quant_scales, base_activation_type);
         kernels::MoeMinLatencyParams min_latency_params{};
 
         // TODO: support lora in the future
@@ -474,8 +490,8 @@ public:
         torch::optional<torch::Tensor> const& swiglu_limit, int64_t const tp_size, int64_t const tp_rank,
         int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size, int64_t const cluster_rank,
         bool const enable_alltoall, bool min_latency_mode, torch::optional<c10::ArrayRef<int64_t>> const& profile_ids,
-        torch::optional<int64_t> const& unpadded_hidden_size, torch::optional<int64_t> const& num_valid_tokens,
-        torch::optional<torch::Tensor> const& out_tensor)
+        torch::optional<int64_t> const& activation_type, torch::optional<int64_t> const& unpadded_hidden_size,
+        torch::optional<int64_t> const& num_valid_tokens, torch::optional<torch::Tensor> const& out_tensor)
     {
         std::lock_guard<std::mutex> lock(mMutex);
 
@@ -541,7 +557,9 @@ public:
         auto const num_experts_total = static_cast<int>(num_experts_on_rank * ep_size);
         auto parallelism_config
             = kernels::MOEParallelismConfig(tp_size, tp_rank, ep_size, ep_rank, cluster_size, cluster_rank);
-        ActivationType base_activation_type = ActivationType::Swiglu;
+        ActivationType base_activation_type = activation_type.has_value()
+            ? static_cast<ActivationType>(activation_type.value())
+            : ActivationType::Swiglu;
         if (swiglu_alpha.has_value())
         {
             CHECK_INPUT(swiglu_alpha.value(), at::ScalarType::Float);
@@ -600,7 +618,8 @@ public:
         WorkspaceInfo const& workspace_info = getWorkspaceInfo(num_rows, hidden_size, inter_size, num_experts_total,
             static_cast<int>(experts_per_token), base_activation_type, parallelism_config, min_latency_mode, stream);
 
-        auto const quant_params = getQuantParams(num_experts_on_rank, hidden_size, inter_size, quant_scales);
+        auto const quant_params
+            = getQuantParams(num_experts_on_rank, hidden_size, inter_size, quant_scales, base_activation_type);
 
         // TODO: support lora in the future
         ::tensorrt_llm::kernels::LoraParams lora_params{};
@@ -652,7 +671,8 @@ public:
         torch::optional<torch::Tensor> const& fc2_expert_biases, int64_t const top_k, int64_t const tp_size,
         int64_t const tp_rank, int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size,
         int64_t const cluster_rank, bool const enable_alltoall, bool const min_latency_mode, int64_t const gemm_idx,
-        int64_t const profile_id, bool const do_preparation, int64_t const unpadded_hidden_size)
+        int64_t const profile_id, bool const do_preparation, int64_t const activation_type_int,
+        int64_t const unpadded_hidden_size)
     {
         std::lock_guard<std::mutex> lock(mMutex);
 
@@ -661,6 +681,7 @@ public:
         {
             return;
         }
+        ActivationType activation_type = static_cast<ActivationType>(activation_type_int);
 
         int64_t const num_rows = input.sizes()[0];
         int64_t hidden_size = fc2_expert_weights.sizes()[1];
@@ -715,14 +736,14 @@ public:
                 tensorrt_llm::runtime::TorchUtils::dataType(mWeightDtype),
                 tensorrt_llm::runtime::TorchUtils::dataType(mOutputDtype), num_experts, static_cast<int>(top_k),
                 hidden_size, unpadded_hidden_size > 0 ? unpadded_hidden_size : hidden_size, inter_size, group_size,
-                ActivationType::Swiglu, USE_BIAS, USE_LORA, min_latency_mode,
+                activation_type, USE_BIAS, USE_LORA, min_latency_mode,
                 /*need_weights*/ false, parallelism_config, enable_alltoall);
 #else
             mProfiler->init(*mKernelRunner.get(), mProfiler->mGemmToProfile,
                 tensorrt_llm::runtime::TorchUtils::dataType(activation_dtype),
                 tensorrt_llm::runtime::TorchUtils::dataType(mWeightDtype),
                 tensorrt_llm::runtime::TorchUtils::dataType(mOutputDtype), num_experts, static_cast<int>(top_k),
-                hidden_size, inter_size, group_size, ActivationType::Swiglu, USE_BIAS, USE_LORA, min_latency_mode,
+                hidden_size, inter_size, group_size, activation_type, USE_BIAS, USE_LORA, min_latency_mode,
                 /*need_weights*/ false, parallelism_config);
 #endif
 
@@ -844,8 +865,10 @@ private:
     }
 
     kernels::QuantParams getQuantParams(int64_t const num_experts_on_rank, int64_t const hidden_size,
-        int64_t const inter_size, torch::optional<c10::ArrayRef<torch::Tensor>> const& quant_scales) const
+        int64_t const inter_size, torch::optional<c10::ArrayRef<torch::Tensor>> const& quant_scales,
+        ActivationType base_activation_type) const
     {
+        int expand_ratio = isGatedActivation(base_activation_type) ? 2 : 1;
         if (isFp8Quant())
         {
             TORCH_CHECK(quant_scales.has_value(), "Expecting quant scales for fp8 quantization");
@@ -910,12 +933,12 @@ private:
                     && fc1_weight_block.sizes()[1]
                         == TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
                                inter_size, TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX)
-                            * 2
+                            * expand_ratio
                     && fc1_weight_block.sizes()[2] * FP8_PER_INT32
                             * TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize
                         == TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
                             hidden_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX),
-                "fc1 weight block size must be (num_experts_on_rank, inter_size * 2, hidden_size // 4 // "
+                "fc1 weight block size must be (num_experts_on_rank, inter_size * expand_ratio, hidden_size // 4 // "
                 "block_scale_vector_size)");
             TORCH_CHECK(fc1_global.sizes()[0] == num_experts_on_rank, "fc1 global size must be (num_experts_on_rank,)");
             TORCH_CHECK(fc2_act_global.dim() == 0 || fc2_act_global.sizes()[0] == num_experts_on_rank,
@@ -963,12 +986,12 @@ private:
                     && fc1_weight_block.sizes()[1]
                         == TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
                                inter_size, TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX)
-                            * 2
+                            * expand_ratio
                     && fc1_weight_block.sizes()[2] * FP8_PER_INT32
                             * TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize
                         == TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
                             hidden_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX),
-                "fc1 weight block size must be (num_experts_on_rank, inter_size * 2, hidden_size // 4 // "
+                "fc1 weight block size must be (num_experts_on_rank, inter_size * expand_ratio, hidden_size // 4 // "
                 "block_scale_vector_size)");
             TORCH_CHECK(fc1_global.sizes()[0] == num_experts_on_rank, "fc1 global size must be (num_experts_on_rank,)");
             TORCH_CHECK(fc2_weight_block.sizes()[0] == num_experts_on_rank
@@ -1029,12 +1052,12 @@ private:
                     && fc1_weight_block.sizes()[1]
                         == TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
                                inter_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentNVFP4)
-                            * 2
+                            * expand_ratio
                     && fc1_weight_block.sizes()[2] * FP8_PER_INT32
                             * TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize
                         == TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
                             hidden_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentNVFP4),
-                "fc1 weight block size must be (num_experts_on_rank, inter_size * 2, hidden_size // 4 // "
+                "fc1 weight block size must be (num_experts_on_rank, inter_size * expand_ratio, hidden_size // 4 // "
                 "block_scale_vector_size)");
             TORCH_CHECK(fc1_global.sizes()[0] == num_experts_on_rank, "fc1 global size must be (num_experts_on_rank,)");
             TORCH_CHECK(fc2_act_global.dim() == 0 || fc2_act_global.sizes()[0] == num_experts_on_rank,
@@ -1101,6 +1124,9 @@ private:
                 auto& fc1_alpha = quant_scales.value()[6];
                 auto& fc2_alpha = quant_scales.value()[7];
                 int group_size = TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::int4_group_size;
+                // Whether it is per-expert activation scale
+                bool fc1_use_per_expert_act_scale = fc1_act_scales.numel() > hidden_size;
+                bool fc2_use_per_expert_act_scale = fc2_act_scales.numel() > inter_size;
                 return kernels::QuantParams::GroupWise(group_size,
                     static_cast<void const*>(fc1_weight_scales.data_ptr()),
                     static_cast<void const*>(fc2_weight_scales.data_ptr()),
@@ -1109,7 +1135,8 @@ private:
                     static_cast<void const*>(fc1_weight_zeros.numel() > 0 ? fc1_weight_zeros.data_ptr() : nullptr),
                     static_cast<void const*>(fc2_weight_zeros.numel() > 0 ? fc2_weight_zeros.data_ptr() : nullptr),
                     static_cast<float const*>(fc1_alpha.numel() > 0 ? fc1_alpha.data_ptr() : nullptr),
-                    static_cast<float const*>(fc2_alpha.numel() > 0 ? fc2_alpha.data_ptr() : nullptr));
+                    static_cast<float const*>(fc2_alpha.numel() > 0 ? fc2_alpha.data_ptr() : nullptr),
+                    fc1_use_per_expert_act_scale, fc2_use_per_expert_act_scale);
             }
             else
             {
@@ -1174,12 +1201,14 @@ private:
 
 } // namespace torch_ext
 
+TRTLLM_NAMESPACE_END
+
 TORCH_LIBRARY(trtllm, m)
 {
-    m.class_<torch_ext::FusedMoeRunner>("FusedMoeRunner")
+    m.class_<tensorrt_llm::torch_ext::FusedMoeRunner>("FusedMoeRunner")
         .def(torch::init<c10::ScalarType, c10::ScalarType, c10::ScalarType, bool, bool, bool, bool, bool>())
-        .def("run_gemm_profile", &torch_ext::FusedMoeRunner::runGemmProfile)
-        .def("get_tactic_num", &torch_ext::FusedMoeRunner::getTacticNum)
-        .def("run_moe", &torch_ext::FusedMoeRunner::runMoe)
-        .def("run_moe_min_latency", &torch_ext::FusedMoeRunner::runMoeMinLantency);
+        .def("run_gemm_profile", &tensorrt_llm::torch_ext::FusedMoeRunner::runGemmProfile)
+        .def("get_tactic_num", &tensorrt_llm::torch_ext::FusedMoeRunner::getTacticNum)
+        .def("run_moe", &tensorrt_llm::torch_ext::FusedMoeRunner::runMoe)
+        .def("run_moe_min_latency", &tensorrt_llm::torch_ext::FusedMoeRunner::runMoeMinLantency);
 }

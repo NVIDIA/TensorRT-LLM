@@ -1,13 +1,18 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
@@ -17,22 +22,54 @@ using namespace tensorrt_llm::batch_manager::kv_cache_manager;
 using namespace tensorrt_llm::runtime;
 using namespace tensorrt_llm::executor::kv_cache;
 
-bool needSkipTest(std::string& skipReason)
+std::vector<std::string> getAvailableBackends()
+{
+    std::vector<std::string> backends;
+
+#ifdef TEST_NIXL_BACKEND
+    backends.push_back("nixl");
+#endif
+
+#ifdef TEST_MOONCAKE_BACKEND
+    backends.push_back("mooncake");
+#endif
+
+    return backends;
+}
+
+bool needSkipTest(std::string const& backend, std::string& skipReason)
 {
     bool skip = false;
     try
     {
         auto& loader = tensorrt_llm::executor::kv_cache::DynLibLoader::getInstance();
 
-        using CreateNixlFuncType = std::unique_ptr<tensorrt_llm::executor::kv_cache::BaseTransferAgent> (*)(
-            tensorrt_llm::executor::kv_cache::BaseAgentConfig const*);
-        auto* func = loader.getFunctionPointer<CreateNixlFuncType>(
-            "libtensorrt_llm_nixl_wrapper.so", "createNixlTransferAgent");
+        if (backend == "nixl")
+        {
+            using CreateNixlFuncType = std::unique_ptr<tensorrt_llm::executor::kv_cache::BaseTransferAgent> (*)(
+                tensorrt_llm::executor::kv_cache::BaseAgentConfig const*);
+            auto* func = loader.getFunctionPointer<CreateNixlFuncType>(
+                "libtensorrt_llm_nixl_wrapper.so", "createNixlTransferAgent");
+        }
+        else if (backend == "mooncake")
+        {
+            using CreateMooncakeFuncType = std::unique_ptr<tensorrt_llm::executor::kv_cache::BaseTransferAgent> (*)(
+                tensorrt_llm::executor::kv_cache::BaseAgentConfig const*);
+            auto* func = loader.getFunctionPointer<CreateMooncakeFuncType>(
+                "libtensorrt_llm_mooncake_wrapper.so", "createMooncakeTransferAgent");
+        }
+        else
+        {
+            skip = true;
+            skipReason = "Unknown backend: " + backend;
+        }
     }
     catch (std::exception const& e)
     {
         std::string error = e.what();
-        if (error.find("libtensorrt_llm_nixl_wrapper.so") != std::string::npos)
+        std::string libName
+            = (backend == "nixl") ? "libtensorrt_llm_nixl_wrapper.so" : "libtensorrt_llm_mooncake_wrapper.so";
+        if (error.find(libName) != std::string::npos)
         {
             skip = true;
             skipReason = error;
@@ -41,17 +78,26 @@ bool needSkipTest(std::string& skipReason)
     return skip;
 }
 
-class AgentCommTest : public ::testing::Test
+class AgentCommTest : public ::testing::TestWithParam<std::string>
 {
 protected:
     void SetUp() override
     {
+        backend = GetParam();
         std::string skipReason;
-        if (needSkipTest(skipReason))
+        if (needSkipTest(backend, skipReason))
         {
             GTEST_SKIP() << skipReason;
         }
-        setenv("TRTLLM_USE_NIXL_KVCACHE", "1", 1);
+
+        if (backend == "nixl")
+        {
+            setenv("TRTLLM_USE_NIXL_KVCACHE", "1", 1);
+        }
+        else if (backend == "mooncake")
+        {
+            setenv("TRTLLM_USE_MOONCAKE_KVCACHE", "1", 1);
+        }
 
         auto constexpr numLayers = 8;
         auto constexpr numHeads = 16;
@@ -101,16 +147,19 @@ protected:
         mCacheState.reset();
     }
 
+    std::string backend;
     std::unique_ptr<CacheTransBufferManager> mTransBufferManager;
     std::unique_ptr<KVCacheManager> mCacheManager;
     std::unique_ptr<CacheState> mCacheState;
 };
 
-TEST_F(AgentCommTest, AgentConnectionManagerBasic)
+TEST_P(AgentCommTest, AgentConnectionManagerBasic)
 {
-    auto connectionManager = std::make_unique<AgentConnectionManager>(mTransBufferManager.get(), *mCacheState);
+    std::vector<CacheTransBufferManager*> bufferManagers{mTransBufferManager.get()};
+    auto connectionManager = std::make_unique<AgentConnectionManager>(bufferManagers, *mCacheState, backend);
     ASSERT_TRUE(connectionManager != nullptr);
-    ASSERT_TRUE(connectionManager->getCacheTransBufferManager() != nullptr);
+    ASSERT_EQ(connectionManager->getCacheTransBufferManagers().size(), bufferManagers.size());
+    ASSERT_TRUE(connectionManager->getCacheTransBufferManagers().front() != nullptr);
     ASSERT_EQ(connectionManager->getDeviceId(), 0);
     ASSERT_TRUE(!connectionManager->getAgentName().empty());
     ASSERT_TRUE(connectionManager->getAgent() != nullptr);
@@ -119,10 +168,11 @@ TEST_F(AgentCommTest, AgentConnectionManagerBasic)
     ASSERT_EQ(commState.getAgentState().size(), 1);
 }
 
-TEST_F(AgentCommTest, AgentConnectionManagerConnect)
+TEST_P(AgentCommTest, AgentConnectionManagerConnect)
 {
-    auto connectionManager0 = std::make_unique<AgentConnectionManager>(mTransBufferManager.get(), *mCacheState);
-    auto connectionManager1 = std::make_unique<AgentConnectionManager>(mTransBufferManager.get(), *mCacheState);
+    std::vector<CacheTransBufferManager*> bufferManagers{mTransBufferManager.get()};
+    auto connectionManager0 = std::make_unique<AgentConnectionManager>(bufferManagers, *mCacheState, backend);
+    auto connectionManager1 = std::make_unique<AgentConnectionManager>(bufferManagers, *mCacheState, backend);
     auto agentName0 = connectionManager0->getAgentName();
     auto agentName1 = connectionManager1->getAgentName();
     ASSERT_TRUE(!agentName0.empty());
@@ -144,18 +194,18 @@ TEST_F(AgentCommTest, AgentConnectionManagerConnect)
     tensorrt_llm::executor::DataTransceiverState dataTransceiverState0{cacheState0, commState0};
     tensorrt_llm::executor::DataTransceiverState dataTransceiverState1{cacheState1, commState1};
     tensorrt_llm::batch_manager::RequestInfo sendRequestInfo{requestId, dataTransceiverState0};
-    size_t cacheBufferId = 0;
+    std::vector<std::optional<size_t>> cacheBufferIds{std::optional<size_t>{0}};
     int validConnectionIdx = 0;
     // convert to AgentConnection
     auto agentConnection0 = const_cast<tensorrt_llm::executor::kv_cache::AgentConnection*>(
         dynamic_cast<tensorrt_llm::executor::kv_cache::AgentConnection const*>(connection0));
-    agentConnection0->sendRequestAndBufferInfo(sendRequestInfo, cacheBufferId, validConnectionIdx);
+    agentConnection0->sendRequestAndBufferInfo(sendRequestInfo, cacheBufferIds, validConnectionIdx);
 
     tensorrt_llm::batch_manager::RequestInfo recvRequestInfo;
-    auto connection1 = connectionManager1->recvConnectionAndRequestInfo(recvRequestInfo);
+    auto connection1 = connectionManager1->recvConnectionAndRequestInfo(recvRequestInfo, std::atomic<bool>(false));
     ASSERT_EQ(recvRequestInfo.getRequestId(), requestId);
 
-    auto sendBuffer = mTransBufferManager->getSendBuffer(cacheBufferId);
+    auto sendBuffer = mTransBufferManager->getSendBuffer(cacheBufferIds[0].value());
     auto sendSize = 1024;
     std::vector<char> sendData(sendSize);
     std::fill(sendData.begin(), sendData.end(), 'a');
@@ -172,7 +222,7 @@ TEST_F(AgentCommTest, AgentConnectionManagerConnect)
 
     future.wait();
 
-    auto recvBuffer = mTransBufferManager->getRecvBuffer(cacheBufferId);
+    auto recvBuffer = mTransBufferManager->getRecvBuffer(cacheBufferIds[0].value());
     std::vector<char> recvData(sendSize);
     TLLM_CUDA_CHECK(cudaMemcpy(recvData.data(), recvBuffer->data(), sendSize, cudaMemcpyDeviceToHost));
     for (size_t i = 0; i < sendSize; i++)
@@ -181,3 +231,6 @@ TEST_F(AgentCommTest, AgentConnectionManagerConnect)
     }
     TLLM_LOG_INFO("after finish");
 }
+
+INSTANTIATE_TEST_SUITE_P(AvailableBackends, AgentCommTest, ::testing::ValuesIn(getAvailableBackends()),
+    [](::testing::TestParamInfo<AgentCommTest::ParamType> const& info) { return info.param; });

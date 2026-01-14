@@ -28,15 +28,11 @@ from defs.trt_test_alternative import (is_linux, is_windows, print_info,
                                        print_warning)
 
 from ..conftest import get_llm_root, llm_models_root, trt_environment
-from .open_search_db_utils import (add_id, get_history_data, get_job_info,
-                                   post_new_perf_data, prepare_baseline_data,
-                                   prepare_regressive_test_cases,
-                                   print_regressive_test_cases)
 from .pytorch_model_config import get_model_yaml_config
 from .sampler_options_config import get_sampler_options_config
 from .utils import (AbstractPerfScriptTestClass, PerfBenchScriptTestCmds,
                     PerfDisaggScriptTestCmds, PerfMetricType,
-                    PerfServerClientBenchmarkCmds, generate_test_nodes)
+                    generate_test_nodes)
 
 if not hasattr(re, "Pattern"):
     re.Pattern = type(re.compile(""))
@@ -73,6 +69,8 @@ MODEL_PATH_DICT = {
     "nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1",
     "llama_v3.3_nemotron_super_49b_fp8":
     "nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-FP8",
+    "llama_v3.3_nemotron_super_49b_v1.5_fp8":
+    "nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1_5-FP8",
     "llama_v3.1_nemotron_ultra_253b":
     "nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1",
     "llama_v3.1_nemotron_ultra_253b_fp8":
@@ -94,23 +92,45 @@ MODEL_PATH_DICT = {
     "modelopt-hf-model-hub/Mixtral-8x7B-Instruct-v0.1-fp4",
     "mistral_nemo_12b_base": "Mistral-Nemo-Base-2407",
     "deepseek_r1_distill_qwen_32b": "DeepSeek-R1/DeepSeek-R1-Distill-Qwen-32B",
+    "deepseek_r1_distill_llama_70b":
+    "DeepSeek-R1/DeepSeek-R1-Distill-Llama-70B/",
     "mixtral_8x22b_v0.1": "Mixtral-8x22B-v0.1",
     "mistral_7b_v0.1": "mistral-7b-v0.1",
     "ministral_8b": "Ministral-8B-Instruct-2410",
     "ministral_8b_fp8": "Ministral-8B-Instruct-2410-FP8",
     "gemma_3_1b_it": "gemma/gemma-3-1b-it",
+    "gemma_3_27b_it": "gemma/gemma-3-27b-it",
+    "gemma_3_27b_it_fp8": "gemma/gemma-3-27b-it-fp8",
+    "gemma_3_27b_it_fp4": "gemma/gemma-3-27b-it-FP4",
     "deepseek_r1_fp8": "DeepSeek-R1/DeepSeek-R1",
     "deepseek_r1_nvfp4": "DeepSeek-R1/DeepSeek-R1-FP4",
     "deepseek_r1_0528_fp8": "DeepSeek-R1/DeepSeek-R1-0528/",
     "deepseek_r1_0528_fp4": "DeepSeek-R1/DeepSeek-R1-0528-FP4/",
+    "deepseek_r1_0528_fp4_v2": "DeepSeek-R1/DeepSeek-R1-0528-FP4-v2/",
     "deepseek_v3_lite_fp8": "DeepSeek-V3-Lite/fp8",
     "deepseek_v3_lite_nvfp4": "DeepSeek-V3-Lite/nvfp4_moe_only",
     "qwen2_7b_instruct": "Qwen2-7B-Instruct",
     "qwen_14b_chat": "Qwen-14B-Chat",
+    "qwen3_0.6b": "Qwen3/Qwen3-0.6B",
+    "qwen3_4b_eagle3": "Qwen3/Qwen3-4B",
+    "qwen3_8b": "Qwen3/Qwen3-8B",
+    "qwen3_8b_fp8": "Qwen3/nvidia-Qwen3-8B-FP8",
+    "qwen3_8b_fp4": "Qwen3/nvidia-Qwen3-8B-NVFP4",
+    "qwen3_14b": "Qwen3/Qwen3-14B",
+    "qwen3_14b_fp8": "Qwen3/nvidia-Qwen3-14B-FP8",
+    "qwen3_14b_fp4": "Qwen3/nvidia-Qwen3-14B-NVFP4",
+    "qwen3_30b_a3b": "Qwen3/Qwen3-30B-A3B",
+    "qwen3_30b_a3b_fp4": "Qwen3/saved_models_Qwen3-30B-A3B_nvfp4_hf",
+    "qwen3_32b": "Qwen3/Qwen3-32B",
+    "qwen3_32b_fp4": "Qwen3/nvidia-Qwen3-32B-NVFP4",
     "qwen3_235b_a22b_fp8": "Qwen3/saved_models_Qwen3-235B-A22B_fp8_hf",
     "qwen3_235b_a22b_fp4": "Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",
+    "qwen2_5_vl_7b_instruct": "multimodals/Qwen2.5-VL-7B-Instruct",
+    "qwen2_5_vl_7b_instruct_fp8": "multimodals/Qwen2.5-VL-7B-Instruct-FP8",
+    "qwen2_5_vl_7b_instruct_fp4": "multimodals/Qwen2.5-VL-7B-Instruct-FP4",
     "starcoder2_3b": "starcoder2-3b",
-    "starcoder_15b": "starcoder2-15b",
+    "starcoder2_7b": "starcoder2-7b",
+    "starcoder2_15b": "starcoder2-15b",
     "t5": "t5-small",  # not supported for trtllm-bench build config
     "flan_t5_base":
     "flan-t5-small",  # not supported for trtllm-bench build config
@@ -125,12 +145,15 @@ MODEL_PATH_DICT = {
     "mamba_2.8b": "mamba/mamba-2.8b-hf",
     "gpt_20b": "gpt-neox-20b",
     "gpt_350m_moe": "gpt2-medium",
-    "phi_3_mini_4k_instruct": "Phi-3/Phi-3-mini-4k-instruct",
-    "phi_3_mini_128k_instruct": "Phi-3/Phi-3-mini-128k-instruct",
     "phi_4_mini_instruct": "Phi-4-mini-instruct",
+    "phi_4_reasoning_plus": "Phi-4-reasoning-plus",
+    "phi_4_reasoning_plus_fp8": "nvidia-Phi-4-reasoning-plus-FP8",
+    "phi_4_reasoning_plus_fp4": "nvidia-Phi-4-reasoning-plus-NVFP4",
     "phi_4_multimodal_instruct": "multimodals/Phi-4-multimodal-instruct",
     "phi_4_multimodal_instruct_image": "multimodals/Phi-4-multimodal-instruct",
     "phi_4_multimodal_instruct_audio": "multimodals/Phi-4-multimodal-instruct",
+    "phi_4_multimodal_instruct_fp4":
+    "multimodals/Phi-4-multimodal-instruct-FP4",
     "phi_4_multimodal_instruct_fp4_image":
     "multimodals/Phi-4-multimodal-instruct-FP4",
     "phi_4_multimodal_instruct_fp4_audio":
@@ -139,13 +162,17 @@ MODEL_PATH_DICT = {
     "multimodals/Phi-4-multimodal-instruct-FP8",
     "phi_4_multimodal_instruct_fp8_audio":
     "multimodals/Phi-4-multimodal-instruct-FP8",
+    "phi_4_multimodal_instruct_fp8":
+    "multimodals/Phi-4-multimodal-instruct-FP8",
     "bielik_11b_v2.2_instruct": "Bielik-11B-v2.2-Instruct",
     "bielik_11b_v2.2_instruct_fp8": "Bielik-11B-v2.2-Instruct-FP8",
     "mistral_small_v3.1_24b": "Mistral-Small-3.1-24B-Instruct-2503",
     "gpt_oss_120b_fp4": "gpt_oss/gpt-oss-120b",
     "gpt_oss_20b_fp4": "gpt_oss/gpt-oss-20b",
-    "nemotron_nano_9b_v2": "NVIDIA-Nemotron-Nano-12B-v2",
+    "nemotron_nano_12b_v2": "NVIDIA-Nemotron-Nano-12B-v2",
+    "nvidia_nemotron_nano_9b_v2_nvfp4": "NVIDIA-Nemotron-Nano-9B-v2-NVFP4",
     "starcoder2_7b": "starcoder2-7b",
+    "kimi_k2_nvfp4": "Kimi-K2-Thinking-NVFP4",
 }
 # Model PATH of HuggingFace
 HF_MODEL_PATH = {
@@ -220,6 +247,11 @@ def get_model_dir(model_name: str):
         model_dir = os.path.join(llm_models_root(),
                                  MODEL_PATH_DICT[model_name.split('_hf')[0]])
     return model_dir
+
+
+def get_dataset_path():
+    return os.path.join(llm_models_root(), "datasets",
+                        "ShareGPT_V3_unfiltered_cleaned_split.json")
 
 
 def cpu_socket_count_gt_1():
@@ -312,46 +344,39 @@ BENCH_PERF_METRIC_LOG_QUERIES = {
                r"Final KV cache size after resize: ([\d\.]+) GiB).*"),
 }
 
-SERVER_BENCHMARK_PERF_METRIC_LOG_QUERIES = {
+AGGR_SERVER_PERF_METRIC_LOG_QUERIES = {
     PerfMetricType.SEQ_THROUGHPUT:
-    re.compile(r"Request throughput \(req\/s\):\s+([\d\.]+)"),
+    re.compile(r"Request throughput \(req\/s\):\s+(-?[\d\.]+)"),
     PerfMetricType.TOKEN_THROUGHPUT:
-    re.compile(r"Output token throughput \(tok\/s\):\s+([\d\.]+)"),
+    re.compile(r"Output token throughput \(tok\/s\):\s+(-?[\d\.]+)"),
     PerfMetricType.TOTAL_TOKEN_THROUGHPUT:
-    re.compile(r"Total Token throughput \(tok\/s\):\s+([\d\.]+)"),
+    re.compile(r"Total Token throughput \(tok\/s\):\s+(-?[\d\.]+)"),
     PerfMetricType.USER_THROUGHPUT:
-    re.compile(r"User throughput \(tok\/s\):\s+([\d\.]+)"),
+    re.compile(r"User throughput \(tok\/s\):\s+(-?[\d\.]+)"),
     PerfMetricType.FIRST_TOKEN_TIME:
-    re.compile(r"Mean TTFT \(ms\):\s+([\d\.]+)"),
+    re.compile(r"Mean TTFT \(ms\):\s+(-?[\d\.]+)"),
     PerfMetricType.MEDIAN_FIRST_TOKEN_TIME:
-    re.compile(r"Median TTFT \(ms\):\s+([\d\.]+)"),
+    re.compile(r"Median TTFT \(ms\):\s+(-?[\d\.]+)"),
     PerfMetricType.P99_FIRST_TOKEN_TIME:
-    re.compile(r"P99 TTFT \(ms\):\s+([\d\.]+)"),
+    re.compile(r"P99 TTFT \(ms\):\s+(-?[\d\.]+)"),
     PerfMetricType.INTER_TOKEN_TIME:
-    re.compile(r"Mean ITL \(ms\):\s+([\d\.]+)"),
+    re.compile(r"Mean ITL \(ms\):\s+(-?[\d\.]+)"),
     PerfMetricType.MEDIAN_INTER_TOKEN_TIME:
-    re.compile(r"Median ITL \(ms\):\s+([\d\.]+)"),
+    re.compile(r"Median ITL \(ms\):\s+(-?[\d\.]+)"),
     PerfMetricType.P99_INTER_TOKEN_TIME:
-    re.compile(r"P99 ITL \(ms\):\s+([\d\.]+)"),
+    re.compile(r"P99 ITL \(ms\):\s+(-?[\d\.]+)"),
     PerfMetricType.OUTPUT_TOKEN_TIME:
-    re.compile(r"Mean TPOT \(ms\):\s+([\d\.]+)"),
+    re.compile(r"Mean TPOT \(ms\):\s+(-?[\d\.]+)"),
     PerfMetricType.MEDIAN_OUTPUT_TOKEN_TIME:
-    re.compile(r"Median TPOT \(ms\):\s+([\d\.]+)"),
+    re.compile(r"Median TPOT \(ms\):\s+(-?[\d\.]+)"),
     PerfMetricType.P99_OUTPUT_TOKEN_TIME:
-    re.compile(r"P99 TPOT \(ms\):\s+([\d\.]+)"),
+    re.compile(r"P99 TPOT \(ms\):\s+(-?[\d\.]+)"),
     PerfMetricType.INFERENCE_TIME:
-    re.compile(r"Mean E2EL \(ms\):\s+([\d\.]+)"),
+    re.compile(r"Mean E2EL \(ms\):\s+(-?[\d\.]+)"),
     PerfMetricType.MEDIAN_INFERENCE_TIME:
-    re.compile(r"Median E2EL \(ms\):\s+([\d\.]+)"),
+    re.compile(r"Median E2EL \(ms\):\s+(-?[\d\.]+)"),
     PerfMetricType.P99_INFERENCE_TIME:
-    re.compile(r"P99 E2EL \(ms\):\s+([\d\.]+)"),
-}
-
-DISAGG_SERVER_METRICS_LOG_QUERIES = {
-    PerfMetricType.DISAGG_SERVER_E2EL:
-    re.compile(r"Median E2EL \(ms\):\s*(\d+\.?\d*)"),
-    PerfMetricType.DISAGG_SERVER_TTFT:
-    re.compile(r"Median TTFT \(ms\):\s*(\d+\.?\d*)"),
+    re.compile(r"P99 E2EL \(ms\):\s+(-?[\d\.]+)"),
 }
 
 # (Relative threshold, Absolute threshold) for all metric types
@@ -445,7 +470,7 @@ INFERENCE_METRICS = [
     PerfMetricType.CONTEXT_GPU_MEMORY,
 ]
 
-SERVER_BENCHMARK_METRICS = [
+AGGR_SERVER_METRICS = [
     PerfMetricType.SEQ_THROUGHPUT,
     PerfMetricType.TOKEN_THROUGHPUT,
     PerfMetricType.TOTAL_TOKEN_THROUGHPUT,
@@ -496,328 +521,6 @@ class PerfTestMetric(NamedTuple):
     # The index of the command of this metric.
     # Currently, we run 1 build command plus N benchmark commands.
     cmd_idx: int
-
-
-class ServerConfig:
-    """
-    Configurations of trtllm-server.
-    """
-
-    def __init__(
-        self,
-        name: str,
-        model_name: str,
-        gpus: int,
-        tp: int,
-        ep: int,
-        max_num_tokens: int,
-        attention_backend: str,
-        max_batch_size: int,
-        pp: int = 1,
-        enable_chunked_prefill: bool = False,
-        disable_overlap_scheduler: bool = False,
-        moe_backend: str = "",
-        moe_max_num_tokens: int = 0,
-        stream_interval: int = 10,
-        enable_attention_dp: bool = False,
-        attention_dp_balance: bool = False,
-        batching_wait_iters: int = 10,
-        timeout_iters: int = 50,
-        kv_cache_dtype: str = "fp8",
-        enable_block_reuse: bool = False,
-        free_gpu_memory_fraction: float = 0.8,
-        enable_padding: bool = True,
-    ):
-        self.name = name
-        self.model_name = model_name
-        self.gpus = gpus
-        self.tp = tp
-        self.ep = ep
-        self.pp = pp
-        self.max_num_tokens = max_num_tokens
-        self.enable_chunked_prefill = enable_chunked_prefill
-        self.disable_overlap_scheduler = disable_overlap_scheduler
-        self.attention_backend = attention_backend
-        self.moe_backend = moe_backend
-        self.moe_max_num_tokens = moe_max_num_tokens
-        self.stream_interval = stream_interval
-        self.enable_attention_dp = enable_attention_dp
-        self.attention_dp_balance = attention_dp_balance
-        self.batching_wait_iters = batching_wait_iters
-        self.timeout_iters = timeout_iters
-        self.kv_cache_dtype = kv_cache_dtype
-        self.enable_block_reuse = enable_block_reuse
-        self.free_gpu_memory_fraction = free_gpu_memory_fraction
-        self.max_batch_size = max_batch_size
-        self.enable_padding = enable_padding
-
-        self.model_path = ""
-
-    def to_cmd(self, working_dir: str) -> List[str]:
-        model_dir = get_model_dir(self.model_name)
-        self.model_path = model_dir if os.path.exists(
-            model_dir) else self.model_name
-        config_path = os.path.join(working_dir,
-                                   f"extra-llm-api-config.{self.name}.yml")
-        return [
-            "trtllm-serve", self.model_path, "--host", "localhost", "--port",
-            "8000", "--backend", "pytorch", "--extra_llm_api_options",
-            config_path
-        ]
-
-    def to_db_data(self) -> dict:
-        """Convert ServerConfig to Database data"""
-        return {
-            "s_model_name": self.model_name.lower(),
-            "l_gpus": self.gpus,
-            "l_tp": self.tp,
-            "l_ep": self.ep,
-            "l_pp": self.pp,
-            "l_max_num_tokens": self.max_num_tokens,
-            "b_enable_chunked_prefill": self.enable_chunked_prefill,
-            "b_disable_overlap_scheduler": self.disable_overlap_scheduler,
-            "s_attention_backend": self.attention_backend,
-            "s_moe_backend": self.moe_backend,
-            "l_moe_max_num_tokens": self.moe_max_num_tokens,
-            "l_stream_interval": self.stream_interval,
-            "b_enable_attention_dp": self.enable_attention_dp,
-            "b_attention_dp_balance": self.attention_dp_balance,
-            "l_batching_wait_iters": self.batching_wait_iters,
-            "l_timeout_iters": self.timeout_iters,
-            "s_kv_cache_dtype": self.kv_cache_dtype,
-            "b_enable_block_reuse": self.enable_block_reuse,
-            "d_free_gpu_memory_fraction": self.free_gpu_memory_fraction,
-            "l_max_batch_size": self.max_batch_size,
-            "b_enable_padding": self.enable_padding,
-            "s_server_log_link": "",
-        }
-
-    def generate_extra_llm_api_config(self) -> str:
-        """Generate extra-llm-api-config.yml content"""
-        config_lines = [
-            f"tensor_parallel_size: {self.tp}",
-            f"moe_expert_parallel_size: {self.ep}",
-            f"pipeline_parallel_size: {self.pp}",
-            f"max_num_tokens: {self.max_num_tokens}",
-            f"enable_attention_dp: {str(self.enable_attention_dp).lower()}",
-            f"disable_overlap_scheduler: {str(self.disable_overlap_scheduler).lower()}",
-            f"stream_interval: {self.stream_interval}",
-            f"attn_backend: {self.attention_backend}",
-            f"enable_chunked_prefill: {str(self.enable_chunked_prefill).lower()}",
-            "cuda_graph_config:",
-            f"  enable_padding: {str(self.enable_padding).lower()}",
-            f"  max_batch_size: {self.max_batch_size}",
-            "kv_cache_config:",
-            f"  dtype: {self.kv_cache_dtype}",
-            f"  free_gpu_memory_fraction: {self.free_gpu_memory_fraction}",
-            f"  enable_block_reuse: {str(self.enable_block_reuse).lower()}",
-            "print_iter_log: false",
-        ]
-
-        # Add moe_config if moe_backend is specified
-        if self.moe_backend:
-            config_lines.append("moe_config:")
-            config_lines.append(f"  backend: {self.moe_backend}")
-            if self.moe_max_num_tokens:
-                config_lines.append(
-                    f"  max_num_tokens: {self.moe_max_num_tokens}")
-
-        if self.attention_dp_balance:
-            config_lines.append("attention_dp_balance:")
-            config_lines.append("  enable_balance: true")
-            config_lines.append(
-                f"  batching_wait_iters: {self.batching_wait_iters}")
-            config_lines.append(f"  timeout_iters: {self.timeout_iters}")
-
-        return "\n".join(config_lines)
-
-
-class ClientConfig:
-    """
-    Configurations of benchmark client.
-    """
-
-    def __init__(self,
-                 name: str,
-                 model_name: str,
-                 concurrency: int,
-                 iterations: int,
-                 isl: int,
-                 osl: int,
-                 random_range_ratio: float = 0.0):
-        self.name = name
-        self.model_name = model_name
-        self.concurrency = concurrency
-        self.iterations = iterations
-        self.isl = isl
-        self.osl = osl
-        self.random_range_ratio = random_range_ratio
-
-        self.model_path = ""
-
-    def to_cmd(self, working_dir: str) -> List[str]:
-        model_dir = get_model_dir(self.model_name)
-        self.model_path = model_dir if os.path.exists(
-            model_dir) else self.model_name
-        return [
-            "python", "-m", "tensorrt_llm.serve.scripts.benchmark_serving",
-            "--model", self.model_path, "--dataset-name", "random",
-            "--random-ids", "--num-prompts",
-            str(self.concurrency * self.iterations), "--random-input-len",
-            str(self.isl), "--random-output-len",
-            str(self.osl), "--random-range-ratio",
-            str(self.random_range_ratio), "--ignore-eos",
-            "--percentile-metrics", "ttft,tpot,itl,e2el", "--max-concurrency",
-            str(self.concurrency)
-        ]
-
-    def to_db_data(self) -> dict:
-        """Convert ClientConfig to Database data"""
-        return {
-            "l_concurrency": self.concurrency,
-            "l_iterations": self.iterations,
-            "l_isl": self.isl,
-            "l_osl": self.osl,
-            "d_random_range_ratio": self.random_range_ratio,
-            "s_client_log_link": "",
-        }
-
-
-def parse_select_pattern(select_pattern: str):
-    """Parse select pattern like 'r1_fp4_dep4,r1_fp4_tep4:con1_iter1_1024_1024,r1_fp4_tep4:con8_iter1_1024_1024'
-
-    Format:
-    - ',' splits different server configs
-    - ':' means for this server, we choose specific clients
-    - If no ':', all clients are chosen for that server
-
-    Returns:
-    - Dict with server name as key and either None (all clients) or set of client names as value
-    """
-    execution_plan = {}
-
-    parts = select_pattern.split(',')
-    for part in parts:
-        part = part.strip()
-        if not part:  # Skip empty parts
-            continue
-
-        if ':' in part:
-            # Format: "server_name:client_name"
-            server_name, client_name = part.split(':', 1)
-            server_name = server_name.strip()
-            client_name = client_name.strip()
-
-            # Only add if not already set to None (all clients)
-            if server_name not in execution_plan:
-                execution_plan[server_name] = set()
-
-            if execution_plan[server_name] is not None:
-                execution_plan[server_name].add(client_name)
-        else:
-            # Format: "server_name" - select all clients for this server
-            server_name = part.strip()
-            execution_plan[server_name] = None
-
-    return execution_plan
-
-
-def parse_config_file(config_file_path: str, select_pattern: str = None):
-    """Parse YAML configuration file and create ServerConfig and ClientConfig objects
-
-    Args:
-        config_file_path: Path to YAML configuration file
-        select_pattern: Selection pattern string (e.g., "r1_fp4_dep4,r1_fp4_tep4:con1_iter1_1024_1024")
-
-    Returns:
-        execution_plan: None (all servers/clients) or dict with server names as keys
-        server_configs: List of ServerConfig objects
-        server_client_configs: Dict with server id as key and list of ClientConfig as value
-    """
-    # Parse selection pattern
-    if select_pattern:
-        execution_plan = parse_select_pattern(select_pattern)
-    else:
-        execution_plan = None
-
-    # Read YAML config file
-    with open(config_file_path, 'r') as f:
-        config = yaml.safe_load(f)
-
-    server_configs = []
-    server_client_configs = {}
-
-    for server_config_data in config['server_configs']:
-        server_name = server_config_data['name']
-
-        # Check if this server should be included based on execution_plan
-        if execution_plan is not None and server_name not in execution_plan:
-            continue
-
-        # Create ServerConfig object
-        server_config = ServerConfig(
-            name=server_config_data['name'],
-            model_name=server_config_data['model_name'],
-            gpus=server_config_data['gpus'],
-            tp=server_config_data['tp'],
-            ep=server_config_data['ep'],
-            pp=server_config_data.get('pp', 1),
-            attention_backend=server_config_data.get('attention_backend',
-                                                     'TRTLLM'),
-            moe_backend=server_config_data.get('moe_backend', ''),
-            moe_max_num_tokens=server_config_data.get('moe_max_num_tokens', 0),
-            stream_interval=server_config_data.get('stream_interval', 10),
-            enable_attention_dp=server_config_data.get('enable_attention_dp',
-                                                       False),
-            attention_dp_balance=server_config_data.get('attention_dp_balance',
-                                                        False),
-            batching_wait_iters=server_config_data.get('batching_wait_iters',
-                                                       10),
-            timeout_iters=server_config_data.get('timeout_iters', 50),
-            enable_chunked_prefill=server_config_data.get(
-                'enable_chunked_prefill', False),
-            max_num_tokens=server_config_data.get('max_num_tokens', 2048),
-            disable_overlap_scheduler=server_config_data.get(
-                'disable_overlap_scheduler', False),
-            kv_cache_dtype=server_config_data.get('kv_cache_dtype', 'fp8'),
-            enable_block_reuse=server_config_data.get('enable_block_reuse',
-                                                      False),
-            free_gpu_memory_fraction=server_config_data.get(
-                'free_gpu_memory_fraction', 0.8),
-            max_batch_size=server_config_data.get('max_batch_size', 256),
-            enable_padding=server_config_data.get('enable_padding', True))
-
-        server_id = len(server_configs)
-        server_configs.append(server_config)
-
-        # Create ClientConfig objects
-        client_configs = []
-        selected_client_names = execution_plan.get(
-            server_name) if execution_plan else None
-
-        for client_config_data in server_config_data['client_configs']:
-            client_name = client_config_data['name']
-
-            # Check if this client should be included
-            # Include if: execution_plan is None OR selected_client_names is None OR client_name in selected_client_names
-            if execution_plan is not None and selected_client_names is not None:
-                if client_name not in selected_client_names:
-                    continue
-
-            client_config = ClientConfig(
-                name=client_config_data['name'],
-                model_name=server_config_data['model_name'],
-                concurrency=client_config_data['concurrency'],
-                iterations=client_config_data.get('iterations', 1),
-                isl=client_config_data.get('isl', 1024),
-                osl=client_config_data.get('osl', 1024),
-                random_range_ratio=client_config_data.get(
-                    'random_range_ratio', 0.0))
-            client_configs.append(client_config)
-
-        server_client_configs[server_id] = client_configs
-
-    return execution_plan, server_configs, server_client_configs
 
 
 class PerfTestConfig:
@@ -929,17 +632,6 @@ class PerfTestConfig:
         self.ctx_server_workers = 0
         self.gen_server_workers = 0
 
-        # Used for perf sanity test
-        # config_file: YAML path, select_pattern: server/client selection string
-        # server_configs: list[ServerConfig], server_client_configs: dict[server_id -> list[ClientConfig]]
-        self.upload_to_db = False
-        self.config_file = None
-        self.gpu_type = None
-        self.config_path = None
-        self.select_pattern = None
-        self.server_configs = []
-        self.server_client_configs = {}
-
     def _to_string_disagg(self, entries: List[str]):
         entries.append(f"disagg_server")
         if self.ctx_tp_size > 1:
@@ -963,15 +655,6 @@ class PerfTestConfig:
                   custom_input_len: int = None,
                   custom_output_len: int = None,
                   device_subtype: str = None) -> str:
-
-        # Used for perf sanity test
-        if self.config_file is not None:
-            entries = ["perf_sanity", self.config_file]
-            if custom_server_name is not None:
-                entries.append(f"server:{custom_server_name}")
-            if custom_client_name is not None:
-                entries.append(f"client:{custom_client_name}")
-            return "-".join(entries)
 
         # First, add the model name.
         entries = [self.model_name]
@@ -1141,19 +824,6 @@ class PerfTestConfig:
 
         # Extract configs from test param labels.
         labels = test_param_labels.split("-")
-
-        # Used for perf sanity test
-        if "perf_sanity" in labels[0]:
-            assert len(labels) > 1, "perf_sanity test must have a config file!"
-            self.runtime = "server-benchmark"
-            self.upload_to_db = "upload" in labels[0]
-            self.config_file = labels[1]
-            self.gpu_type = labels[1].replace("l0_", "").lower()
-            self.config_path = os.path.join(
-                "tests/scripts/perf-sanity", f"{labels[1]}.yaml"
-                if not labels[1].endswith(".yaml") else labels[1])
-            self.select_pattern = labels[2] if len(labels) > 2 else None
-            return
 
         self.model_name = labels.pop(0)
 
@@ -1372,15 +1042,6 @@ class PerfTestConfig:
                     [b >= 32 for b in self.batch_sizes]
                 ), f"gpt_350m and bloom_560m with small BS are very unstable! Please increase to at least 32."
 
-    def set_server_client_configs(self, llm_root: str) -> None:
-        """
-        Set the server and client configs.
-        """
-        if self.runtime == "server-benchmark":
-            config_file_path = os.path.join(llm_root, self.config_path)
-            _, self.server_configs, self.server_client_configs = parse_config_file(
-                config_file_path, self.select_pattern)
-
     def get_model_family(self) -> str:
         """
         Get the model family of the current model.
@@ -1466,6 +1127,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
     def set_runtime_configs(self,
                             llm_root,
                             working_dir,
+                            output_dir,
                             perf_cache_fpath,
                             gpu_clock_lock=None) -> None:
         if self._config.runtime == "cpp":
@@ -1479,9 +1141,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                                                  llm_root)
         elif self._config.runtime == "bench":
             benchmark_script = "trtllm-bench"
-        elif self._config.runtime == "server-benchmark":
-            benchmark_script = None
-            self._config.set_server_client_configs(llm_root)
         elif self._config.runtime == "disagg_server":
             benchmark_script = None
         else:
@@ -1492,7 +1151,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
 
         if self._config.runtime == "bench":
             build_script = "trtllm-bench"
-        elif self._config.runtime == "server-benchmark":
+        elif self._config.runtime == "aggr_server":
+            build_script = None
+        elif self._config.runtime == "multi_node_disagg_server":
             build_script = None
         elif self._config.pp_size > 1 or self._config.model_name not in allowed_models:
             build_script = "trtllm-build"
@@ -1504,31 +1165,10 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         self._build_script = build_script
         self._benchmark_script = benchmark_script
         self._working_dir = working_dir
+        self._output_dir = output_dir
         self._perf_cache_fpath = perf_cache_fpath
         self._llm_root = llm_root
         self._gpu_clock_lock = gpu_clock_lock
-
-    def get_trtllm_server_client_commands(self):
-        server_cmds = []
-        client_cmds = []
-        names = []
-        for server_idx, client_configs in self._config.server_client_configs.items(
-        ):
-            server_config = self._config.server_configs[server_idx]
-            server_cmd = server_config.to_cmd(self._working_dir)
-            server_cmd = " ".join(server_cmd)
-            # Generate extra-llm-api-config.yml
-            config_content = server_config.generate_extra_llm_api_config()
-            config_filename = f"extra-llm-api-config.{server_config.name}.yml"
-            config_path = os.path.join(self._working_dir, config_filename)
-            with open(config_path, 'w') as f:
-                f.write(config_content)
-            for client_config in client_configs:
-                server_cmds.append(server_cmd)
-                client_cmd = client_config.to_cmd(self._working_dir)
-                client_cmds.append(client_cmd)
-                names.append(f"{server_config.name}-{client_config.name}")
-        return server_cmds, client_cmds, names
 
     def get_trtllm_build_command(self, engine_dir, checkpoint_dir) -> list:
         build_cmd = [
@@ -1630,6 +1270,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                                          "llama-7b-hf")
         if not os.path.exists(engine_dir):
             os.makedirs(engine_dir, exist_ok=True)
+
         if self._config.num_loras > 0:
             istdev = 16
             ostdev = 24
@@ -1655,14 +1296,13 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                     self.lora_dirs.append(f"{lora_dir}/{i}")
                     data_cmd += [f"ln -sf {lora_path} {lora_dir}/{i}", ";"]
                 data_cmd += [
-                    "python3", prepare_data_script, f"--stdout",
-                    f"--rand-task-id 0 {nloras-1}",
-                    f"--tokenizer={tokenizer_dir}", f"--lora-dir={lora_dir}",
+                    "trtllm-bench", f"--model={tokenizer_dir}",
+                    "prepare-dataset", "--output", f"{dataset_path}",
+                    f"--rand-task-id 0 {nloras-1}", f"--lora-dir={lora_dir}",
                     f"token-norm-dist",
                     f"--num-requests={self._config.num_reqs}",
                     f"--input-mean={input_len}", f"--output-mean={output_len}",
-                    f"--input-stdev={istdev}", f"--output-stdev={ostdev}",
-                    f" > {dataset_path}"
+                    f"--input-stdev={istdev}", f"--output-stdev={ostdev}"
                 ]
 
             else:
@@ -1675,12 +1315,12 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             dataset_path = os.path.join(engine_dir, "synthetic_data.json")
             if self._build_script == 'trtllm-bench':
                 data_cmd += [
-                    "python3", prepare_data_script, "--stdout",
-                    f"--tokenizer={tokenizer_dir}", f"token-norm-dist",
+                    "trtllm-bench", f"--model={tokenizer_dir}",
+                    "prepare-dataset", "--output", f"{dataset_path}",
+                    "token-norm-dist",
                     f"--num-requests={self._config.num_reqs}",
                     f"--input-mean={input_len}", f"--output-mean={output_len}",
-                    f"--input-stdev={istdev}", f"--output-stdev={ostdev}",
-                    f" > {dataset_path}"
+                    f"--input-stdev={istdev}", f"--output-stdev={ostdev}"
                 ]
             else:
                 data_cmd += [
@@ -1734,6 +1374,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             benchmark_cmd += [f"--pp={self._config.pp_size}"]
         if self._config.streaming == "streaming":
             benchmark_cmd += [f"--streaming"]
+        if self._config.num_gpus > 1:
+            benchmark_cmd += [f"--warmup={2 * self._config.num_gpus}"]
 
         #Add extra-llm-api-config.yml for pytorch backend and tensorrt backend with extra flag
         if self._config.backend == "pytorch" or (self._config.backend == ""
@@ -1748,9 +1390,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 print_info(f"pytorch/TRT model config: {config}")
                 with open(pytorch_config_path, 'w') as f:
                     yaml.dump(config, f, default_flow_style=False)
-                benchmark_cmd += [
-                    f"--extra_llm_api_options={pytorch_config_path}"
-                ]
+                benchmark_cmd += [f"--config={pytorch_config_path}"]
                 # If guided_decoding_backend is set, we need to initialize tokenizer
                 if config.get('guided_decoding_backend') is not None:
                     benchmark_cmd += ["--no_skip_tokenizer_init"]
@@ -1778,41 +1418,24 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             print_info(f"_autodeploy model config: {autodeploy_config}")
             with open(autodeploy_config_path, 'w') as f:
                 yaml.dump(autodeploy_config, f, default_flow_style=False)
-            benchmark_cmd += [
-                f"--extra_llm_api_options={autodeploy_config_path}"
-            ]
+            benchmark_cmd += [f"--config={autodeploy_config_path}"]
         # for sampler options
         sampler_options_path = os.path.join(engine_dir, "sampler_options.yml")
         if not os.path.exists(sampler_options_path):
             os.makedirs(os.path.dirname(sampler_options_path), exist_ok=True)
         sampler_config = get_sampler_options_config(self._config.to_string())
-        print_info(f"sampler options config: {sampler_config}")
-        with open(sampler_options_path, 'w') as f:
-            yaml.dump(sampler_config, f, default_flow_style=False)
-        benchmark_cmd += [f"--sampler_options={sampler_options_path}"]
+        if sampler_config:
+            print_info(f"sampler options config: {sampler_config}")
+            with open(sampler_options_path, 'w') as f:
+                yaml.dump(sampler_config, f, default_flow_style=False)
+            benchmark_cmd += [f"--sampler_options={sampler_options_path}"]
         return benchmark_cmd
 
     def get_commands(self):
-
         # Whether this is python or cpp runtime perf test.
         is_python = self._config.runtime == "python"
         num_gpus = self._config.num_gpus
-        is_server_benchmark = self._config.runtime == "server-benchmark"
         is_disagg = self._config.runtime == "disagg_server"
-
-        if is_server_benchmark:
-            perf_sanity_working_dir = os.path.join(self._working_dir,
-                                                   "perf-sanity")
-            if not os.path.exists(perf_sanity_working_dir):
-                os.makedirs(perf_sanity_working_dir, exist_ok=True)
-            server_cmds, client_cmds, names = self.get_trtllm_server_client_commands(
-            )
-            return PerfServerClientBenchmarkCmds(
-                server_cmds=server_cmds,
-                client_cmds=client_cmds,
-                names=names,
-                working_dir=perf_sanity_working_dir)
-
         if is_disagg:
             ctx_cmd, gen_cmd = self._get_disagg_worker_deploy_command()
             server_cmd = self._get_disagg_server_deploy_command()
@@ -1841,6 +1464,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 build_cmd = self.get_trtllm_bench_build_command(engine_dir)
         else:
             pytest.skip("only support trtllm-bench runtime for now")
+
         # Construct prepare synthetic data command
         data_cmds = []
 
@@ -1896,7 +1520,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             metric.metric_regex.search(line)
             for line in outputs[cmd_idx].split("\n")
         ]
-        print_info(outputs[cmd_idx].split("\n"))
         metric_values = []
         for match in regex_matches:
             if match:
@@ -1977,35 +1600,26 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         Run through the commands and parse multiple perf metrics from the logs.
         """
         #print info to separate cases
-        print_info(f"Running perf test for case: {self._short_test_name}")
         self._current_cmd_idx = 0
         metrics = self._get_metrics()
+        commands = self.get_commands()
         outputs = {}
         result_states = {}
         errors = []
 
-        def add_myelin_time_pass_to(input_env):
-            time_pass_flag = r" -time_pass=on"
-            old_myelin_env = input_env.get("__LUNOWUD", "")
-            if time_pass_flag not in old_myelin_env:
-                input_env["__LUNOWUD"] = old_myelin_env + time_pass_flag
-            return old_myelin_env
-
-        old_llm_venv = add_myelin_time_pass_to(llm_venv._new_env)
+        # Only trtllm-bench needs to prepare dataset first.
         if self._config.runtime == 'bench':
-            #prepare dataset first for trtllm-bench
             print_info(f"Running command for generating dataset")
-            outputs = self.run_ex("prepare_dataset",
-                                  None,
-                                  llm_venv,
-                                  gpu_clock_lock,
-                                  session_data_writer,
-                                  output_dir,
+            outputs = self.run_ex(commands=commands,
+                                  cmd_idx=self._current_cmd_idx,
+                                  full_test_name="prepare_dataset",
+                                  metric_type=None,
+                                  venv=llm_venv,
+                                  gpu_clock_lock=gpu_clock_lock,
+                                  session_data_writer=session_data_writer,
+                                  output_dir=output_dir,
                                   outputs=outputs,
-                                  original_test_name="prepare_dataset",
-                                  cmd_idx=self._current_cmd_idx)
-
-            # Save the result state.
+                                  original_test_name="prepare_dataset")
             result_state = self.get_result_state()
             result_states[self._current_cmd_idx] = result_state
             if result_state != "valid":
@@ -2036,15 +1650,16 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 # Run the command or reuse the existing output logs.
                 print_info(f"Running command for {metric.metric_name}")
                 outputs = self.run_ex(
-                    metric.metric_name,
-                    metric.metric_type,
-                    llm_venv,
-                    gpu_clock_lock,
-                    session_data_writer,
-                    output_dir,
+                    commands=commands,
+                    cmd_idx=self._current_cmd_idx,
+                    full_test_name=metric.metric_name,
+                    metric_type=metric.metric_type,
+                    venv=llm_venv,
+                    gpu_clock_lock=gpu_clock_lock,
+                    session_data_writer=session_data_writer,
+                    output_dir=output_dir,
                     outputs=outputs,
-                    original_test_name=metric.original_test_name,
-                    cmd_idx=self._current_cmd_idx)
+                    original_test_name=metric.original_test_name)
 
                 # Save the result state.
                 result_state = self.get_result_state()
@@ -2054,12 +1669,18 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                     if self._current_cmd_idx in self._test_results:
                         del self._test_results[self._current_cmd_idx]
 
-            self.upload_test_results_to_database()
-
         finally:
             # Clean up engine dir after use.
             shutil.rmtree(self._get_engine_dir(), ignore_errors=True)
 
+        def add_myelin_time_pass_to(input_env):
+            time_pass_flag = r" -time_pass=on"
+            old_myelin_env = input_env.get("__LUNOWUD", "")
+            if time_pass_flag not in old_myelin_env:
+                input_env["__LUNOWUD"] = old_myelin_env + time_pass_flag
+            return old_myelin_env
+
+        old_llm_venv = add_myelin_time_pass_to(llm_venv._new_env)
         llm_venv._new_env["__LUNOWUD"] = old_llm_venv
 
         # Check if any commands failed.
@@ -2075,69 +1696,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
 
             raise RuntimeError(msg)
 
-    def upload_test_results_to_database(self):
-        """
-        Upload the test results and baseline to database.
-        """
-        # Currently only server-benchmark need to store the test result.
-        if self._config.runtime == "server-benchmark":
-            job_config = get_job_info()
-            job_config["s_gpu_type"] = self._config.gpu_type
-            is_post_merge = job_config["b_is_post_merge"]
-            new_data_dict = {}
-            cmd_idx = 0
-            for server_idx, client_configs in self._config.server_client_configs.items(
-            ):
-                server_config = self._config.server_configs[server_idx]
-                server_config_dict = server_config.to_db_data()
-                for client_config in client_configs:
-                    client_config_dict = client_config.to_db_data()
-                    # If cmd_idx not in self._test_results or some metrics missing, skip this cmd_idx
-                    if cmd_idx not in self._test_results or not all(
-                            metric_type in self._test_results[cmd_idx]
-                            for metric_type in SERVER_BENCHMARK_METRICS):
-                        print_info(
-                            f"Skipped posting command {cmd_idx} 's test results since some metrics are missing in test results."
-                        )
-                        cmd_idx += 1
-                        continue
-                    new_data = {}
-                    new_data.update(job_config)
-                    new_data.update(server_config_dict)
-                    new_data.update(client_config_dict)
-                    for metric_type in SERVER_BENCHMARK_METRICS:
-                        new_data[
-                            f"d_{PERF_METRIC_STRING[metric_type]}"] = self._test_results[
-                                cmd_idx][metric_type]
-                    add_id(new_data)
-                    new_data_dict[cmd_idx] = new_data
-                    cmd_idx += 1
-
-            # Get history data for each cmd_idx
-            history_baseline_dict, history_data_dict = get_history_data(
-                new_data_dict)
-            # Prepare regressive test cases
-            regressive_data_list = prepare_regressive_test_cases(
-                history_baseline_dict, new_data_dict)
-
-            if is_post_merge:
-                # Prepare new baseline data for post-merge
-                new_baseline_data_dict = prepare_baseline_data(
-                    history_baseline_dict, history_data_dict, new_data_dict)
-            else:
-                # Pre-merge does not need to upload baseline data
-                new_baseline_data_dict = None
-
-            if self._config.upload_to_db:
-                # Upload the new perf data and baseline data to database
-                post_new_perf_data(new_baseline_data_dict, new_data_dict,
-                                   regressive_data_list)
-
-            # Print regressive test cases
-            print_regressive_test_cases(regressive_data_list)
-        else:
-            return
-
     def _get_engine_dir(self) -> str:
         """
         Get the engine directory to store the engine.
@@ -2151,32 +1709,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         Generate all the metric configs for the current test.
         """
         metrics = []
-        if self._config.runtime == "server-benchmark":
-            cmd_idx = 0
-            for server_idx, client_configs in self._config.server_client_configs.items(
-            ):
-                server_name = self._config.server_configs[server_idx].name
-                for client_config in client_configs:
-                    for metric_type in SERVER_BENCHMARK_METRICS:
-                        metrics.append(
-                            PerfTestMetric(
-                                original_test_name=self._full_test_name,
-                                metric_name=self._get_metric_name(
-                                    metric_type=metric_type,
-                                    server_name=server_name,
-                                    client_name=client_config.name),
-                                metric_type=metric_type,
-                                metric_regex=self._get_metric_regex(
-                                    metric_type),
-                                metric_threshold=self._get_metric_threshold(
-                                    metric_type),
-                                metric_abs_threshold=self.
-                                _get_metric_abs_threshold(metric_type),
-                                cmd_idx=cmd_idx,
-                            ))
-                    cmd_idx += 1
-            return metrics
-
         if self._config.runtime == "disagg_server":
             for metric_type in DISAGG_SERVER_METRICS:
                 metrics.append(
@@ -2265,7 +1797,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                          input_len: int = None,
                          output_len: int = None,
                          server_name: str = None,
-                         client_name: str = None) -> str:
+                         client_name: str = None,
+                         disagg_config_name: str = None) -> str:
         """
         Construct the metric name for given metric_type, bs, input_len, and output_len.
         """
@@ -2279,11 +1812,14 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         if metric_type in BUILDER_METRICS:
             # We build one engine for all benchmark runs, so add all bs and seq lens to the metric name.
             metric_label = self._config.to_string(device_subtype=device_subtype)
-        elif self._config.runtime == "server-benchmark":
+        elif self._config.runtime == "aggr_server":
             metric_label = self._config.to_string(
                 custom_server_name=server_name,
                 custom_client_name=client_name,
             )
+        elif self._config.runtime == "multi_node_disagg_server":
+            metric_label = self._config.to_string(
+                custom_server_name=disagg_config_name)
         else:
             # Otherwise, generate per-bs and per-seqlen label.
             metric_label = self._config.to_string(
@@ -2304,10 +1840,14 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             if metric_type not in BENCH_PERF_METRIC_LOG_QUERIES:
                 raise ValueError(f"Unexpected metric_type: {metric_type}")
             return BENCH_PERF_METRIC_LOG_QUERIES[metric_type]
-        elif self._config.runtime == "server-benchmark":
-            if metric_type not in SERVER_BENCHMARK_PERF_METRIC_LOG_QUERIES:
+        elif self._config.runtime == "aggr_server":
+            if metric_type not in AGGR_SERVER_PERF_METRIC_LOG_QUERIES:
                 raise ValueError(f"Unexpected metric_type: {metric_type}")
-            return SERVER_BENCHMARK_PERF_METRIC_LOG_QUERIES[metric_type]
+            return AGGR_SERVER_PERF_METRIC_LOG_QUERIES[metric_type]
+        elif self._config.runtime == "multi_node_disagg_server":
+            if metric_type not in AGGR_SERVER_PERF_METRIC_LOG_QUERIES:
+                raise ValueError(f"Unexpected metric_type: {metric_type}")
+            return AGGR_SERVER_PERF_METRIC_LOG_QUERIES[metric_type]
         else:
             pytest.skip("only support trtllm-bench runtime for now")
 
@@ -2419,8 +1959,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 self._config.gen_server_workers)
         ])
 
-        ctx_cmd = f'CUDA_VISIBLE_DEVICES={ctx_gpu_list} trtllm-serve {model_dir} --host localhost --port 8001 --extra_llm_api_options {ctx_config_path}'
-        gen_cmd = f'CUDA_VISIBLE_DEVICES={gen_gpu_list} trtllm-serve {model_dir} --host localhost --port 8002 --extra_llm_api_options {gen_config_path}'
+        ctx_cmd = f'CUDA_VISIBLE_DEVICES={ctx_gpu_list} trtllm-serve {model_dir} --host localhost --port 8001 --config {ctx_config_path}'
+        gen_cmd = f'CUDA_VISIBLE_DEVICES={gen_gpu_list} trtllm-serve {model_dir} --host localhost --port 8002 --config {gen_config_path}'
         return ctx_cmd, gen_cmd
 
     def _get_disagg_server_deploy_command(self):
@@ -2492,7 +2032,7 @@ def run_perf_test(perf_case_name, trt_performance_cache_fpath,
     """
     working_dir = llm_venv.get_working_directory()
     test_runner = MultiMetricPerfTest(perf_case_name)
-    test_runner.set_runtime_configs(llm_root, working_dir,
+    test_runner.set_runtime_configs(llm_root, working_dir, output_dir,
                                     trt_performance_cache_fpath,
                                     trt_gpu_clock_lock)
     test_runner.run_metrics(llm_venv, trt_gpu_clock_lock,

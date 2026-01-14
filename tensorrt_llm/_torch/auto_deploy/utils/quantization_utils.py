@@ -8,7 +8,7 @@ from torch.fx import GraphModule, Node
 from ..custom_ops.quant import FP4_GLOBAL_SCALE_MAX, FP8_MAX
 from .logger import ad_logger
 from .node_utils import (
-    extract_param_names_from_lin_node,
+    extract_param_names_from_node,
     get_quantization_params_from_linear_node,
     is_bmm_op,
     is_linear_op,
@@ -117,7 +117,7 @@ def should_skip_quantization(
     else:
         if not (is_linear_op(node_or_name) or is_bmm_op(node_or_name)):
             return True
-        param_name, _ = extract_param_names_from_lin_node(node_or_name)
+        param_name, _ = extract_param_names_from_node(node_or_name)
         modname, _, _ = param_name.rpartition(".")
 
     return any(fnmatch(modname, pattern) for pattern in excluded_patterns)

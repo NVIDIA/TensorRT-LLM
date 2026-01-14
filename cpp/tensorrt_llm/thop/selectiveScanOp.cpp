@@ -21,6 +21,8 @@
 namespace th = torch;
 namespace tk = tensorrt_llm::kernels;
 
+TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -244,6 +246,8 @@ std::tuple<th::Tensor, th::Tensor> selective_scan(th::Tensor const& input, th::T
 
 } // namespace torch_ext
 
+TRTLLM_NAMESPACE_END
+
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
@@ -259,5 +263,5 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("selective_scan", &torch_ext::selective_scan);
+    m.impl("selective_scan", &tensorrt_llm::torch_ext::selective_scan);
 }

@@ -389,7 +389,7 @@ def test_env_overrides_yaml(basic_yaml_files):
     """Test that environment variables override yaml configs."""
     with patch.dict(
         os.environ,
-        {"SIMPLE": '{"value": 888, "name": "env_value"}', "OPTION": '{"name": "env_option"}'},
+        {"AD_SIMPLE": '{"value": 888, "name": "env_value"}', "AD_OPTION": '{"name": "env_option"}'},
     ):
         settings = BasicSettings(yaml_extra=[basic_yaml_files["config1"]])
 
@@ -403,7 +403,7 @@ def test_env_overrides_yaml(basic_yaml_files):
 
 def test_partial_env_override(basic_yaml_files):
     """Test partial environment variable override."""
-    with patch.dict(os.environ, {"SIMPLE": '{"flag": true}', "OPTION": '{"option": "on"}'}):
+    with patch.dict(os.environ, {"AD_SIMPLE": '{"flag": true}', "AD_OPTION": '{"option": "on"}'}):
         settings = BasicSettings(yaml_extra=[basic_yaml_files["config1"]])
 
         # Mix of env and yaml values

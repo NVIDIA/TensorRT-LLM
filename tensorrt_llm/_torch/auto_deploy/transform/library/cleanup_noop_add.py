@@ -51,6 +51,11 @@ class CleanupNoopAdd(BaseTransform):
             num_matches += 1
 
         # store info object about the transform
-        info = TransformInfo(skipped=False, num_matches=num_matches)
+        info = TransformInfo(
+            skipped=False,
+            num_matches=num_matches,
+            is_clean=num_matches == 0,
+            has_valid_shapes=num_matches == 0,
+        )
 
         return gm, info

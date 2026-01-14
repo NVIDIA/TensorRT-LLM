@@ -41,10 +41,10 @@ def _joint_transform(gm: GraphModule) -> None:
             "match_eager_attention": {
                 "stage": "pattern_matcher",
             },
-            "match_grouped_attention_with_repeat_kv": {
+            "match_sdpa_to_torch_attention": {
                 "stage": "pattern_matcher",
             },
-            "match_grouped_attention_without_repeat_kv": {
+            "match_grouped_attention": {
                 "stage": "pattern_matcher",
             },
             "match_attention_layout": {
@@ -117,7 +117,7 @@ def test_match_llama_attention(config: Dict[str, Any], attn_implementation: str)
         "attn_implementation": attn_implementation,
         **config,
     }
-    dynamic_shapes = {0: Dim("batch_size", max=8), 1: Dim("seq_len", min=2, max=8)}
+    dynamic_shapes = {0: Dim.DYNAMIC, 1: Dim.DYNAMIC}
 
     # Build and export model on meta device
     with init_empty_weights():

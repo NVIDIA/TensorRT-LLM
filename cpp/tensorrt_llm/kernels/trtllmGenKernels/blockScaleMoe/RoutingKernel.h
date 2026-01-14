@@ -55,6 +55,9 @@ struct DataBase
     int32_t* mPtrExpandedIdxToPermutedIdx{nullptr};
     // optional: if `nullptr`, it is not filled
     // dim: [mTileTokensDim * mTopK + (mNumExperts × mTileTokensDim) - mNumExperts]
+    int32_t* mPtrPermutedIdxToExpandedIdx{nullptr};
+    // optional: if `nullptr`, it is not filled
+    // dim: [mTileTokensDim * mTopK + (mNumExperts × mTileTokensDim) - mNumExperts]
     // Note: this array (mPtrPermutedIdxToTokenIdx) is uninitialized
     // Any out-of-bounds values are undefined.
     int32_t* mPtrPermutedIdxToTokenIdx{nullptr};
@@ -119,6 +122,7 @@ struct KernelParamsBase
     int32_t* mPtrExpertCounts = nullptr;
     int32_t* mPtrPermutedIdxSize = nullptr;
     int32_t* mPtrExpandedIdxToPermutedIdx = nullptr;
+    int32_t* mPtrPermutedIdxToExpandedIdx = nullptr;
     int32_t* mPtrPermutedIdxToTokenIdx = nullptr;
     int32_t* mPtrCtaIdxXyToBatchIdx = nullptr;
     int32_t* mPtrCtaIdxXyToMnLimit = nullptr;
@@ -144,6 +148,7 @@ struct KernelParamsBase
         mPtrExpertCounts = data.mPtrExpertCounts;
         mPtrPermutedIdxSize = data.mPtrPermutedIdxSize;
         mPtrExpandedIdxToPermutedIdx = data.mPtrExpandedIdxToPermutedIdx;
+        mPtrPermutedIdxToExpandedIdx = data.mPtrPermutedIdxToExpandedIdx;
         mPtrPermutedIdxToTokenIdx = data.mPtrPermutedIdxToTokenIdx;
         mPtrCtaIdxXyToBatchIdx = data.mPtrCtaIdxXyToBatchIdx;
         mPtrCtaIdxXyToMnLimit = data.mPtrCtaIdxXyToMnLimit;
@@ -184,13 +189,15 @@ struct Data : public DataBase
     bool mUseRoutingSoftmax;
 };
 
-template <typename InputT_, typename OutputT_, int MaxNumExperts_, bool UseGroups_, bool isPow2_, bool UsePdl_>
+template <typename InputT_, typename OutputT_, int MaxNumExperts_, int MaxNumTopExperts_, bool UseGroups_, bool isPow2_,
+    bool UsePdl_>
 struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_, isPow2_, UsePdl_>
 {
     using InputT = InputT_;
     using OutputT = OutputT_;
 
     static constexpr bool UseGroups = UseGroups_;
+    static constexpr int MaxNumTopExperts = MaxNumTopExperts_;
 
     PackedScoreIdx<OutputT>* mPtrTopKPacked = nullptr;
 

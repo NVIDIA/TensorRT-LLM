@@ -82,6 +82,7 @@ class CutlassMoEOp(MoEOp):
                                               False),
                 min_latency_mode=min_latency_mode,
                 use_fused_finalize=use_fused_finalize,
+                activation_type=module.activation_type,
             )
 
         # Set tuning configuration
@@ -164,6 +165,7 @@ class CutlassMoEOp(MoEOp):
         swiglu_beta = module.swiglu_beta
         swiglu_limit = module.swiglu_limit
         use_w4_group_scaling = getattr(module, 'has_w4afp8', False)
+        activation_type = module.activation_type
 
         # Determine weight dtype for view operation if needed
         weight_dtype = w3_w1_weight.dtype
@@ -199,7 +201,7 @@ class CutlassMoEOp(MoEOp):
                          input_sf, swizzled_input_sf, swiglu_alpha, swiglu_beta,
                          swiglu_limit, tp_size, tp_rank, ep_size, ep_rank,
                          cluster_size, cluster_rank, use_all_to_all,
-                         min_latency_mode, self.gemm_tactics,
+                         min_latency_mode, self.gemm_tactics, activation_type,
                          unpadded_hidden_size, tuner_num_tokens, None)
 
         # Return output based on latency mode

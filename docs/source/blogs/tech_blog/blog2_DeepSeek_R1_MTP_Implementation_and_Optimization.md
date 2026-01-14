@@ -122,7 +122,7 @@ To benchmark min-latency performance with MTP, you need to follow [this document
 ```bash
 YOUR_DATA_PATH=<your dataset file following the format>
 
-cat >./extra-llm-api-config.yml<<EOF
+cat >./config.yml<<EOF
 cuda_graph_config: {}
 moe_config:
   backend: TRTLLM
@@ -142,7 +142,7 @@ trtllm-bench --model nvidia/DeepSeek-R1-FP4 \
     --max_batch_size 1 \
     --tp 8 \
     --ep 2 \
-    --extra_llm_api_options ./extra-llm-api-config.yml
+    --config ./config.yml
 ```
 
 ## MTP optimization - Relaxed Acceptance
@@ -178,7 +178,7 @@ To benchmark min-latency performance with MTP Relaxed Acceptance, you need to fo
 ```bash
 YOUR_DATA_PATH=<your dataset file following the format>
 
-cat >./extra-llm-api-config.yml<<EOF
+cat >./config.yml<<EOF
 cuda_graph_config: {}
 moe_config:
   backend: TRTLLM
@@ -201,7 +201,7 @@ trtllm-bench --model nvidia/DeepSeek-R1-FP4 \
     --max_batch_size 1 \
     --tp 8 \
     --ep 2 \
-    --extra_llm_api_options ./extra-llm-api-config.yml
+    --config ./config.yml
 ```
 
 ## Evaluation

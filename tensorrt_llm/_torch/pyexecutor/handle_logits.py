@@ -3,7 +3,8 @@ from typing import List
 
 import torch
 
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
+                                                        LlmRequestState)
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 
@@ -72,6 +73,9 @@ class HandleLogits:
 
         total_context_logits = num_context_logits_prefix_sum[-1]
         for batch_index, llm_req in enumerate(generation_requests):
+            if llm_req.state == LlmRequestState.GENERATION_COMPLETE:
+                continue
+
             logits_begin = total_context_logits + batch_index * beam_width
             logits_end = logits_begin + beam_width
 

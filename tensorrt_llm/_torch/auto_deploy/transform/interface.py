@@ -12,11 +12,12 @@ from typing import Any, Callable, Dict, Mapping, Tuple, Type, Union, final
 
 import torch.nn as nn
 from pydantic import BaseModel, Field
-from torch.fx import GraphModule
+from torch.fx import GraphModule, Node
 
 from ..models.factory import ModelFactory
 from ..shim.interface import CachedSequenceInterface
 from ..utils._graph import (
+    add_graph_input,
     canonicalize_graph,
     lift_to_meta,
     named_graphmodules,
@@ -24,7 +25,6 @@ from ..utils._graph import (
     run_shape_prop,
 )
 from ..utils.logger import ad_logger
-from ..utils.sharding_utils import ShardingConfig
 
 
 class TransformError(Exception):
@@ -61,7 +61,10 @@ class Stages(Enum):
 class SharedConfig(BaseModel):
     """Global config shared between multiple transforms in the inference optimizer."""
 
-    sharding_config: ShardingConfig = Field(default_factory=ShardingConfig)
+    model_config = {
+        # to provide an easy way to do config validation of child config classes with more fields
+        "extra": "allow",
+    }
     local_rank: int = Field(default=0)
     world_size: int = Field(default=1)
 
@@ -172,6 +175,10 @@ class TransformInfo(BaseModel):
             is_clean=self.is_clean and other.is_clean,
             has_valid_shapes=self.has_valid_shapes and other.has_valid_shapes,
         )
+
+    # implement + addition operator for TransformInfo
+    def __add__(self, other: "TransformInfo") -> "TransformInfo":
+        return self.__and__(other)
 
 
 TransformHistory = Dict[str, TransformInfo]
@@ -406,14 +413,14 @@ class BaseTransform(ABC):
             return self._apply_to_full_model(mod, cm, factory, shared_config)
 
         # just run it on first graph module we are encountering for now...
-        info = TransformInfo()
+        info = None
         for k, graph_sub in named_graphmodules(mod):
             graph_sub, info_apply = self._apply(graph_sub, cm, factory, shared_config)
             if k == "":
                 mod = graph_sub
             else:
                 mod.set_submodule(k, graph_sub)
-            info = info & info_apply
+            info = info & info_apply if info is not None else info_apply
         return mod, info
 
     @final
@@ -498,6 +505,19 @@ class BaseTransform(ABC):
         raise NotImplementedError(
             f"Transform {self.get_transform_key()} only supports `run_per_gm=True`."
         )
+
+    def _add_or_retrieve_input(
+        self, gm: GraphModule, cm: CachedSequenceInterface, name: str
+    ) -> Node:
+        """Add or retrieve an input node from the graph."""
+        input_nodes = gm.graph.find_nodes(op="placeholder", target=name)
+        if len(input_nodes) == 0:
+            cm.info.activate_arg(name)
+            return add_graph_input(gm, name)
+        elif len(input_nodes) == 1:
+            return input_nodes[0]
+        else:
+            raise ValueError(f"Expected exactly one input node for {name=}, got {input_nodes=}")
 
 
 class TransformRegistry:

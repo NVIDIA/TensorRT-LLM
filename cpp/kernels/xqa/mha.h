@@ -1,13 +1,18 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #pragma once
@@ -85,6 +90,9 @@ struct BeamSearchParams
                                              // match trt-llm API.
 };
 
+uint32_t computeNbSubSeqPerSeqMHA(
+    cudaDeviceProp const& prop, uint32_t batchSize, uint32_t nbKHeads, uint32_t maxSeqLen);
+
 void launchMHA(cudaDeviceProp const& prop, uint32_t const nbKHeads,
 #if SLIDING_WINDOW
     uint32_t slidingWinSize,
@@ -123,7 +131,16 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t const nbKHeads,
 #if SPEC_DEC
     SpecDecParams const& specDecParams,
 #endif
+#if SKIP_SOFTMAX_ATTN
+    float const skipSoftmaxThresholdScaleFactor,
+#if SKIP_SOFTMAX_ATTN_BLOCK_STATS
+    uint32_t* __restrict__ skippedBlockCount, uint32_t* __restrict__ totalBlockCount,
+#endif
+#endif
     uint32_t* semaphores, void* scratch, cudaStream_t stream);
+
+uint32_t computeNbSubSeqPerSeqHopperF8MHA(
+    cudaDeviceProp const& prop, uint32_t batchSize, uint32_t nbKHeads, uint32_t maxSeqLen);
 
 void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #if SLIDING_WINDOW
@@ -162,6 +179,12 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
                                             // int8/fp8 KV cache.
 #if SPEC_DEC
     SpecDecParams const& specDecParams,
+#endif
+#if SKIP_SOFTMAX_ATTN
+    float const skipSoftmaxThresholdScaleFactor,
+#if SKIP_SOFTMAX_ATTN_BLOCK_STATS
+    uint32_t* __restrict__ skippedBlockCount, uint32_t* __restrict__ totalBlockCount,
+#endif
 #endif
     uint32_t* semaphores, void* scratch, cudaStream_t stream);
 

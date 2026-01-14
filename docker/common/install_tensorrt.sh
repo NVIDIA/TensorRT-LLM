@@ -2,23 +2,20 @@
 
 set -ex
 
-TRT_VER="10.13.2.6"
+TRT_VER="10.14.1.48"
 # Align with the pre-installed cuDNN / cuBLAS / NCCL versions from
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-08.html#rel-25-08
-CUDA_VER="13.0" # 13.0.0
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-12.html#rel-25-12
+CUDA_VER="13.1" # 13.1.0
 # Keep the installation for cuDNN if users want to install PyTorch with source codes.
 # PyTorch 2.x can compile with cuDNN v9.
-CUDNN_VER="9.12.0.46-1"
-# NCCL version 2.26.x used in the NGC PyTorch 25.05 image but has a performance regression issue.
-# Use NCCL version 2.27.5 which has the fixes.
-NCCL_VER="2.27.7-1+cuda13.0"
-# Use cuBLAS version 13.0.0.19 instead.
-CUBLAS_VER="13.0.0.19-1"
+CUDNN_VER="9.17.0.29-1"
+NCCL_VER="2.28.9-1+cuda13.0"
+CUBLAS_VER="13.2.0.9-1"
 # Align with the pre-installed CUDA / NVCC / NVRTC versions from
 # https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html
-NVRTC_VER="13.0.48-1"
-CUDA_RUNTIME="13.0.48-1"
-CUDA_DRIVER_VERSION="580.65.06-1.el8"
+NVRTC_VER="13.1.80-1"
+CUDA_RUNTIME="13.1.80-1"
+CUDA_DRIVER_VERSION="590.44.01-1.el8"
 
 for i in "$@"; do
     case $i in
@@ -121,7 +118,12 @@ install_rockylinux_requirements() {
 install_tensorrt() {
     PY_VERSION=$(python3 -c 'import sys; print(".".join(map(str, sys.version_info[0:2])))')
     PARSED_PY_VERSION=$(echo "${PY_VERSION//./}")
+
     TRT_CUDA_VERSION=${CUDA_VER}
+    # No CUDA 13.1 version for TensorRT yet. Use CUDA 13.0 package instead.
+    if [ "$CUDA_VER" = "13.1" ]; then
+        TRT_CUDA_VERSION="13.0"
+    fi
     TRT_VER_SHORT=$(echo $TRT_VER | cut -d. -f1-3)
 
     if [ -z "$RELEASE_URL_TRT" ];then

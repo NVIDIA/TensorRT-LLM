@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 
 #include <ATen/cuda/CUDAContext.h>
@@ -53,6 +54,8 @@
     }
 #define PRINT_TENSOR(x) std::cout << #x << ":\n" << x << std::endl
 #define PRINT_TENSOR_SIZE(x) std::cout << "size of " << #x << ": " << x.sizes() << std::endl
+
+TRTLLM_NAMESPACE_BEGIN
 
 namespace torch_ext
 {
@@ -93,3 +96,5 @@ std::optional<float> getFloatEnv(char const* name);
 cudaDataType_t convert_torch_dtype(torch::ScalarType dtype);
 
 } // namespace torch_ext
+
+TRTLLM_NAMESPACE_END
