@@ -824,6 +824,10 @@ class DecodingBaseConfig(StrictBaseModel):
     def is_linear_tree(self) -> bool:
         return self.max_draft_len == self.max_total_draft_tokens
 
+    @functools.cached_property
+    def num_capture_layers(self) -> int:
+        return 0
+
 
 class KvCacheConnectorConfig(StrictBaseModel):
     """
@@ -1138,6 +1142,8 @@ class NGramDecodingConfig(DecodingBaseConfig):
 
 
 class DraftTargetDecodingConfig(DecodingBaseConfig):
+    draft_target_one_model: bool = False
+    num_draft_layers: Optional[int] = None
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -1151,6 +1157,14 @@ class DraftTargetDecodingConfig(DecodingBaseConfig):
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch" or backend == "_autodeploy"
+
+    @functools.cached_property
+    def spec_dec_mode(self):
+        from tensorrt_llm._torch.speculative.interface import \
+            SpeculativeDecodingMode as TorchSpeculativeDecodingMode
+        if self.draft_target_one_model:
+            return TorchSpeculativeDecodingMode.DRAFT_TARGET_ONE_MODEL
+        return TorchSpeculativeDecodingMode.DRAFT_TARGET
 
 
 class MTPDecodingConfig(DecodingBaseConfig):
