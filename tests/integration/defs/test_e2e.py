@@ -1683,9 +1683,13 @@ def test_openai_lora(llm_root, llm_venv):
 
 def test_openai_chat_multimodal_example(llm_root, llm_venv):
     test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd(
-        ["-m", "pytest",
-         str(test_root / "_test_openai_chat_multimodal.py")])
+    llm_venv.run_cmd([
+        "-m",
+        "pytest",
+        str(test_root / "_test_openai_chat_multimodal.py"),
+        "-m",
+        "not needs_l40s",
+    ])
 
 
 def test_openai_mmencoder_example(llm_root, llm_venv):

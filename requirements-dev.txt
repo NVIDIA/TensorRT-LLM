@@ -28,7 +28,7 @@ jieba==0.42.1
 rouge==1.0.1
 pytest-rerunfailures
 ruff==0.9.4
-lm_eval[api]==0.4.9.2
+lm_eval[api]==0.4.9.1  # 0.4.9.2 bug for custom config: https://github.com/EleutherAI/lm-evaluation-harness/pull/3436
 docstring_parser
 genai-perf==0.0.13
 opentelemetry-sdk>=1.26.0
