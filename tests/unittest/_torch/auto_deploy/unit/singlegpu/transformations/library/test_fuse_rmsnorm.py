@@ -64,6 +64,9 @@ def _run_test(model, op, variant):
     gm_transformed = InferenceOptimizer(
         None,
         {
+            "match_rmsnorm_pattern": {
+                "stage": "pattern_matcher",
+            },
             "fuse_rmsnorm": {
                 "stage": "post_load_fusion",
                 "gated_rmsnorm_backend": "triton",

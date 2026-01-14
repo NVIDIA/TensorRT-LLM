@@ -370,13 +370,30 @@ class HelixCpMnnvlMemory(MnnvlMemory):
         if cls.comm is not None:
             return cls.comm
         comm = mpi_comm().Split(
-            mapping.pp_rank * mapping.tp_size * mapping.moe_tp_size
-            + mapping.tp_rank * mapping.moe_tp_size
-            + mapping.moe_tp_rank,
+            mapping.pp_rank * mapping.tp_size + mapping.tp_rank,
             mapping.cp_rank,
         )
         cls.comm = comm
         return comm
+
+
+def init_helix_cp_comm(mapping: Mapping) -> None:
+    """Pre-initialize the Helix CP communicator.
+
+    This function MUST be called during model initialization when all ranks
+    are synchronized (before any PP pipeline divergence). The MPI Split operation
+    is collective and requires all ranks in the communicator to participate.
+
+    In PP (pipeline parallel) mode, different PP stages execute different parts
+    of the model at different times. If the communicator is initialized lazily
+    during the first forward pass, ranks in different PP stages may not reach
+    the Split operation at the same time, causing a deadlock.
+
+    Args:
+        mapping: The mapping object containing parallelism configuration.
+    """
+    if mapping.has_cp_helix() and not mapping.cp_config.get("use_nccl_for_alltoall", True):
+        HelixCpMnnvlMemory.get_comm(mapping)
 
 
 @dataclass

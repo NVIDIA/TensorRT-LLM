@@ -918,6 +918,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             self.spec_worker = get_spec_worker(model_config.spec_config,
                                                model_config,
                                                model_config.mapping)
+            self.epilogue.append(self.draft_model)
+            self.epilogue.append(self.spec_worker)
 
             if self.draft_config is not None and model_config.spec_config.eagle3_model_arch == "llama3":
                 for key, value in self.draft_config.extra_attrs.items():

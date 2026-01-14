@@ -14,6 +14,7 @@ from tensorrt_llm._utils import mpi_disabled, nvtx_range
 from tensorrt_llm.mapping import CpType
 
 from ..distributed import Distributed
+from .hang_detector import HangDetector
 from .llm_request import (ExecutorRequest, LlmRequest,
                           executor_request_to_llm_request)
 
@@ -47,10 +48,17 @@ class RequestQueueItem:
 class ExecutorRequestQueue:
     """Handles fetching and processing of new requests from the request queue."""
 
-    def __init__(self, dist: Distributed, enable_attention_dp: bool,
-                 max_batch_size: int, max_beam_width: int,
-                 max_num_active_requests: int, enable_iter_perf_stats: bool,
-                 batch_wait_timeout_ms: float):
+    def __init__(
+        self,
+        dist: Distributed,
+        enable_attention_dp: bool,
+        max_batch_size: int,
+        max_beam_width: int,
+        max_num_active_requests: int,
+        enable_iter_perf_stats: bool,
+        batch_wait_timeout_ms: float,
+        hang_detector: Optional[HangDetector] = None,
+    ):
         self.dist = dist
         self.request_queue: queue.Queue[RequestQueueItem] = queue.Queue()
         self.waiting_queue: deque[RequestQueueItem] = deque()
@@ -66,6 +74,7 @@ class ExecutorRequestQueue:
         self.active = True
         self.batch_wait_timeout_ms = batch_wait_timeout_ms
         self.send_requests_handler = None
+        self.hang_detector = hang_detector or HangDetector()
 
         # State tracking
         self.num_fetch_requests = 0
@@ -303,7 +312,8 @@ class ExecutorRequestQueue:
                 self.request_accumulated.clear()
                 # Reset timeout to 0 to avoid hanging when no new requests are available
                 timeout = datetime.timedelta(0)
-            new_requests.extend(self._get_from_request_queue(timeout))
+            with self.hang_detector.pause():
+                new_requests.extend(self._get_from_request_queue(timeout))
 
         # Broadcast requests and handle Python objects
         new_requests, py_request_objects = self._handle_request_broadcasting(
@@ -477,8 +487,9 @@ class ExecutorRequestQueue:
             # Preserve original `new_requests` on rank 0
             _ = self._broadcast_new_requests(new_requests, py_request_objects)
         else:
-            new_requests, py_request_objects = self._broadcast_new_requests(
-                new_requests, py_request_objects)
+            with self.hang_detector.pause():
+                new_requests, py_request_objects = self._broadcast_new_requests(
+                    new_requests, py_request_objects)
 
         return new_requests, py_request_objects
 

@@ -46,6 +46,7 @@ from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
 from .guided_decoder import GuidedDecoder
 from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
+from .hang_detector import HangDetector
 from .kv_cache_connector import KvCacheConnectorManager
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
@@ -137,6 +138,7 @@ class PyExecutor:
                  max_seq_len: Optional[int] = None,
                  peft_cache_config: Optional[PeftCacheConfig] = None,
                  virtual_memory_pools: Optional[dict] = None,
+                 hang_detection_timeout: Optional[int] = None,
                  execution_stream: Optional[torch.cuda.Stream] = None):
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
@@ -280,6 +282,15 @@ class PyExecutor:
         self.adp_ctx_batching_wait_iters_count = 0
         self.batch_wait_iters_count = 0
 
+        def on_detected():
+            self._handle_errors(
+                f"Hang detected on rank {self.global_rank} in PyExecutor.")
+            self.shutdown_event.set()
+            self.is_shutdown = True
+
+        self.hang_detector = HangDetector(timeout=hang_detection_timeout,
+                                          on_detected=on_detected)
+
         # request fetcher initialization
         self._set_global_steady_clock_offset()
         self.executor_request_queue = ExecutorRequestQueue(
@@ -290,6 +301,7 @@ class PyExecutor:
             max_num_active_requests=self.max_num_active_requests,
             enable_iter_perf_stats=self.enable_iter_perf_stats,
             batch_wait_timeout_ms=self.batch_wait_timeout_ms,
+            hang_detector=self.hang_detector,
         )
         self.executor_request_queue.set_exclude_last_generation_logits(
             self.disable_overlap_scheduler, self.dist.pp_size)
@@ -476,6 +488,14 @@ class PyExecutor:
         """
         self.executor_request_queue.enqueue_shutdown_request()
         self.shutdown_event.wait()
+        if self.hang_detector.detected():
+            # Early return here to avoid waiting for hanging threads.
+            # Since `on_detected` has sent the error message as response,
+            # this worker will be asked to shutdown immediately.
+            # Since the whole process will shutdown after this `shutdown` call,
+            # All threads and memory pools will be freed properly.
+            logger.error("Hang detected, shutting down immediately.")
+            return
         self.worker_thread.join()
         self.worker_started = False
         for manager in self.resource_manager.resource_managers.values():
@@ -960,10 +980,11 @@ class PyExecutor:
         # ensure the context is created, otherwise, some MPI calls will fail.
         CUASSERT(cudart.cudaSetDevice(self.device_id))
         microbatch_id = 0
-        with self._profiler() as profile_step:
+        with self._profiler() as profile_step, self.hang_detector:
             iter_start_time = time.time()
             iter_stats = None
             while True:
+                self.hang_detector.checkpoint()
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
@@ -1349,11 +1370,12 @@ class PyExecutor:
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
         CUASSERT(cudart.cudaSetDevice(self.device_id))
-        with self._profiler() as profile_step:
+        with self._profiler() as profile_step, self.hang_detector:
             sample_state = None
             iter_start_time = time.time()
             iter_stats = None
             while True:
+                self.hang_detector.checkpoint()
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
@@ -1551,13 +1573,14 @@ class PyExecutor:
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
         CUASSERT(cudart.cudaSetDevice(self.device_id))
-        with self._profiler() as profile_step:
+        with self._profiler() as profile_step, self.hang_detector:
             iter_start_time = time.time()
             iter_stats = None
             target_inputs = None
             previous_tensors_device = None
             can_forward = False if self.benchmark_req_queues_size > 0 and self.kv_cache_transceiver else True
             while True:
+                self.hang_detector.checkpoint()
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
