@@ -1,6 +1,7 @@
 """A simple wrapper transform to export a model to a graph module."""
 
 import inspect
+import os
 from contextlib import contextmanager
 from inspect import Parameter, Signature
 from typing import Any, Dict, List, Optional, Tuple, Type
@@ -12,6 +13,11 @@ from pydantic import Field
 from ...export import run_forward_for_capture, torch_export_to_gm
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
+from ...utils.debug_markers import (
+    default_coarse_marker_specs,
+    instrument_model_for_debug_markers,
+    strip_debug_markers,
+)
 from ..interface import (
     BaseTransform,
     SharedConfig,
@@ -152,6 +158,16 @@ class ExportToGM(BaseTransform):
         for e_info in export_infos:
             sub_mod = mod.get_submodule(e_info.submodule_name)
 
+            # Optional debug instrumentation: register hooks that insert debug_mark ops
+            # so the exported graph contains unambiguous nodes for coarse module I/O.
+            #
+            # Enabled via env var AD_DEBUG_MARKERS=1. This is intended for debugging only.
+            debug_marker_handles = []
+            if os.environ.get("AD_DEBUG_MARKERS", "0") == "1":
+                specs = default_coarse_marker_specs(sub_mod)
+                applied, debug_marker_handles = instrument_model_for_debug_markers(sub_mod, specs)
+                print(f"[DEBUG MARKERS] Specs applied: {applied}")
+
             # start by capturing the kwargs that are passed to the submodule for export
             with capture_forward_kwargs(sub_mod) as captured_kwargs:
                 run_forward_for_capture(
@@ -184,6 +200,17 @@ class ExportToGM(BaseTransform):
                     strict=self.config.strict,
                     patch_list=self.config.patch_list,
                 )
+
+            # Remove debug marker hooks after export (they've been traced into the graph)
+            for handle in debug_marker_handles:
+                handle.remove()
+
+            # Strip debug markers from graph: remove marker nodes and propagate
+            # their tags to the producer/consumer node's meta. This keeps the graph clean
+            # for pattern matching while preserving tags for comparison.
+            if os.environ.get("AD_DEBUG_MARKERS", "0") == "1":
+                stripped = strip_debug_markers(sub_gm)
+                print(f"[DEBUG MARKERS] Markers stripped (tag -> node): {stripped}")
 
             # post process the sub graph module
             e_info.post_process(sub_mod, sub_gm)
