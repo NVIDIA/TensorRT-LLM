@@ -7,6 +7,9 @@ from ..pyexecutor.guided_decoder import GuidedDecoder
 from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.seq_slot_manager import SeqSlotManager
 from ..speculative.interface import SpecMetadata
+from .draft_target import (DraftTargetOneModelSampler,
+                           DraftTargetOneModelSpecMetadata,
+                           DraftTargetOneModelWorker)
 from .eagle3 import (Eagle3OneModelSampler, Eagle3OneModelSpecMetadata,
                      Eagle3OneModelWorker, Eagle3ResourceManager,
                      Eagle3SpecMetadata)
@@ -78,6 +81,15 @@ def get_spec_metadata(spec_config,
             hidden_size=model_config.hidden_size,
             max_num_tokens=max_num_tokens,
             layers_to_capture=spec_config.eagle3_layers_to_capture,
+            allow_advanced_sampling=spec_config.allow_advanced_sampling,
+        )
+    if spec_config.spec_dec_mode.is_draft_target_one_model():
+        return DraftTargetOneModelSpecMetadata(
+            max_draft_len=spec_config.max_draft_len,
+            max_total_draft_tokens=spec_config.max_total_draft_tokens,
+            spec_dec_mode=spec_config.spec_dec_mode,
+            max_num_requests=max_num_requests,
+            max_num_tokens=max_num_tokens,
             allow_advanced_sampling=spec_config.allow_advanced_sampling,
         )
     if spec_config.spec_dec_mode.is_save_hidden_states():
@@ -167,6 +179,8 @@ def get_spec_decoder(sampler_args: TorchSampler.Args,
         return TorchSampler(sampler_args)
     if spec_config.spec_dec_mode.is_eagle3_one_model():
         return Eagle3OneModelSampler(sampler_args)
+    if spec_config.spec_dec_mode.is_draft_target_one_model():
+        return DraftTargetOneModelSampler(sampler_args)
     raise ValueError(
         f"Unsupported speculative decoding mode: {spec_config.spec_dec_mode}")
 
@@ -208,6 +222,11 @@ def get_num_spec_layers(spec_config):
     if spec_config.spec_dec_mode.is_eagle3_one_model():
         num_eagle_layers = spec_config.num_eagle_layers
         return num_eagle_layers if num_eagle_layers is not None else 1
+    if spec_config.spec_dec_mode.is_draft_target_one_model():
+        # For DraftTarget one-model, the number of spec layers equals the
+        # number of draft model layers that need separate KV cache entries.
+        num_draft_layers = spec_config.num_draft_layers
+        return num_draft_layers if num_draft_layers is not None else 1
     return 0
 
 
@@ -224,6 +243,8 @@ def get_spec_worker(spec_config,
     if spec_dec_mode.is_eagle3_one_model():
         return Eagle3OneModelWorker(spec_config, mapping,
                                     use_separate_draft_kv_cache)
+    if spec_dec_mode.is_draft_target_one_model():
+        return DraftTargetOneModelWorker(spec_config, mapping)
     return None
 
 
