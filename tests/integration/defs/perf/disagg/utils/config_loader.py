@@ -520,7 +520,7 @@ class ConfigLoader:
             ("environment", "trtllm_repo"): lambda: self._get_repo_dir(),
             ("environment", "trtllm_wheel_path"): lambda: EnvManager.get_trtllm_wheel_path(),
             ("benchmark", "dataset_file"): lambda: self._get_dataset_file(config),
-            ("accuracy", "env_var", "HF_HOME"): lambda: self._get_hf_home(),
+            ("accuracy", "env_var", "HF_HOME"): lambda: EnvManager.get_hf_home_dir(),
             ("environment", "work_dir"): lambda: EnvManager.get_script_dir(),
             ("environment", "model_path"): lambda: self._get_full_model_path(config),
             ("slurm", "script_file"): lambda: self._get_script_file(config),
@@ -619,9 +619,6 @@ class ConfigLoader:
         metadata = config.get("metadata", {})
         dataset_file = metadata.get("dataset_file", "")
         return os.path.join(EnvManager.get_dataset_dir(), dataset_file)
-    
-    def _get_hf_home(self) -> str:
-        return os.path.join(EnvManager.get_dataset_dir(), "hf_home")
 
     def _get_script_file(self, config: dict) -> str:
         """Get script file by combining scripts directory with script file name.
