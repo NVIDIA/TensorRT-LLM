@@ -319,3 +319,61 @@ def _fake(
     N_half = weight_quantized.shape[-2]
     N = N_half * 2
     return torch.empty((*input.shape[:-1], N), dtype=input.dtype, device=input.device)
+
+
+@torch.library.custom_op("auto_deploy::torch_fake_quant_hf_fp8_linear", mutates_args=())
+def torch_fake_quant_hf_fp8_linear(
+    input: torch.Tensor,  # [..., K]
+    weight_quantized: torch.Tensor,  # [N, K] float8_e4m3fn
+    bias: Optional[torch.Tensor],  # [N] or None
+    input_scale: List[torch.Tensor],  # unused for HF FP8 (input quantized on the fly)
+    weight_scale: List[torch.Tensor],  # [weight_scale_inv]
+    input_zp: List[torch.Tensor],  # unused
+    weight_zp: List[torch.Tensor],  # unused
+) -> torch.Tensor:
+    """HuggingFace FineGrainedFP8 linear operation.
+    - weight_scale[0] = weight_scale_inv (per-block weight scale)
+    - input_scale, input_zp, weight_zp are unused
+    - block_size is inferred from weight and weight_scale_inv shapes
+    """
+    from transformers.integrations.finegrained_fp8 import act_quant, w8a8_block_fp8_matmul_triton
+
+    weight_scale_inv = weight_scale[0]
+
+    # Infer block_size from weight and weight_scale_inv shapes
+    # weight shape: [N, K], weight_scale_inv shape: [N/block_n, K/block_k]
+    N, K = weight_quantized.shape
+    scale_n, scale_k = weight_scale_inv.shape
+    block_n = N // scale_n
+    block_k = K // scale_k
+    block_size = [block_n, block_k]
+
+    qinput, scale = act_quant(input, block_size[1])
+    output = w8a8_block_fp8_matmul_triton(
+        qinput,
+        weight_quantized,
+        scale,
+        weight_scale_inv,
+        block_size,
+        output_dtype=input.dtype,
+    )
+
+    if bias is not None:
+        output = output + bias
+
+    return output.to(dtype=input.dtype)
+
+
+@torch_fake_quant_hf_fp8_linear.register_fake
+def _torch_fake_quant_hf_fp8_linear_fake(
+    input: torch.Tensor,
+    weight_quantized: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    input_scale: List[torch.Tensor],
+    weight_scale: List[torch.Tensor],
+    input_zp: List[torch.Tensor],
+    weight_zp: List[torch.Tensor],
+) -> torch.Tensor:
+    """Fake implementation for torch.export tracing."""
+    out_features = weight_quantized.shape[0]
+    return torch.empty((*input.shape[:-1], out_features), dtype=input.dtype, device=input.device)

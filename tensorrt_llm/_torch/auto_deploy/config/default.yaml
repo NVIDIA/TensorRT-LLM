@@ -63,6 +63,8 @@ transforms:
     stage: pattern_matcher
   quantize_nvfp4_linear_from_config:
     stage: pattern_matcher
+  quantize_hf_fp8_linear_from_config:
+    stage: pattern_matcher
   quantize_fp8_bmm_from_config:
     stage: pattern_matcher
   quantize_fp8_from_graph:

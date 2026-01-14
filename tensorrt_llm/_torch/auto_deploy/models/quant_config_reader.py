@@ -146,6 +146,8 @@ class HFQuantConfigReader(QuantConfigReader):
     Quantization reader that process transformers.quantizers.HFQuantizer functionality
     """
 
+    _SUPPORTED_QUANT_METHODS = ("mxfp4", "fp8")
+
     def __init__(self):
         super().__init__()
         self._hf_quantizer = None
@@ -180,7 +182,7 @@ class HFQuantConfigReader(QuantConfigReader):
         # TODO(Fridah-nv):this class is only verified with GPT-OSS MXFP4, other hf quantizers
         # should have similar workflow and will be added to the pipeline
         quant_method = str(qconf.get("quant_method", "")).lower()
-        if quant_method != "mxfp4":
+        if quant_method not in cls._SUPPORTED_QUANT_METHODS:
             return None
 
         reader = cls()

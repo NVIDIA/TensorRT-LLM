@@ -362,6 +362,7 @@ def is_fake_quantized_linear_op(node: Node) -> bool:
     quantized_linear_op = {
         torch.ops.auto_deploy.torch_fake_quant_fp8_linear,
         torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear,
+        torch.ops.auto_deploy.torch_fake_quant_hf_fp8_linear,
     }
 
     return is_op(node, quantized_linear_op)
