@@ -838,6 +838,20 @@ public:
         // for enc-dec models, pause means saving generated tokens to prompt but need to re-do encoder phase
         mState = mEncoderTokens.has_value() || mEncoderInputFeatures ? LlmRequestState::kENCODER_INIT
                                                                      : LlmRequestState::kCONTEXT_INIT;
+
+        if (mLlmRequestType == LlmRequestType::LLMREQUEST_TYPE_GENERATION_ONLY)
+        {
+
+            //  If gen only server is configured with MAX_UTILIZATION scheduler, the running gen only request may be
+            //  paused. and rescheduled as context_init state,which will run context phase, degrading performance.
+            // Have no ideal how to avoid this, if we modify the max utilization scheduler to avoid pausing
+            // generation-only requests, it could result in no KV cache being available, causing requests to remain
+            // unscheduled indefinitely.  we just issue a warning here.
+            TLLM_LOG_WARNING(
+                "Pause generation only request ,request_id :%lu , change it as context init state, which may degrade "
+                "performance",
+                mRequestId);
+        }
         mContextCurrentPositionTarget = 0;
         mContextCurrentPositionDraft = 0;
         mPrepopulatedPromptLenTarget = 0;
