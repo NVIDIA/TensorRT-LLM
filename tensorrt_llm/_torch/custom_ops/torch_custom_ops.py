@@ -272,6 +272,13 @@ def fused_moe(
             ) from e
         raise
 
+    # When out_tensor is provided, the result is written in-place to out_tensor.
+    # Return empty list to avoid aliasing constraint violation in PyTorch 2.9.1+
+    # (custom op output cannot be the same tensor as input).
+    # Callers should use out_tensor directly when they provide it.
+    if out_tensor is not None and not min_latency_mode:
+        return []
+
     return output if min_latency_mode else [output]
 
 

@@ -1102,9 +1102,17 @@ def mxe4m3_mxe2m1_block_scale_moe_runner(
         0] = routing_logits  # replace dummy routing logits with actual routing logits
     input_tensors[-2] = topk_weights  # replace dummy topk_weights with actual
     input_tensors[-1] = topk_ids  # replace dummy topk_ids with actual
-    return kernel_runner(input_tensors,
-                         tactic=[-1, -1] if best_tactic == -1 else best_tactic,
-                         output=output)
+    result = kernel_runner(
+        input_tensors,
+        tactic=[-1, -1] if best_tactic == -1 else best_tactic,
+        output=output)
+    # When output is provided, the result is written in-place to output.
+    # Return empty tensor to avoid aliasing constraint violation in PyTorch 2.9.1+
+    # (custom op output cannot be the same tensor as input).
+    # Callers should use output directly when they provide it.
+    if output is not None:
+        return torch.empty(0, device=result.device, dtype=result.dtype)
+    return result
 
 
 @dataclass(frozen=True)
