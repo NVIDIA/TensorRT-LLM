@@ -2430,7 +2430,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             dynamic_tensor_specs=(DynamicTensorSpec(
                 0, 1, get_last_power_of_2_num_tokens_buckets,
                 last_positive_power_of_2), ),
-            constraint_specs=(ConstraintSpec(2, 1, fp8_scale_infer_shape), ),
+            constraint_specs=(ConstraintSpec(2, 2, fp8_scale_infer_shape), ),
         )
 
         def __init__(self):
