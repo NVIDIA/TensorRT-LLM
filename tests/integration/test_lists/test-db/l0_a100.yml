@@ -22,7 +22,7 @@ l0_a100:
     - unittest/llmapi/test_memory_profiling.py::test_pyexecutor_and_kvcache_share_execution_stream # test that PyExecutor and KVCacheManager share the same execution_stream
     - unittest/trt/model_api/test_model_quantization.py
     # executor
-    - unittest/executor/test_base_worker.py
+    - unittest/executor/test_base_worker.py ISOLATION
     - unittest/executor/test_rpc_proxy.py
     - unittest/executor/test_rpc_worker.py
 - condition:
