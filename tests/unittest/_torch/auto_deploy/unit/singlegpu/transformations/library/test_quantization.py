@@ -113,6 +113,51 @@ def test_quantization(quant_config, atol, rtol, num_p_og):
     torch_export_to_gm(gm_transformed, args=(x,))
 
 
+@pytest.mark.parametrize("bias", [True, False])
+@pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")
+def test_hf_fp8_quantization(bias):
+    """Test HuggingFace FineGrained FP8 quantization transform.
+
+    This tests the quantize_hf_fp8_linear_from_config transform which converts
+    linear layers to use the torch_fake_quant_hf_fp8_linear op with per-block
+    quantization matching HuggingFace's FineGrainedFP8 format.
+    """
+    model = MLP(128, 256, 128).to(torch.float16).to("cuda")
+    x = torch.randn(3, 128, dtype=torch.float16).to("cuda")
+
+    quant_config = {"quant_method": "fp8"}
+    QUANT_OP = torch.ops.auto_deploy.torch_fake_quant_hf_fp8_linear
+
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+    gm_transformed = InferenceOptimizer(
+        DummyFactory(quant_config),
+        {
+            "quantize_hf_fp8_linear_from_config": {
+                "stage": "pattern_matcher",
+            },
+        },
+    )(None, gm)
+    gm_transformed.to("cuda")
+    run_test_transformed_gm(
+        model,
+        x,
+        gm_transformed,
+        lambda gm: any(is_op(n, QUANT_OP) for n in gm.graph.nodes),
+        lambda num_p_og: num_p_og,
+        0.1,  # atol
+        0.1,  # rtol
+        True,  # test_load_hook
+        False,  # strict_loading
+        None,  # dynamic_shapes
+        None,  # check_num_matches
+        False,  # skip_output_assert
+        quant_config,
+    )
+
+    assert not torch.allclose(model(x), gm_transformed(x))
+    torch_export_to_gm(gm_transformed, args=(x,))
+
+
 @pytest.mark.parametrize(
     "quant_config,atol,rtol,num_p_og,model_class",
     [

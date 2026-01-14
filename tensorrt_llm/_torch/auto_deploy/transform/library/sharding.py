@@ -493,6 +493,47 @@ class FP8WeightShardingInfo(QuantizationShardingMixin, WeightShardingInfo):
         return
 
 
+class HFFineGrainedFP8WeightShardingInfo(QuantizationShardingMixin, WeightShardingInfo):
+    """Tensor-parallel sharding for HuggingFace FineGrainedFP8 quantized linears.
+
+    HF FP8 uses per-block weight scales (weight_scale_inv) with shape [N/block_n, K/block_k].
+    When sharding the weight along a dimension, we also need to shard the scale tensor.
+    """
+
+    def scale_names(self) -> List[str]:
+        return ["weight_scale_inv"]
+
+    def shard_scales(
+        self,
+        dim: int,
+        rank: int,
+        world_size: int,
+        weight_shape: torch.Size,
+        *,
+        weight_scale_inv: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        # weight_scale_inv has shape [N/block_n, K/block_k]
+        # When we shard weight along dim, we need to shard scale along the same dim
+        sharded_scale = torch.tensor_split(weight_scale_inv, world_size, dim=dim)[rank]
+        return {"weight_scale_inv": sharded_scale}
+
+    def shard_load_hook(
+        self,
+        state_dict,
+        prefix,
+        *args,
+        weight_name: str,
+        weight_shape: torch.Size,
+        dim: int,
+        rank: int,
+        world_size: int,
+    ) -> None:
+        scale_key = weight_name + "_scale_inv"
+        if scale_key in state_dict:
+            scale = state_dict[scale_key]
+            state_dict[scale_key] = torch.tensor_split(scale, world_size, dim=dim)[rank]
+
+
 def _shard_fp4_weight_scale(weight_scale, sharded_uint8_weight_shape, dim, rank, world_size):
     # assert weight_scale.dim() == 1
     weight_shape_original = list(sharded_uint8_weight_shape)
@@ -723,9 +764,34 @@ class NVFP4EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
         _insert_sharded_moe(gm, node, self.config, scale_names=self.scale_names())
 
 
+class HFFP8EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
+    """HuggingFace FineGrainedFP8-specific EP sharding behavior.
+
+    HF FP8 MoE uses per-block weight scales (weight_scale_inv) for each expert's weights.
+    """
+
+    def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
+        if not is_op(node, torch.ops.auto_deploy.torch_quant_hf_fp8_moe):
+            ad_logger.warning(f"EP sharding is only supported for MOE nodes. Skipping {self}.")
+            return False
+        return True
+
+    def scale_names(self) -> List[str]:
+        return ["weight_scale_inv"]
+
+    def apply(self, gm: GraphModule, node: Node) -> None:
+        _insert_sharded_moe(
+            gm,
+            node,
+            self.config,
+            scale_names=self.scale_names(),
+        )
+
+
 EP_SHARDING_RULES = [
     (lambda n: is_op(n, torch.ops.auto_deploy.torch_quant_fp8_moe), FP8EPShardingInfo),
     (lambda n: is_op(n, torch.ops.auto_deploy.torch_quant_nvfp4_moe), NVFP4EPShardingInfo),
+    (lambda n: is_op(n, torch.ops.auto_deploy.torch_quant_hf_fp8_moe), HFFP8EPShardingInfo),
     (lambda n: is_op(n, torch.ops.auto_deploy.torch_moe), EPShardingInfo),
     (lambda n: is_op(n, torch.ops.auto_deploy.triton_mxfp4_moe), MXFP4EPShardingInfo),
 ]
@@ -1221,6 +1287,10 @@ TP_SHARDING_RULES = [
     (
         lambda n: is_op(n, torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear),
         FP4WeightShardingInfo,
+    ),
+    (
+        lambda n: is_op(n, torch.ops.auto_deploy.torch_fake_quant_hf_fp8_linear),
+        HFFineGrainedFP8WeightShardingInfo,
     ),
 ]
 
