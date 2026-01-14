@@ -148,7 +148,6 @@ accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_auto_dtype_4gpus[4-4
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_auto_dtype_4gpus[4-1-True-True-False]
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_auto_dtype_4gpus[4-1-False-False-True]
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_auto_dtype_4gpus[4-4-True-False-True]
-accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_8gpus
 accuracy/test_llm_api_pytorch.py::TestPhi4::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestPhi4::test_fp8
 accuracy/test_llm_api_pytorch.py::TestPhi4MiniInstruct::test_auto_dtype
