@@ -15,8 +15,7 @@ on:
 jobs:
   build:
     name: Build and analyze
-    runs-on: ubuntu-latest
-
+    runs-on: blossom
     steps:
       - uses: actions/checkout@v6
         with:
