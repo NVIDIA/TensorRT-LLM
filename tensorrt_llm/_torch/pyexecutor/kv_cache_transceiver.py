@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from os import getenv
+from typing import List
 
 import tensorrt_llm
 from tensorrt_llm import logger
