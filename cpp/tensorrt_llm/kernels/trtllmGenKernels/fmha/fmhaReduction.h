@@ -17,9 +17,8 @@
 #pragma once
 
 #include "cubin/kernelMetaInfo.h"
-#include "fmhaRunnerParams.h"
-#include "kernelParams.h"
 #include "tensorrt_llm/common/config.h"
+#include "trtllmGen_fmha_export/KernelParamsDecl.h"
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -28,7 +27,7 @@ namespace kernels
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams const& params,
+void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, fmha::KernelParams const& params,
     int32_t multiProcessorCount, cudaStream_t stream);
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

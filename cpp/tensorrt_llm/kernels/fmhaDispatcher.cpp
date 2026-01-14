@@ -111,11 +111,22 @@ bool FmhaDispatcher::isSupported()
         tllmRunnerParams.mKernelType = FmhaKernelType::Context;
         tllmRunnerParams.mTileScheduler = TileScheduler::Persistent;
         tllmRunnerParams.mMultiCtasKvMode = false;
+        tllmRunnerParams.mNumHeadsQ = mFixedParams.numQHeads;
+        tllmRunnerParams.mNumHeadsKv = mFixedParams.numKvHeads;
+        tllmRunnerParams.mHeadDimQkNope = mFixedParams.headSizeQkNope;
+        tllmRunnerParams.mBatchSize = 1;
+        tllmRunnerParams.mMaxSeqLenQ = 1;
+        tllmRunnerParams.mMaxSeqLenKv = 1;
+        tllmRunnerParams.mMaxSeqLenCacheKv = 1;
+        tllmRunnerParams.mSumOfSeqLensQ = 1;
+        tllmRunnerParams.mSumOfSeqLensKv = 1;
+        tllmRunnerParams.mMaxNumPagesPerSeqKv = 1;
         // Assume same headDim for Qk and V here.
         tllmRunnerParams.mHeadDimQk = mFixedParams.headSize;
         tllmRunnerParams.mHeadDimV = mFixedParams.headSizeV;
-        tllmRunnerParams.mNumTokensPerPage = mFixedParams.numTokensPerBlock;
+        tllmRunnerParams.mNumTokensPerPage = (qkvLayout == QkvLayout::PagedKv) ? mFixedParams.numTokensPerBlock : 0;
         tllmRunnerParams.mNumHeadsQPerKv = mFixedParams.numQHeads / mFixedParams.numKvHeads;
+        tllmRunnerParams.mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
         // Set the chunked attention size and sliding window size to INT_MAX to disable them when checking if
         // the kernel is supported.
         tllmRunnerParams.mChunkedAttentionSize = INT_MAX;
@@ -221,10 +232,11 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         tllmRunnerParams.mSumOfSeqLensQ = runnerParams.totalQSeqLen;
         tllmRunnerParams.mSumOfSeqLensKv = runnerParams.totalKvSeqLen;
         tllmRunnerParams.mMaxNumPagesPerSeqKv = maxBlocksPerSeq;
-        tllmRunnerParams.mNumTokensPerPage = numTokensPerBlock;
+        tllmRunnerParams.mNumTokensPerPage = (qkvLayout == QkvLayout::PagedKv) ? numTokensPerBlock : 0;
         tllmRunnerParams.mScaleQ = mFixedParams.qScaling;
         // Set it to INT_MAX as the kv cache pageOffsets will ensure that there is no out-of-bounds access.
         tllmRunnerParams.mNumPagesInMemPool = INT_MAX;
+        tllmRunnerParams.mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
         tllmRunnerParams.mSfStartTokenIdx = 0;
         // For mla chunked prefill
         tllmRunnerParams.softmaxStatsPtr = reinterpret_cast<float2*>(runnerParams.softmaxStatsPtr);
