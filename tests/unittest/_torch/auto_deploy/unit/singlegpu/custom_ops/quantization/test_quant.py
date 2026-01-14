@@ -309,3 +309,65 @@ def test_fake_quant_int4_linear_matches_fp_reference(bias_opt, input_dtype):
     ).to(out_int4.dtype)
     cos = F.cosine_similarity(out_fp32.reshape(-1), out_int4.reshape(-1), dim=0)
     assert cos > 0.98
+
+
+@pytest.mark.parametrize("M", [3, 12])
+@pytest.mark.parametrize("N", [128, 256])  # Must be divisible by block_size
+@pytest.mark.parametrize("K", [128, 256])  # Must be divisible by block_size
+@pytest.mark.parametrize("bias", [True, False])
+@pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")
+def test_hf_fp8_linear(M, N, K, bias):
+    """Test HuggingFace FineGrainedFP8 linear custom op.
+
+    This tests the torch_fake_quant_hf_fp8_linear op which implements
+    per-block FP8 quantization matching HuggingFace's FineGrainedFP8 format.
+    """
+    block_size = [128, 128]
+    block_n, block_k = block_size
+
+    assert N % block_n == 0, f"N={N} must be divisible by block_n={block_n}"
+    assert K % block_k == 0, f"K={K} must be divisible by block_k={block_k}"
+
+    input_tensor = torch.rand(M, K, device="cuda", dtype=torch.float16)
+    weight = torch.rand(N, K, device="cuda", dtype=torch.float16)
+    bias_tensor = torch.rand(N, device="cuda", dtype=torch.float16) if bias else None
+
+    FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
+    eps = torch.finfo(torch.float32).tiny
+
+    # Reshape weight to blocks: [N, K] -> [N/block_n, block_n, K/block_k, block_k]
+    weight_reshaped = weight.detach().float().view(N // block_n, block_n, K // block_k, block_k)
+    # Compute per-block amax: [N/block_n, K/block_k]
+    amax = weight_reshaped.abs().amax(dim=(1, 3)).to(torch.float32)
+    weight_scale_inv = torch.clamp(amax / FP8_MAX, min=eps).to("cuda")
+
+    # Quantize weight to FP8 using per-block scales
+    # Expand scale to match weight shape for element-wise division
+    scale_expanded = weight_scale_inv.repeat_interleave(block_n, dim=0).repeat_interleave(
+        block_k, dim=1
+    )
+    weight_fp8 = (weight.float() / scale_expanded).to(torch.float8_e4m3fn)
+
+    output_hf_fp8 = torch.ops.auto_deploy.torch_fake_quant_hf_fp8_linear(
+        input_tensor,
+        weight_fp8,
+        bias_tensor,
+        [],  # input_scale - unused for HF FP8
+        [weight_scale_inv],  # weight_scale
+        [],  # input_zp - unused
+        [],  # weight_zp - unused
+    )
+
+    weight_dequant = (weight_fp8.float() * scale_expanded).to(input_tensor.dtype)
+    output_ref = torch.nn.functional.linear(input_tensor, weight_dequant, bias_tensor)
+
+    assert output_hf_fp8.shape == output_ref.shape, (
+        f"Shape mismatch: {output_hf_fp8.shape} vs {output_ref.shape}"
+    )
+
+    torch.testing.assert_close(output_hf_fp8, output_ref, rtol=0.1, atol=0.1)
+
+    cos = F.cosine_similarity(
+        output_hf_fp8.reshape(-1).float(), output_ref.reshape(-1).float(), dim=0
+    )
+    assert cos > 0.95, f"Cosine similarity too low: {cos}"
