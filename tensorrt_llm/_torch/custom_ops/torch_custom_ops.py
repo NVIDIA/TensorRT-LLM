@@ -252,14 +252,25 @@ def fused_moe(
     )
 
     run_moe = moe_runner.fused_moe_runner.run_moe_min_latency if min_latency_mode else moe_runner.fused_moe_runner.run_moe
-    output = run_moe(input, token_selected_experts, token_final_scales,
-                     fc1_expert_weights, fc1_expert_biases, fc2_expert_weights,
-                     fc2_expert_biases, quant_scales, input_sf,
-                     swizzled_input_sf, swiglu_alpha, swiglu_beta, swiglu_limit,
-                     tp_size, tp_rank, ep_size, ep_rank, cluster_size,
-                     cluster_rank, enable_alltoall, min_latency_mode,
-                     [gemm_tactic_1, gemm_tactic_2], activation_type,
-                     unpadded_hidden_size, tuner_num_tokens, out_tensor)
+    try:
+        output = run_moe(input, token_selected_experts, token_final_scales,
+                         fc1_expert_weights, fc1_expert_biases,
+                         fc2_expert_weights, fc2_expert_biases, quant_scales,
+                         input_sf, swizzled_input_sf, swiglu_alpha, swiglu_beta,
+                         swiglu_limit, tp_size, tp_rank, ep_size, ep_rank,
+                         cluster_size, cluster_rank, enable_alltoall,
+                         min_latency_mode, [gemm_tactic_1, gemm_tactic_2],
+                         activation_type, unpadded_hidden_size,
+                         tuner_num_tokens, out_tensor)
+    except RuntimeError as e:
+        error_msg = str(e)
+        if "DeepGEMM only supports Hopper" in error_msg:
+            raise RuntimeError(
+                f"{error_msg}"
+                "Note: This is the Cutlass backend with DeepGemm JIT path. "
+                "For Blackwell (SM100+) support, please use the DEEPGEMM backend instead."
+            ) from e
+        raise
 
     return output if min_latency_mode else [output]
 
