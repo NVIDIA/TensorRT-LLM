@@ -87,6 +87,9 @@ def _test_allreduce_fusion(port: int, ModuleCls, strategy: str):
     gm_transformed = InferenceOptimizer(
         None,
         {
+            "match_rmsnorm_pattern": {
+                "stage": "pattern_matcher",
+            },
             "detect_sharding": {
                 "stage": "post_export",
                 "allreduce_strategy": strategy,

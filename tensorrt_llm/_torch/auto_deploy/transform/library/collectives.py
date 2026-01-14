@@ -32,7 +32,10 @@ from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformReg
 def _make_allreduce_residual_rmsnorm_pattern(
     add_order: str = "residual_first", strategy: str = "AUTO"
 ):
-    """Factory function to create pattern functions for allreduce+residual+rmsnorm fusion.
+    """Factory function to create pattern functions for allreduce+residual+torch_rmsnorm fusion.
+
+    This pattern matches the graph after match_rmsnorm_pattern has replaced
+    RMSNorm patterns with torch_rmsnorm ops.
 
     Args:
         add_order: Either "residual_first" (residual + x) or "x_first" (x + residual)
@@ -45,15 +48,14 @@ def _make_allreduce_residual_rmsnorm_pattern(
     def pattern_fn(
         x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float = 0.1253
     ):
-        """Pattern: trtllm_dist_all_reduce(x) -> add residual -> RMSNorm
+        """Pattern: trtllm_dist_all_reduce(x) -> add residual -> torch_rmsnorm
 
         Reference PyTorch composition:
             y = trtllm_dist_all_reduce(x)
             z = residual + y  (or y + residual)
-            normed = RMSNorm(z, weight, eps)
+            normed = torch_rmsnorm(z, weight, eps)
         Returns (normed, z)
         """
-        input_dtype = x.dtype
         hidden_states = torch.ops.auto_deploy.trtllm_dist_all_reduce(x, strategy)
 
         # Handle addition order
@@ -62,11 +64,8 @@ def _make_allreduce_residual_rmsnorm_pattern(
         else:  # x_first
             add = hidden_states + residual
 
-        hidden_states = add.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + eps)
-
-        normed = weight * hidden_states.to(input_dtype)
+        # Use torch_rmsnorm op (already replaced by match_rmsnorm_pattern)
+        normed = torch.ops.auto_deploy.torch_rmsnorm(add, weight, eps)
 
         return normed, add
 
@@ -94,6 +93,9 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
     This transform only applies when TRT-LLM ops are used (MPI mode), as it provides
     optimized fused kernels. The torch backend (demollm mode) does not benefit from
     this fusion and uses unfused operations.
+
+    Note: This transform expects torch_rmsnorm ops in the graph, which are created
+    by the match_rmsnorm_pattern transform that runs earlier in the pipeline.
     """
 
     def _apply(
@@ -114,7 +116,6 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
             0.1253,  # eps
         ]
 
-        op_ignore_types = {torch.ops.aten.to.dtype: (torch.dtype,)}
         scalar_workaround = {"eps": 0.1253}
 
         # ============================================================================
@@ -139,7 +140,6 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
             replace_fn=partial(_allreduce_residual_rmsnorm_replacement, strategy=strategy),
             patterns=patterns,
             dummy_args=dummy_args,
-            op_ignore_types=op_ignore_types,
             scalar_workaround=scalar_workaround,
         )
 
@@ -149,7 +149,6 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
             replace_fn=partial(_allreduce_residual_rmsnorm_replacement, strategy=strategy),
             patterns=patterns,
             dummy_args=dummy_args,
-            op_ignore_types=op_ignore_types,
             scalar_workaround=scalar_workaround,
         )
 
