@@ -16,6 +16,7 @@ try:
 except Exception:
     MPI = None  # deferred; functions will error if used when ENABLE_MULTI_DEVICE is True
 
+from tensorrt_llm._mnnvl_utils import init_helix_cp_comm
 from tensorrt_llm._utils import (mpi_allgather, mpi_barrier, mpi_comm,
                                  mpi_disabled, mpi_isend, mpi_isend_object,
                                  mpi_recv, mpi_recv_object, mpi_send,
@@ -838,9 +839,13 @@ class PPCommNCCL:
             self.nccl_comm.send(tensor, dest)
             return
 
-        self.tensor_ready_event.record()
+        # If the tensor is allocated from non-default memory pool
+        # like userbuffers, its underlying memory may be reused
+        # before the send operation is completed.
+        # We clone the tensor to avoid write-write conflicts.
+        tensor = tensor.clone()
+        self.send_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.send_stream):
-            self.tensor_ready_event.wait()
             self.nccl_comm.send(tensor, dest)
 
     def recv(self, tensor: torch.Tensor, src: Optional[int] = None):
@@ -888,6 +893,7 @@ def init_pp_comm(mapping):
         _pp_comm = PPCommTorch(mapping)
     else:
         _pp_comm = PPCommNCCL(mapping)
+    init_helix_cp_comm(mapping)
 
 
 @TorchDist.log_op
