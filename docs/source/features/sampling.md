@@ -1,6 +1,6 @@
 # Sampling
 
-The Pytorch backend supports a wide variety of features, listed below:
+The PyTorch backend supports a wide variety of features, listed below:
 
 | Forward Pass       | Sampling Strategies              | Sampling Features              |
 |--------------------|----------------------------------|--------------------------------|
@@ -21,7 +21,7 @@ There are two sampling backends available.
 * Torch Sampler
 * TRTLLM Sampler
 
-Torch Sampler currently supports a superset of features of TRTLLM Sampler, and is intended as the long term solution. One can specify which sampler to use explicitly with:
+Torch Sampler currently supports a superset of features of TRTLLM Sampler, and is intended as the long-term solution. One can specify which sampler to use explicitly with:
 
 ```python
 from tensorrt_llm import LLM
