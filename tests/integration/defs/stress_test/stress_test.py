@@ -1217,8 +1217,6 @@ def extract_stress_test_metrics(artifacts_dir=None, current_model=None):
                                             {}).get("avg", 0)
                 tokThroughput = results.get("output_token_throughput",
                                             {}).get("avg", 0)
-                # Try new aiperf format first (input_config.loadgen.concurrency),
-                # fall back to old genai_perf format (input_config.perf_analyzer.stimulus.concurrency)
                 conCurrency = results.get("input_config",
                                           {}).get("loadgen",
                                                   {}).get("concurrency", 0)
@@ -1232,8 +1230,6 @@ def extract_stress_test_metrics(artifacts_dir=None, current_model=None):
                     modelName = model_name_map[first_dir]
                 else:
                     # Fall back to model name from JSON if we can't extract from directory
-                    # Try new aiperf format (input_config.endpoint.model_names),
-                    # fall back to old format (input_config.model_names or input_config.model)
                     modelName = results.get("input_config", {}).get(
                         "endpoint", {}).get("model_names", None)
                     if modelName is None:
