@@ -253,19 +253,18 @@ def submit_job(config, log_dir, dry_run):
     # Create base log directory path
     if log_dir is None:
         log_base = os.path.join(env_config['work_dir'], "logs")
-    else:
-        log_base = log_dir
-    date_prefix = datetime.now().strftime("%Y%m%d-%H%M%S")
-    log_base = os.path.join(log_base, f"{date_prefix}/{isl}-{osl}")
 
-    # Determine directory suffix based on attention_dp
-    if gen_enable_attention_dp:
-        dir_suffix = f"disagg_ctx{ctx_num}_gen{gen_num}_dep{gen_tp_size}_batch{gen_batch_size}_eplb{eplb_num_slots}_mtp{mtp_size}"
-    else:
-        dir_suffix = f"disagg_ctx{ctx_num}_gen{gen_num}_tep{gen_tp_size}_batch{gen_batch_size}_eplb{eplb_num_slots}_mtp{mtp_size}"
+        date_prefix = datetime.now().strftime("%Y%m%d-%H%M%S")
+        log_base = os.path.join(log_base, f"{date_prefix}/{isl}-{osl}")
 
-    # Create full log directory path
-    log_dir = os.path.join(log_base, dir_suffix)
+        # Determine directory suffix based on attention_dp
+        if gen_enable_attention_dp:
+            dir_suffix = f"disagg_ctx{ctx_num}_gen{gen_num}_dep{gen_tp_size}_batch{gen_batch_size}_eplb{eplb_num_slots}_mtp{mtp_size}"
+        else:
+            dir_suffix = f"disagg_ctx{ctx_num}_gen{gen_num}_tep{gen_tp_size}_batch{gen_batch_size}_eplb{eplb_num_slots}_mtp{mtp_size}"
+
+        # Create full log directory path
+        log_dir = os.path.join(log_base, dir_suffix)
 
     # Remove existing directory if it exists
     if os.path.exists(log_dir):
