@@ -191,6 +191,7 @@ GemmAllReduceImplRunner<GemmTraits>::GemmAllReduceImplRunner()
         break;
     // Blackwell
     case 100:
+    case 103:
         registry_builder.addSm100<GemmTraits, GemmAllReduceImpl::kNVLS_2SHOT, _2SM, TileShape::TileShape_128x256x128,
             ClusterShape::ClusterShape_4x1x1>();
         break;

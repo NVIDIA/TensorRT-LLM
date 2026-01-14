@@ -48,6 +48,8 @@ transforms:
   match_rope_layout:
     stage: pattern_matcher
     expected_layout: bsnd
+  match_rmsnorm_pattern:
+    stage: pattern_matcher
   ############################################################################################
   # RUN TRANSFORMATIONS ON STANDARDIZED GRAPH REPRESENTATION
   ############################################################################################

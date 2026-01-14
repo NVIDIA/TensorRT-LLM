@@ -1,5 +1,7 @@
 import gc
 import os
+import threading
+import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
@@ -9,7 +11,7 @@ import zmq
 
 from tensorrt_llm.logger import logger
 
-from .._utils import mpi_comm, mpi_rank
+from .._utils import mpi_comm, mpi_rank, print_all_stacks
 from ..bindings import executor as tllm
 from ..builder import Engine
 from ..llmapi.llm_args import BaseLlmArgs
@@ -152,6 +154,21 @@ def worker_main(
     rpc_addr: Optional[str] = None,
     hmac_key: Optional[bytes] = None,
 ) -> None:
+
+    def _print_stacks():
+        counter = 0
+        while True:
+            time.sleep(print_stacks_period)
+            counter += 1
+            logger.error(f"Printing stacks {counter} times")
+            print_all_stacks()
+
+    print_stacks_period = int(
+        os.getenv("TRTLLM_WORKER_PRINT_STACKS_PERIOD", "-1"))
+    if print_stacks_period > 0:
+        print_stacks_thread = threading.Thread(target=_print_stacks,
+                                               daemon=True)
+        print_stacks_thread.start()
 
     mpi_comm().barrier()
 

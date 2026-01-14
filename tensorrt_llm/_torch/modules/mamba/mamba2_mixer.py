@@ -20,6 +20,7 @@ from einops import rearrange, repeat
 from torch import nn
 
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+from tensorrt_llm.mapping import Mapping
 
 from ...attention_backend import AttentionMetadata
 from ...model_config import ModelConfig
@@ -57,8 +58,20 @@ class Mamba2Mixer(nn.Module):
 
         config = config or ModelConfig()
         self.mapping = config.mapping
-        tp_rank = config.mapping.tp_rank
-        tp_size = config.mapping.tp_size
+
+        if config.mapping.enable_attention_dp:
+            self.mapping = Mapping(
+                world_size=config.mapping.pp_size,
+                tp_size=1,
+                pp_size=config.mapping.pp_size,
+                rank=config.mapping.rank,
+                gpus_per_node=config.mapping.gpus_per_node,
+                enable_attention_dp=True,
+            )
+            tp_size = 1
+        else:
+            self.mapping = config.mapping
+            tp_size = config.mapping.tp_size
 
         d_inner = head_dim * nheads
         d_in_proj = 2 * d_inner + 2 * n_groups * d_state + nheads
@@ -79,10 +92,6 @@ class Mamba2Mixer(nn.Module):
         self.delta_softplus = delta_softplus
         self.remove_padding = remove_padding
         self.apply_silu = apply_silu
-
-        # tp
-        self.tp_size = tp_size
-        self.tp_rank = tp_rank
 
         # paged state parameters
         self.slot_mapping = None

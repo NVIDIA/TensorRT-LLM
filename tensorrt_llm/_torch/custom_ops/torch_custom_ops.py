@@ -1869,3 +1869,99 @@ def record_stream(tensor: torch.Tensor, stream_id: int) -> None:
     stream = get_stream(stream_id)
     assert stream is not None
     tensor.record_stream(stream)
+
+
+class Fp4GemmAllreduceRunner(TunableRunner):
+    runner_dict = dict()
+    tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 0, get_last_power_of_2_num_tokens_buckets,
+        last_positive_power_of_2), ),
+                                 constraint_specs=(ConstraintSpec(
+                                     2, 0, fp4_scale_infer_shape), ))
+
+    def __init__(
+        self,
+        output_dtype: torch.dtype,
+        tp_rank: int,
+        tp_group: List[int],
+    ):
+        self.output_dtype = output_dtype
+        self.tp_rank = tp_rank
+        self.tp_group_str = '-'.join(str(g) for g in tp_group)
+        instance_key = (output_dtype, self.tp_group_str)
+        if instance_key not in Fp4GemmAllreduceRunner.runner_dict:
+            Fp4GemmAllreduceRunner.runner_dict[
+                instance_key] = torch.classes.trtllm.Fp4GemmAllreduceRunner(
+                    output_dtype, tp_rank, tp_group)
+        self.fp4_gemm_all_reduce_runner = Fp4GemmAllreduceRunner.runner_dict[
+            instance_key]
+
+    def unique_id(self):
+        return (self.output_dtype, self.tp_group_str)
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
+        return list(range(self.fp4_gemm_all_reduce_runner.get_num_configs()))
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: int = 0,
+    ) -> torch.Tensor:
+        mat1, mat2, mat1_scale, mat2_scale, global_scale = inputs
+        return self.fp4_gemm_all_reduce_runner.run_gemm(
+            mat1,
+            mat2,
+            mat1_scale,
+            mat2_scale,
+            global_scale,
+            tactic,
+        )
+
+
+@torch.library.custom_op("trtllm::nvfp4_gemm_allreduce", mutates_args=())
+def nvfp4_gemm_allreduce(
+    act_fp4: torch.Tensor,
+    weight_fp4: torch.Tensor,
+    act_sf: torch.Tensor,
+    weight_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    output_dtype: torch.dtype,
+    tp_rank: int,
+    tp_group: List[int],
+) -> torch.Tensor:
+    AutoTuner.get()
+
+    # Use Cutlass runner with predefined configs
+    nvfp4_gemm_allreduce_runner = Fp4GemmAllreduceRunner(
+        output_dtype, tp_rank, tp_group)
+
+    # TODO: Enable auto-tuning
+    # runner_type = type(nvfp4_gemm_allreduce_runner).__name__
+    # _, best_tactic = tuner.choose_one(
+    #     f"trtllm::nvfp4_gemm_allreduce::{runner_type}",
+    #     [nvfp4_gemm_allreduce_runner],
+    #     nvfp4_gemm_allreduce_runner.tuning_config,
+    #     [act_fp4, weight, act_sf, weight_scale, alpha],
+    # )
+
+    best_tactic = -1
+
+    return nvfp4_gemm_allreduce_runner(
+        inputs=[act_fp4, weight_fp4, act_sf, weight_scale, alpha],
+        tactic=best_tactic)
+
+
+@nvfp4_gemm_allreduce.register_fake
+def _(
+    act_fp4: torch.Tensor,
+    weight_fp4: torch.Tensor,
+    act_sf: torch.Tensor,
+    weight_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    output_dtype: torch.dtype,
+    tp_rank: int,
+    tp_group: List[int],
+) -> torch.Tensor:
+    return act_fp4.new_empty((act_fp4.size(0), weight_fp4.size(0)),
+                             dtype=output_dtype)

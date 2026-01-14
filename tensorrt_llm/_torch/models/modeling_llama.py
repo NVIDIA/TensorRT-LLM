@@ -14,7 +14,8 @@ from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams, MoEAllReduce)
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, mpi_disabled
+from tensorrt_llm.bindings import ipc_nvls_supported
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger
@@ -673,9 +674,51 @@ class LlamaDecoderLayer(DecoderLayer):
         # Disable fusion for small models due to accuracy issues
         self.enable_fusion &= config.hidden_size > 4096
 
-        self.PRE_MLP_FUSION = self.mapping.has_tp(
+        enable_gemm_allreduce_fusion = (os.environ.get(
+            "TRTLLM_GEMM_ALLREDUCE_FUSION_ENABLED", "1") == "1")
+        mpi_enabled = not mpi_disabled()
+        dtype_supported = config.torch_dtype in (torch.float16, torch.bfloat16)
+        tp_valid = self.mapping.tp_size > 1
+        quant_valid = self.is_nvfp4 is not None and self.is_nvfp4
+
+        device_supported = get_sm_version() >= 100
+        nvls_supported = ipc_nvls_supported()
+
+        use_fused_gemm_allreduce = all([
+            enable_gemm_allreduce_fusion, mpi_enabled, dtype_supported,
+            tp_valid, quant_valid, device_supported, nvls_supported
+        ])
+
+        def check_in_out_features(in_features, out_features):
+            in_feature_valid = in_features % 128 == 0 and in_features >= 1024
+            out_feature_valid = out_features % 64 == 0 and out_features >= 1024
+            return all([in_feature_valid, out_feature_valid])
+
+        num_heads = config.num_attention_heads
+        head_dim = getattr(config, 'head_dim', None)
+        if not isinstance(head_dim, int):
+            head_dim = config.hidden_size // num_heads
+
+        in_features = num_heads * head_dim
+        out_features = config.hidden_size
+        in_out_features_valid = check_in_out_features(in_features, out_features)
+
+        attn_fused_gemm_allreduce = all(
+            [use_fused_gemm_allreduce, in_out_features_valid])
+        self.PRE_MLP_FUSION = not attn_fused_gemm_allreduce and self.mapping.has_tp(
         ) and not self.enable_attention_dp and self.enable_fusion
-        self.POST_MLP_FUSION = self.mapping.has_tp() and self.enable_fusion
+
+        in_features = config.intermediate_size
+        out_features = config.hidden_size
+        in_features_aligned_with_tp = in_features % self.mapping.tp_size == 0
+        in_out_features_valid = check_in_out_features(
+            in_features // self.mapping.tp_size, out_features)
+        mlp_fused_gemm_allreduce = all([
+            use_fused_gemm_allreduce, in_features_aligned_with_tp,
+            in_out_features_valid
+        ])
+        self.POST_MLP_FUSION = not mlp_fused_gemm_allreduce and self.mapping.has_tp(
+        ) and self.enable_fusion
 
         if self.is_nvfp4:
             self.pre_mlp_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4

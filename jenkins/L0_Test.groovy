@@ -874,7 +874,6 @@ def getMountListForSlurmTest(SlurmCluster cluster, boolean useSbatch = false)
         }
         mounts += [
             "${cluster.scratchPath}:/scratch.trt_llm_data:ro",
-            "/home/svc_tensorrt/.cache:/root/.cache",
         ]
     } else {
         throw new Exception("Unsupported container runtime: ${cluster.containerRuntime}")

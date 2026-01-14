@@ -21,8 +21,10 @@ import math
 import os
 import socket
 import struct
+import sys
 import tempfile
 import trace
+import traceback
 import weakref
 from contextlib import contextmanager
 from enum import EnumMeta
@@ -759,6 +761,13 @@ def is_sm_100f(sm_version=None):
     if sm_version is None:
         sm_version = get_sm_version()
     return sm_version == 100 or sm_version == 103
+
+
+def print_all_stacks():
+    """Print stack traces for all threads"""
+    for thread_id, frame in sys._current_frames().items():
+        logger.error(f"Thread {thread_id} stack trace:\n" +
+                     "".join(traceback.format_stack(frame)))
 
 
 def is_trace_enabled(env_var: str):

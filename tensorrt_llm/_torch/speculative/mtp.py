@@ -558,38 +558,6 @@ class MTPWorker(SpecWorkerBase):
             'next_new_tokens': next_new_tokens
         }
 
-    def skip_forward(
-        self,
-        input_ids,
-        position_ids,
-        hidden_states,
-        logits,
-        attn_metadata,
-        spec_metadata,
-        draft_model,
-    ):
-        batch_size = attn_metadata.num_seqs
-        mtp_num_modules = self.spec_config.num_nextn_predict_layers
-        accepted_tokens = torch.empty((batch_size, (mtp_num_modules + 1)),
-                                      dtype=torch.int,
-                                      device=logits.device)
-        num_accepted_tokens = torch.ones(batch_size,
-                                         dtype=torch.int,
-                                         device=logits.device)
-        next_draft_tokens = torch.empty((batch_size, mtp_num_modules),
-                                        dtype=torch.int,
-                                        device=logits.device)
-        next_new_tokens = torch.empty((batch_size, (mtp_num_modules + 1)),
-                                      dtype=torch.int,
-                                      device=logits.device)
-        return {
-            'logits': logits,
-            'new_tokens': accepted_tokens,
-            'new_tokens_lens': num_accepted_tokens,
-            'next_draft_tokens': next_draft_tokens,
-            'next_new_tokens': next_new_tokens
-        }
-
     def update_mtp_hidden_states(
         self,
         input_ids: torch.IntTensor,

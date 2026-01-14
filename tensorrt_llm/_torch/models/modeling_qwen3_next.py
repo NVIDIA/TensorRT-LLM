@@ -833,7 +833,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         return output
 
 
-class Qwen3NextLinearDecoderLayer(nn.Module):
+class Qwen3NextLinearDecoderLayer(DecoderLayer):
 
     def __init__(
         self,
@@ -1255,6 +1255,7 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
         new_weights = weight_mapper.preprocess_weights(weights)
         super().load_weights(new_weights, weight_mapper)
 
+    def post_load_weights(self):
         for idx, layer in enumerate(
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:

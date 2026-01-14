@@ -11,7 +11,7 @@ class NemotronHHfWeightMapper(HfWeightMapper):
 
     def preprocess_weights(self, weights: dict) -> dict:
         config = self.config.pretrained_config
-        tp_size = self.config.mapping.tp_size
+        tp_size = 1 if self.config.mapping.enable_attention_dp else self.config.mapping.tp_size
         tp_rank = self.config.mapping.tp_rank
         d_inner = config.mamba_head_dim * config.mamba_num_heads
 

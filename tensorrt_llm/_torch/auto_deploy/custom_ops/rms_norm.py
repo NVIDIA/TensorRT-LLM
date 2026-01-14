@@ -88,6 +88,65 @@ def _(input: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     return torch.empty_like(input)
 
 
+@torch.library.custom_op("auto_deploy::torch_rmsnorm_gated", mutates_args=())
+def torch_rmsnorm_gated(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    gate: torch.Tensor | None,
+    eps: float,
+    group_size: int,
+    norm_before_gate: bool = False,
+) -> torch.Tensor:
+    """Custom operator for Torch gated RMSNorm implementation.
+
+    Group RMSNorm with optional SiLU gating, using pure PyTorch operations.
+
+    Args:
+        x: Input tensor of shape [..., H].
+        weight: Scaling weights of shape [H].
+        gate: Optional gate tensor with same shape as x, or None.
+        eps: Small constant for numerical stability.
+        group_size: Size of groups for grouped normalization. H must be divisible by group_size.
+        norm_before_gate: If True, apply gating after normalization. If False, apply before.
+
+    Returns:
+        Normalized and optionally gated tensor of shape like x.
+    """
+    dtype = x.dtype
+    weight = weight.float()
+    x = x.float()
+    z = gate.float() if gate is not None else gate
+
+    if z is not None and not norm_before_gate:
+        x = x * F.silu(z)
+
+    if group_size is None:
+        rstd = 1 / torch.sqrt((x.square()).mean(dim=-1, keepdim=True) + eps)
+        out = x * rstd * weight
+    else:
+        x_group = rearrange(x, "... (g d) -> ... g d", d=group_size)
+        rstd = 1 / torch.sqrt((x_group.square()).mean(dim=-1, keepdim=True) + eps)
+        out = rearrange(x_group * rstd, "... g d -> ... (g d)") * weight
+
+    if z is not None and norm_before_gate:
+        out *= F.silu(z)
+
+    return out.to(dtype)
+
+
+@torch_rmsnorm_gated.register_fake
+def _(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    gate: torch.Tensor | None,
+    eps: float,
+    group_size: int,
+    norm_before_gate: bool = False,
+) -> torch.Tensor:
+    """Fake implementation for the custom operator during tracing."""
+    return x.new_empty(x.shape, dtype=x.dtype)
+
+
 @torch.library.custom_op("auto_deploy::triton_rmsnorm_gated", mutates_args=())
 def triton_rmsnorm_gated(
     x: torch.Tensor,

@@ -157,6 +157,8 @@ def skip_forward(
     if hasattr(module, 'skip_forward'):
         module.forward = module.skip_forward
         remove_weights(module, ignore_modules)
+    elif isinstance(module, DecoderModelForCausalLM):
+        remove_weights(module, ignore_modules)
     else:
         logger.warning(
             f"Fail to skip forward since {module.__class__.__name__} "
@@ -301,8 +303,7 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
         assert num_hidden_layers >= mapping.pp_size, f"{num_hidden_layers} layers are not enough for PP{mapping.pp_size}"
         pp_layer_list = mapping.pp_layers(num_hidden_layers)
         has_pp_layer = len(pp_layer_list) > 0
-        for layer_idx in range(num_hidden_layers):
-            layer = self.layers[layer_idx]
+        for layer_idx, layer in enumerate(self.layers):
             is_last_layer = (layer_idx == num_hidden_layers - 1)
             if layer_idx not in pp_layer_list:
                 # keep next layer's input_layernorm's weights for fusion
