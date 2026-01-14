@@ -49,10 +49,12 @@ def get_benchmark_dataset_configs(model_cache: str) -> List[DatasetConfig]:
 
     To add a new dataset, add a new DatasetConfig entry to this list.
     """
+    datasets_dir = _pl.Path(model_cache) / "datasets"
+
     return [
         DatasetConfig(
             name="ccdv/cnn_dailymail",
-            local_path=f"{model_cache}/datasets/ccdv/cnn_dailymail",
+            local_path=str(datasets_dir / "ccdv" / "cnn_dailymail"),
             config_name="3.0.0",
             split="validation",
             input_key="article",
@@ -63,7 +65,8 @@ def get_benchmark_dataset_configs(model_cache: str) -> List[DatasetConfig]:
         ),
         DatasetConfig(
             name="Open-Orca/1million-gpt-4",
-            local_path="/datasets/1million-gpt-4/1M-GPT4-Augmented.parquet",
+            local_path=str(datasets_dir / "Open-Orca" / "1million-gpt-4" /
+                           "1M-GPT4-Augmented.parquet"),
             split="train",
             input_key="question",
             prompt_key="system_prompt",
@@ -217,7 +220,7 @@ def run_benchmarks(
                                  cwd=root_dir,
                                  timeout=600)
 
-        if "IFB" in batching_type and "executor" in api_types:
+        if "IFB" in batching_types and "executor" in api_types:
             # executor streaming test
             benchmark = [
                 str(benchmark_exe_dir / "gptManagerBenchmark"), "--engine_dir",
@@ -306,7 +309,6 @@ def test_model(build_google_tests, model, prepare_model, run_model_tests,
     run_model_tests(model, run_fp8)
 
 
-#@pytest.mark.skip(reason="https://nvbugs/5601670")
 @pytest.mark.parametrize("build_google_tests", ["80", "86", "89", "90"],
                          indirect=True)
 @pytest.mark.parametrize("model", ["bart", "gpt", "t5"])
