@@ -31,7 +31,7 @@ tensorrt = ">=10.13.3,<10.14.0"
 torch = ">=2.9.0a0,<=2.9.0"
 nvidia-modelopt = {version = ">=0.37.0,<0.38.0", extras = ["torch"]}
 nvidia-nccl-cu13 = "2.27.7"
-nvidia-cuda-nvrtc = "^13.1.80"
+nvidia-cuda-nvrtc = "^13.1.115"
 transformers = "4.57.1"
 prometheus-client = "^0.24.0"
 prometheus-fastapi-instrumentator = "^7.1.0"
