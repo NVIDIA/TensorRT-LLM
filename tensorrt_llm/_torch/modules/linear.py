@@ -639,10 +639,11 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
             copy_weight(module.weight_scale, weight_scale[None])
 
     def process_weights_after_loading_vanilla(self, module: Linear):
-        if not getattr(module, "has_static_input_scale", False):
+        if not hasattr(module, "has_static_input_scale"):
             module.input_scale = None
             module.inv_input_scale = None
-        delattr(module, "has_static_input_scale")
+        else:
+            delattr(module, "has_static_input_scale")
 
     def load_weights_fused_qkv_linear(
             self,
@@ -710,7 +711,7 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         shard_key_to_index = weight_mode.shard_key_to_index
 
         # Handle input_scale
-        if getattr(module, "has_static_input_scale", False):
+        if hasattr(module, "has_static_input_scale"):
             # Compute max and replace input_scale with a new parameter
             max_input_scale = module.tmp_input_scales.max()
             module.input_scale.data.copy_(max_input_scale)
