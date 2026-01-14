@@ -780,10 +780,16 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                 for log_prob in self.py_result.log_probs:
                     log_prob.clear()
 
-            # Perform a deep copy of py_result._generation_logits
+            # Perform copies of py_result._generation_logits
             if need_deep_copy_generation_logits:
-                py_result._generation_logits = deepcopy(
+                # shallow copy of generation_logits to avoid copying the logits tensor
+                py_result._generation_logits = copy(
                     self.py_result._generation_logits)
+                # deep copy the indices to avoid the race condition
+                # In streaming mode LogitsStorage only accesses either the last
+                # or second to last pair of indices. Therefore, copying only these two pairs is sufficient.
+                py_result._generation_logits._logits_indices = py_result._generation_logits._logits_indices[
+                    -2:]
         else:
             py_result = self.py_result
 
