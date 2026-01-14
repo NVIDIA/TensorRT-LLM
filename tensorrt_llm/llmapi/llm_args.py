@@ -2099,7 +2099,7 @@ class BaseLlmArgs(StrictBaseModel):
     perf_metrics_max_requests: int = Field(
         default=0,
         description=
-        "The maximum number of requests for perf metrics. Must also set request_perf_metrics to true to get perf metrics.",
+        "The maximum number of requests for perf metrics. Must also set return_perf_metrics to true to get perf metrics.",
         status="prototype")
 
     orchestrator_type: Optional[Literal["rpc", "ray"]] = Field(
