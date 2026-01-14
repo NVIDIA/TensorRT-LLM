@@ -839,9 +839,13 @@ class PPCommNCCL:
             self.nccl_comm.send(tensor, dest)
             return
 
-        self.tensor_ready_event.record()
+        # If the tensor is allocated from non-default memory pool
+        # like userbuffers, its underlying memory may be reused
+        # before the send operation is completed.
+        # We clone the tensor to avoid write-write conflicts.
+        tensor = tensor.clone()
+        self.send_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.send_stream):
-            self.tensor_ready_event.wait()
             self.nccl_comm.send(tensor, dest)
 
     def recv(self, tensor: torch.Tensor, src: Optional[int] = None):
