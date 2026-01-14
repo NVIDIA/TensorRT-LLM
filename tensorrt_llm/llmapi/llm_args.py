@@ -806,6 +806,10 @@ class DecodingBaseConfig(StrictBaseModel):
     def is_linear_tree(self) -> bool:
         return self.max_draft_len == self.max_total_draft_tokens
 
+    @functools.cached_property
+    def num_capture_layers(self) -> int:
+        return 0
+
 
 class KvCacheConnectorConfig(StrictBaseModel):
     """
@@ -1068,6 +1072,15 @@ class NGramDecodingConfig(DecodingBaseConfig):
 
 
 class DraftTargetDecodingConfig(DecodingBaseConfig):
+    # Enable one-model mode where draft and target share the same model engine.
+    # When True, the draft model layers are added to the target model's KV cache
+    # and run in a single forward pass.
+    draft_target_one_model: bool = False
+    # Number of draft model layers for one-model mode.
+    # If None, will be inferred from the speculative_model_dir config.
+    num_draft_layers: Optional[int] = None
+    # Enable advanced sampling (temperature, top-k, top-p) for one-model mode.
+    allow_advanced_sampling: bool = False
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -1081,6 +1094,14 @@ class DraftTargetDecodingConfig(DecodingBaseConfig):
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch" or backend == "_autodeploy"
+
+    @functools.cached_property
+    def spec_dec_mode(self):
+        from tensorrt_llm._torch.speculative.interface import \
+            SpeculativeDecodingMode as TorchSpeculativeDecodingMode
+        if self.draft_target_one_model:
+            return TorchSpeculativeDecodingMode.DRAFT_TARGET_ONE_MODEL
+        return TorchSpeculativeDecodingMode.DRAFT_TARGET
 
 
 class MTPDecodingConfig(DecodingBaseConfig):
