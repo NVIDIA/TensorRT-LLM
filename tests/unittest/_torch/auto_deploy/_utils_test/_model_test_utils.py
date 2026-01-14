@@ -275,6 +275,46 @@ class FakeFP8Linear(nn.Linear):
         )
 
 
+class FakeHFFP8Linear(nn.Linear):
+    """Fake HuggingFace FineGrainedFP8 linear layer for testing.
+
+    Mimics the behavior of transformers.integrations.finegrained_fp8.FP8Linear
+    with per-block quantization (block_size = [128, 128] by default).
+    """
+
+    def __init__(self, in_features, out_features, bias=True, block_size=None):
+        super().__init__(in_features, out_features, bias)
+        device = self.weight.device
+
+        if block_size is None:
+            block_n = min(128, out_features)
+            block_k = min(128, in_features)
+            block_size = [block_n, block_k]
+        self.block_size = block_size
+
+        N, K = self.weight.shape
+        block_n, block_k = block_size
+
+        weight_reshaped = self.weight.detach().view(N // block_n, block_n, K // block_k, block_k)
+        amax = weight_reshaped.abs().amax(dim=(1, 3)).to(torch.float32)  # [N/block_n, K/block_k]
+
+        eps = torch.finfo(torch.float32).tiny
+        weight_scale_inv = torch.clamp(amax / FP8_MAX, min=eps).to(device)
+
+        weight_fp8 = (
+            self.weight.detach().float()
+            / weight_scale_inv.repeat_interleave(block_n, dim=0).repeat_interleave(block_k, dim=1)
+        ).to(torch.float8_e4m3fn)
+
+        self.weight = nn.Parameter(weight_fp8)
+        self.register_buffer("weight_scale_inv", weight_scale_inv)
+
+    def forward(self, x):
+        return torch.ops.auto_deploy.torch_fake_quant_hf_fp8_linear(
+            x, self.weight, self.bias, [], [self.weight_scale_inv], [], []
+        )
+
+
 def generate_dynamic_shapes(max_batch_size, max_seq_len):
     dynamic_shapes = (
         {

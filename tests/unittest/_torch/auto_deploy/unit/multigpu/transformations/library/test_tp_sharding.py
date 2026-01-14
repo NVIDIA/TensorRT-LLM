@@ -9,12 +9,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from _dist_test_utils import get_device_counts
 from _graph_test_helpers import run_sharding_pattern_detection_test, run_test_transformed_gm
-from _model_test_utils import FakeFP8Linear
+from _model_test_utils import FakeFP8Linear, FakeHFFP8Linear
 
 import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
     FP8WeightShardingInfo,
+    HFFineGrainedFP8WeightShardingInfo,
     LayerType,
     ShardingTransformConfig,
     SplitDimension,
@@ -125,6 +126,23 @@ class FP8MLP(nn.Module):
         return self.linear2(y)
 
 
+class HFFP8MLP(nn.Module):
+    """MLP using HuggingFace FineGrainedFP8 quantization for testing."""
+
+    def __init__(self, in_features, out_features, bias=False):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        # Use larger features divisible by block size (128)
+        hidden_features = max(4 * in_features, 128)
+        self.linear1 = FakeHFFP8Linear(in_features, hidden_features, bias=bias)
+        self.linear2 = FakeHFFP8Linear(hidden_features, out_features, bias=bias)
+
+    def forward(self, x):
+        y = F.relu(self.linear1(x))
+        return self.linear2(y)
+
+
 def _run_sharding_execution_job(
     model_cls: nn.Module,
     dist_op_expected: str,
@@ -150,6 +168,9 @@ def _run_sharding_execution_job(
         ).to(device="cuda", dtype=torch.float16)
     elif model_cls == FP8MLP:
         model = model_cls(num_features, num_features, bias=bias).to("cuda")
+    elif model_cls == HFFP8MLP:
+        # HFFP8MLP needs features divisible by 128 (block size)
+        model = model_cls(128, 128, bias=bias).to("cuda")
     else:
         model = model_cls(num_features, num_features, bias=bias).to(
             device="cuda", dtype=torch.float16
@@ -344,6 +365,26 @@ def _run_pattern_detection_job(
                             min_local_shape=1,
                         )
                     )
+        elif model_cls == HFFP8MLP:
+            for node in gm.graph.nodes:
+                if is_op(node, torch.ops.auto_deploy.torch_fake_quant_hf_fp8_linear):
+                    # linear1 should be sharded on dim=0, add_dist=False, min_local_shape=1
+                    # linear2 should be sharded on dim=1, add_dist=True, min_local_shape=1
+                    if "linear1" in node.args[1].name:
+                        dim = SplitDimension.COLUMN
+                        dist_op = None
+                    else:
+                        dim = SplitDimension.ROW
+                        dist_op = "all_reduce"
+                    expected_transformations.append(
+                        HFFineGrainedFP8WeightShardingInfo(
+                            target_node=node.name,
+                            split_dim=dim,
+                            config=config,
+                            dist_op=dist_op,
+                            min_local_shape=1,
+                        )
+                    )
 
     # get detected transformations
     optimizer = InferenceOptimizer(
@@ -376,6 +417,7 @@ def _run_pattern_detection_job(
     (
         (MLP, "torch_dist_all_reduce"),
         (FP8MLP, "torch_dist_all_reduce"),
+        (HFFP8MLP, "torch_dist_all_reduce"),
         (nn.Linear, "torch_dist_all_gather"),
         (GQA_Block, "torch_dist_all_reduce"),
     ),
@@ -401,6 +443,7 @@ def test_sharding(
     (
         (MLP, "torch_dist_all_reduce"),
         (FP8MLP, "torch_dist_all_reduce"),
+        (HFFP8MLP, "torch_dist_all_reduce"),
         (nn.Linear, "torch_dist_all_gather"),
         (GQA_Block, "torch_dist_all_reduce"),
     ),
