@@ -1,6 +1,7 @@
 import contextlib
 import functools
 import itertools
+import os
 import unittest.mock
 import weakref
 from enum import IntEnum
