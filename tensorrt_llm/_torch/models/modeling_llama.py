@@ -635,7 +635,7 @@ class LlamaDecoderLayer(DecoderLayer):
         )
         self.is_nvfp4 = self.is_quanted and model_config.quant_config.quant_mode.has_nvfp4(
         )
-
+        # Self Attention
         self.self_attn = LlamaAttention(
             model_config,
             layer_idx=layer_idx,
