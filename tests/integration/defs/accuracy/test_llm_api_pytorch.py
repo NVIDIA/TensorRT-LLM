@@ -5350,3 +5350,35 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+
+@skip_pre_hopper
+class TestMiniMaxM2(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "MiniMaxAI/MiniMax-M2"
+    MODEL_PATH = f"{llm_models_root()}/MiniMax-M2"
+
+    @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
+    @pytest.mark.skip_less_device(4)
+    @parametrize_with_ids("attention_dp,cuda_graph,overlap_scheduler",
+                          [(False, True, True), (True, True, True)])
+    def test_4gpus(self, tp_size, ep_size, attention_dp, cuda_graph,
+                   overlap_scheduler):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            moe_config=MoeConfig(
+                backend="DEEPGEMM" if get_sm_version() >= 100 else "CUTLASS"))
+
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=1,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 max_seq_len=4096,
+                 **pytorch_config,
+                 enable_attention_dp=attention_dp) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
