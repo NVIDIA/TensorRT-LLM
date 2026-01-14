@@ -5,6 +5,7 @@ from typing import Callable, Dict, Optional, Type
 
 import torch
 import torch.nn.functional as F
+import threading
 from torch import nn
 
 from tensorrt_llm.llmapi.utils import enable_llm_debug
@@ -157,10 +158,10 @@ class RoutingMethodType(IntEnum):
     RenormalizeNaive = 4,
     # MiniMaxM2: Sigmoid -> RoutingBiasAdd -> TopK -> Renormalize(without bias)
     MiniMax2 = 5,
-    # AdaptiveK: Entropy-based dynamic K selection
-    AdaptiveK = 7,
     # Unspecified
     Unspecified = 6,
+    # AdaptiveK: Entropy-based dynamic K selection
+    AdaptiveK = 7,
 
 
 class BaseMoeRoutingMethod(nn.Module):
@@ -651,7 +652,7 @@ class AdaptiveKMoeRoutingMethod(BaseMoeRoutingMethod):
         self,
         k_min: int = 2,
         k_max: int = 8,
-        entropy_thresholds: list = None,
+        entropy_thresholds: Optional[List[float]] = None,
         output_dtype: torch.dtype = torch.float32,
     ):
         """
@@ -667,7 +668,8 @@ class AdaptiveKMoeRoutingMethod(BaseMoeRoutingMethod):
                     H >= 1.7 -> K=k_max
             output_dtype: Output dtype for routing weights
         """
-        super().__init__(k_max, output_dtype)
+        super().__init__()
+        self.top_k = k_max  # Required for BaseMoeRoutingMethod.get_experts_per_token()
         self.k_min = k_min
         self.k_max = k_max
         self.k_values = [k_min, (k_min + k_max) // 2, k_max]
@@ -678,6 +680,8 @@ class AdaptiveKMoeRoutingMethod(BaseMoeRoutingMethod):
         self._k_counts = {k: 0 for k in self.k_values}
         self._total_tokens = 0
         self._entropy_sum = 0.0
+        self._stats_lock = threading.Lock()
+        self._collect_stats = True  # Set to False for production to avoid overhead
     
     def compute_entropy(self, probs: torch.Tensor) -> torch.Tensor:
         """Compute entropy of routing distribution: H = -sum(p * log(p))"""
@@ -738,11 +742,14 @@ class AdaptiveKMoeRoutingMethod(BaseMoeRoutingMethod):
         return topk_indices.to(torch.int32), normalized_values.to(self.output_dtype)
     
     def _update_stats(self, k_per_token: torch.Tensor, entropy: torch.Tensor):
-        """Update internal statistics for monitoring compute savings."""
-        for k in self.k_values:
-            self._k_counts[k] += (k_per_token == k).sum().item()
-        self._total_tokens += k_per_token.numel()
-        self._entropy_sum += entropy.sum().item()
+        """Update internal statistics for monitoring compute savings (thread-safe)."""
+        if not self._collect_stats:
+            return
+        with self._stats_lock:
+            for k in self.k_values:
+                self._k_counts[k] += (k_per_token == k).sum().item()
+            self._total_tokens += k_per_token.numel()
+            self._entropy_sum += entropy.sum().item()
     
     def get_stats(self) -> dict:
         """Get routing statistics including compute savings."""
@@ -766,6 +773,8 @@ class AdaptiveKMoeRoutingMethod(BaseMoeRoutingMethod):
         self._k_counts = {k: 0 for k in self.k_values}
         self._total_tokens = 0
         self._entropy_sum = 0.0
+        self._stats_lock = threading.Lock()
+        self._collect_stats = True  # Set to False for production to avoid overhead
     
     @property
     def routing_method_type(self) -> RoutingMethodType:
