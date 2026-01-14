@@ -977,7 +977,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if self.kv_cache_manager is not None:
             self.kv_cache_manager.copy_batch_block_offsets(
                 self.kv_cache_block_offsets, self.request_ids, self.beam_width,
-                self.num_contexts, self.num_generations)
+                self.num_contexts, self.num_seqs)
 
             error_message = (
                 f"The max KV cache length of input sequences ({self.kv_lens[:self.num_seqs].max()}) "
