@@ -1415,8 +1415,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 if os.path.exists(config_file):
                     with open(config_file, 'r') as f:
                         autodeploy_config = yaml.safe_load(f)
-                    print_info(
-                        f"Loaded autodeploy config from {config_file}")
+                    print_info(f"Loaded autodeploy config from {config_file}")
                 else:
                     print_warning(
                         f"Autodeploy config file not found: {config_file}")
