@@ -1287,7 +1287,8 @@ void MixtureOfExpertsGemmProfiler::initTmpData(
     int m, int n, int k, char* workspace, size_t ws_size, cudaStream_t stream)
 {
     checkInit();
-    backend.prepare(m, workspace, /*expert_weights*/ nullptr, stream);
+    backend.prepare(m, workspace, /*expert_weights*/ nullptr, /*token_selected_experts_customized*/ nullptr,
+        /*use_customized_router*/ false, stream);
 }
 
 void MixtureOfExpertsGemmProfiler::checkInit()
