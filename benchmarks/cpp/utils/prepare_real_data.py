@@ -221,7 +221,8 @@ def load_dataset_from_local(dataset_config: DatasetConfig):
     if local_path.is_dir():
         try:
             dataset = datasets.load_dataset(*dataset_config.query,
-                                            split=dataset_config.split)
+                                            split=dataset_config.split,
+                                            trust_remote_code=True)
         except ValueError as e:
             raise _create_dataset_load_error(e)
     else:
