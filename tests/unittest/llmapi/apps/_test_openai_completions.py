@@ -3,8 +3,10 @@
 
 from typing import List
 
+import numpy as np
 import openai
 import pytest
+import yaml
 
 from ..test_llm import get_model_path
 from .openai_server import RemoteOpenAIServer
@@ -22,6 +24,23 @@ def backend(request):
     return request.param
 
 
+@pytest.fixture(scope="module")
+def temp_extra_llm_api_options_file(tmp_path_factory):
+    extra_llm_api_options_dict = {
+        "enable_chunked_prefill": False,
+        "gather_generation_logits": True,
+        "kv_cache_config": {
+            "enable_block_reuse": False,
+        }
+    }
+
+    temp_file_path = tmp_path_factory.mktemp(
+        "config") / "extra_llm_api_options.yaml"
+    with open(temp_file_path, 'w') as f:
+        yaml.dump(extra_llm_api_options_dict, f)
+    return temp_file_path
+
+
 @pytest.fixture(scope="module",
                 params=[0, 2],
                 ids=["disable_processpool", "enable_processpool"])
@@ -30,12 +49,16 @@ def num_postprocess_workers(request):
 
 
 @pytest.fixture(scope="module")
-def server(model_name: str, backend: str, num_postprocess_workers: int):
+def server(model_name: str, backend: str, num_postprocess_workers: int,
+           temp_extra_llm_api_options_file: str):
     model_path = get_model_path(model_name)
     args = ["--backend", f"{backend}"]
     args.extend(["--kv_cache_free_gpu_memory_fraction",
                  "0.2"])  # for co-existence with other servers
     args.extend(["--num_postprocess_workers", f"{num_postprocess_workers}"])
+    if backend == "trt":
+        args.extend(
+            ["--extra_llm_api_options", temp_extra_llm_api_options_file])
     with RemoteOpenAIServer(model_path, args) as remote_server:
         yield remote_server
 
@@ -431,6 +454,135 @@ async def test_completion_with_invalid_logit_bias(
         async_client: openai.AsyncOpenAI, model_name: str):
     """Test with invalid token IDs (non-integer keys)"""
     await invalid_logit_bias_helper(async_client, model_name, 'completions')
+
+
+def test_completion_logprobs(client: openai.OpenAI, model_name: str):
+    """Test completion with logprobs enabled (non-streaming)."""
+    prompt = "Hello, my name is"
+
+    completion = client.completions.create(
+        model=model_name,
+        prompt=prompt,
+        max_tokens=5,
+        temperature=0.0,
+        logprobs=1,
+    )
+
+    choice = completion.choices[0]
+    assert choice.logprobs is not None
+
+    # Verify logprobs structure
+    logprobs = choice.logprobs
+    assert logprobs.tokens is not None
+    assert logprobs.token_logprobs is not None
+    assert logprobs.text_offset is not None
+
+    # Verify lengths match
+    assert len(logprobs.tokens) == len(logprobs.token_logprobs)
+    assert len(logprobs.tokens) == len(logprobs.text_offset)
+    assert len(logprobs.tokens) > 0
+
+    # Verify logprobs values are valid (negative or zero for log probabilities)
+    for token_logprob in logprobs.token_logprobs:
+        assert token_logprob is not None
+        assert token_logprob <= 0
+
+    # Verify text_offset is monotonically increasing
+    for i in range(1, len(logprobs.text_offset)):
+        assert logprobs.text_offset[i] >= logprobs.text_offset[i - 1]
+
+    # Verify tokens are non-empty strings
+    for token in logprobs.tokens:
+        assert isinstance(token, str)
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_completion_logprobs_streaming(async_client: openai.AsyncOpenAI,
+                                             model_name: str):
+    """Test completion with logprobs enabled (streaming)."""
+    prompt = "Hello, my name is"
+
+    # First get non-streaming result for comparison
+    single_completion = await async_client.completions.create(
+        model=model_name,
+        prompt=prompt,
+        max_tokens=5,
+        temperature=0.0,
+        logprobs=1,
+    )
+    single_logprobs = single_completion.choices[0].logprobs
+    assert single_logprobs is not None
+
+    # Now test streaming
+    stream = await async_client.completions.create(
+        model=model_name,
+        prompt=prompt,
+        max_tokens=5,
+        temperature=0.0,
+        logprobs=2,
+        stream=True,
+    )
+
+    all_tokens: List[str] = []
+    all_token_logprobs: List[float] = []
+
+    async for chunk in stream:
+        choice = chunk.choices[0]
+        if choice.logprobs is not None:
+            if choice.logprobs.tokens:
+                all_tokens.extend(choice.logprobs.tokens)
+            if choice.logprobs.token_logprobs:
+                all_token_logprobs.extend(choice.logprobs.token_logprobs)
+
+    # Verify streaming logprobs match non-streaming
+    assert all_tokens == single_logprobs.tokens
+    assert len(all_token_logprobs) == len(single_logprobs.token_logprobs)
+
+    # Compare logprobs values (should be close)
+    all_token_logprobs_arr = np.array(all_token_logprobs)
+    single_token_logprobs_arr = np.array(single_logprobs.token_logprobs)
+    assert np.allclose(all_token_logprobs_arr, single_token_logprobs_arr)
+
+    # Verify all logprobs are valid
+    for logprob in all_token_logprobs:
+        assert logprob is not None
+        assert logprob <= 0
+
+
+# @pytest.mark.asyncio(loop_scope="module")
+# @pytest.mark.parametrize("echo", [True, False])
+# async def test_completion_logprobs_with_echo(async_client: openai.AsyncOpenAI,
+#                                              model_name: str, echo: bool):
+#     """Test completion logprobs work correctly with echo parameter."""
+#     prompt = "Hello, my name is"
+
+#     completion = await async_client.completions.create(
+#         model=model_name,
+#         prompt=prompt,
+#         max_tokens=5,
+#         temperature=0.0,
+#         logprobs=1,
+#         echo=echo,
+#     )
+
+#     choice = completion.choices[0]
+#     assert choice.logprobs is not None
+
+#     logprobs = choice.logprobs
+#     assert len(logprobs.tokens) == len(logprobs.token_logprobs)
+#     assert len(logprobs.tokens) == len(logprobs.text_offset)
+#     assert len(logprobs.tokens) > 0
+
+#     # When echo is True, the output includes the prompt tokens
+#     # so we expect more tokens in the output
+#     if echo:
+#         # The echoed output should have more tokens than just the generated ones
+#         assert len(logprobs.tokens) >= 5
+
+#     # Verify all logprobs are valid
+#     for token_logprob in logprobs.token_logprobs:
+#         assert token_logprob is not None
+#         assert token_logprob <= 0
 
 
 def test_completion_cached_tokens(client: openai.OpenAI, model_name: str,
