@@ -1,4 +1,3 @@
-import copy
 import os
 from typing import Dict, List, Optional
 
@@ -869,9 +868,7 @@ def create_py_executor_instance(
     # Treat Ulysses CP as TP for kv cache transceiver
     mapping_for_kv_cache_transceiver = mapping
     if mapping.has_cp_ulysses():
-        mapping_for_kv_cache_transceiver = copy.deepcopy(mapping)
-        mapping_for_kv_cache_transceiver.tp_size = mapping.tp_size * mapping.cp_size
-        mapping_for_kv_cache_transceiver.cp_size = 1
+        mapping_for_kv_cache_transceiver = mapping.repurpose_ulysses_cp_to_tp()
     kv_cache_transceiver = create_kv_cache_transceiver(
         mapping_for_kv_cache_transceiver, dist, kv_cache_manager,
         attention_type, cache_transceiver_config)
