@@ -251,41 +251,41 @@ def load_dataset_from_local(dataset_config: DatasetConfig):
 
 
 @click.command()
-@click.option("--dataset-name", type=str, help=f"Dataset name in HuggingFace.")
+@click.option("--dataset-name", type=str, help="Dataset name in HuggingFace.")
 @click.option("--dataset-config-name",
               type=str,
               default=None,
-              help=f"Dataset config name in HuggingFace (if exists).")
+              help="Dataset config name in HuggingFace (if exists).")
 @click.option("--dataset-split",
               type=str,
               required=True,
-              help=f"Split of the dataset to use.")
+              help="Split of the dataset to use.")
 @click.option("--dataset-input-key",
               type=str,
-              help=f"The dataset dictionary key for input.")
+              help="The dataset dictionary key for input.")
 @click.option("--dataset-image-key",
               type=str,
               default="image",
-              help=f"The dataset dictionary key for images.")
+              help="The dataset dictionary key for images.")
 @click.option("--dataset-prompt-key",
               type=str,
               default=None,
-              help=f"The dataset dictionary key for prompt (if exists).")
+              help="The dataset dictionary key for prompt (if exists).")
 @click.option(
     "--dataset-local-path",
     type=str,
     default=None,
     help=
-    f"The local path to the dataset to be loaded when using an offline cache.")
+    "The local path to the dataset to be loaded when using an offline cache.")
 @click.option(
     "--dataset-prompt",
     type=str,
     default=None,
-    help=f"The prompt string when there is no prompt key for the dataset.")
+    help="The prompt string when there is no prompt key for the dataset.")
 @click.option("--dataset-output-key",
               type=str,
               default=None,
-              help=f"The dataset dictionary key for output (if exists).")
+              help="The dataset dictionary key for output (if exists).")
 @click.option(
     "--num-requests",
     type=int,

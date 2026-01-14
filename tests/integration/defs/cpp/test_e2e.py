@@ -189,10 +189,11 @@ def run_benchmarks(
             prepare_dataset += [k, v]
 
         # Use environment variable to force HuggingFace to use offline cached dataset
+        offline_env = {**_os.environ, 'HF_DATASETS_OFFLINE': '1'}
         _cpp.run_command(prepare_dataset,
                          cwd=root_dir,
                          timeout=300,
-                         env={'HF_DATASETS_OFFLINE': '1'})
+                         env=offline_env)
 
         for batching_type in batching_types:
             for api_type in api_types:
