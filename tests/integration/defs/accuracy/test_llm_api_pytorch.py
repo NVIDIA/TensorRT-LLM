@@ -4846,10 +4846,12 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
         model_path = f"{self.MODEL_PATH}/Qwen3-Next-80B-A3B-Instruct"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
                                         enable_block_reuse=False)
-        pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
-                              cuda_graph_config=CudaGraphConfig(
-                                  max_batch_size=512, enable_padding=True)
-                              if cuda_graph else None)
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig(
+                enable_padding=True,
+                batch_sizes=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048])
+            if cuda_graph else None)
 
         with LLM(
                 model_path,
@@ -4864,6 +4866,7 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
                                 self.GSM8K_MAX_OUTPUT_LEN)
+            mocker.patch.object(GSM8K, "NUM_SAMPLES", 1319)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -5273,6 +5276,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             (4, 4, False, True, True),
             (4, 1, False, False, True),
             (4, 4, True, False, True),
+            (4, 4, True, True, True),
             (4, 1, True, True, True),
             (4, 4, False, True, False),
             (4, 1, False, False, False),
@@ -5282,9 +5286,6 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     )
     def test_auto_dtype_4gpus(self, tp_size, ep_size, attention_dp,
                               overlap_scheduler, cuda_graph):
-        if attention_dp:
-            pytest.skip(
-                "Attention DP is not supported for Nemotron-3-Super yet")
 
         kv_cache_config = KvCacheConfig(enable_block_reuse=False,
                                         mamba_ssm_cache_dtype="float32")
@@ -5311,7 +5312,18 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_mpi_world_size(8)
-    def test_nvfp4_8gpus(self):
+    @pytest.mark.parametrize(
+        "attention_dp",
+        [
+            False,
+            True,
+        ],
+        ids=[
+            "attention_dp_off",
+            "attention_dp_on",
+        ],
+    )
+    def test_nvfp4_8gpus(self, attention_dp):
         # Use this test to track the best performance config.
         # The optimized config is still under investigation.
         # Adding this test as placeholder.
@@ -5326,7 +5338,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                 tensor_parallel_size=8,
                 moe_expert_parallel_size=8,
                 pipeline_parallel_size=1,
-                enable_attention_dp=False,
+                enable_attention_dp=attention_dp,
                 cuda_graph_config=CudaGraphConfig(max_batch_size=32,
                                                   enable_padding=True),
                 disable_overlap_scheduler=False,

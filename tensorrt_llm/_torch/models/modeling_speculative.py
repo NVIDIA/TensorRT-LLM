@@ -918,6 +918,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             self.spec_worker = get_spec_worker(model_config.spec_config,
                                                model_config,
                                                model_config.mapping)
+            self.epilogue.append(self.draft_model)
+            self.epilogue.append(self.spec_worker)
 
             if self.draft_config is not None and model_config.spec_config.eagle3_model_arch == "llama3":
                 for key, value in self.draft_config.extra_attrs.items():
@@ -953,14 +955,6 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             hidden_states = hidden_states[:attn_metadata.num_tokens]
 
         if self.draft_model is not None:
-            # For one-model speculative decoding with PP, only the last PP rank
-            # has valid hidden_states from the target model. The spec_worker (which
-            # runs the draft model loop) should only run on the last PP rank.
-            # Non-last PP ranks return None and let the PP sync handle the results.
-            mapping = self.model.model_config.mapping
-            if mapping.has_pp() and not mapping.is_last_pp_rank():
-                return None
-
             # get logits
             logits = self.logits_processor.forward(
                 hidden_states[spec_metadata.gather_ids],

@@ -141,8 +141,9 @@ class SpeculativeDecodingMode(IntEnum):
             # 1-model has separate logic for handling draft tokens
             return False
 
+        xqa_supported = get_sm_version() < 120
         return not issubclass(attention_backend,
-                              TrtllmAttention) or get_sm_version() < 90
+                              TrtllmAttention) or not xqa_supported
 
     def attention_need_spec_dec_mode(
             self,
@@ -161,14 +162,16 @@ class SpeculativeDecodingMode(IntEnum):
         """
         is_trtllm_attention = issubclass(attention_backend, TrtllmAttention)
 
-        # Always use the multi-token query mode for 1-model.
+        # Always use the multi-token query mode for 1-model if the kernels are available.
+        xqa_supported = get_sm_version() < 120
+        use_case_1 = self.use_one_engine() and xqa_supported
         # For 2-model, we need to enable it when we process multiple tokens at once. This occurs with
         # the target model (verification) or on the first draft for CDL based speculation.
-        use_case_1 = self.is_eagle3_one_model()
-        use_case_2 = (not is_draft_model or
-                      (spec_resource_manager is not None
-                       and spec_resource_manager.is_first_draft
-                       and use_chain_drafter)) and is_trtllm_attention
+        use_case_2 = not self.use_one_engine() and (
+            not is_draft_model or
+            (spec_resource_manager is not None
+             and spec_resource_manager.is_first_draft
+             and use_chain_drafter)) and is_trtllm_attention
 
         return use_case_1 or use_case_2
 
@@ -376,6 +379,37 @@ class SpecWorkerBase(nn.Module, ABC):
         Returns the maximum draft length for this worker.
         Subclasses should override this property.
         """
+
+    def skip_forward(
+        self,
+        input_ids,
+        position_ids,
+        hidden_states,
+        logits,
+        attn_metadata,
+        spec_metadata,
+        draft_model,
+    ):
+        batch_size = attn_metadata.num_seqs
+        accepted_tokens = torch.empty((batch_size, (self.max_draft_len + 1)),
+                                      dtype=torch.int,
+                                      device=logits.device)
+        num_accepted_tokens = torch.ones(batch_size,
+                                         dtype=torch.int,
+                                         device=logits.device)
+        next_draft_tokens = torch.empty((batch_size, self.max_draft_len),
+                                        dtype=torch.int,
+                                        device=logits.device)
+        next_new_tokens = torch.empty((batch_size, (self.max_draft_len + 1)),
+                                      dtype=torch.int,
+                                      device=logits.device)
+        return {
+            'logits': logits,
+            'new_tokens': accepted_tokens,
+            'new_tokens_lens': num_accepted_tokens,
+            'next_draft_tokens': next_draft_tokens,
+            'next_new_tokens': next_new_tokens
+        }
 
     def set_guided_decoder(self,
                            guided_decoder: "CapturableGuidedDecoder") -> bool:
