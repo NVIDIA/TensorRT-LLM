@@ -217,5 +217,5 @@ l0_dgx_b200:
       orchestrator: mpi
   tests:
   - unittest/_torch/auto_deploy/unit/multigpu
-  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[False-2]
+  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[False-4]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_bf16
