@@ -25,6 +25,7 @@ Welcome to TensorRT LLM's Documentation!
    examples/trtllm_serve_examples
    examples/dynamo_k8s_example.rst
    deployment-guide/index.rst
+   deployment-guide/configuring-cpu-affinity.md
 
 .. toctree::
    :maxdepth: 2
