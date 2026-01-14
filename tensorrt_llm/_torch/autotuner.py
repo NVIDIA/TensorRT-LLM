@@ -1547,7 +1547,7 @@ class AutoTuner:
     def _merge_cache_data(self, custom_op: str):
         cache_data = self.profiling_cache.get_specific_custom_op(custom_op)
         merged_cache_data = dict()
-        all_cache_data = self._dist.tp_allgather(obj=cache_data)
+        all_cache_data = self._dist.tp_cp_allgather(obj=cache_data)
 
         for data in all_cache_data:
             for key, value in data.items():
