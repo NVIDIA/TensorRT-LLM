@@ -3884,7 +3884,6 @@ class TestQwen3_30B_A3B_Instruct_2507(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/{MODEL_NAME}"
 
     @skip_pre_hopper
-    # @pytest.mark.skip_less_device_memory(140000)  # Only test for H200, B200
     @pytest.mark.parametrize(
         "target_sparsity,thr_prefill,thr_decode",
         [
@@ -3903,15 +3902,51 @@ class TestQwen3_30B_A3B_Instruct_2507(LlmapiAccuracyTestHarness):
                 "prefill": thr_prefill,
                 "decode": thr_decode,
             })
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.85)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75,
+                                        enable_block_reuse=False)
 
         if get_sm_version() >= 100:
-            pytest.skip("Bug to be fixed on Blackwell")
+            pytest.skip("https://nvbugs/5783509: Bug to be fixed on Blackwell")
 
         with LLM(self.MODEL_PATH,
                  attn_backend="TRTLLM",
                  max_batch_size=256,
                  max_num_tokens=100000,
+                 kv_cache_config=kv_cache_config,
+                 sparse_attention_config=sparse_attention_config) as llm:
+            task = LongBenchV1(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_acc_spec=f"target_sparsity={target_sparsity}")
+
+    @pytest.mark.parametrize(
+        "target_sparsity,thr_prefill,thr_decode",
+        [
+            (0.0, 0.0, 0.0),
+            (0.5, 85.97384174442398, 55.48258322852407),
+            (0.9, 1418.142868970396, 863.147841750025),
+        ],
+        ids=[
+            "target_sparsity_0.0", "target_sparsity_0.5", "target_sparsity_0.9"
+        ],
+    )
+    def test_skip_softmax_attention_2gpus(self, target_sparsity: float,
+                                          thr_prefill: float,
+                                          thr_decode: float):
+        sparse_attention_config = SkipSoftmaxAttentionConfig(
+            threshold_scale_factor={
+                "prefill": thr_prefill,
+                "decode": thr_decode,
+            })
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75,
+                                        enable_block_reuse=False)
+
+        with LLM(self.MODEL_PATH,
+                 attn_backend="TRTLLM",
+                 max_batch_size=256,
+                 max_num_tokens=100000,
+                 tensor_parallel_size=2,
+                 moe_expert_parallel_size=2,
+                 enable_attention_dp=True,
                  kv_cache_config=kv_cache_config,
                  sparse_attention_config=sparse_attention_config) as llm:
             task = LongBenchV1(self.MODEL_NAME)

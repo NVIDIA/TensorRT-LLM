@@ -48,6 +48,9 @@ l0_dgx_h100:
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[False-2]
   # llmapi
   - unittest/llmapi/test_mpi_session.py::test_llmapi_launch_multiple_tasks
+  # ------------- Skip softmax attention tests ---------------
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention_2gpus[target_sparsity_0.5]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention_2gpus[target_sparsity_0.9]
 - condition:
     ranges:
       system_gpu_count:
