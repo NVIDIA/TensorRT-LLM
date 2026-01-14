@@ -707,15 +707,15 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
     @skip_pre_blackwell
     @parametrize_with_ids("torch_compile", [False, True])
     @parametrize_with_ids("enable_gemm_allreduce_fusion", [True, False])
-    def test_fp4_tp2pp2(self, torch_compile):
+    def test_fp4_tp2pp2(self, torch_compile, enable_gemm_allreduce_fusion,
+                        monkeypatch):
         model_path = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct-FP4"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
-        if enable_gemm_allreduce_fusion:
-            os.environ["TRTLLM_GEMM_ALLREDUCE_FUSION_ENABLED"] = "1"
-        else:
-            os.environ["TRTLLM_GEMM_ALLREDUCE_FUSION_ENABLED"] = "0"
-
+        monkeypatch.setenv(
+            "TRTLLM_GEMM_ALLREDUCE_FUSION_ENABLED",
+            "1" if enable_gemm_allreduce_fusion else "0",
+        )
         with LLM(model_path,
                  tensor_parallel_size=2,
                  pipeline_parallel_size=2,
