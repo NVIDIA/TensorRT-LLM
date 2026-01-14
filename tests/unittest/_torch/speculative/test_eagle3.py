@@ -56,7 +56,7 @@ def test_kv_lens_runtime_with_eagle3_one_model():
     mock_kv_cache_manager.max_blocks_per_seq = 16
     mock_kv_cache_manager.max_batch_size = num_seqs
     mock_kv_cache_manager.max_seq_len = 512  # Large enough to hold our test sequences
-    mock_kv_cache_manager.impl.copy_batch_block_offsets = MagicMock()
+    mock_kv_cache_manager.copy_batch_block_offsets = MagicMock()
 
     attn_metadata = TrtllmAttentionMetadata(
         max_num_requests=num_seqs,

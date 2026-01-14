@@ -127,7 +127,6 @@ public:
     public:
         // Attention packed mask input (used by context FMHA).
         uint32_t const* attention_packed_mask = nullptr;
-        kernels::KVBlockArray::DataType* host_block_offsets = nullptr;
         int32_t batch_size = 0;
         float2 const* mrope_rotary_cos_sin = nullptr;
 
@@ -182,7 +181,6 @@ public:
             ss << "context_buf_sf: " << this->context_buf_sf << std::endl;
             ss << "key_value_cache: " << (half*) this->key_value_cache << std::endl;
             ss << "block_offsets: " << this->block_offsets << std::endl;
-            ss << "host_block_offsets: " << this->host_block_offsets << std::endl;
             ss << "host_primary_pool_pointer: " << this->host_primary_pool_pointer << std::endl;
             ss << "host_secondary_pool_pointer: " << this->host_secondary_pool_pointer << std::endl;
             ss << "batch_size: " << this->batch_size << std::endl;

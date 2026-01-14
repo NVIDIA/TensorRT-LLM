@@ -55,8 +55,7 @@ namespace tensorrt_llm::plugins
 //                      all elements must be identical.
 //     8.  past_key_value_pool [batch_size, 2, local_num_kv_heads, max_seq_len, head_size] or
 //         block_offsets [batch_size, 2, max_blocks_per_seq] if paged kv cache (optional)
-//     8.1 host_block_offsets [batch_size, 2, max_blocks_per_seq] if paged kv cache (optional)
-//     8.2 host_pool_pointers [2] if paged kv cache (optional)
+//     8.1 host_pool_pointers [2] if paged kv cache (optional)
 //     9.  kv_cache_quantization_scale [1] (optional)
 //     10. kv_cache_dequantization_scale [1] (optional)
 //     11. attention_output_quantization_scale [1] (on device, optional)

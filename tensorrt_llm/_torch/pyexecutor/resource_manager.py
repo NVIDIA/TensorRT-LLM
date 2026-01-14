@@ -407,6 +407,14 @@ class KVCacheManager(BaseResourceManager):
         self.num_pools = self.impl.num_pools
         self.max_blocks_per_seq = self.impl.max_blocks_per_seq
         self.enable_block_reuse = kv_cache_config.enable_block_reuse
+        self.host_kv_cache_block_offsets = torch.empty(self.num_pools,
+                                                       max_batch_size *
+                                                       max_beam_width,
+                                                       2,
+                                                       self.max_blocks_per_seq,
+                                                       dtype=torch.int32,
+                                                       pin_memory=True,
+                                                       device='cpu')
 
     def shutdown(self):
         self.impl.release_pools()
@@ -1261,6 +1269,21 @@ class KVCacheManager(BaseResourceManager):
             return temp_attention_window_inputs
         else:
             return None
+
+    def copy_batch_block_offsets(self, dst_tensor: torch.Tensor,
+                                 request_ids: List[int], beam_width: int,
+                                 num_context: int, num_gen: int):
+        num_seqs = num_context + num_gen * beam_width
+        self.impl.copy_batch_block_offsets(self.host_kv_cache_block_offsets,
+                                           request_ids[0:num_context], 1, 0)
+        self.impl.copy_batch_block_offsets(self.host_kv_cache_block_offsets,
+                                           request_ids[num_context:],
+                                           beam_width, num_context)
+
+        for pool_idx in range(self.host_kv_cache_block_offsets.shape[0]):
+            dst_tensor[pool_idx, :num_seqs].copy_(
+                self.host_kv_cache_block_offsets[pool_idx, :num_seqs],
+                non_blocking=True)
 
     def reset_reuse_state(self):
         """Reset the reuse state of the KV cache manager."""
