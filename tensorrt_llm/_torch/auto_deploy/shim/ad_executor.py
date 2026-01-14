@@ -490,10 +490,12 @@ class ADEngine(ModelEngine):
             self.max_beam_width = ad_config.max_beam_width
             self.spec_config = ad_config.speculative_config
             self._disable_overlap_scheduler = ad_config.disable_overlap_scheduler
+            self.llm_args.max_stats_len = ad_config.max_stats_len
         else:
             self.max_beam_width = 1
             self.spec_config = None
             self._disable_overlap_scheduler = False
+            self.llm_args.max_stats_len = 1000
 
         # check for max total draft tokens
         if self.spec_config is not None:
