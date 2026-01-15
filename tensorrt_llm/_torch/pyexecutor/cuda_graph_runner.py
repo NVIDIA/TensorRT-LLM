@@ -325,7 +325,8 @@ class CUDAGraphRunner:
                 "multimodal_params"] = self.shared_static_tensors[
                     "multimodal_params"][:batch_size * self.max_beam_width]
 
-        if initial_inputs["attn_metadata"].mapping.has_cp_ulysses():
+        if initial_inputs["attn_metadata"].mapping and initial_inputs[
+                "attn_metadata"].mapping.has_cp_ulysses():
             cp_size = initial_inputs["attn_metadata"].mapping.cp_size
             num_tokens_for_capture_cp = (num_tokens_for_capture + cp_size -
                                          1) // cp_size
