@@ -1,6 +1,7 @@
 import dataclasses
 import datetime
 import heapq
+import os
 import queue
 import threading
 import time
@@ -611,12 +612,20 @@ class ExecutorRequestQueue:
             with nvtx_range("recv_requests_from_prev_pp"):
                 payloads = self.dist.recv_object(self.dist.prev_pp_rank, tag)
 
+        # isend new requests may cause deadlock, when CUDA_LAUNCH_BLOCKING=1 or PP microbatches can't overlap,
+        # the deadlock will happen deterministicly:
+        # 1. rank1 will wait on nccl.send(rank2), without invoking mpi.wait(isend-handle)
+        # 2. rank2 will wait on mpi.recv(rank1) but never receive the new requests.
+        # 3. rank1 will hang on nccl.send because rank2 will never reach nccl.recv(rank1).
+        pp_send_func = self.dist.isend_object if os.environ.get(
+            "TRTLLM_PP_REQ_SEND_ASYNC", "0") == "1" else self.dist.send_object
+
         if not self.dist.is_last_pp_rank:
             if self.send_requests_handler is not None:
                 with nvtx_range("wait_prev_send_requests_handler"):
                     self.send_requests_handler.wait()
             with nvtx_range("send_requests_to_next_pp"):
-                self.send_requests_handler = self.dist.isend_object(
+                self.send_requests_handler = pp_send_func(
                     payloads, self.dist.next_pp_rank, tag)
 
         return payloads
