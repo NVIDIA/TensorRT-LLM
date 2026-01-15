@@ -2021,6 +2021,9 @@ def launchTestListCheck(pipeline, globalVars)
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
+            pipeline.echo "globalVars[JOB_TYPE]: ${globalVars[JOB_TYPE]}"
+            globalVars[JOB_TYPE] = "L0_PostMerge"
+            pipeline.echo "globalVars[JOB_TYPE]: ${globalVars[JOB_TYPE]}"
             if (globalVars[JOB_TYPE] == "L0_PostMerge") {
                 catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
                     throw e
