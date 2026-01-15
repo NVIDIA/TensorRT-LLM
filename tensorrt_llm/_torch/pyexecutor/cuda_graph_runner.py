@@ -16,6 +16,7 @@ from ..memory_buffer_utils import get_memory_buffers
 from ..modules.multi_stream_utils import with_multi_stream
 from ..speculative.eagle3 import Eagle3ResourceManager
 from ..speculative.mtp import SampleStateTensorsMTP
+from ..speculative.utils import get_draft_kv_cache_manager
 from ..utils import make_weak_ref, piecewise_cuda_graph
 from .llm_request import get_draft_token_length
 from .mamba_cache_manager import MambaCacheManager
@@ -439,12 +440,19 @@ class CUDAGraphRunner:
             if available_blocks < 1:
                 return 0
 
+            # Get draft KV cache manager only for one-model speculative decoding.
+            # In two-model mode, each model has its own KV cache manager, so
+            # draft_kv_cache_manager should be None.
+            draft_kv_cache_manager = get_draft_kv_cache_manager(
+                self.spec_config, resource_manager)
+
             self.padding_dummy_request = kv_cache_manager.add_dummy_requests(
                 [CUDA_GRAPH_DUMMY_REQUEST_ID],
                 is_gen=True,
                 max_num_draft_tokens=runtime_draft_len,
                 use_mrope=self.config.use_mrope,
-                max_beam_width=self.config.max_beam_width)[0]
+                max_beam_width=self.config.max_beam_width,
+                draft_kv_cache_manager=draft_kv_cache_manager)[0]
             self.padding_dummy_request.is_cuda_graph_dummy = True
             spec_res_mgr = resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
