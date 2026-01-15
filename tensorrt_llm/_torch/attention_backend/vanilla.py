@@ -245,15 +245,34 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         if self.q_scaling is not None:
             qk_scale = 1 / (math.sqrt(self.head_dim) * self.q_scaling)
 
-        # attention
-        attn_output = torch.nn.functional.scaled_dot_product_attention(
-            q,
-            key_states,
-            value_states,
-            is_causal=is_causal,
-            attn_mask=attn_mask,
-            scale=qk_scale,
+        # AETHER SPARSE ATTENTION INJECTION
+        # Check if AETHER is enabled and conditions are met
+        use_aether = (
+            hasattr(self, 'use_aether') and self.use_aether and 
+            attn_mask is None and  # AETHER handles its own masking
+            sparse_indices is None  # Don't double-sparse
         )
+        
+        if use_aether:
+            try:
+                from tensorrt_llm._torch.kernels.aether_sparse import aether_sparse_attention
+                attn_output = aether_sparse_attention(
+                    q, key_states, value_states, 
+                    is_causal=is_causal
+                )
+            except Exception as e:
+                # Fallback to standard SDPA on any AETHER error
+                print(f"[AETHER] Fallback to SDPA: {e}")
+                attn_output = torch.nn.functional.scaled_dot_product_attention(
+                    q, key_states, value_states,
+                    is_causal=is_causal, attn_mask=attn_mask, scale=qk_scale,
+                )
+        else:
+            # Standard attention path
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                q, key_states, value_states,
+                is_causal=is_causal, attn_mask=attn_mask, scale=qk_scale,
+            )
 
         return attn_output
 
