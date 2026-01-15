@@ -284,16 +284,6 @@ class TRTLLMGenFusedMoE(MoE):
     def post_load_weights(self):
         self.quant_method.post_load_weights(self)
 
-    def process_weights_after_loading(self):
-        if hasattr(self.quant_method, 'process_weights_after_loading'):
-            self.quant_method.process_weights_after_loading(self)
-
-    def pre_reload_weights(self):
-        assert hasattr(
-            self.quant_method, 'pre_reload_weights'
-        ), "pre_reload_weights is not supported for this quant method"
-        self.quant_method.pre_reload_weights(self)
-
     def quantize_input(self, x, post_quant_comm: bool = True):
         """Quantize inputs prior to post-communication (alltoall/allgather) or before MoE computation.
 
