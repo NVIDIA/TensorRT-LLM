@@ -19,13 +19,14 @@ pandas
 h5py==3.12.1
 StrEnum
 sentencepiece>=0.1.99
-tensorrt~=10.13.3
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-10.html#rel-25-10 uses 2.9.0a0.
-torch>=2.9.0a0,<=2.9.0
+tensorrt~=10.14.1
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-12.html#rel-25-12 uses 2.10.0a0.
+torch>=2.9.1,<=2.10.0a0
 torchvision
 nvidia-modelopt[torch]~=0.37.0
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-10.html#rel-25-10 uses 2.27.7
-nvidia-nccl-cu13==2.27.7
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-12.html#rel-25-12 uses 2.28.9
+# torch 2.9.1+cu130 depends on nvidia-nccl-cu13==2.27.7
+nvidia-nccl-cu13>=2.27.7,<=2.28.9
 nvidia-cuda-nvrtc
 transformers==4.57.1
 prometheus_client
@@ -65,7 +66,7 @@ ninja
 etcd3 @ git+https://github.com/kragniz/python-etcd3.git@e58a899579ba416449c4e225b61f039457c8072a
 blake3
 soundfile
-triton==3.5.0
+triton==3.5.1
 tiktoken
 blobfile
 openai-harmony==0.0.4
