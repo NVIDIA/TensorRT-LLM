@@ -1,3 +1,4 @@
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -164,15 +165,18 @@ def test_get_server_configs_dict():
                          ids=["multithread", "singlethread"])
 def test_get_global_disagg_request_id(multithread):
     iter = 10000
+    node_ids = list(range(10))
+    thread_num = len(node_ids)
 
     def get_ids(node_ids):
         all_node_ids = [[] for _ in range(len(node_ids))]
         for i in range(iter):
+            if i % (4000 // thread_num) == 0:
+                time.sleep(0.001)
             for i, node_id in enumerate(node_ids):
                 all_node_ids[i].append(get_global_disagg_request_id(node_id))
         return all_node_ids
 
-    node_ids = list(range(10))
     if multithread:
         with ThreadPoolExecutor(max_workers=len(node_ids)) as executor:
             all_node_ids = [
