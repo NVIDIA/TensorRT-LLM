@@ -175,7 +175,6 @@ triton_server/test_triton.py::test_mistral_ib[mistral-ib] SKIP (https://nvbugs/5
 triton_server/test_triton.py::test_eagle[eagle] SKIP (https://nvbugs/5477378)
 examples/test_mixtral.py::test_llm_mixtral_moe_plugin_lora_4gpus[Mixtral-8x7B-v0.1-chinese-mixtral-lora] SKIP (https://nvbugs/5477421)
 test_e2e.py::test_openai_chat_example[trt] SKIP (https://nvbugs/5477444)
-accuracy/test_disaggregated_serving.py::TestDeepSeekV32Exp::test_auto_dtype[False] SKIP (https://nvbugs/5738168)
 test_e2e.py::test_trtllm_bench_iteration_log[TRT-streaming-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B] SKIP (https://nvbugs/5448523)
 accuracy/test_llm_api_pytorch.py::TestLlama3_2_3B::test_auto_dtype SKIP (https://nvbugs/5520319)
 examples/test_llama.py::test_llm_llama_1gpu_fp8_kv_cache[llama-v2-7b-hf-bfloat16] SKIP (https://nvbugs/5527940)
