@@ -9,7 +9,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from tensorrt_llm._utils import get_free_port as _get_free_port
+from tensorrt_llm._utils import get_free_port
 
 from ..utils.logger import ad_logger
 
@@ -67,10 +67,6 @@ def all_gather_object(object_list, object, group=None):
     if group is None:
         group = DistGroup.get()
     return dist.all_gather_object(object_list, object, group=group)
-
-
-def get_free_port():
-    return _get_free_port()
 
 
 def get_world_size() -> int:

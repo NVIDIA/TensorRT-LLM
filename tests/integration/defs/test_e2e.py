@@ -1653,6 +1653,14 @@ def test_openai_responses(llm_root, llm_venv):
          str(test_root / "_test_openai_responses.py")])
 
 
+def test_openai_responses_entrypoint(llm_root, llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m", "pytest",
+        str(test_root / "_test_openai_responses_entrypoint.py")
+    ])
+
+
 def test_openai_health(llm_root, llm_venv):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([
@@ -1675,9 +1683,13 @@ def test_openai_lora(llm_root, llm_venv):
 
 def test_openai_chat_multimodal_example(llm_root, llm_venv):
     test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd(
-        ["-m", "pytest",
-         str(test_root / "_test_openai_chat_multimodal.py")])
+    llm_venv.run_cmd([
+        "-m",
+        "pytest",
+        str(test_root / "_test_openai_chat_multimodal.py"),
+        "-m",
+        "not needs_l40s",
+    ])
 
 
 def test_openai_mmencoder_example(llm_root, llm_venv):
@@ -3406,7 +3418,7 @@ def test_eagle3_output_consistency_4gpus(model_dir: str, draft_model_dir: str):
     # Run with Eagle3
     spec_config = EagleDecodingConfig(
         max_draft_len=3,
-        speculative_model_dir=eagle_model_dir,
+        speculative_model=eagle_model_dir,
         eagle3_one_model=True,
     )
     with LLM(**llm_common_config, speculative_config=spec_config) as llm_spec:

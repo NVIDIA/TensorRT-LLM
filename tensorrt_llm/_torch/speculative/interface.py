@@ -380,6 +380,37 @@ class SpecWorkerBase(nn.Module, ABC):
         Subclasses should override this property.
         """
 
+    def skip_forward(
+        self,
+        input_ids,
+        position_ids,
+        hidden_states,
+        logits,
+        attn_metadata,
+        spec_metadata,
+        draft_model,
+    ):
+        batch_size = attn_metadata.num_seqs
+        accepted_tokens = torch.empty((batch_size, (self.max_draft_len + 1)),
+                                      dtype=torch.int,
+                                      device=logits.device)
+        num_accepted_tokens = torch.ones(batch_size,
+                                         dtype=torch.int,
+                                         device=logits.device)
+        next_draft_tokens = torch.empty((batch_size, self.max_draft_len),
+                                        dtype=torch.int,
+                                        device=logits.device)
+        next_new_tokens = torch.empty((batch_size, (self.max_draft_len + 1)),
+                                      dtype=torch.int,
+                                      device=logits.device)
+        return {
+            'logits': logits,
+            'new_tokens': accepted_tokens,
+            'new_tokens_lens': num_accepted_tokens,
+            'next_draft_tokens': next_draft_tokens,
+            'next_new_tokens': next_new_tokens
+        }
+
     def set_guided_decoder(self,
                            guided_decoder: "CapturableGuidedDecoder") -> bool:
         self.guided_decoder = guided_decoder
