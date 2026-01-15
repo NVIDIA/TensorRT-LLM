@@ -486,6 +486,7 @@ void KVCacheBlock::freeDescendantsRecursively()
         {
             it->second->freeDescendantsRecursively();
             TLLM_LOG_DEBUG("KVCacheBlock::freeDescendantsRecursively - Freeing block %d", it->second->getBlockId());
+            // TODO: Won't this cause block leak if block is not in free queue?
             it = mNextBlocks.erase(it);
         }
     }
