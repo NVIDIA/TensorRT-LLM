@@ -48,7 +48,11 @@ McastDeviceMemory::McastDeviceMemory(
     , mAllocationSize(0)
     , mMcPtr(0)
     , mMcHandle(0)
+#if ENABLE_MULTI_DEVICE
     , mGroupComm(MPI_Comm_f2c(mpiCommFortranHandle), false)
+#else
+    , mGroupComm(nullptr, false)
+#endif
 {
 
     TLLM_CUDA_CHECK(cudaSetDevice(mDeviceIdx));

@@ -113,7 +113,6 @@ private:
     // For intra-node mcast
     tensorrt_llm::runtime::IpcNvlsHandle* mNvlsHandle;
 
-    void initMcastMemory();
     void allocMnMcastMem(size_t bufSize);
     void allocNvlsMcastMem(size_t bufSize);
 };

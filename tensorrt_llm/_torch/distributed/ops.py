@@ -67,11 +67,7 @@ def get_or_scale_allreduce_mnnvl_workspace(
     NUM_LAMPORT_BUFFERS = 3
 
     # Use MNNVLAllReduce class to share across threads
-    with MNNVLAllReduce.allreduce_mnnvl_workspaces_lock:
-        if mapping.pp_rank not in MNNVLAllReduce.allreduce_mnnvl_workspaces:
-            MNNVLAllReduce.allreduce_mnnvl_workspaces[mapping.pp_rank] = {}
-        allreduce_mnnvl_workspaces = MNNVLAllReduce.allreduce_mnnvl_workspaces[
-            mapping.pp_rank]
+    allreduce_mnnvl_workspaces = MNNVLAllReduce.allreduce_mnnvl_workspaces
 
     # A safe method to get the element size of the dtype
     elem_size = torch.tensor([], dtype=dtype).element_size()
@@ -520,7 +516,6 @@ class MNNVLAllReduce(nn.Module):
     for certain operations when using NVLink for multi-node communication.
     """
     allreduce_mnnvl_workspaces: Dict[int, Dict] = {}
-    allreduce_mnnvl_workspaces_lock = threading.Lock()
 
     def __init__(self, mapping: Mapping, dtype: torch.dtype):
         super().__init__()
