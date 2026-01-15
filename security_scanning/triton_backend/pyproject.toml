@@ -7,7 +7,7 @@ readme = "README.md"
 
 [tool.poetry.dependencies]
 python = ">=3.10,<3.13"
-regex = "^2026.1.14"
+regex = "^2026.1.15"
 fire = "^0.7.1"
 transformers = "4.57.1"
 pandas = "^2.3.3"
