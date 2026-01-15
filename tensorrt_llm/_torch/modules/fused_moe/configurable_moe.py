@@ -1158,7 +1158,6 @@ class ConfigurableMoE(MoE):
     def pre_reload_weights(self):
         """
         Pre reload weights - delegated to backend
-
         """
         assert hasattr(self.backend, "pre_reload_weights"), (
             f"Backend {self.backend.__class__.__name__} must implement pre_reload_weights()"

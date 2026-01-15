@@ -524,16 +524,36 @@ class MoE(nn.Module):
     def load_weights(self,
                      weights: List[Dict],
                      allow_partial_loading: bool = False):
+        """
+        Args:
+            weights: List of weight dictionaries to load.
+            allow_partial_loading: Whether to enable partial loading for module parameters.
+                When True, weights are loaded without applying quantization transformations.
+                When False (default), weights are loaded and quantized together.
+        """
         raise NotImplementedError
-
-    def process_weights_after_loading(self):
-        pass
 
     def post_load_weights(self):
         pass
 
+    def process_weights_after_loading(self):
+        """
+        Apply quantization processing to loaded weights.
+
+        When allow_partial_loading=True is used in load_weights(), this method
+        must be called separately to complete the loading setup.
+        """
+        if hasattr(self.quant_method, 'process_weights_after_loading'):
+            self.quant_method.process_weights_after_loading(self)
+
     def pre_reload_weights(self):
-        pass
+        """
+        Prepare tensors for weight reloading by reverting them to their original creation shape.
+        """
+        assert hasattr(
+            self.quant_method, 'pre_reload_weights'
+        ), "pre_reload_weights is not supported for this quant method"
+        self.quant_method.pre_reload_weights(self)
 
     @abstractmethod
     def quantize_input(
