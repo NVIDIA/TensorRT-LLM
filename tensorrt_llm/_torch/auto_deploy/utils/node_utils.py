@@ -129,7 +129,7 @@ def get_quantization_params_from_linear_node(linear_op: torch.fx.node.Node):
     return input_params, weight_params, output_params
 
 
-def extract_weight_node(node: Node) -> int:
+def extract_weight_node(node: Node) -> Union[Node, None]:
     """Extracts the weight node from the given parametrized node"""
 
     def find_get_attr_node(weight_node: Node) -> Node:
@@ -168,7 +168,9 @@ def extract_weight_node(node: Node) -> int:
         # for modelopt quantized graph, there will be a quantize_op
         _, weight_params, _ = get_quantization_params_from_linear_node(node)
         weight_node = weight_params.input_node if weight_params else weight_node
-        assert weight_node is not None, "Expected at least one weight node in the parametrized node"
+        if weight_node is None:
+            # this node is not a weight node
+            return None
     return find_get_attr_node(weight_node)
 
 
@@ -302,6 +304,14 @@ def filtered_nodes(
 
 def is_any_lin_op(node: Node) -> bool:
     return is_linear_op(node) or is_fake_quantized_linear_op(node)
+
+
+def is_parametrized_op(node: Node) -> bool:
+    # check if the node has a weight argument
+    if (w := extract_weight_node(node)) is not None:
+        if len(shape(w)) > 1:
+            return True
+    return False
 
 
 def is_fp4_op(node: Node) -> bool:
@@ -845,6 +855,18 @@ def get_layer_after_linear_node(
             sources=[linear_nodes[start_lin_index]], boundary_condition=boundary_condition
         )
         lin_nodes_in_subgraph = list(filtered_nodes(forward_subgraph, filter_condition))
+        if len(lin_nodes_in_subgraph) > 1:
+            # it means that probably we went over the boundary of the layer.
+            # It may happen e.g., with MoLE (latent MoE), with the closing latent fc2 projection,
+            # when the subgraph spanned over fc2 "spills" over consecutive layers.
+            # Then, wrap this single linear node in  LayerType.UNKNOWN and return.
+            terminating_indices.append(start_lin_index)
+            return LayerSubgraph(
+                opening_nodes=[linear_nodes[start_lin_index]],
+                subgraph_nodes=[],
+                terminating_node=linear_nodes[start_lin_index],
+                layer_type=LayerType.UNKNOWN,
+            )
         start_lin_index += 1
     start_lin_index -= 1
     terminating_linear_node = lin_nodes_in_subgraph[0]
@@ -877,25 +899,33 @@ def get_layer_after_linear_node(
     ssm_nodes = list(filtered_nodes(interior_nodes, is_any_ssm_op))
     attention_nodes = list(filtered_nodes(interior_nodes, is_any_attention_op))
     intermediate_lin_nodes = list(filtered_nodes(interior_nodes, is_any_lin_op))
+    intermediate_weight_nodes = list(filtered_nodes(interior_nodes, is_parametrized_op))
 
     layer_type = LayerType.MLP
     min_local_shape = 1
     if len(ssm_nodes) > 0:
-        assert len(ssm_nodes) == 1, "SSM layer must have exactly one SSM node"
-        layer_type = LayerType.SSM
-        # determine head size
-        min_local_shape = shape(ssm_nodes[0])[-1]
+        if len(ssm_nodes) == 1:
+            layer_type = LayerType.SSM
+            # determine head size
+            min_local_shape = shape(ssm_nodes[0])[-1]
+        else:
+            layer_type = LayerType.UNKNOWN
     if len(attention_nodes) > 0:
-        assert len(attention_nodes) == 1, "Attention layer must have exactly one attention node"
-        layer_type = LayerType.ATTENTION
-        # determine head size
-        min_local_shape = shape(attention_nodes[0])[-1]
+        if len(attention_nodes) == 1:
+            layer_type = LayerType.ATTENTION
+            # determine head size
+            min_local_shape = shape(attention_nodes[0])[-1]
+        else:
+            layer_type = LayerType.UNKNOWN
     if len(intermediate_lin_nodes) > 0:
-        assert len(intermediate_lin_nodes) == 2, (
-            "MLA layer must have exactly two intermediate linear nodes"
-        )
-        assert len(attention_nodes) == 1, "MLA layer must have exactly one attention node"
-        layer_type = LayerType.MLA
+        if len(intermediate_lin_nodes) == 2 and len(attention_nodes) == 1:
+            layer_type = LayerType.MLA
+        else:
+            layer_type = LayerType.UNKNOWN
+    # only SSM layer can have weight nodes in the interior nodes
+    if len(intermediate_weight_nodes) > 0:
+        if layer_type != LayerType.SSM:
+            layer_type = LayerType.UNKNOWN
 
     layer_subgraph = LayerSubgraph(
         opening_nodes=opening_linear_nodes,

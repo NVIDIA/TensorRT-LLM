@@ -2022,47 +2022,37 @@ def detect_sharding_from_config(
         raise ValueError(f"Unsupported sharding source: {source}")
     tp_plan = config["tp_plan"]
 
-    # If the node is inside the attention module, we need to set min_local_shape to the
-    # head_dim - otherwise, we would risk splitting the heads into smaller shards.
-    # TODO: is there a better way to check if we are in attention module?
-    attn_names = [
-        "attention",
-        "Attention",
-        "attn",
-        "Attn",
-        "q_proj",
-        "k_proj",
-        "v_proj",
-        "o_proj",
-    ]
-
     num_shards = 0
     num_simple_shards = 0
     num_row_col_shards = 0
     num_attention_shards = 0
     num_ssm_shards = 0
-    head_dim = -1
     linear_nodes = list(filtered_nodes(gm.graph.nodes, is_any_lin_op))
+
+    # use layer_subgraphs to determine the layer_type
+    # and check the validity of the sharding transform
+    layer_subgraphs, unprocessed_linear_nodes = get_all_layer_subgraphs(gm)
 
     for lin_node in linear_nodes:
         # use node's weight name to get the module name
         module_name = extract_weight_node(lin_node).target
-
-        if any(attn_name in module_name for attn_name in attn_names):
-            # find the next attention node and infer the head_dim
-            next_attention_node, _ = bfs(
-                lin_node, is_any_attention_op, attr_next="users", include_root=False
-            )
-            if next_attention_node is None:
-                # this is the last attention node in the graph. Take the previously found head_dim
-                assert head_dim != -1, "Head dim not found for the last attention node"
-            else:
-                head_dim = shape(next_attention_node)[-1]
-            min_local_shape = head_dim
-            layer_type = LayerType.ATTENTION
+        # get the parent layer_subgraph
+        layer_subgraph = [
+            layer
+            for layer in layer_subgraphs
+            if lin_node in layer.opening_nodes or lin_node == layer.terminating_node
+        ]
+        if len(layer_subgraph) == 1:
+            layer_subgraph = layer_subgraph[0]
+            layer_type = layer_subgraph.layer_type
         else:
-            min_local_shape = 1
-            layer_type = LayerType.MLP
+            if lin_node in unprocessed_linear_nodes:
+                layer_type = LayerType.UNKNOWN
+            else:
+                ad_logger.warning(
+                    f"Failed to find the parent layer_subgraph for linear node {lin_node}. Skipping."
+                )
+            continue
 
         # use regex to find if module_name matches any of the keys in sharding_config
         for key in tp_plan.keys():
@@ -2076,7 +2066,7 @@ def detect_sharding_from_config(
                 # we have a match. Get the config for this layer
                 config = tp_plan[key]
 
-                if config in ["colwise", "mamba"]:
+                if config in ["colwise", "mamba", "mla"]:
                     cur_node_index = linear_nodes.index(lin_node)
                     layer_subgraph = get_layer_after_linear_node(
                         linear_nodes, [cur_node_index - 1], enforce_strict_linear_history=False
@@ -2093,7 +2083,6 @@ def detect_sharding_from_config(
                             split_dim=SplitDimension.ROW,
                             config=transform_container.config,
                             dist_op="all_reduce",
-                            min_local_shape=min_local_shape,
                             layer_type=layer_type,
                         )
                     ):
@@ -2120,7 +2109,6 @@ def detect_sharding_from_config(
                                     split_dim=SplitDimension.COLUMN,
                                     config=transform_container.config,
                                     dist_op=None,
-                                    min_local_shape=min_local_shape,
                                     layer_type=layer_type,
                                 )
                             )
@@ -2131,7 +2119,6 @@ def detect_sharding_from_config(
                                     split_dim=SplitDimension.ROW,
                                     config=transform_container.config,
                                     dist_op="all_reduce",
-                                    min_local_shape=min_local_shape,
                                     layer_type=layer_type,
                                 )
                             ):
@@ -2150,7 +2137,6 @@ def detect_sharding_from_config(
                             split_dim=SplitDimension.COLUMN,
                             config=transform_container.config,
                             dist_op="all_gather",
-                            min_local_shape=1,
                             layer_type=layer_type,
                         )
                     ):
