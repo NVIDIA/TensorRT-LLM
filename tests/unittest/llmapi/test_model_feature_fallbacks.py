@@ -326,5 +326,62 @@ class TestGuidedDecodingFallback:
         assert mock.args.guided_decoding_backend is None
 
 
+class TestMultimodalModelFallbacks:
+    """Tests for multimodal models (MULTIMODAL_MATRIX coverage)."""
+
+    def test_chunked_prefill_disabled_for_hcxvision(self):
+        """HCXVisionForCausalLM (multimodal) has CHUNKED_PREFILL=NO, should disable."""
+        mock = _make_mock_llm(
+            architecture="HCXVisionForCausalLM",
+            chunked_prefill=True,
+        )
+
+        BaseLLM._apply_model_feature_fallbacks(mock)
+
+        assert mock.args.enable_chunked_prefill is False
+
+    def test_multiple_features_disabled_for_llava_vila(self):
+        """LlavaLlamaModel (VILA) has CHUNKED_PREFILL=NO and KV_CACHE_REUSE=NO."""
+        mock = _make_mock_llm(
+            architecture="LlavaLlamaModel (VILA)",
+            chunked_prefill=True,
+            kv_cache_reuse=True,
+        )
+
+        BaseLLM._apply_model_feature_fallbacks(mock)
+
+        # Both features should be disabled
+        assert mock.args.enable_chunked_prefill is False
+        assert mock.args.kv_cache_config.enable_block_reuse is False
+
+    def test_multimodal_llama4_chunked_prefill_disabled(self):
+        """Llama4ForConditionalGeneration (in both matrices) has CHUNKED_PREFILL=NO in multimodal."""
+        mock = _make_mock_llm(
+            architecture="Llama4ForConditionalGeneration",
+            chunked_prefill=True,
+            kv_cache_reuse=True,
+        )
+
+        BaseLLM._apply_model_feature_fallbacks(mock)
+
+        # MULTIMODAL_MATRIX is checked first, has CHUNKED_PREFILL=NO and KV_CACHE_REUSE=NO
+        assert mock.args.enable_chunked_prefill is False
+        assert mock.args.kv_cache_config.enable_block_reuse is False
+
+    def test_multimodal_supported_features_stay_enabled(self):
+        """Qwen2VLForConditionalGeneration has most features as YES."""
+        mock = _make_mock_llm(
+            architecture="Qwen2VLForConditionalGeneration",
+            chunked_prefill=True,
+            kv_cache_reuse=True,
+        )
+
+        BaseLLM._apply_model_feature_fallbacks(mock)
+
+        # Both features should stay enabled (YES in matrix)
+        assert mock.args.enable_chunked_prefill is True
+        assert mock.args.kv_cache_config.enable_block_reuse is True
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
