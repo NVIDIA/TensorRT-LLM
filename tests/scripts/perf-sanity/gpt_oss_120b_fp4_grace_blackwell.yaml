@@ -146,7 +146,7 @@ server_configs:
       decoding_type: 'Eagle'
       eagle3_layers_to_capture: [-1]
       max_draft_len: 3
-      speculative_model_dir: "gpt_oss/gpt-oss-120b-Eagle3"
+      speculative_model: "gpt_oss/gpt-oss-120b-Eagle3"
     stream_interval: 20
     num_postprocess_workers: 4
     client_configs:
