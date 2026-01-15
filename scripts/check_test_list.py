@@ -15,6 +15,7 @@ Note:
 All the perf tests will be excluded since they are generated dynamically.
 """
 import argparse
+import glob
 import os
 import subprocess
 
@@ -42,7 +43,13 @@ def verify_l0_test_lists(llm_src):
     test_list = f"{llm_src}/l0_test.txt"
 
     # Remove dynamically generated perf tests
-    subprocess.run(f"rm -f {test_db_path}/*perf*", shell=True, check=True)
+    # Exclude perf_sanity tests from being removed since they are different and statically defined
+    for file_path in glob.glob(os.path.join(test_db_path, "*perf*")):
+        if "perf_sanity" not in os.path.basename(file_path):
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
     subprocess.run(
         f"trt-test-db -d {test_db_path} --test-names --output {test_list}",
         shell=True,

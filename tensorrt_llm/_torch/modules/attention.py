@@ -25,7 +25,8 @@ from ..distributed import AllReduceParams, HelixAllToAllNative, alltoall_helix
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
-                     is_torch_compiling, maybe_compile)
+                     is_torch_compiling, maybe_compiled_cat,
+                     maybe_compiled_copy_)
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from .multi_stream_utils import maybe_execute_in_parallel
 from .rms_norm import RMSNorm
@@ -76,16 +77,6 @@ def extract_extra_attrs(layer_idx: str, attn_type: str):
         ), "Attention layer must be a subclass of Attention or an instance of Attention"
 
     return metadata, attn_layer
-
-
-@maybe_compile
-def maybe_compiled_copy_(dst, src):
-    dst.copy_(src)
-
-
-@maybe_compile
-def maybe_compiled_cat(tensors, dim):
-    return torch.cat(tensors, dim)
 
 
 def create_attn_outputs_impl(q: torch.Tensor, attention_mask: str,

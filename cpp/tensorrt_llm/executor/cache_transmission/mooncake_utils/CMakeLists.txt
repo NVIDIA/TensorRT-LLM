@@ -36,5 +36,10 @@ if(MOONCAKE_ROOT AND NOT IS_ROCKY8)
 
     target_link_libraries(${MOONCAKE_WRAPPER_TARGET}
                           PRIVATE ${TRANSFER_ENGINE_LIB} CUDA::cudart)
+
+    # Export variables to parent scope for transfer_agent_binding
+    set(TRANSFER_ENGINE_INCLUDE_DIR
+        ${TRANSFER_ENGINE_INCLUDE_DIR}
+        PARENT_SCOPE)
   endif()
 endif()

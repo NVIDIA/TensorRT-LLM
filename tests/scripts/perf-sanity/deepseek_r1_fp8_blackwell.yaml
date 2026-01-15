@@ -30,12 +30,12 @@ server_configs:
       decoding_type: 'MTP'
       num_nextn_predict_layers: 1
     client_configs:
-      - name: "con4096_iter10_1k1k"
+      - name: "con4096_iter5_1k1k"
         concurrency: 4096
-        iterations: 10
+        iterations: 5
         isl: 1024
         osl: 1024
-        random_range_ratio: 0.2
+        random_range_ratio: 0.8
         backend: "openai"
 
   - name: "r1_fp8_tep8_mtp3_1k1k"
@@ -65,7 +65,7 @@ server_configs:
         iterations: 10
         isl: 1024
         osl: 1024
-        random_range_ratio: 0.2
+        random_range_ratio: 0.8
         backend: "openai"
 
   - name: "r1_fp8_tp8_mtp3_1k1k"
@@ -95,5 +95,5 @@ server_configs:
         iterations: 10
         isl: 1024
         osl: 1024
-        random_range_ratio: 0.2
+        random_range_ratio: 0.8
         backend: "openai"

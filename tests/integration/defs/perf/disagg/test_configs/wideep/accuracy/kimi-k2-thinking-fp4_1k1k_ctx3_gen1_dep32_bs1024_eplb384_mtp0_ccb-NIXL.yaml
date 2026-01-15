@@ -7,7 +7,7 @@ metadata:
   - GB300
   script_file: disaggr_torch.slurm
   benchmark_type: 1k1k
-  dataset_file: disagg_datasets/kimi-k2-1024-1024-100000-ratio-1_for_serve.json
+  dataset_file: disagg_datasets/kimi-k2-1024-1024-20000-ratio-1_for_serve.json
   accuracy:
     datasets:
     - dataset_name: gsm8k
@@ -18,7 +18,7 @@ slurm:
   script_file: disaggr_torch.slurm
   partition: <partition>
   account: <account>
-  job_time: 00:45:00
+  job_time: 03:00:00
   job_name: unified-benchmark
   extra_args: "--gres=gpu:4"
   numa_bind: true

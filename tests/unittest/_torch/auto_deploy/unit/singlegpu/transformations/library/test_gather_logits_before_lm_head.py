@@ -56,10 +56,10 @@ class TestGatherLogitsBeforeLmHeadOp:
 
         # Create gather info: num_tokens_to_gather=batch_size, gather_required=0 (False)
         logits_gather_indices = torch.arange(batch_size, dtype=torch.long, device="cuda")
-        logits_gather_info = torch.tensor([batch_size, 0], dtype=torch.int32, device="cuda")
+        logits_gather_info_host = torch.tensor([batch_size, 0], dtype=torch.int32, device="cpu")
 
         output = torch.ops.auto_deploy.gather_logits_before_lm_head.default(
-            hidden_states, logits_gather_indices, logits_gather_info
+            hidden_states, logits_gather_indices, logits_gather_info_host
         )
 
         # Should return [batch, 1, hidden] for generate format (3D shape preserved)
@@ -82,10 +82,10 @@ class TestGatherLogitsBeforeLmHeadOp:
         gather_indices = torch.arange(0, num_gather, dtype=torch.long, device="cuda")
 
         # Create gather info: num_tokens_to_gather=num_gather, gather_required=1 (True)
-        logits_gather_info = torch.tensor([num_gather, 1], dtype=torch.int32, device="cuda")
+        logits_gather_info_host = torch.tensor([num_gather, 1], dtype=torch.int32, device="cpu")
 
         output = torch.ops.auto_deploy.gather_logits_before_lm_head.default(
-            hidden_states, gather_indices, logits_gather_info
+            hidden_states, gather_indices, logits_gather_info_host
         )
 
         # Should return [1, num_gather, hidden] for packed format (3D shape preserved)
@@ -105,15 +105,15 @@ class TestGatherLogitsBeforeLmHeadOp:
 
         # Create gather info
         logits_gather_indices = torch.arange(batch_size, dtype=torch.long, device="cuda")
-        logits_gather_info = torch.tensor([batch_size, 0], dtype=torch.int32, device="cuda")
+        logits_gather_info_host = torch.tensor([batch_size, 0], dtype=torch.int32, device="cpu")
 
         # Use fake implementation directly
         with FakeTensorMode() as mode:
             hidden_states_fake = mode.from_tensor(hidden_states)
             logits_gather_indices_fake = mode.from_tensor(logits_gather_indices)
-            logits_gather_info_fake = mode.from_tensor(logits_gather_info)
+            logits_gather_info_host_fake = mode.from_tensor(logits_gather_info_host)
             output = torch.ops.auto_deploy.gather_logits_before_lm_head.default(
-                hidden_states_fake, logits_gather_indices_fake, logits_gather_info_fake
+                hidden_states_fake, logits_gather_indices_fake, logits_gather_info_host_fake
             )
 
         # Should return [batch, 1, hidden_size] (fake returns empty_like which preserves 3D shape)
@@ -132,15 +132,15 @@ class TestGatherLogitsBeforeLmHeadOp:
 
         # Create gather info
         logits_gather_indices = torch.arange(num_gather, dtype=torch.long, device="cuda")
-        logits_gather_info = torch.tensor([num_gather, 1], dtype=torch.int32, device="cuda")
+        logits_gather_info_host = torch.tensor([num_gather, 1], dtype=torch.int32, device="cpu")
 
         # Use fake implementation directly
         with FakeTensorMode() as mode:
             hidden_states_fake = mode.from_tensor(hidden_states)
             logits_gather_indices_fake = mode.from_tensor(logits_gather_indices)
-            logits_gather_info_fake = mode.from_tensor(logits_gather_info)
+            logits_gather_info_host_fake = mode.from_tensor(logits_gather_info_host)
             output = torch.ops.auto_deploy.gather_logits_before_lm_head.default(
-                hidden_states_fake, logits_gather_indices_fake, logits_gather_info_fake
+                hidden_states_fake, logits_gather_indices_fake, logits_gather_info_host_fake
             )
 
         # The fake implementation returns empty_like which preserves input shape [1, total_tokens, hidden]
@@ -189,7 +189,7 @@ class TestGatherLogitsBeforeLmHeadTransform:
         else:
             # dynamic_shapes should be a tuple matching the number of positional args
             dynamic_shapes = (
-                {0: Dim("batch_size", min=1, max=max_batch_size)},  # hidden_states
+                {0: Dim.DYNAMIC},  # hidden_states
                 None,  # logit_gather_ids (static)
                 None,  # seq_len (static)
             )
@@ -217,13 +217,13 @@ class TestGatherLogitsBeforeLmHeadTransform:
         # Test forward pass
         # We must pass the new graph inputs manually since we are running the graph directly
         logits_gather_indices = torch.arange(batch_size, dtype=torch.long, device="cuda")
-        logits_gather_info = torch.tensor([batch_size, 0], dtype=torch.int32, device="cuda")
+        logits_gather_info_host = torch.tensor([batch_size, 0], dtype=torch.int32, device="cpu")
         output = gm_transformed(
             hidden_states,
             logit_gather_ids,
             seq_len,
             logits_gather_indices=logits_gather_indices,
-            logits_gather_info=logits_gather_info,
+            logits_gather_info_host=logits_gather_info_host,
         )
         # Output should be [batch_size, 1, vocab_size] since gather now returns 3D
         assert output.shape == (batch_size, 1, vocab_size)
@@ -278,13 +278,13 @@ class TestGatherLogitsBeforeLmHeadTransform:
         # We must pass the new graph inputs manually since we are running the graph directly
         num_gather = len(logit_gather_ids)
         logits_gather_indices = logit_gather_ids
-        logits_gather_info = torch.tensor([num_gather, 1], dtype=torch.int32, device="cuda")
+        logits_gather_info_host = torch.tensor([num_gather, 1], dtype=torch.int32, device="cpu")
         output = gm_transformed(
             hidden_states,
             logit_gather_ids_padded,
             seq_len,
             logits_gather_indices=logits_gather_indices,
-            logits_gather_info=logits_gather_info,
+            logits_gather_info_host=logits_gather_info_host,
         )
         # Output should be [1, num_gather, vocab_size] since gather now returns 3D
         assert output.shape == (1, num_gather, vocab_size)

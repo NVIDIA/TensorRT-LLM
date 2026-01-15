@@ -125,9 +125,9 @@ def test_flat_gqa_op(
     k = torch.randn(1, seq_len.sum(), n_kv_heads * D_HEAD, **dtype_kwargs)
     v = torch.randn(1, seq_len.sum(), n_kv_heads * D_HEAD, **dtype_kwargs)
 
-    # create batch_info: [num_prefill, num_prefill_tokens, num_decode]
+    # create batch_info_host: [num_prefill, num_prefill_tokens, num_decode]
     num_prefill_tokens = seq_len[:num_context].sum()
-    batch_info = torch.tensor([num_context, num_prefill_tokens, num_generate], **int_kwargs)
+    batch_info_host = torch.tensor([num_context, num_prefill_tokens, num_generate], **int_kwargs)
 
     # run op
     output = torch.ops.auto_deploy.triton_attention_flattened_mha_with_cache(
@@ -136,7 +136,7 @@ def test_flat_gqa_op(
         k,
         v,
         # STANDARD METADATA
-        batch_info,
+        batch_info_host,
         seq_len,
         input_positions,
         cache_loc,
@@ -150,7 +150,7 @@ def test_flat_gqa_op(
 
     # Use torch backend as clean reference
     ref_flat = TorchAttentionReference.flattened_mha_with_cache(
-        q, k, v, batch_info, seq_len, input_positions, cache_loc, seq_start, k_cache, v_cache
+        q, k, v, batch_info_host, seq_len, input_positions, cache_loc, seq_start, k_cache, v_cache
     )
 
     assert torch.allclose(

@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from os import getenv
+from typing import List
 
 import tensorrt_llm
 from tensorrt_llm import logger
@@ -95,6 +96,24 @@ class KvCacheTransceiver(ABC):
     def cancel_request(self, req: LlmRequest):
         raise NotImplementedError
 
+    @abstractmethod
+    def prepare_context_request(self, requests: List[LlmRequest]):
+        """
+        Prepare the context request for the cache transceiver in generation-first mode.
+        This method should set the context request state to DISAGG_CONTEXT_WAIT_SCHEDULER
+        so that it won't be scheduled if the responding generation kvcache request is not
+        yet received otherwise set it to CONTEXT_INIT.
+        """
+        ...
+
+    @abstractmethod
+    def get_context_state(self):
+        """
+        Return the opaque context request state, which will be attached to the generation request.
+        The generation server will use this state to get kvcache in generation-first mode.
+        """
+        ...
+
 
 class BindKvCacheTransceiver(KvCacheTransceiver):
 
@@ -140,6 +159,12 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
 
     def cancel_request(self, req: LlmRequest):
         return self.impl.cancel_request(req)
+
+    def prepare_context_request(self, requests: List[LlmRequest]):
+        raise NotImplementedError
+
+    def get_context_state(self):
+        raise NotImplementedError
 
 
 class CacheTransBufferManager:

@@ -13,13 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
 from _model_test_utils import get_small_model_config
 from build_and_run_ad import ExperimentConfig, main
+from test_common.llm_data import with_mocked_hf_download
 
 from tensorrt_llm.llmapi import DraftTargetDecodingConfig, KvCacheConfig
 
 
-def test_ad_speculative_decoding_smoke():
+@pytest.mark.parametrize("use_hf_speculative_model", [False, True])
+@with_mocked_hf_download
+def test_ad_speculative_decoding_smoke(use_hf_speculative_model: bool):
     """Test speculative decoding with AutoDeploy using the build_and_run_ad main()."""
 
     # Use a simple test prompt
@@ -27,15 +31,15 @@ def test_ad_speculative_decoding_smoke():
 
     # Get base model config
     experiment_config = get_small_model_config("meta-llama/Meta-Llama-3.1-8B-Instruct")
-    speculative_model_dir = get_small_model_config("TinyLlama/TinyLlama-1.1B-Chat-v1.0")["args"][
-        "model"
-    ]
+    speculative_model_hf_id = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    if use_hf_speculative_model:
+        # NOTE: this will still mock out the actual HuggingFace download
+        speculative_model = speculative_model_hf_id
+    else:
+        speculative_model = get_small_model_config(speculative_model_hf_id)["args"]["model"]
 
-    print(f"Speculative model path: {speculative_model_dir}")
     # Configure speculative decoding with a draft model
-    spec_config = DraftTargetDecodingConfig(
-        max_draft_len=3, speculative_model_dir=speculative_model_dir
-    )
+    spec_config = DraftTargetDecodingConfig(max_draft_len=3, speculative_model=speculative_model)
 
     # Configure KV cache
     kv_cache_config = KvCacheConfig(
