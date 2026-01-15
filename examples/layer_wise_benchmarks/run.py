@@ -10,13 +10,10 @@ import torch
 import yaml
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
-from tensorrt_llm._torch.distributed import MPIDist, TorchDist
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
-from tensorrt_llm._torch.modules.fused_moe.interface import AlltoallMethodType
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
-from tensorrt_llm._utils import local_mpi_rank, mpi_disabled, mpi_rank, mpi_world_size
+from tensorrt_llm._utils import local_mpi_rank, mpi_rank, mpi_world_size
 from tensorrt_llm.logger import logger
-from tensorrt_llm.tools.layer_wise_benchmarks import BalanceMethod, get_runner_cls, mark_ranges
+from tensorrt_llm.tools.layer_wise_benchmarks import BalanceMethod, Runner, mark_ranges
 
 
 def comma_separated_ints(s):
@@ -46,9 +43,17 @@ group = parser.add_mutually_exclusive_group()
 group.add_argument("--enable-attention-dp", action="store_true", dest="enable_attention_dp")
 group.add_argument("--no-enable-attention-dp", action="store_false", dest="enable_attention_dp")
 parser.set_defaults(enable_attention_dp=None)
+parser.add_argument("--kv-cache-dtype", type=str, choices=["fp8", "nvfp4", "auto"])
+parser.add_argument(
+    "--mamba-ssm-cache-dtype", type=str, choices=["auto", "float16", "bfloat16", "float32"]
+)
 # Model init args
+parser.add_argument("--load-format", type=str, choices=["AUTO", "DUMMY"])
 parser.add_argument("--max-num-tokens", type=int)
 parser.add_argument("--moe-backend", type=str)
+parser.add_argument(
+    "--moe-backend-for-prefill", type=str, choices=["CUTLASS", "DEEPGEMM", "WIDEEP"]
+)
 parser.add_argument("--moe-max-num-tokens", type=int)
 group = parser.add_mutually_exclusive_group()
 group.add_argument(
@@ -110,8 +115,16 @@ if args.max_seq_len is None:
     args.max_seq_len = max(args.seq_len_q_list) + max(args.seq_len_kv_cache_list)
 if args.enable_attention_dp is None:
     args.enable_attention_dp = False
+if args.kv_cache_dtype is None:
+    args.kv_cache_dtype = "auto"
+if args.mamba_ssm_cache_dtype is None:
+    args.mamba_ssm_cache_dtype = "auto"
+if args.load_format is None:
+    args.load_format = "DUMMY"
 if args.max_num_tokens is None:
     args.max_num_tokens = args.max_batch_size * max(args.seq_len_q_list)
+if args.moe_backend_for_prefill is None:
+    args.moe_backend_for_prefill = "CUTLASS"
 if args.use_low_precision_moe_combine is None:
     args.use_low_precision_moe_combine = False
 if args.enable_autotuner is None:
@@ -128,7 +141,6 @@ torch.cuda.set_device(local_rank)
 
 # Create KV cache manager
 logger.info("Layer-wise benchmarks: Create KV cache manager")
-Runner = get_runner_cls(args.model)
 mapping = Runner.create_mapping(enable_attention_dp=args.enable_attention_dp)
 kv_cache_manager = Runner.create_kv_cache_manager(
     args.model,
@@ -136,6 +148,8 @@ kv_cache_manager = Runner.create_kv_cache_manager(
     tokens_per_block=args.tokens_per_block,
     max_batch_size=args.max_batch_size,
     max_seq_len=args.max_seq_len,
+    kv_cache_dtype=args.kv_cache_dtype,
+    mamba_ssm_cache_dtype=args.mamba_ssm_cache_dtype,
     layer_indices=args.layer_indices,
 )
 attn_workspace = torch.empty((0,), device="cuda", dtype=torch.int8)
@@ -151,12 +165,15 @@ logger.info("Layer-wise benchmarks: Create runner")
 runner = Runner(
     args.model,
     mapping,
+    load_format=args.load_format,
     moe_backend=args.moe_backend,
     layer_indices=args.layer_indices,
     scaled_from=args.scaled_from,
     max_seq_len=args.max_seq_len,
     max_num_tokens=args.max_num_tokens,
     moe_max_num_tokens=args.moe_max_num_tokens,
+    kv_cache_dtype=args.kv_cache_dtype,
+    mamba_ssm_cache_dtype=args.mamba_ssm_cache_dtype,
     use_low_precision_moe_combine=args.use_low_precision_moe_combine,
     use_cuda_graph=args.use_cuda_graph,
 )
@@ -174,8 +191,7 @@ run_pack = runner.create_run_pack(
 )
 if args.enable_autotuner:
     cache_path = os.getenv("TLLM_AUTOTUNER_CACHE_PATH") or None
-    dist = TorchDist(mapping=mapping) if mpi_disabled() else MPIDist(mapping=mapping)
-    AutoTuner.get().setup_distributed_state(mapping, dist)
+    AutoTuner.get().setup_distributed_state(mapping)
     with autotune(cache_path=cache_path):
         run_pack()
 else:
@@ -190,18 +206,19 @@ if args.run_type == "GEN":
         max(1, 20480 // ctx_seq_len_q),
     )
     ctx_attn_workspace = torch.empty((0,), device="cuda", dtype=torch.int8)
-    with mock.patch.object(
-        CutlassFusedMoE, "select_alltoall_method_type", return_value=AlltoallMethodType.NotEnabled
-    ):
+    with mock.patch.dict(os.environ, {"TRTLLM_FORCE_ALLTOALL_METHOD": "NotEnabled"}, clear=False):
         ctx_runner = Runner(
             args.model,
             mapping,
-            moe_backend="CUTLASS",
+            load_format=args.load_format,
+            moe_backend=args.moe_backend_for_prefill,
             layer_indices=args.layer_indices,
             scaled_from=args.scaled_from,
             max_seq_len=args.max_seq_len,
             max_num_tokens=ctx_batch_size * ctx_seq_len_q,
             moe_max_num_tokens=16384,
+            kv_cache_dtype=args.kv_cache_dtype,
+            mamba_ssm_cache_dtype=args.mamba_ssm_cache_dtype,
             use_low_precision_moe_combine=args.use_low_precision_moe_combine,
             use_cuda_graph=False,
         )
@@ -221,10 +238,7 @@ if args.run_type == "GEN":
             kv_cache_manager=kv_cache_manager,
             attn_workspace=ctx_attn_workspace,
         )
-        with ctx_runner.replace_routing_method_ctx(
-            balance_method=BalanceMethod.Balanced, balance_ratio=None
-        ):
-            run_pack(check=True)
+        run_pack(check=True)
     del ctx_runner
     del ctx_attn_workspace
     logger.info("Layer-wise benchmarks: Prefill KV cache  ... Done")
@@ -293,6 +307,7 @@ for batch_size, seq_len_q, seq_len_kv_cache, balance_ratio in itertools.product(
     with runner.replace_routing_method_ctx(
         balance_method=BalanceMethod[args.balance_method], balance_ratio=balance_ratio
     ):
+        run_pack()
         if args.use_cuda_graph:
             with with_multi_stream(True):
                 g = torch.cuda.CUDAGraph()
