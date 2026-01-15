@@ -667,7 +667,7 @@ class Attention(nn.Module):
             q, k, v = qkv, None, None
 
         # ulysses context preprocess: convert CP to TP
-        if attn_metadata.mapping.has_cp_ulysses():
+        if attn_metadata.mapping and attn_metadata.mapping.has_cp_ulysses():
             assert position_ids is not None, "position_ids is required for ulysses context preprocess"
             q, k, v = self.ulysses_context_preprocess(q, k, v, attn_metadata,
                                                       position_ids.shape[-1])
@@ -689,7 +689,7 @@ class Attention(nn.Module):
                                         attention_sinks=attention_sinks)
 
         # ulysses context postprocess: convert TP to CP
-        if attn_metadata.mapping.has_cp_ulysses():
+        if attn_metadata.mapping and attn_metadata.mapping.has_cp_ulysses():
             attn_output = self.ulysses_context_postprocess(
                 attn_output, attn_metadata)
         if self.attn_output_gate:
