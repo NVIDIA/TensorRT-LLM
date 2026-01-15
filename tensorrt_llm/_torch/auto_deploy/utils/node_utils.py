@@ -922,9 +922,9 @@ def get_layer_after_linear_node(
             layer_type = LayerType.MLA
         else:
             layer_type = LayerType.UNKNOWN
-    # only SSM layer can have weight nodes in the interior nodes
+    # only SSM or MLA layers can have weight nodes in the interior nodes
     if len(intermediate_weight_nodes) > 0:
-        if layer_type != LayerType.SSM:
+        if layer_type not in [LayerType.SSM, LayerType.MLA]:
             layer_type = LayerType.UNKNOWN
 
     layer_subgraph = LayerSubgraph(
