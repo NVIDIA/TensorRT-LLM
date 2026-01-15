@@ -288,7 +288,7 @@ def trtllm_quant_nvfp4_moe_fused(
         input_blockscale = None
         output_dtype = x.dtype
 
-    # Pad inter_size to be divisible by 128
+    # Pad inter_size to be divisible by TRTLLM_NVFP4_ROW_SIZE
     inter_size_padded = math.ceil(inter_size / TRTLLM_NVFP4_ROW_SIZE) * TRTLLM_NVFP4_ROW_SIZE
     fc1_inter_size_padded = (
         math.ceil(fc1_inter_size / TRTLLM_NVFP4_ROW_SIZE) * TRTLLM_NVFP4_ROW_SIZE
@@ -315,7 +315,6 @@ def trtllm_quant_nvfp4_moe_fused(
         fc1_padded[:, :fc1_inter_size, : hidden_size // FP4_PER_UINT8] = fc1_expert_weights_fp4
         fc1_expert_weights_fp4 = fc1_padded
 
-        # Pad fc1_weight_blockscale_fp8: [E, I, H/16] or [E, 2*I, H/16]
         # Block scales may already be padded, so check actual size
         fc1_bs_size1 = fc1_weight_blockscale_fp8.size(1)
         fc1_bs_size2 = fc1_weight_blockscale_fp8.size(2)
@@ -325,9 +324,7 @@ def trtllm_quant_nvfp4_moe_fused(
             )
             fc1_blockscale_fp8_padded[:, :fc1_bs_size1, :fc1_bs_size2] = fc1_weight_blockscale_fp8
             fc1_weight_blockscale_fp8 = fc1_blockscale_fp8_padded
-        # else: block scales already have correct padded size, use as-is
 
-        # Pad fc2_expert_weights_fp4: [E, H, I/2]
         fc2_padded = fc2_expert_weights_fp4.new_zeros(
             n_experts, hidden_size_padded, inter_size_padded // FP4_PER_UINT8
         )

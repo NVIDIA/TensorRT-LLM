@@ -1743,10 +1743,9 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
         w3_stacked = _stack(w3_list, dim=0, device=device, dtype=dtype)
 
         # Scales are buffers, not parameters
-        # Flatten to 1D since kernel expects scalar or [E] tensors
-        w1_input_scale_stacked = _stack(w1_input_scale, dim=0).flatten()
-        w2_input_scale_stacked = _stack(w2_input_scale, dim=0).flatten()
-        w3_input_scale_stacked = _stack(w3_input_scale, dim=0, device=device, dtype=dtype).flatten()
+        w1_input_scale_stacked = _stack(w1_input_scale, dim=0)
+        w2_input_scale_stacked = _stack(w2_input_scale, dim=0)
+        w3_input_scale_stacked = _stack(w3_input_scale, dim=0, device=device, dtype=dtype)
 
         # Use .view() not .to() to reinterpret bytes as float8, not value conversion
         w1_weight_blockscale_fp8_stacked = _stack(w1_weight_scale, dim=0).view(torch.float8_e4m3fn)
@@ -1755,9 +1754,9 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
             w3_weight_scale, dim=0, device=device, dtype=dtype
         ).view(torch.float8_e4m3fn)
 
-        w1_alpha_stacked = _stack(w1_alpha, dim=0).flatten()
-        w2_alpha_stacked = _stack(w2_alpha, dim=0).flatten()
-        w3_alpha_stacked = _stack(w3_alpha, dim=0, device=device, dtype=dtype).flatten()
+        w1_alpha_stacked = _stack(w1_alpha, dim=0)
+        w2_alpha_stacked = _stack(w2_alpha, dim=0)
+        w3_alpha_stacked = _stack(w3_alpha, dim=0, device=device, dtype=dtype)
 
         args = _prepare_args_cutlass_format_nvfp4()
 
