@@ -125,7 +125,7 @@ bool FmhaDispatcher::isSupported()
         {
             tllmRunnerParams.mSparseMla = true;
             tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
-            tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
+            tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;
         }
 
         foundKernels = mTllmGenFMHARunner->isSupported(tllmRunnerParams);
@@ -237,7 +237,7 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
             tllmRunnerParams.mSparseMla = true;
             tllmRunnerParams.mSparseMlaTopK = runnerParams.sparse_params.sparse_mla_topk;
             tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
-            tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
+            tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;
             tllmRunnerParams.kvPageIdxPtr
                 = reinterpret_cast<int const*>(runnerParams.sparse_params.sparse_attn_indices);
             tllmRunnerParams.kvPtr = runnerParams.sparse_params.sparse_mla_kv_cache_pool;
