@@ -63,13 +63,63 @@ is_active |= (block_idx >= N_blocks - local_window)
 | GPU Compute Capability | >= 8.0 (Ampere+) |
 | FP16 / BF16 / FP32 | ✓ |
 | Triton Kernels | ✓ |
+| TRT-LLM Integration | ✓ |
 | Paged KV Cache | Planned |
 | Tensor Parallel | Planned |
 | CUDA Graph | Planned |
 
 ## Usage
 
-### Python API
+### TensorRT-LLM API (Recommended)
+
+The recommended way to use AETHER is through the official TensorRT-LLM API:
+
+```python
+from tensorrt_llm import LLM
+from tensorrt_llm.llmapi import AetherSparseAttentionConfig
+
+# Create AETHER configuration
+aether_config = AetherSparseAttentionConfig(
+    block_size=64,          # KV block size for partitioning
+    threshold=0.05,         # Attention score threshold (lower = more blocks)
+    local_window=8,         # Recent blocks to always keep
+    use_variance=True,      # Enable variance-aware scoring
+    use_concentration=True, # Enable concentration-based bounds
+    min_seq_length=128,     # Min length to enable sparse attention
+)
+
+# Initialize LLM with AETHER sparse attention
+llm = LLM(
+    model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    sparse_attention_config=aether_config,
+)
+
+# Generate text - AETHER is automatically applied
+output = llm.generate("The capital of France is", max_tokens=50)
+print(output)
+```
+
+### Running the E2E Demo
+
+```bash
+# Basic usage with TinyLlama
+python run_aether_e2e.py --model TinyLlama/TinyLlama-1.1B-Chat-v1.0
+
+# Compare with baseline (non-sparse) inference
+python run_aether_e2e.py --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --compare-baseline
+
+# Custom configuration
+python run_aether_e2e.py \
+    --model meta-llama/Llama-2-7b-hf \
+    --block-size 64 \
+    --threshold 0.05 \
+    --local-window 8 \
+    --compare-baseline
+```
+
+### Low-Level Kernel API
+
+For advanced use cases, you can access the AETHER kernels directly:
 
 ```python
 from tensorrt_llm._torch.attention_backend.sparse.aether_kernels import (

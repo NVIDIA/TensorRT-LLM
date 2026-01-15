@@ -205,6 +205,7 @@ class BaseSparseAttentionConfig(StrictBaseModel):
             "rocket": RocketSparseAttentionConfig,
             "dsa": DeepSeekSparseAttentionConfig,
             "skip_softmax": SkipSoftmaxAttentionConfig,
+            "aether": AetherSparseAttentionConfig,
         }
 
         algorithm = data.get("algorithm", None)
@@ -335,6 +336,70 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         if isinstance(self.threshold_scale_factor, dict):
             return self.threshold_scale_factor.get('decode', None)
         return self.threshold_scale_factor
+
+
+class AetherSparseAttentionConfig(BaseSparseAttentionConfig):
+    """
+    Configuration for AETHER block-sparse attention.
+    
+    AETHER (Adaptive Event-driven Threshold Hybrid Entangled Rendering) 
+    uses block-level upper-bound scoring to dynamically prune attention 
+    blocks, achieving sub-quadratic complexity for long sequences.
+    
+    The algorithm works by:
+    1. Partitioning the KV cache into fixed-size blocks
+    2. Computing block-level statistics (mean, radius, variance)
+    3. Using Cauchy-Schwarz bounds to estimate maximum attention scores
+    4. Pruning blocks below threshold before computing full attention
+    
+    Reference: Sharma, T. (2024). DOI: 10.13141/RG.2.2.14811.27684
+    """
+    algorithm: ClassVar[str] = "aether"
+    
+    block_size: int = Field(
+        default=64, 
+        description="KV block size for sparse attention partitioning. "
+                    "Larger blocks reduce overhead but may keep more irrelevant tokens."
+    )
+    threshold: float = Field(
+        default=0.05, 
+        description="Attention score threshold for block pruning (0.0-1.0). "
+                    "Lower values keep more blocks (better quality, less speedup)."
+    )
+    local_window: int = Field(
+        default=8, 
+        description="Number of recent blocks to always keep regardless of score. "
+                    "Ensures recency bias for causal attention."
+    )
+    use_variance: bool = Field(
+        default=True,
+        description="Enable variance-aware block scoring for tighter bounds."
+    )
+    use_concentration: bool = Field(
+        default=True,
+        description="Enable concentration-based scoring for improved accuracy."
+    )
+    target_sparsity: Optional[float] = Field(
+        default=None,
+        description="Target sparsity ratio (0.0-1.0). If set, uses adaptive thresholding "
+                    "to achieve the target sparsity level instead of fixed threshold."
+    )
+    min_seq_length: int = Field(
+        default=128,
+        description="Minimum sequence length to enable sparse attention. "
+                    "Shorter sequences use dense attention for efficiency."
+    )
+    
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(**data)
+    
+    def supports_backend(self, backend: str) -> bool:
+        # AETHER currently supports PyTorch backend
+        return backend == "pytorch"
+    
+    def get_indices_block_size(self) -> int:
+        return self.block_size
 
 
 class MoeLoadBalancerConfig(StrictBaseModel):
@@ -1591,6 +1656,7 @@ SparseAttentionConfig: TypeAlias = Union[
     RocketSparseAttentionConfig,
     DeepSeekSparseAttentionConfig,
     SkipSoftmaxAttentionConfig,
+    AetherSparseAttentionConfig,
 ]
 
 
