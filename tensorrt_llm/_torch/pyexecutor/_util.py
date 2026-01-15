@@ -874,9 +874,19 @@ def create_py_executor_instance(
             peft_cache_manager.impl if peft_cache_manager is not None else None,
             scheduler_config.capacity_scheduler_policy,
             two_step_lookahead=mapping.has_pp())
-        agent_tree_config = agent_tree_config = llm_args.agent_tree_config
+        
         mb_scheduler = BindMicroBatchScheduler(max_batch_size, max_num_tokens,
-                                               ctx_chunk_config, agent_tree_config)
+                                               ctx_chunk_config)
+        
+        resort_policy_config = pytorch_backend_config.resort_policy_config
+
+        if resort_policy_config is not None:
+            assert resort_policy_config.policy_name == "AgentTree", "Resort policy only supports AgentTree for now"
+            mb_scheduler.impl.set_agent_tree_resort_policy(
+                resort_policy_config.policy_args["agent_percentage"],
+                resort_policy_config.policy_args["agent_types"],
+                resort_policy_config.policy_args["agent_inflight_seq_num"])
+        
         scheduler = SimpleScheduler(capacity_scheduler, mb_scheduler)
 
     config = model_engine.model.model_config.pretrained_config

@@ -9,8 +9,7 @@ from typing import Optional
 from strenum import StrEnum
 
 from tensorrt_llm.bindings import internal as tb_internal
-from tensorrt_llm.llmapi.llm_args import (AgentTreeConfig,
-                                          CapacitySchedulerPolicy)
+from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
 from tensorrt_llm.logger import logger
 
 # Assuming these imports exist in your environment
@@ -192,7 +191,6 @@ class BindMicroBatchScheduler(MicroBatchScheduler):
         max_batch_size: int,
         max_num_tokens: int = None,
         ctx_chunk_config: Optional[tuple[StrEnum, int]] = None,
-        agent_tree_config: Optional[AgentTreeConfig] = None,
     ) -> None:
         super(BindMicroBatchScheduler, self).__init__()
         self.max_batch_size = max_batch_size
@@ -203,13 +201,9 @@ class BindMicroBatchScheduler(MicroBatchScheduler):
             ctx_chunk_config_cpp = tb_internal.batch_manager.ContextChunkingConfig(
                 ctx_chunk_config[0]._to_pybind(), ctx_chunk_config[1])
 
-        agent_tree_config_cpp = agent_tree_config._to_pybind(
-        ) if agent_tree_config else None
-
         self.impl = tb_internal.algorithms.MicroBatchScheduler(
             ctx_chunk_config=ctx_chunk_config_cpp,
-            max_context_length=max_num_tokens,
-            agent_tree_config=agent_tree_config_cpp)
+            max_context_length=max_num_tokens)
 
     def schedule(
         self, active_requests: RequestList, inflight_request_ids: set[int]
