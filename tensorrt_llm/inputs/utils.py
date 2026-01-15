@@ -24,7 +24,8 @@ from tensorrt_llm.inputs.multimodal import (MultimodalServerConfig,
 from tensorrt_llm.inputs.registry import (MULTIMODAL_PLACEHOLDER_REGISTRY,
                                           MultimodalPlaceholderPlacement)
 from tensorrt_llm.llmapi.llm_utils import ModelLoader
-from tensorrt_llm.llmapi.tokenizer import TokenizerBase, TransformersTokenizer
+from tensorrt_llm.tokenizer import TokenizerBase, TransformersTokenizer
+from tensorrt_llm.tokenizer.deepseek_v32 import DeepseekV32Tokenizer
 
 logger = logging.get_logger(__name__)
 
@@ -111,6 +112,15 @@ def load_base64_image(parsed_url: str) -> Image.Image:
     content = base64.b64decode(data)
     image = _load_and_convert_image(BytesIO(content))
     return image
+
+
+def load_base64_image_embeds(str_content: str) -> torch.Tensor:
+    content_bytes = base64.b64decode(str_content)
+    with BytesIO(content_bytes) as buf:
+        image_data: torch.Tensor = torch.load(buf,
+                                              weights_only=True,
+                                              map_location="cpu")
+    return image_data
 
 
 def load_image(image: Union[str, Image.Image],
@@ -373,8 +383,10 @@ NOTE:
     placeholder for the model needs to be added in retrieve_multimodal_placeholder().
 """
 
-HF_CHAT_TEMPLATE_EXCEPTIONS = ["llava_llama"]
-PLACEHOLDER_EXCEPTIONS = ["llava_next", "NemotronH_Nano_VL_V2"]
+HF_CHAT_TEMPLATE_EXCEPTIONS = ["llava_llama", "mistral_large_3"]
+PLACEHOLDER_EXCEPTIONS = [
+    "llava_next", "NemotronH_Nano_VL_V2", "mistral_large_3"
+]
 
 
 # Helpers to always get the latest supported multimodal model types from the registry
@@ -422,13 +434,14 @@ class MultimodalData(TypedDict):
     """Type definition for multimodal data structure."""
     modality: str
     data: Any
+    is_embedding: bool
 
 
 class ConversationMessage(TypedDict):
     """Type definition for conversation message structure."""
     role: str
     content: List[dict[str, Any]]
-    media: List[MultimodalData] | List[torch.Tensor] | List[Dict[str, Any]]
+    media: List[MultimodalData]
 
     # @classmethod
     # def fromSample(cls, sample: dict[str, str]) -> "ConversationMessage":
@@ -443,33 +456,57 @@ class MultimodalDataTracker:
             model_type: str,
             multimodal_server_config: Optional[MultimodalServerConfig] = None):
         self._model_type = model_type
-        self._data = defaultdict[str](list)
-        self._placeholder_counts = defaultdict[str](int)
+        self._data = defaultdict[str, list](list)
+        self._embeddings = defaultdict[str, list](list)
+        self._placeholder_counts = defaultdict[str, int](int)
         self._multimodal_server_config = multimodal_server_config if multimodal_server_config is not None else MultimodalServerConfig(
         )
 
-    async def retrieve_all_async(self) -> Optional[Dict[str, List[Any]]]:
-        """Retrieve all collected multimodal data."""
-        if not self._data:
-            return None
+    async def retrieve_all_async(
+        self
+    ) -> tuple[Optional[Dict[str, List[Any]]], Optional[Dict[str, List[Any]]]]:
+        """Retrieve all collected multimodal data and embeddings."""
 
-        return {
-            modality: await asyncio.gather(*items)
-            for modality, items in self._data.items()
-        }
+        async def _retrieve(
+                data: Optional[dict[str,
+                                    list]]) -> Optional[Dict[str, List[Any]]]:
+            if not data:
+                return None
+            return {
+                modality: await asyncio.gather(*items)
+                for modality, items in data.items() if items
+            }
 
-    def retrieve_all_sync(self) -> Optional[Dict[str, List[Any]]]:
-        """Retrieve all collected multimodal data."""
-        if not self._data:
-            return None
+        return await _retrieve(self._data), await _retrieve(self._embeddings)
 
-        return {modality: items for modality, items in self._data.items()}
+    def retrieve_all_sync(
+        self
+    ) -> tuple[Optional[Dict[str, List[Any]]], Optional[Dict[str, List[Any]]]]:
+        """Retrieve all collected multimodal data and embeddings."""
 
-    def add_data(self, media_type: str, data: Union[Coroutine, Any]):
-        current_count = len(self._data[media_type]) + 1
+        def _retrieve(
+                data: Optional[dict[str,
+                                    list]]) -> Optional[Dict[str, List[Any]]]:
+            if not data:
+                return None
+            return {
+                modality: items
+                for modality, items in data.items() if items
+            }
+
+        return _retrieve(self._data), _retrieve(self._embeddings)
+
+    def add_data(self,
+                 media_type: str,
+                 data: Union[Coroutine, Any],
+                 *,
+                 is_embedding: bool = False):
+        current_count = len(self._data[media_type]) + len(
+            self._embeddings[media_type]) + 1
         placeholder = retrieve_multimodal_placeholder(self._model_type,
                                                       media_type, current_count)
-        self._data[media_type].append(data)
+        (self._embeddings
+         if is_embedding else self._data)[media_type].append(data)
         if placeholder:
             self._placeholder_counts[placeholder] += 1
 
@@ -573,12 +610,25 @@ def apply_chat_template(
     documents: Optional[list[dict[str, str]]] = None,
     chat_template: Optional[str] = None,
     chat_template_kwargs: Optional[dict[str, Any]] = None,
+    enable_tokenize: bool = False,
 ) -> (str | List[str]):
     """Apply chat template to the conversation."""
 
     if model_type in HF_CHAT_TEMPLATE_EXCEPTIONS:
         # special path for models like llava-llama
         return "".join([conv["content"] for conv in conversation])
+
+    # Handle DeepSeek V32 tokenizer with custom chat template
+    if isinstance(tokenizer, DeepseekV32Tokenizer):
+        prompt = tokenizer.apply_chat_template(
+            messages=conversation,
+            tools=tools,
+            **(chat_template_kwargs or {}),
+        )
+        if enable_tokenize:
+            return tokenizer.encode(prompt)
+        return prompt
+
     if isinstance(tokenizer, TransformersTokenizer):
         tokenizer = tokenizer.tokenizer  # we need the TokenizerBase for apply_chat_template
 
@@ -594,7 +644,7 @@ def apply_chat_template(
 
     return tokenizer.apply_chat_template(
         conversation=conversation,
-        tokenize=False,
+        tokenize=enable_tokenize,
         add_generation_prompt=add_generation_prompt,
         tools=tools,
         documents=documents,
@@ -627,33 +677,34 @@ def default_multimodal_input_loader(
             media = [media]
         if modality in ["image", "multiple_image"]:
             if is_embedding:
+                _load = lambda mm: mm
+
                 # each mm_embedding corresponds to each image placeholder
                 if not isinstance(media, list):
                     media = [media]
-
-                mm_data = [{
-                    'modality': modality,
-                    'mm_embedding_info': mm
-                } for mm in media]
             else:
-                mm_data = [
-                    MultimodalData(modality=modality,
-                                   data=load_image(i,
-                                                   format=image_data_format,
-                                                   device=device))
-                    for i in media
-                ]
+                _load = lambda mm: load_image(
+                    mm, format=image_data_format, device=device)
+
+            mm_data = [
+                MultimodalData(modality=modality,
+                               data=_load(mm),
+                               is_embedding=is_embedding) for mm in media
+            ]
         elif modality == "video":
             if is_embedding:
                 raise ValueError(
                     "External embedding is not supported for video modality yet."
                 )
             mm_data = [
-                MultimodalData(modality=modality,
-                               data=load_video(i,
-                                               num_frames,
-                                               format=image_data_format,
-                                               device=device)) for i in media
+                MultimodalData(
+                    modality=modality,
+                    data=load_video(i,
+                                    num_frames,
+                                    format=image_data_format,
+                                    device=device),
+                    is_embedding=False,
+                ) for i in media
             ]
         elif modality == "audio":
             if is_embedding:
@@ -661,8 +712,11 @@ def default_multimodal_input_loader(
                     "External embedding is not supported for audio modality yet."
                 )
             mm_data = [
-                MultimodalData(modality=modality,
-                               data=load_audio(i, device=device)) for i in media
+                MultimodalData(
+                    modality=modality,
+                    data=load_audio(i, device=device),
+                    is_embedding=False,
+                ) for i in media
             ]
         elif modality == "image_audio":
             if is_embedding:
@@ -690,16 +744,22 @@ def default_multimodal_input_loader(
                         pass
                 if _modal is None:
                     raise ValueError(f"Unknown matching modality: {modality}")
-                mm_data.append(MultimodalData(modality=_modal, data=data))
+                mm_data.append(
+                    MultimodalData(modality=_modal,
+                                   data=data,
+                                   is_embedding=False))
         elif modality == "mixture_text_image":
             mm_data = []
             for m in media:
                 if m:
                     mm_data.append(
-                        MultimodalData(modality="image",
-                                       data=load_image(m,
-                                                       format=image_data_format,
-                                                       device=device)))
+                        MultimodalData(
+                            modality="image",
+                            data=load_image(m,
+                                            format=image_data_format,
+                                            device=device),
+                            is_embedding=False,
+                        ))
         else:
             raise ValueError(f"Unknown modality: {modality}")
         return ConversationMessage(role="user", content=prompt, media=mm_data)
@@ -733,17 +793,12 @@ def default_multimodal_input_loader(
                                                is_embedding)
         mm_data_tracker = MultimodalDataTracker(model_type)
         for mdata in conv["media"]:
-            # Check if mdata is a MultimodalData
-            if isinstance(mdata,
-                          dict) and "modality" in mdata and "data" in mdata:
-                mdata_modality = mdata["modality"]
-                if modality == "multiple_image":
-                    mdata_modality = "image"
-                mm_data_tracker.add_data(mdata_modality, mdata["data"])
-            else:
-                # Add embeddings to the tracker for placeholder handling
-                mm_data_tracker.add_data(mdata["modality"],
-                                         mdata["mm_embedding_info"])
+            mdata_modality = mdata["modality"]
+            if modality == "multiple_image":
+                mdata_modality = "image"
+            mm_data_tracker.add_data(mdata_modality,
+                                     mdata["data"],
+                                     is_embedding=is_embedding)
         mm_placeholder_counts = mm_data_tracker.placeholder_counts()
         prompt = conv["content"]
         if mm_placeholder_counts:
@@ -757,13 +812,16 @@ def default_multimodal_input_loader(
             add_generation_prompt=True,
             mm_placeholder_counts=[mm_placeholder_counts])
         input = {"prompt": prompt}
+
         if mm_placeholder_counts:
             if mm_embeddings is not None:
-                input[
+                _, input[
                     "multi_modal_embeddings"] = mm_data_tracker.retrieve_all_sync(
                     )
             else:
-                input["multi_modal_data"] = mm_data_tracker.retrieve_all_sync()
+                input[
+                    "multi_modal_data"], _ = mm_data_tracker.retrieve_all_sync(
+                    )
         inputs.append(input)
 
     return inputs

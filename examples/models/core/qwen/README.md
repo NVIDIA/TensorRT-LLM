@@ -663,19 +663,19 @@ trtllm-eval --model=Qwen3-30B-A3B/ --tokenizer=Qwen3-30B-A3B/ --backend=pytorch 
 To quantize the Qwen3 model for use with the PyTorch backend, we'll use NVIDIA's Model Optimizer (ModelOpt) tool. Follow these steps:
 
 ```bash
-# Clone the TensorRT Model Optimizer (ModelOpt)
-git clone https://github.com/NVIDIA/TensorRT-Model-Optimizer.git
-pushd TensorRT-Model-Optimizer
+# Clone the Model Optimizer (ModelOpt)
+git clone https://github.com/NVIDIA/Model-Optimizer.git
+pushd Model-Optimizer
 
 # install the ModelOpt
 pip install -e .
 
 # Quantize the Qwen3-235B-A22B model by nvfp4
-# By default, the checkpoint would be stored in `TensorRT-Model-Optimizer/examples/llm_ptq/saved_models_Qwen3-235B-A22B_nvfp4_hf/`.
+# By default, the checkpoint would be stored in `Model-Optimizer/examples/llm_ptq/saved_models_Qwen3-235B-A22B_nvfp4_hf/`.
 ./examples/llm_ptq/scripts/huggingface_example.sh --model Qwen3-235B-A22B/ --quant nvfp4 --export_fmt hf
 
 # Quantize the Qwen3-32B model by fp8_pc_pt
-# By default, the checkpoint would be stored in `TensorRT-Model-Optimizer/examples/llm_ptq/saved_models_Qwen3-32B_fp8_pc_pt_hf/`.
+# By default, the checkpoint would be stored in `Model-Optimizer/examples/llm_ptq/saved_models_Qwen3-32B_fp8_pc_pt_hf/`.
 ./examples/llm_ptq/scripts/huggingface_example.sh --model Qwen3-32B/ --quant fp8_pc_pt --export_fmt hf
 popd
 ```
@@ -687,8 +687,8 @@ To run the benchmark, we suggest using the `trtllm-bench` tool. Please refer to 
 ```bash
 #!/bin/bash
 
-folder_model=TensorRT-Model-Optimizer/examples/llm_ptq/saved_models_Qwen3-235B-A22B_nvfp4_hf/
-path_config=extra-llm-api-config.yml
+folder_model=Model-Optimizer/examples/llm_ptq/saved_models_Qwen3-235B-A22B_nvfp4_hf/
+path_config=config.yml
 num_gpus=8
 ep_size=8
 max_input_len=1024
@@ -717,26 +717,27 @@ trtllm-bench --model ${folder_model} --model_path ${folder_model} throughput \
   --tp ${num_gpus}\
   --ep ${ep_size} \
   --kv_cache_free_gpu_mem_fraction ${kv_cache_free_gpu_mem_fraction} \
-  --extra_llm_api_options ${path_config} \
+  --config ${path_config} \
   --concurrency ${concurrency} \
   --num_requests $(( concurrency * 5 )) \
   --warmup 0 \
   --streaming
 ```
 
-We suggest benchmarking with a real dataset. It will prevent from having improperly distributed tokens in the MoE. Here, we use the `aa_prompt_isl_1k_osl_2k_qwen3_10000samples.txt` dataset. It has 10000 samples with an average input length of 1024 and an average output length of 2048. If you don't have a dataset (this or an other) and you want to run the benchmark, you can use the following command to generate a random dataset:
+We suggest benchmarking with a real dataset. It will prevent from having improperly distributed tokens in the MoE. Here, we use the `aa_prompt_isl_1k_osl_2k_qwen3_10000samples.txt` dataset. It has 10000 samples with an average input length of 1024 and an average output length of 2048. If you don't have a dataset (this or another) and you want to run the benchmark, you can use the following command to generate a random dataset:
 
 ```bash
-folder_model=TensorRT-Model-Optimizer/examples/llm_ptq/saved_models_Qwen3-235B-A22B_nvfp4_hf/
+folder_model=Model-Optimizer/examples/llm_ptq/saved_models_Qwen3-235B-A22B_nvfp4_hf/
 min_input_len=1024
 min_output_len=2048
 concurrency=128
 path_data=random_data.txt
 
-python3 benchmarks/cpp/prepare_dataset.py \
-    --tokenizer=${folder_model} \
-    --stdout token-norm-dist --num-requests=$(( concurrency * 5 )) \
-    --input-mean=${min_input_len} --output-mean=${min_output_len} --input-stdev=0 --output-stdev=0 > ${path_data}
+trtllm-bench\
+    --model=${folder_model} \
+    prepare-dataset --output ${path_data} \
+    token-norm-dist --num-requests=$(( concurrency * 5 )) \
+    --input-mean=${min_input_len} --output-mean=${min_output_len} --input-stdev=0 --output-stdev=0
 ```
 
 ### Serving
@@ -747,7 +748,7 @@ We maintain YAML configuration files with recommended performance settings in th
 
 ```shell
 TRTLLM_DIR=/app/tensorrt_llm # change as needed to match your environment
-EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/qwen3.yaml
+EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/curated/qwen3.yaml
 ```
 
 #### trtllm-serve
@@ -755,7 +756,7 @@ EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/qwen3.yaml
 To serve the model using `trtllm-serve`:
 
 ```bash
-trtllm-serve Qwen3-30B-A3B/ --port 8000 --extra_llm_api_options ${EXTRA_LLM_API_FILE}
+trtllm-serve Qwen3-30B-A3B/ --port 8000 --config ${EXTRA_LLM_API_FILE}
 ```
 
 To query the server, you can start with a `curl` command:
@@ -778,9 +779,9 @@ For example, you can launch a single context server on port 8001 with:
 ```bash
 export TRTLLM_USE_UCX_KVCACHE=1
 export TRTLLM_DIR=/app/tensorrt_llm
-export EXTRA_LLM_API_FILE="${TRTLLM_DIR}/examples/configs/qwen3-disagg-prefill.yaml"
+export EXTRA_LLM_API_FILE="${TRTLLM_DIR}/examples/configs/curated/qwen3-disagg-prefill.yaml"
 
-trtllm-serve Qwen3-30B-A3B/ --port 8001 --extra_llm_api_options ${EXTRA_LLM_API_FILE} &> output_ctx &
+trtllm-serve Qwen3-30B-A3B/ --port 8001 --config ${EXTRA_LLM_API_FILE} &> output_ctx &
 ```
 
 And you can launch two generation servers on port 8002 and 8003 with:
@@ -788,10 +789,10 @@ And you can launch two generation servers on port 8002 and 8003 with:
 ```bash
 export TRTLLM_USE_UCX_KVCACHE=1
 export TRTLLM_DIR=/app/tensorrt_llm
-export EXTRA_LLM_API_FILE="${TRTLLM_DIR}/examples/configs/qwen3.yaml"
+export EXTRA_LLM_API_FILE="${TRTLLM_DIR}/examples/configs/curated/qwen3.yaml"
 
 for port in {8002..8003}; do \
-trtllm-serve Qwen3-30B-A3B/ --port ${port} --extra_llm_api_options ${EXTRA_LLM_API_FILE} &> output_gen_${port} & \
+trtllm-serve Qwen3-30B-A3B/ --port ${port} --config ${EXTRA_LLM_API_FILE} &> output_gen_${port} & \
 done
 ```
 
@@ -840,15 +841,15 @@ Qwen3 now supports Eagle3 (Speculative Decoding with Eagle3). To enable Eagle3 o
   Set the decoding type to "Eagle" to enable Eagle3 speculative decoding.
 - `speculative_config.max_draft_len: 3`
   Set the maximum number of draft tokens generated per step (this value can be adjusted as needed).
-- `speculative_config.speculative_model_dir: <EAGLE3_DRAFT_MODEL_PATH>`
-  Specify the path to the Eagle3 draft model (ensure the corresponding draft model weights are prepared).
+- `speculative_config.speculative_model: <HUGGINGFACE ID / LOCAL PATH>`
+  Specify the Eagle3 draft model either as a Huggingface model ID or a local path. You can find ready-to-use Eagle3 draft models at https://huggingface.co/collections/nvidia/speculative-decoding-modules.
 
 Currently, there are some limitations when enabling Eagle3:
 
 1. `attention_dp` is not supported. Please disable it or do not set the related flag (it is disabled by default).
 2. If you want to use `enable_block_reuse`, the kv cache type of the target model and the draft model must be the same. Since the draft model only supports fp16/bf16, you need to disable `enable_block_reuse` when using fp8 kv cache.
 
-Example `extra-llm-api-config.yml` snippet for Eagle3:
+Example `config.yml` snippet for Eagle3:
 
 ```bash
 echo "
@@ -856,7 +857,7 @@ enable_attention_dp: false
 speculative_config:
     decoding_type: Eagle
     max_draft_len: 3
-    speculative_model_dir: <EAGLE3_DRAFT_MODEL_PATH>
+    speculative_model: <HUGGINGFACE ID / LOCAL PATH>
 kv_cache_config:
     enable_block_reuse: false
 " >> ${path_config}

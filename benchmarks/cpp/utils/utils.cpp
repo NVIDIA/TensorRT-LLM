@@ -1,6 +1,7 @@
 
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION &
+ *AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,13 +18,16 @@
  */
 
 #include "utils.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
 #include <random>
 
 #include <filesystem>
 #include <fstream>
 
-namespace tensorrt_llm::benchmark
+TRTLLM_NAMESPACE_BEGIN
+
+namespace benchmark
 {
 
 std::vector<std::vector<SizeType32>> parseVectorOfVectors(std::string const& input)
@@ -98,7 +102,8 @@ Samples parseWorkloadJson(
     if (samples.size() < maxNumSamples)
     {
         TLLM_LOG_WARNING(
-            "Dataset size %zu is smaller than given max_num_samples %d, max_num_samples will be ignored.\n",
+            "Dataset size %zu is smaller than given max_num_samples "
+            "%d, max_num_samples will be ignored.\n",
             samples.size(), maxNumSamples);
     }
     return samples;
@@ -160,4 +165,6 @@ std::ostream& operator<<(std::ostream& os, RecordBwMetric const& metric)
     return os;
 }
 
-} // namespace tensorrt_llm::benchmark
+} // namespace benchmark
+
+TRTLLM_NAMESPACE_END

@@ -123,7 +123,7 @@ public:
         NB_OVERRIDE_PURE(removeSequence, requestId, llmRequest, pinOnRelease);
     }
 
-    std::optional<tbk::KVCacheBlock::IdType> storeBlocksForReuse(tb::LlmRequest::RequestIdType requestId,
+    std::vector<tbk::KVCacheBlock::IdType> storeBlocksForReuse(tb::LlmRequest::RequestIdType requestId,
         tensorrt_llm::common::OptionalRef<tb::LlmRequest const> llmRequest, bool pinBlocks) override
     {
         NB_OVERRIDE_PURE(storeBlocksForReuse, requestId, llmRequest, pinBlocks);
@@ -233,6 +233,11 @@ public:
     SizeType32 getPoolLayerIdx(SizeType32 layer_idx) const override
     {
         NB_OVERRIDE_PURE(getPoolLayerIdx, layer_idx);
+    }
+
+    void syncTransferManagerWithBufferManager() override
+    {
+        NB_OVERRIDE_PURE(syncTransferManagerWithBufferManager);
     }
 
     void refreshBlocks() override
@@ -481,6 +486,9 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             nb::call_guard<nb::gil_scoped_release>())
         .def("flush_iteration_events", &BaseKVCacheManager::flushIterationEvents,
             nb::call_guard<nb::gil_scoped_release>())
+        .def("sync_transfer_manager_with_buffer_manager", &BaseKVCacheManager::syncTransferManagerWithBufferManager,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("refresh_blocks", &BaseKVCacheManager::refreshBlocks, nb::call_guard<nb::gil_scoped_release>())
         .def("get_last_block_id", &BaseKVCacheManager::getLastBlockId, nb::call_guard<nb::gil_scoped_release>())
         .def("unpin_blocks_by_id", &BaseKVCacheManager::unpinBlocksById, nb::call_guard<nb::gil_scoped_release>())
         .def("reset_reuse_state", &BaseKVCacheManager::resetReuseState, nb::call_guard<nb::gil_scoped_release>());

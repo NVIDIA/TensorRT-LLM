@@ -9,7 +9,6 @@ These tests verify that trtllm-serve handles error conditions gracefully:
 """
 
 import asyncio
-import socket
 import time
 from pathlib import Path
 
@@ -19,11 +18,7 @@ import requests
 from defs.conftest import llm_models_root
 from defs.trt_test_alternative import popen, print_error, print_info
 
-
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
+from tensorrt_llm._utils import get_free_port
 
 
 class RemoteOpenAIServer:
@@ -63,7 +58,7 @@ def server(model_path):
     """Start a test server for the module using popen like test_serve.py"""
     host_bind = "0.0.0.0"
     client_host = "localhost"
-    port = _find_free_port()
+    port = get_free_port()
     cmd = [
         "trtllm-serve",
         "serve",
@@ -117,7 +112,8 @@ async def test_invalid_max_tokens(async_client: openai.AsyncOpenAI,
             max_tokens=0,
         )
     error_msg = str(exc_info.value).lower()
-    assert any(keyword in error_msg for keyword in ("mMaxNewTokens", "failed"))
+    assert any(keyword in error_msg
+               for keyword in ("max_tokens", "must be greater than 0"))
 
 
 @pytest.mark.asyncio

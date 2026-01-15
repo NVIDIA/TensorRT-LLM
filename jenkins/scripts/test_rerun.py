@@ -385,7 +385,7 @@ def filter_failed_tests(xml_filename, output_filename):
 
 
 def generate_rerun_report(output_filename, input_filenames):
-    # Merge the input xml files (filter failed tests for results.xml)
+    # Merge the input xml files (filter failed tests for results.xml and results_isolated_*.xml)
     # and generate the rerun report html file.
     new_filename_list = []
     for input_filename in input_filenames:
@@ -393,6 +393,12 @@ def generate_rerun_report(output_filename, input_filenames):
         if "/results.xml" in input_filename:
             new_filename = input_filename.replace("results.xml",
                                                   "failed_results.xml")
+            filter_failed_tests(input_filename, new_filename)
+        elif "/results_isolated_" in input_filename and input_filename.endswith(
+                ".xml"):
+            # Handle isolation test result files: results_isolated_*.xml -> failed_results_isolated_*.xml
+            new_filename = input_filename.replace("results_isolated_",
+                                                  "failed_results_isolated_")
             filter_failed_tests(input_filename, new_filename)
         new_filename_list.append(new_filename)
 

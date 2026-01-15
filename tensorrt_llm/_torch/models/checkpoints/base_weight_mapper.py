@@ -29,9 +29,6 @@ class BaseWeightMapper(ABC):
             raise ValueError("model must have a config attribute")
 
         self._tp_size = 1 if model.model_config.mapping.enable_attention_dp else model.model_config.mapping.tp_size
-        self._head_dim = model.config.head_dim if hasattr(
-            model.config, 'head_dim'
-        ) and model.config.head_dim is not None else model.config.hidden_size // model.config.num_attention_heads
 
         self.map_weights()
 
@@ -114,9 +111,16 @@ class BaseWeightMapper(ABC):
         """
         ...
 
-    def handle_manual_copy(self, module_name: str, module_weights: dict, n: str,
-                           p: nn.Parameter) -> None:
-        p.data.copy_(module_weights[n][:])
+    def handle_manual_copy(self,
+                           module_name: str,
+                           module_weights: dict,
+                           n: str,
+                           p: nn.Parameter,
+                           allow_partial_loading: bool = False) -> None:
+        if not allow_partial_loading:
+            assert n in module_weights
+        if n in module_weights:
+            p.data.copy_(module_weights[n][:])
 
     def does_require_special_handling(self, module_name: str) -> bool:
         return module_name in self.mapping
@@ -124,9 +128,12 @@ class BaseWeightMapper(ABC):
     def is_special_instance_module(self, module: nn.Module) -> bool:
         return False
 
-    def handle_special_instance_module(self, module: nn.Module,
-                                       module_name: str,
-                                       module_weights: dict) -> None:
+    def handle_special_instance_module(
+            self,
+            module: nn.Module,
+            module_name: str,
+            module_weights: dict,
+            allow_partial_loading: bool = False) -> None:
         raise NotImplementedError()
 
     @property
@@ -163,3 +170,11 @@ class BaseWeightMapper(ABC):
         if self._model is None:
             raise RuntimeError("Weight mapper is not initialized")
         return self._model
+
+    @property
+    def _head_dim(self) -> int:
+        model = self.model
+        head_dim = model.config.head_dim if hasattr(
+            model.config, 'head_dim'
+        ) and model.config.head_dim is not None else model.config.hidden_size // model.config.num_attention_heads
+        return head_dim

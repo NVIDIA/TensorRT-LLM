@@ -16,13 +16,13 @@
  */
 #pragma once
 
-#include <stdexcept>
-#include "trtllm/gen/SfLayoutDecl.h"
 #include "trtllm/gen/CommonUtils.h"
+#include "trtllm/gen/SfLayoutDecl.h"
+#include <stdexcept>
 
-#include "TmaDescriptor.h"
-#include "Enums.h"
 #include "BatchedGemmEnums.h"
+#include "Enums.h"
+#include "TmaDescriptor.h"
 
 // NOTE: keep this code dependency free. It has to be included by the device code and has to be
 // compilable with NVRTC.
@@ -224,7 +224,7 @@ static auto makeTmaShapeStrideAbc(GemmOptions const& options, int sizeM, int siz
 
 // Create the TMA shape/stride for A/B block scaling factors.
 static auto makeTmaShapeStrideSfAb(int mM, int mN, int mK, MatrixType matrixType, int tileM, int tileN, int tileK,
-    tg::SfLayout layout, int sfReshapeFactor, int32_t const numEltsPerSf)
+    tg::SfLayout layout, int sfReshapeFactor, const int32_t numEltsPerSf)
 {
 
     // The outer dimension.
@@ -344,7 +344,7 @@ static KernelParams setKernelParams(GemmOptions_ const& options, bool const batc
     // known at kernel launch time. Otherwise, these parameters are defined in the device buffers:
     // ptrTotalNumPaddedTokens, ptrCtaIdxXyToBatchIdx and ptrCtaIdxXyToMnLimit respectively.
 
-    if (options.mIsStaticBatch)
+    if (options.mIsStaticBatch && !options.mIsUniformNumTokensPerBatch)
     {
         params.totalNumPaddedTokens = 0;
         for (int b = 0; b < options.mNumBatches; b++)
@@ -386,6 +386,24 @@ static KernelParams setKernelParams(GemmOptions_ const& options, bool const batc
 
             params.totalNumPaddedTokens += numCtas * tile;
         }
+        params.totalNumOutputPaddedTokens = params.totalNumPaddedTokens;
+    }
+    else if (options.mIsStaticBatch && options.mIsUniformNumTokensPerBatch)
+    {
+        auto numTokens = batchM ? options.mBatchedM[0] : options.mBatchedN[0];
+        auto tileTokensDim = batchM ? options.mTileM : options.mTileN;
+        params.batchStrideInCtas = (options.mBatchStrideInTokens + tileTokensDim - 1) / tileTokensDim;
+        params.ctasInTokenDimPerBatch = (numTokens + tileTokensDim - 1) / tileTokensDim;
+        params.totalNumOutputPaddedTokens = params.ctasInTokenDimPerBatch * tileTokensDim * options.mNumBatches;
+        if (params.batchStrideInCtas == 0)
+        {
+            params.totalNumPaddedTokens = params.ctasInTokenDimPerBatch * tileTokensDim;
+        }
+        else
+        {
+            params.totalNumPaddedTokens = params.ctasInTokenDimPerBatch * tileTokensDim * options.mNumBatches;
+        }
+        ctaOffset = maxNumCtas;
     }
     else
     {
@@ -409,6 +427,12 @@ static KernelParams setKernelParams(GemmOptions_ const& options, bool const batc
     params.ptrSfB = dSfB;
     params.ptrSfC = dSfC;
 
+    // Do we pad A?
+    bool doPadA = options.mMmaKind == tg::MmaKind::MxFp8Fp6Fp4 && options.mDtypeA == tg::Dtype::MxE2m1;
+
+    // Do we pad B?
+    bool doPadB = options.mMmaKind == tg::MmaKind::MxFp8Fp6Fp4 && options.mDtypeB == tg::Dtype::MxE2m1;
+
     if (!batchM)
     {
         // A is the expert
@@ -423,8 +447,9 @@ static KernelParams setKernelParams(GemmOptions_ const& options, bool const batc
             = makeTmaShapeStrideAbc(options, options.mM, options.mN, options.mK, options.mTileM, options.mTileN,
                 options.mTileK, MatrixType::MatrixA, options.mValidM, options.mValidN, options.mValidK);
         // Build tma descriptor for A.
-        params.tmaA[0] = gemm::buildNdTmaDescriptor(
-            options.mDtypeA, options.mMmaKind, shapeA, strideA, tileShapeA, const_cast<void*>(ptrA));
+        params.tmaA[0]
+            = gemm::buildNdTmaDescriptor(options.mDtypeA, shapeA, strideA, tileShapeA, const_cast<void*>(ptrA), doPadA,
+                /*doSwizzle=*/true);
 
         // The input is padded:
         // [act0, padding, padding, ... TileN size .., act1, padding, padding, ...]
@@ -440,14 +465,27 @@ static KernelParams setKernelParams(GemmOptions_ const& options, bool const batc
                     options.mK, options.mTileM, (useRouteAct ? 1 : options.mTileN), options.mTileK, MatrixType::MatrixB,
                     options.mValidM, useRouteAct ? options.mNumTokens : inputNumTokens, options.mValidK);
             // Build tma descriptor for B.
-            params.tmaB[0] = gemm::buildNdTmaDescriptor(
-                options.mDtypeB, options.mMmaKind, shapeB, strideB, tileShapeB, const_cast<void*>(ptrB));
+            params.tmaB[0] = gemm::buildNdTmaDescriptor(options.mDtypeB, shapeB, strideB, tileShapeB,
+                const_cast<void*>(ptrB), doPadB,
+                /*doSwizzle=*/true);
         }
 
         if (options.mDtypeA == tg::Dtype::E2m1 || options.mDtypeA == tg::Dtype::MxE4m3
-            || options.mDtypeA == tg::Dtype::MxE2m1)
+            || options.mDtypeA == tg::Dtype::MxE2m1 || options.mDtypeA == tg::Dtype::MxInt4)
         {
-            tg::Dtype const dTypeSf = (options.mDtypeA == tg::Dtype::E2m1) ? tg::Dtype::E4m3 : tg::Dtype::UE8m0;
+            tg::Dtype dTypeSfA{};
+            if (options.mDtypeA == tg::Dtype::E2m1)
+            {
+                dTypeSfA = tg::Dtype::E4m3;
+            }
+            else if (options.mDtypeA == tg::Dtype::MxInt4)
+            {
+                dTypeSfA = tg::Dtype::Bfloat16;
+            }
+            else
+            {
+                dTypeSfA = tg::Dtype::UE8m0;
+            }
 
             // Build TMA descriptor for gmem A block scaling factors.
             auto [shapeSfA, strideSfA, tileShapesSfA]
@@ -455,7 +493,7 @@ static KernelParams setKernelParams(GemmOptions_ const& options, bool const batc
                     options.mTileM, options.mTileN, options.mTileK, tg::SfLayout::R128c4, options.mSfReshapeFactor,
                     options.mSfBlockSizeA.value_or(tg::dtypeNumEltsPerSf(options.mDtypeA)));
             params.tmaSfA[0]
-                = gemm::buildSfTmaDescriptor(dTypeSf, shapeSfA, strideSfA, tileShapesSfA, const_cast<void*>(dSfA));
+                = gemm::buildSfTmaDescriptor(dTypeSfA, shapeSfA, strideSfA, tileShapesSfA, const_cast<void*>(dSfA));
         }
 
         if (options.mDtypeB == tg::Dtype::E2m1 || options.mDtypeB == tg::Dtype::MxE4m3
@@ -482,9 +520,10 @@ static KernelParams setKernelParams(GemmOptions_ const& options, bool const batc
                 auto [shapeSfB, strideSfB, tileShapesSfB] = makeTmaShapeStrideAbc(options, options.mM,
                     options.mNumTokens, numSfsInK, options.mTileM, 1 /* tileN */, options.mTileK / numEltsPerSf,
                     MatrixType::MatrixB, options.mValidM, options.mNumTokens, numSfsInValidK);
-                params.tmaSfB[0] = gemm::buildNdTmaDescriptor(dTypeSf, options.mMmaKind, shapeSfB, strideSfB,
-                    tileShapesSfB, const_cast<void*>(dSfB),
-                    /*doSwizzle*/ true);
+                params.tmaSfB[0]
+                    = gemm::buildNdTmaDescriptor(dTypeSf, shapeSfB, strideSfB, tileShapesSfB, const_cast<void*>(dSfB),
+                        /*doPad=*/false,
+                        /*doSwizzle=*/true);
             }
             else if (batchedGemm::doesRouteImplUseNoRoute(options.mRouteSfsImpl.value()))
             {
@@ -513,8 +552,8 @@ static KernelParams setKernelParams(GemmOptions_ const& options, bool const batc
             auto [shapeC, strideC, tileShapeC] = makeTmaShapeStrideAbc(options, options.mM, ctaOffset * options.mTileN,
                 options.mK, options.mTileM, options.mTileN, options.mTileK, MatrixType::MatrixC);
             // Build tma descriptor for C.
-            params.tmaC[0]
-                = gemm::buildNdTmaDescriptor(options.mDtypeC, tg::MmaKind::Auto, shapeC, strideC, tileShapeC, ptrC);
+            params.tmaC[0] = gemm::buildNdTmaDescriptor(options.mDtypeC, shapeC, strideC, tileShapeC, ptrC,
+                /*doPad=*/false);
         }
         else
         {
@@ -535,8 +574,9 @@ static KernelParams setKernelParams(GemmOptions_ const& options, bool const batc
             = makeTmaShapeStrideAbc(options, options.mM, options.mN, options.mK, options.mTileM, options.mTileN,
                 options.mTileK, MatrixType::MatrixB, options.mValidM, options.mValidN, options.mValidK);
         // Build tma descriptor for B.
-        params.tmaB[0] = gemm::buildNdTmaDescriptor(
-            options.mDtypeB, options.mMmaKind, shapeB, strideB, tileShapeB, const_cast<void*>(ptrB));
+        params.tmaB[0]
+            = gemm::buildNdTmaDescriptor(options.mDtypeB, shapeB, strideB, tileShapeB, const_cast<void*>(ptrB), doPadB,
+                /*doSwizzle=*/true);
 
         if (options.mRouteImpl == batchedGemm::RouteImpl::NoRoute)
         {
@@ -549,8 +589,9 @@ static KernelParams setKernelParams(GemmOptions_ const& options, bool const batc
                 = makeTmaShapeStrideAbc(options, inputNumTokens, options.mN, options.mK, options.mTileM, options.mTileN,
                     options.mTileK, MatrixType::MatrixA, inputNumTokens, options.mValidN, options.mValidK);
             // Build tma descriptor for A.
-            params.tmaA[0] = gemm::buildNdTmaDescriptor(
-                options.mDtypeA, options.mMmaKind, shapeA, strideA, tileShapeA, const_cast<void*>(ptrA));
+            params.tmaA[0] = gemm::buildNdTmaDescriptor(options.mDtypeA, shapeA, strideA, tileShapeA,
+                const_cast<void*>(ptrA), doPadA,
+                /*doSwizzle=*/true);
         }
 
         if (options.mDtypeA == tg::Dtype::E2m1 || options.mDtypeA == tg::Dtype::MxE4m3
@@ -598,8 +639,8 @@ static KernelParams setKernelParams(GemmOptions_ const& options, bool const batc
             auto [shapeC, strideC, tileShapeC] = makeTmaShapeStrideAbc(options, ctaOffset * options.mTileM, options.mN,
                 options.mK, options.mTileM, options.mTileN, options.mTileK, MatrixType::MatrixC);
             // Build tma descriptor for C.
-            params.tmaC[0]
-                = gemm::buildNdTmaDescriptor(options.mDtypeC, tg::MmaKind::Auto, shapeC, strideC, tileShapeC, ptrC);
+            params.tmaC[0] = gemm::buildNdTmaDescriptor(options.mDtypeC, shapeC, strideC, tileShapeC, ptrC,
+                /*doPad=*/false);
         }
         else
         {

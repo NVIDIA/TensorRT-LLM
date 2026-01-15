@@ -60,9 +60,10 @@ set(SRCS
     evictionPolicy.cpp
     cacheTransBuffer.cpp)
 
-file(GLOB_RECURSE XGRAMMAR_SRCS "${3RDPARTY_DIR}/xgrammar/cpp/*.cc")
+set(xgrammar_source_dir ${CMAKE_BINARY_DIR}/_deps/xgrammar-src)
+file(GLOB_RECURSE XGRAMMAR_SRCS "${xgrammar_source_dir}/cpp/*.cc")
 list(FILTER XGRAMMAR_SRCS EXCLUDE REGEX
-     "${3RDPARTY_DIR}/xgrammar/cpp/nanobind/.*\\.cc")
+     "${xgrammar_source_dir}/cpp/nanobind/.*\\.cc")
 list(APPEND SRCS ${XGRAMMAR_SRCS})
 
 if(NOT WIN32)
@@ -83,9 +84,9 @@ endif()
 add_library(${BATCH_MANAGER_STATIC_TARGET} STATIC ${SRCS})
 target_include_directories(
   ${BATCH_MANAGER_STATIC_TARGET}
-  PUBLIC ${3RDPARTY_DIR}/xgrammar/3rdparty/picojson
-         ${3RDPARTY_DIR}/xgrammar/3rdparty/dlpack/include
-         ${3RDPARTY_DIR}/xgrammar/include)
+  PUBLIC ${xgrammar_source_dir}/3rdparty/picojson
+         ${xgrammar_source_dir}/3rdparty/dlpack/include
+         ${xgrammar_source_dir}/include)
 
 set_target_properties(
   ${BATCH_MANAGER_STATIC_TARGET}

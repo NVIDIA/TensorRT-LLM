@@ -1,3 +1,6 @@
+import json
+import os
+import shutil
 import unittest
 from copy import deepcopy
 from dataclasses import dataclass
@@ -50,8 +53,9 @@ EXAONE4_SINGLE_LAYER_CONFIG = {
     "max_position_embeddings": 131072,
     "model_type": "exaone4",
     "num_attention_heads": 40,
-    "num_hidden_layers":
-    4,  #NOTE: For testing, we use 4 instead of 64(all layers)
+    # NOTE: For testing, we use 32 instead of 64(all layers)
+    # Increase from 4 to 32 to trigger the deep_gemm kernel issue
+    "num_hidden_layers": 32,
     "num_key_value_heads": 8,
     "pad_token_id": 0,
     "rms_norm_eps": 1e-05,
@@ -71,6 +75,15 @@ EXAONE4_SINGLE_LAYER_CONFIG = {
     "use_cache": True,
     "vocab_size": 102400,
     "attn_implementation": "flash_attention_2"
+}
+
+EXAONE4_FP8_QUANT_CONFIG = {
+    "quantization_config": {
+        "activation_scheme": "dynamic",
+        "modules_to_not_convert": None,
+        "quant_method": "fp8",
+        "weight_block_size": [128, 128]
+    },
 }
 
 
@@ -387,3 +400,30 @@ class TestEXAONE4(unittest.TestCase):
         if graph_runner is not None:
             graph_runner.clear()
         kv_cache_manager.shutdown()
+
+    @parameterized.expand([None, "FP8"])
+    def test_llm_load(self, quant_algo):
+
+        def dump_config_json(dst_dir, config):
+            if os.path.exists(dst_dir):
+                shutil.rmtree(dst_dir)
+            os.makedirs(dst_dir)
+
+            dst_path = os.path.join(dst_dir, 'config.json')
+            with open(dst_path, 'w', encoding='utf-8') as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+
+        config_dict = deepcopy(EXAONE4_SINGLE_LAYER_CONFIG)
+        if quant_algo == "FP8":
+            if getSMVersion() < 89:
+                self.skipTest(
+                    "This test is not supported in pre-Ada architecture")
+
+            config_dict.update(EXAONE4_FP8_QUANT_CONFIG)
+
+        tmp_model_dir = f"/tmp/exaone4_llm_load_test_model"
+        dump_config_json(tmp_model_dir, config_dict)
+        try:
+            tensorrt_llm.LLM(model=tmp_model_dir, load_format="dummy")
+        except Exception:
+            raise RuntimeError("Failed to load model.")

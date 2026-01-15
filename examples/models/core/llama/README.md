@@ -1542,7 +1542,7 @@ This section provides the steps to run LLaMa-3.3 70B model FP8 precision on PyTo
 
 ### Prepare TensorRT LLM extra configs
 ```bash
-cat >./extra-llm-api-config.yml <<EOF
+cat >./config.yml <<EOF
 stream_interval: 10
 cuda_graph_config:
   max_batch_size: 1024
@@ -1559,14 +1559,14 @@ Explanation:
 
 
 ### Launch trtllm-serve OpenAI-compatible API server
-TensorRT LLM supports nvidia TensorRT Model Optimizer quantized FP8 checkpoint
+TensorRT LLM supports nvidia Model Optimizer quantized FP8 checkpoint
 ``` bash
 trtllm-serve nvidia/Llama-3.3-70B-Instruct-FP8 \
     --tp_size 8 \
     --max_batch_size 1024 \
     --trust_remote_code \
     --num_postprocess_workers 2 \
-    --extra_llm_api_options ./extra-llm-api-config.yml
+    --config ./config.yml
 ```
 
 ### Run performance benchmarks

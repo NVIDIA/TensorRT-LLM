@@ -11,10 +11,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v2
+        uses: actions/checkout@v6
 
       - name: Get assignee
-        uses: actions/github-script@v6
+        uses: actions/github-script@v8
         id: get-assignee
         with:
           github-token: ${{secrets.GITHUB_TOKEN}}

@@ -167,13 +167,11 @@ def create_kt_cache_from_k(
 def pytorch_reference_paged_kt_cache_bmm(
     q: torch.Tensor,
     k: torch.Tensor,
-    dim_pos: torch.Tensor,
     kv_lens: torch.Tensor,
     kt_page_size: int,
     sm_scale: float = None,
 ) -> torch.Tensor:
     num_gen_tokens, num_kv_heads, num_heads_per_kv, head_dim = q.shape
-    total_num_heads = num_kv_heads * num_heads_per_kv
     device = q.device
 
     if sm_scale is None:
@@ -182,7 +180,10 @@ def pytorch_reference_paged_kt_cache_bmm(
     max_kt_tokens = max((kv_len.item() + kt_page_size - 1) // kt_page_size for kv_len in kv_lens)
     total_kt_tokens = num_gen_tokens * max_kt_tokens
 
-    scores = torch.zeros((total_num_heads, 1, total_kt_tokens), dtype=torch.float32, device=device)
+    # Output shape matches kernel: [num_kv_heads, num_heads_per_kv, total_kt_tokens]
+    scores = torch.zeros(
+        (num_kv_heads, num_heads_per_kv, total_kt_tokens), dtype=torch.float32, device=device
+    )
 
     # Process each generation token
     for batch_idx in range(num_gen_tokens):
@@ -191,25 +192,27 @@ def pytorch_reference_paged_kt_cache_bmm(
 
         q_batch = q[batch_idx]  # [num_kv_heads, num_heads_per_kv, head_dim]
         k_batch = k[batch_idx].view(num_kv_heads, head_dim)  # [num_kv_heads, head_dim]
-        dim_pos_batch = dim_pos[batch_idx]  # [num_kv_heads, head_dim]
 
         output_offset = batch_idx * max_kt_tokens
 
         for kv_head_idx in range(num_kv_heads):
+            q_heads = q_batch[kv_head_idx]  # [num_heads_per_kv, head_dim]
+            q_sum = q_heads.sum(dim=0)  # [head_dim]
+            dim_pos_vec = q_sum > 0  # [head_dim], boolean mask
+
+            k_vec = k_batch[kv_head_idx]  # [head_dim]
+
+            # Select k_max where dim_pos > 0, k_min otherwise
+            # For simplicity in test, we use k as both min and max
+            k_selected = torch.where(dim_pos_vec, k_vec, k_vec)
+
             for q_head_idx in range(num_heads_per_kv):
-                global_head_idx = kv_head_idx * num_heads_per_kv + q_head_idx
-
                 q_vec = q_batch[kv_head_idx, q_head_idx]  # [head_dim]
-                k_vec = k_batch[kv_head_idx]  # [head_dim]
-                dim_pos_vec = dim_pos_batch[kv_head_idx]  # [head_dim]
-
-                # Simulate KT selection based on dim_pos
-                k_selected = torch.where(dim_pos_vec > 0, k_vec, k_vec)
 
                 # Compute score for each kt token (simplified)
                 for kt_idx in range(num_kt_tokens):
                     score = torch.dot(q_vec, k_selected) * sm_scale
-                    scores[global_head_idx, 0, output_offset + kt_idx] = score
+                    scores[kv_head_idx, q_head_idx, output_offset + kt_idx] = score
 
     return scores
 
@@ -312,17 +315,6 @@ def test_triton_rocket_paged_kt_cache_bmm(
     # Create K tensor for reference: [num_gen_tokens, num_kv_heads * head_dim]
     k = torch.randn((num_gen_tokens, num_kv_heads * head_dim), dtype=dtype, device=device)
 
-    # Create dim_pos: [num_gen_tokens, num_kv_heads, head_dim]
-    # Randomly set some dimensions to head_dim (positive) and others to 0
-    dim_pos = torch.zeros(
-        (num_gen_tokens, num_kv_heads, head_dim), dtype=torch.int32, device=device
-    )
-    for i in range(num_gen_tokens):
-        for j in range(num_kv_heads):
-            num_positive = torch.randint(0, head_dim, (1,)).item()
-            positive_indices = torch.randperm(head_dim)[:num_positive]
-            dim_pos[i, j, positive_indices] = head_dim
-
     # Create paged KT cache
     kt_cache_tensor, kt_cache_block_offsets, max_kt_blocks_per_seq = create_kt_cache_from_k(
         k=k,
@@ -344,7 +336,6 @@ def test_triton_rocket_paged_kt_cache_bmm(
         q=q,
         kt_cache_tensor=kt_cache_tensor,
         kt_cache_block_offsets=kt_cache_block_offsets,
-        dim_pos=dim_pos,
         kv_lens=kv_lens_tensor,
         output_offsets=output_offsets,
         kt_page_size=kt_page_size,
@@ -357,7 +348,6 @@ def test_triton_rocket_paged_kt_cache_bmm(
     reference_scores = pytorch_reference_paged_kt_cache_bmm(
         q=q,
         k=k,
-        dim_pos=dim_pos,
         kv_lens=kv_lens_tensor,
         kt_page_size=kt_page_size,
         sm_scale=None,

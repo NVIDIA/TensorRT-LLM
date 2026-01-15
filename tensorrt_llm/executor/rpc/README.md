@@ -83,3 +83,8 @@ except RPCError as e:
 # Shutdown server from client
 client.shutdown_server()
 ```
+
+## Network Security
+
+The RPC supports built-in HMAC-based authentication to secure the communication between the server and the client. 
+To enable that, you need to provide a shared secret key (bytes) to both the `RPCServer` and `RPCClient`.

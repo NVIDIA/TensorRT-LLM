@@ -1,4 +1,6 @@
 import argparse
+import json
+import time
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import (AttentionDpConfig, AutoDecodingConfig,
@@ -23,6 +25,11 @@ def add_llm_args(parser):
                         type=str,
                         nargs="+",
                         help="A single or a list of text prompts.")
+    parser.add_argument('--checkpoint_format',
+                        type=str,
+                        default=None,
+                        choices=["HF", "mistral"],
+                        help="Model checkpoint format.")
     # Build config
     parser.add_argument("--max_seq_len",
                         type=int,
@@ -70,6 +77,11 @@ def add_llm_args(parser):
                         choices=["auto", "TorchSampler", "TRTLLMSampler"])
     parser.add_argument('--tp_size', type=int, default=1)
     parser.add_argument('--pp_size', type=int, default=1)
+    parser.add_argument('--orchestrator_type',
+                        type=str,
+                        default=None,
+                        choices=[None, 'rpc', 'ray'],
+                        help='Orchestrator type for multi-GPU execution')
     parser.add_argument('--moe_ep_size', type=int, default=-1)
     parser.add_argument('--moe_tp_size', type=int, default=-1)
     parser.add_argument('--moe_cluster_size', type=int, default=-1)
@@ -85,6 +97,9 @@ def add_llm_args(parser):
                         default=False,
                         action='store_true')
     parser.add_argument("--tokens_per_block", type=int, default=32)
+    parser.add_argument('--log_kv_cache_events',
+                        default=False,
+                        action='store_true')
 
     # Runtime
     parser.add_argument('--disable_overlap_scheduler',
@@ -138,6 +153,14 @@ def add_llm_args(parser):
                         default=False,
                         action='store_true')
     parser.add_argument('--dynamic_tree_max_topK', type=int, default=None)
+    parser.add_argument('--allow_advanced_sampling',
+                        default=False,
+                        action='store_true')
+    parser.add_argument('--eagle3_model_arch',
+                        type=str,
+                        default="llama3",
+                        choices=["llama3", "mistral_large3"],
+                        help="The model architecture of the eagle3 model.")
 
     # Relaxed acceptance
     parser.add_argument('--use_relaxed_acceptance_for_thinking',
@@ -182,7 +205,7 @@ def setup_llm(args, **kwargs):
         free_gpu_memory_fraction=args.kv_cache_fraction,
         dtype=args.kv_cache_dtype,
         tokens_per_block=args.tokens_per_block,
-    )
+        event_buffer_max_size=1024 if args.log_kv_cache_events else 0)
 
     spec_decode_algo = args.spec_decode_algo.upper(
     ) if args.spec_decode_algo is not None else None
@@ -197,19 +220,21 @@ def setup_llm(args, **kwargs):
             relaxed_topk=args.relaxed_topk,
             relaxed_delta=args.relaxed_delta,
             mtp_eagle_one_model=args.use_one_model,
-            speculative_model_dir=args.model_dir)
+            speculative_model=args.model_dir)
     elif spec_decode_algo == "EAGLE3":
         spec_config = EagleDecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,
-            speculative_model_dir=args.draft_model_dir,
+            speculative_model=args.draft_model_dir,
             eagle3_one_model=args.use_one_model,
             eagle_choices=args.eagle_choices,
             use_dynamic_tree=args.use_dynamic_tree,
-            dynamic_tree_max_topK=args.dynamic_tree_max_topK)
+            dynamic_tree_max_topK=args.dynamic_tree_max_topK,
+            allow_advanced_sampling=args.allow_advanced_sampling,
+            eagle3_model_arch=args.eagle3_model_arch)
     elif spec_decode_algo == "DRAFT_TARGET":
         spec_config = DraftTargetDecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,
-            speculative_model_dir=args.draft_model_dir)
+            speculative_model=args.draft_model_dir)
     elif spec_decode_algo == "NGRAM":
         spec_config = NGramDecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,
@@ -237,6 +262,7 @@ def setup_llm(args, **kwargs):
     llm = LLM(
         model=args.model_dir,
         backend='pytorch',
+        checkpoint_format=args.checkpoint_format,
         disable_overlap_scheduler=args.disable_overlap_scheduler,
         kv_cache_config=kv_cache_config,
         attn_backend=args.attention_backend,
@@ -267,6 +293,7 @@ def setup_llm(args, **kwargs):
         trust_remote_code=args.trust_remote_code,
         gather_generation_logits=args.return_generation_logits,
         max_beam_width=args.max_beam_width,
+        orchestrator_type=args.orchestrator_type,
         **kwargs)
 
     use_beam_search = args.max_beam_width > 1
@@ -276,7 +303,7 @@ def setup_llm(args, **kwargs):
             args.n = args.max_beam_width
         assert best_of <= args.max_beam_width, f"beam width: {best_of}, should be less or equal to max_beam_width: {args.max_beam_width}"
 
-    assert best_of >= args.n, f"In sampling mode best_of value: {best_of} should be less or equal to n: {args.n}"
+    assert best_of >= args.n, f"In sampling mode best_of value: {best_of} should be greater than or equal to n: {args.n}"
 
     sampling_params = SamplingParams(
         max_tokens=args.max_tokens,
@@ -343,6 +370,13 @@ def main():
                     print(
                         f"[{i}]{sequence_id_text} Generation {output_name}: {sequence.additional_generation_outputs[output_name]}"
                     )
+
+    if args.log_kv_cache_events:
+        time.sleep(1)  # Wait for events to be dispatched
+        events = llm.get_kv_cache_events(5)
+        print("=== KV_CACHE_EVENTS_START ===")
+        print(json.dumps(events, indent=2))
+        print("=== KV_CACHE_EVENTS_END ===")
 
 
 if __name__ == '__main__':

@@ -20,6 +20,8 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
 
+TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -32,6 +34,7 @@ void fused_qk_norm_rope(
     int64_t num_heads_k,         // Number of key heads
     int64_t num_heads_v,         // Number of value heads
     int64_t head_dim,            // Dimension per head
+    int64_t rotary_dim,          // Dimension for RoPE
     double eps,                  // Epsilon for RMS normalization
     torch::Tensor& q_weight,     // RMSNorm weights for query [head_dim]
     torch::Tensor& k_weight,     // RMSNorm weights for key [head_dim]
@@ -42,7 +45,8 @@ void fused_qk_norm_rope(
     double factor, // factor in rope_scaling in config.json. When it is not 1.0, it means the model is using yarn.
     double low,    // threshold for high frequency
     double high,   // threshold for low frequency
-    double attention_factor // attention_factor applied on cos and sin
+    double attention_factor, // attention_factor applied on cos and sin
+    bool is_qk_norm          // Whether to apply QK norm
 )
 {
     // Input validation
@@ -69,21 +73,22 @@ void fused_qk_norm_rope(
 
     tensorrt_llm::kernels::launchFusedQKNormRope(reinterpret_cast<__nv_bfloat16*>(qkv.data_ptr()),
         static_cast<int>(num_tokens), static_cast<int>(num_heads_q), static_cast<int>(num_heads_k),
-        static_cast<int>(num_heads_v), static_cast<int>(head_dim), static_cast<float>(eps),
-        reinterpret_cast<__nv_bfloat16*>(q_weight.data_ptr()), reinterpret_cast<__nv_bfloat16*>(k_weight.data_ptr()),
-        static_cast<float>(base),
+        static_cast<int>(num_heads_v), static_cast<int>(head_dim), static_cast<int>(rotary_dim),
+        static_cast<float>(eps), reinterpret_cast<__nv_bfloat16*>(q_weight.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(k_weight.data_ptr()), static_cast<float>(base),
         !is_neox, // interleave
         reinterpret_cast<int const*>(position_ids.data_ptr()), static_cast<float>(factor), static_cast<float>(low),
-        static_cast<float>(high), static_cast<float>(attention_factor), stream);
+        static_cast<float>(high), static_cast<float>(attention_factor), stream, is_qk_norm);
 }
 
 // Register the PyTorch operators
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "fused_qk_norm_rope(Tensor(a!) qkv, int num_heads_q, int num_heads_k, int num_heads_v, int head_dim, float "
+        "fused_qk_norm_rope(Tensor(a!) qkv, int num_heads_q, int num_heads_k, int num_heads_v, int head_dim, int "
+        "rotary_dim, float "
         "eps, Tensor q_weight, Tensor k_weight, float base, bool is_neox, Tensor position_ids, float factor, float "
-        "low, float high, float attention_factor) -> ()");
+        "low, float high, float attention_factor, bool is_qk_norm) -> ()");
 }
 
 // Register the CUDA implementation
@@ -93,3 +98,5 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 }
 
 } // namespace torch_ext
+
+TRTLLM_NAMESPACE_END

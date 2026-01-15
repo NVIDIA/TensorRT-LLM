@@ -1,6 +1,6 @@
 import asyncio
+import dataclasses
 import json
-import threading
 import time
 import weakref
 from dataclasses import dataclass, field
@@ -15,12 +15,11 @@ import torch.nn.functional as F
 from tensorrt_llm.llmapi import tracing
 
 try:
-    import ray
+    pass
 except ModuleNotFoundError:
-    from tensorrt_llm import ray_stub as ray
+    pass
 
-from .._ray_utils import unwrap_ray_errors
-from .._utils import mpi_disabled, nvtx_range_debug, ray_use_rpc
+from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.tracer import global_tracer
@@ -160,104 +159,12 @@ class CompletionOutput:
         return self.logprobs[self._last_logprobs_len:]
 
 
-def warmup_tensorrt_llm():
-    import tensorrt_llm
-    print("Warmup by importing tensorrt_llm with version",
-          tensorrt_llm.version.__version__)
-
-
-@ray.remote(max_concurrency=1000000, num_cpus=2)
-class RayAsyncQueue:
-    """Ray actor for async response handling."""
-
-    def __init__(self):
-        self.data = {}
-        self.event_map = {}
-        self.warmup_done = False
-
-    def register(self, key: int):
-        assert key not in self.event_map, f"Key {key} already registered"
-        self.event_map[key] = asyncio.Event()
-
-    def unregister(self, key: int):
-        if key in self.event_map:
-            del self.event_map[key]
-
-        if key in self.data:
-            del self.data[key]
-
-    def warmup(self):
-        if self.warmup_done:
-            return
-        warmup_tensorrt_llm()
-        self.warmup_done = True
-
-    def put_response(self, key: int, item: Any):
-        assert key in self.event_map, f"Key {key} not registered"
-        self.data[key] = item
-        self.event_map[key].set()
-
-    async def get_async(self, key: int):
-        assert key in self.event_map, f"Key {key} not registered"
-        await self.event_map[key].wait()
-        self.event_map[key].clear()
-        ret = self.data[key]
-        del self.data[key]
-        return ret
-
-
-SYNC_QUEUE_MAX_CONCURRENCY = 2
-
-
-@ray.remote(max_concurrency=SYNC_QUEUE_MAX_CONCURRENCY,
-            num_cpus=SYNC_QUEUE_MAX_CONCURRENCY)
-class RaySyncQueue:
-    """Ray actor for sync response handling."""
-
-    def __init__(self):
-        self.data = {}
-        self.event_map = {}
-        self.semaphore = threading.Semaphore(SYNC_QUEUE_MAX_CONCURRENCY - 1)
-        self.warmup_done = False
-
-    def register(self, key: int):
-        assert key not in self.event_map, f"Key {key} already registered"
-        self.event_map[key] = threading.Event()
-        self.event_map[key]
-
-    def unregister(self, key: int):
-        if key in self.event_map:
-            del self.event_map[key]
-
-        if key in self.data:
-            del self.data[key]
-
-    def warmup(self):
-        if self.warmup_done:
-            return
-        warmup_tensorrt_llm()
-        self.warmup_done = True
-
-    def put_response(self, key: int, item: Any):
-        self.data[key] = item
-        self.event_map[key].set()
-
-    def get(self, key: int):
-        with self.semaphore:
-            self.event_map[key].wait()
-            self.event_map[key].clear()
-            ret = self.data[key]
-            del self.data[key]
-            return ret
-
-
 class GenerationResultBase:
     ''' This holds the core logic of the GenerationResult class. '''
 
     def __init__(self,
                  id: int,
                  sampling_params: SamplingParams,
-                 ray_queue: Optional[RayAsyncQueue] = None,
                  background_error_handler: Optional[Callable] = None,
                  postproc_params: "Optional[PostprocParams]" = None):
         self.id = id
@@ -275,22 +182,12 @@ class GenerationResultBase:
         # torch backend will use trtllm sampler in beam search mode, but it does not support return logprobs incrementally
         self.use_trtllm_sampler = sampling_params.use_beam_search and sampling_params.best_of > 1
 
-        if ray_queue is not None and not ray_use_rpc():
-            if has_event_loop():
-                self.aqueue = ray_queue
-                self.queue = self.aqueue
-            else:
-                self.queue = ray_queue
-                self.aqueue = None
-            with unwrap_ray_errors():
-                ray.get(self.queue.register.remote(id))
+        if has_event_loop():
+            self.aqueue = AsyncQueue()
+            self.queue = self.aqueue.sync_q
         else:
-            if has_event_loop():
-                self.aqueue = AsyncQueue()
-                self.queue = self.aqueue.sync_q
-            else:
-                self.queue = Queue()
-                self.aqueue = None
+            self.queue = Queue()
+            self.aqueue = None
 
         # In Sampling mode, the Executor runtime will return best_of sequences
         # in total, which the LLM API will select the n-best sequences among
@@ -423,7 +320,14 @@ class GenerationResultBase:
         if response_tensors.request_perf_metrics is not None:
             output.request_perf_metrics = response_tensors.request_perf_metrics
 
-        if self._done:
+        # Check if this specific sequence is finished (not just if the entire request is done)
+        # This is important for best_of > n sampling where sequences finish at different times
+        sequence_is_finished = (finish_reasons and finish_reasons[src_idx]
+                                != tllm.FinishReason.NOT_FINISHED
+                                and finish_reasons[src_idx]
+                                != tllm.FinishReason.CANCELLED) or self._done
+
+        if sequence_is_finished:
             if finish_reasons[src_idx] == tllm.FinishReason.END_ID:
                 output.finish_reason = 'stop'
             elif finish_reasons[src_idx] == tllm.FinishReason.STOP_WORDS:
@@ -448,6 +352,9 @@ class GenerationResultBase:
             else:
                 raise ValueError(
                     f"Unknown finish reason: {finish_reasons[src_idx]}")
+
+        # Only record stats and do tracing when the entire request is done
+        if self._done:
             self.record_stats(output, req_perf_metrics_dict)
             self.do_tracing(output, req_perf_metrics_dict)
 
@@ -509,12 +416,19 @@ class GenerationResultBase:
             self.cached_tokens = getattr(response_result, 'cached_tokens', 0)
             self.avg_decoded_tokens_per_iter = response_result.avg_decoded_tokens_per_iter
             if context_phase_params is not None:
-                self.disaggregated_params = DisaggregatedParams(
+                existing_disagg_params = self.disaggregated_params
+                # Use `replace` to preserve things like `mrope_position_ids_handle` and
+                # `mrope_position_deltas_handle`. However, explicitly set
+                # `multimodal_embedding_handles=None` since they should no longer be needed.
+                self.disaggregated_params = dataclasses.replace(
+                    existing_disagg_params or DisaggregatedParams(),
                     request_type="context_only",
                     first_gen_tokens=context_phase_params.first_gen_tokens,
                     ctx_request_id=context_phase_params.req_id,
                     opaque_state=context_phase_params.opaque_state,
-                    draft_tokens=context_phase_params.draft_tokens)
+                    draft_tokens=context_phase_params.draft_tokens,
+                    multimodal_embedding_handles=None,
+                )
 
             finish_reasons = response_result.finish_reasons
             # output_token_ids = (beams, tokens)
@@ -534,6 +448,8 @@ class GenerationResultBase:
             if hasattr(response_result, 'mm_embedding_handle'
                        ) and response_result.mm_embedding_handle is not None:
                 self._mm_embedding_handle = response_result.mm_embedding_handle
+                mrope_position_ids_handle = response_result.mrope_position_ids_handle
+                mrope_position_deltas_handle = response_result.mrope_position_deltas_handle
                 if self.disaggregated_params is not None:
                     self.disaggregated_params.multimodal_embedding_handles = [
                         response_result.mm_embedding_handle
@@ -545,6 +461,8 @@ class GenerationResultBase:
                             response_result.mm_embedding_handle
                         ],
                         multimodal_hashes=self._multimodal_hashes)
+                self.disaggregated_params.mrope_position_ids_handle = mrope_position_ids_handle
+                self.disaggregated_params.mrope_position_deltas_handle = mrope_position_deltas_handle
 
             # Processing background errors here ASAF during generation.
             if self._background_error_handler and (
@@ -556,12 +474,6 @@ class GenerationResultBase:
                 handler(response.error_msg)
         else:
             raise ValueError(f"Unknown response type: {response}")
-
-        if self._done and mpi_disabled() and not ray_use_rpc():
-            assert hasattr(
-                self.queue, "unregister"
-            ), "Ray path should be activated for unregistering the Ray queue."
-            self.queue.unregister.remote(self.id)
 
     def record_stats(self,
                      output: CompletionOutput,
@@ -761,7 +673,6 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
 
                             beam_output.finish_reason = 'stop'
                             beam_output.stop_reason = stop_reason
-                            self.abort()
                             self._done = True
                             break
 
@@ -788,15 +699,9 @@ class GenerationResult(GenerationResultBase):
         disaggregated_params: Optional[DisaggregatedParams] = None,
         logprob_params: Optional[LogprobParams] = None,
     ) -> None:
-        use_async_queue = has_event_loop()
-        shared_queue = None
-        if executor and executor.use_ray_queue() and not ray_use_rpc():
-            shared_queue = executor.async_response_queue_weakref if use_async_queue else executor.sync_response_queue_weakref
-
         super().__init__(
             generation_request.id,
             generation_request.sampling_params,
-            shared_queue,
             background_error_handler,
             postproc_params=generation_request.postproc_params,
         )
@@ -855,22 +760,12 @@ class GenerationResult(GenerationResultBase):
         return response
 
     def _result_step(self, timeout: Optional[float] = None):
-        if mpi_disabled() and not ray_use_rpc():
-            with unwrap_ray_errors():
-                response = ray.get(self.queue.get.remote(self.request_id))
-            response = self._handle_ray_response(response)
-        else:
-            response = self.queue.get()
-
+        response = self.queue.get()
         self._handle_response(response)
 
     async def _aresult_step(self):
         assert self.aqueue is not None, "The asyncio event loop was not present during initialization, so async operations are not available."
-        if mpi_disabled() and not ray_use_rpc():
-            response = await self.aqueue.get_async.remote(self.request_id)
-            response = self._handle_ray_response(response)
-        else:
-            response = await self.aqueue.get()
+        response = await self.aqueue.get()
         global_tracer().log_instant("result_step.get")
         self._handle_response(response)
 
@@ -928,8 +823,12 @@ class GenerationResult(GenerationResultBase):
 
     def _repr_fields(self):
         return [
-            'request_id', 'prompt_token_ids', 'outputs', 'finished',
-            "context_logits", "mm_embedding_handle"
+            'request_id',
+            'prompt_token_ids',
+            'outputs',
+            'finished',
+            "context_logits",
+            "mm_embedding_handle",
         ]
 
     def __repr__(self) -> str:

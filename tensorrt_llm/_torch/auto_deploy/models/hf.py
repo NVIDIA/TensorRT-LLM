@@ -110,6 +110,10 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         "use_cache": False,
     }
 
+    # The below maps from a model's config class definition's name (str) to the alternative `AutoModelForCausalLM`
+    # implementation we would like to use.
+    _custom_model_mapping: Dict[str, Type[AutoModelForCausalLM]] = {}
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._quant_config_reader: QuantConfigReader | None = None
@@ -136,13 +140,6 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
     def vocab_size_padded(self) -> Optional[int]:
         model_config, _ = self._get_model_config()
         return getattr(model_config, "vocab_size", None)
-
-    @property
-    def chunk_size(self) -> Optional[int]:
-        """Returns the chunk size for this model."""
-        model_config, _ = self._get_model_config()
-        # chunk_size is an input to a custom op, so it can not be none. We set it to a default value of 128.
-        return getattr(model_config, "chunk_size", 128)
 
     def _recursive_update_config(
         self, config: PretrainedConfig, update_dict: Dict[str, Any]
@@ -212,14 +209,28 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         """Build the model on the desired device."""
         model_config, unused_kwargs = self._get_model_config()
 
+        config_cls_name = type(model_config).__name__
+        custom_model_cls = self._custom_model_mapping.get(config_cls_name, None)
         with (init_empty_weights if device == "meta" else nullcontext)():
-            model = self.automodel_cls.from_config(
-                model_config,
-                **{
-                    "trust_remote_code": True,
-                    **unused_kwargs,
-                },
-            )
+            if custom_model_cls is not None:
+                # `_from_config` has some behavior we would like to use where possible. It is
+                # defined in the `PreTrainedModel` mixin.
+                ad_logger.info(f"Using custom model implementation {custom_model_cls}")
+                if not hasattr(custom_model_cls, "_from_config"):
+                    raise ValueError(
+                        f"`{custom_model_cls.__name__}` must have a `_from_config` class method. "
+                        "Consider inheriting from `PreTrainedModel`."
+                    )
+                model = custom_model_cls._from_config(model_config, **unused_kwargs)
+            else:
+                model = self.automodel_cls.from_config(
+                    model_config,
+                    **{
+                        "trust_remote_code": True,
+                        **unused_kwargs,
+                    },
+                )
+
         if device == "meta":
             # post-init --> this must be called explicitly for HF models the way we initialize them
             # since this "gets lost" with the init_empty_weights context manager.
@@ -228,7 +239,7 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         else:
             model.to(device)
 
-        # if present, initialize sharding config. We need head_dim for colwise sharding.
+        # if present, initialize sharding config.
         self._set_sharding_config(model.config)
         self._checkpoint_conversion_mapping = getattr(model, "_checkpoint_conversion_mapping", None)
 
@@ -241,17 +252,8 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
 
     def _set_sharding_config(self, model_config: PretrainedConfig):
         """Set the sharding config for the model."""
-        self._sharding_config["head_dim"] = 1
         if hasattr(model_config, "base_model_tp_plan"):
             self._sharding_config["tp_plan"] = model_config.base_model_tp_plan
-        if hasattr(model_config, "head_dim") and model_config.head_dim is not None:
-            self._sharding_config["head_dim"] = model_config.head_dim
-        elif hasattr(model_config, "hidden_size") and hasattr(model_config, "num_attention_heads"):
-            self._sharding_config["head_dim"] = (
-                model_config.hidden_size // model_config.num_attention_heads
-            )
-        if hasattr(model_config, "num_hidden_layers"):
-            self._sharding_config["num_hidden_layers"] = model_config.num_hidden_layers
 
     def get_quant_config(self) -> Dict:
         """Returns the quantization config for this model or an empty dict if not quantized."""
@@ -482,6 +484,27 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
     def get_export_infos(self, model: nn.Module) -> List[SubModuleExportInfo]:
         return [FullModelExportInfo()]
 
+    @classmethod
+    def register_custom_model_cls(
+        cls, config_cls_name: str, custom_model_cls: Type[AutoModelForCausalLM]
+    ) -> None:
+        """Register a custom model implementation.
+
+        This is useful when the default `AutoModelForCausalLM` is not the one we want to use. For
+        example, when the model's code is in a HuggingFace repo that is out of date, or has
+        dependencies that TensorRT-LLM does not have, etc.
+
+        Args:
+            config_cls_name: This should be the model's config class definition's `__name__` attribute.
+            custom_model_cls: The `AutoModelForCausalLM` implementation that should be used for
+                `model_type`.
+        """
+        cls._custom_model_mapping[config_cls_name] = custom_model_cls
+
+    def __init_subclass__(cls, **kwargs):
+        """Hook when child classes are defined."""
+        cls._custom_model_mapping = {}
+
 
 class _StateDictParamNameConverter:
     """Helper class for applying param name conversions to a state dict.
@@ -610,10 +633,6 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
             text_config = model_config.text_config
             if hasattr(text_config, "base_model_tp_plan"):
                 self._sharding_config["tp_plan"] = text_config.base_model_tp_plan
-            if hasattr(text_config, "head_dim"):
-                self._sharding_config["head_dim"] = text_config.head_dim
-            if hasattr(text_config, "num_hidden_layers"):
-                self._sharding_config["num_hidden_layers"] = text_config.num_hidden_layers
 
     @property
     def automodel_cls(self) -> Type[_BaseAutoModelClass]:

@@ -3,11 +3,10 @@ from typing import List, Optional
 import pytest
 import torch
 import torch.nn as nn
-from _graph_test_helpers import SequenceEmbeddingInfo
 from _model_test_utils import GQA
 from _torch_test_utils import all_close
 
-from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import CacheConfig
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import CacheConfig, SequenceInfo
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.factory import (
     FullModelExportInfo,
@@ -42,19 +41,25 @@ class DummyFactory(ModelFactory):
 
 
 # Class that uses SDPA directly instead of the regular attention mechanism
-class GQAWithSdpa(GQA):
-    """GQA model that uses SDPA directly instead of the regular attention."""
+class GQAWithSdpaAndEmbedding(GQA):
+    """GQA model with embedding layer that uses SDPA directly instead of the regular attention."""
 
     def __init__(
         self,
-        *args,
-        **kwargs,
+        num_attention_heads: int,
+        hidden_size: int,
+        num_key_value_heads: int,
+        vocab_size: int = 1000,
     ):
-        super().__init__(*args, **kwargs)
+        super().__init__(num_attention_heads, hidden_size, num_key_value_heads)
         # Store the head dimensions explicitly
-        self.num_heads = args[0]  # First argument is num_attention_heads
-        self.num_kv_heads = args[2]  # Third argument is num_key_value_heads
-        self.head_dim = args[1] // self.num_heads  # hidden_size / num_heads
+        self.num_heads = num_attention_heads
+        self.num_kv_heads = num_key_value_heads
+        self.head_dim = hidden_size // num_attention_heads
+        self.vocab_size = vocab_size
+
+        # Add embedding layer
+        self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
 
         if self.num_heads != self.num_kv_heads:
             self.num_key_value_groups = self.num_heads // self.num_kv_heads
@@ -69,12 +74,15 @@ class GQAWithSdpa(GQA):
         Forward pass with input tokens and optional position ids.
         position_ids parameter added to match expected interface in kvcache.py
         """
-        b, s, _ = input_ids.shape
+        # Embed input_ids: [b, s] -> [b, s, hidden]
+        x = self.embed_tokens(input_ids)
+
+        b, s, _ = x.shape
 
         # Project input to q, k, v representations
-        q = self.q_proj(input_ids)  # [b, s, n*h_d]
-        k = self.k_proj(input_ids)  # [b, s, n_kv*h_d]
-        v = self.v_proj(input_ids)  # [b, s, n_kv*h_d]
+        q = self.q_proj(x)  # [b, s, n*h_d]
+        k = self.k_proj(x)  # [b, s, n_kv*h_d]
+        v = self.v_proj(x)  # [b, s, n_kv*h_d]
 
         # Reshape to [b, s, n, h_d]
         q = q.view(b, s, self.num_heads, self.head_dim)
@@ -141,29 +149,29 @@ def test_sdpa_with_kv_cache(dtype, attn_backend, gqa_config):
     num_reset_steps = 2
     num_random_steps = 4
     max_position_embeddings = 128
+    vocab_size = 1000
 
-    # set up sequence+cache objects
-    ci = SequenceEmbeddingInfo(
+    # set up sequence+cache objects using standard SequenceInfo
+    ci = SequenceInfo(
         max_seq_len=max_position_embeddings,
         max_batch_size=batch_size,
-        hidden_size=hidden_size,
-        dtype=dtype,
     )
     cm = CachedSequenceInterface(sequence_info=ci, device="cuda")
 
-    # Create the model with SDPA and wrap it in a fake factory
-    model = GQAWithSdpa(
+    # Create the model with embedding layer and SDPA, wrap it in a fake factory
+    model = GQAWithSdpaAndEmbedding(
         num_attention_heads,
         hidden_size,
         num_key_value_heads,
+        vocab_size=vocab_size,
     ).to(dtype=dtype, device="cuda")
 
-    # Create input tensor and position_ids
-    x = torch.rand(batch_size, seq_len, hidden_size).to(device="cuda", dtype=dtype)
+    # Create input token ids and position_ids
+    input_ids = torch.randint(0, vocab_size, (batch_size, seq_len), device="cuda")
     position_ids = torch.arange(0, seq_len).unsqueeze(0).repeat(batch_size, 1).to("cuda")
 
     # Get the model's regular output
-    y_model = model(x, position_ids)  # b, s, d
+    y_model = model(input_ids, position_ids)  # b, s, d
 
     # Apply the transformation
     optimizer = InferenceOptimizer(
@@ -186,9 +194,6 @@ def test_sdpa_with_kv_cache(dtype, attn_backend, gqa_config):
             },
             "cleanup_input_constraints": {
                 "stage": "post_export",
-            },
-            "update_in_out_nodes": {
-                "stage": "cache_init",
             },
             "insert_cached_attention": {
                 "stage": "cache_init",
@@ -215,25 +220,29 @@ def test_sdpa_with_kv_cache(dtype, attn_backend, gqa_config):
 
     # Test 1: Regular inference (all tokens at once)
     cm.info.reset()
-    y_no_cache = _call_and_unnest(x, 0)
+    y_no_cache = _call_and_unnest(input_ids, 0)
     assert all_close(y_model, y_no_cache, atol=atol, rtol=rtol)
 
     # Test 2: Autoregressive inference with KV cache
     cm.info.reset()
     y_with_cache = torch.empty_like(y_model)
-    for i_p in range(x.shape[1]):
+    for i_p in range(input_ids.shape[1]):
         # Just pass the current token
-        y_with_cache[:, i_p : i_p + 1] = _call_and_unnest(x[:, i_p : i_p + 1], i_p)
+        y_with_cache[:, i_p : i_p + 1] = _call_and_unnest(input_ids[:, i_p : i_p + 1], i_p)
     assert all_close(y_model, y_with_cache, atol=atol, rtol=rtol)
 
     # Test 3: Cache continuation after random tokens
-    for i_p in range(x.shape[1] - num_reset_steps, x.shape[1] - num_reset_steps + num_random_steps):
-        _call_and_unnest(torch.rand_like(x[:, :1]), i_p)
+    for i_p in range(
+        input_ids.shape[1] - num_reset_steps,
+        input_ids.shape[1] - num_reset_steps + num_random_steps,
+    ):
+        random_tokens = torch.randint(0, vocab_size, (batch_size, 1), device="cuda")
+        _call_and_unnest(random_tokens, i_p)
 
     # Continue inference from previous context
     cm.info.reset()
-    for i_p in range(x.shape[1] - num_reset_steps, x.shape[1]):
-        y_with_cache[:, i_p : i_p + 1] = _call_and_unnest(x[:, i_p : i_p + 1], i_p)
+    for i_p in range(input_ids.shape[1] - num_reset_steps, input_ids.shape[1]):
+        y_with_cache[:, i_p : i_p + 1] = _call_and_unnest(input_ids[:, i_p : i_p + 1], i_p)
     assert all_close(y_model, y_with_cache, atol=atol, rtol=rtol)
 
     # Test 4: Exportability of the transformed model

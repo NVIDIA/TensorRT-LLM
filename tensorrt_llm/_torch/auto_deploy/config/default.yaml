@@ -28,6 +28,8 @@ transforms:
     stage: pattern_matcher
   match_dense_moe_pattern:
     stage: pattern_matcher
+  match_bmm_moe_pattern:
+    stage: pattern_matcher
   match_repeat_kv:
     stage: pattern_matcher
     run_shape_prop: true
@@ -46,6 +48,8 @@ transforms:
   match_rope_layout:
     stage: pattern_matcher
     expected_layout: bsnd
+  match_rmsnorm_pattern:
+    stage: pattern_matcher
   ############################################################################################
   # RUN TRANSFORMATIONS ON STANDARDIZED GRAPH REPRESENTATION
   ############################################################################################
@@ -73,12 +77,17 @@ transforms:
     stage: pattern_matcher
   quantize_mxfp4_moe:
     stage: pattern_matcher
+  detect_hidden_states_for_capture:
+    stage: pattern_matcher
   detect_sharding:
     stage: sharding
     simple_shard_only: false
-    sharding_source: ['factory','heuristic']
+    sharding_source: ['manual', 'factory', 'heuristic']
     support_partial_config: true
     sharding_dims: ['tp', 'ep', 'bmm']
+    shard_all_unprocessed: true
+    allreduce_strategy: 'NCCL'
+    dist_backend: auto
     requires_shape_prop: true
   sharding_transform_executor:
     stage: sharding
@@ -119,26 +128,33 @@ transforms:
     stage: post_load_fusion
     enabled: true
     backend: trtllm
+  fuse_nvfp4_moe:
+    stage: post_load_fusion
+    enabled: false
   fuse_allreduce_residual_rmsnorm:
     stage: post_load_fusion
   # TODO (lucaslie): add backend selection as part of configurable inference optimizers
   fuse_rmsnorm:
     stage: post_load_fusion
-    rmsnorm_backend: triton
+    rmsnorm_backend: flashinfer
     gated_rmsnorm_backend: triton
     requires_shape_prop: true
-
+  fuse_add_rms_norm:
+    stage: post_load_fusion
+    enabled: true
+  gather_logits_before_lm_head:
+    stage: post_load_fusion
+    # TODO: fix https://github.com/NVIDIA/TensorRT-LLM/issues/9878 to enable by default
+    enabled: false
   ############################################################################################
   # VISUALIZE GRAPH
   ############################################################################################
   visualize_namespace:
     stage: visualize
-    enabled: false # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/8460
+    enabled: false
   ############################################################################################
   # SWITCH TO CACHED+FLATTENED ATTENTION + INITIALIZE CACHES
   ############################################################################################
-  update_in_out_nodes:
-    stage: cache_init
   insert_cached_attention:
     stage: cache_init
     backend: flashinfer
@@ -151,6 +167,12 @@ transforms:
   insert_cached_causal_conv:
     stage: cache_init
     backend: cuda_causal_conv
+  insert_cached_delta_rule:
+    stage: cache_init
+    backend: fla_delta
+  insert_cached_residual_add:
+    stage: cache_init
+    backend: cached_residual_add
   initialize_cache:
     stage: cache_init
     run_per_gm: false
@@ -163,6 +185,9 @@ transforms:
   ############################################################################################
   fuse_causal_conv_activation:
     stage: compile
+  multi_stream_moe:
+    stage: compile
+    enabled: false
   compile_model:
     stage: compile
     run_per_gm: false

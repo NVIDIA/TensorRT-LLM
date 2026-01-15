@@ -154,7 +154,8 @@ bool CacheFormatter::needSendCache(
         return true;
     }
 
-    int selfTpRank = selfIdx % selfConfig.getParallelConfig().mTensorParallelism;
+    int selfCpSize = selfConfig.getParallelConfig().mContextParallelism;
+    int selfTpRank = (selfIdx % (selfConfig.getParallelConfig().mTensorParallelism * selfCpSize)) / selfCpSize;
     int selfTpRankInDpGroup = selfTpRank;
     if (selfConfig.getParallelConfig().mEnableAttentionDP)
     {
@@ -761,10 +762,11 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
                 {
                     cacheBufferId = mCacheTransBufferManager->assignBufferIndexForRecv();
                 }
-                TLLM_CHECK(cacheBufferId.has_value());
                 auto [recvSplitCachestmp, bufferCoverTargetNumtmp, onlyUseDynamicBuffer]
                     = mCacheTransBufferManager->getOrAllocateRecvBuffers(
                         cacheBufferId, static_cast<int>(targetNum), bufferEleSizes, bufferManager);
+                TLLM_CHECK(cacheBufferId.has_value() || onlyUseDynamicBuffer);
+
                 bufferCoverTargetNum = bufferCoverTargetNumtmp;
                 remainNoCoverTargetNum = targetNum > bufferCoverTargetNum ? targetNum - bufferCoverTargetNum : 0;
 

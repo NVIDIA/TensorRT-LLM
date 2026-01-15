@@ -18,6 +18,7 @@
 
 #include "cute/numeric/integral_constant.hpp"
 #include "cutlass/gemm/dispatch_policy.hpp"
+#include "tensorrt_llm/common/config.h"
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -26,8 +27,8 @@
 
 #include "tensorrt_llm/kernels/cutlass_kernels/fpA_intB_gemm/launchers/fpA_intB_launcher_sm90.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace cutlass_kernels_oss
@@ -270,4 +271,5 @@ void sm90_dispatch_gemm_to_cutlass(ActivationType const* A, WeightType const* B,
 
 } // namespace cutlass_kernels_oss
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

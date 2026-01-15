@@ -61,12 +61,14 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="Paths to custom module directories to import.",
 )
 @optgroup.option(
+    "--config",
     "--extra_llm_api_options",
+    "extra_llm_api_options",
     type=str,
     default=None,
     help=
-    "Path to a YAML file that overwrites the parameters specified by trtllm-bench."
-)
+    "Path to a YAML file that overwrites the parameters specified by trtllm-bench. "
+    "Can be specified as either --config or --extra_llm_api_options.")
 @optgroup.option("--sampler_options",
                  type=click.Path(exists=True,
                                  readable=True,
@@ -293,6 +295,7 @@ def throughput_command(
 ) -> None:
     """Run a throughput test on a TRT-LLM engine."""
     logger.info("Preparing to run throughput benchmark...")
+
     # Parameters from CLI
     image_data_format: str = params.get("image_data_format", "pt")
     data_device: str = params.get("data_device", "cpu")
@@ -350,7 +353,7 @@ def throughput_command(
         # If we're dealing with a model name, perform a snapshot download to
         # make sure we have a local copy of the model.
         if bench_env.checkpoint_path is None:
-            snapshot_download(options.model)
+            snapshot_download(options.model, revision=bench_env.revision)
 
         exec_settings = get_settings(params, metadata, bench_env.model,
                                      bench_env.checkpoint_path)
@@ -376,6 +379,7 @@ def throughput_command(
             param_hint="backend")
 
     exec_settings["model"] = options.model
+    exec_settings["revision"] = bench_env.revision
     engine_bs = exec_settings["settings_config"]["max_batch_size"]
     engine_tokens = exec_settings["settings_config"]["max_num_tokens"]
 

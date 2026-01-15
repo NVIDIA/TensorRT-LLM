@@ -30,17 +30,9 @@ function maybe_export_free_tcp_addr_for_spawn_proxy_process {
         return
     fi
 
-    # find free port starting from 10012
-    local free_port=$(python -c 'import socket; s=socket.socket();
-port = 10012
-while True:
-    try:
-        s.bind(("", port))
-        break
-    except OSError:
-        port += 1
-print(port); s.close()')
-    export TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR="tcp://127.0.0.1:${free_port}"
+    # Generate unique IPC address without importing tensorrt_llm to avoid MPI initialization conflicts
+    local free_port=$(python3 -c "import uuid, tempfile, os; print(f'ipc://{os.path.join(tempfile.gettempdir(), \"rpc_test_\" + str(uuid.uuid4()))}')")
+    export TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR=$free_port
     log_stderr "TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR: $TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR"
 }
 
@@ -48,10 +40,13 @@ print(port); s.close()')
 export tllm_mpi_size=$(mpi_world_size)
 log_stderr "tllm_mpi_size: $tllm_mpi_size"
 
-maybe_export_free_tcp_addr_for_spawn_proxy_process
 export TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY=$(openssl rand -hex 32)
 
 if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
+
+    # IPC only works on localhost and in MPI rank0 process
+    maybe_export_free_tcp_addr_for_spawn_proxy_process
+
     log_stderr "Rank${mpi_rank} run ${task_with_command[@]} in background"
 
     # MPI doesn't allow spawn a process sharing the MPI environment in a MPI

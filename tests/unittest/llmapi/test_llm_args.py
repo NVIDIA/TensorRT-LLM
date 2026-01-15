@@ -445,18 +445,18 @@ class TestTorchLlmArgs:
             args = TorchLlmArgs(model=llama_model_path)
             args.invalid_arg = 1
 
-    def test_from_build_config(self):
-        build_config = BuildConfig(
-            max_beam_width=4,
-            max_batch_size=8,
-            max_num_tokens=256,
-        )
-        args = TorchLlmArgs.from_kwargs(model=llama_model_path,
-                                        build_config=build_config)
+    def test_speculative_model_alias(self):
+        """Test that speculative_model_dir is accepted as an alias for speculative_model."""
 
-        assert args.max_batch_size == build_config.max_batch_size
-        assert args.max_num_tokens == build_config.max_num_tokens
-        assert args.max_beam_width == build_config.max_beam_width
+        spec_config = EagleDecodingConfig(
+            max_draft_len=3,
+            speculative_model_dir="/path/to/model",
+            eagle3_one_model=False,
+        )
+
+        args = TorchLlmArgs(model=llama_model_path,
+                            speculative_config=spec_config)
+        assert args.speculative_model == "/path/to/model"
 
 
 class TestTrtLlmArgs:

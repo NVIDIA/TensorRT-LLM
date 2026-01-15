@@ -18,6 +18,7 @@
 
 #include "DevKernel.h"
 #include "RoutingKernel.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/KernelRunner.h"
@@ -26,8 +27,8 @@
 #include <set>
 #include <string>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace trtllmGenFp8BlockScaleMoe
@@ -77,8 +78,10 @@ enum class RoutingMethodType : int64_t
     Llama4 = 3,
     // RenormalizeNaive: Softmax -> TopK -> Renormalize
     RenormalizeNaive = 4,
+    // MiniMaxM2: Sigmoid -> RoutingBiasAdd -> TopK -> Renormalize(without bias)
+    MiniMax2 = 5,
     // Unspecified
-    Unspecified = 5,
+    Unspecified = 6,
 };
 
 inline int32_t maybeGetMinTokenCount(int32_t numPaddedTokens, int32_t hiddenSize, int32_t dtypeSizeBits)
@@ -97,6 +100,7 @@ inline std::string serializeMoeRoutingMethodType(RoutingMethodType routingMethod
     case RoutingMethodType::DeepSeekV3: return "DeepSeekV3";
     case RoutingMethodType::Llama4: return "Llama4";
     case RoutingMethodType::RenormalizeNaive: return "RenormalizeNaive";
+    case RoutingMethodType::MiniMax2: return "MiniMax2";
     default: TLLM_CHECK_WITH_INFO(false, "Invalid routing method"); return "";
     };
 }
@@ -396,4 +400,5 @@ private:
 
 } // namespace trtllmGenFp8BlockScaleMoe
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

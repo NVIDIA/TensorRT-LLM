@@ -16,12 +16,14 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
+
 #include <cstdint>
 #include <optional>
 #include <string>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace common
 {
 
@@ -480,4 +482,5 @@ public:
 };
 
 } // namespace common
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

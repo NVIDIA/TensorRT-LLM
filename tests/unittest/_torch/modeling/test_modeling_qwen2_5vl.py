@@ -187,7 +187,7 @@ class TestQwen2_5_VL(TestModelingMultimodal):
             return self.trtllm_model.forward(**trtllm_inputs)
         else:
             # NOTE: Qwen2.5-VL model uses mrope
-            graph_runner = create_mock_cuda_graph_runner(1, True)
+            graph_runner = create_mock_cuda_graph_runner(1, use_mrope=True)
             trtllm_inputs["attn_metadata"] = trtllm_inputs[
                 "attn_metadata"].create_cuda_graph_metadata(1)
 
@@ -232,13 +232,6 @@ class TestQwen2_5_VL(TestModelingMultimodal):
                                    chunked_prefill=False,
                                    kv_cache_reuse=False),
 
-            # ==== Disable fuse rope scenarios ====
-            TestQwen2_5_VLScenario(modality="image",
-                                   use_cuda_graph=False,
-                                   disable_fuse_rope=True,
-                                   chunked_prefill=False,
-                                   kv_cache_reuse=False),
-
             # ==== Chunked Prefill Scenarios ====
             TestQwen2_5_VLScenario(modality="image",
                                    use_cuda_graph=False,
@@ -252,6 +245,13 @@ class TestQwen2_5_VL(TestModelingMultimodal):
                                    disable_fuse_rope=False,
                                    chunked_prefill=False,
                                    kv_cache_reuse=True),
+
+            # ==== Disable fuse rope scenarios ====
+            TestQwen2_5_VLScenario(modality="image",
+                                   use_cuda_graph=False,
+                                   disable_fuse_rope=True,
+                                   chunked_prefill=False,
+                                   kv_cache_reuse=False),
         ]
         return scenarios
 
