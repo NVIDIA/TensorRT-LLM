@@ -9,7 +9,7 @@ server_configs:
     tensor_parallel_size: 4
     moe_expert_parallel_size: 4
     pipeline_parallel_size: 1
-    max_batch_size: 32
+    max_batch_size: 4
     max_num_tokens: 12288
     trust_remote_code: true
     attn_backend: "TRTLLM"
@@ -18,7 +18,7 @@ server_configs:
       backend: 'TRTLLM'
     cuda_graph_config:
       enable_padding: true
-      max_batch_size: 32
+      max_batch_size: 4
     kv_cache_config:
       dtype: 'fp8'
       enable_block_reuse: false
