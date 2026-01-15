@@ -82,5 +82,8 @@ GPT-OSS/120B-MXFP4:
     spec_dec_algo: Eagle
     accuracy: 65.0
   - quant_algo: W4A16_MXFP4
+    spec_dec_algo: Eagle3
+    accuracy: 65.0
+  - quant_algo: W4A16_MXFP4
     kv_cache_quant_algo: FP8
     accuracy: 65.0
