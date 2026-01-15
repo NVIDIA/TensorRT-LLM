@@ -5,7 +5,7 @@ TensorRT LLM
 <h4>TensorRT LLM provides users with an easy-to-use Python API to define Large Language Models (LLMs) and supports
 state-of-the-art optimizations to perform inference efficiently on NVIDIA GPUs.</h4>
 
-🌟 TensorRT LLM is experimenting with Image&Video Generation models in [TensorRT-LLM/feat/visual_gen](https://github.com/nvidia/tensorrt-llm/tree/feat/visual_gen) branch.
+🌟 TensorRT LLM is experimenting with Image&Video Generation models in [TensorRT-LLM/feat/visual_gen](https://github.com/NVIDIA/TensorRT-LLM/tree/feat/visual_gen/tensorrt_llm/visual_gen) branch.
 This branch is a prototype and not stable for production use. PRs are not accepted.
 
 [![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)](https://nvidia.github.io/TensorRT-LLM/)
