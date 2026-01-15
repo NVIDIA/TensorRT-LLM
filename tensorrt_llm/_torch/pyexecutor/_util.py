@@ -25,8 +25,8 @@ from tensorrt_llm.mapping import CpType, Mapping
 
 from ..attention_backend import get_sparse_attn_kv_cache_manager
 from ..model_config import ModelConfig
-from ..speculative import (get_num_extra_kv_tokens, get_spec_decoder,
-                           should_use_separate_draft_kv_cache)
+from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
+                           get_spec_decoder, should_use_separate_draft_kv_cache)
 from .config_utils import is_mla, is_nemotron_hybrid, is_qwen3_next
 from .guided_decoder import GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
@@ -536,7 +536,9 @@ class KvCacheCreator:
         # Draft model layers in one-model mode start at target_num_layers.
         target_pretrained_config = self._model_engine.model.model_config.pretrained_config
         target_num_layers = target_pretrained_config.num_hidden_layers
-        num_draft_layers = self._draft_config.pretrained_config.num_hidden_layers
+        # Use get_num_spec_layers to get the correct number of draft layers
+        # for the speculative decoding mode (e.g., num_eagle_layers for Eagle3)
+        num_draft_layers = get_num_spec_layers(self._speculative_config)
 
         # Create layer_mask: False for target layers, True for draft layers.
         # This ensures the draft KV cache manager uses the correct layer indices
@@ -567,6 +569,7 @@ class KvCacheCreator:
             dtype=self._draft_config.pretrained_config.torch_dtype,
             is_draft=True,
             layer_mask=layer_mask,
+            num_layers=num_draft_layers,
         )
 
     def build_managers(self,
@@ -625,7 +628,8 @@ def _create_kv_cache_manager(
         model_config: Optional[ModelConfig] = None,
         dtype: Optional[torch.dtype] = None,
         is_draft: Optional[bool] = None,
-        layer_mask: Optional[List[bool]] = None) -> KVCacheManager:
+        layer_mask: Optional[List[bool]] = None,
+        num_layers: Optional[int] = None) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model engine or model config
@@ -662,7 +666,8 @@ def _create_kv_cache_manager(
     else:
         kv_cache_dtype = str_dtype_to_binding(torch_dtype_to_str(dtype))
 
-    num_hidden_layers = config.num_hidden_layers
+    # Use provided num_layers if available, otherwise use config
+    num_hidden_layers = num_layers if num_layers is not None else config.num_hidden_layers
 
     if is_mla(config):
         kv_cache_manager = kv_cache_manager_cls(
