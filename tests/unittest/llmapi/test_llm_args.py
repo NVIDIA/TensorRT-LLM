@@ -445,6 +445,19 @@ class TestTorchLlmArgs:
             args = TorchLlmArgs(model=llama_model_path)
             args.invalid_arg = 1
 
+    def test_speculative_model_alias(self):
+        """Test that speculative_model_dir is accepted as an alias for speculative_model."""
+
+        spec_config = EagleDecodingConfig(
+            max_draft_len=3,
+            speculative_model_dir="/path/to/model",
+            eagle3_one_model=False,
+        )
+
+        args = TorchLlmArgs(model=llama_model_path,
+                            speculative_config=spec_config)
+        assert args.speculative_model == "/path/to/model"
+
 
 class TestTrtLlmArgs:
 

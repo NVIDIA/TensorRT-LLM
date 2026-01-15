@@ -62,7 +62,9 @@ class LongBenchV2(Evaluator):
                  cot: bool = False,
                  no_context: bool = False,
                  rag: int = 0,
+                 max_len: int = 128000,
                  max_input_length: int = 128000,
+                 max_output_length: int = 32000,
                  output_dir: Optional[str] = None,
                  random_seed: int = 0,
                  apply_chat_template: bool = False,
@@ -81,8 +83,10 @@ class LongBenchV2(Evaluator):
             cot: Enable Chain-of-Thought reasoning
             no_context: Test without context (memorization test)
             rag: Number of top retrieved contexts to use (0 to disable)
-            max_input_length: Maximum prompt length in tokens for truncation
-            output_dir: Directory to save evaluation results
+            max_len: Maximum length (input + output) in tokens
+            max_input_length: Maximum context length in tokens. If exceeds, the prompt will be truncated in the middle.
+            max_output_length: Maximum output length in tokens for truncation
+            output_dir: Directory to save the task infos
             random_seed: Random seed for reproducibility
             apply_chat_template: Whether to apply model's chat template
             system_prompt: System prompt to prepend
@@ -91,7 +95,8 @@ class LongBenchV2(Evaluator):
         super().__init__(random_seed=random_seed,
                          apply_chat_template=apply_chat_template,
                          system_prompt=system_prompt,
-                         chat_template_kwargs=chat_template_kwargs)
+                         chat_template_kwargs=chat_template_kwargs,
+                         output_dir=output_dir)
 
         self.dataset_path = dataset_path
         self.num_samples = num_samples
@@ -103,7 +108,9 @@ class LongBenchV2(Evaluator):
         self.no_context = no_context
         self.rag = rag
         self.output_dir = output_dir
-        self.max_input_length = max_input_length
+        # We need to minus max_output_length from max_len to reserve budget for output tokens.
+        self.max_input_length = min(max_input_length,
+                                    max_len - max_output_length)
 
         # Will be set during evaluation
         self.tokenizer = None
@@ -305,7 +312,6 @@ class LongBenchV2(Evaluator):
 
         If the prompt exceeds max_input_length, it takes the first half and last half
         to preserve both context beginning and end.
-        We need to minus max_output_length from max_len to reserve budget for output tokens.
 
         Args:
             prompt: The prompt string to truncate
@@ -714,7 +720,7 @@ class LongBenchV2(Evaluator):
     @click.option("--output_dir",
                   type=str,
                   default=None,
-                  help="Directory to save results.")
+                  help="Directory to save the task infos.")
     @click.option("--random_seed",
                   type=int,
                   default=0,
@@ -728,11 +734,18 @@ class LongBenchV2(Evaluator):
                   default=None,
                   help="System prompt.")
     @click.option(
+        "--max_len",
+        type=int,
+        default=1024000,
+        help=
+        "Maximum length (input + output) in tokens which can be supported by the model."
+    )
+    @click.option(
         "--max_input_length",
         type=int,
         default=128000,
         help=
-        "Maximum prompt length before apply chat template. If exceeds, the prompt will be truncated in the middle."
+        "Maximum context length in tokens. If exceeds, the prompt will be truncated in the middle."
     )
     @click.option("--max_output_length",
                   type=int,
@@ -763,7 +776,7 @@ class LongBenchV2(Evaluator):
                 cot: bool, no_context: bool, rag: int,
                 output_dir: Optional[str], random_seed: int,
                 apply_chat_template: bool, system_prompt: Optional[str],
-                max_input_length: int, max_output_length: int,
+                max_len: int, max_input_length: int, max_output_length: int,
                 chat_template_kwargs: Optional[dict[str, Any]],
                 temperature: float, top_p: float) -> None:
         llm: Union[LLM, PyTorchLLM] = ctx.obj
@@ -782,7 +795,9 @@ class LongBenchV2(Evaluator):
                                 cot=cot,
                                 no_context=no_context,
                                 rag=rag,
+                                max_len=max_len,
                                 max_input_length=max_input_length,
+                                max_output_length=max_output_length,
                                 output_dir=output_dir,
                                 random_seed=random_seed,
                                 apply_chat_template=apply_chat_template,

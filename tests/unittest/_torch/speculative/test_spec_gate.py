@@ -55,7 +55,7 @@ def test_spec_gate_e2e(enforce_single_worker):
 
     spec_config = EagleDecodingConfig(
         max_draft_len=max_draft_len,
-        speculative_model_dir=eagle_model_dir,
+        speculative_model=eagle_model_dir,
         eagle3_one_model=False,
         max_concurrency=10000,
         acceptance_window=acceptance_window,

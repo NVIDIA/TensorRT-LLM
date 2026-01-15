@@ -3418,7 +3418,7 @@ def test_eagle3_output_consistency_4gpus(model_dir: str, draft_model_dir: str):
     # Run with Eagle3
     spec_config = EagleDecodingConfig(
         max_draft_len=3,
-        speculative_model_dir=eagle_model_dir,
+        speculative_model=eagle_model_dir,
         eagle3_one_model=True,
     )
     with LLM(**llm_common_config, speculative_config=spec_config) as llm_spec:

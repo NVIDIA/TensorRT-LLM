@@ -223,7 +223,7 @@ def get_model_yaml_config(model_label: str,
                 'speculative_config': {
                     'decoding_type': 'Eagle',
                     'eagle3_one_model': True,
-                    'speculative_model_dir': 'Qwen3-4B_eagle3',
+                    'speculative_model': 'Qwen3-4B_eagle3',
                     'max_draft_len': 3,
                 },
                 'kv_cache_config': {
