@@ -50,7 +50,9 @@ def text_dataset_dump(input_lens, input_ids, output_lens, task_ids, metadata,
                        output_len=output_lens[i],
                        task_id=task_ids[i]))
     workload = Workload(metadata=metadata, samples=samples)
-    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    output_dir = os.path.dirname(output_file)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
     with open(output_file, 'w') as f:
         json.dump(workload.model_dump(), f)
 
