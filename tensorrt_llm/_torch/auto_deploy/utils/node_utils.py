@@ -510,6 +510,7 @@ def is_any_moe_op(node: Node) -> bool:
             torch.ops.auto_deploy.torch_moe,
             torch.ops.auto_deploy.torch_quant_fp8_moe,
             torch.ops.auto_deploy.torch_quant_nvfp4_moe,
+            torch.ops.auto_deploy.torch_quant_hf_fp8_moe,
             torch.ops.auto_deploy.triton_mxfp4_moe,
         ],
     )

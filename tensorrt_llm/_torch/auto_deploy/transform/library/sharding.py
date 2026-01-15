@@ -758,9 +758,34 @@ class NVFP4EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
         _insert_sharded_moe(gm, node, self.config, scale_names=self.scale_names())
 
 
+class HFFP8EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
+    """HuggingFace FineGrainedFP8-specific EP sharding behavior.
+
+    HF FP8 MoE uses per-block weight scales (weight_scale_inv) for each expert's weights.
+    """
+
+    def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
+        if not is_op(node, torch.ops.auto_deploy.torch_quant_hf_fp8_moe):
+            ad_logger.warning(f"EP sharding is only supported for MOE nodes. Skipping {self}.")
+            return False
+        return True
+
+    def scale_names(self) -> List[str]:
+        return ["weight_scale_inv"]
+
+    def apply(self, gm: GraphModule, node: Node) -> None:
+        _insert_sharded_moe(
+            gm,
+            node,
+            self.config,
+            scale_names=self.scale_names(),
+        )
+
+
 EP_SHARDING_RULES = [
     (lambda n: is_op(n, torch.ops.auto_deploy.torch_quant_fp8_moe), FP8EPShardingInfo),
     (lambda n: is_op(n, torch.ops.auto_deploy.torch_quant_nvfp4_moe), NVFP4EPShardingInfo),
+    (lambda n: is_op(n, torch.ops.auto_deploy.torch_quant_hf_fp8_moe), HFFP8EPShardingInfo),
     (lambda n: is_op(n, torch.ops.auto_deploy.torch_moe), EPShardingInfo),
     (lambda n: is_op(n, torch.ops.auto_deploy.triton_mxfp4_moe), MXFP4EPShardingInfo),
 ]
