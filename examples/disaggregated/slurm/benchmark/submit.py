@@ -139,7 +139,7 @@ def convert_allocations_to_server_config(allocations, server_port=8333):
 
 
 def convert_envs_to_str(env_vars: Dict[str, str]) -> str:
-    ','.join([f"{key}='{value}'" for key, value in env_vars.items()])
+    return ','.join([f"{key}='{value}'" for key, value in env_vars.items()])
 
 
 def replace_env_in_file(log_dir, file_path, env_var):
