@@ -4660,10 +4660,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           {"scores_filter": "exact_match,flexible-extract"})
         monkeypatch.setenv("OVERRIDE_QUANT_ALGO", "W4A16_MXFP4")
 
-        pytorch_config = dict(
-            disable_overlap_scheduler=not overlap_scheduler,
-            cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
-
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
                                         dtype=kv_cache_dtype)
 
@@ -4672,11 +4668,12 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                   pipeline_parallel_size=pp_size,
                   moe_expert_parallel_size=ep_size,
                   kv_cache_config=kv_cache_config,
-                  **pytorch_config,
+                  disable_overlap_scheduler=not overlap_scheduler,
+                  cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
                   enable_attention_dp=attention_dp,
                   moe_config=MoeConfig(backend="TRITON"))
         with llm:
-            model_name = "GPT-OSS/BF16"
+            model_name = "GPT-OSS/120B-MXFP4"
             task = GSM8K(model_name)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
