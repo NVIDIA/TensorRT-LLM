@@ -120,7 +120,7 @@ class EnvManager:
     @staticmethod
     def get_dataset_dir() -> str:
         return os.getenv("DATASET_DIR", "<Your dataset directory>")
-    
+
     @staticmethod
     def get_hf_home_dir() -> str:
         return os.getenv("HF_HOME_DIR", "<Your HF home directory>")
