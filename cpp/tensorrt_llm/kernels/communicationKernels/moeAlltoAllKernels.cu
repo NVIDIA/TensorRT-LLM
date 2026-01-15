@@ -374,10 +374,6 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
     int thread_idx = ThreadingPolicy::offset();
     int local_token_idx = ThreadingPolicy::token_idx();
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaGridDependencySynchronize();
-#endif
-
     if (local_num_tokens == 0)
     {
         // Special case: If local_num_tokens == 0,
@@ -489,6 +485,10 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
             }
         }
         is_last_token = __shfl_sync(0xffffffff, is_last_token, 0);
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+        cudaGridDependencySynchronize();
+#endif
 
         if (is_last_token)
         {
