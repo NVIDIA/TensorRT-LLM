@@ -239,7 +239,7 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
         with AutoDeployLLM(model=self.MODEL_PATH_NVFP4,
                            tokenizer=self.MODEL_PATH_NVFP4,
                            **kwargs) as llm:
-            # Manually set quant_config for FP8 model to get the accuracy threshold
+            # Manually set quant_config for NVFP4 model to get the accuracy threshold
             llm.args.quant_config.quant_algo = QuantAlgo.NVFP4
             llm.args.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
             sampling_params = self.get_default_sampling_params()
