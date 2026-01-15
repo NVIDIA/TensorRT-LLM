@@ -1,7 +1,8 @@
 """Graph-related utilities for transformations."""
 
+import itertools
 from contextlib import contextmanager
-from typing import Any, Dict, Iterator, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterator, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -129,8 +130,8 @@ def _move_single_gm_to_device(gm: GraphModule, device: torch.device) -> None:
         )
     if recompile_graph:
         # recompile graph to update self generated codes in subgraph
-        gm.graph.lint()
-        gm.recompile()
+        lint(gm)
+        recompile(gm)
 
 
 def move_to_device(mod: nn.Module, device: DeviceLikeType) -> None:
@@ -161,18 +162,88 @@ def _is_impure_node(node: Node) -> bool:
             node.target._nondeterministic_seeded = True
 
 
-def _canonicalize_single_gm(gm: GraphModule) -> None:
-    # clean up graph (needs to be done repeatedly until no more dead code)
-    gm.graph.eliminate_dead_code(is_impure_node=_is_impure_node)
+def delete_all_unused_submodules(gm: GraphModule) -> None:
+    """Optimized version of delete_all_unused_submodules with O(n+m) complexity.
 
-    # recompile to propagate all graph changes to the graph module
+    The original implementation uses a list for tracking used modules, making membership
+    checks O(n). This version uses a set for O(1) lookups and deletes deepest modules
+    first to avoid redundant operations.
+
+    Original implementation is at GraphModule.delete_all_unused_submodules
+
+    Args:
+        gm: The GraphModule to clean up.
+    """
+    used: Set[str] = set()
+
+    # Define join function once outside the loop
+    def join_fn(x: str, y: str) -> str:
+        return f"{x}.{y}" if y else x
+
+    for node in gm.graph.nodes:
+        if node.op == "call_module" or node.op == "get_attr":
+            fullpath = node.target.split(".")
+            # Add all intermediate paths using set.update for efficiency
+            used.update(itertools.accumulate(fullpath, join_fn))
+
+            # For call_module, also mark all recursive submodules as used
+            if node.op == "call_module":
+                try:
+                    submod = gm.get_submodule(node.target)
+                    for submod_name, _ in submod.named_modules():
+                        if submod_name:
+                            used.add(f"{node.target}.{submod_name}")
+                except AttributeError:
+                    # Node referenced nonexistent submodule, don't need to
+                    # worry about GCing anything
+                    pass
+
+    # Collect modules to delete (skip empty root name)
+    to_delete = [name for name, _ in gm.named_modules() if name and name not in used]
+
+    # Sort by depth (deepest first) to delete children before parents
+    to_delete.sort(key=lambda x: x.count("."), reverse=True)
+
+    # Track deleted prefixes to skip already-deleted modules
+    deleted_prefixes: Set[str] = set()
+
+    for name in to_delete:
+        # Skip if a parent was already deleted
+        if any(name.startswith(prefix + ".") for prefix in deleted_prefixes):
+            continue
+        gm.delete_submodule(name)
+        deleted_prefixes.add(name)
+
+
+def eliminate_dead_code(
+    gm: GraphModule, is_impure_node: Optional[Callable[[Node], bool]] = None
+) -> None:
+    """Eliminate dead code from the graph of the given GraphModule."""
+    gm.graph.eliminate_dead_code(is_impure_node=is_impure_node)
+
+
+def recompile(gm: GraphModule) -> None:
+    """Recompile the graph of the given GraphModule."""
     gm.recompile()
 
+
+def lint(gm: GraphModule) -> None:
+    """Lint the graph of the given GraphModule."""
+    gm.graph.lint()
+
+
+def _canonicalize_single_gm(gm: GraphModule) -> None:
+    # clean up graph (needs to be done repeatedly until no more dead code)
+    eliminate_dead_code(gm, is_impure_node=_is_impure_node)
+
+    # recompile to propagate all graph changes to the graph module
+    recompile(gm)
+
     # clean up graph module
-    gm.delete_all_unused_submodules()
+    delete_all_unused_submodules(gm)
 
     # lint the graph
-    gm.graph.lint()
+    lint(gm)
 
 
 def canonicalize_graph(mod: nn.Module) -> None:
@@ -217,7 +288,7 @@ def _run_shape_prop_single_gm(
         ad_logger.warning("No fake tensors and no args available for shape propagation")
 
     # lint the graph
-    gm.graph.lint()
+    lint(gm)
 
 
 def run_shape_prop(

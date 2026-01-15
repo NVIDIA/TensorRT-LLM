@@ -33,7 +33,7 @@ from .....functional import AllReduceStrategy
 from ...custom_ops.trtllm_dist import is_trtllm_op_available
 from ...models.factory import ModelFactory, ShardingConfigSource
 from ...shim.interface import CachedSequenceInterface
-from ...utils._graph import del_attr_by_name
+from ...utils._graph import del_attr_by_name, eliminate_dead_code
 from ...utils.logger import ad_logger
 from ...utils.node_utils import (
     LayerSubgraph,
@@ -1460,7 +1460,7 @@ def _insert_sharded_moe(
         node.replace_all_uses_with(dist_node)
         dist_node.replace_input_with(dist_node, node)
 
-    gm.graph.eliminate_dead_code()
+    eliminate_dead_code(gm)
     # Expert weights registered via gm.register_parameter() are top-level attributes.
     # Unlike submodules, these aren't cleaned up by eliminate_dead_code() or
     # delete_all_unused_submodules() - must delete manually after removing their get_attr nodes.
