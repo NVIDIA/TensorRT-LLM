@@ -252,14 +252,32 @@ def fused_moe(
     )
 
     run_moe = moe_runner.fused_moe_runner.run_moe_min_latency if min_latency_mode else moe_runner.fused_moe_runner.run_moe
-    output = run_moe(input, token_selected_experts, token_final_scales,
-                     fc1_expert_weights, fc1_expert_biases, fc2_expert_weights,
-                     fc2_expert_biases, quant_scales, input_sf,
-                     swizzled_input_sf, swiglu_alpha, swiglu_beta, swiglu_limit,
-                     tp_size, tp_rank, ep_size, ep_rank, cluster_size,
-                     cluster_rank, enable_alltoall, min_latency_mode,
-                     [gemm_tactic_1, gemm_tactic_2], activation_type,
-                     unpadded_hidden_size, tuner_num_tokens, out_tensor)
+    try:
+        output = run_moe(input, token_selected_experts, token_final_scales,
+                         fc1_expert_weights, fc1_expert_biases,
+                         fc2_expert_weights, fc2_expert_biases, quant_scales,
+                         input_sf, swizzled_input_sf, swiglu_alpha, swiglu_beta,
+                         swiglu_limit, tp_size, tp_rank, ep_size, ep_rank,
+                         cluster_size, cluster_rank, enable_alltoall,
+                         min_latency_mode, [gemm_tactic_1, gemm_tactic_2],
+                         activation_type, unpadded_hidden_size,
+                         tuner_num_tokens, out_tensor)
+    except RuntimeError as e:
+        error_msg = str(e)
+        if "DeepGEMM only supports Hopper" in error_msg:
+            raise RuntimeError(
+                f"{error_msg}"
+                "Note: This is the Cutlass backend with DeepGemm JIT path. "
+                "For Blackwell (SM100+) support, please use the DEEPGEMM backend instead."
+            ) from e
+        raise
+
+    # When out_tensor is provided, the result is written in-place to out_tensor.
+    # Return empty list to avoid aliasing constraint violation in PyTorch 2.9.1+
+    # (custom op output cannot be the same tensor as input).
+    # Callers should use out_tensor directly when they provide it.
+    if out_tensor is not None and not min_latency_mode:
+        return []
 
     return output if min_latency_mode else [output]
 
@@ -1856,6 +1874,59 @@ def record_stream(tensor: torch.Tensor, stream_id: int) -> None:
     stream = get_stream(stream_id)
     assert stream is not None
     tensor.record_stream(stream)
+
+
+def fused_add_rms_norm_quant(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    gamma: torch.Tensor,
+    sf_scale: Optional[torch.Tensor],
+    use_rms_norm: bool = True,
+    eps: float = 1e-6,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused Add + RMSNorm/LayerNorm + FP4 Quantization kernel.
+
+    Args:
+        input: [M, N] input tensor (fp16/bf16)
+        residual: [M, N] residual tensor (fp16/bf16)
+        gamma: [N] normalization weight (fp16/bf16)
+        sf_scale: [1] optional scale factor for FP4 quantization (float32)
+        use_rms_norm: if True use RMSNorm, else use LayerNorm
+        eps: epsilon for normalization
+
+    Returns:
+        normed_output_fp4: [M, N/8] FP4 quantized normalized output (int32, packed)
+        output: [M, N] pre-norm output (input + residual), same dtype as input
+        sf_out: scale factors for FP4 quantization (uint8), swizzled layout
+
+    Note:
+        This kernel requires SM90 (Hopper) or SM100 (Blackwell) GPU.
+        Hidden dimension N must be >= 2048 and <= 16384.
+    """
+    return torch.ops.trtllm.fused_add_rms_norm_quant(input, residual, gamma,
+                                                     sf_scale, use_rms_norm,
+                                                     eps)
+
+
+@torch.library.register_fake("trtllm::fused_add_rms_norm_quant")
+def _fused_add_rms_norm_quant_fake(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    gamma: torch.Tensor,
+    sf_scale: Optional[torch.Tensor],
+    use_rms_norm: bool = True,
+    eps: float = 1e-5,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    m, n = input.shape
+    # normed_output_fp4: [M, N/8] as int32 (8 FP4 values packed per int32)
+    normed_output_fp4 = input.new_empty((m, n // 8), dtype=torch.int32)
+    # output: [M, N] pre-norm output, same dtype as input
+    output = input.new_empty((m, n), dtype=input.dtype)
+    # sf_out: scale factors, swizzled layout
+    sf_vec_size = 16
+    sf_size = ((m + 127) // 128) * 128 * ((n // sf_vec_size + 3) // 4) * 4
+    sf_out = input.new_empty((sf_size, ), dtype=torch.uint8)
+    return normed_output_fp4, output, sf_out
 
 
 class Fp4GemmAllreduceRunner(TunableRunner):

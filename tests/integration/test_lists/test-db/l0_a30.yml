@@ -20,7 +20,6 @@ l0_a30:
   - unittest/_torch/modeling -k "modeling_qwen_moe"
   - unittest/_torch/modeling -k "modeling_out_of_tree"
   - unittest/_torch/modeling -k "modeling_starcoder2"
-  - unittest/_torch/auto_deploy/unit/singlegpu
   - unittest/_torch/sampler/test_beam_search.py
   - unittest/_torch/sampler/test_return_logits.py
   - test_e2e.py::test_openai_completions_with_logit_bias[torch_sampler]
@@ -244,3 +243,19 @@ l0_a30:
   - triton_server/test_triton_llm.py::test_tiny_llama_ifb_token_counts[tensorrtllm-both-False-1---False-True-False-0-128-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap--guaranteed_no_evict---1-1-1-False-tensorrt_llm_bls]
   - triton_server/test_triton_llm.py::test_tiny_llama_ifb_token_counts[tensorrtllm-both-False-1---False-True-False-0-128-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap--guaranteed_no_evict---1-1-1-False-ensemble]
   - triton_server/test_triton_llm.py::test_tiny_llama_ifb_token_counts[tensorrtllm-both-False-1---False-True-False-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap--guaranteed_no_evict---1-1-1-False-tensorrt_llm_bls]
+# ------------- AutoDeploy Backend Stages ---------------
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*a30*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
+      backend: autodeploy
+  tests:
+  # TODO (lucaslie): consider more fine-grained split
+  - unittest/_torch/auto_deploy/unit/singlegpu

@@ -269,7 +269,7 @@ class Scenario:
     rope_original_max_position_embeddings: int = 4096
     rope_type: str = "yarn"
     model_type: str = "deepseek_v3"
-    kv_cache_tokens_per_block: int = 64
+    kv_cache_tokens_per_block: int = 32
 
 
 @dataclass(kw_only=True, frozen=True)
@@ -329,11 +329,16 @@ context_sequence_lengths = [
 generation_seq_len_q = [1, 4]
 num_generation_steps = [10]
 
+# tokens_per_block = 32 for blackwell
+tokens_per_block = 32 if torch.cuda.get_device_capability() >= (10, 0) else 64
+
 kv_cache_dtype_list = [torch.bfloat16]
 if torch.cuda.get_device_capability() in [(8, 9), (9, 0), (10, 0), (12, 0)]:
     kv_cache_dtype_list.append(torch.float8_e4m3fn)
 scenarios = [
-    Scenario(kv_cache_dtype=kv_cache_dtype, num_layers=num_layers)
+    Scenario(kv_cache_dtype=kv_cache_dtype,
+             num_layers=num_layers,
+             kv_cache_tokens_per_block=tokens_per_block)
     for kv_cache_dtype in kv_cache_dtype_list for num_layers in [1, 2]
 ]
 

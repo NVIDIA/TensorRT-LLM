@@ -220,11 +220,11 @@ def setup_llm(args, **kwargs):
             relaxed_topk=args.relaxed_topk,
             relaxed_delta=args.relaxed_delta,
             mtp_eagle_one_model=args.use_one_model,
-            speculative_model_dir=args.model_dir)
+            speculative_model=args.model_dir)
     elif spec_decode_algo == "EAGLE3":
         spec_config = EagleDecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,
-            speculative_model_dir=args.draft_model_dir,
+            speculative_model=args.draft_model_dir,
             eagle3_one_model=args.use_one_model,
             eagle_choices=args.eagle_choices,
             use_dynamic_tree=args.use_dynamic_tree,
@@ -234,7 +234,7 @@ def setup_llm(args, **kwargs):
     elif spec_decode_algo == "DRAFT_TARGET":
         spec_config = DraftTargetDecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,
-            speculative_model_dir=args.draft_model_dir)
+            speculative_model=args.draft_model_dir)
     elif spec_decode_algo == "NGRAM":
         spec_config = NGramDecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,

@@ -115,8 +115,6 @@ struct LowLatencyLayerNorm
 
         uint32_t work_id = blockIdx.x;
 
-        FusedOperator fused_operator(param);
-
         constexpr auto PACKED_PER_N_BLOCK = Traits::N_BLOCK / N_THREADS / Traits::PACKED_ELEMS_PER_COMPUTE;
 
         typename Traits::AccumulatorType data[PACKED_PER_N_BLOCK][Traits::PACKED_ELEMS_PER_COMPUTE];
@@ -139,7 +137,7 @@ struct LowLatencyLayerNorm
             for (int i = 0; i < PACKED_PER_N_BLOCK; i++)
             {
                 auto offset = (thread_id + i * N_THREADS) * Traits::PACKED_ELEMS_PER_COMPUTE;
-                if (offset <= sz)
+                if (offset < sz)
                 {
                     data[i] = *reinterpret_cast<PackedType const*>(&g_data[offset]);
                 }
@@ -154,6 +152,14 @@ struct LowLatencyLayerNorm
         };
 
         static_assert(Traits::OUTPUT_SCALE != SCALE_TYPE::VECTOR);
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDACC_VER_MAJOR__ >= 12))
+        if constexpr (arch::is_major_v<9> || arch::is_major_v<10>)
+        {
+            cudaGridDependencySynchronize();
+        }
+#endif
+        FusedOperator fused_operator(param);
 
         if constexpr (Traits::BIAS == SCALE_TYPE::VECTOR)
         {
@@ -175,13 +181,6 @@ struct LowLatencyLayerNorm
             load_to_register(param.beta, r_beta, param.n);
         }
 
-#if (defined(__CUDA_ARCH__) && (__CUDACC_VER_MAJOR__ >= 12))
-        if constexpr (arch::is_major_v<9> || arch::is_major_v<10>)
-        {
-            cudaGridDependencySynchronize();
-            cudaTriggerProgrammaticLaunchCompletion();
-        }
-#endif
         load_to_register(&param.input[work_id * param.n], data, param.n);
 
         if constexpr (Traits::RESIDUAL)
@@ -259,12 +258,12 @@ struct LowLatencyLayerNorm
         if constexpr (!Traits::RMS_NORM)
         {
             mean = var_and_mean[1] / param.n;
-            variance = rsqrtf(
-                var_and_mean[0] / param.n - var_and_mean[1] * var_and_mean[1] + (Traits::AccumulatorType)(1e-5));
+            variance = rsqrtf(var_and_mean[0] / param.n - var_and_mean[1] * var_and_mean[1]
+                + (Traits::AccumulatorType)(param.layernorm_eps));
         }
         else
         {
-            variance = rsqrtf(var_and_mean[0] / param.n + (Traits::AccumulatorType)(1e-5));
+            variance = rsqrtf(var_and_mean[0] / param.n + (Traits::AccumulatorType)(param.layernorm_eps));
         }
 
         for (int i = 0; i < PACKED_PER_N_BLOCK; i++)
@@ -333,6 +332,14 @@ struct LowLatencyLayerNorm
     {
         __shared__ Shared shared;
         compute(param, &shared);
+        __syncthreads();
+        asm volatile("membar.gl;" : : : "memory");
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDACC_VER_MAJOR__ >= 12))
+        if constexpr (arch::is_major_v<9> || arch::is_major_v<10>)
+        {
+            cudaTriggerProgrammaticLaunchCompletion();
+        }
+#endif
     }
 };
 

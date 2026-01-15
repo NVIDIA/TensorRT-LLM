@@ -15,7 +15,7 @@ myst-parser = "^4.0.1"
 breathe = "^4.36.0"
 sphinx-copybutton = "^0.5.2"
 autodoc-pydantic = "^2.2.0"
-sphinx-togglebutton = "^0.3.2"
+sphinx-togglebutton = "^0.4.4"
 
 
 [build-system]

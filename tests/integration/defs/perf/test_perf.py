@@ -342,6 +342,11 @@ BENCH_PERF_METRIC_LOG_QUERIES = {
     PerfMetricType.KV_CACHE_SIZE:
     re.compile(r".*(?:Allocated ([\d\.]+) GiB for max tokens in paged KV cache|"
                r"Final KV cache size after resize: ([\d\.]+) GiB).*"),
+    PerfMetricType.PER_USER_OUTPUT_THROUGHPUT:
+    re.compile(
+        r"Per User Output Throughput \[w\/ ctx\] \(tps\/user\):\s+([\d\.]+)"),
+    PerfMetricType.PER_GPU_OUTPUT_THROUGHPUT:
+    re.compile(r"Per GPU Output Throughput \(tps\/gpu\):\s+([\d\.]+)"),
 }
 
 AGGR_SERVER_PERF_METRIC_LOG_QUERIES = {
@@ -457,6 +462,8 @@ PERF_METRIC_STRING = {
     PerfMetricType.ENGINE_SIZE: "engine_size",
     PerfMetricType.CONTEXT_GPU_MEMORY: "context_gpu_memory",
     PerfMetricType.KV_CACHE_SIZE: "kv_cache_size",
+    PerfMetricType.PER_USER_OUTPUT_THROUGHPUT: "per_user_output_throughput",
+    PerfMetricType.PER_GPU_OUTPUT_THROUGHPUT: "per_gpu_output_throughput",
 }
 
 BUILDER_METRICS = [

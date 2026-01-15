@@ -2,10 +2,11 @@ import logging
 import random
 import re
 import tempfile
+from pathlib import Path
 from typing import Optional
 
 import click
-from datasets import load_dataset
+import datasets
 from PIL import Image
 from pydantic import BaseModel, model_validator
 from utils.utils import (get_norm_dist_lengths, multimodal_dataset_dump,
@@ -29,7 +30,7 @@ def validate_output_len_dist(ctx, param, value):
 class DatasetConfig(BaseModel):
     """Dataset configurations."""
     """Name of the dataset on HuggingFace."""
-    name: str
+    name: Optional[str] = None
     """Config name of the dataset if existing."""
     config_name: Optional[str] = None
     """Split of the dataset. Typical values: train, validation, test. Setting to None will include all splits."""
@@ -44,6 +45,8 @@ class DatasetConfig(BaseModel):
     prompt: Optional[str] = None
     """The dataset dictionary key used to derive the output sequence length. Set to None if the dataset does not have a key for output."""
     output_key: Optional[str]
+    """The local path to the dataset to be loaded when using a local cache."""
+    local_path: Optional[str] = None
 
     @model_validator(mode='after')
     def check_prompt(self) -> 'DatasetConfig':
@@ -54,19 +57,40 @@ class DatasetConfig(BaseModel):
             raise AssertionError("Either --prompt-key or --prompt must be set.")
         return self
 
+    @model_validator(mode='after')
+    def check_name_and_local_path(self) -> 'DatasetConfig':
+        if self.name and self.local_path:
+            raise AssertionError(
+                "--dataset-name and --dataset-local-path cannot be set at the same time."
+            )
+        if (not self.name) and (not self.local_path):
+            raise AssertionError(
+                "Either --dataset-name or --dataset-local-path must be set.")
+        return self
+
     @property
     def query(self):
         """Generate the query for HuggingFace `datasets.load_dataset()`"""
+        first_arg = self.local_path if self.local_path else self.name
+
         if self.config_name:
-            return [self.name, self.config_name]
+            return [first_arg, self.config_name]
         else:
-            return [self.name]
+            return [first_arg]
+
+    @property
+    def display_name(self) -> str:
+        """Returns a human-readable identifier for error messages."""
+        # model_validator ensures exactly one of name or local_path is set
+        if self.name is not None:
+            return self.name
+        return self.local_path
 
     def get_prompt(self, req):
         """Get the prompt sentence from the given request."""
         if self.prompt_key:
             assert self.prompt_key in req, (
-                f"Dataset {self.name} does not have key '{self.prompt_key}'. "
+                f"Dataset {self.display_name} does not have key '{self.prompt_key}'. "
                 "Please set --prompt-key to one of the available keys: "
                 f"{req.keys()}")
             return req[self.prompt_key]
@@ -76,7 +100,7 @@ class DatasetConfig(BaseModel):
     def get_input(self, req):
         """Get the input sentence from the given request."""
         assert self.input_key in req, (
-            f"Dataset {self.name} does not have key '{self.input_key}'. "
+            f"Dataset {self.display_name} does not have key '{self.input_key}'. "
             "Please set --input-key to one of the available keys: "
             f"{req.keys()}")
         return req[self.input_key]
@@ -86,7 +110,7 @@ class DatasetConfig(BaseModel):
         image_keys = [self.image_key
                       ] + [f"{self.image_key}_{i}" for i in range(1, 8)]
         assert any(key in req for key in image_keys), (
-            f"Dataset {self.name} does not have key '{self.image_key}'. "
+            f"Dataset {self.display_name} does not have key '{self.image_key}'. "
             "Please set --dataset-image-key to one of the available keys: "
             f"{req.keys()}")
         images = []
@@ -101,14 +125,45 @@ class DatasetConfig(BaseModel):
             raise RuntimeError(
                 "--output-key is not set. Please either:\n"
                 "1. Define output length through --output-len-dist.\n"
-                f"2. If the dataset {self.name} has key for golden output and "
+                f"2. If the dataset {self.display_name} has key for golden output and "
                 "you wish to set output length to the length of the golden "
                 "output, set --output-key.")
         assert self.output_key in req, (
-            f"Dataset {self.name} does not have key '{self.output_key}'. "
+            f"Dataset {self.display_name} does not have key '{self.output_key}'. "
             "Please set --output-key to one of the available keys: "
             f"{req.keys()}")
         return req[self.output_key]
+
+
+def _create_dataset_load_error(e: ValueError) -> ValueError:
+    """Create a more informative ValueError from a dataset loading error.
+
+    Args:
+        e: The original ValueError from datasets.load_dataset().
+    Returns:
+        A new ValueError with additional context.
+    """
+    error_msg = str(e)
+    if "Config" in error_msg:
+        error_msg += "\n Please add the config name to the dataset config yaml."
+    elif "split" in error_msg:
+        error_msg += "\n Please specify supported split in the dataset config yaml."
+    return ValueError(error_msg)
+
+
+def load_dataset(dataset_config: DatasetConfig):
+    """Load dataset from local path or HuggingFace.
+    Args:
+        dataset_config: A `DatasetConfig` object that defines the dataset to load.
+    Returns:
+        Dataset iterator.
+    Raises:
+        ValueError: When dataset loading fails due to incorrect dataset config setting.
+    """
+    if dataset_config.local_path:
+        return load_dataset_from_local(dataset_config)
+    else:
+        return load_dataset_from_hf(dataset_config)
 
 
 def load_dataset_from_hf(dataset_config: DatasetConfig):
@@ -121,55 +176,117 @@ def load_dataset_from_hf(dataset_config: DatasetConfig):
     Raises:
         ValueError: When dataset loading fails due to incorrect dataset config setting.
     """
+    logging.debug(
+        f"Loading dataset from HF: query={dataset_config.query}, split={dataset_config.split}"
+    )
+
     try:
         dataset = iter(
-            load_dataset(*dataset_config.query,
-                         split=dataset_config.split,
-                         streaming=True,
-                         trust_remote_code=True))
+            datasets.load_dataset(*dataset_config.query,
+                                  split=dataset_config.split,
+                                  streaming=True,
+                                  trust_remote_code=True))
     except ValueError as e:
-        if "Config" in e:
-            e += "\n Please add the config name to the dataset config yaml."
-        elif "split" in e:
-            e += "\n Please specify supported split in the dataset config yaml."
-        raise ValueError(e)
+        raise _create_dataset_load_error(e)
+
+    logging.debug("Finished loading HF dataset")
 
     return dataset
 
 
+def load_dataset_from_local(dataset_config: DatasetConfig):
+    """Load dataset from local path.
+
+    Args:
+        dataset_config: A `DatasetConfig` object that defines the dataset to load.
+    Returns:
+        Dataset iterator.
+    Raises:
+        FileNotFoundError: When local dataset path does not exist.
+        ValueError: When dataset loading fails due to incorrect dataset config setting.
+    """
+
+    local_path = Path(dataset_config.local_path)
+
+    if not local_path.exists():
+        raise FileNotFoundError(
+            f"Local dataset path {local_path} does not exist.")
+
+    logging.debug(
+        f"Loading dataset from local path: path={local_path}, query={dataset_config.query}, split={dataset_config.split}"
+    )
+
+    # If it's a directory we can use the normal loader, otherwise custom loader
+    # depends on the file extension
+    if local_path.is_dir():
+        try:
+            dataset = datasets.load_dataset(*dataset_config.query,
+                                            split=dataset_config.split,
+                                            trust_remote_code=True)
+        except ValueError as e:
+            raise _create_dataset_load_error(e)
+    else:
+        format_map = {
+            ".json": "json",
+            ".jsonl": "json",
+            ".csv": "csv",
+            ".parquet": "parquet",
+        }
+
+        file_extension = local_path.suffix
+        dataset_type = format_map.get(file_extension)
+
+        if dataset_type is None:
+            raise ValueError(f"Unsupported file extension: {file_extension}")
+
+        try:
+            dataset = datasets.load_dataset(dataset_type,
+                                            data_files=str(local_path),
+                                            split=dataset_config.split)
+        except ValueError as e:
+            raise _create_dataset_load_error(e)
+
+    logging.debug("Finished loading local dataset")
+
+    return iter(dataset)
+
+
 @click.command()
-@click.option("--dataset-name",
-              required=True,
-              type=str,
-              help=f"Dataset name in HuggingFace.")
+@click.option("--dataset-name", type=str, help="Dataset name in HuggingFace.")
 @click.option("--dataset-config-name",
               type=str,
               default=None,
-              help=f"Dataset config name in HuggingFace (if exists).")
+              help="Dataset config name in HuggingFace (if exists).")
 @click.option("--dataset-split",
               type=str,
               required=True,
-              help=f"Split of the dataset to use.")
+              help="Split of the dataset to use.")
 @click.option("--dataset-input-key",
               type=str,
-              help=f"The dataset dictionary key for input.")
+              help="The dataset dictionary key for input.")
 @click.option("--dataset-image-key",
               type=str,
               default="image",
-              help=f"The dataset dictionary key for images.")
+              help="The dataset dictionary key for images.")
 @click.option("--dataset-prompt-key",
               type=str,
               default=None,
-              help=f"The dataset dictionary key for prompt (if exists).")
+              help="The dataset dictionary key for prompt (if exists).")
+@click.option(
+    "--dataset-local-path",
+    type=str,
+    default=None,
+    help=
+    "The local path to the dataset to be loaded when using an offline cache.")
 @click.option(
     "--dataset-prompt",
     type=str,
     default=None,
-    help=f"The prompt string when there is no prompt key for the dataset.")
+    help="The prompt string when there is no prompt key for the dataset.")
 @click.option("--dataset-output-key",
               type=str,
               default=None,
-              help=f"The dataset dictionary key for output (if exists).")
+              help="The dataset dictionary key for output (if exists).")
 @click.option(
     "--num-requests",
     type=int,
@@ -208,7 +325,7 @@ def dataset(root_args, **kwargs):
     modality = None
     multimodal_texts = []
     multimodal_image_paths = []
-    for req in load_dataset_from_hf(dataset_config):
+    for req in load_dataset(dataset_config):
         if any(key in req for key in ['image', 'image_1', 'video']):
             # multimodal input
             if 'video' in req and req['video'] is not None:

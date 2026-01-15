@@ -887,7 +887,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                     from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
                         MistralConfigLoader
                     self.draft_config = MistralConfigLoader().load(
-                        spec_config.speculative_model_dir,
+                        spec_config.speculative_model,
                         mapping=model_config.mapping,
                         moe_backend=model_config.moe_backend,
                         moe_max_num_tokens=model_config.moe_max_num_tokens,
@@ -898,7 +898,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                     self.draft_config.extra_attrs = model_config.extra_attrs
                 elif spec_config.eagle3_model_arch == "llama3":
                     self.draft_config = ModelConfig.from_pretrained(
-                        model_config.spec_config.speculative_model_dir,
+                        model_config.spec_config.speculative_model,
                         trust_remote_code=True,
                         attn_backend=model_config.attn_backend,
                         moe_backend=model_config.moe_backend,

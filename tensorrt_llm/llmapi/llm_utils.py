@@ -109,8 +109,8 @@ class ModelLoader:
 
         self.model_obj = _ModelWrapper(self.llm_args.model)
         self.speculative_model_obj = _ModelWrapper(
-            self.llm_args.speculative_model_dir
-        ) if self.llm_args.speculative_model_dir is not None else None
+            self.llm_args.speculative_model
+        ) if self.llm_args.speculative_model is not None else None
 
         if isinstance(self.llm_args, TrtLlmArgs):
             self.convert_checkpoint_options = self.llm_args._convert_checkpoint_options
@@ -125,7 +125,7 @@ class ModelLoader:
             Path] = self.model_obj.model_dir if self.model_obj.is_local_model else None
 
         self._speculative_model_dir: Optional[
-            Path] = self.speculative_model_obj.model_dir if self.speculative_model_obj is not None and self.model_obj.is_local_model else None
+            Path] = self.speculative_model_obj.model_dir if self.speculative_model_obj is not None and self.speculative_model_obj.is_local_model else None
         self._model_info: Optional[_ModelInfo] = None
         self._model_format = self.llm_args.model_format
 
@@ -145,9 +145,7 @@ class ModelLoader:
             return
 
         if (self.model_obj.is_hub_model
-                and self._model_format is not _ModelFormatKind.TLLM_ENGINE) or (
-                    self.speculative_model_obj
-                    and self.speculative_model_obj.is_hub_model):
+                and self._model_format is not _ModelFormatKind.TLLM_ENGINE):
             # Download HF model if necessary
             if self.model_obj.model_name is None:
                 raise ValueError(
@@ -305,31 +303,18 @@ class ModelLoader:
     def _download_hf_model(self):
         ''' Download HF model from third-party model hub like www.modelscope.cn or huggingface.  '''
         model_dir = None
-        speculative_model_dir = None
         # Only the rank0 are allowed to download model
         if mpi_rank() == 0:
             assert self._workspace is not None
             assert isinstance(self.model_obj.model_name, str)
             # this will download only once when multiple MPI processes are running
-
             model_dir = download_hf_model(self.model_obj.model_name,
                                           revision=self.llm_args.revision)
             print_colored(f"Downloaded model to {model_dir}\n", 'grey')
-            if self.speculative_model_obj:
-                speculative_model_dir = download_hf_model(
-                    self.speculative_model_obj.model_name)
-                print_colored(f"Downloaded model to {speculative_model_dir}\n",
-                              'grey')
         # Make all the processes got the same model_dir
         self._model_dir = mpi_broadcast(model_dir, root=0)
         self.model_obj.model_dir = self._model_dir  # mark as a local model
         assert self.model_obj.is_local_model
-        if self.speculative_model_obj:
-            self._speculative_model_dir = mpi_broadcast(speculative_model_dir,
-                                                        root=0)
-            self.speculative_model_obj.model_dir = self._speculative_model_dir
-
-            assert self.speculative_model_obj.is_local_model
 
     def _update_from_hf_quant_config(self) -> bool:
         """Update quant_config from the config file of pre-quantized HF checkpoint.
@@ -440,8 +425,8 @@ class ModelLoader:
         model_cls = AutoModelForCausalLM.get_trtllm_model_class(
             self._model_dir, self.llm_args.trust_remote_code,
             self.llm_args.decoding_config.decoding_mode
-            if hasattr(self.llm_args, "speculative_model_dir")
-            and self.llm_args.speculative_model_dir else None)
+            if hasattr(self.llm_args, "speculative_model")
+            and self.llm_args.speculative_model else None)
 
         prequantized = self._update_from_hf_quant_config()
 
@@ -638,18 +623,42 @@ class CachedModelLoader:
         else:
             return [task(*args, **kwargs)]
 
+    def _download_hf_model_if_needed(self,
+                                     model_obj: _ModelWrapper,
+                                     revision: Optional[str] = None) -> Path:
+        """Download a model from HF hub if needed.
+
+        Also updates the model_obj.model_dir with the local model dir on rank 0.
+        """
+        if model_obj.is_hub_model:
+            model_dirs = self._submit_to_all_workers(
+                CachedModelLoader._node_download_hf_model,
+                model=model_obj.model_name,
+                revision=revision)
+            model_dir = model_dirs[0]
+            model_obj.model_dir = model_dir
+            return model_dir
+        return model_obj.model_dir
+
     def __call__(self) -> Tuple[Path, Union[Path, None]]:
 
         if self.llm_args.model_format is _ModelFormatKind.TLLM_ENGINE:
             return Path(self.llm_args.model), None
 
+        # Download speculative model from HuggingFace if needed (all backends)
+        if (self.llm_args.speculative_config is not None and
+                self.llm_args.speculative_config.speculative_model is not None):
+            spec_model_obj = _ModelWrapper(
+                self.llm_args.speculative_config.speculative_model)
+            spec_model_dir = self._download_hf_model_if_needed(spec_model_obj)
+            self.llm_args.speculative_config.speculative_model = spec_model_dir
+
+        # AutoDeploy doesn't use ModelLoader
         if self.llm_args.backend == "_autodeploy":
             return None, ""
 
         self.engine_cache_stage: Optional[CachedStage] = None
-
         self._hf_model_dir = None
-
         self.model_loader = ModelLoader(self.llm_args)
 
         if self.llm_args.backend is not None:
@@ -657,14 +666,8 @@ class CachedModelLoader:
                 raise ValueError(
                     f'backend {self.llm_args.backend} is not supported.')
 
-            if self.model_loader.model_obj.is_hub_model:
-                hf_model_dirs = self._submit_to_all_workers(
-                    CachedModelLoader._node_download_hf_model,
-                    model=self.model_loader.model_obj.model_name,
-                    revision=self.llm_args.revision)
-                self._hf_model_dir = hf_model_dirs[0]
-            else:
-                self._hf_model_dir = self.model_loader.model_obj.model_dir
+            self._hf_model_dir = self._download_hf_model_if_needed(
+                self.model_loader.model_obj, revision=self.llm_args.revision)
 
             if self.llm_args.quant_config.quant_algo is not None:
                 logger.warning(

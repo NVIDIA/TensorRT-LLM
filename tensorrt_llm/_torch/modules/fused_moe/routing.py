@@ -155,8 +155,10 @@ class RoutingMethodType(IntEnum):
     Llama4 = 3,
     # Qwen3: Softmax -> TopK -> Renormalize
     RenormalizeNaive = 4,
+    # MiniMaxM2: Sigmoid -> RoutingBiasAdd -> TopK -> Renormalize(without bias)
+    MiniMax2 = 5,
     # Unspecified
-    Unspecified = 5,
+    Unspecified = 6,
 
 
 class BaseMoeRoutingMethod(nn.Module):
@@ -379,6 +381,57 @@ class DeepSeekV3MoeRoutingMethod(BaseMoeRoutingMethod):
         return RoutingMethodType.DeepSeekV3
 
 
+class MiniMaxM2MoeRoutingMethod(BaseMoeRoutingMethod):
+
+    def __init__(
+        self,
+        top_k: int,
+        num_experts: int,
+        callable_e_score_correction_bias: Callable[[], torch.Tensor],
+        output_dtype: torch.dtype = torch.float32,
+    ):
+        super().__init__()
+        self.top_k = top_k
+        self.num_experts = num_experts
+        assert callable(callable_e_score_correction_bias)
+        self.callable_e_score_correction_bias = callable_e_score_correction_bias
+        self.output_dtype = output_dtype
+
+    @staticmethod
+    @torch.compile(options={"max-autotune": True})
+    def get_scores(logits, e_score_correction_bias):
+        scores = F.sigmoid(logits)
+        scores_with_bias = scores + e_score_correction_bias
+        if enable_llm_debug():
+            has_nan = torch.isnan(scores_with_bias).any()
+            if has_nan:
+                warnings.warn(
+                    "Detected NAN in the tensor scores_with_bias. Please check if it matches the expectation."
+                )
+
+        return scores, scores_with_bias
+
+    def apply(self,
+              router_logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        scores, scores_with_bias = self.get_scores(router_logits,
+                                                   self.e_score_correction_bias)
+        _, topk_idx = torch.topk(scores_with_bias,
+                                 k=self.top_k,
+                                 dim=-1,
+                                 sorted=False)
+        top_k_weights = scores.gather(1, topk_idx)
+        top_k_weights /= (top_k_weights.sum(dim=-1, keepdim=True) + 1e-20)
+        return topk_idx.to(torch.int32), top_k_weights.to(self.output_dtype)
+
+    @property
+    def e_score_correction_bias(self) -> torch.Tensor:
+        return self.callable_e_score_correction_bias()
+
+    @property
+    def routing_method_type(self):
+        return RoutingMethodType.MiniMax2
+
+
 class RenormalizeMoeRoutingMethod(BaseMoeRoutingMethod):
 
     def __init__(
@@ -587,6 +640,8 @@ ROUTING_METHOD_TYPE_TO_CLASS: Dict[RoutingMethodType,
                                        RenormalizeNaiveMoeRoutingMethod,
                                        RoutingMethodType.Unspecified:
                                        BaseMoeRoutingMethod,
+                                       RoutingMethodType.MiniMax2:
+                                       MiniMaxM2MoeRoutingMethod,
                                    }
 
 

@@ -47,7 +47,7 @@ def test_spec_gate_e2e():
 
     spec_config = EagleDecodingConfig(
         max_draft_len=max_draft_len,
-        speculative_model_dir=eagle_model_dir,
+        speculative_model=eagle_model_dir,
         # Llama 3 does not support one model eagle.
         eagle3_one_model=False,
         max_concurrency=10000,

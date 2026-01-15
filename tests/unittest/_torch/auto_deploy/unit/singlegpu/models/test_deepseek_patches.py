@@ -4,7 +4,7 @@ import types
 
 import pytest
 import torch
-from _model_test_utils import _hf_model_dir_or_hub_id
+from test_common.llm_data import hf_id_to_local_model_dir
 from transformers import AutoConfig, AutoModelForCausalLM
 
 from tensorrt_llm._torch.auto_deploy.models.patches.deepseek import (
@@ -77,7 +77,7 @@ def _generate_ds_attention_mask(b, s):
     "model_name, module_name, patch, inputs",
     [
         pytest.param(
-            _hf_model_dir_or_hub_id("DeepSeek-R1/DeepSeek-R1", "deepseek-ai/DeepSeek-R1"),
+            hf_id_to_local_model_dir("deepseek-ai/DeepSeek-R1"),
             "model.layers.0.self_attn",
             deepseek_v3_attention,
             [
@@ -87,7 +87,7 @@ def _generate_ds_attention_mask(b, s):
             ],
         ),  # attention requires  inputs [hidden_states, attention_mask, position_ids]
         pytest.param(
-            _hf_model_dir_or_hub_id("DeepSeek-R1/DeepSeek-R1", "deepseek-ai/DeepSeek-R1"),
+            hf_id_to_local_model_dir("deepseek-ai/DeepSeek-R1"),
             "model.layers.0.mlp",
             deepseek_v3_moe_exact,
             [torch.randn(2, 6, 8, dtype=torch.bfloat16)],

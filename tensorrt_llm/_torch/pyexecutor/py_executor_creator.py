@@ -395,7 +395,7 @@ def create_py_executor(
                 draft_llm_args.load_format = LoadFormat.DUMMY
 
             draft_model_engine = PyTorchModelEngine(
-                model_path=spec_config.speculative_model_dir,
+                model_path=spec_config.speculative_model,
                 llm_args=draft_llm_args,
                 mapping=mapping,
                 attn_runtime_features=attn_runtime_features,

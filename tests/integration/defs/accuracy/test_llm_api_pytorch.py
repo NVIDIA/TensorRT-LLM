@@ -96,6 +96,20 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
+    def test_nvfp4_with_norm_quant(self, monkeypatch):
+        model_path = f"{llm_models_root()}/nvfp4-quantized/Meta-Llama-3.1-8B"
+        with LLM(model_path) as llm:
+            sm_version = get_sm_version()
+            if sm_version not in (100, 103):
+                pytest.skip(
+                    f"test_nvfp4_with_norm_quant supports SM 100 and 103 only")
+            monkeypatch.setenv("TRTLLM_DISABLE_NVFP4_LAYERNORM_FUSION", "0")
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
     @skip_pre_blackwell
     @pytest.mark.parametrize("stream_interval", [4, 64],
                              ids=["stream_interval_4", "stream_interval_64"])
@@ -276,7 +290,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
         draft_len = 4
         spec_config = EagleDecodingConfig(max_draft_len=draft_len,
-                                          speculative_model_dir=eagle_model_dir,
+                                          speculative_model=eagle_model_dir,
                                           eagle3_one_model=eagle3_one_model)
 
         with LLM(model=target_model_dir,
@@ -369,8 +383,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         cuda_graph_config = CudaGraphConfig(enable_padding=True)
         spec_config = EagleDecodingConfig(
             max_draft_len=3,
-            speculative_model_dir=
-            f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B",
+            speculative_model=f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B",
             eagle3_one_model=eagle3_one_model)
         llm = LLM(
             self.MODEL_PATH,
@@ -621,7 +634,7 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
         eagle_model_dir = f"{llm_models_root()}/EAGLE3-LLaMA3.3-Instruct-70B"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
         spec_config = EagleDecodingConfig(max_draft_len=3,
-                                          speculative_model_dir=eagle_model_dir,
+                                          speculative_model=eagle_model_dir,
                                           eagle3_one_model=eagle3_one_model)
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
         pytorch_config = dict(
@@ -1383,7 +1396,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         )
         mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3,
                                        mtp_eagle_one_model=False,
-                                       speculative_model_dir=self.MODEL_PATH)
+                                       speculative_model=self.MODEL_PATH)
         with LLM(self.MODEL_PATH,
                  kv_cache_config=kv_cache_config,
                  enable_chunked_prefill=False,
@@ -2935,7 +2948,7 @@ class TestGLM4_6(LlmapiAccuracyTestHarness):
 
         mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3,
                                        mtp_eagle_one_model=False,
-                                       speculative_model_dir=model_path)
+                                       speculative_model=model_path)
 
         with LLM(model_path,
                  max_batch_size=max_batch_size,
@@ -3441,7 +3454,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
 
         draft_len = 4
         spec_config = EagleDecodingConfig(max_draft_len=draft_len,
-                                          speculative_model_dir=eagle_model_dir,
+                                          speculative_model=eagle_model_dir,
                                           eagle3_one_model=eagle3_one_model)
 
         llm = LLM(model=target_model_dir,
@@ -3812,7 +3825,7 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
         if eagle3:
             spec_config = EagleDecodingConfig(
                 max_draft_len=2,
-                speculative_model_dir=
+                speculative_model=
                 f"{llm_models_root()}/Qwen3/qwen3-235B-eagle3/",
                 eagle3_one_model=True)
         with LLM(
@@ -3860,7 +3873,7 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
         if eagle3:
             spec_config = EagleDecodingConfig(
                 max_draft_len=2,
-                speculative_model_dir=
+                speculative_model=
                 f"{llm_models_root()}/Qwen3/qwen3-235B-eagle3/",
                 eagle3_one_model=True)
         with LLM(
@@ -3884,7 +3897,6 @@ class TestQwen3_30B_A3B_Instruct_2507(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/{MODEL_NAME}"
 
     @skip_pre_hopper
-    # @pytest.mark.skip_less_device_memory(140000)  # Only test for H200, B200
     @pytest.mark.parametrize(
         "target_sparsity,thr_prefill,thr_decode",
         [
@@ -3903,15 +3915,51 @@ class TestQwen3_30B_A3B_Instruct_2507(LlmapiAccuracyTestHarness):
                 "prefill": thr_prefill,
                 "decode": thr_decode,
             })
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.85)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75,
+                                        enable_block_reuse=False)
 
         if get_sm_version() >= 100:
-            pytest.skip("Bug to be fixed on Blackwell")
+            pytest.skip("https://nvbugs/5783509: Bug to be fixed on Blackwell")
 
         with LLM(self.MODEL_PATH,
                  attn_backend="TRTLLM",
                  max_batch_size=256,
                  max_num_tokens=100000,
+                 kv_cache_config=kv_cache_config,
+                 sparse_attention_config=sparse_attention_config) as llm:
+            task = LongBenchV1(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_acc_spec=f"target_sparsity={target_sparsity}")
+
+    @pytest.mark.parametrize(
+        "target_sparsity,thr_prefill,thr_decode",
+        [
+            (0.0, 0.0, 0.0),
+            (0.5, 85.97384174442398, 55.48258322852407),
+            (0.9, 1418.142868970396, 863.147841750025),
+        ],
+        ids=[
+            "target_sparsity_0.0", "target_sparsity_0.5", "target_sparsity_0.9"
+        ],
+    )
+    def test_skip_softmax_attention_2gpus(self, target_sparsity: float,
+                                          thr_prefill: float,
+                                          thr_decode: float):
+        sparse_attention_config = SkipSoftmaxAttentionConfig(
+            threshold_scale_factor={
+                "prefill": thr_prefill,
+                "decode": thr_decode,
+            })
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75,
+                                        enable_block_reuse=False)
+
+        with LLM(self.MODEL_PATH,
+                 attn_backend="TRTLLM",
+                 max_batch_size=256,
+                 max_num_tokens=100000,
+                 tensor_parallel_size=2,
+                 moe_expert_parallel_size=2,
+                 enable_attention_dp=True,
                  kv_cache_config=kv_cache_config,
                  sparse_attention_config=sparse_attention_config) as llm:
             task = LongBenchV1(self.MODEL_NAME)
@@ -4479,7 +4527,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
         draft_len = 3
         spec_config = EagleDecodingConfig(max_draft_len=draft_len,
-                                          speculative_model_dir=eagle_model_dir,
+                                          speculative_model=eagle_model_dir,
                                           eagle3_one_model=one_model,
                                           allow_advanced_sampling=True)
 
@@ -4545,7 +4593,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
         draft_len = 3
         spec_config = EagleDecodingConfig(max_draft_len=draft_len,
-                                          speculative_model_dir=eagle_model_dir,
+                                          speculative_model=eagle_model_dir,
                                           eagle3_one_model=one_model,
                                           allow_advanced_sampling=True)
 
@@ -4609,7 +4657,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
         draft_len = 3
         spec_config = EagleDecodingConfig(max_draft_len=draft_len,
-                                          speculative_model_dir=eagle_model_dir,
+                                          speculative_model=eagle_model_dir,
                                           eagle3_one_model=one_model,
                                           allow_advanced_sampling=True)
 
@@ -4668,7 +4716,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
         draft_len = 3
         spec_config = EagleDecodingConfig(max_draft_len=draft_len,
-                                          speculative_model_dir=eagle_model_dir,
+                                          speculative_model=eagle_model_dir,
                                           eagle3_one_model=one_model)
 
         max_seq_len = MAX_INPUT_LEN + MAX_OUTPUT_LEN
@@ -5150,7 +5198,7 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
         if eagle3:
             spec_config = EagleDecodingConfig(
                 max_draft_len=2,
-                speculative_model_dir=
+                speculative_model=
                 f"{llm_models_root()}/Mistral-Large-3-675B/Mistral-Large-3-675B-Instruct-2512-Eagle/",
                 eagle3_one_model=True,
                 eagle3_model_arch="mistral_large3")
@@ -5201,7 +5249,7 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
         if eagle3:
             spec_config = EagleDecodingConfig(
                 max_draft_len=2,
-                speculative_model_dir=
+                speculative_model=
                 f"{llm_models_root()}/Mistral-Large-3-675B/Mistral-Large-3-675B-Instruct-2512-Eagle/",
                 eagle3_one_model=True,
                 eagle3_model_arch="mistral_large3")
@@ -5310,6 +5358,44 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
+    @skip_pre_hopper
+    @pytest.mark.skip_less_mpi_world_size(4)
+    @pytest.mark.skip_less_device_memory(40000)
+    @pytest.mark.parametrize(
+        "attention_dp",
+        [
+            False,
+            True,
+        ],
+        ids=[
+            "attention_dp_off",
+            "attention_dp_on",
+        ],
+    )
+    def test_fp8_4gpus(self, attention_dp):
+        with LLM(
+                f"{llm_models_root()}/Nemotron-SuperV3-phase1-mtp-fp8-fp8kv",
+                kv_cache_config=KvCacheConfig(
+                    enable_block_reuse=False,
+                    mamba_ssm_cache_dtype="float16",
+                    free_gpu_memory_fraction=0.5,
+                ),
+                max_batch_size=32,
+                tensor_parallel_size=4,
+                moe_expert_parallel_size=4,
+                enable_attention_dp=attention_dp,
+                cuda_graph_config=CudaGraphConfig(max_batch_size=512,
+                                                  enable_padding=True),
+                disable_overlap_scheduler=False,
+                moe_config=MoeConfig(backend="CUTLASS"),
+        ) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
     @skip_pre_blackwell
     @pytest.mark.skip_less_mpi_world_size(8)
     @pytest.mark.parametrize(
@@ -5350,3 +5436,35 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+
+@skip_pre_hopper
+class TestMiniMaxM2(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "MiniMaxAI/MiniMax-M2"
+    MODEL_PATH = f"{llm_models_root()}/MiniMax-M2"
+
+    @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
+    @pytest.mark.skip_less_device(4)
+    @parametrize_with_ids("attention_dp,cuda_graph,overlap_scheduler",
+                          [(False, True, True), (True, True, True)])
+    def test_4gpus(self, tp_size, ep_size, attention_dp, cuda_graph,
+                   overlap_scheduler):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            moe_config=MoeConfig(
+                backend="DEEPGEMM" if get_sm_version() >= 100 else "CUTLASS"))
+
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=1,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 max_seq_len=4096,
+                 **pytorch_config,
+                 enable_attention_dp=attention_dp) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
