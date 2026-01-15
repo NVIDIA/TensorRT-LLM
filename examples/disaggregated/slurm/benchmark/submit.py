@@ -228,6 +228,8 @@ def submit_job(config, log_dir, dry_run):
     if benchmark_config['mode'] == "gen_only_no_context":
         worker_env_var += " TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1"
         server_env_var += " TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1"
+    if benchmark_config['mode'] == "gen_only":
+        worker_env_var += " TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1"
 
     profiling_config = config.get('profiling', {})
     profiling_config.setdefault('nsys_on', False)
