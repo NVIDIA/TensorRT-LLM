@@ -227,6 +227,10 @@ methods:
         annotation: Optional[Dict[str, str]]
         default: null
         status: prototype
+      max_stats_len:
+        annotation: int
+        default: 1000
+        status: prototype
     return_annotation: None
   generate:
     parameters:
