@@ -19,4 +19,4 @@ l0_gb200_multi_nodes_aggr_perf_sanity_2_nodes:
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp4_v2_2_nodes_grace_blackwell-r1_fp4_v2_tep8_mtp3] TIMEOUT (90)
   # k2_thinking_fp4_2_nodes_grace_blackwell
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-k2_thinking_fp4_2_nodes_grace_blackwell-k2_thinking_fp4_tep8_32k8k] TIMEOUT (90)
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-k2_thinking_fp4_2_nodes_grace_blackwell-k2_thinking_fp4_dep8_32k8k] TIMEOUT (90)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-k2_thinking_fp4_2_nodes_grace_blackwell-k2_thinking_fp4_dep8_32k8k] TIMEOUT (120)

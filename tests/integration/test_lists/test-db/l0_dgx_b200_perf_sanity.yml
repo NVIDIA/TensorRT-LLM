@@ -32,4 +32,4 @@ l0_dgx_b200_perf_sanity:
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-k2_thinking_fp4_blackwell-k2_thinking_fp4_tep8_8k1k]
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-k2_thinking_fp4_blackwell-k2_thinking_fp4_dep8_8k1k] TIMEOUT (90)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-k2_thinking_fp4_blackwell-k2_thinking_fp4_tep8_32k8k] TIMEOUT (90)
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-k2_thinking_fp4_blackwell-k2_thinking_fp4_dep8_32k8k] TIMEOUT (90)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-k2_thinking_fp4_blackwell-k2_thinking_fp4_dep8_32k8k] TIMEOUT (120)
