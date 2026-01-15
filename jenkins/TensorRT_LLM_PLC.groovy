@@ -38,29 +38,40 @@ def createKubernetesPodConfig()
     return podConfig
 }
 
+def getLLMRepo () {
+    def LLM_REPO = "https://github.com/NVIDIA/TensorRT-LLM.git"
+    if (params.repoUrlKey == "tensorrt_llm_internal") {
+        withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
+            LLM_REPO = DEFAULT_LLM_REPO
+        }
+    }
+    if (params.repoUrlKey == "custom_repo") {
+        if (params.customRepoUrl == "") {
+            throw new Exception("Invalid custom repo url provided")
+        }
+        LLM_REPO = params.customRepoUrl
+    }
+    return LLM_REPO
+}
+
+def checkoutSource ()
+{
+    def LLM_REPO = getLLMRepo()
+    sh "git config --global --add safe.directory ${env.WORKSPACE}"
+    sh "git config --global user.email \"90828364+tensorrt-cicd@users.noreply.github.com\""
+    sh "git config --global user.name \"TensorRT LLM\""
+    trtllm_utils.checkoutSource(LLM_REPO, params.branchName, env.WORKSPACE, false, true)
+}
+
 def generate()
 {
     sh "pwd && ls -alh"
 
     container("alpine") {
-        def LLM_REPO = "https://github.com/NVIDIA/TensorRT-LLM.git"
-        if (params.repoUrlKey == "tensorrt_llm_internal") {
-            withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
-                LLM_REPO = DEFAULT_LLM_REPO
-            }
-        }
-        if (params.repoUrlKey == "custom_repo") {
-            if (params.customRepoUrl == "") {
-                throw new Exception("Invalid custom repo url provided")
-            }
-            LLM_REPO = params.customRepoUrl
-        }
         sh "apt update"
         sh "apt install -y python3-dev git curl git-lfs"
-        sh "git config --global --add safe.directory ${env.WORKSPACE}"
-        sh "git config --global user.email \"90828364+tensorrt-cicd@users.noreply.github.com\""
-        sh "git config --global user.name \"TensorRT LLM\""
-        trtllm_utils.checkoutSource(LLM_REPO, params.branchName, env.WORKSPACE, false, true)
+        def LLM_REPO = getLLMRepo()
+        checkoutSource()
         sh "python3 --version"
         sh "curl -sSL https://install.python-poetry.org | POETRY_VERSION=1.8.5 python3 -"
         sh "cd ${env.WORKSPACE}"
@@ -101,23 +112,10 @@ def generate()
 def sonar_scan()
 {
     container("alpine") {
-        def LLM_REPO = "https://github.com/NVIDIA/TensorRT-LLM.git"
-        def scannerHome = tool 'sonarScanner';
-        if (params.repoUrlKey == "tensorrt_llm_internal") {
-            withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
-                LLM_REPO = DEFAULT_LLM_REPO
-            }
-        }
-        if (params.repoUrlKey == "custom_repo") {
-            if (params.customRepoUrl == "") {
-                throw new Exception("Invalid custom repo url provided")
-            }
-            LLM_REPO = params.customRepoUrl
-        }
+        def scannerHome = tool 'sonarScanner'
         sh "apt update"
         sh "apt install -y git git-lfs openjdk-17-jdk"
-        sh "git config --global --add safe.directory ${env.WORKSPACE}"
-        trtllm_utils.checkoutSource(LLM_REPO, params.branchName, env.WORKSPACE, false, true)
+        checkoutSource()
         sh "cd ${env.WORKSPACE}"
         withSonarQubeEnv() {
           sh "${scannerHome}/bin/sonar-scanner -Dsonar.projectKey=GPUSW_TensorRT-LLM-Team_TensorRT-LLM_tensorrt-llm -Dsonar.sources=. -Dsonar.branch.name=${params.branchName}"
