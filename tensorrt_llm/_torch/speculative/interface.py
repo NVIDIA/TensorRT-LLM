@@ -1,6 +1,7 @@
 import copy
 import os
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Type
@@ -11,10 +12,12 @@ from torch import nn
 from tensorrt_llm.logger import logger
 
 from ..._utils import get_sm_version
-from ..attention_backend.trtllm import AttentionBackend, TrtllmAttention
+from ..attention_backend.trtllm import (AttentionBackend, TrtllmAttention,
+                                        TrtllmAttentionMetadata)
 from ..cute_dsl_kernels.argmax import argmax as cute_argmax
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
-from ..pyexecutor.resource_manager import BaseResourceManager
+from ..pyexecutor.resource_manager import (BaseResourceManager,
+                                           ResourceManagerType)
 
 if TYPE_CHECKING:
     from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
@@ -24,6 +27,17 @@ if IS_FLASHINFER_AVAILABLE:
 
 # Environment variable name for forcing the number of accepted tokens in speculative decoding
 FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR = "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS"
+
+
+def should_use_separate_draft_kv_cache(spec_config) -> bool:
+    """
+    Check if separate draft KV cache should be used for one-engine speculative decoding.
+    """
+    if spec_config is None:
+        return False
+    if not spec_config.spec_dec_mode.use_one_engine():
+        return False
+    return spec_config._allow_separate_draft_kv_cache
 
 
 def get_force_num_accepted_tokens() -> int:
@@ -599,6 +613,52 @@ class SpecWorkerBase(nn.Module, ABC):
             return input_ids_ctx
         else:
             return torch.empty(0, dtype=torch.int32, device="cuda")
+
+    def get_draft_kv_cache_manager(self, resource_manager):
+        """
+        Get the draft KV cache manager if using separate KV cache layouts.
+        """
+        if self.use_separate_draft_kv_cache and resource_manager is not None:
+            return resource_manager.get_resource_manager(
+                ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+        return None
+
+    @contextmanager
+    def draft_kv_cache_context(self, attn_metadata, draft_kv_cache_manager):
+        """
+        Context manager to temporarily switch to draft KV cache manager.
+
+        This swaps both the kv_cache_manager reference AND the block offset tensors,
+        since the main and draft KV caches have different block layouts.
+        """
+        if draft_kv_cache_manager is None:
+            yield
+            return
+
+        # Only TrtllmAttentionMetadata supports separate draft KV cache layouts
+        if not isinstance(attn_metadata, TrtllmAttentionMetadata):
+            yield
+            return
+
+        # Save main KV cache manager and block offsets
+        target_kv_cache_manager = attn_metadata.kv_cache_manager
+        target_kv_cache_block_offsets = attn_metadata.kv_cache_block_offsets
+        target_host_kv_cache_block_offsets = attn_metadata.host_kv_cache_block_offsets
+
+        # Switch to draft KV cache manager and its block offsets
+        attn_metadata.kv_cache_manager = draft_kv_cache_manager
+        if hasattr(attn_metadata, 'draft_kv_cache_block_offsets'
+                   ) and attn_metadata.draft_kv_cache_block_offsets is not None:
+            attn_metadata.kv_cache_block_offsets = attn_metadata.draft_kv_cache_block_offsets
+            attn_metadata.host_kv_cache_block_offsets = attn_metadata.draft_host_kv_cache_block_offsets
+
+        try:
+            yield
+        finally:
+            # Restore main KV cache manager and block offsets
+            attn_metadata.kv_cache_manager = target_kv_cache_manager
+            attn_metadata.kv_cache_block_offsets = target_kv_cache_block_offsets
+            attn_metadata.host_kv_cache_block_offsets = target_host_kv_cache_block_offsets
 
     def _sample_tokens_for_batch(
         self,

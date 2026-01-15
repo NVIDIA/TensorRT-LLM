@@ -623,6 +623,10 @@ def create_py_executor(
 
     if model_engine.model.model_config.is_generation:
         #NOTE: non-generation models do not have kv cache
+
+        # Get draft config for one-engine speculative decoding if available
+        draft_config = getattr(model_engine.model, 'draft_config', None)
+
         kv_cache_creator = KvCacheCreator(
             model_engine=model_engine,
             draft_model_engine=draft_model_engine,
@@ -640,6 +644,7 @@ def create_py_executor(
             profiling_stage_data=profiling_stage_data,
             sparse_attention_config=sparse_attention_config,
             execution_stream=execution_stream,
+            draft_config=draft_config,
         )
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
         with allocation_scope(
