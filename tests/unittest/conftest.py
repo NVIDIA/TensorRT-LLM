@@ -14,7 +14,9 @@
 # limitations under the License.
 # # Force resource release after test
 import os
+import signal
 import sys
+import threading
 import traceback
 import warnings
 from functools import partial
@@ -37,9 +39,23 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from integration.defs import test_list_parser
 
 
+def dump_threads(signum, frame):
+    """Dump all threads' stacks"""
+    current_thread = threading.current_thread()
+    for thread_id, thread in threading._active.items():
+        if thread == current_thread:
+            continue
+        stack = sys._current_frames()[thread_id]
+        print(f"\n=== Thread {thread.name} ({thread_id}) ===")
+        traceback.print_stack(stack)
+
+
 def pytest_configure(config):
     # avoid thread leak of tqdm's TMonitor
     tqdm.tqdm.monitor_interval = 0
+
+    # Dump all threads' stacks when SIGALRM is received
+    signal.signal(signal.SIGALRM, dump_threads)
 
 
 @pytest.hookimpl(wrapper=True)
