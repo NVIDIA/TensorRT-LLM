@@ -76,7 +76,7 @@ def generate()
         sh "curl -sSL https://install.python-poetry.org | POETRY_VERSION=1.8.5 python3 -"
         sh "cd ${env.WORKSPACE}"
         sh "/root/.local/bin/poetry -h"
-        sh "export PATH=\"/root/.local/bin:\$PATH\" && python3 scripts/generate_lock_file.py"
+        sh "export PATH=\"/root/.local/bin:\$PATH\" && python3 scripts/generate_lock_file.py -p requirements.txt"
         def count = sh(script: "git status --porcelain security_scanning/ | wc -l", returnStdout: true).trim()
         echo "Changed/untracked file count: ${count}"
         if (count == "0") {
