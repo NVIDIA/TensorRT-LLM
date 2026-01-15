@@ -24,8 +24,11 @@ from tensorrt_llm.mapping import Mapping
 
 from ...attention_backend import AttentionMetadata
 from ...model_config import ModelConfig
+from ...speculative import SpecMetadata
 from ..linear import Linear, TensorParallelMode
 from .causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+from .causal_conv1d_triton import \
+    causal_conv1d_update as causal_conv1d_update_triton
 from .layernorm_gated import RMSNorm as RMSNormGated
 from .selective_state_update import selective_state_update
 from .ssd_combined import mamba_chunk_scan_combined
@@ -82,6 +85,7 @@ class Mamba2Mixer(nn.Module):
         self.tp_d_inner = d_inner // tp_size
         self.tp_nheads = nheads // tp_size
         self.tp_ngroups = n_groups // tp_size
+        self.num_heads = nheads
 
         self.layer_idx = layer_idx
         self.d_conv = d_conv
@@ -167,6 +171,7 @@ class Mamba2Mixer(nn.Module):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         mamba_metadata: Mamba2Metadata,
+        spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
 
@@ -175,6 +180,7 @@ class Mamba2Mixer(nn.Module):
         num_decodes = attn_metadata.seq_lens.shape[0] - num_prefills
         num_prefill_tokens = attn_metadata.num_ctx_tokens
         num_decode_tokens = attn_metadata.num_tokens - num_prefill_tokens
+        num_actual_tokens = attn_metadata.num_tokens
         seqlen_split_size = [num_prefill_tokens, num_decode_tokens]
         batch_split_size = [num_prefills, num_decodes]
 
@@ -183,10 +189,10 @@ class Mamba2Mixer(nn.Module):
 
         state_indices_p, state_indices_d = torch.split(state_indices,
                                                        batch_split_size)
-        conv_states = attn_metadata.kv_cache_manager.get_conv_states(
+        layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(
             self.layer_idx)
-        ssm_states = attn_metadata.kv_cache_manager.get_ssm_states(
-            self.layer_idx)
+        conv_states = layer_cache.conv
+        ssm_states = layer_cache.temporal
 
         # in_proj
         zxbcdt = self.in_proj(hidden_states)
@@ -199,7 +205,21 @@ class Mamba2Mixer(nn.Module):
         xbc_p, xbc_d = torch.split(xbc, seqlen_split_size, dim=0)
         dt_p, dt_d = torch.split(dt, seqlen_split_size, dim=0)
 
-        out = []
+        # Preallocate output tensor to avoid memcpy cost for merging prefill
+        # and decode outputs
+        preallocated_ssm_out = torch.empty(
+            [
+                zxbcdt.shape[0],
+                (self.num_heads * self.head_dim) // self.tp_size,
+            ],
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        preallocated_ssm_out_p, preallocated_ssm_out_d = torch.split(
+            preallocated_ssm_out,
+            [num_prefill_tokens, num_decode_tokens],
+            dim=0,
+        )
 
         if num_prefills > 0:
 
@@ -239,7 +259,7 @@ class Mamba2Mixer(nn.Module):
                     has_initial_states[:, None, None, None],
                     ssm_states[state_indices_p], 0)
 
-            y, current_ssm_states = mamba_chunk_scan_combined(
+            current_ssm_states = mamba_chunk_scan_combined(
                 x_p,
                 dt_p,
                 self.A,
@@ -247,30 +267,62 @@ class Mamba2Mixer(nn.Module):
                 C_p,
                 chunk_size=self.chunk_size,
                 D=self.D,
-                z=z_p,
+                z=None,
                 dt_bias=self.dt_bias,
                 initial_states=initial_states,
                 chunk_indices=mamba_metadata.chunk_indices,
                 chunk_offsets=mamba_metadata.chunk_offsets,
                 dt_softplus=self.delta_softplus,
+                dt_limit=(0.0, float("inf")),
                 cu_seqlens=cu_seqlens,
                 seq_idx=seq_idx,
                 return_varlen_states=True,
                 return_final_states=False,
-                mamba_ssm_cache_dtype=self._mamba_ssm_cache_dtype,
+                out=preallocated_ssm_out_p.view(1, num_prefill_tokens, -1,
+                                                self.head_dim),
+                state_dtype=self._mamba_ssm_cache_dtype,
             )
-            out.append(rearrange(y, "b l h p -> (b l) (h p)"))
 
             # copy new ssm state
             ssm_states[state_indices_p] = current_ssm_states
 
         if num_decodes > 0:
-            xbc_d = causal_conv1d_update(xbc_d,
-                                         conv_states,
-                                         self.conv1d.weight,
-                                         self.conv1d.bias,
-                                         activation="silu",
-                                         conv_state_indices=state_indices_d)
+            is_target_verify = attn_metadata.kv_cache_manager.is_speculative(
+            ) and spec_metadata is not None
+            if is_target_verify:
+                draft_token_num = spec_metadata.max_draft_len + 1
+                intermediate_conv_states = layer_cache.intermediate_conv_window
+
+                self.intermediate_state_indices = torch.arange(
+                    num_decodes,
+                    dtype=torch.int32,
+                    device=state_indices_d.device)
+
+                # Reshape for batch processing
+                xbc_d_reshaped = xbc_d.view(num_decodes, draft_token_num,
+                                            -1).transpose(1, 2)
+                # TODO:support tree structure
+                xbc_d_processed = causal_conv1d_update_triton(
+                    xbc_d_reshaped,
+                    conv_states,
+                    self.conv1d.weight,
+                    self.conv1d.bias,
+                    activation="silu",
+                    conv_state_indices=state_indices_d[:num_decodes],
+                    intermediate_conv_window=intermediate_conv_states,
+                    intermediate_state_indices=self.intermediate_state_indices,
+                )
+
+                xbc_d = xbc_d_processed.transpose(1, 2).view(
+                    num_decode_tokens, -1)
+
+            else:
+                xbc_d = causal_conv1d_update(xbc_d,
+                                             conv_states,
+                                             self.conv1d.weight,
+                                             self.conv1d.bias,
+                                             activation="silu",
+                                             conv_state_indices=state_indices_d)
 
             x_d, B_d, C_d = torch.split(
                 xbc_d,
@@ -292,29 +344,64 @@ class Mamba2Mixer(nn.Module):
                        n=self.d_state).to(dtype=torch.float32)
             dt_bias = repeat(self.dt_bias, "h -> h p", p=self.head_dim)
             D = repeat(self.D, "h -> h p", p=self.head_dim)
+            if is_target_verify:
+                intermediate_ssm_states = layer_cache.intermediate_ssm
+                selective_state_update(
+                    ssm_states,
+                    x_d.view(
+                        num_decodes,
+                        draft_token_num,
+                        self.num_heads // self.tp_size,
+                        self.head_dim,
+                    ),
+                    dt_d.view(
+                        num_decodes,
+                        draft_token_num,
+                        self.num_heads // self.tp_size,
+                        self.head_dim,
+                    ),
+                    A,
+                    B_d.view(num_decodes, draft_token_num, self.tp_ngroups, -1),
+                    C_d.view(num_decodes, draft_token_num, self.tp_ngroups, -1),
+                    D,
+                    z=None,
+                    dt_bias=dt_bias,
+                    dt_softplus=True,
+                    state_batch_indices=state_indices_d[:num_decodes],
+                    out=preallocated_ssm_out_d.view(
+                        num_decodes,
+                        draft_token_num,
+                        self.num_heads // self.tp_size,
+                        self.head_dim,
+                    ),
+                    disable_state_update=True,
+                    intermediate_states_buffer=intermediate_ssm_states,
+                    cache_steps=draft_token_num,
+                    intermediate_state_indices=self.intermediate_state_indices,
+                )
 
-            y = selective_state_update(
-                ssm_states,
-                x_d,
-                dt_d,
-                A,
-                B_d,
-                C_d,
-                D,
-                z=z_d,
-                dt_bias=dt_bias,
-                dt_softplus=self.delta_softplus,
-                state_batch_indices=state_indices_d,
-            )
+            else:
 
-            out.append(rearrange(y, "b h p -> b (h p)"))
-
-        out = torch.cat(out, dim=0)
+                selective_state_update(
+                    ssm_states,
+                    x_d,
+                    dt_d,
+                    A,
+                    B_d,
+                    C_d,
+                    D,
+                    z=None,
+                    dt_bias=dt_bias,
+                    dt_softplus=self.delta_softplus,
+                    state_batch_indices=state_indices_d,
+                    out=preallocated_ssm_out_d.view(num_decodes, -1,
+                                                    self.head_dim),
+                )
 
         # norm
-        out = self.norm(out)
+        hidden_states = self.norm(preallocated_ssm_out, z[:num_actual_tokens])
 
         # out_proj
-        out = self.out_proj(out)
+        out = self.out_proj(hidden_states)
 
         return out

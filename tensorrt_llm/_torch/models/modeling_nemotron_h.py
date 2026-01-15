@@ -14,7 +14,7 @@
 # limitations under the License.
 
 import re
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import torch
 from torch import nn
@@ -37,9 +37,11 @@ from ..modules.mamba.mamba2_mixer import Mamba2Mixer
 from ..modules.mlp import MLP
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
+from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, EventType
-from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             register_auto_model)
+from .modeling_deepseekv3 import DeepseekV3MTPHead
+from .modeling_speculative import SpecDecOneEngineForCausalLM
+from .modeling_utils import DecoderModel, register_auto_model
 
 
 class NemotronHConfig(PretrainedConfig):
@@ -347,13 +349,17 @@ class NemotronHLayer(DecoderLayer):
         position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
 
         residual = hidden_states
 
         hidden_states = self.norm(hidden_states)
-        hidden_states = self.mixer(hidden_states, attn_metadata, **kwargs)
+        hidden_states = self.mixer(hidden_states,
+                                   attn_metadata,
+                                   spec_metadata=spec_metadata,
+                                   **kwargs)
         hidden_states = torch.add(hidden_states, residual)
 
         return hidden_states
@@ -405,6 +411,7 @@ class NemotronHModel(DecoderModel):
                                layer_type,
                                aux_stream_dict=self.aux_stream_dict))
         self.layers = nn.ModuleList(layers)
+        self.num_hidden_layers = config.num_hidden_layers
 
         # final norm
         self.norm_f = RMSNorm(
@@ -421,6 +428,7 @@ class NemotronHModel(DecoderModel):
         input_ids: Optional[torch.IntTensor] = None,
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -439,10 +447,11 @@ class NemotronHModel(DecoderModel):
 
         hidden_states = inputs_embeds
 
-        for layer in self.layers:
+        for layer in self.layers[:self.num_hidden_layers]:
             hidden_states = layer(position_ids,
                                   hidden_states,
                                   attn_metadata,
+                                  spec_metadata=spec_metadata,
                                   mamba_metadata=self.mamba_metadata)
 
         hidden_states = self.norm_f(hidden_states)
@@ -451,8 +460,8 @@ class NemotronHModel(DecoderModel):
 
 
 @register_auto_model("NemotronHForCausalLM")
-class NemotronHForCausalLM(DecoderModelForCausalLM[NemotronHModel,
-                                                   NemotronHConfig]):
+class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
+                                                       NemotronHConfig]):
 
     def __init__(
         self,
@@ -477,15 +486,274 @@ class NemotronHForCausalLM(DecoderModelForCausalLM[NemotronHModel,
             ]
 
         super().__init__(
-            NemotronHModel(model_config),
-            config=model_config,
-            hidden_size=model_config.pretrained_config.hidden_size,
-            vocab_size=model_config.pretrained_config.vocab_size,
+            model=NemotronHModel(model_config),
+            model_config=model_config,
         )
+        self.model_nextn = 0
+        if model_config.spec_config is not None and model_config.spec_config.spec_dec_mode.is_mtp_one_model(
+        ):
+            model_nextn = model_config.spec_config.num_nextn_predict_layers
+            ckpt_nextn = self.config.num_nextn_predict_layers
+            self.num_hidden_layers = self.config.num_hidden_layers
+            assert ckpt_nextn > 0, "There is not MTP modules in the checkpoint."
+            if ckpt_nextn == 1 and not model_config.spec_config.use_mtp_vanilla:
+                pass
+            else:
+                # modify the QuantConfig to support duplicated mtp layers
+                if model_config.quant_config.exclude_modules is not None:
+                    extend_exclude_modules = []
+                    for model_mtp_idx in range(
+                            self.num_hidden_layers,
+                            self.num_hidden_layers + model_nextn):
+                        ckpt_mtp_idx = (model_mtp_idx - self.num_hidden_layers
+                                        ) % ckpt_nextn + self.num_hidden_layers
+                        model_prefix = f"model.layers.{model_mtp_idx}"
+                        ckpt_prefix = f"model.layers.{ckpt_mtp_idx}"
+                        for exclude_module in model_config.quant_config.exclude_modules:
+                            if ckpt_prefix in exclude_module and model_prefix not in exclude_module:
+                                extend_exclude_modules.append(
+                                    exclude_module.replace(
+                                        ckpt_prefix, model_prefix))
+                    self.model_config.quant_config.exclude_modules.extend(
+                        extend_exclude_modules)
+            self.model.layers.extend(self.draft_model.mtp_layers)
+            self.epilogue.extend(self.draft_model.mtp_layers)
+            self.epilogue.append(self.spec_worker)
 
-    def load_weights(self, weights: dict, weight_mapper: BaseWeightMapper):
+    def forward(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: torch.IntTensor = None,
+        position_ids: Optional[torch.IntTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
+        return_context_logits: bool = False,
+        **kwargs,
+    ) -> torch.Tensor:
+        return super().forward(attn_metadata=attn_metadata,
+                               input_ids=input_ids,
+                               position_ids=position_ids,
+                               inputs_embeds=inputs_embeds,
+                               spec_metadata=spec_metadata,
+                               return_context_logits=return_context_logits,
+                               **kwargs)
+
+    def load_weights(self, weights: Dict, weight_mapper: BaseWeightMapper):
         new_weights = weight_mapper.preprocess_weights(weights)
-        super().load_weights(new_weights, weight_mapper)
+        super().load_weights(weights=new_weights, weight_mapper=weight_mapper)
 
 
 AutoConfig.register(NemotronHConfig.model_type, NemotronHConfig)
+
+
+class NemotronHMTPDecoderLayer(NemotronHLayer):
+
+    def __init__(
+        self,
+        model_config: ModelConfig[NemotronHConfig],
+        layer_idx: int,
+        aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
+        has_start_projections: bool,
+        has_end_norm: bool,
+        layer_type: str,
+    ) -> None:
+
+        super().__init__(
+            model_config=model_config,
+            layer_idx=layer_idx,
+            layer_type=layer_type,
+            aux_stream_dict=aux_stream_dict,
+        )
+
+        config = model_config.pretrained_config
+        self.model_config = model_config
+        self.has_start_projections = has_start_projections
+        self.has_end_norm = has_end_norm
+
+        if has_start_projections:
+            self.enorm = RMSNorm(
+                hidden_size=config.hidden_size,
+                eps=config.rms_norm_eps,
+                dtype=config.torch_dtype,
+            )
+            self.hnorm = RMSNorm(
+                hidden_size=config.hidden_size,
+                eps=config.rms_norm_eps,
+                dtype=config.torch_dtype,
+            )
+
+            if model_config.mapping.enable_attention_dp:
+                self.eh_proj = Linear(
+                    in_features=config.hidden_size * 2,
+                    out_features=config.hidden_size,
+                    bias=False,
+                    dtype=config.torch_dtype,
+                    quant_config=model_config.quant_config,
+                    skip_create_weights_in_init=model_config.
+                    skip_create_weights_in_init,
+                )
+            else:
+                self.eh_proj = Linear(
+                    in_features=config.hidden_size * 2,
+                    out_features=config.hidden_size,
+                    bias=False,
+                    dtype=config.torch_dtype,
+                    tensor_parallel_mode=TensorParallelMode.ROW,
+                    mapping=model_config.mapping,
+                    quant_config=model_config.quant_config,
+                    reduce_output=True,
+                    skip_create_weights_in_init=model_config.
+                    skip_create_weights_in_init,
+                )
+
+        if has_end_norm:
+            self.final_layernorm = RMSNorm(
+                hidden_size=config.hidden_size,
+                eps=config.rms_norm_eps,
+                dtype=config.torch_dtype,
+            )
+
+    def forward(
+        self,
+        inputs_embeds: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None = None,
+        attn_metadata: Optional[AttentionMetadata] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+
+        if self.has_start_projections:
+            assert inputs_embeds is not None
+            inputs_embeds_normed = self.enorm(inputs_embeds)
+            previous_hidden_states_normed = self.hnorm(hidden_states)
+
+            # Fuse via concatenation and linear projection
+            fused = torch.cat(
+                [inputs_embeds_normed, previous_hidden_states_normed], dim=-1)
+
+            # Split fused hidden_states columnwise based on TP
+            mapping = self.model_config.mapping
+            if mapping.tp_size > 1 and not mapping.enable_attention_dp:
+                fused = torch.chunk(fused, mapping.tp_size,
+                                    dim=-1)[mapping.tp_rank]
+
+            hidden_states = self.eh_proj(fused)
+            residual = None  # Start fresh after fusion
+
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.norm(hidden_states)
+        else:
+            hidden_states, residual = self.norm(hidden_states, residual)
+
+        hidden_states = self.mixer(
+            hidden_states=hidden_states,
+            attn_metadata=attn_metadata,
+        )
+
+        if self.has_end_norm:
+            if residual is not None:
+                hidden_states = hidden_states + residual
+                residual = None
+
+            hidden_states = self.final_layernorm(hidden_states)
+
+        return hidden_states, residual
+
+
+class NemotronHMTP(nn.Module):
+    """NemotronH MTP Layer - single MTP layer following DeepseekV3MTP pattern."""
+
+    def __init__(self,
+                 model_config: ModelConfig[NemotronHConfig],
+                 layer_idx: int,
+                 aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
+                 is_separate_draft_engine: bool = False,
+                 prefix: str = ""):
+        super().__init__()
+        config = model_config.pretrained_config
+        self.model_config = model_config
+        self.config = config
+        self.layer_idx = layer_idx
+
+        # Pattern configuration
+        self.pattern_str = config.mtp_hybrid_override_pattern
+        self.pattern_len = len(self.pattern_str)
+        assert self.pattern_len > 0
+
+        # Build pattern-based layers
+        self.layers = nn.ModuleDict()
+
+        for i in range(self.pattern_len):
+            step_rel_idx = i % self.pattern_len
+
+            char = self.pattern_str[step_rel_idx]
+
+            is_start_of_step = step_rel_idx == 0
+            is_end_of_step = step_rel_idx == self.pattern_len - 1
+
+            sublayer_quant_config = self._get_mtp_sublayer_quant_config(
+                model_config, self.layer_idx)
+
+            # Create a temporary model_config with the override quant_config
+            sublayer_model_config = ModelConfig(
+                pretrained_config=model_config.pretrained_config,
+                mapping=model_config.mapping,
+                quant_config=sublayer_quant_config,
+                skip_create_weights_in_init=model_config.
+                skip_create_weights_in_init,
+            )
+
+            self.layers[str(i)] = NemotronHMTPDecoderLayer(
+                model_config=sublayer_model_config,
+                layer_idx=self.layer_idx,
+                aux_stream_dict=aux_stream_dict,
+                has_start_projections=is_start_of_step,
+                has_end_norm=is_end_of_step,
+                layer_type=char,
+            )
+
+        # Add shared_head for MTP, following DeepseekV3MTP pattern
+        self.shared_head = DeepseekV3MTPHead(model_config)
+
+    def _get_mtp_sublayer_quant_config(
+            self, model_config: ModelConfig[NemotronHConfig], layer_idx: int):
+        """
+        Get quantization config for MTP sublayer.
+        The MTP layer in the nvfp4 checkpoint is unquantized. Because the TRTLLM
+        moe_backend only supports fp8/fp4 quantization, we need to override
+        the quant_config for the MTP layer.
+        """
+        from tensorrt_llm.models.modeling_utils import QuantConfig
+        quant_config = model_config.quant_config
+        # MTP layers are always unquantized, force quant_algo=None
+        if quant_config is None:
+            return None
+        return QuantConfig(
+            quant_algo=None,
+            kv_cache_quant_algo=quant_config.kv_cache_quant_algo,
+        )
+
+    def forward(
+        self,
+        input_ids: torch.IntTensor,
+        position_ids: torch.IntTensor,
+        hidden_states: torch.Tensor,
+        embed_tokens: Embedding,
+        attn_metadata: AttentionMetadata,
+        all_rank_num_tokens: Optional[List[int]] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        inputs_embeds = embed_tokens(input_ids)
+        residual = None
+        for i in range(self.pattern_len):
+            layer = self.layers[str(i)]
+            hidden_states, residual = layer(
+                inputs_embeds=inputs_embeds,
+                positions=position_ids,
+                hidden_states=hidden_states,
+                residual=residual,
+                attn_metadata=attn_metadata,
+            )
+        return hidden_states
