@@ -378,5 +378,42 @@ REGISTER_NODE_TYPE(AgentChatbotNode, NodeType::kAGENT_CHATBOT, "agent_chatbot")
 REGISTER_NODE_TYPE(AgentLatencyNode, NodeType::kAGENT_LATENCY, "agent_latency")
 REGISTER_NODE_TYPE(AgentDeepResearchNode, NodeType::kAGENT_DEEP_RESEARCH, "agent_deep_research")
 
+AgentTreePolicy::AgentTreePolicy(std::optional<batch_scheduler::AgentTreeConfig> agentTreeConfig)
+    : mAgentTreeConfig(std::move(agentTreeConfig))
+    , mAgentTreeRoot(createAgentTreeRoot(mAgentTreeConfig))
+{
+}
+
+RequestVector AgentTreePolicy::resortRequests(RequestVector const& requests) const
+{
+    // If no agent tree root, return requests as-is
+    if (!mAgentTreeRoot)
+    {
+        return requests;
+    }
+
+    // Create a mutable copy for partitioning
+    RequestVector activeRequests = requests;
+
+    // Partition: generation requests first (must be scheduled in overlap scheduler),
+    // non-generation requests after (can be sorted/truncated by agent tree).
+    auto genEndIt = std::stable_partition(activeRequests.begin(), activeRequests.end(),
+        [](auto const& req) { return req->isGenerationInProgressState(); });
+    auto const genCount = static_cast<SizeType32>(std::distance(activeRequests.begin(), genEndIt));
+
+    // Sort and truncate only non-generation requests [genEndIt, end)
+    // Pass genCount as reservedCount so truncation respects: maxRequests - genCount
+    RequestVector nonGenRequests(genEndIt, activeRequests.end());
+    auto sortedNonGenRequests = sortAndTruncateRequestsByAgentTree(mAgentTreeRoot, nonGenRequests, genCount);
+
+    // Build final result: [generation requests] + [sorted non-generation requests]
+    RequestVector result;
+    result.reserve(genCount + sortedNonGenRequests.size());
+    result.insert(result.end(), activeRequests.begin(), genEndIt);
+    result.insert(result.end(), sortedNonGenRequests.begin(), sortedNonGenRequests.end());
+
+    return result;
+}
+
 } // namespace agent_tree
 } // namespace tensorrt_llm::batch_manager

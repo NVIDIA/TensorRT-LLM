@@ -19,8 +19,8 @@
 #include <limits>
 
 #include "common.h"
-#include "tensorrt_llm/batch_manager/agentTree.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
+#include "tensorrt_llm/batch_manager/resortPolicy.h"
 #include "tensorrt_llm/common/algorithm.h"
 #include "tensorrt_llm/runtime/common.h"
 
@@ -58,11 +58,17 @@ public:
     explicit MicroBatchScheduler(std::optional<batch_scheduler::ContextChunkingConfig> ctxChunkConfig = std::nullopt,
         std::optional<SizeType32> maxContextLength = std::nullopt,
         LlmRequestState noScheduleUntilState = LlmRequestState::kCONTEXT_INIT,
-        LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_TO_COMPLETE,
-        std::optional<batch_scheduler::AgentTreeConfig> agentTreeConfig = std::nullopt);
+        LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_TO_COMPLETE);
 
     std::tuple<RequestVector, RequestVector> operator()(RequestVector& activeRequests, ReqIdsSet const& inflightReqIds,
         SizeType32 maxBatchSizeRuntime, std::optional<SizeType32> maxNumTokensRuntime) const;
+
+    /// @brief Sets the resort policy to use AgentTreePolicy with the given configuration.
+    /// @param agentPercentage The ratio of agent requests to schedule (0.0-1.0, -1.0 for random).
+    /// @param agentTypes The list of agent types to schedule.
+    /// @param agentInflightSeqNum The maximum number of inflight sequences for agent requests.
+    void setAgentTreeResortPolicy(
+        float agentPercentage, std::optional<std::vector<std::string>> agentTypes, SizeType32 agentInflightSeqNum);
 
     static void setCtxRequestsChunkSize(RequestVector& contextsToBeChunked, ContextChunkingPolicy ctxChunkPolicy,
         std::optional<SizeType32> ctxTokensCapacity, SizeType32 chunkUnitSize,
@@ -90,8 +96,8 @@ private:
     LlmRequestState mNoScheduleUntilState;
     LlmRequestState mNoScheduleAfterState;
 
-    std::optional<batch_scheduler::AgentTreeConfig> mAgentTreeConfig;
-    std::shared_ptr<agent_tree::AgentTreeNode> mAgentTreeRoot;
+    /// Optional resort policy for reordering requests before scheduling.
+    std::unique_ptr<ResortPolicy> mResortPolicy;
 };
 
 } // namespace tensorrt_llm::batch_manager
