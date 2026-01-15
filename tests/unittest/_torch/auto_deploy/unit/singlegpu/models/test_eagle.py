@@ -21,18 +21,16 @@ import pytest
 import torch
 from _model_test_utils import get_small_model_config
 from build_and_run_ad import ExperimentConfig, main
-from transformers import AutoConfig
 
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_eagle import (
     Eagle3DrafterForCausalLM,
-    Eagle3Model,
+    Eagle3DraftOutput,
 )
-from tensorrt_llm._torch.auto_deploy.models.eagle import EagleDrafterFactory
+from tensorrt_llm._torch.auto_deploy.models.eagle import EagleConfigInfo, EagleDrafterFactory
 from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactoryRegistry
 from tests.test_common.llm_data import hf_id_to_local_model_dir
 
 EAGLE_MODEL_HUB_ID = "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B"
-
 
 ###############################################################################
 # Mock classes for standalone Eagle testing
@@ -55,7 +53,17 @@ class MockEagle3ModelForCausalLM(Eagle3DrafterForCausalLM):
         self._hidden_size = config.hidden_size
         self._dtype = config.dtype
 
-    def forward(self, input_ids, **kwargs):
+    def forward(self, input_ids, position_ids, input_embeds=None, **kwargs):
+        assert self.model.embed_tokens is not None, (
+            "embed_tokens must be set before running standalone Eagle model."
+        )
+        assert self.lm_head is not None, (
+            "lm_head must be set before running standalone Eagle model."
+        )
+
+        if input_embeds is None:
+            inputs_embeds = self.model.embed_tokens(input_ids)
+
         # Inject mock hidden states if not provided
         if "hidden_states" not in kwargs:
             batch_size, seq_len = input_ids.shape
@@ -64,7 +72,9 @@ class MockEagle3ModelForCausalLM(Eagle3DrafterForCausalLM):
                 dtype=self._dtype,
                 device=input_ids.device,
             )
-        return super().forward(input_ids, **kwargs)
+        draft_output = super().forward(inputs_embeds, position_ids, **kwargs)
+        logits = self.lm_head(draft_output.norm_hidden_state)
+        return Eagle3DraftOutput(logits=logits, last_hidden_state=draft_output.last_hidden_state)
 
 
 class MockEagleDrafterFactory(EagleDrafterFactory):
@@ -74,8 +84,15 @@ class MockEagleDrafterFactory(EagleDrafterFactory):
     generates random hidden states, enabling testing without a target model.
     """
 
-    _drafter_model_mapping = {
-        "llama": MockEagle3ModelForCausalLM,
+    _drafter_mapping = {
+        "llama": EagleConfigInfo(
+            config_class=MockEagle3ModelForCausalLM,
+            eagle_config_defaults={
+                "load_embedding_from_target": False,
+                "load_lm_head_from_target": False,
+                "num_capture_layers": 1,
+            },
+        ),
     }
 
 
@@ -125,7 +142,7 @@ def test_eagle_model_torch_export():
     torch.export for potential TensorRT compilation.
 
     Note: We skip loading weights since torch.export only traces the computation
-    graph (model architecture), not the actual weight values. Random init is fine.
+    graph (model architecture).
     """
     print("\n" + "=" * 80)
     print("Test: EagleModel torch.export")
@@ -141,40 +158,35 @@ def test_eagle_model_torch_export():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.float16
 
-    # Use pretrained config (llama) - can provide it directly to instantiate Eagle3Model.
-    config_path = eagle_path / "config.json"
-    config = AutoConfig.from_pretrained(config_path)
-
-    # Create model with random weights (no need to load for export test)
-    model = Eagle3Model(config)
-    model.to(device)
-    model.eval()
+    # Create model via EagleDrafterFactory (creates Eagle3DrafterForCausalLM)
+    factory = EagleDrafterFactory(model=str(eagle_path), skip_loading_weights=True)
+    model = factory.build_model(device)
+    config = model.config
 
     # Create inputs for export
     batch_size = 1
     seq_len = 8
     hidden_dim = config.hidden_size
 
-    input_ids = torch.randint(
-        0, config.vocab_size, (batch_size, seq_len), device=device, dtype=torch.long
-    )
+    inputs_embeds = torch.randn((batch_size, seq_len, hidden_dim), device=device, dtype=dtype)
     position_ids = torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0)
     mock_hidden_states = torch.randn((batch_size, seq_len, hidden_dim), device=device, dtype=dtype)
 
     print("Export input shapes:")
-    print(f"  input_ids: {input_ids.shape}")
+    print(f"  inputs_embeds: {inputs_embeds.shape}")
     print(f"  position_ids: {position_ids.shape}")
     print(f"  hidden_states: {mock_hidden_states.shape}")
 
     example_args = (
-        input_ids,
+        inputs_embeds,
         position_ids,
-        mock_hidden_states,
     )
 
     # Attempt torch.export
     try:
-        exported_program = torch.export.export(model, args=example_args)
+        exported_program = torch.export.export(
+            model, args=example_args, kwargs={"hidden_states": mock_hidden_states}
+        )
         print("✅ torch.export successful!")
         print("Graph module code preview (first 20 lines):")
         code_lines = exported_program.graph_module.code.split("\n")[:20]
