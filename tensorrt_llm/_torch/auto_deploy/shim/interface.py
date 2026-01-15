@@ -86,6 +86,15 @@ class CachedSequenceInterface:
             vocab_size_padded=vocab_size_padded,
         )
 
+        # NOTE: we keep an extra state slot around to simplify cuda graph padding
+        # WHY?
+        # Requests that just finished won't free their used resources immediately. Specifically, the
+        # running order is self.scheduler.schedule_request, self._forward_step() and
+        # self._process_previous_batch() in the PyExecutor. Hence, the current forward step will
+        # remove finished requests but will not remove mamba_cache immediately and therefore it
+        # won't be available in time for padding in the next forward step.
+        self.max_num_state_slots = max_batch_size + 1
+
         self._resource_lookup: ResourceHandlerDict = {}
         self._caches: Dict[str, torch.Tensor] = {}
         # KVCacheManager (or MambaHybridCacheManager) for managed resources
@@ -194,8 +203,10 @@ class CachedSequenceInterface:
             "force_distributed_sync": force_sync,
         }
 
-        # TODO: consider if we want to keep max_batch_size+1 hack around for cuda graph padding...
         if self._state_resource_order:
+            # NOTE: +1 for cuda graph padding
+            kv_cache_kwargs["max_batch_size"] = self.max_num_state_slots
+
             self._kv_cache_manager = MambaHybridCacheManager(
                 # Mamba params for single-layer byte buffer
                 mamba_d_state=1,

@@ -1050,7 +1050,10 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     # initialize_cache/resize_kv_cache transform pipeline. Get it from the interface.
     kv_cache_manager = engine.cache_seq_interface.kv_cache_manager
     assert kv_cache_manager is not None, "KVCacheManager not initialized."
-    seq_slot_manager = SeqSlotManager(max_num_sequences=max_num_sequences)
+    # NOTE: +1 for cuda graph padding
+    seq_slot_manager = SeqSlotManager(
+        max_num_sequences=engine.cache_seq_interface.max_num_state_slots
+    )
 
     draft_kv_cache_manager = create_draft_kv_cache_manager_maybe(
         draft_model_engine, ad_config, dist_mapping
