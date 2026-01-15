@@ -29,10 +29,10 @@ import tensorrt_llm as tllm
 from tensorrt_llm import Mapping
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
-                                             MPIDist, TorchDist)
+                                             Distributed)
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._utils import (get_sm_version, local_mpi_rank, local_mpi_size,
-                                 mpi_disabled, nvtx_range)
+                                 nvtx_range)
 from tensorrt_llm.bindings.internal.runtime import delay_kernel
 from tensorrt_llm.functional import AllReduceParams, AllReduceStrategy
 from tensorrt_llm.logger import logger
@@ -41,7 +41,7 @@ from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 
 def profile_allreduce(
     mapping: Mapping,
-    dist: TorchDist | MPIDist,
+    dist: Distributed,
     enable_cudagraph: bool = False,
     inner_loop=200,
     outer_loop=10,
@@ -137,14 +137,10 @@ def allreduce_benchmark(
     cudart.cudaSetDevice(local_rank)
 
     mapping = Mapping(world_size, rank, gpus_per_node, tp_size=world_size)
-    if mpi_disabled():
-        dist = TorchDist(mapping=mapping)
-    else:
-        dist = MPIDist(mapping=mapping)
 
     logger.set_rank(mapping.rank)
 
-    AutoTuner.get().setup_distributed_state(mapping, dist)
+    AutoTuner.get().setup_distributed_state(mapping)
 
     sm_version = get_sm_version()
 

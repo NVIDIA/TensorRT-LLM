@@ -39,7 +39,7 @@ LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = env.wheelDockerImagePy310
 LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = env.wheelDockerImagePy312
 
 // DLFW torch image
-DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:25.10-py3"
+DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:25.12-py3"
 
 //Ubuntu base image
 UBUNTU_22_04_IMAGE = "urm.nvidia.com/docker/ubuntu:22.04"
@@ -315,6 +315,11 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false) {
                 if (line.matches(/.*Running \d+ items in this shard.*/) || line.matches(/.*\[pytest-split\] Running group.*/)) {
                     foundRunningLine = true
                     return false  // Don't include the "Running" line itself
+                }
+                // Stop collecting when we hit the warnings/errors summary separator
+                if (foundRunningLine && line.contains('======================')) {
+                    foundRunningLine = false  // Stop collecting
+                    return false
                 }
 
                 def hasDoubleColon = line.contains('::')
@@ -874,7 +879,6 @@ def getMountListForSlurmTest(SlurmCluster cluster, boolean useSbatch = false)
         }
         mounts += [
             "${cluster.scratchPath}:/scratch.trt_llm_data:ro",
-            "/home/svc_tensorrt/.cache:/root/.cache",
         ]
     } else {
         throw new Exception("Unsupported container runtime: ${cluster.containerRuntime}")
@@ -1155,7 +1159,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export pytestCommand="$pytestCommand"
                     export coverageConfigFile="$coverageConfigFile"
                     export NVIDIA_IMEX_CHANNELS=\${NVIDIA_IMEX_CHANNELS:-0}
-                    export NVIDIA_VISIBLE_DEVICES=\${NVIDIA_VISIBLE_DEVICES:-\$(seq -s, 0 \$((\$(nvidia-smi --query-gpu=count -i 0 --format=noheader)-1)))}
+                    export NVIDIA_VISIBLE_DEVICES=\${NVIDIA_VISIBLE_DEVICES:-\$(seq -s, 0 \$((\$(nvidia-smi --query-gpu=count -i 0 --format=csv,noheader)-1)))}
                     ${envExportStatements}
 
                     echo "Env NVIDIA_IMEX_CHANNELS: \$NVIDIA_IMEX_CHANNELS"
@@ -2149,8 +2153,12 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
         // If stageName contains "-FMHA-", add "backend=fmha" to makoArgs
         // At this point, only tests with backend=fmha or unspecified backend will be run
         makoArgs += ["backend=fmha"]
+    } else if (stageName.contains("-AutoDeploy-")) {
+        // If stageName contains "-AutoDeploy-", add "backend=autodeploy" to makoArgs
+        // At this point, only tests with backend=autodeploy or unspecified backend will be run
+        makoArgs += ["backend=autodeploy"]
     } else {
-        // If stageName does not contain "-PyTorch-", "-TensorRT-", "-CPP-", "-Triton-", or "-FMHA-", do not add any backend
+        // If stageName does not contain "-PyTorch-", "-TensorRT-", "-CPP-", "-Triton-", "-FMHA-", or "-AutoDeploy-", do not add any backend
         // At this point, all tests will be run
         // For cases where backend is not specified in makoArgs, we will match all types of backends and tests without specified backend
     }
@@ -3151,6 +3159,7 @@ def launchTestJobs(pipeline, testFilter)
         "A30-Triton-1": ["a30", "l0_a30", 1, 1],
         "A30-PyTorch-1": ["a30", "l0_a30", 1, 2],
         "A30-PyTorch-2": ["a30", "l0_a30", 2, 2],
+        "A30-AutoDeploy-1": ["a30", "l0_a30", 1, 1],
         "A30-CPP-1": ["a30", "l0_a30", 1, 3],
         "A30-CPP-2": ["a30", "l0_a30", 2, 3],
         "A30-CPP-3": ["a30", "l0_a30", 3, 3],
@@ -3162,11 +3171,13 @@ def launchTestJobs(pipeline, testFilter)
         "H100_PCIe-PyTorch-3": ["h100-cr", "l0_h100", 3, 4],
         "H100_PCIe-PyTorch-4": ["h100-cr", "l0_h100", 4, 4],
         "H100_PCIe-PyTorch-Ray-1": ["h100-cr", "l0_h100", 1, 1],
+        "H100_PCIe-AutoDeploy-1": ["h100-cr", "l0_h100", 1, 1],
         "H100_PCIe-CPP-1": ["h100-cr", "l0_h100", 1, 1],
         "H100_PCIe-TensorRT-1": ["h100-cr", "l0_h100", 1, 1],
         "B200_PCIe-PyTorch-1": ["b100-ts2", "l0_b200", 1, 3],
         "B200_PCIe-PyTorch-2": ["b100-ts2", "l0_b200", 2, 3],
         "B200_PCIe-PyTorch-3": ["b100-ts2", "l0_b200", 3, 3],
+        "B200_PCIe-AutoDeploy-1": ["b100-ts2", "l0_b200", 1, 1],
         "RTX5090-PyTorch-1": ["rtx-5090", "l0_gb202", 1, 1],
         "RTX5080-TensorRT-1": ["rtx-5080", "l0_gb203", 1, 2],
         "RTX5080-TensorRT-2": ["rtx-5080", "l0_gb203", 2, 2],
@@ -3249,15 +3260,19 @@ def launchTestJobs(pipeline, testFilter)
     fullSet = parallelJobs.keySet()
 
     x86SlurmTestConfigs = [
-        "DGX_H100-2_GPUs-PyTorch-Others-1": ["dgx-h100-x2-oci", "l0_dgx_h100", 1, 1, 2],
+        "DGX_H100-2_GPUs-PyTorch-Others-1": ["dgx-h100-x2-oci", "l0_dgx_h100", 1, 2, 2],
+        "DGX_H100-2_GPUs-PyTorch-Others-2": ["dgx-h100-x2-oci", "l0_dgx_h100", 2, 2, 2],
         "DGX_H100-2_GPUs-PyTorch-GptOss-1": ["dgx-h100-x2-oci", "l0_dgx_h100", 1, 1, 2],
         "DGX_H100-2_GPUs-PyTorch-Ray-1": ["dgx-h100-x2-oci", "l0_dgx_h100", 1, 1, 2],
-        "DGX_H100-4_GPUs-PyTorch-DeepSeek-1": ["dgx-h100-x4-oci", "l0_dgx_h100", 1, 1, 4],
+        "DGX_H100-4_GPUs-PyTorch-DeepSeek-1": ["dgx-h100-x4-oci", "l0_dgx_h100", 1, 2, 4],
+        "DGX_H100-4_GPUs-PyTorch-DeepSeek-2": ["dgx-h100-x4-oci", "l0_dgx_h100", 2, 2, 4],
         "DGX_H100-4_GPUs-PyTorch-GptOss-1": ["dgx-h100-x4-oci", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-PyTorch-Others-1": ["dgx-h100-x4-oci", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-PyTorch-Ray-1": ["dgx-h100-x4-oci", "l0_dgx_h100", 1, 1, 4],
+        "DGX_H100-4_GPUs-AutoDeploy-1": ["dgx-h100-x4-oci", "l0_dgx_h100", 1, 1, 4],
         "DGX_B200-4_GPUs-PyTorch-1": ["b200-x4-lbd", "l0_dgx_b200", 1, 1, 4, 1, true],
         "DGX_B200-4_GPUs-PyTorch-Ray-1": ["b200-x4-lbd", "l0_dgx_b200", 1, 1, 4, 1, true],
+        "DGX_B200-4_GPUs-AutoDeploy-1": ["b200-x4-lbd", "l0_dgx_b200", 1, 1, 4, 1, true],
         "DGX_B200-8_GPUs-PyTorch-1": ["b200-x8-lbd", "l0_dgx_b200", 1, 1, 8, 1, true],
         "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["b200-x4-lbd", "l0_dgx_b200", 1, 2, 4, 1, true],
         "DGX_B200-4_GPUs-PyTorch-Post-Merge-2": ["b200-x4-lbd", "l0_dgx_b200", 2, 2, 4, 1, true],
@@ -3388,7 +3403,7 @@ def launchTestJobs(pipeline, testFilter)
     // Python version and OS for sanity check
     x86SanityCheckConfigs = [
         "PY312-DLFW": [
-            LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,
+            LLM_DOCKER_IMAGE,  // Workaround ABI incompatibilities between PyTorch 2.9.1 and 2.10.0a0
             "B200_PCIe",
             X86_64_TRIPLE,
             false,
@@ -3417,15 +3432,16 @@ def launchTestJobs(pipeline, testFilter)
     ]
 
     aarch64SanityCheckConfigs = [
+        /* //Disable PY312-UB2404 temporarily since lack of official PyTorch for CUDA 13.1.
         "PY312-UB2404": [
             LLM_DOCKER_IMAGE,
             "GH200",
             AARCH64_TRIPLE,
             false,
             "",
-            UBUNTU_24_04_IMAGE,
-            true, // Extra PyTorch CUDA 13.0 install
-        ],
+            DLFW_IMAGE,
+            false, // Extra PyTorch CUDA 13.0 install
+        ],*/
         "PY312-DLFW": [
             LLM_DOCKER_IMAGE,
             "GH200",
@@ -3523,7 +3539,7 @@ def launchTestJobs(pipeline, testFilter)
                             def platform = cpu_arch == X86_64_TRIPLE ? "x86_64" : "sbsa"
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget https://developer.download.nvidia.com/compute/cuda/repos/${ubuntu_version}/${platform}/cuda-keyring_1.1-1_all.deb")
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "dpkg -i cuda-keyring_1.1-1_all.deb")
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y cuda-toolkit-13-0")
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y cuda-toolkit-13-1")
                         }
                         // Extra PyTorch CUDA 13.0 install for all bare-metal environments (Default PyTorch is for CUDA 12.8)
                         if (values[6]) {
@@ -3531,9 +3547,9 @@ def launchTestJobs(pipeline, testFilter)
                             // Use internal mirror instead of https://download.pytorch.org/whl/cu130 for better network stability.
                             // PyTorch CUDA 13.0 package and torchvision package can be installed as expected.
                             if (k8s_arch == "amd64") {
-                                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.9.0+cu130 torchvision==0.24.0+cu130 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple")
+                                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.9.1+cu130 torchvision==0.24.1+cu130 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple")
                             } else {
-                                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.9.0+cu130 torchvision==0.24.0 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple")
+                                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.9.1+cu130 torchvision==0.24.1 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple")
                             }
                         }
 

@@ -5,6 +5,7 @@ from .modeling_bert import BertForSequenceClassification
 from .modeling_clip import CLIPVisionModel
 from .modeling_deepseekv3 import DeepseekV3ForCausalLM
 from .modeling_exaone4 import Exaone4ForCausalLM
+from .modeling_exaone_moe import ExaoneMoeForCausalLM
 from .modeling_gemma3 import Gemma3ForCausalLM
 from .modeling_gemma3vl import Gemma3VLM
 from .modeling_glm import Glm4MoeForCausalLM
@@ -14,6 +15,7 @@ from .modeling_hunyuan_moe import HunYuanMoEV1ForCausalLM
 from .modeling_hyperclovax import HCXVisionForCausalLM
 from .modeling_llama import LlamaForCausalLM
 from .modeling_llava_next import LlavaNextModel
+from .modeling_minimaxm2 import MiniMaxM2ForCausalLM
 from .modeling_mistral import Mistral3VLM, MistralForCausalLM
 from .modeling_mixtral import MixtralForCausalLM
 from .modeling_nemotron import NemotronForCausalLM
@@ -44,6 +46,7 @@ __all__ = [
     "CLIPVisionModel",
     "DeepseekV3ForCausalLM",
     "Exaone4ForCausalLM",
+    "ExaoneMoeForCausalLM",
     "Gemma3ForCausalLM",
     "Gemma3VLM",
     "HCXVisionForCausalLM",
@@ -78,6 +81,7 @@ __all__ = [
     "SeedOssForCausalLM",
     "Glm4MoeForCausalLM",
     "Qwen3VLModel",
+    "MiniMaxM2ForCausalLM",
 ]
 
 if transformers.__version__ >= "4.45.1":

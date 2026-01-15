@@ -37,6 +37,8 @@ class ConfigValidator:
         logger.info("Validate streaming is true succeeded!")
         ConfigValidator._validate_ctx_and_gen_max_seq_length(extracted_config)
         logger.info("Validate context and generation maximum sequence length succeeded!")
+        ConfigValidator._validate_concurrency_list(extracted_config)
+        logger.info("Validate concurrency list succeeded!")
 
     @staticmethod
     def _validate_gen_max_tokens(extracted_config: dict) -> None:
@@ -52,8 +54,9 @@ class ConfigValidator:
         gen_max_batch_size = extracted_config["gen_max_batch_size"]
         mtp_size = extracted_config["mtp_size"]
         if mtp_size > 0:
-            assert gen_max_tokens == (gen_max_batch_size * (mtp_size + 1)), (
-                "config error: gen_max_tokens != gen_max_batch_size * (mtp_size + 1)"
+            # Confirmed with dev, this one should be >=
+            assert gen_max_tokens >= (gen_max_batch_size * (mtp_size + 1)), (
+                "config error: gen_max_tokens < gen_max_batch_size * (mtp_size + 1)"
             )
 
     @staticmethod
@@ -85,3 +88,29 @@ class ConfigValidator:
         gen_max_seq_len = extracted_config["gen_max_seq_len"]
         assert ctx_max_seq_len > isl, "config error: ctx_max_seq_len > isl"
         assert gen_max_seq_len > (isl + osl), "config error: gen_max_seq_len <= (isl + osl)"
+
+    @staticmethod
+    def _validate_concurrency_list(extracted_config: dict) -> None:
+        """Validate concurrency list.
+
+        Args:
+            extracted_config: Extracted configuration fields
+
+        Raises:
+            ValueError: If concurrency list is invalid
+        """
+        concurrency_list = extracted_config["concurrency_list"]
+        assert concurrency_list, "config error: concurrency_list is empty"
+        gen_enable_dp = extracted_config["gen_enable_dp"]
+        logger.info(f"gen_enable_dp: {gen_enable_dp}")
+        for concurrency in concurrency_list:
+            gen_batch_size = extracted_config["gen_batch_size"]
+            if gen_enable_dp:
+                gen_tp_size = extracted_config["gen_tp_size"]
+                assert concurrency <= gen_batch_size * gen_tp_size, (
+                    "config error: concurrency exceeds gen_batch_size * gen_tp_size"
+                )
+            else:
+                assert concurrency <= gen_batch_size, (
+                    "config error: concurrency exceeds gen_batch_size"
+                )

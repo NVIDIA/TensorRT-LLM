@@ -131,7 +131,7 @@ server_configs:
         iterations: 5
         isl: 8192
         osl: 1024
-        random_range_ratio: 0.8
+        random_range_ratio: 0.2
         backend: "openai"
 
   - name: "r1_fp4_v2_tep4_mtp3_8k1k"
@@ -161,7 +161,7 @@ server_configs:
         iterations: 10
         isl: 8192
         osl: 1024
-        random_range_ratio: 0.8
+        random_range_ratio: 0.2
         backend: "openai"
 
   - name: "r1_fp4_v2_tp4_mtp3_8k1k"
@@ -191,7 +191,7 @@ server_configs:
         iterations: 10
         isl: 8192
         osl: 1024
-        random_range_ratio: 0.8
+        random_range_ratio: 0.2
         backend: "openai"
 
   # 1k8k configs

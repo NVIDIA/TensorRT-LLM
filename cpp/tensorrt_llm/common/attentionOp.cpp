@@ -298,6 +298,11 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     xqaParams.use_sparse_attention = useTllmGenSparseAttention();
     // Skip softmax threshold.
     xqaParams.skip_softmax_threshold_scale_factor = mSkipSoftmaxThresholdScaleFactorDecode;
+#ifdef SKIP_SOFTMAX_STAT
+    // Statistics of skip-softmax, pointers of device memory for output
+    xqaParams.skip_softmax_total_blocks = mSkipSoftmaxTotalBlocks;
+    xqaParams.skip_softmax_skipped_blocks = mSkipSoftmaxSkippedBlocks;
+#endif
     // Cross attention parameters.
     xqaParams.encoder_input_lengths = generationsParams.encoder_input_lengths;
 
@@ -1036,7 +1041,7 @@ int AttentionOp::mlaGeneration(
         TllmGenFmhaRunnerParams tllmRunnerParams{};
 
         // Parameters to select kernels.
-        tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
+        tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;
         tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
         tllmRunnerParams.mMultiCtasKvMode = mMultiBlockMode;
         // Note that the tileScheduler and multiCtasKvMode will be automatically tuned when using multi_block mode.
