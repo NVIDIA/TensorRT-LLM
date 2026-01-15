@@ -18,7 +18,6 @@ l0_dgx_h100:
   - unittest/llmapi/test_llm_multi_gpu_pytorch.py -m "gpu2"
   - unittest/llmapi/test_additional_model_outputs.py -m "gpu2"
   - unittest/_torch/multi_gpu -m "not post_merge" TIMEOUT (90)
-  - unittest/_torch/auto_deploy/unit/multigpu
   - unittest/_torch/modeling/test_modeling_pixtral.py::test_tensor_parallelism
   # ------------- Disaggregated serving tests ---------------
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_eagle3[eagle3_one_model=False-overlap_scheduler=False]
@@ -44,8 +43,6 @@ l0_dgx_h100:
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[True-True-True]
   - unittest/llmapi/apps/test_disagg_serving_perf_metrics.py
   - disaggregated/test_disaggregated.py::test_disaggregated_cancel_large_context_requests[DeepSeek-V3-Lite-bf16]
-  # ------------- AutoDeploy tests ---------------
-  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[False-2]
   # llmapi
   - unittest/llmapi/test_mpi_session.py::test_llmapi_launch_multiple_tasks
   # ------------- Skip softmax attention tests ---------------
@@ -130,8 +127,6 @@ l0_dgx_h100:
   - disaggregated/test_auto_scaling.py::test_worker_restart[http-load_balancing]
   - disaggregated/test_auto_scaling.py::test_minimal_instances[http-round_robin]
   - disaggregated/test_auto_scaling.py::test_disagg_server_restart[http-round_robin]
-  # ------------- AutoDeploy tests ---------------
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_bf16
 - condition:
     ranges:
       system_gpu_count:
@@ -308,3 +303,22 @@ l0_dgx_h100:
     - unittest/llmapi/test_async_llm.py -m "gpu4"
     - ray_orchestrator/RL/test_rl_perf_reproduce.py::test_rl_perf_reproduce[tp2_2instances]
     - ray_orchestrator/RL/test_rl_perf_reproduce.py::test_rl_perf_reproduce[tp1_4instances]
+# ------------- AutoDeploy Backend Stages ---------------
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+        lte: 4
+    wildcards:
+      gpu:
+      - '*h100*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
+      backend: autodeploy
+      auto_trigger: others
+      orchestrator: mpi
+  tests:
+  - unittest/_torch/auto_deploy/unit/multigpu
+  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[False-4]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_bf16
