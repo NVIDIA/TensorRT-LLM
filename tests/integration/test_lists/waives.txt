@@ -230,7 +230,6 @@ full:H100_PCIe/unittest/llmapi/test_llm_pytorch.py::test_llama_7b_multi_lora_evi
 unittest/_torch/speculative/test_draft_len_schedule.py::test_correctness_across_batch_sizes[model_drafter-schedule1] SKIP (https://nvbugs/5680911)
 accuracy/test_llm_api_pytorch.py::TestSeedOss_36B::test_auto_dtype SKIP (https://nvbugs/5612438)
 accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[True] SKIP (https://nvbugs/5688721)
-accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[False-2] SKIP (https://nvbugs/5769712)
 accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[False-4] SKIP (https://nvbugs/5769712)
 test_e2e.py::test_openai_completions_example[trt] SKIP (https://nvbugs/5701450)
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp4-fp8kv=False-attn_backend=TRTLLM-torch_compile=False] SKIP (https://nvbugs/5701457)

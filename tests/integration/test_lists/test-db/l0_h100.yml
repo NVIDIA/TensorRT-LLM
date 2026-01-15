@@ -111,16 +111,6 @@ l0_h100:
   - test_e2e.py::test_openai_chat_harmony
   - test_e2e.py::test_openai_responses
   - test_e2e.py::test_trtllm_benchmark_serving[llama-3.1-model/Meta-Llama-3.1-8B]
-  # ------------- AutoDeploy tests ---------------
-  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[False-1]
-  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[True-1]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[False]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[True]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_fp8
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_bf16
-  - examples/test_ad_speculative_decoding.py::test_autodeploy_spec_dec_output[draft_target]
-  - examples/test_ad_speculative_decoding.py::test_autodeploy_spec_dec_output[eagle3]
-  - examples/test_ad_speculative_decoding.py::test_autodeploy_eagle3_acceptance_rate
 - condition:
     ranges:
       system_gpu_count:
@@ -422,3 +412,28 @@ l0_h100:
       backend: fmha
   tests:
   - test_fmha.py::test_fmha TIMEOUT (90)
+# ------------- AutoDeploy Backend Stages ---------------
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*h100*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
+      backend: autodeploy
+      orchestrator: mpi
+  tests:
+  - unittest/_torch/auto_deploy/unit/singlegpu
+  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[False-1]
+  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[True-1]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[False]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[True]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_fp8
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_bf16
+  - examples/test_ad_speculative_decoding.py::test_autodeploy_spec_dec_output[draft_target]
+  - examples/test_ad_speculative_decoding.py::test_autodeploy_spec_dec_output[eagle3]
+  - examples/test_ad_speculative_decoding.py::test_autodeploy_eagle3_acceptance_rate
