@@ -3,3 +3,4 @@
 # WAR against https://github.com/advisories/GHSA-gm62-xv2j-4w53
 # WAR against https://github.com/advisories/GHSA-2xpw-w6gg-jr37
 urllib3>=2.6.3
+aiohttp>=3.13.3
