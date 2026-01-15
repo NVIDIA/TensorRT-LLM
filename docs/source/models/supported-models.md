@@ -1,5 +1,6 @@
 (support-matrix)=
 <!-- Generated from tensorrt_llm/llmapi/model_support_matrix.py; do not edit. -->
+<!-- To regenerate: build docs, which runs generate_supported_models() -->
 # Supported Models
 
 The following is a table of supported models for the PyTorch backend:

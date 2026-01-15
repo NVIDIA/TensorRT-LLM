@@ -256,14 +256,24 @@ class BaseLLM:
         atexit.register(LLM._shutdown_wrapper, weakref.ref(self))
 
     def _apply_model_feature_fallbacks(self) -> None:
+        if not getattr(self.args, "auto_disable_unsupported_features", False):
+            return
         cfg = getattr(self, "_hf_model_config", None)
         if cfg is None:
+            logger.debug(
+                "Skipping model feature fallbacks: HF model config not available"
+            )
             return
         archs = getattr(cfg, "architectures", None)
         if not (isinstance(archs, (list, tuple)) and archs
                 and isinstance(archs[0], str)):
+            logger.debug(
+                f"Skipping model feature fallbacks: invalid or missing architectures field (got {archs})"
+            )
             return
         arch = archs[0]
+        logger.debug(
+            f"Applying model feature fallbacks for architecture: {arch}")
 
         def _disable_if_unsupported(
             feature: SupportFeature,

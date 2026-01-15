@@ -514,6 +514,7 @@ def render_supported_models_markdown() -> str:
     out: List[str] = []
     out.append("(support-matrix)=")
     out.append("<!-- Generated from tensorrt_llm/llmapi/model_support_matrix.py; do not edit. -->")
+    out.append("<!-- To regenerate: build docs, which runs generate_supported_models() -->")
     out.append("# Supported Models")
     out.append("")
     out.append("The following is a table of supported models for the PyTorch backend:")
