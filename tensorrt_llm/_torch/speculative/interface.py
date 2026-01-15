@@ -12,10 +12,14 @@ from tensorrt_llm.logger import logger
 
 from ..._utils import get_sm_version
 from ..attention_backend.trtllm import AttentionBackend, TrtllmAttention
+from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..pyexecutor.resource_manager import BaseResourceManager
 
 if TYPE_CHECKING:
     from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
+
+if IS_FLASHINFER_AVAILABLE:
+    import flashinfer
 
 # Environment variable name for forcing the number of accepted tokens in speculative decoding
 FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR = "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS"
@@ -371,6 +375,9 @@ class SpecWorkerBase(nn.Module, ABC):
         super().__init__()
         self.guided_decoder: Optional["CapturableGuidedDecoder"] = None
         self.force_num_accepted_tokens = get_force_num_accepted_tokens()
+        self.use_flashinfer = IS_FLASHINFER_AVAILABLE and flashinfer.__version__ >= "0.6.0"
+        self.seed = 0
+        self.offset = 0
 
     @property
     @abstractmethod
@@ -446,8 +453,17 @@ class SpecWorkerBase(nn.Module, ABC):
             top_ks = spec_metadata.top_ks[:num_tokens]
             top_ps = spec_metadata.top_ps[:num_tokens]
 
+            if self.use_flashinfer:
+                self.seed += 1
+
             sampled_tokens = sampling_batch_spec_dec_one_model(
-                logits, temperatures, top_ks, top_ps)
+                logits,
+                temperatures,
+                top_ks,
+                top_ps,
+                use_flashinfer=self.use_flashinfer,
+                seed=self.seed,
+                offset=self.offset)
         else:
             sampled_tokens = torch.argmax(logits, dim=-1)
 
