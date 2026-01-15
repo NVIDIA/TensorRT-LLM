@@ -955,7 +955,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         if attn_metadata.padded_num_tokens is not None:
             hidden_states = hidden_states[:attn_metadata.num_tokens]
 
-        if attn_metadata.mapping.has_cp_ulysses():
+        if attn_metadata.mapping and attn_metadata.mapping.has_cp_ulysses():
             hidden_states = cp_allgather(hidden_states,
                                          attn_metadata.mapping,
                                          dim=0)
