@@ -96,6 +96,20 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
+    def test_nvfp4_with_norm_quant(self, monkeypatch):
+        model_path = f"{llm_models_root()}/nvfp4-quantized/Meta-Llama-3.1-8B"
+        with LLM(model_path) as llm:
+            sm_version = get_sm_version()
+            if sm_version not in (100, 103):
+                pytest.skip(
+                    f"test_nvfp4_with_norm_quant supports SM 100 and 103 only")
+            monkeypatch.setenv("TRTLLM_DISABLE_NVFP4_LAYERNORM_FUSION", "0")
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
     @skip_pre_blackwell
     @pytest.mark.parametrize("stream_interval", [4, 64],
                              ids=["stream_interval_4", "stream_interval_64"])

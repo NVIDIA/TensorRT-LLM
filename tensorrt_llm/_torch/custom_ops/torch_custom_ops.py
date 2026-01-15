@@ -1876,6 +1876,59 @@ def record_stream(tensor: torch.Tensor, stream_id: int) -> None:
     tensor.record_stream(stream)
 
 
+def fused_add_rms_norm_quant(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    gamma: torch.Tensor,
+    sf_scale: Optional[torch.Tensor],
+    use_rms_norm: bool = True,
+    eps: float = 1e-6,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused Add + RMSNorm/LayerNorm + FP4 Quantization kernel.
+
+    Args:
+        input: [M, N] input tensor (fp16/bf16)
+        residual: [M, N] residual tensor (fp16/bf16)
+        gamma: [N] normalization weight (fp16/bf16)
+        sf_scale: [1] optional scale factor for FP4 quantization (float32)
+        use_rms_norm: if True use RMSNorm, else use LayerNorm
+        eps: epsilon for normalization
+
+    Returns:
+        normed_output_fp4: [M, N/8] FP4 quantized normalized output (int32, packed)
+        output: [M, N] pre-norm output (input + residual), same dtype as input
+        sf_out: scale factors for FP4 quantization (uint8), swizzled layout
+
+    Note:
+        This kernel requires SM90 (Hopper) or SM100 (Blackwell) GPU.
+        Hidden dimension N must be >= 2048 and <= 16384.
+    """
+    return torch.ops.trtllm.fused_add_rms_norm_quant(input, residual, gamma,
+                                                     sf_scale, use_rms_norm,
+                                                     eps)
+
+
+@torch.library.register_fake("trtllm::fused_add_rms_norm_quant")
+def _fused_add_rms_norm_quant_fake(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    gamma: torch.Tensor,
+    sf_scale: Optional[torch.Tensor],
+    use_rms_norm: bool = True,
+    eps: float = 1e-5,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    m, n = input.shape
+    # normed_output_fp4: [M, N/8] as int32 (8 FP4 values packed per int32)
+    normed_output_fp4 = input.new_empty((m, n // 8), dtype=torch.int32)
+    # output: [M, N] pre-norm output, same dtype as input
+    output = input.new_empty((m, n), dtype=input.dtype)
+    # sf_out: scale factors, swizzled layout
+    sf_vec_size = 16
+    sf_size = ((m + 127) // 128) * 128 * ((n // sf_vec_size + 3) // 4) * 4
+    sf_out = input.new_empty((sf_size, ), dtype=torch.uint8)
+    return normed_output_fp4, output, sf_out
+
+
 class Fp4GemmAllreduceRunner(TunableRunner):
     runner_dict = dict()
     tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
