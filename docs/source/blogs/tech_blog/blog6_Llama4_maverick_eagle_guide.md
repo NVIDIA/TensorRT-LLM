@@ -67,7 +67,7 @@ This command launches the server with Llama4 Maverick as the main model and Eagl
 docker run -d --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \
     -p 8000:8000 --gpus=all -e "TRTLLM_ENABLE_PDL=1" \
     -v /path/to/maverick:/config/models/maverick -v /path/to/eagle:/config/models/eagle \
-    docker.io/<username>/tensorrt_llm:main sh \
+    docker.io/<username>/tensorrt_llm:main bash \
         -c "echo -e 'enable_autotuner: false\nenable_attention_dp: false\nenable_min_latency: true\ncuda_graph_config:\n  max_batch_size: 8\nspeculative_config:\n  decoding_type: Eagle\n  max_draft_len: 3\n  speculative_model_dir: /config/models/eagle\n  eagle3_one_model: true\nkv_cache_config:\n  enable_block_reuse: false' > c.yaml && \
         TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL=True \
         trtllm-serve /config/models/maverick \
