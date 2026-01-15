@@ -154,6 +154,7 @@ class Attention(nn.Module):
         attn_output_gate: Optional[bool] = None,
         use_custom_cublas_mm: bool = False,
         reduce_output: bool = True,
+        use_aether_sparse: bool = False,  # AETHER sparse attention flag
     ):
         """
         Initialize the Attention module.
@@ -206,6 +207,7 @@ class Attention(nn.Module):
         self.dense_bias = dense_bias
         self.q_scaling = q_scaling
         self.attn_output_gate = attn_output_gate
+        self.use_aether_sparse = use_aether_sparse  # AETHER: Enable block-sparse attention
 
         if self.attn_output_gate:
             logger.info_once("using attn output gate!", key="attn_output_gate")
@@ -468,6 +470,36 @@ class Attention(nn.Module):
             if mrope_position_deltas is not None:
                 mrope_config["mrope_position_deltas"] = mrope_position_deltas
 
+        # AETHER SPARSE ATTENTION BYPASS
+        # When use_aether_sparse is True, bypass standard attention and use AETHER kernel
+        if self.use_aether_sparse:
+            try:
+                from tensorrt_llm._torch.kernels.aether_sparse import aether_sparse_attention
+                # Reshape q, k, v for AETHER: [num_tokens, hidden] -> [B, H, S, D]
+                # For generation, we need proper tensor shapes
+                q_reshaped = q[:num_tokens, :].view(-1, self.num_heads, self.head_dim).transpose(0, 1).unsqueeze(0)
+                if k is not None:
+                    k_reshaped = k[:num_tokens, :].view(-1, self.num_key_value_heads, self.head_dim).transpose(0, 1).unsqueeze(0)
+                    v_reshaped = v[:num_tokens, :].view(-1, self.num_key_value_heads, self.head_dim).transpose(0, 1).unsqueeze(0)
+                else:
+                    # Fused QKV - split it
+                    q_split, k_split, v_split = q[:num_tokens, :].split(
+                        [self.num_heads * self.head_dim, 
+                         self.num_key_value_heads * self.head_dim, 
+                         self.num_key_value_heads * self.head_dim], dim=-1)
+                    q_reshaped = q_split.view(-1, self.num_heads, self.head_dim).transpose(0, 1).unsqueeze(0)
+                    k_reshaped = k_split.view(-1, self.num_key_value_heads, self.head_dim).transpose(0, 1).unsqueeze(0)
+                    v_reshaped = v_split.view(-1, self.num_key_value_heads, self.head_dim).transpose(0, 1).unsqueeze(0)
+                
+                # Run AETHER sparse attention
+                attn_out = aether_sparse_attention(q_reshaped, k_reshaped, v_reshaped, is_causal=True)
+                # Reshape back: [1, H, S, D] -> [num_tokens, H*D]
+                attn_output = attn_out.squeeze(0).transpose(0, 1).reshape(num_tokens, -1)
+                return attn_output, None
+            except Exception as e:
+                # Fallback to standard attention on error
+                logger.warning(f"[AETHER] Sparse attention failed, falling back to standard: {e}")
+        
         attn_output = self.attn.forward(
             q,
             k,
