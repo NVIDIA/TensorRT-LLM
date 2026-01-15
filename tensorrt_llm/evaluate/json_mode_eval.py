@@ -36,13 +36,15 @@ class JsonModeEval(Evaluator):
                  num_samples: Optional[int] = None,
                  random_seed: int = 0,
                  apply_chat_template: bool = True,
-                 system_prompt: Optional[str] = None):
+                 system_prompt: Optional[str] = None,
+                 output_dir: Optional[str] = None):
         if not apply_chat_template:
             raise ValueError(
                 f"{self.__class__.__name__} requires apply_chat_template=True.")
         super().__init__(random_seed=random_seed,
                          apply_chat_template=apply_chat_template,
-                         system_prompt=system_prompt)
+                         system_prompt=system_prompt,
+                         output_dir=output_dir)
         if dataset_path is None:
             dataset_path = "NousResearch/json-mode-eval"
         self.data = datasets.load_dataset(dataset_path,
@@ -120,11 +122,16 @@ class JsonModeEval(Evaluator):
                   type=int,
                   default=512,
                   help="Maximum generation length.")
+    @click.option("--output_dir",
+                  type=str,
+                  default=None,
+                  help="Directory to save the task infos.")
     @click.pass_context
     @staticmethod
     def command(ctx, dataset_path: Optional[str], num_samples: int,
                 random_seed: int, system_prompt: Optional[str],
-                max_input_length: int, max_output_length: int) -> None:
+                max_input_length: int, max_output_length: int,
+                output_dir: Optional[str]) -> None:
         llm: Union[LLM, PyTorchLLM] = ctx.obj
         sampling_params = SamplingParams(
             max_tokens=max_output_length,
@@ -133,6 +140,7 @@ class JsonModeEval(Evaluator):
                                  num_samples=num_samples,
                                  random_seed=random_seed,
                                  apply_chat_template=True,
-                                 system_prompt=system_prompt)
+                                 system_prompt=system_prompt,
+                                 output_dir=output_dir)
         evaluator.evaluate(llm, sampling_params)
         llm.shutdown()

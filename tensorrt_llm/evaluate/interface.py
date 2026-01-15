@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import copy
+import json
+import os
 import random
 from abc import ABC, abstractmethod
 from typing import Any, Iterable, List, Optional, Union
@@ -35,7 +37,8 @@ class Evaluator(ABC):
                  apply_chat_template: bool = False,
                  fewshot_as_multiturn: bool = False,
                  system_prompt: Optional[str] = None,
-                 chat_template_kwargs: Optional[dict[str, Any]] = None):
+                 chat_template_kwargs: Optional[dict[str, Any]] = None,
+                 output_dir: Optional[str] = None):
         random.seed(random_seed)
         np.random.seed(random_seed)
         torch.manual_seed(random_seed)
@@ -43,6 +46,7 @@ class Evaluator(ABC):
         self.fewshot_as_multiturn = fewshot_as_multiturn
         self.system_prompt = system_prompt
         self.chat_template_kwargs = chat_template_kwargs
+        self.output_dir = output_dir
 
     @abstractmethod
     def generate_samples(self) -> Iterable[tuple]:
@@ -105,6 +109,11 @@ class Evaluator(ABC):
         results = []
         for output in tqdm(outputs, desc="Fetching responses"):
             results.append(output.result())
+
+        if self.output_dir:
+            dump_inference_results(self.output_dir, results,
+                                   getattr(llm, 'tokenizer', None))
+
         profiler.stop("trtllm exec")
         elapsed_time = profiler.elapsed_time_in_sec("trtllm exec")
         logger.info(f"TRTLLM execution time: {elapsed_time:.3f} seconds.")
@@ -116,3 +125,60 @@ class Evaluator(ABC):
     @staticmethod
     def command(ctx, *args, **kwargs) -> None:
         raise NotImplementedError()
+
+
+def dump_inference_results(output_dir: str, results: List[dict],
+                           tokenizer: Any):
+    if not output_dir:
+        return
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Collect results
+    results_list = []
+    for task_id, result in enumerate(results):
+        output_ids = result.outputs[0].token_ids
+        output_text = result.outputs[0].text.strip()
+        input_text = result.prompt.strip()
+        input_ids = tokenizer.encode(input_text)
+        results_list.append({
+            "task_id": task_id,
+            "input_ids": input_ids,
+            "output_ids": output_ids,
+            "input_text": input_text,
+            "output_text": output_text
+        })
+
+    # Dump token ids
+    ids_path = os.path.join(output_dir, "dumped_ids.json")
+    try:
+        with open(ids_path, "w") as f:
+            for item in results_list:
+                data = {
+                    "task_id": item["task_id"],
+                    "input_ids": item["input_ids"],
+                    "output_ids": item["output_ids"],
+                    "input_tokens": len(item["input_ids"]),
+                    "output_tokens": len(item["output_ids"])
+                }
+                f.write(json.dumps(data) + "\n")
+        logger.info(f"Dumped IDs to {ids_path}")
+    except Exception as e:
+        logger.warning(f"Failed to dump IDs to {ids_path}: {e}")
+
+    # Dump text
+    text_path = os.path.join(output_dir, "dumped_text.json")
+    try:
+        with open(text_path, "w") as f:
+            for item in results_list:
+                data = {
+                    "task_id": item["task_id"],
+                    "input_text": item["input_text"],
+                    "output_text": item["output_text"],
+                    "input_len": len(item["input_text"]),
+                    "output_len": len(item["output_text"])
+                }
+                f.write(json.dumps(data) + "\n")
+        logger.info(f"Dumped text to {text_path}")
+    except Exception as e:
+        logger.warning(f"Failed to dump text to {text_path}: {e}")

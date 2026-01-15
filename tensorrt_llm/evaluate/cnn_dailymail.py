@@ -34,10 +34,12 @@ class CnnDailymail(Evaluator):
                  random_seed: int = 0,
                  rouge_path: Optional[str] = None,
                  apply_chat_template: bool = False,
-                 system_prompt: Optional[str] = None):
+                 system_prompt: Optional[str] = None,
+                 output_dir: Optional[str] = None):
         super().__init__(random_seed=random_seed,
                          apply_chat_template=apply_chat_template,
-                         system_prompt=system_prompt)
+                         system_prompt=system_prompt,
+                         output_dir=output_dir)
         if dataset_path is None:
             dataset_path = "ccdv/cnn_dailymail"
         self.data = datasets.load_dataset(dataset_path,
@@ -111,12 +113,17 @@ class CnnDailymail(Evaluator):
                   type=int,
                   default=100,
                   help="Maximum generation length.")
+    @click.option("--output_dir",
+                  type=str,
+                  default=None,
+                  help="Directory to save the task infos.")
     @click.pass_context
     @staticmethod
     def command(ctx, dataset_path: Optional[str], num_samples: int,
                 random_seed: int, rouge_path: Optional[str],
                 apply_chat_template: bool, system_prompt: Optional[str],
-                max_input_length: int, max_output_length: int) -> None:
+                max_input_length: int, max_output_length: int,
+                output_dir: Optional[str]) -> None:
         llm: Union[LLM, PyTorchLLM] = ctx.obj
         sampling_params = SamplingParams(
             max_tokens=max_output_length,
@@ -126,6 +133,7 @@ class CnnDailymail(Evaluator):
                                  random_seed=random_seed,
                                  rouge_path=rouge_path,
                                  apply_chat_template=apply_chat_template,
-                                 system_prompt=system_prompt)
+                                 system_prompt=system_prompt,
+                                 output_dir=output_dir)
         evaluator.evaluate(llm, sampling_params)
         llm.shutdown()
