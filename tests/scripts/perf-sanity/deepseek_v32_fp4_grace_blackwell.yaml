@@ -40,7 +40,7 @@ server_configs:
     tensor_parallel_size: 4
     moe_expert_parallel_size: 4
     pipeline_parallel_size: 1
-    max_batch_size: 512
+    max_batch_size: 256
     max_num_tokens: 8192
     attn_backend: "TRTLLM"
     enable_attention_dp: true
@@ -52,7 +52,7 @@ server_configs:
       backend: 'CUTLASS'
     cuda_graph_config:
       enable_padding: true
-      max_batch_size: 512
+      max_batch_size: 256
     kv_cache_config:
       dtype: 'fp8'
       enable_block_reuse: false

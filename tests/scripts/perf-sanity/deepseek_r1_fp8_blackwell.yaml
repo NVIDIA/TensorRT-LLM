@@ -9,7 +9,7 @@ server_configs:
     tensor_parallel_size: 8
     moe_expert_parallel_size: 1
     pipeline_parallel_size: 1
-    max_batch_size: 8
+    max_batch_size: 4
     max_num_tokens: 8192
     attn_backend: "TRTLLM"
     enable_attention_dp: false
@@ -17,7 +17,7 @@ server_configs:
       backend: 'TRTLLM'
     cuda_graph_config:
       enable_padding: true
-      max_batch_size: 8
+      max_batch_size: 4
     kv_cache_config:
       dtype: 'fp8'
       enable_block_reuse: false
@@ -40,7 +40,7 @@ server_configs:
     tensor_parallel_size: 8
     moe_expert_parallel_size: 8
     pipeline_parallel_size: 1
-    max_batch_size: 512
+    max_batch_size: 128
     max_num_tokens: 8192
     attn_backend: "TRTLLM"
     enable_attention_dp: true
@@ -52,7 +52,7 @@ server_configs:
       backend: 'DEEPGEMM'
     cuda_graph_config:
       enable_padding: true
-      max_batch_size: 512
+      max_batch_size: 128
     kv_cache_config:
       dtype: 'fp8'
       enable_block_reuse: false
@@ -75,7 +75,7 @@ server_configs:
     tensor_parallel_size: 8
     moe_expert_parallel_size: 1
     pipeline_parallel_size: 1
-    max_batch_size: 8
+    max_batch_size: 4
     max_num_tokens: 12288
     attn_backend: "TRTLLM"
     enable_attention_dp: false
@@ -83,7 +83,7 @@ server_configs:
       backend: 'TRTLLM'
     cuda_graph_config:
       enable_padding: true
-      max_batch_size: 8
+      max_batch_size: 4
     kv_cache_config:
       dtype: 'fp8'
       enable_block_reuse: false
@@ -106,7 +106,7 @@ server_configs:
     tensor_parallel_size: 8
     moe_expert_parallel_size: 8
     pipeline_parallel_size: 1
-    max_batch_size: 512
+    max_batch_size: 32
     max_num_tokens: 12288
     attn_backend: "TRTLLM"
     enable_attention_dp: true
@@ -118,7 +118,7 @@ server_configs:
       backend: 'DEEPGEMM'
     cuda_graph_config:
       enable_padding: true
-      max_batch_size: 512
+      max_batch_size: 32
     kv_cache_config:
       dtype: 'fp8'
       enable_block_reuse: false
