@@ -923,7 +923,7 @@ def create_draft_model_engine_maybe(
     drafting_loop_wrapper = None
 
     draft_model_engine = PyTorchModelEngine(
-        model_path=draft_spec_config.speculative_model_dir,
+        model_path=draft_spec_config.speculative_model,
         llm_args=draft_llm_args,
         mapping=dist_mapping,
         attn_runtime_features=attn_runtime_features,
