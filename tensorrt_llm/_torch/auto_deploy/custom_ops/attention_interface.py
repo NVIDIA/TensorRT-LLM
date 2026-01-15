@@ -725,7 +725,9 @@ class SequenceInfo:
         """Set an example sequence useful for testing and export purposes without cache history."""
         # use a best guess default for input_ids if not provided
         if input_ids is None:
-            bs, seq_len = min(2, self.max_batch_size), min(4, self.max_seq_len)
+            # Use batch_size >= 2 for export to prevent torch.export from specializing
+            # the batch dimension when max_batch_size=1 (dimension value 1 triggers static optimization)
+            bs, seq_len = max(2, min(2, self.max_batch_size)), min(4, self.max_seq_len)
             input_ids = torch.ones(bs, seq_len, dtype=torch.int).tolist()
 
         # figure out page assignments
