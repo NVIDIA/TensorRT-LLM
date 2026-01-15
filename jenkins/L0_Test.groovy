@@ -1992,9 +1992,13 @@ def launchTestListCheck(pipeline, globalVars)
             def llmSrc = "${llmPath}/TensorRT-LLM/src"
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install -r ${llmSrc}/requirements-dev.txt")
             sh "NVIDIA_TRITON_SERVER_VERSION=25.10 LLM_ROOT=${llmSrc} LLM_BACKEND_ROOT=${llmSrc}/triton_backend python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa --waive"
+            sh "cd aaa/"
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
+            pipeline.echo "globalVars[JOB_TYPE]: ${globalVars[JOB_TYPE]}"
+            globalVars[JOB_TYPE] = "L0_PostMerge"
+            pipeline.echo "globalVars[JOB_TYPE]: ${globalVars[JOB_TYPE]}"
             if (globalVars[JOB_TYPE] == "L0_PostMerge") {
                 catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
                     throw e
