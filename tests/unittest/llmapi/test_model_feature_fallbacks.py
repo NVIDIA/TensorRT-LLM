@@ -20,10 +20,12 @@ auto-disables unsupported features based on model architecture.
 """
 
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
 from tensorrt_llm.llmapi.llm import BaseLLM
+from tensorrt_llm.llmapi.model_support_matrix import SupportStatus
 
 
 def _make_mock_llm(
@@ -32,6 +34,8 @@ def _make_mock_llm(
     chunked_prefill: bool = False,
     attention_dp: bool = False,
     disable_overlap_scheduler: bool | None = None,
+    cuda_graph_config: object | None = None,
+    guided_decoding_backend: str | None = None,
     auto_disable: bool = True,
 ) -> SimpleNamespace:
     """Create a mock LLM-like object for testing.
@@ -42,6 +46,8 @@ def _make_mock_llm(
         chunked_prefill: enable_chunked_prefill value
         attention_dp: enable_attention_dp value
         disable_overlap_scheduler: None means attribute doesn't exist
+        cuda_graph_config: CUDA graph config object, None means disabled
+        guided_decoding_backend: Guided decoding backend string, None means disabled
         auto_disable: auto_disable_unsupported_features value (defaults to True
             for testing purposes, though production default is False)
     """
@@ -58,6 +64,8 @@ def _make_mock_llm(
     mock.args.auto_disable_unsupported_features = auto_disable
     mock.args.enable_chunked_prefill = chunked_prefill
     mock.args.enable_attention_dp = attention_dp
+    mock.args.cuda_graph_config = cuda_graph_config
+    mock.args.guided_decoding_backend = guided_decoding_backend
 
     if disable_overlap_scheduler is not None:
         mock.args.disable_overlap_scheduler = disable_overlap_scheduler
@@ -216,6 +224,106 @@ class TestMultipleFeatureFallbacks:
         # Both features disabled
         assert mock.args.kv_cache_config.enable_block_reuse is False
         assert mock.args.enable_attention_dp is False
+
+
+class TestCudaGraphFallback:
+    """Tests for CUDA graph fallback (no models currently have NO status)."""
+
+    def test_cuda_graph_stays_enabled_for_supported(self):
+        """CUDA graph should stay enabled for models that support it (YES)."""
+        cuda_cfg = SimpleNamespace(mode="static")
+        mock = _make_mock_llm(
+            architecture="DeepseekV3ForCausalLM",  # Has CUDA_GRAPH=YES
+            cuda_graph_config=cuda_cfg,
+        )
+
+        BaseLLM._apply_model_feature_fallbacks(mock)
+
+        # CUDA graph stays enabled
+        assert mock.args.cuda_graph_config is cuda_cfg
+
+    def test_cuda_graph_disabled_when_unsupported(self):
+        """CUDA graph should be disabled when model has NO status (mocked)."""
+        cuda_cfg = SimpleNamespace(mode="static")
+        mock = _make_mock_llm(
+            architecture="MockUnsupportedModel",
+            cuda_graph_config=cuda_cfg,
+        )
+
+        # Mock get_support_status to return NO for CUDA_GRAPH
+        def mock_status(arch, feature):
+            from tensorrt_llm.llmapi.model_support_matrix import Feature
+
+            if feature == Feature.CUDA_GRAPH:
+                return SupportStatus.NO
+            return None
+
+        with patch("tensorrt_llm.llmapi.llm.get_support_status", side_effect=mock_status):
+            BaseLLM._apply_model_feature_fallbacks(mock)
+
+        # CUDA graph should be disabled (set to None)
+        assert mock.args.cuda_graph_config is None
+
+    def test_cuda_graph_no_change_when_not_configured(self):
+        """No change when CUDA graph is not configured."""
+        mock = _make_mock_llm(
+            architecture="DeepseekV3ForCausalLM",
+            cuda_graph_config=None,  # Not configured
+        )
+
+        BaseLLM._apply_model_feature_fallbacks(mock)
+
+        # Still None
+        assert mock.args.cuda_graph_config is None
+
+
+class TestGuidedDecodingFallback:
+    """Tests for guided decoding fallback (no models currently have NO status)."""
+
+    def test_guided_decoding_stays_enabled_for_supported(self):
+        """Guided decoding should stay enabled for models that support it."""
+        mock = _make_mock_llm(
+            architecture="DeepseekV3ForCausalLM",  # Has GUIDED_DECODING=YES
+            guided_decoding_backend="xgrammar",
+        )
+
+        BaseLLM._apply_model_feature_fallbacks(mock)
+
+        # Guided decoding stays enabled
+        assert mock.args.guided_decoding_backend == "xgrammar"
+
+    def test_guided_decoding_disabled_when_unsupported(self):
+        """Guided decoding should be disabled when model has NO status (mocked)."""
+        mock = _make_mock_llm(
+            architecture="MockUnsupportedModel",
+            guided_decoding_backend="xgrammar",
+        )
+
+        # Mock get_support_status to return NO for GUIDED_DECODING
+        def mock_status(arch, feature):
+            from tensorrt_llm.llmapi.model_support_matrix import Feature
+
+            if feature == Feature.GUIDED_DECODING:
+                return SupportStatus.NO
+            return None
+
+        with patch("tensorrt_llm.llmapi.llm.get_support_status", side_effect=mock_status):
+            BaseLLM._apply_model_feature_fallbacks(mock)
+
+        # Guided decoding should be disabled (set to None)
+        assert mock.args.guided_decoding_backend is None
+
+    def test_guided_decoding_no_change_when_not_configured(self):
+        """No change when guided decoding is not configured."""
+        mock = _make_mock_llm(
+            architecture="DeepseekV3ForCausalLM",
+            guided_decoding_backend=None,  # Not configured
+        )
+
+        BaseLLM._apply_model_feature_fallbacks(mock)
+
+        # Still None
+        assert mock.args.guided_decoding_backend is None
 
 
 if __name__ == "__main__":

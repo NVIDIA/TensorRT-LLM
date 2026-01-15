@@ -331,6 +331,30 @@ class BaseLLM:
                                     ),
         )
 
+        # CUDA graph: disable by setting cuda_graph_config to None
+        _disable_if_unsupported(
+            SupportFeature.CUDA_GRAPH,
+            enabled=getattr(self.args, "cuda_graph_config", None) is not None,
+            arg_path="cuda_graph_config",
+            disable=lambda: setattr(self.args, "cuda_graph_config", None),
+        )
+
+        # Guided decoding: disable by setting guided_decoding_backend to None
+        _disable_if_unsupported(
+            SupportFeature.GUIDED_DECODING,
+            enabled=getattr(self.args, "guided_decoding_backend", None)
+            is not None,
+            arg_path="guided_decoding_backend",
+            disable=lambda: setattr(self.args, "guided_decoding_backend", None),
+        )
+
+        # Features NOT handled here (with reasons):
+        # - DISAGGREGATED_SERVING: Server/deployment-level config, not LLM init
+        # - MTP, EAGLE3_*: User explicitly configures speculative decoding
+        # - TORCH_SAMPLER, TLLM_CPP_SAMPLER: sampler_type=auto handles selection
+        # - SLIDING_WINDOW_ATTENTION: Model architecture inherent, not configurable
+        # - LOGITS_POST_PROCESSOR: User-provided callback, not a simple flag
+
     @property
     @set_api_status("beta")
     def llm_id(self) -> str:
