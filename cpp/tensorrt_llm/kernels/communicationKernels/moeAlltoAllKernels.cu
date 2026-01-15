@@ -338,6 +338,7 @@ __global__ void moeA2APrepareDispatchKernel(
 {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();
+    cudaTriggerProgrammaticLaunchCompletion();
 #endif
 
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -353,10 +354,6 @@ __global__ void moeA2APrepareDispatchKernel(
         // Increment flag_val for this dispatch round
         *flag_val_ptr = *flag_val_ptr + 1;
     }
-
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaTriggerProgrammaticLaunchCompletion();
-#endif
 }
 
 // ============================================================================
@@ -374,12 +371,12 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
     int max_tokens_per_rank,                                                // Maximum tokens per rank
     int local_num_tokens, int rank_id, int ep_size, int num_experts_per_rank)
 {
+    int thread_idx = ThreadingPolicy::offset();
+    int local_token_idx = ThreadingPolicy::token_idx();
+
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();
 #endif
-
-    int thread_idx = ThreadingPolicy::offset();
-    int local_token_idx = ThreadingPolicy::token_idx();
 
     if (local_num_tokens == 0)
     {
@@ -978,6 +975,7 @@ __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, uint8_t c
 {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();
+    cudaTriggerProgrammaticLaunchCompletion();
 #endif
 
     if (blockIdx.x == 0 && threadIdx.x == 0)
@@ -988,9 +986,6 @@ __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, uint8_t c
 
     if (payload_bytes == nullptr)
     {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-        cudaTriggerProgrammaticLaunchCompletion();
-#endif
         return;
     }
 
@@ -999,9 +994,6 @@ __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, uint8_t c
     int total_slots = ep_size * max_tokens_per_rank;
     if (slot_idx >= total_slots)
     {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-        cudaTriggerProgrammaticLaunchCompletion();
-#endif
         return;
     }
 
@@ -1012,9 +1004,6 @@ __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, uint8_t c
     // Skip invalid tokens beyond per-source recv count
     if (token_idx >= recv_counters[source_rank])
     {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-        cudaTriggerProgrammaticLaunchCompletion();
-#endif
         return;
     }
 
@@ -1025,10 +1014,6 @@ __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, uint8_t c
 
     // Copy one token's data using vectorized copy with policy
     vectorized_copy<ThreadingPolicy>(dst_ptr, src_ptr, bytes_per_token);
-
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaTriggerProgrammaticLaunchCompletion();
-#endif
 }
 
 // ============================================================================
@@ -1040,9 +1025,6 @@ __global__ void moeA2ACombineKernel(
     const CombineKernelPointers ptrs, // Combine-specific struct, src_data_ptrs[0] is output
     int max_tokens_per_rank, int elements_per_token, int local_num_tokens, int rank_id, int ep_size)
 {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaGridDependencySynchronize();
-#endif
 
     int local_token_idx = ThreadingPolicy::token_idx();
     int const size_per_token = elements_per_token * sizeof(T);
@@ -1061,6 +1043,10 @@ __global__ void moeA2ACombineKernel(
         if (local_token_idx >= local_num_tokens)
             return;
     }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
 
 #if !DISABLE_SYNC_FOR_PROFILING
     // In-kernel readiness synchronization at start of combine:
