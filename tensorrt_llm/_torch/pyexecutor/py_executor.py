@@ -1148,9 +1148,9 @@ class PyExecutor:
                                     name: tensor.clone()
                                     for name, tensor in batch_outputs.items()
                                 }
-                                self.start_sample_event.record()
+                                self.sample_stream.wait_stream(
+                                    torch.cuda.current_stream())
                                 with torch.cuda.stream(self.sample_stream):
-                                    self.start_sample_event.wait()
                                     sample_state = self._sample_async(
                                         scheduled_batch, batch_outputs_copy)
                                     self.finish_sample_event.record()
