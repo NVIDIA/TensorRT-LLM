@@ -34,7 +34,6 @@ else
 fi
 
 if [ "${benchmark_mode}" = "gen_only" ]; then
-    export TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1
     export TLLM_BENCHMARK_REQ_QUEUES_SIZE=${concurrency}
 fi
 
