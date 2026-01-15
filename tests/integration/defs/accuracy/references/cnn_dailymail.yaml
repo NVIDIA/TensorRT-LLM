@@ -68,6 +68,8 @@ lmsys/vicuna-7b-v1.3:
     accuracy: 33.419
   - spec_dec_algo: Eagle
     accuracy: 27.832
+  - spec_dec_algo: Eagle3
+    accuracy: 27.832
 llama-7b-hf:
   - accuracy: 30.457
   - quant_algo: W4A16_GPTQ
@@ -190,6 +192,9 @@ meta-llama/Llama-3.2-3B:
 meta-llama/Llama-3.3-70B-Instruct:
   - quant_algo: FP8
     spec_dec_algo: Eagle
+    accuracy: 33.244
+  - quant_algo: FP8
+    spec_dec_algo: Eagle3
     accuracy: 33.244
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
