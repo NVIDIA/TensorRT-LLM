@@ -245,9 +245,10 @@ class BaseQuantizeUtil(ABC):
                 (self.intermediate_size, self.hidden_size), dtype=self.dtype, device="cuda"
             )
 
-            weights[f"{expert_id}.w1.weight"] = w1_weight
-            weights[f"{expert_id}.w2.weight"] = w2_weight
-            weights[f"{expert_id}.w3.weight"] = w3_weight
+            # Keep the tensor on CPU for eplb
+            weights[f"{expert_id}.w1.weight"] = w1_weight.to("cpu")
+            weights[f"{expert_id}.w2.weight"] = w2_weight.to("cpu")
+            weights[f"{expert_id}.w3.weight"] = w3_weight.to("cpu")
         return weights
 
     def create_ref_module(self, routing_method, ref_cls=RefGatedMLPFusedMoE) -> torch.nn.Module:
@@ -308,15 +309,16 @@ class FP8QuantizeUtil(BaseQuantizeUtil):
             w2_input_scale = x_scale.cuda()
             w3_input_scale = x_scale.cuda()
 
-            weights[f"{expert_id}.w1.weight"] = w1_weight_fp8
-            weights[f"{expert_id}.w2.weight"] = w2_weight_fp8
-            weights[f"{expert_id}.w3.weight"] = w3_weight_fp8
-            weights[f"{expert_id}.w1.weight_scale"] = w1_weight_scale.float()
-            weights[f"{expert_id}.w2.weight_scale"] = w2_weight_scale.float()
-            weights[f"{expert_id}.w3.weight_scale"] = w3_weight_scale.float()
-            weights[f"{expert_id}.w1.input_scale"] = w1_input_scale
-            weights[f"{expert_id}.w2.input_scale"] = w2_input_scale
-            weights[f"{expert_id}.w3.input_scale"] = w3_input_scale
+            # Keep the tensor on CPU for eplb
+            weights[f"{expert_id}.w1.weight"] = w1_weight_fp8.to("cpu")
+            weights[f"{expert_id}.w2.weight"] = w2_weight_fp8.to("cpu")
+            weights[f"{expert_id}.w3.weight"] = w3_weight_fp8.to("cpu")
+            weights[f"{expert_id}.w1.weight_scale"] = w1_weight_scale.float().to("cpu")
+            weights[f"{expert_id}.w2.weight_scale"] = w2_weight_scale.float().to("cpu")
+            weights[f"{expert_id}.w3.weight_scale"] = w3_weight_scale.float().to("cpu")
+            weights[f"{expert_id}.w1.input_scale"] = w1_input_scale.to("cpu")
+            weights[f"{expert_id}.w2.input_scale"] = w2_input_scale.to("cpu")
+            weights[f"{expert_id}.w3.input_scale"] = w3_input_scale.to("cpu")
         return weights
 
     def create_ref_module(self, routing_method, ref_cls=FP8RefGatedMLPFusedMoE) -> torch.nn.Module:
@@ -395,24 +397,25 @@ class NVFP4QuantizeUtil(BaseQuantizeUtil):
             w2_input_scale = x_sf_global.cuda()
             w3_input_scale = x_sf_global.cuda()
 
-            weights[f"{expert_id}.w1.weight"] = w1_weight_nvfp4
-            weights[f"{expert_id}.w2.weight"] = w2_weight_nvfp4
-            weights[f"{expert_id}.w3.weight"] = w3_weight_nvfp4
+            # Keep the tensor on CPU for eplb
+            weights[f"{expert_id}.w1.weight"] = w1_weight_nvfp4.to("cpu")
+            weights[f"{expert_id}.w2.weight"] = w2_weight_nvfp4.to("cpu")
+            weights[f"{expert_id}.w3.weight"] = w3_weight_nvfp4.to("cpu")
             weights[f"{expert_id}.w1.weight_scale"] = w1_sf_block_unswizzled.view(
                 torch.float8_e4m3fn
-            ).cuda()
+            ).to("cpu")
             weights[f"{expert_id}.w2.weight_scale"] = w2_sf_block_unswizzled.view(
                 torch.float8_e4m3fn
-            ).cuda()
+            ).to("cpu")
             weights[f"{expert_id}.w3.weight_scale"] = w3_sf_block_unswizzled.view(
                 torch.float8_e4m3fn
-            ).cuda()
-            weights[f"{expert_id}.w1.input_scale"] = 1.0 / w1_input_scale
-            weights[f"{expert_id}.w2.input_scale"] = 1.0 / w2_input_scale
-            weights[f"{expert_id}.w3.input_scale"] = 1.0 / w3_input_scale
-            weights[f"{expert_id}.w1.weight_scale_2"] = 1.0 / w3_w1_global
-            weights[f"{expert_id}.w2.weight_scale_2"] = 1.0 / w2_sf_global
-            weights[f"{expert_id}.w3.weight_scale_2"] = 1.0 / w3_w1_global
+            ).to("cpu")
+            weights[f"{expert_id}.w1.input_scale"] = (1.0 / w1_input_scale).to("cpu")
+            weights[f"{expert_id}.w2.input_scale"] = (1.0 / w2_input_scale).to("cpu")
+            weights[f"{expert_id}.w3.input_scale"] = (1.0 / w3_input_scale).to("cpu")
+            weights[f"{expert_id}.w1.weight_scale_2"] = (1.0 / w3_w1_global).to("cpu")
+            weights[f"{expert_id}.w2.weight_scale_2"] = (1.0 / w2_sf_global).to("cpu")
+            weights[f"{expert_id}.w3.weight_scale_2"] = (1.0 / w3_w1_global).to("cpu")
         return weights
 
     def create_ref_module(
