@@ -31,7 +31,7 @@ import numpy as np
 import torch
 from diffusers import Flux2Pipeline
 from diffusers.image_processor import PipelineImageInput
-from diffusers.pipelines.flux.pipeline_flux import FluxPipelineOutput, calculate_shift, retrieve_timesteps
+from diffusers.pipelines.flux.pipeline_flux import Flux2PipelineOutput, calculate_shift, retrieve_timesteps
 from diffusers.utils import is_torch_xla_available
 from safetensors.torch import load_file
 
