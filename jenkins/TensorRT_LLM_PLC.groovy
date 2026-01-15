@@ -73,16 +73,17 @@ def generate()
         def LLM_REPO = getLLMRepo()
         checkoutSource()
         sh "python3 --version"
-        sh "curl -sSL https://install.python-poetry.org | POETRY_VERSION=1.8.5 python3 -"
+        sh "curl -sSL https://install.python-poetry.org | python3 -"
         sh "cd ${env.WORKSPACE}"
         sh "/root/.local/bin/poetry -h"
-        sh "export PATH=\"/root/.local/bin:\$PATH\" && python3 scripts/generate_lock_file.py -p requirements.txt"
+        sh "export PATH=\"/root/.local/bin:\$PATH\" && python3 scripts/generate_lock_file.py"
         def count = sh(script: "git status --porcelain security_scanning/ | wc -l", returnStdout: true).trim()
         echo "Changed/untracked file count: ${count}"
         if (count == "0") {
             echo "No update that needs to be checked in"
         } else {
             sh "git status"
+            sh "git add -u security_scanning/"
             sh "git add \$(find . -type f \\( -name 'poetry.lock' -o -name 'pyproject.toml' -o -name 'metadata.json' \\))"
             sh "git commit -s -m \"[None][infra] Check in most recent lock file from nightly pipeline\""
             withCredentials([
