@@ -1535,8 +1535,8 @@ def get_harmony_adapter():
 def handle_streaming_response(tools: List[ChatCompletionToolsParam],
                               tool_choice: str, result: GenerationResult,
                               model: str, request_id: str, done: bool,
-                              num_prompt_tokens: int) -> List[str]:
-    first_iteration = True
+                              num_prompt_tokens: int,
+                              first_iteration: bool) -> List[str]:
     output = result.outputs[0]
 
     # Convert tools to dictionary format for harmony adapter (standard pattern)
