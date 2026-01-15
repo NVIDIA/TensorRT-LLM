@@ -1124,13 +1124,13 @@ type = ["mypy (>=1.18.2)"]
 
 [[package]]
 name = "prometheus-client"
-version = "0.24.0"
+version = "0.24.1"
 description = "Python client for the Prometheus monitoring system."
 optional = false
 python-versions = ">=3.9"
 files = [
-    {file = "prometheus_client-0.24.0-py3-none-any.whl", hash = "sha256:4ab6d4fb5a1b25ad74b58e6271857e356fff3399473e599d227ab5d0ce6637f0"},
-    {file = "prometheus_client-0.24.0.tar.gz", hash = "sha256:726b40c0d499f4904d4b5b7abe8d43e6aff090de0d468ae8f2226290b331c667"},
+    {file = "prometheus_client-0.24.1-py3-none-any.whl", hash = "sha256:150db128af71a5c2482b36e588fc8a6b95e498750da4b17065947c16070f4055"},
+    {file = "prometheus_client-0.24.1.tar.gz", hash = "sha256:7e0ced7fbbd40f7b84962d5d2ab6f17ef88a72504dcf7c0b40737b43b2a461f9"},
 ]
 
 [package.extras]

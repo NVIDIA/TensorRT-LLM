@@ -211,7 +211,7 @@ class ServerConfig:
         else:
             self.eagle3_layers_to_capture = []
         self.max_draft_len = speculative_config.get("max_draft_len", 0)
-        self.speculative_model_dir = speculative_config.get("speculative_model_dir", "")
+        self.speculative_model = speculative_config.get("speculative_model", "")
 
         # match_mode: "config" (default) or "scenario"
         self.match_mode = server_config_data.get("match_mode", "config")
@@ -338,7 +338,7 @@ class ServerConfig:
             "l_num_nextn_predict_layers": self.num_nextn_predict_layers,
             "s_eagle3_layers_to_capture": ",".join(map(str, self.eagle3_layers_to_capture)),
             "l_max_draft_len": self.max_draft_len,
-            "s_speculative_model_dir": self.speculative_model_dir,
+            "s_speculative_model_dir": self.speculative_model,
             "s_server_log_link": "",
             "s_server_env_var": self.env_vars,
         }
@@ -348,15 +348,15 @@ class ServerConfig:
         """Generate extra-llm-api-config.yml content."""
         config_data = dict(self.extra_llm_api_config_data)
 
-        # Handle speculative_model_dir path conversion
+        # Handle speculative_model path conversion
         if (
             "speculative_config" in config_data
-            and "speculative_model_dir" in config_data["speculative_config"]
+            and "speculative_model" in config_data["speculative_config"]
         ):
-            spec_model_dir = config_data["speculative_config"]["speculative_model_dir"]
-            if spec_model_dir:
-                config_data["speculative_config"]["speculative_model_dir"] = os.path.join(
-                    llm_models_root(), spec_model_dir
+            spec_model = config_data["speculative_config"]["speculative_model"]
+            if spec_model:
+                config_data["speculative_config"]["speculative_model"] = os.path.join(
+                    llm_models_root(), spec_model
                 )
 
         return yaml.dump(config_data, default_flow_style=False, sort_keys=False)
