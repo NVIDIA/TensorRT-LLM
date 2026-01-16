@@ -15,6 +15,7 @@ Note:
 All the perf tests will be excluded since they are generated dynamically.
 """
 import argparse
+import glob
 import os
 import subprocess
 
@@ -23,10 +24,9 @@ MARKER_LIST_IN_TEST = [" TIMEOUT"]
 
 
 def install_python_dependencies(llm_src):
-    subprocess.run(
-        f"cd {llm_src} && pip3 install --retries 1 -r requirements-dev.txt",
-        shell=True,
-        check=True)
+    subprocess.run(f"cd {llm_src} && pip3 install -r requirements-dev.txt",
+                   shell=True,
+                   check=True)
     subprocess.run(
         f"pip3 install --force-reinstall --no-deps {llm_src}/../tensorrt_llm-*.whl",
         shell=True,
@@ -43,7 +43,13 @@ def verify_l0_test_lists(llm_src):
     test_list = f"{llm_src}/l0_test.txt"
 
     # Remove dynamically generated perf tests
-    subprocess.run(f"rm -f {test_db_path}/*perf*", shell=True, check=True)
+    # Exclude perf_sanity tests from being removed since they are different and statically defined
+    for file_path in glob.glob(os.path.join(test_db_path, "*perf*")):
+        if "perf_sanity" not in os.path.basename(file_path):
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
     subprocess.run(
         f"trt-test-db -d {test_db_path} --test-names --output {test_list}",
         shell=True,

@@ -1570,3 +1570,39 @@ TEST_F(VirtualMemoryManagerTest, TestCudaVirtualMemoryAllocator)
         ASSERT_EQ(memoryBegin, memoryAfterCleanup) << "Buffer destruction should free memory";
     }
 }
+
+TEST_F(VirtualMemoryManagerTest, TestCudaVirtualMemoryAllocatorUnalignedSize)
+{
+    std::size_t constexpr size = 64 * 1024 * 1024 + 1; // 64 MB + 1 byte
+    std::string tag = "test_allocator_tag";
+
+    // Create a CUDA stream for the allocator
+    CudaStream stream;
+    auto streamPtr = std::make_shared<CudaStream>(std::move(stream));
+
+    // Create configuration for the virtual address allocator
+    auto config = std::make_shared<CudaVirtualMemoryAllocator::Configuration>(
+        *mVMManager.get(), tag, CudaVirtualMemoryAllocator::RestoreMode::NONE, streamPtr);
+
+    auto memoryBegin = getCurrentProcessMemoryInfo();
+
+    // Create a buffer using the virtual address allocator
+    auto buffer = std::make_unique<VirtualAddressDeviceBuffer>(
+        size, nvinfer1::DataType::kINT8, CudaVirtualMemoryAllocator{config});
+
+    auto memoryAfterAllocation = getCurrentProcessMemoryInfo();
+    if (memoryInfoAvailable())
+    {
+        // Allocates a larger memory block than requested
+        ASSERT_LT(memoryBegin + size, memoryAfterAllocation) << "Buffer allocation does not allocate memory";
+    }
+
+    // Clean up by destroying the buffer (this should automatically clean up the virtual memory)
+    buffer.reset();
+
+    auto memoryAfterCleanup = getCurrentProcessMemoryInfo();
+    if (memoryInfoAvailable())
+    {
+        ASSERT_EQ(memoryBegin, memoryAfterCleanup) << "Buffer destruction should free memory";
+    }
+}

@@ -503,6 +503,11 @@ def device_sleep(
 def assert_no_cuda_sync(
     sync_timeout_s: float = 5, ) -> Generator[None, None, None]:
     """Check that the function does not stream synchronize."""
+    if int(os.environ.get("CUDA_LAUNCH_BLOCKING", 0)):
+        print("CUDA_LAUNCH_BLOCKING set, skipping 'assert_no_cuda_sync'")
+        yield None
+        return
+
     # NB: This implementation only assumes that the CUDA operations performed
     #     in the guarded scope use the currently selected CUDA stream. This
     #     should also cover custom Torch ops as well as non-Torch kernels.

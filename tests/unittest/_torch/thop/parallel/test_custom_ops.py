@@ -62,6 +62,7 @@ def test_register_fake(custom_ops):
         "trtllm::mtp_relaxed_acceptance_op",
         "trtllm::mtp_update_hidden_states_op",
         "trtllm::mtp_prepare_drafter_inputs_op",
+        "trtllm::extract_real_draft_tokens_op",
         "trtllm::selective_scan",
         "trtllm::reducescatter_list",
         "trtllm::reducescatter_list_pg",
@@ -101,6 +102,7 @@ def test_register_fake(custom_ops):
         "trtllm::moe_a2a_initialize",
         "trtllm::moe_a2a_get_combine_payload_tensor",
         "trtllm::moe_a2a_sanitize_expert_ids",
+        "trtllm::moe_a2a_get_aux_data_size",
     }
 
     ops_missing_fake_impl = []

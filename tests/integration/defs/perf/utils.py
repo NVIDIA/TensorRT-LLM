@@ -19,17 +19,16 @@ import io
 import os
 import re
 import subprocess
-import time
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional
 
-import requests
 from _pytest.nodes import Item
 from _pytest.python import Function
 from defs.trt_test_alternative import (check_output, popen, print_error,
                                        print_info)
+from test_common.http_utils import wait_for_endpoint_ready
 
 from ..common import get_trt_llm_lib_dir, venv_mpi_check_output
 from ..local_venv import PythonVenvRunnerImpl
@@ -115,6 +114,8 @@ class PerfMetricType(str, Enum):
     KV_CACHE_SIZE = "KV_CACHE_SIZE"
     DISAGG_SERVER_E2EL = "DISAGG_SERVER_E2EL"
     DISAGG_SERVER_TTFT = "DISAGG_SERVER_TTFT"
+    PER_USER_OUTPUT_THROUGHPUT = "PER_USER_OUTPUT_THROUGHPUT"
+    PER_GPU_OUTPUT_THROUGHPUT = "PER_GPU_OUTPUT_THROUGHPUT"
 
 
 @contextlib.contextmanager
@@ -126,6 +127,10 @@ def temp_wd(path):
         yield
     finally:
         os.chdir(prev_cwd)
+
+
+def add_host_port_to_cmd(cmd: List[str], host: str, port: int) -> List[str]:
+    return cmd + ["--host", host, "--port", str(port)]
 
 
 class PerfBenchScriptTestCmds(NamedTuple):
@@ -235,75 +240,12 @@ class PerfBenchScriptTestCmds(NamedTuple):
         return cmd_str
 
 
-class PerfServerClientBenchmarkCmds(NamedTuple):
-    server_cmds: List[str]
-    client_cmds: List[List[str]]
-    names: List[str]
-    working_dir: str
-
-    def wait_for_endpoint_ready(self, url: str, timeout: int = 5400):
-        start = time.monotonic()
-        while time.monotonic() - start < timeout:
-            try:
-                time.sleep(10)
-                if requests.get(url).status_code == 200:
-                    print(f"endpoint {url} is ready")
-                    return
-            except Exception as err:
-                print(f"endpoint {url} is not ready, with exception: {err}")
-        print_error(
-            f"Endpoint {url} did not become ready within {timeout} seconds")
-
-    def run_cmd(self, cmd_idx: int, venv) -> str:
-        output = ""
-        server_file_path = os.path.join(
-            self.working_dir, f"trtllm-serve.{self.names[cmd_idx]}.log")
-        client_file_path = os.path.join(
-            self.working_dir, f"trtllm-benchmark.{self.names[cmd_idx]}.log")
-        try:
-            with (  # Start server process
-                    open(server_file_path, 'w') as server_ctx,
-                    popen(self.server_cmds[cmd_idx],
-                          stdout=server_ctx,
-                          stderr=subprocess.STDOUT,
-                          env=venv._new_env,
-                          shell=True) as server_proc):
-                self.wait_for_endpoint_ready(
-                    "http://localhost:8000/v1/models",
-                    timeout=7200)  # 120 minutes for large models
-                output += subprocess.check_output(self.client_cmds[cmd_idx],
-                                                  env=venv._new_env).decode()
-                # Write output to client file path
-                with open(client_file_path, 'w') as client_ctx:
-                    client_ctx.write(output)
-        finally:
-            server_proc.terminate()
-            server_proc.wait()
-        return output
-
-    def get_cmd_str(self, cmd_idx) -> List[str]:
-        return ["server-benchmark tests, please check config files"]
-
-
 class PerfDisaggScriptTestCmds(NamedTuple):
     ctx_cmd: str
     gen_cmd: str
     server_cmd: str
     client_cmd: List[str]
     benchmark_cmd: List[str]
-
-    def wait_for_endpoint_ready(self, url: str, timeout: int = 600):
-        start = time.monotonic()
-        while time.monotonic() - start < timeout:
-            try:
-                time.sleep(1)
-                if requests.get(url).status_code == 200:
-                    print(f"endpoint {url} is ready")
-                    return
-            except Exception as err:
-                print(f"endpoint {url} is not ready, with exception: {err}")
-        print_error(
-            f"Endpoint {url} did not become ready within {timeout} seconds")
 
     def run_cmd(self, cmd_idx: int, venv) -> str:
         output = ""
@@ -329,7 +271,7 @@ class PerfDisaggScriptTestCmds(NamedTuple):
                           stderr=subprocess.STDOUT,
                           env=venv._new_env,
                           shell=True) as server_proc):
-                self.wait_for_endpoint_ready(
+                wait_for_endpoint_ready(
                     f"http://localhost:8000/health",
                     timeout=1800)  # 30 minutes for large models
                 check_output(self.client_cmd, env=venv._new_env)
@@ -422,23 +364,49 @@ class AbstractPerfScriptTestClass(abc.ABC):
         """
         return self._error
 
+    def _check_benchmark_output_for_errors(self, output: str) -> None:
+        """
+        Check whether the benchmark output contains error messages (e.g., failed requests).
+        """
+        if not output:
+            return
+
+        # Check for non-zero failed requests
+        failed_requests_match = re.search(r'Failed requests:\s+(\d+)', output)
+        if failed_requests_match:
+            failed_count = int(failed_requests_match.group(1))
+            if failed_count > 0:
+                self._result_state = "failed"
+                self._error = Exception(
+                    f"Benchmark has {failed_count} failed requests")
+                print_error(
+                    f"Benchmark output contains {failed_count} failed requests. Marking test as failed."
+                )
+                return
+
+        # Check for explicit failure markers
+        if "!FAILED REQUESTS!" in output or "!CHECK LOG FOR ERRORS!" in output:
+            self._result_state = "failed"
+            self._error = Exception("Benchmark output contains failure markers")
+            print_error(
+                "Benchmark output contains failure markers. Marking test as failed."
+            )
+
     def run_ex(self,
+               commands,
                full_test_name: str,
                metric_type: PerfMetricType,
                venv: Optional[PythonVenvRunnerImpl],
                gpu_clock_lock: GPUClockLock,
                session_data_writer: SessionDataWriter,
                output_dir: str,
+               cmd_idx: int = 0,
                outputs: Dict[int, str] = {},
                original_test_name: str = None,
-               cmd_idx: int = 0,
                **kwargs) -> List[str]:
         """
         Run the commands and write the results to the output csv and/or yaml files.
         """
-
-        # Get the commands.
-        commands = self.get_commands()
 
         # Avoid modifying argument directly
         outputs = outputs.copy()
@@ -450,9 +418,8 @@ class AbstractPerfScriptTestClass(abc.ABC):
         self._gpu_clock_lock = gpu_clock_lock
         tmpDir = temp_wd(self.get_working_dir())
 
-        is_prepare_dataset_cmd = 'prepare_dataset' in commands.get_cmd_str(
-            cmd_idx)
-
+        cmd_str = commands.get_cmd_str(cmd_idx)
+        is_prepare_dataset_cmd = 'prepare_dataset' in cmd_str or "prepare-dataset" in cmd_str
         # Start the timer.
         self._start_timestamp = datetime.utcnow()
         try:
@@ -473,6 +440,10 @@ class AbstractPerfScriptTestClass(abc.ABC):
                             # Print the output log to buf.
                             # if not is_prepare_dataset_cmd:
                             print(collect_and_clean_myelin_time(output))
+
+                    # Check whether output has error message
+                    if not is_prepare_dataset_cmd:
+                        self._check_benchmark_output_for_errors(output)
 
                     # Print the output log to stdout and cache it.
                     if is_prepare_dataset_cmd:
@@ -515,7 +486,7 @@ class AbstractPerfScriptTestClass(abc.ABC):
             # Parse the perf result from the test outputs.
             if is_prepare_dataset_cmd:
                 print_info(
-                    f"skip writing perf result when calling generating dataset in trtllm-bench"
+                    f"skip writing perf result when calling generating dataset in trtllm-bench."
                 )
                 outputs.pop(cmd_idx)
             else:
@@ -539,11 +510,6 @@ class AbstractPerfScriptTestClass(abc.ABC):
         Store the test results in the _test_results.
         Write the test results and GPU monitoring data to the output csv and/or yaml files.
         """
-        # Store the test result
-        if cmd_idx not in self._test_results:
-            self._test_results[cmd_idx] = {}
-        self._test_results[cmd_idx][metric_type] = self._perf_result
-
         # Get GPU monitoring data
         self._gpu_monitor_data = self._gpu_clock_lock.get_state_data()
         if not self._gpu_monitor_data:

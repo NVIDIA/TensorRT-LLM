@@ -66,6 +66,7 @@ add_library(
   fp8Quantize.cpp
   dsv3FusedAGemmOp.cpp
   fusedQKNormRopeOp.cpp
+  fusedAddRMSNormQuant.cpp
   fusedTopkSoftmax.cpp
   gatherTreeOp.cpp
   groupRmsNormOp.cpp
@@ -100,11 +101,12 @@ add_library(
   virtualMemoryAllocator.cpp
   weightOnlyQuantGemm.cpp
   weightOnlyQuantOp.cpp
-  mtpOp.cpp
+  specDecOp.cpp
   loraOp.cpp
   finegrained_mixed_dtype_gemm_thop.cpp
   tinygemm2.cpp
-  dsv3RopeOp.cpp)
+  dsv3RopeOp.cpp
+  fusedGemmAllreduceOp.cpp)
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(
   th_common PRIVATE ${TORCH_LIBRARIES} th_utils ${Python3_LIBRARIES}

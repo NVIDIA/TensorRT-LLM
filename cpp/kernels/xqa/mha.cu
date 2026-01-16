@@ -465,6 +465,91 @@ using WarpAcc = WarpAccT<warpTile.y, warpTile.x>;
 #if SPEC_DEC
 #define MMAS_N_PER_MASK 2
 
+#if SLIDING_WINDOW && !IS_SPEC_DEC_TREE
+__device__ inline void applyMaskFromInputSlidingAndSpecDec(Warp const& warp, WarpAcc& acc, MaskType const* mask,
+    uint32_t rowOffset, uint32_t nbValidCols, uint32_t qSeqLen, uint32_t actualQSeqLen, uint32_t headGrpSize,
+    int32_t tok0WinBeg, uint32_t seqIter, uint32_t const cacheSeqLen, uint32_t const warpTileTokenBeg)
+{
+    uint32_t const idxInQuad = laneId() % 4;
+    uint32_t const idxQuad = laneId() / 4;
+    // Packed mask is aligned with 32 bits (2 uint16_t).
+    uint32_t const nbPackedMasksPerRow = divUp(qSeqLen, 32u) * 2u;
+    uint16_t const* uint16Mask = reinterpret_cast<uint16_t const*>(mask);
+    constexpr uint64_t fullMask = ~uint64_t{0};
+    Range const tileRange = {warpTileTokenBeg, warpTileTokenBeg + warpTile.x};
+    Range const maxMaskOutRange = {0, mha::max(0, tok0WinBeg) + (nbValidRows / MMAS_N_PER_MASK - 1)};
+    bool const ctaNeedBegMask = tileRange.beg < maxMaskOutRange.end;
+    assert(ctaNeedBegMask == overlap(tileRange, maxMaskOutRange));
+    int32_t const tok0NbMaskOut = int32_t(tok0WinBeg) - int32_t(warpTileTokenBeg);
+    uint32_t const nbSeqItersWithoutSpecDecMask = (cacheSeqLen - actualQSeqLen) / ctaTile.x;
+    bool const ctaNeedSpecDecMask = (seqIter >= nbSeqItersWithoutSpecDecMask);
+    bool const needMask = ctaNeedBegMask || ctaNeedSpecDecMask;
+
+    if (!needMask)
+    {
+        return;
+    }
+#pragma unroll
+    for (uint32_t m = 0; m < acc.rows; m++)
+    {
+#pragma unroll
+        for (uint32_t i = 0; i < InstAcc::rows; i++)
+        {
+            uint32_t const idxQTokInCta = (rowOffset + instM * m + idxQuad + i * 8) / headGrpSize;
+            uint32_t const tokenRow = min(idxQTokInCta, actualQSeqLen - 1);
+#if SLIDING_WINDOW && !IS_SPEC_DEC_TREE
+            int32_t const begNbMaskOut = tok0NbMaskOut + int32_t(idxQTokInCta);
+            uint64_t const begMask = (begNbMaskOut > 0 ? fullMask << begNbMaskOut : fullMask);
+#else
+            uint64_t const begMask = fullMask;
+#endif
+
+#pragma unroll
+            for (uint32_t mask_n = 0; mask_n < acc.cols / MMAS_N_PER_MASK; mask_n++)
+            {
+                uint32_t const firstCol = instN * mask_n * MMAS_N_PER_MASK + InstAcc::cols * idxInQuad;
+                uint32_t const lastCol = firstCol + instN * (MMAS_N_PER_MASK - 1) + InstAcc::cols - 1;
+                uint32_t const maskPos0 = firstCol + actualQSeqLen < nbValidCols
+                    ? 0u
+                    : min(firstCol + actualQSeqLen - nbValidCols, actualQSeqLen - 1);
+                uint32_t const maskPos1 = lastCol + actualQSeqLen < nbValidCols
+                    ? 0u
+                    : min(lastCol + actualQSeqLen - nbValidCols, actualQSeqLen - 1);
+                uint32_t const maskPosStart = (maskPos0 / 16) * 16;
+                uint32_t packedMask = ~uint32_t{0};
+                if (ctaNeedSpecDecMask)
+                {
+                    reinterpret_cast<uint16_t*>(&packedMask)[0]
+                        = uint16Mask[tokenRow * nbPackedMasksPerRow + (maskPos0 / 16)];
+                    reinterpret_cast<uint16_t*>(&packedMask)[1]
+                        = uint16Mask[tokenRow * nbPackedMasksPerRow + (maskPos1 / 16)];
+                }
+#pragma unroll
+                for (uint32_t nj = 0; nj < MMAS_N_PER_MASK; nj++)
+                {
+#pragma unroll
+                    for (uint32_t j = 0; j < InstAcc::cols; j++)
+                    {
+                        uint32_t const n = (mask_n * MMAS_N_PER_MASK + nj);
+                        uint32_t const col = instN * n + InstAcc::cols * idxInQuad + j;
+                        // bool const maskFlag = col + qSeqLen < nbValidCols ? true : mask[tokenRow * qSeqLen + (col +
+                        // qSeqLen - nbValidCols)];
+                        bool const maskFlag = col + actualQSeqLen < nbValidCols
+                            ? true
+                            : packedMask & (1u << ((col + actualQSeqLen - nbValidCols) - maskPosStart));
+
+                        bool const begMaskFlag = ctaNeedBegMask ? (begMask & (1ULL << col)) : true;
+
+                        acc(m, n)(i, j)
+                            = maskFlag && begMaskFlag && col < nbValidCols ? acc(m, n)(i, j) : safeInitRowMax;
+                    }
+                }
+            }
+        }
+    }
+}
+#endif
+
 __device__ inline void applyMaskFromInput(Warp const& warp, WarpAcc& acc, MaskType const* mask, uint32_t rowOffset,
     uint32_t nbValidCols, uint32_t qSeqLen, uint32_t actualQSeqLen, uint32_t headGrpSize)
 {
@@ -517,6 +602,7 @@ __device__ inline void applyMaskFromInput(Warp const& warp, WarpAcc& acc, MaskTy
         }
     }
 }
+
 #endif
 
 __device__ inline QuadRegRowMax warpTileOnlineSoftmax(Warp const& warp, QuadRegRowMax const& rowMaxHint, WarpAcc& acc)
@@ -1611,8 +1697,14 @@ CUBIN_EXPORT __global__
 #endif
 
     uint32_t const cacheSeqLen = getCacheSeqLen<usePagedKVCache>(cacheList, idxReq);
-#if SLIDING_WINDOW
+#if SLIDING_WINDOW && SPEC_DEC && !IS_SPEC_DEC_TREE
+    uint32_t const tok0SeqLen = cacheSeqLen - actualQSeqLen + 1 + idxHeadTokenInGrp; // ctaTokOffset;
+    int32_t const tok0WinBeg = int32_t(tok0SeqLen) - int32_t(slidingWinSize);
+    uint32_t const nbTotalSkipTokens = mha::max(0, tok0WinBeg);
+    bool const rtIsReallySliding = (cacheSeqLen + actualQSeqLen > slidingWinSize);
+#elif SLIDING_WINDOW
     bool const rtIsReallySliding = (cacheSeqLen > slidingWinSize);
+    assert(!SPEC_DEC || !rtIsReallySliding);
     uint32_t const nbTotalSkipTokens = rtIsReallySliding ? cacheSeqLen - slidingWinSize : 0;
 #else
     constexpr bool rtIsReallySliding = false;
@@ -1626,7 +1718,10 @@ CUBIN_EXPORT __global__
 #endif
 
     uint32_t const nbSeqIters = useKVCache ? divUp(cacheSeqLen, ctaTile.x) : 0;
-#if SPEC_DEC
+#if SLIDING_WINDOW && SPEC_DEC && !IS_SPEC_DEC_TREE
+    uint32_t const nbSeqItersWithoutMask
+        = rtIsReallySliding ? nbSkipLeadingTiles : (cacheSeqLen - actualQSeqLen) / ctaTile.x;
+#elif SPEC_DEC
     uint32_t const nbSeqItersWithoutMask = (cacheSeqLen - actualQSeqLen) / ctaTile.x;
 #endif
 
@@ -1912,8 +2007,18 @@ CUBIN_EXPORT __global__
             if (seqIter >= nbSeqItersWithoutMask)
             {
                 uint32_t const nbValidCols = (warpTileTokenBeg < cacheSeqLen ? cacheSeqLen - warpTileTokenBeg : 0U);
-                applyMaskFromInput(
-                    warp, acc, mask, idxHeadTokenInGrp, nbValidCols, qSeqLen, actualQSeqLen, headGrpSize);
+#if SLIDING_WINDOW && !IS_SPEC_DEC_TREE
+                if (rtIsReallySliding)
+                {
+                    applyMaskFromInputSlidingAndSpecDec(warp, acc, mask, idxHeadTokenInGrp, nbValidCols, qSeqLen,
+                        actualQSeqLen, headGrpSize, tok0WinBeg, seqIter, cacheSeqLen, warpTileTokenBeg);
+                }
+                else
+#endif
+                {
+                    applyMaskFromInput(
+                        warp, acc, mask, idxHeadTokenInGrp, nbValidCols, qSeqLen, actualQSeqLen, headGrpSize);
+                }
             }
 #else
             bool const isFirstIter = (seqIter == nbSkipLeadingTiles);
@@ -2682,6 +2787,25 @@ static constexpr auto kernel_mha = kernel_mha_impl;
 #endif
 
 #ifndef GENERATE_CUBIN
+uint32_t computeNbSubSeqPerSeqMHA(cudaDeviceProp const& prop, uint32_t batchSize, uint32_t nbKHeads, uint32_t maxSeqLen)
+{
+    if (!allowMultiBlockMode)
+    {
+        return 1;
+    }
+    auto const env = std::getenv("XQA_NB_SUB_SEQ");
+    if (env != nullptr)
+    {
+        int32_t const val = std::stoi(env);
+        if (val > 0)
+        {
+            return val;
+        }
+    }
+    return std::min<uint32_t>(
+        std::max<uint32_t>(1U, prop.multiProcessorCount / (batchSize * nbKHeads)), divUp(maxSeqLen, ctaTile.x));
+}
+
 void launchMHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #if SLIDING_WINDOW
     uint32_t slidingWinSize,
@@ -2720,6 +2844,13 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #if SPEC_DEC
     SpecDecParams const& specDecParams,
 #endif
+#if SKIP_SOFTMAX_ATTN
+    float const skipSoftmaxThresholdScaleFactor, // for compatibility with mha_sm90.cu only
+#if SKIP_SOFTMAX_ATTN_BLOCK_STATS
+    uint32_t* __restrict__ skippedBlockCount,    // for compatibility with mha_sm90.cu only
+    uint32_t* __restrict__ totalBlockCount,      // for compatibility with mha_sm90.cu only
+#endif
+#endif
     uint32_t* semaphores, void* scratch, cudaStream_t stream)
 {
 #if SPEC_DEC
@@ -2741,24 +2872,7 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
     uint32_t const nbQHeads = nbKHeads * headGrpSize;
 
     // const uint32_t nbSubSeqPerSeq = allowMultiBlockMode ? DBG_NB_CTAS_PER_SEQ : 1;
-    uint32_t const nbSubSeqPerSeq = [&]() -> uint32_t
-    {
-        if (!allowMultiBlockMode)
-        {
-            return 1;
-        }
-        auto const env = std::getenv("XQA_NB_SUB_SEQ");
-        if (env != nullptr)
-        {
-            int32_t const val = std::stoi(env);
-            if (val > 0)
-            {
-                return val;
-            }
-        }
-        return std::min<uint32_t>(
-            std::max<uint32_t>(1U, prop.multiProcessorCount / (batchSize * nbKHeads)), divUp(maxSeqLen, ctaTile.x));
-    }();
+    uint32_t const nbSubSeqPerSeq = computeNbSubSeqPerSeqMHA(prop, batchSize, nbKHeads, maxSeqLen);
     // gridDim.z == batchSize && gridDim.y == nbKHeads && gridDim.x == nbSubSeqPerSeq
 #if SPEC_DEC
     const uint32_t nbTokenBlocksPerGrp = divUp(qSeqLen * headGrpSize, rowsPerBlock);

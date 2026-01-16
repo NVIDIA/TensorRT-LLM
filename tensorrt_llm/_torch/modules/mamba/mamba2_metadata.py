@@ -108,6 +108,7 @@ class Mamba2Metadata:
         self.chunk_offsets: torch.Tensor = None
 
     def prepare(self, attn_metadata: AttentionMetadata):
+        batch_size = attn_metadata.seq_lens.shape[0]
         num_contexts = attn_metadata.num_contexts
         context_lens = attn_metadata.seq_lens_cuda[:num_contexts]
         num_ctx_tokens = attn_metadata.num_ctx_tokens
@@ -116,6 +117,16 @@ class Mamba2Metadata:
                          dim=0,
                          dtype=torch.int,
                          out=self.cu_seqlens[1:num_contexts + 1])
+            torch.add(self.cu_seqlens[num_contexts],
+                      torch.arange(1,
+                                   batch_size - num_contexts + 1,
+                                   dtype=self.cu_seqlens.dtype,
+                                   device=self.cu_seqlens.device),
+                      out=self.cu_seqlens[num_contexts + 1:batch_size + 1])
+            # Need both `query_start_loc` and `query_start_loc_long` because `causal_conv1d_fn`
+            # accepts only `int32` while `chunk_gated_delta_rule` accepts only `long`.
+            self.query_start_loc = self.cu_seqlens[:batch_size + 1]
+            self.query_start_loc_long = self.query_start_loc.to(torch.long)
             self.seq_idx = torch.repeat_interleave(
                 torch.arange(num_contexts,
                              dtype=torch.int,
@@ -135,3 +146,10 @@ class Mamba2Metadata:
             else:
                 self.chunk_indices = None
                 self.chunk_offsets = None
+        else:
+            self.query_start_loc = None
+            self.query_start_loc_long = torch.arange(
+                0,
+                batch_size + 1,
+                dtype=torch.long,
+                device=self.cu_seqlens.device)

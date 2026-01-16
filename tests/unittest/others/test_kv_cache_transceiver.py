@@ -6,7 +6,7 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.bindings.executor as trtllm
-from tensorrt_llm._torch.distributed import MPIDist
+from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import \
     create_kv_cache_transceiver
 from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
@@ -79,7 +79,7 @@ def test_kv_cache_transceiver_single_process(ctx_gen_kv_cache_dtype,
 
     cache_transceiver_config = CacheTransceiverConfig(backend=backend,
                                                       max_tokens_in_buffer=512)
-    dist = MPIDist(mapping=mapping)
+    dist = Distributed.get(mapping)
     kv_cache_transceiver_ctx = create_kv_cache_transceiver(
         mapping, dist, kv_cache_manager_ctx, attention_type,
         cache_transceiver_config)
@@ -139,7 +139,7 @@ def test_kv_cache_transceiver_single_process(ctx_gen_kv_cache_dtype,
 def test_cancel_request_in_transmission(attention_type):
     # Init kv_cache manager and cache transceiver
     mapping = Mapping(world_size=1, rank=0)
-    dist = MPIDist(mapping=mapping)
+    dist = Distributed.get(mapping)
     ctx_kv_cache_dtype, gen_kv_cache_dtype = DataType.HALF, DataType.HALF
     kv_cache_manager_ctx = create_kv_cache_manager(mapping, ctx_kv_cache_dtype)
     kv_cache_manager_gen = create_kv_cache_manager(mapping, gen_kv_cache_dtype)

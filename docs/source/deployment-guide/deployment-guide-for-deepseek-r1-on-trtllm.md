@@ -66,7 +66,7 @@ We maintain YAML configuration files with recommended performance settings in th
 
 ```shell
 TRTLLM_DIR=/app/tensorrt_llm # change as needed to match your environment
-EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/deepseek-r1-throughput.yaml
+EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/curated/deepseek-r1-throughput.yaml
 ```
 
 Note: if you don't have access to the source code locally, you can manually create the YAML config file using the code in the dropdown below.
@@ -74,7 +74,7 @@ Note: if you don't have access to the source code locally, you can manually crea
 ````{admonition} Show code
 :class: dropdown
 
-```{literalinclude} ../../../examples/configs/deepseek-r1-throughput.yaml
+```{literalinclude} ../../../examples/configs/curated/deepseek-r1-throughput.yaml
 ---
 language: shell
 prepend: |
@@ -90,7 +90,7 @@ To use the `DeepGEMM` MOE backend on B200/GB200, use this config instead:
 
 ```shell
 TRTLLM_DIR=/app/tensorrt_llm # change as needed to match your environment
-EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/deepseek-r1-deepgemm.yaml
+EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/curated/deepseek-r1-deepgemm.yaml
 ```
 
 Note: if you don't have access to the source code locally, you can manually create the YAML config file using the code in the dropdown below.
@@ -98,7 +98,7 @@ Note: if you don't have access to the source code locally, you can manually crea
 ````{admonition} Show code
 :class: dropdown
 
-```{literalinclude} ../../../examples/configs/deepseek-r1-deepgemm.yaml
+```{literalinclude} ../../../examples/configs/curated/deepseek-r1-deepgemm.yaml
 ---
 language: shell
 prepend: |
@@ -115,7 +115,7 @@ append: EOF
 Below is an example command to launch the TensorRT LLM server with the DeepSeek-R1 model from within the container. The command is specifically configured for the 1024/1024 Input/Output Sequence Length test. The explanation of each flag is shown in the “LLM API Options (YAML Configuration)” section.
 
 ```shell
-trtllm-serve deepseek-ai/DeepSeek-R1-0528 --host 0.0.0.0 --port 8000 --extra_llm_api_options ${EXTRA_LLM_API_FILE}
+trtllm-serve deepseek-ai/DeepSeek-R1-0528 --host 0.0.0.0 --port 8000 --config ${EXTRA_LLM_API_FILE}
 ```
 
 After the server is set up, the client can now send prompt requests to the server and receive results.
@@ -124,7 +124,7 @@ After the server is set up, the client can now send prompt requests to the serve
 
 <!-- TODO: this section is duplicated across the deployment guides; they should be consolidated to a central file and imported as needed, or we can remove this and link to LLM API reference -->
 
-These options provide control over TensorRT LLM's behavior and are set within the YAML file passed to the `trtllm-serve` command via the `--extra_llm_api_options` argument.
+These options provide control over TensorRT LLM's behavior and are set within the YAML file passed to the `trtllm-serve` command via the `--config` argument.
 
 
 #### `tensor_parallel_size`
@@ -154,7 +154,7 @@ These options provide control over TensorRT LLM's behavior and are set within th
 
 #### `trust_remote_code`
 
-&emsp;**Description:** Allows TensorRT LLM to download models and tokenizers from Hugging Face. This flag is passed directly to the Hugging Face API.
+* **Description:** Allows TensorRT LLM to download models and tokenizers from Hugging Face. This flag is passed directly to the Hugging Face API.
 
 #### `kv_cache_config`
 
@@ -200,7 +200,7 @@ These options provide control over TensorRT LLM's behavior and are set within th
 
 * **Default**: `TRTLLM`
 
-See the [`TorchLlmArgs` class](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs) for the full list of options which can be used in the `extra_llm_api_options`.
+See the [`TorchLlmArgs` class](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs) for the full list of options which can be used in the YAML configuration file.
 
 ### Wide Expert Parallelism
 
@@ -250,7 +250,7 @@ Here is an example response, showing that the TensorRT LLM server returns “New
 ### Troubleshooting Tips
 
 * If you encounter CUDA out-of-memory errors, try reducing `max_batch_size` or `max_seq_len`.
-  * For running input/output sequence lengths of 8K/1K on H200, there is a known CUDA Out-Of-Memory issue caused by the PyTorch CUDA Caching Allocator fragmenting memory. As a workaround, you can set the environment variable `PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:8192`. For more details, please refer to the [PyTorch documentation on optimizing memory usage](https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf).
+  * For running input/output sequence lengths of 8K/1K on H200, there is a known CUDA Out-Of-Memory issue caused by the PyTorch CUDA Caching Allocator fragmenting memory. As a workaround, you can set the environment variable `PYTORCH_ALLOC_CONF=max_split_size_mb:8192`. For more details, please refer to the [PyTorch documentation on optimizing memory usage](https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf).
 * Ensure your model checkpoints are compatible with the expected format.
 * For performance issues, check GPU utilization with nvidia-smi while the server is running.
 * If the container fails to start, verify that the NVIDIA Container Toolkit is properly installed.
@@ -399,31 +399,64 @@ P99 E2EL (ms):                            [result]
 
 For a single request, ITLs are the time intervals between tokens, while TPOT is the average of those intervals:
 
-```math
-\text{TPOT (1\ request)} = \text{Avg(ITL)} = \frac{\text{E2E\ latency} - \text{TTFT}}{\text{\#Output\ Tokens} - 1}
-```
+$$
+\text{TPOT (1 request)} = \text{Avg(ITL)} = \frac{\text{E2E latency} - \text{TTFT}}{\text{Num Output Tokens} - 1}
+$$
 
 Across different requests, **average TPOT** is the mean of each request's TPOT (all requests weighted equally), while **average ITL** is token-weighted (all tokens weighted equally):
 
-```math
+$$
 \text{Avg TPOT (N requests)} = \frac{\text{TPOT}_1 + \text{TPOT}_2 + \cdots + \text{TPOT}_N}{N}
-```
+$$
 
-```math
-\text{Avg ITL (N requests)} = \frac{\text{Sum of all ITLs across requests}}{\text{\#Output Tokens across requests}}
-```
+$$
+\text{Avg ITL (N requests)} = \frac{\text{Sum of all ITLs across requests}}{\text{Num Output Tokens across requests}}
+$$
 
 #### End-to-End (E2E) Latency
   * The typical total time from when a request is submitted until the final token of the response is received.
 
 #### Total Token Throughput
   * The combined rate at which the system processes both input (prompt) tokens and output (generated) tokens.
-```math
-\text{Total\ TPS} = \frac{\text{\#Input\ Tokens}+\text{\#Output\ Tokens}}{T_{last} - T_{first}}
-```
+
+$$
+\text{Total TPS} = \frac{\text{Num Input Tokens}+\text{Num Output Tokens}}{T_{last} - T_{first}}
+$$
 
 #### Tokens Per Second (TPS) or Output Token Throughput
   * how many output tokens the system generates each second.
-```math
-\text{TPS} = \frac{\text{\#Output\ Tokens}}{T_{last} - T_{first}}
+
+$$
+\text{TPS} = \frac{\text{Num Output Tokens}}{T_{last} - T_{first}}
+$$
+
+## Preconfigured Recipes
+
+The following sections help you pick a known-good `trtllm-serve --config` for your target GPU and traffic pattern.
+
+### Recipe selector
+
+```{eval-rst}
+.. trtllm_config_selector::
+   :models: deepseek-ai/DeepSeek-R1-0528, nvidia/DeepSeek-R1-0528-FP4-v2
+```
+
+```{eval-rst}
+.. include:: ../_includes/note_sections.rst
+   :start-after: .. start-note-traffic-patterns
+   :end-before: .. end-note-traffic-patterns
+```
+
+### Recipe database
+
+```{eval-rst}
+.. include:: config_table.rst
+   :start-after: .. start-deepseek-ai/DeepSeek-R1-0528
+   :end-before: .. end-deepseek-ai/DeepSeek-R1-0528
+```
+
+```{eval-rst}
+.. include:: config_table.rst
+   :start-after: .. start-nvidia/DeepSeek-R1-0528-FP4-v2
+   :end-before: .. end-nvidia/DeepSeek-R1-0528-FP4-v2
 ```

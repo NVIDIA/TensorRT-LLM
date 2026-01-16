@@ -2,12 +2,16 @@ import math
 import os
 import platform
 import threading
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
 
+from tensorrt_llm._mnnvl_utils import HelixCpMnnvlMemory, MnnvlMemory
+from tensorrt_llm._torch.distributed.symm_mem_allreduce import \
+    SymmetricMemoryAllReduce
 from tensorrt_llm._utils import mpi_comm, mpi_disabled
+from tensorrt_llm.bindings import internal as _tllm_internal
 from tensorrt_llm.bindings.internal.runtime import McastGPUBuffer
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
                                      AllReduceStrategy, MoEAllReduceParams)
@@ -61,14 +65,12 @@ def get_or_scale_allreduce_mnnvl_workspace(
     """
 
     NUM_LAMPORT_BUFFERS = 3
-    if not hasattr(_thread_local,
-                   f'allreduce_mnnvl_workspaces_{mapping.pp_rank}'):
-        setattr(_thread_local, f'allreduce_mnnvl_workspaces_{mapping.pp_rank}',
-                {})
+
+    # Use MNNVLAllReduce class to share across threads
+    allreduce_mnnvl_workspaces = MNNVLAllReduce.allreduce_mnnvl_workspaces
+
     # A safe method to get the element size of the dtype
     elem_size = torch.tensor([], dtype=dtype).element_size()
-    allreduce_mnnvl_workspaces = getattr(
-        _thread_local, f'allreduce_mnnvl_workspaces_{mapping.pp_rank}')
     force_mn = os.environ.get("TRTLLM_FORCE_MNNVL_AR", "0") == "1"
     use_fabric_handle = force_mn or mapping.is_multi_node()
 
@@ -97,19 +99,19 @@ def get_or_scale_allreduce_mnnvl_workspace(
             # Increase the buffer size in 8 MiB granularity to avoid frequently scaling the buffer
             buffer_size_bytes = math.ceil(req_buffer_size_bytes /
                                           (8 * 1024 * 1024)) * (8 * 1024 * 1024)
-            if mapping.tp_rank == 0:
-                logger.debug(
-                    f"[MNNVL] Requested {req_buffer_size_bytes} bytes, is larger than the current workspace size. Scaling workspace for pp_rank {mapping.pp_rank}, tp_size {mapping.tp_size} from {allreduce_mnnvl_workspaces[mapping]['buffer_size_bytes']} to {buffer_size_bytes} bytes"
-                )
+            logger.debug(
+                f"[MNNVL] Requested {req_buffer_size_bytes} bytes, is larger than the current workspace size. Scaling workspace for pp_rank {mapping.pp_rank}, tp_size {mapping.tp_size} from {allreduce_mnnvl_workspaces[mapping]['buffer_size_bytes']} to {buffer_size_bytes} bytes"
+            )
         # Each workspace contains NUM_LAMPORT_BUFFERS buffers.
         workspace_size_bytes = NUM_LAMPORT_BUFFERS * buffer_size_bytes
+        # Pass the pre-split MPI communicator's Fortran handle to avoid redundant splitting in C++
         mcast_buf_handle = McastGPUBuffer(
             workspace_size_bytes,
             mapping.tp_size,
             mapping.tp_rank,
-            mapping.pp_rank * mapping.cp_size + mapping.cp_rank,
             mapping.local_rank,
             use_fabric_handle,  # whether to use fabric handle or POSIX FD ipc
+            comm.py2f(),  # Fortran handle for the MPI communicator
         )
 
         # We use per FP32 element in the buffer for lamport sync
@@ -336,6 +338,7 @@ def alltoall_helix(
         inputs (List[Tensor]): The input tensors.
             Its length must be a multiple of the group size,
             and all tensors in a group must have the same shape.
+            All input tensors must be contiguous.
         group (List[int]): The group of ranks to participate in the all-to-all.
     Returns:
         The output tensors.
@@ -358,6 +361,84 @@ def alltoall_helix(
             "all input tensors in a group must have the same shape"
 
     return torch.ops.trtllm.alltoall_helix(inputs, group, num_lists)
+
+
+class HelixAllToAllNative:
+    """
+    Manager for Helix All-to-All operations with MNNVL workspace management.
+
+    Exchanges data along the cp_size dimension:
+    - partial_o: [..., cp_size, kv_lora_rank] half-precision
+    - softmax_stats: [..., cp_size, 2] float32
+    """
+
+    # Global cache: mapping -> instance
+    _cache: Dict[Mapping, "HelixAllToAllNative"] = {}
+
+    def __init__(self, mapping: Mapping, workspace: HelixCpMnnvlMemory,
+                 workspace_tensor: torch.Tensor):
+        """Private constructor - use get() instead."""
+        self.mapping = mapping
+        self.workspace = workspace
+        self.workspace_tensor = workspace_tensor
+
+    @staticmethod
+    def get(mapping: Mapping) -> "HelixAllToAllNative":
+        """
+        Get or create a HelixAllToAllNative instance for the given configuration.
+
+        Args:
+            mapping: TensorRT-LLM mapping object containing cp_size and cp_rank
+
+        Returns:
+            Cached or newly-created HelixAllToAllNative instance
+        """
+        if mapping not in HelixAllToAllNative._cache:
+            logger.info(
+                f"Rank {mapping.cp_rank} initializing HelixCpMnnvlMemory for Helix"
+            )
+            MnnvlMemory.initialize()
+
+            # Get workspace size (in bytes)
+            workspace_size_per_rank = _tllm_internal.thop.get_helix_workspace_size_per_rank(
+                mapping.cp_size)
+
+            # Allocate MNNVL memory using CP communicator for Helix
+            workspace = HelixCpMnnvlMemory(mapping, workspace_size_per_rank)
+            workspace_tensor = workspace.as_torch_strided_tensor(torch.uint64)
+
+            torch.ops.trtllm.initialize_helix_workspace(workspace_tensor,
+                                                        mapping.cp_rank,
+                                                        mapping.cp_size)
+            torch.cuda.synchronize()
+            HelixCpMnnvlMemory.get_comm(mapping).barrier()
+
+            HelixAllToAllNative._cache[mapping] = HelixAllToAllNative(
+                mapping, workspace, workspace_tensor)
+
+        return HelixAllToAllNative._cache[mapping]
+
+    def alltoall_native(self, partial_o: torch.Tensor,
+                        softmax_stats: torch.Tensor):
+        """
+        Perform all-to-all data exchange.
+
+        Args:
+            partial_o: Tensor with shape [..., cp_size, kv_lora_rank], dtype half.
+            softmax_stats: Tensor with shape [..., cp_size, 2], dtype float32.
+
+        Returns:
+            Tuple of (partial_o_out, softmax_stats_out) with same shapes as inputs.
+        """
+        partial_o_out, softmax_stats_out = torch.ops.trtllm.alltoall_helix_native(
+            partial_o,
+            softmax_stats,
+            self.workspace_tensor,
+            self.mapping.cp_rank,
+            self.mapping.cp_size,
+        )
+
+        return partial_o_out, softmax_stats_out
 
 
 def reducescatter(
@@ -434,6 +515,7 @@ class MNNVLAllReduce(nn.Module):
     This class handles the MNNVL-specific allreduce operations, which can be more efficient
     for certain operations when using NVLink for multi-node communication.
     """
+    allreduce_mnnvl_workspaces: Dict[int, Dict] = {}
 
     def __init__(self, mapping: Mapping, dtype: torch.dtype):
         super().__init__()
@@ -447,7 +529,7 @@ class MNNVLAllReduce(nn.Module):
             )
 
         # Initialize the workspace
-        _ = get_or_scale_allreduce_mnnvl_workspace(self.mapping, self.dtype)
+        get_or_scale_allreduce_mnnvl_workspace(self.mapping, self.dtype)
 
     @staticmethod
     def get_supported_dtypes():
@@ -566,13 +648,17 @@ class AllReduce(nn.Module):
             strategy (AllReduceStrategy):
                 The following all-reduce strategies are supported:
 
+                - SYMM_MEM: Uses PyTorch's symmetric memory with MULTIMEM hardware instructions.
+                  Falls back automatically if not supported.
+
                 - UB: AllReduce uses user-buffer based all-reduce kernel.
 
                 - NCCL: Use NCCL allreduce.
 
                 - MIN_LATENCY: AllReduce uses MIN_LATENCY mode kernel.
 
-                - AUTO: AUTO chooses between NCCL and MIN_LATENCY mode based on a heuristic policy.
+                - AUTO: AUTO chooses the best available strategy. Will try MNNVL,
+                  then choose between NCCL and MIN_LATENCY based on a heuristic policy.
 
                 - LOWPRECISION: AllReduce quantizes data to lower precision for transmission.
                   Should only be used on topologies with PCIe switches and without NVLink.
@@ -601,20 +687,53 @@ class AllReduce(nn.Module):
         self.workspace = None
         self.strategy = strategy
         self.mnnvl_allreduce = None
+        self.symm_mem_allreduce = None
         self._disable_mpi = mpi_disabled()
 
         self.all_reduce_op = torch.ops.trtllm.allreduce_pg if self._disable_mpi else torch.ops.trtllm.allreduce
-
         if self.mapping.tp_size > 1:
-            # When Strategy is UB, it is guaranteed that the workspace is not used.
+            # Initialize Symmetric Memory AllReduce if needed (before workspace allocation)
+            if self.strategy == AllReduceStrategy.SYMM_MEM:
+                try:
+                    symm_mem = SymmetricMemoryAllReduce(
+                        self.mapping,
+                        dtype=dtype if dtype else torch.bfloat16,
+                    )
+                    if not symm_mem.disabled:
+                        self.symm_mem_allreduce = symm_mem
+                        logger.info(
+                            f"SymmetricMemoryAllReduce (MULTIMEM) is enabled with fallback support for world_size={self.mapping.tp_size}"
+                        )
+                        # Keep SYMM_MEM strategy but allocate workspace for fallback to regular allreduce
+                    else:
+                        logger.info(
+                            f"SymmetricMemoryAllReduce is disabled (not supported or unavailable), falling back to AUTO strategy"
+                        )
+                        # Fall back to AUTO if SYMM_MEM can't be enabled
+                        self.strategy = AllReduceStrategy.AUTO
+                except Exception as e:
+                    logger.info(
+                        f"Symmetric Memory AllReduce can't be enabled due to {e}, falling back to AUTO strategy"
+                    )
+                    self.symm_mem_allreduce = None
+                    # Fall back to AUTO if SYMM_MEM initialization fails
+                    self.strategy = AllReduceStrategy.AUTO
+
+            # Allocate workspace for strategies that need it
+            # Note: SYMM_MEM now also needs workspace for fallback scenarios (fused ops, etc.)
+            # Only UB doesn't need workspace
             if self.strategy != AllReduceStrategy.UB:
                 if self.strategy == AllReduceStrategy.LOWPRECISION:
                     allocate_low_presicion_allreduce_workspace(self.mapping)
-                self.workspace = get_allreduce_workspace(self.mapping)
+                if self.strategy not in (AllReduceStrategy.UB,
+                                         AllReduceStrategy.NCCL,
+                                         AllReduceStrategy.NCCL_SYMMETRIC):
+                    self.workspace = get_allreduce_workspace(self.mapping)
 
-            # Initialize MNNVL AllReduce if needed
+            # Initialize MNNVL if using AUTO or MNNVL strategy
             if self.strategy in (AllReduceStrategy.AUTO,
                                  AllReduceStrategy.MNNVL):
+                # Try to initialize MNNVL
                 if MNNVLAllReduce.is_mnnvl(self.mapping, dtype):
                     # ALWAYS capture the exception when creating this instance
                     try:
@@ -667,23 +786,43 @@ class AllReduce(nn.Module):
         input = input.contiguous()  # Underlying op requires contiguous input
 
         allreduce_strategy = self.strategy
+
         if all_reduce_params is None:
             all_reduce_params = AllReduceParams()
 
-        # Try MNNVL AllReduce first if available
+        # Try Symmetric Memory AllReduce first if available
+        # Note: Currently only supports NONE fusion op (plain allreduce)
+        if self.symm_mem_allreduce and all_reduce_params.fusion_op == AllReduceFusionOp.NONE:
+            symm_mem_output = self.symm_mem_allreduce(input)
+            if symm_mem_output is not None:
+                logger.debug(
+                    f"Using SymmetricMemoryAllReduce (MULTIMEM) for input shape {input.shape}"
+                )
+                return symm_mem_output
+        elif self.symm_mem_allreduce and all_reduce_params.fusion_op != AllReduceFusionOp.NONE:
+            # Log once per rank that we're skipping symm_mem due to fusion
+            logger.debug_once(
+                f"Skipping SymmetricMemoryAllReduce for fused operation (fusion_op={all_reduce_params.fusion_op}), using regular allreduce",
+                key=(self.mapping.tp_rank, all_reduce_params.fusion_op,
+                     "debug_fusion_skip"),
+            )
+
+        # Try MNNVL AllReduce if symm_mem didn't handle it
         if self.mnnvl_allreduce:
             mnnvl_output = self.mnnvl_allreduce(
                 input, all_reduce_params=all_reduce_params)
             if mnnvl_output is not None:
                 return mnnvl_output
 
-        # Fall back to regular AllReduce if MNNVL is not available or not applicable
-        # Make sure the strategy is AUTO since allreduceOp does not have the branch for MNNVL
-        if allreduce_strategy == AllReduceStrategy.MNNVL:
+        # Fall back to regular AllReduce if specialized methods are not available or not applicable
+        # Make sure the strategy is AUTO since allreduceOp does not have the branch for MNNVL/SYMM_MEM
+        if allreduce_strategy in (AllReduceStrategy.MNNVL,
+                                  AllReduceStrategy.SYMM_MEM):
             allreduce_strategy = AllReduceStrategy.AUTO
 
         additional_args = {}
         if self._disable_mpi:
+            # Get ProcessGroup from mapping
             pg = self.mapping.tp_group_pg
             assert pg is not None, "TP ProcessGroup not initialised"
             additional_args = {
@@ -691,21 +830,42 @@ class AllReduce(nn.Module):
                 "pg": pg.boxed(),
             }
 
-        output = self.all_reduce_op(
-            input=input,
-            residual=all_reduce_params.residual,
-            norm_weight=all_reduce_params.norm_weight,
-            scale=all_reduce_params.scale,
-            bias=all_reduce_params.bias,
-            workspace=self.workspace,
-            group=self.mapping.tp_group,
-            strategy=allreduce_strategy,
-            op=all_reduce_params.fusion_op,
-            eps=all_reduce_params.eps,
-            trigger_completion_at_end=all_reduce_params.
-            trigger_completion_at_end,
-            **additional_args,
-        )
+        # In case that AutoTuner brings potential perf regression
+        # TODO: Remove this if no perf regression is observed.
+        disable_allreduce_autotune = os.environ.get(
+            "TLLM_DISABLE_ALLREDUCE_AUTOTUNE", "0") == "1"
+
+        if allreduce_strategy == AllReduceStrategy.AUTO and not disable_allreduce_autotune and not self._disable_mpi:
+            output = torch.ops.trtllm.tunable_allreduce(
+                input=input,
+                residual=all_reduce_params.residual,
+                norm_weight=all_reduce_params.norm_weight,
+                scale=all_reduce_params.scale,
+                bias=all_reduce_params.bias,
+                workspace=self.workspace,
+                group=self.mapping.tp_group,
+                strategy=allreduce_strategy,
+                op=all_reduce_params.fusion_op,
+                eps=all_reduce_params.eps,
+                trigger_completion_at_end=all_reduce_params.
+                trigger_completion_at_end,
+            )
+        else:
+            output = self.all_reduce_op(
+                input=input,
+                residual=all_reduce_params.residual,
+                norm_weight=all_reduce_params.norm_weight,
+                scale=all_reduce_params.scale,
+                bias=all_reduce_params.bias,
+                workspace=self.workspace,
+                group=self.mapping.tp_group,
+                strategy=allreduce_strategy,
+                op=all_reduce_params.fusion_op,
+                eps=all_reduce_params.eps,
+                trigger_completion_at_end=all_reduce_params.
+                trigger_completion_at_end,
+                **additional_args,
+            )
 
         return output if len(output) > 1 else output[0]
 

@@ -52,7 +52,8 @@ namespace tensorrt_llm::executor
 namespace
 {
 
-[[nodiscard]] bool executorConfigIsValid(ExecutorConfig const& executorConfig, runtime::ModelConfig const& modelConfig)
+[[nodiscard]] bool executorConfigIsValid(
+    ::tensorrt_llm::executor::ExecutorConfig const& executorConfig, runtime::ModelConfig const& modelConfig)
 {
     // Make sure logic in this function matches fixExecutorConfig
     if (executorConfig.getEnableChunkedContext())
@@ -65,8 +66,8 @@ namespace
     return true;
 }
 
-[[nodiscard]] ExecutorConfig fixExecutorConfig(
-    ExecutorConfig const& executorConfig, runtime::ModelConfig const& modelConfig)
+[[nodiscard]] ::tensorrt_llm::executor::ExecutorConfig fixExecutorConfig(
+    ::tensorrt_llm::executor::ExecutorConfig const& executorConfig, runtime::ModelConfig const& modelConfig)
 {
     // Make sure logic in this function matches executorConfigIsValid
     auto fixedExecutorConfig = executorConfig;
@@ -241,7 +242,7 @@ private:
 
 void Executor::Impl::loadModel(std::optional<std::filesystem::path> const& modelPathOpt,
     std::optional<BufferView> const& engineBufferOpt, runtime::GptJsonConfig const& jsonConfig,
-    ExecutorConfig const& executorConfig, bool isEncoder,
+    ::tensorrt_llm::executor::ExecutorConfig const& executorConfig, bool isEncoder,
     std::optional<std::map<std::string, Tensor>> const& managedWeightsOpt)
 {
     auto const gpusPerNode = jsonConfig.getGpusPerNode();
@@ -288,7 +289,7 @@ void Executor::Impl::loadModel(std::optional<std::filesystem::path> const& model
 
 Executor::Impl::Impl(std::filesystem::path const& modelPath,
     std::optional<std::filesystem::path> const& encoderModelPath, ModelType const modelType,
-    ExecutorConfig const& executorConfig)
+    ::tensorrt_llm::executor::ExecutorConfig const& executorConfig)
 {
     auto decoderJsonConfig = runtime::GptJsonConfig::parse(modelPath / "config.json");
 
@@ -329,7 +330,7 @@ Executor::Impl::Impl(std::filesystem::path const& modelPath,
 
 Executor::Impl::Impl(BufferView const& engineBufferView, std::string const& jsonConfigStr,
     std::optional<BufferView> const& encoderEngineBufferView, std::optional<std::string> const& encoderJsonConfigStr,
-    ModelType const modelType, ExecutorConfig const& executorConfig,
+    ModelType const modelType, ::tensorrt_llm::executor::ExecutorConfig const& executorConfig,
     std::optional<std::map<std::string, Tensor>> const& managedWeightsOpt)
 {
     auto decoderJsonConfig = runtime::GptJsonConfig::parse(jsonConfigStr);
@@ -367,7 +368,7 @@ Executor::Impl::Impl(BufferView const& engineBufferView, std::string const& json
 }
 
 Executor::Impl::Impl(std::shared_ptr<Model> model, std::optional<std::shared_ptr<Model>> encoderModel,
-    ExecutorConfig const& executorConfig)
+    ::tensorrt_llm::executor::ExecutorConfig const& executorConfig)
 {
     auto const& worldConfig = model->getWorldConfig();
     auto const tp = worldConfig.getTensorParallelism();
@@ -388,7 +389,7 @@ Executor::Impl::~Impl()
     shutdown();
 }
 
-void Executor::Impl::initialize(ExecutorConfig const& executorConfig)
+void Executor::Impl::initialize(::tensorrt_llm::executor::ExecutorConfig const& executorConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -484,7 +485,7 @@ void Executor::Impl::initialize(ExecutorConfig const& executorConfig)
 
 std::shared_ptr<Model> Executor::Impl::createModel(runtime::RawEngine const& rawEngine,
     runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
-    ExecutorConfig const& executorConfig)
+    ::tensorrt_llm::executor::ExecutorConfig const& executorConfig)
 {
     auto const gptModelType = [&executorConfig, &modelConfig]()
     {
@@ -512,7 +513,7 @@ std::shared_ptr<Model> Executor::Impl::createModel(runtime::RawEngine const& raw
 
 std::shared_ptr<Model> Executor::Impl::createEncoderModel(runtime::RawEngine const& rawEngine,
     runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
-    ExecutorConfig const& executorConfig)
+    ::tensorrt_llm::executor::ExecutorConfig const& executorConfig)
 {
     auto fixedExecutorConfig = ExecutorConfig{};
     fixedExecutorConfig.setSchedulerConfig(executorConfig.getSchedulerConfig());
@@ -579,7 +580,7 @@ void Executor::Impl::setOrchLeaderComm(
 }
 
 void Executor::Impl::initializeCommAndWorkers(SizeType32 tp, SizeType32 pp, SizeType32 cp,
-    ExecutorConfig const& executorConfig, std::optional<ModelType> modelType,
+    ::tensorrt_llm::executor::ExecutorConfig const& executorConfig, std::optional<ModelType> modelType,
     std::optional<std::filesystem::path> const& modelPath, std::optional<runtime::WorldConfig> const& worldConfig,
     std::optional<runtime::GptJsonConfig> const& decoderGptJsonConfig)
 {
@@ -638,7 +639,7 @@ void Executor::Impl::validateParallelConfig(ParallelConfig const& parallelConfig
 }
 
 void Executor::Impl::initializeOrchestrator(SizeType32 tp, SizeType32 pp, SizeType32 cp,
-    ExecutorConfig const& executorConfig, ParallelConfig parallelConfig, ModelType modelType,
+    ::tensorrt_llm::executor::ExecutorConfig const& executorConfig, ParallelConfig parallelConfig, ModelType modelType,
     std::filesystem::path const& modelPath)
 {
 #if ENABLE_MULTI_DEVICE
@@ -2178,11 +2179,11 @@ void Executor::Impl::terminateContextFinishedRequests(InTransList& inTransmissio
         auto req = item.request;
         if (req->isDisaggContextCompleteState())
         {
-            // If lastBlockId was tracked, unpin it. Otherwise, just terminate.
+            // If pinnedBlockIds were tracked, unpin them. Otherwise, just terminate.
             auto kvMgr = mModel->getKVCacheManager();
-            if (kvMgr && item.lastBlockId.has_value())
+            if (kvMgr && !item.pinnedBlockIds.empty())
             {
-                kvMgr->unpinBlocksById(item.lastBlockId.value());
+                kvMgr->unpinBlocksById(item.pinnedBlockIds);
             }
             else
             {
@@ -2233,14 +2234,14 @@ Executor::Impl::RequestList Executor::Impl::populateNewResponses(
             // move the in transmission requests to another tracker
             if (llmReq->isDisaggContextTransmissionState())
             {
-                std::optional<SizeType32> lastBlockId{};
+                std::vector<SizeType32> pinnedBlockIds{};
                 auto kvMgr = mModel->getKVCacheManager();
                 if (kvMgr && kvMgr->isEnableBlockReuse() && !kvMgr->getBlockManager().isVariableWindow())
                 {
-                    lastBlockId = kvMgr->storeBlocksForReuse(llmReq->mRequestId, llmReq, /*pinBlocks=*/true);
+                    pinnedBlockIds = kvMgr->storeBlocksForReuse(llmReq->mRequestId, llmReq, /*pinBlocks=*/true);
                     mModel->terminateRequest(llmReq);
                 }
-                inTransmissionRequests.push_back(InTransmissionItem{*it, lastBlockId});
+                inTransmissionRequests.push_back(InTransmissionItem{*it, pinnedBlockIds});
             }
             finishedRequests.push_back(*it);
             it = activeRequests.erase(it);

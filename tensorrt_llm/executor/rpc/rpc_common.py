@@ -2,7 +2,7 @@ import os
 import tempfile
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import KW_ONLY, dataclass
 from typing import Any, Literal, NamedTuple, Optional
 
 
@@ -66,6 +66,7 @@ class RPCStreamingError(RPCError):
 @dataclass
 class RPCRequest:
     request_id: str
+    _: KW_ONLY
     method_name: str
     args: tuple
     kwargs: dict
@@ -74,6 +75,7 @@ class RPCRequest:
     is_streaming: bool = False
     creation_timestamp: Optional[
         float] = None  # Unix timestamp when request was created
+    routing_id: Optional[bytes] = None
 
     def __post_init__(self):
         """Initialize creation_timestamp if not provided."""
@@ -81,10 +83,12 @@ class RPCRequest:
             self.creation_timestamp = time.time()
 
 
-class RPCResponse(NamedTuple):
+@dataclass
+class RPCResponse:
     request_id: str
+    _: KW_ONLY
     result: Any
     error: Optional[RPCError] = None
     is_streaming: bool = False  # True if more responses coming
-    sequence_number: int = 0  # For ordering streaming responses
+    chunk_index: int = 0  # For ordering streaming responses
     stream_status: Literal['start', 'data', 'end', 'error'] = 'data'

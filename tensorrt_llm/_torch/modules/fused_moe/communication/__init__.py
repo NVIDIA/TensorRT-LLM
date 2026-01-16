@@ -20,8 +20,8 @@ This module provides various communication strategies for expert parallelism in 
 
 Available Communication Methods:
 - AllGatherReduceScatter: Default fallback method, always available
-- MnnvlLatency: MNNVL-optimized communication for latency
-- MNNVLThroughput: MNNVL-optimized communication for throughput
+- NVLinkTwoSided: NVLINK-optimized communication for latency (formerly MNNVLLatency)
+- NVLinkOneSided: NVLINK-optimized communication for throughput (formerly MNNVLThroughput)
 - DeepEP: Deep Expert Parallelism with support for large batches
 - DeepEPLowLatency: Deep Expert Parallelism optimized for low latency
 
@@ -34,16 +34,16 @@ from .base import Communication
 from .communication_factory import CommunicationFactory
 from .deep_ep import DeepEP
 from .deep_ep_low_latency import DeepEPLowLatency
-from .mnnvl_latency import MnnvlLatency
-from .mnnvl_throughput import MNNVLThroughput
+from .nvlink_one_sided import NVLinkOneSided
+from .nvlink_two_sided import NVLinkTwoSided
 
 __all__ = [
     # Base classes and types
     "Communication",
     # Communication strategies
     "AllGatherReduceScatter",
-    "MnnvlLatency",
-    "MNNVLThroughput",
+    "NVLinkTwoSided",
+    "NVLinkOneSided",
     "DeepEP",
     "DeepEPLowLatency",
     # Factory

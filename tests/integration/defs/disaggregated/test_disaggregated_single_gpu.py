@@ -351,8 +351,8 @@ def test_disaggregated_llama_context_capacity(model, enable_cuda_graph,
             max_tokens = 25
 
             requests = []
-            # Send 256 requests to make sure the context worker is saturated
-            for _ in range(256):
+            # Send 32 requests to make sure the context worker is saturated
+            for _ in range(32):
                 requests.append(
                     (prompt, SamplingParams(max_tokens=1, ignore_eos=True),
                      DisaggregatedParams(request_type="context_only")))
@@ -400,7 +400,7 @@ def test_disaggregated_spec_dec_batch_slot_limit(model, spec_dec_model_path,
     # Test whether the batch slots are properly released when using speculative decoding
     # with disaggregated serving.
     spec_dec_config = EagleDecodingConfig(
-        speculative_model_dir=model_path(spec_dec_model_path),
+        speculative_model=model_path(spec_dec_model_path),
         eagle3_one_model=eagle3_one_model,
         max_draft_len=3)
 

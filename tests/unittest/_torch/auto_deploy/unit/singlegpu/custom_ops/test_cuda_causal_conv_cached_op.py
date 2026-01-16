@@ -57,21 +57,23 @@ def test_generate_only_with_slot_mapping_cuda(conv_env):
     )
 
     # Metadata (not used in generate-only op entry, but required by the interface)
-    seq_len = torch.ones(batch, device=device, dtype=torch.int32)
-    seq_start = torch.zeros(batch, device=device, dtype=torch.int32)
+    cu_seqlen = torch.zeros(batch, device=device, dtype=torch.int32)
     use_initial_states = torch.zeros(batch, device=device, dtype=torch.bool)
+    # batch_info_host: [num_prefill, num_prefill_tokens, num_decode]
+    # For generate-only: num_decode = batch, num_prefill = 0
+    batch_info_host = torch.tensor([0, 0, batch], device=device, dtype=torch.int32)
     # Snapshot caches for reference before running op (op mutates caches)
     gathered_before = conv_state_cache.clone().index_select(0, slot_idx)
     x_ref = x.clone()
-    # Run CUDA cached op
-    y = torch.ops.auto_deploy.cuda_cached_causal_conv1d(
+    # Run CUDA cached op (modifies x in-place and returns None)
+    torch.ops.auto_deploy.cuda_cached_causal_conv1d(
         # INPUTS
         x,
         w,
         b,
-        # METADATA
-        seq_len,
-        seq_start,
+        # STANDARD METADATA
+        batch_info_host,
+        cu_seqlen,
         slot_idx,
         use_initial_states,
         # CACHES
@@ -84,6 +86,7 @@ def test_generate_only_with_slot_mapping_cuda(conv_env):
         pm,
         None,
     )
+    y = x  # The op modifies x in-place
 
     assert y.shape == (batch, seq, c)
     assert torch.isfinite(y).all()
@@ -99,7 +102,6 @@ def test_generate_only_with_slot_mapping_cuda(conv_env):
     )
 
 
-@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5548861")
 def test_context_flattened_and_state_writeback_cuda(conv_env):
     device = conv_env["device"]
     dtype = conv_env["dtype"]
@@ -121,18 +123,26 @@ def test_context_flattened_and_state_writeback_cuda(conv_env):
         dtype=dtype,
     )
 
-    seq_len = torch.tensor(lens, device=device, dtype=torch.int32)
-    seq_start = torch.tensor([0, lens[0]], device=device, dtype=torch.int32)
+    # batch_info_host: [num_prefill, num_prefill_tokens, num_decode]
+    num_prefill = len(lens)
+    batch_info_host = torch.tensor([num_prefill, total, 0], device=device, dtype=torch.int32)
+    cu_seqlen = torch.tensor([0, lens[0], total], device=device, dtype=torch.int32)
+    use_initial_states = torch.zeros(num_prefill, device=device, dtype=torch.bool)
 
-    y = torch.ops.auto_deploy.cuda_cached_causal_conv1d(
+    # Snapshot input for reference before running op (op mutates x)
+    x_ref = x.clone()
+
+    # Run CUDA cached op (modifies x in-place and returns None)
+    torch.ops.auto_deploy.cuda_cached_causal_conv1d(
         # INPUTS
         x,
         w,
         b,
-        # METADATA
-        seq_len,
-        seq_start,
+        # STANDARD METADATA
+        batch_info_host,
+        cu_seqlen,
         slot_idx,
+        use_initial_states,
         # CACHES
         conv_state_cache,
         # CONSTANTS
@@ -141,7 +151,9 @@ def test_context_flattened_and_state_writeback_cuda(conv_env):
         d,
         g,
         pm,
+        None,
     )
+    y = x  # The op modifies x in-place
 
     assert y.shape == (batch, seq, c)
     assert torch.isfinite(y).all()
@@ -150,9 +162,9 @@ def test_context_flattened_and_state_writeback_cuda(conv_env):
     y_ref = torch.empty_like(y)
     for i, ln in enumerate(lens):
         st = 0 if i == 0 else lens[0]
-        x_i = x[:, st : st + ln]
+        x_i = x_ref[:, st : st + ln]
         y_i, _ = (
-            tensorrt_llm._torch.auto_deploy.custom_ops.torch_backend_causal_conv._torch_causal_conv1d_prefill(  # type: ignore  # noqa: E501
+            tensorrt_llm._torch.auto_deploy.custom_ops.mamba.torch_backend_causal_conv._torch_causal_conv1d_prefill(  # type: ignore  # noqa: E501
                 x_i, w, b, s, p, d, g, pm
             )
         )
@@ -172,25 +184,3 @@ def test_context_flattened_and_state_writeback_cuda(conv_env):
         )
 
     assert torch.allclose(y, y_ref.to(y.dtype), atol=conv_env["atol"], rtol=conv_env["rtol"])
-
-
-def test_prepare_metadata_cuda(conv_env):
-    device = conv_env["device"]
-
-    b, s = 4, 6
-    # input_ids = torch.randint(0, 1000, (b, s), device=device)
-    position_ids = torch.arange(s, device=device).expand(b, -1)
-    seq_len = torch.tensor([2, 1, 0, 0], device=device, dtype=torch.int32)
-    input_pos = torch.tensor([0, 3, 0, 0], device=device, dtype=torch.int32)
-    cache_loc = torch.arange(b, device=device, dtype=torch.int32)
-    pages_per_seq = torch.ones(b, device=device, dtype=torch.int32)
-    slot_idx = torch.tensor([2, 0, 1, 3], device=device, dtype=torch.int32)
-    page_size = 128
-    chunk_size = 128
-    out = torch.ops.auto_deploy.cuda_causal_conv_prepare_metadata(
-        position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size, chunk_size
-    )
-    assert len(out) == 4
-    seq_len_s, seq_start, slot_s, use_initial_states = out
-    assert seq_len_s.numel() == 2 and slot_s.numel() == 2
-    assert torch.all(seq_start == torch.tensor([0, 2], device=device, dtype=seq_start.dtype))

@@ -58,7 +58,7 @@ We maintain YAML configuration files with recommended performance settings in th
 
 ```shell
 TRTLLM_DIR=/app/tensorrt_llm # change as needed to match your environment
-EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/llama-3.3-70b.yaml
+EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/curated/llama-3.3-70b.yaml
 ```
 
 Note: if you don't have access to the source code locally, you can manually create the YAML config file using the code in the dropdown below.
@@ -66,7 +66,7 @@ Note: if you don't have access to the source code locally, you can manually crea
 ````{admonition} Show code
 :class: dropdown
 
-```{literalinclude} ../../../examples/configs/llama-3.3-70b.yaml
+```{literalinclude} ../../../examples/configs/curated/llama-3.3-70b.yaml
 ---
 language: shell
 prepend: |
@@ -83,7 +83,7 @@ append: EOF
 Below is an example command to launch the TensorRT LLM server with the Llama-3.3-70B-Instruct-FP8 model from within the container. The command is specifically configured for the 1024/1024 Input/Output Sequence Length test. The explanation of each flag is shown in the “LLM API Options (YAML Configuration)” section.
 
 ```shell
-trtllm-serve nvidia/Llama-3.3-70B-Instruct-FP8 --host 0.0.0.0 --port 8000 --extra_llm_api_options ${EXTRA_LLM_API_FILE}
+trtllm-serve nvidia/Llama-3.3-70B-Instruct-FP8 --host 0.0.0.0 --port 8000 --config ${EXTRA_LLM_API_FILE}
 ```
 
 After the server is set up, the client can now send prompt requests to the server and receive results.
@@ -92,7 +92,7 @@ After the server is set up, the client can now send prompt requests to the serve
 
 <!-- TODO: this section is duplicated across the deployment guides; they should be consolidated to a central file and imported as needed, or we can remove this and link to LLM API reference -->
 
-These options provide control over TensorRT LLM's behavior and are set within the YAML file passed to the `trtllm-serve` command via the `--extra_llm_api_options` argument.
+These options provide control over TensorRT LLM's behavior and are set within the YAML file passed to the `trtllm-serve` command via the `--config` argument.
 
 #### `tensor_parallel_size`
 
@@ -170,7 +170,7 @@ These options provide control over TensorRT LLM's behavior and are set within th
 
 &emsp;**Default**: TRTLLM
 
-See the [TorchLlmArgs](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs) class for the full list of options which can be used in the `extra_llm_api_options`.
+See the [TorchLlmArgs](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs) class for the full list of options which can be used in the YAML configuration file.
 
 ## Testing API Endpoint
 
@@ -354,31 +354,33 @@ P99 E2EL (ms):                            [result]
 
 For a single request, ITLs are the time intervals between tokens, while TPOT is the average of those intervals:
 
-```math
-\text{TPOT (1\ request)} = \text{Avg(ITL)} = \frac{\text{E2E\ latency} - \text{TTFT}}{\text{\#Output\ Tokens} - 1}
-```
+$$
+\text{TPOT (1 request)} = \text{Avg(ITL)} = \frac{\text{E2E latency} - \text{TTFT}}{\text{Num Output Tokens} - 1}
+$$
 
 Across different requests, **average TPOT** is the mean of each request's TPOT (all requests weighted equally), while **average ITL** is token-weighted (all tokens weighted equally):
 
-```math
+$$
 \text{Avg TPOT (N requests)} = \frac{\text{TPOT}_1 + \text{TPOT}_2 + \cdots + \text{TPOT}_N}{N}
-```
+$$
 
-```math
-\text{Avg ITL (N requests)} = \frac{\text{Sum of all ITLs across requests}}{\text{\#Output Tokens across requests}}
-```
+$$
+\text{Avg ITL (N requests)} = \frac{\text{Sum of all ITLs across requests}}{\text{Num Output Tokens across requests}}
+$$
 
 #### End-to-End (E2E) Latency
   * The typical total time from when a request is submitted until the final token of the response is received.
 
 #### Total Token Throughput
   * The combined rate at which the system processes both input (prompt) tokens and output (generated) tokens.
-```math
-\text{Total\ TPS} = \frac{\text{\#Input\ Tokens}+\text{\#Output\ Tokens}}{T_{last} - T_{first}}
-```
+
+$$
+\text{Total TPS} = \frac{\text{Num Input Tokens}+\text{Num Output Tokens}}{T_{last} - T_{first}}
+$$
 
 #### Tokens Per Second (TPS) or Output Token Throughput
   * how many output tokens the system generates each second.
-```math
-\text{TPS} = \frac{\text{\#Output\ Tokens}}{T_{last} - T_{first}}
-```
+
+$$
+\text{TPS} = \frac{\text{Num Output Tokens}}{T_{last} - T_{first}}
+$$

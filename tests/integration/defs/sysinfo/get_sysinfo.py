@@ -191,7 +191,13 @@ def construct_gpu_properties(mako_opts, device_index=0):
         assert gpu_name != "", "device_product_name is empty after removing substring 'NVIDIA' and leading/trailing whitespaces."
 
         compute_capability = get_compute_capability(device_index)
-        gpu_memory = pynvml.nvmlDeviceGetMemoryInfo(handle).total / (1024**2)
+        try:
+            gpu_memory = pynvml.nvmlDeviceGetMemoryInfo(handle).total / (1024**
+                                                                         2)
+        except pynvml.NVMLError_NotSupported as e:
+            logger.warning("Unable to get GPU memory info: {}".format(e))
+            # Fallback to 8 GiB, expressed in MiB to match the nvml path above.
+            gpu_memory = 8 * 1024
         # Gather GPU information
         mako_opt_dict["gpu"] = gpu_name
         mako_opt_dict["gpu_memory"] = gpu_memory

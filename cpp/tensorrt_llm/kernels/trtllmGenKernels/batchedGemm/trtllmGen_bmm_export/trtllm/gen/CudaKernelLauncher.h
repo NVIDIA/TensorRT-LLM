@@ -19,8 +19,8 @@
 #ifdef TLLM_ENABLE_CUDA
 #include <cstdio>
 #include <cstdlib>
-#include <cuda_runtime_api.h>
 #include <cuda.h>
+#include <cuda_runtime_api.h>
 #endif
 namespace batchedGemm
 {

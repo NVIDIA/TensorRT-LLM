@@ -1,5 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
 """Graph transformation to automatically add kv cache into fused MHA op."""
 
+import inspect
 import operator
 from typing import Dict, List, Optional, Tuple, Type
 
@@ -13,13 +30,15 @@ from ...custom_ops.attention_interface import (
     AttentionRegistry,
     CacheConfig,
     Constant,
+    PrepareMetadataCallable,
 )
 from ...distributed.common import all_gather_object, get_world_size
 from ...distributed.common import is_initialized as is_distributed_initialized
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils._graph import add_graph_input
-from ...utils.node_utils import get_all_input_output_nodes, is_op
+from ...utils.cuda_mem_tracker import get_mem_info_in_mb
+from ...utils.node_utils import is_op
 from ..interface import (
     BaseTransform,
     SharedConfig,
@@ -27,44 +46,6 @@ from ..interface import (
     TransformInfo,
     TransformRegistry,
 )
-
-
-@TransformRegistry.register("update_in_out_nodes")
-class UpdateInOutNodes(BaseTransform):
-    """Modify the graph module by adding new input nodes.
-
-    The new input nodes correspond to the extra arguments needed for cached and flattened attention.
-
-    Args:
-        egm: The graph module to analyze and modify.
-        cm: Cached sequence interface containing extra argument information.
-    """
-
-    def _apply(
-        self,
-        gm: GraphModule,
-        cm: CachedSequenceInterface,
-        factory: ModelFactory,
-        shared_config: SharedConfig,
-    ) -> Tuple[GraphModule, TransformInfo]:
-        # loop through nodes to get input, output, and get_attr nodes
-        input_nodes, output_nodes = get_all_input_output_nodes(gm.graph)
-
-        # NOTE: for now, we wanna make sure we *only* return the final output and no hidden states.
-        # Later on, we can revisit how to support returning hidden states.
-        assert len(output_nodes) == 1, "Expected exactly one output node!"
-        assert len(output_nodes[0].all_input_nodes) == 1, (
-            "Expected to only return final tensor output!"
-        )
-
-        # Activate and add extra argument nodes
-        new_args = cm.info.switch_to_cached_attn_inputs()
-        for name in new_args:
-            input_nodes.append(add_graph_input(gm, name))
-
-        info = TransformInfo(skipped=False, num_matches=1, is_clean=False, has_valid_shapes=False)
-
-        return gm, info
 
 
 class InsertCachedAttentionConfig(TransformConfig):
@@ -91,26 +72,74 @@ class InsertCachedAttention(BaseTransform):
     def attn_descriptor(self) -> Type[AttentionDescriptor]:
         return AttentionRegistry.get(self.config.backend)
 
-    def _process_get_metadata(
-        self, gm: GraphModule, m_args: List[str], const_args: List[Constant]
+    def _process_metadata_std(self, gm: GraphModule, cm: CachedSequenceInterface) -> List[Node]:
+        """Process the standard metadata nodes."""
+        return [
+            self._add_or_retrieve_input(gm, cm, arg_name)
+            for arg_name in self.attn_descriptor.get_standard_metadata_args()
+        ]
+
+    def _insert_extra_metadata_op(
+        self,
+        gm: GraphModule,
+        prep_meta_op: PrepareMetadataCallable,
+        inputs_for_prep_meta: List[Node],
+        const_args: List[Constant],
+        num_meta_out: int,
+    ) -> List[Node]:
+        # add the computed extra metadata nodes to the graph and add to meta for cached attention op
+        meta_nodes_extra = []
+        node_last_input = gm.graph.find_nodes(op="placeholder", sort=True)[-1]
+        with gm.graph.inserting_before(node_last_input.next):
+            ret_node = gm.graph.call_function(
+                prep_meta_op, args=(*inputs_for_prep_meta, *const_args)
+            )
+            for idx in range(num_meta_out):
+                meta_extra_node = gm.graph.call_function(operator.getitem, args=(ret_node, idx))
+                meta_nodes_extra.append(meta_extra_node)
+
+        return meta_nodes_extra
+
+    def _process_metadata_extra(
+        self, gm: GraphModule, cm: CachedSequenceInterface, any_source_attn_node: Node
     ) -> List[Node]:
         """Process the get_metadata function into an op and return node references."""
-        # retrieve input nodes
-        input_nodes, _ = get_all_input_output_nodes(gm.graph)
-        input_nodes_mapping = {n.target: n for n in input_nodes}
+        # get the metadata op for extra metadata and number of return values
+        prep_meta_op, num_meta_out, const_args = (
+            self.attn_descriptor.get_prepare_extra_metadata_info(any_source_attn_node)
+        )
 
-        # filtered and sorted for SequenceInfo arguments + constants (input_ids, position_ids, etc.)
-        inputs_from_info = [input_nodes_mapping[k] for k in m_args]
+        # if there is no extra metadata op or no return values, we can return early
+        if prep_meta_op is None or num_meta_out == 0:
+            return []
 
-        # insert metadata computation and extract each argument as a node
-        get_metadata, num_metadata = self.attn_descriptor.get_prepare_metadata_op()
-        with gm.graph.inserting_before(input_nodes[-1].next):
-            ret_node = gm.graph.call_function(get_metadata, args=(*inputs_from_info, *const_args))
-            metadata_nodes = [
-                gm.graph.call_function(operator.getitem, args=(ret_node, idx))
-                for idx in range(num_metadata)
-            ]
-        return metadata_nodes
+        # check what inputs the extra metadata op expects
+        inputs_for_prep_meta = [
+            self._add_or_retrieve_input(gm, cm, arg.name)
+            for arg in prep_meta_op._schema.arguments
+            if arg.name in cm.info.available_args
+        ]
+
+        return self._insert_extra_metadata_op(
+            gm, prep_meta_op, inputs_for_prep_meta, const_args, num_meta_out
+        )
+
+    def _process_metadata_host(self, cm: CachedSequenceInterface):
+        """Process the host-side prepare metadata function."""
+        prep_meta_host_op = self.attn_descriptor.get_host_prepare_metadata_function()
+        if prep_meta_host_op is None:
+            return
+
+        # analyze the args of the host-side prepare metadata function using inspect
+        sig = inspect.signature(prep_meta_host_op)
+        args = sig.parameters.keys()
+
+        # check if all args are available in the cached sequence interface
+        unavailable_args = args - cm.info.available_args
+        assert not unavailable_args, f"Missing args in SequenceInfo: {unavailable_args=}"
+
+        # add the host-side prepare metadata function to the graph
+        cm.info.register_host_prepare_for_attention_forward(prep_meta_host_op, list(args))
 
     def _process_cache_node(self, gm: GraphModule, cache_name: str) -> Node:
         """Process the cache nodes by inserting a cached attention replacement op."""
@@ -121,7 +150,8 @@ class InsertCachedAttention(BaseTransform):
         gm: GraphModule,
         attn_node: Node,
         qkv_nodes: List[Node],
-        meta_nodes: List[Node],
+        meta_nodes_std: List[Node],
+        meta_nodes_extra: List[Node],
         cache_nodes: List[Node],
         buffer_nodes: List[Node],
         constants: List[Constant],
@@ -130,7 +160,14 @@ class InsertCachedAttention(BaseTransform):
         with gm.graph.inserting_before(attn_node):
             cached_attn_node = gm.graph.call_function(
                 self.attn_descriptor.get_cached_attention_op(),
-                args=(*qkv_nodes, *meta_nodes, *cache_nodes, *buffer_nodes, *constants),
+                args=(
+                    *qkv_nodes,
+                    *meta_nodes_std,
+                    *meta_nodes_extra,
+                    *cache_nodes,
+                    *buffer_nodes,
+                    *constants,
+                ),
             )
         attn_node.replace_all_uses_with(cached_attn_node)
         gm.graph.erase_node(attn_node)
@@ -165,10 +202,14 @@ class InsertCachedAttention(BaseTransform):
         if cm.info.is_paged:
             assert attn_descriptor.is_paged(), "Paged sequence info requires paged attention op."
 
+        # get standard metadata nodes for all source attention nodes
+        meta_nodes_std = self._process_metadata_std(gm, cm)
+
         # insert metadata computation and extract each argument as a node
-        metadata_nodes = self._process_get_metadata(
-            gm, cm.info.args_for_prepare_metadata, cm.info.const_args_for_prepare_metadata
-        )
+        meta_nodes_extra = self._process_metadata_extra(gm, cm, source_attn_nodes[0])
+
+        # Register host-side prepare_metadata function for attention descriptor.
+        self._process_metadata_host(cm)
 
         buffer_in_lookup: Dict[str, Node] = {}
 
@@ -201,8 +242,16 @@ class InsertCachedAttention(BaseTransform):
 
             # insert cached attention replacement op
             self._insert_cached_attn_node(
-                gm, attn_node, qkv, metadata_nodes, cache_in_nodes, buffer_in_nodes, constants
+                gm,
+                attn_node,
+                qkv,
+                meta_nodes_std,
+                meta_nodes_extra,
+                cache_in_nodes,
+                buffer_in_nodes,
+                constants,
             )
+
             num_cached_attn_replacements += 1
 
         info = TransformInfo(
@@ -256,11 +305,7 @@ class ResizeKVCache(BaseTransform):
     ) -> Tuple[nn.Module, TransformInfo]:
         free_mem_ratio = self.config.free_mem_ratio
 
-        def _get_mem_info_in_mb():
-            free_mem, total_mem = torch.cuda.mem_get_info()
-            return free_mem // 1024**2, total_mem // 1024**2
-
-        free_mem, total_mem = _get_mem_info_in_mb()
+        free_mem, total_mem = get_mem_info_in_mb(empty_cache=True)
         self._log_info(f"Free memory (MB): {free_mem}, Total memory (MB): {total_mem}")
         current_cache_size = cm.current_cache_size_bytes()
         current_kv_cache_size = getattr(cm, "current_kv_cache_size_bytes", None)
@@ -269,7 +314,7 @@ class ResizeKVCache(BaseTransform):
         )
         current_num_pages = cm.info.num_pages
         self._log_info(
-            f"Current cache size (MB): {current_cache_size // 1024 // 1024}, "
+            f"Current cache size (MB): {current_cache_size // 1024**2}, "
             f"Current num pages: {current_num_pages}"
         )
         if current_kv_cache_size != current_cache_size:
@@ -288,12 +333,34 @@ class ResizeKVCache(BaseTransform):
 
         # Let's run a forward pass to get the memory usage
         cm.info.set_max_num_tokens_sample()
-        free_mem_pre, _ = _get_mem_info_in_mb()
+        free_mem_pre, _ = get_mem_info_in_mb(empty_cache=True)
         self._log_info(f"Free memory before forward pass (MB): {free_mem_pre}")
 
-        mod(**cm.named_args)
+        # Reset peak memory stats to get the extra memory used during the forward pass
+        torch.cuda.reset_peak_memory_stats()
+        memory_allocated_before_forward_pass_mb = torch.cuda.memory_allocated() // 1024**2
+        try:
+            mod(**cm.named_args)
+        except torch.OutOfMemoryError as e:
+            self.ad_logger.error(
+                f"OutOfMemoryError in forward pass while trying to resize the kv-cache:\n{e}"
+            )
+            raise e
 
-        free_mem_post, _ = _get_mem_info_in_mb()
+        peak_memory_during_forward_pass_mb = torch.cuda.max_memory_allocated() // 1024**2
+        mem_used_during_forward_pass_mb = (
+            peak_memory_during_forward_pass_mb - memory_allocated_before_forward_pass_mb
+        )
+        self._log_info(
+            f"Peak memory uasge during forward pass (MB): {peak_memory_during_forward_pass_mb}"
+        )
+        self._log_info(
+            f"Extra memory used during forward pass (MB): {mem_used_during_forward_pass_mb}"
+        )
+
+        # TODO (lucaslie): logic needs overhaul, too much going on. For now, this is just reverting
+        # to the original logic. Full overhaulwill be done as part of #10013
+        free_mem_post, _ = get_mem_info_in_mb(empty_cache=False)
         self._log_info(f"Free memory after forward pass (MB): {free_mem_post}")
 
         memory_for_forward_pass = free_mem_pre - free_mem_post

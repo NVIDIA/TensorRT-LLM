@@ -80,7 +80,13 @@ class BenchmarkMetrics:
     std_e2el_ms: float
     percentiles_e2el_ms: list[tuple[float, float]]
     tput_user: list[float]
-    avg_decoded_tokens_per_iter: float
+    # Statistics for avg_decoded_tokens_per_iter across all requests
+    mean_avg_decoded_tokens_per_iter: float
+    min_avg_decoded_tokens_per_iter: float
+    max_avg_decoded_tokens_per_iter: float
+    median_avg_decoded_tokens_per_iter: float
+    std_avg_decoded_tokens_per_iter: float
+    percentiles_avg_decoded_tokens_per_iter: list[tuple[float, float]]
 
 
 async def get_request(
@@ -144,7 +150,7 @@ def calculate_metrics(
     ttfts: list[float] = []
     e2els: list[float] = []
     tput_user: list[float] = []
-    latest_avg_decoded_tokens_per_iter: float = 0.0
+    avg_decoded_tokens_per_iter_list: list[float] = []
     error_counts: dict[str, int] = {}
     for i in range(len(outputs)):
         if outputs[i].exception_type:
@@ -177,11 +183,11 @@ def calculate_metrics(
             tput_user.append(output_len / (outputs[i].latency))
             completed += 1
 
-            # Track the latest avg_decoded_tokens_per_iter if available
+            # Collect avg_decoded_tokens_per_iter for all requests
             if hasattr(outputs[i], 'avg_decoded_tokens_per_iter'
                        ) and outputs[i].avg_decoded_tokens_per_iter is not None:
-                latest_avg_decoded_tokens_per_iter = outputs[
-                    i].avg_decoded_tokens_per_iter
+                avg_decoded_tokens_per_iter_list.append(
+                    outputs[i].avg_decoded_tokens_per_iter)
         else:
             actual_output_lens.append(0)
 
@@ -247,7 +253,20 @@ def calculate_metrics(
         percentiles_e2el_ms=[(p, np.percentile(e2els or 0, p) * 1000)
                              for p in selected_percentiles],
         tput_user=np.mean(tput_user or 0),
-        avg_decoded_tokens_per_iter=latest_avg_decoded_tokens_per_iter,
+        mean_avg_decoded_tokens_per_iter=np.mean(
+            avg_decoded_tokens_per_iter_list or 0),
+        min_avg_decoded_tokens_per_iter=np.min(avg_decoded_tokens_per_iter_list)
+        if avg_decoded_tokens_per_iter_list else 0.0,
+        max_avg_decoded_tokens_per_iter=np.max(avg_decoded_tokens_per_iter_list)
+        if avg_decoded_tokens_per_iter_list else 0.0,
+        median_avg_decoded_tokens_per_iter=np.median(
+            avg_decoded_tokens_per_iter_list or 0),
+        std_avg_decoded_tokens_per_iter=np.std(avg_decoded_tokens_per_iter_list
+                                               or 0),
+        percentiles_avg_decoded_tokens_per_iter=[
+            (p, np.percentile(avg_decoded_tokens_per_iter_list or 0, p))
+            for p in selected_percentiles
+        ],
     )
     return metrics, actual_output_lens
 
@@ -466,10 +485,6 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("User throughput (tok/s):",
                                     metrics.tput_user))
 
-    # Print last avg_decoded_tokens_per_iter value if available
-    if metrics.avg_decoded_tokens_per_iter > 0.0:
-        print("{:<40} {:<10.2f}".format("Avg Decoded Tokens per Iter:",
-                                        metrics.avg_decoded_tokens_per_iter))
     if len(outputs) - metrics.completed > 0:
         print(
             f"=======================!FAILED REQUESTS!=======================")
@@ -488,7 +503,17 @@ async def benchmark(
         "output_throughput": metrics.output_throughput,
         "total_token_throughput": metrics.total_token_throughput,
         "user_throughput": metrics.tput_user,
-        "avg_decoded_tokens_per_iter": metrics.avg_decoded_tokens_per_iter,
+        "avg_decoded_tokens_per_iter": {
+            "mean": metrics.mean_avg_decoded_tokens_per_iter,
+            "min": metrics.min_avg_decoded_tokens_per_iter,
+            "max": metrics.max_avg_decoded_tokens_per_iter,
+            "median": metrics.median_avg_decoded_tokens_per_iter,
+            "std": metrics.std_avg_decoded_tokens_per_iter,
+            "percentiles": {
+                f"p{p}": v
+                for p, v in metrics.percentiles_avg_decoded_tokens_per_iter
+            }
+        },
         "input_lens": [output.prompt_len for output in outputs],
         "output_lens": actual_output_lens,
         "ttfts": [output.ttft for output in outputs],
@@ -504,30 +529,64 @@ async def benchmark(
         metric_name: str,
         # E.g., "Time to First Token"
         metric_header: str,
+        # E.g., "ms" or "" for no unit
+        unit_suffix: str = "ms",
     ):
-        # This function prints and adds statistics of the specified
-        # metric.
-        if metric_attribute_name not in selected_percentile_metrics:
+        # This function prints and adds statistics of the specified metric.
+        # Skip if not in selected metrics (except avg_decoded_tokens_per_iter which has its own condition)
+        if (metric_attribute_name not in selected_percentile_metrics
+                and metric_attribute_name != "avg_decoded_tokens_per_iter"):
             return
+
+        # Build attribute suffix (e.g., "_ms" or "")
+        attr_suffix = f"_{unit_suffix}" if unit_suffix else ""
+        # Build display unit (e.g., " (ms)" or "")
+        display_unit = f" ({unit_suffix})" if unit_suffix else ""
+
         print("{s:{c}^{n}}".format(s=metric_header, n=50, c='-'))
         print("{:<40} {:<10.2f}".format(
-            f"Mean {metric_name} (ms):",
-            getattr(metrics, f"mean_{metric_attribute_name}_ms")))
+            f"Mean {metric_name}{display_unit}:",
+            getattr(metrics, f"mean_{metric_attribute_name}{attr_suffix}")))
         print("{:<40} {:<10.2f}".format(
-            f"Median {metric_name} (ms):",
-            getattr(metrics, f"median_{metric_attribute_name}_ms")))
-        result[f"mean_{metric_attribute_name}_ms"] = getattr(
-            metrics, f"mean_{metric_attribute_name}_ms")
-        result[f"median_{metric_attribute_name}_ms"] = getattr(
-            metrics, f"median_{metric_attribute_name}_ms")
-        result[f"std_{metric_attribute_name}_ms"] = getattr(
-            metrics, f"std_{metric_attribute_name}_ms")
-        for p, value in getattr(metrics,
-                                f"percentiles_{metric_attribute_name}_ms"):
+            f"Median {metric_name}{display_unit}:",
+            getattr(metrics, f"median_{metric_attribute_name}{attr_suffix}")))
+        if hasattr(metrics, f"std_{metric_attribute_name}{attr_suffix}"):
+            print("{:<40} {:<10.2f}".format(
+                f"Std Dev {metric_name}{display_unit}:",
+                getattr(metrics, f"std_{metric_attribute_name}{attr_suffix}")))
+            result[f"std_{metric_attribute_name}{attr_suffix}"] = getattr(
+                metrics, f"std_{metric_attribute_name}{attr_suffix}")
+        if hasattr(metrics, f"min_{metric_attribute_name}{attr_suffix}"):
+            print("{:<40} {:<10.2f}".format(
+                f"Min {metric_name}{display_unit}:",
+                getattr(metrics, f"min_{metric_attribute_name}{attr_suffix}")))
+            result[f"min_{metric_attribute_name}{attr_suffix}"] = getattr(
+                metrics, f"min_{metric_attribute_name}{attr_suffix}")
+        if hasattr(metrics, f"max_{metric_attribute_name}{attr_suffix}"):
+            print("{:<40} {:<10.2f}".format(
+                f"Max {metric_name}{display_unit}:",
+                getattr(metrics, f"max_{metric_attribute_name}{attr_suffix}")))
+            result[f"max_{metric_attribute_name}{attr_suffix}"] = getattr(
+                metrics, f"max_{metric_attribute_name}{attr_suffix}")
+
+        result[f"mean_{metric_attribute_name}{attr_suffix}"] = getattr(
+            metrics, f"mean_{metric_attribute_name}{attr_suffix}")
+        result[f"median_{metric_attribute_name}{attr_suffix}"] = getattr(
+            metrics, f"median_{metric_attribute_name}{attr_suffix}")
+
+        for p, value in getattr(
+                metrics, f"percentiles_{metric_attribute_name}{attr_suffix}"):
             p_word = str(int(p)) if int(p) == p else str(p)
-            print("{:<40} {:<10.2f}".format(f"P{p_word} {metric_name} (ms):",
-                                            value))
-            result[f"p{p_word}_{metric_attribute_name}_ms"] = value
+            print("{:<40} {:<10.2f}".format(
+                f"P{p_word} {metric_name}{display_unit}:", value))
+            result[f"p{p_word}_{metric_attribute_name}{attr_suffix}"] = value
+
+    # Print avg_decoded_tokens_per_iter statistics if available
+    if metrics.mean_avg_decoded_tokens_per_iter > 0.0:
+        process_one_metric("avg_decoded_tokens_per_iter",
+                           "Avg Decoded Tokens per Iter",
+                           "Avg Decoded Tokens per Iter",
+                           unit_suffix="")
 
     process_one_metric("ttft", "TTFT", "Time to First Token")
     process_one_metric("tpot", "TPOT",

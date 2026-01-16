@@ -133,7 +133,7 @@ export TRITON_ROOT=/local/user/triton
 
 3. **Select Triton as the MoE backend**
 
-• **trtllm-serve** (or other similar commands) — add this snippet to the YAML file passed via `--extra_llm_api_options`:
+• **trtllm-serve** (or other similar commands) — add this snippet to the YAML file passed via `--config`:
 
 ```yaml
 moe_config:

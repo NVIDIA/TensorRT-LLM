@@ -68,6 +68,7 @@ option(USING_OSS_CUTLASS_MOE_GEMM "Using open sourced Cutlass moe gemm kernel"
        ON)
 option(USING_OSS_CUTLASS_ALLREDUCE_GEMM
        "Using open sourced Cutlass AR gemm kernel" ON)
+option(SKIP_SOFTMAX_STAT "Enable Statistics of Skip-Softmax" OFF)
 
 message(STATUS "ENABLE_NVSHMEM is ${ENABLE_NVSHMEM}")
 
@@ -270,6 +271,10 @@ if(BUILD_DEEP_GEMM)
   FetchContent_MakeAvailable(deepgemm)
 endif()
 
+if(NOT NVTX_DISABLE)
+  set(maybe_nvtx_includedir ${CMAKE_BINARY_DIR}/_deps/nvtx-src/include)
+endif()
+
 # include as system to suppress warnings
 include_directories(
   SYSTEM
@@ -277,7 +282,7 @@ include_directories(
   ${CUDAToolkit_INCLUDE_DIRS}/cccl
   ${CUDNN_ROOT_DIR}/include
   $<TARGET_PROPERTY:TensorRT::NvInfer,INTERFACE_INCLUDE_DIRECTORIES>
-  ${CMAKE_BINARY_DIR}/_deps/nvtx-src/include
+  ${maybe_nvtx_includedir}
   ${CMAKE_BINARY_DIR}/_deps/cutlass-src/include
   ${CMAKE_BINARY_DIR}/_deps/cutlass-src/tools/util/include
   ${CMAKE_BINARY_DIR}/_deps/json-src/include)
@@ -354,6 +359,11 @@ if(ENABLE_NVSHMEM)
 else()
   add_compile_definitions($<$<COMPILE_LANGUAGE:CXX>:ENABLE_NVSHMEM=0>
                           $<$<COMPILE_LANGUAGE:CUDA>:ENABLE_NVSHMEM=0>)
+endif()
+
+if(SKIP_SOFTMAX_STAT)
+  add_compile_definitions("SKIP_SOFTMAX_STAT")
+  message(STATUS "SKIP_SOFTMAX_STAT is enabled")
 endif()
 
 # Fix linking issue with TRT 10, the detailed description about `--mcmodel` can
@@ -494,7 +504,7 @@ print(os.path.dirname(torch.__file__),end='');"
   endif()
   list(APPEND CMAKE_PREFIX_PATH ${TORCH_DIR})
   set(USE_SYSTEM_NVTX ON)
-  set(nvtx3_dir ${3RDPARTY_DIR}/NVTX/include)
+  set(nvtx3_dir ${CMAKE_BINARY_DIR}/_deps/nvtx-src/include)
   set(CMAKE_CUDA_ARCHITECTURES_BACKUP ${CMAKE_CUDA_ARCHITECTURES})
   find_package(Torch REQUIRED)
   set(CMAKE_CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES_BACKUP})
@@ -571,7 +581,7 @@ if(ENABLE_UCX)
       OUTPUT_VARIABLE UCXX_BUILD_OUTPUT
       RESULT_VARIABLE UCXX_BUILD_RESULT)
     if(UCXX_BUILD_RESULT)
-      message("ucxx build:" ${UCXX_BUILD_OUTPUT})
+      message("ucxx build: ${UCXX_BUILD_OUTPUT}")
       message(FATAL_ERROR "ucxx build failed")
     endif()
     find_package(ucxx REQUIRED PATHS ${CMAKE_BINARY_DIR}/ucxx/build

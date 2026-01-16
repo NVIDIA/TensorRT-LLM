@@ -19,7 +19,7 @@ FetchContent_Declare(
 FetchContent_Declare(
   cutlass
   GIT_REPOSITORY https://github.com/NVIDIA/cutlass
-  GIT_TAG v4.2.1 # f3fde58372d33e9a5650ba7b80fc48b3b49d40c8
+  GIT_TAG v4.3.0 # e67e63c331d6e4b729047c95cf6b92c8454cba89
   GIT_SHALLOW TRUE
   SOURCE_SUBDIR
   dont-add-this-project-with-add-subdirectory)
@@ -38,8 +38,10 @@ FetchContent_Declare(
 
 FetchContent_Declare(
   deepgemm
-  GIT_REPOSITORY https://github.com/ruoqianguo/DeepGEMM
-  GIT_TAG 9fa5965e265e27995f539e0dd73a06351a8a9eaf
+  GIT_REPOSITORY https://github.com/deepseek-ai/DeepGEMM
+  GIT_TAG 4ff3f54d9b7ed3129e4f36f9871232ea7ecab86b # nv_dev branch
+  GIT_SUBMODULES_RECURSE
+  ON
   SOURCE_SUBDIR
   dont-add-this-project-with-add-subdirectory)
 
@@ -53,6 +55,8 @@ FetchContent_Declare(
   flashmla
   GIT_REPOSITORY https://github.com/deepseek-ai/FlashMLA.git
   GIT_TAG 1408756a88e52a25196b759eaf8db89d2b51b5a1
+  GIT_SUBMODULES_RECURSE
+  ON
   SOURCE_SUBDIR
   dont-add-this-project-with-add-subdirectory)
 

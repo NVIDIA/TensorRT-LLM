@@ -14,10 +14,12 @@
 # limitations under the License.
 
 import re
+import time
 from pathlib import Path
 from typing import Any, Callable
 
 import pytest
+import requests
 import yaml
 
 from ..test_llm import get_model_path
@@ -257,3 +259,29 @@ def expand_slurm_nodelist(nodelist_str):
             expanded_nodes.append(group)
 
     return expanded_nodes
+
+
+def wait_for_endpoint_ready(url: str, timeout: int = 300, interval: int = 3):
+    start = time.monotonic()
+    while time.monotonic() - start < timeout:
+        try:
+            time.sleep(interval)
+            if requests.get(url).status_code == 200:
+                print(f"endpoint {url} is ready")
+                return
+        except Exception as err:
+            print(f"endpoint {url} is not ready, with exception: {err}")
+
+
+def wait_for_endpoint_down(url: str, timeout: int = 300):
+    start = time.monotonic()
+    while time.monotonic() - start < timeout:
+        try:
+            if requests.get(url).status_code >= 100:
+                print(
+                    f"endpoint {url} returned status code {requests.get(url).status_code}"
+                )
+                time.sleep(1)
+        except Exception as err:
+            print(f"endpoint {url} is down, with exception: {err}")
+            return

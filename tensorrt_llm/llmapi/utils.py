@@ -56,6 +56,7 @@ def print_colored(message,
         bold_red="\x1b[31;1m",
         bold_green="\033[1;32m",
         green="\033[0;32m",
+        cyan="\033[0;36m",
     )
     reset = "\x1b[0m"
 
@@ -113,6 +114,7 @@ def logger_debug(message,
             location) > 50 else location
         print_colored(f"{timestamp} [{cur_dualname}]", "bold_green", writer)
         print_colored(f" {message}\n", color, writer)
+        writer.flush()
     else:
         # Fallback to logger.debug
         logger.debug(message)
@@ -222,6 +224,7 @@ class DisabledTqdm(tqdm):
 
 def download_hf_model(model: str, revision: Optional[str] = None) -> Path:
     ignore_patterns = ["original/**/*"]
+    logger.info(f"Downloading model {model} from HuggingFace")
     with get_file_lock(model):
         hf_folder = snapshot_download(
             model,
@@ -229,6 +232,7 @@ def download_hf_model(model: str, revision: Optional[str] = None) -> Path:
             ignore_patterns=ignore_patterns,
             revision=revision,
             tqdm_class=DisabledTqdm)
+    logger.info(f"Finished downloading model {model} from HuggingFace")
     return Path(hf_folder)
 
 

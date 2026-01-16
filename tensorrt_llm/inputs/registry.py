@@ -1,5 +1,6 @@
 import enum
 import random
+import traceback
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import (Any, Callable, Dict, List, Optional, Protocol, Tuple, Type,
@@ -139,6 +140,21 @@ class BaseMultimodalInputProcessor(ABC):
         self._tokenizer = tokenizer
         self._use_fast: bool = kwargs.get('use_fast', True)
         self._multimodal_hashing_supported: Optional[bool] = None
+
+    def attach_multimodal_embeddings(
+        self,
+        inputs: TextPrompt,
+        multimodal_embedding: Dict[str, List[torch.Tensor]],
+        sampling_params: SamplingParams,
+    ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
+        """
+        Handle externally provided multimodal input embeddings.
+
+        While inputs["multi_modal_data"] is handled by __call__, this method is intended to process
+        inputs["multi_modal_embeddings"].
+        """
+        raise NotImplementedError(
+            "Input processor does not support multimodal embedding input")
 
     @property
     @abstractmethod
@@ -340,6 +356,20 @@ class BaseMultimodalDummyInputsBuilder(ABC):
     def get_dummy_prompt(self, input_seq_len: int):
         # TODO(yechank): We use the max resolution as starting point and keep reducing the resolution until the prompt length is less than the input sequence length.
         # Need to find better way to calculate the dummy prompt length as this iteration may not be efficient.
+
+        # Use the registered model_type from the decorator if available,
+        # otherwise fall back to HuggingFace config's model_type.
+        # This ensures consistency between placeholder registration and lookup.
+        registered_model_type = getattr(self.__class__,
+                                        '_registered_model_type', None)
+        config_model_type = self.config.model_type
+        model_type = registered_model_type or config_model_type
+
+        logger.debug(
+            f"[get_dummy_prompt] registered_model_type={registered_model_type}, "
+            f"config.model_type={config_model_type}, using model_type={model_type}"
+        )
+
         while self.image_max_dim >= self.image_min_dim:
             image = self.get_dummy_image(max_width=self.image_max_dim,
                                          max_height=self.image_max_dim)
@@ -347,7 +377,7 @@ class BaseMultimodalDummyInputsBuilder(ABC):
             test_mm_prompt = tensorrt_llm.inputs.utils.default_multimodal_input_loader(
                 tokenizer=self.tokenizer,
                 model_dir=self.model_path,
-                model_type=self.config.model_type,
+                model_type=model_type,
                 modality="image",
                 prompts=[""],
                 media=[[image]],
@@ -549,6 +579,9 @@ def register_input_processor(
         MULTIMODAL_PLACEHOLDER_REGISTRY.set_placeholder_metadata(
             model_type, placeholder_metadata)
 
+        # Store model_type on processor class for use in get_dummy_prompt
+        processor_cls._registered_model_type = model_type
+
         return model_cls
 
     return wrapper
@@ -584,6 +617,12 @@ def create_input_processor(
             logger.debug(
                 f"Unable to load HF config from {model_path_or_dir}: {e}. Falling back."
             )
+    elif checkpoint_format in ("mistral", "mistral_large_3"):
+        logger.debug(f"Detected checkpoint_format={checkpoint_format}.")
+        from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
+            MistralConfigLoader
+        model_config = MistralConfigLoader().load(model_path_or_dir)
+        config = model_config.pretrained_config
     else:
         logger.debug(
             f"checkpoint_format={checkpoint_format}; skipping HF config load.")
@@ -697,8 +736,6 @@ def create_input_processor_with_hash(
                     input_processor.multimodal_hashing_supported = True
                 return prompt_token_ids, extra_processed_inputs
             except Exception as e:
-                import traceback
-                traceback.print_exc()
                 logger.warning(f"Multimodal hashing failed: {e}.")
                 if try_multimodal_hashing:
                     # if trying for first time, fall back to basic input processor
@@ -708,9 +745,8 @@ def create_input_processor_with_hash(
                     try:
                         return input_processor(inputs, sampling_params)
                     except Exception as e2:
-                        import traceback
-                        traceback.print_exc()
                         logger.warning(f"Basic input processor failed: {e}.")
+                        logger.debug(traceback.format_exc())
                         raise e2
                 else:
                     raise e
@@ -718,9 +754,8 @@ def create_input_processor_with_hash(
             try:
                 return input_processor(inputs, sampling_params)
             except Exception as e:
-                import traceback
-                traceback.print_exc()
                 logger.warning(f"Basic input processor failed: {e}.")
+                logger.debug(traceback.format_exc())
                 raise e
 
     return input_processor_wrapper

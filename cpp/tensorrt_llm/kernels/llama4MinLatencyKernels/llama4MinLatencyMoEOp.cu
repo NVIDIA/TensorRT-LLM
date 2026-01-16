@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/llama4MinLatencyKernels/llama4MinLatencyMoEOp.h"
 #include "tensorrt_llm/kernels/llama4MinLatencyKernels/llama4Utils.cuh"
 #include <cmath>
@@ -33,7 +34,9 @@
 #define ENABLE_PREFETCH 1
 #define ENABLE_PREEXIT 1
 
-namespace tensorrt_llm::kernels::llama4_min_latency::llama4_moe
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::llama4_min_latency::llama4_moe
 {
 
 #define TOPK_VEC_SIZE 4
@@ -79,7 +82,7 @@ __global__ void llama4_moe_fc13_swiglu_fp8_kernel(int num_tokens,
 
     // Logits depends on the previous kernel, so we cannot prefetch anything.
 #if ENABLE_ACQBULK
-    asm volatile("griddepcontrol.wait;" ::: "memory");
+    cudaGridDependencySynchronize();
 #endif
 
     // Perform top1 within the current thread, which processes 4 experts.
@@ -188,7 +191,7 @@ __global__ void llama4_moe_fc13_swiglu_fp8_kernel(int num_tokens,
     }
 
 #if ENABLE_PREEXIT
-    asm volatile("griddepcontrol.launch_dependents;");
+    cudaTriggerProgrammaticLaunchCompletion();
 #endif
 #endif
 }
@@ -239,7 +242,7 @@ __global__ void llama4_moe_fc2_fp8_kernel(int num_tokens,
     scaling_factors_shared[tid] = scaling_factors[tid];
 
 #if ENABLE_ACQBULK
-    asm volatile("griddepcontrol.wait;" ::: "memory");
+    cudaGridDependencySynchronize();
 #endif
 
     // Select the corresponding expert weight.
@@ -307,7 +310,7 @@ __global__ void llama4_moe_fc2_fp8_kernel(int num_tokens,
     }
 
 #if ENABLE_PREEXIT
-    asm volatile("griddepcontrol.launch_dependents;");
+    cudaTriggerProgrammaticLaunchCompletion();
 #endif
 #endif
 }
@@ -351,4 +354,6 @@ void run_moe_llama4_tp8ep1_min_latency(int num_tokens, int num_experts,
         exp_idx, output_void, dequant_fc2, stream);
 }
 
-} // namespace tensorrt_llm::kernels::llama4_min_latency::llama4_moe
+} // namespace kernels::llama4_min_latency::llama4_moe
+
+TRTLLM_NAMESPACE_END

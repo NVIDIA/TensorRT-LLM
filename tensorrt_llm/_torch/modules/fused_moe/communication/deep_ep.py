@@ -26,6 +26,7 @@ from typing import List, Optional, Tuple
 import torch
 
 from tensorrt_llm._torch.modules.fused_moe.deep_ep_utils import buffer_pool, deep_ep_installed
+from tensorrt_llm._utils import local_mpi_size
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -50,6 +51,15 @@ class DeepEP(Communication):
     ):
         super().__init__(mapping)
 
+        # Check if DeepEP is feasible for the given number of ranks
+        if not self._is_deepep_feasible(mapping.moe_ep_size):
+            raise RuntimeError(
+                f"DeepEP is not feasible for {mapping.moe_ep_size} ranks. "
+                f"DeepEP supports: "
+                f"1) Intranode: 2, 4, or 8 ranks; "
+                f"2) Internode: 2, 4, 8, or 16 nodes with 8 ranks per node."
+            )
+
         # Store needed parameters
         self.num_slots = num_slots
         self.hidden_size = hidden_size
@@ -67,13 +77,37 @@ class DeepEP(Communication):
         self.deep_ep_buffer.reserve(hidden_size, weight_dtype)
 
     @staticmethod
-    def is_platform_supported(mapping: Mapping) -> bool:
+    def is_platform_supported() -> bool:
         """
         Check if DeepEP is supported on the current platform
         """
         if os.environ.get("TRTLLM_CAN_USE_DEEP_EP", "0") != "1":
             return False
         return deep_ep_installed
+
+    @staticmethod
+    def _is_deepep_feasible(num_ranks: int) -> bool:
+        """
+        Check if DeepEP is feasible for the given number of ranks
+
+        DeepEP supports two modes:
+        1. Intranode: Single node with 2, 4, or 8 ranks
+        2. Internode: 2, 4, 8, or 16 nodes with 8 ranks per node
+        """
+        NUM_INTRANODE_SUPPORTED_RANKS = {2, 4, 8}
+        REQUIRED_LOCAL_MPI_SIZE = 8
+        NUM_INTERNODE_SUPPORTED_RDMA_RANKS = {2, 4, 8, 16}
+        mpi_size = local_mpi_size()
+
+        # Intranode cases
+        if num_ranks == mpi_size and num_ranks in NUM_INTRANODE_SUPPORTED_RANKS:
+            return True
+
+        # Internode cases
+        if mpi_size != REQUIRED_LOCAL_MPI_SIZE:
+            return False
+        num_rdma_nodes = num_ranks // mpi_size
+        return num_rdma_nodes in NUM_INTERNODE_SUPPORTED_RDMA_RANKS
 
     def supports_post_quant_dispatch(self) -> bool:
         """
@@ -94,7 +128,7 @@ class DeepEP(Communication):
             return False
         if self.weight_dtype != torch.bfloat16:
             return False
-        return self.is_platform_supported(self.mapping)
+        return True
 
     def dispatch(
         self,

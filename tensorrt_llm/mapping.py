@@ -16,6 +16,7 @@ from enum import IntEnum
 from typing import List
 
 import torch
+from torch.distributed import ProcessGroup
 
 from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
 from tensorrt_llm._utils import mpi_disabled
@@ -62,8 +63,19 @@ class MappingBase:
         if moe_cluster_size == -1:
             moe_cluster_size = 1
 
-        cp_type = CpType.ULYSSES if cp_config is None else cp_config.get(
-            "cp_type", CpType.ULYSSES)
+        # Set default cp_type to ULYSSES.
+        cp_type = CpType.ULYSSES
+
+        # Convert cp_type to CpType enum if it is a string.
+        if cp_config is not None:
+            if "cp_type" in cp_config and isinstance(cp_config["cp_type"], str):
+                try:
+                    cp_config["cp_type"] = CpType[cp_config["cp_type"].upper()]
+                except KeyError:
+                    raise ValueError(f"Invalid cp_type: {cp_config['cp_type']}. " \
+                                    f"Must be one of: {', '.join([t.name for t in CpType])}")
+            cp_type = cp_config.get("cp_type", CpType.ULYSSES)
+
         moe_world_size = tp_size if cp_type == CpType.ULYSSES else tp_size * cp_size
 
         if moe_tp_size == -1 and moe_ep_size == -1:
@@ -280,18 +292,16 @@ class MappingBase:
         return self.cp_size > 1
 
     def prev_cp_rank(self):
-        p = self.rank - self.tp_size
-        if p // (self.tp_size * self.cp_size) < self.rank // (self.tp_size *
-                                                              self.cp_size):
-            return p + self.tp_size * self.cp_size
-        return p
+        # cp ranks are consecutive, so prev is rank - 1 with wraparound within cp group.
+        if self.cp_rank == 0:
+            return self.rank + self.cp_size - 1
+        return self.rank - 1
 
     def next_cp_rank(self):
-        p = self.rank + self.tp_size
-        if p // (self.tp_size * self.cp_size) > self.rank // (self.tp_size *
-                                                              self.cp_size):
-            return p - self.tp_size * self.cp_size
-        return p
+        # cp ranks are consecutive, so next is rank + 1 with wraparound within cp group.
+        if self.cp_rank == self.cp_size - 1:
+            return self.rank - self.cp_size + 1
+        return self.rank + 1
 
     def has_moe_cluster(self):
         return self.moe_cluster_size > 1
@@ -317,6 +327,39 @@ class MappingBase:
             # If num_layers % pp_size = n != 0, first n ranks get one extra layer
             return torch.tensor_split(torch.arange(num_layers),
                                       self.pp_size)[self.pp_rank].tolist()
+
+    def pp_rank_of_layer(self, layer_idx: int, num_layers: int) -> int:
+        """Return pipeline-parallel rank that owns `layer_idx` for a model with `num_layers` layers.
+        Mirrors the partitioning behavior in `pp_layers()`.
+        """
+        if layer_idx < 0 or layer_idx >= num_layers:
+            raise ValueError(f"{layer_idx=} is out of range for {num_layers=}.")
+        if not self.has_pp():
+            return 0
+
+        if self.pp_partition is not None:
+            if len(self.pp_partition) != self.pp_size:
+                raise ValueError(
+                    f"{len(self.pp_partition)=} does not match {self.pp_size=}."
+                )
+            if sum(self.pp_partition) != num_layers:
+                raise ValueError(
+                    f"{sum(self.pp_partition)=} does not match {num_layers=}.")
+            end = 0
+            for pp_rank, n in enumerate(self.pp_partition):
+                end += n
+                if layer_idx < end:
+                    return pp_rank
+            raise RuntimeError("Unreachable: invalid pp_partition.")
+
+        base, rem = divmod(num_layers, self.pp_size)
+        if base == 0:
+            # Matches torch.tensor_split: first `num_layers` ranks get one layer.
+            return layer_idx
+        cutoff = (base + 1) * rem
+        if layer_idx < cutoff:
+            return layer_idx // (base + 1)
+        return rem + (layer_idx - cutoff) // base
 
     def ep_experts(self, num_experts: int) -> List[int]:
         assert self.cp_size == 1
@@ -366,17 +409,17 @@ class Mapping(MappingBase):
 
     A node with 8 GPUs, tp_size = 4, cp_size = 2, pp_size = 1
 
-    2 tp groups:
-
-    - [0, 1, 2, 3]
-    - [4, 5, 6, 7]
-
     4 cp groups:
 
-    - [0, 4]
-    - [1, 5]
-    - [2, 6]
-    - [3, 7]
+    - [0, 1]
+    - [2, 3]
+    - [4, 5]
+    - [6, 7]
+
+    2 tp groups:
+
+    - [0, 2, 4, 6]
+    - [1, 3, 5, 7]
 
     A node with 8 GPUs, moe_tp_size = 2, moe_ep_size = 4
 
@@ -425,23 +468,23 @@ class Mapping(MappingBase):
 
     2 nodes with 8 GPUs, tp_size 2, pp_size 2, cp_size 2
 
-    4 tp groups:
+    4 cp groups:
     - [0, 1]
     - [2, 3]
     - [4, 5]
     - [6, 7]
+
+    4 tp groups:
+    - [0, 2]
+    - [1, 3]
+    - [4, 6]
+    - [5, 7]
 
     4 pp groups:
     - [0, 4]
     - [1, 5]
     - [2, 6]
     - [3, 7]
-
-    4 cp groups:
-    - [0, 2]
-    - [1, 3]
-    - [4, 6]
-    - [5, 7]
     """
 
     def __new__(cls, *args, **kwargs):
@@ -485,25 +528,45 @@ class Mapping(MappingBase):
                          enable_attention_dp=enable_attention_dp,
                          enable_lm_head_tp_in_adp=enable_lm_head_tp_in_adp)
 
+    def repurpose_helix_cp_to_tp(self):
+        # In helix parallelism, CP is relevant only for the attention layer. These ranks are repurposed to TP
+        # for FFN layers.
+        assert self.has_cp_helix()
+        return Mapping(
+            world_size=self.world_size,
+            rank=self.rank,
+            gpus_per_node=self.gpus_per_node,
+            cp_size=1,
+            cp_config={},
+            tp_size=self.tp_size * self.cp_size,
+            pp_size=self.pp_size,
+            pp_partition=self.pp_partition,
+            moe_cluster_size=self.moe_cluster_size,
+            moe_tp_size=self.moe_tp_size,
+            moe_ep_size=self.moe_ep_size,
+            # attn_tp_size, attn_cp_size shall be set in the constructor of Mapping.
+            enable_attention_dp=self.enable_attention_dp,
+            enable_lm_head_tp_in_adp=self.enable_lm_head_tp_in_adp)
+
     # DeviceMesh specific methods
     @property
-    def tp_group_pg(self):
+    def tp_group_pg(self) -> ProcessGroup:
         raise NotImplementedError("tp_group_pg is not implemented.")
 
     @property
-    def pp_group_pg(self):
+    def pp_group_pg(self) -> ProcessGroup:
         raise NotImplementedError("pp_group_pg is not implemented.")
 
     @property
-    def cp_group_pg(self):
+    def cp_group_pg(self) -> ProcessGroup:
         raise NotImplementedError("cp_group_pg is not implemented.")
 
     @property
-    def moe_tp_group_pg(self):
+    def moe_tp_group_pg(self) -> ProcessGroup:
         raise NotImplementedError("moe_tp_group_pg is not implemented.")
 
     @property
-    def moe_ep_group_pg(self):
+    def moe_ep_group_pg(self) -> ProcessGroup:
         raise NotImplementedError("moe_ep_group_pg is not implemented.")
 
     def build_mesh(self):
@@ -519,7 +582,7 @@ class MpiTopology(Mapping):
 
     @property
     def tp_rank(self) -> int:
-        return self.rank % self.tp_size
+        return self.rank % (self.tp_size * self.cp_size) // self.cp_size
 
     @property
     def pp_rank(self) -> int:
@@ -527,7 +590,7 @@ class MpiTopology(Mapping):
 
     @property
     def cp_rank(self) -> int:
-        return self.rank % (self.tp_size * self.cp_size) // self.tp_size
+        return self.rank % self.cp_size
 
     @property
     def tp_group(self) -> List[int]:
@@ -535,7 +598,7 @@ class MpiTopology(Mapping):
 
     @property
     def pp_group(self) -> List[int]:
-        return self.pp_groups[self.cp_rank * self.tp_size + self.tp_rank]
+        return self.pp_groups[self.tp_rank * self.cp_size + self.cp_rank]
 
     @property
     def cp_group(self) -> List[int]:
@@ -566,20 +629,20 @@ class MpiTopology(Mapping):
             ranks = range(i, self.world_size, self.tp_size * self.cp_size)
             self.pp_groups.append(list(ranks))
 
-        # init cp group
+        # init cp group (consecutive ranks within each tp slice).
         for i in range(self.pp_size):
             for j in range(self.tp_size):
-                ranks = range(i * self.tp_size * self.cp_size + j,
-                              (i + 1) * self.tp_size * self.cp_size + j,
-                              self.tp_size)
+                ranks = range(
+                    i * self.tp_size * self.cp_size + j * self.cp_size,
+                    i * self.tp_size * self.cp_size + (j + 1) * self.cp_size)
                 self.cp_groups.append(list(ranks))
 
-        # init tp group
+        # init tp group (interleaved ranks with stride of cp_size).
         for i in range(self.pp_size):
             for j in range(self.cp_size):
-                ranks = range(
-                    i * self.tp_size * self.cp_size + j * self.tp_size,
-                    i * self.tp_size * self.cp_size + (j + 1) * self.tp_size)
+                ranks = range(i * self.tp_size * self.cp_size + j,
+                              (i + 1) * self.tp_size * self.cp_size + j,
+                              self.cp_size)
                 self.tp_groups.append(list(ranks))
 
         # init moe tp group

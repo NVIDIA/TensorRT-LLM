@@ -11,18 +11,11 @@ endif()
 set(DEEP_GEMM_SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/deepgemm-src)
 get_filename_component(DEEP_GEMM_SOURCE_DIR ${DEEP_GEMM_SOURCE_DIR} ABSOLUTE)
 
-if(NOT EXISTS ${DEEP_GEMM_SOURCE_DIR})
-  message(
-    FATAL_ERROR
-      "DeepGEMM submodule not found at ${DEEP_GEMM_SOURCE_DIR}. Please run: git submodule update --init --recursive"
-  )
-endif()
-
 # Check if submodules are initialized
 if(NOT EXISTS ${DEEP_GEMM_SOURCE_DIR}/third-party/cutlass/include)
   message(
     FATAL_ERROR
-      "DeepGEMM submodules not initialized. Please run: git submodule update --init --recursive"
+      "DeepGEMM submodules not initialized. Something went wrong with FetchContent.\n"
   )
 endif()
 
@@ -45,7 +38,13 @@ foreach(SOURCE_FILE ${DEEP_GEMM_ALL_FILES})
   if(FILE_EXT STREQUAL ".py")
     # Read file content and replace module imports for Python files
     file(READ ${SOURCE_FILE} _content)
-    string(REPLACE "deep_gemm_cpp" "tensorrt_llm.deep_gemm_cpp_tllm" _content
+    string(REPLACE "from . import _C" "import tensorrt_llm.deep_gemm_cpp_tllm"
+                   _content "${_content}")
+    string(REPLACE ".._C" "tensorrt_llm.deep_gemm_cpp_tllm" _content
+                   "${_content}")
+    string(REPLACE "._C" "tensorrt_llm.deep_gemm_cpp_tllm" _content
+                   "${_content}")
+    string(REPLACE "_C." "tensorrt_llm.deep_gemm_cpp_tllm." _content
                    "${_content}")
 
     # Add adaptation header
