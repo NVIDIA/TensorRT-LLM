@@ -35,7 +35,6 @@ from tensorrt_llm.scaffolding.task_collection import (
     DropKVCacheWorkerTag,
     TaskMetricsCollector,
     drop_kv_cache_scope,
-    sub_request_node,
     with_task_collection,
 )
 
@@ -685,7 +684,6 @@ class MultiroundChatWorker(Worker):
     }
 
 
-@sub_request_node("multiround_chat", is_top_level=True)
 @drop_kv_cache_scope()
 @with_task_collection(
     "trace",
