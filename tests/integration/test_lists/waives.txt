@@ -22,9 +22,6 @@ examples/test_nemotron.py::test_llm_nemotron_3_8b_1gpu[bfloat16-full_prec] SKIP 
 examples/test_nemotron.py::test_llm_nemotron_3_8b_1gpu[bfloat16-int4_awq] SKIP (https://nvbugs/5000026)
 examples/test_nemotron.py::test_llm_nemotron_4_15b_1gpu[bfloat16-fp8] SKIP (https://nvbugs/5000026)
 examples/test_nemotron.py::test_llm_nemotron_4_15b_1gpu[bfloat16-full_prec] SKIP (https://nvbugs/5000026)
-examples/test_nemotron.py::test_llm_nemotron_4_15b_2gpus[bfloat16-fp8] SKIP (https://nvbugs/5000026)
-examples/test_nemotron.py::test_llm_nemotron_4_15b_2gpus[bfloat16-full_prec] SKIP (https://nvbugs/5000026)
-examples/test_nemotron.py::test_llm_nemotron_4_15b_2gpus[bfloat16-int4_awq] SKIP (https://nvbugs/5000026)
 examples/test_whisper.py::test_llm_whisper_general[large-v3-enable_gemm_plugin-enable_attention_plugin-disable_weight_only-float16-nb:1-use_python_runtime] SKIP (https://nvbugs/4866931)
 examples/test_nemotron.py::test_llm_nemotron_3_8b_1gpu[bfloat16-fp8] SKIP (https://nvbugs/4961624)
 examples/test_mistral.py::test_llm_mistral_v1_1gpu[mistral-7b-v0.1-float16-max_attention_window_size_4096-chunked_summarization_long] SKIP (https://nvbugs/5321371)
@@ -104,8 +101,6 @@ triton_server/test_triton.py::test_triton_extensive[triton-extensive] SKIP
 triton_server/test_triton.py::test_qwen2_vl[qwen2_vl] SKIP
 triton_server/test_triton.py::test_gpt_ib_speculative_decoding_bls[gpt-ib-speculative-decoding-bls] SKIP
 triton_server/test_triton_llm.py::test_mistral_v1_multi_models[False-1---False-True-False-0-128-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap--max_utilization-4096--1-1-1-False-ensemble] SKIP
-examples/test_gpt.py::test_llm_gpt2_starcoder_weight_only[starcoder2-int4-float16] SKIP (https://nvbugs/5289523)
-examples/test_gpt.py::test_llm_gpt2_starcoder_weight_only[starcoder2-int8-float16] SKIP (https://nvbugs/5289523)
 perf/test_perf.py::test_perf[llama_v3.1_70b-bench-bfloat16-input_output_len:512,200-quant:fp8-tp:4] SKIP (https://nvbugspro.nvidia.com/bug/5304388)
 perf/test_perf.py::test_perf[llama_v3.1_70b_instruct-cppmanager-exe-plugin_ifb-float16-input_output_len:200,2000-reqs:64-gpus:8] SKIP (https://nvbugspro.nvidia.com/bug/5304388)
 perf/test_perf.py::test_perf[llama_v3.1_nemotron_nano_8b-bench-bfloat16-maxbs:64-input_output_len:1000,1000-con:1] SKIP (https://nvbugspro.nvidia.com/bug/5304388)
@@ -154,7 +149,6 @@ examples/test_recurrentgemma.py::test_llm_recurrentgemma_2gpu[recurrentgemma-2b]
 examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_cpp_session-recurrentgemma-2b-use_paged_cache-fp8-float16-enable_attn_plugin-enable_gemm_plugin] SKIP (https://nvbugs/5419070)
 examples/test_granite.py::test_granite_bf16_lora[granite-3.0-1b-a400m-instruct] SKIP (https://nvbugs/5431132)
 examples/test_gemma.py::test_hf_gemma_fp8_base_bf16_multi_lora[gemma-2-9b-it] SKIP (https://nvbugs/5434451)
-examples/test_gemma.py::test_hf_gemma_fp8_base_bf16_multi_lora[gemma-3-1b-it] SKIP (https://nvbugs/5434451)
 examples/test_nemotron_nas.py::test_nemotron_nas_summary_1gpu[DeciLM-7B] SKIP (https://nvbugs/5444636)
 accuracy/test_cli_flow.py::TestLongAlpaca7B::test_multiblock_aggressive SKIP (https://nvbugs/5444627)
 examples/test_qwen2audio.py::test_llm_qwen2audio_single_gpu[qwen2_audio_7b_instruct] SKIP (https://nvbugs/5447530)
@@ -211,8 +205,6 @@ test_e2e.py::test_trtllm_bench_pytorch_backend_sanity[meta-llama/Llama-3.1-8B-ll
 accuracy/test_disaggregated_serving.py::TestLlama4ScoutInstruct::test_auto_dtype[False] SKIP (https://nvbugs/5629792)
 llmapi/test_llm_examples.py::test_llmapi_example_multilora SKIP (https://nvbugs/5636857)
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16_4gpus[tp4-attn_backend=TRTLLM-torch_compile=False] SKIP (https://nvbugs/5616182)
-examples/test_phi.py::test_llm_phi_quantization_1gpu[Phi-3-small-128k-instruct-fp8-bfloat16] SKIP (https://nvbugs/5465143)
-examples/test_multimodal.py::test_llm_multimodal_general[Mistral-Small-3.1-24B-Instruct-2503-pp:1-tp:1-bfloat16-bs:8-cpp_e2e:False-nb:1] SKIP (https://nvbugs/5644684)
 accuracy/test_llm_api_pytorch.py::TestLlama3_1NemotronNano8Bv1::test_fp8_prequantized SKIP (https://nvbugs/5640697)
 accuracy/test_llm_api_pytorch.py::TestQwQ_32B::test_auto_dtype_tp4 SKIP (https://nvbugs/5640697)
 test_e2e.py::test_trtllm_multimodal_benchmark_serving SKIP (https://nvbugs/5647825)
@@ -220,7 +212,6 @@ unittest/_torch/modules/test_fused_moe.py::test_fused_moe_alltoall[DeepEPLowLate
 test_e2e.py::test_ptp_quickstart_advanced[Nemotron-Super-49B-v1-FP8-nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-FP8] SKIP (https://nvbugs/5670469)
 test_e2e.py::test_ptp_quickstart_advanced[Nemotron-Super-49B-v1-NVFP4-nvfp4-quantized/Llama-3_3-Nemotron-Super-49B-v1_nvfp4_hf] SKIP (https://nvbugs/5670469)
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[True-True-cutlass-auto] SKIP (https://nvbugs/5756804)
-examples/test_llama.py::test_llm_llama_1gpu_fp4[llama-3.1-70b-instruct-enable_norm_quant_fusion-enable_fused_quant-fp4_plugin-bfloat16] SKIP (https://nvbugs/5451216)
 accuracy/test_llm_api_pytorch.py::TestNemotronNas::test_auto_dtype_tp8 SKIP (https://nvbugs/5673527)
 unittest/_torch/auto_deploy/unit/multigpu/test_ad_build_small_multi.py::test_build_ad[meta-llama/Meta-Llama-3.1-8B-Instruct-llm_extra_args0-2] SKIP (https://nvbugs/5680755)
 full:H100_PCIe/unittest/llmapi/test_llm_pytorch.py::test_llama_7b_multi_lora_evict_and_reload_lora_gpu_cache SKIP (https://nvbugs/5682551)
