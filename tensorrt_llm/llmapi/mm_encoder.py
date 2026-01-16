@@ -14,6 +14,7 @@ from .llm_args import TorchLlmArgs
 from .mpi_session import external_mpi_comm_available
 
 
+# TODO: separate EncoderArgs ?
 class MultimodalEncoder(_TorchLLM):
     """MultimodalEncoder class is the main class for running a multimodal encoder model using PyTorch backend.
 """
