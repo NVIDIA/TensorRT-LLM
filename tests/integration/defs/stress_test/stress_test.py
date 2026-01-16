@@ -32,6 +32,7 @@ import contextlib
 import json
 import os
 import re
+import socket
 import subprocess
 import tempfile
 import threading
@@ -44,7 +45,7 @@ import pandas as pd
 import pytest
 import requests
 import yaml
-from defs.common import parse_gsm8k_output
+from defs.common import get_free_port_in_ci, parse_gsm8k_output
 from defs.conftest import get_device_count, get_device_memory, llm_models_root
 from defs.trt_test_alternative import (Popen, cleanup_process_tree, print_info,
                                        print_warning)
@@ -72,10 +73,18 @@ from defs.trt_test_alternative import (Popen, cleanup_process_tree, print_info,
 GRACEFUL_TERMINATION_TIMEOUT = 300  # seconds - set longer when stress large model
 
 
+def _get_default_port() -> int:
+    """Get a default port using CI allocation if available, otherwise use 8000."""
+    try:
+        return get_free_port_in_ci()
+    except Exception:
+        return 8000
+
+
 @dataclass(frozen=True)
 class ServerConfig:
     """Dataclass to store server configuration for trtllm-serve"""
-    port: int = 8000
+    port: int = field(default_factory=_get_default_port)
     host: str = "localhost"
     pp_size: int = 1
     ep_size: Optional[int] = 1
@@ -341,6 +350,26 @@ def check_server_health(server_url: str,
         return False, f"Unexpected error during health check: {str(e)}"
 
 
+def is_port_available(port: int,
+                      host: str = "localhost") -> Tuple[bool, Optional[str]]:
+    """
+    Check if a port is available for binding.
+
+    Args:
+        port: Port number to check
+        host: Host to bind to
+
+    Returns:
+        Tuple of (is_available, error_message)
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind((host, port))
+            return True, None
+        except OSError as e:
+            return False, f"Port {port} is already in use on {host}: {e}"
+
+
 @pytest.mark.parametrize(
     "test_mode",
     ["stress-test", "stress-stage-alone", "stress-test-with-accuracy"],
@@ -519,7 +548,16 @@ def stress_test(config,
     else:
         stress_config = None
 
-    # Check if server is already running
+    # Check if port is available (more reliable than just health check)
+    is_available, port_error = is_port_available(test_server_config.port,
+                                                 test_server_config.host)
+    if not is_available:
+        raise RuntimeError(
+            f"Cannot start server: {port_error}. "
+            f"Please run 'fuser -k {test_server_config.port}/tcp' to free the port, "
+            f"or check if another process is using this port.")
+
+    # Also check if a healthy server is already running (different scenario)
     is_healthy, _ = check_server_health(test_server_config.url,
                                         test_server_config.health_check_timeout)
     if is_healthy:
@@ -530,6 +568,9 @@ def stress_test(config,
     # Start server
     print_info("Starting trtllm-serve server...")
     print_info(f"Model path: {model_path}")
+    print_info(
+        f"Server port: {test_server_config.port} (allocated via CI port mechanism)"
+    )
 
     # Verify that model path exists
     if not os.path.exists(model_path):
