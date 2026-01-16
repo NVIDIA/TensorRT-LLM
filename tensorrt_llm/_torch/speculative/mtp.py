@@ -473,8 +473,7 @@ class MTPWorker(SpecWorkerBase):
 
         raw_logits = logits
 
-        if self.guided_decoder is not None:
-            self.guided_decoder.execute(logits)
+        self._execute_guided_decoder_if_present(logits)
 
         # Sample and verify draft tokens
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
@@ -541,7 +540,7 @@ class MTPWorker(SpecWorkerBase):
 
         # restore attn metadata
         if attn_metadata is not None:
-            self.restore_attn_metadata(attn_metadata=attn_metadata)
+            self._restore_attn_metadata_from_spec_dec(attn_metadata)
 
         # prepare next new tokens to support overlap scheduler
         next_new_tokens = accepted_tokens[
@@ -845,6 +844,10 @@ class MTPWorker(SpecWorkerBase):
                 self.spec_config.begin_thinking_phase_token,
                 self.spec_config.end_thinking_phase_token)
 
+            # Apply force override for relaxed acceptance path
+            num_accepted_tokens = self._apply_force_accepted_tokens(
+                num_accepted_tokens, num_contexts)
+
         # Strict acceptance
         else:
             if self.is_thop:
@@ -856,36 +859,25 @@ class MTPWorker(SpecWorkerBase):
                 accepted_tokens, num_accepted_tokens = torch.ops.trtllm.mtp_sampling_and_accepted_draft_tokens_op(
                     logits, spec_metadata.draft_tokens, target_tokens_cache,
                     mtp_num_modules, batch_size, num_contexts, logits.shape[-1])
+
+                # Apply force override for THOP path
+                num_accepted_tokens = self._apply_force_accepted_tokens(
+                    num_accepted_tokens, num_contexts)
             else:
-                target_tokens = self._sample_tokens_for_batch(
-                    logits, spec_metadata, num_contexts, batch_size)
-
-                # context
-                accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts]
-
-                # generation
-                gen_target_tokens = target_tokens[num_contexts:].reshape(
-                    num_gens, mtp_num_modules + 1)
-                accepted_tokens[num_contexts:, :] = gen_target_tokens
+                # Reshape draft tokens for base implementation
                 draft_tokens = spec_metadata.draft_tokens.reshape(
                     num_gens, mtp_num_modules)
-                num_accepted_tokens[num_contexts:] += torch.cumprod(
-                    (draft_tokens == gen_target_tokens[:, :mtp_num_modules]
-                     ).int(),
-                    dim=-1).sum(1)
 
-        # Check for environment variable override
-        if self.force_num_accepted_tokens != 0:
-            # total tokens per iteration = accepted draft tokens + 1 target token
-            force_total_tokens = min(self.force_num_accepted_tokens + 1,
-                                     mtp_num_modules + 1)
-            num_accepted_tokens[num_contexts:] = force_total_tokens
+                # Use base implementation for strict acceptance
+                accepted_tokens, num_accepted_tokens = self._sample_and_accept_draft_tokens_base(
+                    logits, draft_tokens, num_contexts, batch_size,
+                    spec_metadata)
 
         return accepted_tokens, num_accepted_tokens
 
     def change_attn_metadata(self, num_accepted_tokens: torch.Tensor,
                              attn_metadata: AttentionMetadata):
-        attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
+        self._prepare_attn_metadata_for_spec_dec(attn_metadata)
         batch_size = attn_metadata.num_seqs
         mtp_num_modules = self.spec_config.num_nextn_predict_layers
 
@@ -907,10 +899,6 @@ class MTPWorker(SpecWorkerBase):
                 # used for vanilla MLA, list on cpu
                 attn_metadata.kv_cache_params.num_cached_tokens_per_seq[
                     i] -= mtp_num_modules + 1 - num_accepted_tokens[i].item()
-
-    def restore_attn_metadata(self, attn_metadata: AttentionMetadata):
-        attn_metadata.restore_from_spec_dec()
-        attn_metadata.on_update()
 
     def prepare_drafter_inputs(
         self,
@@ -1137,7 +1125,7 @@ class MTPWorker(SpecWorkerBase):
             draft_tokens = self.get_draft_tokens_from_gathered(sliced_gathered)
         else:
             # Simple argmax if no TP or no model config
-            draft_tokens = torch.argmax(logits, dim=-1).type(torch.int32)
+            draft_tokens = self._draft_sampler_greedy(logits)
 
         return draft_tokens
 
@@ -1176,15 +1164,14 @@ class MTPEagleWorker(MTPWorker):
 
         raw_logits = logits
 
-        if self.guided_decoder is not None:
-            self.guided_decoder.execute(logits)
+        self._execute_guided_decoder_if_present(logits)
 
         # Sample and verify draft tokens
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
             input_ids, logits, spec_metadata, attn_metadata)
 
         # Save the old attn_metadata and spec_metadata
-        attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
+        self._prepare_attn_metadata_for_spec_dec(attn_metadata)
 
         # Prepare inputs for the 1st MTP layer
         @torch.compile(options={"max-autotune": True})
@@ -1323,8 +1310,7 @@ class MTPEagleWorker(MTPWorker):
             }
 
         # restore attn_metadata to support cuda graph
-        attn_metadata.restore_from_spec_dec()
-        attn_metadata.on_update()
+        self._restore_attn_metadata_from_spec_dec(attn_metadata)
 
         @torch.compile(options={"max-autotune": True})
         def prepare_next_tokens(next_draft_tokens, accepted_tokens,
