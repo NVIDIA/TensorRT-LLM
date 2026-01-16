@@ -1041,7 +1041,7 @@ int AttentionOp::mlaGeneration(
         TllmGenFmhaRunnerParams tllmRunnerParams{};
 
         // Parameters to select kernels.
-        tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
+        tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;
         tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
         tllmRunnerParams.mMultiCtasKvMode = mMultiBlockMode;
         // Note that the tileScheduler and multiCtasKvMode will be automatically tuned when using multi_block mode.
