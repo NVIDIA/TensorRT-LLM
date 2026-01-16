@@ -261,17 +261,3 @@ unittest/llmapi/test_llm_pytorch.py::test_gemma3_1b_instruct_multi_lora
 llmapi/test_llm_api_qa.py::TestLlmDefaultBackend::test_llm_args_logging
 llmapi/test_llm_api_qa.py::TestLlmDefaultBackend::test_llm_args_type_tensorrt
 llmapi/test_llm_api_qa.py::TestLlmDefaultBackend::test_llm_args_type_default
-
-# keep test cases associated open bugs
-examples/test_llama.py::test_llm_llama_1gpu_fp4[llama-3.1-70b-instruct-enable_norm_quant_fusion-enable_fused_quant-fp4_plugin-bfloat16]
-examples/test_nemotron.py::test_llm_nemotron_4_15b_2gpus[bfloat16-full_prec]
-examples/test_nemotron.py::test_llm_nemotron_4_15b_2gpus[bfloat16-fp8]
-examples/test_nemotron.py::test_llm_nemotron_4_15b_2gpus[bfloat16-int4_awq]
-examples/test_gpt.py::test_llm_gpt2_starcoder_weight_only[starcoder2-int4-float16]
-examples/test_gpt.py::test_llm_gpt2_starcoder_weight_only[starcoder2-int8-float16]
-examples/test_gemma.py::test_hf_gemma_fp8_base_bf16_multi_lora[gemma-3-1b-it]
-examples/test_phi.py::test_phi_fp8_with_bf16_lora[Phi-4-mini-instruct]
-examples/test_phi.py::test_llm_phi_quantization_1gpu[Phi-3-small-128k-instruct-fp8-bfloat16]
-examples/test_multimodal.py::test_llm_multimodal_general[Mistral-Small-3.1-24B-Instruct-2503-pp:1-tp:1-bfloat16-bs:8-cpp_e2e:False-nb:1]
-accuracy/test_cli_flow.py::TestPhi4MiniInstruct::test_auto_dtype
-accuracy/test_cli_flow.py::TestPhi4MiniInstruct::test_tp2
