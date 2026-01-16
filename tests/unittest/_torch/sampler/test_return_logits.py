@@ -179,6 +179,7 @@ def test_generation_with_return_logits(
                 idx=idx,
                 output=output,
                 streaming=True)
+        assert idx == sampling_params.max_tokens - 1
     else:
         for idx, output in enumerate(
                 llm.generate(
@@ -197,3 +198,4 @@ def test_generation_with_return_logits(
                 idx=idx,
                 output=output,
                 streaming=False)
+        assert idx == len(prompts) - 1
