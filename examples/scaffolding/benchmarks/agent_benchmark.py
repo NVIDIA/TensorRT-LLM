@@ -21,7 +21,9 @@ from .benchmark_utils import (
 )
 
 
-async def run_agent_benchmark_core(llm, prompts, concurrency, benchmark_name, args):
+async def run_agent_benchmark_core(
+    llm, prompts, concurrency, benchmark_name, args, use_poisson_arrival: bool = True
+):
     """Core agent benchmark logic that can be reused.
 
     Args:
@@ -38,7 +40,7 @@ async def run_agent_benchmark_core(llm, prompts, concurrency, benchmark_name, ar
     requests = [ScaffoldingBenchRequest(prompt=prompt) for prompt in prompts]
 
     # Select strategy based on Poisson arrival flag
-    if getattr(args, "enable_poisson_arrival", False):
+    if use_poisson_arrival and getattr(args, "enable_poisson_arrival", False):
         strategy = PoissonWarmupStrategy(
             num_requests=len(requests),
             warmup_window=getattr(args, "poisson_warmup_window", 60.0),
@@ -144,7 +146,12 @@ async def async_burst_agent_benchmark(args):
     try:
         prompts = load_prompts_from_json(args.burst_prompt_num)
         return await run_agent_benchmark_core(
-            llm, prompts, args.burst_agent_concurrency, "Agent-Burst", args
+            llm,
+            prompts,
+            args.burst_agent_concurrency,
+            "Agent-Burst",
+            args,
+            use_poisson_arrival=False,
         )
     finally:
         await cleanup_agent_resources(llm, mcp_worker)
