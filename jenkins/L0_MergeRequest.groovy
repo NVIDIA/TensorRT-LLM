@@ -5,6 +5,8 @@ import groovy.transform.Field
 import groovy.json.JsonOutput
 import com.nvidia.bloom.KubernetesManager
 import com.nvidia.bloom.Constants
+import com.nvidia.bloom.Logger
+import com.nvidia.bloom.JobBuilder
 import org.jenkinsci.plugins.workflow.cps.CpsThread
 import org.jsoup.Jsoup
 import org.jenkinsci.plugins.pipeline.modeldefinition.Utils as jUtils
@@ -959,36 +961,7 @@ def getCommonParameters()
     ]
 }
 
-def triggerJob(jobName, parameters, jenkinsUrl = "", credentials = "")
-{
-    if (jenkinsUrl == "" && env.localJobCredentials) {
-        jenkinsUrl = env.JENKINS_URL
-        credentials = env.localJobCredentials
-    }
-    def status = ""
-    if (jenkinsUrl != "") {
-        def jobPath = trtllm_utils.resolveFullJobName(jobName).replace('/', '/job/').substring(1)
-        def handle = triggerRemoteJob(
-            job: "${jenkinsUrl}${jobPath}/",
-            auth: CredentialsAuth(credentials: credentials),
-            parameters: trtllm_utils.toRemoteBuildParameters(parameters),
-            pollInterval: 60,
-            abortTriggeredJob: true,
-        )
-        status = handle.getBuildResult().toString()
-    } else {
-        def handle = build(
-            job: jobName,
-            parameters: trtllm_utils.toBuildParameters(parameters),
-            propagate: false,
-        )
-        echo "Triggered job: ${handle.absoluteUrl}"
-        status = handle.result
-    }
-    return status
-}
-
-def launchJob(jobName, reuseBuild, enableFailFast, globalVars, platform="x86_64", additionalParameters = [:]) {
+def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, platform="x86_64", additionalParameters = [:]) {
     def parameters = getCommonParameters()
     String globalVarsJson = writeJSON returnText: true, json: globalVars
     parameters += [
@@ -1018,13 +991,26 @@ def launchJob(jobName, reuseBuild, enableFailFast, globalVars, platform="x86_64"
         parameters['reuseArtifactPath'] = "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${reuseBuild}"
     }
 
+    if (jobName.startsWith("/")) {
+        jobName = jobName.substring(1)
+    } else {
+        def pos = env.JOB_NAME.lastIndexOf("/")
+        if (pos != -1) {
+            jobDir = env.JOB_NAME.substring(0, pos + 1)
+        } else {
+            jobDir = ""
+        }
+        jobName = "${jobDir}${jobName}"
+    }
+
     echo "Trigger ${jobName} job, params: ${parameters}"
 
-    def status = triggerJob(jobName, parameters)
-    if (status != "SUCCESS") {
+    def logger = new Logger(pipeline)
+    def (jenkinsURL, buildStatus) = JobBuilder.build(pipeline, logger, jobName, parameters, 1, false)
+    if (buildStatus != "SUCCESS") {
         error "Downstream job did not succeed"
     }
-    return status
+    return buildStatus
 }
 
 def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
@@ -1037,17 +1023,17 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         },
         "x86_64-Linux": {
             script {
-                def testStageName = "[Build-x86_64] ${env.localJobCredentials ? "Remote Run" : "Run"}"
+                def testStageName = "[Build-x86_64] Remote Run"
                 stage(testStageName) {
                     def additionalParameters = [
                         'dockerImage': globalVars["LLM_DOCKER_IMAGE"],
                         'wheelDockerImagePy310': globalVars["LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE"],
                         'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
                     ]
-                    launchJob("/LLM/helpers/Build-x86_64", reuseBuild, enableFailFast, globalVars, "x86_64", additionalParameters)
+                    launchJob(pipeline, "/LLM/helpers/Build-x86_64", reuseBuild, enableFailFast, globalVars, "x86_64", additionalParameters)
                 }
 
-                testStageName = "[Test-x86_64-Single-GPU] ${env.localJobCredentials ? "Remote Run" : "Run"}"
+                testStageName = "[Test-x86_64-Single-GPU] Remote Run"
                 def singleGpuTestFailed = false
                 stage(testStageName) {
                     if (X86_TEST_CHOICE == STAGE_CHOICE_SKIP) {
@@ -1063,7 +1049,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
                         ]
 
-                        launchJob("L0_Test-x86_64-Single-GPU", false, enableFailFast, globalVars, "x86_64", additionalParameters)
+                        launchJob(pipeline, "L0_Test-x86_64-Single-GPU", false, enableFailFast, globalVars, "x86_64", additionalParameters)
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
@@ -1104,7 +1090,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
                 }
 
-                testStageName = "[Test-x86_64-Multi-GPU] ${env.localJobCredentials ? "Remote Run" : "Run"}"
+                testStageName = "[Test-x86_64-Multi-GPU] Remote Run"
                 stage(testStageName) {
                     if (X86_TEST_CHOICE == STAGE_CHOICE_SKIP) {
                         echo "x86_64 test job is skipped due to Jenkins configuration"
@@ -1119,7 +1105,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
                         ]
 
-                        launchJob("L0_Test-x86_64-Multi-GPU", false, enableFailFast, globalVars, "x86_64", additionalParameters)
+                        launchJob(pipeline, "L0_Test-x86_64-Multi-GPU", false, enableFailFast, globalVars, "x86_64", additionalParameters)
 
                     } catch (InterruptedException e) {
                         throw e
@@ -1144,15 +1130,15 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     return
                 }
 
-                def testStageName = "[Build-SBSA] ${env.localJobCredentials ? "Remote Run" : "Run"}"
+                def testStageName = "[Build-SBSA] Remote Run"
                 stage(testStageName) {
                     def additionalParameters = [
                         "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
                     ]
-                    launchJob("/LLM/helpers/Build-SBSA", reuseBuild, enableFailFast, globalVars, "SBSA", additionalParameters)
+                    launchJob(pipeline, "/LLM/helpers/Build-SBSA", reuseBuild, enableFailFast, globalVars, "SBSA", additionalParameters)
                 }
 
-                testStageName = "[Test-SBSA-Single-GPU] ${env.localJobCredentials ? "Remote Run" : "Run"}"
+                testStageName = "[Test-SBSA-Single-GPU] Remote Run"
                 def singleGpuTestFailed = false
                 stage(testStageName) {
                     if (SBSA_TEST_CHOICE == STAGE_CHOICE_SKIP) {
@@ -1166,7 +1152,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
                         ]
 
-                        launchJob("L0_Test-SBSA-Single-GPU", false, enableFailFast, globalVars, "SBSA", additionalParameters)
+                        launchJob(pipeline, "L0_Test-SBSA-Single-GPU", false, enableFailFast, globalVars, "SBSA", additionalParameters)
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
@@ -1207,7 +1193,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
                 }
 
-                testStageName = "[Test-SBSA-Multi-GPU] ${env.localJobCredentials ? "Remote Run" : "Run"}"
+                testStageName = "[Test-SBSA-Multi-GPU] Remote Run"
                 stage(testStageName) {
                     if (SBSA_TEST_CHOICE == STAGE_CHOICE_SKIP) {
                         echo "SBSA test job is skipped due to Jenkins configuration"
@@ -1220,7 +1206,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
                         ]
 
-                        launchJob("L0_Test-SBSA-Multi-GPU", false, enableFailFast, globalVars, "SBSA", additionalParameters)
+                        launchJob(pipeline, "L0_Test-SBSA-Multi-GPU", false, enableFailFast, globalVars, "SBSA", additionalParameters)
 
                     } catch (InterruptedException e) {
                         throw e
@@ -1242,7 +1228,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
     def dockerBuildJob = [
         "Build-Docker-Images": {
             script {
-                def testStageName = "[Build-Docker-Images] ${env.localJobCredentials ? "Remote Run" : "Run"}"
+                def testStageName = "[Build-Docker-Images] Remote Run"
                 stage(testStageName) {
                     def branch = env.gitlabBranch ? env.gitlabBranch : "main"
                     if (globalVars[GITHUB_PR_API_URL]) {
@@ -1256,7 +1242,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         'runSanityCheck': env.JOB_NAME ==~ /.*PostMerge.*/ ? true : false,
                     ]
 
-                    launchJob("/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, "x86_64", additionalParameters)
+                    launchJob(pipeline, "/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, "x86_64", additionalParameters)
                 }
             }
         }
