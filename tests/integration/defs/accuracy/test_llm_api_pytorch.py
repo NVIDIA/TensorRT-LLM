@@ -3918,9 +3918,6 @@ class TestQwen3_30B_A3B_Instruct_2507(LlmapiAccuracyTestHarness):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75,
                                         enable_block_reuse=False)
 
-        if get_sm_version() >= 100:
-            pytest.skip("https://nvbugs/5783509: Bug to be fixed on Blackwell")
-
         with LLM(self.MODEL_PATH,
                  attn_backend="TRTLLM",
                  max_batch_size=256,
