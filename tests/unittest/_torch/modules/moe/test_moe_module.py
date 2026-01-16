@@ -116,8 +116,6 @@ def _test_moe_worker(
         pretrained_config.torch_dtype = dtype
 
         if enable_eplb:
-            num_slots = 144
-            layer_updates_per_iter = 2
             moe_load_balancer_config = MoeLoadBalancerConfig(
                 num_slots=num_slots,
                 layer_updates_per_iter=layer_updates_per_iter,
@@ -165,20 +163,35 @@ def _test_moe_worker(
             ref_fused_moe.cuda(f"cuda:{mapping.rank}")
 
             # Evaluate the outputs
-            with torch.inference_mode():
-                ref_output = ref_fused_moe.forward(x, router_logits)
-                if isinstance(moe_load_balancer, MoeLoadBalancer):
-                    with MoeLoadBalancerIterContext(moe_load_balancer):
+            def _run_forward(x, router_logits):
+                with torch.inference_mode():
+                    ref_output = ref_fused_moe.forward(x, router_logits)
+                    if isinstance(moe_load_balancer, MoeLoadBalancer):
+                        with MoeLoadBalancerIterContext(moe_load_balancer):
+                            output = fused_moe.forward(
+                                x, router_logits, all_rank_num_tokens=all_rank_num_tokens
+                            )
+                    else:
                         output = fused_moe.forward(
                             x, router_logits, all_rank_num_tokens=all_rank_num_tokens
                         )
-                else:
-                    output = fused_moe.forward(
-                        x, router_logits, all_rank_num_tokens=all_rank_num_tokens
-                    )
+                torch.cuda.synchronize()
+                return ref_output, output
 
-            torch.cuda.synchronize()
+            ref_output, output = _run_forward(x, router_logits)
             ref_fused_moe.check_accuracy(output, ref_output)
+
+            if enable_eplb:
+                # Multi iter run for eplb
+                assert isinstance(moe_load_balancer, MoeLoadBalancer), (
+                    "Moe load balancer should be created when eplb is enabled"
+                )
+                extra_steps = 2
+                for _ in range(extra_steps):
+                    _ = _run_forward(x, router_logits)
+                assert moe_load_balancer.iter_id == extra_steps + 1, (
+                    "Iter id should be equal to extra steps + 1 after multiple iterations"
+                )
 
 
 @pytest.mark.parametrize(
@@ -347,7 +360,7 @@ def test_moe_multi_gpu(comm_method_type, moe_backend, quant_algo):
 @pytest.mark.parametrize(
     "layer_updates_per_iter",
     [
-        2,
+        1,
     ],
     ids=lambda val: f"layer_updates_per_iter={val}",
 )

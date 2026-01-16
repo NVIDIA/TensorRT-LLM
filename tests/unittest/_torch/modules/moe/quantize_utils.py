@@ -417,13 +417,13 @@ class NVFP4QuantizeUtil(BaseQuantizeUtil):
             weights[f"{expert_id}.w3.weight"] = w3_weight_nvfp4
             weights[f"{expert_id}.w1.weight_scale"] = w1_sf_block_unswizzled.view(
                 torch.float8_e4m3fn
-            )
+            ).cuda()
             weights[f"{expert_id}.w2.weight_scale"] = w2_sf_block_unswizzled.view(
                 torch.float8_e4m3fn
-            )
+            ).cuda()
             weights[f"{expert_id}.w3.weight_scale"] = w3_sf_block_unswizzled.view(
                 torch.float8_e4m3fn
-            )
+            ).cuda()
             weights[f"{expert_id}.w1.input_scale"] = 1.0 / w1_input_scale
             weights[f"{expert_id}.w2.input_scale"] = 1.0 / w2_input_scale
             weights[f"{expert_id}.w3.input_scale"] = 1.0 / w3_input_scale
