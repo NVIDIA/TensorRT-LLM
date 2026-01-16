@@ -215,7 +215,7 @@ class MTPSampler(TorchSampler):
 
     SampleState = SampleStateMTP
 
-    @dataclass(frozen=True, kw_only=True)
+    @dataclass(kw_only=True)
     class Store(TorchSampler.Store):
         new_tokens: torch.Tensor
         next_new_tokens: torch.Tensor

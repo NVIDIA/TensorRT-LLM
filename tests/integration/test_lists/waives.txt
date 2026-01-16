@@ -284,6 +284,8 @@ test_e2e.py::test_ptp_quickstart_advanced_2gpus_sm120[Nemotron-Super-49B-v1-BF16
 triton_server/test_triton.py::test_gpt_speculative_decoding[gpt-speculative-decoding] SKIP (https://nvbugs/5762854)
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B_Instruct_RocketKV::test_auto_dtype SKIP (https://nvbugs/5762822)
 unittest/_torch/sampler/test_return_logits.py SKIP (https://nvbugs/5764627)
+unittest/_torch/sampler/test_logits_logprobs.py::test_generate_with_return_logits SKIP (https://nvbugs/5764627)
+unittest/_torch/sampler/test_logits_logprobs.py::test_generate_async_with_return_logits SKIP (https://nvbugs/5764627)
 examples/serve/test_serve.py::test_config_file_loading[--config] SKIP (https://nvbugs/5754977)
 full:RTXPro6000D/accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=CUTLASS-mtp_nextn=2-tp2pp2-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False] SKIP (https://nvbugspro.nvidia.com/bug/5794313)
 examples/test_ray.py::test_ray_disaggregated_serving[tp2] SKIP (https://nvbugs/5612502)
