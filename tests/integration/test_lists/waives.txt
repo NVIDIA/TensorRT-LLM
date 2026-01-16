@@ -388,3 +388,5 @@ unittest/_torch/auto_deploy/unit/multigpu/test_ad_allreduce_strategies.py::test_
 unittest/_torch/misc/test_autotuner.py::test_autotuner_distributed_strategy[2-DistributedTuningStrategy.BROADCAST] SKIP (https://nvbugs/5814253)
 stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-MAX_UTILIZATION-pytorch-stress-test] SKIP (https://nvbugs/5814203)
 unittest/_torch/attention/test_trtllm_flashinfer_symbol_collision.py::test_flashinfer_fused_moe_matches_torch_moe SKIP (https://nvbugs/5814215)
+full:sm89/accuracy/test_llm_api_pytorch.py::TestNemotronV3Nano::test_auto_dtype SKIP (https://nvbugs/5814504)
+full:sm89/accuracy/test_llm_api_pytorch_multimodal.py::TestNVILA_8B::test_auto_dtype SKIP (https://nvbugs/5814504)
