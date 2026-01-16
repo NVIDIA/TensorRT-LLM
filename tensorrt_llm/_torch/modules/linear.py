@@ -704,7 +704,7 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         This method:
         1. Computes the max input_scale of all shards(qkv or gate/up) and update input_scale parameter to the max value
         2. Computes the max weight_scale across all shards(qkv or gate/up)
-        3. Rescales each weight shard: weight * (original_scale / max_scale)
+        3. Rescales each weight shard: weight * original_scale, then divide by max_scale
         4. Updates weight_scale parameter to the unified max value
         """
         weight_mode = module.weights_loading_config.weight_mode
@@ -715,17 +715,15 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
             # Compute max and replace input_scale with a new parameter
             max_input_scale = module.tmp_input_scales.max()
             module.input_scale.data.copy_(max_input_scale)
-            module.inv_input_scale.data = 1.0 / module.input_scale
             delattr(module, "has_static_input_scale")
         else:
             module.input_scale = None
-            module.inv_input_scale = None
 
         # Compute max weight_scale
         max_weight_scale = module.tmp_weight_scales.max()
         module.weight_scale.data.copy_(max_weight_scale)
 
-        # Rescale each weight shard: weight * (original_scale / max_scale)
+        # Rescale each weight shard: (weight * original_scale) / max_scale
         for shard_key in weight_mode.shard_keys:
             idx = shard_key_to_index[shard_key]
             original_scale = module.tmp_weight_scales[idx]
@@ -734,11 +732,13 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
             shard_offset, shard_size = module.fused_weight_shard_indices_mapping[
                 shard_key]
 
-            # Rescale: FP8 -> BF16 -> multiply by ratio -> FP8
+            # Rescale: FP8 -> BF16 -> multiply by original_scale -> divide by max_scale -> FP8
             weight_shard = module.weight.data[shard_offset:shard_offset +
                                               shard_size]
-            rescaled_weight = (weight_shard.to(module.dtype).mul_(
-                original_scale / max_weight_scale).to(torch.float8_e4m3fn))
+            rescaled_weight = weight_shard.to(module.dtype).mul_(original_scale)
+            rescaled_weight = rescaled_weight.div_(
+                max_weight_scale.to(rescaled_weight.device)).to(
+                    torch.float8_e4m3fn)
             module.weight.data[shard_offset:shard_offset +
                                shard_size] = rescaled_weight
 
