@@ -197,6 +197,9 @@ class CachedSequenceInterface:
             "max_seq_len": self.info.max_seq_len,
             "max_batch_size": self.info.max_batch_size,
             "mapping": Mapping(),
+            # NOTE (lucaslie): this is the only 1-byte dtype currently supported by the
+            # KVCacheManager. Ideally, we would use the typical uint8 dtype for byte-level
+            # abstraction, but this is not supported.
             "dtype": DataType.FP8,  # 1-byte dtype for byte-level abstraction
             "layer_mask": None,
             "is_estimating_kv_cache": is_estimating,

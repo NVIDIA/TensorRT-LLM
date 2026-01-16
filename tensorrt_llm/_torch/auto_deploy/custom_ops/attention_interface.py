@@ -390,9 +390,12 @@ class SequenceInfo:
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
         self.tokens_per_block = tokens_per_block or max_seq_len
+        # NOTE (lucaslie): +1 is a WAR to address issue when using flashinfer attention with
+        # (max_batch_size, max_seq_len) input in trtllm runtime.
+        # see https://github.com/NVIDIA/TensorRT-LLM/issues/4504
         self.max_num_tokens = max_num_tokens or (max_seq_len + 1) * max_batch_size
 
-        # TODO: remove?
+        # TODO (lucaslie): can we remove this eventually from this i/f?
         self.vocab_size_padded = vocab_size_padded
 
         # log parameters

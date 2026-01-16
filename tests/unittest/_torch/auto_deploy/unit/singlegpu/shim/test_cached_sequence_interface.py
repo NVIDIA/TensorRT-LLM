@@ -11,10 +11,13 @@ import torch
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import (
     PagedResourceHandler,
+    SequenceInfo,
     StateResourceHandler,
     UnpagedResourceHandler,
 )
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
+from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManager
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
 # =============================================================================
@@ -161,7 +164,6 @@ def test_add_resource_state_handler(paged_kv_cache_config):
     handler = StateResourceHandler(4, 64, 16, dtype=torch.bfloat16)
     interface.add_resource("ssm_state_0", handler)
 
-    assert "ssm_state_0" in interface._resource_lookup
     assert interface._resource_lookup["ssm_state_0"] is handler
 
 
@@ -208,9 +210,6 @@ def test_add_multiple_resources(paged_kv_cache_config):
 
 def test_initialize_resources_paged_only_creates_kv_cache_manager(paged_kv_cache_config):
     """Test paged-only resources create KVCacheManager (not MambaHybridCacheManager)."""
-    from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManager
-    from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
@@ -232,8 +231,6 @@ def test_initialize_resources_paged_only_creates_kv_cache_manager(paged_kv_cache
 
 def test_initialize_resources_mixed_creates_mamba_hybrid_cache_manager(paged_kv_cache_config):
     """Test mixed paged + state resources create MambaHybridCacheManager."""
-    from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManager
-
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
@@ -307,7 +304,6 @@ def test_initialize_resources_creates_state_views_with_correct_shape(paged_kv_ca
     interface.initialize_resources()
 
     # Check state view exists
-    assert "ssm_state_0" in interface._caches
     ssm_cache = interface._caches["ssm_state_0"]
     assert ssm_cache is not None
     # Shape: [num_states, num_heads, head_dim, ssm_state_size]
@@ -597,24 +593,18 @@ def test_to_moves_sequence_info(paged_kv_cache_config):
 
 def test_sequence_info_tokens_per_block_from_constructor():
     """Verify tokens_per_block is set correctly from constructor."""
-    from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import SequenceInfo
-
     seq_info = SequenceInfo(max_seq_len=128, max_batch_size=4, tokens_per_block=32)
     assert seq_info.tokens_per_block == 32
 
 
 def test_sequence_info_tokens_per_block_defaults_to_max_seq_len():
     """Verify tokens_per_block defaults to max_seq_len when not provided."""
-    from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import SequenceInfo
-
     seq_info = SequenceInfo(max_seq_len=128, max_batch_size=4)
     assert seq_info.tokens_per_block == 128
 
 
 def test_sequence_info_estimate_cache_tokens_per_forward():
     """Test estimate_cache_tokens_per_forward() calculation."""
-    from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import SequenceInfo
-
     # With max_num_tokens=64, max_batch_size=4, tokens_per_block=16
     # seq_len = ceil(64/4) = 16
     # num_blocks_per_seq = ceil(16/16) = 1
@@ -638,8 +628,6 @@ def test_sequence_info_estimate_cache_tokens_per_forward():
 
 def test_sequence_info_estimate_cache_tokens_per_forward_with_overflow():
     """Test estimate_cache_tokens_per_forward() with sequence overflow into extra blocks."""
-    from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import SequenceInfo
-
     # With max_num_tokens=100, max_batch_size=4, tokens_per_block=16
     # seq_len = ceil(100/4) = 25
     # num_blocks_per_seq = ceil(25/16) = 2
@@ -658,8 +646,6 @@ def test_sequence_info_estimate_cache_tokens_per_forward_with_overflow():
 
 def test_sequence_info_estimate_cache_loc_capacity_no_resize():
     """Test estimate_cache_loc_capacity() when capacity is sufficient."""
-    from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import SequenceInfo
-
     seq_info = SequenceInfo(
         max_seq_len=128,
         max_batch_size=4,
@@ -679,8 +665,6 @@ def test_sequence_info_estimate_cache_loc_capacity_no_resize():
 
 def test_sequence_info_estimate_cache_loc_capacity_resizes():
     """Test estimate_cache_loc_capacity() resizes buffer when needed."""
-    from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import SequenceInfo
-
     seq_info = SequenceInfo(
         max_seq_len=128,
         max_batch_size=4,
@@ -701,8 +685,6 @@ def test_sequence_info_estimate_cache_loc_capacity_resizes():
 
 def test_sequence_info_last_page_len_uses_tokens_per_block():
     """Verify nest_sequences calculates last_page_len using tokens_per_block."""
-    from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import SequenceInfo
-
     seq_info = SequenceInfo(
         max_seq_len=128,
         max_batch_size=4,
@@ -725,8 +707,6 @@ def test_sequence_info_last_page_len_uses_tokens_per_block():
 
 def test_sequence_info_page_assignments():
     """Test page_assignments property returns correct structure."""
-    from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import SequenceInfo
-
     seq_info = SequenceInfo(
         max_seq_len=128,
         max_batch_size=4,

@@ -101,6 +101,8 @@ class _FlashInferPlanner:
 
         self.__init__()  # reset all state
 
+        # NOTE (lucaslie): avoid OOM for many cudagraphs,
+        # see https://github.com/NVIDIA/TensorRT-LLM/pull/3686
         self.workspace_buffer = torch.empty(320 * 1024 * 1024, device=device, dtype=torch.uint8)
 
         # NOTE (lucaslie): flashinfer fa3 backend has accuracy issue + illegal memory access issues

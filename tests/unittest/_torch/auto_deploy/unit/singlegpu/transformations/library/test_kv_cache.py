@@ -1,4 +1,5 @@
 from typing import List, Optional
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -6,6 +7,8 @@ import torch.nn as nn
 from _model_test_utils import GQA
 from _torch_test_utils import all_close
 
+# Initialize resources first
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import PagedResourceHandler
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.factory import (
     FullModelExportInfo,
@@ -14,6 +17,7 @@ from tensorrt_llm._torch.auto_deploy.models.factory import (
 )
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
 from tensorrt_llm._torch.auto_deploy.transform.interface import Stages, TransformConfig
+from tensorrt_llm._torch.auto_deploy.transform.library.kvcache import InitializeCache, ResizeKVCache
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
@@ -281,10 +285,6 @@ def dummy_cached_interface():
 
 def test_initialize_cache_transform_calls_initialize_resources(dummy_cached_interface):
     """Verify InitializeCache transform calls cm.initialize_resources()."""
-    from unittest.mock import MagicMock
-
-    from tensorrt_llm._torch.auto_deploy.transform.library.kvcache import InitializeCache
-
     # Create a mock module
     mock_module = MagicMock()
 
@@ -315,12 +315,6 @@ def test_initialize_cache_transform_calls_initialize_resources(dummy_cached_inte
 
 def test_resize_kv_cache_transform_skipped_when_not_needed(dummy_cached_interface):
     """Verify ResizeKVCache transform is skipped when resize not needed."""
-    from unittest.mock import MagicMock
-
-    # Initialize resources first
-    from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import PagedResourceHandler
-    from tensorrt_llm._torch.auto_deploy.transform.library.kvcache import ResizeKVCache
-
     dummy_cached_interface.add_resource(
         "k_cache_0", PagedResourceHandler(8, 64, dtype=torch.float16)
     )
@@ -349,11 +343,6 @@ def test_resize_kv_cache_transform_skipped_when_not_needed(dummy_cached_interfac
 
 def test_resize_kv_cache_transform_runs_when_needed():
     """Verify ResizeKVCache transform runs when resize is needed."""
-    from unittest.mock import MagicMock
-
-    from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import PagedResourceHandler
-    from tensorrt_llm._torch.auto_deploy.transform.library.kvcache import ResizeKVCache
-
     # Create interface with resizing enabled
     kv_cache_config = KvCacheConfig(
         tokens_per_block=32,
@@ -533,6 +522,9 @@ def test_insert_cached_attention_passes_kv_cache_config():
 
     # Initialize resources
     cm.initialize_resources()
+
+    assert not cm.is_paged(), "triton should not use paged resources"
+    assert cm._caches, "at least some resources should be present"
 
     # Verify cache dtype matches config
     for name, handler in cm._resource_lookup.items():
