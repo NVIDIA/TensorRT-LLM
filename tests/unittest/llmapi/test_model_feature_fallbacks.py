@@ -85,8 +85,8 @@ class TestFallbackMechanism:
             auto_disable=False,
         )
 
-        # Mock all features as NO
-        with patch("tensorrt_llm.llmapi.llm.get_support_status", return_value=SupportStatus.NO):
+        # Mock all features as unsupported
+        with patch("tensorrt_llm.llmapi.llm.is_feature_unsupported", return_value=True):
             BaseLLM._apply_model_feature_fallbacks(mock)
 
         # Nothing should change when auto_disable is off
@@ -121,28 +121,26 @@ class TestFallbackMechanism:
 
         assert mock.args.kv_cache_config.enable_block_reuse is True
 
-    def test_feature_disabled_when_status_is_no(self):
-        """Feature should be disabled when matrix returns NO."""
+    def test_feature_disabled_when_unsupported(self):
+        """Feature should be disabled when matrix returns unsupported."""
         mock = _make_mock_llm(
             architecture="MockModel",
             chunked_prefill=True,
         )
 
-        with patch("tensorrt_llm.llmapi.llm.get_support_status") as mock_status:
-            mock_status.return_value = SupportStatus.NO
+        with patch("tensorrt_llm.llmapi.llm.is_feature_unsupported", return_value=True):
             BaseLLM._apply_model_feature_fallbacks(mock)
 
         assert mock.args.enable_chunked_prefill is False
 
-    def test_feature_stays_enabled_when_status_is_yes(self):
-        """Feature should stay enabled when matrix returns YES."""
+    def test_feature_stays_enabled_when_supported(self):
+        """Feature should stay enabled when matrix returns supported."""
         mock = _make_mock_llm(
             architecture="MockModel",
             chunked_prefill=True,
         )
 
-        with patch("tensorrt_llm.llmapi.llm.get_support_status") as mock_status:
-            mock_status.return_value = SupportStatus.YES
+        with patch("tensorrt_llm.llmapi.llm.is_feature_unsupported", return_value=False):
             BaseLLM._apply_model_feature_fallbacks(mock)
 
         assert mock.args.enable_chunked_prefill is True
@@ -154,8 +152,7 @@ class TestFallbackMechanism:
             chunked_prefill=False,
         )
 
-        with patch("tensorrt_llm.llmapi.llm.get_support_status") as mock_status:
-            mock_status.return_value = SupportStatus.NO
+        with patch("tensorrt_llm.llmapi.llm.is_feature_unsupported", return_value=True):
             BaseLLM._apply_model_feature_fallbacks(mock)
 
         assert mock.args.enable_chunked_prefill is False

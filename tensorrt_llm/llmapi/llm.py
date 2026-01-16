@@ -45,8 +45,7 @@ from .llm_args import (TORCH_LLMARGS_EXPLICIT_DOCSTRING,
 from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig,
                         LlmBuildStats, ModelLoader, _ModelRuntimeContext)
 from .model_support_matrix import Feature as SupportFeature
-from .model_support_matrix import SupportStatus
-from .model_support_matrix import get_status as get_support_status
+from .model_support_matrix import is_feature_unsupported
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
 from .tokenizer import TokenizerBase, _xgrammar_tokenizer_info
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
@@ -260,91 +259,49 @@ class BaseLLM:
             return
         cfg = getattr(self, "_hf_model_config", None)
         if cfg is None:
-            logger.debug(
-                "Skipping model feature fallbacks: HF model config not available"
-            )
             return
         archs = getattr(cfg, "architectures", None)
         if not (isinstance(archs, (list, tuple)) and archs
                 and isinstance(archs[0], str)):
-            logger.debug(
-                f"Skipping model feature fallbacks: invalid or missing architectures field (got {archs})"
-            )
             return
         arch = archs[0]
-        logger.debug(
-            f"Applying model feature fallbacks for architecture: {arch}")
 
-        def _disable_if_unsupported(
-            feature: SupportFeature,
-            *,
-            enabled: bool,
-            arg_path: str,
-            disable,
-        ) -> None:
-            # Preserve behavior: only override when user explicitly enabled it.
-            if not enabled:
-                return
-            status = get_support_status(arch, feature)
-            # Preserve behavior: unknown/untested/missing status must not disable anything.
-            if status not in (SupportStatus.NO, SupportStatus.NA):
-                return
-            logger.warning(
-                f"{arch}: {feature.value} unsupported; disabling {arg_path}")
-            disable()
+        def _disable(feature: SupportFeature, attr: str) -> None:
+            if is_feature_unsupported(arch, feature):
+                logger.warning(
+                    f"{arch}: {feature.value} unsupported; disabling {attr}")
+                return True
+            return False
 
         kv_cfg = getattr(self.args, "kv_cache_config", None)
-
-        def _disable_kv_cache_reuse() -> None:
-            if kv_cfg is not None:
+        if kv_cfg and getattr(kv_cfg, "enable_block_reuse", False):
+            if _disable(SupportFeature.KV_CACHE_REUSE,
+                        "kv_cache_config.enable_block_reuse"):
                 kv_cfg.enable_block_reuse = False
 
-        _disable_if_unsupported(
-            SupportFeature.KV_CACHE_REUSE,
-            enabled=kv_cfg is not None
-            and getattr(kv_cfg, "enable_block_reuse", False),
-            arg_path="kv_cache_config.enable_block_reuse",
-            disable=_disable_kv_cache_reuse,
-        )
+        if getattr(self.args, "enable_chunked_prefill", False):
+            if _disable(SupportFeature.CHUNKED_PREFILL,
+                        "enable_chunked_prefill"):
+                self.args.enable_chunked_prefill = False
 
-        _disable_if_unsupported(
-            SupportFeature.CHUNKED_PREFILL,
-            enabled=getattr(self.args, "enable_chunked_prefill", False),
-            arg_path="enable_chunked_prefill",
-            disable=lambda: setattr(self.args, "enable_chunked_prefill", False),
-        )
+        if getattr(self.args, "enable_attention_dp", False):
+            if _disable(SupportFeature.ATTENTION_DP, "enable_attention_dp"):
+                self.args.enable_attention_dp = False
 
-        _disable_if_unsupported(
-            SupportFeature.ATTENTION_DP,
-            enabled=getattr(self.args, "enable_attention_dp", False),
-            arg_path="enable_attention_dp",
-            disable=lambda: setattr(self.args, "enable_attention_dp", False),
-        )
+        if hasattr(self.args, "disable_overlap_scheduler"
+                   ) and not self.args.disable_overlap_scheduler:
+            if _disable(SupportFeature.OVERLAP_SCHEDULER,
+                        "disable_overlap_scheduler"):
+                self.args.disable_overlap_scheduler = True
 
-        # disable_overlap_scheduler is inverted: we only flip it when currently False.
-        _disable_if_unsupported(
-            SupportFeature.OVERLAP_SCHEDULER,
-            enabled=hasattr(self.args, "disable_overlap_scheduler")
-            and getattr(self.args, "disable_overlap_scheduler") is False,
-            arg_path="disable_overlap_scheduler",
-            disable=lambda: setattr(self.args, "disable_overlap_scheduler", True
-                                    ),
-        )
+        if getattr(self.args, "cuda_graph_config", None) is not None:
+            if _disable(SupportFeature.CUDA_GRAPH, "cuda_graph_config"):
+                self.args.cuda_graph_config = None
 
-        _disable_if_unsupported(
-            SupportFeature.CUDA_GRAPH,
-            enabled=getattr(self.args, "cuda_graph_config", None) is not None,
-            arg_path="cuda_graph_config",
-            disable=lambda: setattr(self.args, "cuda_graph_config", None),
-        )
-
-        _disable_if_unsupported(
-            SupportFeature.GUIDED_DECODING,
-            enabled=getattr(self.args, "guided_decoding_backend", None)
-            is not None,
-            arg_path="guided_decoding_backend",
-            disable=lambda: setattr(self.args, "guided_decoding_backend", None),
-        )
+        if getattr(self.args, "guided_decoding_backend", None) is not None:
+            if _disable(SupportFeature.GUIDED_DECODING,
+                        "guided_decoding_backend"):
+                self.args.guided_decoding_backend = None
 
     @property
     @set_api_status("beta")

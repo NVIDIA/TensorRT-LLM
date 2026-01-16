@@ -53,7 +53,7 @@ class Feature(str, Enum):
 class SupportedModel:
     architecture: str
     model: str
-    huggingface_example: str
+    huggingface: str
 
 
 @dataclass(frozen=True)
@@ -77,117 +77,117 @@ SUPPORTED_MODELS_PYTORCH: Tuple[SupportedModel, ...] = (
     SupportedModel(
         architecture="BertForSequenceClassification",
         model="BERT-based",
-        huggingface_example="textattack/bert-base-uncased-yelp-polarity",
+        huggingface="textattack/bert-base-uncased-yelp-polarity",
     ),
     SupportedModel(
         architecture="DeciLMForCausalLM",
         model="Nemotron",
-        huggingface_example="nvidia/Llama-3_1-Nemotron-51B-Instruct",
+        huggingface="nvidia/Llama-3_1-Nemotron-51B-Instruct",
     ),
     SupportedModel(
         architecture="DeepseekV3ForCausalLM",
         model="DeepSeek-V3",
-        huggingface_example="deepseek-ai/DeepSeek-V3",
+        huggingface="deepseek-ai/DeepSeek-V3",
     ),
     SupportedModel(
         architecture="DeepseekV32ForCausalLM",
         model="DeepSeek-V3.2",
-        huggingface_example="deepseek-ai/DeepSeek-V3.2",
+        huggingface="deepseek-ai/DeepSeek-V3.2",
     ),
     SupportedModel(
         architecture="Exaone4ForCausalLM",
         model="EXAONE 4.0",
-        huggingface_example="LGAI-EXAONE/EXAONE-4.0-32B",
+        huggingface="LGAI-EXAONE/EXAONE-4.0-32B",
     ),
     SupportedModel(
         architecture="Gemma3ForCausalLM",
         model="Gemma 3",
-        huggingface_example="google/gemma-3-1b-it",
+        huggingface="google/gemma-3-1b-it",
     ),
     SupportedModel(
         architecture="GptOssForCausalLM",
         model="GPT-OSS",
-        huggingface_example="openai/gpt-oss-120b",
+        huggingface="openai/gpt-oss-120b",
     ),
     SupportedModel(
         architecture="LlamaForCausalLM",
         model="Llama 3.1, Llama 3, Llama 2, LLaMA",
-        huggingface_example="meta-llama/Meta-Llama-3.1-70B",
+        huggingface="meta-llama/Meta-Llama-3.1-70B",
     ),
     SupportedModel(
         architecture="Llama4ForConditionalGeneration",
         model="Llama 4",
-        huggingface_example="meta-llama/Llama-4-Scout-17B-16E-Instruct",
+        huggingface="meta-llama/Llama-4-Scout-17B-16E-Instruct",
     ),
     SupportedModel(
         architecture="MiniMaxM2ForCausalLM",
         model="MiniMax M2/M2.1",
-        huggingface_example="MiniMaxAI/MiniMax-M2",
+        huggingface="MiniMaxAI/MiniMax-M2",
     ),
     SupportedModel(
         architecture="MistralForCausalLM",
         model="Mistral",
-        huggingface_example="mistralai/Mistral-7B-v0.1",
+        huggingface="mistralai/Mistral-7B-v0.1",
     ),
     SupportedModel(
         architecture="MixtralForCausalLM",
         model="Mixtral",
-        huggingface_example="mistralai/Mixtral-8x7B-v0.1",
+        huggingface="mistralai/Mixtral-8x7B-v0.1",
     ),
     SupportedModel(
         architecture="MllamaForConditionalGeneration",
         model="Llama 3.2",
-        huggingface_example="meta-llama/Llama-3.2-11B-Vision",
+        huggingface="meta-llama/Llama-3.2-11B-Vision",
     ),
     SupportedModel(
         architecture="NemotronForCausalLM",
         model="Nemotron-3, Nemotron-4, Minitron",
-        huggingface_example="nvidia/Minitron-8B-Base",
+        huggingface="nvidia/Minitron-8B-Base",
     ),
     SupportedModel(
         architecture="NemotronHForCausalLM",
         model="Nemotron-3-Nano",
-        huggingface_example="nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8",
+        huggingface="nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8",
     ),
     SupportedModel(
         architecture="NemotronNASForCausalLM",
         model="NemotronNAS",
-        huggingface_example="nvidia/Llama-3_3-Nemotron-Super-49B-v1",
+        huggingface="nvidia/Llama-3_3-Nemotron-Super-49B-v1",
     ),
     SupportedModel(
         architecture="Phi3ForCausalLM",
         model="Phi-4",
-        huggingface_example="microsoft/Phi-4",
+        huggingface="microsoft/Phi-4",
     ),
     SupportedModel(
         architecture="Qwen2ForCausalLM",
         model="QwQ, Qwen2",
-        huggingface_example="Qwen/Qwen2-7B-Instruct",
+        huggingface="Qwen/Qwen2-7B-Instruct",
     ),
     SupportedModel(
         architecture="Qwen2ForProcessRewardModel",
         model="Qwen2-based",
-        huggingface_example="Qwen/Qwen2.5-Math-PRM-7B",
+        huggingface="Qwen/Qwen2.5-Math-PRM-7B",
     ),
     SupportedModel(
         architecture="Qwen2ForRewardModel",
         model="Qwen2-based",
-        huggingface_example="Qwen/Qwen2.5-Math-RM-72B",
+        huggingface="Qwen/Qwen2.5-Math-RM-72B",
     ),
     SupportedModel(
         architecture="Qwen3ForCausalLM",
         model="Qwen3",
-        huggingface_example="Qwen/Qwen3-8B",
+        huggingface="Qwen/Qwen3-8B",
     ),
     SupportedModel(
         architecture="Qwen3MoeForCausalLM",
         model="Qwen3MoE",
-        huggingface_example="Qwen/Qwen3-30B-A3B",
+        huggingface="Qwen/Qwen3-30B-A3B",
     ),
     SupportedModel(
         architecture="Qwen3NextForCausalLM",
         model="Qwen3Next",
-        huggingface_example="Qwen/Qwen3-Next-80B-A3B-Thinking",
+        huggingface="Qwen/Qwen3-Next-80B-A3B-Thinking",
     ),
 )
 KEY_MODEL_FEATURES: Tuple[Feature, ...] = (
@@ -488,6 +488,12 @@ def get_status(architecture: str, feature: Feature) -> Optional[SupportStatus]:
     return cell.status
 
 
+def is_feature_unsupported(architecture: str, feature: Feature) -> bool:
+    """Return True if the feature is explicitly unsupported (NO or N/A) for this architecture."""
+    status = get_status(architecture, feature)
+    return status in (SupportStatus.NO, SupportStatus.NA)
+
+
 def _render_md_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
     widths = [len(h) for h in headers]
     for row in rows:
@@ -524,7 +530,7 @@ def render_supported_models_markdown() -> str:
         [
             f"`{m.architecture}`",
             m.model,
-            f"`{m.huggingface_example}`",
+            f"`{m.huggingface}`",
         ]
         for m in SUPPORTED_MODELS_PYTORCH
     ]
@@ -577,5 +583,4 @@ def render_supported_models_markdown() -> str:
     out.append("- I: Image")
     out.append("- V: Video")
     out.append("- A: Audio")
-    out.append("")
     return "\n".join(out)
