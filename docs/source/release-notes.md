@@ -4,6 +4,18 @@
 
 All published functionality in the Release Notes has been fully tested and verified with known limitations documented. To share feedback about this release, access our [NVIDIA Developer Forum](https://forums.developer.nvidia.com/).
 
+## TensorRT-LLM Release 1.2
+
+### Key Features and Enhancements
+
+### Infrastructure Changes
+
+### API Changes
+
+### Fixed Issues
+
+### Known Issues
+
 ## TensorRT-LLM Release 1.1
 
 ### Key Features and Enhancements
