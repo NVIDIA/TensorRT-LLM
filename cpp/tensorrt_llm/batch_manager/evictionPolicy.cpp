@@ -105,14 +105,13 @@ bool LRUEvictionPolicy::verifyQueueIntegrity()
 
 std::tuple<BlockPtr, bool> LRUEvictionPolicy::getFreeBlock(SizeType32 cacheLevel)
 {
+    // Evict first lowest priority block.
     for (SizeType32 level = 0; level < kMaxPriority - kMinPriority + 1; level++)
     {
-        // Find the first non-empty queue, and return the first block.
         if (!mFreeQueues[cacheLevel][level].empty())
         {
             auto block = mFreeQueues[cacheLevel][level].front();
 
-            // mFreeQueues only contains leaf blocks, so no need to iterate through the next block pointers.
             // It's possible to have a primary block with children in secondary memory. We handle this
             // by freeing all descendants in WindowBlockManager::getFreeBlock. This is done either by
             // offloading (preferred method) or explicitly.
@@ -120,6 +119,12 @@ std::tuple<BlockPtr, bool> LRUEvictionPolicy::getFreeBlock(SizeType32 cacheLevel
         }
     }
     TLLM_THROW("No free block found. This shouldn't happen!");
+}
+
+bool LRUEvictionPolicy::blockAlreadyReleased(BlockPtr block)
+{
+    SizeType32 const id = block->getBlockId();
+    return mFreeBlockIterators.find(id) != mFreeBlockIterators.end();
 }
 
 void LRUEvictionPolicy::releaseBlock(BlockPtr block)
@@ -132,7 +137,7 @@ void LRUEvictionPolicy::releaseBlock(BlockPtr block, bool toFront)
     SizeType32 const cacheLevel = getCacheLevel(block);
     SizeType32 const id = block->getBlockId();
 
-    // If there are no children, this is a leaf block. Insert into a queue.
+    // Insert block into a queue and record iterator to block for easy erase.
     auto& q = mFreeQueues[cacheLevel][getPriorityIdx(block->getPriority())];
     if (toFront)
     {
