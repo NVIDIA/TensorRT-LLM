@@ -576,7 +576,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         speculative_decoding_config = {
             "decoding_type": "Eagle",
             "max_draft_len": 4,
-            "speculative_model_dir":
+            "speculative_model":
             f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B",
             "eagle3_one_model": eagle3_one_model
         }
@@ -675,7 +675,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         speculative_decoding_config = {
             "decoding_type": "Eagle",
             "max_draft_len": 3,
-            "speculative_model_dir":
+            "speculative_model":
             f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B",
             "eagle3_one_model": eagle3_one_model
         }
@@ -1037,12 +1037,12 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
         ctx_server_config["kv_cache_config"] = {
             "max_attention_window": [512, 512, 512, 512, 512, 32768],
             "enable_block_reuse": block_reuse,
-            "enable_partial_reuse": False,
+            "enable_partial_reuse": block_reuse,
         }
         gen_server_config["kv_cache_config"] = {
             "max_attention_window": [512, 512, 512, 512, 512, 32768],
             "enable_block_reuse": block_reuse,
-            "enable_partial_reuse": False,
+            "enable_partial_reuse": block_reuse,
         }
         disaggregated_server_config = {
             "hostname": "localhost",
@@ -1066,7 +1066,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
-@skip_pre_hopper
+@skip_pre_blackwell
 @pytest.mark.skip_less_device_memory(80000)
 class TestGPTOSS(LlmapiAccuracyTestHarness):
     extra_evaluator_kwargs = {
@@ -1099,13 +1099,13 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         ctx_server_config["kv_cache_config"] = {
             "max_attention_window": [128, 32768],
             "enable_block_reuse": block_reuse,
-            "enable_partial_reuse": False,
+            "enable_partial_reuse": block_reuse,
             "free_gpu_memory_fraction": 0.5,
         }
         gen_server_config["kv_cache_config"] = {
             "max_attention_window": [128, 32768],
             "enable_block_reuse": block_reuse,
-            "enable_partial_reuse": False,
+            "enable_partial_reuse": block_reuse,
             "free_gpu_memory_fraction": 0.5,
         }
         disaggregated_server_config = {
@@ -1131,6 +1131,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
 
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
+@skip_pre_blackwell
 class TestDeepSeekV32Exp(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V3.2-Exp"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3.2-Exp-FP4-v2"

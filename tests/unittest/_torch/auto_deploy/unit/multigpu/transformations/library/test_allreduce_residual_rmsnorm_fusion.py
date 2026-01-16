@@ -6,10 +6,11 @@ from _dist_test_utils import get_device_counts
 from torch.export import export
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.trtllm_dist import is_trtllm_op_available
-from tensorrt_llm._torch.auto_deploy.distributed import common as dist
+from tensorrt_llm._torch.auto_deploy.distributed.common import initialize_or_skip
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
+from tensorrt_llm._utils import get_free_port
 from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
 
 # needed since MPI executor pool leaks a thread (_manager_spawn) on shutdown
@@ -66,7 +67,7 @@ def _test_allreduce_fusion(port: int, ModuleCls, strategy: str):
     if not is_trtllm_op_available():
         pytest.skip("Require trtllm ops to run test_allreduce_fusion.")
 
-    _, _ = dist.initialize_or_skip(port=port)
+    _, _ = initialize_or_skip(port=port)
 
     # Testing tensors
     dtype = torch.float16
@@ -146,7 +147,7 @@ def _test_allreduce_fusion(port: int, ModuleCls, strategy: str):
 def test_allreduce_fusion(device_count, ModuleCls, strategy):
     if device_count <= 1:
         pytest.skip("Require multi GPUs to run test_allreduce_fusion.")
-    port = dist.get_free_port()
+    port = get_free_port()
 
     n_workers = device_count
     mpi_pool = MpiPoolSession(n_workers=n_workers)

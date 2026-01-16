@@ -27,11 +27,9 @@ import tensorrt_llm
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams, AllReduceStrategy,
-                                             MoEAllReduce, MoEAllReduceParams,
-                                             MPIDist, TorchDist)
+                                             MoEAllReduce, MoEAllReduceParams)
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
-from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.mapping import Mapping
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
@@ -133,12 +131,8 @@ def run_allreduce_op(
         tp_size=tensor_parallel_size,
         rank=tensor_parallel_rank,
     )
-    if mpi_disabled():
-        dist = TorchDist(mapping=mapping)
-    else:
-        dist = MPIDist(mapping=mapping)
 
-    AutoTuner.get().setup_distributed_state(mapping, dist)
+    AutoTuner.get().setup_distributed_state(mapping)
     linear = Linear(
         in_features=hidden_size,
         out_features=hidden_size,

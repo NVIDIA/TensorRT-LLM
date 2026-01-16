@@ -278,7 +278,7 @@ class ModelLoader:
                 if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
                 ):
                     weights = checkpoint_loader.load_weights(
-                        self.spec_config.speculative_model_dir,
+                        self.spec_config.speculative_model,
                         mapping=self.mapping)
 
                     draft_model_arch = model.draft_config.pretrained_config.architectures[

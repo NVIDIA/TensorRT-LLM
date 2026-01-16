@@ -384,6 +384,12 @@ class LlmArgs(AutoDeployConfig, BaseLlmArgs, BaseSettings):
 
     _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)
 
+    max_stats_len: int = Field(
+        default=1000,
+        description="The max number of performance statistic entries.",
+        status="prototype",
+    )
+
     @property
     def quant_config(self) -> QuantConfig:
         if self._quant_config is None:
