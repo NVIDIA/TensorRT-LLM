@@ -43,7 +43,6 @@ from ...utils.node_utils import (
     extract_weight_node,
     filtered_nodes,
     get_all_layer_subgraphs,
-    get_layer_after_linear_node,
     is_any_attention_op,
     is_any_lin_op,
     is_any_moe_op,
@@ -2066,11 +2065,6 @@ def detect_sharding_from_config(
                 # we have a match. Get the config for this layer
                 config = tp_plan[key]
 
-                if config in ["colwise", "mamba", "mla"]:
-                    cur_node_index = linear_nodes.index(lin_node)
-                    layer_subgraph = get_layer_after_linear_node(
-                        linear_nodes, [cur_node_index - 1], enforce_strict_linear_history=False
-                    )
                 if config == "colwise":
                     _process_column_sharding(
                         layer_subgraph=layer_subgraph,
