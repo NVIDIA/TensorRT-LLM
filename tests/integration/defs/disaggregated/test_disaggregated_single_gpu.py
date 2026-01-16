@@ -400,7 +400,7 @@ def test_disaggregated_spec_dec_batch_slot_limit(model, spec_dec_model_path,
     # Test whether the batch slots are properly released when using speculative decoding
     # with disaggregated serving.
     spec_dec_config = EagleDecodingConfig(
-        speculative_model_dir=model_path(spec_dec_model_path),
+        speculative_model=model_path(spec_dec_model_path),
         eagle3_one_model=eagle3_one_model,
         max_draft_len=3)
 

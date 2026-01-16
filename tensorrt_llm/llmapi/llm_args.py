@@ -13,7 +13,7 @@ from typing import (Any, ClassVar, Dict, List, Literal, Optional, Set, Tuple,
 
 import torch
 import yaml
-from pydantic import BaseModel
+from pydantic import AliasChoices, BaseModel
 from pydantic import Field as PydanticField
 from pydantic import PrivateAttr, field_validator, model_validator
 from strenum import StrEnum
@@ -651,7 +651,14 @@ class DecodingBaseConfig(StrictBaseModel):
     # If it's a static or dynamic tree, each draft layer may generate more than one draft token.
     # In this case, max_total_draft_tokens >= max_draft_len.
     max_total_draft_tokens: Optional[int] = None
-    speculative_model_dir: Optional[Union[str, Path]] = None
+    # The speculative (draft) model. Accepts either:
+    # - A HuggingFace Hub model ID (str), e.g., "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B"
+    #   which will be automatically downloaded.
+    # - A local filesystem path to a downloaded model directory.
+    speculative_model: Optional[Union[str, Path]] = Field(
+        default=None,
+        validation_alias=AliasChoices("speculative_model",
+                                      "speculative_model_dir"))
 
     # PyTorch only.
     # When specified, speculation will be disabled at batch sizes above
@@ -858,28 +865,29 @@ class EagleDecodingConfig(DecodingBaseConfig):
     # choices: llama3, mistral_large3
     eagle3_model_arch: str = "llama3"
 
-    def __init__(self, **kwargs):
-        super().__init__()
-        for attr_name, attr_value in kwargs.items():
-            if attr_name == 'max_draft_len':
-                self.num_eagle_layers = attr_value
-                self.max_total_draft_tokens = attr_value  # If using linear-tree, the max_total_draft_tokens is the same as max_draft_len
-            # Convert the data type of Eagle choice from str to List[List[int]]
-            if attr_name == 'eagle_choices' and attr_value is not None:
-                logger.warning(
-                    "NOTE: The Draft token tree is still under development, PLEASE DO NOT USE IT !!!"
-                )
-                if not isinstance(attr_value, list):
-                    if isinstance(attr_value, str):
-                        attr_value = ast.literal_eval(
-                            attr_value.replace(" ", ""))
-                    else:
-                        raise ValueError(
-                            "Wrong eagle choices type. Eagle choices should be a List[List[int]] or a string like [[0], [1], [2], [0, 0], [0, 1]]."
-                        )
-            setattr(self, attr_name, attr_value)
+    @field_validator('eagle_choices', mode='before')
+    @classmethod
+    def validate_eagle_choices(cls, v):
+        if v is not None:
+            logger.warning(
+                "NOTE: The Draft token tree is still under development, PLEASE DO NOT USE IT !!!"
+            )
+            if not isinstance(v, list):
+                if isinstance(v, str):
+                    v = ast.literal_eval(v.replace(" ", ""))
+                else:
+                    raise ValueError(
+                        "Wrong eagle choices type. Eagle choices should be a List[List[int]] or a string like [[0], [1], [2], [0, 0], [0, 1]]."
+                    )
+        return v
 
-        assert self.max_draft_len is not None, "max_draft_len is required for Eagle"
+    @model_validator(mode='after')
+    def validate_eagle_config(self) -> 'EagleDecodingConfig':
+        if self.max_draft_len is None:
+            raise ValueError("max_draft_len is required for Eagle")
+        self.num_eagle_layers = self.max_draft_len
+        self.max_total_draft_tokens = self.max_draft_len  # If using linear-tree, the max_total_draft_tokens is the same as max_draft_len
+
         if self.eagle3_model_arch == "mistral_large3" and self.eagle3_layers_to_capture is None:
             # FIXME find a better way to setup it.
             self.eagle3_layers_to_capture = {-1}
@@ -889,7 +897,10 @@ class EagleDecodingConfig(DecodingBaseConfig):
         # and reset the max_draft_len and num_eagle_layers if necessary
         if self.eagle_choices is not None:
             # If eagle_choices is provided, use_dynamic_tree should not be used
-            assert not self.use_dynamic_tree, "If eagle_choices is provided, use_dynamic_tree need to be False"
+            if self.use_dynamic_tree:
+                raise ValueError(
+                    "If eagle_choices is provided, use_dynamic_tree need to be False"
+                )
 
             # Get num_eagle_layers from eagle_choices
             num_eagle_layers_from_choices = self.check_eagle_choices()
@@ -906,10 +917,23 @@ class EagleDecodingConfig(DecodingBaseConfig):
 
         # Dynamic tree logic
         if self.use_dynamic_tree:
-            assert self.eagle_choices is None, "If use_dynamic_tree is True, eagle_choices should be None"
-            assert self.max_draft_len is not None and self.max_draft_len > 0, "max_draft_len should be provided, which indicates the number of drafter layers"
-            assert self.dynamic_tree_max_topK is not None and self.dynamic_tree_max_topK > 0, "dynamic_tree_max_topK should be provided, which indicates the number of nodes to expand each time"
-            assert self.max_total_draft_tokens is not None and self.max_total_draft_tokens > 0, "max_total_draft_tokens should be provided, which indicates the total nodes of the final draft tree. (exclude the root node)"
+            if self.eagle_choices is not None:
+                raise ValueError(
+                    "If use_dynamic_tree is True, eagle_choices should be None")
+            if self.max_draft_len is None or self.max_draft_len <= 0:
+                raise ValueError(
+                    "max_draft_len should be provided, which indicates the number of drafter layers"
+                )
+            if self.dynamic_tree_max_topK is None or self.dynamic_tree_max_topK <= 0:
+                raise ValueError(
+                    "dynamic_tree_max_topK should be provided, which indicates the number of nodes to expand each time"
+                )
+            if self.max_total_draft_tokens is None or self.max_total_draft_tokens <= 0:
+                raise ValueError(
+                    "max_total_draft_tokens should be provided, which indicates the total nodes of the final draft tree. (exclude the root node)"
+                )
+
+        return self
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -918,7 +942,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
     decoding_type: ClassVar[str] = "Eagle"
 
     def validate(self) -> None:
-        if self.speculative_model_dir is None:
+        if self.speculative_model is None:
             raise ValueError("Draft model must be provided for EAGLE")
 
     def check_eagle_choices(self):
@@ -2119,9 +2143,6 @@ class BaseLlmArgs(StrictBaseModel):
 
     _parallel_config: Optional[_ParallelConfig] = PrivateAttr(default=None)
     _model_format: Optional[_ModelFormatKind] = PrivateAttr(default=None)
-    _speculative_model: Optional[str] = PrivateAttr(default=None)
-    _speculative_model_format: Optional[_ModelFormatKind] = PrivateAttr(
-        default=None)
 
     @property
     def parallel_config(self) -> _ParallelConfig:
@@ -2132,12 +2153,8 @@ class BaseLlmArgs(StrictBaseModel):
         return self._model_format
 
     @property
-    def speculative_model_dir(self) -> Optional[_ModelFormatKind]:
-        return self._speculative_model
-
-    @property
-    def speculative_model_format(self) -> _ModelFormatKind:
-        return self._speculative_model_format
+    def speculative_model(self) -> Optional[Union[str, Path]]:
+        return self.speculative_config.speculative_model if self.speculative_config is not None else None
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "BaseLlmArgs":
@@ -2508,7 +2525,7 @@ class TrtLlmArgs(BaseLlmArgs):
 
             elif isinstance(self.speculative_config, EagleDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0
-                assert self.speculative_config.speculative_model_dir is not None, "Path to EAGLE3 weights must be specified."
+                assert self.speculative_config.speculative_model is not None, "EAGLE3 draft model must be specified."
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
                 self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.EAGLE
                 eagle_config = _EagleConfig(
@@ -2527,14 +2544,6 @@ class TrtLlmArgs(BaseLlmArgs):
 
         else:
             self.decoding_config = None
-
-        self._speculative_model = getattr(self.speculative_config,
-                                          "speculative_model_dir", None)
-        speculative_model_obj = _ModelWrapper(
-            self._speculative_model
-        ) if self._speculative_model is not None else None
-        if self._speculative_model and speculative_model_obj.is_local_model:
-            self._speculative_model_format = _ModelFormatKind.HF
 
         return self
 
@@ -3031,12 +3040,12 @@ class TorchLlmArgs(BaseLlmArgs):
 
             if isinstance(self.speculative_config, EagleDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0
-                assert self.speculative_config.speculative_model_dir is not None, "Path to EAGLE3 weights must be specified."
+                assert self.speculative_config.speculative_model is not None, "EAGLE3 draft model must be specified."
             elif isinstance(self.speculative_config, NGramDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0 and self.speculative_config.max_matching_ngram_size > 0
             elif isinstance(self.speculative_config, DraftTargetDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0
-                assert self.speculative_config.speculative_model_dir is not None, "Path to draft model must be specified."
+                assert self.speculative_config.speculative_model is not None, "Draft model must be specified."
             elif isinstance(self.speculative_config, MTPDecodingConfig):
                 assert self.speculative_config.num_nextn_predict_layers > 0
                 self.speculative_config.max_draft_len = self.speculative_config.num_nextn_predict_layers
@@ -3062,14 +3071,6 @@ class TorchLlmArgs(BaseLlmArgs):
 
         else:
             self.decoding_config = None
-
-        self._speculative_model = getattr(self.speculative_config,
-                                          "speculative_model_dir", None)
-        speculative_model_obj = _ModelWrapper(
-            self._speculative_model
-        ) if self._speculative_model is not None else None
-        if self._speculative_model and speculative_model_obj.is_local_model:
-            self._speculative_model_format = _ModelFormatKind.HF
 
         return self
 
