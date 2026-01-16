@@ -49,7 +49,6 @@ from mpi4py.MPI import COMM_WORLD
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._utils import global_mpi_rank, global_mpi_size
 from tensorrt_llm.llmapi.llm import RequestOutput
-from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 
 
 @dataclass
@@ -157,6 +156,7 @@ class TritonPythonModel:
             text_output_config["data_type"])
         if global_mpi_rank() == 0:
             # Initialize engine arguments
+            # TODO
             self.llm_engine_args = update_llm_args_with_extra_dict(
                 {},
                 get_model_config(os.environ.get('LLM_CONFIG_PATH',

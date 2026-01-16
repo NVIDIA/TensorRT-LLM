@@ -12,9 +12,7 @@ from typing import Any, List, Literal, Optional, Sequence, Union, cast
 
 import transformers
 from tqdm import tqdm
-from transformers import PreTrainedTokenizerBase
 
-from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.inputs.data import TextPrompt
 from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams
 from tensorrt_llm.inputs.registry import (BaseMultimodalInputProcessor,
@@ -40,8 +38,8 @@ from ..logger import logger
 from ..sampling_params import SamplingParams
 from ..scheduling_params import SchedulingParams
 from .llm_args import (TORCH_LLMARGS_EXPLICIT_DOCSTRING,
-                       TRT_LLMARGS_EXPLICIT_DOCSTRING, PeftCacheConfig,
-                       PybindMirror, TorchLlmArgs, TrtLlmArgs)
+                       TRT_LLMARGS_EXPLICIT_DOCSTRING, BaseLlmArgs,
+                       PeftCacheConfig, PybindMirror, TorchLlmArgs, TrtLlmArgs)
 from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig,
                         LlmBuildStats, ModelLoader, _ModelRuntimeContext)
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
@@ -119,78 +117,23 @@ class BaseLLM:
     The base class for all LLM classes.
     """
 
-    def __init__(self,
-                 model: Union[str, Path],
-                 tokenizer: Optional[Union[str, Path, TokenizerBase,
-                                           PreTrainedTokenizerBase]] = None,
-                 tokenizer_mode: Literal['auto', 'slow'] = 'auto',
-                 skip_tokenizer_init: bool = False,
-                 trust_remote_code: bool = False,
-                 tensor_parallel_size: int = 1,
-                 dtype: str = "auto",
-                 revision: Optional[str] = None,
-                 tokenizer_revision: Optional[str] = None,
-                 **kwargs: Any) -> None:
-
-        self._executor_cls = kwargs.pop("executor_cls", GenerationExecutor)
-        self._orchestrator_type = kwargs.get("orchestrator_type", None)
+    def __init__(self, args: BaseLlmArgs) -> None:
         self._llm_id = None
+        self.args = args
 
         log_level = logger.level
         logger.set_level("info")  # force display the backend
 
-        try:
-            env_overrides = kwargs.get("env_overrides", None)
-            self._process_env_overrides(env_overrides)
+        self._process_env_overrides(self.args.env_overrides)
 
-            backend = kwargs.get('backend', None)
-            if backend == "pytorch":
-                logger.info("Using LLM with PyTorch backend")
-                llm_args_cls = TorchLlmArgs
-                if self._orchestrator_type == "ray" or mpi_disabled():
-                    self._orchestrator_type = "ray"
-                    os.environ["TLLM_DISABLE_MPI"] = "1"
-                    # Propagate to args construction
-                    kwargs["orchestrator_type"] = "ray"
+        if self.args.backend == "pytorch":
+            logger.info("Using LLM with PyTorch backend")
+        elif self.args.backend == "_autodeploy":
+            logger.info("Using LLM with AutoDeploy backend")
+        else:
+            logger.info("Using LLM with TensorRT backend")
 
-            elif backend == '_autodeploy':
-                logger.info("Using LLM with AutoDeploy backend")
-                from .._torch.auto_deploy.llm_args import \
-                    LlmArgs as AutoDeployLlmArgs
-                llm_args_cls = AutoDeployLlmArgs
-            else:
-                logger.info("Using LLM with TensorRT backend")
-                llm_args_cls = TrtLlmArgs
-
-            # check the kwargs and raise ValueError directly
-            valid_keys = set(
-                list(llm_args_cls.model_fields.keys()) +
-                ['_mpi_session', 'backend'])
-            for key in kwargs:
-                if key not in valid_keys:
-                    raise ValueError(
-                        f"{self.__class__.__name__} got invalid argument: {key}"
-                    )
-
-            self.args = llm_args_cls.from_kwargs(
-                model=model,
-                tokenizer=tokenizer,
-                tokenizer_mode=tokenizer_mode,
-                skip_tokenizer_init=skip_tokenizer_init,
-                trust_remote_code=trust_remote_code,
-                tensor_parallel_size=tensor_parallel_size,
-                dtype=dtype,
-                revision=revision,
-                tokenizer_revision=tokenizer_revision,
-                **kwargs)
-
-        except Exception as e:
-            logger.error(
-                f"Failed to parse the arguments for the LLM constructor: {e}")
-            raise e
-
-        finally:
-            logger.set_level(log_level)  # restore the log level
+        logger.set_level(log_level)  # restore the log level
 
         logger_debug(f"LLM.args.mpi_session: {self.args.mpi_session}\n",
                      "yellow")
@@ -767,9 +710,8 @@ class BaseLLM:
 
         # TODO smor- need to refine what is the desired behavior if lora is enabled
         # in terms of the tokenizer initialization process
-        if hasattr(self.args, "backend") and self.args.backend in [
-                "pytorch", "_autodeploy"
-        ] and self.args.lora_config is not None:
+        if self.args.backend in ["pytorch", "_autodeploy"
+                                 ] and self.args.lora_config is not None:
             num_lora_dirs = len(self.args.lora_config.lora_dir)
             if num_lora_dirs == 1:
                 tokenizer_path = self.args.lora_config.lora_dir[0]
@@ -865,23 +807,9 @@ class _TrtLLM(BaseLLM):
     Parameters:
 """
 
-    def __init__(self,
-                 model: Union[str, Path],
-                 tokenizer: Optional[Union[str, Path, TokenizerBase,
-                                           PreTrainedTokenizerBase]] = None,
-                 tokenizer_mode: Literal['auto', 'slow'] = 'auto',
-                 skip_tokenizer_init: bool = False,
-                 trust_remote_code: bool = False,
-                 tensor_parallel_size: int = 1,
-                 dtype: str = "auto",
-                 revision: Optional[str] = None,
-                 tokenizer_revision: Optional[str] = None,
-                 **kwargs: Any) -> None:
-        # TODO: deprecate backend in LLM kwargs
-
-        super().__init__(model, tokenizer, tokenizer_mode, skip_tokenizer_init,
-                         trust_remote_code, tensor_parallel_size, dtype,
-                         revision, tokenizer_revision, **kwargs)
+    def __init__(self, model: Union[str, Path], **kwargs: Any) -> None:
+        args = TrtLlmArgs(model=model, **kwargs)
+        super().__init__(args)
 
     @property
     def workspace(self) -> Path:
@@ -1026,7 +954,7 @@ class _TrtLLM(BaseLLM):
                          or (self.args.build_config
                              and self.args.build_config.gather_context_logits))
 
-        self._executor = self._executor_cls.create(
+        self._executor = GenerationExecutor.create(
             self._engine_dir,
             executor_config=self._executor_config,
             batched_logits_processor=self.args.batched_logits_processor,
@@ -1049,36 +977,12 @@ class _TorchLLM(BaseLLM):
     Parameters:
 """
 
-    def __init__(self,
-                 model: Union[str, Path],
-                 tokenizer: Optional[Union[str, Path, TokenizerBase,
-                                           PreTrainedTokenizerBase]] = None,
-                 tokenizer_mode: Literal['auto', 'slow'] = 'auto',
-                 skip_tokenizer_init: bool = False,
-                 trust_remote_code: bool = False,
-                 tensor_parallel_size: int = 1,
-                 dtype: str = "auto",
-                 revision: Optional[str] = None,
-                 tokenizer_revision: Optional[str] = None,
-                 **kwargs: Any) -> None:
-
-        # TODO: deprecate backend in LLM kwargs
-        backend = kwargs.pop("backend", "pytorch")
-
+    def __init__(self, model: Union[str, Path], **kwargs: Any) -> None:
         # Validate that users don't pass TrtLlmArgs-specific arguments
         self._validate_args_for_torch_backend(kwargs)
 
-        super().__init__(model,
-                         tokenizer,
-                         tokenizer_mode,
-                         skip_tokenizer_init,
-                         trust_remote_code,
-                         tensor_parallel_size,
-                         dtype,
-                         revision,
-                         tokenizer_revision,
-                         backend=backend,
-                         **kwargs)
+        args = TorchLlmArgs(model=model, **kwargs)
+        super().__init__(args)
 
     @set_api_status("prototype")
     def _collective_rpc(self,
@@ -1129,7 +1033,7 @@ class _TorchLLM(BaseLLM):
 
         # TODO: revisit gather_context_logits
         return_logits = self.args.gather_generation_logits
-        self._executor = self._executor_cls.create(
+        self._executor = GenerationExecutor.create(
             self._engine_dir,
             executor_config=None,
             batched_logits_processor=self.args.batched_logits_processor,
@@ -1168,23 +1072,10 @@ class _TorchLLM(BaseLLM):
             )
 
 
+# NOTE: this is defined as a subclass instead of simply setting LLM = _TorchLLM so that
+# LLM.__name__ is "LLM"
 class LLM(_TorchLLM):
-
-    def __init__(self,
-                 model: Union[str, Path],
-                 tokenizer: Optional[Union[str, Path, TokenizerBase,
-                                           PreTrainedTokenizerBase]] = None,
-                 tokenizer_mode: Literal['auto', 'slow'] = 'auto',
-                 skip_tokenizer_init: bool = False,
-                 trust_remote_code: bool = False,
-                 tensor_parallel_size: int = 1,
-                 dtype: str = "auto",
-                 revision: Optional[str] = None,
-                 tokenizer_revision: Optional[str] = None,
-                 **kwargs: Any) -> None:
-        super().__init__(model, tokenizer, tokenizer_mode, skip_tokenizer_init,
-                         trust_remote_code, tensor_parallel_size, dtype,
-                         revision, tokenizer_revision, **kwargs)
+    pass
 
 
 # sphinx will ignore the LLM's docstring if it is not explicitly set

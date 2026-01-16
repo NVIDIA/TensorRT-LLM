@@ -15,7 +15,7 @@ methods:
         default: False
         status: beta
       cp_config:
-        annotation: Optional[dict]
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.CpConfig]
         default: null
         status: prototype
       pp_partition:
