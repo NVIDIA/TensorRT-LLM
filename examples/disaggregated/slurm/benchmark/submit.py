@@ -182,14 +182,7 @@ def submit_job(config, log_dir, dry_run):
     # Set default accuracy configuration for backward compatibility
     if 'accuracy' not in config:
         config['accuracy'] = {
-            'enable_accuracy_test':
-            False,
-            'model':
-            'local-completions',
-            'tasks':
-            'gsm8k',
-            'model_args_extra':
-            'num_concurrent=512,max_retries=3,tokenized_requests=false,timeout=1200,max_gen_toks=256,max_length=4096'
+            'enable_accuracy_test': False
         }
 
     # Set default environment configuration for backward compatibility
