@@ -44,9 +44,6 @@ profiling:
   nsys_on: false
 accuracy:
   enable_accuracy_test: false  # Set to true to enable accuracy evaluation
-  model: local-completions
-  tasks: gsm8k
-  model_args_extra: num_concurrent=512,max_retries=3,tokenized_requests=false,timeout=1200,max_gen_toks=256,max_length=4096
 worker_config:
   gen:
     tensor_parallel_size: 32
