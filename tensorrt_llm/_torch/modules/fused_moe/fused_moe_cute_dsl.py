@@ -258,6 +258,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                                   ConstraintSpec(
                                       4, 0, helper.infer_shape_num_tokens)),
                 inputs_pre_hook=helper.inputs_pre_hook,
+                use_cold_l2_cache=True,
             )
         return self.__class__.tuning_config_cache[key]
 
