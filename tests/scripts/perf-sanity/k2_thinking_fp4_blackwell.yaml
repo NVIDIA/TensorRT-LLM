@@ -74,7 +74,7 @@ server_configs:
     moe_expert_parallel_size: 8
     pipeline_parallel_size: 1
     max_batch_size: 4
-    max_num_tokens: 12288
+    max_num_tokens: 8192
     trust_remote_code: true
     attn_backend: "TRTLLM"
     enable_chunked_prefill: true
@@ -105,7 +105,7 @@ server_configs:
     moe_expert_parallel_size: 8
     pipeline_parallel_size: 1
     max_batch_size: 32
-    max_num_tokens: 12288
+    max_num_tokens: 8192
     trust_remote_code: true
     attn_backend: "TRTLLM"
     enable_chunked_prefill: true
