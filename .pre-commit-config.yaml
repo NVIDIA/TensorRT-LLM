@@ -1396,7 +1396,7 @@ repos:
         exclude: |
             (?x)^(.*cubin.cpp | .*cubin.h)$
     -   id: check-yaml
-        args: [--allow-multiple-documents]
+        args: [--allow-multiple-documents, --unsafe]
         exclude: ".*/gitlab/.*.yml"
     -   id: trailing-whitespace
         exclude: '\.(patch|md)$'

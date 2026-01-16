@@ -122,6 +122,10 @@ class EnvManager:
         return os.getenv("DATASET_DIR", "<Your dataset directory>")
 
     @staticmethod
+    def get_hf_home_dir() -> str:
+        return os.getenv("HF_HOME_DIR", "<Your HF home directory>")
+
+    @staticmethod
     def get_output_path() -> str:
         output_path = os.getenv(
             "OUTPUT_PATH", "<The csv and disagg comparison HTML output directory>"
