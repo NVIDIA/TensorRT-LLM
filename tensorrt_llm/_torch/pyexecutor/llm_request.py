@@ -639,13 +639,33 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         result, is_final = super().create_serialized_result(
             use_fast_logits, mpi_world_rank)
 
-        # Performs a deep copy of py_result._log_probs to eliminate race conditions that may occur between IPC communication and the overriding of newly generated log_probs in streaming mode.
-        if self.streaming and self.py_result.log_probs and self.sampling_config.beam_width <= 1:
+        # When using beam search we cannot incrementically update the logprobs in the result.
+        # Instead we need to update all logprobs. In that case no deep copy is needed.
+        need_deep_copy_logprobs = self.py_result.log_probs and self.sampling_config.beam_width <= 1
+        need_deep_copy_generation_logits = self.py_result._generation_logits is not None
+        need_any_deep_copy = need_deep_copy_logprobs or need_deep_copy_generation_logits
+        # Performs a deep copy of py_result._log_probs or py_result._generation_logits to eliminate race conditions
+        # that may occur between IPC communication and the overriding of newly generated log_probs
+        # or the updating of py_result._generation_logits._logits_indices in streaming mode.
+        if self.streaming and need_any_deep_copy:
             py_result = copy(self.py_result)
-            py_result._log_probs = deepcopy(self.py_result._log_probs)
+            # Perform a deep copy of py_result._log_probs
+            if need_deep_copy_logprobs:
+                py_result._log_probs = deepcopy(self.py_result._log_probs)
 
-            for log_prob in self.py_result.log_probs:
-                log_prob.clear()
+                for log_prob in self.py_result.log_probs:
+                    log_prob.clear()
+
+            # Perform copies of py_result._generation_logits
+            if need_deep_copy_generation_logits:
+                # shallow copy of generation_logits to avoid copying the logits tensor
+                py_result._generation_logits = copy(
+                    self.py_result._generation_logits)
+                # deep copy the indices to avoid the race condition
+                # In streaming mode LogitsStorage only accesses either the last
+                # or second to last pair of indices. Therefore, copying only these two pairs is sufficient.
+                py_result._generation_logits._logits_indices = py_result._generation_logits._logits_indices[
+                    -2:]
         else:
             py_result = self.py_result
 
