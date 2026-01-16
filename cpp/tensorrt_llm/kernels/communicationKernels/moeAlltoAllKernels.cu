@@ -337,10 +337,8 @@ __global__ void moeA2APrepareDispatchKernel(
     int* send_counters, int* local_token_counter, int ep_size, uint32_t* flag_val_ptr)
 {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaGridDependencySynchronize();
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
-
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     // Zero send_counters
     if (idx < ep_size)
@@ -354,6 +352,9 @@ __global__ void moeA2APrepareDispatchKernel(
         // Increment flag_val for this dispatch round
         *flag_val_ptr = *flag_val_ptr + 1;
     }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
 }
 
 // ============================================================================
@@ -371,6 +372,10 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
     int max_tokens_per_rank,                                                // Maximum tokens per rank
     int local_num_tokens, int rank_id, int ep_size, int num_experts_per_rank)
 {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+
     int thread_idx = ThreadingPolicy::offset();
     int local_token_idx = ThreadingPolicy::token_idx();
 
@@ -486,12 +491,12 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
         }
         is_last_token = __shfl_sync(0xffffffff, is_last_token, 0);
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-        cudaGridDependencySynchronize();
-#endif
-
         if (is_last_token)
         {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+            // Make sure the update of `flag_val ` in `moeA2APrepareDispatchKernel` is visible before accessment.
+            cudaGridDependencySynchronize();
+#endif
 // Store send_counters to recv_counters
 #pragma unroll 1 // No unroll as one iter is typically enough
             for (int target_rank = lane_id; target_rank < ep_size; target_rank += warpSize)
@@ -543,10 +548,6 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 #endif
         }
     }
-
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaTriggerProgrammaticLaunchCompletion();
-#endif
 }
 
 void moe_a2a_prepare_dispatch_launch(MoeA2ADispatchParams const& params)
@@ -974,10 +975,8 @@ __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, uint8_t c
     int bytes_per_token, int ep_size, int max_tokens_per_rank, uint32_t* flag_val_ptr, int const* recv_counters)
 {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaGridDependencySynchronize();
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
-
     if (blockIdx.x == 0 && threadIdx.x == 0)
     {
         // Increment flag_val for this combine round
@@ -1012,6 +1011,9 @@ __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, uint8_t c
     uint8_t* dst_ptr = recv_buffer_bytes + slot_offset;
     uint8_t const* src_ptr = payload_bytes + slot_offset;
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
     // Copy one token's data using vectorized copy with policy
     vectorized_copy<ThreadingPolicy>(dst_ptr, src_ptr, bytes_per_token);
 }
@@ -1025,7 +1027,9 @@ __global__ void moeA2ACombineKernel(
     const CombineKernelPointers ptrs, // Combine-specific struct, src_data_ptrs[0] is output
     int max_tokens_per_rank, int elements_per_token, int local_num_tokens, int rank_id, int ep_size)
 {
-
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
     int local_token_idx = ThreadingPolicy::token_idx();
     int const size_per_token = elements_per_token * sizeof(T);
 
@@ -1109,10 +1113,6 @@ __global__ void moeA2ACombineKernel(
 
     // Accumulate across ranks in registers, then store once per segment
     vectorized_combine<TOP_K, ThreadingPolicy, T>(token_output, size_per_token, rank_id, max_tokens_per_rank, ptrs);
-
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaTriggerProgrammaticLaunchCompletion();
-#endif
 }
 
 void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params)
