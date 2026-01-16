@@ -1,4 +1,6 @@
 from .auto_heuristic import suggest_spec_config
+from .draft_target import (DraftTargetOneModelSpecMetadata,
+                           DraftTargetOneModelWorker)
 from .eagle3 import Eagle3SpecMetadata
 from .interface import SpecMetadata, SpecWorkerBase
 from .mtp import MTPEagleWorker, MTPSpecMetadata, MTPWorker
@@ -11,6 +13,8 @@ from .utils import (get_num_extra_kv_tokens, get_num_spec_layers,
                     update_spec_config_from_model_config)
 
 __all__ = [
+    "DraftTargetOneModelSpecMetadata",
+    "DraftTargetOneModelWorker",
     "Eagle3SpecMetadata",
     "MTPEagleWorker",
     "MTPSpecMetadata",
