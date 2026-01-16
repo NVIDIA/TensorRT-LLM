@@ -5273,6 +5273,7 @@ class TestNemotronV3Nano(LlmapiAccuracyTestHarness):
     EXTRA_EVALUATOR_KWARGS = dict(chat_template_kwargs=dict(
         enable_thinking=False))
 
+    @pytest.mark.skip_less_device_memory(80000)
     def test_auto_dtype(self):
         with LLM(
                 f"{llm_models_root()}/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
@@ -5290,6 +5291,7 @@ class TestNemotronV3Nano(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
     @skip_pre_hopper
+    @pytest.mark.skip_less_device_memory(40000)
     def test_fp8(self):
         with LLM(
                 f"{llm_models_root()}/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8",
@@ -5313,6 +5315,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     EXTRA_EVALUATOR_KWARGS = dict(chat_template_kwargs=dict(
         enable_thinking=False))
 
+    @skip_pre_hopper
     @pytest.mark.skip_less_device_memory(64000)
     @pytest.mark.skip_less_mpi_world_size(4)
     @pytest.mark.parametrize(
