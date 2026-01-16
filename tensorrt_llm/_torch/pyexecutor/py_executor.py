@@ -2293,6 +2293,7 @@ class PyExecutor:
 
     @nvtx_range("_send_kv_async")
     def _send_kv_async(self, scheduled_requests: List[LlmRequest]):
+
         def kv_connector_request_finished(req: LlmRequest):
             try:
                 cache_block_ids = self.kv_cache_manager.get_cache_indices(req)
@@ -2308,8 +2309,8 @@ class PyExecutor:
         if self.kv_cache_transceiver:
             for req in scheduled_requests:
                 if req.is_context_only_request and (
-                        req.is_context_finished
-                        or req.is_finished_due_to_length) and not req.is_finished_due_to_cancellation:
+                        req.is_context_finished or req.is_finished_due_to_length
+                ) and not req.is_finished_due_to_cancellation:
                     self.kv_cache_transceiver.respond_and_send_async(req)
 
                     self.async_transfer_manager.start_transfer(req)
