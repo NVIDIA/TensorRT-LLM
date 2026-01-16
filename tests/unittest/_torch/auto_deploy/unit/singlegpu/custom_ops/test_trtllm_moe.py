@@ -986,23 +986,10 @@ def test_stack_nvfp4_moe_weights_transform_relu2(hidden_size, intermediate_size)
     num_transformed = _stack_nvfp4_moe_weights(gm)
     gm.recompile()
 
-    print(f"Transformed {num_transformed} nodes")
     assert num_transformed == 1, f"Expected 1 transform, got {num_transformed}"
 
     # Run the transformed graph
     transformed_output = gm(x, selected_experts, routing_weights)
-
-    # Compare
-    diff = (ref_output - transformed_output).abs()
-    print(f"max diff: {diff.max()}")
-    print(f"ref_output[:5]: {ref_output.flatten()[:5]}")
-    print(f"transformed_output[:5]: {transformed_output.flatten()[:5]}")
-
-    # Debug: print scale values
-    print("\n=== Scale Debug ===")
-    print(f"w1_input_scale[0]: {w1_input_scale[0]}")
-    print(f"w1_alpha[0]: {w1_alpha[0]}")
-    print(f"w1_weight_scale[0].shape: {w1_weight_scale[0].shape}")
 
     # Get the registered parameters after transform
     fc1_act_scale = getattr(gm, "nvfp4_moe_w3_w1_input_scale_stacked_0", None)
