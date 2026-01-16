@@ -326,6 +326,8 @@ class PyExecutor:
 
         if self.dist.pp_size > 1:
             self.event_loop = self._executor_loop_pp
+            self.pp_async_broadcast_sample_state = os.environ.get(
+                "TLLM_PP_ASYNC_BROADCAST_SAMPLE_STATE", "1") == "1"
         else:
             self.event_loop = self._executor_loop if self.disable_overlap_scheduler else self._executor_loop_overlap
         if is_trace_enabled("TLLM_TRACE_EXECUTOR_LOOP"):
@@ -1214,8 +1216,11 @@ class PyExecutor:
                 # The first rank determines the number of executed batches.
                 if self.dist.rank == 0:
                     executed_batches = []
-                    # Wait for at least one batch to finish if no new request is available.
-                    must_get = not can_queue
+                    if self.pp_async_broadcast_sample_state:
+                        # Wait for at least one batch to finish if no new request is available.
+                        must_get = not can_queue
+                    else:
+                        must_get = True
                     while not self.executed_batch_response_queue.empty() or (
                             must_get and self.unhandled_batch_counter > 0):
                         with nvtx_range("get_executed_batch"):
