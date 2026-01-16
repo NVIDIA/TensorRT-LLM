@@ -50,7 +50,10 @@ def _template_moe(
     x = x.view(-1, hidden_dim)
     num_experts = len(mlps)
 
-    final_hidden_states = torch.zeros_like(x)
+    # Match common HF MoE reference behavior: accumulate in routing weights dtype
+    # (typically fp32) then cast back to the input activation dtype.
+    accum_dtype = routing_weights.dtype if routing_weights is not None else x.dtype
+    final_hidden_states = torch.zeros(x.shape, device=x.device, dtype=accum_dtype, layout=x.layout)
     valid_mask = (selected_experts >= 0) & (selected_experts < num_experts)
     # For out-of-range indices, set them to num_experts
     selected_experts_fixed = torch.where(
@@ -80,10 +83,8 @@ def _template_moe(
             expert_out = mlps[expert_idx](tokens_for_this_expert)
             current_hidden_states = expert_out * routing_weights[top_x, idx, None]
 
-        final_hidden_states.index_add_(
-            0, top_x, current_hidden_states.to(final_hidden_states.dtype)
-        )
-    return final_hidden_states.view(x_shape)
+        final_hidden_states.index_add_(0, top_x, current_hidden_states.to(accum_dtype))
+    return final_hidden_states.to(x.dtype).view(x_shape)
 
 
 @torch.library.custom_op("auto_deploy::torch_moe", mutates_args=())
