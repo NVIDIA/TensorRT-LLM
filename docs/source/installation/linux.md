@@ -9,15 +9,15 @@
    Before the pre-built Python wheel can be installed via `pip`, a few
    prerequisites must be put into place:
 
-   Install CUDA Toolkit 13.0 following the [CUDA Installation Guide for Linux](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/)
+   Install CUDA Toolkit 13.1 following the [CUDA Installation Guide for Linux](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/)
    and make sure `CUDA_HOME` environment variable is properly set.
 
-   The `cuda-compat-13-0` package may be required depending on your system's NVIDIA GPU
+   The `cuda-compat-13-1` package may be required depending on your system's NVIDIA GPU
    driver version. For additional information, refer to the [CUDA Forward Compatibility](https://docs.nvidia.com/deploy/cuda-compatibility/forward-compatibility.html).
 
    ```bash
-   # By default, PyTorch CUDA 12.8 package is installed. Install PyTorch CUDA 13.0 package to align with the CUDA version used for building TensorRT LLM wheels.
-   pip3 install torch==2.9.0 torchvision --index-url https://download.pytorch.org/whl/cu130
+   # By default, PyTorch CUDA 13.0 package is installed. Since PyTorch CUDA 13.1 package to align with the CUDA version used for building TensorRT LLM wheels.
+   pip3 install torch==2.9.1 torchvision --index-url https://download.pytorch.org/whl/cu130
 
    sudo apt-get -y install libopenmpi-dev
    
@@ -39,7 +39,11 @@
    ```bash
    pip3 install --upgrade pip setuptools && pip3 install tensorrt_llm
    ```
+
+   > **Note:** Since there is no public python torch package align with cuda 13.1, If you need to install tensorrt-llm in Nvidia TensorRT LLM public image, please use the wheel under '/app/tensorrt_llm' directly.
+
    **This project will download and install additional third-party open source software projects. Review the license terms of these open source projects before use.**
+
 
 2. Sanity check the installation by running the following in Python (tested on Python 3.12):
 

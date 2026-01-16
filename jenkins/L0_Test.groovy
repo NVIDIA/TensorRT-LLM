@@ -1988,7 +1988,7 @@ def launchTestListCheck(pipeline)
             def llmPath = sh (script: "realpath .", returnStdout: true).trim()
             def llmSrc = "${llmPath}/TensorRT-LLM/src"
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install -r ${llmSrc}/requirements-dev.txt")
-            sh "NVIDIA_TRITON_SERVER_VERSION=25.10 LLM_ROOT=${llmSrc} LLM_BACKEND_ROOT=${llmSrc}/triton_backend python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa --waive"
+            sh "NVIDIA_TRITON_SERVER_VERSION=25.12 LLM_ROOT=${llmSrc} LLM_BACKEND_ROOT=${llmSrc}/triton_backend python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa --waive"
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
@@ -3432,7 +3432,10 @@ def launchTestJobs(pipeline, testFilter)
     ]
 
     aarch64SanityCheckConfigs = [
-        /* //Disable PY312-UB2404 temporarily since lack of official PyTorch for CUDA 13.1.
+        // Due to lack of official PyTorch for CUDA 13.1. Change to use dlfw image test temporarily
+        // Need change back:
+        // 1. DLFW_IMAGE-> UBUNTU_24_04_IMAGE;
+        // 2. Extra Extra PyTorch CUDA install false -> true
         "PY312-UB2404": [
             LLM_DOCKER_IMAGE,
             "GH200",
@@ -3441,7 +3444,7 @@ def launchTestJobs(pipeline, testFilter)
             "",
             DLFW_IMAGE,
             false, // Extra PyTorch CUDA 13.0 install
-        ],*/
+        ],
         "PY312-DLFW": [
             LLM_DOCKER_IMAGE,
             "GH200",
