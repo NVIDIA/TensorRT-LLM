@@ -383,6 +383,7 @@ accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backe
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_auto_dtype_4gpus[4-4-True-False-True] SKIP (https://nvbugs/5810980)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[latency] SKIP (https://nvbugs/5814309)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus[tp4-mtp_nextn=2-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=True] SKIP (https://nvbugs/5800646)
+unittest/_torch/thop/parallel/test_fp4_swizzle.py::test_swizzle_sf SKIP (https://nvbugs/5811159)
 unittest/_torch/auto_deploy/unit/multigpu/custom_ops/test_mxfp4_moe_ep.py::test_mxfp4_mlp_ep_dtypes[1-4-6] SKIP (https://nvbugs/5814247)
 unittest/_torch/auto_deploy/unit/multigpu/custom_ops/test_mxfp4_moe_ep.py::test_mxfp4_mlp_ep_dtypes[1-4-8] SKIP (https://nvbugs/5814247)
 unittest/_torch/auto_deploy/unit/multigpu/test_ad_allreduce_strategies.py::test_allreduce_strategies[AUTO] SKIP (https://nvbugs/5814247)
