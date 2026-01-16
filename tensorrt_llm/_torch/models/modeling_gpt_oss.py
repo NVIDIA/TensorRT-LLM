@@ -536,6 +536,7 @@ class Transformer(DecoderModel):
                 enable_torch_compile_for_embedding=
                 enable_torch_compile_for_embedding,
                 use_custom_cublas_mm=self.use_custom_cublas_mm,
+                allreduce_strategy=config.allreduce_strategy,
             )
         # For modeling_speculative, different name expected
         self.embed_tokens = self.embedding

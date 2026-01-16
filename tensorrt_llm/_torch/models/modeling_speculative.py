@@ -344,6 +344,7 @@ class Eagle3DraftModel(DecoderModel):
                     mapping=model_config.mapping,
                     tensor_parallel_mode=TensorParallelMode.COLUMN,
                     gather_output=True,
+                    allreduce_strategy=model_config.allreduce_strategy,
                 )
         else:
             # Shared with target model.

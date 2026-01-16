@@ -199,6 +199,7 @@ class QwenMoeModel(DecoderModel):
             mapping=config.mapping,
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             gather_output=True,
+            allreduce_strategy=config.allreduce_strategy,
         )
         self.layers = nn.ModuleList([
             QwenMoeDecoderLayer(
