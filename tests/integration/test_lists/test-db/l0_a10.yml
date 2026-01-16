@@ -53,7 +53,6 @@ l0_a10:
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[False-True-TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[True-False-TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[True-True-TinyLlama-1.1B-Chat-v1.0]
-  - test_e2e.py::test_openai_chat_guided_decoding
   - test_e2e.py::test_get_ci_container_port
   - test_e2e.py::test_openai_chat_multimodal_example ISOLATION
   - test_e2e.py::test_openai_mmencoder_example
