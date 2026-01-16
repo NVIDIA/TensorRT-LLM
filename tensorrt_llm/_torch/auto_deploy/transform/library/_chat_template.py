@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-For DriveOS LLM API. Processes the chat template to create a JSON file with
+For EdgeLLM API. Processes the chat template to create a JSON file with
 chat template data for the following:
 
 Roles:

@@ -25,17 +25,17 @@ from ...utils.node_utils import is_op
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
 
-@TransformRegistry.register("adapt_to_driveos_llm")
-class AdaptToDriveOSLLM(BaseTransform):
-    """Transform that adapts the model graph for DriveOS LLM deployment.
+@TransformRegistry.register("adapt_to_edgellm")
+class AdaptToEdgeLLM(BaseTransform):
+    """Transform that adapts the model graph for EdgeLLM deployment.
 
     This transform performs several modifications to make the model compatible
-    with DriveOS runtime requirements:
+    with EdgeLLM runtime requirements:
 
         1. Converts all model weights to float16 precision
         2. Adds float32 cast after the final linear layer (for logits output)
         3. Inserts float16 casts after attention output reshapes
-        4. Changes any bfloat16 casts to float16 (DriveOS may not support bfloat16)
+        4. Changes any bfloat16 casts to float16 (EdgeLLM may not support bfloat16)
 
     These modifications ensure proper data type handling throughout the model
     while maintaining numerical precision where needed (e.g., logits output).
@@ -120,7 +120,7 @@ class AdaptToDriveOSLLM(BaseTransform):
     def _change_cast_bfloat16_to_float16(self, gm: GraphModule) -> int:
         """Replace all bfloat16 cast operations with float16 casts.
 
-        DriveOS or certain hardware backends may not support bfloat16 natively.
+        EdgeLLM or certain hardware backends may not support bfloat16 natively.
         This method converts all bfloat16 casts to float16 for compatibility.
 
         Args:
@@ -159,7 +159,7 @@ class AdaptToDriveOSLLM(BaseTransform):
         num_attn_casts = self._insert_cast_after_attn_reshape(gm)
         num_bfloat16_casts = self._change_cast_bfloat16_to_float16(gm)
         ad_logger.info(f"Changed {num_bfloat16_casts} bfloat16 casts to float16")
-        ad_logger.info(f"Adapted DriveOS LLM model (inserted {num_attn_casts} attention casts)")
+        ad_logger.info(f"Adapted EdgeLLM model (inserted {num_attn_casts} attention casts)")
 
         return gm, TransformInfo(
             skipped=False, num_matches=num_attn_casts, is_clean=False, has_valid_shapes=True

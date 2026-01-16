@@ -160,7 +160,7 @@ class ExportToONNX(BaseTransform):
     4. Processing and exporting chat templates
 
     The exported ONNX model includes custom ops from the auto_deploy. These custom ops include:
-    - torch_onnx_attention_plugin: Fused RoPE + Attention for efficient inference(exported as DriveOS LLM's custom op)
+    - torch_onnx_attention_plugin: Fused RoPE + Attention for efficient inference(exported as EdgeLLM's custom op)
     - torch_onnx_gather_nd: N-dimensional gather operation (exported as onnxscript.opset20.GatherND)
 
     Note:
