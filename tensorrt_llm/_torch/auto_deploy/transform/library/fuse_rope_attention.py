@@ -105,7 +105,7 @@ class FuseRopeAttention(BaseTransform):
     The fusion provides several benefits:
         - Reduced memory bandwidth by eliminating intermediate tensors
         - Enables KV-cache integration for efficient autoregressive generation
-        - Allows backend-specific optimizations (e.g., TensorRT, DriveOS)
+        - Allows backend-specific optimizations (e.g., TensorRT, EdgeLLM)
 
     Pattern matched (backwards from attention):
         1. torch_attention(rope_q, rope_k, view_v, attn_mask, ...)

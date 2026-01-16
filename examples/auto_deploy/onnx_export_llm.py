@@ -51,10 +51,10 @@ def main():
     max_batch_size = 13
     max_seq_len = 4
 
-    # Prepare the AutoDeploy config, mode is export_driveos_llm_onnx
+    # Prepare the AutoDeploy config, mode is export_edgellm_onnx
     ad_config = AutoDeployConfig(
         model=args.model,
-        mode="export_driveos_llm_onnx",
+        mode="export_edgellm_onnx",
         max_batch_size=max_batch_size,
         max_seq_len=max_seq_len,
         device=args.device,

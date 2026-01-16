@@ -1,10 +1,10 @@
-# Export ONNX for DriveOS LLM
+# Export ONNX for EdgeLLM
 
-AutoDeploy provides a mode to export PyTorch/HuggingFace models to ONNX format specifically designed for DriveOS LLM deployment. This mode performs graph transformations to fuse RoPE (Rotary Position Embedding) and attention operations into a single `AttentionPlugin` operation, then exports the optimized graph to ONNX.
+AutoDeploy provides a mode to export PyTorch/HuggingFace models to ONNX format specifically designed for EdgeLLM deployment. This mode performs graph transformations to fuse RoPE (Rotary Position Embedding) and attention operations into a single `AttentionPlugin` operation, then exports the optimized graph to ONNX.
 
 ## Overview
 
-The `export_driveos_llm_onnx` mode differs from the standard AutoDeploy workflow in two key ways:
+The `export_edgellm_onnx` mode differs from the standard AutoDeploy workflow in two key ways:
 
 1. **Operation Fusion**: Fuses `torch_rope_with_explicit_cos_sin` and `torch_cached_attention_with_cache` into a single `AttentionPlugin` operation
 1. **ONNX Export**: Outputs an ONNX model file instead of a TensorRT Engine
@@ -68,10 +68,10 @@ You can also use the ONNX export functionality programmatically:
 ```python
 from tensorrt_llm._torch.auto_deploy import LLM, AutoDeployConfig
 
-# Create AutoDeploy config with export_driveos_llm_onnx mode
+# Create AutoDeploy config with export_edgellm_onnx mode
 ad_config = AutoDeployConfig(
     model="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
-    mode="export_driveos_llm_onnx",
+    mode="export_edgellm_onnx",
     max_batch_size=8,
     max_seq_len=512,
     device="cpu",

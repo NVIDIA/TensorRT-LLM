@@ -47,8 +47,7 @@ def attention_plugin(
 
     Note:
         This is a placeholder implementation for ONNX export. The actual computation
-        is performed by the backend runtime (e.g., TensorRT, DriveOS).
-
+        is performed by the backend runtime (e.g., TensorRT, EdgeLLM
     Args:
         qkv: Concatenated query, key, value tensor of shape
             [batch_size, seq_len, (num_q_heads + 2 * num_kv_heads) * head_size].

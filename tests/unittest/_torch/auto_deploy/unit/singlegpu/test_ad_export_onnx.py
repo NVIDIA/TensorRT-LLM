@@ -20,7 +20,7 @@ from tensorrt_llm._torch.auto_deploy import LLM, AutoDeployConfig
 def test_ad_export_onnx(model: str, output_dir: str, num_attn_ops: int):
     ad_config = AutoDeployConfig(
         model=get_small_model_config(model)["args"]["model"],
-        mode="export_driveos_llm_onnx",
+        mode="export_edgellm_onnx",
         max_batch_size=13,
         max_seq_len=4,
     )
