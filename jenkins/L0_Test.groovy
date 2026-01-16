@@ -108,7 +108,7 @@ ENABLE_NGC_RELEASE_IMAGE_TEST = params.enableNgcReleaseImageTest ?: false
 
 COMMON_SSH_OPTIONS = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o TCPKeepAlive=no -o ServerAliveInterval=30 -o ServerAliveCountMax=20"
 
-def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String stageName){
+def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String stageName, Boolean stageIsInterrupted=false) {
     withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
         def randomLoginNode = SlurmConfig.getRandomLoginNode(cluster.host)
         def remote = [
@@ -131,15 +131,19 @@ def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String st
             def timeoutTestFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/unfinished_test.txt"
             def downloadTimeoutTestSucceed = Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -P ${remote.port} -r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${timeoutTestFilePath} ${stageName}/", returnStatus: true, numRetries: 3) == 0
             if (downloadTimeoutTestSucceed) {
-                sh "ls ${stageName}"
-                def timeoutTestXml = generateTimeoutTestResultXml(stageName, "unfinished_test.txt")
-                if (timeoutTestXml != null) {
-                    sh """
+                if (stageIsInterrupted) {
+                    echo "Stage is interrupted, skip to generate terminated unexpectedly test result."
+                } else {
+                    sh "ls ${stageName}"
+                    def timeoutTestXml = generateTimeoutTestResultXml(stageName, "unfinished_test.txt")
+                    if (timeoutTestXml != null) {
+                        sh """
 cat > ${stageName}/results-timeout.xml << 'EOF_TIMEOUT_XML'
 ${timeoutTestXml}
 EOF_TIMEOUT_XML
-                    """
-                    hasTimeoutTest = true
+                        """
+                        hasTimeoutTest = true
+                    }
                 }
             }
             // Download normal test results
@@ -899,6 +903,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
     Utils.exec(pipeline, script: "env | sort && pwd && ls -alh")
 
+    def stageIsInterrupted = false
+
     try {
         // Run ssh command to start node in desired cluster via SLURM
         withCredentials([
@@ -1370,8 +1376,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             }
             echo "Finished test stage execution."
         }
+    } catch (InterruptedException e) {
+        stageIsInterrupted = true
     } finally {
-        uploadResults(pipeline, cluster, jobUID, stageName)
+        uploadResults(pipeline, cluster, jobUID, stageName, stageIsInterrupted)
         stage("Clean Up Slurm Resource") {
             // Workaround to handle the interruption during clean up SLURM resources
             retry(3) {
@@ -1598,13 +1606,17 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
             sh "mkdir -p ${stageName}"
             finallyRunner()
             if (stageIsFailed) {
-                def timeoutTestXml = generateTimeoutTestResultXml(stageName, "unfinished_test.txt")
-                if (timeoutTestXml != null) {
-                    sh """
+                if (stageIsInterrupted) {
+                    echo "Stage is interrupted, skip to generate terminated unexpectedly test result."
+                } else {
+                    def timeoutTestXml = generateTimeoutTestResultXml(stageName, "unfinished_test.txt")
+                    if (timeoutTestXml != null) {
+                        sh """
 cat > ${stageName}/results-timeout.xml << 'EOF_TIMEOUT_XML'
 ${timeoutTestXml}
 EOF_TIMEOUT_XML
-                    """
+                        """
+                    }
                 }
                 def stageXml = generateStageFailTestResultXml(stageName, "Stage Failed", "Stage run failed without result", "results*.xml")
                 if (stageXml != null) {
