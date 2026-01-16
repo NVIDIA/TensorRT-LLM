@@ -878,7 +878,7 @@ def create_py_executor_instance(
         mb_scheduler = BindMicroBatchScheduler(max_batch_size, max_num_tokens,
                                                ctx_chunk_config)
         
-        resort_policy_config = pytorch_backend_config.resort_policy_config
+        resort_policy_config = llm_args.resort_policy_config
 
         if resort_policy_config is not None:
             assert resort_policy_config.policy_name == "AgentTree", "Resort policy only supports AgentTree for now"
