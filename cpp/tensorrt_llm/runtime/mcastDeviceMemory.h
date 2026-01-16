@@ -43,8 +43,8 @@ public:
     McastDeviceMemory(McastDeviceMemory const&) = delete;
     McastDeviceMemory& operator=(McastDeviceMemory const&) = delete;
 
-    McastDeviceMemory(
-        size_t bufSize, uint32_t groupSize, uint32_t groupRank, uint32_t splitColor, int deviceIdx, bool mnNvlink);
+    McastDeviceMemory(size_t bufSize, uint32_t groupSize, uint32_t groupRank, int deviceIdx, bool mnNvlink,
+        int64_t mpiCommFortranHandle);
 
     // We don't register the pointer in these two functions since we don't expect any python-level code would call
     // to obtain the raw pointers.
