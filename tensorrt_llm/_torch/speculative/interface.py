@@ -387,13 +387,14 @@ class SpecWorkerBase(nn.Module, ABC):
     Provides common functionality for sampling and token handling.
     """
 
-    def __init__(self):
+    def __init__(self, use_separate_draft_kv_cache: bool = False):
         super().__init__()
         self.guided_decoder: Optional["CapturableGuidedDecoder"] = None
         self.force_num_accepted_tokens = get_force_num_accepted_tokens()
         self.use_flashinfer = IS_FLASHINFER_AVAILABLE and flashinfer.__version__ >= "0.6.0"
         self.seed = 0
         self.offset = 0
+        self.use_separate_draft_kv_cache = use_separate_draft_kv_cache
 
     @property
     @abstractmethod

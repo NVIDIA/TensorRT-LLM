@@ -362,10 +362,9 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                  spec_config: "EagleDecodingConfig",
                  mapping: Mapping,
                  use_separate_draft_kv_cache: bool = False):
-        super().__init__()
+        super().__init__(use_separate_draft_kv_cache)
         self.spec_config = spec_config
         self.mapping = mapping
-        self.use_separate_draft_kv_cache = use_separate_draft_kv_cache
 
     @property
     def max_draft_len(self) -> int:

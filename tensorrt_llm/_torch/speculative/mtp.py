@@ -371,10 +371,9 @@ class MTPWorker(SpecWorkerBase):
                  spec_config: "MTPDecodingConfig",
                  model_config=None,
                  use_separate_draft_kv_cache: bool = False):
-        super().__init__()
+        super().__init__(use_separate_draft_kv_cache)
         self.spec_config = spec_config
         self.model_config = model_config
-        self.use_separate_draft_kv_cache = use_separate_draft_kv_cache
         self.is_thop = False
 
     @property

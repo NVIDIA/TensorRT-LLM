@@ -561,7 +561,7 @@ class KvCacheCreator:
             sparse_attn_config=None,  # Not applicable for draft in one-model mode
             max_num_tokens=self._max_num_tokens,
             max_beam_width=self._max_beam_width,
-            kv_connector_manager=None,  # Not supported for draft models
+            kv_connector_manager=self._kv_connector_manager,
             estimating_kv_cache=estimating_kv_cache,
             execution_stream=self._execution_stream,
             # One-model draft specific overrides
