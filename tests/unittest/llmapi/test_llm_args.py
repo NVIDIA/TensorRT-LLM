@@ -7,12 +7,10 @@ import yaml
 import tensorrt_llm.bindings.executor as tle
 from tensorrt_llm import LLM as TorchLLM
 from tensorrt_llm._tensorrt_engine import LLM
-from tensorrt_llm.builder import LoraConfig
 from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
                                  SchedulerConfig)
 from tensorrt_llm.llmapi.llm_args import *
 from tensorrt_llm.llmapi.utils import print_traceback_on_error
-from tensorrt_llm.plugin import PluginConfig
 
 from .test_llm import llama_model_path
 
@@ -54,19 +52,16 @@ class TestYaml:
             dict_content = yaml.safe_load(f)
         return dict_content
 
-    def test_update_llm_args_with_extra_dict_with_speculative_config(self):
+    def test_llm_args_yaml_with_speculative_config(self):
         yaml_content = """
 speculative_config:
     decoding_type: Lookahead
     max_window_size: 4
     max_ngram_size: 3
     """
-        dict_content = self._yaml_to_dict(yaml_content)
+        llm_args_dict = self._yaml_to_dict(yaml_content)
 
-        llm_args = TrtLlmArgs(model=llama_model_path)
-        llm_args_dict = update_llm_args_with_extra_dict(llm_args.model_dump(),
-                                                        dict_content)
-        llm_args = TrtLlmArgs(**llm_args_dict)
+        llm_args = TrtLlmArgs(model=llama_model_path, **llm_args_dict)
         assert llm_args.speculative_config.max_window_size == 4
         assert llm_args.speculative_config.max_ngram_size == 3
         assert llm_args.speculative_config.max_verification_set_size == 4
@@ -77,28 +72,21 @@ pytorch_backend_config: # this is deprecated
     max_num_tokens: 1
     max_seq_len: 1
 """
-        dict_content = self._yaml_to_dict(yaml_content)
+        llm_args_dict = self._yaml_to_dict(yaml_content)
 
-        llm_args = TrtLlmArgs(model=llama_model_path)
-        llm_args_dict = update_llm_args_with_extra_dict(llm_args.model_dump(),
-                                                        dict_content)
         with pytest.raises(ValueError):
-            llm_args = TrtLlmArgs(**llm_args_dict)
+            llm_args = TrtLlmArgs(model=llama_model_path, **llm_args_dict)
 
     def test_llm_args_with_build_config(self):
-        # build_config isn't a Pydantic
         yaml_content = """
 build_config:
     max_beam_width: 4
     max_batch_size: 8
     max_num_tokens: 256
     """
-        dict_content = self._yaml_to_dict(yaml_content)
+        llm_args_dict = self._yaml_to_dict(yaml_content)
 
-        llm_args = TrtLlmArgs(model=llama_model_path)
-        llm_args_dict = update_llm_args_with_extra_dict(llm_args.model_dump(),
-                                                        dict_content)
-        llm_args = TrtLlmArgs(**llm_args_dict)
+        llm_args = TrtLlmArgs(model=llama_model_path, **llm_args_dict)
         assert llm_args.build_config.max_beam_width == 4
         assert llm_args.build_config.max_batch_size == 8
         assert llm_args.build_config.max_num_tokens == 256
@@ -110,12 +98,9 @@ kv_cache_config:
     max_tokens: 1024
     max_attention_window: [1024, 1024, 1024]
     """
-        dict_content = self._yaml_to_dict(yaml_content)
+        llm_args_dict = self._yaml_to_dict(yaml_content)
 
-        llm_args = TrtLlmArgs(model=llama_model_path)
-        llm_args_dict = update_llm_args_with_extra_dict(llm_args.model_dump(),
-                                                        dict_content)
-        llm_args = TrtLlmArgs(**llm_args_dict)
+        llm_args = TrtLlmArgs(model=llama_model_path, **llm_args_dict)
         assert llm_args.kv_cache_config.enable_block_reuse == True
         assert llm_args.kv_cache_config.max_tokens == 1024
         assert llm_args.kv_cache_config.max_attention_window == [
@@ -128,12 +113,9 @@ max_batch_size: 16
 max_num_tokens: 256
 max_seq_len: 128
     """
-        dict_content = self._yaml_to_dict(yaml_content)
+        llm_args_dict = self._yaml_to_dict(yaml_content)
 
-        llm_args = TrtLlmArgs(model=llama_model_path)
-        llm_args_dict = update_llm_args_with_extra_dict(llm_args.model_dump(),
-                                                        dict_content)
-        llm_args = TrtLlmArgs(**llm_args_dict)
+        llm_args = TrtLlmArgs(model=llama_model_path, **llm_args_dict)
         assert llm_args.max_batch_size == 16
         assert llm_args.max_num_tokens == 256
         assert llm_args.max_seq_len == 128
@@ -365,54 +347,6 @@ def test_PeftCacheConfig_from_pybind_gets_python_only_default_values_when_none(
     assert config.lora_prefetch_dir == "."
 
 
-def test_update_llm_args_with_extra_dict_with_nested_dict():
-    llm_api_args_dict = {
-        "model":
-        "dummy-model",
-        "build_config":
-        None,  # Will override later.
-        "extended_runtime_perf_knob_config":
-        ExtendedRuntimePerfKnobConfig(multi_block_mode=True),
-        "kv_cache_config":
-        KvCacheConfig(enable_block_reuse=False),
-        "peft_cache_config":
-        PeftCacheConfig(num_host_module_layer=0),
-        "scheduler_config":
-        SchedulerConfig(capacity_scheduler_policy=CapacitySchedulerPolicy.
-                        GUARANTEED_NO_EVICT)
-    }
-    plugin_config = PluginConfig(dtype='float16', nccl_plugin=None)
-    build_config = BuildConfig(max_input_len=1024,
-                               lora_config=LoraConfig(lora_ckpt_source='hf'),
-                               plugin_config=plugin_config)
-    extra_llm_args_dict = {
-        "build_config": build_config.model_dump(mode="json"),
-    }
-
-    llm_api_args_dict = update_llm_args_with_extra_dict(llm_api_args_dict,
-                                                        extra_llm_args_dict,
-                                                        "build_config")
-    initialized_llm_args = TrtLlmArgs(**llm_api_args_dict)
-
-    def check_nested_dict_equality(dict1, dict2, path=""):
-        if not isinstance(dict1, dict) or not isinstance(dict2, dict):
-            if dict1 != dict2:
-                raise ValueError(f"Mismatch at {path}: {dict1} != {dict2}")
-            return True
-        if dict1.keys() != dict2.keys():
-            raise ValueError(f"Different keys at {path}:")
-        for key in dict1:
-            new_path = f"{path}.{key}" if path else key
-            if not check_nested_dict_equality(dict1[key], dict2[key], new_path):
-                raise ValueError(f"Mismatch at {path}: {dict1} != {dict2}")
-        return True
-
-    build_config_dict1 = build_config.model_dump(mode="json")
-    build_config_dict2 = initialized_llm_args.build_config.model_dump(
-        mode="json")
-    check_nested_dict_equality(build_config_dict1, build_config_dict2)
-
-
 class TestTorchLlmArgsCudaGraphSettings:
 
     def test_cuda_graph_batch_sizes_case_0(self):
@@ -568,7 +502,7 @@ class TestTrtLlmArgs:
         args = TrtLlmArgs(model=llama_model_path, build_config=build_config)
         args_dict = args.model_dump()
 
-        new_args = TrtLlmArgs.from_kwargs(**args_dict)
+        new_args = TrtLlmArgs(**args_dict)
 
         assert new_args.model_dump() == args_dict
 
@@ -590,36 +524,6 @@ class TestTrtLlmArgs:
         assert args.max_num_tokens == 16
         assert args.max_batch_size == 4
 
-    def test_model_dump_does_not_mutate_original(self):
-        """Test that model_dump() and update_llm_args_with_extra_dict don't mutate the original."""
-        # Create args with specific build_config values
-        build_config = BuildConfig(
-            max_batch_size=8,
-            max_num_tokens=256,
-        )
-        args = TrtLlmArgs(model=llama_model_path, build_config=build_config)
-
-        # Store original values
-        original_max_batch_size = args.build_config.max_batch_size
-        original_max_num_tokens = args.build_config.max_num_tokens
-
-        # Convert to dict and pass through update_llm_args_with_extra_dict with overrides
-        args_dict = args.model_dump()
-        extra_dict = {
-            "max_batch_size": 128,
-            "max_num_tokens": 1024,
-        }
-        updated_dict = update_llm_args_with_extra_dict(args_dict, extra_dict)
-
-        # Verify original args was NOT mutated
-        assert args.build_config.max_batch_size == original_max_batch_size
-        assert args.build_config.max_num_tokens == original_max_num_tokens
-
-        # Verify updated dict has new values
-        new_args = TrtLlmArgs(**updated_dict)
-        assert new_args.build_config.max_batch_size == 128
-        assert new_args.build_config.max_num_tokens == 1024
-
 
 class TestStrictBaseModelArbitraryArgs:
     """Test that StrictBaseModel prevents arbitrary arguments from being accepted."""
@@ -627,9 +531,9 @@ class TestStrictBaseModelArbitraryArgs:
     def test_cuda_graph_config_arbitrary_args(self):
         """Test that CudaGraphConfig rejects arbitrary arguments."""
         # Valid arguments should work
-        config = CudaGraphConfig(batch_sizes=[1, 2, 4], max_batch_size=8)
+        config = CudaGraphConfig(batch_sizes=[1, 2, 4], max_batch_size=4)
         assert config.batch_sizes == [1, 2, 4]
-        assert config.max_batch_size == 8
+        assert config.max_batch_size == 4
 
         # Arbitrary arguments should be rejected
         with pytest.raises(
@@ -845,3 +749,19 @@ class TestStrictBaseModelArbitraryArgs:
                 pydantic_core._pydantic_core.ValidationError) as exc_info:
             TestConfig(field1="test", field2=100, extra_field="should_fail")
         assert "extra_field" in str(exc_info.value)
+
+
+def test_executor_config_consistency():
+    """Verify that BaseLlmArgs exposes all ExecutorConfig options."""
+    # max_beam_width is not included since vague behavior due to lacking the support for dynamic beam width during
+    # generation
+    black_list = set(["max_beam_width"])
+    executor_config_attrs = set(attr for attr in dir(tle.ExecutorConfig)
+                                if not attr.startswith('_')
+                                and callable(getattr(tle.ExecutorConfig, attr)))
+    executor_config_attrs -= black_list
+    llm_args_attr = set(BaseLlmArgs.model_fields.keys())
+    # NOTE: When cpp ExecutorConfig add new options, please add the new options into `LlmArgs` with docs as well
+    # ASK chunweiy for help if you are not sure about the new options.
+    assert executor_config_attrs.issubset(llm_args_attr), \
+        f"New options found in underlying ExecutorConfig: {executor_config_attrs - llm_args_attr}"
