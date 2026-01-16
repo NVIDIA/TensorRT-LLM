@@ -145,11 +145,13 @@ class GuidedDecoder:
                  guided_decoding_config: GuidedDecodingConfig,
                  max_num_sequences: int,
                  vocab_size_padded: int,
-                 max_num_draft_tokens: int = 0):
+                 max_num_draft_tokens: int = 0,
+                 rank: int = 0):
         self.guided_decoding_backend = guided_decoding_config.backend
         self.max_num_sequences = max_num_sequences
         self.vocab_size_padded = vocab_size_padded
         self.max_num_draft_tokens = max_num_draft_tokens
+        self.rank = rank
 
         if self.guided_decoding_backend == GuidedDecodingConfig.GuidedDecodingBackend.XGRAMMAR:
             self.grammar_matcher_factory = XGrammarMatcherFactory(
@@ -305,9 +307,26 @@ class GuidedDecoder:
         """
         if num_bitmask_tokens is None:
             num_bitmask_tokens = requests.num_bitmask_tokens
+
+        # In general, the logits passed to GuidedDecoder are complete in the vocabulary dimension.
+        # In some special cases (e.g., MTP), the logits are sharded in the vocabulary dimension.
+        vocab_size_padded = self.vocab_size_padded if d2t is None else d2t.size(
+            0)
+        assert vocab_size_padded % logits.size(1) == 0
+        tp_size = vocab_size_padded // logits.size(1)
+        assert self.bitmask_size % tp_size == 0
+        tp_rank = self.rank % tp_size
+        bitmask_start = tp_rank * self.bitmask_size // tp_size
+        bitmask_end = bitmask_start + self.bitmask_size // tp_size
+
+        if d2t is not None:
+            d2t_start = tp_rank * vocab_size_padded // tp_size
+            d2t_end = d2t_start + vocab_size_padded // tp_size
+            d2t = d2t[d2t_start:d2t_end]
+
         torch.ops.trtllm.logits_bitmask(
             logits[:num_bitmask_tokens],
-            self.bitmask[:num_bitmask_tokens],
+            self.bitmask[:num_bitmask_tokens, bitmask_start:bitmask_end],
             token_mask=self.token_mask[:num_bitmask_tokens],
             d2t=d2t)
 
@@ -423,9 +442,13 @@ class CapturableGuidedDecoder(GuidedDecoder):
                  guided_decoding_config: GuidedDecodingConfig,
                  max_num_sequences: int,
                  vocab_size_padded: int,
-                 max_num_draft_tokens: int = 0):
-        super().__init__(guided_decoding_config, max_num_sequences,
-                         vocab_size_padded, max_num_draft_tokens)
+                 max_num_draft_tokens: int = 0,
+                 rank: int = 0):
+        super().__init__(guided_decoding_config=guided_decoding_config,
+                         max_num_sequences=max_num_sequences,
+                         vocab_size_padded=vocab_size_padded,
+                         max_num_draft_tokens=max_num_draft_tokens,
+                         rank=rank)
         # self.requests should be accessed by normal host code;
         # self.requests_hostfunc should be accessed by hostfunc (CUDA callback).
         self.requests_hostfunc: Optional[GuidedRequests] = None

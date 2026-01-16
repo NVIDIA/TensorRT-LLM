@@ -273,6 +273,13 @@ class OpenAIServer:
         self.app.add_api_route("/v1/responses",
                                self.openai_responses,
                                methods=["POST"])
+        self.app.add_api_route('/v1/responses/{response_id}',
+                               self.openai_responses_get_response,
+                               methods=["GET"])
+        self.app.add_api_route('/v1/responses/{response_id}',
+                               self.openai_responses_delete_response,
+                               methods=["DELETE"])
+
         # RL-only endpoints
         self.app.add_api_route("/release_memory",
                                 self.release_memory,
@@ -556,9 +563,13 @@ class OpenAIServer:
                 )
             prompt = prompt_inputs(prompt)
 
-            mm_data = await mm_coroutines
-            if mm_data is not None:
+            mm_data, mm_embeddings = await mm_coroutines
+            if mm_data:
                 prompt["multi_modal_data"] = mm_data
+            if mm_embeddings:
+                prompt["multi_modal_embeddings"] = mm_embeddings
+            if mm_data and mm_embeddings:
+                raise ValueError("Passing 'multi_modal_data' and 'multi_modal_embeddings' at the same time is not supported.")
 
             postproc_args.reasoning_parser = self.llm.args.reasoning_parser
             postproc_args.tool_parser = self.tool_parser
@@ -659,7 +670,9 @@ class OpenAIServer:
                 )
             prompt = prompt_inputs(prompt)
 
-            mm_data = await mm_coroutines
+            mm_data, mm_embeddings = await mm_coroutines
+            if mm_embeddings:
+                raise ValueError("Cannot use multimodal embeddings as input")
             if mm_data is not None:
                 prompt["multi_modal_data"] = mm_data
 
@@ -1064,6 +1077,38 @@ class OpenAIServer:
             return self.create_error_response(str(e))
 
         return JSONResponse(content={"detail": "None"})
+
+    async def openai_responses_get_response(self, response_id: str) -> JSONResponse:
+        logger.info(f"Getting response: {response_id}")
+        if not self.enable_store:
+            return self.create_error_response(message="Response storage is disabled", err_type="InvalidRequestError")
+
+        if not response_id.startswith("resp_"):
+            return self._create_invalid_response_id_error(response_id)
+
+        response = await self.conversation_store.load_response(response_id)
+        if response is None:
+            return self._create_response_id_not_found_error(response_id)
+
+        return JSONResponse(content=response.model_dump())
+
+    async def openai_responses_delete_response(self, response_id: str) -> JSONResponse:
+        logger.info(f"Deleting response: {response_id}")
+        if not self.enable_store:
+            return self.create_error_response(message="Response storage is disabled", err_type="InvalidRequestError")
+
+        if not response_id.startswith("resp_"):
+            return self._create_invalid_response_id_error(response_id)
+
+        success = await self.conversation_store.pop_response(response_id)
+        if not success:
+            return self._create_response_id_not_found_error(response_id)
+
+        return JSONResponse(content={
+            "id": response_id,
+            "object": "response",
+            "deleted": True
+        })
 
     async def release_memory(self, request: MemoryUpdateRequest) -> JSONResponse:
         assert isinstance(self.llm, AsyncLLM), "/release_memory endpoint is only supported with AsyncLLM()"

@@ -218,7 +218,7 @@ SERVER_CONFIG_METRICS = {
 SPECULATIVE_CONFIG_METRICS = {
     "decoding_type": (True, str),
     "max_draft_len": (True, int),
-    "speculative_model_dir": (True, str),
+    "speculative_model": (True, str),
     "eagle3_one_model": (True, str_to_bool),
 }
 
@@ -259,7 +259,7 @@ class ServerConfig:
         enable_padding: bool = True,
         decoding_type: str = "",
         max_draft_len: int = 0,
-        speculative_model_dir: str = "",
+        speculative_model: str = "",
         eagle3_one_model: bool = False,
     ):
         self.name = name
@@ -285,7 +285,7 @@ class ServerConfig:
         self.enable_padding = enable_padding
         self.decoding_type = decoding_type
         self.max_draft_len = max_draft_len
-        self.speculative_model_dir = speculative_model_dir
+        self.speculative_model = speculative_model
         self.eagle3_one_model = eagle3_one_model
 
         model_dir = get_model_dir(self.model_name)
@@ -345,9 +345,9 @@ class ServerConfig:
             config_lines.append(f"  decoding_type: {self.decoding_type}")
             if self.max_draft_len > 0:
                 config_lines.append(f"  max_draft_len: {self.max_draft_len}")
-            if self.speculative_model_dir:
+            if self.speculative_model:
                 config_lines.append(
-                    f"  speculative_model_dir: {self.speculative_model_dir}")
+                    f"  speculative_model: {self.speculative_model}")
             if self.eagle3_one_model:
                 config_lines.append(
                     f"  eagle3_one_model: {str(self.eagle3_one_model).lower()}")
@@ -500,8 +500,8 @@ def parse_config_file(config_file_path: str, select_pattern: str = None):
                                                  {}).get('decoding_type', ''),
             max_draft_len=server_config_data.get('speculative_config',
                                                  {}).get('max_draft_len', 0),
-            speculative_model_dir=server_config_data.get(
-                'speculative_config', {}).get('speculative_model_dir', ''),
+            speculative_model=server_config_data.get(
+                'speculative_config', {}).get('speculative_model', ''),
             eagle3_one_model=server_config_data.get(
                 'speculative_config', {}).get('eagle3_one_model', False))
 
