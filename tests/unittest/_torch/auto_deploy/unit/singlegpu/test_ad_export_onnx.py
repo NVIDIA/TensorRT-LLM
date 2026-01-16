@@ -4,7 +4,8 @@ import onnx
 import pytest
 from _model_test_utils import get_small_model_config
 
-from tensorrt_llm._torch.auto_deploy import LLM, AutoDeployConfig
+from tensorrt_llm._torch.auto_deploy import LLM
+from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
 
 
 @pytest.mark.parametrize(
@@ -18,14 +19,14 @@ from tensorrt_llm._torch.auto_deploy import LLM, AutoDeployConfig
     ],
 )
 def test_ad_export_onnx(model: str, output_dir: str, num_attn_ops: int):
-    ad_config = AutoDeployConfig(
+    ad_config = LlmArgs(
         model=get_small_model_config(model)["args"]["model"],
-        mode="export_driveos_llm_onnx",
+        mode="export_edgellm_onnx",
         max_batch_size=13,
         max_seq_len=4,
     )
     ad_config.transforms["export_to_onnx"]["output_dir"] = output_dir
-    _ = LLM(**ad_config.to_llm_kwargs())
+    _ = LLM(**ad_config.model_dump(exclude_unset=True))
 
     # check if the output directory exists
     assert os.path.exists(output_dir)

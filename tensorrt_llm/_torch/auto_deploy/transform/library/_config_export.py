@@ -17,7 +17,7 @@ from typing import Any, Dict
 
 from ...utils.logger import ad_logger
 
-DRIVEOS_LLM_VERSION = "0.5.0.0"
+EDGELLM_VERSION = "0.5.0.0"
 
 
 def _export_native_llm_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
@@ -166,8 +166,8 @@ def export_vision_config(config: Any) -> Dict[str, Any]:
         raise KeyError(
             "Required field 'vision_config' or 'image_embd_layer' in 'embd_layer' not found in config"
         )
-    # Add DriveOS LLM API version
-    config_dict["driveos_llm_version"] = DRIVEOS_LLM_VERSION
+    # Add EdgeLLM API version
+    config_dict["edgellm_version"] = EDGELLM_VERSION
 
     # Return the original config_dict as-is without any modification
     # Since MRoPE needs LLM config, ViTRunner will use the LLM config.
@@ -199,7 +199,7 @@ def export_llm_config(config: Any, model_type: str) -> Dict[str, Any]:
     # Add model name to output
     output_config["model"] = model_name
 
-    # Add DriveOS LLM API version
-    output_config["driveos_llm_version"] = DRIVEOS_LLM_VERSION
+    # Add EdgeLLM API version
+    output_config["edgellm_version"] = EDGELLM_VERSION
 
     return output_config

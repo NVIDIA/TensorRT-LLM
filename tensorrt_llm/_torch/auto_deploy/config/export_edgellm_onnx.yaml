@@ -89,7 +89,7 @@ transforms:
     stage: post_load_fusion
     enabled:
       false # https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this causes OOMs on GPU
-      # But while export ONNX for DriveOS LLM, we compile the model on CPU..
+      # But while export ONNX for EdgeLLM, we compile the model on CPU..
       # So we can enable this transform.
       # TODO(yoco):However, it currently make non-strict ONNX export fail.
   fuse_moe:
@@ -118,7 +118,7 @@ transforms:
     stage: export_onnx
   gather_last_token_ids:
     stage: export_onnx
-  adapt_to_driveos_llm:
+  adapt_to_edgellm:
     stage: export_onnx
   export_to_onnx:
     stage: export_onnx

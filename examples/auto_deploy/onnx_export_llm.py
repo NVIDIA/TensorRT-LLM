@@ -15,7 +15,8 @@
 
 import argparse
 
-from tensorrt_llm._torch.auto_deploy import LLM, AutoDeployConfig
+from tensorrt_llm._torch.auto_deploy import LLM
+from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
 
 
 def main():
@@ -23,7 +24,7 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+        required=True,
         help="The HF model to use for onnx export.",
     )
     parser.add_argument(
@@ -42,7 +43,7 @@ def main():
 
     print(f"Constructing model from {args.model}")
 
-    # to enable dynamic batch_size, the match size must > 1
+    # to enable dynamic batch_size, the batch size must > 1
     # NOTE(yoco): Originally this is 2, however, don't know why, when set to 2,
     # the batch_size will collapse static int 2 even we explicitly it is dynamic axis.
     # And more weird, when set to 13, the batch_size will be dynamic.
@@ -51,10 +52,10 @@ def main():
     max_batch_size = 13
     max_seq_len = 4
 
-    # Prepare the AutoDeploy config, mode is export_driveos_llm_onnx
-    ad_config = AutoDeployConfig(
+    # Prepare the AutoDeploy config, mode is export_edgellm_onnx
+    ad_config = LlmArgs(
         model=args.model,
-        mode="export_driveos_llm_onnx",
+        mode="export_edgellm_onnx",
         max_batch_size=max_batch_size,
         max_seq_len=max_seq_len,
         device=args.device,
@@ -62,7 +63,7 @@ def main():
     ad_config.attn_backend = "torch"
     if args.output_dir is not None:
         ad_config.transforms["export_to_onnx"]["output_dir"] = args.output_dir
-    LLM(**ad_config.to_llm_kwargs())
+    LLM(**ad_config.model_dump(exclude_unset=True))
 
 
 if __name__ == "__main__":
