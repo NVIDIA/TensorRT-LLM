@@ -902,6 +902,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
     try {
         // Run ssh command to start node in desired cluster via SLURM
         withCredentials([
+            string(credentialsId: 'TRTLLM_HF_TOKEN', variable: 'HF_TOKEN'),
             usernamePassword(
                 credentialsId: 'svc_tensorrt',
                 usernameVariable: 'USERNAME',
@@ -1158,6 +1159,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export resourcePathNode=$resourcePathNode
                     export pytestCommand="$pytestCommand"
                     export coverageConfigFile="$coverageConfigFile"
+                    export HF_TOKEN=$HF_TOKEN
                     export NVIDIA_IMEX_CHANNELS=\${NVIDIA_IMEX_CHANNELS:-0}
                     export NVIDIA_VISIBLE_DEVICES=\${NVIDIA_VISIBLE_DEVICES:-\$(seq -s, 0 \$((\$(nvidia-smi --query-gpu=count -i 0 --format=csv,noheader)-1)))}
                     ${envExportStatements}
@@ -2789,6 +2791,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         containerLD_LIBRARY_PATH = containerLD_LIBRARY_PATH.replaceAll(':+$', '')
         withEnv(["LD_LIBRARY_PATH=${containerLD_LIBRARY_PATH}"]) {
             withCredentials([
+                string(credentialsId: 'TRTLLM_HF_TOKEN', variable: 'HF_TOKEN'),
                 usernamePassword(
                     credentialsId: 'svc_tensorrt_gitlab_read_api_token',
                     usernameVariable: 'GITLAB_API_USER',
