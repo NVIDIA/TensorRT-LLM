@@ -65,14 +65,12 @@ def get_or_scale_allreduce_mnnvl_workspace(
     """
 
     NUM_LAMPORT_BUFFERS = 3
-    if not hasattr(_thread_local,
-                   f'allreduce_mnnvl_workspaces_{mapping.pp_rank}'):
-        setattr(_thread_local, f'allreduce_mnnvl_workspaces_{mapping.pp_rank}',
-                {})
+
+    # Use MNNVLAllReduce class to share across threads
+    allreduce_mnnvl_workspaces = MNNVLAllReduce.allreduce_mnnvl_workspaces
+
     # A safe method to get the element size of the dtype
     elem_size = torch.tensor([], dtype=dtype).element_size()
-    allreduce_mnnvl_workspaces = getattr(
-        _thread_local, f'allreduce_mnnvl_workspaces_{mapping.pp_rank}')
     force_mn = os.environ.get("TRTLLM_FORCE_MNNVL_AR", "0") == "1"
     use_fabric_handle = force_mn or mapping.is_multi_node()
 
@@ -101,19 +99,19 @@ def get_or_scale_allreduce_mnnvl_workspace(
             # Increase the buffer size in 8 MiB granularity to avoid frequently scaling the buffer
             buffer_size_bytes = math.ceil(req_buffer_size_bytes /
                                           (8 * 1024 * 1024)) * (8 * 1024 * 1024)
-            if mapping.tp_rank == 0:
-                logger.debug(
-                    f"[MNNVL] Requested {req_buffer_size_bytes} bytes, is larger than the current workspace size. Scaling workspace for pp_rank {mapping.pp_rank}, tp_size {mapping.tp_size} from {allreduce_mnnvl_workspaces[mapping]['buffer_size_bytes']} to {buffer_size_bytes} bytes"
-                )
+            logger.debug(
+                f"[MNNVL] Requested {req_buffer_size_bytes} bytes, is larger than the current workspace size. Scaling workspace for pp_rank {mapping.pp_rank}, tp_size {mapping.tp_size} from {allreduce_mnnvl_workspaces[mapping]['buffer_size_bytes']} to {buffer_size_bytes} bytes"
+            )
         # Each workspace contains NUM_LAMPORT_BUFFERS buffers.
         workspace_size_bytes = NUM_LAMPORT_BUFFERS * buffer_size_bytes
+        # Pass the pre-split MPI communicator's Fortran handle to avoid redundant splitting in C++
         mcast_buf_handle = McastGPUBuffer(
             workspace_size_bytes,
             mapping.tp_size,
             mapping.tp_rank,
-            mapping.pp_rank * mapping.cp_size + mapping.cp_rank,
             mapping.local_rank,
             use_fabric_handle,  # whether to use fabric handle or POSIX FD ipc
+            comm.py2f(),  # Fortran handle for the MPI communicator
         )
 
         # We use per FP32 element in the buffer for lamport sync
@@ -517,6 +515,7 @@ class MNNVLAllReduce(nn.Module):
     This class handles the MNNVL-specific allreduce operations, which can be more efficient
     for certain operations when using NVLink for multi-node communication.
     """
+    allreduce_mnnvl_workspaces: Dict[int, Dict] = {}
 
     def __init__(self, mapping: Mapping, dtype: torch.dtype):
         super().__init__()
@@ -530,7 +529,7 @@ class MNNVLAllReduce(nn.Module):
             )
 
         # Initialize the workspace
-        _ = get_or_scale_allreduce_mnnvl_workspace(self.mapping, self.dtype)
+        get_or_scale_allreduce_mnnvl_workspace(self.mapping, self.dtype)
 
     @staticmethod
     def get_supported_dtypes():
