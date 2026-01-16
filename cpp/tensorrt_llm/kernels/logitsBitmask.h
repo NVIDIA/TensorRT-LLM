@@ -32,7 +32,7 @@ void invokeLogitsBitmask(
 
 template <typename T>
 void invokeContiguousLogitsBitmask(T* logits, uint32_t const* bitmask, int32_t const* tokenMask, int32_t const* d2t,
-    int32_t batchSize, int32_t vocabSizePadded, int32_t bitmaskSize, cudaStream_t stream);
+    int32_t batchSize, int32_t vocabSizePadded, int32_t bitmaskStride, cudaStream_t stream);
 
 } // namespace kernels
 

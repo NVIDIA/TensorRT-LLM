@@ -110,6 +110,7 @@ l0_h100:
   - test_e2e.py::test_trtllm_bench_help_sanity[meta-llama/Llama-3.1-8B]
   - test_e2e.py::test_openai_chat_harmony
   - test_e2e.py::test_openai_responses
+  - test_e2e.py::test_openai_chat_guided_decoding
   - test_e2e.py::test_trtllm_benchmark_serving[llama-3.1-model/Meta-Llama-3.1-8B]
 - condition:
     ranges:

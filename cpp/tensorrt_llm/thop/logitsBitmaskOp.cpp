@@ -23,6 +23,11 @@ TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
+namespace
+{
+int32_t constexpr kBitsPerMaskElement = 32;
+} // namespace
+
 void logitsBitmask(torch::Tensor const& logits, torch::Tensor const& bitmask,
     at::optional<torch::Tensor> const& tokenMask = at::nullopt, at::optional<torch::Tensor> const& d2t = at::nullopt)
 {
@@ -34,12 +39,15 @@ void logitsBitmask(torch::Tensor const& logits, torch::Tensor const& bitmask,
     TORCH_CHECK(bitmask.size(0) == batchSize, "bitmask must have the same batch size as logits.");
 
     int32_t vocabSizePadded = logits.size(1);
-    int32_t bitmaskSize = bitmask.size(1);
+    if (!d2t.has_value())
+    {
+        TORCH_CHECK(bitmask.size(1) == tensorrt_llm::common::ceilDiv(vocabSizePadded, kBitsPerMaskElement),
+            "bitmask.size(1) must be equal to ceilDiv(vocab_size, 32).");
+    }
     TORCH_CHECK(logits.is_cuda(), "logits must be a CUDA tensor.");
     TORCH_CHECK(logits.is_contiguous(), "logits must be contiguous.");
     TORCH_CHECK(logits.dim() == 2, "logits must be a 2D tensor.");
     TORCH_CHECK(bitmask.is_cuda(), "bitmask must be a CUDA tensor.");
-    TORCH_CHECK(bitmask.is_contiguous(), "bitmask must be contiguous.");
     TORCH_CHECK(bitmask.dim() == 2, "bitmask must be a 2D tensor.");
     TORCH_CHECK(bitmask.scalar_type() == torch::kUInt32 || bitmask.scalar_type() == torch::kInt32,
         "bitmask must have element type uint32 or int32.");
@@ -52,7 +60,7 @@ void logitsBitmask(torch::Tensor const& logits, torch::Tensor const& bitmask,
         TORCH_CHECK(tokenMask->dim() == 1, "tokenMask must be a 1D tensor.");
         TORCH_CHECK(tokenMask->size(0) == batchSize, "tokenMask must have the same batch size as logits.");
         TORCH_CHECK(tokenMask->scalar_type() == torch::kInt32, "tokenMask must have element type int32.");
-        tokenMaskPtr = reinterpret_cast<int32_t const*>(tokenMask->data_ptr());
+        tokenMaskPtr = static_cast<int32_t const*>(tokenMask->data_ptr());
     }
 
     int32_t const* d2tPtr = nullptr;
@@ -63,7 +71,7 @@ void logitsBitmask(torch::Tensor const& logits, torch::Tensor const& bitmask,
         TORCH_CHECK(d2t->dim() == 1, "d2t must be a 1D tensor.");
         TORCH_CHECK(d2t->size(0) == vocabSizePadded, "d2t must have the same vocab size as logits.");
         TORCH_CHECK(d2t->scalar_type() == torch::kInt32, "d2t must have element type int32.");
-        d2tPtr = reinterpret_cast<int32_t const*>(d2t->data_ptr());
+        d2tPtr = static_cast<int32_t const*>(d2t->data_ptr());
     }
 
     auto stream = at::cuda::getCurrentCUDAStream(logits.get_device()).stream();
@@ -72,23 +80,23 @@ void logitsBitmask(torch::Tensor const& logits, torch::Tensor const& bitmask,
     {
     case torch::kFloat32:
     {
-        tensorrt_llm::kernels::invokeContiguousLogitsBitmask<float>(reinterpret_cast<float*>(logits.data_ptr()),
-            reinterpret_cast<uint32_t const*>(bitmask.data_ptr()), tokenMaskPtr, d2tPtr, batchSize, vocabSizePadded,
-            bitmaskSize, stream);
+        tensorrt_llm::kernels::invokeContiguousLogitsBitmask<float>(static_cast<float*>(logits.data_ptr()),
+            static_cast<uint32_t const*>(bitmask.data_ptr()), tokenMaskPtr, d2tPtr, batchSize, vocabSizePadded,
+            bitmask.stride(0), stream);
         break;
     }
     case torch::kFloat16:
     {
-        tensorrt_llm::kernels::invokeContiguousLogitsBitmask<__half>(reinterpret_cast<__half*>(logits.data_ptr()),
-            reinterpret_cast<uint32_t const*>(bitmask.data_ptr()), tokenMaskPtr, d2tPtr, batchSize, vocabSizePadded,
-            bitmaskSize, stream);
+        tensorrt_llm::kernels::invokeContiguousLogitsBitmask<__half>(static_cast<__half*>(logits.data_ptr()),
+            static_cast<uint32_t const*>(bitmask.data_ptr()), tokenMaskPtr, d2tPtr, batchSize, vocabSizePadded,
+            bitmask.stride(0), stream);
         break;
     }
     case torch::kBFloat16:
     {
         tensorrt_llm::kernels::invokeContiguousLogitsBitmask<__nv_bfloat16>(
-            reinterpret_cast<__nv_bfloat16*>(logits.data_ptr()), reinterpret_cast<uint32_t const*>(bitmask.data_ptr()),
-            tokenMaskPtr, d2tPtr, batchSize, vocabSizePadded, bitmaskSize, stream);
+            static_cast<__nv_bfloat16*>(logits.data_ptr()), static_cast<uint32_t const*>(bitmask.data_ptr()),
+            tokenMaskPtr, d2tPtr, batchSize, vocabSizePadded, bitmask.stride(0), stream);
         break;
     }
     default: TORCH_CHECK(false, "logits dtype must be float, half or bfloat16."); break;

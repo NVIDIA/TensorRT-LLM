@@ -358,7 +358,9 @@ class ResizeKVCache(BaseTransform):
             f"Extra memory used during forward pass (MB): {mem_used_during_forward_pass_mb}"
         )
 
-        free_mem_post, _ = get_mem_info_in_mb(empty_cache=True)
+        # TODO (lucaslie): logic needs overhaul, too much going on. For now, this is just reverting
+        # to the original logic. Full overhaulwill be done as part of #10013
+        free_mem_post, _ = get_mem_info_in_mb(empty_cache=False)
         self._log_info(f"Free memory after forward pass (MB): {free_mem_post}")
 
         memory_for_forward_pass = free_mem_pre - free_mem_post
