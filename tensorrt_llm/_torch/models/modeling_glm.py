@@ -982,8 +982,6 @@ class Glm4MoeForCausalLM(SpecDecOneEngineForCausalLM[Glm4Model, PretrainedConfig
                                 )
                     self.model_config.quant_config.exclude_modules.extend(extend_exclude_modules)
             self.model.layers.extend(self.draft_model.mtp_layers)
-            self.epilogue.extend(self.draft_model.mtp_layers)
-            self.epilogue.append(self.spec_worker)
 
     def forward(
         self,
