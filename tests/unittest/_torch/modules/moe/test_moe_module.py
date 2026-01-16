@@ -46,7 +46,20 @@ MPI.pickle.__init__(
 )
 
 
-def test_moe_worker(moe_backend, dtype, quant_algo, mapping=None, enable_eplb=False):
+def _skip_helper(quant_algo):
+    if quant_algo == QuantAlgo.NVFP4 and getSMVersion() < 100:
+        pytest.skip("This test is not supported in pre-Blackwell architecture")
+
+
+def _test_moe_worker(
+    moe_backend,
+    dtype,
+    quant_algo,
+    mapping=None,
+    enable_eplb=False,
+    layer_updates_per_iter=-1,
+    num_slots=-1,
+):
     # Hardcode some parameters for testing
     # activation and weight related
     seq_len = 4
@@ -86,80 +99,86 @@ def test_moe_worker(moe_backend, dtype, quant_algo, mapping=None, enable_eplb=Fa
         )
         weights = quantize_util.create_weights(**quant_kwargs)
 
-    # Deepcopy the CPU weight since when eplb turns on, fused moe may advise_tensor_pageout in post load weight.
-    ref_weights = copy.deepcopy(weights) if enable_eplb else weights
+        if enable_eplb:
+            # Keep the tensor on CPU for eplb
+            for key in weights:
+                if isinstance(weights[key], torch.Tensor):
+                    weights[key] = weights[key].to("cpu")
 
-    # Create pretrained config
-    pretrained_config = PretrainedConfig()
-    pretrained_config.num_experts = num_experts
-    pretrained_config.hidden_size = hidden_size
-    pretrained_config.intermediate_size = intermediate_size
-    pretrained_config.torch_dtype = dtype
+        # Deepcopy the CPU weight since when eplb turns on, fused moe may advise_tensor_pageout in post load weight.
+        ref_weights = copy.deepcopy(weights) if enable_eplb else weights
 
-    if enable_eplb:
-        num_slots = 144
-        layer_updates_per_iter = 2
-        moe_load_balancer_config = MoeLoadBalancerConfig(
-            num_slots=num_slots,
-            layer_updates_per_iter=layer_updates_per_iter,
-        )
-    else:
-        moe_load_balancer_config = None
+        # Create pretrained config
+        pretrained_config = PretrainedConfig()
+        pretrained_config.num_experts = num_experts
+        pretrained_config.hidden_size = hidden_size
+        pretrained_config.intermediate_size = intermediate_size
+        pretrained_config.torch_dtype = dtype
 
-    model_config = ModelConfig(
-        pretrained_config=pretrained_config,
-        mapping=mapping,
-        quant_config=quant_config,
-        moe_backend=moe_backend,
-        moe_disable_finalize_fusion=not finalize_fusion,
-        moe_load_balancer=moe_load_balancer_config,
-    )
+        if enable_eplb:
+            num_slots = 144
+            layer_updates_per_iter = 2
+            moe_load_balancer_config = MoeLoadBalancerConfig(
+                num_slots=num_slots,
+                layer_updates_per_iter=layer_updates_per_iter,
+            )
+        else:
+            moe_load_balancer_config = None
 
-    moe_load_balancer = nullcontext()
-    if enable_eplb:
-        # A simple implementation of maybe_create_moe_load_balancer for unit test.
-        ep_rank = model_config.mapping.moe_ep_rank
-        ep_size = model_config.mapping.moe_ep_size
-        model_config.moe_load_balancer.setup(ep_rank=ep_rank, ep_size=ep_size)
-        moe_load_balancer = MoeLoadBalancer(
-            ep_rank=ep_rank,
-            ep_size=ep_size,
-            layer_updates_per_iter=model_config.moe_load_balancer.layer_updates_per_iter,
+        model_config = ModelConfig(
+            pretrained_config=pretrained_config,
+            mapping=mapping,
+            quant_config=quant_config,
+            moe_backend=moe_backend,
+            moe_disable_finalize_fusion=not finalize_fusion,
+            moe_load_balancer=moe_load_balancer_config,
         )
 
-    with moe_load_balancer:
-        # Create fused MoE module
-        fused_moe = create_moe(
-            routing_method=routing_method, reduce_results=True, model_config=model_config
-        )
+        moe_load_balancer = nullcontext()
+        if enable_eplb:
+            # A simple implementation of maybe_create_moe_load_balancer for unit test.
+            ep_rank = model_config.mapping.moe_ep_rank
+            ep_size = model_config.mapping.moe_ep_size
+            model_config.moe_load_balancer.setup(ep_rank=ep_rank, ep_size=ep_size)
+            moe_load_balancer = MoeLoadBalancer(
+                ep_rank=ep_rank,
+                ep_size=ep_size,
+                layer_updates_per_iter=model_config.moe_load_balancer.layer_updates_per_iter,
+            )
 
-        fused_moe.load_weights([weights])
-        fused_moe.post_load_weights()
-        fused_moe.cuda(f"cuda:{mapping.rank}")
+        with moe_load_balancer:
+            # Create fused MoE module
+            fused_moe = create_moe(
+                routing_method=routing_method, reduce_results=True, model_config=model_config
+            )
 
-        if isinstance(moe_load_balancer, MoeLoadBalancer):
-            moe_load_balancer.register_weight_slots_after_to_cuda()
-            moe_load_balancer.finalize_model()
+            fused_moe.load_weights([weights])
+            fused_moe.post_load_weights()
+            fused_moe.cuda(f"cuda:{mapping.rank}")
 
-        ref_fused_moe = quantize_util.create_ref_module(routing_method)
-        ref_fused_moe.load_weights([ref_weights])
-        ref_fused_moe.cuda(f"cuda:{mapping.rank}")
-
-        # Evaluate the outputs
-        with torch.inference_mode():
-            ref_output = ref_fused_moe.forward(x, router_logits)
             if isinstance(moe_load_balancer, MoeLoadBalancer):
-                with MoeLoadBalancerIterContext(moe_load_balancer):
+                moe_load_balancer.register_weight_slots_after_to_cuda()
+                moe_load_balancer.finalize_model()
+
+            ref_fused_moe = quantize_util.create_ref_module(routing_method)
+            ref_fused_moe.load_weights([ref_weights])
+            ref_fused_moe.cuda(f"cuda:{mapping.rank}")
+
+            # Evaluate the outputs
+            with torch.inference_mode():
+                ref_output = ref_fused_moe.forward(x, router_logits)
+                if isinstance(moe_load_balancer, MoeLoadBalancer):
+                    with MoeLoadBalancerIterContext(moe_load_balancer):
+                        output = fused_moe.forward(
+                            x, router_logits, all_rank_num_tokens=all_rank_num_tokens
+                        )
+                else:
                     output = fused_moe.forward(
                         x, router_logits, all_rank_num_tokens=all_rank_num_tokens
                     )
-            else:
-                output = fused_moe.forward(
-                    x, router_logits, all_rank_num_tokens=all_rank_num_tokens
-                )
 
-        torch.cuda.synchronize()
-        ref_fused_moe.check_accuracy(output, ref_output)
+            torch.cuda.synchronize()
+            ref_fused_moe.check_accuracy(output, ref_output)
 
 
 @pytest.mark.parametrize(
@@ -193,22 +212,23 @@ def test_moe(dtype, moe_backend, quant_algo, mocker):
     if moe_backend == "TRTLLM":
         if dtype == torch.float16 and quant_algo == QuantAlgo.NVFP4:
             pytest.skip("TRTLLM NVFP4 MoE backend does not support float16 yet")
-    if quant_algo == QuantAlgo.NVFP4 and getSMVersion() < 100:
-        pytest.skip("This test is not supported in pre-Blackwell architecture")
+    _skip_helper(quant_algo)
 
-    test_moe_worker(moe_backend=moe_backend, dtype=dtype, quant_algo=quant_algo)
+    _test_moe_worker(moe_backend=moe_backend, dtype=dtype, quant_algo=quant_algo)
 
 
 def _test_moe_multi_gpu(
-    alltoall_method_type,
+    comm_method_type,
     moe_backend,
     quant_algo,
     dtype,
     ep_size,
     world_size,
     enable_eplb=False,
+    layer_updates_per_iter=-1,
+    num_slots=-1,
 ):
-    def init_worker(custom_paths, alltoall_method_type):
+    def init_worker(custom_paths, comm_method_type):
         # Update the sys.path to align with main process for submodule import
         for custom_path in custom_paths:
             if custom_path.endswith("tests/unittest") and custom_path not in sys.path:
@@ -218,13 +238,13 @@ def _test_moe_multi_gpu(
         os.environ["ENABLE_CONFIGURABLE_MOE"] = "1"
 
         # Set comm method
-        os.environ["TRTLLM_FORCE_COMM_METHOD"] = alltoall_method_type
+        os.environ["TRTLLM_FORCE_COMM_METHOD"] = comm_method_type
 
     with MPIPoolExecutor(
-        initializer=init_worker, initargs=(sys.path, alltoall_method_type), max_workers=world_size
+        initializer=init_worker, initargs=(sys.path, comm_method_type), max_workers=world_size
     ) as executor:
         results = executor.map(
-            test_moe_worker,
+            _test_moe_worker,
             *zip(
                 *[
                     (
@@ -239,6 +259,8 @@ def _test_moe_multi_gpu(
                             enable_attention_dp=True,
                         ),
                         enable_eplb,
+                        layer_updates_per_iter,
+                        num_slots,
                     )
                 ]
                 * world_size
@@ -266,22 +288,21 @@ def _test_moe_multi_gpu(
     ids=lambda val: f"moe_backend={val}",
 )
 @pytest.mark.parametrize(
-    "alltoall_method_type",
+    "comm_method_type",
     [
         "NVLINK_ONE_SIDED",
         "NVLINK_TWO_SIDED",
     ],
-    ids=lambda val: f"alltoall_method_type={val}",
+    ids=lambda val: f"comm_method_type={val}",
 )
-def test_moe_multi_gpu(alltoall_method_type, moe_backend, quant_algo):
-    if quant_algo == QuantAlgo.NVFP4 and getSMVersion() < 100:
-        pytest.skip("This test is not supported in pre-Blackwell architecture")
+def test_moe_multi_gpu(comm_method_type, moe_backend, quant_algo):
+    _skip_helper(quant_algo)
 
     dtype = torch.bfloat16
     ep_size = 4
     world_size = 4
     _test_moe_multi_gpu(
-        alltoall_method_type,
+        comm_method_type,
         moe_backend,
         quant_algo,
         dtype=dtype,
@@ -309,26 +330,43 @@ def test_moe_multi_gpu(alltoall_method_type, moe_backend, quant_algo):
     ids=lambda val: f"moe_backend={val}",
 )
 @pytest.mark.parametrize(
-    "alltoall_method_type",
+    "comm_method_type",
     [
         "NVLINK_ONE_SIDED",
         "NVLINK_TWO_SIDED",
     ],
-    ids=lambda val: f"alltoall_method_type={val}",
+    ids=lambda val: f"comm_method_type={val}",
 )
-def test_moe_multi_gpu_eplb(alltoall_method_type, moe_backend, quant_algo):
-    if quant_algo == QuantAlgo.NVFP4 and getSMVersion() < 100:
-        pytest.skip("This test is not supported in pre-Blackwell architecture")
+@pytest.mark.parametrize(
+    "num_slots",
+    [
+        144,
+    ],
+    ids=lambda val: f"num_slots={val}",
+)
+@pytest.mark.parametrize(
+    "layer_updates_per_iter",
+    [
+        2,
+    ],
+    ids=lambda val: f"layer_updates_per_iter={val}",
+)
+def test_moe_multi_gpu_eplb(
+    layer_updates_per_iter, num_slots, comm_method_type, moe_backend, quant_algo
+):
+    _skip_helper(quant_algo)
 
     dtype = torch.bfloat16
     ep_size = 4
     world_size = 4
     _test_moe_multi_gpu(
-        alltoall_method_type,
+        comm_method_type,
         moe_backend,
         quant_algo,
         dtype=dtype,
         ep_size=ep_size,
         world_size=world_size,
         enable_eplb=True,
+        layer_updates_per_iter=layer_updates_per_iter,
+        num_slots=num_slots,
     )
