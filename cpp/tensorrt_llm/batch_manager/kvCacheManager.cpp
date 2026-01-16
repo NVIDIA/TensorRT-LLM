@@ -2581,6 +2581,19 @@ void KVCacheManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const& bl
     mBlockManager.unpinBlocksById(blockIds);
 }
 
+tle::RetentionPriority KVCacheManager::getPriorityByBlockId(KVCacheBlock::IdType blockId) const
+{
+    if (blockId >= 0 && blockId < mBlockManager.getMaxNumBlocks())
+    {
+        BlockPtr const& block = mBlockManager.getBlockById(blockId);
+        if (block)
+        {
+            return block->getPriority();
+        }
+    }
+    return tle::KvCacheRetentionConfig::kDefaultRetentionPriority;
+}
+
 SizeType32 KVCacheManager::copyBlockOffsets(ITensor& output, SizeType32 outputSlotOffset, RequestIdType requestId) const
 {
     auto const& sequence = getSequence(requestId);
