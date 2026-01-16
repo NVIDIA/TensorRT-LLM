@@ -34,12 +34,12 @@ public:
     //! \param bufSize The total size of the buffer in bytes.
     //! \param groupSize The number of ranks in the communication group.
     //! \param groupRank The rank of the local process within the group.
-    //! \param splitColor The color of the split for topology split.
-    //! \param device The CUDA device for buffer allocation.
+    //! \param deviceIdx The CUDA device for buffer allocation.
     //! \param mnNvlink Flag indicating if multi-node NVLink is used.
-    McastGPUBuffer(
-        size_t bufSize, uint32_t groupSize, uint32_t groupRank, uint32_t splitColor, uint32_t deviceIdx, bool mnNvlink)
-        : mMcastDeviceMemory(bufSize, groupSize, groupRank, splitColor, deviceIdx, mnNvlink)
+    //! \param mpiCommFortranHandle The Fortran handle for the MPI communicator (from Python mpi4py).
+    McastGPUBuffer(size_t bufSize, uint32_t groupSize, uint32_t groupRank, uint32_t deviceIdx, bool mnNvlink,
+        int64_t mpiCommFortranHandle)
+        : mMcastDeviceMemory(bufSize, groupSize, groupRank, deviceIdx, mnNvlink, mpiCommFortranHandle)
         , mBufSize(bufSize)
         , mLocalDevice(at::Device(at::DeviceType::CUDA, deviceIdx))
     {
