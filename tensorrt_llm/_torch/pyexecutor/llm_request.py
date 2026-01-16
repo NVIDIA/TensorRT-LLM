@@ -566,6 +566,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # currently, keep py_stop_words_list as python list, rather than tensor.
         self.py_stop_words_list = stop_words_list
 
+        self.py_disaggregated_params = None
+
         self.py_result = PyResult(
             prompt_len=self.py_prompt_len,
             max_new_tokens=self.py_max_new_tokens,
@@ -826,6 +828,10 @@ def executor_request_to_llm_request(
         py_multimodal_data=getattr(executor_request, "py_multimodal_data",
                                    None),
         kv_cache_retention_config=executor_request.kv_cache_retention_config)
+
+    llm_request.py_disaggregated_params = getattr(executor_request,
+                                                  "py_disaggregated_params",
+                                                  None)
     if child_req_ids:
         for child_id in child_req_ids:
             llm_request.create_child_request(child_id)
