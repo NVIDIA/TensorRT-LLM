@@ -1,4 +1,4 @@
-# Adapted from: https://github.com/huggingface/diffusers/blob/9d313fc718c8ace9a35f07dad9d5ce8018f8d216/src/diffusers/pipelines/flux/pipeline_flux.py
+# Adapted from: https://github.com/huggingface/diffusers/blob/8af8e86bc7a2a2a038b6d5954793cdcc7b20f1e3/src/diffusers/pipelines/flux2/pipeline_flux2.py
 # Copyright 2025 Black Forest Labs and The HuggingFace Team. All rights reserved.
 #
 # Adapted from: https://github.com/ali-vilab/TeaCache
@@ -25,20 +25,22 @@
 # limitations under the License.
 
 import gc
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union, Tuple
 
 import numpy as np
 import torch
+import PIL
 from diffusers import Flux2Pipeline
-from diffusers.pipelines.flux.pipeline_flux import Flux2PipelineOutput, calculate_shift, retrieve_timesteps
+from diffusers.pipelines.flux2.pipeline_flux2 import Flux2PipelineOutput, retrieve_timesteps, compute_empirical_mu
 from diffusers.utils import is_torch_xla_available
 from safetensors.torch import load_file
 
+from visual_gen.configs.diffusion_cache import TeaCacheConfig
 from visual_gen.configs.op_manager import LinearOpManager
 from visual_gen.configs.parallel import VAEParallelConfig
 from visual_gen.configs.pipeline import PipelineConfig
 from visual_gen.layers.linear import ditLinear
-from visual_gen.models.transformers.flux_transformer import ditFlux2Transformer2DModel
+from visual_gen.models.transformers.flux2_transformer import ditFlux2Transformer2DModel
 from visual_gen.pipelines.base_pipeline import ditBasePipeline
 from visual_gen.utils.logger import get_logger
 
@@ -54,6 +56,26 @@ else:
 
 
 class ditFlux2Pipeline(Flux2Pipeline, ditBasePipeline):
+
+    def _set_teacache_coefficients(self, **kwargs) -> None:
+            teacache_configs = kwargs.pop("teacache", None)
+            
+            if teacache_configs is not None:
+                logger.debug("Setting up TeaCache configuration")
+                self.transformer.teacache_coefficients = [
+                    1.04582360e+02,
+                    -6.87605554e+00,
+                    -8.61659379e-02,
+                    5.37600252e-02
+                ]
+                TeaCacheConfig.set_config(
+                    enable_teacache=teacache_configs.pop("enable_teacache", False),
+                    teacache_thresh=teacache_configs.pop("teacache_thresh", 0.),
+                    use_ret_steps=teacache_configs.pop("use_ret_steps", False),
+                    ret_steps=teacache_configs.pop("ret_steps", 0),
+                    cutoff_steps=teacache_configs.pop("cutoff_steps", 50),
+                    cnt=0
+                )
 
     def _after_load(self, pretrained_model_name_or_path, *args, **kwargs) -> None:
         """Post-processing hook after load model checkpoints in 'from_pretrained' method."""
@@ -74,15 +96,10 @@ class ditFlux2Pipeline(Flux2Pipeline, ditBasePipeline):
         if linear_type == "te-fp8-per-tensor":
             self._fuse_gemm_gelu(self.transformer)
 
-        self.transformer.teacache_coefficients = [
-            1.04582360e+02,
-            -6.87605554e+00,
-            -8.61659379e-02,
-            5.37600252e-02
-        ]
-
         if not VAEParallelConfig.disable_parallel_vae:
             logger.warning("VAE parallel is not supported for FluxPipeline")
+
+        self._set_teacache_coefficients(**kwargs)
 
     def load_fp4_weights(self, path, svd_weight_name_table):
         weights_table = load_file(path)
@@ -91,7 +108,7 @@ class ditFlux2Pipeline(Flux2Pipeline, ditBasePipeline):
                 module.load_fp4_weight(weights_table, svd_weight_name_table)
 
     @torch.no_grad()
-   def __call__(
+    def __call__(
         self,
         image: Optional[Union[List[PIL.Image.Image], PIL.Image.Image]] = None,
         prompt: Union[str, List[str]] = None,
@@ -113,7 +130,15 @@ class ditFlux2Pipeline(Flux2Pipeline, ditBasePipeline):
         text_encoder_out_layers: Tuple[int] = (10, 20, 30),
         caption_upsample_temperature: float = None,
     ):
-       
+        #setup teacache num_steps
+        if TeaCacheConfig.enable_teacache():
+            TeaCacheConfig.set_config(
+                    num_steps=num_inference_steps
+            )
+
+            if TeaCacheConfig.cutoff_steps() > TeaCacheConfig.num_steps():
+                logger.warning("Number of cutoff_steps > num_steps.")
+
         # 1. Check inputs. Raise error if not correct
         self.check_inputs(
             prompt=prompt,
@@ -137,8 +162,8 @@ class ditFlux2Pipeline(Flux2Pipeline, ditBasePipeline):
             batch_size = prompt_embeds.shape[0]
 
 
-        batch_size, prompt, negative_prompt, prompt_embeds = self.dit_dp_split(
-            batch_size, prompt, negative_prompt, prompt_embeds
+        batch_size, prompt, _, prompt_embeds, _ = self.dit_dp_split(
+            batch_size, prompt, None, prompt_embeds, None
         )
 
         device = self._execution_device

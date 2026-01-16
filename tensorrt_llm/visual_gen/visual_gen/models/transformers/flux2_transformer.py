@@ -248,10 +248,9 @@ class ditFlux2Transformer2DModel(Flux2Transformer2DModel, ditBaseTransformer):
         if TeaCacheConfig.enable_teacache():
             img_mod1, _ = double_stream_mod_img
             img_mod1_shift, img_mod1_scale, _ = img_mod1
-            img_modulated = self.transformer_blocks[0].img_norm1(img)
+            img_modulated = self.transformer_blocks[0].norm1_context(hidden_states) # norm1 or norm1_context
             img_modulated = (1 + img_mod1_scale) * img_modulated + img_mod1_shift
-            should_calc, hidden_states = self._calc_teacache_distance(modulated_inp, hidden_states)
-
+            should_calc, hidden_states = self._calc_teacache_distance(img_modulated, hidden_states)
 
         if should_calc:
             original_hidden_states = hidden_states.clone()
