@@ -540,6 +540,53 @@ class SpecWorkerBase(nn.Module, ABC):
         if self.guided_decoder is not None:
             self.guided_decoder.execute(logits)
 
+    def _prepare_next_new_tokens(self, accepted_tokens, next_draft_tokens,
+                                 batch_indices_cuda, batch_size,
+                                 num_accepted_tokens):
+        """
+        Prepare next_new_tokens for overlap scheduler support.
+
+        Args:
+            accepted_tokens: [batch_size, max_draft_len + 1] - Accepted tokens
+            next_draft_tokens: [batch_size, max_draft_len] - Predicted draft tokens
+            batch_indices_cuda: Batch indices tensor
+            batch_size: Number of requests
+            num_accepted_tokens: [batch_size] - Number of accepted tokens per request
+
+        Returns:
+            next_new_tokens: [batch_size, max_draft_len + 1] - Input tokens for next iteration
+        """
+        next_new_tokens = accepted_tokens[batch_indices_cuda[:batch_size],
+                                          num_accepted_tokens - 1].unsqueeze(1)
+        next_new_tokens = torch.concat([next_new_tokens, next_draft_tokens],
+                                       dim=1)
+        return next_new_tokens
+
+    def _prepare_context_input_ids(self, input_ids, num_ctx_tokens, gather_ids,
+                                   accepted_tokens, num_contexts):
+        """
+        Prepare context input IDs for draft model forward.
+        Shifts input IDs left by 1 and places the first accepted token at gather positions.
+
+        Args:
+            input_ids: Original input IDs tensor
+            num_ctx_tokens: Number of context tokens
+            gather_ids: Indices for placing accepted tokens (last token positions)
+            accepted_tokens: [batch_size, max_draft_len + 1] - Accepted tokens
+            num_contexts: Number of context requests
+
+        Returns:
+            input_ids_ctx: Prepared context input IDs
+        """
+        input_prompt_ids = input_ids[:num_ctx_tokens]
+        input_ids_ctx = torch.empty_like(input_prompt_ids,
+                                         dtype=torch.int32,
+                                         device="cuda")
+        input_ids_ctx[:-1].copy_(input_prompt_ids[1:])
+        input_ids_ctx[
+            gather_ids[:num_contexts]] = accepted_tokens[:num_contexts, 0]
+        return input_ids_ctx
+
     def _sample_tokens_for_batch(
         self,
         logits: torch.Tensor,

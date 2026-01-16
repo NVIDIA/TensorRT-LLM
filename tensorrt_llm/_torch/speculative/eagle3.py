@@ -484,11 +484,9 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
 
         # prepare next new tokens to support overlap scheduler
-        next_new_tokens = accepted_tokens[
-            spec_metadata.batch_indices_cuda[:batch_size],
-            num_accepted_tokens - 1].unsqueeze(1)
-        next_new_tokens = torch.concat([next_new_tokens, next_draft_tokens],
-                                       dim=1)
+        next_new_tokens = self._prepare_next_new_tokens(
+            accepted_tokens, next_draft_tokens,
+            spec_metadata.batch_indices_cuda, batch_size, num_accepted_tokens)
 
         attn_metadata.use_spec_decoding = True
 
@@ -566,14 +564,9 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         hidden_states = draft_model.apply_eagle3_fc(hidden_states)
 
         # context
-        input_ctx_ids = input_ids[:attn_metadata.num_ctx_tokens]
-        input_ids_ctx = torch.empty_like(input_ctx_ids,
-                                         dtype=torch.int32,
-                                         device="cuda")
-        input_ids_ctx[:-1].copy_(input_ctx_ids[1:])
-        input_ids_ctx[
-            spec_metadata.
-            gather_ids[:num_contexts]] = accepted_tokens[:num_contexts, 0]
+        input_ids_ctx = self._prepare_context_input_ids(
+            input_ids, attn_metadata.num_ctx_tokens, spec_metadata.gather_ids,
+            accepted_tokens, num_contexts)
 
         # generation
         input_ids_gen = accepted_tokens[num_contexts:, :].flatten()
