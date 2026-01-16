@@ -13,6 +13,27 @@ import torch
 from transformers import AutoModelForCausalLM
 
 
+def minimax_m2_rmsnorm(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    """MiniMaxM2RMSNorm forward using AutoDeploy's global RMSNorm op.
+
+    This patch replaces MiniMax's RMSNorm implementation with AutoDeploy's
+    torch_rmsnorm_global custom op. This ensures:
+    1. The RMSNorm remains as a single op in the FX graph (easier to detect/replace)
+    2. During sharding pass, if this is in an attention subgraph with TP,
+       it can be replaced with col_sharded_global_rmsnorm for correct global
+       normalization across column-sharded activations.
+
+    Args:
+        hidden_states: Input tensor of shape [..., hidden_size]
+
+    Returns:
+        Normalized tensor of same shape
+    """
+    return torch.ops.auto_deploy.torch_rmsnorm_global(
+        hidden_states, self.weight, self.variance_epsilon
+    )
+
+
 def minimax_m2_moe(self, hidden_states: torch.Tensor):
     """MiniMaxM2SparseMoeBlock forward function rewritten to enable torch.export.
 
@@ -63,6 +84,7 @@ _from_config_previous = AutoModelForCausalLM.from_config
 
 CUSTOM_MODULE_PATCHES: Dict[str, callable] = {
     "MiniMaxM2SparseMoeBlock": minimax_m2_moe,
+    "MiniMaxM2RMSNorm": minimax_m2_rmsnorm,
 }
 
 

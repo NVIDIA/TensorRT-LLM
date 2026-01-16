@@ -685,6 +685,58 @@ def _resolve_ep_cls_from_node(node: Node) -> type[EPShardingInfo]:
     return EPShardingInfo
 
 
+class GlobalRMSNormShardingInfo(ShardingTransformInfo):
+    """Configuration for replacing global RMSNorm with column-sharded version.
+
+    When QK normalization (torch_rmsnorm_global) is applied to column-sharded
+    activations, it needs to be replaced with col_sharded_global_rmsnorm which
+    uses all_reduce to compute the correct global mean across shards.
+    """
+
+    world_size: int
+
+    @classmethod
+    def from_node(cls, node: Node, **kwargs) -> "GlobalRMSNormShardingInfo":
+        """Create a GlobalRMSNormShardingInfo from a node."""
+        return cls(target_node=node.name, **kwargs)
+
+    def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
+        """Validate that the node is a torch_rmsnorm_global op."""
+        if not is_op(node, torch.ops.auto_deploy.torch_rmsnorm_global):
+            ad_logger.debug(
+                f"GlobalRMSNormShardingInfo only applies to torch_rmsnorm_global ops. "
+                f"Got {node.target}. Skipping."
+            )
+            return False
+        return True
+
+    def apply(self, gm: GraphModule, node: Node) -> None:
+        """Replace torch_rmsnorm_global with col_sharded_global_rmsnorm.
+
+        The replacement adds the world_size parameter which is needed for
+        computing the correct global mean across all shards.
+        """
+        # Get original arguments: (input, weight, eps)
+        input_node = node.args[0]
+        weight_node = node.args[1]
+        eps = node.args[2]
+
+        # Insert the new node with world_size parameter
+        with gm.graph.inserting_after(node):
+            new_node = gm.graph.call_function(
+                torch.ops.auto_deploy.col_sharded_global_rmsnorm,
+                args=(input_node, weight_node, eps, self.world_size),
+            )
+            node.replace_all_uses_with(new_node)
+
+        # Remove the old node
+        gm.graph.erase_node(node)
+        ad_logger.debug(
+            f"Replaced torch_rmsnorm_global with col_sharded_global_rmsnorm "
+            f"(world_size={self.world_size})"
+        )
+
+
 ########################################################
 #  Transform API classes
 ########################################################
@@ -821,6 +873,9 @@ class ShardingTransformExecutor(BaseTransform):
         for ep_transform in transforms.ep_transforms:
             if check_and_apply(ep_transform):
                 num_matches += 1
+        for global_rmsnorm_transform in transforms.global_rmsnorm_transforms:
+            if check_and_apply(global_rmsnorm_transform):
+                num_matches += 1
 
         # post-sharding cleanup transformations
         for update_transform in transforms.parameter_update_transforms:
@@ -844,6 +899,7 @@ class ShardingTransformContainer(BaseModel):
     parameter_update_transforms: List[ParameterUpdateInfo] = Field(default_factory=list)
     bmm_transforms: List[BMMShardingInfo] = Field(default_factory=list)
     ep_transforms: List[EPShardingInfo] = Field(default_factory=list)
+    global_rmsnorm_transforms: List[GlobalRMSNormShardingInfo] = Field(default_factory=list)
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -852,6 +908,7 @@ class ShardingTransformContainer(BaseModel):
             BMMShardingInfo: self.bmm_transforms,
             EPShardingInfo: self.ep_transforms,
             ParameterUpdateInfo: self.parameter_update_transforms,
+            GlobalRMSNormShardingInfo: self.global_rmsnorm_transforms,
         }
 
     def add(self, transform: ShardingTransformInfo) -> bool:
@@ -2014,6 +2071,21 @@ def _shard_intermediate_attention_weights(
         ):
             ad_logger.debug(f"Added sharding for intermediate attention weight: {weight_key}")
             added_nodes += 1
+
+        # Check if the user node is a global RMSNorm that needs all_reduce for correct sharding
+        # torch_rmsnorm_global is used for QK normalization that needs global mean across shards
+        if is_op(user_node, torch.ops.auto_deploy.torch_rmsnorm_global):
+            if transform_container.add(
+                GlobalRMSNormShardingInfo.from_node(
+                    user_node,
+                    config=config,
+                    world_size=world_size,
+                )
+            ):
+                ad_logger.debug(
+                    f"Added GlobalRMSNormShardingInfo for {user_node.name} "
+                    f"(will use all_reduce for global mean)"
+                )
 
     return added_nodes
 
