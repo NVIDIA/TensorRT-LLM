@@ -2183,11 +2183,10 @@ class PyExecutor:
                 # If set before, the response of a request may be incorrect, as it will
                 # use the wrong indices for generation logits when streaming is enabled.
                 for request in scheduled_batch.generation_requests:
-                    if request.state != LlmRequestState.GENERATION_COMPLETE:
-                        if not self.disable_overlap_scheduler and request.will_complete_next_iteration(
-                        ):
-                            request.set_exclude_last_generation_logits(False)
-                            request.state = LlmRequestState.GENERATION_TO_COMPLETE
+                    if request.state != LlmRequestState.GENERATION_COMPLETE and request.will_complete_next_iteration(
+                    ):
+                        request.set_exclude_last_generation_logits(False)
+                        request.state = LlmRequestState.GENERATION_TO_COMPLETE
 
                 if can_queue:
                     if self.enable_iter_perf_stats:

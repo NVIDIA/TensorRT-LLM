@@ -185,6 +185,7 @@ def test_generation_with_return_logits(
                 idx=idx,
                 output=output,
                 streaming=True)
+        assert idx == sampling_params.max_tokens - 1
     else:
         for idx, output in enumerate(
                 llm.generate(
@@ -203,6 +204,7 @@ def test_generation_with_return_logits(
                 idx=idx,
                 output=output,
                 streaming=False)
+        assert idx == len(prompts) - 1
 
 @pytest.mark.parametrize("logprobs_k", [0, 1, 3], ids=["top_0", "top_1", "top_3"])
 @pytest.mark.parametrize("logprobs_mode", ["raw", "processed"])

@@ -765,8 +765,10 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         result, is_final = super().create_serialized_result(
             use_fast_logits, mpi_world_rank)
 
+        # When using beam search we cannot incrementically update the logprobs in the result.
+        # Instead we need to update all logprobs. In that case no deep copy is needed.
         need_deep_copy_logprobs = self.py_result.log_probs and self.sampling_config.beam_width <= 1
-        need_deep_copy_generation_logits = self.py_result._generation_logits
+        need_deep_copy_generation_logits = self.py_result._generation_logits is not None
         need_any_deep_copy = need_deep_copy_logprobs or need_deep_copy_generation_logits
         # Performs a deep copy of py_result._log_probs or py_result._generation_logits to eliminate race conditions
         # that may occur between IPC communication and the overriding of newly generated log_probs
