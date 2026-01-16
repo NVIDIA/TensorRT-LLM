@@ -35,6 +35,18 @@ _VALID_KV_CACHE_DTYPES = ("fp8", "nvfp4", "auto")
 
 def validate_and_set_mamba_ssm_cache_dtype(config: ModelConfig,
                                            mamba_ssm_cache_dtype: str) -> None:
+    # Flashinfer kernel only support bfloat16 for mamba_ssm_cache_dtype.
+    try:
+        from flashinfer.mamba import \
+            selective_state_update as selective_state_update_flashinfer
+    except Exception:
+        selective_state_update_flashinfer = None
+    if selective_state_update_flashinfer is not None:
+        mamba_ssm_cache_dtype = "bfloat16"
+        logger.warning(
+            "Using bfloat16 for mamba_ssm_cache_dtype to match flashinfer kernel dtype requirement."
+        )
+
     if mamba_ssm_cache_dtype == "auto":
         mamba_ssm_cache_dtype = config.pretrained_config.torch_dtype
     else:

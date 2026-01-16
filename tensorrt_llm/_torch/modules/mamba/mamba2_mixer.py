@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Optional
 
 import torch
@@ -26,7 +27,14 @@ from ...model_config import ModelConfig
 from ..linear import Linear, TensorParallelMode
 from .causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from .layernorm_gated import RMSNorm as RMSNormGated
-from .selective_state_update import selective_state_update
+
+try:
+    from flashinfer.mamba import \
+        selective_state_update as selective_state_update_flashinfer
+except Exception:
+    selective_state_update_flashinfer = None
+from .selective_state_update import \
+    selective_state_update as selective_state_update_triton
 from .ssd_combined import mamba_chunk_scan_combined
 
 
@@ -54,6 +62,17 @@ class Mamba2Mixer(nn.Module):
         config: Optional[ModelConfig] = None,
     ):
         super().__init__()
+
+        # flashinfer kernel only support bfloat16 for weight_dtype.
+        # Enable flashinfer kernel by default.
+        if os.environ.get(
+                "TLLM_USE_FLASHINFER_DECODE_KERNEL",
+                "1") == "1" and selective_state_update_flashinfer is not None:
+            self._weight_dtype = torch.bfloat16
+            self._decode_func = selective_state_update_flashinfer
+        else:
+            self._weight_dtype = torch.float32
+            self._decode_func = selective_state_update_triton
 
         config = config or ModelConfig()
         self.mapping = config.mapping
@@ -121,13 +140,13 @@ class Mamba2Mixer(nn.Module):
         # D
         self.D = nn.Parameter(
             torch.empty(self.tp_nheads,
-                        dtype=torch.float32,
+                        dtype=self._weight_dtype,
                         requires_grad=False))
 
         # dt_bias
         self.dt_bias = nn.Parameter(
             torch.empty(self.tp_nheads,
-                        dtype=torch.float32,
+                        dtype=self._weight_dtype,
                         requires_grad=False))
 
         # norm
@@ -284,7 +303,7 @@ class Mamba2Mixer(nn.Module):
             dt_bias = repeat(self.dt_bias, "h -> h p", p=self.head_dim)
             D = repeat(self.D, "h -> h p", p=self.head_dim)
 
-            y = selective_state_update(
+            y = self._decode_func(
                 ssm_states,
                 x_d,
                 dt_d,

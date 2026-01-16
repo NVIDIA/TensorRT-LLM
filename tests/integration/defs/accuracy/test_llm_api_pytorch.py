@@ -5312,9 +5312,9 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
-    @skip_pre_blackwell
-    @pytest.mark.skip_less_mpi_world_size(8)
-    def test_nvfp4_8gpus(self):
+    # @skip_pre_blackwell
+    # @pytest.mark.skip_less_mpi_world_size(8)
+    def test_nvfp4_4gpus(self):
         # Use this test to track the best performance config.
         # The optimized config is still under investigation.
         # Adding this test as placeholder.
@@ -5326,8 +5326,8 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                     free_gpu_memory_fraction=0.5,
                 ),
                 max_batch_size=32,
-                tensor_parallel_size=8,
-                moe_expert_parallel_size=8,
+                tensor_parallel_size=4,
+                moe_expert_parallel_size=4,
                 pipeline_parallel_size=1,
                 enable_attention_dp=False,
                 cuda_graph_config=CudaGraphConfig(max_batch_size=32,
