@@ -3139,29 +3139,6 @@ def test_ptp_quickstart_bert(llm_root, llm_venv, model_name, model_path,
     print("Success: HF model logits match TRTLLM logits!")
 
 
-@pytest.mark.parametrize("model_name,model_path", [
-    ("Llama3.1-8B-BF16", "llama-3.1-model/Meta-Llama-3.1-8B"),
-])
-def test_ptp_star_attention_example(llm_root, llm_venv, model_name, model_path,
-                                    star_attention_input_root):
-    print(f"Testing {model_name}.")
-    workspace = llm_venv.get_working_directory()
-    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
-    input_file = Path(
-        os.path.join(star_attention_input_root,
-                     "test_star_attention_input.jsonl"))
-    output_file = Path(os.path.join(workspace, "star_attention_output.jsonl"))
-    llm_venv.run_cmd([
-        str(example_root / "star_attention.py"),
-        "--model_path",
-        f"{llm_models_root()}/{model_path}",
-        "--sa_block_size=200",
-        "--sa_anchor_size=200",
-        f"--input_file={input_file}",
-        f"--output_file={output_file}",
-    ])
-
-
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("model_name,model_path", [
     ("DeepSeek-R1-Distill-Qwen-7B", "DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B"),

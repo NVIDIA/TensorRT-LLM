@@ -505,7 +505,8 @@ def create_py_executor(
                 kwargs = {
                     "guided_decoding_config": guided_decoding_config,
                     "max_num_sequences": max_batch_size,
-                    "vocab_size_padded": model_engine.model.vocab_size_padded
+                    "vocab_size_padded": model_engine.model.vocab_size_padded,
+                    "rank": mapping.rank,
                 }
                 if spec_config is not None:
                     kwargs[

@@ -138,6 +138,36 @@ def convert_allocations_to_server_config(allocations, server_port=8333):
     return server_config
 
 
+def convert_envs_to_str(env_vars: Dict[str, str]) -> str:
+    return ','.join([f"{key}='{value}'" for key, value in env_vars.items()])
+
+
+def replace_env_in_file(log_dir, file_path, env_var):
+    with open(file_path, 'r', encoding='utf-8') as f:
+        config_content = f.read()
+
+    for env_name, env_value in env_var.items():
+        file_content = config_content.replace(env_name, env_value)
+
+    tmp_dir = os.path.join(log_dir, "lm_eval_configs")
+    os.makedirs(tmp_dir, exist_ok=True)
+    tmp_file = os.path.join(tmp_dir, os.path.basename(file_path))
+
+    # Write modified config to temp file
+    with open(tmp_file, 'w', encoding='utf-8') as f:
+        f.write(file_content)
+
+    # Check if has custom utils.py in the same directory
+    # Needed for GPQA task
+    custom_utils_path = os.path.join(os.path.dirname(file_path), 'utils.py')
+    if os.path.exists(custom_utils_path):
+        # copy utils.py to temp directory
+        shutil.copy(custom_utils_path, tmp_dir)
+
+    # Return temp directory
+    return tmp_dir
+
+
 def submit_job(config, log_dir, dry_run):
     # Extract configurations
     slurm_config = config['slurm']
@@ -208,24 +238,24 @@ def submit_job(config, log_dir, dry_run):
     gen_batch_size = worker_config['gen']['max_batch_size']
     gen_enable_attention_dp = worker_config['gen']['enable_attention_dp']
 
+    # Get eplb num_slots for gen worker
+    load_balancer_config = worker_config['gen'].get('moe_config', {}).get(
+        'load_balancer', {})
+    if isinstance(load_balancer_config, str):
+        with open(load_balancer_config, 'r') as f:
+            load_balancer_config = yaml.safe_load(f)
+    eplb_num_slots = load_balancer_config.get('num_slots', 0)
+
+    # Get mtp_size from gen config's speculative_config
+    mtp_size = worker_config['gen'].get('speculative_config',
+                                        {}).get('num_nextn_predict_layers', 0)
+
+    # Create base log directory path
     if log_dir is None:
-        # Create base log directory path
-        date_prefix = datetime.now().strftime("%Y%m%d")
-        log_base = os.path.join(env_config['work_dir'],
-                                f"{date_prefix}/{isl}-{osl}")
+        log_base = os.path.join(env_config['work_dir'], "logs")
 
-        # Get eplb num_slots for gen worker
-        load_balancer_config = worker_config['gen'].get('moe_config', {}).get(
-            'load_balancer', {})
-        if isinstance(load_balancer_config, str):
-            with open(load_balancer_config, 'r') as f:
-                load_balancer_config = yaml.safe_load(f)
-        eplb_num_slots = load_balancer_config.get('num_slots', 0)
-
-        # Get mtp_size from gen config's speculative_config
-        mtp_size = worker_config['gen'].get('speculative_config',
-                                            {}).get('num_nextn_predict_layers',
-                                                    0)
+        date_prefix = datetime.now().strftime("%Y%m%d-%H%M%S")
+        log_base = os.path.join(log_base, f"{date_prefix}/{isl}-{osl}")
 
         # Determine directory suffix based on attention_dp
         if gen_enable_attention_dp:
@@ -340,27 +370,59 @@ def submit_job(config, log_dir, dry_run):
         f"--container-mounts={env_config['container_mount']}",
         f"--mpi=pmix --overlap -N 1 -n 1",
     ]
-    if benchmark_config['use_nv_sa_benchmark']:
-        benchmark_cmd = [
-            f"bash {env_config['work_dir']}/run_benchmark_nv_sa.sh",
-            f"'{env_config['model_path']}' {isl} {osl} {benchmark_config['benchmark_ratio']} {benchmark_config['multi_round']} {gen_num} '{benchmark_config['concurrency_list']}' {benchmark_config['streaming']} '{log_dir}' {disagg_server_hostname} {disagg_server_port}",
-            f"&> {log_dir}/6_bench.log"
+
+    # Append benchmark commands
+    if benchmark_config.get('enable_benchmark', True):
+        env_var = config['benchmark'].get('env_var', {})
+        benchmark_prefix = client_slurm_prefix + [
+            f"--export \"{convert_envs_to_str(env_var)}\""
         ]
-        client_cmds.append(" ".join(client_slurm_prefix + benchmark_cmd))
-    else:
-        benchmark_cmd = [
-            f"bash {env_config['work_dir']}/run_benchmark.sh",
-            f"'{env_config['model_path']}' '{benchmark_config['dataset_file']}' {benchmark_config['multi_round']} {gen_num} '{benchmark_config['concurrency_list']}' {benchmark_config['streaming']} '{log_dir}' {disagg_server_hostname} {disagg_server_port}",
-            f"&> {log_dir}/6_bench.log"
-        ]
-        client_cmds.append(" ".join(client_slurm_prefix + benchmark_cmd))
+        if benchmark_config['use_nv_sa_benchmark']:
+            benchmark_cmd = [
+                f"bash {env_config['work_dir']}/run_benchmark_nv_sa.sh",
+                f"'{env_config['model_path']}' {isl} {osl} {benchmark_config['benchmark_ratio']} {benchmark_config['multi_round']} {gen_num} '{benchmark_config['concurrency_list']}' {benchmark_config['streaming']} '{log_dir}' {disagg_server_hostname} {disagg_server_port}",
+                f"&> {log_dir}/6_bench.log"
+            ]
+            client_cmds.append(" ".join(benchmark_prefix + benchmark_cmd))
+        else:
+            benchmark_cmd = [
+                f"bash {env_config['work_dir']}/run_benchmark.sh",
+                f"'{env_config['model_path']}' '{benchmark_config['dataset_file']}' {benchmark_config['multi_round']} {gen_num} '{benchmark_config['concurrency_list']}' {benchmark_config['streaming']} '{log_dir}' {disagg_server_hostname} {disagg_server_port}",
+                f"&> {log_dir}/6_bench.log"
+            ]
+            client_cmds.append(" ".join(benchmark_prefix + benchmark_cmd))
+
+    # Append accuracy test commands
     if config['accuracy']['enable_accuracy_test']:
-        accuracy_cmd = [
-            f"bash {env_config['work_dir']}/accuracy_eval.sh",
-            f"'{log_dir}' '{config['accuracy']['model']}' '{config['accuracy']['tasks']}' '{env_config['model_path']}' '{config['accuracy']['model_args_extra']}' '{log_dir}/accuracy_eval' {disagg_server_hostname} {disagg_server_port}",
-            f"&> {log_dir}/7_accuracy_eval.log"
+        env_var = config['accuracy'].get('env_var', {})
+        accuracy_prefix = client_slurm_prefix + [
+            f"--export \"{convert_envs_to_str(env_var)}\""
         ]
-        client_cmds.append(" ".join(client_slurm_prefix + accuracy_cmd))
+        for task in config['accuracy']['tasks']:
+            extra_kwargs = config['accuracy']['tasks'][task].get(
+                'extra_kwargs', {})
+            extra_kwargs_str = ""
+            for key, value in extra_kwargs.items():
+                if isinstance(value, bool):
+                    if value:
+                        extra_kwargs_str += f" --{key}"
+                elif key == "custom_config":
+                    extra_kwargs_str += f" --include_path={replace_env_in_file(log_dir, value, env_var)}"
+                else:
+                    extra_kwargs_str += f" --{key}='{value}'"
+            end_point_map = {
+                'local-completions': 'v1/completions',
+                'local-chat-completions': 'v1/chat/completions',
+            }
+            model = config['accuracy']['tasks'][task]['model']
+            accuracy_cmd = [
+                'lm_eval', '--model', model, '--tasks', task, '--model_args',
+                f"model={env_config['model_path']},base_url=http://{disagg_server_hostname}:{disagg_server_port}/{end_point_map[model]},{config['accuracy']['tasks'][task]['model_args_extra']}",
+                '--log_samples', '--output_path',
+                f'{log_dir}/accuracy_eval_{task}', extra_kwargs_str,
+                f"&> {log_dir}/7_accuracy_eval_{task}.log"
+            ]
+            client_cmds.append(" ".join(accuracy_prefix + accuracy_cmd))
     with open(os.path.join(log_dir, "client_cmds.sh"), "w") as f:
         f.write("\n".join(client_cmds) + "\n")
 
