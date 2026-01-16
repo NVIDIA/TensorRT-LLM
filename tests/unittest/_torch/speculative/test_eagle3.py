@@ -591,9 +591,9 @@ def test_deepseek_mla_eagle3():
         )
 
         spec_config = Eagle3DecodingConfig(max_draft_len=max_draft_len,
-                                          speculative_model=eagle_model_dir,
-                                          eagle3_one_model=use_one_model,
-                                          load_format="dummy")
+                                           speculative_model=eagle_model_dir,
+                                           eagle3_one_model=use_one_model,
+                                           load_format="dummy")
 
         llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
 
