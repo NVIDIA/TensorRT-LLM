@@ -633,3 +633,93 @@ class NVFP4QuantizationFromGraph(NVFP4LinearQuantizationFromConfig):
         return gm, TransformInfo(
             skipped=False, num_matches=cnt, is_clean=cnt == 0, has_valid_shapes=True
         )
+
+
+@TransformRegistry.register("quantize_hf_fp8_linear_from_config")
+class HFFineGrainedFP8LinearQuantization(Quantization):
+    """Quantization transform for HuggingFace FineGrainedFP8 (block-wise FP8) models.
+
+    This transform replaces linear ops with the HF FineGrainedFP8 quantized op.
+    The HF FP8 format uses per-block weight scales (weight_scale_inv) and
+    dynamic input quantization.
+
+    Config format (from HF config.json):
+        "quantization_config": {
+            "quant_method": "fp8",
+            "weight_block_size": [128, 128],
+            "modules_to_not_convert": ["lm_head"]
+        }
+    """
+
+    algo_name = "fp8"
+
+    def target_op(self):
+        return torch.ops.auto_deploy.torch_fake_quant_hf_fp8_linear.default
+
+    def quantize_weight(self, w: torch.Tensor) -> torch.Tensor:
+        return torch.empty_like(w, dtype=torch.float8_e4m3fn, device=w.device)
+
+    def scale_names(self) -> List[str]:
+        return ["weight_scale_inv"]
+
+    def default_scales(self, original_weight_shape: Tuple) -> Dict[str, torch.Tensor]:
+        # Default block size is 128x128 for HF FP8
+        N, K = original_weight_shape
+        block_n, block_k = 128, 128
+        scale_shape = (N // block_n, K // block_k)
+        return {"weight_scale_inv": torch.ones(scale_shape, dtype=torch.bfloat16)}
+
+    def build_custom_args_for_linear(self, scales: Dict[str, Node]) -> Tuple:
+        return ([], [scales["weight_scale_inv"]], [], [])
+
+    def load_hook(self, state_dict, prefix, *args, weight_name: str):
+        """Load hook to handle HF FineGrainedFP8 checkpoint format.
+
+        HF FP8 checkpoints store:
+        - weight: float8_e4m3fn tensor
+        - weight_scale_inv: per-block scale tensor
+        """
+        if weight_name not in state_dict:
+            return
+
+        weight = state_dict[weight_name]
+        if weight.dtype == torch.float8_e4m3fn:
+            scale_inv_name = weight_name + "_scale_inv"
+            if scale_inv_name in state_dict:
+                # Rename to match our buffer name
+                mod_prefix = weight_name.rsplit(".", 1)[0]
+                state_dict[mod_prefix + ".weight_scale_inv"] = state_dict[scale_inv_name]
+
+    def _apply(
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        qcfg = factory.get_quant_config()
+        if not qcfg:
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
+        quant_method = str(qcfg.get("quant_method", "")).lower()
+        if quant_method != self.algo_name:
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
+        excluded = qcfg.get("modules_to_not_convert", [])
+
+        cnt = 0
+        for n in gm.graph.nodes:
+            if not is_linear_op(n):
+                continue
+            if should_skip_quantization(n, excluded):
+                continue
+            self._insert_quantized_linear(gm, n, is_quantized_graph=False)
+            cnt += 1
+
+        return gm, TransformInfo(
+            skipped=False, num_matches=cnt, is_clean=False, has_valid_shapes=(cnt == 0)
+        )
