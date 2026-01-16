@@ -115,8 +115,9 @@ potentially negatively impacting performance. In practice, this effect has been
 observed to have minimal performance impact, but some degradation of
 performance due to remote NUMA node access is still theoretically possible.
 
-One example of how to apply bindpcie to `trtllm-serve` when launched from an
-sbatch script using `trtllm-llmapi-launch` is as follows:
+The `bindpcie` script can only be applied to deployments that make use of
+`trtllm-llmapi-launch` within an sbatch script. One example of how to apply
+bindpcie to `trtllm-serve` in an sbatch script is as follows:
 
 ```bash
 # Prevent TensorRT-LLM from autoconfiguring or clearing CPU affinity
