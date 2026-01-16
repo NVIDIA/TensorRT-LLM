@@ -111,4 +111,4 @@ def apply_visual_gen_norm(model: nn.Module, rmsnorm: list = [], layernorm: list 
         del module
 
     gc.collect()
-    torch.cuda.empty_cache()
+    torch.cuda.empty_cache() 

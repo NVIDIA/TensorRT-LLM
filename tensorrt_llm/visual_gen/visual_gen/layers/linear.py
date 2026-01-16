@@ -605,4 +605,4 @@ class ditLinear(nn.Linear):
             visual_gen_linear.weight.data = linear.weight.data
             if bias:
                 visual_gen_linear.bias.data = linear.bias.data
-        return visual_gen_linear
+        return visual_gen_linear 
