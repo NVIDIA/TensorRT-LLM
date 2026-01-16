@@ -466,11 +466,6 @@ MULTIMODAL_ARCH_ORDER: Tuple[str, ...] = (
     "Qwen2_5_VLForConditionalGeneration",
 )
 
-# Display names for multimodal architectures (for docs rendering)
-MULTIMODAL_ARCH_DISPLAY_NAMES: Mapping[str, str] = {
-    "LlavaLlamaModel": "LlavaLlamaModel (VILA)",
-}
-
 
 def get_cell(architecture: str, feature: Feature) -> Optional[FeatureCell]:
     row = MULTIMODAL_MATRIX.get(architecture)
@@ -571,9 +566,8 @@ def render_supported_models_markdown() -> str:
     mm_rows: List[List[str]] = []
     for arch in MULTIMODAL_ARCH_ORDER:
         cells = MULTIMODAL_MATRIX.get(arch, {})
-        display_name = MULTIMODAL_ARCH_DISPLAY_NAMES.get(arch, arch)
         mm_rows.append(
-            [f"`{display_name}`"]
+            [f"`{arch}`"]
             + [cells.get(feature, FeatureCell()).render() for feature in MULTIMODAL_FEATURES]
         )
     out.append(_render_md_table(headers=mm_headers, rows=mm_rows))
