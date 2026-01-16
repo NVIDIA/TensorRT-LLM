@@ -910,19 +910,21 @@ def get_layer_after_linear_node(
             min_local_shape = shape(ssm_nodes[0])[-1]
         else:
             layer_type = LayerType.UNKNOWN
-    if len(attention_nodes) > 0:
+    if len(attention_nodes) > 0 and layer_type != LayerType.UNKNOWN:
         if len(attention_nodes) == 1:
             layer_type = LayerType.ATTENTION
             # determine head size
             min_local_shape = shape(attention_nodes[0])[-1]
         else:
             layer_type = LayerType.UNKNOWN
-    if len(intermediate_lin_nodes) > 0:
+    if len(intermediate_lin_nodes) > 0 and layer_type != LayerType.UNKNOWN:
         if len(intermediate_lin_nodes) == 2 and len(attention_nodes) == 1:
             layer_type = LayerType.MLA
         else:
             layer_type = LayerType.UNKNOWN
     # only SSM or MLA layers can have weight nodes in the interior nodes
+    # TODO: Minimax does have RMSNorm inside attention, we need to
+    # support it in the future.
     if len(intermediate_weight_nodes) > 0:
         if layer_type not in [LayerType.SSM, LayerType.MLA]:
             layer_type = LayerType.UNKNOWN
