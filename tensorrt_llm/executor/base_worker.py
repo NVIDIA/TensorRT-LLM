@@ -448,16 +448,6 @@ class BaseWorker(GenerationExecutor):
                 context_phase_params = request.disaggregated_params.get_context_phase_params(
                 )
 
-        if self._is_pytorch_backend:
-            if not self.llm_args.disable_overlap_scheduler:
-                is_disaggregated = self.engine.kv_cache_transceiver is not None
-                if is_disaggregated and (
-                        request_type
-                        == tllm.RequestType.REQUEST_TYPE_CONTEXT_ONLY):
-                    raise ValueError(
-                        "Context only requests are not supported in pytorch backend when overlap is enabled."
-                    )
-
         assert request.id is not None
 
         def _deduce_max_tokens(request: GenerationRequest,
