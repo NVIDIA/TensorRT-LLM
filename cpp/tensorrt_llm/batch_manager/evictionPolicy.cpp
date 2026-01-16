@@ -124,7 +124,7 @@ std::tuple<BlockPtr, bool> LRUEvictionPolicy::getFreeBlock(SizeType32 cacheLevel
 bool LRUEvictionPolicy::blockAlreadyReleased(BlockPtr block)
 {
     SizeType32 const id = block->getBlockId();
-    return mFreeBlockIterators.find(id) != mFreeBlockIterators.end();
+    return mFreeBlockIterators[id] == std::nullopt;
 }
 
 void LRUEvictionPolicy::releaseBlock(BlockPtr block)
