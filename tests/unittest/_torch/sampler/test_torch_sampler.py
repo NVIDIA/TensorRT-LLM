@@ -748,8 +748,8 @@ def test_write_finish_reasons():
                 prompt=[1, 12],
                 stop_words_list=[[12, 13], [14, 15]],
                 new_tokens=[13, 14, 15],
-                # We have an early exit specifically for stop words
-                finish_reasons=[STOP_WORDS, NOT_FINISHED, NOT_FINISHED],
+                # We don't use early exit to avoid stream synchronization for stop words
+                finish_reasons=[STOP_WORDS, NOT_FINISHED, STOP_WORDS],
             ),
             RequestCase(
                 prompt=[1, 12],

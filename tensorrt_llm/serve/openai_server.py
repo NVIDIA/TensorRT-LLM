@@ -51,20 +51,22 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 MemoryUpdateRequest, ModelCard,
                                                 ModelList, PromptTokensDetails,
                                                 ResponsesRequest,
+                                                ResponsesResponse,
                                                 UpdateWeightsRequest, UsageInfo,
                                                 to_llm_disaggregated_params)
 from tensorrt_llm.serve.postprocess_handlers import (
     ChatCompletionPostprocArgs, ChatPostprocArgs, CompletionPostprocArgs,
-    chat_harmony_post_processor, chat_harmony_streaming_post_processor,
-    chat_response_post_processor, chat_stream_post_processor,
-    completion_response_post_processor, completion_stream_post_processor)
+    ResponsesAPIPostprocArgs, chat_harmony_post_processor,
+    chat_harmony_streaming_post_processor, chat_response_post_processor,
+    chat_stream_post_processor, completion_response_post_processor,
+    completion_stream_post_processor, responses_api_post_processor,
+    responses_api_streaming_post_processor)
 from tensorrt_llm.serve.responses_utils import (ConversationHistoryStore,
+                                                ResponsesStreamingProcessor,
                                                 ServerArrivalTimeMiddleware)
 from tensorrt_llm.serve.responses_utils import \
     create_response as responses_api_create_response
 from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
-from tensorrt_llm.serve.responses_utils import \
-    process_streaming_events as responses_api_process_streaming_events
 from tensorrt_llm.serve.responses_utils import \
     request_preprocess as responses_api_request_preprocess
 from tensorrt_llm.version import __version__ as VERSION
@@ -119,9 +121,8 @@ class OpenAIServer:
             self.model_config = None
 
         # Enable response storage for Responses API
-        self.enable_store = True
-        if len(os.getenv("TRTLLM_RESPONSES_API_DISABLE_STORE", "")) > 0:
-            self.enable_store = False
+        self.enable_store = (len(os.getenv("TRTLLM_RESPONSES_API_DISABLE_STORE", "")) < 1) and not self.postproc_worker_enabled
+
         self.conversation_store = ConversationHistoryStore()
 
         model_dir = Path(model)
@@ -156,6 +157,8 @@ class OpenAIServer:
         self.tool_call_id_type = "random" # default tool call id type is random
         if self.model_config.model_type == "kimi_k2":
             self.tool_call_id_type = "kimi_k2"
+        elif self.model_config.model_type == "deepseek_v32":
+            self.tool_call_id_type = "deepseek_v32"
 
         # as disagg-worker
         self.disagg_cluster_storage = None
@@ -270,6 +273,13 @@ class OpenAIServer:
         self.app.add_api_route("/v1/responses",
                                self.openai_responses,
                                methods=["POST"])
+        self.app.add_api_route('/v1/responses/{response_id}',
+                               self.openai_responses_get_response,
+                               methods=["GET"])
+        self.app.add_api_route('/v1/responses/{response_id}',
+                               self.openai_responses_delete_response,
+                               methods=["DELETE"])
+
         # RL-only endpoints
         self.app.add_api_route("/release_memory",
                                 self.release_memory,
@@ -553,9 +563,13 @@ class OpenAIServer:
                 )
             prompt = prompt_inputs(prompt)
 
-            mm_data = await mm_coroutines
-            if mm_data is not None:
+            mm_data, mm_embeddings = await mm_coroutines
+            if mm_data:
                 prompt["multi_modal_data"] = mm_data
+            if mm_embeddings:
+                prompt["multi_modal_embeddings"] = mm_embeddings
+            if mm_data and mm_embeddings:
+                raise ValueError("Passing 'multi_modal_data' and 'multi_modal_embeddings' at the same time is not supported.")
 
             postproc_args.reasoning_parser = self.llm.args.reasoning_parser
             postproc_args.tool_parser = self.tool_parser
@@ -656,7 +670,9 @@ class OpenAIServer:
                 )
             prompt = prompt_inputs(prompt)
 
-            mm_data = await mm_coroutines
+            mm_data, mm_embeddings = await mm_coroutines
+            if mm_embeddings:
+                raise ValueError("Cannot use multimodal embeddings as input")
             if mm_data is not None:
                 prompt["multi_modal_data"] = mm_data
 
@@ -942,19 +958,39 @@ class OpenAIServer:
             return self.create_error_response(message=str(e), err_type="internal_error")
 
     async def openai_responses(self, request: ResponsesRequest, raw_request: Request) -> Response:
-        async def create_stream_response(generator, request: ResponsesRequest, sampling_params) -> AsyncGenerator[str, None]:
-            async for event_data in responses_api_process_streaming_events(
-                request=request,
-                sampling_params=sampling_params,
-                generator=generator,
-                model_name=self.model,
-                conversation_store=self.conversation_store,
-                use_harmony=self.use_harmony,
-                reasoning_parser=self.llm.args.reasoning_parser,
-                tool_parser=self.tool_parser,
-                enable_store=self.enable_store
-            ):
-                yield event_data
+        async def create_response(
+                promise: RequestOutput, postproc_params: PostprocParams) -> ResponsesResponse:
+            await promise.aresult()
+            if self.postproc_worker_enabled:
+                response = promise.outputs[0]._postprocess_result
+            else:
+                args = postproc_params.postproc_args
+                response = await responses_api_create_response(
+                    generator=promise,
+                    request=request,
+                    sampling_params=args.sampling_params,
+                    model_name=self.model,
+                    conversation_store=self.conversation_store,
+                    generation_result=None,
+                    enable_store=self.enable_store and request.store,
+                    use_harmony=self.use_harmony,
+                    reasoning_parser=args.reasoning_parser,
+                    tool_parser=args.tool_parser,
+                )
+
+            return response
+
+        async def create_streaming_generator(promise: RequestOutput, postproc_params: PostprocParams):
+            post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
+            streaming_processor = args.streaming_processor
+            initial_responses = streaming_processor.get_initial_responses()
+            for initial_response in initial_responses:
+                yield initial_response
+
+            async for res in promise:
+                pp_results = res.outputs[0]._postprocess_result if self.postproc_worker_enabled else post_processor(res, args)
+                for pp_res in pp_results:
+                    yield pp_res
 
         try:
             if request.background:
@@ -977,38 +1013,61 @@ class OpenAIServer:
                 request=request,
                 prev_response=prev_response,
                 conversation_store=self.conversation_store,
-                enable_store=self.enable_store,
+                enable_store=self.enable_store and request.store,
                 use_harmony=self.use_harmony,
                 tokenizer=self.tokenizer if not self.use_harmony else None,
                 model_config=self.model_config if not self.use_harmony else None,
                 processor=self.processor if not self.use_harmony else None,
             )
 
+            streaming_processor = None
+            if request.stream:
+                # Per-request streaming processor
+                streaming_processor = ResponsesStreamingProcessor(
+                    request=request,
+                    sampling_params=sampling_params,
+                    model_name=self.model,
+                    conversation_store=self.conversation_store,
+                    enable_store=self.enable_store and request.store,
+                    use_harmony=self.use_harmony,
+                    reasoning_parser=self.llm.args.reasoning_parser,
+                    tool_parser=self.tool_parser,
+                )
+
+            postproc_args = ResponsesAPIPostprocArgs(
+                model=self.model,
+                request=request,
+                sampling_params=sampling_params,
+                use_harmony=self.use_harmony,
+                reasoning_parser=self.llm.args.reasoning_parser,
+                tool_parser=self.tool_parser,
+                streaming_processor=streaming_processor,
+            )
+            postproc_params = PostprocParams(
+                post_processor=responses_api_streaming_post_processor
+                if request.stream else responses_api_post_processor,
+                postproc_args=postproc_args,
+            )
             promise = self.llm.generate_async(
                 inputs=input_tokens,
                 sampling_params=sampling_params,
                 streaming=request.stream,
+                _postproc_params=postproc_params if self.postproc_worker_enabled else None,
             )
+
+            if self.postproc_worker_enabled and request.store:
+                logger.warning("Postproc workers are enabled, request will not be stored!")
 
             asyncio.create_task(self.await_disconnected(raw_request, promise))
 
             if request.stream:
                 return StreamingResponse(
-                    create_stream_response(promise, request, sampling_params),
+                    content=create_streaming_generator(promise, postproc_params),
                     media_type="text/event-stream"
                 )
             else:
-                return await responses_api_create_response(
-                    generator=promise,
-                    request=request,
-                    sampling_params=sampling_params,
-                    model_name=self.model,
-                    conversation_store=self.conversation_store,
-                    generation_result=None,
-                    enable_store=self.enable_store,
-                    use_harmony=self.use_harmony,
-                    reasoning_parser=self.llm.args.reasoning_parser,
-                    tool_parser=self.tool_parser)
+                response = await create_response(promise, postproc_params)
+                return JSONResponse(content=response.model_dump())
         except CppExecutorError:
             logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server
@@ -1018,6 +1077,38 @@ class OpenAIServer:
             return self.create_error_response(str(e))
 
         return JSONResponse(content={"detail": "None"})
+
+    async def openai_responses_get_response(self, response_id: str) -> JSONResponse:
+        logger.info(f"Getting response: {response_id}")
+        if not self.enable_store:
+            return self.create_error_response(message="Response storage is disabled", err_type="InvalidRequestError")
+
+        if not response_id.startswith("resp_"):
+            return self._create_invalid_response_id_error(response_id)
+
+        response = await self.conversation_store.load_response(response_id)
+        if response is None:
+            return self._create_response_id_not_found_error(response_id)
+
+        return JSONResponse(content=response.model_dump())
+
+    async def openai_responses_delete_response(self, response_id: str) -> JSONResponse:
+        logger.info(f"Deleting response: {response_id}")
+        if not self.enable_store:
+            return self.create_error_response(message="Response storage is disabled", err_type="InvalidRequestError")
+
+        if not response_id.startswith("resp_"):
+            return self._create_invalid_response_id_error(response_id)
+
+        success = await self.conversation_store.pop_response(response_id)
+        if not success:
+            return self._create_response_id_not_found_error(response_id)
+
+        return JSONResponse(content={
+            "id": response_id,
+            "object": "response",
+            "deleted": True
+        })
 
     async def release_memory(self, request: MemoryUpdateRequest) -> JSONResponse:
         assert isinstance(self.llm, AsyncLLM), "/release_memory endpoint is only supported with AsyncLLM()"

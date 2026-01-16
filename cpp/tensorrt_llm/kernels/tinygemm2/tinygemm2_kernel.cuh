@@ -172,7 +172,7 @@ struct Profile
 };
 
 template <int WARP_TILE_M, int TILE_M, int TILE_N, int TILE_K, int STAGES, int STAGE_UNROLL, bool PROFILE>
-__global__ __launch_bounds__(384, 1) void kernel(__nv_bfloat16* output, __nv_bfloat16* weights,
+__global__ __launch_bounds__(384, 1) void tinygemm_kernel(__nv_bfloat16* output, __nv_bfloat16* weights,
     __nv_bfloat16* activations, __nv_bfloat16* bias, int M, int N, int K,
     const __grid_constant__ CUtensorMap weight_map, const __grid_constant__ CUtensorMap activation_map,
     Profile* profile = nullptr)
@@ -236,7 +236,6 @@ __global__ __launch_bounds__(384, 1) void kernel(__nv_bfloat16* output, __nv_bfl
         if (!weight_warp)
         {
             cudaGridDependencySynchronize();
-            cudaTriggerProgrammaticLaunchCompletion();
         }
 
         for (int ki = 0; ki < K_LOOPS_DMA; ki++)
@@ -441,6 +440,9 @@ __global__ __launch_bounds__(384, 1) void kernel(__nv_bfloat16* output, __nv_bfl
 
             if (PROFILE && blockIdx.y == 0 && threadIdx.x == 0)
                 profile[blockIdx.x].complete = gclock64();
+
+            if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0)
+                cudaTriggerProgrammaticLaunchCompletion();
         }
     }
 #endif // end if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)

@@ -24,6 +24,14 @@ from ..metadata import KVCacheParams
 from ..pyexecutor.resource_manager import KVCacheManager
 from ..utils import get_model_extra_attrs
 
+try:
+    # Transformers v5
+    from transformers.configuration_utils import ALLOWED_ATTENTION_LAYER_TYPES
+except ImportError:
+    # Transformers v4
+    from transformers.configuration_utils import \
+        ALLOWED_LAYER_TYPES as ALLOWED_ATTENTION_LAYER_TYPES
+
 
 @dataclass
 class AttentionRuntimeFeatures:
@@ -354,6 +362,15 @@ class AttentionMetadata:
         Hook to be called when using TRTLLM attention backend in spec-dec mode.
         """
 
+    def update_helix_param(
+        self,
+        helix_position_offsets: List[int],
+        helix_is_inactive_rank: List[bool],
+    ) -> None:
+        """
+        Hook to be called when using helix parallelism.
+        """
+
     def update_for_spec_dec(self) -> None:
         """
         Hook to be called during forward when using spec-dec one-model mode.
@@ -438,6 +455,13 @@ class RopeParams:
     @staticmethod
     def from_config(config) -> "RopeParams":
         rope_params = RopeParams()
+
+        hf_rope_parameters = getattr(config, 'rope_parameters', None)
+        if hf_rope_parameters is not None:
+            assert not set(hf_rope_parameters.keys()).issubset(
+                ALLOWED_ATTENTION_LAYER_TYPES), (
+                    "Per-layer-type RoPE configuration is not supported yet.")
+            config.update(hf_rope_parameters)
 
         # get rotary parameters.
         hidden_size = config.hidden_size
@@ -696,9 +720,13 @@ class AttentionBackend(Generic[TMetadata]):
     def support_mla(cls) -> bool:
         return False
 
-    @classmethod
-    def support_nvfp4_output(cls) -> bool:
-        return False
+    def create_output(self, q: torch.Tensor, **kwargs) -> List[torch.Tensor]:
+        """
+        Create the output tensors for the attention operation.
+        """
+        num_tokens = q.shape[0]
+        hidden_size = self.num_heads * self.head_dim
+        return [q.new_empty([num_tokens, hidden_size], dtype=q.dtype)]
 
 
 @dataclass(kw_only=True, unsafe_hash=True)

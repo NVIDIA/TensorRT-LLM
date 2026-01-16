@@ -370,6 +370,7 @@ def check_missing_libs(lib_name: str) -> list[str]:
 
 def generate_python_stubs_linux(binding_type: str, venv_python: Path,
                                 deep_ep: bool, flash_mla: bool,
+                                transfer_agent_binding: bool,
                                 binding_lib_name: str):
     is_nanobind = binding_type == "nanobind"
     if is_nanobind:
@@ -411,6 +412,16 @@ def generate_python_stubs_linux(binding_type: str, venv_python: Path,
             build_run(
                 f"\"{venv_python}\" -m pybind11_stubgen -o . deep_ep_cpp_tllm --exit-code",
                 env=env_stub_gen)
+        if transfer_agent_binding:
+            # Generate stubs for tensorrt_llm_transfer_agent_binding
+            if is_nanobind:
+                build_run(
+                    f"\"{venv_python}\" -m nanobind.stubgen -m tensorrt_llm_transfer_agent_binding -O .",
+                    env=env_stub_gen)
+            else:
+                build_run(
+                    f"\"{venv_python}\" -m pybind11_stubgen -o . tensorrt_llm_transfer_agent_binding --exit-code",
+                    env=env_stub_gen)
     finally:
         if link_dir:
             rmtree(link_dir)
@@ -801,17 +812,15 @@ def main(*,
                 build_run(
                     f"find {ucx_dir} -type f -name '*.so*' -exec patchelf --set-rpath \'$ORIGIN:$ORIGIN/ucx:$ORIGIN/../\' {{}} \\;"
                 )
-        if os.path.exists(
-                build_dir /
-                "tensorrt_llm/executor/cache_transmission/nixl_utils/libtensorrt_llm_nixl_wrapper.so"
-        ):
-            install_file(
-                build_dir /
-                "tensorrt_llm/executor/cache_transmission/nixl_utils/libtensorrt_llm_nixl_wrapper.so",
-                lib_dir / "libtensorrt_llm_nixl_wrapper.so")
+        # NIXL wrapper and libraries
+        nixl_utils_dir = build_dir / "tensorrt_llm/executor/cache_transmission/nixl_utils"
+        if os.path.exists(nixl_utils_dir / "libtensorrt_llm_nixl_wrapper.so"):
+            install_file(nixl_utils_dir / "libtensorrt_llm_nixl_wrapper.so",
+                         lib_dir / "libtensorrt_llm_nixl_wrapper.so")
             build_run(
                 f'patchelf --set-rpath \'$ORIGIN/nixl/\' {lib_dir / "libtensorrt_llm_nixl_wrapper.so"}'
             )
+            # Copy NIXL libraries
             if os.path.exists("/opt/nvidia/nvda_nixl"):
                 nixl_dir = lib_dir / "nixl"
                 if nixl_dir.exists():
@@ -825,6 +834,15 @@ def main(*,
                 build_run(
                     f"find {nixl_dir} -type f -name '*.so*' -exec patchelf --set-rpath \'$ORIGIN:$ORIGIN/plugins:$ORIGIN/../:$ORIGIN/../ucx/:$ORIGIN/../../ucx/\' {{}} \\;"
                 )
+        # Install tensorrt_llm_transfer_agent_binding Python module (standalone agent bindings)
+        # This is built when either NIXL or Mooncake is enabled
+        # Install to tensorrt_llm/ (same level as bindings.so)
+        agent_binding_so = list(
+            nixl_utils_dir.glob("tensorrt_llm_transfer_agent_binding*.so"))
+        if agent_binding_so:
+            trtllm_dir = project_dir / "tensorrt_llm"
+            install_file(agent_binding_so[0],
+                         trtllm_dir / agent_binding_so[0].name)
         if os.path.exists(
                 build_dir /
                 "tensorrt_llm/executor/cache_transmission/mooncake_utils/libtensorrt_llm_mooncake_wrapper.so"
@@ -946,6 +964,7 @@ def main(*,
                         binding_type, venv_python,
                         bool(deep_ep_cuda_architectures),
                         bool(flash_mla_cuda_architectures),
+                        nixl_root is not None or mooncake_root is not None,
                         binding_lib_file_name)
 
     if not skip_building_wheel:

@@ -83,19 +83,19 @@ def BUILD_CONFIGS = [
     (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars NIXL_ROOT=/opt/nvidia/nvda_nixl --extra-cmake-vars MOONCAKE_ROOT=/usr/local/Mooncake",
     (TARNAME) : "TensorRT-LLM-GH200.tar.gz",
     (WHEEL_ARCHS): "90-real;100-real;103-real;120-real",
-    (BUILD_JOBS_FOR_CONFIG): "4", // TODO: Remove after fix the build OOM issue on SBSA
+    (BUILD_JOBS_FOR_CONFIG): "8", // TODO: Remove after fix the build OOM issue on SBSA
   ],
   (CONFIG_LINUX_AARCH64_PYBIND): [
     (WHEEL_EXTRA_ARGS) : "--binding_type pybind --extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars NIXL_ROOT=/opt/nvidia/nvda_nixl --extra-cmake-vars MOONCAKE_ROOT=/usr/local/Mooncake",
     (TARNAME) : "pybind-TensorRT-LLM-GH200.tar.gz",
     (WHEEL_ARCHS): "90-real;100-real;103-real;120-real",
-    (BUILD_JOBS_FOR_CONFIG): "4", // TODO: Remove after fix the build OOM issue on SBSA
+    (BUILD_JOBS_FOR_CONFIG): "8", // TODO: Remove after fix the build OOM issue on SBSA
   ],
   (CONFIG_LINUX_AARCH64_LLVM) : [
     (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars WARNING_IS_ERROR=ON -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_CUDA_HOST_COMPILER=clang -DCMAKE_LINKER_TYPE=LLD",
     (TARNAME) : "llvm-TensorRT-LLM-GH200.tar.gz",
     (WHEEL_ARCHS): "90-real;100-real;103-real;120-real",
-    (BUILD_JOBS_FOR_CONFIG): "4", // TODO: Remove after fix the build OOM issue on SBSA
+    (BUILD_JOBS_FOR_CONFIG): "8", // TODO: Remove after fix the build OOM issue on SBSA
   ],
 ]
 
@@ -585,7 +585,7 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
     parallelJobs.failFast = enableFailFast
 
     if (cpu_arch == X86_64_TRIPLE && !reuseArtifactPath) {
-        def key = "Build with build type Debug"
+        def key = "Build With Build Type Debug"
         parallelJobs += [
         (key): {
             script {
@@ -628,7 +628,7 @@ pipeline {
         HF_DATASETS_OFFLINE=1
     }
     stages {
-        stage("BuildJob") {
+        stage("Build Job") {
             steps {
                 launchStages(this, params.targetArch, params.enableFailFast, globalVars)
             }

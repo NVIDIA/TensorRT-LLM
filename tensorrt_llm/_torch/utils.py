@@ -21,6 +21,7 @@ aux_stream_name_list = [
     'MoeShared',
     'MoeChunkingOverlap',
     'MoeBalancer',
+    'MoeOutputMemset',
 ]
 AuxStreamType = Enum(
     'AuxStreamType',
@@ -403,3 +404,13 @@ def split(x: torch.Tensor,
 
 def relu2(x: torch.Tensor) -> torch.Tensor:
     return torch.square(F.relu(x))
+
+
+@maybe_compile
+def maybe_compiled_copy_(dst, src):
+    dst.copy_(src)
+
+
+@maybe_compile
+def maybe_compiled_cat(tensors, dim):
+    return torch.cat(tensors, dim)

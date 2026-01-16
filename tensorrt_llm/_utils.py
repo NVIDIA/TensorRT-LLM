@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,8 +21,10 @@ import math
 import os
 import socket
 import struct
+import sys
 import tempfile
 import trace
+import traceback
 import weakref
 from contextlib import contextmanager
 from enum import EnumMeta
@@ -430,6 +432,7 @@ _torch_dtype_to_np_typestr_dict = {
     torch.qint8: "|u1",
     torch.bool: "|b1",
     torch.bfloat16: "<f2",
+    torch.uint8: "|u1",
 }
 
 
@@ -561,7 +564,15 @@ def mpi_world_size():
 
 
 def local_mpi_rank():
-    return local_comm.Get_rank() if ENABLE_MULTI_DEVICE else 0
+    if mpi_disabled():
+        # For Ray/non-MPI: the device was already set during worker init
+        # torch.cuda.current_device() returns the correct local device ID
+        try:
+            return torch.cuda.current_device()
+        except ValueError:
+            return 0
+    return mpi_comm().Get_rank() % torch.cuda.device_count(
+    ) if ENABLE_MULTI_DEVICE else 0
 
 
 def local_mpi_size():
@@ -750,6 +761,13 @@ def is_sm_100f(sm_version=None):
     if sm_version is None:
         sm_version = get_sm_version()
     return sm_version == 100 or sm_version == 103
+
+
+def print_all_stacks():
+    """Print stack traces for all threads"""
+    for thread_id, frame in sys._current_frames().items():
+        logger.error(f"Thread {thread_id} stack trace:\n" +
+                     "".join(traceback.format_stack(frame)))
 
 
 def is_trace_enabled(env_var: str):

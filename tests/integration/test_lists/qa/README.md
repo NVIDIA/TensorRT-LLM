@@ -68,8 +68,8 @@ This directory contains various test configuration files:
 - `llm_triton_integration.txt` - Triton backend integration tests
 
 ### Release-Specific Tests
-- `llm_digits_func.txt` - Functional tests for DIGITS release
-- `llm_digits_perf.txt` - Performance tests for DIGITS release
+- `llm_spark_func.txt` - Functional tests for DGX-Spark release
+- `llm_spark_perf.yml` - Performance tests for DGX-Spark release
 
 ## Test Execution Schedule
 

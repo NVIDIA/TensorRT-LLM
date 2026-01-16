@@ -45,6 +45,9 @@ class AccuracyConfig:
     """Accuracy test configuration (supports multiple datasets)."""
 
     datasets: List[DatasetThreshold]  # List of dataset threshold configurations
+    metrics: Optional[MetricsConfig] = (
+        None  # Optional custom metrics config (defaults to _COMMON_ACCURACY_METRICS)
+    )
 
     def get_dataset_config(self, dataset_name: str) -> Optional[DatasetThreshold]:
         """Get configuration by dataset name.
@@ -68,6 +71,16 @@ class AccuracyConfig:
         """
         return [ds.dataset_name for ds in self.datasets]
 
+    def get_metrics_config(self) -> MetricsConfig:
+        """Get metrics configuration for accuracy parsing.
+
+        Returns:
+            Custom metrics config if provided, otherwise _COMMON_ACCURACY_METRICS
+        """
+        if self.metrics is not None:
+            return self.metrics
+        return _COMMON_ACCURACY_METRICS
+
 
 # ============================================================================
 # Default Metrics configuration
@@ -77,7 +90,7 @@ class AccuracyConfig:
 # Note: Only log_file is used by AccuracyParser (accuracy_parser.py)
 # The regex pattern is hardcoded in AccuracyParser._extract_accuracy_values()
 _COMMON_ACCURACY_METRICS = MetricsConfig(
-    log_file="accuracy_eval.log",
+    log_file="7_accuracy_eval.log",
     extractor_pattern=r"\|([a-zA-Z0-9_-]+)\|.*?\|([\w-]+)\|.*?\|exact_match\|.*?\|([0-9.]+)\|",
     metric_names=["flexible-extract", "strict-match"],
 )
@@ -85,7 +98,7 @@ _COMMON_ACCURACY_METRICS = MetricsConfig(
 DEFAULT_METRICS_CONFIG = {
     # Performance test default configuration
     ("disagg", "perf"): MetricsConfig(
-        log_file="bench.log",
+        log_file="6_bench.log",
         extractor_pattern=r"""
             ^.*?Median\ TTFT\ \(ms\):\s+([0-9.]+).*?$\n
             (?:.*\n)*?
@@ -96,7 +109,7 @@ DEFAULT_METRICS_CONFIG = {
         metric_names=["SERVER_MEDIAN_TTFT", "SERVER_MEDIAN_E2EL"],
     ),
     ("wideep", "perf"): MetricsConfig(
-        log_file="bench.log",
+        log_file="6_bench.log",
         extractor_pattern=r"""
             ^.*?Mean\ TTFT\ \(ms\):\s+([0-9.]+).*?$\n
             (?:.*\n)*?
@@ -138,6 +151,19 @@ DEFAULT_METRICS_CONFIG = {
             "SERVER_E2EL",  # Median E2EL (keep the same name as disagg)
             "SERVER_P99_E2EL",
         ],
+    ),
+    # Stress test configuration (combines perf metrics + accuracy validation)
+    # Uses the same perf metrics pattern as disagg perf tests
+    ("disagg", "stress"): MetricsConfig(
+        log_file="6_bench.log",
+        extractor_pattern=r"""
+            ^.*?Median\ TTFT\ \(ms\):\s+([0-9.]+).*?$\n
+            (?:.*\n)*?
+            ^.*?Median\ E2EL\ \(ms\):\s+([0-9.]+).*?$\n
+            (?:.*\n)*?
+            ^.*?Benchmark\ with\ concurrency\ (\d+)\ done
+        """,
+        metric_names=["SERVER_MEDIAN_TTFT", "SERVER_MEDIAN_E2EL"],
     ),
     # Accuracy test configuration
     ("disagg", "accuracy"): _COMMON_ACCURACY_METRICS,
@@ -336,7 +362,8 @@ class ConfigLoader:
 
         # Load accuracy configuration (only for accuracy tests)
         accuracy_config = None
-        if test_category == "accuracy":
+        # Load accuracy config for both "accuracy" and "stress" test categories
+        if test_category in ["accuracy", "stress"]:
             acc_meta = metadata.get("accuracy", {})
             if acc_meta and "datasets" in acc_meta:
                 datasets = []
@@ -373,8 +400,27 @@ class ConfigLoader:
                             higher_is_better=higher_is_better,
                         )
                     )
-                accuracy_config = AccuracyConfig(datasets=datasets)
-                logger.info(f"Loaded accuracy config with {len(datasets)} dataset(s)")
+
+                # Check if custom accuracy metrics are provided
+                custom_metrics = None
+                if "metrics" in acc_meta:
+                    metrics_override = acc_meta["metrics"]
+                    custom_metrics = MetricsConfig(
+                        log_file=metrics_override.get("log_file", "7_accuracy_eval.log"),
+                        extractor_pattern=metrics_override.get(
+                            "extractor_pattern",
+                            r"\|([a-zA-Z0-9_-]+)\|.*?\|([\w-]+)\|.*?\|exact_match\|.*?\|([0-9.]+)\|",
+                        ),
+                        metric_names=metrics_override.get(
+                            "metric_names", ["flexible-extract", "strict-match"]
+                        ),
+                    )
+                    logger.info("Using custom accuracy metrics config from YAML")
+
+                accuracy_config = AccuracyConfig(datasets=datasets, metrics=custom_metrics)
+                logger.info(
+                    f"Loaded accuracy config with {len(datasets)} dataset(s) for {test_category} test"
+                )
 
         return TestConfig(
             config_path=str(yaml_path),
@@ -478,6 +524,7 @@ class ConfigLoader:
             ("environment", "model_path"): lambda: self._get_full_model_path(config),
             ("slurm", "script_file"): lambda: self._get_script_file(config),
             ("slurm", "set_segment"): lambda: EnvManager.get_slurm_set_segment(),
+            ("slurm", "extra_args"): lambda: EnvManager.get_slurm_extra_args(),
         }
 
         # Apply overrides based on field paths

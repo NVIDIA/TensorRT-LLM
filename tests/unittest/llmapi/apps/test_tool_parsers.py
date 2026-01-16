@@ -25,6 +25,7 @@ from tensorrt_llm.serve.tool_parser.base_tool_parser import BaseToolParser
 from tensorrt_llm.serve.tool_parser.core_types import StructureInfo
 from tensorrt_llm.serve.tool_parser.deepseekv3_parser import DeepSeekV3Parser
 from tensorrt_llm.serve.tool_parser.deepseekv31_parser import DeepSeekV31Parser
+from tensorrt_llm.serve.tool_parser.deepseekv32_parser import DeepSeekV32Parser
 from tensorrt_llm.serve.tool_parser.kimi_k2_tool_parser import KimiK2ToolParser
 from tensorrt_llm.serve.tool_parser.qwen3_coder_parser import \
     Qwen3CoderToolParser
@@ -1169,6 +1170,149 @@ class TestDeepSeekV31Parser(BaseToolParserTestClass):
             parse_streaming_increment_partial_bot_token=partial_bot_token,
             undefined_tool=undefined_tool_text,
         )
+
+
+# ============================================================================
+# DeepSeekV32Parser Tests
+# ============================================================================
+
+
+class TestDeepSeekV32Parser(BaseToolParserTestClass):
+    """Test suite for DeepSeekV32Parser class."""
+
+    def make_parser(self):
+        return DeepSeekV32Parser()
+
+    def make_tool_parser_test_cases(self):
+        return ToolParserTestCases(
+            has_tool_call_true=
+            'Some text <｜DSML｜function_calls> <｜DSML｜invoke name="get_weather"> <｜DSML｜parameter name="location" string="true">NYC</｜DSML｜parameter> </｜DSML｜invoke> </｜DSML｜function_calls>',
+            detect_and_parse_single_tool=(
+                # Input text.
+                ('Normal text'
+                 '<｜DSML｜function_calls> <｜DSML｜invoke name="get_weather"> <｜DSML｜parameter name="location" string="true">NYC</｜DSML｜parameter> </｜DSML｜invoke> </｜DSML｜function_calls>'
+                 ),
+                # Expected `normal_text`.
+                "Normal text",
+                # Expected `name`.
+                "get_weather",
+                # Expected `parameters`.
+                {
+                    "location": "NYC"
+                },
+            ),
+            detect_and_parse_multiple_tools=(
+                # Input text.
+                ('<｜DSML｜function_calls> <｜DSML｜invoke name="get_weather"> <｜DSML｜parameter name="location" string="true">NYC</｜DSML｜parameter> </｜DSML｜invoke> <｜DSML｜invoke name="search_web"> { "query": "AI" } </｜DSML｜invoke> </｜DSML｜function_calls>'
+                 ),
+                # Expected names.
+                ("get_weather", "search_web"),
+            ),
+            detect_and_parse_malformed_tool=(
+                # Format error: using "|" instead of "｜"
+                '<|DSML|function_calls> <|DSML|invoke name="get_weather"> <|DSML|parameter name="location" string="true">NYC</|DSML|parameter> </|DSML|invoke> </|DSML|function_calls>'
+            ),
+            detect_and_parse_with_parameters_key=(
+                # Input text.
+                ('<｜DSML｜function_calls> <｜DSML｜invoke name="search_web"> { "query": "test" } </｜DSML｜invoke> </｜DSML｜function_calls>'
+                 ),
+                # Expected `name`.
+                "search_web",
+                # Expected `parameters`.
+                {
+                    "query": "test"
+                },
+            ),
+            parse_streaming_increment_partial_bot_token="<｜DSML｜function_calls>",
+            undefined_tool=
+            ('<｜DSML｜function_calls> <｜DSML｜invoke name="undefined_func"> <｜DSML｜parameter name="arg" string="true">value</｜DSML｜parameter> </｜DSML｜invoke> </｜DSML｜function_calls>'
+             ),
+        )
+
+    def test_initialization(self, parser):
+        """Test that DeepSeekV32Parser initializes correctly."""
+        assert parser.bot_token == "<｜DSML｜function_calls>"
+        assert parser.eot_token == "</｜DSML｜function_calls>"
+        assert parser.invoke_end_token == "</｜DSML｜invoke>"
+        assert parser._last_arguments == ""
+
+    def test_parse_streaming_increment_complete_tool_call(
+            self, sample_tools, parser):
+        """Test streaming parser with complete tool call in chunks."""
+        parser.parse_streaming_increment('<｜DSML｜function_calls> ',
+                                         sample_tools)
+        result = parser.parse_streaming_increment(
+            '<｜DSML｜invoke name="get_weather"> ', sample_tools)
+        assert len(result.calls) == 0
+
+        parser.parse_streaming_increment(
+            '<｜DSML｜parameter name="location" string="true">NYC</｜DSML｜parameter> ',
+            sample_tools)
+        result = parser.parse_streaming_increment(
+            '</｜DSML｜invoke> </｜DSML｜function_calls>', sample_tools)
+
+        assert result.calls[0].name == "get_weather"
+        assert json.loads(result.calls[1].parameters) == {"location": "NYC"}
+
+    def test_parse_streaming_increment_multiple_tools_streaming(
+            self, sample_tools, parser):
+        """Test streaming parser handles end token correctly."""
+        # First tool
+        parser.parse_streaming_increment("<｜DSML｜function_calls> ",
+                                         sample_tools)
+        parser.parse_streaming_increment("<｜DSML｜invoke name=\"get_weather\"> ",
+                                         sample_tools)
+        parser.parse_streaming_increment(
+            "<｜DSML｜parameter name=\"location\" string=\"true\">NYC</｜DSML｜parameter> ",
+            sample_tools)
+        parser.parse_streaming_increment("</｜DSML｜invoke> ", sample_tools)
+
+        # Second tool
+        parser.parse_streaming_increment("<｜DSML｜invoke name=\"search_web\"> ",
+                                         sample_tools)
+        parser.parse_streaming_increment(
+            "<｜DSML｜parameter name=\"query\" string=\"true\">AI</｜DSML｜parameter> ",
+            sample_tools)
+        result = parser.parse_streaming_increment(
+            "</｜DSML｜invoke> <｜DSML｜function_calls>", sample_tools)
+
+        assert result.calls[0].name == "search_web"
+        assert json.loads(result.calls[1].parameters) == {"query": "AI"}
+        assert result.calls[1].tool_index == 1
+
+    def test_structure_info_function(self):
+        """Test that DeepSeekV32Parser structure_info returns correct lambda function."""
+        parser = DeepSeekV32Parser()
+        func = parser.structure_info()
+
+        info = func("get_weather")
+
+        assert info.begin == "<｜DSML｜invoke name=\"get_weather\">"
+        assert info.end == "</｜DSML｜invoke>"
+        assert info.trigger == "<｜DSML｜invoke name=\"get_weather\">"
+
+    def test_structure_info_different_names(self):
+        """Test that DeepSeekV32Parser structure_info returns correct lambda function."""
+        parser = DeepSeekV32Parser()
+        func = parser.structure_info()
+
+        info1 = func("get_weather")
+        info2 = func("search_web")
+
+        assert "get_weather" in info1.begin
+        assert "search_web" in info2.begin
+        assert info1.end == info2.end == "</｜DSML｜invoke>"
+
+    def test_deepseek_v32_format_compliance(self, sample_tools, parser):
+        """Test that DeepSeekV32Parser follows the documented format structure."""
+
+        # Test the exact format from the docstring
+        text = "<｜DSML｜function_calls> <｜DSML｜invoke name=\"get_weather\"> <｜DSML｜parameter name=\"location\" string=\"true\">NYC</｜DSML｜parameter> </｜DSML｜invoke> </｜DSML｜function_calls>"
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_weather"
+        assert json.loads(result.calls[0].parameters) == {"location": "NYC"}
 
 
 # ============================================================================

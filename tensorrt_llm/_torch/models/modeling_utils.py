@@ -12,6 +12,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_any_only
 from tqdm import tqdm
 
+from tensorrt_llm._utils import local_mpi_rank
 from tensorrt_llm.lora_manager import HfLoraLoader
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
@@ -155,6 +156,8 @@ def skip_forward(
     """Skip forward of a module."""
     if hasattr(module, 'skip_forward'):
         module.forward = module.skip_forward
+        remove_weights(module, ignore_modules)
+    elif isinstance(module, DecoderModelForCausalLM):
         remove_weights(module, ignore_modules)
     else:
         logger.warning(
@@ -300,8 +303,7 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
         assert num_hidden_layers >= mapping.pp_size, f"{num_hidden_layers} layers are not enough for PP{mapping.pp_size}"
         pp_layer_list = mapping.pp_layers(num_hidden_layers)
         has_pp_layer = len(pp_layer_list) > 0
-        for layer_idx in range(num_hidden_layers):
-            layer = self.layers[layer_idx]
+        for layer_idx, layer in enumerate(self.layers):
             is_last_layer = (layer_idx == num_hidden_layers - 1)
             if layer_idx not in pp_layer_list:
                 # keep next layer's input_layernorm's weights for fusion
@@ -852,8 +854,10 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
         'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],
         'gate_up_proj': ['gate_proj', 'up_proj']
     }
+    device_id = local_mpi_rank()
 
     def load_single_module(name, module):
+        torch.cuda.set_device(device_id)
         if len(module._parameters) > 0:
             # skip load weights if module is in skip_modules
             if any(skip_module in name for skip_module in skip_modules):
@@ -931,7 +935,7 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                                 p.data.copy_(module_weights[n][:])
 
     if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
-                      "True") in ["True", "true", "1", "yes", "y"]:
+                      "False") in ["True", "true", "1", "yes", "y"]:
         for name, module in tqdm(list(
                 model.named_modules(remove_duplicate=False)),
                                  desc="Loading weights"):
@@ -977,8 +981,10 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
     if params_map is not None:
         weights = weight_mapper.rename_by_params_map(params_map, weights)
         logger.info(f"Renamed weights with params_map: {params_map}")
+    device_id = local_mpi_rank()
 
     def load_single_module(name, module):
+        torch.cuda.set_device(device_id)
         if len(module._parameters) > 0:
             if weight_mapper.should_skip_module(name):
                 return
@@ -1034,7 +1040,7 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
                                 allow_partial_loading=allow_partial_loading)
 
     if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
-                      "True") in ["True", "true", "1", "yes", "y"]:
+                      "False") in ["True", "true", "1", "yes", "y"]:
         for name, module in tqdm(list(
                 model.named_modules(remove_duplicate=False)),
                                  desc="Loading weights"):

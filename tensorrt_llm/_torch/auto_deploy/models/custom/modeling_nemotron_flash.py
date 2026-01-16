@@ -13,6 +13,7 @@ from transformers.modeling_outputs import CausalLMOutput, MoeModelOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 from transformers.tokenization_utils_base import BatchEncoding
 
+from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm.inputs.utils import HF_CHAT_TEMPLATE_EXCEPTIONS
 
 from ..nemotron_flash import NemotronFlashForCausalLMFactory
@@ -182,6 +183,8 @@ class DeltaNet(nn.Module):
         self.qk_activation = qk_activation
         self.qk_norm = qk_norm
 
+        # can't use ActivationType enum here,
+        #  because there is no Elu defined in cpp/tensorrt_llm/kernels/cutlass_kernels/include/common.h
         assert self.qk_activation in ["silu", "relu", "elu", "identity"]
         assert self.qk_norm in ["l2", "sum"]
 
@@ -331,7 +334,7 @@ class NemotronFlashMamba2(nn.Module):
         self.num_heads = self.d_inner // self.headdim
         self.rmsnorm = rmsnorm
         self.dt_limit = dt_limit
-        self.activation = "silu"
+        self.activation = ActivationType.Silu
         self.chunk_size = chunk_size
         self.layer_idx = layer_idx
 

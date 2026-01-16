@@ -33,6 +33,7 @@ from transformers.utils import ModelOutput
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.rms_norm import gated_rms_norm_ref
 from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
+from tensorrt_llm._torch.utils import ActivationType
 
 
 class MambaRMSNormGated(torch.nn.Module):
@@ -112,11 +113,6 @@ class NemotronHMamba2Mixer(nn.Module):
         A = torch.arange(1, self.num_heads + 1)
         self.A_log = nn.Parameter(torch.log(A))
         self.A_log._no_weight_decay = True
-        # Instead of recomputing `torch.exp(self.A_log.float())` on every forward pass, we will register a hook
-        # that sets this appropriately when loading weights.
-        # NOTE: we explicitly register this as a non-persistent buffer so that it does not appear in the state dict of
-        # this module, or an equivalent graph module trace from it, but still gets included in e.g. `to()` calls.
-        self.register_buffer("_minus_A", -A.float(), persistent=False)
         self.norm = MambaRMSNormGated(
             self.intermediate_size,
             eps=self.layer_norm_epsilon,
@@ -127,8 +123,6 @@ class NemotronHMamba2Mixer(nn.Module):
 
         self.out_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.use_bias)
         self.use_bias = config.use_bias
-
-        self.register_load_state_dict_post_hook(self._load_state_dict_post_hook)
 
     def torch_forward(self, input_states):
         batch_size, seq_len, _ = input_states.shape
@@ -165,7 +159,7 @@ class NemotronHMamba2Mixer(nn.Module):
         )
 
         # 3. SSM transformation
-        A = self._minus_A
+        A = -torch.exp(self.A_log.float())
         y = torch.ops.auto_deploy.torch_ssm(
             hidden_states=hidden_states.view(batch_size, seq_len, -1, self.head_dim),
             A=A,
@@ -191,10 +185,6 @@ class NemotronHMamba2Mixer(nn.Module):
 
     def forward(self, hidden_states):
         return self.torch_forward(hidden_states)
-
-    @staticmethod
-    def _load_state_dict_post_hook(module, incompatible_keys) -> None:
-        module._minus_A.data = -torch.exp(module.A_log.float())
 
 
 class NemotronHRMSNorm(nn.Module):
@@ -249,14 +239,23 @@ class NemotronHBlock(nn.Module):
 
 # Copied from transformers.models.nemotron.modeling_nemotron Nemotron->NemotronH
 class NemotronHMLP(nn.Module):
-    def __init__(self, config, layer_idx: int, intermediate_size: Optional[int] = None):
+    def __init__(
+        self,
+        config,
+        layer_idx: int,
+        intermediate_size: Optional[int] = None,
+        is_expert: bool = False,
+    ):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
         self.intermediate_size = intermediate_size or config.intermediate_size
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
+        # Use latent size for expert MLPs if provided by config (required for SuperV3)
+        use_latent_size = (getattr(self.config, "moe_latent_size", None) is not None) and is_expert
+        input_size = self.config.moe_latent_size if use_latent_size else self.hidden_size
+        self.up_proj = nn.Linear(input_size, self.intermediate_size, bias=config.mlp_bias)
+        self.down_proj = nn.Linear(self.intermediate_size, input_size, bias=config.mlp_bias)
         self.act_fn = ACT2FN[config.mlp_hidden_act]
 
     def forward(self, x):
@@ -270,7 +269,10 @@ class NemotronHMOE(nn.Module):
         self.experts = nn.ModuleList(
             [
                 NemotronHMLP(
-                    config, intermediate_size=config.moe_intermediate_size, layer_idx=layer_idx
+                    config,
+                    layer_idx=layer_idx,
+                    intermediate_size=config.moe_intermediate_size,
+                    is_expert=True,
                 )
                 for _ in range(config.n_routed_experts)
             ]
@@ -280,7 +282,19 @@ class NemotronHMOE(nn.Module):
             config=config,
             intermediate_size=config.moe_shared_expert_intermediate_size,
             layer_idx=layer_idx,
+            is_expert=False,
         )
+        # Add latent projections when using latent MoE (required for SuperV3)
+        if getattr(config, "moe_latent_size", None) is not None:
+            self.fc1_latent_proj = nn.Linear(
+                config.hidden_size, config.moe_latent_size, bias=config.mlp_bias
+            )
+            self.fc2_latent_proj = nn.Linear(
+                config.moe_latent_size, config.hidden_size, bias=config.mlp_bias
+            )
+        else:
+            self.fc1_latent_proj = nn.Identity()
+            self.fc2_latent_proj = nn.Identity()
 
     def forward(self, hidden_states: torch.Tensor):
         residuals = hidden_states
@@ -308,8 +322,8 @@ class NemotronHMOE(nn.Module):
             w1_weight=[e.up_proj.weight for e in self.experts],
             w2_weight=[e.down_proj.weight for e in self.experts],
             w3_weight=[],
-            act_fn="relu2",
-            mlp_style="mlp",
+            act_fn=ActivationType.Relu2,
+            is_gated_mlp=False,
         )
 
         if has_latent_proj:

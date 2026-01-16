@@ -1,5 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
 """Graph transformation to automatically add kv cache into fused MHA op."""
 
+import inspect
 import operator
 from typing import Dict, List, Optional, Tuple, Type
 
@@ -20,6 +37,7 @@ from ...distributed.common import is_initialized as is_distributed_initialized
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils._graph import add_graph_input
+from ...utils.cuda_mem_tracker import get_mem_info_in_mb
 from ...utils.node_utils import is_op
 from ..interface import (
     BaseTransform,
@@ -106,6 +124,23 @@ class InsertCachedAttention(BaseTransform):
             gm, prep_meta_op, inputs_for_prep_meta, const_args, num_meta_out
         )
 
+    def _process_metadata_host(self, cm: CachedSequenceInterface):
+        """Process the host-side prepare metadata function."""
+        prep_meta_host_op = self.attn_descriptor.get_host_prepare_metadata_function()
+        if prep_meta_host_op is None:
+            return
+
+        # analyze the args of the host-side prepare metadata function using inspect
+        sig = inspect.signature(prep_meta_host_op)
+        args = sig.parameters.keys()
+
+        # check if all args are available in the cached sequence interface
+        unavailable_args = args - cm.info.available_args
+        assert not unavailable_args, f"Missing args in SequenceInfo: {unavailable_args=}"
+
+        # add the host-side prepare metadata function to the graph
+        cm.info.register_host_prepare_for_attention_forward(prep_meta_host_op, list(args))
+
     def _process_cache_node(self, gm: GraphModule, cache_name: str) -> Node:
         """Process the cache nodes by inserting a cached attention replacement op."""
         return add_graph_input(gm, cache_name)
@@ -173,6 +208,9 @@ class InsertCachedAttention(BaseTransform):
         # insert metadata computation and extract each argument as a node
         meta_nodes_extra = self._process_metadata_extra(gm, cm, source_attn_nodes[0])
 
+        # Register host-side prepare_metadata function for attention descriptor.
+        self._process_metadata_host(cm)
+
         buffer_in_lookup: Dict[str, Node] = {}
 
         # replace fused attention node with attention node that has kv cache
@@ -213,6 +251,7 @@ class InsertCachedAttention(BaseTransform):
                 buffer_in_nodes,
                 constants,
             )
+
             num_cached_attn_replacements += 1
 
         info = TransformInfo(
@@ -266,11 +305,7 @@ class ResizeKVCache(BaseTransform):
     ) -> Tuple[nn.Module, TransformInfo]:
         free_mem_ratio = self.config.free_mem_ratio
 
-        def _get_mem_info_in_mb():
-            free_mem, total_mem = torch.cuda.mem_get_info()
-            return free_mem // 1024**2, total_mem // 1024**2
-
-        free_mem, total_mem = _get_mem_info_in_mb()
+        free_mem, total_mem = get_mem_info_in_mb(empty_cache=True)
         self._log_info(f"Free memory (MB): {free_mem}, Total memory (MB): {total_mem}")
         current_cache_size = cm.current_cache_size_bytes()
         current_kv_cache_size = getattr(cm, "current_kv_cache_size_bytes", None)
@@ -279,7 +314,7 @@ class ResizeKVCache(BaseTransform):
         )
         current_num_pages = cm.info.num_pages
         self._log_info(
-            f"Current cache size (MB): {current_cache_size // 1024 // 1024}, "
+            f"Current cache size (MB): {current_cache_size // 1024**2}, "
             f"Current num pages: {current_num_pages}"
         )
         if current_kv_cache_size != current_cache_size:
@@ -298,12 +333,34 @@ class ResizeKVCache(BaseTransform):
 
         # Let's run a forward pass to get the memory usage
         cm.info.set_max_num_tokens_sample()
-        free_mem_pre, _ = _get_mem_info_in_mb()
+        free_mem_pre, _ = get_mem_info_in_mb(empty_cache=True)
         self._log_info(f"Free memory before forward pass (MB): {free_mem_pre}")
 
-        mod(**cm.named_args)
+        # Reset peak memory stats to get the extra memory used during the forward pass
+        torch.cuda.reset_peak_memory_stats()
+        memory_allocated_before_forward_pass_mb = torch.cuda.memory_allocated() // 1024**2
+        try:
+            mod(**cm.named_args)
+        except torch.OutOfMemoryError as e:
+            self.ad_logger.error(
+                f"OutOfMemoryError in forward pass while trying to resize the kv-cache:\n{e}"
+            )
+            raise e
 
-        free_mem_post, _ = _get_mem_info_in_mb()
+        peak_memory_during_forward_pass_mb = torch.cuda.max_memory_allocated() // 1024**2
+        mem_used_during_forward_pass_mb = (
+            peak_memory_during_forward_pass_mb - memory_allocated_before_forward_pass_mb
+        )
+        self._log_info(
+            f"Peak memory uasge during forward pass (MB): {peak_memory_during_forward_pass_mb}"
+        )
+        self._log_info(
+            f"Extra memory used during forward pass (MB): {mem_used_during_forward_pass_mb}"
+        )
+
+        # TODO (lucaslie): logic needs overhaul, too much going on. For now, this is just reverting
+        # to the original logic. Full overhaulwill be done as part of #10013
+        free_mem_post, _ = get_mem_info_in_mb(empty_cache=False)
         self._log_info(f"Free memory after forward pass (MB): {free_mem_post}")
 
         memory_for_forward_pass = free_mem_pre - free_mem_post

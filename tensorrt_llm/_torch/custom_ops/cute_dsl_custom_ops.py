@@ -6,7 +6,7 @@ import torch
 from tensorrt_llm.logger import logger
 
 from ..._utils import get_sm_version
-from ...math_utils import pad_up
+from ...math_utils import ceil_div, pad_up
 from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
                          DynamicTensorSpec, OptimizationProfile, TunableRunner,
                          TuningConfig)
@@ -314,29 +314,14 @@ class GatherGroupedGemmInputsHelper(GroupedGemmInputsHelper):
                 num_non_exiting_tiles, global_sf)
 
 
-class FusedMoEInputsHelper:
-
-    def __init__(self, num_experts: int, top_k: int, num_local_experts: int,
-                 local_expert_offset: int):
-        self.num_experts = num_experts
-        self.top_k = top_k
-        self.num_local_experts = num_local_experts
-        self.local_expert_offset = local_expert_offset
-
-    def infer_shape_num_tokens(self, input_shapes: List[torch.Size]) -> int:
-        return input_shapes[0][0]
-
-    def inputs_pre_hook(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
-        x, x_sf, token_selected_experts, token_final_scales, *others = inputs
-        num_tokens = token_selected_experts.size(0)
-        new_token_final_scales, new_token_selected_experts = torch.randn(
-            num_tokens, self.num_experts,
-            device=token_selected_experts.device).topk(self.top_k, dim=-1)
-        new_token_selected_experts = new_token_selected_experts.to(
-            token_selected_experts.dtype)
-        new_token_final_scales = new_token_final_scales.softmax(dim=-1).to(
-            token_final_scales.dtype)
-        return x, x_sf, new_token_selected_experts, new_token_final_scales, *others
+def get_dense_gemm_approximate_cta_nums(
+        M: int, N: int, tile_mn: Tuple[int, int],
+        cluster_shape_mn: Tuple[int, int]) -> int:
+    tile_m, tile_n = tile_mn
+    cluster_m, cluster_n = cluster_shape_mn
+    clustered_ctas_m = pad_up(ceil_div(M, tile_m), cluster_m)
+    clustered_ctas_n = pad_up(ceil_div(N, tile_n), cluster_n)
+    return clustered_ctas_m * clustered_ctas_n
 
 
 if IS_CUTLASS_DSL_AVAILABLE:
@@ -371,7 +356,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         def __init__(self,
                      output_dtype: torch.dtype,
                      to_userbuffers: bool = False,
-                     use_tvm_ffi: bool = False):
+                     use_tvm_ffi: bool = True):
             super().__init__()
 
             if output_dtype != torch.bfloat16:
@@ -384,15 +369,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         def unique_id(self):
             return (self.output_dtype, self.to_userbuffers, self.use_tvm_ffi)
-
-        def __hash__(self):
-            return hash(
-                (self.output_dtype, self.to_userbuffers, self.use_tvm_ffi))
-
-        def __eq__(self, other):
-            if not isinstance(other, self.__class__):
-                return False
-            return self.output_dtype == other.output_dtype and self.to_userbuffers == other.to_userbuffers and self.use_tvm_ffi == other.use_tvm_ffi
 
         def get_valid_tactics(
             self,
@@ -479,6 +455,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 (4, 4),
             ]
             swap_ab_candidates = [True, False]
+            # prune: prefetch is beneficial only when K is large enough
             use_prefetch_candidates = [True, False]
 
             valid_tactics = []
@@ -509,6 +486,19 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         b_major,
                         c_major,
                 ):
+                    # Prefetch pruning to save tuning time
+                    cta_nums = get_dense_gemm_approximate_cta_nums(
+                        m, n, mma_tiler_mn, cluster_shape_mn)
+                    cta_wave_ratio = cta_nums / torch.cuda.get_device_properties(
+                    ).multi_processor_count
+                    if use_prefetch and not any((
+                            # CTA waves ratio between 0.5 and 1.0
+                            0.5 < cta_wave_ratio < 1.0,
+                            # K is large enough
+                            real_k >= 8192,
+                    )):
+                        continue
+
                     valid_tactics.append(
                         (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch))
 
@@ -775,7 +765,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         alpha: torch.Tensor,
         output_dtype: torch.dtype,
         to_userbuffers: bool = False,
-        use_tvm_ffi: bool = False,
+        use_tvm_ffi: bool = True,
     ) -> torch.Tensor:
         """CuteDSL-based NVFP4 GEMM optimized for Blackwell.
 
@@ -825,7 +815,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         alpha: torch.Tensor,  # Match custom op signature
         output_dtype: torch.dtype,
         to_userbuffers: bool = False,
-        use_tvm_ffi: bool = False,
+        use_tvm_ffi: bool = True,
     ):
         # [m, k]
         shape = list(mat_a.shape)
@@ -864,6 +854,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     f"{self.__class__.kernel_class.__name__} supports SM 100 (B200) and SM 103 (B300) only, but got SM {sm_version}"
                 )
 
+            if self.tile_size not in (128, 256):
+                raise ValueError(
+                    f"{self.__class__.kernel_class.__name__} supports tile_size (MMA tile M dimension) 128 and 256 only, but got {self.tile_size}"
+                )
+
         def unique_id(self):
             return (
                 self.num_experts,
@@ -885,9 +880,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             m, k = a.size(0), a.size(1) * 2
             l, n = b.size(0), b.size(1)
 
-            # TODO: Add full shmoo
-            mma_tiler_mn_candidates = [(128, 128), (128, 256)]
-            cluster_shape_mn_candidates = [(1, 1), (1, 2)]
+            mma_tiler_mn_candidates = [(self.tile_size, 128),
+                                       (self.tile_size, 256)]
+            cluster_shape_mn_candidates = [(self.tile_size // 128, 1),
+                                           (self.tile_size // 128, 2)]
 
             valid_tactics = []
             for mma_tiler_mn, cluster_shape_mn in itertools.product(
@@ -896,9 +892,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         ab_dtype=cutlass.Float4E2M1FN,
                         sf_dtype=cutlass.Float8E4M3FN,
                         sf_vec_size=self.scaling_vector_size,
-                        acc_dtype=cutlass.Float32,
                         c_dtype=cutlass.BFloat16,
-                        use_2cta_instrs=False,
                         mma_tiler_mn=mma_tiler_mn,
                         cluster_shape_mn=cluster_shape_mn,
                         m=m,
@@ -908,7 +902,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         a_major="k",
                         b_major="k",
                         c_major="n",
-                        m_aligned=self.tile_size,
                 ):
                     valid_tactics.append((mma_tiler_mn, cluster_shape_mn))
 
@@ -931,7 +924,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                           5, 0,
                                           helper.infer_shape_max_num_tiles)),
                     inputs_pre_hook=helper.inputs_pre_hook,
-                    use_cuda_graph=True,
                 )
             return self.__class__.tuning_config_cache[key]
 
@@ -1004,15 +996,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if isinstance(tactic, tuple):
                 mma_tiler_mn, cluster_shape_mn = tactic
             else:
-                mma_tiler_mn, cluster_shape_mn = (128, 128), (1, 1)
+                mma_tiler_mn = (self.tile_size, 128)
+                cluster_shape_mn = (self.tile_size // 128, 1)
+            assert mma_tiler_mn[
+                0] == self.tile_size, f"Tactic ({tactic}) is incompatible with tile size ({self.tile_size})"
 
             cache_key = (self.scaling_vector_size, self.tile_size, mma_tiler_mn,
                          cluster_shape_mn)
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
                     sf_vec_size=self.scaling_vector_size,
-                    acc_dtype=cutlass.Float32,
-                    use_2cta_instrs=False,
                     mma_tiler_mn=mma_tiler_mn,
                     cluster_shape_mn=cluster_shape_mn,
                 )
@@ -1151,9 +1144,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     f"{self.__class__.kernel_class.__name__} supports SM 100 (B200) and SM 103 (B300) only, but got SM {sm_version}"
                 )
 
-            if self.tile_size not in [128, 256]:
+            if self.tile_size not in (128, 256):
                 raise ValueError(
-                    f"{self.__class__.kernel_class.__name__} supports tile size (mma tile M dimension) 128 and 256 only, but got {self.tile_size}"
+                    f"{self.__class__.kernel_class.__name__} supports tile_size (MMA tile M dimension) 128 and 256 only, but got {self.tile_size}"
                 )
 
         def unique_id(self):
@@ -1177,12 +1170,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
             m, k = a.size(0), a.size(1) * 2
             l, n = b.size(0), b.size(1)
 
-            # TODO: Add full shmoo
             mma_tiler_mn_candidates = [(self.tile_size, 128),
                                        (self.tile_size, 256)]
             cluster_shape_mn_candidates = [(self.tile_size // 128, 1),
                                            (self.tile_size // 128, 2)]
-            raster_along_m_candidates = [True, False]
+            # raster_along_m=False should be theoretically more performant than raster_along_m=True.
+            # TODO: Add raster_along_m=True if we find it more performant in some cases.
+            raster_along_m_candidates = [False]
 
             valid_tactics = []
             for mma_tiler_mn, cluster_shape_mn, raster_along_m in itertools.product(
@@ -1228,7 +1222,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             8, 0, helper.infer_shape_max_num_permuted_tokens),
                         ConstraintSpec(10, 0, helper.infer_shape_num_tokens)),
                     inputs_pre_hook=helper.inputs_pre_hook_finalize_fusion,
-                    use_cuda_graph=True,
                 )
             return self.__class__.tuning_config_cache[key]
 
@@ -1320,11 +1313,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if isinstance(tactic, tuple):
                 mma_tiler_mn, cluster_shape_mn, raster_along_m = tactic
             else:
-                mma_tiler_mn, cluster_shape_mn, raster_along_m = (
-                    self.tile_size, 128), (self.tile_size // 128, 1), False
+                mma_tiler_mn = (self.tile_size, 128)
+                cluster_shape_mn = (self.tile_size // 128, 1)
+                raster_along_m = False
+            assert mma_tiler_mn[
+                0] == self.tile_size, f"Tactic ({tactic}) is incompatible with tile size ({self.tile_size})"
 
             cache_key = (self.scaling_vector_size, self.tile_size, mma_tiler_mn,
-                         cluster_shape_mn)
+                         cluster_shape_mn, raster_along_m)
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
                     sf_vec_size=self.scaling_vector_size,
@@ -1537,6 +1533,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     f"{self.__class__.kernel_class.__name__} supports SM 100 (B200) and SM 103 (B300) only, but got SM {sm_version}"
                 )
 
+            if self.tile_size not in (128, 256):
+                raise ValueError(
+                    f"{self.__class__.kernel_class.__name__} supports tile_size (MMA tile M dimension) 128 and 256 only, but got {self.tile_size}"
+                )
+
         def unique_id(self):
             return (
                 self.num_experts,
@@ -1557,9 +1558,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             m, k = a.size(0), a.size(1) * 2
             l, n = b.size(0), b.size(1)
 
-            # TODO: Add full shmoo
-            mma_tiler_mn_candidates = [(128, 128), (128, 256)]
-            cluster_shape_mn_candidates = [(1, 1), (1, 2)]
+            mma_tiler_mn_candidates = [(self.tile_size, 128),
+                                       (self.tile_size, 256)]
+            cluster_shape_mn_candidates = [(self.tile_size // 128, 1),
+                                           (self.tile_size // 128, 2)]
 
             valid_tactics = []
             for mma_tiler_mn, cluster_shape_mn in itertools.product(
@@ -1568,9 +1570,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         ab_dtype=cutlass.Float4E2M1FN,
                         sf_dtype=cutlass.Float8E4M3FN,
                         sf_vec_size=self.scaling_vector_size,
-                        acc_dtype=cutlass.Float32,
                         c_dtype=cutlass.Float4E2M1FN,
-                        use_2cta_instrs=False,
                         mma_tiler_mn=mma_tiler_mn,
                         cluster_shape_mn=cluster_shape_mn,
                         m=m,
@@ -1580,7 +1580,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         a_major="k",
                         b_major="k",
                         c_major="n",
-                        m_aligned=self.tile_size,
                 ):
                     valid_tactics.append((mma_tiler_mn, cluster_shape_mn))
 
@@ -1603,7 +1602,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                           5, 0,
                                           helper.infer_shape_max_num_tiles)),
                     inputs_pre_hook=helper.inputs_pre_hook,
-                    use_cuda_graph=True,
                 )
             return self.__class__.tuning_config_cache[key]
 
@@ -1689,15 +1687,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if isinstance(tactic, tuple):
                 mma_tiler_mn, cluster_shape_mn = tactic
             else:
-                mma_tiler_mn, cluster_shape_mn = (128, 128), (1, 1)
+                mma_tiler_mn = (self.tile_size, 128)
+                cluster_shape_mn = (self.tile_size // 128, 1)
+            assert mma_tiler_mn[
+                0] == self.tile_size, f"Tactic ({tactic}) is incompatible with tile size ({self.tile_size})"
 
             cache_key = (self.scaling_vector_size, self.tile_size, mma_tiler_mn,
                          cluster_shape_mn)
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
                     sf_vec_size=self.scaling_vector_size,
-                    acc_dtype=cutlass.Float32,
-                    use_2cta_instrs=False,
                     mma_tiler_mn=mma_tiler_mn,
                     cluster_shape_mn=cluster_shape_mn,
                     vectorized_f32=True,
@@ -1845,9 +1844,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.tile_size = tile_size
             self.scaling_vector_size = scaling_vector_size
 
-            if get_sm_version() != 100 and get_sm_version() != 103:
+            if (sm_version := get_sm_version()) not in (100, 103):
                 raise ValueError(
-                    f"SM version {get_sm_version()} is not supported for {self.__class__.__name__}, it only supports SM 100 and SM 103"
+                    f"{self.__class__.kernel_class.__name__} supports SM 100 (B200) and SM 103 (B300) only, but got SM {sm_version}"
+                )
+
+            if self.tile_size not in (128, 256):
+                raise ValueError(
+                    f"{self.__class__.kernel_class.__name__} supports tile_size (MMA tile M dimension) 128 and 256 only, but got {self.tile_size}"
                 )
 
         def unique_id(self):
@@ -1872,23 +1876,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
             k = a.size(1) * 2
             l, n = b.size(0), b.size(1)
 
-            if self.tile_size == 128:
-                mma_tiler_mn_candidates = [(128, 128), (128, 256)]
-                cluster_shape_mn_candidates = [(1, 1)]
-            elif self.tile_size == 256:
-                mma_tiler_mn_candidates = [(256, 128), (256, 256)]
-                cluster_shape_mn_candidates = [(2, 1)]
-            else:
-                raise ValueError(f"Tile size {self.tile_size} is not supported")
+            mma_tiler_mn_candidates = [(self.tile_size, 128),
+                                       (self.tile_size, 256)]
+            cluster_shape_mn_candidates = [(self.tile_size // 128, 1)]
+            # TODO: Add raster_along_m=True if we find it more performant in some cases.
+            raster_along_m_candidates = [False]
 
             valid_tactics = []
-            for mma_tiler_mn, cluster_shape_mn in itertools.product(
-                    mma_tiler_mn_candidates, cluster_shape_mn_candidates):
+            for mma_tiler_mn, cluster_shape_mn, raster_along_m in itertools.product(
+                    mma_tiler_mn_candidates, cluster_shape_mn_candidates,
+                    raster_along_m_candidates):
                 if self.__class__.kernel_class.can_implement(
                         ab_dtype=cutlass.Float4E2M1FN,
                         sf_dtype=cutlass.Float8E4M3FN,
                         sf_vec_size=self.scaling_vector_size,
-                        acc_dtype=cutlass.Float32,
                         c_dtype=cutlass.Float4E2M1FN,
                         mma_tiler_mn=mma_tiler_mn,
                         cluster_shape_mn=cluster_shape_mn,
@@ -1899,9 +1900,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         a_major="k",
                         b_major="k",
                         c_major="n",
-                        m_aligned=self.tile_size,
                 ):
-                    valid_tactics.append((mma_tiler_mn, cluster_shape_mn))
+                    valid_tactics.append(
+                        (mma_tiler_mn, cluster_shape_mn, raster_along_m))
 
             return valid_tactics
 
@@ -1930,7 +1931,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                           6, 0,
                                           helper.infer_shape_max_num_tiles)),
                     inputs_pre_hook=helper.inputs_pre_hook,
-                    use_cuda_graph=True,
                 )
             return self.__class__.tuning_config_cache[key]
 
@@ -2032,22 +2032,24 @@ if IS_CUTLASS_DSL_AVAILABLE:
             stream = cuda.CUstream(torch_stream.cuda_stream)
 
             if isinstance(tactic, tuple):
-                mma_tiler_mn, cluster_shape_mn = tactic
+                mma_tiler_mn, cluster_shape_mn, raster_along_m = tactic
             else:
-                mma_tiler_mn, cluster_shape_mn = (self.tile_size,
-                                                  128), (self.tile_size // 128,
-                                                         1)
+                mma_tiler_mn = (self.tile_size, 128)
+                cluster_shape_mn = (self.tile_size // 128, 1)
+                raster_along_m = False
+            assert mma_tiler_mn[
+                0] == self.tile_size, f"Tactic ({tactic}) is incompatible with tile size ({self.tile_size})"
 
             cache_key = (self.scaling_vector_size, self.tile_size, self.top_k,
-                         mma_tiler_mn, cluster_shape_mn)
+                         mma_tiler_mn, cluster_shape_mn, raster_along_m)
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
                     sf_vec_size=self.scaling_vector_size,
-                    acc_dtype=cutlass.Float32,
                     mma_tiler_mn=mma_tiler_mn,
                     cluster_shape_mn=cluster_shape_mn,
                     vectorized_f32=True,
                     topk=self.top_k,
+                    raster_along_m=raster_along_m,
                 )
                 # Compute max active clusters on current device
                 hardware_info = cutlass.utils.HardwareInfo()
@@ -2177,225 +2179,3 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                    dtype=input_scale.dtype,
                                    device=input_scale.device)
         return output, output_scale
-
-    class FusedMoEInputsHelper:
-
-        def __init__(self, num_experts: int, top_k: int, num_local_experts: int,
-                     local_expert_offset: int):
-            self.num_experts = num_experts
-            self.top_k = top_k
-            self.num_local_experts = num_local_experts
-            self.local_expert_offset = local_expert_offset
-
-        def infer_shape_num_tokens(self, input_shapes: List[torch.Size]) -> int:
-            return input_shapes[0][0]
-
-        def inputs_pre_hook(self,
-                            inputs: List[torch.Tensor]) -> List[torch.Tensor]:
-            x, x_sf, token_selected_experts, token_final_scales, *others = inputs
-            num_tokens = token_selected_experts.size(0)
-            new_token_final_scales, new_token_selected_experts = torch.randn(
-                num_tokens,
-                self.num_experts,
-                device=token_selected_experts.device).topk(self.top_k, dim=-1)
-            new_token_selected_experts = new_token_selected_experts.to(
-                token_selected_experts.dtype)
-            new_token_final_scales = new_token_final_scales.softmax(dim=-1).to(
-                token_final_scales.dtype)
-            return x, x_sf, new_token_selected_experts, new_token_final_scales, *others
-
-    class Sm100BlockScaledFusedMoERunner(TunableRunner):
-        tuning_config_cache = dict()
-
-        def __init__(self,
-                     num_experts: int,
-                     top_k: int,
-                     num_local_experts: int,
-                     local_expert_offset: int,
-                     output_dtype: torch.dtype,
-                     scaling_vector_size: int = 16):
-            super().__init__()
-            self.num_experts = num_experts
-            self.top_k = top_k
-            self.num_local_experts = num_local_experts
-            self.local_expert_offset = local_expert_offset
-
-            assert output_dtype == torch.bfloat16
-            self.output_dtype = output_dtype
-            self.scaling_vector_size = scaling_vector_size
-
-        def unique_id(self):
-            return (
-                self.num_experts,
-                self.top_k,
-                self.num_local_experts,
-                self.local_expert_offset,
-                self.output_dtype,
-                self.scaling_vector_size,
-            )
-
-        def get_valid_tactics(
-            self,
-            inputs: List[torch.Tensor],
-            profile: OptimizationProfile,
-            **kwargs,
-        ) -> List[int]:
-            return [128]
-
-        def get_tuning_config(self) -> TuningConfig:
-            key = self.unique_id()
-            if key not in self.__class__.tuning_config_cache:
-                helper = FusedMoEInputsHelper(self.num_experts, self.top_k,
-                                              self.num_local_experts,
-                                              self.local_expert_offset)
-                self.__class__.tuning_config_cache[key] = TuningConfig(
-                    dynamic_tensor_specs=(DynamicTensorSpec(
-                        0, 0, get_last_power_of_2_num_tokens_buckets,
-                        last_positive_power_of_2), ),
-                    constraint_specs=(ConstraintSpec(1, 0,
-                                                     fp4_scale_infer_shape),
-                                      ConstraintSpec(
-                                          2, 0, helper.infer_shape_num_tokens),
-                                      ConstraintSpec(
-                                          3, 0, helper.infer_shape_num_tokens)),
-                    inputs_pre_hook=helper.inputs_pre_hook,
-                    use_cuda_graph=True,
-                )
-            return self.__class__.tuning_config_cache[key]
-
-        def forward(self, inputs: List[torch.Tensor],
-                    tactic: Optional[int]) -> torch.Tensor:
-            if isinstance(tactic, int):
-                tile_size = tactic
-            else:
-                tile_size = 128
-
-            x, x_sf, token_selected_experts, token_final_scales, gemm1_weight, gemm1_weight_scale, gemm1_alpha, gemm2_input_global_scale, gemm2_weight, gemm2_weight_scale, gemm2_alpha = inputs
-            tile_idx_to_expert_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx, total_num_padded_tokens, num_non_exiting_tiles = torch.ops.trtllm.moe_sort(
-                token_selected_experts=token_selected_experts,
-                token_final_scales=token_final_scales,
-                num_experts=self.num_experts,
-                top_k=self.top_k,
-                local_expert_offset=self.local_expert_offset,
-                local_num_experts=self.num_local_experts,
-                tile_tokens_dim=tile_size,
-            )
-            x, x_sf = torch.ops.trtllm.moe_permute(
-                input=x,
-                input_sf=x_sf,
-                tile_idx_to_mn_limit=tile_idx_to_mn_limit,
-                permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
-                num_non_exiting_tiles=num_non_exiting_tiles,
-                tile_tokens_dim=tile_size,
-                top_k=self.top_k,
-            )
-            x = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_blackwell(
-                input=x.view(torch.float4_e2m1fn_x2),
-                weight=gemm1_weight.view(torch.float4_e2m1fn_x2),
-                input_scale=x_sf.view(torch.uint8),
-                weight_scale=gemm1_weight_scale.view(torch.uint8),
-                alpha=gemm1_alpha,
-                tile_idx_to_group_idx=tile_idx_to_expert_idx,
-                num_non_exiting_tiles=num_non_exiting_tiles,
-                num_experts=self.num_experts,
-                top_k=self.top_k,
-                num_local_experts=self.num_local_experts,
-                local_expert_offset=self.local_expert_offset,
-                tile_size=tile_size,
-                output_dtype=self.output_dtype,
-            )
-            x, x_sf = torch.ops.trtllm.moe_swiglu_nvfp4_quantize(
-                input=x,
-                global_sf=gemm2_input_global_scale,
-                tile_idx_to_mn_limit=tile_idx_to_mn_limit,
-                num_non_exiting_tiles=num_non_exiting_tiles,
-                tile_tokens_dim=tile_size,
-            )
-            x = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_blackwell(
-                input=x.view(torch.float4_e2m1fn_x2),
-                weight=gemm2_weight.view(torch.float4_e2m1fn_x2),
-                input_scale=x_sf.view(torch.uint8),
-                weight_scale=gemm2_weight_scale.view(torch.uint8),
-                alpha=gemm2_alpha,
-                tile_idx_to_group_idx=tile_idx_to_expert_idx,
-                num_non_exiting_tiles=num_non_exiting_tiles,
-                num_experts=self.num_experts,
-                top_k=self.top_k,
-                num_local_experts=self.num_local_experts,
-                local_expert_offset=self.local_expert_offset,
-                tile_size=tile_size,
-                output_dtype=self.output_dtype,
-            )
-            x = torch.ops.trtllm.moe_unpermute(
-                permuted_input=x,
-                expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
-                topk_scales=token_final_scales,
-            )
-            return x
-
-    @torch.library.custom_op("trtllm::cute_dsl_nvfp4_fused_moe_blackwell",
-                             mutates_args=(),
-                             device_types="cuda")
-    def cute_dsl_nvfp4_fused_moe_blackwell(
-        input: torch.Tensor,
-        input_scale: torch.Tensor,
-        token_selected_experts: torch.Tensor,
-        token_final_scales: torch.Tensor,
-        gemm1_weight: torch.Tensor,
-        gemm1_weight_scale: torch.Tensor,
-        gemm1_alpha: torch.Tensor,
-        gemm2_input_global_scale: torch.Tensor,
-        gemm2_weight: torch.Tensor,
-        gemm2_weight_scale: torch.Tensor,
-        gemm2_alpha: torch.Tensor,
-        num_experts: int,
-        top_k: int,
-        num_local_experts: int,
-        local_expert_offset: int,
-        output_dtype: torch.dtype,
-        scaling_vector_size: int = 16,
-    ) -> torch.Tensor:
-        tuner = AutoTuner.get()
-        runner = Sm100BlockScaledFusedMoERunner(num_experts, top_k,
-                                                num_local_experts,
-                                                local_expert_offset,
-                                                output_dtype,
-                                                scaling_vector_size)
-        inputs = [
-            input, input_scale, token_selected_experts, token_final_scales,
-            gemm1_weight, gemm1_weight_scale, gemm1_alpha,
-            gemm2_input_global_scale, gemm2_weight, gemm2_weight_scale,
-            gemm2_alpha
-        ]
-
-        _, best_tactic = tuner.choose_one(
-            "trtllm::cute_dsl_nvfp4_fused_moe_blackwell",
-            [runner],
-            runner.get_tuning_config(),
-            inputs,
-        )
-        output = runner(inputs, tactic=best_tactic)
-        return output
-
-    @torch.library.register_fake("trtllm::cute_dsl_nvfp4_fused_moe_blackwell")
-    def _(
-        input: torch.Tensor,
-        input_scale: torch.Tensor,
-        token_selected_experts: torch.Tensor,
-        token_final_scales: torch.Tensor,
-        gemm1_weight: torch.Tensor,
-        gemm1_weight_scale: torch.Tensor,
-        gemm1_alpha: torch.Tensor,
-        gemm2_input_global_scale: torch.Tensor,
-        gemm2_weight: torch.Tensor,
-        gemm2_weight_scale: torch.Tensor,
-        gemm2_alpha: torch.Tensor,
-        num_experts: int,
-        top_k: int,
-        num_local_experts: int,
-        local_expert_offset: int,
-        output_dtype: torch.dtype,
-        scaling_vector_size: int = 16,
-    ):
-        m, k = input.size(0), input.size(1) * 2
-        return torch.empty(m, k, dtype=output_dtype, device=input.device)

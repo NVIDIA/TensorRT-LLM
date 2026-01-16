@@ -154,7 +154,8 @@ bool CacheFormatter::needSendCache(
         return true;
     }
 
-    int selfTpRank = selfIdx % selfConfig.getParallelConfig().mTensorParallelism;
+    int selfCpSize = selfConfig.getParallelConfig().mContextParallelism;
+    int selfTpRank = (selfIdx % (selfConfig.getParallelConfig().mTensorParallelism * selfCpSize)) / selfCpSize;
     int selfTpRankInDpGroup = selfTpRank;
     if (selfConfig.getParallelConfig().mEnableAttentionDP)
     {

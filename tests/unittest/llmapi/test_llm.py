@@ -4,6 +4,7 @@ import gc
 import json
 import os
 import sys
+import time
 
 # Required for test_generate_with_seed to pass.
 # See the discussion in https://github.com/NVIDIA/TensorRT-LLM/pull/4264#issuecomment-2943269891
@@ -1217,7 +1218,7 @@ def test_llm_api_medusa():
 
     speculative_config = MedusaDecodingConfig(num_medusa_heads=4,
             max_draft_len=63,
-            speculative_model_dir=get_model_path("medusa-vicuna-7b-v1.3"),
+            speculative_model=get_model_path("medusa-vicuna-7b-v1.3"),
             medusa_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], \
                                             [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], \
                                             [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], \
@@ -1256,7 +1257,7 @@ def test_llm_api_medusa_tp2():
 
     speculative_config = MedusaDecodingConfig(num_medusa_heads=4,
             max_draft_len=63,
-              speculative_model_dir=get_model_path("medusa-vicuna-7b-v1.3"),
+              speculative_model=get_model_path("medusa-vicuna-7b-v1.3"),
                             medusa_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], \
                                             [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], \
                                             [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], \
@@ -1294,7 +1295,7 @@ def test_llm_api_eagle(**llm_kwargs):
 
     speculative_config = EagleDecodingConfig(
         max_draft_len=63,
-        speculative_model_dir=get_model_path("EAGLE-Vicuna-7B-v1.3"),
+        speculative_model=get_model_path("EAGLE-Vicuna-7B-v1.3"),
         num_eagle_layers=4,
         max_non_leaves_per_layer=10,
                             eagle_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], \
@@ -1341,7 +1342,7 @@ def test_llm_api_eagle2(**llm_kwargs):
 
     speculative_config = EagleDecodingConfig(
         max_draft_len=63,
-        speculative_model_dir=get_model_path("EAGLE-Vicuna-7B-v1.3"),
+        speculative_model=get_model_path("EAGLE-Vicuna-7B-v1.3"),
         num_eagle_layers=4,
         max_non_leaves_per_layer=10,
         use_dynamic_tree=True,
@@ -2193,6 +2194,7 @@ def llm_get_stats_test_harness(tp_size: int = 1,
                                    sampling_params=sampling_params):
             print(output)
 
+        time.sleep(2)
         results = llm.get_stats(2)
 
         validate_stats(results=results,
@@ -2203,7 +2205,7 @@ def llm_get_stats_test_harness(tp_size: int = 1,
                        enable_chunked_prefill=enable_chunked_prefill,
                        enable_iter_req_stats=enable_iter_req_stats)
 
-        assert not llm.get_stats(2)
+        assert not llm.get_stats(0.5)
 
         # test that IterationResult()._done is properly set
         _ = llm.generate(prompts, sampling_params=sampling_params)
@@ -2340,8 +2342,9 @@ def llm_get_stats_async_test_harness(tp_size: int = 1,
         async def task1(repetition_index: int):
             results = []
             await asyncio.sleep(
-                3)  # ensure there's stats to collect for the assertion
-            async for stats in llm.get_stats_async(timeout=2):
+                4)  # ensure there's stats to collect for the assertion
+            async for stats in llm.get_stats_async(
+                    10):  # it will return immediately
                 results.append(stats)
 
             assert results
@@ -2390,7 +2393,8 @@ def test_llm_chunked_prefill():
                   enable_chunked_prefill=False,
                   fast_build=True)
 
-        with pytest.raises(ValueError):
+        # max_num_tokens validation now raises RequestError consistently
+        with pytest.raises(RequestError):
             output = llm.generate_async(
                 "A " * build_config.max_num_tokens,
                 sampling_params=sampling_params,
@@ -2433,13 +2437,9 @@ def _test_llm_capture_request_error(pytorch_backend: bool, tp_size: int = 1):
     )
 
     prompt = 'A ' * 65  # the minimum max_num_tokens is 64
-    if pytorch_backend:
-        # pytorch backend will raise ValueError for max_num_tokens
-        with pytest.raises(ValueError):
-            llm.generate(prompt)
-    else:
-        with pytest.raises(RequestError):
-            llm.generate(prompt)
+    # Both backends now consistently raise RequestError for max_num_tokens validation
+    with pytest.raises(RequestError):
+        llm.generate(prompt)
 
 
 def test_llm_capture_request_error():

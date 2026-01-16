@@ -10,8 +10,7 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings
-from tensorrt_llm._utils import mpi_disabled
-from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
+from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
 from tensorrt_llm.llmapi.llm_args import (KvCacheConfig, PeftCacheConfig,
                                           PybindMirror)
 from tensorrt_llm.lora_helper import LoraConfig
@@ -27,11 +26,6 @@ from .kv_cache_connector import KvCacheConnectorManager
 from .llm_request import (LlmRequest, LlmRequestState, SamplingConfig,
                           get_draft_token_length)
 from .scheduler import ScheduledRequests
-
-if ENABLE_MULTI_DEVICE:
-    from mpi4py import MPI
-
-    from tensorrt_llm._utils import mpi_comm
 
 BufferManagerCpp = tensorrt_llm.bindings.internal.runtime.BufferManager
 KVCacheManagerCpp = tensorrt_llm.bindings.internal.batch_manager.KVCacheManager
@@ -176,6 +170,7 @@ class KVCacheManager(BaseResourceManager):
         indexer_k_cache_quant_block_size: int = 128,
         indexer_k_cache_index_head_dim: int = 0,
         is_estimating_kv_cache: bool = False,
+        execution_stream: Optional[torch.cuda.Stream] = None,
         **kwargs,
     ) -> None:
         self.mapping = mapping
@@ -351,9 +346,13 @@ class KVCacheManager(BaseResourceManager):
         # Set up temp_attention_window_inputs
         temp_attention_window_inputs = self._set_temp_attention_window_inputs()
 
-        # Note that this stream is unused for now. Will be used for copying to host
-        # when that feature is enabled.
-        self._stream = torch.cuda.Stream()
+        # Use the provided execution stream for proper synchronization with KVCacheTransferManager.
+        # The execution stream is the stream where model forward kernels run, and KVCacheTransferManager
+        # needs to synchronize with it for onboard/offload operations.
+        # If no execution stream is provided, create a new one (for backward compatibility).
+        self._stream = execution_stream if execution_stream is not None else torch.cuda.Stream(
+        )
+        logger.info(f"[KVCacheManager] execution_stream: {self._stream}")
         kwargs = {
             'num_kv_heads_per_layer': self.num_kv_heads_per_layer,
             'size_per_head': head_dim,
@@ -365,7 +364,7 @@ class KVCacheManager(BaseResourceManager):
             'temp_attention_window_inputs': temp_attention_window_inputs,
             'dtype': dtype,
             'sink_token_length': sink_token_length,
-            'stream': self._stream.cuda_stream,
+            'stream': self._stream.cuda_stream,  # Pass to BufferManager
             'max_sequence_length': max_seq_len,
             'enable_block_reuse': kv_cache_config.enable_block_reuse,
             'onboard_blocks': kv_cache_config.onboard_blocks,
@@ -552,6 +551,23 @@ class KVCacheManager(BaseResourceManager):
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
                 req.prompt_len = token_num - 1
                 req.py_prompt_len = req.prompt_len
+                # Helix parallelism: each CP rank holds token_num tokens per sequence.
+                # Since KV cache write for query token happens only on the active rank,
+                # prompt_len is (token_num - 1) there and token_num on inactive ranks.
+                if self.mapping.has_cp_helix():
+                    # Mark only the last rank to be active for helix parallelism.
+                    if self.mapping.cp_size - 1 == self.mapping.cp_rank:
+                        req.py_helix_is_inactive_rank = False
+                        req.prompt_len = token_num - 1
+                        req.py_prompt_len = req.prompt_len
+                        req.seqlen_this_rank_cp = req.prompt_len
+                        req.total_input_len_cp = token_num * self.mapping.cp_size - 1
+                    else:
+                        req.py_helix_is_inactive_rank = True
+                        req.prompt_len = token_num
+                        req.py_prompt_len = req.prompt_len
+                        req.seqlen_this_rank_cp = req.prompt_len
+                        req.total_input_len_cp = token_num * self.mapping.cp_size - 1
                 req.py_draft_tokens = [1] * max_num_draft_tokens
                 if prepare_resource:
                     for _ in range(max_num_draft_tokens):
@@ -582,11 +598,11 @@ class KVCacheManager(BaseResourceManager):
             self.update_kv_cache_draft_token_location(scheduled_batch,
                                                       attn_metadata,
                                                       kv_cache_dtype_byte_size)
-            # rewind kv cache
-            for request in scheduled_batch.generation_requests:
-                if request.state != LlmRequestState.GENERATION_COMPLETE:
-                    if request.py_rewind_len > 0:
-                        self.rewind_kv_cache(request, request.py_rewind_len)
+        # rewind kv cache
+        for request in scheduled_batch.generation_requests:
+            if request.state != LlmRequestState.GENERATION_COMPLETE:
+                if request.py_rewind_len > 0:
+                    self.rewind_kv_cache(request, request.py_rewind_len)
 
         # For context requests, we store the blocks for reuse.
         for request in scheduled_batch.context_requests:
@@ -781,12 +797,11 @@ class KVCacheManager(BaseResourceManager):
 
         if mapping.world_size > 1:
             # make sure all ranks use same value for maxTokens
-            if mpi_disabled():
-                from tensorrt_llm._utils import torch_comm
-                max_tokens = torch_comm().allreduce(
-                    max_tokens, op=torch.distributed.ReduceOp.MIN)
-            else:
-                max_tokens = mpi_comm().allreduce(max_tokens, op=MPI.MIN)
+            dist = Distributed.get(mapping)
+            max_tokens = dist.allreduce(
+                max_tokens,
+                op=ReduceOp.MIN,
+            )
 
         # get number of blocks
         blocks_in_primary_pool = int(max_tokens // tokens_per_block)
@@ -1116,7 +1131,8 @@ class KVCacheManager(BaseResourceManager):
             tensor_parallelism=self.mapping.tp_size,
             pipeline_parallelism=self.mapping.pp_size,
             rank=self.mapping.rank,
-            gpus_per_node=self.mapping.gpus_per_node)
+            gpus_per_node=self.mapping.gpus_per_node,
+            enable_attention_dp=self.mapping.enable_attention_dp)
 
         window_size_to_layers = self._get_window_size_to_layers()
         logger.debug(f"window_size_to_layers: {window_size_to_layers}")
@@ -1408,7 +1424,8 @@ class ResourceManager:
                     resource_manager.update_resources(scheduled_batch)
 
     def free_resources(self, request: LlmRequest):
-        for _, resource_manager in reversed(self.resource_managers.items()):
+        for resource_type, resource_manager in reversed(
+                self.resource_managers.items()):
             if hasattr(resource_manager, "free_resources"):
                 resource_manager.free_resources(request)
 
@@ -1425,7 +1442,8 @@ class PeftCacheManager(BaseResourceManager):
                  peft_cache_config: PeftCacheConfig,
                  lora_config: LoraConfig,
                  model_config: ModelConfigCpp,
-                 world_config: WorldConfig | None = None):
+                 world_config: WorldConfig | None = None,
+                 execution_stream: Optional[torch.cuda.Stream] = None):
         import tensorrt_llm.bindings as _tb
 
         peft_cache_config = peft_cache_config._to_pybind()
@@ -1450,8 +1468,12 @@ class PeftCacheManager(BaseResourceManager):
             world_config = _tb.WorldConfig()
 
         BufferManager = tensorrt_llm.bindings.internal.runtime.BufferManager
-        buffer_manager = BufferManager(torch.cuda.current_stream().cuda_stream,
-                                       True)
+        buffer_manager_stream = execution_stream.cuda_stream if execution_stream is not None else torch.cuda.current_stream(
+        ).cuda_stream
+        buffer_manager = BufferManager(buffer_manager_stream, True)
+        logger.info(
+            f"[PeftCacheManager] buffer_manager_stream: {buffer_manager_stream}"
+        )
         self.impl = PeftCacheManagerCpp(config=peft_cache_manager_config,
                                         model_config=model_config,
                                         world_config=world_config,

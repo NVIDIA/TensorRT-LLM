@@ -433,7 +433,7 @@ class CutlassFusedMoE(MoE):
             elif self.has_w4a16_mxfp4:
                 weight_dtype = torch.uint8
 
-        final_hidden_states = torch.ops.trtllm.fused_moe(
+        result = torch.ops.trtllm.fused_moe(
             x,
             token_selected_experts,
             token_final_scales,
@@ -468,10 +468,13 @@ class CutlassFusedMoE(MoE):
             unpadded_hidden_size=self.unpadded_hidden_size,
             out_tensor=moe_output,
         )
-        # Custom op requires all inputs are in the same type.
-        # Only in cutlass_min_latency_mode, the output is a list of tensors.
-        # Otherwise, the output should be unpacked as a single tensor.
-        final_hidden_states = final_hidden_states[0]
+        # When moe_output is provided, the result is written in-place and
+        # fused_moe returns empty list to avoid aliasing constraint violation.
+        # Otherwise, unpack the single tensor from the returned list.
+        if moe_output is not None:
+            final_hidden_states = moe_output
+        else:
+            final_hidden_states = result[0]
 
         return final_hidden_states
 

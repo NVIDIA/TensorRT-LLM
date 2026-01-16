@@ -890,12 +890,13 @@ class Glm4Model(DecoderModel):
         config = model_config.pretrained_config
         self.vocab_size = config.vocab_size
         self.num_hidden_layers = config.num_hidden_layers
-        aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
+        aux_stream_list = [torch.cuda.Stream() for _ in range(4)]
         self.aux_stream_dict = {
             AuxStreamType.Attention: aux_stream_list[0],
             AuxStreamType.MoeShared: aux_stream_list[0],
             AuxStreamType.MoeChunkingOverlap: aux_stream_list[1],
             AuxStreamType.MoeBalancer: aux_stream_list[2],
+            AuxStreamType.MoeOutputMemset: aux_stream_list[3],
         }
 
         self.embed_tokens = Embedding(
@@ -981,8 +982,6 @@ class Glm4MoeForCausalLM(SpecDecOneEngineForCausalLM[Glm4Model, PretrainedConfig
                                 )
                     self.model_config.quant_config.exclude_modules.extend(extend_exclude_modules)
             self.model.layers.extend(self.draft_model.mtp_layers)
-            self.epilogue.extend(self.draft_model.mtp_layers)
-            self.epilogue.append(self.spec_worker)
 
     def forward(
         self,

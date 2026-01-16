@@ -13,7 +13,7 @@ from strenum import StrEnum
 
 import tensorrt_llm
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
-from tensorrt_llm._utils import get_sm_version, mpi_disabled
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
                                           ContextChunkingPolicy,
                                           GuidedDecodingConfig, LoadFormat,
@@ -27,7 +27,7 @@ from tensorrt_llm.quantization import QuantAlgo
 
 from ..attention_backend.interface import AttentionRuntimeFeatures
 from ..attention_backend.trtllm import TrtllmAttention
-from ..distributed import MPIDist, TorchDist
+from ..distributed import Distributed
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
 from ..virtual_memory import ExecutorMemoryType, RestoreMode
@@ -221,7 +221,7 @@ def create_py_executor(
     tokenizer: Optional[TokenizerBase] = None,
     profiling_stage_data: Optional[dict] = None,
 ) -> PyExecutor:
-
+    torch.cuda.set_per_process_memory_fraction(1.0)
     garbage_collection_gen0_threshold = llm_args.garbage_collection_gen0_threshold
     lora_config = llm_args.lora_config
     kv_connector_config = llm_args.kv_connector_config
@@ -303,10 +303,7 @@ def create_py_executor(
             "when only processing vision encoder inputs.")
 
     mapping = _get_mapping(llm_args.parallel_config.to_mapping())
-    if mpi_disabled():
-        dist = TorchDist(mapping=mapping)
-    else:
-        dist = MPIDist(mapping=mapping)
+    dist = Distributed.get(mapping)
 
     vm_pools = {}
     enable_sleep = llm_args.enable_sleep
@@ -398,7 +395,7 @@ def create_py_executor(
                 draft_llm_args.load_format = LoadFormat.DUMMY
 
             draft_model_engine = PyTorchModelEngine(
-                model_path=spec_config.speculative_model_dir,
+                model_path=spec_config.speculative_model,
                 llm_args=draft_llm_args,
                 mapping=mapping,
                 attn_runtime_features=attn_runtime_features,
@@ -508,7 +505,8 @@ def create_py_executor(
                 kwargs = {
                     "guided_decoding_config": guided_decoding_config,
                     "max_num_sequences": max_batch_size,
-                    "vocab_size_padded": model_engine.model.vocab_size_padded
+                    "vocab_size_padded": model_engine.model.vocab_size_padded,
+                    "rank": mapping.rank,
                 }
                 if spec_config is not None:
                     kwargs[
@@ -601,6 +599,13 @@ def create_py_executor(
     resources = {}
     estimating_kv_cache = False
     kv_cache_creator = None
+
+    # Create the execution stream for model forward operations
+    # for proper synchronization with KVCacheTransferManager's onboard/offload operations.
+    execution_stream = torch.cuda.Stream()
+    logger.info(
+        f"[create_py_executor] Created execution_stream: {execution_stream}")
+
     if model_engine.model.model_config.is_generation:
         #NOTE: non-generation models do not have kv cache
         kv_cache_creator = KvCacheCreator(
@@ -619,6 +624,7 @@ def create_py_executor(
             speculative_config=spec_config,
             profiling_stage_data=profiling_stage_data,
             sparse_attention_config=sparse_attention_config,
+            execution_stream=execution_stream,
         )
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
         with allocation_scope(
@@ -676,6 +682,7 @@ def create_py_executor(
             scheduler_config=scheduler_config,
             cache_transceiver_config=cache_transceiver_config,
             virtual_memory_pools=vm_pools if not estimating_kv_cache else None,
+            execution_stream=execution_stream,
         )
         # Originally, peft_cache_config might be mutated inside
         # create_py_executor_instance. Restore it here.
@@ -736,6 +743,7 @@ def create_py_executor(
                 scheduler_config=scheduler_config,
                 cache_transceiver_config=cache_transceiver_config,
                 virtual_memory_pools=vm_pools,
+                execution_stream=execution_stream,
             )
 
     _adjust_torch_mem_fraction()

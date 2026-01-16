@@ -26,12 +26,13 @@ from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.utils import ActivationType, relu2
 
 from ..attention_backend import AttentionMetadata
+from ..distributed import AllReduce
 from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import MoEWeightLoadingMode, create_moe
-from ..modules.linear import Linear
+from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mamba.mamba2_mixer import Mamba2Mixer
 from ..modules.mlp import MLP
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
@@ -84,8 +85,10 @@ class TransformerLayer(Attention):
         self,
         model_config: ModelConfig[NemotronHConfig],
         layer_idx: int,
+        reduce_output: bool = False,
     ):
         config = model_config.pretrained_config
+
         super().__init__(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
@@ -96,6 +99,7 @@ class TransformerLayer(Attention):
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             config=model_config,
+            reduce_output=reduce_output,
         )
 
     def forward(
@@ -124,7 +128,7 @@ class NemotronHMOE(nn.Module):
         from .modeling_deepseekv3 import DeepseekV3Gate
 
         self.activation_type = ActivationType.Relu2
-        self.reduce_results = True
+        self.reduce_results = False
 
         config = model_config.pretrained_config
         self.hidden_dim = config.hidden_size
@@ -144,6 +148,7 @@ class NemotronHMOE(nn.Module):
         self.top_k = config.num_experts_per_tok
         self.enable_attention_dp = model_config.mapping.enable_attention_dp
         self.routed_scaling_factor = config.routed_scaling_factor
+        self.mapping = model_config.mapping
 
         # Setup shared expert MLP.
         if config.n_shared_experts is None or config.n_shared_experts == 0:
@@ -152,6 +157,7 @@ class NemotronHMOE(nn.Module):
             shared_expert_intermediate_size = (
                 config.moe_shared_expert_intermediate_size *
                 config.n_shared_experts)
+
             self.shared_experts = MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=shared_expert_intermediate_size,
@@ -160,7 +166,9 @@ class NemotronHMOE(nn.Module):
                 dtype=config.torch_dtype,
                 config=model_config,
                 layer_idx=self.layer_idx,
-            )
+                reduce_output=False,
+                overridden_tp_size=1
+                if model_config.mapping.enable_attention_dp else None)
         # Setup MoE gate.
         self.gate = DeepseekV3Gate(
             self.hidden_size,
@@ -190,19 +198,36 @@ class NemotronHMOE(nn.Module):
             activation_type=self.activation_type,
         )
 
+        if not model_config.mapping.enable_attention_dp:
+            # AllReduce for combining shared and routed expert outputs in multi-GPU settings.
+            self.allreduce = AllReduce(
+                mapping=model_config.mapping,
+                strategy=model_config.allreduce_strategy,
+            )
+        else:
+            self.allreduce = None
+
         # Setup latent projection layers.
+        # These layers should NOT be TP-sharded to ensure MoE receives
+        # full latent representation. They are replicated across all GPUs.
         if self.use_latent_moe:
             self.fc1_latent_proj = Linear(
                 in_features=self.hidden_size,
                 out_features=self.moe_hidden_size,
                 bias=self.mlp_bias,
                 dtype=config.torch_dtype,
+                quant_config=model_config.get_quant_config(),
+                skip_create_weights_in_init=model_config.
+                skip_create_weights_in_init,
             )
             self.fc2_latent_proj = Linear(
                 in_features=self.moe_hidden_size,
                 out_features=self.hidden_size,
                 bias=self.mlp_bias,
                 dtype=config.torch_dtype,
+                quant_config=model_config.get_quant_config(),
+                skip_create_weights_in_init=model_config.
+                skip_create_weights_in_init,
             )
         else:
             self.fc1_latent_proj = None
@@ -223,6 +248,7 @@ class NemotronHMOE(nn.Module):
         assert hidden_states.shape[-1] == self.hidden_dim
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_dim)
+        all_rank_num_tokens = attn_metadata.all_rank_num_tokens
 
         def _compute_shared_output():
             if self.shared_experts is not None:
@@ -239,7 +265,6 @@ class NemotronHMOE(nn.Module):
                 routed_hidden_states = self.fc1_latent_proj(
                     routed_hidden_states)
 
-            all_rank_num_tokens = attn_metadata.all_rank_num_tokens
             final_hidden_states = self.experts(
                 routed_hidden_states,
                 router_logits,
@@ -257,6 +282,10 @@ class NemotronHMOE(nn.Module):
             self.event_dict[EventType.MoeShared], self.aux_stream_shared)
 
         final_hidden_states = shared_output + routed_output
+
+        # Perform all-reduce after combining outputs for multi-GPU support.
+        if not self.enable_attention_dp and self.mapping.tp_size > 1:
+            final_hidden_states = self.allreduce(final_hidden_states)
 
         return final_hidden_states.view(orig_shape)
 
@@ -301,7 +330,11 @@ class NemotronHLayer(DecoderLayer):
         elif layer_type == "-":
             self.mixer = MLPLayer(model_config, layer_idx)
         elif layer_type == "*":
-            self.mixer = TransformerLayer(model_config, layer_idx)
+            self.mixer = TransformerLayer(
+                model_config,
+                layer_idx,
+                reduce_output=not model_config.mapping.enable_attention_dp
+                and model_config.mapping.tp_size > 1)
         elif layer_type == "E":
             self.mixer = NemotronHMOE(model_config,
                                       layer_idx=layer_idx,
@@ -344,12 +377,24 @@ class NemotronHModel(DecoderModel):
             aux_stream_list[2],
         }
 
-        # calculate embeddings
-        self.embed_tokens = Embedding(
-            config.vocab_size,
-            config.hidden_size,
-            dtype=config.torch_dtype,
-        )
+        if model_config.mapping.enable_attention_dp:
+            # When attention_dp is enabled, we cannot do all_reduce since
+            # the problem size of different ranks are different.
+            # So, we don't do parallelism here.
+            self.embed_tokens = Embedding(
+                config.vocab_size,
+                config.hidden_size,
+                dtype=config.torch_dtype,
+            )
+        else:
+            self.embed_tokens = Embedding(
+                config.vocab_size,
+                config.hidden_size,
+                dtype=config.torch_dtype,
+                mapping=model_config.mapping,
+                tensor_parallel_mode=TensorParallelMode.COLUMN,
+                gather_output=True,
+            )
 
         # create layers
         layers = []

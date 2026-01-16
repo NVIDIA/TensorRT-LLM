@@ -6,7 +6,6 @@ print_iter_log: true
 kv_cache_config:
   dtype: fp8
   free_gpu_memory_fraction: 0.8
-  enable_block_reuse: false
 stream_interval: 10
 moe_config:
   backend: CUTLASS

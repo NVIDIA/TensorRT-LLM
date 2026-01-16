@@ -60,5 +60,14 @@ def test_config_validates_against_llm_args(config_path: Path):
 
 
 @pytest.mark.part0
+@pytest.mark.parametrize("config_path", DATABASE_CONFIGS, ids=get_config_id)
+def test_config_does_not_disable_kv_cache_block_reuse(config_path: Path):
+    with open(config_path) as f:
+        config_dict = yaml.safe_load(f) or {}
+
+    assert config_dict.get("kv_cache_config", {}).get("enable_block_reuse") is not False
+
+
+@pytest.mark.part0
 def test_database_config_count():
     assert len(DATABASE_CONFIGS) > 0, "No database config files found"

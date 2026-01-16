@@ -283,6 +283,8 @@ struct TllmGenFmhaRunnerParams
     // The start token index in SF tensor. Used for FP4 SF offset calculation in generation phase kernel when inflight
     // batching is enabled.
     int mSfStartTokenIdx;
+    // Skip softmax threshold scale factor.
+    float mSkipSoftmaxThresholdScaleFactor;
     // Whether to use sparse MLA.
     bool mSparseMla;
     // The top k value for sparse MLA.
@@ -336,16 +338,22 @@ struct TllmGenSelectKernelParams
     bool mForceGmemReduction;
     // The mask type.
     TrtllmGenAttentionMaskType mMaskType;
+    // The number of tokens per page.
+    int mNumTokensPerPage;
     // Reuse smemK for V or not (only work with MLA generation kernels).
     bool mReuseSmemKForV;
     // Do we need to select a new kernel as the parameters have been updated.
     bool mSelectNewKernel;
     // The tile scheduler.
     TileScheduler mTileScheduler;
+    // The tile size for Q.
+    int mTileSizeQ;
     // The tile size for Kv.
     int mTileSizeKv;
     // Use 2 CTA MMA or not.
     bool mUses2CtaMma;
+    // Skips softmax or not.
+    bool mSkipsSoftmaxWhenPossible;
 
     // The constructor.
     TllmGenSelectKernelParams(TllmGenFmhaRunnerParams params)
@@ -355,11 +363,14 @@ struct TllmGenSelectKernelParams
         , mMultiCtasKvMode(params.mMultiCtasKvMode ? MultiCtasKvMode::GmemReduction : MultiCtasKvMode::Disabled)
         , mForceGmemReduction(false)
         , mMaskType(params.mMaskType)
+        , mNumTokensPerPage(params.mNumTokensPerPage)
         , mReuseSmemKForV(false)
         , mSelectNewKernel(false)
         , mTileScheduler(params.mTileScheduler)
+        , mTileSizeQ(128)
         , mTileSizeKv(128)
-        , mUses2CtaMma(false){};
+        , mUses2CtaMma(false)
+        , mSkipsSoftmaxWhenPossible(params.mSkipSoftmaxThresholdScaleFactor != 0.0f){};
 };
 
 } // namespace kernels

@@ -30,7 +30,7 @@
 
 """Example usage of the kernel.
 
-python cutlass_ir/compiler/python/examples/blackwell/contiguous_blockscaled_grouped_gemm_finalize_fusion.py \
+python run_blockscaled_contiguous_grouped_gemm_finalize_fusion.py \
         --ab_dtype Float4E2M1FN --out_dtype Float32 \
         --sf_dtype Float8E4M3FN --sf_vec_size 16 \
         --mma_tiler_mn 256,256 --cluster_shape_mn 1,1 --seq_len 4096 \
@@ -532,7 +532,6 @@ def run(
             Defaults to False.
     """
     m_aligned = mma_tiler_mn[0]
-    use_2cta_instrs = mma_tiler_mn[0] == 256 and cluster_shape_mn[0] % 2 == 0
 
     print("Running Blackwell Persistent Dense Contiguous Grouped GEMM test with:")
     print(f"nkl: {nkl}")
@@ -547,8 +546,6 @@ def run(
     print(f"Sequence length: {seq_len}")
     print(f"Matrix majors - A: {a_major}, B: {b_major}, Out: {out_major}")
     print(f"Mma Tiler (M, N): {mma_tiler_mn}, Cluster Shape (M, N): {cluster_shape_mn}")
-    print(f"2CTA MMA instructions: {'True' if use_2cta_instrs else 'False'}")
-    print(f"Use TMA Store: {'True'}")
     print(f"Tolerance: {tolerance}")
     print(f"Warmup iterations: {warmup_iterations}")
     print(f"Iterations: {iterations}")
@@ -581,7 +578,7 @@ def run(
     ):
         raise TypeError(
             f"Unsupported testcase {ab_dtype}, {sf_dtype}, {sf_vec_size}, {out_dtype}, "
-            f"{use_2cta_instrs}, {mma_tiler_mn}, {cluster_shape_mn}, {n}, {k}, {l}, "
+            f"{mma_tiler_mn}, {cluster_shape_mn}, {n}, {k}, {l}, "
             f"{a_major}, {b_major}, {out_major}, {m_aligned}"
         )
 
@@ -735,7 +732,6 @@ def run(
             torch.testing.assert_close(
                 actual_result.cpu(), ref_device.cpu(), atol=tolerance, rtol=1e-02
             )
-        # {$nv-internal-release begin}
         elif out_dtype is cutlass.Float4E2M1FN:
             # Convert ref : f32 -> f4 -> f32
             ref_f4_ = torch.empty(*(1, valid_m, n), dtype=torch.uint8, device="cuda").permute(
@@ -752,7 +748,6 @@ def run(
             torch.testing.assert_close(
                 actual_result.cpu(), ref_device.cpu(), atol=tolerance, rtol=1e-02
             )
-        # {$nv-internal-release end}
 
     def generate_tensors():
         (
@@ -959,7 +954,9 @@ if __name__ == "__main__":
             f"Invalid benchmark argument format. Expected file path, 'MxNxKxL', or '[m0,m1,...]xNxK'. Got: {arg}"
         )
 
-    parser = argparse.ArgumentParser(description="Example of Dense Persistent GEMM on Blackwell.")
+    parser = argparse.ArgumentParser(
+        description="Example of BlockScaled Contiguous grouped GEMM finalize fusion kernel on Blackwell."
+    )
 
     parser.add_argument(
         "--nkl",

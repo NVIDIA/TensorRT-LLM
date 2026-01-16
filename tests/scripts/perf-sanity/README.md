@@ -4,106 +4,76 @@ Performance sanity testing scripts for TensorRT-LLM with configuration-driven te
 
 ## Overview
 
-- Run performance sanity benchmarks across multiple model configurations
+- Run performance sanity benchmarks across multiple model configs
 - Support three deployment architectures: single-node, multi-node aggregated, and multi-node disaggregated
-- Manage test cases through YAML configuration files
+- Manage test cases through YAML config files
 - Automated resource calculation and job submission via SLURM
 
 ## Configuration File Types
 
-There are three types of YAML configuration files for different deployment architectures:
+There are two modes for perf sanity tests: aggregated (aggr) and disaggregated (disagg).
 
-### 1. Single-Node Aggregated Test Configuration
+### Aggregated Mode (aggr)
 
-**File Example**: `l0_dgx_b200.yaml`
+**Config Location**: [`tests/scripts/perf-sanity`](./)
 
-**Use Case**: Single-node performance tests on a single server with multiple GPUs.
+**File Naming**: `xxx.yaml` where words are connected by `_` (underscore), not `-` (hyphen).
 
-**Structure**:
-```yaml
-server_configs:
-  - name: "r1_fp8_dep8_mtp1_1k1k"
-    model_name: "deepseek_r1_0528_fp8"
-    gpus: 8
-    tensor_parallel_size: 8
-    moe_expert_parallel_size: 8
-    pipeline_parallel_size: 1
-    max_batch_size: 512
-    max_num_tokens: 8192
-    attention_backend: "TRTLLM"
-    enable_attention_dp: true
-    attention_dp_config:
-      batching_wait_iters: 0
-      enable_balance: true
-      timeout_iters: 60
-    moe_config:
-      backend: 'DEEPGEMM'
-    cuda_graph_config:
-      enable_padding: true
-      max_batch_size: 512
-    kv_cache_config:
-      dtype: 'fp8'
-      enable_block_reuse: false
-      free_gpu_memory_fraction: 0.8
-    speculative_config:
-      decoding_type: 'MTP'
-      num_nextn_predict_layers: 1
-    client_configs:
-      - name: "con4096_iter10_1k1k"
-        concurrency: 4096
-        iterations: 10
-        isl: 1024
-        osl: 1024
-        random_range_ratio: 0.8
-        backend: "openai"
+**File Examples**:
+- `deepseek_r1_fp4_v2_grace_blackwell.yaml` - Single-node aggregated test
+- `deepseek_r1_fp4_v2_2_nodes_grace_blackwell.yaml` - Multi-node aggregated test
+
+**Use Cases**:
+- Single-node: Performance tests on a single server with multiple GPUs
+- Multi-node: Model runs across multiple nodes with unified execution
+
+**Test Case Names**:
+```
+perf/test_perf_sanity.py::test_e2e[aggr_upload-{config yaml file base name}]
+perf/test_perf_sanity.py::test_e2e[aggr_upload-{config yaml file base name}-{server_config_name}]
 ```
 
+- Without server config name: runs all server configs in the YAML file
+- With server config name: runs only the specified server config (the `name` field in `server_configs`)
 
-### 2. Multi-Node Aggregated Test Configuration
+**Examples**:
+```
+perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp4_v2_grace_blackwell]
+perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp4_v2_grace_blackwell-r1_fp4_v2_dep4_mtp1_1k1k]
+perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp4_v2_grace_blackwell-r1_fp4_v2_tep4_mtp3_1k1k]
+```
 
-**File Example**: `l0_gb200_multi_nodes.yaml`
+### Disaggregated Mode (disagg)
 
-**Use Case**: Multi-node aggregated architecture where model runs across multiple nodes with unified execution.
+**Config Location**: [`tests/integration/defs/perf/disagg/test_configs/disagg/perf`](../../integration/defs/perf/disagg/test_configs/disagg/perf)
 
-**Structure**:
-```yaml
-# Hardware Config
-hardware:
-  gpus_per_node: 4
-  gpus_per_server: 8
+**File Naming**: `xxx.yaml` (can contain `-` hyphen).
 
-server_configs:
-  - name: "r1_fp4_v2_dep8_mtp1"
-    model_name: "deepseek_r1_0528_fp4_v2"
-    gpus: 8
-    gpus_per_node: 4
-    trust_remote_code: true
-    tensor_parallel_size: 8
-    moe_expert_parallel_size: 8
-    pipeline_parallel_size: 1
-    max_batch_size: 512
-    max_num_tokens: 2112
-    attn_backend: "TRTLLM"
-    enable_attention_dp: true
-    attention_dp_config:
-      batching_wait_iters: 0
-      enable_balance: true
-      timeout_iters: 60
-    moe_config:
-      backend: 'CUTLASS'
-    cuda_graph_config:
-      enable_padding: true
-      max_batch_size: 512
-    kv_cache_config:
-      dtype: 'fp8'
-      enable_block_reuse: false
-      free_gpu_memory_fraction: 0.5
-    client_configs:
-      - name: "con32_iter12_1k1k"
-        concurrency: 32
-        iterations: 12
-        isl: 1024
-        osl: 1024
-        random_range_ratio: 0.8
-        backend: "openai"
+**File Example**: `deepseek-r1-fp4_1k1k_ctx1_gen1_dep8_bs768_eplb0_mtp0_ccb-UCX.yaml`
+
+**Use Case**: Disaggregated architecture where model runs across multiple nodes with separate context (prefill) and generation (decode) servers.
+
+**Test Case Name**:
+```
+perf/test_perf_sanity.py::test_e2e[disagg_upload-{config yaml file base name}]
+```
+
+**Example**:
+```
+perf/test_perf_sanity.py::test_e2e[disagg_upload-deepseek-r1-fp4_1k1k_ctx1_gen1_dep8_bs768_eplb0_mtp0_ccb-UCX]
+```
+
+## Running Tests
+
+**Important**: Do NOT add `--perf` flag when running pytest. Perf sanity tests are static test cases and do not use perf mode.
+
+```bash
+# Run all server configs in an aggregated test
+pytest perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp4_v2_grace_blackwell]
+
+# Run a specific server config in an aggregated test
+pytest perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp4_v2_grace_blackwell-r1_fp4_v2_dep4_mtp1_1k1k]
+
+# Run a specific disaggregated test
+pytest perf/test_perf_sanity.py::test_e2e[disagg_upload-deepseek-r1-fp4_1k1k_ctx1_gen1_dep8_bs768_eplb0_mtp0_ccb-UCX]
 ```

@@ -125,7 +125,7 @@ bool FmhaDispatcher::isSupported()
         {
             tllmRunnerParams.mSparseMla = true;
             tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
-            tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
+            tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;
         }
 
         foundKernels = mTllmGenFMHARunner->isSupported(tllmRunnerParams);
@@ -194,6 +194,7 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         tllmRunnerParams.cumSeqLensKvPtr = reinterpret_cast<int const*>(runnerParams.cuKvSeqLenPtr);
         // Attention scales device pointers (only fp8 kernels need to load scales from the device memory).
         tllmRunnerParams.outputScalePtr = reinterpret_cast<float const*>(runnerParams.scaleBmm2Ptr);
+        // TRTLLM-GEN kernels always use the Log2 scale
         tllmRunnerParams.scaleSoftmaxLog2Ptr = runnerParams.scaleBmm1Ptr
             ? reinterpret_cast<float const*>(runnerParams.scaleBmm1Ptr + kIdxScaleSoftmaxLog2Ptr)
             : nullptr;
@@ -227,6 +228,8 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         tllmRunnerParams.mSfStartTokenIdx = 0;
         // For mla chunked prefill
         tllmRunnerParams.softmaxStatsPtr = reinterpret_cast<float2*>(runnerParams.softmaxStatsPtr);
+        // For skip softmax
+        tllmRunnerParams.mSkipSoftmaxThresholdScaleFactor = runnerParams.skipSoftmaxThresholdScaleFactor;
         tllmRunnerParams.stream = runnerParams.stream;
         // Set the sparse attention parameters if sparseMLA is used.
         if (mFixedParams.useSparseMLA)
@@ -234,7 +237,7 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
             tllmRunnerParams.mSparseMla = true;
             tllmRunnerParams.mSparseMlaTopK = runnerParams.sparse_params.sparse_mla_topk;
             tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
-            tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
+            tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;
             tllmRunnerParams.kvPageIdxPtr
                 = reinterpret_cast<int const*>(runnerParams.sparse_params.sparse_attn_indices);
             tllmRunnerParams.kvPtr = runnerParams.sparse_params.sparse_mla_kv_cache_pool;

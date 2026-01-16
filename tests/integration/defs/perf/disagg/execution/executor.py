@@ -4,191 +4,204 @@ import os
 import re
 import shutil
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import yaml
 from reporting.report import LogParser, LogWriter, ResultSaver
-from utils.common import (
-    GPU_RESOURCE_CONFIG,
-    SESSION_COLLECT_CMD_TYPE,
-    EnvManager,
-    extract_config_fields,
-)
+from utils.common import EnvManager
 from utils.logger import logger
 
 from execution.subprocess_utils import exec_cmd, exec_cmd_with_output
 
 # ============================================================================
-# SLURM Run Command Builder
+# Job Manager
 # ============================================================================
 
 
-class SlurmRunCommandBuilder:
-    """SLURM Run Command Builder.
-
-    Build srun commands for different GPU types and command types.
-    Reuses GPU_RESOURCE_CONFIG for consistency with SlurmJobBuilder.
-    """
-
-    def build_srun_prefix(self, job_name: str) -> List[str]:
-        """Build srun command prefix based on GPU type."""
-        gpu_type = EnvManager.get_gpu_type()
-
-        # Reuse the same GPU_RESOURCE_CONFIG as SlurmJobBuilder
-        gpu_config = GPU_RESOURCE_CONFIG.get(gpu_type)
-        if not gpu_config:
-            raise ValueError(
-                f"GPU resource configuration not found for {gpu_type}. "
-                f"Please add configuration in GPU_RESOURCE_CONFIG."
-            )
-
-        # Common srun arguments
-        srun_args = [
-            "srun",
-            "-l",
-            "--container-name=sysinfo-get",
-            f"--container-image={EnvManager.get_container_image()}",
-            f"--container-mounts={EnvManager.get_container_mount()}",
-        ]
-
-        # Add GPU-specific gres parameter (reuse gres_gpu field)
-        # If gres_gpu is not None, add --gres parameter
-        if gpu_config["gres_gpu"] is not None:
-            srun_args.append(f"--gres=gpu:{gpu_config['gres_gpu']}")
-
-        # Add common parameters
-        srun_args.extend(
-            [
-                f"--partition={EnvManager.get_slurm_partition()}",
-                f"--account={EnvManager.get_slurm_account()}",
-                f"--job-name={job_name}",
-                "--time=02:00:00",
-                "--mpi=pmix",
-                # Note: Removed --overlap to ensure GPU allocation for session_collect
-                # which runs after all test jobs have completed
-                "-N",
-                "1",
-                "-n",
-                "1",
-            ]
-        )
-
-        return srun_args
-
-    def build_script_command(self, cmd_type: str) -> List[str]:
-        """Build script command based on command type."""
-        work_dir = EnvManager.get_work_dir()
-        output_path = EnvManager.get_output_path()
-        install_mode = EnvManager.get_install_mode()
-        repo_dir = EnvManager.get_repo_dir()
-        trtllm_wheel_path = EnvManager.get_trtllm_wheel_path()
-
-        if cmd_type == SESSION_COLLECT_CMD_TYPE:
-            if install_mode == "none":
-                return [
-                    "bash",
-                    "-c",
-                    f"cd {work_dir} && python3 {work_dir}/simple_collect.py {output_path}",
-                ]
-            elif install_mode == "wheel":
-                # Install TensorRT-LLM wheel first, then run simple_collect.py
-                # Note: Use --no-deps to avoid overwriting container's pre-installed packages (like torch)
-                install_cmd = f"""
-                    cd {repo_dir}
-                    echo 'Step 1: Installing TensorRT-LLM wheel...'
-                    pip3 install {trtllm_wheel_path} || echo 'Wheel install failed, continuing...'
-                    echo 'Wheel installation completed'
-
-                    echo 'Step 2: Running simple_collect.py...'
-                    cd {work_dir}
-                    python3 {work_dir}/simple_collect.py {output_path}
-                """
-                return ["bash", "-c", install_cmd]
-            elif install_mode == "source":
-                install_cmd = f"""
-                cd {repo_dir}
-                pip3 install -e . || echo 'Source install failed, continuing...'
-
-                echo 'Source installation completed'
-
-                echo 'Step 3: Running simple_collect.py...'
-                cd {work_dir}
-                python3 {work_dir}/simple_collect.py {output_path}
-                """
-                return ["bash", "-c", install_cmd]
-            else:
-                raise ValueError(f"Invalid install mode: {install_mode}")
-        else:
-            # Future command types can be added here
-            # elif cmd_type == "benchmark_collect":
-            #     model_dir = EnvManager.get_model_dir()
-            #     return [
-            #         "bash", "-c",
-            #         f"cd {work_dir} && python3 {work_dir}/benchmark_collect.py "
-            #         f"--model-dir {model_dir} --output {output_path}"
-            #     ]
-            # elif cmd_type == "metrics_collect":
-            #     return [
-            #         "bash", "-c",
-            #         f"cd {work_dir} && python3 {work_dir}/metrics_collect.py --config {work_dir}/config.yaml"
-            #     ]
-            raise ValueError(
-                f"Unsupported command type: {cmd_type}. "
-                f"Currently supported: {SESSION_COLLECT_CMD_TYPE}"
-            )
-
-    def run_job(self, cmd_type: str, job_name: str, log_file: str = None) -> Dict[str, Any]:
-        """Execute srun job.
-
-        Args:
-            cmd_type: Type of command to execute
-            job_name: Name for the SLURM job
-            log_file: Optional path to save command output
-
-        Returns:
-            Dict with status and message
-        """
-        try:
-            # Build complete command
-            srun_prefix = self.build_srun_prefix(job_name)
-            script_command = self.build_script_command(cmd_type)
-            full_command = srun_prefix + script_command
-
-            # Execute with optional log file
-            if log_file:
-                logger.info(f"Saving output to: {log_file}")
-                # Use Python file redirection to avoid shell quoting issues
-                import subprocess
-
-                with open(log_file, "w") as f:
-                    result = subprocess.run(
-                        full_command, stdout=f, stderr=subprocess.STDOUT, timeout=7200, text=True
-                    )
-                    if result.returncode != 0:
-                        raise subprocess.CalledProcessError(result.returncode, full_command)
-                logger.success(f"Output saved to {log_file}")
-                output = ""  # Output is in file
-            else:
-                output = exec_cmd_with_output(full_command, timeout=7200)
-
-            return {"status": True, "msg": "Job executed successfully", "output": output}
-        except Exception as e:
-            logger.error(f"Job execution failed: {e}")
-            return {"status": False, "msg": str(e)}
-
-
-def make_slurm_run_command():
-    """Create run command function (maintain interface compatibility)."""
-    builder = SlurmRunCommandBuilder()
-    return builder.run_job
-
-
 class JobManager:
-    """Job manager class."""
+    """Job manager class for test jobs and session collection."""
+
+    # ============================================================================
+    # Generic Job Submission (Direct sbatch)
+    # ============================================================================
 
     @staticmethod
-    def submit_job(test_config) -> tuple:
-        """Submit job using submit.py with YAML config.
+    def submit_shell_job(
+        job_name: str,
+        script_path: str,
+        script_args: list[str] = None,
+        output_log_file: str = None,
+        timeout: int = 7200,
+        container_name: str = None,
+    ) -> tuple[bool, str]:
+        """Submit a generic shell script job using sbatch --wrap.
+
+        This is a low-level method for submitting shell scripts to SLURM
+        via sbatch --wrap (non-blocking). Supports executing script files
+        with arguments inside containers.
+
+        Args:
+            job_name: SLURM job name
+            script_path: Path to the shell script file to execute
+            script_args: List of arguments to pass to the script (optional)
+            output_log_file: Full path to output log file (optional, defaults to OUTPUT_PATH/{job_name}.log)
+            timeout: Job timeout in seconds (default: 7200 = 2 hours)
+            container_name: Container name for srun (optional, defaults to job_name)
+
+        Returns:
+            tuple: (success: bool, job_id: str)
+        """
+        try:
+            # Get environment configuration
+            container_image = EnvManager.get_container_image()
+            container_mount = EnvManager.get_container_mount()
+            output_path = EnvManager.get_output_path()
+
+            # Ensure output directory exists
+            os.makedirs(output_path, exist_ok=True)
+
+            # Set defaults
+            if output_log_file is None:
+                output_log_file = f"{output_path}/{job_name}.log"
+            if container_name is None:
+                container_name = job_name
+            if script_args is None:
+                script_args = []
+
+            # Build the bash command with script and arguments
+            # Quote the script path and each argument separately
+            quoted_script = f'"{script_path}"'
+            quoted_args = " ".join(f'"{arg}"' for arg in script_args)
+            bash_command = f"bash {quoted_script} {quoted_args}".strip()
+
+            # Build complete srun command (runs inside sbatch)
+            srun_command = (
+                f"srun -l "
+                f"--container-name={container_name} "
+                f"--container-image={container_image} "
+                f"--container-mounts={container_mount} "
+                f"{bash_command}"
+            )
+
+            # Convert timeout to HH:MM:SS format
+            hours = timeout // 3600
+            minutes = (timeout % 3600) // 60
+            seconds = timeout % 60
+            time_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+            sbatch_args = [
+                "sbatch",
+                f"--job-name={job_name}",
+                f"--partition={EnvManager.get_slurm_partition()}",
+                f"--account={EnvManager.get_slurm_account()}",
+                f"--time={time_str}",
+                "--nodes=1",
+                "--ntasks=1",
+                f"--output={output_log_file}",
+                "--parsable",  # Easier job ID parsing
+            ]
+
+            # Add extra SLURM arguments (including --gres from GPU_RESOURCE_CONFIG)
+            slurm_extra_args = EnvManager.get_slurm_extra_args()
+            if slurm_extra_args:
+                sbatch_args.append(slurm_extra_args)
+
+            # Add --wrap with the srun command
+            sbatch_args.extend(["--wrap", srun_command])
+
+            # Submit the job
+            logger.info(f"Submitting job '{job_name}' (using sbatch --wrap)...")
+            logger.debug(f"Script: {script_path}")
+            logger.debug(f"Log file: {output_log_file}")
+
+            # Use check=False to allow submission even with Kerberos warnings
+            # (mimics submit.py behavior)
+            output = exec_cmd_with_output(sbatch_args, timeout=60, check=False)
+            job_id = output.strip()
+
+            # Parse job ID (--parsable returns just the job ID)
+            if job_id.isdigit():
+                logger.success(f"Job '{job_name}' submitted: {job_id}")
+                logger.info(f"All logs will be written to: {output_log_file}")
+                return True, job_id
+
+            # Fallback: try to extract from "Submitted batch job" format
+            match = re.search(r"Submitted batch job (\d+)", output)
+            if match:
+                job_id = match.group(1)
+                logger.success(f"Job '{job_name}' submitted: {job_id}")
+                return True, job_id
+
+            logger.error(f"Failed to parse job ID from output: {output}")
+            return False, ""
+
+        except Exception as e:
+            logger.error(f"Failed to submit job '{job_name}': {e}")
+            import traceback
+
+            logger.debug(traceback.format_exc())
+            return False, str(e)
+
+    # ============================================================================
+    # Session Collection Job Submission
+    # ============================================================================
+
+    @staticmethod
+    def submit_session_collect_job() -> tuple[bool, str]:
+        """Submit session collect job using sbatch (non-blocking).
+
+        This method prepares the arguments for the session_collect.sh script
+        and submits it via the generic submit_shell_job() method.
+
+        Key benefits:
+        - Non-blocking execution (pytest doesn't wait)
+        - Better resource scheduling (queues if resources unavailable)
+        - Fault tolerance (job survives parent process exit)
+        - Unified job management (reuses wait_for_completion)
+        - All logs redirected to session_collect.log
+
+        Returns:
+            tuple: (success: bool, job_id: str)
+        """
+        try:
+            # Get environment configuration
+            work_dir = EnvManager.get_work_dir()
+            repo_dir = EnvManager.get_repo_dir()
+            install_mode = EnvManager.get_install_mode()
+            trtllm_wheel_path = EnvManager.get_trtllm_wheel_path()
+            output_path = EnvManager.get_output_path()
+
+            # Prepare script path and arguments
+            script_path = f"{work_dir}/session_collect.sh"
+            script_args = [install_mode, repo_dir, work_dir, output_path, trtllm_wheel_path]
+
+            # Submit using the generic shell job method
+            return JobManager.submit_shell_job(
+                job_name="session_collect",
+                script_path=script_path,
+                script_args=script_args,
+                output_log_file=f"{output_path}/session_collect.log",
+                timeout=7200,  # 2 hours
+                container_name="session-collect",
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to prepare session collect job: {e}")
+            import traceback
+
+            logger.debug(traceback.format_exc())
+            return False, str(e)
+
+    # ============================================================================
+    # Test Job Submission (Via submit.py script)
+    # ============================================================================
+
+    @staticmethod
+    def submit_test_job(test_config) -> tuple:
+        """Submit benchmark test job using submit.py script.
+
+        This method submits test jobs by calling the submit.py script,
+        which handles test-specific configuration and SLURM job setup.
 
         Args:
             test_config: TestConfig object containing configuration
@@ -196,7 +209,7 @@ class JobManager:
         Returns:
             tuple: (success: bool, job_id: str)
         """
-        logger.info("Submitting job using submit.py...")
+        logger.info("Submitting test job via submit.py...")
 
         try:
             import re
@@ -219,7 +232,10 @@ class JobManager:
 
             # Call submit.py with the temporary config file
             submit_script = os.path.join(EnvManager.get_script_dir(), "submit.py")
-            cmd = ["python3", submit_script, "-c", temp_config_path]
+
+            case_log_dir = JobManager.get_result_dir(test_config)
+
+            cmd = ["python3", submit_script, "-c", temp_config_path, "--log-dir", case_log_dir]
 
             logger.info(f"Command: {' '.join(cmd)}")
 
@@ -255,7 +271,7 @@ class JobManager:
 
     @staticmethod
     def backup_logs(
-        job_id: str,
+        job_id: Optional[str],
         test_config,
         result_dir: str,
         is_passed: bool,
@@ -263,66 +279,56 @@ class JobManager:
         """Backup logs and config files to test_id directory.
 
         Args:
-            job_id: SLURM job ID
+            job_id: SLURM job ID (None if submission failed)
             test_config: TestConfig object
-            result_dir: Result directory path
+            result_dir: Result directory path (already named as test_id)
             is_passed: Whether the job passed
         Returns:
-            backup_dir path if successful, None otherwise
+            Final directory path if successful, None otherwise
         """
+        if job_id is None:
+            logger.warning(f"Job submission failed for {test_config.test_id}")
+        else:
+            logger.info(f"Backing up logs for job {job_id} ({test_config.test_id})")
+
         if not os.path.exists(result_dir):
             logger.warning(f"Result directory does not exist yet: {result_dir}")
             return None
 
-        # Replace colons with hyphens for safe directory naming
-        dst_dir_name = test_config.test_id.replace(":", "-")
-        # Add ERROR suffix if the job failed
-        if not is_passed:
-            dst_dir_name = f"{dst_dir_name}_ERROR"
-        backup_dir = os.path.join(os.path.dirname(result_dir), dst_dir_name)
-
         try:
-            logger.info("Copying result directory to backup...")
-            logger.info(f"Source: {result_dir}")
-            logger.info(f"Destination: {backup_dir}")
+            final_dir = result_dir
 
-            # Remove old backup if it exists
-            if os.path.exists(backup_dir):
-                logger.warning("Backup directory already exists, removing old backup")
-                shutil.rmtree(backup_dir)
+            # For FAILED cases, rename directory to add _ERROR suffix
+            if not is_passed:
+                error_dir = f"{result_dir}_ERROR"
+                logger.info(f"Renaming failed case directory: {result_dir} -> {error_dir}")
 
-            # Copy result directory
-            shutil.copytree(result_dir, backup_dir)
-            logger.success(f"Backup created successfully: {backup_dir}")
+                # Remove old error directory if exists
+                if os.path.exists(error_dir):
+                    logger.warning(f"Removing existing error directory: {error_dir}")
+                    shutil.rmtree(error_dir)
 
-            # Copy SLURM log file
-            work_dir = EnvManager.get_work_dir()
-            slurm_out_file = os.path.join(work_dir, f"slurm-{job_id}.out")
-            if os.path.exists(slurm_out_file):
-                shutil.copy(slurm_out_file, backup_dir)
-                logger.success(f"SLURM log copied successfully: {slurm_out_file}")
-            else:
-                logger.warning(f"SLURM log not found: {slurm_out_file}")
+                # Rename to add _ERROR suffix
+                shutil.move(result_dir, error_dir)
+                final_dir = error_dir
+                logger.success(f"Directory renamed to: {final_dir}")
 
-            # Move temporary config file to backup directory (not copy)
+            # Copy temporary config file to the directory
             temp_config_path = test_config.temp_config_path
             if os.path.exists(temp_config_path):
-                dest_path = os.path.join(backup_dir, os.path.basename(temp_config_path))
-                shutil.move(temp_config_path, dest_path)
-                logger.success(f"Temporary config moved to backup: {dest_path}")
+                dest_path = os.path.join(final_dir, os.path.basename(temp_config_path))
+                shutil.copy(temp_config_path, dest_path)
+                logger.success(f"Temporary config copied to: {dest_path}")
+                # Clean up the original temp config file
+                os.remove(temp_config_path)
+                logger.info(f"Cleaned up temporary config: {temp_config_path}")
             else:
-                # Fallback: copy original config if no temp file (backward compatibility)
-                case_config_path = test_config.config_path
-                if os.path.exists(case_config_path):
-                    shutil.copy(case_config_path, backup_dir)
-                    logger.success(f"Case config copied successfully: {case_config_path}")
-                else:
-                    logger.warning(f"Case config not found: {case_config_path}")
+                logger.warning(f"Temporary config not found: {temp_config_path}")
 
-            return backup_dir
+            return final_dir
 
         except Exception as e:
-            logger.warning(f"Failed to create backup copy: {e}")
+            logger.warning(f"Failed to backup logs: {e}")
             # Try to clean up temporary file on backup failure
             temp_config_path = test_config.temp_config_path
             if os.path.exists(temp_config_path):
@@ -334,26 +340,6 @@ class JobManager:
             return None
 
     @staticmethod
-    def cleanup_result_dir(result_dir: str) -> bool:
-        """Clean up result directory.
-
-        Args:
-            result_dir: Result directory path
-
-        Returns:
-            True if successful, False otherwise
-        """
-        if os.path.exists(result_dir):
-            try:
-                shutil.rmtree(result_dir)
-                logger.success(f"Result directory removed: {result_dir}")
-                return True
-            except Exception as e:
-                logger.warning(f"Failed to remove result directory: {e}")
-                return False
-        return True
-
-    @staticmethod
     def get_result_dir(test_config) -> str:
         """Get result directory.
 
@@ -363,16 +349,10 @@ class JobManager:
         Returns:
             Result directory path
         """
-        config_data = test_config.config_data
-        fields = extract_config_fields(config_data)
-
-        # Extract fields for logging and result directory
-        log_base = fields["log_base"]
-        context_dir = fields["context_dir"]
-        log_dir_name = log_base
-
-        result_dir = os.path.join(EnvManager.get_script_dir(), log_dir_name, context_dir)
-        return result_dir
+        # Use the same path as in submit_job: {output_path}/slurm_logs/{test_id}
+        log_dir = os.path.join(EnvManager.get_output_path(), "slurm_logs")
+        case_log_dir = os.path.join(log_dir, test_config.test_id.replace(":", "-"))
+        return case_log_dir
 
     @staticmethod
     def check_result(
@@ -385,6 +365,8 @@ class JobManager:
 
         High-level method that automatically extracts parameters from TestConfig,
         parses logs, generates performance reports, and saves results to CSV.
+
+        Note: backup_logs should be called separately by the caller (test_disagg.py).
 
         Args:
             job_id: SLURM job ID
@@ -400,30 +382,26 @@ class JobManager:
         result_dir = JobManager.get_result_dir(test_config)
         logger.info(f"Result directory: {result_dir}")
 
-        # Call the internal implementation method
-        check_result = JobManager._check_job_result(
-            job_id=job_id,
-            test_category=test_config.test_category,  # Pass test category for routing
-            benchmark_type=test_config.benchmark_type,
-            config=config_data,
-            metrics_config=test_config.metrics_config,
-            accuracy_config=test_config.accuracy_config,  # Pass accuracy config
-            model_name=test_config.model_name,
-            result_dir=result_dir,
-            timestamps=timestamps,
-            test_name=test_name,
-        )
+        # Initialize default result in case of exception
+        check_result = {"job_id": job_id, "status": "ERROR", "success": False}
 
-        is_passed = check_result["success"]
-        # Backup logs and config files
-        JobManager.backup_logs(job_id, test_config, result_dir, is_passed)
-
-        # Clean up result directory
-        if EnvManager.get_debug_mode():
-            logger.debug(f"Debug mode: Skipping result directory cleanup: {result_dir}")
-        else:
-            JobManager.cleanup_result_dir(result_dir)
-
+        try:
+            # Call the internal implementation method
+            check_result = JobManager._check_job_result(
+                job_id=job_id,
+                test_category=test_config.test_category,  # Pass test category for routing
+                benchmark_type=test_config.benchmark_type,
+                config=config_data,
+                metrics_config=test_config.metrics_config,
+                accuracy_config=test_config.accuracy_config,  # Pass accuracy config
+                model_name=test_config.model_name,
+                result_dir=result_dir,
+                timestamps=timestamps,
+                test_name=test_name,
+            )
+        except Exception as e:
+            logger.error(f"Exception during result checking: {e}")
+            check_result["error"] = f"Exception during result checking: {str(e)}"
         return check_result
 
     @staticmethod
@@ -483,43 +461,38 @@ class JobManager:
         return False, None
 
     @staticmethod
-    def check_job_status(job_id: str) -> str:
-        """Check job status using sacct (works for all job states)."""
+    def check_job_exists(job_id: str) -> bool:
+        """Check if job still exists in SLURM queue.
+
+        Returns:
+            True if job exists (running or pending), False if job is gone
+        """
         try:
-            # Use sacct to get job status - works for both running and completed jobs
-            sacct_output = exec_cmd_with_output(
-                ["sacct", "-j", job_id, "--noheader", "--format=State", "-X"], timeout=30
-            )
-            if sacct_output.strip():
-                return sacct_output.strip()
-            else:
-                # If sacct returns empty, job might be very new, wait a bit and try once more
-                time.sleep(3)
-                sacct_output = exec_cmd_with_output(
-                    ["sacct", "-j", job_id, "--noheader", "--format=State", "-X"], timeout=30
-                )
-                return sacct_output.strip() if sacct_output.strip() else "UNKNOWN"
+            # Use squeue to check if job exists in queue
+            squeue_output = exec_cmd_with_output(["squeue", "-j", job_id, "--noheader"], timeout=30)
+            # If output is not empty, job exists
+            return bool(squeue_output.strip())
         except Exception as e:
-            logger.error(f"Error checking job status with sacct: {e}")
-            return "ERROR"
+            # If command fails, assume job doesn't exist
+            logger.debug(f"squeue check failed (job likely finished): {e}")
+            return False
 
     @staticmethod
     def wait_for_completion(
         job_id: str, timeout: int = 3600, test_config=None, check_early_failure: bool = True
-    ) -> tuple[bool, Optional[str]]:
-        """Wait for job completion with optional early failure detection.
+    ) -> None:
+        """Wait for job to finish (disappear from queue).
+
+        Simplified logic: Just wait until job no longer exists in SLURM queue,
+        regardless of final status (COMPLETED, CANCELLED, FAILED, etc).
+        If timeout or early failure detected, cancel the job.
+        The actual success/failure will be determined by log file parsing.
 
         Args:
             job_id: SLURM job ID
             timeout: Maximum wait time in seconds
             test_config: TestConfig object (required for early failure detection)
             check_early_failure: Whether to check logs for early failures
-
-        Returns:
-            tuple: (completed_successfully, error_message)
-                - (True, None): Job completed normally
-                - (False, "timeout"): Job timed out
-                - (False, error_msg): Job failed early with specific error
         """
         start_time = time.time()
         check_interval = 180  # Check every 3 minutes
@@ -527,60 +500,44 @@ class JobManager:
         last_failure_check = start_time
 
         # Wait for job to appear in system (initial delay)
-        logger.info(f"Waiting for job {job_id} to appear in system...")
+        logger.info(f"Waiting for job {job_id} to start...")
         time.sleep(60)  # Initial wait for job to be scheduled
 
-        last_status = None  # Track status changes
+        logger.info(f"Waiting for job {job_id} to finish...")
+
         while time.time() - start_time < timeout:
-            status = JobManager.check_job_status(job_id)
+            # Simple check: does job still exist?
+            job_exists = JobManager.check_job_exists(job_id)
 
-            # Only log when status changes
-            if status != last_status:
-                logger.info(f"Job {job_id} status changed: {status}")
-                last_status = status
+            if not job_exists:
+                # Job has disappeared from queue - it's done (whatever the status was)
+                logger.success(f"Job {job_id} finished (no longer in queue)")
+                return
 
-            # Check for terminal states - all mean the job is done
-            if status in [
-                "COMPLETED",
-                "FAILED",
-                "CANCELLED",
-                "TIMEOUT",
-                "NODE_FAIL",
-                "OUT_OF_MEMORY",
-                "ERROR",
-                "CANCELLED+",
-            ] or ("error" in status.lower() and status != "ERROR"):
-                if status == "COMPLETED":
-                    logger.success(f"Job {job_id} completed successfully")
-                    return True, None
-                else:
-                    logger.error(f"Job {job_id} finished with status: {status}")
-                    return True, None  # Job finished (let check_result determine success)
-
-            # For running states, don't log repeatedly - status change already logged above
-            # Only log unexpected/unknown statuses
-            if status not in ["RUNNING", "PENDING", "CONFIGURING", "COMPLETING", "UNKNOWN"]:
-                logger.warning(f"Job {job_id} has unexpected status: {status}")
-
-            # Check for early failures (only when job is running and test_config is provided)
+            # Check for early failures (only if test_config is provided)
             current_time = time.time()
             if (
                 check_early_failure
                 and test_config
-                and status == "RUNNING"
                 and current_time - last_failure_check >= failure_check_interval
             ):
                 has_error, error_msg = JobManager.check_for_early_failure(job_id, test_config)
                 if has_error:
                     logger.error(f"Early failure detected: {error_msg}")
-                    logger.warning(f"Stopping wait for job {job_id}")
-                    return False, error_msg
+                    logger.warning(f"Cancelling job {job_id} due to early failure")
+                    JobManager.cancel_job(job_id)
+                    # Wait a bit for job to be cancelled, then return
+                    time.sleep(10)
+                    return
                 last_failure_check = current_time
 
             time.sleep(check_interval)
 
-        logger.warning(f"Job {job_id} timeout after {timeout} seconds")
-        return False, "timeout"
+        # Timeout - cancel the job
+        logger.warning(f"Job {job_id} timeout after {timeout} seconds, cancelling...")
+        JobManager.cancel_job(job_id)
+        # Wait a bit for job to be cancelled
+        time.sleep(10)
 
     @staticmethod
     def cancel_job(job_id: str) -> bool:
@@ -601,28 +558,34 @@ class JobManager:
             job_id: SLURM job ID for finding the slurm log file
             result_dir: Result directory containing log and config files
         """
-        # Print the slurm log to console
-        slurm_log_writer = LogWriter(EnvManager.get_work_dir())
-        slurm_log_writer.print_to_console(f"slurm-{job_id}.out")
+        # Print the slurm log to console (check if exists first)
+        slurm_log_path = os.path.join(EnvManager.get_work_dir(), f"slurm-{job_id}.out")
+        if os.path.exists(slurm_log_path):
+            slurm_log_writer = LogWriter(EnvManager.get_work_dir())
+            slurm_log_writer.print_to_console(f"slurm-{job_id}.out")
+        else:
+            logger.warning(f"SLURM log file not found: {slurm_log_path}")
 
         # Print all .log and .yaml files in result_dir (except output_server.log)
+        if not os.path.exists(result_dir):
+            logger.warning(f"Result directory not found: {result_dir}")
+            return
+
         log_writer = LogWriter(result_dir)
         files_to_print = []
-        if os.path.exists(result_dir):
-            for file in os.listdir(result_dir):
-                if (
-                    file.endswith(".log") or file.endswith(".yaml")
-                ) and file != "output_server.log":
-                    files_to_print.append(file)
+        for file in os.listdir(result_dir):
+            if (file.endswith(".log") or file.endswith(".yaml")) and file != "output_server.log":
+                files_to_print.append(file)
 
         # Sort files for consistent output order
         files_to_print.sort()
 
         for file in files_to_print:
-            if os.path.exists(os.path.join(result_dir, file)):
+            file_path = os.path.join(result_dir, file)
+            if os.path.exists(file_path):
                 log_writer.print_to_console(file)
             else:
-                logger.warning(f"{file} not found: {file}")
+                logger.warning(f"Log file not found: {file}")
 
     @staticmethod
     def _check_accuracy_result(
@@ -648,6 +611,21 @@ class JobManager:
         # Validate accuracy_config
         if not accuracy_config:
             result["error"] = "Accuracy config not found in test configuration"
+            return result
+
+        # Check if result_dir exists
+        if not os.path.exists(result_dir):
+            error_msg = f"Result directory not found: {result_dir}"
+            logger.error(error_msg)
+            result["error"] = error_msg
+            return result
+
+        # Check if required log file exists (7_accuracy_eval.log)
+        accuracy_log = os.path.join(result_dir, "7_accuracy_eval.log")
+        if not os.path.exists(accuracy_log):
+            error_msg = f"Accuracy evaluation log file not found: {accuracy_log}"
+            logger.error(error_msg)
+            result["error"] = error_msg
             return result
 
         # Import and use AccuracyParser
@@ -734,17 +712,34 @@ class JobManager:
         """
         result = {"job_id": job_id, "status": "UNKNOWN", "success": False}
 
+        # Check if result_dir exists
+        if not os.path.exists(result_dir):
+            error_msg = f"Result directory not found: {result_dir}"
+            logger.error(error_msg)
+            result["error"] = error_msg
+            return result
+
+        # Check if required log file exists (6_bench.log)
+        bench_log = os.path.join(result_dir, "6_bench.log")
+        if not os.path.exists(bench_log):
+            error_msg = f"Benchmark log file not found: {bench_log}"
+            logger.error(error_msg)
+            result["error"] = error_msg
+            return result
+
         # Parse metrics and save to CSV
         log_parser = LogParser(benchmark_type, config, metrics_config, result_dir)
         parse_result = log_parser.parse(model_name, timestamps=timestamps, test_name=test_name)
 
         if not parse_result["status"]:
+            result["error"] = "Failed to parse benchmark logs"
             return result
 
         # Check if df is None
         result_df = parse_result.get("df")
         if result_df is None:
             logger.error("Parse result contains None DataFrame")
+            result["error"] = "Parse result contains None DataFrame"
             return result
 
         # Save results to CSV
@@ -779,11 +774,11 @@ class JobManager:
 
         Args:
             job_id: SLURM job ID
-            test_category: Test category ("perf" or "accuracy")
+            test_category: Test category ("perf", "accuracy", or "stress")
             benchmark_type: Benchmark type (1k1k, 8k1k, etc.)
             config: Configuration dict (YAML data)
             metrics_config: MetricsConfig object (default or custom)
-            accuracy_config: AccuracyConfig object (required for accuracy tests)
+            accuracy_config: AccuracyConfig object (required for accuracy and stress tests)
             model_name: Model name
             result_dir: Result directory
             timestamps: Optional timestamps dict
@@ -791,6 +786,7 @@ class JobManager:
 
         Returns:
             Dict with success status and details
+            For stress tests, includes both perf and accuracy results
         """
         logger.info(f"Checking result directory: {result_dir}")
 
@@ -799,12 +795,63 @@ class JobManager:
 
         # Route based on test_category
         if test_category == "accuracy":
+            # Use metrics config from accuracy_config (defaults to _COMMON_ACCURACY_METRICS)
+            accuracy_metrics = accuracy_config.get_metrics_config()
             return JobManager._check_accuracy_result(
                 job_id=job_id,
-                metrics_config=metrics_config,
+                metrics_config=accuracy_metrics,
                 accuracy_config=accuracy_config,
                 result_dir=result_dir,
             )
+        elif test_category == "stress":
+            # Stress tests combine both perf and accuracy validation
+            # First check performance and write CSV
+            perf_result = JobManager._check_perf_result(
+                job_id=job_id,
+                benchmark_type=benchmark_type,
+                config=config,
+                metrics_config=metrics_config,
+                model_name=model_name,
+                result_dir=result_dir,
+                timestamps=timestamps,
+                test_name=test_name,
+            )
+
+            # If perf check failed, return immediately
+            if not perf_result.get("success", False):
+                return perf_result
+
+            # Then check accuracy if accuracy_config is provided
+            if accuracy_config:
+                # Use metrics config from accuracy_config (defaults to _COMMON_ACCURACY_METRICS)
+                accuracy_metrics = accuracy_config.get_metrics_config()
+
+                accuracy_result = JobManager._check_accuracy_result(
+                    job_id=job_id,
+                    metrics_config=accuracy_metrics,
+                    accuracy_config=accuracy_config,
+                    result_dir=result_dir,
+                )
+
+                # If accuracy check failed, merge results and return
+                if not accuracy_result.get("success", False):
+                    return {
+                        **perf_result,
+                        "success": False,
+                        "accuracy_result": accuracy_result,
+                        "error": f"Perf passed but accuracy failed: {accuracy_result.get('error', 'Unknown')}",
+                    }
+
+                # Both passed, merge results
+                return {
+                    **perf_result,
+                    "accuracy_result": accuracy_result,
+                    "success": True,
+                }
+            else:
+                # No accuracy config, just return perf result
+                logger.warning("Stress test has no accuracy_config, only perf validation performed")
+                return perf_result
         else:  # perf
             return JobManager._check_perf_result(
                 job_id=job_id,
@@ -816,7 +863,3 @@ class JobManager:
                 timestamps=timestamps,
                 test_name=test_name,
             )
-
-
-# create executor function
-run_job = make_slurm_run_command()
