@@ -1043,7 +1043,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                       "--test-list=$testListPathNode",
                       "--splitting-algorithm least_duration",
                       "--splits $splits",
-                      "--group $splitId"
+                      "--group $splitId",
+                      " > /dev/null"
                     ]
                 ).join(" ")
 
