@@ -18,7 +18,7 @@
 
 import inspect
 import operator
-from typing import Dict, List, Optional, Tuple, Type
+from typing import List, Optional, Tuple, Type
 
 import torch
 import torch.nn as nn
@@ -28,12 +28,9 @@ from torch.fx import GraphModule, Node
 from ...custom_ops.attention_interface import (
     AttentionDescriptor,
     AttentionRegistry,
-    CacheConfig,
     Constant,
     PrepareMetadataCallable,
 )
-from ...distributed.common import all_gather_object, get_world_size
-from ...distributed.common import is_initialized as is_distributed_initialized
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils._graph import add_graph_input
@@ -52,9 +49,6 @@ class InsertCachedAttentionConfig(TransformConfig):
     """Configuration for the insert cached attention transform."""
 
     backend: Optional[str] = Field(default=None, description="The attention backend to use.")
-    cache_config: CacheConfig = Field(
-        default_factory=CacheConfig, description="The custom cache configuration to use."
-    )
 
 
 @TransformRegistry.register("insert_cached_attention")
@@ -153,7 +147,6 @@ class InsertCachedAttention(BaseTransform):
         meta_nodes_std: List[Node],
         meta_nodes_extra: List[Node],
         cache_nodes: List[Node],
-        buffer_nodes: List[Node],
         constants: List[Constant],
     ):
         """Insert a cached attention node into the graph."""
@@ -165,7 +158,6 @@ class InsertCachedAttention(BaseTransform):
                     *meta_nodes_std,
                     *meta_nodes_extra,
                     *cache_nodes,
-                    *buffer_nodes,
                     *constants,
                 ),
             )
@@ -182,10 +174,6 @@ class InsertCachedAttention(BaseTransform):
         """Replace uncached source attention node with corresponding cached attn node."""
         attn_descriptor = self.attn_descriptor
 
-        # run field-wise or to combine the cache config from the transform and the factory
-        # the transform config takes precedence over the factory config
-        cache_config = self.config.cache_config | factory.get_cache_config()
-
         # Get all attention nodes and their info objects
         source_op = attn_descriptor.get_source_attention_op()
 
@@ -198,10 +186,6 @@ class InsertCachedAttention(BaseTransform):
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
 
-        # Sanity check
-        if cm.info.is_paged:
-            assert attn_descriptor.is_paged(), "Paged sequence info requires paged attention op."
-
         # get standard metadata nodes for all source attention nodes
         meta_nodes_std = self._process_metadata_std(gm, cm)
 
@@ -211,8 +195,6 @@ class InsertCachedAttention(BaseTransform):
         # Register host-side prepare_metadata function for attention descriptor.
         self._process_metadata_host(cm)
 
-        buffer_in_lookup: Dict[str, Node] = {}
-
         # replace fused attention node with attention node that has kv cache
         num_cached_attn_replacements = 0
         for idx, attn_node in enumerate(source_attn_nodes):
@@ -221,21 +203,12 @@ class InsertCachedAttention(BaseTransform):
 
             # setup + store cache initializers and caches as input nodes
             cache_in_nodes = []
-            for k, get_cache in attn_descriptor.get_cache_initializers(
-                attn_node, cache_config
+            for k, resource_handler in attn_descriptor.get_cache_initializers(
+                attn_node, cm.kv_cache_config
             ).items():
                 k_indexed = f"{k}_{idx}"
-                cm.add_cache(k_indexed, get_cache)
+                cm.add_resource(k_indexed, resource_handler)
                 cache_in_nodes.append(self._process_cache_node(gm, k_indexed))
-
-            # setup + store global buffer initializers and buffers as input nodes
-            # NOTE: we have to check against existing keys to make sure nothing is registered twice...
-            buffer_in_nodes = []
-            for k, get_buffer in attn_descriptor.get_global_buffer_initializers(attn_node).items():
-                if k not in buffer_in_lookup:
-                    cm.add_cache(k, get_buffer)
-                    buffer_in_lookup[k] = self._process_cache_node(gm, k)
-                buffer_in_nodes.append(buffer_in_lookup[k])  # store buffer nodes for this op
 
             # retrieve constants for attention_op
             constants = attn_descriptor.get_constants(attn_node)
@@ -248,7 +221,6 @@ class InsertCachedAttention(BaseTransform):
                 meta_nodes_std,
                 meta_nodes_extra,
                 cache_in_nodes,
-                buffer_in_nodes,
                 constants,
             )
 
@@ -275,27 +247,17 @@ class InsertCachedMLAAttention(InsertCachedAttention):
     pass
 
 
-class ResizeKVCacheConfig(TransformConfig):
-    """Configuration for the resize kv cache transform."""
-
-    free_mem_ratio: float = Field(
-        default=0.0, ge=0.0, le=1.0, description="The fraction of available memory to occupy."
-    )
-
-
 @TransformRegistry.register("resize_kv_cache")
 class ResizeKVCache(BaseTransform):
-    """Inflate the kv cache to occupy the available GPU memory.
+    """Resize the KV cache to occupy available GPU memory.
 
-    free_mem_ratio specifies the fraction of available memory to occupy.
+    This implements the two-phase approach:
+    1. Run a forward pass to allocate intermediate memory (activations, workspaces, etc.)
+    2. Call resize_kv_cache_manager() to recreate KVCacheManager with optimal capacity
     """
 
-    config: ResizeKVCacheConfig
-
-    @classmethod
-    def get_config_class(cls) -> Type[TransformConfig]:
-        return ResizeKVCacheConfig
-
+    # TODO: need a more robust way to skip this for max_tokens=None and free_gpu_memory_fraction=0.0
+    # TODO: also need a heuristic for this?
     def _apply_to_full_model(
         self,
         mod: nn.Module,
@@ -303,27 +265,8 @@ class ResizeKVCache(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[nn.Module, TransformInfo]:
-        free_mem_ratio = self.config.free_mem_ratio
-
-        free_mem, total_mem = get_mem_info_in_mb(empty_cache=True)
-        self._log_info(f"Free memory (MB): {free_mem}, Total memory (MB): {total_mem}")
-        current_cache_size = cm.current_cache_size_bytes()
-        current_kv_cache_size = getattr(cm, "current_kv_cache_size_bytes", None)
-        current_kv_cache_size = (
-            current_kv_cache_size() if callable(current_kv_cache_size) else current_cache_size
-        )
-        current_num_pages = cm.info.num_pages
-        self._log_info(
-            f"Current cache size (MB): {current_cache_size // 1024**2}, "
-            f"Current num pages: {current_num_pages}"
-        )
-        if current_kv_cache_size != current_cache_size:
-            self._log_info(
-                f"Current KV-only cache size (MB): {current_kv_cache_size // 1024 // 1024}"
-            )
-
-        if free_mem_ratio == 0.0:
-            self._log_info(f"Skipping cache resize for {free_mem_ratio=}")
+        # check if we need a resize or not
+        if not cm.needs_resize():
             return mod, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
@@ -342,7 +285,7 @@ class ResizeKVCache(BaseTransform):
         try:
             mod(**cm.named_args)
         except torch.OutOfMemoryError as e:
-            self.ad_logger.error(
+            self._log_info(
                 f"OutOfMemoryError in forward pass while trying to resize the kv-cache:\n{e}"
             )
             raise e
@@ -366,37 +309,12 @@ class ResizeKVCache(BaseTransform):
         memory_for_forward_pass = free_mem_pre - free_mem_post
         self._log_info(f"Memory for forward pass (MB): {memory_for_forward_pass}")
 
-        # Compute new pages using KV-only bytes to avoid SSM/conv inflating per-page cost
-        # Reserve headroom to avoid OOM from other allocations (workspaces, cudagraph pools, etc.)
-        reserve_mb = max(1024, (total_mem * 5) // 100)  # at least 1 GiB or 5% of total
-        available_mb = max(0, free_mem_post - reserve_mb)
-
-        new_kv_total_bytes = int(
-            available_mb * 1024 * 1024 * free_mem_ratio + current_kv_cache_size
-        )
-        per_page_bytes = max(1, current_kv_cache_size // max(1, current_num_pages))
-        new_num_pages = int(new_kv_total_bytes // per_page_bytes)
-
-        # Need to sync all the GPUs if distributed group is initialized
-        log_msg = f"Using local new_num_pages: {new_num_pages}"
-        if is_distributed_initialized():
-            gathered_num_pages = [None] * get_world_size()
-            all_gather_object(gathered_num_pages, new_num_pages)
-            new_num_pages = min(gathered_num_pages)
-            log_msg = f"After all_gather - new_num_pages: {new_num_pages}"
-
-        self._log_info(log_msg)
-        cm.resize_cache(new_num_pages)
-
-        # Log the final cache size for performance measurement, do not remove this log.
-        final_cache_size_bytes = cm.current_cache_size_bytes()
-        final_cache_size_gb = final_cache_size_bytes / (1024**3)  # Convert to GiB
-        self._log_info(
-            f"Final KV cache size after resize: {final_cache_size_gb:.2f} GiB ({new_num_pages} pages)"
-        )
+        # Resize - KVCacheManager will compute optimal capacity based on free memory
+        cm.resize_kv_cache_manager()
 
         # Free memory
-        torch.cuda.empty_cache()
+        free_mem_post, _ = get_mem_info_in_mb(empty_cache=True)
+        self._log_info(f"Free memory after resizing (MB): {free_mem_post}")
 
         info = TransformInfo(
             skipped=False,
@@ -410,6 +328,13 @@ class ResizeKVCache(BaseTransform):
 
 @TransformRegistry.register("initialize_cache")
 class InitializeCache(BaseTransform):
+    """Initialize KV caches using KVCacheManager.
+
+    Gets kv_cache_config from shared_config.ad_config and creates the KVCacheManager
+    in estimation mode with conservative capacity. The ResizeKVCache transform will
+    later recreate it with optimal capacity after measuring memory usage.
+    """
+
     def _apply_to_full_model(
         self,
         mod: nn.Module,
@@ -417,7 +342,9 @@ class InitializeCache(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[nn.Module, TransformInfo]:
-        num_caches = cm.initialize_caches()
+        # Initialize with estimation mode
+        # This allows resize_kv_cache to recreate with correct capacity after measuring memory
+        num_caches = cm.initialize_resources()
         self._log_info(f"Initialized {num_caches} caches for cached attention")
 
         info = TransformInfo(

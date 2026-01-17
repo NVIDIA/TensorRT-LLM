@@ -171,8 +171,10 @@ class KVCacheManager(BaseResourceManager):
         indexer_k_cache_index_head_dim: int = 0,
         is_estimating_kv_cache: bool = False,
         execution_stream: Optional[torch.cuda.Stream] = None,
+        force_distributed_sync: bool = False,
         **kwargs,
     ) -> None:
+        self.force_distributed_sync = force_distributed_sync
         self.mapping = mapping
         self.dtype = dtype
         self.kv_cache_type = kv_cache_type
@@ -795,7 +797,7 @@ class KVCacheManager(BaseResourceManager):
                     f"max_tokens is set by kv_cache_config.max_tokens: {max_tokens}"
                 )
 
-        if mapping.world_size > 1:
+        if mapping.world_size > 1 or self.force_distributed_sync:
             # make sure all ranks use same value for maxTokens
             dist = Distributed.get(mapping)
             max_tokens = dist.allreduce(

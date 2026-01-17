@@ -27,7 +27,6 @@ from torch._prims_common import DeviceLikeType
 from torch.export import Dim
 from torch.fx import GraphModule
 
-from ..custom_ops.attention_interface import CacheConfig
 from ..utils.cuda_mem_tracker import get_mem_info_in_mb
 from ..utils.logger import ad_logger
 
@@ -211,13 +210,15 @@ class ModelFactory(ABC):
         """Returns the sharding config for this model."""
         return self._sharding_config
 
-    def get_cache_config(self) -> CacheConfig:
-        """Return the cache configuration for the model.
+    def get_cache_config_updates(self) -> Dict[str, Any]:
+        """Return updates for the KVCacheConfig for the model.
 
         Returns:
-            The cache configuration for the model.
+            A dictionary of updates for the KVCacheConfig for the model.
+
+        Check tensorrt_llm/llmapi/llm_args.py for the KVCacheConfig fields.
         """
-        return CacheConfig()
+        return {}
 
     def init_tokenizer(self) -> Optional[Any]:
         """Initialize the tokenizer for the model.
