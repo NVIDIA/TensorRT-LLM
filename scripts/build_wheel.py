@@ -457,6 +457,43 @@ def generate_python_stubs_windows(binding_type: str, venv_python: Path,
         (pkg_dir / stubgen).unlink()
 
 
+def build_kv_cache_manager_v2(project_dir, venv_python, use_mypyc=False):
+    print("-- Building kv_cache_manager_v2...")
+    kv_cache_mgr_dir = project_dir / "tensorrt_llm/runtime/kv_cache_manager_v2"
+    runtime_dir = project_dir / "tensorrt_llm/runtime"
+
+    # Clean up any existing mypyc artifacts in runtime directory to prevent stale inclusion
+    # when switching from --mypyc to standard build
+    if not use_mypyc:
+        for so_file in runtime_dir.glob("*__mypyc*.so"):
+            print(f"Removing stale mypyc artifact: {so_file}")
+            so_file.unlink()
+
+        # Also clean up any .so files inside kv_cache_manager_v2
+        for so_file in kv_cache_mgr_dir.rglob("*.so"):
+            print(f"Removing stale artifact: {so_file}")
+            so_file.unlink()
+
+    # Build rawref
+    print("-- Building kv_cache_manager_v2 rawref extension...")
+    rawref_dir = kv_cache_mgr_dir / "rawref"
+    build_run(f'"{venv_python}" setup.py build_ext --inplace', cwd=rawref_dir)
+
+    if use_mypyc:
+        # Build mypyc
+        print("-- Building kv_cache_manager_v2 mypyc extensions...")
+        # setup_mypyc.py is in kv_cache_manager_v2 but executed from runtime dir
+        setup_mypyc = kv_cache_mgr_dir / "setup_mypyc.py"
+        build_run(f'"{venv_python}" "{setup_mypyc}" build_ext --inplace',
+                  cwd=runtime_dir)
+
+        # Verify that the shared library was generated
+        if not list(runtime_dir.glob("*__mypyc*.so")):
+            raise RuntimeError(
+                "Failed to build kv_cache_manager_v2: no shared library generated."
+            )
+
+
 def main(*,
          build_type: str = "Release",
          generator: str = "",
@@ -487,7 +524,8 @@ def main(*,
          skip_stubs: bool = False,
          generate_fmha: bool = False,
          no_venv: bool = False,
-         nvrtc_dynamic_linking: bool = False):
+         nvrtc_dynamic_linking: bool = False,
+         mypyc: bool = False):
 
     if clean:
         clean_wheel = True
@@ -967,6 +1005,8 @@ def main(*,
                         nixl_root is not None or mooncake_root is not None,
                         binding_lib_file_name)
 
+    build_kv_cache_manager_v2(project_dir, venv_python, use_mypyc=mypyc)
+
     if not skip_building_wheel:
         if dist_dir is None:
             dist_dir = project_dir / "build"
@@ -988,6 +1028,15 @@ def main(*,
         build_run(
             f'\"{venv_python}\" -m build {project_dir} --skip-dependency-check {extra_wheel_build_args} --no-isolation --wheel --outdir "{dist_dir}"'
         )
+        env = os.environ.copy()
+        if mypyc:
+            env["TRTLLM_ENABLE_MYPYC"] = "1"
+        else:
+            env["TRTLLM_ENABLE_MYPYC"] = "0"
+
+        build_run(
+            f'\"{venv_python}\" -m build {project_dir} --skip-dependency-check --no-isolation --wheel --outdir "{dist_dir}"',
+            env=env)
 
     if install:
         build_run(f"\"{sys.executable}\" -m pip install -e .[devel]")
@@ -1135,6 +1184,9 @@ def add_arguments(parser: ArgumentParser):
         "--nvrtc_dynamic_linking",
         action="store_true",
         help="Link against dynamic NVRTC libraries instead of static ones")
+    parser.add_argument("--mypyc",
+                        action="store_true",
+                        help="Compile kv_cache_manager_v2 with mypyc")
 
 
 if __name__ == "__main__":
