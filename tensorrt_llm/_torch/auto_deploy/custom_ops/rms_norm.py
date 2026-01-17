@@ -2,6 +2,7 @@
 
 import flashinfer
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from einops import rearrange
 
@@ -252,3 +253,100 @@ def gated_rms_norm_ref(
     if z is not None and norm_before_gate:
         out *= F.silu(z)
     return out.to(dtype)
+
+
+# =============================================================================
+# Global RMSNorm for column-sharded activations (QK normalization)
+# =============================================================================
+
+
+@torch.library.custom_op("auto_deploy::torch_rmsnorm_global", mutates_args=())
+def torch_rmsnorm_global(input: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """RMSNorm that marks this norm as needing global reduction when column-sharded.
+
+    This op behaves identically to torch_rmsnorm in single-GPU mode. During the sharding
+    pass, if this op is detected in an attention subgraph with tensor parallelism, it will
+    be replaced with col_sharded_global_rmsnorm which uses all_reduce for correct global
+    normalization across shards.
+
+    Use this op for QK normalization where the norm is applied to column-sharded activations
+    (e.g., after q_proj/k_proj with column sharding).
+
+    Args:
+        input: Input tensor to normalize, shape [..., hidden_size].
+        weight: Scaling weights, shape [hidden_size].
+        eps: Small constant for numerical stability.
+
+    Returns:
+        Normalized and scaled tensor.
+    """
+    # Same implementation as torch_rmsnorm - the difference is semantic
+    out = torch.empty_like(input)
+    input_fp32 = input.to(torch.float32)
+    variance = input_fp32.pow(2).mean(-1, keepdim=True)
+    input_normalized = input_fp32 * torch.rsqrt(variance + eps)
+    out.copy_((weight * input_normalized.to(out.dtype)))
+    return out
+
+
+@torch_rmsnorm_global.register_fake
+def _(input: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """Fake implementation for tracing."""
+    return torch.empty_like(input)
+
+
+@torch.library.custom_op("auto_deploy::col_sharded_global_rmsnorm", mutates_args=())
+def col_sharded_global_rmsnorm(
+    input: torch.Tensor, weight: torch.Tensor, eps: float, world_size: int
+) -> torch.Tensor:
+    """RMSNorm for column-sharded activations with global reduction.
+
+    When activations are column-sharded (split along the last dimension across devices),
+    standard RMSNorm computes an incorrect local mean. This op uses all_reduce to compute
+    the global mean of squared values across all shards, ensuring correct normalization.
+
+    The computation is:
+        1. Compute local sum of squares: sum(input^2) over local features
+        2. All-reduce to get global sum of squares across all shards
+        3. Compute global mean: global_sum / (local_dim * world_size)
+        4. Normalize: input * rsqrt(global_mean + eps)
+        5. Scale with local weight (weight is also column-sharded)
+
+    Args:
+        input: Input tensor, shape [..., local_hidden_size] where local_hidden_size
+               is the shard of the full hidden dimension on this device.
+        weight: Scaling weights, shape [local_hidden_size] (column-sharded).
+        eps: Small constant for numerical stability.
+        world_size: Number of devices across which the activation is sharded.
+
+    Returns:
+        Normalized and scaled tensor with same shape as input.
+    """
+    local_dim = input.shape[-1]
+
+    # Cast to float32 for precision
+    input_fp32 = input.to(torch.float32)
+
+    # Compute local sum of squares (NOT mean - we need sum for all_reduce)
+    local_sum_sq = input_fp32.pow(2).sum(-1, keepdim=True)
+
+    # All-reduce to get global sum of squares
+    global_sum_sq = local_sum_sq.clone()
+    dist.all_reduce(global_sum_sq, op=dist.ReduceOp.SUM)
+
+    # Compute global mean: global_sum / total_elements
+    global_count = local_dim * world_size
+    global_mean_sq = global_sum_sq / global_count
+
+    # Normalize
+    input_normalized = input_fp32 * torch.rsqrt(global_mean_sq + eps)
+
+    # Apply weight (local weight since it's also column-sharded)
+    out = weight * input_normalized.to(input.dtype)
+    return out
+
+
+@col_sharded_global_rmsnorm.register_fake
+def _(input: torch.Tensor, weight: torch.Tensor, eps: float, world_size: int) -> torch.Tensor:
+    """Fake implementation for tracing."""
+    return torch.empty_like(input)

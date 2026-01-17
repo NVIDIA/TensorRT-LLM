@@ -398,6 +398,9 @@ class BaseTransform(ABC):
         autodeploy_meta[self._history_key] = history
         self._set_autodeploy_meta(mod, autodeploy_meta)
 
+        # dump graph for debugging (enabled via AD_DUMP_GRAPH_DIR env var)
+        ad_logger.dump_graph(mod, t_name, self.config.stage.value)
+
         # return the graph module
         return mod
 

@@ -10,6 +10,7 @@ import torch.nn as nn
 from ..distributed import common as dist_ad
 from ..models.factory import ModelFactory
 from ..shim.interface import CachedSequenceInterface
+from ..utils.logger import ad_logger
 from .interface import (
     InferenceOptimizerConfig,
     SharedConfig,
@@ -56,6 +57,14 @@ class InferenceOptimizer:
             A nn.Module representing the optimized inference model.
         """
         ############################################################################################
+        # SETUP DEBUG DUMPING IF ENABLED
+        ############################################################################################
+        if ad_logger.debug_dump_enabled:
+            # Save inputs for replay
+            inputs_to_save = dict(cm.named_args) if hasattr(cm, "named_args") else None
+            ad_logger.set_debug_inputs(inputs_to_save)
+
+        ############################################################################################
         # RUN THROUGH CONFIGURED TRANSFORMATIONS
         ############################################################################################
 
@@ -70,6 +79,24 @@ class InferenceOptimizer:
             # run transform
             mod = transform(mod, cm, self.factory, self.shared_config)
 
+            # Dump after export_to_gm (post-export state)
+            if ad_logger.debug_dump_enabled and t_name == "export_to_gm":
+                model_path = getattr(self.factory, "checkpoint_path", None)
+                ad_logger.dump_debug_artifacts(mod, "post_export", model_path=model_path)
+            if t_name == "export_to_gm":
+                from tensorrt_llm._torch.auto_deploy.utils.dtype_metadata import dump_dtype_metadata
+
+                dump_dtype_metadata(mod, "dtype_metadata.json")
+        ############################################################################################
+        # DUMP FINAL STATE IF DEBUG ENABLED
+        ############################################################################################
+        if ad_logger.debug_dump_enabled:
+            model_path = getattr(self.factory, "checkpoint_path", None)
+            ad_logger.dump_debug_artifacts(mod, "final", model_path=model_path)
+
+            from tensorrt_llm._torch.auto_deploy.utils.graph_debug_compare import run_comparison
+
+            run_comparison(mod, cm, self.factory, output_dir="1layer_subblock_debug_scatter_plots")
         ############################################################################################
         # RETURN OPTIMIZED MODEL
         ############################################################################################
