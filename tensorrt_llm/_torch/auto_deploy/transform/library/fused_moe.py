@@ -1289,6 +1289,40 @@ class MatchBmmMoePattern(BaseTransform):
         return gm, info
 
 
+def remove_original_experts(gm: GraphModule, weight_lists: List[List[Node]]) -> None:
+    """Remove original expert submodules after weights have been stacked.
+
+    This function attempts to free GPU memory by deleting the original expert
+    submodules whose weights have been replaced by fused/stacked versions.
+
+    Args:
+        gm: The GraphModule containing the expert submodules
+        weight_lists: List of weight node lists (e.g., [w1_list, w2_list, w3_list])
+    """
+    from tensorrt_llm._torch.auto_deploy.utils._graph import get_attr_by_name
+
+    # Flatten all weight lists
+    all_weights = []
+    for weight_list in weight_lists:
+        all_weights.extend(weight_list)
+
+    for w in all_weights:
+        if w.op == "get_attr" and isinstance(w.target, str):
+            w_param = get_attr_by_name(gm, w.target)
+            if w_param is not None:
+                owner_module_path, _, param_name = w.target.rpartition(".")
+                if param_name != "weight":
+                    continue
+                owner_module = gm.get_submodule(owner_module_path)
+                owner_param = get_attr_by_name(owner_module, param_name)
+                if owner_param is w_param:
+                    gm.delete_submodule(owner_module_path)
+                else:
+                    # param w is not owned by owner_module, skip
+                    continue
+            else:
+                continue
+
 def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "triton"]) -> int:
     """
     Stack per-expert FP8 weights and scales by materializing stacked tensors as parameters.
@@ -1513,6 +1547,8 @@ def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "
 
         node.replace_all_uses_with(new_node)
         graph.erase_node(node)
+        eliminate_dead_code(gm)
+        remove_original_experts(gm, [w1_list, w2_list, w3_list])
 
     # Clean up after processing all nodes
     # eliminate_dead_code will remove unused get_attr nodes, then delete_all_unused_submodules
