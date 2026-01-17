@@ -789,11 +789,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 dtype=torch.int32,
                 capture_graph=capture_graph,
             )
-            self.host_kv_cache_block_offsets = torch.empty_like(
-                self.kv_cache_block_offsets,
-                device='cpu',
-                pin_memory=True,
-            )
+            self.host_kv_cache_block_offsets = self.kv_cache_manager.host_kv_cache_block_offsets
             self.block_ids_per_seq = None
             self.kv_block_ids_per_seq = None
             if self.enable_flash_mla:
@@ -987,18 +983,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         assert self.request_ids is not None
         if self.kv_cache_manager is not None:
             # Copy blocks for all context requests
-            self.kv_cache_manager.impl.copy_batch_block_offsets(
-                self.host_kv_cache_block_offsets,
-                self.request_ids[:self.num_contexts], 1, 0)
-            # Copy blocks for all generation requests
-            self.kv_cache_manager.impl.copy_batch_block_offsets(
-                self.host_kv_cache_block_offsets,
-                self.request_ids[self.num_contexts:], self.beam_width,
-                self.num_contexts)
-            for pool_idx in range(self.host_kv_cache_block_offsets.shape[0]):
-                self.kv_cache_block_offsets[pool_idx, :self.num_seqs].copy_(
-                    self.host_kv_cache_block_offsets[pool_idx, :self.num_seqs],
-                    non_blocking=True)
+            self.kv_cache_manager.copy_batch_block_offsets(
+                self.kv_cache_block_offsets, self.request_ids, self.beam_width,
+                self.num_contexts, self.num_generations)
+
             error_message = (
                 f"The max KV cache length of input sequences ({self.kv_lens[:self.num_seqs].max()}) "
                 f"exceeds the KV cache manager's maximum supported length "

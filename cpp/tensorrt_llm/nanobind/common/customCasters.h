@@ -315,5 +315,24 @@ struct type_caster<torch::ScalarType>
         throw std::runtime_error("from_cpp for torch::ScalarType is not implemented");
     }
 };
+
+template <>
+class type_caster<CUstream>
+{
+public:
+    NB_TYPE_CASTER(CUstream, const_name("int"));
+
+    bool from_python([[maybe_unused]] handle src, uint8_t flags, cleanup_list* cleanup)
+    {
+        value = reinterpret_cast<CUstream>(PyLong_AsVoidPtr(src.ptr()));
+        return true;
+        return true;
+    }
+
+    static handle from_cpp(CUstream const& src, rv_policy /* policy */, cleanup_list* /* cleanup */)
+    {
+        return PyLong_FromVoidPtr(src);
+    }
+};
 } // namespace detail
 } // namespace NB_NAMESPACE
