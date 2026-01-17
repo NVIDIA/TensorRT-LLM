@@ -1,16 +1,17 @@
 metadata:
-  model_name: deepseek_r1_0528_fp4_v2
+  model_name: k2_thinking_fp4
   supported_gpus:
   - B200
 server_configs:
-  # 1k1k configs - TP4 with TRTLLM, MTP3
-  - name: "r1_fp4_v2_tp4_mtp3_1k1k"
-    model_name: "deepseek_r1_0528_fp4_v2"
-    tensor_parallel_size: 4
-    moe_expert_parallel_size: 1
+  # 8k1k configs - TEP8 with TRTLLM
+  - name: "k2_thinking_fp4_tep8_8k1k"
+    model_name: "k2_thinking_fp4"
+    tensor_parallel_size: 8
+    moe_expert_parallel_size: 8
     pipeline_parallel_size: 1
     max_batch_size: 4
-    max_num_tokens: 8192
+    max_num_tokens: 12288
+    trust_remote_code: true
     attn_backend: "TRTLLM"
     enable_attention_dp: false
     moe_config:
@@ -21,27 +22,26 @@ server_configs:
     kv_cache_config:
       dtype: 'fp8'
       enable_block_reuse: false
-      free_gpu_memory_fraction: 0.8
-    speculative_config:
-      decoding_type: 'MTP'
-      num_nextn_predict_layers: 3
+      free_gpu_memory_fraction: 0.6
     client_configs:
-      - name: "con2_iter10_1k1k"
+      - name: "con2_iter10_8k1k"
         concurrency: 2
         iterations: 10
-        isl: 1024
+        isl: 8192
         osl: 1024
         random_range_ratio: 0.2
         backend: "openai"
+        trust_remote_code: true
 
-  # 1k1k configs - DEP8 with CUTLASS, MTP1
-  - name: "r1_fp4_v2_dep8_mtp1_1k1k"
-    model_name: "deepseek_r1_0528_fp4_v2"
+  # 8k1k configs - DEP8 with CUTLASS
+  - name: "k2_thinking_fp4_dep8_8k1k"
+    model_name: "k2_thinking_fp4"
     tensor_parallel_size: 8
     moe_expert_parallel_size: 8
     pipeline_parallel_size: 1
-    max_batch_size: 128
-    max_num_tokens: 8192
+    max_batch_size: 64
+    max_num_tokens: 12288
+    trust_remote_code: true
     attn_backend: "TRTLLM"
     enable_attention_dp: true
     attention_dp_config:
@@ -52,32 +52,32 @@ server_configs:
       backend: 'CUTLASS'
     cuda_graph_config:
       enable_padding: true
-      max_batch_size: 128
+      max_batch_size: 64
     kv_cache_config:
       dtype: 'fp8'
       enable_block_reuse: false
-      free_gpu_memory_fraction: 0.8
-    speculative_config:
-      decoding_type: 'MTP'
-      num_nextn_predict_layers: 1
+      free_gpu_memory_fraction: 0.6
     client_configs:
-      - name: "con1024_iter10_1k1k"
-        concurrency: 1024
+      - name: "con512_iter10_8k1k"
+        concurrency: 512
         iterations: 10
-        isl: 1024
+        isl: 8192
         osl: 1024
         random_range_ratio: 0.2
         backend: "openai"
+        trust_remote_code: true
 
-  # 8k1k configs - TP4 with TRTLLM, MTP3
-  - name: "r1_fp4_v2_tp4_mtp3_8k1k"
-    model_name: "deepseek_r1_0528_fp4_v2"
-    tensor_parallel_size: 4
-    moe_expert_parallel_size: 1
+  # 32k8k configs - TEP8 with TRTLLM
+  - name: "k2_thinking_fp4_tep8_32k8k"
+    model_name: "k2_thinking_fp4"
+    tensor_parallel_size: 8
+    moe_expert_parallel_size: 8
     pipeline_parallel_size: 1
     max_batch_size: 4
-    max_num_tokens: 12288
+    max_num_tokens: 8192
+    trust_remote_code: true
     attn_backend: "TRTLLM"
+    enable_chunked_prefill: true
     enable_attention_dp: false
     moe_config:
       backend: 'TRTLLM'
@@ -87,28 +87,28 @@ server_configs:
     kv_cache_config:
       dtype: 'fp8'
       enable_block_reuse: false
-      free_gpu_memory_fraction: 0.8
-    speculative_config:
-      decoding_type: 'MTP'
-      num_nextn_predict_layers: 3
+      free_gpu_memory_fraction: 0.6
     client_configs:
-      - name: "con4_iter10_8k1k"
-        concurrency: 4
+      - name: "con2_iter10_32k8k"
+        concurrency: 2
         iterations: 10
-        isl: 8192
-        osl: 1024
+        isl: 32768
+        osl: 8192
         random_range_ratio: 0.2
         backend: "openai"
+        trust_remote_code: true
 
-  # 8k1k configs - DEP8 with CUTLASS, MTP1
-  - name: "r1_fp4_v2_dep8_mtp1_8k1k"
-    model_name: "deepseek_r1_0528_fp4_v2"
+  # 32k8k configs - DEP8 with CUTLASS
+  - name: "k2_thinking_fp4_dep8_32k8k"
+    model_name: "k2_thinking_fp4"
     tensor_parallel_size: 8
     moe_expert_parallel_size: 8
     pipeline_parallel_size: 1
     max_batch_size: 32
-    max_num_tokens: 12288
+    max_num_tokens: 8192
+    trust_remote_code: true
     attn_backend: "TRTLLM"
+    enable_chunked_prefill: true
     enable_attention_dp: true
     attention_dp_config:
       batching_wait_iters: 0
@@ -122,15 +122,13 @@ server_configs:
     kv_cache_config:
       dtype: 'fp8'
       enable_block_reuse: false
-      free_gpu_memory_fraction: 0.8
-    speculative_config:
-      decoding_type: 'MTP'
-      num_nextn_predict_layers: 1
+      free_gpu_memory_fraction: 0.6
     client_configs:
-      - name: "con256_iter10_8k1k"
-        concurrency: 256
+      - name: "con128_iter10_32k8k"
+        concurrency: 128
         iterations: 10
-        isl: 8192
-        osl: 1024
+        isl: 32768
+        osl: 8192
         random_range_ratio: 0.2
         backend: "openai"
+        trust_remote_code: true
