@@ -11,7 +11,7 @@ from transformers import AutoConfig, AutoModelForCausalLM
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.llm_args import AutoDeployConfig
+from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_nemotron_h import NemotronHForCausalLM
 from tensorrt_llm._torch.auto_deploy.utils._graph import move_to_device
 
@@ -164,7 +164,7 @@ def test_custom_model_implementation_can_be_exported(
                 "dtype": "bfloat16",
             },
         }
-    llm_args = AutoDeployConfig(**llm_args)
+    llm_args = LlmArgs(**llm_args)
 
     factory = llm_args.create_factory()
     model = factory.build_model("meta")

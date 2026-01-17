@@ -14,7 +14,7 @@ from pydantic_settings import (
     SettingsConfigDict,
 )
 
-from tensorrt_llm._torch.auto_deploy import LLM, AutoDeployConfig, DemoLLM
+from tensorrt_llm._torch.auto_deploy import LLM, DemoLLM
 from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
 from tensorrt_llm._torch.auto_deploy.utils._config import (
     DynamicYamlMixInForSettings,
@@ -142,7 +142,6 @@ class ExperimentConfig(DynamicYamlMixInForSettings, BaseSettings):
     # The main AutoDeploy arguments - contains model, tokenizer, backend configs, etc.
     args: LlmArgs = Field(
         description="The main AutoDeploy arguments containing model, tokenizer, backend configs, etc. "
-        "Contains all the fields from `AutoDeployConfig` and `BaseLlmArgs`. "
         "Please check `tensorrt_llm._torch.auto_deploy.llm_args.LlmArgs` for more details."
     )
 
@@ -213,7 +212,7 @@ class ExperimentConfig(DynamicYamlMixInForSettings, BaseSettings):
     def sync_model_with_args(cls, model_value, info):
         if "args" not in info.data:
             return model_value
-        args: AutoDeployConfig = info.data["args"]
+        args: LlmArgs = info.data["args"]
         return args.model
 
     @field_validator("prompt", mode="after")
@@ -221,7 +220,7 @@ class ExperimentConfig(DynamicYamlMixInForSettings, BaseSettings):
     def sync_prompt_batch_size_with_args_max_batch_size(cls, prompt: PromptConfig, info):
         if "args" not in info.data:
             return prompt
-        args: AutoDeployConfig = info.data["args"]
+        args: LlmArgs = info.data["args"]
         if args.max_batch_size < prompt.batch_size:
             args.max_batch_size = prompt.batch_size
         return prompt
@@ -231,7 +230,7 @@ class ExperimentConfig(DynamicYamlMixInForSettings, BaseSettings):
     def adjust_args_for_benchmark(cls, benchmark: BenchmarkConfig, info):
         if "args" not in info.data:
             return benchmark
-        args: AutoDeployConfig = info.data["args"]
+        args: LlmArgs = info.data["args"]
         if benchmark.enabled:
             # propagate benchmark settings to args
             args.max_batch_size = max(benchmark.bs, args.max_batch_size)
@@ -246,7 +245,7 @@ def build_llm_from_config(config: ExperimentConfig) -> LLM:
         "demollm": DemoLLM,
         "trtllm": LLM,
     }
-    llm = llm_lookup[config.args.runtime](**config.args.to_llm_kwargs())
+    llm = llm_lookup[config.args.runtime](**config.args.model_dump(exclude_unset=True))
     return llm
 
 
