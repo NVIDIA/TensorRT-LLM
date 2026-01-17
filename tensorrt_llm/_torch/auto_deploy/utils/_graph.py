@@ -166,8 +166,7 @@ def delete_all_unused_submodules(gm: GraphModule) -> None:
     """Optimized version of delete_all_unused_submodules with O(n+m) complexity.
 
     The original implementation uses a list for tracking used modules, making membership
-    checks O(n). This version uses a set for O(1) lookups and deletes deepest modules
-    first to avoid redundant operations.
+    checks O(n). This version uses a set for O(1) lookups.
 
     Original implementation is at GraphModule.delete_all_unused_submodules
 
@@ -176,43 +175,47 @@ def delete_all_unused_submodules(gm: GraphModule) -> None:
     """
     used: Set[str] = set()
 
-    # Define join function once outside the loop
-    def join_fn(x: str, y: str) -> str:
-        return f"{x}.{y}" if y else x
-
-    for node in gm.graph.nodes:
-        if node.op == "call_module" or node.op == "get_attr":
-            fullpath = node.target.split(".")
-            # Add all intermediate paths using set.update for efficiency
-            used.update(itertools.accumulate(fullpath, join_fn))
-
-            # For call_module, also mark all recursive submodules as used
-            if node.op == "call_module":
-                try:
-                    submod = gm.get_submodule(node.target)
-                    for submod_name, _ in submod.named_modules():
-                        if submod_name:
-                            used.add(f"{node.target}.{submod_name}")
-                except AttributeError:
-                    # Node referenced nonexistent submodule, don't need to
-                    # worry about GCing anything
-                    pass
-
-    # Collect modules to delete (skip empty root name)
-    to_delete = [name for name, _ in gm.named_modules() if name and name not in used]
-
-    # Sort by depth (deepest first) to delete children before parents
-    to_delete.sort(key=lambda x: x.count("."), reverse=True)
-
-    # Track deleted prefixes to skip already-deleted modules
-    deleted_prefixes: Set[str] = set()
-
-    for name in to_delete:
-        # Skip if a parent was already deleted
-        if any(name.startswith(prefix + ".") for prefix in deleted_prefixes):
+    for node in itertools.chain(
+        gm.graph.find_nodes(op="call_module", sort=False),
+        gm.graph.find_nodes(op="get_attr", sort=False),
+    ):
+        # check if it's already used and it's not a call_module node
+        # in this case we can skip. We cannot skip if it's a call_module node because we need to
+        # mark all recursive submodules as used.
+        if node.target in used and node.op != "call_module":
             continue
+
+        # A list of strings representing the different parts
+        # of the path. For example, `foo.bar.baz` gives us
+        # ["foo", "bar", "baz"]
+        fullpath = node.target.split(".")
+
+        # Progressively collect all the names of intermediate
+        # modules. For example, if we have the target
+        # `foo.bar.baz`, we'll add `foo`, `foo.bar`, and
+        # `foo.bar.baz` to the list.
+        used.update(".".join(fullpath[:i]) for i in range(1, len(fullpath) + 1))
+
+        # For call_module, also mark all recursive submodules as used
+        if node.op == "call_module":
+            try:
+                submod = gm.get_submodule(node.target)
+                for submod_name, _ in submod.named_modules():
+                    if submod_name != "":
+                        used.add(f"{node.target}.{submod_name}")
+            except AttributeError:
+                # Node referenced nonexistent submodule, don't need to
+                # worry about GCing anything
+                pass
+
+    # also add the root module to the used set
+    used.add("")
+
+    # Go over all modules and delete if on the list. Since we use named_modules, parents will be
+    # deleted first and children will be automatically skipped inside delete_submodule.
+    to_delete = [name for name, _ in gm.named_modules() if name not in used]
+    for name in to_delete:
         gm.delete_submodule(name)
-        deleted_prefixes.add(name)
 
 
 def eliminate_dead_code(
