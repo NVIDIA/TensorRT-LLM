@@ -686,11 +686,16 @@ def _resolve_ep_cls_from_node(node: Node) -> type[EPShardingInfo]:
 
 
 class GlobalRMSNormShardingInfo(ShardingTransformInfo):
-    """Configuration for replacing global RMSNorm with column-sharded version.
+    """Configuration for replacing RMSNorm with column-sharded global version.
 
-    When QK normalization (torch_rmsnorm_global) is applied to column-sharded
-    activations, it needs to be replaced with col_sharded_global_rmsnorm which
-    uses all_reduce to compute the correct global mean across shards.
+    When RMSNorm (torch_rmsnorm) operates on column-sharded activations with
+    weight shape [num_heads * head_dim] (full hidden size), it needs to be
+    replaced with col_sharded_global_rmsnorm which uses all_reduce to compute
+    the correct global mean across shards.
+
+    The detection of whether an RMSNorm needs this treatment is done in
+    _shard_attention_global_rmsnorm based on weight shape matching q/k projection
+    output dimensions.
     """
 
     world_size: int
@@ -701,39 +706,53 @@ class GlobalRMSNormShardingInfo(ShardingTransformInfo):
         return cls(target_node=node.name, **kwargs)
 
     def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
-        """Validate that the node is a torch_rmsnorm_global op."""
-        if not is_op(node, torch.ops.auto_deploy.torch_rmsnorm_global):
+        """Validate that the node is a torch_rmsnorm op."""
+        if not is_op(node, torch.ops.auto_deploy.torch_rmsnorm):
             ad_logger.debug(
-                f"GlobalRMSNormShardingInfo only applies to torch_rmsnorm_global ops. "
+                f"GlobalRMSNormShardingInfo only applies to torch_rmsnorm ops. "
                 f"Got {node.target}. Skipping."
             )
             return False
         return True
 
     def apply(self, gm: GraphModule, node: Node) -> None:
-        """Replace torch_rmsnorm_global with col_sharded_global_rmsnorm.
+        """Replace torch_rmsnorm with col_sharded_global_rmsnorm and shard the weight.
 
-        The replacement adds the world_size parameter which is needed for
-        computing the correct global mean across all shards.
+        This handles both:
+        1. Weight sharding: Column-shard the RMSNorm weight across ranks
+        2. Op replacement: Replace with col_sharded_global_rmsnorm which uses all_reduce
+           for computing the correct global mean across shards.
         """
         # Get original arguments: (input, weight, eps)
         input_node = node.args[0]
         weight_node = node.args[1]
         eps = node.args[2]
 
+        # Shard the weight parameter (column-wise for 1D RMSNorm weight)
+        weight_key = weight_node.target
+        weight_tensor = gm.get_parameter(weight_key)
+        shard_weight_tensor(
+            gm=gm,
+            weight_tensor=weight_tensor,
+            param_key=weight_key,
+            dim=0,  # Column shard for 1D weight
+            rank=self.config.rank,
+            world_size=self.world_size,
+        )
+        ad_logger.debug(f"Sharded global RMSNorm weight: {weight_key}")
+
         # Insert the new node with world_size parameter
         with gm.graph.inserting_after(node):
             new_node = gm.graph.call_function(
-                torch.ops.auto_deploy.col_sharded_global_rmsnorm,
+                torch.ops.auto_deploy.col_sharded_global_rmsnorm.default,
                 args=(input_node, weight_node, eps, self.world_size),
             )
-            node.replace_all_uses_with(new_node)
 
-        # Remove the old node
+        # Replace all uses with the new node and remove the old node
+        node.replace_all_uses_with(new_node)
         gm.graph.erase_node(node)
         ad_logger.debug(
-            f"Replaced torch_rmsnorm_global with col_sharded_global_rmsnorm "
-            f"(world_size={self.world_size})"
+            f"Replaced torch_rmsnorm with col_sharded_global_rmsnorm (world_size={self.world_size})"
         )
 
 
@@ -1382,14 +1401,30 @@ def _shard_parameter_node(
 
 
 def _update_node_args(node: Node, args: tuple) -> None:
-    """Update the node's arguments with the new sharded arguments."""
+    """Update the node's arguments with the new sharded arguments.
+
+    For Node args: preserve the current value (may have been updated by other transforms).
+    For non-Node args (shapes, sizes, indices): use the stored sharded value.
+
+    This prevents ParameterUpdateInfo from reverting Node references that were
+    intentionally updated by other transforms.
+    """
     if "sharded" in node.meta and node.meta["sharded"]:
         return
-    node.args = args
+
+    # Build new args: preserve current Node refs, apply stored non-Node values
+    new_args = []
+    for i, stored_arg in enumerate(args):
+        if isinstance(stored_arg, Node):
+            # Node args: preserve current value (may have been updated by other transforms)
+            new_args.append(node.args[i])
+        else:
+            # Non-Node args (shapes, sizes, indices): use stored sharded value
+            new_args.append(stored_arg)
+
+    node.args = tuple(new_args)
     node.meta["sharded"] = True
-    ad_logger.debug(
-        f"Updated node {node}: replaced original arguments {node.args} with sharded arguments {args}."
-    )
+    ad_logger.debug(f"Updated node {node}: sharded arguments are now {node.args}.")
 
 
 def _insert_sharded_moe(
@@ -1959,27 +1994,33 @@ def _determine_fused_weight_dims(
             fused_weight_dims = [weight_dim // num_chunks] * num_chunks
 
 
-def _shard_intermediate_attention_weights(
+def _shard_attention_global_rmsnorm(
     layer_subgraph: LayerSubgraph,
     linear_nodes: List[Node],
     transform_container: ShardingTransformContainer,
 ) -> int:
     """
-    Shard intermediate weights (e.g. q_norm, k_norm) for attention layers.
+    Shard RMSNorm ops in attention layers that operate on full hidden size.
 
-    For attention layers, there may be intermediate weights (like q_norm.weight, k_norm.weight)
-    that operate directly on q_proj/k_proj output (before reshaping to [batch, seq, num_heads, head_dim]).
-    These need to be sharded along the same head dimension.
+    This function detects torch_rmsnorm ops whose weight shape matches q/k projection
+    output dimensions (num_heads * head_dim). These are global QK norms that operate
+    on flattened Q/K output [batch, seq, hidden_size] before reshape and need special
+    handling for tensor parallelism:
+    1. Weight sharding: The norm weight is column-sharded across ranks
+    2. Global mean: Replaced with col_sharded_global_rmsnorm which uses all_reduce
 
-    Example1: - Norm on all heads directly on flattened Q/K output [batch, seq, hidden_size] (e.g. MiniMax):
+    The detection is shape-based rather than relying on specific op types, making this
+    approach more generic and applicable to any model with similar QK norm patterns.
+
+    Example1: - Global Norm on all heads directly on flattened Q/K output (e.g. MiniMax):
         self.q_norm = MiniMaxM2RMSNorm(self.head_dim * config.num_attention_heads, eps=config.rms_norm_eps)
-        weight shape: [num_heads * head_dim]
-        Status: Needs qk norm sharding. (will be handled in this function)
+        weight shape: [num_heads * head_dim] -> matches valid_sizes -> will be sharded
+        Status: Needs sharding (weight matches q projection output dim)
 
     Example2: - Norm per head after reshaping to [batch, seq, num_heads, head_dim] (e.g. GLM 4.7):
         self.q_norm = Glm4MoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        weight shape: [head_dim]
-        Status: No need to shard/will be skipped.
+        weight shape: [head_dim] -> does NOT match valid_sizes -> skipped
+        Status: No sharding needed (weight doesn't match q/k output dims)
 
     Args:
         layer_subgraph: The attention layer subgraph
@@ -2018,6 +2059,14 @@ def _shard_intermediate_attention_weights(
     for weight_node in intermediate_weight_nodes:
         weight_key = weight_node.target
 
+        # First check: is this weight consumed by a torch_rmsnorm op
+        if len(list(weight_node.users)) == 0:
+            continue
+
+        user_node = list(weight_node.users)[0]
+        if not is_op(user_node, torch.ops.auto_deploy.torch_rmsnorm):
+            continue
+
         # Try to get the parameter
         try:
             param = gm.get_parameter(weight_key)
@@ -2025,9 +2074,7 @@ def _shard_intermediate_attention_weights(
             ad_logger.debug(f"Could not get parameter for {weight_key}, skipping")
             continue
 
-        # Only shard 1D weights that match the expected dimension
-        # TODO: 1D weights are probably more strict (allowing elemwise operations).
-        # Ideally we should detect if head dimension is present in the weight shape.
+        # Only shard 1D weights (RMSNorm weights are always 1D)
         if param.dim() != 1:
             ad_logger.debug(
                 f"Skipping intermediate weight {weight_key} with dim={param.dim()} (not 1D)"
@@ -2043,49 +2090,28 @@ def _shard_intermediate_attention_weights(
             continue
 
         # Check if weight size matches one of the q/k/v projection output dimensions
-        # This filters out unrelated weights like inv_freq
+        # This filters out per-head norms and unrelated weights like inv_freq
         if valid_sizes and param.shape[0] not in valid_sizes:
             ad_logger.debug(
                 f"Skipping intermediate weight {weight_key} with shape {param.shape} "
-                f"(not in valid_sizes={valid_sizes})"
+                f"(not in valid_sizes={valid_sizes}, likely per-head norm)"
             )
             continue
 
-        # Get the user node for this weight (for WeightShardingInfo)
-        if len(list(weight_node.users)) == 0:
-            ad_logger.debug(f"Weight node {weight_key} has no users, skipping")
-            continue
-
-        user_node = list(weight_node.users)[0]
-
-        # Add sharding info for this intermediate weight
+        # Add GlobalRMSNormShardingInfo to replace with col_sharded_global_rmsnorm
+        # This handles both weight sharding and op replacement in one transform
         if transform_container.add(
-            WeightShardingInfo.from_node(
+            GlobalRMSNormShardingInfo.from_node(
                 user_node,
-                split_dim=SplitDimension.COLUMN,
                 config=config,
-                dist_op=None,  # No dist op needed for intermediate column-sharded weights
-                min_local_shape=layer_subgraph.min_local_shape,
-                layer_type=LayerType.ATTENTION,
+                world_size=world_size,
             )
         ):
-            ad_logger.debug(f"Added sharding for intermediate attention weight: {weight_key}")
+            ad_logger.debug(
+                f"Added GlobalRMSNormShardingInfo for {user_node.name} "
+                f"(will replace with col_sharded_global_rmsnorm for global mean)"
+            )
             added_nodes += 1
-
-        # Check if the user node is a global RMSNorm that needs all_reduce for correct sharding
-        # torch_rmsnorm_global is used for QK normalization that needs global mean across shards
-        if is_op(user_node, torch.ops.auto_deploy.torch_rmsnorm_global):
-            if transform_container.add(
-                GlobalRMSNormShardingInfo.from_node(
-                    user_node,
-                    config=config,
-                    world_size=world_size,
-                )
-            ):
-                ad_logger.debug(
-                    f"Added GlobalRMSNormShardingInfo for {user_node.name} "
-                    f"(will use all_reduce for global mean)"
-                )
 
     return added_nodes
 
@@ -2170,7 +2196,7 @@ def _process_column_sharding(
         # chunk nodes do not need to be updated
 
     # Shard intermediate weights (e.g. q/k/v -> q_norm, k_norm ... -> o_proj) for attention layers
-    added_nodes += _shard_intermediate_attention_weights(
+    added_nodes += _shard_attention_global_rmsnorm(
         layer_subgraph, linear_nodes, transform_container
     )
 
