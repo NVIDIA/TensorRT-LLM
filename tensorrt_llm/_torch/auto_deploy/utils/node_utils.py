@@ -143,8 +143,19 @@ def get_quantization_params_from_linear_node(linear_op: torch.fx.node.Node):
     return input_params, weight_params, output_params
 
 
-def extract_weight_name(node: Node) -> str:
+def get_all_weights_in_subgraph(
+    sources: list[Node],
+    sinks: list[Node],
+):
+    """Get all weight nodes (get_attr nodes) in the subgraph between sources and sinks."""
+    weight_nodes = subgraph(sources, sinks, include=is_weight_node)
+    return weight_nodes
+
+
+def extract_weight_name(node: Node) -> Union[str, bool]:
     weight_nodes = extract_weight_nodes(node)
+    if len(weight_nodes.weights) == 0:
+        return False
     return weight_nodes.weights[0].node_key
 
 
@@ -157,7 +168,7 @@ def get_param_or_buffer(tensor_name: str, gm: GraphModule) -> torch.Tensor:
         raise KeyError(f"Tensor {tensor_name} not found in the graph")
 
 
-def extract_weight_nodes(node: Node) -> WeightNodes:
+def extract_weight_nodes(node: Node, filter: bool = False) -> WeightNodes:
     """Extracts the list of weight node and optional bias node from the given parametrized node"""
     gm = node.graph.owning_module
     param_names = {name for name, _ in gm.named_parameters()}.union(
@@ -212,6 +223,12 @@ def extract_weight_nodes(node: Node) -> WeightNodes:
             for n in node.all_input_nodes
             if (attr_node := find_get_attr_node(n)) is not None
         ]
+        # exclude_nodes = ["mixer_d", "dt_bias"]
+        exclude_nodes = ["a_log"]
+        if filter:
+            all_weight_nodes = [
+                n for n in all_weight_nodes if not any([k in str(n) for k in exclude_nodes])
+            ]
         # separate weight nodes and bias nodes
         bias_nodes = [n for n in all_weight_nodes if n.target.endswith("bias")]
         weight_nodes = [n for n in all_weight_nodes if n not in bias_nodes]
@@ -429,6 +446,10 @@ def is_dist_op(node: Node) -> bool:
         torch.ops.auto_deploy.trtllm_dist_all_reduce,
     }
     return is_op(node, dist_ops)
+
+
+def is_weight_node(node: Node) -> bool:
+    return node.op == "get_attr" and node.target and has_shape(node) and len(shape(node)) > 0
 
 
 def get_user_if_pattern_match(node, ops, numusers, user_idx: int = 0):
