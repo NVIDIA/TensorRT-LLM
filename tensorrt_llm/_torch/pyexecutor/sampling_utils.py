@@ -266,7 +266,8 @@ def greedy_search_sampling_batch(
     next_tokens = torch.argmax(logits, dim=-1)
     softmax: Optional[torch.Tensor] = None
     if return_probs:
-        softmax = torch.softmax(logits, dim=-1)
+        softmax = torch.zeros_like(logits)
+        softmax.scatter_(1, next_tokens.unsqueeze(-1), 1.0)
     return next_tokens, softmax
 
 
@@ -471,10 +472,10 @@ def sample(
     strategy: Strategy,
     logits: torch.Tensor,
     *,
-    generator: Optional[torch.Generator] = None,
+    generator: torch.Generator | None = None,
     group_metadata: StrategyMetadata | None = None,
     return_probs: bool = True,
-) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+) -> tuple[torch.Tensor, torch.Tensor | None, float | None]:
     match strategy:
         case ("top_k", top_k, temperature):
             tokens, softmax = top_k_sampling_batch(
@@ -506,6 +507,7 @@ def sample(
             )
         case ("greedy", None):
             tokens, softmax = greedy_search_sampling_batch(logits, return_probs=return_probs)
+            temperature = None
         case ("beam_search", beam_width_in, beam_width_out, temperature):
             assert group_metadata is not None and isinstance(group_metadata, BeamSearchMetadata), (
                 "BeamSearchMetadata is required for beam_search_sampling_batch"
@@ -519,7 +521,7 @@ def sample(
                 generator=generator,
                 return_probs=return_probs,
             )
-    return tokens, softmax
+    return tokens, softmax, temperature
 
 
 GenericStrategyKeyType = TypeVar("GenericStrategyKeyType")
@@ -545,11 +547,11 @@ class GroupedStrategySampler(Generic[GenericStrategyKeyType], abc.ABC):
         strategies: list[Strategy],
         logits: torch.Tensor,
         *,
-        group_logit_indices: Optional[torch.Tensor] = None,
-        generator: Optional[torch.Generator] = None,
+        group_logit_indices: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
         return_probs: bool,
         group_metadata: StrategyMetadata | None = None,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, float | torch.Tensor | None]:
         raise NotImplementedError
 
 
@@ -579,11 +581,11 @@ class SimpleGroupedStrategySampler(GroupedStrategySampler[Strategy]):
         strategies: list[Strategy],
         logits: torch.Tensor,
         *,
-        group_logit_indices: Optional[torch.Tensor] = None,
-        generator: Optional[torch.Generator] = None,
+        group_logit_indices: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
         return_probs: bool,
         group_metadata: StrategyMetadata | None = None,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, float | None]:
         if group_key[0] == "beam_search":
             beam_width_in = group_key[1]
         else:

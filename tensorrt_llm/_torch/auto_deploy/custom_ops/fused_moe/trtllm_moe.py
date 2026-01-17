@@ -271,13 +271,9 @@ def trtllm_quant_nvfp4_moe_fused(
     # Convert the inter_size from number of uint8 elements to number of FP4 elements.
     inter_size *= FP4_PER_UINT8
 
-    # Validate shapes and padding requirements as defined by the cutlass kernel.
+    # Validate block scale tensors are 3D (padding requirements handled below)
     assert fc1_weight_blockscale_fp8.ndim == 3, "fc1_weight_blockscale_fp8 must be 3D"
     assert fc2_weight_blockscale_fp8.ndim == 3, "fc2_weight_blockscale_fp8 must be 3D"
-    assert fc1_weight_blockscale_fp8.size(1) % TRTLLM_NVFP4_ROW_SIZE == 0
-    assert fc2_weight_blockscale_fp8.size(1) % TRTLLM_NVFP4_ROW_SIZE == 0
-    assert fc1_weight_blockscale_fp8.size(2) % TRTLLM_NVFP4_COLUMN_SIZE == 0
-    assert fc2_weight_blockscale_fp8.size(2) % TRTLLM_NVFP4_COLUMN_SIZE == 0
 
     _validate_mlp_style_and_act_fn(is_gated_mlp, act_fn)
     act_fn = ActivationType.Swiglu if act_fn == ActivationType.Silu else act_fn
@@ -292,7 +288,7 @@ def trtllm_quant_nvfp4_moe_fused(
         input_blockscale = None
         output_dtype = x.dtype
 
-    # Pad inter_size to be divisible by 128
+    # Pad inter_size to be divisible by TRTLLM_NVFP4_ROW_SIZE
     inter_size_padded = math.ceil(inter_size / TRTLLM_NVFP4_ROW_SIZE) * TRTLLM_NVFP4_ROW_SIZE
     fc1_inter_size_padded = (
         math.ceil(fc1_inter_size / TRTLLM_NVFP4_ROW_SIZE) * TRTLLM_NVFP4_ROW_SIZE
@@ -305,18 +301,30 @@ def trtllm_quant_nvfp4_moe_fused(
         not is_gated_mlp and inter_size_padded != inter_size
     )
     hidden_size_needs_padding = hidden_size % TRTLLM_NVFP4_COLUMN_SIZE != 0
+
+    hidden_blocks_padded = hidden_size_padded // NVFP4_BLOCK_SIZE
+    inter_blocks_padded = inter_size_padded // NVFP4_BLOCK_SIZE
+
     if inter_size_needs_padding or hidden_size_needs_padding:
-        assert False, "See https://github.com/NVIDIA/TensorRT-LLM/issues/10331"
-        # fc1_expert_weights_fp4: [E, I, H] or [E, 2*I, H]
+        # Pad fc1_expert_weights_fp4: [E, I, H/2] or [E, 2*I, H/2]
         fc1_padded = fc1_expert_weights_fp4.new_zeros(
             fc1_expert_weights_fp4.size(0),
             fc1_inter_size_padded,
             hidden_size_padded // FP4_PER_UINT8,
         )
-        fc1_padded[:, :fc1_inter_size, :] = fc1_expert_weights_fp4
+        fc1_padded[:, :fc1_inter_size, : hidden_size // FP4_PER_UINT8] = fc1_expert_weights_fp4
         fc1_expert_weights_fp4 = fc1_padded
 
-        # fc2_expert_weights_fp4: [E, H, I]
+        # Block scales may already be padded, so check actual size
+        fc1_bs_size1 = fc1_weight_blockscale_fp8.size(1)
+        fc1_bs_size2 = fc1_weight_blockscale_fp8.size(2)
+        if fc1_bs_size1 < fc1_inter_size_padded or fc1_bs_size2 < hidden_blocks_padded:
+            fc1_blockscale_fp8_padded = fc1_weight_blockscale_fp8.new_zeros(
+                n_experts, fc1_inter_size_padded, hidden_blocks_padded
+            )
+            fc1_blockscale_fp8_padded[:, :fc1_bs_size1, :fc1_bs_size2] = fc1_weight_blockscale_fp8
+            fc1_weight_blockscale_fp8 = fc1_blockscale_fp8_padded
+
         fc2_padded = fc2_expert_weights_fp4.new_zeros(
             n_experts, hidden_size_padded, inter_size_padded // FP4_PER_UINT8
         )
@@ -325,16 +333,20 @@ def trtllm_quant_nvfp4_moe_fused(
             f"inter_size {inter_size} must be divisible by {NVFP4_BLOCK_SIZE}"
         )
 
-        fc2_padded[:, :, : inter_size // FP4_PER_UINT8] = fc2_expert_weights_fp4
+        fc2_padded[:, :hidden_size, : inter_size // FP4_PER_UINT8] = fc2_expert_weights_fp4
         fc2_expert_weights_fp4 = fc2_padded
 
-        fc2_blockscale_fp8_padded = fc2_weight_blockscale_fp8.new_zeros(
-            n_experts, hidden_size_padded, inter_size_padded // NVFP4_BLOCK_SIZE
-        )
-        fc2_blockscale_fp8_padded[:, :, : inter_size // NVFP4_BLOCK_SIZE] = (
-            fc2_weight_blockscale_fp8
-        )
-        fc2_weight_blockscale_fp8 = fc2_blockscale_fp8_padded
+        # Pad fc2_weight_blockscale_fp8: [E, H, I/16]
+        # Block scales may already be padded, so check actual size
+        fc2_bs_size1 = fc2_weight_blockscale_fp8.size(1)
+        fc2_bs_size2 = fc2_weight_blockscale_fp8.size(2)
+        if fc2_bs_size1 < hidden_size_padded or fc2_bs_size2 < inter_blocks_padded:
+            fc2_blockscale_fp8_padded = fc2_weight_blockscale_fp8.new_zeros(
+                n_experts, hidden_size_padded, inter_blocks_padded
+            )
+            fc2_blockscale_fp8_padded[:, :fc2_bs_size1, :fc2_bs_size2] = fc2_weight_blockscale_fp8
+            fc2_weight_blockscale_fp8 = fc2_blockscale_fp8_padded
+        # else: block scales already have correct padded size, use as-is
 
     # quant_scales is described by this code:
     # https://github.com/NVIDIA/TensorRT-LLM/blob/c9771ebb997683c08b26bbba796a7fc6aff09d93/cpp/tensorrt_llm/thop/moeOp.cpp#L1015
