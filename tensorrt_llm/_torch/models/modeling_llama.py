@@ -692,19 +692,19 @@ class LlamaDecoderLayer(DecoderLayer):
         self.enable_fusion &= config.hidden_size > 4096
 
         enable_gemm_allreduce_fusion = (os.environ.get(
-            "TRTLLM_GEMM_ALLREDUCE_FUSION_ENABLED", "1") == "1")
+            "TRTLLM_GEMM_ALLREDUCE_FUSION_ENABLED", "0") == "1")
         mpi_enabled = not mpi_disabled()
         dtype_supported = config.torch_dtype in (torch.float16, torch.bfloat16)
         tp_valid = self.mapping.tp_size > 1
         quant_valid = self.is_nvfp4 is not None and self.is_nvfp4
-
         device_supported = get_sm_version() >= 100
-        nvls_supported = ipc_nvls_supported()
 
         use_fused_gemm_allreduce = all([
             enable_gemm_allreduce_fusion, mpi_enabled, dtype_supported,
-            tp_valid, quant_valid, device_supported, nvls_supported
+            tp_valid, quant_valid, device_supported
         ])
+        if use_fused_gemm_allreduce:
+            use_fused_gemm_allreduce = ipc_nvls_supported()
 
         def check_in_out_features(in_features, out_features):
             in_feature_valid = in_features % 128 == 0 and in_features >= 1024

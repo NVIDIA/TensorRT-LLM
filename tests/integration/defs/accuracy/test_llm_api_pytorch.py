@@ -14,6 +14,7 @@
 # limitations under the License.
 import os
 import sys
+from unittest import mock
 
 import pytest
 import torch
@@ -705,17 +706,24 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @skip_pre_blackwell
+    @parametrize_with_ids("enable_gemm_allreduce_fusion", [False, True])
     @parametrize_with_ids("torch_compile", [False, True])
-    def test_fp4_tp2pp2(self, torch_compile):
+    def test_fp4_tp2pp2(self, enable_gemm_allreduce_fusion, torch_compile):
         model_path = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct-FP4"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
-        with LLM(model_path,
-                 tensor_parallel_size=2,
-                 pipeline_parallel_size=2,
-                 max_batch_size=32,
-                 kv_cache_config=kv_cache_config,
-                 torch_compile_config=torch_compile_config) as llm:
+
+        with (mock.patch.dict(
+                os.environ, {
+                    "TRTLLM_GEMM_ALLREDUCE_FUSION_ENABLED":
+                    str(int(enable_gemm_allreduce_fusion))
+                }),
+              LLM(model_path,
+                  tensor_parallel_size=2,
+                  pipeline_parallel_size=2,
+                  max_batch_size=32,
+                  kv_cache_config=kv_cache_config,
+                  torch_compile_config=torch_compile_config) as llm):
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             sampling_params = SamplingParams(
                 max_tokens=256,
