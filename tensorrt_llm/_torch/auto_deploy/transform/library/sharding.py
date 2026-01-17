@@ -43,6 +43,7 @@ from ...utils.node_utils import (
     extract_weight_nodes,
     filtered_nodes,
     get_all_layer_subgraphs,
+    get_all_weights_in_subgraph,
     get_layer_after_linear_node,
     is_any_attention_op,
     is_any_lin_op,
@@ -895,8 +896,15 @@ def _load_hook(
     # This is quite a hacky solution. A better solution would be to store extra_state in
     # the state_dict to identify whether the state_dict is sharded or not.
     key = prefix + param_key
+    if "a_log" in str(key).lower():
+        ad_logger.info(f"Loading key: {key}")
     if key not in state_dict:
+        # if "experts" not in key:
+        #     ad_logger.info(f"Key not found: {key}")
         return
+    if "a_log" in str(key).lower():
+        # if "experts" not in key:
+        ad_logger.info(f"Key found: {key}")
     p_to_load = state_dict[key]
     p_to_load = p_to_load if param_shape == p_to_load.shape else f_split(p_to_load)
     state_dict[key] = p_to_load
@@ -1060,31 +1068,6 @@ def _resolve_tp_cls_from_node(node: Node):
     return WeightShardingInfo
 
 
-def _get_dim0_from_arg(gm: GraphModule, arg: Union[Node, torch.Tensor]) -> int:
-    """Helper to get the first dimension size of an argument (Node or Tensor)."""
-    if isinstance(arg, torch.Tensor):
-        return arg.shape[0]
-    if isinstance(arg, Node):
-        if arg.op == "get_attr":
-            # Traverse attributes to find the tensor
-            obj = gm
-            for atom in arg.target.split("."):
-                obj = getattr(obj, atom)
-            return obj.shape[0]
-        if "val" in arg.meta:
-            return shape(arg)[0]
-    raise ValueError(f"Cannot determine shape[0] for {arg}")
-
-
-def get_all_weights_in_subgraph(
-    sources: list[Node],
-    sinks: list[Node],
-):
-    """Get all weight nodes (get_attr nodes) in the subgraph between sources and sinks."""
-    weight_nodes = subgraph(sources, sinks, include=lambda n: n.op == "get_attr")
-    return weight_nodes
-
-
 def init_process_grid_from_config(
     config: ShardingTransformConfig,
 ) -> Dict[ShardingDim, Dict[str, int]]:
@@ -1246,7 +1229,7 @@ def _shard_parameter_node(
         return
 
     # Shard weight using the unified function (also updates the parameter)
-    weight_nodes = extract_weight_nodes(node)
+    weight_nodes = extract_weight_nodes(node, filter=True)
     for weight_node in weight_nodes.weights:
         _, weight_new_shape = shard_weight_tensor(
             gm=gm,
