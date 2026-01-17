@@ -689,7 +689,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                     "--entrypoint=\"\" " +
                     "--security-opt seccomp=unconfined " +
                     "-u root:root " +
-                    "-v /home/scratch.trt_llm_data:/scratch.trt_llm_data:ro " +
+                    "-v /home/scratch.trt_llm_data_ci:/scratch.trt_llm_data:ro " +
                     "-v /tmp/ccache:${CCACHE_DIR}:rw " +
                     "-v /tmp/pipcache/http-v2:/root/.cache/pip/http-v2:rw " +
                     "--cap-add=SYSLOG"
@@ -871,7 +871,7 @@ def getMountListForSlurmTest(SlurmCluster cluster, boolean useSbatch = false)
     // data/cache mounts
     if (cluster.containerRuntime.toString() == "DOCKER") {
         mounts += [
-            "/home/scratch.trt_llm_data:/scratch.trt_llm_data:ro",
+            "/home/scratch.trt_llm_data_ci:/scratch.trt_llm_data:ro",
         ]
     } else if (cluster.containerRuntime.toString() == "ENROOT") {
         if (!cluster.scratchPath) {

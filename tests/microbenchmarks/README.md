@@ -16,7 +16,7 @@ python ./build_time_benchmark.py --model "TinyLlama/TinyLlama_v1.1" # no weights
 python ./build_time_benchmark.py --model "openai-community/gpt2" --load # with weights loading
 
 # example 3: benchmark a local download HF model
-python  ./build_time_benchmark.py --model /home/scratch.trt_llm_data/llm-models/falcon-rw-1b/
+python  ./build_time_benchmark.py --model /home/scratch.trt_llm_data_ci/llm-models/falcon-rw-1b/
 
 # example 4: benchmark one model with managed weights option, with verbose option
 python ./build_time_benchmark.py --model llama2-70b.TP4 --managed_weights -v
