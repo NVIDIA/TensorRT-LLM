@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION &
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
  * AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,55 +16,48 @@
  */
 #pragma once
 
-#include <cassert>
 #include <string>
+#include <cassert>
 
-namespace batchedGemm
-{
+namespace batchedGemm {
 
-namespace batchedGemm
-{
+namespace batchedGemm {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-enum class RouteImpl
-{
-    // No Routing
-    NoRoute = 0,
-    // Use LDGSTS to do the routing
-    Ldgsts = 1,
-    // Use UTMALDG.GATHER4 to do the routing
-    Tma = 2,
-    // Use LDG+STS to do the routing
-    LdgPlusSts = 3
+enum class RouteImpl {
+  // No Routing
+  NoRoute = 0,
+  // Use LDGSTS to do the routing
+  Ldgsts = 1,
+  // Use UTMALDG.GATHER4 to do the routing
+  Tma = 2,
+  // Use LDG+STS to do the routing
+  LdgPlusSts = 3
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-inline bool doesRouteImplUseNoRoute(RouteImpl mode)
-{
-    return (mode == RouteImpl::NoRoute);
+inline bool doesRouteImplUseNoRoute(RouteImpl mode) {
+  return (mode == RouteImpl::NoRoute);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-inline bool doesRouteImplUseLdgsts(RouteImpl mode)
-{
-    return (mode == RouteImpl::Ldgsts);
+inline bool doesRouteImplUseLdgsts(RouteImpl mode) {
+  return (mode == RouteImpl::Ldgsts);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-inline bool doesRouteImplUseTma(RouteImpl mode)
-{
-    return (mode == RouteImpl::Tma);
+inline bool doesRouteImplUseTma(RouteImpl mode) {
+  return (mode == RouteImpl::Tma);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-inline bool doesRouteImplUseLdgPlusSts(RouteImpl mode)
-{
-    return (mode == RouteImpl::LdgPlusSts);
+inline bool doesRouteImplUseLdgPlusSts(RouteImpl mode) {
+  return (mode == RouteImpl::LdgPlusSts);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

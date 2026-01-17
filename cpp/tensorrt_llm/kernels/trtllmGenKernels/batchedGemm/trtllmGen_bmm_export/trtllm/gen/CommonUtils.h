@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION &
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
  * AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,13 +16,10 @@
  */
 #pragma once
 
-namespace batchedGemm
-{
+namespace batchedGemm {
 
-namespace trtllm
-{
-namespace gen
-{
+namespace trtllm {
+namespace gen {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -41,18 +38,14 @@ constexpr unsigned long XLargeN = 1UL << 35;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <typename T>
-inline T ceilDiv(T m, T n)
-{
-    return (m + n - T(1)) / n;
+template <typename T> inline T ceilDiv(T m, T n) {
+  return (m + n - T(1)) / n;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <typename T>
-inline T roundUp(T m, T n)
-{
-    return ceilDiv(m, n) * n;
+template <typename T> inline T roundUp(T m, T n) {
+  return ceilDiv(m, n) * n;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

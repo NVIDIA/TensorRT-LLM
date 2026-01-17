@@ -199,7 +199,7 @@ class FP4BlockScaleMoERunner(TunableRunner):
                  topk_group: Optional[int], intermediate_size: int,
                  local_expert_offset: int, local_num_experts: int,
                  routed_scaling_factor: Optional[float],
-                 routing_method_type: int, do_finalize: bool):
+                 routing_method_type: int, do_finalize: bool, act_type: int):
 
         self.num_experts = num_experts
         self.top_k = top_k
@@ -211,6 +211,7 @@ class FP4BlockScaleMoERunner(TunableRunner):
         self.routed_scaling_factor = routed_scaling_factor
         self.routing_method_type = routing_method_type
         self.do_finalize = do_finalize
+        self.act_type = act_type
 
         self.tuning_config = FP4BlockScaleMoERunner.get_tuning_config(
             self.num_experts // self.local_num_experts)
@@ -218,13 +219,15 @@ class FP4BlockScaleMoERunner(TunableRunner):
     # The unique_id is used by the autotuner to get the cache key, so we hash on members
     # that influence tactic validity here. e.g. we are tuning FC1 and FC2 so the routing type does not matter
     def unique_id(self):
-        return (self.top_k, self.intermediate_size, self.local_num_experts)
+        return (self.top_k, self.intermediate_size, self.local_num_experts,
+                self.act_type)
 
     def get_runner(self):
-        instance_key = ()
+        instance_key = (self.act_type, )
         if instance_key not in FP4BlockScaleMoERunner.runner_dict:
             FP4BlockScaleMoERunner.runner_dict[
-                instance_key] = torch.classes.trtllm.FP4BlockScaleMoERunner()
+                instance_key] = torch.classes.trtllm.FP4BlockScaleMoERunner(
+                    self.act_type)
         return FP4BlockScaleMoERunner.runner_dict[instance_key]
 
     def forward(
@@ -390,6 +393,7 @@ def fp4_block_scale_moe_runner(
         routed_scaling_factor: Optional[float],
         routing_method_type: int,
         do_finalize: bool,
+        act_type: int = 0,
         topk_weights: Optional[torch.Tensor] = None,
         topk_ids: Optional[torch.Tensor] = None) -> List[torch.Tensor]:
 
@@ -405,6 +409,7 @@ def fp4_block_scale_moe_runner(
         routed_scaling_factor,
         routing_method_type,
         do_finalize,
+        act_type,
     )
 
     # Prepare dummy topk tensors and hook for AutoTuner profiling
@@ -515,6 +520,7 @@ def _(routing_logits,
       routed_scaling_factor,
       routing_method_type,
       do_finalize,
+      act_type,
       topk_weights: Optional[torch.Tensor] = None,
       topk_ids: Optional[torch.Tensor] = None) -> List[torch.Tensor]:
     if do_finalize:
@@ -564,6 +570,7 @@ class FP8BlockScaleMoERunner(TunableRunner):
         local_num_experts: int,
         routed_scaling_factor: Optional[float],
         routing_method_type: int,
+        act_type: int,
     ):
 
         self.num_experts = num_experts
@@ -575,7 +582,7 @@ class FP8BlockScaleMoERunner(TunableRunner):
         self.local_num_experts = local_num_experts
         self.routed_scaling_factor = routed_scaling_factor
         self.routing_method_type = routing_method_type
-
+        self.act_type = 0
         self.tuning_config = FP8BlockScaleMoERunner.get_tuning_config(
             self.num_experts // self.local_num_experts)
 
@@ -583,7 +590,8 @@ class FP8BlockScaleMoERunner(TunableRunner):
     # that influence tactic validity here. e.g. we are tuning FC1 and FC2 so the routing
     # type does not matter
     def unique_id(self):
-        return (self.top_k, self.intermediate_size, self.local_num_experts)
+        return (self.top_k, self.intermediate_size, self.local_num_experts,
+                self.act_type)
 
     def get_runner(self):
         instance_key = ()
@@ -704,26 +712,26 @@ class FP8BlockScaleMoERunner(TunableRunner):
 
 
 @torch.library.custom_op("trtllm::fp8_block_scale_moe_runner", mutates_args=())
-def fp8_block_scale_moe_runner(
-        routing_logits: Optional[torch.Tensor],
-        routing_bias: torch.Tensor,
-        hidden_states: torch.Tensor,
-        hidden_states_scale: torch.Tensor,
-        gemm1_weights: torch.Tensor,
-        gemm1_weights_scale: torch.Tensor,
-        gemm2_weights: torch.Tensor,
-        gemm2_weights_scale: torch.Tensor,
-        num_experts: int,
-        top_k: int,
-        n_group: Optional[int],
-        topk_group: Optional[int],
-        intermediate_size: int,
-        local_expert_offset: int,
-        local_num_experts: int,
-        routed_scaling_factor: Optional[float],
-        routing_method_type: int,
-        topk_weights: Optional[torch.Tensor] = None,
-        topk_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
+def fp8_block_scale_moe_runner(routing_logits: Optional[torch.Tensor],
+                               routing_bias: torch.Tensor,
+                               hidden_states: torch.Tensor,
+                               hidden_states_scale: torch.Tensor,
+                               gemm1_weights: torch.Tensor,
+                               gemm1_weights_scale: torch.Tensor,
+                               gemm2_weights: torch.Tensor,
+                               gemm2_weights_scale: torch.Tensor,
+                               num_experts: int,
+                               top_k: int,
+                               n_group: Optional[int],
+                               topk_group: Optional[int],
+                               intermediate_size: int,
+                               local_expert_offset: int,
+                               local_num_experts: int,
+                               routed_scaling_factor: Optional[float],
+                               routing_method_type: int,
+                               topk_weights: Optional[torch.Tensor] = None,
+                               topk_ids: Optional[torch.Tensor] = None,
+                               act_type: int = 0) -> torch.Tensor:
 
     tuner = AutoTuner.get()
     kernel_runner = FP8BlockScaleMoERunner(
@@ -736,6 +744,7 @@ def fp8_block_scale_moe_runner(
         local_num_experts,
         routed_scaling_factor,
         routing_method_type,
+        act_type,
     )
 
     # Prepare dummy topk tensors and hook for AutoTuner profiling
