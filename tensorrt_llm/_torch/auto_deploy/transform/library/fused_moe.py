@@ -1319,19 +1319,12 @@ def remove_original_experts(gm: GraphModule, weight_lists: List[List[Node]]) -> 
                 owner_module = gm.get_submodule(owner_module_path)
                 owner_param = get_attr_by_name(owner_module, param_name)
                 if owner_param is w_param:
-                    torch.cuda.empty_cache()
-                    # gc.collect()
-                    # print("memory before delete: ", torch.cuda.memory_allocated())
                     gm.delete_submodule(owner_module_path)
-                    torch.cuda.empty_cache()
-                    # gc.collect()
-                    # print("memory after delete: ", torch.cuda.memory_allocated())
                 else:
                     # param w is not owned by owner_module, skip
                     continue
             else:
                 continue
-
 
 def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "triton"]) -> int:
     """
@@ -1519,12 +1512,12 @@ def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "
                 0, device=w1_input_scale_stacked.device, dtype=w1_input_scale_stacked.dtype
             )
         )
-        #        assert torch.all(w1_input_scale_stacked[0] == w1_input_scale_stacked), (
-        #            "All w1 scales should have the same value."
-        #        )
-        #        assert torch.all(w2_input_scale_stacked[0] == w2_input_scale_stacked), (
-        #            "All w2 scales should have the same value."
-        #        )
+        assert torch.all(w1_input_scale_stacked[0] == w1_input_scale_stacked), (
+            "All w1 scales should have the same value."
+        )
+        assert torch.all(w2_input_scale_stacked[0] == w2_input_scale_stacked), (
+            "All w2 scales should have the same value."
+        )
 
         w1_weight_scale_stacked = _stack(w1_weight_scale, dim=0).to(torch.float32)
         w2_weight_scale_stacked = _stack(w2_weight_scale, dim=0).to(torch.float32)
