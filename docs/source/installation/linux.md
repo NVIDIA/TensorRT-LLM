@@ -44,7 +44,6 @@
 
    **This project will download and install additional third-party open source software projects. Review the license terms of these open source projects before use.**
 
-
 2. Sanity check the installation by running the following in Python (tested on Python 3.12):
 
     ```{literalinclude} ../../../examples/llm-api/quickstart_example.py
