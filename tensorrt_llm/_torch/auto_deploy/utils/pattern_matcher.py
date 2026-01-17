@@ -84,7 +84,15 @@ def _trace_to_gm(fn: Callable, args: Sequence[torch.Tensor]) -> GraphModule:
     """
     Exports a function or Module into a GraphModule via torch_export_to_gm.
     """
+    from torch._guards import detect_fake_mode
+    from torch.fx.experimental.proxy_tensor import make_fx
+
     module = fn if isinstance(fn, torch.nn.Module) else _WrapperModule(fn)
+
+    # Use make_fx for FakeTensors to avoid FakeTensorMode mismatch during pattern matching
+    if detect_fake_mode(args) is not None:
+        return make_fx(module, tracing_mode="fake")(*args)
+
     return torch_export_to_gm(module, tuple(args))
 
 
