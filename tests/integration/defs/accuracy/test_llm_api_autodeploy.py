@@ -141,6 +141,7 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Nemotron-MOE"
     MODEL_PATH_BF16 = f"{llm_models_root()}/Nemotron-Nano-3-30B-A3.5B-dev-1024"
     MODEL_PATH_FP8 = f"{llm_models_root()}/Nemotron-Nano-3-30B-A3.5B-FP8-KVFP8-dev"
+    MODEL_PATH_NVFP4 = f"{llm_models_root()}/Nemotron-3-Nano-30B-A3B-NVFP4"
 
     def get_default_kwargs(self):
         return {
@@ -194,11 +195,11 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
         # TODO: multi-stream MOE seems to increase the memory usage
         kwargs["max_batch_size"] = 32
         kwargs["free_mem_ratio"] = 0.4
-        sampling_params = self.get_default_sampling_params()
         with AutoDeployLLM(model=self.MODEL_PATH_BF16,
                            tokenizer=self.MODEL_PATH_BF16,
                            world_size=world_size,
                            **kwargs) as llm:
+            sampling_params = self.get_default_sampling_params()
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=sampling_params)
             task = GSM8K(self.MODEL_NAME)
@@ -208,6 +209,7 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize("world_size", [1, 4])
     def test_fp8(self, world_size):
         kwargs = self.get_default_kwargs()
+        kwargs["max_batch_size"] = 64
         with AutoDeployLLM(model=self.MODEL_PATH_FP8,
                            tokenizer=self.MODEL_PATH_FP8,
                            world_size=world_size,
@@ -216,6 +218,22 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
             llm.args.quant_config.quant_algo = QuantAlgo.FP8
             llm.args.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
             sampling_params = self.get_default_sampling_params()
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=sampling_params)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip(reason="NVFP4 model is not in the CI yet")
+    def test_nvfp4(self):
+        kwargs = self.get_default_kwargs()
+        with AutoDeployLLM(model=self.MODEL_PATH_NVFP4,
+                           tokenizer=self.MODEL_PATH_NVFP4,
+                           **kwargs) as llm:
+            # Manually set quant_config for NVFP4 model to get the accuracy threshold
+            llm.args.quant_config.quant_algo = QuantAlgo.NVFP4
+            llm.args.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
+            sampling_params = self.get_default_sampling_params()
+
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=sampling_params)
             task = GSM8K(self.MODEL_NAME)

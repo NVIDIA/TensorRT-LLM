@@ -82,9 +82,9 @@ pipeline {
         string(name: "BRANCH", defaultValue: "main", description: "Branch to checkout.")
         string(name: "OPEN_SEARCH_PROJECT_NAME", defaultValue: "swdl-trtllm-infra-ci-prod-perf_sanity_info", description: "OpenSearch project name.")
         string(name: "OPERATION", defaultValue: "SLACK BOT SENDS MESSAGE", description: "Operation to perform.")
-        string(name: "QUERY_JOB_NUMBER", defaultValue: "1", description: "Number of latest jobs to query.")
-        string(name: "SLACK_CHANNEL_ID", defaultValue: "C0A7D0LCA1F", description: "Slack channel IDs to send messages to.")
-        string(name: "SLACK_BOT_TOKEN", defaultValue: "", description: "Slack bot token for authentication.")
+        string(name: "QUERY_JOB_NUMBER", defaultValue: "1", description: "Number of latest jobs to query. (Only used when OPERATION is SLACK BOT SENDS MESSAGE)")
+        string(name: "SLACK_CHANNEL_ID", defaultValue: "C0A7D0LCA1F", description: "Slack channel IDs to send messages to. (Only used when OPERATION is SLACK BOT SENDS MESSAGE)")
+        string(name: "SLACK_BOT_TOKEN", defaultValue: "", description: "Slack bot token for authentication. (Only used when OPERATION is SLACK BOT SENDS MESSAGE)")
     }
     stages {
         stage("Run Perf Sanity Script") {

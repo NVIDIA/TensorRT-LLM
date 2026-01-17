@@ -354,7 +354,7 @@ def get_input_embeddings(model: nn.Module) -> torch.Tensor:
             op="call_function", target=torch.ops.aten.embedding.default
         )
         for node in found_nodes:
-            embedding_weights.append(get_weight_tensor(gm, node))
+            embedding_weights.append(get_weight_tensor(node))
 
     if hasattr(model, "get_input_embeddings"):
         embedding_weights.append(model.get_input_embeddings())
@@ -400,7 +400,7 @@ def get_lm_head_node(gm: GraphModule, output_node: Optional[Node] = None) -> Nod
 def get_lm_head_weights(model: nn.Module) -> torch.Tensor:
     gm, output_node = get_output_node(model)
     lm_head_node = get_lm_head_node(gm, output_node)
-    return get_weight_tensor(gm, lm_head_node)
+    return get_weight_tensor(lm_head_node)
 
 
 def get_attr_by_name(obj, name):

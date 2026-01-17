@@ -425,6 +425,8 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 paged_kv_indices_buffer=self._paged_kv_indices,
                 paged_kv_last_page_len_buffer=self._paged_kv_last_page_len,
                 use_tensor_cores=use_tensor_cores,
+                backend="fa2"
+                if torch.cuda.get_device_capability(0) == (9, 0) else "auto",
             )
 
         def decode_plan():

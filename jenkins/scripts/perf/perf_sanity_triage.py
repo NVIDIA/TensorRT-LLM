@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import re
 import sys
 import time
 
@@ -17,58 +18,85 @@ MAX_TEST_CASES_PER_MSG = 5
 POST_SLACK_MSG_RETRY_TIMES = 5
 
 
-def query_regression_data(project_name):
-    """Query regression data from OpenSearch database."""
-    last_days = QUERY_LOOKBACK_DAYS
+def _parse_value(value):
+    value = value.strip()
+    if len(value) >= 2 and ((value[0] == value[-1]) and value[0] in ("'", '"')):
+        return value[1:-1]
+    lower = value.lower()
+    if lower == "true":
+        return True
+    if lower == "false":
+        return False
+    if re.fullmatch(r"-?\d+", value):
+        return int(value)
+    if re.fullmatch(r"-?\d+\.\d+", value):
+        return float(value)
+    return value
 
-    must_clauses = [
-        {"term": {"b_is_valid": True}},
-        {"term": {"b_is_post_merge": True}},
-        {"term": {"b_is_regression": True}},
-        {"term": {"b_is_baseline": False}},
-        {
-            "range": {
-                "ts_created": {
-                    "gte": int(time.time() - 24 * 3600 * last_days)
-                    // (24 * 3600)
-                    * 24
-                    * 3600
-                    * 1000,
-                }
-            }
-        },
+
+def _split_and_clauses(text):
+    return [
+        part.strip() for part in re.split(r"\s+AND\s+", text, flags=re.IGNORECASE) if part.strip()
     ]
 
-    json_data = {
-        "query": {
-            "bool": {"must": must_clauses},
-        },
-        "size": MAX_QUERY_SIZE,
-    }
-    json_data = json.dumps(json_data)
 
-    data_list = []
+def _parse_assignments(text):
+    clauses = _split_and_clauses(text)
+    if not clauses:
+        return None, "No fields provided"
+    result = {}
+    for clause in clauses:
+        if "=" not in clause:
+            return None, f"Invalid clause (missing '='): {clause}"
+        key, value = clause.split("=", 1)
+        key = key.strip()
+        if not key:
+            return None, f"Invalid clause (empty field name): {clause}"
+        result[key] = _parse_value(value)
+    return result, None
+
+
+def parse_update_operation(operation):
+    match = re.match(
+        r"^\s*UPDATE\s+SET\s+(.+?)(?:\s+WHERE\s+(.+))?\s*$", operation, flags=re.IGNORECASE
+    )
+    if not match:
+        return None, None, "Invalid UPDATE operation format"
+    set_text = match.group(1).strip()
+    where_text = match.group(2).strip() if match.group(2) else ""
+    set_values, error = _parse_assignments(set_text)
+    if error:
+        return None, None, f"Invalid SET clause: {error}"
+    where_values = {}
+    if match.group(2) is not None:
+        if not where_text:
+            return None, None, "Invalid WHERE clause: empty scope"
+        where_values, error = _parse_assignments(where_text)
+        if error:
+            return None, None, f"Invalid WHERE clause: {error}"
+    return set_values, where_values, None
+
+
+def update_perf_data_fields(data_list, set_values):
+    updated_list = []
+    for data in data_list:
+        updated_data = data.copy()
+        for key, value in set_values.items():
+            updated_data[key] = value
+        updated_list.append(updated_data)
+    return updated_list
+
+
+def post_perf_data(data_list, project_name):
+    if not data_list:
+        print(f"No data to post to {project_name}")
+        return False
     try:
-        res = OpenSearchDB.queryFromOpenSearchDB(json_data, project_name)
-        if res is None:
-            print(f"Failed to query from {project_name}, returned no response")
-            return None
-        payload = res.json().get("hits", {}).get("hits", [])
-        if len(payload) == 0:
-            print(f"No regression data found in {project_name}, returned empty list")
-            return []
-        for hit in payload:
-            data_dict = hit.get("_source", {})
-            data_dict["_id"] = hit.get("_id", "")
-            if data_dict["_id"] == "":
-                print(f"Failed to query from {project_name}, returned data with no _id")
-                return None
-            data_list.append(data_dict)
-        print(f"Successfully queried from {project_name}, queried {len(data_list)} entries")
-        return data_list
+        print(f"Ready to post {len(data_list)} data to {project_name}")
+        return OpenSearchDB.postToOpenSearchDB(data_list, project_name)
     except Exception as e:
-        print(f"Failed to query from {project_name}, returned error: {e}")
-        return None
+        print(f"Failed to post data to {project_name}, error: {e}")
+        return False
 
 
 def get_regression_data_by_job_id(data_list, query_job_number):
@@ -235,7 +263,27 @@ def main():
     print(f"Query Job Number: {args.query_job_number}")
 
     if args.operation == "SLACK BOT SENDS MESSAGE":
-        data_list = query_regression_data(args.project_name)
+        last_days = QUERY_LOOKBACK_DAYS
+        must_clauses = [
+            {"term": {"b_is_valid": True}},
+            {"term": {"b_is_post_merge": True}},
+            {"term": {"b_is_regression": True}},
+            {"term": {"b_is_baseline": False}},
+            {
+                "range": {
+                    "ts_created": {
+                        "gte": int(time.time() - 24 * 3600 * last_days)
+                        // (24 * 3600)
+                        * 24
+                        * 3600
+                        * 1000,
+                    }
+                }
+            },
+        ]
+        data_list = OpenSearchDB.queryPerfDataFromOpenSearchDB(
+            args.project_name, must_clauses, size=MAX_QUERY_SIZE
+        )
         if data_list is None:
             print("Failed to query regression data")
             return
@@ -243,6 +291,31 @@ def main():
         regression_dict = get_regression_data_by_job_id(data_list, args.query_job_number)
         messages = process_regression_message(regression_dict)
         send_regression_message(messages, args.channel_id, args.bot_token)
+    elif args.operation.strip().upper().startswith("UPDATE"):
+        set_values, where_values, error = parse_update_operation(args.operation)
+        if error:
+            print(error)
+            return
+
+        must_clauses = []
+        for key, value in where_values.items():
+            must_clauses.append({"term": {key: value}})
+
+        data_list = OpenSearchDB.queryPerfDataFromOpenSearchDB(
+            args.project_name, must_clauses, size=MAX_QUERY_SIZE
+        )
+        if data_list is None:
+            print("Failed to query data for update")
+            return
+        if len(data_list) == 0:
+            print("No data matched the update scope")
+            return
+
+        updated_data_list = update_perf_data_fields(data_list, set_values)
+        if not post_perf_data(updated_data_list, args.project_name):
+            print("Failed to post updated data")
+            return
+        print(f"Updated {len(updated_data_list)} entries successfully")
     else:
         print(f"Unknown operation: {args.operation}")
 
