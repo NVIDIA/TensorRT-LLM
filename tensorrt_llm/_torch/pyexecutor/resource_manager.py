@@ -407,6 +407,14 @@ class KVCacheManager(BaseResourceManager):
         self.num_pools = self.impl.num_pools
         self.max_blocks_per_seq = self.impl.max_blocks_per_seq
         self.enable_block_reuse = kv_cache_config.enable_block_reuse
+        self.host_kv_cache_block_offsets = torch.empty(self.num_pools,
+                                                       max_batch_size *
+                                                       max_beam_width,
+                                                       2,
+                                                       self.max_blocks_per_seq,
+                                                       dtype=torch.int32,
+                                                       pin_memory=True,
+                                                       device='cpu')
 
     def shutdown(self):
         self.impl.release_pools()
@@ -650,7 +658,7 @@ class KVCacheManager(BaseResourceManager):
         accepted_draft_token_offsets, packed_accepted_draft_tokens_indices, rewind_draft_token_separate_adjustments = self.locate_accepted_draft_tokens(
             requests)
         past_key_value_lengths = attn_metadata.kv_lens_cuda[:len(requests)]
-        if attn_metadata.kv_cache_block_offsets is not None and attn_metadata.host_kv_cache_block_offsets is not None and attn_metadata.host_kv_cache_pool_pointers is not None and attn_metadata.host_kv_cache_pool_mapping is not None:
+        if attn_metadata.kv_cache_block_offsets is not None and attn_metadata.host_kv_cache_pool_pointers is not None and attn_metadata.host_kv_cache_pool_mapping is not None:
             use_paged_kv_cache = True
         else:
             use_paged_kv_cache = False
@@ -1261,6 +1269,20 @@ class KVCacheManager(BaseResourceManager):
             return temp_attention_window_inputs
         else:
             return None
+
+    def copy_batch_block_offsets(self, dst_tensor: torch.Tensor,
+                                 request_ids: List[int], beam_width: int,
+                                 num_context: int, num_seqs: int):
+        self.impl.copy_batch_block_offsets(self.host_kv_cache_block_offsets,
+                                           request_ids[:num_context], 1, 0)
+        self.impl.copy_batch_block_offsets(self.host_kv_cache_block_offsets,
+                                           request_ids[num_context:],
+                                           beam_width, num_context)
+
+        for pool_idx in range(self.host_kv_cache_block_offsets.shape[0]):
+            dst_tensor[pool_idx, :num_seqs].copy_(
+                self.host_kv_cache_block_offsets[pool_idx, :num_seqs],
+                non_blocking=True)
 
     def reset_reuse_state(self):
         """Reset the reuse state of the KV cache manager."""

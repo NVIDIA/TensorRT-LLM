@@ -121,8 +121,7 @@ void MLARopeGeneration(torch::Tensor fused_q, // [tokens, num_heads, (nope_dim +
     std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
     torch::Tensor sequence_length, torch::Tensor host_past_key_value_lengths, torch::Tensor host_context_lengths,
     int64_t const num_contexts, std::optional<torch::Tensor> kv_cache_block_offsets,
-    std::optional<torch::Tensor> host_kv_cache_block_offsets, std::optional<torch::Tensor> host_kv_cache_pool_pointers,
-    std::optional<torch::Tensor> host_kv_cache_pool_mapping,
+    std::optional<torch::Tensor> host_kv_cache_pool_pointers, std::optional<torch::Tensor> host_kv_cache_pool_mapping,
     torch::optional<torch::Tensor> kv_scale_orig_quant, // [1] q,k quant scale
     torch::optional<torch::Tensor> kv_scale_quant_orig, // [1] bmm quant scale
     torch::optional<torch::Tensor> out_scale,           // [1] output quant scale
@@ -147,8 +146,8 @@ void MLARopeGeneration(torch::Tensor fused_q, // [tokens, num_heads, (nope_dim +
     TLLM_CHECK_WITH_INFO(
         host_kv_cache_pool_mapping.has_value(), "KV cache pool mapping is required for MLA generation.");
 
-    bool const use_kv_cache = kv_cache_block_offsets.has_value() && host_kv_cache_block_offsets.has_value()
-        && host_kv_cache_pool_pointers.has_value() && host_kv_cache_pool_mapping.has_value();
+    bool const use_kv_cache = kv_cache_block_offsets.has_value() && host_kv_cache_pool_pointers.has_value()
+        && host_kv_cache_pool_mapping.has_value();
 
     int32_t const num_seqs = host_context_lengths.size(0);
 
@@ -331,7 +330,6 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", Tensor host_context_lengths"
         ", int num_contexts"
         ", Tensor? kv_cache_block_offsets"
-        ", Tensor? host_kv_cache_block_offsets"
         ", Tensor? host_kv_cache_pool_pointers"
         ", Tensor? host_kv_cache_pool_mapping"
         ", Tensor? kv_scale_orig_quant"

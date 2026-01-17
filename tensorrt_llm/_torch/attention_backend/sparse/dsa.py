@@ -1679,16 +1679,12 @@ class DSATrtllmAttention(TrtllmAttention):
             max_seq_len = metadata.max_gen_seq_len
             block_offsets = metadata.kv_cache_block_offsets[:, metadata.
                                                             num_contexts:]
-            host_block_offsets = metadata.host_kv_cache_block_offsets[:,
-                                                                      metadata.
-                                                                      num_contexts:]
         else:
             cached_token_indptr = metadata.ctx_cached_token_indptr
             kv_indptr = metadata.ctx_kv_indptr
             num_seqs = metadata.num_contexts
             max_seq_len = metadata.max_ctx_seq_len
             block_offsets = metadata.kv_cache_block_offsets
-            host_block_offsets = metadata.host_kv_cache_block_offsets
         assert self.is_mla_enable and self.mla_params is not None
         assert metadata.kv_cache_manager is not None
 
@@ -1708,7 +1704,6 @@ class DSATrtllmAttention(TrtllmAttention):
             self.mla_params.qk_rope_head_dim,
             self.mla_params.kv_lora_rank,
             block_offsets,
-            host_block_offsets,
             metadata.kv_cache_manager.kv_cache_pool_pointers,
             metadata.kv_cache_manager.kv_cache_pool_mapping,
             self.kv_scale_orig_quant,
