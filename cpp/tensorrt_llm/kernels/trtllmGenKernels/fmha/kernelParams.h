@@ -39,12 +39,6 @@ namespace kernels
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-enum class SparsityMode : int32_t
-{
-    Token = 0,
-    Block = 1,
-};
-
 struct KernelParams
 {
     // TMA descriptor for Q.
@@ -154,6 +148,10 @@ struct KernelParams
     int64_t mNumHiddenEltsO;
     // The total number of pages in the paged-kv memory pool.
     int32_t mNumPagesInMemPool;
+    // The top k value for sparse MLA.
+    int32_t mNumSparseTopk;
+    // The number of tokensQ per CTA (used for groupsHeadsTokensQ generation kernel).
+    int32_t mNumTokensPerCtaQ;
     // The number of tokens per page (used if dynamic numTokensPerPage is enabled).
     int32_t mNumTokensPerPageLog2;
     // The output scale for FP8 quantization.
@@ -171,10 +169,8 @@ struct KernelParams
     int32_t mStartTokenIdx;
     // The sum of sequence lengths for Q and K/V.
     int32_t mSumOfSeqLensQ, mSumOfSeqLensKv;
-    // The top k value for sparse MLA.
-    int32_t mNumSparseTopk;
     // Sparsity mode for sparse attention.
-    SparsityMode mSparsityMode;
+    int32_t mSparsityMode;
 
     // Create the TMA shape/stride for Q.
     template <class FmhaOptions>
@@ -719,12 +715,23 @@ struct KernelParams
         tileShapeKv[0] = numEltsInClampedHeadDimKv / numEltsDivisor;
         tileShapeKv[1] = numKeysPerTile;
 
-        // If sparse MLA is enabled, the shape and stride for K need to be updated for 2D layout (numTokensKvInPagedKv,
-        // headDimQk).
+        int32_t numInstsQ{kernelMeta.mStepQ / kernelMeta.mTileSizeQ};
+        int32_t tileSizePerCtaQ{kernelMeta.mTileSizeQ * numInstsQ};
+        // TODO(yuhangh): check the correctness
+        if (kernelMeta.mGroupsHeadsQ && !isSpecDecodingGenerationKernel(options.mKernelType))
+        {
+            tileSizePerCtaQ = 1;
+        }
+        params.mNumTokensPerCtaQ = tileSizePerCtaQ;
+
+        // If sparse attention is enabled, the shape and stride for KV need to be updated for 2D layout
+        // (numTokensKvInPagedKv, headDimQk).
         if (options.mSparseAttention)
         {
             shapeK = std::vector<uint64_t>{static_cast<uint64_t>(options.mHeadDimQk), static_cast<uint64_t>(INT_MAX)};
             strideK = std::vector<uint64_t>{1, static_cast<uint64_t>(options.mHeadDimQk)};
+            shapeV = std::vector<uint64_t>{static_cast<uint64_t>(options.mHeadDimV), static_cast<uint64_t>(INT_MAX)};
+            strideV = std::vector<uint64_t>{1, static_cast<uint64_t>(options.mHeadDimV)};
             tileShapeKv[1] = 1;
         }
 
@@ -854,13 +861,14 @@ struct KernelParams
         params.mNumSparseTopk = options.mSparseTopK;
         if (options.mSparseAttention)
         {
-            params.mSparsityMode = SparsityMode::Token;
+            params.mSparsityMode = 0;
         }
         else if (options.mUseBlockSparseAttention)
         {
-            params.mSparsityMode = SparsityMode::Block;
+            params.mSparsityMode = 1;
         }
         params.mSkipSoftmaxThresholdScaleFactor = options.mSkipSoftmaxThresholdScaleFactor;
+
         return params;
     }
 };

@@ -589,6 +589,11 @@ private:
             {
                 maxNumHeadsQPerKvInCta = 128;
             }
+            // TODO(yuhang): check if this is correct.
+            if (params.mSparseAttention)
+            {
+                maxNumHeadsQPerKvInCta = 64;
+            }
             TLLM_CHECK_WITH_INFO((params.mNumHeadsQPerKv < maxNumHeadsQPerKvInCta
                                      || params.mNumHeadsQPerKv % maxNumHeadsQPerKvInCta == 0),
                 "Not supported");
