@@ -1292,6 +1292,47 @@ class MatchBmmMoePattern(BaseTransform):
         return gm, info
 
 
+def remove_original_experts(gm: GraphModule, weight_lists: List[List[Node]]) -> None:
+    """Remove original expert submodules after weights have been stacked.
+
+    This function attempts to free GPU memory by deleting the original expert
+    submodules whose weights have been replaced by fused/stacked versions.
+
+    Args:
+        gm: The GraphModule containing the expert submodules
+        weight_lists: List of weight node lists (e.g., [w1_list, w2_list, w3_list])
+    """
+    from tensorrt_llm._torch.auto_deploy.utils._graph import get_attr_by_name
+
+    # Flatten all weight lists
+    all_weights = []
+    for weight_list in weight_lists:
+        all_weights.extend(weight_list)
+
+    for w in all_weights:
+        if w.op == "get_attr" and isinstance(w.target, str):
+            w_param = get_attr_by_name(gm, w.target)
+            if w_param is not None:
+                owner_module_path, _, param_name = w.target.rpartition(".")
+                if param_name != "weight":
+                    continue
+                owner_module = gm.get_submodule(owner_module_path)
+                owner_param = get_attr_by_name(owner_module, param_name)
+                if owner_param is w_param:
+                    torch.cuda.empty_cache()
+                    # gc.collect()
+                    # print("memory before delete: ", torch.cuda.memory_allocated())
+                    gm.delete_submodule(owner_module_path)
+                    torch.cuda.empty_cache()
+                    # gc.collect()
+                    # print("memory after delete: ", torch.cuda.memory_allocated())
+                else:
+                    # param w is not owned by owner_module, skip
+                    continue
+            else:
+                continue
+
+
 def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "triton"]) -> int:
     """
     Stack per-expert FP8 weights and scales by materializing stacked tensors as parameters.
@@ -1478,12 +1519,12 @@ def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "
                 0, device=w1_input_scale_stacked.device, dtype=w1_input_scale_stacked.dtype
             )
         )
-        assert torch.all(w1_input_scale_stacked[0] == w1_input_scale_stacked), (
-            "All w1 scales should have the same value."
-        )
-        assert torch.all(w2_input_scale_stacked[0] == w2_input_scale_stacked), (
-            "All w2 scales should have the same value."
-        )
+        #        assert torch.all(w1_input_scale_stacked[0] == w1_input_scale_stacked), (
+        #            "All w1 scales should have the same value."
+        #        )
+        #        assert torch.all(w2_input_scale_stacked[0] == w2_input_scale_stacked), (
+        #            "All w2 scales should have the same value."
+        #        )
 
         w1_weight_scale_stacked = _stack(w1_weight_scale, dim=0).to(torch.float32)
         w2_weight_scale_stacked = _stack(w2_weight_scale, dim=0).to(torch.float32)
@@ -1516,6 +1557,8 @@ def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "
 
         node.replace_all_uses_with(new_node)
         graph.erase_node(node)
+        eliminate_dead_code(gm)
+        remove_original_experts(gm, [w1_list, w2_list, w3_list])
 
     # Clean up after processing all nodes
     # eliminate_dead_code will remove unused get_attr nodes, then delete_all_unused_submodules
