@@ -494,7 +494,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
         if (is_last_token)
         {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-            // Make sure the update of `flag_val ` in `moeA2APrepareDispatchKernel` is visible before accessment.
+            // Make sure the update of `flag_val ` in `moeA2APrepareDispatchKernel` is visible before access.
             cudaGridDependencySynchronize();
 #endif
 // Store send_counters to recv_counters
