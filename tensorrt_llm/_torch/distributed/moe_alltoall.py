@@ -54,25 +54,31 @@ class MoeAlltoAll:
             dtype: torch.dtype,
             extra_payload_bytes_per_token: int = 0) -> int:
         element_size = dtype.itemsize
+
         # Auxiliary data size
-        aux_size = MoeAlltoAll.get_aux_data_size(ep_size, max_num_tokens)
+        workspace_size = MoeAlltoAll.get_aux_data_size(ep_size, max_num_tokens)
 
         # Dispatch needs workspace for [ep_size, max_tokens] tokens,
-        # but due to the variety of quantization recipes, we cannot know the exact size,
-        # so we conservatively estimate assuming no quantization.
-        payload_size_dispatch = ep_size * max_num_tokens * (
-            hidden_size * element_size  # (Unquantized) token hidden states
-            + top_k * 4  # token_selected_experts
-            + top_k * 4  # token_final_scales
-            + extra_payload_bytes_per_token  # extra payload bytes per token
-        )
+        # but due to the variety of quantization recipes, we cannot know the exact size, so we conservatively estimate assuming no quantization.
+        # Meanwhile, we consider the alignment requirement as in moeA2ADispatchOp and moeA2ACombineOp.
+        # (Unquantized) token hidden states
+        workspace_size += ep_size * max_num_tokens * hidden_size * element_size
+        workspace_size = pad_up(workspace_size, 128)
+        # token_selected_experts
+        workspace_size += ep_size * max_num_tokens * top_k * 4
+        workspace_size = pad_up(workspace_size, 128)
+        # token_final_scales
+        workspace_size += ep_size * max_num_tokens * top_k * 4
+        workspace_size = pad_up(workspace_size, 128)
+        # extra payload bytes per token
+        workspace_size += ep_size * max_num_tokens * extra_payload_bytes_per_token
+        workspace_size = pad_up(workspace_size, 128)
 
         # Required workspace for combine [ep_size, max_tokens] tokens
-        payload_size_combine = ep_size * max_num_tokens * hidden_size * element_size
+        workspace_size += ep_size * max_num_tokens * hidden_size * element_size
+        workspace_size = pad_up(workspace_size, 128)
 
-        # Pad to 128 bytes to ensure alignment. This matches the implementation of C++ torch OP code.
-        return pad_up(aux_size, 128) + pad_up(
-            payload_size_dispatch, 128) + pad_up(payload_size_combine, 128)
+        return workspace_size
 
     @classmethod
     def _init_constants(cls):
