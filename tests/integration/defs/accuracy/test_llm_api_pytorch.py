@@ -1118,6 +1118,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_hopper
     def test_fp8_vswa_reuse(self):
         # NOTE: Test with VSWA kv cache config.
         kv_cache_config = KvCacheConfig(
@@ -1132,6 +1133,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_hopper
     @pytest.mark.parametrize("backend", ["xgrammar"])
     def test_fp8_guided_decoding_vswa_reuse(self, backend: str, mocker):
         mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
@@ -5276,6 +5278,7 @@ class TestNemotronV3Nano(LlmapiAccuracyTestHarness):
     EXTRA_EVALUATOR_KWARGS = dict(chat_template_kwargs=dict(
         enable_thinking=False))
 
+    @pytest.mark.skip_less_device_memory(80000)
     def test_auto_dtype(self):
         with LLM(
                 f"{llm_models_root()}/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
