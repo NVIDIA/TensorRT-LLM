@@ -17,7 +17,7 @@ from ...custom_ops.quant import (
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.node_utils import (
-    extract_param_names_from_node,
+    extract_weight_nodes,
     get_quantization_params_from_linear_node,
     is_bmm_op,
     is_linear_op,
@@ -139,13 +139,13 @@ class Quantization(BaseTransform):
 
         The state_dict is also updated to contain the sharded weights.
         """
-        param_name, _ = extract_param_names_from_node(node)
-        original_weight = gm.get_parameter(param_name)
-        new_param = nn.Parameter(self.quantize_weight(original_weight), requires_grad=False)
-        modname, _, attrname = param_name.rpartition(".")
+        weight_nodes = extract_weight_nodes(node)
+        assert len(weight_nodes.weights) == 1, "Expected exactly one weight node"
+        lin_weight = weight_nodes.weights[0]
+        new_param = nn.Parameter(self.quantize_weight(lin_weight.tensor), requires_grad=False)
+        modname, _, attrname = lin_weight.node_key.rpartition(".")
 
-        submod = gm.get_submodule(modname)
-        setattr(submod, attrname, new_param)
+        setattr(lin_weight.submod, attrname, new_param)
 
         # check modelopt quantizers from graph
         if is_quantized_graph:
@@ -171,10 +171,12 @@ class Quantization(BaseTransform):
             )
             # Note: canonicalize_graph() will remove input/weight/output quantizer
 
-        for scale_name, scale in self.default_scales(original_weight.shape).items():
-            submod.register_buffer(scale_name, scale)
+        for scale_name, scale in self.default_scales(lin_weight.tensor.shape).items():
+            lin_weight.submod.register_buffer(scale_name, scale)
 
-        gm._register_load_state_dict_pre_hook(partial(self.load_hook, weight_name=param_name))
+        gm._register_load_state_dict_pre_hook(
+            partial(self.load_hook, weight_name=lin_weight.node_key)
+        )
 
         with gm.graph.inserting_before(node):
             scales = {}
