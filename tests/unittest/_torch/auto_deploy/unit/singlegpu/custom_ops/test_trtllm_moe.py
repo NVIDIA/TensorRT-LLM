@@ -792,3 +792,213 @@ def test_trtllm_fused_moe_nvfp4(
     print(f"{trtllm_output=}")
     # print(f"{diff.abs()>=2e-1=}")
     torch.testing.assert_close(ref_output, trtllm_output, rtol=2e-1, atol=2e-1)
+
+
+@pytest.mark.parametrize(
+    "hidden_size, intermediate_size",
+    [
+        (128, 128),  # No padding needed
+        (128, 160),  # Small padded case (inter_size needs padding)
+        (2688, 1856),  # Nemotron-Nano-3-30B-A3 dimensions (padding required)
+    ],
+)
+@pytest.mark.skipif(
+    not fp4_compatible() or not trtllm_ops_available(),
+    reason="Requires fp4 and trtllm support",
+)
+def test_stack_nvfp4_moe_weights_transform_relu2(hidden_size, intermediate_size):
+    """
+    Test for _stack_nvfp4_moe_weights transform with non-gated MLP (Relu2).
+
+    Tests both:
+    - 128x128: No padding needed
+    - 2688x1856: Padding required for intermediate_size
+
+    Compares torch_quant_nvfp4_moe (before transform) vs
+    trtllm_quant_nvfp4_moe_fused (after transform).
+    """
+    import torch.fx as fx
+
+    from tensorrt_llm._torch.auto_deploy.transform.library.fused_moe import _stack_nvfp4_moe_weights
+
+    torch.manual_seed(42)
+
+    batch_size, num_experts, top_k = 1, 2, 2
+    otype = torch.float16
+    is_gated_mlp = False  # Non-gated MLP (Relu2)
+    act_fn = ActivationType.Relu2
+
+    # Generate test data
+    x = gen_tensor((batch_size, hidden_size), otype) * 0.5
+    router_logits = torch.randn(batch_size, num_experts, dtype=otype).cuda()
+    routing_weights, selected_experts = compute_routing(router_logits, top_k)
+
+    # Quantize weights for each expert
+    def quantize_weight(weight):
+        """Quantize weight and return FP4 values + 2D block scales for fused kernel.
+
+        Key insight: fp4_quantize returns block scales in an internal interleaved
+        layout that works with nvfp4_gemm but NOT with the fused MoE kernel.
+
+        For the fused kernel, we must:
+        1. Get FP4 values from fp4_quantize
+        2. Compute block scales manually in row-major format
+        3. Pad to kernel's expected dimensions
+        4. Apply block_scale_interleave for swizzling
+        """
+        m, n = weight.shape
+        amax = weight.abs().max().to(torch.float32)
+        gs = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / amax
+
+        # Get FP4 values only (ignore block scales - they're in wrong format)
+        fp4, _ = torch.ops.trtllm.fp4_quantize(weight, gs, NVFP4_BLOCK_SIZE, False)
+
+        # Compute block scales manually in row-major format
+        # Each block is NVFP4_BLOCK_SIZE (16) elements along the N dimension
+        n_blocks = n // NVFP4_BLOCK_SIZE
+        # Reshape to (M, n_blocks, 16) and compute max per block
+        weight_blocks = weight.view(m, n_blocks, NVFP4_BLOCK_SIZE)
+        block_maxes = weight_blocks.abs().amax(dim=2)  # (M, n_blocks)
+
+        # Convert to FP8 E4M3 block scales
+        # block_scale = block_max * gs / FLOAT8_E4M3_MAX
+        block_scales_fp8 = (
+            (block_maxes * gs / FLOAT8_E4M3_MAX).clamp(max=FLOAT8_E4M3_MAX).to(torch.float8_e4m3fn)
+        )
+
+        # Pad to kernel's expected dimensions (multiples of 128 for rows, 8 for block cols)
+        padded_m = math.ceil(m / 128) * 128
+        padded_n_blocks = math.ceil(n_blocks / 8) * 8
+
+        # Create padded buffer (zeros are neutral for unused blocks)
+        block_scales_padded = torch.zeros(
+            (padded_m, padded_n_blocks), dtype=torch.uint8, device="cuda"
+        )
+        block_scales_padded[:m, :n_blocks] = block_scales_fp8.view(torch.uint8)
+
+        # Apply block_scale_interleave for fused kernel's swizzled format
+        block_scales_swizzled = (
+            torch.ops.trtllm.block_scale_interleave(block_scales_padded.cpu().contiguous())
+            .reshape(padded_m, padded_n_blocks)
+            .cuda()
+        )
+
+        input_scale = torch.tensor(1.0, device="cuda", dtype=torch.float32)
+        alpha = torch.tensor(
+            1.0 / (input_scale.item() * gs.item()), device="cuda", dtype=torch.float32
+        )
+        return fp4, block_scales_swizzled, input_scale, alpha
+
+    # Create per-expert weights and scales
+    w1_weight, w2_weight, w3_weight = [], [], []
+    w1_input_scale, w2_input_scale, w3_input_scale = [], [], []
+    w1_weight_scale, w2_weight_scale, w3_weight_scale = [], [], []
+    w1_alpha, w2_alpha, w3_alpha = [], [], []
+
+    for _ in range(num_experts):
+        # w1 (gate), w2 (down), w3 (up)
+        w1 = gen_tensor((intermediate_size, hidden_size), otype, scale=0.1)
+        w2 = gen_tensor((hidden_size, intermediate_size), otype, scale=0.1)
+
+        fp4, bs, iscale, alpha = quantize_weight(w1)
+        w1_weight.append(fp4)
+        w1_weight_scale.append(bs)
+        w1_input_scale.append(iscale)  # Keep as scalar, not [1]
+        w1_alpha.append(alpha)  # Keep as scalar, not [1]
+
+        fp4, bs, iscale, alpha = quantize_weight(w2)
+        w2_weight.append(fp4)
+        w2_weight_scale.append(bs)
+        w2_input_scale.append(iscale)  # Keep as scalar, not [1]
+        w2_alpha.append(alpha)  # Keep as scalar, not [1]
+
+    # Call torch_quant_nvfp4_moe directly (reference)
+    ref_output = torch.ops.auto_deploy.torch_quant_nvfp4_moe(
+        x,
+        selected_experts,
+        routing_weights,
+        w1_weight,
+        w2_weight,
+        w3_weight,
+        w1_input_scale,
+        w2_input_scale,
+        w3_input_scale,
+        w1_weight_scale,
+        w2_weight_scale,
+        w3_weight_scale,
+        w1_alpha,
+        w2_alpha,
+        w3_alpha,
+        is_gated_mlp=is_gated_mlp,
+        act_fn=act_fn,
+    )
+
+    # Now create a GraphModule and apply the transform
+    class MoEModule(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            for i in range(num_experts):
+                self.register_buffer(f"w1_{i}", w1_weight[i])
+                self.register_buffer(f"w2_{i}", w2_weight[i])
+                self.register_buffer(f"w1_scale_{i}", w1_weight_scale[i])
+                self.register_buffer(f"w2_scale_{i}", w2_weight_scale[i])
+                self.register_buffer(f"w1_iscale_{i}", w1_input_scale[i])
+                self.register_buffer(f"w2_iscale_{i}", w2_input_scale[i])
+                self.register_buffer(f"w1_alpha_{i}", w1_alpha[i])
+                self.register_buffer(f"w2_alpha_{i}", w2_alpha[i])
+                if is_gated_mlp:
+                    self.register_buffer(f"w3_{i}", w3_weight[i])
+                    self.register_buffer(f"w3_scale_{i}", w3_weight_scale[i])
+                    self.register_buffer(f"w3_iscale_{i}", w3_input_scale[i])
+                    self.register_buffer(f"w3_alpha_{i}", w3_alpha[i])
+
+        def forward(self, x, selected_experts, routing_weights):
+            return torch.ops.auto_deploy.torch_quant_nvfp4_moe(
+                x,
+                selected_experts,
+                routing_weights,
+                [getattr(self, f"w1_{i}") for i in range(num_experts)],
+                [getattr(self, f"w2_{i}") for i in range(num_experts)],
+                [getattr(self, f"w3_{i}") for i in range(num_experts)] if is_gated_mlp else [],
+                [getattr(self, f"w1_iscale_{i}") for i in range(num_experts)],
+                [getattr(self, f"w2_iscale_{i}") for i in range(num_experts)],
+                [getattr(self, f"w3_iscale_{i}") for i in range(num_experts)]
+                if is_gated_mlp
+                else [],
+                [getattr(self, f"w1_scale_{i}") for i in range(num_experts)],
+                [getattr(self, f"w2_scale_{i}") for i in range(num_experts)],
+                [getattr(self, f"w3_scale_{i}") for i in range(num_experts)]
+                if is_gated_mlp
+                else [],
+                [getattr(self, f"w1_alpha_{i}") for i in range(num_experts)],
+                [getattr(self, f"w2_alpha_{i}") for i in range(num_experts)],
+                [getattr(self, f"w3_alpha_{i}") for i in range(num_experts)]
+                if is_gated_mlp
+                else [],
+                is_gated_mlp=is_gated_mlp,
+                act_fn=act_fn,
+            )
+
+    module = MoEModule().cuda()
+    gm = fx.symbolic_trace(module)
+
+    # Apply the transform
+    num_transformed = _stack_nvfp4_moe_weights(gm)
+    gm.recompile()
+
+    assert num_transformed == 1, f"Expected 1 transform, got {num_transformed}"
+
+    # Run the transformed graph
+    transformed_output = gm(x, selected_experts, routing_weights)
+
+    # Get the registered parameters after transform
+    fc1_act_scale = getattr(gm, "nvfp4_moe_w3_w1_input_scale_stacked_0", None)
+    fc1_alpha = getattr(gm, "nvfp4_moe_w1_alpha_stacked_0", None)
+    if fc1_act_scale is not None:
+        print(f"fc1_act_scale (after transform): {fc1_act_scale}, shape: {fc1_act_scale.shape}")
+    if fc1_alpha is not None:
+        print(f"fc1_alpha (after transform): {fc1_alpha}, shape: {fc1_alpha.shape}")
+
+    # Should be close for FP4 quantization (gated MLP may have slightly larger diff due to alpha handling)
+    tol = 1e-3
+    torch.testing.assert_close(ref_output, transformed_output, rtol=tol, atol=tol)
