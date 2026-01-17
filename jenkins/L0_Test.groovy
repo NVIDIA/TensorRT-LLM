@@ -3432,10 +3432,9 @@ def launchTestJobs(pipeline, testFilter)
     ]
 
     aarch64SanityCheckConfigs = [
-        // Due to lack of official PyTorch for CUDA 13.1. Change to use dlfw image test temporarily
-        // Need change back:
-        // 1. DLFW_IMAGE-> UBUNTU_24_04_IMAGE;
-        // 2. Extra Extra PyTorch CUDA install false -> true
+        // Workaround PyTorch 2.9.1 vs. 2.10.0a0 incompatibility issue. Once resolved, change back to:
+        // 1. DLFW_IMAGE -> UBUNTU_24_04_IMAGE
+        // 2. Extra PyTorch CUDA install: false -> true
         "PY312-UB2404": [
             LLM_DOCKER_IMAGE,
             "GH200",
