@@ -3,7 +3,7 @@ from typing import Any, Dict, Optional
 
 import torch
 import torch.nn.functional as F
-from test_common.llm_data import hf_id_to_local_model_dir
+from test_common.llm_data import hf_id_to_local_model_dir, llm_models_root
 from torch import nn
 from torch.export import Dim
 
@@ -37,6 +37,15 @@ def repeat_kv(q: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
         .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
         .contiguous()
     )
+
+
+def get_model_path(model_dir: str) -> str:
+    """Get model path using llm_models_root()."""
+    models_root = llm_models_root()
+    if models_root is None:
+        return None
+    model_path = models_root / model_dir
+    return str(model_path) if model_path.exists() else None
 
 
 class GQA(nn.Module):
@@ -483,6 +492,11 @@ _SMALL_MODEL_CONFIGS = {
         "model_kwargs": {
             "num_hidden_layers": 8,
         },
+    },
+    "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B": {
+        "model_kwargs": {
+            "hidden_size": 64,
+        }
     },
 }
 
