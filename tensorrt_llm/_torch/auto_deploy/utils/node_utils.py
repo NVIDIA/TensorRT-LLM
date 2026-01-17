@@ -168,7 +168,7 @@ def get_param_or_buffer(tensor_name: str, gm: GraphModule) -> torch.Tensor:
         raise KeyError(f"Tensor {tensor_name} not found in the graph")
 
 
-def extract_weight_nodes(node: Node, filter: bool = False) -> WeightNodes:
+def extract_weight_nodes(node: Node) -> WeightNodes:
     """Extracts the list of weight node and optional bias node from the given parametrized node"""
     gm = node.graph.owning_module
     param_names = {name for name, _ in gm.named_parameters()}.union(
@@ -223,12 +223,6 @@ def extract_weight_nodes(node: Node, filter: bool = False) -> WeightNodes:
             for n in node.all_input_nodes
             if (attr_node := find_get_attr_node(n)) is not None
         ]
-        # exclude_nodes = ["mixer_d", "dt_bias"]
-        exclude_nodes = ["a_log"]
-        if filter:
-            all_weight_nodes = [
-                n for n in all_weight_nodes if not any([k in str(n) for k in exclude_nodes])
-            ]
         # separate weight nodes and bias nodes
         bias_nodes = [n for n in all_weight_nodes if n.target.endswith("bias")]
         weight_nodes = [n for n in all_weight_nodes if n not in bias_nodes]

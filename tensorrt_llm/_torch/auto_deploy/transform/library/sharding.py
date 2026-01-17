@@ -896,15 +896,8 @@ def _load_hook(
     # This is quite a hacky solution. A better solution would be to store extra_state in
     # the state_dict to identify whether the state_dict is sharded or not.
     key = prefix + param_key
-    if "a_log" in str(key).lower():
-        ad_logger.info(f"Loading key: {key}")
     if key not in state_dict:
-        # if "experts" not in key:
-        #     ad_logger.info(f"Key not found: {key}")
         return
-    if "a_log" in str(key).lower():
-        # if "experts" not in key:
-        ad_logger.info(f"Key found: {key}")
     p_to_load = state_dict[key]
     p_to_load = p_to_load if param_shape == p_to_load.shape else f_split(p_to_load)
     state_dict[key] = p_to_load
@@ -1229,7 +1222,7 @@ def _shard_parameter_node(
         return
 
     # Shard weight using the unified function (also updates the parameter)
-    weight_nodes = extract_weight_nodes(node, filter=True)
+    weight_nodes = extract_weight_nodes(node)
     for weight_node in weight_nodes.weights:
         _, weight_new_shape = shard_weight_tensor(
             gm=gm,
