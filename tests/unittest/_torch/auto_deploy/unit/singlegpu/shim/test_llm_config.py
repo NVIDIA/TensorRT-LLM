@@ -333,6 +333,9 @@ class TestCudaGraphBatchSizesHeuristic:
         # Should be sorted in descending order
         assert args.cuda_graph_batch_sizes == sorted(args.cuda_graph_batch_sizes, reverse=True), (
             f"Expected descending order, got {args.cuda_graph_batch_sizes}"
+        )
+
+
 class TestSequenceInfoExampleBatchSize:
     """Test that SequenceInfo generates proper example batch sizes for export."""
 
