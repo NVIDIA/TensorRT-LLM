@@ -19,6 +19,7 @@ transforms:
   detect_hf_attn_layers:
     stage: cache_init
     run_per_gm: false
+    pre_recompile_forward: true  # calls mod.forward() for profiling
   transformers_replace_cached_attn:
     stage: cache_init
     backend: flashinfer
@@ -30,6 +31,7 @@ transforms:
     stage: cache_init
     run_per_gm: false
     free_mem_ratio: 0.0
+    pre_recompile_forward: true  # calls mod(**args) for memory measurement
   ############################################################################################
   # COMPILE MODEL
   ############################################################################################

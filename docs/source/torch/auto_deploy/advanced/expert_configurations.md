@@ -209,7 +209,7 @@ Example:
 If `world_size == 4`, ranks \[0,1\] and \[2,3\] will create two EP groups. Experts will be distributed across these two
 groups, and internally, TP=2 column-row sharding will be applied.
 
-#### `requires_shape_prop` (bool, default: `true`)
+#### `pre_shape_prop` (bool, default: `true`)
 
 Whether shape propagation is required before applying this transform. Shape propagation enables the transform to make informed decisions about sharding strategies based on tensor dimensions.
 

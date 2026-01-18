@@ -397,8 +397,8 @@ def test_fuse_moe_cleanup():
         {
             "fuse_moe": {
                 "stage": "post_load_fusion",
-                "run_graph_cleanup": False,  # verify cleanup is done as part of the transformation
-                "run_shape_prop": False,  # shape_prop can also trigger cleanup
+                "post_graph_cleanup": False,  # verify cleanup is done as part of the transformation
+                "post_shape_prop": False,  # shape_prop can also trigger cleanup
             },
         },
     )(None, gm)

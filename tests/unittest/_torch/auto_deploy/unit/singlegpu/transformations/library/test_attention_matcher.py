@@ -413,7 +413,7 @@ def _get_match_repeat_kv_optimizer() -> Callable:
         },
         "match_repeat_kv": {
             "stage": "pattern_matcher",
-            "run_shape_prop": True,
+            "post_shape_prop": True,
         },
     }
 

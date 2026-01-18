@@ -127,12 +127,10 @@ class FuseCausalConvActivation(BaseTransform):
                 graph.erase_node(activation_node)
                 graph.erase_node(conv_node)
 
-        gm.recompile()
-
         info = TransformInfo(
             skipped=False,
             num_matches=len(matches),
-            is_clean=False,
-            has_valid_shapes=False,
+            is_clean=len(matches) == 0,
+            has_valid_shapes=len(matches) == 0,
         )
         return gm, info
