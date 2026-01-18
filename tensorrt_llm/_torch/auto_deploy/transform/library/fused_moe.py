@@ -1680,9 +1680,9 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
         new_key_fc1_alpha = f"nvfp4_moe_w1_alpha_stacked_{fused_key_counter}"
         new_key_fc2_alpha = f"nvfp4_moe_w2_alpha_stacked_{fused_key_counter}"
 
-        weight_dtype = torch.float8_e4m3fn
-        _register_parameter(gm, new_key_fc1_expert_weights, fc1_expert_weights.to(weight_dtype))
-        _register_parameter(gm, new_key_fc2_expert_weights, fc2_expert_weights.to(weight_dtype))
+        # FP4 weights are already packed as uint8, don't convert dtype
+        _register_parameter(gm, new_key_fc1_expert_weights, fc1_expert_weights)
+        _register_parameter(gm, new_key_fc2_expert_weights, fc2_expert_weights)
         _register_parameter(
             gm, new_key_fc1_weight_blockscale_fp8, fc1_weight_blockscale_fp8_stacked
         )
@@ -1747,11 +1747,12 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
         w2_input_scale_stacked = _stack(w2_input_scale, dim=0)
         w3_input_scale_stacked = _stack(w3_input_scale, dim=0, device=device, dtype=dtype)
 
-        w1_weight_blockscale_fp8_stacked = _stack(w1_weight_scale, dim=0).to(torch.float8_e4m3fn)
-        w2_weight_blockscale_fp8_stacked = _stack(w2_weight_scale, dim=0).to(torch.float8_e4m3fn)
+        # Use .view() not .to() to reinterpret bytes as float8, not value conversion
+        w1_weight_blockscale_fp8_stacked = _stack(w1_weight_scale, dim=0).view(torch.float8_e4m3fn)
+        w2_weight_blockscale_fp8_stacked = _stack(w2_weight_scale, dim=0).view(torch.float8_e4m3fn)
         w3_weight_blockscale_fp8_stacked = _stack(
             w3_weight_scale, dim=0, device=device, dtype=dtype
-        ).to(torch.float8_e4m3fn)
+        ).view(torch.float8_e4m3fn)
 
         w1_alpha_stacked = _stack(w1_alpha, dim=0)
         w2_alpha_stacked = _stack(w2_alpha, dim=0)

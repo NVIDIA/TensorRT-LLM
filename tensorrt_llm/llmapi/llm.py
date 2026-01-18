@@ -31,7 +31,7 @@ from ..executor import (DetokenizedGenerationResultBase, GenerationExecutor,
                         GenerationResult, IterationResult, LoRARequest,
                         PostprocWorkerConfig, PromptAdapterRequest)
 from ..executor.postproc_worker import PostprocParams
-from ..executor.utils import (create_mpi_comm_session,
+from ..executor.utils import (RequestError, create_mpi_comm_session,
                               get_spawn_proxy_process_env)
 from ..inputs import (PromptInputs, create_input_processor,
                       create_input_processor_with_hash, get_cache_salt_id,
@@ -666,7 +666,7 @@ class BaseLLM:
             if sampling_params.prompt_logprobs and not sampling_params.return_context_logits:
                 sampling_params.return_context_logits = True
                 sampling_params._context_logits_auto_enabled = True
-            if sampling_params.logprobs and not sampling_params.return_generation_logits:
+            if sampling_params.logprobs is not None and not sampling_params.return_generation_logits:
                 sampling_params.return_generation_logits = True
                 sampling_params._generation_logits_auto_enabled = True
 
@@ -686,7 +686,7 @@ class BaseLLM:
             if self.args.backend == "pytorch" and not self.args.enable_chunked_prefill and not is_gen_only:
                 max_num_tokens = self.args.max_num_tokens
                 if max_num_tokens and prompt_len / self.args.parallel_config.cp_size + query_len > max_num_tokens:
-                    raise ValueError(
+                    raise RequestError(
                         f"The sum of prompt length ({prompt_len/self.args.parallel_config.cp_size}), query length ({query_len}) should not exceed "
                         f"max_num_tokens ({max_num_tokens})")
             return
@@ -737,7 +737,7 @@ class BaseLLM:
                 f"Example: LLM(..., build_config=BuildConfig(gather_context_logits=True))."
             )
 
-        if sampling_params.logprobs and not self.args.gather_generation_logits:
+        if sampling_params.logprobs is not None and not self.args.gather_generation_logits:
             raise ValueError(
                 f"`sampling_params.logprobs={sampling_params.logprobs}` requires `gather_generation_logits=True` "
                 f"to be passed explicitly to the `LLM()` constructor.")

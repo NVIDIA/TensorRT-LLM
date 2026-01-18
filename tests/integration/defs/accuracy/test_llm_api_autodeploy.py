@@ -13,34 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-
 import pytest
+from test_common.llm_data import hf_id_to_local_model_dir, llm_models_root
 
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.sampling_params import SamplingParams
 
-from ..conftest import llm_models_root
 from .accuracy_core import GSM8K, MMLU, CnnDailymail, LlmapiAccuracyTestHarness
-
-
-def _hf_model_dir_or_hub_id(
-    hf_model_subdir: str,
-    hf_hub_id: str,
-) -> str:
-    llm_models_path = llm_models_root()
-    if llm_models_path and os.path.isdir(
-        (model_fullpath := os.path.join(llm_models_path, hf_model_subdir))):
-        return str(model_fullpath)
-    else:
-        return hf_hub_id
 
 
 class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.1-8B"
-    MODEL_PATH = _hf_model_dir_or_hub_id("llama-3.1-model/Meta-Llama-3.1-8B",
-                                         MODEL_NAME)
+    MODEL_PATH = hf_id_to_local_model_dir(MODEL_NAME)
 
     def get_default_kwargs(self, enable_chunked_prefill=False):
         config = {
@@ -156,6 +141,7 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Nemotron-MOE"
     MODEL_PATH_BF16 = f"{llm_models_root()}/Nemotron-Nano-3-30B-A3.5B-dev-1024"
     MODEL_PATH_FP8 = f"{llm_models_root()}/Nemotron-Nano-3-30B-A3.5B-FP8-KVFP8-dev"
+    MODEL_PATH_NVFP4 = f"{llm_models_root()}/Nemotron-3-Nano-30B-A3B-NVFP4"
 
     def get_default_kwargs(self):
         return {
@@ -208,10 +194,10 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
         # TODO: multi-stream MOE seems to increase the memory usage
         kwargs["max_batch_size"] = 32
         kwargs["free_mem_ratio"] = 0.4
-        sampling_params = self.get_default_sampling_params()
         with AutoDeployLLM(model=self.MODEL_PATH_BF16,
                            tokenizer=self.MODEL_PATH_BF16,
                            **kwargs) as llm:
+            sampling_params = self.get_default_sampling_params()
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=sampling_params)
             task = GSM8K(self.MODEL_NAME)
@@ -220,6 +206,7 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(32000)
     def test_fp8(self):
         kwargs = self.get_default_kwargs()
+        kwargs["max_batch_size"] = 64
         with AutoDeployLLM(model=self.MODEL_PATH_FP8,
                            tokenizer=self.MODEL_PATH_FP8,
                            **kwargs) as llm:
@@ -227,6 +214,22 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
             llm.args.quant_config.quant_algo = QuantAlgo.FP8
             llm.args.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
             sampling_params = self.get_default_sampling_params()
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=sampling_params)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip(reason="NVFP4 model is not in the CI yet")
+    def test_nvfp4(self):
+        kwargs = self.get_default_kwargs()
+        with AutoDeployLLM(model=self.MODEL_PATH_NVFP4,
+                           tokenizer=self.MODEL_PATH_NVFP4,
+                           **kwargs) as llm:
+            # Manually set quant_config for NVFP4 model to get the accuracy threshold
+            llm.args.quant_config.quant_algo = QuantAlgo.NVFP4
+            llm.args.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
+            sampling_params = self.get_default_sampling_params()
+
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=sampling_params)
             task = GSM8K(self.MODEL_NAME)

@@ -841,8 +841,8 @@ Qwen3 now supports Eagle3 (Speculative Decoding with Eagle3). To enable Eagle3 o
   Set the decoding type to "Eagle" to enable Eagle3 speculative decoding.
 - `speculative_config.max_draft_len: 3`
   Set the maximum number of draft tokens generated per step (this value can be adjusted as needed).
-- `speculative_config.speculative_model_dir: <EAGLE3_DRAFT_MODEL_PATH>`
-  Specify the path to the Eagle3 draft model (ensure the corresponding draft model weights are prepared).
+- `speculative_config.speculative_model: <HUGGINGFACE ID / LOCAL PATH>`
+  Specify the Eagle3 draft model either as a Huggingface model ID or a local path. You can find ready-to-use Eagle3 draft models at https://huggingface.co/collections/nvidia/speculative-decoding-modules.
 
 Currently, there are some limitations when enabling Eagle3:
 
@@ -857,7 +857,7 @@ enable_attention_dp: false
 speculative_config:
     decoding_type: Eagle
     max_draft_len: 3
-    speculative_model_dir: <EAGLE3_DRAFT_MODEL_PATH>
+    speculative_model: <HUGGINGFACE ID / LOCAL PATH>
 kv_cache_config:
     enable_block_reuse: false
 " >> ${path_config}

@@ -395,7 +395,7 @@ def create_py_executor(
                 draft_llm_args.load_format = LoadFormat.DUMMY
 
             draft_model_engine = PyTorchModelEngine(
-                model_path=spec_config.speculative_model_dir,
+                model_path=spec_config.speculative_model,
                 llm_args=draft_llm_args,
                 mapping=mapping,
                 attn_runtime_features=attn_runtime_features,
@@ -505,7 +505,8 @@ def create_py_executor(
                 kwargs = {
                     "guided_decoding_config": guided_decoding_config,
                     "max_num_sequences": max_batch_size,
-                    "vocab_size_padded": model_engine.model.vocab_size_padded
+                    "vocab_size_padded": model_engine.model.vocab_size_padded,
+                    "rank": mapping.rank,
                 }
                 if spec_config is not None:
                     kwargs[

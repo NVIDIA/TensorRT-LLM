@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+from test_common.llm_data import with_mocked_hf_download
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM, SamplingParams
@@ -92,47 +93,82 @@ def test_kv_lens_runtime_with_eagle3_one_model():
 
 
 @pytest.mark.parametrize(
-    "use_cuda_graph,attn_backend,disable_overlap_scheduler,enable_block_reuse,use_one_model,enable_chunked_prefill,use_chain_drafter,multi_batch,attention_dp",
+    "use_cuda_graph,attn_backend,disable_overlap_scheduler,enable_block_reuse,use_one_model,enable_chunked_prefill,use_chain_drafter,multi_batch,attention_dp,use_hf_speculative_model",
     [
-        [True, "TRTLLM", True, False, False, False, True, False, False],
-        [True, "TRTLLM", True, False, False, False, False, False, False],
-        [False, "TRTLLM", True, False, False, False, True, False, False],
-        [False, "TRTLLM", True, False, False, False, False, False, False],
-        [True, "FLASHINFER", True, False, False, False, True, False, False],
-        [False, "FLASHINFER", True, False, False, False, True, False, False],
-        [False, "TRTLLM", False, True, True, False, True, False, False],
-        [True, "TRTLLM", False, True, True, False, True, False, False],
-        [True, "TRTLLM", True, False, True, True, True, False, False],
-        [True, "TRTLLM", True, False, True, False, True, False, False],
-        [True, "TRTLLM", True, False, False, True, True, False, False],
-        [True, "TRTLLM", False, False, False, False, True, False, False],
-        [False, "TRTLLM", False, False, False, False, True, False, False],
-        [True, "TRTLLM", False, False, False, False, False, True, False],
-        [True, "TRTLLM", False, False, False, False, False, True, True],
-        [False, "TRTLLM", False, False, False, False, False, True, False],
-        [True, "TRTLLM", False, False, False, False, True, True, False],
-        [False, "TRTLLM", False, False, False, False, True, True, False],
-        [True, "TRTLLM", False, False, False, False, False, False, False],
-        [False, "TRTLLM", False, False, False, False, False, False, False],
-        [True, "TRTLLM", False, False, False, True, True, False, False],
-        [True, "TRTLLM", False, False, False, True, False, False, False],
-        [True, "FLASHINFER", False, False, False, False, True, False, False],
-        [False, "FLASHINFER", False, False, False, False, True, False, False],
+        [True, "TRTLLM", True, False, False, False, True, False, False, False],
+        [True, "TRTLLM", True, False, False, False, False, False, False, False],
+        [False, "TRTLLM", True, False, False, False, True, False, False, False],
+        [
+            False, "TRTLLM", True, False, False, False, False, False, False,
+            False
+        ],
+        [
+            True, "FLASHINFER", True, False, False, False, True, False, False,
+            False
+        ],
+        [
+            False, "FLASHINFER", True, False, False, False, True, False, False,
+            False
+        ],
+        [False, "TRTLLM", False, True, True, False, True, False, False, False],
+        [True, "TRTLLM", False, True, True, False, True, False, False, False],
+        [True, "TRTLLM", True, False, True, True, True, False, False, False],
+        [True, "TRTLLM", True, False, True, False, True, False, False, False],
+        [True, "TRTLLM", True, False, False, True, True, False, False, False],
+        [True, "TRTLLM", False, False, False, False, True, False, False, False],
+        [
+            False, "TRTLLM", False, False, False, False, True, False, False,
+            False
+        ],
+        [True, "TRTLLM", False, False, False, False, False, True, False, False],
+        [True, "TRTLLM", False, False, False, False, False, True, True, False],
+        [
+            False, "TRTLLM", False, False, False, False, False, True, False,
+            False
+        ],
+        [True, "TRTLLM", False, False, False, False, True, True, False, False],
+        [False, "TRTLLM", False, False, False, False, True, True, False, False],
+        [
+            True, "TRTLLM", False, False, False, False, False, False, False,
+            False
+        ],
+        [
+            False, "TRTLLM", False, False, False, False, False, False, False,
+            False
+        ],
+        [True, "TRTLLM", False, False, False, True, True, False, False, False],
+        [True, "TRTLLM", False, False, False, True, False, False, False, False],
+        [
+            True, "FLASHINFER", False, False, False, False, True, False, False,
+            False
+        ],
+        [
+            False, "FLASHINFER", False, False, False, False, True, False, False,
+            False
+        ],
+        # Tests (mocked) speculative model auto-download from HuggingFace
+        [False, "TRTLLM", True, False, False, False, True, False, False, True],
     ])
 @pytest.mark.high_cuda_memory
+@with_mocked_hf_download
 def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
                       disable_overlap_scheduler: bool, enable_block_reuse: bool,
                       use_one_model: bool, enable_chunked_prefill: bool,
                       use_chain_drafter: bool, multi_batch: bool,
-                      attention_dp: bool, request):
+                      attention_dp: bool, use_hf_speculative_model: bool,
+                      request):
     # Eagle3 one model works with overlap scheduler and block reuse.
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 35:
         pytest.skip("Not enough memory to load target + draft model")
 
     models_path = llm_models_root()
-    eagle_model_dir = f"{models_path}/EAGLE3-LLaMA3.1-Instruct-8B"
     target_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
+
+    if use_hf_speculative_model:
+        eagle_model = "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B"
+    else:
+        eagle_model = f"{models_path}/EAGLE3-LLaMA3.1-Instruct-8B"
 
     # bs > 1 gives non-deterministic when doing IFB. There are slight chances
     # that ref and spec does not match 100%
@@ -165,7 +201,7 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
 
     spec_config = EagleDecodingConfig(
         max_draft_len=max_draft_len,
-        speculative_model_dir=eagle_model_dir,
+        speculative_model=eagle_model,
         # Llama 3 does not support one model eagle.
         eagle3_one_model=use_one_model,
     )
@@ -241,7 +277,7 @@ def test_eagle3_spec_decoding_stats(eagle3_one_model):
                                     free_gpu_memory_fraction=0.6)
     spec_config = EagleDecodingConfig(
         max_draft_len=3,
-        speculative_model_dir=eagle_model_dir,
+        speculative_model=eagle_model_dir,
         eagle3_one_model=eagle3_one_model,
     )
 
@@ -321,7 +357,7 @@ def test_llama_eagle3_long_prompt(use_cuda_graph):
 
     spec_config = EagleDecodingConfig(
         max_draft_len=3,
-        speculative_model_dir=eagle_model_dir,
+        speculative_model=eagle_model_dir,
         eagle3_one_model=False,
     )
 
@@ -445,7 +481,7 @@ def test_deepseek_eagle3():
 
         spec_config = EagleDecodingConfig(
             max_draft_len=max_draft_len,
-            speculative_model_dir=eagle_model_dir,
+            speculative_model=eagle_model_dir,
             # Llama 3 does not support one model eagle.
             eagle3_one_model=use_one_model,
             eagle3_layers_to_capture={29},
@@ -555,7 +591,7 @@ def test_deepseek_mla_eagle3():
         )
 
         spec_config = EagleDecodingConfig(max_draft_len=max_draft_len,
-                                          speculative_model_dir=eagle_model_dir,
+                                          speculative_model=eagle_model_dir,
                                           eagle3_one_model=use_one_model,
                                           load_format="dummy")
 
@@ -654,7 +690,7 @@ def test_multi_eagle3(use_one_model: bool):
 
         spec_config = EagleDecodingConfig(
             max_draft_len=max_draft_len,
-            speculative_model_dir=eagle_model_dir,
+            speculative_model=eagle_model_dir,
             # Llama 3 does not support one model eagle.
             eagle3_one_model=use_one_model,
             num_eagle_layers=2,
@@ -713,7 +749,7 @@ def test_eagle3_cuda_graph_padding(disable_overlap_scheduler: bool):
 
     spec_config = EagleDecodingConfig(
         max_draft_len=max_draft_len,
-        speculative_model_dir=eagle_model_dir,
+        speculative_model=eagle_model_dir,
         eagle3_one_model=use_one_model,
     )
 
@@ -766,7 +802,7 @@ def test_eagle3_cdl_sampling(disable_overlap_scheduler: bool):
 
     spec_config = EagleDecodingConfig(
         max_draft_len=max_draft_len,
-        speculative_model_dir=eagle_model_dir,
+        speculative_model=eagle_model_dir,
         eagle3_one_model=use_one_model,
     )
 

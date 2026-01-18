@@ -89,7 +89,8 @@ cpp_file_prefix_text = R"""/*
 
 #include "tensorrt_llm/common/config.h"
 
-TRTLLM_NAMESPACE_BEGIN
+namespace tensorrt_llm
+{
 namespace kernels
 {
 // clang-format off
@@ -98,7 +99,7 @@ namespace kernels
 cpp_file_suffex_text = R"""
 // clang-format on
 } // namespace kernels
-TRTLLM_NAMESPACE_END
+}
 """
 
 cubin_meta_info_struct_prefix_text = R"""
@@ -438,8 +439,9 @@ if __name__ == "__main__":
             CompileMacroOption('HEAD_ELEMS', 'd', [128]),
             CompileMacroOption('BEAM_WIDTH', 'beam', [1]),
             CompileMacroOption('CACHE_ELEM_ENUM', 'kvt', [0, 1, 2]),
-            CompileMacroOption('TOKENS_PER_PAGE', 'pagedKV',
-                               [0, 64, 128]),  # 0 denotes contiguous kv cache.
+            CompileMacroOption(
+                'TOKENS_PER_PAGE', 'pagedKV',
+                [0, 32, 64, 128]),  # 0 denotes contiguous kv cache.
             CompileMacroOption('HEAD_GRP_SIZE', 'nqpkv', [0]),
             CompileMacroOption('M_TILESIZE', 'm', [16, 32]),
         ]]
