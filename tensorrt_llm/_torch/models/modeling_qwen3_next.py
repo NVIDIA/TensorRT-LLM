@@ -754,8 +754,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         batch_split_size = [num_prefills, num_decodes]
         has_initial_states = mamba_metadata.has_initial_states
 
-        state_indices = attn_metadata.kv_cache_manager.get_state_indices(
-        )[:num_prefills + num_decodes]
+        batch_size = num_prefills + num_decodes
+        state_indices = mamba_metadata.state_indices[:batch_size]
 
         state_indices_p, state_indices_d = torch.split(state_indices,
                                                        batch_split_size)
@@ -1213,13 +1213,7 @@ class Qwen3NextModel(DecoderModel):
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
 
-        if self.mamba_metadata is None or self.mamba_metadata.max_batch_size != attn_metadata.max_num_requests:
-            self.mamba_metadata = Mamba2Metadata(
-                attn_metadata.max_num_requests,
-                # chunk_size=self.model_config.pretrained_config.mamba2_chunk_size)
-                # TODO check how to get the correct chunk_size
-                chunk_size=128)
-        self.mamba_metadata.prepare(attn_metadata)
+        mamba_metadata = attn_metadata.mamba_metadata
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
@@ -1233,7 +1227,7 @@ class Qwen3NextModel(DecoderModel):
                 attn_metadata=attn_metadata,
                 residual=residual,
                 spec_metadata=spec_metadata,
-                mamba_metadata=self.mamba_metadata)
+                mamba_metadata=mamba_metadata)
         return hidden_states
 
 
