@@ -280,7 +280,8 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
         # if not set, use heuristic
         if self.cuda_graph_batch_sizes is None:
             cg_bs = {1, self.max_batch_size}
-            cg_bs.update(range(1, 128 + 1, 16))
+            # Only add batch sizes up to max_batch_size
+            cg_bs.update(range(1, min(128, self.max_batch_size) + 1, 16))
             cg_bs.update(range(128, self.max_batch_size + 1, 128))
         else:
             cg_bs = [b for b in self.cuda_graph_batch_sizes if b <= self.max_batch_size]
