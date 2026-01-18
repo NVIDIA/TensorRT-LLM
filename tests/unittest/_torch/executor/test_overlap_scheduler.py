@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -42,9 +43,18 @@ def create_llm(model_dir, disable_overlap_scheduler, sampler_type):
 
 
 @pytest.mark.parametrize("sampler_type", ["TorchSampler", "TRTLLMSampler"])
+@pytest.mark.parametrize("use_python_scheduler", [False, True],
+                         ids=["cpp_scheduler", "python_scheduler"])
 @pytest.mark.high_cuda_memory
 @pytest.mark.mpi_ray_parity
-def test_overlap_scheduler_consistency(model_path, test_case, sampler_type):
+def test_overlap_scheduler_consistency(model_path, test_case, sampler_type,
+                                       use_python_scheduler, mocker):
+    # Patch environment variable to control scheduler type
+    env_patch = {
+        "TLLM_USE_PYTHON_SCHEDULER": "1"
+    } if use_python_scheduler else {}
+    mocker.patch.dict(os.environ, env_patch)
+
     # Test configuration
     prompts = test_case["prompts"]
     max_new_tokens = test_case["max_new_tokens"]
