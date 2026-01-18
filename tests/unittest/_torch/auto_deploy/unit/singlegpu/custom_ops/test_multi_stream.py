@@ -9,6 +9,7 @@ from tensorrt_llm._torch.auto_deploy.transform.library.multi_stream_moe import (
     cuda_stream_manager,
     record_event_wrapper,
 )
+from tensorrt_llm._torch.auto_deploy.utils._graph import canonicalize_graph
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 
 
@@ -75,9 +76,7 @@ def replace_multi_stream_linear_with_aux_stream_wrapper(gm: GraphModule) -> Tupl
         num_replaced += 1
 
     if num_replaced:
-        graph.eliminate_dead_code()
-        graph.lint()
-        gm.recompile()
+        canonicalize_graph(gm)
 
     return gm, num_replaced
 

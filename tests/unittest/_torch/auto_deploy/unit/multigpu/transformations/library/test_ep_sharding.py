@@ -18,6 +18,7 @@ from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
     ShardingTransformConfig,
 )
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
+from tensorrt_llm._torch.auto_deploy.utils._graph import lint, recompile
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 from tensorrt_llm.functional import AllReduceStrategy
 
@@ -188,8 +189,8 @@ def test_llama4_stacked_moe_pattern_detection():
         )
         graph.output(moe_node)
 
-    graph.lint()
-    gm.recompile()
+    lint(gm)
+    recompile(gm)
 
     # Run pattern detection for EP
     optimizer = InferenceOptimizer(

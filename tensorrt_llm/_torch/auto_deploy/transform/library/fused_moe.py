@@ -10,6 +10,7 @@ from tensorrt_llm._torch.utils import ActivationType
 
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
+from ...utils._graph import delete_all_unused_submodules, eliminate_dead_code
 from ...utils.cuda_mem_tracker import cuda_memory_tracker
 from ...utils.node_utils import bfs, extract_op_args, identify_regions_between_residuals, is_op
 from ..interface import (
@@ -112,8 +113,8 @@ def _insert_fused_moe_ops(gm: GraphModule, backend: Literal["auto", "trtllm", "t
             # Delete the unstacked weights immediately to save GPU memory
             # This will happen automatically after the graph is canonicalized,
             # but for large models we'll run out of memory during the transformation itself.
-            gm.graph.eliminate_dead_code()
-            gm.delete_all_unused_submodules()
+            eliminate_dead_code(gm)
+            delete_all_unused_submodules(gm)
 
     return fused_key_counter
 
@@ -635,7 +636,7 @@ class MatchMoePattern(BaseTransform):
             graph.erase_node(final_hidden_state_node)
 
             while _remove_dead_inplace_nodes_in_region(gm.graph, start_boundary, end_boundary):
-                gm.graph.eliminate_dead_code()
+                eliminate_dead_code(gm)
 
             num_moe_patterns += 1
 
@@ -1272,14 +1273,14 @@ class MatchBmmMoePattern(BaseTransform):
                 graph.erase_node(output_node)
 
                 # Clean up dead nodes
-                gm.graph.eliminate_dead_code()
+                eliminate_dead_code(gm)
 
                 # Clean up dead inplace nodes in the region
                 while _remove_dead_inplace_nodes_in_region(gm.graph, start_boundary, end_boundary):
-                    gm.graph.eliminate_dead_code()
+                    eliminate_dead_code(gm)
 
                 # Delete unused submodules/parameters
-                gm.delete_all_unused_submodules()
+                delete_all_unused_submodules(gm)
 
                 num_moe_patterns += 1
 
@@ -1517,8 +1518,8 @@ def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "
     # Clean up after processing all nodes
     # eliminate_dead_code will remove unused get_attr nodes, then delete_all_unused_submodules
     # will remove the parameters/buffers that are no longer referenced
-    gm.graph.eliminate_dead_code()
-    gm.delete_all_unused_submodules()
+    eliminate_dead_code(gm)
+    delete_all_unused_submodules(gm)
 
     return fused_key_counter
 
@@ -1776,8 +1777,8 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
     # Clean up after processing all nodes
     # eliminate_dead_code will remove unused get_attr nodes, then delete_all_unused_submodules
     # will remove the parameters/buffers that are no longer referenced
-    gm.graph.eliminate_dead_code()
-    gm.delete_all_unused_submodules()
+    eliminate_dead_code(gm)
+    delete_all_unused_submodules(gm)
     return fused_key_counter
 
 
