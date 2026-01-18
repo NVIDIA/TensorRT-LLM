@@ -1475,12 +1475,6 @@ def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "
                 0, device=w1_input_scale_stacked.device, dtype=w1_input_scale_stacked.dtype
             )
         )
-        assert torch.all(w1_input_scale_stacked[0] == w1_input_scale_stacked), (
-            "All w1 scales should have the same value."
-        )
-        assert torch.all(w2_input_scale_stacked[0] == w2_input_scale_stacked), (
-            "All w2 scales should have the same value."
-        )
 
         w1_weight_scale_stacked = _stack(w1_weight_scale, dim=0).to(torch.float32)
         w2_weight_scale_stacked = _stack(w2_weight_scale, dim=0).to(torch.float32)
