@@ -261,10 +261,10 @@ class CompletionRequest(OpenAIBaseModel):
 
     # doc: begin-completion-sampling-params
     use_beam_search: bool = False
-    top_k: int = 0
+    top_k: Optional[int] = None
     top_p_min: float = 0.0
-    min_p: float = 0.0
-    repetition_penalty: float = 1.0
+    min_p: Optional[float] = None
+    repetition_penalty: Optional[float] = None
     length_penalty: float = 1.0
     early_stopping: bool = False
     stop_token_ids: Optional[List[int]] = Field(default_factory=list)
@@ -309,9 +309,8 @@ class CompletionRequest(OpenAIBaseModel):
             presence_penalty=self.presence_penalty,
             seed=self.seed,
             stop=self.stop,
-            temperature=(self.temperature
-                         if self.temperature is not None else 1.0),
-            top_p=(self.top_p if self.top_p is not None else 1.0),
+            temperature=self.temperature,
+            top_p=self.top_p,
             prompt_ignore_length=self.prompt_ignore_length,
 
             # completion-sampling-params
@@ -571,10 +570,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
     # doc: begin-chat-completion-sampling-params
     best_of: Optional[int] = None
     use_beam_search: bool = False
-    top_k: int = 0
+    top_k: Optional[int] = None
     top_p_min: float = 0.0
-    min_p: float = 0.0
-    repetition_penalty: float = 1.0
+    min_p: Optional[float] = None
+    repetition_penalty: Optional[float] = None
     length_penalty: float = 1.0
     early_stopping: bool = False
     stop_token_ids: Optional[List[int]] = Field(default_factory=list)
@@ -657,15 +656,14 @@ class ChatCompletionRequest(OpenAIBaseModel):
             presence_penalty=self.presence_penalty,
             seed=self.seed,
             stop=self.stop,
-            temperature=(self.temperature
-                         if self.temperature is not None else 1.0),
+            temperature=self.temperature,
             prompt_ignore_length=self.prompt_ignore_length,
 
             # chat-completion-sampling-params
             best_of=self.best_of,
             use_beam_search=self.use_beam_search,
             top_k=self.top_k,
-            top_p=(self.top_p if self.top_p is not None else 1.0),
+            top_p=self.top_p,
             top_p_min=self.top_p_min if self.top_p_min > 0 else None,
             min_p=self.min_p,
             repetition_penalty=self.repetition_penalty,
