@@ -254,6 +254,12 @@ public:
     {
         PYBIND11_OVERLOAD_PURE(void, tbk::BaseKVCacheManager, flushIterationEvents);
     }
+
+    tensorrt_llm::executor::RetentionPriority getPriorityByBlockId(tbk::KVCacheBlock::IdType blockId) const override
+    {
+        PYBIND11_OVERLOAD_PURE(
+            tensorrt_llm::executor::RetentionPriority, tbk::BaseKVCacheManager, getPriorityByBlockId, blockId);
+    }
 };
 
 // TODO: Deduplicate executor bindings KvCacheStats
@@ -495,7 +501,9 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
         .def("refresh_blocks", &BaseKVCacheManager::refreshBlocks, py::call_guard<py::gil_scoped_release>())
         .def("get_last_block_id", &BaseKVCacheManager::getLastBlockId, py::call_guard<py::gil_scoped_release>())
         .def("unpin_blocks_by_id", &BaseKVCacheManager::unpinBlocksById, py::call_guard<py::gil_scoped_release>())
-        .def("reset_reuse_state", &BaseKVCacheManager::resetReuseState, py::call_guard<py::gil_scoped_release>());
+        .def("reset_reuse_state", &BaseKVCacheManager::resetReuseState, py::call_guard<py::gil_scoped_release>())
+        .def("get_priority_by_block_id", &BaseKVCacheManager::getPriorityByBlockId,
+            py::call_guard<py::gil_scoped_release>());
 
     py::enum_<tbk::CacheType>(m, "CacheType")
         .value("SELF", tbk::CacheType::kSELF)
