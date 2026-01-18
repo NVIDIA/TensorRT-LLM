@@ -30,6 +30,10 @@ include_directories(${PROJECT_SOURCE_DIR}/include)
 
 nanobind_add_module(${TRTLLM_NB_MODULE} ${SRCS})
 
+# Add cppzmq include directory for ZeroMQ C++ bindings
+target_include_directories(${TRTLLM_NB_MODULE}
+                           PRIVATE ${CMAKE_BINARY_DIR}/_deps/cppzmq-src)
+
 set_property(TARGET ${TRTLLM_NB_MODULE} PROPERTY POSITION_INDEPENDENT_CODE ON)
 
 target_link_directories(${TRTLLM_NB_MODULE} PUBLIC
@@ -49,7 +53,8 @@ target_link_libraries(
          ${CUDA_DRV_LIB}
          ${CUDA_NVML_LIB}
          th_common
-         pg_utils)
+         pg_utils
+  PRIVATE ${ZMQ_LIBRARIES})
 target_compile_definitions(
   ${TRTLLM_NB_MODULE} PUBLIC TRTLLM_NB_MODULE=${TRTLLM_NB_MODULE}
                              PYBIND11_DETAILED_ERROR_MESSAGES=1)

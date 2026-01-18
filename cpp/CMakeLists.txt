@@ -257,10 +257,14 @@ if(BINDING_TYPE STREQUAL "nanobind")
   include_directories(${CMAKE_BINARY_DIR}/_deps/nanobind-src/include)
 endif()
 
-FetchContent_MakeAvailable(cutlass cxxopts flashmla json xgrammar)
+FetchContent_MakeAvailable(cutlass cxxopts flashmla json xgrammar cppzmq)
+
+# Find ZeroMQ
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(ZMQ REQUIRED libzmq)
 
 if(ENABLE_UCX)
-  FetchContent_MakeAvailable(cppzmq ucxx)
+  FetchContent_MakeAvailable(ucxx)
 endif()
 
 if(NOT NVTX_DISABLE)

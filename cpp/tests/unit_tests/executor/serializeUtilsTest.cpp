@@ -158,7 +158,7 @@ void compareResult(texec::Result res, texec::Result res2)
 void compareResponse(texec::Response res, texec::Response res2)
 {
     EXPECT_EQ(res.hasError(), res2.hasError());
-    EXPECT_EQ(res.getRequestId(), res2.getRequestId());
+    EXPECT_EQ(res.getContextRequestId(), res2.getContextRequestId());
     if (res.hasError())
     {
         EXPECT_EQ(res.getErrorMsg(), res2.getErrorMsg());
@@ -1103,7 +1103,7 @@ TEST(SerializeUtilsTest, RequestAndBufferInfo)
 
         EXPECT_EQ(original.mAgentName, deserialized.mAgentName);
         EXPECT_EQ(original.mAddress, deserialized.mAddress);
-        EXPECT_EQ(original.mRequestInfo.getRequestId(), deserialized.mRequestInfo.getRequestId());
+        EXPECT_EQ(original.mRequestInfo.getContextRequestId(), deserialized.mRequestInfo.getContextRequestId());
         ASSERT_EQ(original.mBufferDescs.size(), deserialized.mBufferDescs.size());
         EXPECT_EQ(original.mBufferDescs[0].getAddr(), deserialized.mBufferDescs[0].getAddr());
         EXPECT_EQ(original.mBufferDescs[0].getLen(), deserialized.mBufferDescs[0].getLen());
@@ -1122,7 +1122,7 @@ TEST(SerializeUtilsTest, RequestAndBufferInfo)
 
         EXPECT_EQ(original.mAgentName, deserialized.mAgentName);
         EXPECT_EQ(original.mAddress, deserialized.mAddress);
-        EXPECT_EQ(original.mRequestInfo.getRequestId(), deserialized.mRequestInfo.getRequestId());
+        EXPECT_EQ(original.mRequestInfo.getContextRequestId(), deserialized.mRequestInfo.getContextRequestId());
         ASSERT_EQ(original.mBufferDescs.size(), deserialized.mBufferDescs.size());
         EXPECT_EQ(original.mBufferDescs[0].getAddr(), deserialized.mBufferDescs[0].getAddr());
         EXPECT_EQ(original.mBufferDescs[0].getLen(), deserialized.mBufferDescs[0].getLen());
@@ -1217,7 +1217,8 @@ TEST(SerializeUtilsTest, NotificationInfo)
         auto deserializedRequestInfo = std::get<kv_cache::RequestAndBufferInfo>(deserialized.mInfo);
         EXPECT_EQ(requestInfo.mAgentName, deserializedRequestInfo.mAgentName);
         EXPECT_EQ(requestInfo.mAddress, deserializedRequestInfo.mAddress);
-        EXPECT_EQ(requestInfo.mRequestInfo.getRequestId(), deserializedRequestInfo.mRequestInfo.getRequestId());
+        EXPECT_EQ(
+            requestInfo.mRequestInfo.getContextRequestId(), deserializedRequestInfo.mRequestInfo.getContextRequestId());
         EXPECT_EQ(requestInfo.mMetadata, deserializedRequestInfo.mMetadata);
         EXPECT_EQ(requestInfo.mValidConnectionIdx, deserializedRequestInfo.mValidConnectionIdx);
     }

@@ -18,6 +18,7 @@
 #include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
 #include "tensorrt_llm/executor/types.h"
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <sstream>
 #define UCX_WRAPPER_LIB_NAME "tensorrt_llm_ucx_wrapper"
@@ -35,6 +36,7 @@
 
 #include "tensorrt_llm/batch_manager/cacheFormatter.h"
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
+#include "tensorrt_llm/batch_manager/cacheTransferServer.h"
 #include "tensorrt_llm/batch_manager/contextProgress.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheType.h"
@@ -49,6 +51,9 @@
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
 #include <algorithm>
+#include <boost/uuid/uuid.hpp>
+#include <boost/uuid/uuid_generators.hpp>
+#include <boost/uuid/uuid_io.hpp>
 #include <cstddef>
 #include <numeric>
 #include <unordered_set>
@@ -57,6 +62,77 @@ namespace tensorrt_llm::batch_manager
 {
 
 std::mutex CacheTransceiver::mDllMutex;
+
+TransferTagClient::TransferTagClient()
+{
+    mContext = std::make_unique<zmq::context_t>(1);
+}
+
+TransferTagType TransferTagClient::getTransferTag(std::string const& serverEndpoint,
+    RequestIdType const& receiverTransferId, UuidType const& receiverServerUuid, int32_t expectedRefCount)
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+
+    zmq::socket_t socket(*mContext, zmq::socket_type::dealer);
+    socket.connect(serverEndpoint);
+
+    TransferTagRequest req;
+    std::memset(&req, 0, sizeof(req));
+    req.type = TransferTagRequestType::kGetTransferTag;
+    req.payload.getTransferTag.receiverTransferId = receiverTransferId;
+    req.payload.getTransferTag.receiverServerUuid = receiverServerUuid;
+    req.payload.getTransferTag.expectedRefCount = expectedRefCount;
+
+    zmq::message_t requestMsg(&req, sizeof(req));
+    socket.send(requestMsg, zmq::send_flags::none);
+
+    zmq::message_t responseMsg;
+    (void) socket.recv(responseMsg, zmq::recv_flags::none);
+    TLLM_CHECK_WITH_INFO(responseMsg.size() == sizeof(TransferTagType),
+        "TransferTagClient received invalid response size: %zu", responseMsg.size());
+
+    TransferTagType transferTag;
+    std::memcpy(&transferTag, responseMsg.data(), sizeof(TransferTagType));
+    return transferTag;
+}
+
+void TransferTagClient::releaseTransferTag(std::string const& serverEndpoint, RequestIdType const& receiverTransferId,
+    UuidType const& receiverServerUuid, TransferTagType transferTag)
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+
+    zmq::socket_t socket(*mContext, zmq::socket_type::dealer);
+    socket.connect(serverEndpoint);
+
+    TransferTagRequest req;
+    std::memset(&req, 0, sizeof(req));
+    req.type = TransferTagRequestType::kReleaseTransferTag;
+    req.payload.releaseTransferTag.receiverTransferId = receiverTransferId;
+    req.payload.releaseTransferTag.receiverServerUuid = receiverServerUuid;
+    req.payload.releaseTransferTag.transferTag = transferTag;
+
+    zmq::message_t requestMsg(&req, sizeof(req));
+    socket.send(requestMsg, zmq::send_flags::none);
+
+    zmq::message_t responseMsg;
+    (void) socket.recv(responseMsg, zmq::recv_flags::none);
+}
+
+TransferTagClient::~TransferTagClient()
+{
+    try
+    {
+        mContext->close();
+    }
+    catch (std::exception const& e)
+    {
+        TLLM_LOG_ERROR("Error closing ZMQ context in TransferTagClient destructor: %s", e.what());
+    }
+    catch (...)
+    {
+        TLLM_LOG_ERROR("Unknown error closing ZMQ context in TransferTagClient");
+    }
+}
 
 std::unique_ptr<BaseCacheTransceiver> CacheTransceiverFactory::createCacheTransceiver(
     kv_cache_manager::BaseKVCacheManager* cacheManager, runtime::ModelConfig const& modelConfig,
@@ -130,6 +206,37 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     {
         mGroupComm = std::make_shared<CacheTransceiverComm>(tensorrt_llm::pg_utils::get_world_pg());
     }
+    // Broadcast rank 0 UUID to all other ranks
+    if (worldConfig.getRank() == 0)
+    {
+        boost::uuids::random_generator uuidGen;
+        auto uuid = boost::uuids::to_string(uuidGen());
+        std::copy(uuid.begin(), uuid.end(), mUuid.begin());
+        std::vector<char> uuidVec(mUuid.begin(), mUuid.end());
+        mGroupComm->bcast(uuidVec, 0);
+        mTransferTagServer = std::make_unique<TransferTagServer>();
+        mTransferTagServer->waitForReady();
+        mTransferTagServerEndpoint = mTransferTagServer->getEndpoint();
+    }
+    else
+    {
+        std::vector<char> uuidVec;
+        mGroupComm->bcast(uuidVec, 0);
+        if (uuidVec.size() == mUuid.size())
+        {
+            std::copy(uuidVec.begin(), uuidVec.end(), mUuid.begin());
+        }
+        else
+        {
+            TLLM_THROW("Received UUID size mismatch");
+        }
+    }
+    // Broadcast endpoint
+    std::vector<char> endpointVec(mTransferTagServerEndpoint.begin(), mTransferTagServerEndpoint.end());
+    mGroupComm->bcast(endpointVec, 0);
+    mTransferTagServerEndpoint.assign(endpointVec.begin(), endpointVec.end());
+
+    TLLM_LOG_INFO("CacheTransceiver UUID = %s", std::string(mUuid.begin(), mUuid.end()).c_str());
 
     if (worldConfig.isTensorParallel())
     {
@@ -233,7 +340,7 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
 
     mCacheSender = std::make_unique<CacheSender>(mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter());
     mCacheReceiver
-        = std::make_unique<CacheReceiver>(mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter());
+        = std::make_unique<CacheReceiver>(mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter(), mUuid);
 
     initializeCommState();
 }
@@ -258,6 +365,7 @@ void CacheTransceiver::setContextState(LlmRequest* llmRequest)
     auto contextState = std::make_unique<executor::DataTransceiverState>();
     contextState->setCommState(*mCommState);
     contextState->setCacheState(*mCacheState);
+    contextState->setTransferTagServerEndpoint(mTransferTagServerEndpoint);
     if (!llmRequest->hasDraftTokens())
     {
         llmRequest->setContextPhaseParams(

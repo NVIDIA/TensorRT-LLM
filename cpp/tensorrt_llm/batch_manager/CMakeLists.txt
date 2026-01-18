@@ -58,7 +58,8 @@ set(SRCS
     utils/logitsThread.cpp
     utils/staticThreadPool.cpp
     evictionPolicy.cpp
-    cacheTransBuffer.cpp)
+    cacheTransBuffer.cpp
+    cacheTransferServer.cpp)
 
 set(xgrammar_source_dir ${CMAKE_BINARY_DIR}/_deps/xgrammar-src)
 file(GLOB_RECURSE XGRAMMAR_SRCS "${xgrammar_source_dir}/cpp/*.cc")
@@ -111,5 +112,9 @@ endif()
 
 find_library(TORCH_PYTHON_LIB torch_python REQUIRED
              HINTS ${TORCH_INSTALL_PREFIX}/lib)
-target_link_libraries(${BATCH_MANAGER_STATIC_TARGET}
-                      PUBLIC ${TORCH_PYTHON_LIB} Python3::Python pg_utils)
+
+target_include_directories(${BATCH_MANAGER_STATIC_TARGET}
+                           PRIVATE ${CMAKE_BINARY_DIR}/_deps/cppzmq-src)
+target_link_libraries(
+  ${BATCH_MANAGER_STATIC_TARGET} PUBLIC ${TORCH_PYTHON_LIB} Python3::Python
+                                        pg_utils ${ZMQ_LIBRARIES})
