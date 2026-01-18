@@ -340,14 +340,6 @@ def is_any_lin_op(node: Node) -> bool:
     return is_linear_op(node) or is_fake_quantized_linear_op(node)
 
 
-def is_parametrized_op(node: Node) -> bool:
-    # check if the node has a weight argument
-    if (w := extract_weight_node(node)) is not None:
-        if len(shape(w)) > 1:
-            return True
-    return False
-
-
 def is_fp4_op(node: Node) -> bool:
     return is_op(
         node,
@@ -437,6 +429,10 @@ def is_dist_op(node: Node) -> bool:
         torch.ops.auto_deploy.trtllm_dist_all_reduce,
     }
     return is_op(node, dist_ops)
+
+
+def is_weight_node(node: Node) -> bool:
+    return node.op == "get_attr" and node.target and has_shape(node) and len(shape(node)) > 0
 
 
 def get_user_if_pattern_match(node, ops, numusers, user_idx: int = 0):
@@ -944,7 +940,7 @@ def get_layer_after_linear_node(
     ssm_nodes = list(filtered_nodes(interior_nodes, is_any_ssm_op))
     attention_nodes = list(filtered_nodes(interior_nodes, is_any_attention_op))
     intermediate_lin_nodes = list(filtered_nodes(interior_nodes, is_any_lin_op))
-    intermediate_weight_nodes = list(filtered_nodes(interior_nodes, is_parametrized_op))
+    intermediate_weight_nodes = list(filtered_nodes(interior_nodes, is_weight_node))
 
     layer_type = LayerType.MLP
     min_local_shape = 1

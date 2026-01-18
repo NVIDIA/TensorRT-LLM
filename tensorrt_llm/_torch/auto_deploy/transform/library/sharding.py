@@ -2020,7 +2020,7 @@ def detect_sharding_from_config(
 
     for lin_node in linear_nodes:
         # use node's weight name to get the module name
-        module_name = extract_weight_node(lin_node).target
+        weight_name = extract_weight_name(lin_node)
         # get the parent layer_subgraph
         layer_subgraph = [
             layer
