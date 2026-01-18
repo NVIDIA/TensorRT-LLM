@@ -3,7 +3,7 @@ from abc import ABC, abstractmethod
 from collections import namedtuple
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, Optional, Set, Tuple
+from typing import Optional
 
 from strenum import StrEnum
 
@@ -105,7 +105,7 @@ class SerializableSchedulerOutput:
 
     def to_scheduler_result(
         self, active_requests: RequestList
-    ) -> Tuple[ScheduledRequests, RequestList, int]:
+    ) -> tuple[ScheduledRequests, RequestList, int]:
         id_to_request = {req.request_id: req for req in active_requests}
         scheduled_requests = ScheduledRequests()
         scheduled_requests.context_requests = [
@@ -189,7 +189,7 @@ class BindMicroBatchScheduler(MicroBatchScheduler):
         self,
         max_batch_size: int,
         max_num_tokens: int = None,
-        ctx_chunk_config: Optional[Tuple[StrEnum, int]] = None,
+        ctx_chunk_config: Optional[tuple[StrEnum, int]] = None,
     ) -> None:
         super(BindMicroBatchScheduler, self).__init__()
         self.max_batch_size = max_batch_size
@@ -292,7 +292,7 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
 
     def schedule(
             self, active_requests: RequestList,
-            inflight_request_ids: Set[int]) -> Tuple[RequestList, RequestList]:
+            inflight_request_ids: set[int]) -> tuple[RequestList, RequestList]:
 
         context_requests: RequestList = []
         generation_requests: RequestList = []
@@ -605,7 +605,7 @@ class SchedulerPolicyBase(ABC):
     @abstractmethod
     def schedule(
             self, scheduler: 'PyCapacityScheduler',
-            active_requests: RequestList) -> Tuple[RequestList, RequestList]:
+            active_requests: RequestList) -> tuple[RequestList, RequestList]:
         """
         Schedule requests according to the policy.
 
@@ -627,7 +627,7 @@ class MaxRequestsPolicy(SchedulerPolicyBase):
 
     def schedule(
             self, scheduler: 'PyCapacityScheduler',
-            active_requests: RequestList) -> Tuple[RequestList, RequestList]:
+            active_requests: RequestList) -> tuple[RequestList, RequestList]:
         scheduled_requests: RequestList = []
 
         for req in active_requests:
@@ -655,7 +655,7 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
 
     def schedule(
             self, scheduler: 'PyCapacityScheduler',
-            active_requests: RequestList) -> Tuple[RequestList, RequestList]:
+            active_requests: RequestList) -> tuple[RequestList, RequestList]:
         scheduled_requests: RequestList = []
         has_peft = scheduler.peft_cache_manager is not None
 
@@ -678,7 +678,7 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
         claimed_peft_pages = 0
         available_peft_pages = scheduler._get_max_peft_pages(
         ) if has_peft else 0
-        uniq_task_ids: Set[int] = set() if has_peft else None
+        uniq_task_ids: set[int] = set() if has_peft else None
 
         pending_requests: RequestList = []
         pending_dis_gen_init_requests: RequestList = []
@@ -763,7 +763,7 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
 
     def schedule(
             self, scheduler: 'PyCapacityScheduler',
-            active_requests: RequestList) -> Tuple[RequestList, RequestList]:
+            active_requests: RequestList) -> tuple[RequestList, RequestList]:
         scheduler.kv_cache_manager.start_scheduling()
 
         skipping_is_relevant = scheduler._is_skipping_relevant()
@@ -772,7 +772,7 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
             scheduler.kv_cache_manager, scheduler.two_step_lookahead)
 
         num_scheduled_peft_pages = 0
-        seen_task_ids: Set[int] = set()
+        seen_task_ids: set[int] = set()
 
         newly_contributed_context_blocks, _ = scheduler._prefill_contributed_blocks(
             active_requests)
@@ -843,7 +843,7 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
             self, scheduler: 'PyCapacityScheduler', req: LlmRequest,
             scheduled_requests: RequestList,
             scheduled_blocks_manager: 'MaxUtilizationScheduledBlocksManager',
-            num_scheduled_peft_pages: int, seen_task_ids: Set[int]) -> bool:
+            num_scheduled_peft_pages: int, seen_task_ids: set[int]) -> bool:
         if len(scheduled_requests) >= scheduler.max_num_requests:
             return False
 
@@ -888,7 +888,7 @@ class NoEvictScheduledBlocksManager:
         """
         self.kv_cache_manager = kv_cache_manager
         stats = kv_cache_manager.get_kv_cache_stats()
-        self.available_blocks: Dict[int, int] = dict(
+        self.available_blocks: dict[int, int] = dict(
             stats.num_free_blocks_per_window_size)
 
     def decrement_reserved_blocks(self, req: LlmRequest) -> None:
@@ -927,13 +927,13 @@ class MaxUtilizationScheduledBlocksManager:
         self.kv_cache_manager = kv_cache_manager
         self.two_steps_look_ahead = two_steps_look_ahead
         window_sizes = set(kv_cache_manager.max_attention_window_vec)
-        self.num_scheduled_blocks: Dict[int, int] = {
+        self.num_scheduled_blocks: dict[int, int] = {
             ws: 0
             for ws in window_sizes
         }
 
     def prepare_blocks_if_schedulable(
-            self, req: LlmRequest) -> Optional[Dict[int, int]]:
+            self, req: LlmRequest) -> Optional[dict[int, int]]:
         """
         Check if request can be scheduled and return new block counts if so.
         Returns None if request cannot fit.
@@ -954,7 +954,7 @@ class MaxUtilizationScheduledBlocksManager:
             blocks_if_scheduled[window_size] = scheduled_total
         return blocks_if_scheduled
 
-    def update_scheduled_blocks(self, blocks: Dict[int, int]) -> None:
+    def update_scheduled_blocks(self, blocks: dict[int, int]) -> None:
         """
         Update the scheduled blocks after successfully scheduling a request.
         C++ reference: scheduledBlocksManager.h:102-110
@@ -1067,7 +1067,7 @@ class PyCapacityScheduler:
         return True
 
     def _prefill_contributed_blocks(
-            self, active_requests: RequestList) -> Tuple[Set, Set]:
+            self, active_requests: RequestList) -> tuple[set, set]:
         """
         Collect blocks contributed by chunked context requests already executing.
         These blocks can be reused by later requests.
@@ -1108,7 +1108,7 @@ class PyCapacityScheduler:
 
     def _one_manager_beneficial_to_skip(self, kv_cache_manager, unique_tokens,
                                         req: LlmRequest,
-                                        newly_contributed_blocks: Set) -> bool:
+                                        newly_contributed_blocks: set) -> bool:
         """
         Check if skipping is beneficial for one KV cache manager.
         C++ reference: capacityScheduler.cpp:70-92 (oneManagerBeneficialToSkip)
@@ -1122,8 +1122,8 @@ class PyCapacityScheduler:
         return False
 
     def _beneficial_to_skip(
-            self, req: LlmRequest, newly_contributed_context_blocks: Set,
-            newly_contributed_cross_context_blocks: Set) -> bool:
+            self, req: LlmRequest, newly_contributed_context_blocks: set,
+            newly_contributed_cross_context_blocks: set) -> bool:
         """
         Check if it's beneficial to skip this request.
         A request should be skipped if it can reuse blocks contributed by
@@ -1167,7 +1167,7 @@ class PyCapacityScheduler:
 
     def _get_peft_task_info(
             self, req: LlmRequest,
-            seen_task_ids: Set[int]) -> Tuple[Optional[int], bool, int]:
+            seen_task_ids: set[int]) -> tuple[Optional[int], bool, int]:
         """
         Get PEFT task information for a request.
         Returns (lora_task_id, is_new_task, required_pages).
@@ -1189,7 +1189,7 @@ class PyCapacityScheduler:
 
     def schedule_request(
         self, active_requests: RequestList
-    ) -> Tuple[RequestList, RequestList, RequestList]:
+    ) -> tuple[RequestList, RequestList, RequestList]:
         """
         Schedule requests based on the configured policy.
 
@@ -1214,7 +1214,7 @@ class PyCapacityScheduler:
 
     def _classify_output(
             self,
-            scheduled_requests: RequestList) -> Tuple[RequestList, RequestList]:
+            scheduled_requests: RequestList) -> tuple[RequestList, RequestList]:
         """
         Separate scheduled requests into normal requests and disagg gen init requests.
         C++ reference: capacityScheduler.cpp:522-534
@@ -1238,7 +1238,7 @@ class SimpleUnifiedScheduler(RequestScheduler):
         kv_cache_manager,
         peft_cache_manager,
         scheduler_policy: CapacitySchedulerPolicy,
-        ctx_chunk_config: Optional[Tuple[StrEnum, int]] = None,
+        ctx_chunk_config: Optional[tuple[StrEnum, int]] = None,
         cross_kv_cache_manager=None,
         two_step_lookahead: bool = False,
         scheduler_capacity: Optional[int] = None,
