@@ -1,17 +1,19 @@
-[tool.poetry]
+[project]
 name = "unknown-package"
 version = "0.1.0"
 description = ""
-authors = ["TensorRT LLM [90828364+tensorrt-cicd@users.noreply.github.com]"]
+authors = [
+    {name = "TensorRT LLM [90828364+tensorrt-cicd@users.noreply.github.com]"}
+]
 readme = "README.md"
-
-[tool.poetry.dependencies]
-python = ">=3.10,<3.13"
-pandas = "^2.3.3"
-numpy = "<2"
-matplotlib = "^3.10.8"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "pandas (>=2.3.3,<3.0.0)",
+    "numpy (<2)",
+    "matplotlib (>=3.10.8,<4.0.0)"
+]
 
 
 [build-system]
-requires = ["poetry-core"]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
