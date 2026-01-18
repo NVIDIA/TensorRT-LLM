@@ -516,6 +516,7 @@ class BenchRunner:
             str(self.num_requests),
         ]
         print(f"Running command: {' '.join(command)}")
+        check_output(" ".join(command), shell=True, env=self.llm_venv._new_env)
 
     def build_engine(self):
         if self.skip_engine_build:
