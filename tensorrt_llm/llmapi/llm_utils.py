@@ -25,7 +25,8 @@ from ..llmapi.llm_args import TrtLlmArgs
 from ..logger import logger
 from ..mapping import Mapping
 from ..models.automodel import MODEL_MAP, AutoConfig, AutoModelForCausalLM
-from ..models.modeling_utils import PretrainedConfig, QuantAlgo, QuantConfig
+from ..models.modeling_utils import QuantAlgo  # noqa: F401
+from ..models.modeling_utils import PretrainedConfig, QuantConfig
 from ..module import Module
 from .build_cache import (BuildCache, BuildCacheConfig, CachedStage,
                           get_build_cache_config_from_env)
@@ -317,106 +318,13 @@ class ModelLoader:
         assert self.model_obj.is_local_model
 
     def _update_from_hf_quant_config(self) -> bool:
-        """Update quant_config from the config file of pre-quantized HF checkpoint.
-
-        Returns:
-            prequantized (bool): Whether the checkpoint is pre-quantized.
-        """
         quant_config = self.llm_args.quant_config
-
-        hf_quant_config_path = f"{self._model_dir}/hf_quant_config.json"
-        if os.path.exists(hf_quant_config_path):
-            logger.info(
-                f"Found {hf_quant_config_path}, pre-quantized checkpoint is used."
-            )
-            with open(hf_quant_config_path, "r") as f:
-                hf_quant_config = json.load(f)
-                hf_quant_config = hf_quant_config["quantization"]
-
-            hf_quant_algo = hf_quant_config.pop("quant_algo", None)
-            if hf_quant_algo is not None:
-                # fp8_pb_wo from modelopt is the same as fp8_block_scales
-                if hf_quant_algo == "fp8_pb_wo":
-                    hf_quant_algo = QuantAlgo.FP8_BLOCK_SCALES
-                else:
-                    hf_quant_algo = QuantAlgo(hf_quant_algo)
-                if quant_config.quant_algo is None:
-                    logger.info(
-                        f"Setting quant_algo={hf_quant_algo} form HF quant config."
-                    )
-                    quant_config.quant_algo = hf_quant_algo
-                elif quant_config.quant_algo != hf_quant_algo:
-                    raise ValueError(
-                        f"Specified quant_algo={quant_config.quant_algo}, conflicting with quant_algo={hf_quant_algo} from HF quant config."
-                    )
-            else:
-                raise ValueError(
-                    "Pre-quantized checkpoint must have quant_algo.")
-
-            hf_kv_cache_quant_algo = hf_quant_config.pop(
-                "kv_cache_quant_algo", None)
-            if hf_kv_cache_quant_algo is not None:
-                hf_kv_cache_quant_algo = QuantAlgo(hf_kv_cache_quant_algo)
-                if quant_config.kv_cache_quant_algo is None:
-                    logger.info(
-                        f"Setting kv_cache_quant_algo={hf_kv_cache_quant_algo} form HF quant config."
-                    )
-                    quant_config.kv_cache_quant_algo = hf_kv_cache_quant_algo
-                elif quant_config.kv_cache_quant_algo != hf_kv_cache_quant_algo:
-                    raise ValueError(
-                        f"Specified kv_cache_quant_algo={quant_config.kv_cache_quant_algo}, conflicting with kv_cache_quant_algo={hf_kv_cache_quant_algo} from HF quant config."
-                    )
-            else:
-                if quant_config.kv_cache_quant_algo not in [
-                        None, QuantAlgo.FP8, QuantAlgo.NVFP4
-                ]:
-                    raise ValueError(
-                        f"Only kv_cache_quant_algo={QuantAlgo.FP8} or {QuantAlgo.NVFP4} is allowed for pre-quantized checkpoint, got {quant_config.kv_cache_quant_algo}."
-                    )
-
-            for key, value in hf_quant_config.items():
-                logger.info(
-                    f"Setting {key}={str(value)[:100]}{'...' if len(str(value)) > 100 else ''} from HF quant config."
-                )
-                setattr(quant_config, key, value)
-
-            # Update the quant_config in llm_args for pytorch
-            self.llm_args.quant_config = quant_config
-
-            return True
-
-        hf_config_path = f"{self._model_dir}/config.json"
-        if os.path.exists(hf_config_path):
-            with open(hf_config_path, "r") as f:
-                hf_config = json.load(f)
-                hf_quant_config = hf_config.get("quantization_config", None)
-
-            if hf_quant_config is not None:
-                logger.info(
-                    f"Found quantization_config field in {hf_config_path}, pre-quantized checkpoint is used."
-                )
-                # DeepSeek V3 FP8 ckpt
-                if hf_quant_config.get(
-                        "quant_method") == "fp8" and hf_quant_config.get(
-                            "weight_block_size"):
-                    quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
-                    quant_config.exclude_modules = ["*eh_proj"]
-                elif hf_quant_config.get("quant_method") == "mxfp4":
-                    from .._torch.model_config import ModelConfig
-                    quant_config.quant_algo = ModelConfig.get_mxfp4_quant_algo(
-                        self.llm_args.moe_config.backend)
-                    quant_config.group_size = 32
-                    quant_config.exclude_modules = [
-                        'block.*.attn.out', 'block.*.mlp.gate',
-                        'block.*.attn.qkv', 'embedding', 'unembedding'
-                    ]
-                else:
-                    raise NotImplementedError(
-                        f"Unsupported quantization_config: {hf_quant_config}.")
-
-                return True
-
-        return False
+        # TrtLlmArgs doesn't have moe_config, use default 'CUTLASS'
+        moe_config = getattr(self.llm_args, 'moe_config', None)
+        moe_backend = moe_config.backend if moe_config is not None else 'CUTLASS'
+        quant_config_changed, _ = quant_config.update_from_model_ckpt(
+            self._model_dir, moe_backend)
+        return quant_config_changed
 
     def _load_model_from_hf(self):
         ''' Load a TRT-LLM model from a HF model. '''
