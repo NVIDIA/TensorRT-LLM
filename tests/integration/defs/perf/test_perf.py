@@ -1407,7 +1407,21 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 os.makedirs(os.path.dirname(autodeploy_config_path),
                             exist_ok=True)
 
-            # Check if model has a specific autodeploy config file
+            # Default autodeploy config
+            autodeploy_config = {
+                'transforms': {
+                    'compile_model': {
+                        'backend': self._config.ad_compile_backend
+                    },
+                    'resize_kv_cache': {
+                        'free_mem_ratio': self._config.free_mem_ratio
+                    },
+                },
+                'runtime': self._config.extra_runtime,
+                'skip_loading_weights': self._config.skip_loading_weights
+            }
+
+            # If model has a curated config, use it instead
             if self._config.model_name in AUTODEPLOY_MODEL_CONFIGS:
                 config_file = os.path.join(
                     self._llm_root,
@@ -1415,25 +1429,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 if os.path.exists(config_file):
                     with open(config_file, 'r') as f:
                         autodeploy_config = yaml.safe_load(f)
-                    print_info(f"Loaded autodeploy config from {config_file}")
-                else:
-                    print_warning(
-                        f"Autodeploy config file not found: {config_file}")
-                    autodeploy_config = {}
-            else:
-                # Create default _autodeploy specific configuration
-                autodeploy_config = {
-                    'transforms': {
-                        'compile_model': {
-                            'backend': self._config.ad_compile_backend
-                        },
-                        'resize_kv_cache': {
-                            'free_mem_ratio': self._config.free_mem_ratio
-                        },
-                    },
-                    'runtime': self._config.extra_runtime,
-                    'skip_loading_weights': self._config.skip_loading_weights
-                }
 
             print_info(f"_autodeploy model config: {autodeploy_config}")
             with open(autodeploy_config_path, 'w') as f:
