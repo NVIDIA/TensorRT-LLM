@@ -421,6 +421,9 @@ class BaseTransform(ABC):
             else:
                 mod.set_submodule(k, graph_sub)
             info = info & info_apply if info is not None else info_apply
+        # Handle case where no GraphModules were found (e.g., loaded from cache)
+        if info is None:
+            info = TransformInfo(skipped=True, num_matches=0)
         return mod, info
 
     @final

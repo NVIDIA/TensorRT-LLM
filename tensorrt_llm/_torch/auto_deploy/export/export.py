@@ -311,6 +311,7 @@ def torch_export_to_gm(
     def _capture_fn(model, args, kwargs):
         ep = te.export(model, args, kwargs, dynamic_shapes=dynamic_shapes, strict=strict)
         egm = ep.module()
+        egm._exported_program = ep  # Store for caching
         assert isinstance(egm, fx.GraphModule)
         return egm
 

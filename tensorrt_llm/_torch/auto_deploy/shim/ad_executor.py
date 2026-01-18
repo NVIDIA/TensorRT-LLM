@@ -443,8 +443,17 @@ class ADEngine(ModelEngine):
         # TODO (lucaslie): consider how we move args around InferenceOptimizer.__init__,
         # ADEngine.__init__, and ADEngine.build_from_config. Seems a bit unnatural atm.
 
+        # Create cache config if caching is enabled
+        cache_config = (
+            ad_config.create_cache_config() if hasattr(ad_config, "create_cache_config") else None
+        )
+
         # construct inference optimizer
-        build_and_optimize = InferenceOptimizer(factory=factory, config=ad_config.transforms)
+        build_and_optimize = InferenceOptimizer(
+            factory=factory,
+            config=ad_config.transforms,
+            cache_config=cache_config,
+        )
 
         # construct engine
         return cls(
