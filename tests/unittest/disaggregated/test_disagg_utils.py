@@ -1,11 +1,14 @@
+import time
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 import yaml
 
 # isort: off
 from tensorrt_llm.llmapi.disagg_utils import (
-    CtxGenServerConfig, DisaggServerConfig, extract_ctx_gen_cfgs,
-    extract_router_config, extract_disagg_cfg, get_server_configs_dict,
-    parse_disagg_config_file)
+    MIN_GLOBAL_ID, CtxGenServerConfig, DisaggServerConfig, extract_ctx_gen_cfgs,
+    extract_router_config, extract_disagg_cfg, get_global_disagg_request_id,
+    get_local_request_id, get_server_configs_dict, parse_disagg_config_file)
 # isort: on
 
 
@@ -155,3 +158,48 @@ def test_get_server_configs_dict():
     assert len(server_dict) == 2
     assert ("host1", 8001) in server_dict
     assert ("host2", 8002) in server_dict
+
+
+# test get_global_disagg_request_id
+@pytest.mark.parametrize("multithread", [True, False],
+                         ids=["multithread", "singlethread"])
+def test_get_global_disagg_request_id(multithread):
+    iter = 10000
+    node_ids = list(range(10))
+    thread_num = len(node_ids)
+
+    def get_ids(node_ids):
+        all_node_ids = [[] for _ in range(len(node_ids))]
+        for i in range(iter):
+            if i % (4000 // thread_num) == 0:
+                time.sleep(0.001)
+            for i, node_id in enumerate(node_ids):
+                all_node_ids[i].append(get_global_disagg_request_id(node_id))
+        return all_node_ids
+
+    if multithread:
+        with ThreadPoolExecutor(max_workers=len(node_ids)) as executor:
+            all_node_ids = [
+                ids[0] for ids in executor.map(get_ids, [[i] for i in node_ids])
+            ]
+    else:
+        all_node_ids = get_ids(node_ids)
+
+    all_ids = set(i for ids in all_node_ids for i in ids)
+    assert len(all_ids) == iter * len(node_ids)
+    assert all(id >= MIN_GLOBAL_ID and id < ((1 << 63) - 1) for id in all_ids)
+
+
+def test_get_local_request_id():
+    last_id = MIN_GLOBAL_ID - 100
+    ids = set()
+    for i in range(1000):
+        last_id = get_local_request_id(last_id)
+        assert last_id >= 0
+        assert last_id < MIN_GLOBAL_ID
+        ids.add(last_id)
+    assert len(ids) == 1000
+    assert min(ids) == 0
+    assert max(ids) == MIN_GLOBAL_ID - 1
+    assert max(ids) - min(ids) > (
+        1 << 40)  # ensure there is enough space for local ids

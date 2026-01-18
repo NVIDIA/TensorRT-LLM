@@ -23,6 +23,7 @@ from tensorrt_llm.llmapi.disagg_utils import (
     DisaggServerConfig,
     MetadataServerConfig,
     ServerRole,
+    get_global_disagg_request_id,
 )
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.cluster_storage import ClusterStorage, WatchEventType
@@ -115,14 +116,15 @@ class OpenAIDisaggregatedService(OpenAIService):
         need_ctx = need_ctx and not await self._check_gen_only_disagg(request)
         ctx_response = None
         gen_req = request
+        disagg_request_id = get_global_disagg_request_id(self._config.node_id)
         if need_ctx:
-            ctx_req = self._get_ctx_request(request)
+            ctx_req = self._get_ctx_request(request, disagg_request_id)
             # ctx generator is empty
             ctx_response = await self._ctx_client.send_request(
                 ctx_req, server=reserved_ctx_server, hooks=hooks
             )
             await self._verify_ctx_response(ctx_response)
-            gen_req = self._get_gen_request(request, ctx_response)
+            gen_req = self._get_gen_request(request, ctx_response, disagg_request_id)
         if ctx_response is None or self._need_gen(ctx_response):
             return await self._gen_client.send_request(
                 gen_req, server=reserved_gen_server, hooks=hooks
@@ -140,9 +142,13 @@ class OpenAIDisaggregatedService(OpenAIService):
             return False
         return True
 
-    def _get_ctx_request(self, request: UCompletionRequest) -> UCompletionRequest:
+    def _get_ctx_request(
+        self, request: UCompletionRequest, disagg_request_id: Optional[int]
+    ) -> UCompletionRequest:
         ctx_request = copy.deepcopy(request)
-        ctx_request.disaggregated_params = DisaggregatedParams(request_type="context_only")
+        ctx_request.disaggregated_params = DisaggregatedParams(
+            request_type="context_only", disagg_request_id=disagg_request_id
+        )
         ctx_request.stream = False
         ctx_request.stream_options = None
         return ctx_request
@@ -151,6 +157,7 @@ class OpenAIDisaggregatedService(OpenAIService):
         self,
         request: UCompletionRequest,
         ctx_response: UCompletionResponse,
+        disagg_request_id: Optional[int],
     ) -> UCompletionRequest:
         request.disaggregated_params = ctx_response.choices[0].disaggregated_params
         request.disaggregated_params.request_type = "generation_only"

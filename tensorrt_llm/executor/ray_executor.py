@@ -233,7 +233,8 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
         Low-level API to the executor. Return a "future" GenerationResult
         which can be waited. Forwards the request to the workers through RPC.
         """
-        request.set_id(self._get_next_client_id())
+        if request.id is None:
+            request.set_id(self._get_next_client_id())
         logprob_params = self._get_logprob_params(request)
 
         with nvtx_range_debug("rpc_submit"):
