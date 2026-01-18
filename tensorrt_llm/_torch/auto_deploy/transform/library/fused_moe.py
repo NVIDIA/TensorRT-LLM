@@ -1353,9 +1353,10 @@ def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "
 
         # For optimization reasons, we precompute a few additional arguments to the trtllm_quant_fp8_moe_fused op
         # to avoid computing them at runtime.
-        fc1_dequant = (w1_weight_scale_stacked * w1_input_scale_stacked[0]).squeeze()
-        fc2_act_scale_recip = (1.0 / w2_input_scale_stacked[0]).to(torch.float32)
-        fc2_dequant = (w2_weight_scale_stacked * w2_input_scale_stacked[0]).squeeze()
+        # Support per-expert input scales (broadcast if all experts have the same scale)
+        fc1_dequant = (w1_weight_scale_stacked * w1_input_scale_stacked).squeeze()
+        fc2_act_scale_recip = (1.0 / w2_input_scale_stacked).to(torch.float32)
+        fc2_dequant = (w2_weight_scale_stacked * w2_input_scale_stacked).squeeze()
 
         new_key_fc1_dequant = f"quant_moe_fc1_dequant_stacked_{fused_key_counter}"
         new_key_fc2_act_scale_recip = f"quant_moe_fc2_act_scale_recip_stacked_{fused_key_counter}"
