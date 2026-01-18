@@ -444,7 +444,10 @@ class ADEngine(ModelEngine):
         # ADEngine.__init__, and ADEngine.build_from_config. Seems a bit unnatural atm.
 
         # construct inference optimizer
-        build_and_optimize = InferenceOptimizer(factory=factory, config=ad_config.transforms)
+        build_and_optimize = InferenceOptimizer(
+            factory=factory,
+            config=ad_config.transforms,
+        )
 
         # construct engine
         return cls(

@@ -16,6 +16,8 @@ from ...llmapi.llm_args import (
     SamplerType,
     _ParallelConfig,
 )
+
+# Cache config is now part of export_to_gm transform
 from .models import ModelFactory, ModelFactoryRegistry
 from .utils._config import DynamicYamlMixInForSettings
 from .utils.logger import ad_logger
@@ -270,8 +272,9 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
                 if shortcut_key in self.model_fields_set:
                     self.transforms[t_key][config_key] = getattr(self, shortcut_key)
                 # then update the shortcut field with the value from the transforms config to make
-                # sure both fields are in sync
-                setattr(self, shortcut_key, self.transforms[t_key][config_key])
+                # sure both fields are in sync (only if the key exists in the transform config)
+                elif config_key in self.transforms[t_key]:
+                    setattr(self, shortcut_key, self.transforms[t_key][config_key])
 
         return self
 
