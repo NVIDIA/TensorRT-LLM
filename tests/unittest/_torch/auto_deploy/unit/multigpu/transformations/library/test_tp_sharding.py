@@ -548,7 +548,7 @@ def _run_pattern_detection_job(
                             fused_weight_dims=fused_weight_dims,
                         )
                     )
-                if is_op(node, torch.ops.auto_deploy.torch_causal_conv1d):
+                elif is_op(node, torch.ops.auto_deploy.torch_causal_conv1d):
                     expected_transformations.append(
                         WeightShardingInfo(
                             target_node=node.name,
@@ -557,10 +557,10 @@ def _run_pattern_detection_job(
                             dist_op=None,
                             min_local_shape=1,
                             layer_type=LayerType.SSM,
-                            fused_weight_dims=(num_features, 16 * num_heads, 16 * num_heads),
+                            fused_weight_dims=(num_features, 16, 16),
                         )
                     )
-                if is_op(node, torch.ops.auto_deploy.torch_ssm):
+                elif is_op(node, torch.ops.auto_deploy.torch_ssm):
                     expected_transformations.append(
                         WeightShardingInfo(
                             target_node=node.name,
@@ -572,7 +572,7 @@ def _run_pattern_detection_job(
                             fused_weight_dims=None,
                         )
                     )
-                if len(node.args) > 1 and "norm_weight" in node.args[0].name:
+                elif len(node.args) > 1 and "norm_weight" in node.args[0].name:
                     expected_transformations.append(
                         WeightShardingInfo(
                             target_node=node.name,
