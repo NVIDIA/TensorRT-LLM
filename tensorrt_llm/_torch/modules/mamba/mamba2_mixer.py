@@ -86,6 +86,7 @@ class Mamba2Mixer(nn.Module):
         self.tp_nheads = nheads // tp_size
         self.tp_ngroups = n_groups // tp_size
         self.num_heads = nheads
+        self.tp_size = tp_size
 
         self.layer_idx = layer_idx
         self.d_conv = d_conv

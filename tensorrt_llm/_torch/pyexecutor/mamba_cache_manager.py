@@ -405,7 +405,7 @@ class MambaCacheManager(BaseResourceManager):
         _, state_indices_d = torch.split(state_indices, batch_split_size)
 
         num_accepted_draft_tokens_list = []
-        for seq in scheduled_batch.generation_requests:
+        for seq in scheduled_batch.generation_requests[:num_decodes]:
             num_accepted_draft_tokens_list.append(
                 seq.py_num_accepted_draft_tokens)
 
