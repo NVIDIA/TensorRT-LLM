@@ -10,7 +10,7 @@ from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.speculative.drafting_loops import TreeDraftingLoopWrapper
 from tensorrt_llm._torch.speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
 from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
-from tensorrt_llm.llmapi import EagleDecodingConfig
+from tensorrt_llm.llmapi import Eagle3DecodingConfig
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -84,7 +84,7 @@ def test_draft_token_static_tree_prepare_for_generation():
         )
 
         # 2) Create spec metadata
-        spec_config = EagleDecodingConfig(
+        spec_config = Eagle3DecodingConfig(
             max_draft_len=max_draft_len,
             max_total_draft_tokens=max_total_draft_tokens,
             speculative_model=eagle_model_dir,
