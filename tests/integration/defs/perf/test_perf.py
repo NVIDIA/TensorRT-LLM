@@ -238,6 +238,17 @@ TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=
     "llama_v3.1_nemotron_ultra_253b_fp8",
 }
 
+# Autodeploy model configs - maps model names to curated YAML config files
+AUTODEPLOY_MODEL_CONFIGS = {
+    'deepseek_r1': 'deepseek-r1-latency.yaml',
+    'deepseek_r1_fp8': 'deepseek-r1-latency.yaml',
+    'llama_v3.3_70b_instruct_fp8': 'llama-3.3-70b.yaml',
+}
+
+# Path to curated configs directory
+AUTODEPLOY_CONFIGS_DIR = os.path.join(os.path.dirname(__file__),
+                                      '../../../../examples/configs/curated')
+
 
 def get_model_dir(model_name: str):
     model_dir = ""
@@ -1401,7 +1412,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 os.makedirs(os.path.dirname(autodeploy_config_path),
                             exist_ok=True)
 
-            # Create _autodeploy specific configuration
+            # Default autodeploy config
             autodeploy_config = {
                 'transforms': {
                     'compile_model': {
@@ -1414,6 +1425,15 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 'runtime': self._config.extra_runtime,
                 'skip_loading_weights': self._config.skip_loading_weights
             }
+
+            # If model has a curated config, use it instead
+            if self._config.model_name in AUTODEPLOY_MODEL_CONFIGS:
+                config_file = os.path.join(
+                    AUTODEPLOY_CONFIGS_DIR,
+                    AUTODEPLOY_MODEL_CONFIGS[self._config.model_name])
+                if os.path.exists(config_file):
+                    with open(config_file, 'r') as f:
+                        autodeploy_config = yaml.safe_load(f)
 
             print_info(f"_autodeploy model config: {autodeploy_config}")
             with open(autodeploy_config_path, 'w') as f:

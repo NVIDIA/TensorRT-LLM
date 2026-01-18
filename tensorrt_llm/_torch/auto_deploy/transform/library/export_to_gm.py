@@ -41,6 +41,15 @@ class ExportToGMConfig(TransformConfig):
         "Default is to apply all registered patches.",
         default=None,
     )
+    enable_cache: bool = Field(
+        description="Enable caching of exported graph to speed up subsequent runs.",
+        default=True,
+    )
+    cache_dir: Optional[str] = Field(
+        description="Directory to store export cache. "
+        "Defaults to TRTLLM_CACHE_DIR/autodeploy/export or ~/.cache/autodeploy/export.",
+        default=None,
+    )
 
 
 @contextmanager

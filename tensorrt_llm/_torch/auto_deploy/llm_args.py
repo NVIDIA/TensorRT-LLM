@@ -16,7 +16,8 @@ from ...llmapi.llm_args import (
     SamplerType,
     _ParallelConfig,
 )
-from .cache import CompilationCacheConfig
+
+# Cache config is now part of export_to_gm transform
 from .models import ModelFactory, ModelFactoryRegistry
 from .utils._config import DynamicYamlMixInForSettings
 from .utils.logger import ad_logger
@@ -177,29 +178,6 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
         "the value is the transform configuration.",
     )
 
-    ### COMPILATION CACHE CONFIG ###################################################################
-    compilation_cache_dir: Optional[str] = Field(
-        default=None,
-        description="Directory to store compilation cache. Supports environment variable expansion "
-        "(e.g., $SCRATCH/cache). Defaults to AUTODEPLOY_CACHE_DIR env var or ~/.cache/autodeploy/compilation.",
-    )
-
-    enable_compilation_cache: bool = Field(
-        default=True,
-        description="Enable compilation caching to reduce startup time on subsequent runs. "
-        "Uses torch.export.save/load for robust serialization.",
-    )
-
-    compilation_cache_save: bool = Field(
-        default=True,
-        description="Save compilation results to cache after compilation.",
-    )
-
-    compilation_cache_load: bool = Field(
-        default=True,
-        description="Load from compilation cache if a valid cache exists.",
-    )
-
     ### SHORTCUTS FOR COMMON INFERENCE OPTIMIZER CONFIGS ###########################################
     attn_backend: str = Field(
         default="flashinfer",
@@ -294,8 +272,9 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
                 if shortcut_key in self.model_fields_set:
                     self.transforms[t_key][config_key] = getattr(self, shortcut_key)
                 # then update the shortcut field with the value from the transforms config to make
-                # sure both fields are in sync
-                setattr(self, shortcut_key, self.transforms[t_key][config_key])
+                # sure both fields are in sync (only if the key exists in the transform config)
+                elif config_key in self.transforms[t_key]:
+                    setattr(self, shortcut_key, self.transforms[t_key][config_key])
 
         return self
 
@@ -337,22 +316,6 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
             tokenizer_kwargs=self.tokenizer_kwargs,
             skip_loading_weights=self.skip_loading_weights,
             max_seq_len=self.max_seq_len,
-        )
-
-    def create_cache_config(self) -> Optional[CompilationCacheConfig]:
-        """Create a cache configuration from the arguments.
-
-        Returns:
-            CompilationCacheConfig if caching is enabled, None otherwise.
-        """
-        if not self.enable_compilation_cache:
-            return None
-
-        return CompilationCacheConfig(
-            cache_dir=self.compilation_cache_dir,
-            enabled=self.enable_compilation_cache,
-            save_cache=self.compilation_cache_save,
-            load_cache=self.compilation_cache_load,
         )
 
     def to_dict(self) -> Dict[str, Any]:
