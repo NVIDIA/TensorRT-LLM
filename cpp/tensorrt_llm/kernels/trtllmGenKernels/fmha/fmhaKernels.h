@@ -690,6 +690,11 @@ private:
             {
                 continue;
             }
+            // If tileSizeQ < mNumHeadsQPerKv, this will result in 0, causing division by zero.
+            if (tileSizeQ < params.mNumHeadsQPerKv)
+            {
+                continue;
+            }
 
             // Update the tileSizeQ.
             selectKernelParamsCopy.mTileSizeQ = tileSizeQ;
