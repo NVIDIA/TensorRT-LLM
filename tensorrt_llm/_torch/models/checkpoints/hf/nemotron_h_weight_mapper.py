@@ -1,5 +1,6 @@
 import torch
 
+import tensorrt_llm.logger as logger
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import \
     HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
@@ -54,6 +55,16 @@ class NemotronHHfWeightMapper(HfWeightMapper):
             # change embedding layer to embed_token
             if "embeddings" in key:
                 key = key.replace("embeddings", "embed_tokens")
+
+            # MTP layers are stored as mtp.layers.0.xxx (sublayer 0, Attention) and mtp.layers.1.xxx (sublayer 1, MoE)
+            if "mtp.layers." in key:
+                import re
+                match = re.match(r'mtp\.layers\.(\d+)\.(.*)', key)
+                if match:
+                    sublayer_idx, rest = match.groups()
+                    key = f"model.layers.{config.num_hidden_layers}.layers.{sublayer_idx}.{rest}"
+                else:
+                    logger.warning(f"Failed to match MTP pattern for: {name}")
 
             if "A_log" in key:
                 key = key.replace("A_log", "A")
