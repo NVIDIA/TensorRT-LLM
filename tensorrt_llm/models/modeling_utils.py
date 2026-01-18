@@ -459,7 +459,17 @@ class QuantConfig:
         return self._update_from_legacy_args(hf_quant_config, moe_backend,
                                              checkpoint_dir)
 
-    def load_quant_config_from_dtypes_json(self, dtypes_json_file, moe_backend):
+    def load_quant_config_from_dtypes_json(self, dtypes_json_file: str,
+                                           moe_backend: str) -> tuple:
+        """Load quantization config from dtypes.json file.
+
+        Args:
+            dtypes_json_file (str): Path to the dtypes.json file.
+            moe_backend (str): The MoE backend type (e.g., 'CUTLASS', 'TRTLLM', 'TRITON').
+
+        Returns:
+            tuple: A tuple of (is_quant_config_changed, layer_quant_config).
+        """
         layer_quant_config = None
 
         exclude_modules = set()
@@ -492,10 +502,24 @@ class QuantConfig:
 
         return True, layer_quant_config
 
-    def update_from_model_ckpt(self, model_ckpt_path: Path, moe_backend: str):
-        hf_quant_config_path = Path(model_ckpt_path / "hf_quant_config.json")
-        hf_config_path = Path(model_ckpt_path / "config.json")
-        quant_config_dtypes = Path(model_ckpt_path / 'dtypes.json')
+    def update_from_model_ckpt(self, model_ckpt_path: str,
+                               moe_backend: str) -> tuple:
+        """Update quantization config from model checkpoint.
+
+        Automatically detects and loads quantization configuration from various
+        checkpoint formats including hf_quant_config.json, config.json, or dtypes.json.
+
+        Args:
+            model_ckpt_path (str): Path to the model checkpoint directory.
+            moe_backend (str): The MoE backend type (e.g., 'CUTLASS', 'TRTLLM', 'TRITON').
+
+        Returns:
+            tuple: A tuple of (is_quant_config_changed, layer_quant_config).
+        """
+        model_ckpt_path = Path(model_ckpt_path)
+        hf_quant_config_path = model_ckpt_path / "hf_quant_config.json"
+        hf_config_path = model_ckpt_path / "config.json"
+        quant_config_dtypes = model_ckpt_path / 'dtypes.json'
         if hf_quant_config_path.exists():
             logger.info(
                 f"Found {hf_quant_config_path}, pre-quantized checkpoint is used."
