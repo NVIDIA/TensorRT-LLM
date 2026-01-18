@@ -351,13 +351,14 @@ def maybe_pad_for_cuda_graph(func):
         def _call_func():
             return func(self, scheduled_requests, resource_manager, *args, **kwargs)
 
-        # check if we use cuda graph and we can run it
-        if not (self.cuda_graph_used and scheduled_requests.can_run_cuda_graph):
-            return _call_func()
+        # check conditions for current rank
+        can_run_cuda_graph = self.cuda_graph_used and scheduled_requests.can_run_cuda_graph
+        batch_size = scheduled_requests.batch_size
 
         # generate a persistent dummy request right away to ensure we can reserve the necessary
-        # resources (kv page and slot)
-        if self.padding_dummy_request is None:
+        # resources (kv page and slot) the first time we can actually run cuda graph according to
+        # this rank
+        if can_run_cuda_graph and self.padding_dummy_request is None:
             self.padding_dummy_request = _generate_dummy_request(
                 resource_manager,
                 request_id=CUDA_GRAPH_DUMMY_REQUEST_ID,
@@ -367,20 +368,45 @@ def maybe_pad_for_cuda_graph(func):
                 max_beam_width=self.max_beam_width,
             )
 
-        # check closest cuda graph batch size
-        closest_cg_bs = _round_up_to_closest(
-            self.cuda_graph_batch_sizes, scheduled_requests.batch_size
-        )
+        # check if we can pad the batch based on the availability of the dummy request
+        can_pad = self.padding_dummy_request is not None
 
-        # check if we need to pad
-        num_padding = closest_cg_bs - scheduled_requests.batch_size
+        # in attention DP mode, we check all ranks
+        if self.enable_attention_dp and self.mapping.tp_size > 1:
+            assert self.dist is not None, "Distributed object is required for attention DP mode"
+            all_rank_info = self.dist.tp_allgather([can_run_cuda_graph, can_pad, batch_size])
+        else:
+            all_rank_info = [[can_run_cuda_graph, can_pad, batch_size]]
 
-        if num_padding <= 0:
+        # now let's check if we can run cuda graph and pad the batch for all ranks
+        can_run_cuda_graph_all = all(r_info[0] for r_info in all_rank_info)
+        max_batch_size = max(r_info[2] for r_info in all_rank_info)
+
+        # let's check if all ranks can pad the batch if they need to
+        can_pad_all = all(r_info[1] or (r_info[2] == max_batch_size) for r_info in all_rank_info)
+
+        # fall back if we cannot run cudagraph
+        if not (can_run_cuda_graph_all and can_pad_all):
             return _call_func()
 
-        # check if we have a dummy request to use
-        if self.padding_dummy_request is None:
-            ad_logger.info("No CUDA graph padding possible due to missing dummy request.")
+        # check if cudagraph batch size is available
+        # NOTE: we assume uniform cudagraph batch sizes across all ranks ensuring all ranks get the
+        # same closest cudagraph batch size here based on the max batch size across all ranks
+        closest_cg_bs = _round_up_to_closest(self.cuda_graph_batch_sizes, max_batch_size)
+
+        if closest_cg_bs is None:
+            return _call_func()
+
+        # check actual amount of padding needed
+        num_padding = closest_cg_bs - batch_size
+
+        # we should only hit this point for either of these conditions
+        assert num_padding == 0 or (num_padding > 0 and self.padding_dummy_request is not None), (
+            "Padding should not be needed or available at this point"
+        )
+
+        # no padding needed on current rank
+        if num_padding == 0:
             return _call_func()
 
         # pad the scheduled requests with the dummy request
@@ -411,7 +437,12 @@ class ADEngine(ModelEngine):
         return self.cache_seq_interface.device
 
     @classmethod
-    def build_from_config(cls, ad_config: LlmArgs, mapping: Optional[Mapping] = None):
+    def build_from_config(
+        cls,
+        ad_config: LlmArgs,
+        mapping: Optional[Mapping] = None,
+        dist: Optional[Distributed] = None,
+    ):
         """Build the ADEngine using the LlmArgs that gets passed through from the LLM."""
 
         max_batch_size = ad_config.max_batch_size
@@ -453,6 +484,7 @@ class ADEngine(ModelEngine):
             device,
             ad_config=ad_config,
             mapping=mapping,
+            dist=dist,
             reporting_info=reporting_info,
         )
 
@@ -464,6 +496,7 @@ class ADEngine(ModelEngine):
         device: DeviceLikeType,
         ad_config: Optional[LlmArgs] = None,
         mapping: Optional[Mapping] = None,
+        dist: Optional[Distributed] = None,
         reporting_info: ReportingInfo = ReportingInfo(),
     ) -> None:
         """Initialize the engine with model and sequence information."""
@@ -484,7 +517,7 @@ class ADEngine(ModelEngine):
         self.iter_states = {}
 
         # NOTE (lucaslie): not a declared base member in the base class; required by PyExecutor...
-        self.enable_attention_dp = False
+        self.enable_attention_dp = mapping.enable_attention_dp if mapping else False
 
         if ad_config is not None:
             self.max_beam_width = ad_config.max_beam_width
@@ -537,6 +570,7 @@ class ADEngine(ModelEngine):
 
         # Reuse _execute_logit_post_processors from PyTorchModelEngine
         self.mapping = mapping
+        self.dist = dist
         self._execute_logit_post_processors = types.MethodType(
             PyTorchModelEngine._execute_logit_post_processors, self
         )
@@ -1005,12 +1039,22 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     # initialize process groups
     world_size = mpi_world_size()
     rank = mpi_rank()
-    dist_mapping = Mapping(rank=rank, world_size=world_size, tp_size=world_size)
+    enable_attention_dp = ad_config.transforms.get("detect_sharding", {}).get(
+        "enable_attention_dp", False
+    )
+    dist_mapping = Mapping(
+        rank=rank,
+        world_size=world_size,
+        tp_size=world_size,
+        enable_attention_dp=enable_attention_dp,
+    )
     dist = Distributed.get(dist_mapping)
     ad_logger.set_rank(rank)
     torch.cuda.set_device(rank)
     port = dist.broadcast(get_free_port())  # use MPI broadcast to pick a free port
     initialize_or_skip(rank, world_size, port)
+
+    ad_logger.info(f"{dist_mapping=}, {dist=}, {port=}")
 
     # Setup AutoTuner with distributed state for allreduce autotuning
     AutoTuner.get().setup_distributed_state(dist_mapping)
@@ -1030,7 +1074,7 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     )
 
     # initialize model engine
-    engine = ADEngine.build_from_config(ad_config=ad_config, mapping=dist_mapping)
+    engine = ADEngine.build_from_config(ad_config=ad_config, mapping=dist_mapping, dist=dist)
 
     spec_config = ad_config.speculative_config
     if spec_config is not None and not (
