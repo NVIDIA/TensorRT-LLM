@@ -295,7 +295,6 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device_memory(180000)
-    @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize("world_size", [4, 8])
     def test_fp8(self, world_size):
         if get_device_count() < world_size:
