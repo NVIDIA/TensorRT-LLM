@@ -21,7 +21,10 @@ def model_path():
     return llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 
 
-def create_llm(model_dir, disable_overlap_scheduler, sampler_type):
+def create_llm(model_dir,
+               disable_overlap_scheduler,
+               sampler_type,
+               env_overrides=None):
     """Create LLM with specific overlap scheduler setting"""
     pytorch_config = dict(disable_overlap_scheduler=disable_overlap_scheduler,
                           sampler_type=sampler_type)
@@ -37,14 +40,23 @@ def create_llm(model_dir, disable_overlap_scheduler, sampler_type):
         **pytorch_config,
         kv_cache_config=trt_kv_cache_config,
         max_num_tokens=
-        128  # Only one request longer than max_num_tokens is required to test chunked prefill
+        128,  # Only one request longer than max_num_tokens is required to test chunked prefill
+        env_overrides=env_overrides,
     )
 
 
 @pytest.mark.parametrize("sampler_type", ["TorchSampler", "TRTLLMSampler"])
+@pytest.mark.parametrize("use_python_scheduler", [False, True],
+                         ids=["cpp_scheduler", "python_scheduler"])
 @pytest.mark.high_cuda_memory
 @pytest.mark.mpi_ray_parity
-def test_overlap_scheduler_consistency(model_path, test_case, sampler_type):
+def test_overlap_scheduler_consistency(model_path, test_case, sampler_type,
+                                       use_python_scheduler):
+    # Use env_overrides to pass env var to MPI subprocess
+    env_overrides = {
+        "TLLM_USE_PYTHON_SCHEDULER": "1"
+    } if use_python_scheduler else {}
+
     # Test configuration
     prompts = test_case["prompts"]
     max_new_tokens = test_case["max_new_tokens"]
@@ -62,7 +74,8 @@ def test_overlap_scheduler_consistency(model_path, test_case, sampler_type):
     # Test with overlap scheduler enabled
     with create_llm(model_path,
                     disable_overlap_scheduler=False,
-                    sampler_type=sampler_type) as llm:
+                    sampler_type=sampler_type,
+                    env_overrides=env_overrides) as llm:
         outputs_with_overlap = llm.generate(prompts,
                                             sampling_params=sampling_config,
                                             use_tqdm=True)
@@ -73,7 +86,8 @@ def test_overlap_scheduler_consistency(model_path, test_case, sampler_type):
     # Test with overlap scheduler disabled
     with create_llm(model_path,
                     disable_overlap_scheduler=True,
-                    sampler_type=sampler_type) as llm:
+                    sampler_type=sampler_type,
+                    env_overrides=env_overrides) as llm:
         outputs_without_overlap = llm.generate(prompts,
                                                sampling_params=sampling_config,
                                                use_tqdm=True)

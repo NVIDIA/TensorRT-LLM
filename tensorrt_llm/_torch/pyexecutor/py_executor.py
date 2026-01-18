@@ -2041,6 +2041,7 @@ class PyExecutor:
     def _schedule(self):
         scheduler_output = self.scheduler.schedule_request(
             self.active_requests, self.inflight_req_ids)
+
         scheduled_context_requests = scheduler_output.context_requests
         if self.enable_attention_dp and self.attention_dp_enable_balance:
             scheduled_context_requests = self._balance_adp_requests(
@@ -2060,6 +2061,7 @@ class PyExecutor:
         scheduled_requests.context_requests = scheduled_context_requests
         scheduled_requests.generation_requests = scheduler_output.generation_requests
         scheduled_requests.paused_requests = scheduler_output.paused_requests
+
         return scheduled_requests, scheduler_output.fitting_disagg_gen_init_requests, scheduler_output.num_fitting_requests
 
     @nvtx_range("_check_disagg_gen_transfer_status")
