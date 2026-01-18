@@ -1,3 +1,4 @@
+import inspect
 import os
 from functools import cached_property
 from typing import Dict, List, Optional, Union
@@ -21,9 +22,9 @@ from .interface import AlltoallMethodType, MoE, MoEWeightLoadingMode
 # isort: off
 from .quantization import (
     DeepSeekFP8BlockScalesFusedMoEMethod, NVFP4TRTLLMGenFusedMoEBaseMethod,
-    NVFP4TRTLLMGenFusedMoEMethod, UnquantizedFusedMoEMethod,
-    W4A8MXFP4FP8TRTLLMGenFusedMoEMethod, W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod,
-    W4A8NVFP4FP8TRTLLMGenFusedMoEMethod, W4A16MXFP4TRTLLMGenFusedMoEMethod)
+    NVFP4TRTLLMGenFusedMoEMethod, W4A8MXFP4FP8TRTLLMGenFusedMoEMethod,
+    W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod, W4A8NVFP4FP8TRTLLMGenFusedMoEMethod,
+    W4A16MXFP4TRTLLMGenFusedMoEMethod)
 # isort: on
 from .routing import BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod
 
@@ -273,16 +274,12 @@ class TRTLLMGenFusedMoE(MoE):
         assert len(weights) == 1
         weights = weights[0]
 
-        if not isinstance(self.quant_method, UnquantizedFusedMoEMethod):
-            assert not allow_partial_loading, "Partial loading is not supported for quantized MoE now"
-            self.quant_method.load_weights(self, weights,
-                                           self.weight_loading_mode)
-        else:
-            self.quant_method.load_weights(
-                self,
-                weights,
-                self.weight_loading_mode,
-                allow_partial_loading=allow_partial_loading)
+        kargs = {}
+        if "allow_partial_loading" in inspect.getfullargspec(
+                self.quant_method.load_weights).args:
+            kargs["allow_partial_loading"] = allow_partial_loading
+        self.quant_method.load_weights(self, weights, self.weight_loading_mode,
+                                       **kargs)
 
     def post_load_weights(self):
         self.quant_method.post_load_weights(self)
