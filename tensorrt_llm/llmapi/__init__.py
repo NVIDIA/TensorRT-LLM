@@ -5,7 +5,8 @@ from ..sampling_params import GuidedDecodingParams, SamplingParams
 from .build_cache import BuildCacheConfig
 from .llm import LLM, RequestOutput
 # yapf: disable
-from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BatchingType,
+from .llm_args import (AetherSparseAttentionConfig, AttentionDpConfig,
+                       AutoDecodingConfig, BatchingType,
                        CacheTransceiverConfig, CalibConfig,
                        CapacitySchedulerPolicy, ContextChunkingPolicy,
                        CudaGraphConfig, DeepSeekSparseAttentionConfig,
@@ -67,4 +68,5 @@ __all__ = [
     'RocketSparseAttentionConfig',
     'DeepSeekSparseAttentionConfig',
     'SkipSoftmaxAttentionConfig',
+    'AetherSparseAttentionConfig',
 ]
