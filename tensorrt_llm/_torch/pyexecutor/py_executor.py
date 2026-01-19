@@ -105,6 +105,8 @@ class BatchState:
     iter_start_time: float = 0
     iter_stats: IterationStats = None
     ctx_transmission_reqs: list[LlmRequest] = None
+    attn_metadata: 'TrtllmAttentionMetadata' = None
+    scheduled_batch: 'ScheduledRequests' = None
 
 
 @dataclasses.dataclass
@@ -1213,9 +1215,12 @@ class PyExecutor:
                                                 'attn_metadata', None)
                         kv_cache_dtype_byte_size = getattr(
                             self.model_engine, 'kv_cache_dtype_byte_size', None)
+
                         self.resource_manager.update_resources(
-                            previous_scheduled_batch, attn_metadata,
-                            kv_cache_dtype_byte_size)
+                            previous_scheduled_batch,
+                            attn_metadata,
+                            kv_cache_dtype_byte_size,
+                            sample_state=previous_batch.sample_state)
 
                         self._remove_inflight_ids(previous_batch)
 
@@ -1483,9 +1488,12 @@ class PyExecutor:
                                             None)
                     kv_cache_dtype_byte_size = getattr(
                         self.model_engine, 'kv_cache_dtype_byte_size', None)
+
                     self.resource_manager.update_resources(
-                        scheduled_batch, attn_metadata,
-                        kv_cache_dtype_byte_size)
+                        scheduled_batch,
+                        attn_metadata,
+                        kv_cache_dtype_byte_size,
+                        sample_state=sample_state)
                     if self.enable_kv_cache_events:
                         self._add_kv_cache_events()
 
@@ -1758,11 +1766,16 @@ class PyExecutor:
                         iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
                             'num_ctx_tokens']
 
+                    # save attn_metadata and scheduled_batch for next iteration's update_resources
+                    attn_metadata_to_save = getattr(self.model_engine,
+                                                    'attn_metadata', None)
                     self.previous_batch = BatchState(
                         sample_state=sample_state,
                         iter_start_time=iter_start_time,
                         iter_stats=iter_stats,
-                        ctx_transmission_reqs=ctx_transmission_reqs)
+                        ctx_transmission_reqs=ctx_transmission_reqs,
+                        attn_metadata=attn_metadata_to_save,
+                        scheduled_batch=scheduled_batch)
 
                 if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
                     self._check_kv_transfer_timeout()
@@ -1868,13 +1881,18 @@ class PyExecutor:
 
         self._handle_canceled_requests()
         finished_requests = self._handle_responses()
-        scheduled_requests = self.previous_batch.sample_state.scheduled_requests
-        attn_metadata = getattr(self.model_engine, 'attn_metadata', None)
+        # use saved scheduled_batch, because sample_state.scheduled_requests might have been updated
+        scheduled_requests = getattr(
+            self.previous_batch, 'scheduled_batch',
+            self.previous_batch.sample_state.scheduled_requests)
+        # use saved attn_metadata in previous_batch, instead of current model_engine's
+        attn_metadata = getattr(self.previous_batch, 'attn_metadata', None)
         kv_cache_dtype_byte_size = getattr(self.model_engine,
                                            'kv_cache_dtype_byte_size', None)
         self.resource_manager.update_resources(scheduled_requests,
                                                attn_metadata,
-                                               kv_cache_dtype_byte_size)
+                                               kv_cache_dtype_byte_size,
+                                               self.previous_batch.sample_state)
         if self.enable_kv_cache_events:
             self._add_kv_cache_events()
 

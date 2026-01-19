@@ -593,7 +593,8 @@ class KVCacheManager(BaseResourceManager):
     def update_resources(self,
                          scheduled_batch: ScheduledRequests,
                          attn_metadata: "AttentionMetadata" = None,
-                         kv_cache_dtype_byte_size: float = None):
+                         kv_cache_dtype_byte_size: float = None,
+                         sample_state: Optional["SampleState"] = None):
         if not self.is_draft:
             self.update_kv_cache_draft_token_location(scheduled_batch,
                                                       attn_metadata,
@@ -1413,13 +1414,15 @@ class ResourceManager:
     def update_resources(self,
                          scheduled_batch: ScheduledRequests,
                          attn_metadata: Optional["AttentionMetadata"] = None,
-                         kv_cache_dtype_byte_size: Optional[float] = None):
+                         kv_cache_dtype_byte_size: Optional[float] = None,
+                         sample_state: Optional["SampleState"] = None):
         for _, resource_manager in self.resource_managers.items():
             if hasattr(resource_manager, "update_resources"):
                 if isinstance(resource_manager, KVCacheManager):
                     resource_manager.update_resources(scheduled_batch,
                                                       attn_metadata,
-                                                      kv_cache_dtype_byte_size)
+                                                      kv_cache_dtype_byte_size,
+                                                      sample_state)
                 else:
                     resource_manager.update_resources(scheduled_batch)
 

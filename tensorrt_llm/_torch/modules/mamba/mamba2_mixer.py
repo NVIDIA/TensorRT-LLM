@@ -405,4 +405,4 @@ class Mamba2Mixer(nn.Module):
         # out_proj
         out = self.out_proj(hidden_states)
 
-        return out
+        return out[:num_actual_tokens]
