@@ -666,7 +666,7 @@ class BaseLLM:
             if sampling_params.prompt_logprobs and not sampling_params.return_context_logits:
                 sampling_params.return_context_logits = True
                 sampling_params._context_logits_auto_enabled = True
-            if sampling_params.logprobs and not sampling_params.return_generation_logits:
+            if sampling_params.logprobs is not None and not sampling_params.return_generation_logits:
                 sampling_params.return_generation_logits = True
                 sampling_params._generation_logits_auto_enabled = True
 
@@ -737,7 +737,7 @@ class BaseLLM:
                 f"Example: LLM(..., build_config=BuildConfig(gather_context_logits=True))."
             )
 
-        if sampling_params.logprobs and not self.args.gather_generation_logits:
+        if sampling_params.logprobs is not None and not self.args.gather_generation_logits:
             raise ValueError(
                 f"`sampling_params.logprobs={sampling_params.logprobs}` requires `gather_generation_logits=True` "
                 f"to be passed explicitly to the `LLM()` constructor.")
