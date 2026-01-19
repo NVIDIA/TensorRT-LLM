@@ -189,7 +189,6 @@ def save_env_file(env_file, server_env_var, worker_env_var, ctx_worker_env_var,
 
 
 def submit_job(config, log_dir, dry_run):
-    script_dir = os.path.dirname(os.path.abspath(__file__))
     # Extract configurations
     slurm_config = config['slurm']
     slurm_config.setdefault('extra_args', '')
@@ -199,6 +198,12 @@ def submit_job(config, log_dir, dry_run):
     env_config = config['environment']
     worker_config = config['worker_config']
     benchmark_config = config['benchmark']
+
+    if 'work_dir' in env_config and os.path.isdir(env_config['work_dir']):
+        script_dir = env_config['work_dir']
+    else:
+        script_dir = os.path.dirname(os.path.abspath(
+            __file__))
 
     # Set default accuracy configuration for backward compatibility
     if 'accuracy' not in config:
@@ -281,7 +286,7 @@ def submit_job(config, log_dir, dry_run):
     if 'log_dir' in env_config and env_config['log_dir']:
         log_dir = env_config['log_dir']
     if log_dir is None:
-        log_base = os.path.join(env_config['work_dir'], "logs")
+        log_base = os.path.join(script_dir, "logs")
 
         date_prefix = datetime.now().strftime("%Y%m%d-%H%M%S")
         log_base = os.path.join(log_base, f"{date_prefix}/{isl}-{osl}")
@@ -514,7 +519,7 @@ def submit_job(config, log_dir, dry_run):
 
         # Environment and paths
         '--trtllm-repo', env_config['trtllm_repo'],
-        '--work-dir', script_dir,  # Use script_dir instead of work_dir
+        '--work-dir', script_dir,
         '--full-logdir', log_dir,
         '--container-name', container_name,
         '--container-mount', container_mount_str,
