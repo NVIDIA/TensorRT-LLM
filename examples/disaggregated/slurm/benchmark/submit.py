@@ -170,6 +170,7 @@ def replace_env_in_file(log_dir, file_path, env_var):
 
 def save_env_file(env_file, server_env_var, worker_env_var, ctx_worker_env_var,
                   gen_worker_env_var):
+
     def get_env_var_str(env_var_str):
         env_data = {}
         for env_var in env_var_str.split():
@@ -202,8 +203,7 @@ def submit_job(config, log_dir, dry_run):
     if 'work_dir' in env_config and os.path.isdir(env_config['work_dir']):
         script_dir = env_config['work_dir']
     else:
-        script_dir = os.path.dirname(os.path.abspath(
-            __file__))
+        script_dir = os.path.dirname(os.path.abspath(__file__))
 
     # Set default accuracy configuration for backward compatibility
     if 'accuracy' not in config:
@@ -308,9 +308,11 @@ def submit_job(config, log_dir, dry_run):
             shutil.rmtree(log_dir)
         else:
             print(
-                f"[WARNING] trtllm_config.yaml exists, not removing the directory: {log_dir}")
+                f"[WARNING] trtllm_config.yaml exists, not removing the directory: {log_dir}"
+            )
             for file in os.listdir(log_dir):
-                if file != 'trtllm_config.yaml' and not file.startswith('concurrency_'):
+                if file != 'trtllm_config.yaml' and not file.startswith(
+                        'concurrency_'):
                     if os.path.isdir(os.path.join(log_dir, file)):
                         shutil.rmtree(os.path.join(log_dir, file))
                     else:
@@ -434,7 +436,8 @@ def submit_job(config, log_dir, dry_run):
         if benchmark_config['use_nv_sa_benchmark']:
             if benchmark_config['mode'] == "gen_only":
                 print(
-                    f"[ERROR] SA benchmark client script is not supported for gen_only mode")
+                    f"[ERROR] SA benchmark client script is not supported for gen_only mode"
+                )
                 sys.exit(1)
             benchmark_cmd = [
                 f"bash {os.path.join(script_dir, 'run_benchmark_nv_sa.sh')}",
@@ -492,8 +495,8 @@ def submit_job(config, log_dir, dry_run):
 
     # Verify the script file exists
     if not os.path.exists(slurm_script_file):
-        print(
-            f"[ERROR] SLURM script file not found: {slurm_script_file}", file=sys.stderr)
+        print(f"[ERROR] SLURM script file not found: {slurm_script_file}",
+              file=sys.stderr)
         sys.exit(1)
 
     # Prepare sbatch command
