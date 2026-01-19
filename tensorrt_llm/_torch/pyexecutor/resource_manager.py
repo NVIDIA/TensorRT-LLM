@@ -1069,8 +1069,8 @@ class KVCacheManager(BaseResourceManager):
             window_size_to_layers_map[window_size].append(local_layer_idx)
         return window_size_to_layers_map
 
-    @staticmethod
     def adjust_window_sizes_for_vswa(
+        self,
         window_size_to_layers: Dict[int, List[int]],
         max_attention_window_vec: List[int],
         kv_cache_config: KvCacheConfig,
@@ -1087,8 +1087,7 @@ class KVCacheManager(BaseResourceManager):
 
         def calculate_cache_size_per_token(layers: Set[int]) -> int:
             # Same as BaseKVCacheManager::calculateCacheSizePerTokenForSingleWindowSize
-            total_kv_heads = sum(model_config.num_kv_heads_per_layer[i]
-                                 for i in layers)
+            total_kv_heads = sum(self.num_kv_heads_per_layer[i] for i in layers)
             return total_kv_heads * kv_factor * model_config.head_size
 
         # Calculate the required memory bytes per sequence.
