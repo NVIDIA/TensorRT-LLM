@@ -8,6 +8,7 @@ from typing import Callable, Iterable, List, Optional, Tuple, Union
 
 import torch
 from pydantic import BaseModel, ConfigDict
+from torch import nn
 from torch._ops import OpOverload, OpOverloadPacket
 from torch.fx import GraphModule, Node
 
@@ -49,6 +50,19 @@ class LayerSubgraph(BaseModel):
     terminating_node: Union[Node, None]
     layer_type: LayerType
     min_local_shape: int = 1
+
+
+class WeightNode(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    node: Node
+    tensor: torch.Tensor
+    node_key: str
+    submod: nn.Module
+
+
+class WeightNodes(BaseModel):
+    weights: list[WeightNode]
+    biases: list[WeightNode]
 
 
 @dataclass
@@ -129,8 +143,26 @@ def get_quantization_params_from_linear_node(linear_op: torch.fx.node.Node):
     return input_params, weight_params, output_params
 
 
-def extract_weight_node(node: Node) -> int:
-    """Extracts the weight node from the given parametrized node"""
+def extract_weight_name(node: Node) -> str:
+    weight_nodes = extract_weight_nodes(node)
+    return weight_nodes.weights[0].node_key
+
+
+def get_param_or_buffer(tensor_name: str, gm: GraphModule) -> torch.Tensor:
+    if tensor_name in dict(gm.named_parameters()):
+        return gm.get_parameter(tensor_name)
+    elif tensor_name in dict(gm.named_buffers()):
+        return gm.get_buffer(tensor_name)
+    else:
+        raise KeyError(f"Tensor {tensor_name} not found in the graph")
+
+
+def extract_weight_nodes(node: Node) -> WeightNodes:
+    """Extracts the list of weight node and optional bias node from the given parametrized node"""
+    gm = node.graph.owning_module
+    param_names = {name for name, _ in gm.named_parameters()}.union(
+        {name for name, _ in gm.named_buffers()}
+    )
 
     def find_get_attr_node(weight_node: Node) -> Node:
         """Recursively traverse inputs of allowed nodes to find a node with 'get_attr' op."""
@@ -141,7 +173,12 @@ def extract_weight_node(node: Node) -> int:
             torch.ops.aten.view.default,
         }
 
-        if weight_node.op == "get_attr":
+        if (
+            weight_node.op == "get_attr"
+            and weight_node.target in param_names
+            and has_shape(weight_node)
+            and len(shape(weight_node)) > 0
+        ):
             return weight_node
 
         # If node is not in the list of allowable ops then return None
@@ -155,55 +192,54 @@ def extract_weight_node(node: Node) -> int:
         return None
 
     if is_op(node, torch.ops.aten.bmm):
-        weight_node = node.args[1]
+        # no bias for bmm
+        weight_node = find_get_attr_node(node.args[1])
+        return WeightNodes(
+            weights=[
+                WeightNode(
+                    node=node.args[1],
+                    node_key=weight_node.target,
+                    tensor=get_param_or_buffer(weight_node.target, gm),
+                    submod=gm.get_submodule(weight_node.target.rpartition(".")[0]),
+                )
+            ],
+            biases=[],
+        )
     # for other parametrized nodes, we need to find the weight node
     else:
-        weight_nodes = [
-            n for n in node.args if isinstance(n, Node) and find_get_attr_node(n) is not None
+        all_weight_nodes = [
+            attr_node
+            for n in node.all_input_nodes
+            if (attr_node := find_get_attr_node(n)) is not None
         ]
-        # can be two weights (if bias weight is present)
-        weight_node = None
-        if weight_nodes:
-            weight_node = weight_nodes[0]
-        # for modelopt quantized graph, there will be a quantize_op
-        _, weight_params, _ = get_quantization_params_from_linear_node(node)
-        weight_node = weight_params.input_node if weight_params else weight_node
-        assert weight_node is not None, "Expected at least one weight node in the parametrized node"
-    return find_get_attr_node(weight_node)
+        # separate weight nodes and bias nodes
+        bias_nodes = [n for n in all_weight_nodes if n.target.endswith("bias")]
+        weight_nodes = [n for n in all_weight_nodes if n not in bias_nodes]
+        weight_nodes = [
+            WeightNode(
+                node=n,
+                node_key=n.target,
+                submod=gm.get_submodule(n.target.rpartition(".")[0]),
+                tensor=get_param_or_buffer(n.target, gm),
+            )
+            for n in weight_nodes
+        ]
+        bias_nodes = [
+            WeightNode(
+                node=n,
+                node_key=n.target,
+                submod=gm.get_submodule(n.target.rpartition(".")[0]),
+                tensor=get_param_or_buffer(n.target, gm),
+            )
+            for n in bias_nodes
+        ]
+    return WeightNodes(weights=weight_nodes, biases=bias_nodes)
 
 
 def num_users_of_weight_node(node: Node) -> int:
     """Returns the number of users of the weight node of the given parametrized node."""
-    weight_node = extract_weight_node(node)
+    weight_node = extract_weight_nodes(node).weights[0].node
     return len(weight_node.users) if weight_node is not None else 0
-
-
-def extract_param_names_from_node(node: Node) -> Tuple[str, Optional[str]]:
-    """Extracts the name of the parameter associated with the given parametrized node.
-
-    Args:
-        node: node with weight parameters in the graph.
-    """
-    weight_node = extract_weight_node(node)
-
-    assert weight_node, "Cannot identify weight parameter of linear node."
-
-    # Map arg to named parameter
-    weight_name = weight_node.target
-
-    # check for bias
-    if is_op(node, torch.ops.aten.bmm):
-        bias_node = node.args[2] if len(node.args) > 2 else None
-    else:
-        weight_nodes = [n for n in node.args if isinstance(n, Node) and n.op == "get_attr"]
-        if len(weight_nodes) > 1:
-            bias_node = weight_nodes[1]
-        else:
-            bias_node = None
-    assert bias_node is None or bias_node.op == "get_attr"
-    bias_name = bias_node.target if bias_node is not None else None
-
-    return weight_name, bias_name
 
 
 def get_op_overload_packet(node: Union[OpOverloadPacket, OpOverload]) -> OpOverloadPacket:
@@ -331,6 +367,15 @@ def is_any_ssm_op(node: Node) -> bool:
         node,
         ops=[
             torch.ops.auto_deploy.torch_ssm,
+        ],
+    )
+
+
+def is_any_conv_op(node: Node) -> bool:
+    return is_op(
+        node,
+        ops=[
+            torch.ops.auto_deploy.torch_causal_conv1d,
         ],
     )
 
@@ -499,8 +544,10 @@ def get_all_layer_subgraphs(gm: GraphModule) -> List[List[Node]]:
         # closing is the last linear node in the layer
         layer_subgraph = get_layer_after_linear_node(linear_nodes, terminating_indices)
         if layer_subgraph.opening_nodes is not None and len(layer_subgraph.opening_nodes) > 0:
-            unprocessed_linear_nodes -= set(layer_subgraph.opening_nodes) | set(
-                [layer_subgraph.terminating_node]
+            unprocessed_linear_nodes -= (
+                set(layer_subgraph.opening_nodes)
+                | set([layer_subgraph.terminating_node])
+                | set(layer_subgraph.subgraph_nodes)
             )
             layer_subgraphs.append(layer_subgraph)
         last_lin_index = terminating_indices[-1] + 1
@@ -746,7 +793,7 @@ def get_weight_shape(node: Node, dim: Optional[int] = None) -> Optional[Union[in
     """Get the shape of the weight node."""
     if not is_any_lin_op(node):
         return None
-    s = list(shape(extract_weight_node(node)))
+    s = list(shape(extract_weight_nodes(node).weights[0].node))
     if len(s) == 0:
         return None
     if is_fp4_op(node):
@@ -936,10 +983,10 @@ def shape(node: Node) -> Tuple[int, ...]:
     return node.meta["val"].shape
 
 
-def get_weight_tensor(gm: GraphModule, node: Node) -> "torch.Tensor":
+def get_weight_tensor(node: Node) -> torch.Tensor:
     """Extract the weight tensor from a node within a GraphModule."""
-    weight_name = extract_param_names_from_node(node)[0]
-    return gm.get_parameter(weight_name)
+    weight_nodes = extract_weight_nodes(node)
+    return weight_nodes.weights[0].tensor
 
 
 def draw_graph(gm: GraphModule, filename: str):

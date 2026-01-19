@@ -563,9 +563,13 @@ class OpenAIServer:
                 )
             prompt = prompt_inputs(prompt)
 
-            mm_data = await mm_coroutines
-            if mm_data is not None:
+            mm_data, mm_embeddings = await mm_coroutines
+            if mm_data:
                 prompt["multi_modal_data"] = mm_data
+            if mm_embeddings:
+                prompt["multi_modal_embeddings"] = mm_embeddings
+            if mm_data and mm_embeddings:
+                raise ValueError("Passing 'multi_modal_data' and 'multi_modal_embeddings' at the same time is not supported.")
 
             postproc_args.reasoning_parser = self.llm.args.reasoning_parser
             postproc_args.tool_parser = self.tool_parser
@@ -666,7 +670,9 @@ class OpenAIServer:
                 )
             prompt = prompt_inputs(prompt)
 
-            mm_data = await mm_coroutines
+            mm_data, mm_embeddings = await mm_coroutines
+            if mm_embeddings:
+                raise ValueError("Cannot use multimodal embeddings as input")
             if mm_data is not None:
                 prompt["multi_modal_data"] = mm_data
 

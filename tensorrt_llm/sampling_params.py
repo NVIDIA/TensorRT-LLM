@@ -6,6 +6,7 @@ from typing import List, NamedTuple, Optional, Tuple, Union
 
 import torch
 from pydantic import BaseModel
+from strenum import StrEnum
 
 from tensorrt_llm.bindings import executor as tllme
 from tensorrt_llm.logger import logger
@@ -44,6 +45,18 @@ class LogprobParams(NamedTuple):
     drop_context_logits: bool = False
     # Drop the geneation_logits once the logprobs are computed
     drop_generation_logits: bool = False
+
+
+class LogprobMode(StrEnum):
+    RAW = "raw"
+    """
+    Return the raw log probabilities, i.e., the log probabilities calculated directly from the model output logits.
+    """
+    PROCESSED = "processed"
+    """
+    Return the processed log probabilities, i.e., the log probabilities after applying sampling parameters,
+    such as temperature, top-k, top-p, etc.
+    """
 
 
 class LogitsProcessor(ABC):
@@ -172,7 +185,9 @@ class SamplingParams:
         min_p (float, optional): scale the most likely token to determine the minimum token probability. None means using C++ runtime default 0.0. Defaults to None.
         beam_width_array (List[int], optional): The array of beam width using in Variable-Beam-Width-Search. Defaults to None.
 
-        logprobs (int, optional): Number of log probabilities to return per output token. Defaults to None.
+        logprobs (int, optional): Number of log probabilities to return per output token. When set to 0, return only the sampled token's log probability.
+                                  When set to K>0, return top-K log probabilities + the sampled token's log probability (last entry) if it's not in the Top-K. Defaults to None.
+        logprobs_mode (LogprobMode): The mode of log probabilities to return. Defaults to LogprobMode.RAW.
         prompt_logprobs (int, optional): Number of log probabilities to return per prompt token. Defaults to None.
         return_context_logits (bool): Controls if Result should contain the context logits. Defaults to False.
         return_generation_logits (bool): Controls if Result should contain the generation logits. Defaults to False.
@@ -219,6 +234,7 @@ class SamplingParams:
     n: int = 1
     best_of: Optional[int] = None
     use_beam_search: bool = False
+    logprobs_mode: LogprobMode = LogprobMode.RAW
 
     # Keep the below fields in sync with tllme.SamplingConfig or maintin the mapping table.
     top_k: Optional[int] = None
@@ -321,6 +337,8 @@ class SamplingParams:
                 f"under the greedy decoding."
             )
 
+        self.logprobs_mode = LogprobMode(self.logprobs_mode)
+
         if self.truncate_prompt_tokens is not None and self.truncate_prompt_tokens < 1:
             raise ValueError(
                 f"truncate_prompt_tokens must be >= 1, got {self.truncate_prompt_tokens}"
@@ -329,8 +347,11 @@ class SamplingParams:
         if self.guided_decoding is not None:
             self.guided_decoding._validate()
 
-        # correct types as users might pass in logprob=True for Top-1 logprobs
-        self.logprobs = self.logprobs and int(self.logprobs)
+        # correct types as users might pass in logprob=True for Top-0 logprobs and logprobs=False for no logprobs
+        if self.logprobs is False:
+            self.logprobs = None
+        if self.logprobs is True:
+            self.logprobs = 0
         self.prompt_logprobs = self.prompt_logprobs and int(self.prompt_logprobs)
 
     # NB: Static, because downstream code only holds instances of
@@ -494,7 +515,7 @@ class SamplingParams:
         config_kwargs = {f: getattr(self, f) for f in fields}
 
         if is_pytorch_backend:
-            config_kwargs["return_log_probs"] = bool(self.logprobs)
+            config_kwargs["return_log_probs"] = self.logprobs is not None
             if self.prompt_logprobs and not self.return_context_logits:
                 logger.info(
                     "Since prompt_logprobs is requested but return_context_logits is False, "

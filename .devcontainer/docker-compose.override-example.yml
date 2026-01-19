@@ -5,4 +5,4 @@ services:
     volumes:
       # Uncomment the following lines to enable
       # # Mount TRTLLM data volume:
-      # - /home/scratch.trt_llm_data/:/home/scratch.trt_llm_data/:ro
+      # - /home/scratch.trt_llm_data_ci/:/home/scratch.trt_llm_data_ci/:ro

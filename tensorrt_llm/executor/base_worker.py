@@ -562,6 +562,7 @@ class BaseWorker(GenerationExecutor):
                 cache_salt_id=request.cache_salt_id)
             executor_request.py_num_logprobs = request.sampling_params.logprobs
             executor_request.py_lora_path = py_lora_path
+            executor_request.py_logprobs_mode = request.sampling_params.logprobs_mode
 
             if self._is_pytorch_backend and request.multimodal_params is not None:
                 if request.multimodal_params.multimodal_data is not None:
