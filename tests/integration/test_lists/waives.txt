@@ -393,3 +393,8 @@ unittest/_torch/auto_deploy/unit/multigpu/custom_ops/test_mxfp4_moe_ep.py::test_
 unittest/_torch/auto_deploy/unit/multigpu/test_ad_allreduce_strategies.py::test_allreduce_strategies[AUTO] SKIP (https://nvbugs/5814247)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus[tp4-mtp_nextn=2-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=True] SKIP (https://nvbugs/5800646)
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[dp4-trtllm-auto] SKIP (https://nvbugs/5651865)
+test_e2e.py::test_openai_chat_harmony SKIP (https://nvbugs/5819444)
+accuracy/test_cli_flow.py::TestLlama2_7B::test_fp8 SKIP (https://nvbugs/5819452)
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus[ep4-mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False] SKIP (https://nvbugs/5800646)
+accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[dep4_latency_moe_cutlass-torch_compile=True] SKIP (https://nvbugs/5819021)
+accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4[latency_moe_cutlass] SKIP (https://nvbugs/5740377)
