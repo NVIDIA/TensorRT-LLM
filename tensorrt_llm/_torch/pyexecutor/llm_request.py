@@ -84,7 +84,7 @@ class LogitsStorage:
         self.use_device_memory = use_device_memory
         self.use_chunked_generation_logits = use_chunked_generation_logits
         self.chunk_size = chunk_size
-        self._logits_indices = []
+        self._logits_indices: list[tuple[int, int]] = []
 
         # Lazily initialized by _init() upon first append()
         self._storage: torch.Tensor | None = None
@@ -775,12 +775,14 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # or the updating of py_result._generation_logits._logits_indices in streaming mode.
         if self.streaming and need_any_deep_copy:
             py_result = copy(self.py_result)
-            # Perform a deep copy of py_result._log_probs
+            # Move _log_probs to py_result and create a new empty LogProbStorage in self.py_result
+            # This avoids performing a deepcopy
             if need_deep_copy_logprobs:
-                py_result._log_probs = deepcopy(self.py_result._log_probs)
-
-                for log_prob in self.py_result.log_probs:
-                    log_prob.clear()
+                py_result._log_probs = self.py_result._log_probs
+                self.py_result._log_probs = LogProbStorage()
+                # Initialize the storage and adjust the cum_log_probs to the previous value
+                self.py_result._log_probs._init(py_result.log_probs)
+                self.py_result._log_probs.cum_log_probs = py_result.cum_log_probs
 
             # Perform copies of py_result._generation_logits
             if need_deep_copy_generation_logits:
