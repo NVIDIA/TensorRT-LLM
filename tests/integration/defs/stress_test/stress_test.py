@@ -176,7 +176,7 @@ class PerformanceParams:
     # Ensure indefinite runs specially for different concurrency values
     test_timeout: int = 3600  # 1 hours for tinyllama and llama-v3-8b-instruct-hf
     concurrency_list: List[int] = field(
-        default_factory=lambda: [8, 16, 32, 64, 128, 256, 512])
+        default_factory=lambda: [8, 16, 32, 64, 128, 256])
 
     @property
     def request_count_list(self) -> List[int]:
