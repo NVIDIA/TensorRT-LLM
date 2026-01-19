@@ -134,6 +134,7 @@ transforms:
     stage: post_load_fusion
     expect_mem_change: true
     backend: trtllm
+    allow_different_input_scales: false
   fuse_nvfp4_moe:
     stage: post_load_fusion
     expect_mem_change: true
