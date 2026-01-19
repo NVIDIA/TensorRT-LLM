@@ -87,7 +87,13 @@ def _test_moe_worker(
 
         # Create activation and weight
         x = torch.randn((seq_len, hidden_size), dtype=dtype, device="cuda")
-        router_logits = torch.randn((seq_len, num_experts), dtype=dtype, device="cuda")
+        if enable_eplb:
+            # Here we create same router_logits for all tokens to force the eplb update weights
+            router_logits = torch.randn((1, num_experts), dtype=dtype, device="cuda").expand(
+                seq_len, num_experts
+            )
+        else:
+            router_logits = torch.randn((seq_len, num_experts), dtype=dtype, device="cuda")
 
         quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(quant_algo, x)
         quantize_util = quantize_util_cls(
@@ -178,7 +184,11 @@ def _test_moe_worker(
                 torch.cuda.synchronize()
                 return ref_output, output
 
+            load_expert_ids = None
             if isinstance(moe_load_balancer, MoeLoadBalancer):
+                load_expert_ids = moe_load_balancer.single_layer_load_balancers[
+                    0
+                ].get_load_expert_ids()
                 moe_load_balancer.set_iter_info(enable_statistic=True, enable_update_weights=True)
 
             ref_output, output = _run_forward(x, router_logits)
@@ -196,6 +206,12 @@ def _test_moe_worker(
                 assert moe_load_balancer.iter_id == extra_steps + 1, (
                     "Iter id should be equal to extra steps + 1 after multiple iterations"
                 )
+
+                current_expert_ids = moe_load_balancer.single_layer_load_balancers[
+                    0
+                ].get_old_rank_expert_ids()
+                assert len(current_expert_ids) == 4
+                assert len(load_expert_ids) == 2
 
 
 @pytest.mark.parametrize(

@@ -143,6 +143,11 @@ public:
         return mLayerId;
     }
 
+    std::vector<std::vector<int>> getOldRankExpertIds() const
+    {
+        return mCpuPlacementInfo.oldRankExpertIds;
+    }
+
     tensorrt_llm::kernels::MoeLoadBalanceMetaInfo getMetaInfo() const
     {
         return mMetaInfo;
