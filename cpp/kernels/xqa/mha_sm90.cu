@@ -48,13 +48,13 @@ static_assert(specDecQLen * headGrpSize <= 32, "SPEC_Q_SEQ_LEN macro value is to
 #else
 #define SWAP_AB (!SPEC_DEC)
 #endif
+#define DISABLE_VT_FOR_FP16_NO_SWAP_AB 1
 
 #if SKIP_SOFTMAX_ATTN
 static_assert(SWAP_AB && USE_PAGED_KV_CACHE && !SPEC_DEC && BEAM_WIDTH == 1, "SKIP_SOFTMAX_ATTN is not supported.");
 #endif
 
 #define IS_SUPPORTED_F16_CASE (CACHE_ELEM_ENUM == 0 && !USE_INPUT_KV && !LOW_PREC_OUTPUT)
-#define DISABLE_VT_FOR_FP16_NO_SWAP_AB 1
 
 inline constexpr bool swapAB = SWAP_AB;
 
@@ -268,6 +268,7 @@ CUBIN_EXPORT __device__ constexpr uint32_t smemSize = sizeof(SharedMem);
 static_assert(smemSize < kMAX_SMEM_SIZE);
 #endif
 
+// for needInputCvt and fp16 no_swapAB cases, use 2 qLoad warp to reduce reg pressure
 constexpr uint32_t nbQLdWarps = (needInputCvt || (!swapAB && CACHE_ELEM_ENUM == 0)) ? nbIOWarps - 2 : 1;
 constexpr uint32_t nbQLdThrds = warp_size * nbQLdWarps;
 
@@ -693,7 +694,7 @@ CUBIN_EXPORT __global__
 #else
             IOHead const* __restrict__ const q, // [nbReq][beamWidth][nbQHeads],
 #endif
-            float const* attentionSinks, // [headGrpSize]
+            float const* attentionSinks, // [nbKHeads][headGrpSize]
             KVCacheList<usePagedKVCache> const cacheList,
 #if USE_BEAM_SEARCH
             BeamSearchParams const beamSearchParams,
@@ -1366,8 +1367,8 @@ CUBIN_EXPORT __global__
 #pragma unroll
                         for (uint32_t cachePartIdx = 0; cachePartIdx < cacheHeadNbParts; cachePartIdx++)
                         {
-                            auto const descV
-                                = addAddr(descVBase, &vBuf[cachePartIdx](kOffsetInGrains.get() * cacheElemsPerGrain, 0));
+                            auto const descV = addAddr(
+                                descVBase, &vBuf[cachePartIdx](kOffsetInGrains.get() * cacheElemsPerGrain, 0));
                             gmma::mma_async_shmA<MathElem, cacheHeadPartElems, false, true>(
                                 reinterpret_cast<float(&)[exactDiv(cacheHeadPartElems, gmma::instNBase)][2][2]>(
                                     acc(m, cachePartIdx * exactDiv(cacheHeadPartElems, gmma::instNBase))),
@@ -1808,10 +1809,11 @@ CUBIN_EXPORT __global__
             // Add the attention sinks.
             if (attentionSinks != nullptr)
             {
+                float const* const attentionSinksHeadGrp = attentionSinks + headGrpSize * idxHeadGrp;
                 for (uint32_t i = 0; i < headsPerWarp; i++)
                 {
                     uint32_t const idxHead = wid + nbMathWarps * i;
-                    float sink = expf(attentionSinks[idxHead % headGrpSize + idxHeadGrp * headGrpSize] - states[i].max);
+                    float sink = expf(attentionSinksHeadGrp[idxHead % headGrpSize] - states[i].max);
                     states[i].sum += sink;
                 }
             }
@@ -3658,7 +3660,7 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #else
     InputHead const* q,
 #endif
-    float const* attentionSinks, // [headGrpSize]
+    float const* attentionSinks, // [nbKHeads][headGrpSize]
 #if USE_PAGED_KV_CACHE
 #if PAGED_KV_CACHE_LAYOUT == 1
     GMemCacheHead* kCacheVLLM, GMemCacheHead* vCacheVLLM,
