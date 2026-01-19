@@ -1988,7 +1988,7 @@ def launchTestListCheck(pipeline)
             def llmPath = sh (script: "realpath .", returnStdout: true).trim()
             def llmSrc = "${llmPath}/TensorRT-LLM/src"
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install -r ${llmSrc}/requirements-dev.txt")
-            sh "NVIDIA_TRITON_SERVER_VERSION=25.10 LLM_ROOT=${llmSrc} LLM_BACKEND_ROOT=${llmSrc}/triton_backend python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa --waive"
+            sh "NVIDIA_TRITON_SERVER_VERSION=25.12 LLM_ROOT=${llmSrc} LLM_BACKEND_ROOT=${llmSrc}/triton_backend python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa --waive"
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
@@ -3281,12 +3281,9 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["b300-x4", "l0_dgx_b300", 1, 2, 4],
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-2": ["b300-x4", "l0_dgx_b300", 2, 2, 4],
         // PerfSanity post-merge tests
-        // "DGX_B200-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["b200-x4", "l0_dgx_b200_perf_sanity", 1, 3, 4],
-        // "DGX_B200-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["b200-x4", "l0_dgx_b200_perf_sanity", 2, 3, 4],
-        // "DGX_B200-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["b200-x4", "l0_dgx_b200_perf_sanity", 3, 3, 4],
-        // "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["b200-x8", "l0_dgx_b200_perf_sanity", 1, 3, 8],
-        // "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["b200-x8", "l0_dgx_b200_perf_sanity", 2, 3, 8],
-        // "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["b200-x8", "l0_dgx_b200_perf_sanity", 3, 3, 8],
+        "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["b200-x8-lbd", "l0_dgx_b200_perf_sanity", 1, 3, 8, 1, true],
+        "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["b200-x8-lbd", "l0_dgx_b200_perf_sanity", 2, 3, 8, 1, true],
+        "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["b200-x8-lbd", "l0_dgx_b200_perf_sanity", 3, 3, 8, 1, true],
     ]
     fullSet += x86SlurmTestConfigs.keySet()
 
@@ -3320,8 +3317,7 @@ def launchTestJobs(pipeline, testFilter)
         // "GB300-PyTorch-1": ["gb300-single", "l0_gb300", 1, 1],
         // "GB300-4_GPUs-PyTorch-Post-Merge-1": ["gb300-x4", "l0_gb300_multi_gpus", 1, 1, 4],
         // PerfSanity pre-merge tests
-        "GB200-4_GPUs-PyTorch-PerfSanity-1": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 1, 2, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-2": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 2, 2, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-1": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 1, 1, 4],
         // PerfSanity post-merge tests
         "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 1, 3, 4],
         "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 2, 3, 4],
@@ -3338,8 +3334,11 @@ def launchTestJobs(pipeline, testFilter)
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-2": ["gb200-oci-trtllm", "l0_gb200_multi_nodes", 2, 3, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-3": ["gb200-oci-trtllm", "l0_gb200_multi_nodes", 3, 3, 8, 2],
         // PerfSanity post-merge tests
-        "GB200-8_GPUs-2_Nodes-PyTorch-PerfSanity-Post-Merge-1": ["gb200-oci-trtllm", "l0_gb200_multi_nodes_aggr_perf_sanity_2_nodes", 1, 2, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-PerfSanity-Post-Merge-2": ["gb200-oci-trtllm", "l0_gb200_multi_nodes_aggr_perf_sanity_2_nodes", 2, 2, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-PerfSanity-Post-Merge-1": ["gb200-oci-trtllm", "l0_gb200_multi_nodes_aggr_perf_sanity_2_nodes", 1, 5, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-PerfSanity-Post-Merge-2": ["gb200-oci-trtllm", "l0_gb200_multi_nodes_aggr_perf_sanity_2_nodes", 2, 5, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-PerfSanity-Post-Merge-3": ["gb200-oci-trtllm", "l0_gb200_multi_nodes_aggr_perf_sanity_2_nodes", 3, 5, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-PerfSanity-Post-Merge-4": ["gb200-oci-trtllm", "l0_gb200_multi_nodes_aggr_perf_sanity_2_nodes", 4, 5, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-PerfSanity-Post-Merge-5": ["gb200-oci-trtllm", "l0_gb200_multi_nodes_aggr_perf_sanity_2_nodes", 5, 5, 8, 2],
         "GB200-12_GPUs-3_Nodes-PyTorch-PerfSanity-Disagg-Post-Merge-1": ["gb200-oci-trtllm", "l0_gb200_multi_nodes_disagg_perf_sanity_3_nodes", 1, 1, 12, 3],
         // "GB200-24_GPUs-6_Nodes-PyTorch-PerfSanity-Disagg-Post-Merge-1": ["gb200-oci-trtllm", "l0_gb200_multi_nodes_disagg_perf_sanity_6_nodes", 1, 2, 24, 6],
         // "GB200-24_GPUs-6_Nodes-PyTorch-PerfSanity-Disagg-Post-Merge-2": ["gb200-oci-trtllm", "l0_gb200_multi_nodes_disagg_perf_sanity_6_nodes", 2, 2, 24, 6],
@@ -3432,7 +3431,9 @@ def launchTestJobs(pipeline, testFilter)
     ]
 
     aarch64SanityCheckConfigs = [
-        /* //Disable PY312-UB2404 temporarily since lack of official PyTorch for CUDA 13.1.
+        // Workaround PyTorch 2.9.1 vs. 2.10.0a0 incompatibility issue. Once resolved, change back to:
+        // 1. DLFW_IMAGE -> UBUNTU_24_04_IMAGE
+        // 2. Extra PyTorch CUDA install: false -> true
         "PY312-UB2404": [
             LLM_DOCKER_IMAGE,
             "GH200",
@@ -3441,7 +3442,7 @@ def launchTestJobs(pipeline, testFilter)
             "",
             DLFW_IMAGE,
             false, // Extra PyTorch CUDA 13.0 install
-        ],*/
+        ],
         "PY312-DLFW": [
             LLM_DOCKER_IMAGE,
             "GH200",

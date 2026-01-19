@@ -5261,7 +5261,7 @@ For more information, please refer to <http://unlicense.org>
   - `Tracker`: https://github.com/tox-dev/py-filelock/issues
 
 
-## flashinfer-python (0.3.1.post1)
+## flashinfer-python (0.6.0)
 
 ### Licenses
 License: `Apache-2.0`
