@@ -11,6 +11,7 @@ from torch.fx import GraphModule, Node
 
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
+from ...utils._graph import delete_all_unused_submodules, eliminate_dead_code
 from ...utils.cuda_mem_tracker import cuda_memory_tracker
 from ...utils.logger import ad_logger
 from ...utils.node_utils import extract_weight_name, is_linear_op, is_op
@@ -75,8 +76,8 @@ def _insert_fused_gemm(gm: GraphModule, idx: int, parent_node: Node, linear_node
         n.replace_all_uses_with(get_split_node)
 
     # Clean up deleted modules to save GPU memory
-    gm.graph.eliminate_dead_code()
-    gm.delete_all_unused_submodules()
+    eliminate_dead_code(gm)
+    delete_all_unused_submodules(gm)
 
 
 def check_same_children(parent_node: Node, is_desired_child: Callable[[Node], bool]) -> bool:
@@ -185,8 +186,8 @@ class QuantizationFusionMixin(ABC):
             n.replace_all_uses_with(get_split_node)
 
         # Clean up deleted modules to save GPU memory
-        gm.graph.eliminate_dead_code()
-        gm.delete_all_unused_submodules()
+        eliminate_dead_code(gm)
+        delete_all_unused_submodules(gm)
 
     def _apply_fusion_pass(
         self,

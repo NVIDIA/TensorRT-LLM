@@ -44,7 +44,7 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
                 },
                 "compile_model": {
                     "backend":
-                    "torch-opt",
+                    "torch-cudagraph",
                     "cuda_graph_batch_sizes":
                     [1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
                 },
