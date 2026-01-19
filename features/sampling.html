@@ -35,7 +35,7 @@
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
     <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
-    <link rel="stylesheet" type="text/css" href="../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../_static/togglebutton.css?v=9c3e77be" />
     <link rel="stylesheet" type="text/css" href="../_static/config_selector.css?v=e17d8078" />
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
@@ -56,14 +56,14 @@
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
-    <script src="../_static/togglebutton.js?v=4a39c7ea"></script>
+    <script src="../_static/togglebutton.js?v=1ae7504c"></script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'features/sampling';</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc8';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -78,7 +78,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc8" />
+  <meta name="docsearch:version" content="1.3.0rc0" />
 
 
   </head>
@@ -525,18 +525,81 @@
                   
   <section class="tex2jax_ignore mathjax_ignore" id="sampling">
 <h1>Sampling<a class="headerlink" href="#sampling" title="Link to this heading">#</a></h1>
-<p>The PyTorch backend supports most of the sampling features that are supported on the C++ backend, such as temperature, top-k and top-p sampling, beam search, stop words, bad words, penalty, context and generation logits, log probability and logits processors</p>
+<p>The PyTorch backend supports a wide variety of features, listed below:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Forward Pass</p></th>
+<th class="head"><p>Sampling Strategies</p></th>
+<th class="head"><p>Sampling Features</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>No drafting</p></td>
+<td><p>Greedy</p></td>
+<td><p>Guided Decoding</p></td>
+</tr>
+<tr class="row-odd"><td><p>Draft target model</p></td>
+<td><p>TopP</p></td>
+<td><p>Plugging Logits Post-Processor</p></td>
+</tr>
+<tr class="row-even"><td><p>Eagle 3</p></td>
+<td><p>TopK</p></td>
+<td><p>Temperature</p></td>
+</tr>
+<tr class="row-odd"><td><p>Ngram</p></td>
+<td><p>TopK + TopP</p></td>
+<td><p>MinP</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p>Beam Search</p></td>
+<td><p>Embedding / Logits Bias</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p>Best of / n (composable)</p></td>
+<td><p>Stop criteria</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p>Rejection sampling (composable)</p></td>
+<td><p>Return Logits</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>Return LogProbs</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>TopK LogProbs</p></td>
+</tr>
+</tbody>
+</table>
+</div>
 <section id="general-usage">
 <h2>General usage<a class="headerlink" href="#general-usage" title="Link to this heading">#</a></h2>
-<p>To use the feature:</p>
-<ol class="arabic simple">
-<li><p>Enable the <code class="docutils literal notranslate"><span class="pre">enable_trtllm_sampler</span></code> option in the <code class="docutils literal notranslate"><span class="pre">LLM</span></code> class</p></li>
-<li><p>Pass a <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/80649a8/tensorrt_llm/sampling_params.py"><code class="docutils literal notranslate"><span class="pre">SamplingParams</span></code></a> object with the desired options to the <code class="docutils literal notranslate"><span class="pre">generate()</span></code> function</p></li>
-</ol>
-<p>The following example prepares two identical prompts which will give different results due to the sampling parameters chosen:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span>
+<p>There are two sampling backends available.</p>
+<ul class="simple">
+<li><p>Torch Sampler</p></li>
+<li><p>TRTLLM Sampler</p></li>
+</ul>
+<p>Torch Sampler currently supports a superset of features of TRTLLM Sampler, and is intended as the long-term solution. One can specify which sampler to use explicitly with:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span>
+
+<span class="c1"># Chooses TorchSampler explicitly</span>
 <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s1">&#39;nvidia/Llama-3.1-8B-Instruct-FP8&#39;</span><span class="p">,</span>
-          <span class="n">enable_trtllm_sampler</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+          <span class="n">sampler_type</span><span class="o">=</span><span class="s2">&quot;TorchSampler&quot;</span><span class="p">)</span>
+
+<span class="c1"># Chooses TRTLLMSampler explicitly</span>
+<span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s1">&#39;nvidia/Llama-3.1-8B-Instruct-FP8&#39;</span><span class="p">,</span>
+          <span class="n">sampler_type</span><span class="o">=</span><span class="s2">&quot;TRTLLMSampler&quot;</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>By default, the sampling backend is chosen to be <code class="docutils literal notranslate"><span class="pre">auto</span></code>. This will use:</p>
+<ul class="simple">
+<li><p>TRTLLM Sampler when using Beam Search.</p></li>
+<li><p>Torch Sampler otherwise.</p></li>
+</ul>
+<p>Here is an example to run a model with basic usage of sampling parameters. This example prepares two identical prompts which will give different results due to the sampling parameters chosen:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span>
+<span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s1">&#39;nvidia/Llama-3.1-8B-Instruct-FP8&#39;</span><span class="p">)</span>
 <span class="n">sampling_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span>
         <span class="n">temperature</span><span class="o">=</span><span class="mf">1.0</span><span class="p">,</span>
         <span class="n">top_k</span><span class="o">=</span><span class="mi">8</span><span class="p">,</span>
@@ -546,7 +609,65 @@
             <span class="s2">&quot;Hello, my name is&quot;</span><span class="p">],</span> <span class="n">sampling_params</span><span class="p">)</span>
 </pre></div>
 </div>
-<p>Note: The <code class="docutils literal notranslate"><span class="pre">enable_trtllm_sampler</span></code> option is not currently supported when using speculative decoders, such as MTP or Eagle-3, so there is a smaller subset of sampling options available.</p>
+<p>It is also possible to specify different sampling parameters on a per-prompt basis:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span>
+<span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s1">&#39;nvidia/Llama-3.1-8B-Instruct-FP8&#39;</span><span class="p">)</span>
+<span class="n">sampling_params_0</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span>
+        <span class="n">temperature</span><span class="o">=</span><span class="mf">1.0</span><span class="p">,</span>
+        <span class="n">top_k</span><span class="o">=</span><span class="mi">8</span><span class="p">,</span>
+        <span class="n">top_p</span><span class="o">=</span><span class="mf">0.5</span><span class="p">,</span>
+    <span class="p">)</span>
+<span class="n">sampling_params_1</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span>
+        <span class="n">top_k</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span>
+    <span class="p">)</span>
+<span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">([</span><span class="s2">&quot;Hello, my name is&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;Hello, my name is&quot;</span><span class="p">],</span>
+            <span class="p">[</span><span class="n">sampling_params_0</span><span class="p">,</span>
+            <span class="n">sampling_params_1</span><span class="p">])</span>
+</pre></div>
+</div>
+<section id="llm-api-sampling-behavior-when-using-torch-sampler">
+<h3>LLM API sampling behavior when using Torch Sampler<a class="headerlink" href="#llm-api-sampling-behavior-when-using-torch-sampler" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p>The sampling is controlled via <code class="docutils literal notranslate"><span class="pre">SamplingParams</span></code>.</p></li>
+<li><p>By default (<code class="docutils literal notranslate"><span class="pre">temperature</span> <span class="pre">=</span> <span class="pre">top_p</span> <span class="pre">=</span> <span class="pre">top_k</span> <span class="pre">=</span> <span class="pre">None</span></code>), greedy sampling is used.</p></li>
+<li><p>If either <code class="docutils literal notranslate"><span class="pre">temperature</span> <span class="pre">=</span> <span class="pre">0</span></code>, <code class="docutils literal notranslate"><span class="pre">top_p</span> <span class="pre">=</span> <span class="pre">0</span></code>, and/or <code class="docutils literal notranslate"><span class="pre">top_k</span> <span class="pre">=</span> <span class="pre">1</span></code>, is specified, sampling is greedy,
+irrespective of the values of the remaining parameters.</p></li>
+<li><p>Otherwise, sampling proceeds according to the specified sampling parameter values and any
+unspecified parameters default to <code class="docutils literal notranslate"><span class="pre">top_k</span> <span class="pre">=</span> <span class="pre">0</span></code>, <code class="docutils literal notranslate"><span class="pre">top_p</span> <span class="pre">=</span> <span class="pre">1</span></code>, <code class="docutils literal notranslate"><span class="pre">temperature</span> <span class="pre">=</span> <span class="pre">1.0</span></code>:</p>
+<ul>
+<li><p>The logits are scaled by <code class="docutils literal notranslate"><span class="pre">1/temperature</span></code> before applying softmax to compute probabilities.
+Sampling is performed according to these probabilities.</p></li>
+<li><p>If <code class="docutils literal notranslate"><span class="pre">top_k</span> <span class="pre">=</span> <span class="pre">0</span></code> (or <code class="docutils literal notranslate"><span class="pre">top_k</span> <span class="pre">=</span> <span class="pre">vocab_size</span></code>) and <code class="docutils literal notranslate"><span class="pre">top_p</span> <span class="pre">=</span> <span class="pre">1</span></code>, the output tokens are sampled
+from the entire vocabulary.</p></li>
+<li><p>If <code class="docutils literal notranslate"><span class="pre">1</span> <span class="pre">&lt;</span> <span class="pre">top_k</span> <span class="pre">&lt;</span> <span class="pre">vocab_size</span></code> is specified, the sampling is restricted to
+the <code class="docutils literal notranslate"><span class="pre">top_k</span></code> highest-probability tokens.</p></li>
+<li><p>If <code class="docutils literal notranslate"><span class="pre">0</span> <span class="pre">&lt;</span> <span class="pre">top_p</span> <span class="pre">&lt;</span> <span class="pre">1.0</span></code> is specified, the sampling is further restricted to a minimal subset
+of highest-probability tokens with total probability greater than <code class="docutils literal notranslate"><span class="pre">top_p</span></code> (“nucleus sampling”).
+In particular, the probability of the lowest-probability token in the selected
+subset is greater or equal than the probability of any not selected token.
+When combined with <code class="docutils literal notranslate"><span class="pre">top_k</span></code>, the probabilities of the tokens selected by <code class="docutils literal notranslate"><span class="pre">top_k</span></code> are rescaled
+such that they sum to one before <code class="docutils literal notranslate"><span class="pre">top_p</span></code> is applied.</p></li>
+<li><p>The implementation does not guarantee any particular treatment of tied probabilities.</p></li>
+</ul>
+</li>
+</ul>
+</section>
+<section id="performance">
+<h3>Performance<a class="headerlink" href="#performance" title="Link to this heading">#</a></h3>
+<p>The Torch Sampler leverages the optimized sampling kernels provided by
+<a class="reference external" href="https://docs.flashinfer.ai/api/sampling.html">FlashInfer</a>. The sampler
+also uses the <a class="reference external" href="https://flashinfer.ai/2025/03/10/sampling.html">sorting-free implementations</a>
+whenever possible. This optimization does not compute the complete set of token sampling probabilities
+(after top-k / top-p masking etc.), which typically can be omitted unless requested by the user or
+required for speculative decoding (rejection sampling).
+In case of unexpected problems, the use of FlashInfer in Torch Sampler can
+be disabled via the <code class="docutils literal notranslate"><span class="pre">disable_flashinfer_sampling</span></code> config option (note that this option is likely
+to be removed in a future TensorRT LLM release).</p>
+<p>Moreover, Torch Sampler internally batches requests with compatible sampling parameters. This
+can greatly reduce the overall latency of the sampling step when request batches are comprised
+of requests with very heterogeneous sampling strategies (e.g. a mix of requests using greedy and top-p-after-top-k sampling).</p>
+</section>
 </section>
 <section id="beam-search">
 <h2>Beam search<a class="headerlink" href="#beam-search" title="Link to this heading">#</a></h2>
@@ -555,8 +676,6 @@
 <ol class="arabic simple">
 <li><p>Enable the <code class="docutils literal notranslate"><span class="pre">use_beam_search</span></code> option in the <code class="docutils literal notranslate"><span class="pre">SamplingParams</span></code> object</p></li>
 <li><p>Set the <code class="docutils literal notranslate"><span class="pre">max_beam_width</span></code> parameter in the <code class="docutils literal notranslate"><span class="pre">LLM</span></code> class to match the <code class="docutils literal notranslate"><span class="pre">best_of</span></code> parameter in <code class="docutils literal notranslate"><span class="pre">SamplingParams</span></code></p></li>
-<li><p>Disable overlap scheduling using the <code class="docutils literal notranslate"><span class="pre">disable_overlap_scheduler</span></code> parameter of the <code class="docutils literal notranslate"><span class="pre">LLM</span></code> class</p></li>
-<li><p>Disable the usage of CUDA Graphs by passing <code class="docutils literal notranslate"><span class="pre">None</span></code> to the <code class="docutils literal notranslate"><span class="pre">cuda_graph_config</span></code> parameter of the <code class="docutils literal notranslate"><span class="pre">LLM</span></code> class</p></li>
 </ol>
 <p>Parameter Configuration:</p>
 <ul class="simple">
@@ -568,10 +687,8 @@
 <p>The following example demonstrates beam search with a beam width of 4, returning the top 3 sequences:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span>
 <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s1">&#39;nvidia/Llama-3.1-8B-Instruct-FP8&#39;</span><span class="p">,</span>
-          <span class="n">enable_trtllm_sampler</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
           <span class="n">max_beam_width</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span>   <span class="c1"># must equal SamplingParams.best_of</span>
-          <span class="n">disable_overlap_scheduler</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-          <span class="n">cuda_graph_config</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
+    <span class="p">)</span>
 <span class="n">sampling_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span>
         <span class="n">best_of</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span>   <span class="c1"># must equal LLM.max_beam_width</span>
         <span class="n">use_beam_search</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
@@ -587,7 +704,7 @@
 <p>Logits processors allow you to modify the logits produced by the network before sampling, enabling custom generation behavior and constraints.</p>
 <p>To use a custom logits processor:</p>
 <ol class="arabic simple">
-<li><p>Create a custom class that inherits from <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/80649a8/tensorrt_llm/sampling_params.py"><code class="docutils literal notranslate"><span class="pre">LogitsProcessor</span></code></a> and implements the <code class="docutils literal notranslate"><span class="pre">__call__</span></code> method</p></li>
+<li><p>Create a custom class that inherits from <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0af1a0e/tensorrt_llm/sampling_params.py"><code class="docutils literal notranslate"><span class="pre">LogitsProcessor</span></code></a> and implements the <code class="docutils literal notranslate"><span class="pre">__call__</span></code> method</p></li>
 <li><p>Pass an instance of this class to the <code class="docutils literal notranslate"><span class="pre">logits_processor</span></code> parameter of <code class="docutils literal notranslate"><span class="pre">SamplingParams</span></code></p></li>
 </ol>
 <p>The following example demonstrates logits processing:</p>
@@ -615,7 +732,7 @@
 <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">([</span><span class="s2">&quot;Hello, my name is&quot;</span><span class="p">],</span> <span class="n">sampling_params</span><span class="p">)</span>
 </pre></div>
 </div>
-<p>You can find a more detailed example on logits processors <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/80649a8/examples/llm-api/llm_logits_processor.py">here</a>.</p>
+<p>You can find a more detailed example on logits processors <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0af1a0e/examples/llm-api/llm_logits_processor.py">here</a>.</p>
 </section>
 </section>
 
@@ -668,7 +785,11 @@
   </div>
   <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="visible nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#general-usage">General usage</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#general-usage">General usage</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#llm-api-sampling-behavior-when-using-torch-sampler">LLM API sampling behavior when using Torch Sampler</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#performance">Performance</a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#beam-search">Beam search</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#logits-processor">Logits processor</a></li>
 </ul>
@@ -762,9 +883,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on January 11, 2026.</p>
+  <p>Last updated on January 18, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/80649a8">80649a8</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0af1a0e">0af1a0e</a>.</p>
   
 </div></div>
       

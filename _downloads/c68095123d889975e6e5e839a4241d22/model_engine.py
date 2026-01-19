@@ -35,7 +35,7 @@ from ..attention_backend.vanilla import VanillaAttentionMetadata
 from ..autotuner import AutoTuner, autotune
 from ..compilation.backend import Backend
 from ..compilation.utils import capture_piecewise_cuda_graph
-from ..distributed import MPIDist
+from ..distributed import Distributed
 from ..distributed.communicator import init_pp_comm
 from ..expert_statistic import ExpertStatistic
 from ..memory_buffer_utils import with_shared_pool
@@ -134,7 +134,7 @@ class PyTorchModelEngine(ModelEngine):
         llm_args: TorchLlmArgs,
         mapping: Optional[Mapping] = None,
         attn_runtime_features: Optional[AttentionRuntimeFeatures] = None,
-        dist: Optional[MPIDist] = None,
+        dist: Optional[Distributed] = None,
         spec_config: Optional["DecodingBaseConfig"] = None,
         is_draft_model: bool = False,
         drafting_loop_wrapper: Optional[Callable[[torch.nn.Module],
@@ -1155,6 +1155,11 @@ class PyTorchModelEngine(ModelEngine):
         release_gc()
 
     def _init_max_seq_len(self):
+        # Allow user to override the inferred max_seq_len with a warning.
+        allow_long_max_model_len = os.getenv(
+            "TLLM_ALLOW_LONG_MAX_MODEL_LEN",
+            "0").lower() in ["1", "true", "yes", "y"]
+
         # For mm_encoder_only mode, infer_max_seq_len() is for LLM decoder models
         if hasattr(self.model, 'infer_max_seq_len'):
             inferred_max_seq_len = self.model.infer_max_seq_len()
@@ -1166,15 +1171,20 @@ class PyTorchModelEngine(ModelEngine):
                 f"max_seq_len is not specified, using inferred value {inferred_max_seq_len}"
             )
             self.max_seq_len = inferred_max_seq_len
-
         elif inferred_max_seq_len < self.max_seq_len:
-            # NOTE: py_executor_creator makes sure that the executor uses this
-            # smaller value as its max_seq_len too.
-            logger.warning(
-                f"Specified {self.max_seq_len=} is larger than what the model can support "
-                f"({inferred_max_seq_len}). Setting max_seq_len to {inferred_max_seq_len}. "
-            )
-            self.max_seq_len = inferred_max_seq_len
+            if allow_long_max_model_len:
+                logger.warning(
+                    f"User specified max_seq_len is larger than the config in the model config file "
+                    f"({inferred_max_seq_len}). Setting max_seq_len to user's specified value {self.max_seq_len}. "
+                )
+            else:
+                # NOTE: py_executor_creator makes sure that the executor uses this
+                # smaller value as its max_seq_len too.
+                logger.warning(
+                    f"Specified {self.max_seq_len=} is larger than what the model can support "
+                    f"({inferred_max_seq_len}). Setting max_seq_len to {inferred_max_seq_len}. "
+                )
+                self.max_seq_len = inferred_max_seq_len
 
     def _infer_max_seq_len_from_config(self) -> int:
 

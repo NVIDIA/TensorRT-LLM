@@ -35,7 +35,7 @@
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
     <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
-    <link rel="stylesheet" type="text/css" href="../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../_static/togglebutton.css?v=9c3e77be" />
     <link rel="stylesheet" type="text/css" href="../_static/config_selector.css?v=e17d8078" />
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
@@ -56,14 +56,14 @@
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
-    <script src="../_static/togglebutton.js?v=4a39c7ea"></script>
+    <script src="../_static/togglebutton.js?v=1ae7504c"></script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'commands/trtllm-eval';</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc8';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -78,7 +78,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc8" />
+  <meta name="docsearch:version" content="1.3.0rc0" />
 
 
   </head>
@@ -794,6 +794,12 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 <dd><p>Maximum generation length.</p>
 </dd></dl>
 
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-cnn_dailymail-output_dir">
+<span class="sig-name descname"><span class="pre">--output_dir</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;output_dir&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-cnn_dailymail-output_dir" title="Link to this definition">#</a></dt>
+<dd><p>Directory to save the task infos.</p>
+</dd></dl>
+
 </section>
 <section id="trtllm-eval-gpqa-diamond">
 <h4>gpqa_diamond<a class="headerlink" href="#trtllm-eval-gpqa-diamond" title="Link to this heading">#</a></h4>
@@ -848,6 +854,24 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 <dt class="sig sig-object std" id="cmdoption-trtllm-eval-gpqa_diamond-max_output_length">
 <span class="sig-name descname"><span class="pre">--max_output_length</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;max_output_length&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-gpqa_diamond-max_output_length" title="Link to this definition">#</a></dt>
 <dd><p>Maximum generation length.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-gpqa_diamond-log_samples">
+<span class="sig-name descname"><span class="pre">--log_samples</span></span><span class="sig-prename descclassname"></span><a class="headerlink" href="#cmdoption-trtllm-eval-gpqa_diamond-log_samples" title="Link to this definition">#</a></dt>
+<dd><p>Log sample outputs for debugging.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-gpqa_diamond-output_path">
+<span class="sig-name descname"><span class="pre">--output_path</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;output_path&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-gpqa_diamond-output_path" title="Link to this definition">#</a></dt>
+<dd><p>Path to save evaluation results.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-gpqa_diamond-output_dir">
+<span class="sig-name descname"><span class="pre">--output_dir</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;output_dir&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-gpqa_diamond-output_dir" title="Link to this definition">#</a></dt>
+<dd><p>Directory to save the task infos.</p>
 </dd></dl>
 
 </section>
@@ -906,6 +930,24 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 <dd><p>Maximum generation length.</p>
 </dd></dl>
 
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-gpqa_extended-log_samples">
+<span class="sig-name descname"><span class="pre">--log_samples</span></span><span class="sig-prename descclassname"></span><a class="headerlink" href="#cmdoption-trtllm-eval-gpqa_extended-log_samples" title="Link to this definition">#</a></dt>
+<dd><p>Log sample outputs for debugging.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-gpqa_extended-output_path">
+<span class="sig-name descname"><span class="pre">--output_path</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;output_path&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-gpqa_extended-output_path" title="Link to this definition">#</a></dt>
+<dd><p>Path to save evaluation results.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-gpqa_extended-output_dir">
+<span class="sig-name descname"><span class="pre">--output_dir</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;output_dir&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-gpqa_extended-output_dir" title="Link to this definition">#</a></dt>
+<dd><p>Directory to save the task infos.</p>
+</dd></dl>
+
 </section>
 <section id="trtllm-eval-gpqa-main">
 <h4>gpqa_main<a class="headerlink" href="#trtllm-eval-gpqa-main" title="Link to this heading">#</a></h4>
@@ -960,6 +1002,24 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 <dt class="sig sig-object std" id="cmdoption-trtllm-eval-gpqa_main-max_output_length">
 <span class="sig-name descname"><span class="pre">--max_output_length</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;max_output_length&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-gpqa_main-max_output_length" title="Link to this definition">#</a></dt>
 <dd><p>Maximum generation length.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-gpqa_main-log_samples">
+<span class="sig-name descname"><span class="pre">--log_samples</span></span><span class="sig-prename descclassname"></span><a class="headerlink" href="#cmdoption-trtllm-eval-gpqa_main-log_samples" title="Link to this definition">#</a></dt>
+<dd><p>Log sample outputs for debugging.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-gpqa_main-output_path">
+<span class="sig-name descname"><span class="pre">--output_path</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;output_path&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-gpqa_main-output_path" title="Link to this definition">#</a></dt>
+<dd><p>Path to save evaluation results.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-gpqa_main-output_dir">
+<span class="sig-name descname"><span class="pre">--output_dir</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;output_dir&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-gpqa_main-output_dir" title="Link to this definition">#</a></dt>
+<dd><p>Directory to save the task infos.</p>
 </dd></dl>
 
 </section>
@@ -1024,6 +1084,24 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 <dd><p>Maximum generation length.</p>
 </dd></dl>
 
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-gsm8k-log_samples">
+<span class="sig-name descname"><span class="pre">--log_samples</span></span><span class="sig-prename descclassname"></span><a class="headerlink" href="#cmdoption-trtllm-eval-gsm8k-log_samples" title="Link to this definition">#</a></dt>
+<dd><p>Log sample outputs for debugging.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-gsm8k-output_path">
+<span class="sig-name descname"><span class="pre">--output_path</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;output_path&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-gsm8k-output_path" title="Link to this definition">#</a></dt>
+<dd><p>Path to save evaluation results.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-gsm8k-output_dir">
+<span class="sig-name descname"><span class="pre">--output_dir</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;output_dir&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-gsm8k-output_dir" title="Link to this definition">#</a></dt>
+<dd><p>Directory to save the task infos.</p>
+</dd></dl>
+
 </section>
 <section id="trtllm-eval-json-mode-eval">
 <h4>json_mode_eval<a class="headerlink" href="#trtllm-eval-json-mode-eval" title="Link to this heading">#</a></h4>
@@ -1066,6 +1144,12 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 <dt class="sig sig-object std" id="cmdoption-trtllm-eval-json_mode_eval-max_output_length">
 <span class="sig-name descname"><span class="pre">--max_output_length</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;max_output_length&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-json_mode_eval-max_output_length" title="Link to this definition">#</a></dt>
 <dd><p>Maximum generation length.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-json_mode_eval-output_dir">
+<span class="sig-name descname"><span class="pre">--output_dir</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;output_dir&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-json_mode_eval-output_dir" title="Link to this definition">#</a></dt>
+<dd><p>Directory to save the task infos.</p>
 </dd></dl>
 
 </section>
@@ -1115,6 +1199,24 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 <dt class="sig sig-object std" id="cmdoption-trtllm-eval-longbench_v1-system_prompt">
 <span class="sig-name descname"><span class="pre">--system_prompt</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;system_prompt&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-longbench_v1-system_prompt" title="Link to this definition">#</a></dt>
 <dd><p>System prompt.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-longbench_v1-log_samples">
+<span class="sig-name descname"><span class="pre">--log_samples</span></span><span class="sig-prename descclassname"></span><a class="headerlink" href="#cmdoption-trtllm-eval-longbench_v1-log_samples" title="Link to this definition">#</a></dt>
+<dd><p>Log sample outputs for debugging.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-longbench_v1-output_path">
+<span class="sig-name descname"><span class="pre">--output_path</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;output_path&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-longbench_v1-output_path" title="Link to this definition">#</a></dt>
+<dd><p>Path to save evaluation results.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-longbench_v1-output_dir">
+<span class="sig-name descname"><span class="pre">--output_dir</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;output_dir&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-longbench_v1-output_dir" title="Link to this definition">#</a></dt>
+<dd><p>Directory to save the task infos.</p>
 </dd></dl>
 
 </section>
@@ -1198,7 +1300,7 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-eval-longbench_v2-output_dir">
 <span class="sig-name descname"><span class="pre">--output_dir</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;output_dir&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-longbench_v2-output_dir" title="Link to this definition">#</a></dt>
-<dd><p>Directory to save results.</p>
+<dd><p>Directory to save the task infos.</p>
 </dd></dl>
 
 <dl class="std option">
@@ -1220,9 +1322,15 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 </dd></dl>
 
 <dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-longbench_v2-max_len">
+<span class="sig-name descname"><span class="pre">--max_len</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;max_len&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-longbench_v2-max_len" title="Link to this definition">#</a></dt>
+<dd><p>Maximum length (input + output) in tokens which can be supported by the model.</p>
+</dd></dl>
+
+<dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-eval-longbench_v2-max_input_length">
 <span class="sig-name descname"><span class="pre">--max_input_length</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;max_input_length&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-longbench_v2-max_input_length" title="Link to this definition">#</a></dt>
-<dd><p>Maximum prompt length before apply chat template. If exceeds, the prompt will be truncated in the middle.</p>
+<dd><p>Maximum context length in tokens. If exceeds, the prompt will be truncated in the middle.</p>
 </dd></dl>
 
 <dl class="std option">
@@ -1321,6 +1429,12 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 <span class="sig-name descname"><span class="pre">--accuracy_threshold</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;accuracy_threshold&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-mmlu-accuracy_threshold" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-mmlu-output_dir">
+<span class="sig-name descname"><span class="pre">--output_dir</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;output_dir&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-mmlu-output_dir" title="Link to this definition">#</a></dt>
+<dd><p>Directory to save the task infos.</p>
+</dd></dl>
+
 </section>
 <section id="trtllm-eval-mmmu">
 <h4>mmmu<a class="headerlink" href="#trtllm-eval-mmmu" title="Link to this heading">#</a></h4>
@@ -1369,6 +1483,24 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 <dt class="sig sig-object std" id="cmdoption-trtllm-eval-mmmu-max_output_length">
 <span class="sig-name descname"><span class="pre">--max_output_length</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;max_output_length&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-mmmu-max_output_length" title="Link to this definition">#</a></dt>
 <dd><p>Maximum generation length.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-mmmu-log_samples">
+<span class="sig-name descname"><span class="pre">--log_samples</span></span><span class="sig-prename descclassname"></span><a class="headerlink" href="#cmdoption-trtllm-eval-mmmu-log_samples" title="Link to this definition">#</a></dt>
+<dd><p>Log sample outputs for debugging.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-mmmu-output_path">
+<span class="sig-name descname"><span class="pre">--output_path</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;output_path&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-mmmu-output_path" title="Link to this definition">#</a></dt>
+<dd><p>Path to save evaluation results.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-mmmu-output_dir">
+<span class="sig-name descname"><span class="pre">--output_dir</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;output_dir&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-mmmu-output_dir" title="Link to this definition">#</a></dt>
+<dd><p>Directory to save the task infos.</p>
 </dd></dl>
 
 </section>
@@ -1534,9 +1666,9 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on January 11, 2026.</p>
+  <p>Last updated on January 18, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/80649a8">80649a8</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0af1a0e">0af1a0e</a>.</p>
   
 </div></div>
       
