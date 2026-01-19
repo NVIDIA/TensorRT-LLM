@@ -34,7 +34,7 @@
     <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
     <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../../_static/autodoc_pydantic.css" />
-    <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css?v=9c3e77be" />
     <link rel="stylesheet" type="text/css" href="../../_static/config_selector.css?v=e17d8078" />
     <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=19d20f17" />
   
@@ -55,14 +55,14 @@
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
-    <script src="../../_static/togglebutton.js?v=4a39c7ea"></script>
+    <script src="../../_static/togglebutton.js?v=1ae7504c"></script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = '_modules/tensorrt_llm/sampling_params';</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc8';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -75,7 +75,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc8" />
+  <meta name="docsearch:version" content="1.3.0rc0" />
 
 
   </head>
@@ -528,6 +528,7 @@
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">pydantic</span><span class="w"> </span><span class="kn">import</span> <span class="n">BaseModel</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">strenum</span><span class="w"> </span><span class="kn">import</span> <span class="n">StrEnum</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.bindings</span><span class="w"> </span><span class="kn">import</span> <span class="n">executor</span> <span class="k">as</span> <span class="n">tllme</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.logger</span><span class="w"> </span><span class="kn">import</span> <span class="n">logger</span>
@@ -569,6 +570,18 @@
     <span class="n">drop_context_logits</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="c1"># Drop the geneation_logits once the logprobs are computed</span>
     <span class="n">drop_generation_logits</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">LogprobMode</span><span class="p">(</span><span class="n">StrEnum</span><span class="p">):</span>
+    <span class="n">RAW</span> <span class="o">=</span> <span class="s2">&quot;raw&quot;</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    Return the raw log probabilities, i.e., the log probabilities calculated directly from the model output logits.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">PROCESSED</span> <span class="o">=</span> <span class="s2">&quot;processed&quot;</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    Return the processed log probabilities, i.e., the log probabilities after applying sampling parameters,</span>
+<span class="sd">    such as temperature, top-k, top-p, etc.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">LogitsProcessor</span><span class="p">(</span><span class="n">ABC</span><span class="p">):</span>
@@ -699,7 +712,9 @@
 <span class="sd">        min_p (float, optional): scale the most likely token to determine the minimum token probability. None means using C++ runtime default 0.0. Defaults to None.</span>
 <span class="sd">        beam_width_array (List[int], optional): The array of beam width using in Variable-Beam-Width-Search. Defaults to None.</span>
 
-<span class="sd">        logprobs (int, optional): Number of log probabilities to return per output token. Defaults to None.</span>
+<span class="sd">        logprobs (int, optional): Number of log probabilities to return per output token. When set to 0, return only the sampled token&#39;s log probability.</span>
+<span class="sd">                                  When set to K&gt;0, return top-K log probabilities + the sampled token&#39;s log probability (last entry) if it&#39;s not in the Top-K. Defaults to None.</span>
+<span class="sd">        logprobs_mode (LogprobMode): The mode of log probabilities to return. Defaults to LogprobMode.RAW.</span>
 <span class="sd">        prompt_logprobs (int, optional): Number of log probabilities to return per prompt token. Defaults to None.</span>
 <span class="sd">        return_context_logits (bool): Controls if Result should contain the context logits. Defaults to False.</span>
 <span class="sd">        return_generation_logits (bool): Controls if Result should contain the generation logits. Defaults to False.</span>
@@ -746,6 +761,7 @@
     <span class="n">n</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
     <span class="n">best_of</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">use_beam_search</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="n">logprobs_mode</span><span class="p">:</span> <span class="n">LogprobMode</span> <span class="o">=</span> <span class="n">LogprobMode</span><span class="o">.</span><span class="n">RAW</span>
 
     <span class="c1"># Keep the below fields in sync with tllme.SamplingConfig or maintin the mapping table.</span>
     <span class="n">top_k</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
@@ -848,6 +864,8 @@
                 <span class="sa">f</span><span class="s2">&quot;under the greedy decoding.&quot;</span>
             <span class="p">)</span>
 
+        <span class="bp">self</span><span class="o">.</span><span class="n">logprobs_mode</span> <span class="o">=</span> <span class="n">LogprobMode</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">logprobs_mode</span><span class="p">)</span>
+
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">truncate_prompt_tokens</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">truncate_prompt_tokens</span> <span class="o">&lt;</span> <span class="mi">1</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s2">&quot;truncate_prompt_tokens must be &gt;= 1, got </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">truncate_prompt_tokens</span><span class="si">}</span><span class="s2">&quot;</span>
@@ -856,8 +874,11 @@
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">guided_decoding</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">guided_decoding</span><span class="o">.</span><span class="n">_validate</span><span class="p">()</span>
 
-        <span class="c1"># correct types as users might pass in logprob=True for Top-1 logprobs</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">logprobs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">logprobs</span> <span class="ow">and</span> <span class="nb">int</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">logprobs</span><span class="p">)</span>
+        <span class="c1"># correct types as users might pass in logprob=True for Top-0 logprobs and logprobs=False for no logprobs</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">logprobs</span> <span class="ow">is</span> <span class="kc">False</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">logprobs</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">logprobs</span> <span class="ow">is</span> <span class="kc">True</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">logprobs</span> <span class="o">=</span> <span class="mi">0</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">prompt_logprobs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">prompt_logprobs</span> <span class="ow">and</span> <span class="nb">int</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">prompt_logprobs</span><span class="p">)</span>
 
     <span class="c1"># NB: Static, because downstream code only holds instances of</span>
@@ -1024,7 +1045,7 @@
         <span class="n">config_kwargs</span> <span class="o">=</span> <span class="p">{</span><span class="n">f</span><span class="p">:</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">f</span><span class="p">)</span> <span class="k">for</span> <span class="n">f</span> <span class="ow">in</span> <span class="n">fields</span><span class="p">}</span>
 
         <span class="k">if</span> <span class="n">is_pytorch_backend</span><span class="p">:</span>
-            <span class="n">config_kwargs</span><span class="p">[</span><span class="s2">&quot;return_log_probs&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="nb">bool</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">logprobs</span><span class="p">)</span>
+            <span class="n">config_kwargs</span><span class="p">[</span><span class="s2">&quot;return_log_probs&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">logprobs</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">prompt_logprobs</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">return_context_logits</span><span class="p">:</span>
                 <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
                     <span class="s2">&quot;Since prompt_logprobs is requested but return_context_logits is False, &quot;</span>
@@ -1189,9 +1210,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on January 11, 2026.</p>
+  <p>Last updated on January 18, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/80649a8">80649a8</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0af1a0e">0af1a0e</a>.</p>
   
 </div></div>
       

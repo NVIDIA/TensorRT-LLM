@@ -35,7 +35,7 @@
     <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
     <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../../_static/autodoc_pydantic.css" />
-    <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css?v=9c3e77be" />
     <link rel="stylesheet" type="text/css" href="../../_static/config_selector.css?v=e17d8078" />
     <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=19d20f17" />
   
@@ -56,14 +56,14 @@
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
-    <script src="../../_static/togglebutton.js?v=4a39c7ea"></script>
+    <script src="../../_static/togglebutton.js?v=1ae7504c"></script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'legacy/reference/precision';</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc8';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -76,7 +76,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc8" />
+  <meta name="docsearch:version" content="1.3.0rc0" />
 
 
   </head>
@@ -586,7 +586,7 @@ maintaining the accuracy of the network (on downstream tasks).</p>
 weights of the model. TensorRT-LLM includes scripts to prepare the model to
 run using the SmoothQuant method.</p>
 <p>Examples of how to enable SmoothQuant for GPT, GPT-J and LLaMA can be found in
-the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/80649a8/examples/quantization">examples/quantization</a> folder of that release.</p>
+the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0af1a0e/examples/quantization">examples/quantization</a> folder of that release.</p>
 </section>
 <section id="int4-and-int8-weight-only-w4a16-and-w8a16">
 <h2>INT4 and INT8 Weight-Only (W4A16 and W8A16)<a class="headerlink" href="#int4-and-int8-weight-only-w4a16-and-w8a16" title="Link to this heading">#</a></h2>
@@ -595,8 +595,8 @@ a model and dequantizing those weights on-the-fly in linear layers (Matmuls).
 The activations are encoded using floating-point values (FP16 or BF16).</p>
 <p>To use INT4/INT8 Weight-Only methods, the user must determine the scaling
 factors to use to quantize and dequantize the weights of the model.</p>
-<p>This release includes examples for <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/80649a8/examples/models/core/gpt">GPT</a> and
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/80649a8/examples/models/core/llama">LLaMA</a>.</p>
+<p>This release includes examples for <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0af1a0e/examples/models/core/gpt">GPT</a> and
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0af1a0e/examples/models/core/llama">LLaMA</a>.</p>
 </section>
 <section id="gptq-and-awq-w4a16">
 <h2>GPTQ and AWQ (W4A16)<a class="headerlink" href="#gptq-and-awq-w4a16" title="Link to this heading">#</a></h2>
@@ -606,19 +606,19 @@ and
 <a class="reference external" href="https://arxiv.org/abs/2306.00978">https://arxiv.org/abs/2306.00978</a>,
 respectively. TensorRT-LLM supports per-group scaling factors and
 zero-offsetting in linear layers to implement GPTQ and AWQ methods. See the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/80649a8/cpp/tensorrt_llm/plugins/weightOnlyGroupwiseQuantMatmulPlugin">WeightOnlyGroupwiseQuantMatmulPlugin</a>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0af1a0e/cpp/tensorrt_llm/plugins/weightOnlyGroupwiseQuantMatmulPlugin">WeightOnlyGroupwiseQuantMatmulPlugin</a>
 plugin and the corresponding
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/80649a8/tensorrt_llm/quantization/functional.py"><code class="docutils literal notranslate"><span class="pre">weight_only_groupwise_quant_matmul</span></code></a>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0af1a0e/tensorrt_llm/quantization/functional.py"><code class="docutils literal notranslate"><span class="pre">weight_only_groupwise_quant_matmul</span></code></a>
 Python function, for details.</p>
-<p>This release includes examples of applying GPTQ to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/80649a8/examples/models/core/gpt">GPT-NeoX</a>
-and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/80649a8/examples/models/core/llama">LLaMA-v2</a>, as well as an example of using AWQ with
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/80649a8/examples/models/contrib/gptj">GPT-J</a>.</p>
+<p>This release includes examples of applying GPTQ to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0af1a0e/examples/models/core/gpt">GPT-NeoX</a>
+and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0af1a0e/examples/models/core/llama">LLaMA-v2</a>, as well as an example of using AWQ with
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0af1a0e/examples/models/contrib/gptj">GPT-J</a>.</p>
 </section>
 <section id="fp8-hopper">
 <h2>FP8 (Hopper)<a class="headerlink" href="#fp8-hopper" title="Link to this heading">#</a></h2>
 <p>This release of TensorRT-LLM contains implementations of FP8 for GPT-NeMo,
 GPT-J and LLaMA. Those examples can be found in
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/80649a8/examples/quantization">examples/quantization</a>.</p>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0af1a0e/examples/quantization">examples/quantization</a>.</p>
 </section>
 <section id="nvfp4-blackwell">
 <h2>NVFP4 (Blackwell)<a class="headerlink" href="#nvfp4-blackwell" title="Link to this heading">#</a></h2>
@@ -1120,7 +1120,7 @@ The language component decides which quantization methods are supported by a giv
 <section id="technical-detail-the-quantmode-flags">
 <h2>Technical Detail: The <code class="docutils literal notranslate"><span class="pre">QuantMode</span></code> Flags<a class="headerlink" href="#technical-detail-the-quantmode-flags" title="Link to this heading">#</a></h2>
 <p>The quantization method is controlled by the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/80649a8/tensorrt_llm/quantization/mode.py"><code class="docutils literal notranslate"><span class="pre">QuantMode</span></code></a> flags. The different fields
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0af1a0e/tensorrt_llm/quantization/mode.py"><code class="docutils literal notranslate"><span class="pre">QuantMode</span></code></a> flags. The different fields
 are:</p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">INT4_WEIGHTS</span></code>, the weights are quantized to 4 bits (W4A*),</p></li>
@@ -1270,9 +1270,9 @@ are:</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on January 11, 2026.</p>
+  <p>Last updated on January 18, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/80649a8">80649a8</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0af1a0e">0af1a0e</a>.</p>
   
 </div></div>
       

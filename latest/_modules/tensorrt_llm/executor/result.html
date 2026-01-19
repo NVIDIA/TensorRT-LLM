@@ -34,7 +34,7 @@
     <link rel="stylesheet" type="text/css" href="../../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
     <link rel="stylesheet" type="text/css" href="../../../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../../../_static/autodoc_pydantic.css" />
-    <link rel="stylesheet" type="text/css" href="../../../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/togglebutton.css?v=9c3e77be" />
     <link rel="stylesheet" type="text/css" href="../../../_static/config_selector.css?v=e17d8078" />
     <link rel="stylesheet" type="text/css" href="../../../_static/custom.css?v=19d20f17" />
   
@@ -55,14 +55,14 @@
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
-    <script src="../../../_static/togglebutton.js?v=4a39c7ea"></script>
+    <script src="../../../_static/togglebutton.js?v=1ae7504c"></script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = '_modules/tensorrt_llm/executor/result';</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc8';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -75,7 +75,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc8" />
+  <meta name="docsearch:version" content="1.3.0rc0" />
 
 
   </head>
@@ -1458,6 +1458,21 @@
             <span class="n">logits</span> <span class="o">=</span> <span class="n">logits</span><span class="p">[:</span><span class="nb">len</span><span class="p">(</span><span class="n">tokens</span><span class="p">)]</span>
 
         <span class="n">logprobs</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">log_softmax</span><span class="p">(</span><span class="n">logits</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="s2">&quot;cuda&quot;</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">),</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+
+        <span class="c1"># only return sampled token</span>
+        <span class="k">if</span> <span class="n">top_k</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="n">results</span><span class="p">:</span> <span class="n">TokenLogprobs</span> <span class="o">=</span> <span class="p">[]</span>
+            <span class="k">if</span> <span class="n">tokens</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">for</span> <span class="n">t</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">logprobs</span><span class="o">.</span><span class="n">size</span><span class="p">(</span><span class="mi">0</span><span class="p">)):</span>
+                    <span class="n">token_id</span> <span class="o">=</span> <span class="n">tokens</span><span class="p">[</span><span class="n">t</span><span class="p">]</span>
+                    <span class="n">token_logprob</span> <span class="o">=</span> <span class="n">logprobs</span><span class="p">[</span><span class="n">t</span><span class="p">,</span> <span class="n">token_id</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
+                    <span class="n">rank</span> <span class="o">=</span> <span class="p">(</span><span class="n">logprobs</span><span class="p">[</span><span class="n">t</span><span class="p">]</span> <span class="o">&gt;</span> <span class="n">token_logprob</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span> <span class="o">+</span> <span class="mi">1</span>
+                    <span class="n">token_dict</span> <span class="o">=</span> <span class="p">{</span>
+                        <span class="n">token_id</span><span class="p">:</span> <span class="n">Logprob</span><span class="p">(</span><span class="n">logprob</span><span class="o">=</span><span class="n">token_logprob</span><span class="p">,</span> <span class="n">rank</span><span class="o">=</span><span class="n">rank</span><span class="p">)</span>
+                    <span class="p">}</span>
+                    <span class="n">results</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">token_dict</span><span class="p">)</span>
+            <span class="k">return</span> <span class="n">results</span>
+
         <span class="n">topk_vals</span><span class="p">,</span> <span class="n">topk_indices</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">topk</span><span class="p">(</span><span class="n">logprobs</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="n">top_k</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
 
         <span class="n">results</span><span class="p">:</span> <span class="n">TokenLogprobs</span> <span class="o">=</span> <span class="p">[]</span>
@@ -1486,7 +1501,7 @@
         <span class="kc">None</span><span class="p">)</span> <span class="k">if</span> <span class="n">k_prompt_logprobs</span> <span class="ow">and</span> <span class="n">context_logits</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span>
     <span class="n">generation_logprobs</span> <span class="o">=</span> <span class="n">_topk_logprobs</span><span class="p">(</span>
         <span class="n">generation_logits</span><span class="p">,</span> <span class="n">k_logprobs</span><span class="p">,</span> <span class="n">output_token_ids</span>
-    <span class="p">)</span> <span class="k">if</span> <span class="n">k_logprobs</span> <span class="ow">and</span> <span class="n">generation_logits</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span>
+    <span class="p">)</span> <span class="k">if</span> <span class="n">k_logprobs</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">generation_logits</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span>
 
     <span class="k">return</span> <span class="n">LogProbsResult</span><span class="p">(</span><span class="n">prompt</span><span class="o">=</span><span class="n">prompt_logprobs</span><span class="p">,</span>
                           <span class="n">generation</span><span class="o">=</span><span class="n">generation_logprobs</span><span class="p">)</span>
@@ -1625,9 +1640,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on January 11, 2026.</p>
+  <p>Last updated on January 18, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/80649a8">80649a8</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0af1a0e">0af1a0e</a>.</p>
   
 </div></div>
       

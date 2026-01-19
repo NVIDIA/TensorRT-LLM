@@ -2,7 +2,7 @@ OpenAI Completion Client
 ========================
 Refer to the `trtllm-serve documentation <https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve.html>`_ for starting a server.
 
-Source https://github.com/NVIDIA/TensorRT-LLM/blob/80649a8b78b2fbe9ac4fa9b004fcceb251ba7c2e/examples/serve/openai_completion_client.py.
+Source https://github.com/NVIDIA/TensorRT-LLM/blob/0af1a0e4789eed690f91d2efde77f09ad35d1805/examples/serve/openai_completion_client.py.
 
 .. literalinclude:: ../../../examples/serve/openai_completion_client.py
     :lines: 2-15

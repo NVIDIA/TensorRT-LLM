@@ -34,7 +34,7 @@
     <link rel="stylesheet" type="text/css" href="../../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
     <link rel="stylesheet" type="text/css" href="../../../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../../../_static/autodoc_pydantic.css" />
-    <link rel="stylesheet" type="text/css" href="../../../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/togglebutton.css?v=9c3e77be" />
     <link rel="stylesheet" type="text/css" href="../../../_static/config_selector.css?v=e17d8078" />
     <link rel="stylesheet" type="text/css" href="../../../_static/custom.css?v=19d20f17" />
   
@@ -55,14 +55,14 @@
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
-    <script src="../../../_static/togglebutton.js?v=4a39c7ea"></script>
+    <script src="../../../_static/togglebutton.js?v=1ae7504c"></script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = '_modules/tensorrt_llm/llmapi/llm';</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc8';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -75,7 +75,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc8" />
+  <meta name="docsearch:version" content="1.3.0rc0" />
 
 
   </head>
@@ -553,7 +553,7 @@
                         <span class="n">GenerationResult</span><span class="p">,</span> <span class="n">IterationResult</span><span class="p">,</span> <span class="n">LoRARequest</span><span class="p">,</span>
                         <span class="n">PostprocWorkerConfig</span><span class="p">,</span> <span class="n">PromptAdapterRequest</span><span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..executor.postproc_worker</span><span class="w"> </span><span class="kn">import</span> <span class="n">PostprocParams</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..executor.utils</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">create_mpi_comm_session</span><span class="p">,</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..executor.utils</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">RequestError</span><span class="p">,</span> <span class="n">create_mpi_comm_session</span><span class="p">,</span>
                               <span class="n">get_spawn_proxy_process_env</span><span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..inputs</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">PromptInputs</span><span class="p">,</span> <span class="n">create_input_processor</span><span class="p">,</span>
                       <span class="n">create_input_processor_with_hash</span><span class="p">,</span> <span class="n">get_cache_salt_id</span><span class="p">,</span>
@@ -1194,7 +1194,7 @@
             <span class="k">if</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">prompt_logprobs</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">return_context_logits</span><span class="p">:</span>
                 <span class="n">sampling_params</span><span class="o">.</span><span class="n">return_context_logits</span> <span class="o">=</span> <span class="kc">True</span>
                 <span class="n">sampling_params</span><span class="o">.</span><span class="n">_context_logits_auto_enabled</span> <span class="o">=</span> <span class="kc">True</span>
-            <span class="k">if</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">logprobs</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">return_generation_logits</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">logprobs</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">return_generation_logits</span><span class="p">:</span>
                 <span class="n">sampling_params</span><span class="o">.</span><span class="n">return_generation_logits</span> <span class="o">=</span> <span class="kc">True</span>
                 <span class="n">sampling_params</span><span class="o">.</span><span class="n">_generation_logits_auto_enabled</span> <span class="o">=</span> <span class="kc">True</span>
 
@@ -1214,7 +1214,7 @@
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">backend</span> <span class="o">==</span> <span class="s2">&quot;pytorch&quot;</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">enable_chunked_prefill</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">is_gen_only</span><span class="p">:</span>
                 <span class="n">max_num_tokens</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">max_num_tokens</span>
                 <span class="k">if</span> <span class="n">max_num_tokens</span> <span class="ow">and</span> <span class="n">prompt_len</span> <span class="o">/</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">cp_size</span> <span class="o">+</span> <span class="n">query_len</span> <span class="o">&gt;</span> <span class="n">max_num_tokens</span><span class="p">:</span>
-                    <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="k">raise</span> <span class="n">RequestError</span><span class="p">(</span>
                         <span class="sa">f</span><span class="s2">&quot;The sum of prompt length (</span><span class="si">{</span><span class="n">prompt_len</span><span class="o">/</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">cp_size</span><span class="si">}</span><span class="s2">), query length (</span><span class="si">{</span><span class="n">query_len</span><span class="si">}</span><span class="s2">) should not exceed &quot;</span>
                         <span class="sa">f</span><span class="s2">&quot;max_num_tokens (</span><span class="si">{</span><span class="n">max_num_tokens</span><span class="si">}</span><span class="s2">)&quot;</span><span class="p">)</span>
             <span class="k">return</span>
@@ -1265,7 +1265,7 @@
                 <span class="sa">f</span><span class="s2">&quot;Example: LLM(..., build_config=BuildConfig(gather_context_logits=True)).&quot;</span>
             <span class="p">)</span>
 
-        <span class="k">if</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">logprobs</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">gather_generation_logits</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">logprobs</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">gather_generation_logits</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s2">&quot;`sampling_params.logprobs=</span><span class="si">{</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">logprobs</span><span class="si">}</span><span class="s2">` requires `gather_generation_logits=True` &quot;</span>
                 <span class="sa">f</span><span class="s2">&quot;to be passed explicitly to the `LLM()` constructor.&quot;</span><span class="p">)</span>
@@ -1837,9 +1837,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on January 11, 2026.</p>
+  <p>Last updated on January 18, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/80649a8">80649a8</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0af1a0e">0af1a0e</a>.</p>
   
 </div></div>
       

@@ -34,7 +34,7 @@
     <link rel="stylesheet" type="text/css" href="_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
     <link rel="stylesheet" type="text/css" href="_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="_static/autodoc_pydantic.css" />
-    <link rel="stylesheet" type="text/css" href="_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="_static/togglebutton.css?v=9c3e77be" />
     <link rel="stylesheet" type="text/css" href="_static/config_selector.css?v=e17d8078" />
     <link rel="stylesheet" type="text/css" href="_static/custom.css?v=19d20f17" />
   
@@ -55,14 +55,14 @@
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
-    <script src="_static/togglebutton.js?v=4a39c7ea"></script>
+    <script src="_static/togglebutton.js?v=1ae7504c"></script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'genindex';</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc8';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -75,7 +75,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc8" />
+  <meta name="docsearch:version" content="1.3.0rc0" />
 
 
   </head>
@@ -938,6 +938,23 @@
 </li>
       </ul></li>
       <li>
+    --log_samples
+
+      <ul>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_diamond-log_samples">trtllm-eval-gpqa_diamond command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_extended-log_samples">trtllm-eval-gpqa_extended command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_main-log_samples">trtllm-eval-gpqa_main command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gsm8k-log_samples">trtllm-eval-gsm8k command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-longbench_v1-log_samples">trtllm-eval-longbench_v1 command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmmu-log_samples">trtllm-eval-mmmu command line option</a>
+</li>
+      </ul></li>
+      <li>
     --max_batch_size
 
       <ul>
@@ -991,6 +1008,13 @@
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmlu-max_input_length">trtllm-eval-mmlu command line option</a>
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmmu-max_input_length">trtllm-eval-mmmu command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --max_len
+
+      <ul>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-longbench_v2-max_len">trtllm-eval-longbench_v2 command line option</a>
 </li>
       </ul></li>
       <li>
@@ -1199,7 +1223,25 @@
     --output_dir
 
       <ul>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-cnn_dailymail-output_dir">trtllm-eval-cnn_dailymail command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_diamond-output_dir">trtllm-eval-gpqa_diamond command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_extended-output_dir">trtllm-eval-gpqa_extended command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_main-output_dir">trtllm-eval-gpqa_main command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gsm8k-output_dir">trtllm-eval-gsm8k command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-json_mode_eval-output_dir">trtllm-eval-json_mode_eval command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-longbench_v1-output_dir">trtllm-eval-longbench_v1 command line option</a>
+</li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-longbench_v2-output_dir">trtllm-eval-longbench_v2 command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmlu-output_dir">trtllm-eval-mmlu command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmmu-output_dir">trtllm-eval-mmmu command line option</a>
 </li>
       </ul></li>
       <li>
@@ -1207,6 +1249,23 @@
 
       <ul>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-output_json">trtllm-bench-throughput command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --output_path
+
+      <ul>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_diamond-output_path">trtllm-eval-gpqa_diamond command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_extended-output_path">trtllm-eval-gpqa_extended command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_main-output_path">trtllm-eval-gpqa_main command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gsm8k-output_path">trtllm-eval-gsm8k command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-longbench_v1-output_path">trtllm-eval-longbench_v1 command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmmu-output_path">trtllm-eval-mmmu command line option</a>
 </li>
       </ul></li>
       <li>
@@ -4327,6 +4386,8 @@
         <li><a href="llm-api/reference.html#id5">(tensorrt_llm.llmapi.CompletionOutput property)</a>
 </li>
       </ul></li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.logprobs_mode">logprobs_mode (tensorrt_llm.llmapi.SamplingParams attribute)</a>
+</li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.PositionEmbeddingType.long_rope">long_rope (tensorrt_llm.functional.PositionEmbeddingType attribute)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.RotaryScalingType.longrope">longrope (tensorrt_llm.functional.RotaryScalingType attribute)</a>
@@ -4599,6 +4660,8 @@
         <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.ModelRunnerCpp.max_sequence_length">(tensorrt_llm.runtime.ModelRunnerCpp property)</a>
 </li>
       </ul></li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.max_stats_len">max_stats_len (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.max_tokens">max_tokens (tensorrt_llm.llmapi.KvCacheConfig attribute)</a>
 
       <ul>
@@ -5054,6 +5117,8 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.model_dump_json">(tensorrt_llm.llmapi.UserProvidedDecodingConfig method)</a>
 </li>
       </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.model_extra">model_extra (tensorrt_llm.llmapi.AttentionDpConfig property)</a>
 
       <ul>
@@ -5102,8 +5167,6 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.model_extra">(tensorrt_llm.llmapi.UserProvidedDecodingConfig property)</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.model_fields">model_fields (tensorrt_llm.llmapi.AttentionDpConfig attribute)</a>
 
       <ul>
@@ -6919,10 +6982,10 @@
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.Tensor.size">size() (tensorrt_llm.functional.Tensor method)</a>
 </li>
-      <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.ModelConfig.skip_cross_attn_blocks">skip_cross_attn_blocks (tensorrt_llm.runtime.ModelConfig attribute)</a>
-</li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.ModelConfig.skip_cross_attn_blocks">skip_cross_attn_blocks (tensorrt_llm.runtime.ModelConfig attribute)</a>
+</li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.ModelConfig.skip_cross_kv">skip_cross_kv (tensorrt_llm.runtime.ModelConfig attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.skip_indexer_for_short_seqs">skip_indexer_for_short_seqs (tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig attribute)</a>
@@ -6993,34 +7056,28 @@
       </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BuildConfig.speculative_decoding_mode">speculative_decoding_mode (tensorrt_llm.llmapi.BuildConfig attribute)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.speculative_model_dir">speculative_model_dir (tensorrt_llm.llmapi.AutoDecodingConfig attribute)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.speculative_model">speculative_model (tensorrt_llm.llmapi.AutoDecodingConfig attribute)</a>
 
       <ul>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.speculative_model_dir">(tensorrt_llm.llmapi.DraftTargetDecodingConfig attribute)</a>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.speculative_model">(tensorrt_llm.llmapi.DraftTargetDecodingConfig attribute)</a>
 </li>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.speculative_model_dir">(tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.speculative_model">(tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
 </li>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.speculative_model_dir">(tensorrt_llm.llmapi.LookaheadDecodingConfig attribute)</a>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.speculative_model">(tensorrt_llm.llmapi.LookaheadDecodingConfig attribute)</a>
 </li>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.speculative_model_dir">(tensorrt_llm.llmapi.MedusaDecodingConfig attribute)</a>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.speculative_model">(tensorrt_llm.llmapi.MedusaDecodingConfig attribute)</a>
 </li>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.speculative_model_dir">(tensorrt_llm.llmapi.MTPDecodingConfig attribute)</a>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.speculative_model">(tensorrt_llm.llmapi.MTPDecodingConfig attribute)</a>
 </li>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.speculative_model_dir">(tensorrt_llm.llmapi.NGramDecodingConfig attribute)</a>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.speculative_model">(tensorrt_llm.llmapi.NGramDecodingConfig attribute)</a>
 </li>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.speculative_model_dir">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig attribute)</a>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.speculative_model">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig attribute)</a>
 </li>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.speculative_model_dir">(tensorrt_llm.llmapi.TorchLlmArgs property)</a>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.speculative_model">(tensorrt_llm.llmapi.TorchLlmArgs property)</a>
 </li>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.speculative_model_dir">(tensorrt_llm.llmapi.TrtLlmArgs property)</a>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.speculative_model">(tensorrt_llm.llmapi.TrtLlmArgs property)</a>
 </li>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.speculative_model_dir">(tensorrt_llm.llmapi.UserProvidedDecodingConfig attribute)</a>
-</li>
-      </ul></li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.speculative_model_format">speculative_model_format (tensorrt_llm.llmapi.TorchLlmArgs property)</a>
-
-      <ul>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.speculative_model_format">(tensorrt_llm.llmapi.TrtLlmArgs property)</a>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.speculative_model">(tensorrt_llm.llmapi.UserProvidedDecodingConfig attribute)</a>
 </li>
       </ul></li>
       <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.SpeculativeDecodingMode">SpeculativeDecodingMode (class in tensorrt_llm.models)</a>
@@ -10390,8 +10447,6 @@
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kINT32EE4sizeE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT32&gt;::size (C++ member)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kINT32EE4typeE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT32&gt;::type (C++ type)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4IEN12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kINT64EXL1EEEE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT64, true&gt; (C++ struct)</a>
@@ -10414,6 +10469,8 @@
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType5kINT8EE4nameE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT8&gt;::name (C++ member)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType5kINT8EE4sizeE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT8&gt;::size (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType5kINT8EE4typeE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT8&gt;::type (C++ type)</a>
@@ -13253,6 +13310,8 @@
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-cnn_dailymail-num_samples">--num_samples</a>
 </li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-cnn_dailymail-output_dir">--output_dir</a>
+</li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-cnn_dailymail-random_seed">--random_seed</a>
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-cnn_dailymail-rouge_path">--rouge_path</a>
@@ -13270,11 +13329,17 @@
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_diamond-dataset_path">--dataset_path</a>
 </li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_diamond-log_samples">--log_samples</a>
+</li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_diamond-max_input_length">--max_input_length</a>
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_diamond-max_output_length">--max_output_length</a>
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_diamond-num_samples">--num_samples</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_diamond-output_dir">--output_dir</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_diamond-output_path">--output_path</a>
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_diamond-random_seed">--random_seed</a>
 </li>
@@ -13291,11 +13356,17 @@
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_extended-dataset_path">--dataset_path</a>
 </li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_extended-log_samples">--log_samples</a>
+</li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_extended-max_input_length">--max_input_length</a>
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_extended-max_output_length">--max_output_length</a>
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_extended-num_samples">--num_samples</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_extended-output_dir">--output_dir</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_extended-output_path">--output_path</a>
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_extended-random_seed">--random_seed</a>
 </li>
@@ -13312,11 +13383,17 @@
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_main-dataset_path">--dataset_path</a>
 </li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_main-log_samples">--log_samples</a>
+</li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_main-max_input_length">--max_input_length</a>
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_main-max_output_length">--max_output_length</a>
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_main-num_samples">--num_samples</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_main-output_dir">--output_dir</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_main-output_path">--output_path</a>
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_main-random_seed">--random_seed</a>
 </li>
@@ -13335,11 +13412,17 @@
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gsm8k-fewshot_as_multiturn">--fewshot_as_multiturn</a>
 </li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gsm8k-log_samples">--log_samples</a>
+</li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gsm8k-max_input_length">--max_input_length</a>
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gsm8k-max_output_length">--max_output_length</a>
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gsm8k-num_samples">--num_samples</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gsm8k-output_dir">--output_dir</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gsm8k-output_path">--output_path</a>
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gsm8k-random_seed">--random_seed</a>
 </li>
@@ -13358,6 +13441,8 @@
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-json_mode_eval-num_samples">--num_samples</a>
 </li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-json_mode_eval-output_dir">--output_dir</a>
+</li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-json_mode_eval-random_seed">--random_seed</a>
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-json_mode_eval-system_prompt">--system_prompt</a>
@@ -13373,7 +13458,13 @@
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-longbench_v1-dataset_path">--dataset_path</a>
 </li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-longbench_v1-log_samples">--log_samples</a>
+</li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-longbench_v1-num_samples">--num_samples</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-longbench_v1-output_dir">--output_dir</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-longbench_v1-output_path">--output_path</a>
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-longbench_v1-random_seed">--random_seed</a>
 </li>
@@ -13399,6 +13490,8 @@
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-longbench_v2-length">--length</a>
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-longbench_v2-max_input_length">--max_input_length</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-longbench_v2-max_len">--max_len</a>
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-longbench_v2-max_output_length">--max_output_length</a>
 </li>
@@ -13445,6 +13538,8 @@
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmlu-num_samples">--num_samples</a>
 </li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmlu-output_dir">--output_dir</a>
+</li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmlu-random_seed">--random_seed</a>
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmlu-system_prompt">--system_prompt</a>
@@ -13458,11 +13553,17 @@
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmmu-dataset_path">--dataset_path</a>
 </li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmmu-log_samples">--log_samples</a>
+</li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmmu-max_input_length">--max_input_length</a>
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmmu-max_output_length">--max_output_length</a>
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmmu-num_samples">--num_samples</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmmu-output_dir">--output_dir</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmmu-output_path">--output_path</a>
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmmu-random_seed">--random_seed</a>
 </li>
@@ -13901,15 +14002,19 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.validate_draft_len_schedule_and_sort">(tensorrt_llm.llmapi.UserProvidedDecodingConfig class method)</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_dtype">validate_dtype() (tensorrt_llm.llmapi.TorchLlmArgs class method)</a>
 
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.validate_dtype">(tensorrt_llm.llmapi.TrtLlmArgs class method)</a>
 </li>
       </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="legacy/python-api/tensorrt_llm.plugin.html#tensorrt_llm.plugin.PluginConfig.validate_dtype_not_auto">validate_dtype_not_auto() (tensorrt_llm.plugin.PluginConfig class method)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.validate_eagle_choices">validate_eagle_choices() (tensorrt_llm.llmapi.EagleDecodingConfig class method)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.validate_eagle_config">validate_eagle_config() (tensorrt_llm.llmapi.EagleDecodingConfig method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.validate_enable_build_cache">validate_enable_build_cache() (tensorrt_llm.llmapi.TrtLlmArgs method)</a>
 </li>
@@ -14234,9 +14339,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on January 11, 2026.</p>
+  <p>Last updated on January 18, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/80649a8">80649a8</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0af1a0e">0af1a0e</a>.</p>
   
 </div></div>
       
