@@ -176,8 +176,7 @@ class PerformanceParams:
     # Ensure indefinite runs specially for different concurrency values
     test_timeout: int = 3600  # 1 hours for tinyllama and llama-v3-8b-instruct-hf
     concurrency_list: List[int] = field(
-        default_factory=lambda:
-        [8, 16, 32, 64, 128, 256, 384, 512, 640, 768, 896, 1024])
+        default_factory=lambda: [8, 16, 32, 64, 128, 256, 512])
 
     @property
     def request_count_list(self) -> List[int]:
@@ -593,7 +592,7 @@ def stress_test(config,
             extra_llm_options.update({
                 "cuda_graph_config": {
                     "enable_padding": True,
-                    "batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128, 256, 384],
+                    "batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
                 },
                 "print_iter_log": True,
             })
@@ -800,6 +799,7 @@ def create_aiperf_command(model_name,
                           model_path,
                           request_count,
                           concurrency,
+                          server_url,
                           input_len_mean=PerformanceParams.input_len_mean,
                           input_len_std=PerformanceParams.input_len_std,
                           output_len_mean=PerformanceParams.output_len_mean,
@@ -813,6 +813,7 @@ def create_aiperf_command(model_name,
         model_path: Path to the model
         request_count: Number of requests to send
         concurrency: Number of concurrent requests
+        server_url: URL of the server (e.g., "localhost:8000")
         input_len_mean: Mean input length
         input_len_std: Standard deviation of input length
         output_len_mean: Mean output length
@@ -831,6 +832,8 @@ def create_aiperf_command(model_name,
         model_path,
         "--endpoint-type",
         "completions",
+        "-u",
+        server_url,
         "--random-seed",
         "123",
         "--synthetic-input-tokens-mean",
@@ -969,6 +972,7 @@ def measure_capacity_stage(model_name,
             model_path=model_path,
             request_count=request_count,
             concurrency=concurrency,
+            server_url=f"{server_config.host}:{server_config.port}",
             input_len_mean=performance_params.input_len_mean,
             input_len_std=performance_params.input_len_std,
             output_len_mean=performance_params.output_len_mean,
@@ -1064,6 +1068,7 @@ def stress_stage(model_name,
         model_path=model_path,
         request_count=request_count,
         concurrency=stress_concurrency,
+        server_url=f"{server_config.host}:{server_config.port}",
         input_len_mean=PerformanceParams.input_len_mean,
         input_len_std=PerformanceParams.input_len_std,
         output_len_mean=PerformanceParams.output_len_mean,
@@ -1254,29 +1259,30 @@ def extract_stress_test_metrics(artifacts_dir=None, current_model=None):
             with open(json_file, "r") as f:
                 results = json.load(f)
 
-                reqThroughput = results.get("request_throughput",
-                                            {}).get("avg", 0)
-                tokThroughput = results.get("output_token_throughput",
-                                            {}).get("avg", 0)
-                conCurrency = results.get("input_config",
-                                          {}).get("loadgen",
-                                                  {}).get("concurrency", 0)
+                # Use `or {}` to handle both missing keys AND explicit null values
+                reqThroughput = (results.get("request_throughput")
+                                 or {}).get("avg", 0)
+                tokThroughput = (results.get("output_token_throughput")
+                                 or {}).get("avg", 0)
+
+                # Get concurrency from input_config.loadgen or input_config.perf_analyzer.stimulus
+                input_config = results.get("input_config") or {}
+                conCurrency = (input_config.get("loadgen")
+                               or {}).get("concurrency", 0)
                 if conCurrency == 0:
-                    conCurrency = results.get("input_config", {}).get(
-                        "perf_analyzer", {}).get("stimulus",
-                                                 {}).get("concurrency", 0)
+                    conCurrency = ((input_config.get("perf_analyzer")
+                                    or {}).get("stimulus")
+                                   or {}).get("concurrency", 0)
 
                 # Try to determine model name from directory structure first
                 if first_dir in model_name_map:
                     modelName = model_name_map[first_dir]
                 else:
                     # Fall back to model name from JSON if we can't extract from directory
-                    modelName = results.get("input_config", {}).get(
-                        "endpoint", {}).get("model_names", None)
+                    endpoint = (input_config.get("endpoint") or {})
+                    modelName = endpoint.get("model_names", None)
                     if modelName is None:
-                        modelName = results.get("input_config",
-                                                {}).get("model_names",
-                                                        ["unknown"])
+                        modelName = input_config.get("model_names", ["unknown"])
                     modelName = modelName[0] if isinstance(modelName,
                                                            list) else modelName
 
