@@ -1020,7 +1020,6 @@ common-files: &common_files |
         tests/unittest/_torch/ray_orchestrator/single_gpu/test_cache_transceiver_comm.py |
         tests/unittest/_torch/sampler/test_beam_search.py |
         tests/unittest/_torch/sampler/test_best_of_n.py |
-        tests/unittest/_torch/sampler/test_return_logits.py |
         tests/unittest/_torch/sampler/test_torch_multi_arange.py |
         tests/unittest/_torch/sampler/test_trtllm_sampler.py |
         tests/unittest/_torch/speculative/test_draft_target.py |
