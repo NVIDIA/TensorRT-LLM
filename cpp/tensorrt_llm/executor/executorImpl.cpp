@@ -907,7 +907,7 @@ std::vector<IdType> Executor::Impl::enqueueRequests(common::ArrayView<Request co
         auto now = std::chrono::steady_clock::now();
         for (auto const& req : requests)
         {
-            ids.emplace_back(generateReqId());
+            ids.emplace_back(generateReqId(req));
             TLLM_LOG_DEBUG("Enqueue new request with id %d", ids.back());
 
             std::vector<IdType> childReqIds;

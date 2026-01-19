@@ -178,9 +178,19 @@ private:
 
     void initializeLogitsPostProcessorBatched(LogitsPostProcessorConfig const& logitsProcConfig);
 
+    IdType generateReqId(Request const& request)
+    {
+        if (request.getDisaggRequestId().has_value())
+        {
+            return request.getDisaggRequestId().value();
+        }
+        return generateReqId();
+    }
+
     IdType generateReqId()
     {
-        return (mLastReqId++ % UINT64_MAX);
+        static constexpr IdType kMaxLocalReqId = 1ULL << 42U;
+        return (mLastReqId++ % kMaxLocalReqId);
     }
 
     std::vector<RequestWithId> getLeaderNewReqWithIds(
