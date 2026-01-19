@@ -64,6 +64,7 @@ class ditFlux2Pipeline(Flux2Pipeline, ditBasePipeline):
     
     def load_flux_2_dev_nvf4(torch_dtype, **dit_configs):
         visual_gen.setup_configs(**dit_configs)
+
         def hack_input_amax_values(
             model: torch.nn.Module,
             amax: dict[str, float],
@@ -76,9 +77,9 @@ class ditFlux2Pipeline(Flux2Pipeline, ditBasePipeline):
 
                     scale_name = name + ".input_scale"
                     if scale_name in amax.keys():
-                        module.input_scale = amax[name + ".input_scale"]
+                        module.input_scale = 1. / amax[scale_name]
                     else:
-                        print(name, "using dynamic scale")
+                        logger.warning(name, "using dynamic scale")
             
         def convert_nvfp4_to_diffusers(nvfp4_state_dict):
             """
@@ -170,7 +171,7 @@ class ditFlux2Pipeline(Flux2Pipeline, ditBasePipeline):
         nvfp4_file_path = f"{model_path}/{file_pattern}"
         nvfp4_state_dict = load_file(nvfp4_file_path)
         converted_dict = convert_nvfp4_to_diffusers(nvfp4_state_dict)
-        exclude_pattern = f"^(?!.*(img_in|txt_in|time_in|guidance_in|txt_attn|final_layer|embedder|to_out|norm_out|proj_out|to_add_out|to_added_qkv|stream)).*"
+        exclude_pattern = f"^(?!.*(embedder|to_out|norm_out|proj_out|to_add_out|to_added_qkv|stream)).*"
         apply_visual_gen_linear(pipe.transformer, load_parameters=True, quantize_weights=True, exclude_pattern=exclude_pattern)
         hack_input_amax_values(
             pipe.transformer,
