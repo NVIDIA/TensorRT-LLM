@@ -32,8 +32,7 @@ FROM base AS devel
 ENV PYTORCH_ALLOC_CONF="garbage_collection_threshold:0.99999"
 
 # Copy all installation scripts at once to reduce layers
-COPY docker/common/install.sh \
-     docker/common/install_base.sh \
+COPY docker/common/install_base.sh \
      docker/common/install_cmake.sh \
      docker/common/install_ccache.sh \
      docker/common/install_cuda_toolkit.sh \
@@ -44,7 +43,11 @@ COPY docker/common/install.sh \
      docker/common/install_ucx.sh \
      docker/common/install_nixl.sh \
      docker/common/install_etcd.sh \
+     constraints.txt \
      ./
+
+# Name install.sh conflicts with UCX installation
+COPY docker/common/install.sh ./install_master.sh
 
 ARG TRT_VER
 ARG CUDA_VER
@@ -52,6 +55,7 @@ ARG CUDNN_VER
 ARG NCCL_VER
 ARG CUBLAS_VER
 ARG TORCH_INSTALL_TYPE="skip"
+ARG CONSTRAINTS_FILE="constraints.txt"
 RUN GITHUB_MIRROR=${GITHUB_MIRROR} \
     PYTHON_VERSION=${PYTHON_VERSION} \
     TRT_VER=${TRT_VER} \
@@ -60,7 +64,8 @@ RUN GITHUB_MIRROR=${GITHUB_MIRROR} \
     NCCL_VER=${NCCL_VER} \
     CUBLAS_VER=${CUBLAS_VER} \
     TORCH_INSTALL_TYPE=${TORCH_INSTALL_TYPE} \
-    bash ./install.sh --base --cmake --ccache --cuda_toolkit --tensorrt --polygraphy --mpi4py --pytorch --opencv && \
+    CONSTRAINTS_FILE=${CONSTRAINTS_FILE} \
+    bash ./install_master.sh --all && \
     rm install_base.sh && \
     rm install_cmake.sh && \
     rm install_ccache.sh && \
@@ -69,20 +74,11 @@ RUN GITHUB_MIRROR=${GITHUB_MIRROR} \
     rm install_polygraphy.sh && \
     rm install_mpi4py.sh && \
     rm install_pytorch.sh && \
-    rm install.sh
-
-# Copy and install dependencies from constraints.txt
-COPY constraints.txt /tmp/constraints.txt
-RUN pip3 install --no-cache-dir -r /tmp/constraints.txt && rm /tmp/constraints.txt
-
-# Install UCX, NIXL, etcd
-# TODO: Combine these into the main install.sh script
-RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install_ucx.sh && \
-    GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install_nixl.sh && \
-    bash ./install_etcd.sh && \
     rm install_ucx.sh && \
     rm install_nixl.sh && \
-    rm install_etcd.sh
+    rm install_etcd.sh && \
+    rm install_master.sh && \
+    rm constraints.txt
 
 # Generate OSS attribution file for devel image
 ARG TRT_LLM_VER
