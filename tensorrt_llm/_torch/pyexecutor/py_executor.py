@@ -31,7 +31,8 @@ from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             StaticBatchingStats)
 from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
-from tensorrt_llm.llmapi.llm_args import PeftCacheConfig
+from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
+                                          PeftCacheConfig)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.runtime.generation import CUASSERT
@@ -1702,9 +1703,24 @@ class PyExecutor:
                     else:
                         previous_tensors_device = self.previous_batch and self.previous_batch.sample_state and self.previous_batch.sample_state.device
 
+                    # Extract seq_slots from the previous batch to detect if generation requests
+                    # were in the previous batch. This is important for NON_MIX_BATCHING:
+                    # if a generation request wasn't in the previous batch (e.g., it was context-only),
+                    # the position_id calculation needs adjustment.
+                    previous_batch_seq_slots = None
+                    if self.scheduler_config.capacity_scheduler_policy == CapacitySchedulerPolicy.NON_MIX_BATCHING and self.previous_batch and self.previous_batch.sample_state:
+                        prev_scheduled = self.previous_batch.sample_state.scheduled_requests
+                        previous_batch_seq_slots = set()
+                        for req in prev_scheduled.context_requests:
+                            if req.py_seq_slot is not None:
+                                previous_batch_seq_slots.add(req.py_seq_slot)
+                        for req in prev_scheduled.generation_requests:
+                            if req.py_seq_slot is not None:
+                                previous_batch_seq_slots.add(req.py_seq_slot)
+
                     batch_outputs = self._forward_step(
                         scheduled_batch, previous_tensors_device,
-                        num_accepted_tokens_device)
+                        num_accepted_tokens_device, previous_batch_seq_slots)
 
                 if self.previous_batch is not None:
                     self._update_requests(self.previous_batch.sample_state)
@@ -2274,11 +2290,11 @@ class PyExecutor:
         self.kv_cache_transceiver.check_gen_transfer_status(atLeastNum)
         self._check_cache_transfer_errors("generation requests")
 
-    def _forward_step(
-            self,
-            scheduled_requests,
-            new_tensors_device: Optional[SampleStateTensors] = None,
-            num_accepted_tokens_device: Optional[torch.Tensor] = None):
+    def _forward_step(self,
+                      scheduled_requests,
+                      new_tensors_device: Optional[SampleStateTensors] = None,
+                      num_accepted_tokens_device: Optional[torch.Tensor] = None,
+                      previous_batch_seq_slots: Optional[set] = None):
         ExpertStatistic.set_iter(self.iter_counter)
 
         @nvtx_range(
@@ -2286,14 +2302,15 @@ class PyExecutor:
         )
         def forward(scheduled_requests, resource_manager, new_tensors_device,
                     gather_context_logits, cache_indirection_buffer,
-                    num_accepted_tokens_device):
+                    num_accepted_tokens_device, previous_batch_seq_slots):
             return self.model_engine.forward(
                 scheduled_requests,
                 resource_manager,
                 new_tensors_device,
                 gather_context_logits=gather_context_logits,
                 cache_indirection_buffer=cache_indirection_buffer,
-                num_accepted_tokens_device=num_accepted_tokens_device)
+                num_accepted_tokens_device=num_accepted_tokens_device,
+                previous_batch_seq_slots=previous_batch_seq_slots)
 
         try:
             gather_context_logits = any(
@@ -2308,7 +2325,8 @@ class PyExecutor:
                 outputs = forward(scheduled_requests, self.resource_manager,
                                   new_tensors_device, gather_context_logits,
                                   cache_indirection_buffer,
-                                  num_accepted_tokens_device)
+                                  num_accepted_tokens_device,
+                                  previous_batch_seq_slots)
 
             # Ensure the default stream waits for execution_stream to complete
             # before downstream operations use the outputs.

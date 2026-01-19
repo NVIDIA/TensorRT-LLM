@@ -1415,6 +1415,7 @@ class CapacitySchedulerPolicy(StrEnum, metaclass=PybindMirrorEnumMeta):
     MAX_UTILIZATION = "MAX_UTILIZATION"
     GUARANTEED_NO_EVICT = "GUARANTEED_NO_EVICT"
     STATIC_BATCH = "STATIC_BATCH"
+    NON_MIX_BATCHING = "NON_MIX_BATCHING"
 
     def _to_pybind(self):
         return getattr(_CapacitySchedulerPolicy, self.value)

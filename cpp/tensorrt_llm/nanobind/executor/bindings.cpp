@@ -90,7 +90,8 @@ void initBindings(nb::module_& m)
     nb::enum_<tle::CapacitySchedulerPolicy>(m, "CapacitySchedulerPolicy")
         .value("MAX_UTILIZATION", tle::CapacitySchedulerPolicy::kMAX_UTILIZATION)
         .value("GUARANTEED_NO_EVICT", tle::CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT)
-        .value("STATIC_BATCH", tle::CapacitySchedulerPolicy::kSTATIC_BATCH);
+        .value("STATIC_BATCH", tle::CapacitySchedulerPolicy::kSTATIC_BATCH)
+        .value("NON_MIX_BATCHING", tle::CapacitySchedulerPolicy::kNON_MIX_BATCHING);
 
     nb::enum_<tle::ContextChunkingPolicy>(m, "ContextChunkingPolicy")
         .value("EQUAL_PROGRESS", tle::ContextChunkingPolicy::kEQUAL_PROGRESS)
