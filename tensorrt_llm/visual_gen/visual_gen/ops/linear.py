@@ -101,7 +101,6 @@ class DefaultLinear(BaseLinear):
         input_scale: torch.Tensor,
         weight_scale: torch.Tensor,
     ) -> torch.Tensor:
-        # print(f"DefaultLinear: input.dtype: {input.dtype}, weight.dtype: {weight.dtype}, bias.dtype: {bias.dtype}")
         return F.linear(input, weight, bias)
 
 

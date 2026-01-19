@@ -252,6 +252,7 @@ class ditFlux2Transformer2DModel(Flux2Transformer2DModel, ditBaseTransformer):
             img_modulated = (1 + img_mod1_scale) * img_modulated + img_mod1_shift
             should_calc, hidden_states = self._calc_teacache_distance(img_modulated, hidden_states)
 
+        print(should_calc)
         if should_calc:
             original_hidden_states = hidden_states.clone()
             # text encoder
