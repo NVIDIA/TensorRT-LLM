@@ -124,6 +124,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String st
 
         def hasTimeoutTest = false
         def downloadResultSucceed = false
+        def downloadPerfResultSucceed = false
 
         pipeline.stage('Submit Test Result') {
             sh "mkdir -p ${stageName}"
@@ -146,8 +147,28 @@ EOF_TIMEOUT_XML
             def resultsFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/results.xml"
             downloadResultSucceed = Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -P ${remote.port} -r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${resultsFilePath} ${stageName}/", returnStatus: true, numRetries: 3) == 0
 
-            echo "hasTimeoutTest: ${hasTimeoutTest}, downloadResultSucceed: ${downloadResultSucceed}"
-            if (hasTimeoutTest || downloadResultSucceed) {
+            // Download perf test results
+            def perfResultsBasePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}"
+            def folderListOutput = Utils.exec(
+                pipeline,
+                script: Utils.sshUserCmd(
+                    remote,
+                    "\"find '${perfResultsBasePath}' -maxdepth 1 -type d \\( -name 'aggr*' -o -name 'disagg*' \\) -printf '%f\\n' || true\""
+                ),
+                returnStdout: true,
+                numRetries: 3
+            )?.trim() ?: ""
+            def perfFolders = folderListOutput.split(/\s+/).collect { it.trim().replaceAll(/\/$/, '') }.findAll { it }
+            echo "Perf Result Folders: ${perfFolders}"
+            if (perfFolders) {
+                def scpSources = perfFolders.size() == 1
+                    ? "${remote.user}@${remote.host}:${perfResultsBasePath}/${perfFolders[0]}"
+                    : "${remote.user}@${remote.host}:{${perfFolders.collect { "${perfResultsBasePath}/${it}" }.join(',')}}"
+                downloadPerfResultSucceed = Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -P ${remote.port} -r -p ${COMMON_SSH_OPTIONS} ${scpSources} ${stageName}/", returnStatus: true, numRetries: 3) == 0
+            }
+
+            echo "hasTimeoutTest: ${hasTimeoutTest}, downloadResultSucceed: ${downloadResultSucceed}, downloadPerfResultSucceed: ${downloadPerfResultSucceed}"
+            if (hasTimeoutTest || downloadResultSucceed || downloadPerfResultSucceed) {
                 sh "ls ${stageName}"
                 echo "Upload test results."
                 sh "tar -czvf results-${stageName}.tar.gz ${stageName}/"
@@ -689,7 +710,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                     "--entrypoint=\"\" " +
                     "--security-opt seccomp=unconfined " +
                     "-u root:root " +
-                    "-v /home/scratch.trt_llm_data:/scratch.trt_llm_data:ro " +
+                    "-v /home/scratch.trt_llm_data_ci:/scratch.trt_llm_data:ro " +
                     "-v /tmp/ccache:${CCACHE_DIR}:rw " +
                     "-v /tmp/pipcache/http-v2:/root/.cache/pip/http-v2:rw " +
                     "--cap-add=SYSLOG"
@@ -871,7 +892,7 @@ def getMountListForSlurmTest(SlurmCluster cluster, boolean useSbatch = false)
     // data/cache mounts
     if (cluster.containerRuntime.toString() == "DOCKER") {
         mounts += [
-            "/home/scratch.trt_llm_data:/scratch.trt_llm_data:ro",
+            "/home/scratch.trt_llm_data_ci:/scratch.trt_llm_data:ro",
         ]
     } else if (cluster.containerRuntime.toString() == "ENROOT") {
         if (!cluster.scratchPath) {

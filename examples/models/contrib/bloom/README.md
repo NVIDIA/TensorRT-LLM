@@ -189,7 +189,7 @@ Note we use `--bin_model_dir` instead of `--model_dir` since SmoothQuant model n
 
 ```
 # Quantize HF Bloom 3B into FP8 and export trtllm checkpoint
-python ../../../quantization/quantize.py --model_dir /home/scratch.trt_llm_data/llm-models/bloom-3b \
+python ../../../quantization/quantize.py --model_dir /home/scratch.trt_llm_data_ci/llm-models/bloom-3b \
                                    --dtype float16 \
                                    --qformat fp8 \
                                    --kv_cache_dtype fp8 \
@@ -230,7 +230,7 @@ mpirun -n 8 --allow-run-as-root \
                            --engine_dir ./bloom/176B/trt_engines/fp16/8-gpu/
 
 python ../../../summarize.py --test_trt_llm \
-                       --hf_model_dir /home/scratch.trt_llm_data/llm-models/bloom-3b \
+                       --hf_model_dir /home/scratch.trt_llm_data_ci/llm-models/bloom-3b \
                        --data_type fp16 \
                        --engine_dir /tmp/bloom/3b/trt_engines/fp8/1-gpu/
 ```

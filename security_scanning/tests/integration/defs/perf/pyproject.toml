@@ -5,7 +5,6 @@ description = ""
 authors = [
     {name = "TensorRT LLM [90828364+tensorrt-cicd@users.noreply.github.com]"}
 ]
-readme = "README.md"
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "pandas (>=2.3.3,<3.0.0)",
