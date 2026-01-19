@@ -29,7 +29,6 @@ from common import (
     validate_parallel_config,
 )
 from huggingface_hub import hf_hub_download
-
 from visual_gen import setup_configs
 from visual_gen.models.transformers.flux_transformer import ditFluxTransformer2DModel
 from visual_gen.pipelines.flux_pipeline import ditFluxPipeline
@@ -118,9 +117,44 @@ def run_inference(pipe, args, enable_autotuner: bool = False):
     if args.enable_cuda_graph:
         assert args.attn_type != "sage-attn", "sage-attn has accuracy issue when enable cudagraph"
         assert not (
-            args.enable_async_cpu_offload or args.enable_sequential_cpu_offload or args.enable_model_cpu_offload
+            args.enable_async_cpu_offload
+            or args.enable_sequential_cpu_offload
+            or args.enable_model_cpu_offload
         ), "CudaGraph is not supported when using cpu offload"
-        pipe.transformer.forward = cudagraph_wrapper(pipe.transformer.forward)
+
+        # === Text Encoders (prompt encode) ===
+        # Wrap text encoder forward methods for CUDA Graph
+        if hasattr(pipe, "text_encoder") and pipe.text_encoder is not None:
+            pipe.text_encoder.forward = cudagraph_wrapper(pipe.text_encoder.forward)
+        if hasattr(pipe, "text_encoder_2") and pipe.text_encoder_2 is not None:
+            pipe.text_encoder_2.forward = cudagraph_wrapper(pipe.text_encoder_2.forward)
+
+        # === VAE Decode (includes unpack_latents + scaling + vae.decode) ===
+        pipe.run_vae_decode = cudagraph_wrapper(pipe.run_vae_decode)
+
+        # === Transformer ===
+        if args.enable_teacache:
+            # When using TeaCache + CUDA Graph, wrap multiple components separately
+            # This allows TeaCache's dynamic skip logic to work while maximizing CUDA Graph coverage
+            # 1. Pre-processing: embeddings (x_embedder, time_text_embed, context_embedder, pos_embed)
+            pipe.transformer.run_pre_processing = cudagraph_wrapper(
+                pipe.transformer.run_pre_processing
+            )
+            # 2. TeaCache check: norm1 computation for distance calculation
+            pipe.transformer.run_teacache_check = cudagraph_wrapper(
+                pipe.transformer.run_teacache_check
+            )
+            # 3. Transformer blocks: the main computation
+            pipe.transformer.run_transformer_blocks = cudagraph_wrapper(
+                pipe.transformer.run_transformer_blocks
+            )
+            # 4. Post-processing: norm_out and proj_out
+            pipe.transformer.run_post_processing = cudagraph_wrapper(
+                pipe.transformer.run_post_processing
+            )
+        else:
+            # Without TeaCache, wrap the entire forward for maximum performance
+            pipe.transformer.forward = cudagraph_wrapper(pipe.transformer.forward)
 
     image, elapsed_time = benchmark_inference(
         inference_fn,

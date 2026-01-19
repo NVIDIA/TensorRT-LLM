@@ -4,7 +4,8 @@
 # Adapted from: https://github.com/ali-vilab/TeaCache
 # @article{
 #   title={Timestep Embedding Tells: It's Time to Cache for Video Diffusion Model},
-#   author={Liu, Feng and Zhang, Shiwei and Wang, Xiaofeng and Wei, Yujie and Qiu, Haonan and Zhao, Yuzhong and Zhang, Yingya and Ye, Qixiang and Wan, Fang},
+#   author={Liu, Feng and Zhang, Shiwei and Wang, Xiaofeng and Wei, Yujie
+#           and Qiu, Haonan and Zhao, Yuzhong and Zhang, Yingya and Ye, Qixiang and Wan, Fang},
 #   journal={arXiv preprint arXiv:2411.19108},
 #   year={2024}
 # }
@@ -31,7 +32,11 @@ import numpy as np
 import torch
 from diffusers import FluxPipeline
 from diffusers.image_processor import PipelineImageInput
-from diffusers.pipelines.flux.pipeline_flux import FluxPipelineOutput, calculate_shift, retrieve_timesteps
+from diffusers.pipelines.flux.pipeline_flux import (
+    FluxPipelineOutput,
+    calculate_shift,
+    retrieve_timesteps,
+)
 from diffusers.utils import is_torch_xla_available
 from safetensors.torch import load_file
 
@@ -55,14 +60,16 @@ else:
 
 
 class ditFluxPipeline(FluxPipeline, ditBasePipeline):
-
     def _after_load(self, pretrained_model_name_or_path, *args, **kwargs) -> None:
         """Post-processing hook after load model checkpoints in 'from_pretrained' method."""
         if not isinstance(self.transformer, ditFluxTransformer2DModel):
             logger.debug("Loading ditFluxTransformer2DModel from diffusers transformer")
             torch_dtype = kwargs.get("torch_dtype", torch.float32)
             self.transformer = ditFluxTransformer2DModel.from_pretrained(
-                pretrained_model_name_or_path, subfolder="transformer", torch_dtype=torch_dtype, low_cpu_mem_usage=True
+                pretrained_model_name_or_path,
+                subfolder="transformer",
+                torch_dtype=torch_dtype,
+                low_cpu_mem_usage=True,
             )
             gc.collect()
             torch.cuda.empty_cache()
@@ -91,6 +98,23 @@ class ditFluxPipeline(FluxPipeline, ditBasePipeline):
         for name, module in self.transformer.named_modules():
             if isinstance(module, ditLinear):
                 module.load_fp4_weight(weights_table, svd_weight_name_table)
+
+    def run_vae_decode(self, latents: torch.Tensor, height: int, width: int) -> torch.Tensor:
+        """VAE decode with latent unpacking and scaling.
+
+        This method can be wrapped with CUDA Graph for better performance.
+        """
+        # DC-Gen uses 1x1 patch, standard FLUX uses 2x2 patch
+        if getattr(self, "_is_dc_ae", False):
+            latents = self._unpack_latents_dc_ae(latents, height, width, self.vae_scale_factor)
+        else:
+            latents = self._unpack_latents(latents, height, width, self.vae_scale_factor)
+        latents = latents / self.vae.config.scaling_factor
+        # shift_factor only applies to standard VAE (AutoencoderKL), DC-AE doesn't have this attribute
+        if hasattr(self.vae.config, "shift_factor"):
+            latents = latents + self.vae.config.shift_factor
+        image = self.vae.decode(latents, return_dict=False)[0]
+        return image
 
     @torch.no_grad()
     def __call__(
@@ -156,13 +180,19 @@ class ditFluxPipeline(FluxPipeline, ditBasePipeline):
             batch_size = prompt_embeds.shape[0]
 
         # Leverage ditBasePipeline's dit_dp_split method, which splits the data for data parallel
-        batch_size, prompt, negative_prompt, prompt_embeds, negative_prompt_embeds = self.dit_dp_split(
-            batch_size, prompt, negative_prompt, prompt_embeds, negative_prompt_embeds
+        batch_size, prompt, negative_prompt, prompt_embeds, negative_prompt_embeds = (
+            self.dit_dp_split(
+                batch_size, prompt, negative_prompt, prompt_embeds, negative_prompt_embeds
+            )
         )
 
         device = self._execution_device
 
-        lora_scale = self.joint_attention_kwargs.get("scale", None) if self.joint_attention_kwargs is not None else None
+        lora_scale = (
+            self.joint_attention_kwargs.get("scale", None)
+            if self.joint_attention_kwargs is not None
+            else None
+        )
         has_neg_prompt = negative_prompt is not None or (
             negative_prompt_embeds is not None and negative_pooled_prompt_embeds is not None
         )
@@ -227,8 +257,15 @@ class ditFluxPipeline(FluxPipeline, ditBasePipeline):
         )
 
         # 5. Prepare timesteps
-        sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
-        if hasattr(self.scheduler.config, "use_flow_sigmas") and self.scheduler.config.use_flow_sigmas:
+        sigmas = (
+            np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
+            if sigmas is None
+            else sigmas
+        )
+        if (
+            hasattr(self.scheduler.config, "use_flow_sigmas")
+            and self.scheduler.config.use_flow_sigmas
+        ):
             sigmas = None
         image_seq_len = latents.shape[1]
         mu = calculate_shift(
@@ -259,13 +296,17 @@ class ditFluxPipeline(FluxPipeline, ditBasePipeline):
             negative_ip_adapter_image is None and negative_ip_adapter_image_embeds is None
         ):
             negative_ip_adapter_image = np.zeros((width, height, 3), dtype=np.uint8)
-            negative_ip_adapter_image = [negative_ip_adapter_image] * self.transformer.encoder_hid_proj.num_ip_adapters
+            negative_ip_adapter_image = [
+                negative_ip_adapter_image
+            ] * self.transformer.encoder_hid_proj.num_ip_adapters
 
         elif (ip_adapter_image is None and ip_adapter_image_embeds is None) and (
             negative_ip_adapter_image is not None or negative_ip_adapter_image_embeds is not None
         ):
             ip_adapter_image = np.zeros((width, height, 3), dtype=np.uint8)
-            ip_adapter_image = [ip_adapter_image] * self.transformer.encoder_hid_proj.num_ip_adapters
+            ip_adapter_image = [
+                ip_adapter_image
+            ] * self.transformer.encoder_hid_proj.num_ip_adapters
 
         if self.joint_attention_kwargs is None:
             self._joint_attention_kwargs = {}
@@ -317,7 +358,9 @@ class ditFluxPipeline(FluxPipeline, ditBasePipeline):
                 cfg_negative_inputs = None
                 if do_true_cfg:
                     if negative_image_embeds is not None:
-                        self._joint_attention_kwargs["ip_adapter_image_embeds"] = negative_image_embeds
+                        self._joint_attention_kwargs["ip_adapter_image_embeds"] = (
+                            negative_image_embeds
+                        )
 
                     cfg_negative_inputs = {
                         "hidden_states": latents,
@@ -364,7 +407,9 @@ class ditFluxPipeline(FluxPipeline, ditBasePipeline):
                     prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
 
                 # call the callback, if provided
-                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                if i == len(timesteps) - 1 or (
+                    (i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0
+                ):
                     progress_bar.update()
 
                 if XLA_AVAILABLE:
@@ -378,9 +423,7 @@ class ditFluxPipeline(FluxPipeline, ditBasePipeline):
         if output_type == "latent":
             image = latents
         else:
-            latents = self._unpack_latents(latents, height, width, self.vae_scale_factor)
-            latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
-            image = self.vae.decode(latents, return_dict=False)[0]
+            image = self.run_vae_decode(latents, height, width)
             image = self.image_processor.postprocess(image, output_type=output_type)
 
         # Offload all models

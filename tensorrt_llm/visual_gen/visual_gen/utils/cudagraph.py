@@ -23,8 +23,7 @@ from torch.utils._pytree import tree_map_only
 
 
 def cudagraph_wrapper(func):
-    """
-    Decorator to automatically handle CUDAGraph record/replay for the given function.
+    """Decorator to automatically handle CUDAGraph record/replay for the given function.
 
     This decorator caches CUDAGraphs based on the shapes of tensor arguments,
     providing automatic replay for performance optimization.
@@ -61,7 +60,11 @@ def cudagraph_wrapper(func):
         # Generate cache key based on tensor shapes (excluding self for bound methods)
         input_shapes = tuple(
             list(tuple(arg.shape) for arg in args_for_key if isinstance(arg, torch.Tensor))
-            + list((k, tuple(kwargs[k].shape)) for k in sorted(kwargs.keys()) if isinstance(kwargs[k], torch.Tensor))
+            + list(
+                (k, tuple(kwargs[k].shape))
+                for k in sorted(kwargs.keys())
+                if isinstance(kwargs[k], torch.Tensor)
+            )
         )
         key = hash(input_shapes)
 
@@ -80,7 +83,7 @@ def cudagraph_wrapper(func):
             # For bound methods that expect self as first parameter, we need to handle differently
             if hasattr(func, "__self__") and func.__code__.co_varnames[0] == "self":
                 # This is a bound method, call it without passing self explicitly
-                if len(in_args) == func.__code__.co_argcount:
+                if len(in_args) == func.__code__.co_argcount and in_args[0] is func.__self__:
                     # We have too many args, remove the first one (which would be self)
                     actual_args = in_args[1:]
                     func(*actual_args, **in_kwargs)
@@ -95,7 +98,7 @@ def cudagraph_wrapper(func):
         with torch.cuda.graph(g):
             # Same logic for CUDAGraph recording
             if hasattr(func, "__self__") and func.__code__.co_varnames[0] == "self":
-                if len(in_args) == func.__code__.co_argcount:
+                if len(in_args) == func.__code__.co_argcount and in_args[0] is func.__self__:
                     actual_args = in_args[1:]
                     out_tensors = func(*actual_args, **in_kwargs)
                 else:

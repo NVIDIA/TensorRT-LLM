@@ -86,14 +86,20 @@ class ditFluxAttnProcessor(ditAttnProcessor):
             query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
             key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
 
-        hidden_states = self.visual_gen_attn(query, key, value, attn_mask=attention_mask, tensor_layout="NHD")
+        hidden_states = self.visual_gen_attn(
+            query, key, value, attn_mask=attention_mask, tensor_layout="NHD"
+        )
 
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
 
         if encoder_hidden_states is not None:
             encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
-                [encoder_hidden_states.shape[1], hidden_states.shape[1] - encoder_hidden_states.shape[1]], dim=1
+                [
+                    encoder_hidden_states.shape[1],
+                    hidden_states.shape[1] - encoder_hidden_states.shape[1],
+                ],
+                dim=1,
             )
             hidden_states = attn.to_out[0](hidden_states)
             hidden_states = attn.to_out[1](hidden_states)
@@ -107,8 +113,15 @@ class ditFluxAttnProcessor(ditAttnProcessor):
 class ditFluxIPAdapterAttnProcessor(FluxIPAdapterAttnProcessor, ditAttnProcessor):
     """Flux Attention processor for IP-Adapter."""
 
-    def __init__(self, hidden_size: int, cross_attention_dim: int, num_tokens=(4,), scale=1.0, device=None, dtype=None):
-
+    def __init__(
+        self,
+        hidden_size: int,
+        cross_attention_dim: int,
+        num_tokens=(4,),
+        scale=1.0,
+        device=None,
+        dtype=None,
+    ):
         super(ditFluxIPAdapterAttnProcessor, self).__init__(
             hidden_size=hidden_size,
             cross_attention_dim=cross_attention_dim,
@@ -159,7 +172,13 @@ class ditFluxIPAdapterAttnProcessor(FluxIPAdapterAttnProcessor, ditAttnProcessor
             key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
 
         hidden_states = self.visual_gen_attn(
-            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False, tensor_layout="NHD"
+            query,
+            key,
+            value,
+            attn_mask=attention_mask,
+            dropout_p=0.0,
+            is_causal=False,
+            tensor_layout="NHD",
         )
 
         hidden_states = hidden_states.flatten(2, 3)
@@ -167,7 +186,11 @@ class ditFluxIPAdapterAttnProcessor(FluxIPAdapterAttnProcessor, ditAttnProcessor
 
         if encoder_hidden_states is not None:
             encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
-                [encoder_hidden_states.shape[1], hidden_states.shape[1] - encoder_hidden_states.shape[1]], dim=1
+                [
+                    encoder_hidden_states.shape[1],
+                    hidden_states.shape[1] - encoder_hidden_states.shape[1],
+                ],
+                dim=1,
             )
             hidden_states = attn.to_out[0](hidden_states)
             hidden_states = attn.to_out[1](hidden_states)
@@ -185,7 +208,9 @@ class ditFluxIPAdapterAttnProcessor(FluxIPAdapterAttnProcessor, ditAttnProcessor
                 ip_key = ip_key.view(batch_size, -1, attn.heads, attn.head_dim)
                 ip_value = ip_value.view(batch_size, -1, attn.heads, attn.head_dim)
 
-                (ip_query, ip_key, ip_value) = (x.permute(0, 2, 1, 3) for x in (ip_query, ip_key, ip_value))
+                (ip_query, ip_key, ip_value) = (
+                    x.permute(0, 2, 1, 3) for x in (ip_query, ip_key, ip_value)
+                )
                 current_ip_hidden_states = F.scaled_dot_product_attention(
                     ip_query,
                     ip_key,
@@ -196,7 +221,9 @@ class ditFluxIPAdapterAttnProcessor(FluxIPAdapterAttnProcessor, ditAttnProcessor
                 )
                 current_ip_hidden_states = current_ip_hidden_states.permute(0, 2, 1, 3)
 
-                current_ip_hidden_states = current_ip_hidden_states.reshape(batch_size, -1, attn.heads * attn.head_dim)
+                current_ip_hidden_states = current_ip_hidden_states.reshape(
+                    batch_size, -1, attn.heads * attn.head_dim
+                )
                 current_ip_hidden_states = current_ip_hidden_states.to(ip_query.dtype)
                 ip_attn_output += scale * current_ip_hidden_states
 
@@ -207,7 +234,9 @@ class ditFluxIPAdapterAttnProcessor(FluxIPAdapterAttnProcessor, ditAttnProcessor
 
 @maybe_allow_in_graph
 class ditSvdFluxSingleTransformerBlock(FluxSingleTransformerBlock):
-    def __init__(self, dim: int, num_attention_heads: int, attention_head_dim: int, mlp_ratio: float = 4.0):
+    def __init__(
+        self, dim: int, num_attention_heads: int, attention_head_dim: int, mlp_ratio: float = 4.0
+    ):
         super(ditSvdFluxSingleTransformerBlock, self).__init__(
             dim=dim,
             num_attention_heads=num_attention_heads,
@@ -247,7 +276,10 @@ class ditSvdFluxSingleTransformerBlock(FluxSingleTransformerBlock):
         if hidden_states.dtype == torch.float16:
             hidden_states = hidden_states.clip(-65504, 65504)
 
-        encoder_hidden_states, hidden_states = hidden_states[:, :text_seq_len], hidden_states[:, text_seq_len:]
+        encoder_hidden_states, hidden_states = (
+            hidden_states[:, :text_seq_len],
+            hidden_states[:, text_seq_len:],
+        )
         return encoder_hidden_states, hidden_states
 
 
@@ -313,7 +345,9 @@ class ditFluxTransformer2DModel(FluxTransformer2DModel, ditBaseTransformer):
                     attn_processor.name = name
                     module.set_processor(attn_processor)
                 else:
-                    logger.warning(f"Unsupported attn processor: {type(origin_attn_processor)} for {name}")
+                    logger.warning(
+                        f"Unsupported attn processor: {type(origin_attn_processor)} for {name}"
+                    )
 
         # Collect all linear modules to replace first to avoid modifying during iteration
         linear_modules_to_replace = []
@@ -362,10 +396,13 @@ class ditFluxTransformer2DModel(FluxTransformer2DModel, ditBaseTransformer):
                 # For Xlabs ControlNet.
                 if controlnet_blocks_repeat:
                     hidden_states = (
-                        hidden_states + controlnet_block_samples[index_block % len(controlnet_block_samples)]
+                        hidden_states
+                        + controlnet_block_samples[index_block % len(controlnet_block_samples)]
                     )
                 else:
-                    hidden_states = hidden_states + controlnet_block_samples[index_block // interval_control]
+                    hidden_states = (
+                        hidden_states + controlnet_block_samples[index_block // interval_control]
+                    )
 
         for index_block, block in enumerate(self.single_transformer_blocks):
             PipelineConfig.set_config(current_dit_block_id=global_block_index)
@@ -380,24 +417,29 @@ class ditFluxTransformer2DModel(FluxTransformer2DModel, ditBaseTransformer):
 
             # controlnet residual
             if controlnet_single_block_samples is not None:
-                interval_control = len(self.single_transformer_blocks) / len(controlnet_single_block_samples)
+                interval_control = len(self.single_transformer_blocks) / len(
+                    controlnet_single_block_samples
+                )
                 interval_control = int(np.ceil(interval_control))
-                hidden_states = hidden_states + controlnet_single_block_samples[index_block // interval_control]
+                hidden_states = (
+                    hidden_states + controlnet_single_block_samples[index_block // interval_control]
+                )
 
         return hidden_states
 
     def _sp_split(self, hidden_states, encoder_hidden_states, image_rotary_emb):
         sp_size = DiTParallelConfig.sp_size()
         if sp_size > 1:
-            assert (
-                hidden_states.shape[1] % sp_size == 0
-            ), f"Hidden states({hidden_states.shape}) sequence length must be divisible by sp_size({sp_size})"
-            assert (
-                encoder_hidden_states.shape[1] % sp_size == 0
-            ), f"Encoder hidden states({encoder_hidden_states.shape}) sequence length must be divisible by sp_size({sp_size})"
-            assert (
-                image_rotary_emb[0].shape[0] % sp_size == 0
-            ), f"Image rotary emb({image_rotary_emb[0].shape}) sequence length must be divisible by sp_size({sp_size})"
+            assert hidden_states.shape[1] % sp_size == 0, (
+                f"Hidden states({hidden_states.shape}) sequence length must be divisible by sp_size({sp_size})"
+            )
+            assert encoder_hidden_states.shape[1] % sp_size == 0, (
+                f"Encoder hidden states({encoder_hidden_states.shape}) "
+                f"sequence length must be divisible by sp_size({sp_size})"
+            )
+            assert image_rotary_emb[0].shape[0] % sp_size == 0, (
+                f"Image rotary emb({image_rotary_emb[0].shape}) sequence length must be divisible by sp_size({sp_size})"
+            )
 
             txt_seq_len = encoder_hidden_states.shape[1]
             hidden_states = dit_sp_split(hidden_states, dim=1)
@@ -406,7 +448,9 @@ class ditFluxTransformer2DModel(FluxTransformer2DModel, ditBaseTransformer):
             for emb in image_rotary_emb:
                 txt_rotary_emb = dit_sp_split(emb[:txt_seq_len], dim=0)
                 latent_rotary_emb = dit_sp_split(emb[txt_seq_len:], dim=0)
-                chunked_image_rotary_emb.append(torch.cat([txt_rotary_emb, latent_rotary_emb], dim=0))
+                chunked_image_rotary_emb.append(
+                    torch.cat([txt_rotary_emb, latent_rotary_emb], dim=0)
+                )
             image_rotary_emb = tuple(chunked_image_rotary_emb)
 
         return hidden_states, encoder_hidden_states, image_rotary_emb
@@ -441,6 +485,47 @@ class ditFluxTransformer2DModel(FluxTransformer2DModel, ditBaseTransformer):
 
         return hidden_states
 
+    def run_pre_processing(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        pooled_projections: torch.Tensor,
+        timestep: torch.Tensor,
+        img_ids: torch.Tensor,
+        txt_ids: torch.Tensor,
+        guidance: torch.Tensor = None,
+    ):
+        """Pre-processing: embeddings and position encoding. Can be wrapped with CUDA Graph."""
+        hidden_states = self.x_embedder(hidden_states)
+
+        timestep = timestep.to(hidden_states.dtype) * 1000
+        if guidance is not None:
+            guidance = guidance.to(hidden_states.dtype) * 1000
+
+        temb = (
+            self.time_text_embed(timestep, pooled_projections)
+            if guidance is None
+            else self.time_text_embed(timestep, guidance, pooled_projections)
+        )
+        encoder_hidden_states = self.context_embedder(encoder_hidden_states)
+
+        ids = torch.cat((txt_ids, img_ids), dim=0)
+        image_rotary_emb = self.pos_embed(ids)
+
+        return hidden_states, encoder_hidden_states, temb, image_rotary_emb
+
+    def run_post_processing(self, hidden_states: torch.Tensor, temb: torch.Tensor):
+        """Post-processing: output norm and projection. Can be wrapped with CUDA Graph."""
+        hidden_states = self.norm_out(hidden_states, temb)
+        output = self.proj_out(hidden_states)
+        return output
+
+    def run_teacache_check(self, hidden_states: torch.Tensor, temb: torch.Tensor):
+        """TeaCache distance check. Can be wrapped with CUDA Graph (always runs)."""
+        with disable_weight_management():
+            modulated_inp, _, _, _, _ = self.transformer_blocks[0].norm1(hidden_states, emb=temb)
+        return modulated_inp
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -466,23 +551,13 @@ class ditFluxTransformer2DModel(FluxTransformer2DModel, ditBaseTransformer):
             # weight the lora layers by setting `lora_scale` for each PEFT layer
             scale_lora_layers(self, lora_scale)
         else:
-            if joint_attention_kwargs is not None and joint_attention_kwargs.get("scale", None) is not None:
+            if (
+                joint_attention_kwargs is not None
+                and joint_attention_kwargs.get("scale", None) is not None
+            ):
                 logger.warning(
                     "Passing `scale` via `joint_attention_kwargs` when not using the PEFT backend is ineffective."
                 )
-
-        hidden_states = self.x_embedder(hidden_states)
-
-        timestep = timestep.to(hidden_states.dtype) * 1000
-        if guidance is not None:
-            guidance = guidance.to(hidden_states.dtype) * 1000
-
-        temb = (
-            self.time_text_embed(timestep, pooled_projections)
-            if guidance is None
-            else self.time_text_embed(timestep, guidance, pooled_projections)
-        )
-        encoder_hidden_states = self.context_embedder(encoder_hidden_states)
 
         if txt_ids.ndim == 3:
             logger.warning(
@@ -497,17 +572,29 @@ class ditFluxTransformer2DModel(FluxTransformer2DModel, ditBaseTransformer):
             )
             img_ids = img_ids[0]
 
-        ids = torch.cat((txt_ids, img_ids), dim=0)
-        image_rotary_emb = self.pos_embed(ids)
+        # === Pre-processing (can be CUDA Graph wrapped) ===
+        hidden_states, encoder_hidden_states, temb, image_rotary_emb = self.run_pre_processing(
+            hidden_states,
+            encoder_hidden_states,
+            pooled_projections,
+            timestep,
+            img_ids,
+            txt_ids,
+            guidance,
+        )
 
-        if joint_attention_kwargs is not None and "ip_adapter_image_embeds" in joint_attention_kwargs:
+        if (
+            joint_attention_kwargs is not None
+            and "ip_adapter_image_embeds" in joint_attention_kwargs
+        ):
             ip_adapter_image_embeds = joint_attention_kwargs.pop("ip_adapter_image_embeds")
             ip_hidden_states = self.encoder_hid_proj(ip_adapter_image_embeds)
             joint_attention_kwargs.update({"ip_hidden_states": ip_hidden_states})
 
+        # === TeaCache logic with conditional branching ===
         if TeaCacheConfig.enable_teacache():
-            with disable_weight_management():
-                modulated_inp, _, _, _, _ = self.transformer_blocks[0].norm1(hidden_states, emb=temb)
+            # TeaCache check (can be CUDA Graph wrapped separately)
+            modulated_inp = self.run_teacache_check(hidden_states, temb)
             should_calc, hidden_states = self._calc_teacache_distance(modulated_inp, hidden_states)
             if should_calc:
                 original_hidden_states = hidden_states.clone()
@@ -534,8 +621,8 @@ class ditFluxTransformer2DModel(FluxTransformer2DModel, ditBaseTransformer):
                 controlnet_blocks_repeat,
             )
 
-        hidden_states = self.norm_out(hidden_states, temb)
-        output = self.proj_out(hidden_states)
+        # === Post-processing (can be CUDA Graph wrapped) ===
+        output = self.run_post_processing(hidden_states, temb)
 
         if USE_PEFT_BACKEND:
             # remove `lora_scale` from each PEFT layer
