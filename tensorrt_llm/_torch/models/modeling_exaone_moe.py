@@ -1,6 +1,5 @@
 import math
 import os
-import re
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -32,15 +31,15 @@ from ..models.modeling_deepseekv3 import Deepseekv3MoE
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
-from ..modules.linear import TensorParallelMode
+from ..modules.linear import Linear, TensorParallelMode
+from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
-from ..utils import AuxStreamType, Fp4QuantizedTensor
-from .modeling_utils import (
-    DecoderModel,
-    DecoderModelForCausalLM,
-    EagerFusionConfig,
-    register_auto_model,
-)
+from ..speculative import SpecMetadata
+from ..utils import AuxStreamType, EventType, Fp4QuantizedTensor
+from .checkpoints.hf.exaone_moe_weight_mapper import ExaoneMoeWeightMapper
+from .modeling_deepseekv3 import DeepseekV3MTPHead
+from .modeling_speculative import SpecDecOneEngineForCausalLM
+from .modeling_utils import DecoderModel, EagerFusionConfig, register_auto_model
 
 # fmt: off
 # TODO: Remove this once we have a proper transformers package
@@ -59,11 +58,11 @@ AutoConfig.register(ExaoneMoEConfig.model_type, ExaoneMoEConfig)
 # fmt: on
 
 
-def check_is_moe(config: ExaoneMoEConfig, layer_idx: int) -> bool:
+def check_is_moe(config: ExaoneMoEConfig, layer_idx: int, is_mtp_layer: bool = False) -> bool:
     """
     Check if the current layer is a MoE layer.
     """
-    return hasattr(config, "is_moe_layer") and config.is_moe_layer[layer_idx]
+    return not is_mtp_layer and hasattr(config, "is_moe_layer") and config.is_moe_layer[layer_idx]
 
 
 def enable_attn_allreduce(mapping: Mapping):
@@ -75,13 +74,15 @@ class ExaoneMoeAttention(QKNormRoPEAttention):
         self,
         model_config: ModelConfig[ExaoneMoEConfig],
         layer_idx: Optional[int] = None,
+        is_mtp_layer: bool = False,
         fuse_qk_norm_rope: bool = False,
         disable_deep_gemm: bool = False,
     ):
         config = model_config.pretrained_config
 
         self.attention_window_size = None
-        self.is_sliding = config.layer_types[layer_idx] == "sliding_attention"
+        # A MTP layer uses the global attention.
+        self.is_sliding = not is_mtp_layer and config.layer_types[layer_idx] == "sliding_attention"
 
         # NOTE: In ExaoneMoe, only sliding layers apply rope.
         pos_embd_params = None
@@ -190,10 +191,15 @@ class ExaoneMoeDecoderLayer(DecoderLayer):
             hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=config.torch_dtype
         )
 
-        self.self_attn = ExaoneMoeAttention(model_config, layer_idx=layer_idx)
+        is_mtp_layer = False
+        if layer_idx >= config.num_hidden_layers:
+            is_mtp_layer = True
+        self.self_attn = ExaoneMoeAttention(
+            model_config, layer_idx=layer_idx, is_mtp_layer=is_mtp_layer
+        )
 
         # MoE or Dense layer
-        self.is_moe_layer = check_is_moe(config, layer_idx)
+        self.is_moe_layer = check_is_moe(config, layer_idx, is_mtp_layer)
         if self.is_moe_layer:
             self.fusion_config.PRE_MOE_FUSION = self.enable_fusion and has_tp
             self.fusion_config.POST_MOE_FUSION = self.fusion_config.PRE_MOE_FUSION and not has_pp
@@ -451,6 +457,117 @@ class ExaoneMoeDecoderLayer(DecoderLayer):
         return hidden_states, residual
 
 
+class ExaoneMoeMTPHead(DeepseekV3MTPHead):
+    """The shared head of the MTP Layer."""
+
+
+class ExaoneMoeMTP(ExaoneMoeDecoderLayer):
+    def __init__(
+        self,
+        model_config: ModelConfig[ExaoneMoEConfig],
+        layer_idx: int,
+        aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
+    ):
+        super().__init__(model_config, aux_stream_dict, layer_idx)
+        self.model_config = model_config
+        self.mapping = model_config.mapping
+        config = model_config.pretrained_config
+        self.aux_stream = aux_stream_dict[AuxStreamType.MoeShared]
+        self.event_dict = {key: torch.cuda.Event() for key in [EventType.Main, EventType.MoeShared]}
+
+        # Normalization for input embedding
+        self.enorm = RMSNorm(
+            hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=config.torch_dtype
+        )
+        self.hnorm = RMSNorm(
+            hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=config.torch_dtype
+        )
+
+        if model_config.mapping.enable_attention_dp:
+            self.eh_proj = Linear(
+                config.hidden_size * 2,
+                config.hidden_size,
+                bias=False,
+                dtype=config.torch_dtype,
+                skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+            )
+        else:
+            self.eh_proj = Linear(
+                config.hidden_size * 2,
+                config.hidden_size,
+                bias=False,
+                dtype=config.torch_dtype,
+                tensor_parallel_mode=TensorParallelMode.ROW,
+                mapping=model_config.mapping,
+                reduce_output=True,
+                skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+            )
+
+        self.shared_head = ExaoneMoeMTPHead(model_config=model_config)
+
+    def forward(
+        self,
+        input_ids: torch.IntTensor,
+        position_ids: torch.IntTensor,
+        hidden_states: torch.Tensor,
+        embed_tokens: Embedding,
+        attn_metadata: AttentionMetadata,
+        all_rank_num_tokens: Optional[List[int]] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        # if self.model_config.mapping.rank == 0:
+        #     print(f"[TRT-LLM DEBUG] ExaoneMoeMTP forward input_ids: {input_ids}")
+        def norm_embeds():
+            return self.enorm(embed_tokens(input_ids))
+
+        def norm_hidden():
+            return self.hnorm(hidden_states)
+
+        inputs_embeds, hidden_states = maybe_execute_in_parallel(
+            norm_embeds,
+            norm_hidden,
+            self.event_dict[EventType.Main],
+            self.event_dict[EventType.MoeShared],
+            self.aux_stream,
+        )
+        hidden_states = torch.concat([inputs_embeds, hidden_states], dim=-1)
+        # Split hidden_states columnwise based on TP
+        tp_size = self.model_config.mapping.tp_size
+        tp_rank = self.model_config.mapping.tp_rank
+
+        if tp_size > 1 and not (self.model_config.mapping.enable_attention_dp):
+            hidden_states = torch.chunk(hidden_states, tp_size, dim=-1)[tp_rank]
+        hidden_states = self.eh_proj(hidden_states)
+
+        # Input layer norm
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+
+        # Self Attention
+        hidden_states = self.self_attn(
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            attn_metadata=attn_metadata,
+            all_reduce_params=AllReduceParams(enable_allreduce=not (self.disable_attn_allreduce)),
+            **kwargs,
+        )
+
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+
+        hidden_states = self.mlp(
+            hidden_states,
+            all_rank_num_tokens=all_rank_num_tokens,
+            final_all_reduce_params=AllReduceParams(
+                enable_allreduce=tp_size > 1 and not (self.model_config.mapping.enable_attention_dp)
+            ),
+        )
+
+        hidden_states, _ = self.shared_head.norm(hidden_states, residual)
+
+        return hidden_states
+
+
 class ExaoneMoeModel(DecoderModel):
     def __init__(self, model_config: ModelConfig[ExaoneMoEConfig]):
         super().__init__(model_config)
@@ -521,54 +638,77 @@ class ExaoneMoeModel(DecoderModel):
 
 
 @register_auto_model("ExaoneMoEForCausalLM")
-class ExaoneMoeForCausalLM(DecoderModelForCausalLM[ExaoneMoeModel, ExaoneMoEConfig]):
+class ExaoneMoeForCausalLM(SpecDecOneEngineForCausalLM[ExaoneMoeModel, ExaoneMoEConfig]):
     def __init__(
         self,
         model_config: ModelConfig[ExaoneMoEConfig],
     ):
+        if (
+            model_config.spec_config is not None
+            and model_config.spec_config.spec_dec_mode.is_mtp_one_model()
+        ):
+            # NOTE: K-EXAONE does not contain the 'num_nextn_predict_layers' field,
+            # which should be equal to 1. Manually set the value here.
+            model_config.pretrained_config.num_nextn_predict_layers = 1
+
         super().__init__(
-            ExaoneMoeModel(model_config),
-            config=model_config,
-            hidden_size=model_config.pretrained_config.hidden_size,
-            vocab_size=model_config.pretrained_config.vocab_size,
+            model=ExaoneMoeModel(model_config),
+            model_config=model_config,
         )
+
+        if (
+            model_config.spec_config is not None
+            and model_config.spec_config.spec_dec_mode.is_mtp_one_model()
+        ):
+            model_nextn = model_config.spec_config.num_nextn_predict_layers
+            ckpt_nextn = self.config.num_nextn_predict_layers
+            self.num_hidden_layers = self.config.num_hidden_layers
+            if ckpt_nextn == 0:
+                raise ValueError(
+                    "No MTP module is in given checkpoint. Please check if the checkpoint supports the MTP layer "
+                    "(`num_nextn_predict_layers`)."
+                )
+            if ckpt_nextn == 1 and not model_config.spec_config.use_mtp_vanilla:
+                pass
+            else:
+                # modify the QuantConfig to support duplicated mtp layers
+                if model_config.quant_config.exclude_modules is not None:
+                    extend_exclude_modules = []
+                    for model_mtp_idx in range(
+                        self.num_hidden_layers, self.num_hidden_layers + model_nextn
+                    ):
+                        ckpt_mtp_idx = (
+                            model_mtp_idx - self.num_hidden_layers
+                        ) % ckpt_nextn + self.num_hidden_layers
+                        model_prefix = f"model.layers.{model_mtp_idx}"
+                        ckpt_prefix = f"model.layers.{ckpt_mtp_idx}"
+                        for exclude_module in model_config.quant_config.exclude_modules:
+                            if ckpt_prefix in exclude_module and model_prefix not in exclude_module:
+                                extend_exclude_modules.append(
+                                    exclude_module.replace(ckpt_prefix, model_prefix)
+                                )
+                    self.model_config.quant_config.exclude_modules.extend(extend_exclude_modules)
+            self.model.layers.extend(self.draft_model.mtp_layers)
+            self.epilogue.extend(self.draft_model.mtp_layers)
+            self.epilogue.append(self.spec_worker)
 
     def load_weights(
         self,
         weights: Dict,
-        weight_mapper: Optional["BaseWeightMapper"] = None,  # noqa: F821
+        weight_mapper: Optional[ExaoneMoeWeightMapper] = None,  # noqa: F821
         skip_modules: Optional[List[str]] = None,
         allow_partial_loading: bool = False,
     ):
-        # MoE naming pattern.
-        moe_weight_patterns = {
-            "gate_proj": "w1",
-            "up_proj": "w3",
-            "down_proj": "w2",
-        }
+        assert isinstance(weight_mapper, ExaoneMoeWeightMapper)
 
-        module_names = list(weights)
-        for name in module_names:
-            if "mlp.e_score_correction_bias" in name:
-                # Move bias into the gate module.
-                new_name = name.replace(
-                    "mlp.e_score_correction_bias", "mlp.gate.e_score_correction_bias"
-                )
-            else:
-                # MoE Weight Remapping.
-                new_name = name
-                for k, v in moe_weight_patterns.items():
-                    pattern = rf"(experts\.\d+\.){k}\b"
-                    new_name = re.sub(pattern, rf"\1{v}", new_name)
+        if self.draft_model is not None:
+            weight_mapper.preprocess_weights(weights)
 
-            # Remap the name-parameter pair if needed.
-            if new_name != name:
-                weights[new_name] = weights.pop(name)
-
+        # Weight renaming MoE is handled in ExaoneMoeWeightMapper.rename_by_params_map
         super().load_weights(
             weights=weights,
             weight_mapper=weight_mapper,
-            skip_modules=skip_modules or [],
+            params_map=weight_mapper.params_map,
             allow_partial_loading=allow_partial_loading,
         )
 

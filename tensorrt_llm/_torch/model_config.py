@@ -360,6 +360,44 @@ class ModelConfig(Generic[TConfig]):
             else:
                 quant_config.exclude_modules = default_exclude
 
+        elif hf_quant_config.get("quant_method") == "compressed-tensors":
+            config_groups = hf_quant_config.get("config_groups")
+            if config_groups is None:
+                raise ValueError(
+                    f"config_groups is not set in {hf_quant_config}.")
+
+            weights_quant_config = config_groups["group_0"]["weights"]
+            inputs_quant_config = config_groups["group_0"]["input_activations"]
+
+            if weights_quant_config["num_bits"] == 8:
+                if weights_quant_config["strategy"] == "channel":
+                    if inputs_quant_config["strategy"] != "token":
+                        raise ValueError(
+                            f"Unsupported inputs_quant_strategy: {inputs_quant_config['strategy']}."
+                        )
+                    quant_config.quant_algo = QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN
+                elif weights_quant_config["strategy"] == "block":
+                    if inputs_quant_config["strategy"] != "group":
+                        raise ValueError(
+                            f"Unsupported inputs_quant_strategy: {inputs_quant_config['strategy']}."
+                        )
+                    quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
+                    group_size = inputs_quant_config["group_size"]
+                    if group_size != 128:
+                        raise ValueError(
+                            f"Unsupported group_size: {group_size}.")
+                    quant_config.group_size = group_size
+
+                else:
+                    raise ValueError(
+                        f"Unsupported weights_quant_strategy: {weights_quant_config['strategy']}."
+                    )
+            else:
+                raise ValueError(
+                    f"Unsupported quant_bits: {weights_quant_config['num_bits']}."
+                )
+
+            quant_config.exclude_modules = hf_quant_config.get("ignore", [])
         return quant_config, layer_quant_config
 
     @staticmethod

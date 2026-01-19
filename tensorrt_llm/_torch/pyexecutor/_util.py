@@ -1143,12 +1143,6 @@ def validate_feature_combination(llm_args, model_engine, sampler_type):
 
     CONFLICT_RULES = [
         {
-            "features": ["mtp", "slide_window_attention"],
-            "message":
-            ERR_MSG_TMPL.format(feature1="mtp",
-                                feature2="slide_window_attention")
-        },
-        {
             "features": ["trtllm_sampler", "mtp"],
             "message":
             ERR_MSG_TMPL.format(feature1="trtllm_sampler", feature2="mtp") +
