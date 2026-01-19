@@ -1521,10 +1521,10 @@ class HarmonyAdapter:
         return True
 
 
-_SERVE_HARMONY_ADAPTER: HarmonyAdapter = None
+_SERVE_HARMONY_ADAPTER: HarmonyAdapter | None = None
 
 
-def get_harmony_adapter():
+def get_harmony_adapter() -> HarmonyAdapter:
     global _SERVE_HARMONY_ADAPTER
     if _SERVE_HARMONY_ADAPTER is None:
         _SERVE_HARMONY_ADAPTER = HarmonyAdapter()
