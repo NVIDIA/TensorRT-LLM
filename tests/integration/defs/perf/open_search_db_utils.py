@@ -22,6 +22,7 @@ import sys
 import time
 from datetime import datetime
 
+import yaml
 from defs.trt_test_alternative import print_info, print_warning
 
 _project_root = os.path.abspath(
@@ -224,93 +225,6 @@ def get_common_values(new_data_dict, match_keys):
     return common_values_dict
 
 
-def query_history_data(common_values_dict):
-    """
-    Query post-merge data with common values to narrow down scope.
-    """
-    # Query data from the last 90 days
-    last_days = QUERY_LOOKBACK_DAYS
-
-    # Build must clauses with base filters
-    must_clauses = [
-        {
-            "term": {
-                "b_is_valid": True
-            }
-        },
-        {
-            "term": {
-                "b_is_post_merge": True
-            }
-        },
-        {
-            "term": {
-                "b_is_regression": False
-            }
-        },
-        {
-            "range": {
-                "ts_created": {
-                    "gte":
-                    int(time.time() - 24 * 3600 * last_days) // (24 * 3600) *
-                    24 * 3600 * 1000,
-                }
-            }
-        },
-    ]
-
-    # Add common values as term filters to narrow down the query
-    for key, value in common_values_dict.items():
-        must_clauses.append({"term": {key: value}})
-
-    json_data = {
-        "query": {
-            "bool": {
-                "must": must_clauses
-            },
-        },
-        "size": MAX_QUERY_SIZE,
-    }
-    json_data = json.dumps(json_data)
-
-    data_list = []
-    try:
-        res = OpenSearchDB.queryFromOpenSearchDB(json_data,
-                                                 TEST_INFO_PROJECT_NAME)
-        if res is None:
-            # No response from database, return None
-            print_info(
-                f"Failed to query from {TEST_INFO_PROJECT_NAME}, returned no response"
-            )
-            return None
-        payload = res.json().get("hits", {}).get("hits", [])
-        if len(payload) == 0:
-            # No history data found in database, return empty list
-            print_info(
-                f"No history data found in {TEST_INFO_PROJECT_NAME}, returned empty list"
-            )
-            return []
-        for hit in payload:
-            data_dict = hit.get("_source", {})
-            data_dict["_id"] = hit.get("_id", "")
-            if data_dict["_id"] == "":
-                print_info(
-                    f"Failed to query from {TEST_INFO_PROJECT_NAME}, returned data with no _id"
-                )
-                # Invalid data, return None
-                return None
-            data_list.append(data_dict)
-        print_info(
-            f"Successfully queried from {TEST_INFO_PROJECT_NAME}, queried {len(data_list)} entries"
-        )
-        return data_list
-    except Exception as e:
-        print_info(
-            f"Failed to query from {TEST_INFO_PROJECT_NAME}, returned error: {e}"
-        )
-        return None
-
-
 def match(history_data, new_data, match_keys):
     """
     Check if the server and client config of history data match the new data
@@ -423,7 +337,37 @@ def get_history_data(new_data_dict, match_keys, common_values_dict):
     cmd_idxs = new_data_dict.keys()
     history_data_list = None
     if cmd_idxs:
-        history_data_list = query_history_data(common_values_dict)
+        last_days = QUERY_LOOKBACK_DAYS
+        must_clauses = [
+            {
+                "term": {
+                    "b_is_valid": True
+                }
+            },
+            {
+                "term": {
+                    "b_is_post_merge": True
+                }
+            },
+            {
+                "term": {
+                    "b_is_regression": False
+                }
+            },
+            {
+                "range": {
+                    "ts_created": {
+                        "gte":
+                        int(time.time() - 24 * 3600 * last_days) //
+                        (24 * 3600) * 24 * 3600 * 1000,
+                    }
+                }
+            },
+        ]
+        for key, value in common_values_dict.items():
+            must_clauses.append({"term": {key: value}})
+        history_data_list = OpenSearchDB.queryPerfDataFromOpenSearchDB(
+            TEST_INFO_PROJECT_NAME, must_clauses, size=MAX_QUERY_SIZE)
 
     # If query_history_data returned None, it means network failure
     if history_data_list is None:
@@ -666,11 +610,14 @@ def _print_regression_data(data, print_func=None):
         print_func(f'"{key}": {value}')
 
 
-def check_perf_regression(new_data_dict, fail_on_regression=False):
+def check_perf_regression(new_data_dict,
+                          fail_on_regression=False,
+                          output_dir=None):
     """
     Check performance regression by printing regression data from new_data_dict.
     If fail_on_regression is True, raises RuntimeError when regressions are found.
     (This is a temporary feature to fail regression tests. We are observing the stability and will fail them by default soon.)
+    If output_dir is provided, saves regression data to regression_data.yaml.
     """
     # Filter regression data from new_data_dict
     regressive_data_list = [
@@ -686,6 +633,15 @@ def check_perf_regression(new_data_dict, fail_on_regression=False):
         data for data in regressive_data_list
         if not data.get("b_is_post_merge", False)
     ]
+
+    # Save regression data to yaml file if output_dir is provided
+    if output_dir is not None and len(regressive_data_list) > 0:
+        regression_data_file = os.path.join(output_dir, "regression_data.yaml")
+        with open(regression_data_file, 'w') as f:
+            yaml.dump(regressive_data_list, f, default_flow_style=False)
+        print_info(
+            f"Saved {len(regressive_data_list)} regression data to {regression_data_file}"
+        )
 
     # Print pre-merge regression data with print_warning
     if len(pre_merge_regressions) > 0:

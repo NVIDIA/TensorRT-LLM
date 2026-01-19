@@ -14,6 +14,7 @@ The following is a table of supported models for the PyTorch backend:
 | `GptOssForCausalLM`                  | GPT-OSS                            | `openai/gpt-oss-120b`                        |
 | `LlamaForCausalLM`                   | Llama 3.1, Llama 3, Llama 2, LLaMA | `meta-llama/Meta-Llama-3.1-70B`              |
 | `Llama4ForConditionalGeneration`     | Llama 4                            | `meta-llama/Llama-4-Scout-17B-16E-Instruct`  |
+| `MiniMaxM2ForCausalLM`               | MiniMax M2/M2.1                    | `MiniMaxAI/MiniMax-M2`                       |
 | `MistralForCausalLM`                 | Mistral                            | `mistralai/Mistral-7B-v0.1`                  |
 | `MixtralForCausalLM`                 | Mixtral                            | `mistralai/Mixtral-8x7B-v0.1`                |
 | `MllamaForConditionalGeneration`     | Llama 3.2                          | `meta-llama/Llama-3.2-11B-Vision`            |
