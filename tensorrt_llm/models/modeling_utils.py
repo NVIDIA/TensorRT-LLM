@@ -369,16 +369,18 @@ class QuantConfig:
         if hf_kv_cache_quant_algo is not None:
             hf_kv_cache_quant_algo = QuantAlgo(hf_kv_cache_quant_algo)
 
-        if self.kv_cache_quant_algo is None and hf_kv_cache_quant_algo is not None:
-            logger.info(
-                f"Setting kv_cache_quant_algo={hf_kv_cache_quant_algo} form HF quant config."
-            )
-            self.kv_cache_quant_algo = hf_kv_cache_quant_algo
-
-        elif self.kv_cache_quant_algo != hf_kv_cache_quant_algo:
-            raise ValueError(
-                f"Specified kv_cache_quant_algo={self.kv_cache_quant_algo}, conflicting with kv_cache_quant_algo={hf_kv_cache_quant_algo} from HF quant config."
-            )
+        # Only enforce conflict checks if HF config explicitly specifies kv_cache_quant_algo.
+        # If HF kv_cache is unspecified (None), keep the existing user/runtime-configured value.
+        if hf_kv_cache_quant_algo is not None:
+            if self.kv_cache_quant_algo is None:
+                logger.info(
+                    f"Setting kv_cache_quant_algo={hf_kv_cache_quant_algo} form HF quant config."
+                )
+                self.kv_cache_quant_algo = hf_kv_cache_quant_algo
+            elif self.kv_cache_quant_algo != hf_kv_cache_quant_algo:
+                raise ValueError(
+                    f"Specified kv_cache_quant_algo={self.kv_cache_quant_algo}, conflicting with kv_cache_quant_algo={hf_kv_cache_quant_algo} from HF quant config."
+                )
 
         if self.kv_cache_quant_algo not in [
                 None, QuantAlgo.FP8, QuantAlgo.NVFP4
