@@ -117,6 +117,8 @@ class ditBasePipeline(DiffusionPipeline):
     def torch_compile(self):
         logger.debug("Setting up torch compile")
         if PipelineConfig.enable_torch_compile:
+            if isinstance(PipelineConfig.torch_compile_models, str):
+                PipelineConfig.torch_compile_models = [PipelineConfig.torch_compile_models]
             torch_compile_models = PipelineConfig.torch_compile_models.copy()
             torch_compile_mode = PipelineConfig.torch_compile_mode
             for name in torch_compile_models:

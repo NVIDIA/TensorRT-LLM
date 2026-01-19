@@ -147,4 +147,4 @@ class ditAttnProcessor:
             return outputs
 
         self.select_attn_impl(attn_inputs)
-        return self.attn_impl(**attn_inputs) 
+        return self.attn_impl(**attn_inputs)

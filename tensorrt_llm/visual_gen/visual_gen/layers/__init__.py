@@ -34,14 +34,16 @@ def apply_visual_gen_linear(model: nn.Module,
                     exclude_pattern: str = "",
                     amax_values: dict[str, float] | None = None,
                     to_input_scale: Callable | None = None,
-):
+):  
     # check if amax_values and to_input_scale are both None or both not None
     assert (amax_values is None) == (to_input_scale is None)
+    
     exclude_pattern_ = re.compile(exclude_pattern)
+    
     # Collect all linear modules to replace first to avoid modifying during iteration
     linear_modules_to_replace = []
     for name, module in model.named_modules():
-        if isinstance(module, nn.Linear) and exclude_pattern_.match(name) is None:
+        if isinstance(module, nn.Linear) and exclude_pattern_.match(name) is not None:
             linear_modules_to_replace.append(name)
 
     # Replace linear modules
@@ -111,4 +113,4 @@ def apply_visual_gen_norm(model: nn.Module, rmsnorm: list = [], layernorm: list 
         del module
 
     gc.collect()
-    torch.cuda.empty_cache() 
+    torch.cuda.empty_cache()

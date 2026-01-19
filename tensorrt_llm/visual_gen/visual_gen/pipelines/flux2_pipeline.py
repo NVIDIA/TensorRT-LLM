@@ -35,14 +35,18 @@ from diffusers.pipelines.flux2.pipeline_flux2 import Flux2PipelineOutput, retrie
 from diffusers.utils import is_torch_xla_available
 from safetensors.torch import load_file
 
+import visual_gen
 from visual_gen.configs.diffusion_cache import TeaCacheConfig
 from visual_gen.configs.op_manager import LinearOpManager
 from visual_gen.configs.parallel import VAEParallelConfig
 from visual_gen.configs.pipeline import PipelineConfig
 from visual_gen.layers.linear import ditLinear
+from visual_gen.layers import apply_visual_gen_linear
 from visual_gen.models.transformers.flux2_transformer import ditFlux2Transformer2DModel
 from visual_gen.pipelines.base_pipeline import ditBasePipeline
 from visual_gen.utils.logger import get_logger
+from huggingface_hub import snapshot_download
+from safetensors.torch import load_file
 
 logger = get_logger(__name__)
 
@@ -56,6 +60,124 @@ else:
 
 
 class ditFlux2Pipeline(Flux2Pipeline, ditBasePipeline):
+    
+    
+    def load_flux_2_dev_nvf4(torch_dtype, **dit_configs):
+        visual_gen.setup_configs(**dit_configs)
+        def hack_input_amax_values(
+            model: torch.nn.Module,
+            amax: dict[str, float],
+            linear_type:str = "flashinfer-nvfp4-cutlass"
+        ):
+            for name, module in model.named_modules():
+                if isinstance(module, ditLinear) and hasattr(module, linear_type + "_weight"):
+                    if "_orig_mod" in name:
+                        name = name.replace("_orig_mod.", "")
+
+                    scale_name = name + ".input_scale"
+                    if scale_name in amax.keys():
+                        module.input_scale = amax[name + ".input_scale"]
+                    else:
+                        print(name, "using dynamic scale")
+            
+        def convert_nvfp4_to_diffusers(nvfp4_state_dict):
+            """
+            Converts Black Forest Labs NVFP4 keys to Hugging Face Diffusers Flux2 structure.
+            """
+            # 1. Double Blocks Map
+            double_part_map = {
+                'img_attn.proj': 'attn.to_out.0',
+                'img_attn.qkv':  'attn.to_qkv',
+                'txt_attn.qkv':  'attn.to_added_qkv', 
+                'img_mlp.0':     'ff.linear_in',
+                'img_mlp.2':     'ff.linear_out',
+                'txt_mlp.0':     'ff_context.linear_in',
+                'txt_mlp.2':     'ff_context.linear_out'
+            }
+
+            # 2. Single Blocks Map
+            single_part_map = {
+                'linear1': 'attn.to_qkv_mlp_proj',
+                'linear2': 'attn.to_out'
+            }
+
+            # 3. Modulation/Embedder Map (The Missing Piece)
+            # NVFP4 Key (prefix) -> Diffusers Key (prefix)
+            special_map = {
+                'double_stream_modulation_img.lin': 'double_stream_modulation_img.linear',
+                'double_stream_modulation_txt.lin': 'double_stream_modulation_txt.linear',
+                'single_stream_modulation.lin':     'single_stream_modulation.linear',
+            }
+            output_dict = {}
+
+            for key, value in nvfp4_state_dict.items():
+                
+                # We only care about input_scale
+                if not key.endswith('.input_scale'):
+                    continue
+                    
+                parts = key.split('.')
+                
+                # --- CASE A: Modulation Layers (Handling the new error) ---
+                # These keys look like: "double_stream_modulation_img.linear.input_scale"
+                # We check if the start of the key matches our special map
+                found_special = False
+                for src_prefix, tgt_prefix in special_map.items():
+                    if key.startswith(src_prefix):
+                        # Simply keep the prefix and append input_scale
+                        new_key = f"{tgt_prefix}.input_scale"
+                        output_dict[new_key] = value
+                        found_special = True
+                        break
+                
+                if found_special:
+                    continue
+
+                # --- CASE B: Transformer Blocks (Existing logic) ---
+                block_type = parts[0]
+                block_idx = parts[1]
+                new_key = None
+
+                if block_type == 'double_blocks':
+                    middle_identifier = ".".join(parts[2:-1])
+                    if middle_identifier in double_part_map:
+                        target_prefix = double_part_map[middle_identifier]
+                        new_key = f"transformer_blocks.{block_idx}.{target_prefix}.input_scale"
+
+                elif block_type == 'single_blocks':
+                    middle_identifier = parts[2]
+                    if middle_identifier in single_part_map:
+                        target_prefix = single_part_map[middle_identifier]
+                        new_key = f"single_transformer_blocks.{block_idx}.{target_prefix}.input_scale"
+
+                if new_key:
+                    output_dict[new_key] = value
+                    
+            return output_dict
+              
+
+        model_id = "/workspace/home/.cache/huggingface/hub/models--black-forest-labs--FLUX.2-dev/snapshots/6aab690f8379b70adc89edfa6bb99b3537ba52a3"
+        pipe = ditFlux2Pipeline.from_pretrained(model_id, torch_dtype=torch_dtype, **dit_configs)
+ 
+        file_pattern = "flux2-dev-nvfp4.safetensors"
+
+        model_path = snapshot_download(
+            repo_id="black-forest-labs/FLUX.2-dev-NVFP4",
+            allow_patterns=[file_pattern],
+            local_files_only=False,  # Set to True only after you download it once
+        )
+        
+        nvfp4_file_path = f"{model_path}/{file_pattern}"
+        nvfp4_state_dict = load_file(nvfp4_file_path)
+        converted_dict = convert_nvfp4_to_diffusers(nvfp4_state_dict)
+        exclude_pattern = f"^(?!.*(img_in|txt_in|time_in|guidance_in|txt_attn|final_layer|embedder|to_out|norm_out|proj_out|to_add_out|to_added_qkv|stream)).*"
+        apply_visual_gen_linear(pipe.transformer, load_parameters=True, quantize_weights=True, exclude_pattern=exclude_pattern)
+        hack_input_amax_values(
+            pipe.transformer,
+            converted_dict
+        )
+
+        return pipe
 
     def _set_teacache_coefficients(self, **kwargs) -> None:
             teacache_configs = kwargs.pop("teacache", None)

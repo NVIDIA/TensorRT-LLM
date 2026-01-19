@@ -1,7 +1,7 @@
 # Adapted from https://github.com/huggingface/diffusers/blob/edf36f5128abf3e6ecf92b5145115514363c58e6/src/diffusers/models/transformers/transformer_flux2.py
-# Copyright 2025 Black Forest Labs, The HuggingFace Team and The InstantX Team. All rights reserved.
+# Copyright 2026 Black Forest Labs, The HuggingFace Team and The InstantX Team. All rights reserved.
 #
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
