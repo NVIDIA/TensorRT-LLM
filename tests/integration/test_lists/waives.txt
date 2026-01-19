@@ -398,6 +398,6 @@ accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4_4gpus[latency_
 perf/test_perf_sanity.py::test_e2e[aggr_upload-k2_thinking_fp4_2_nodes_grace_blackwell-k2_thinking_fp4_dep8_32k8k] SKIP (https://nvbugs/5819053)
 perf/test_perf_sanity.py::test_e2e[aggr_upload-k2_thinking_fp4_2_nodes_grace_blackwell-k2_thinking_fp4_tep8_32k8k] SKIP (https://nvbugs/5819053)
 perf/test_perf_sanity.py::test_e2e[aggr_upload-k2_thinking_fp4_grace_blackwell-k2_thinking_fp4_tep4_8k1k] SKIP (https://nvbugs/5820541)
-accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[tep4_latency_moe_cutlass-torch_compile=False] SKIP (https://nvbugs/5819042)
+accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[tep4_latency_moe_cutlass-torch_compile=False] SKIP (https://nvbugs/5819021)
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_bf16_cache_aware_balance[DeepSeek-V3-Lite-bf16] SKIP (https://nvbugs/5820576)
 llmapi/test_llm_examples.py::test_llmapi_tensorrt_engine SKIP (https://nvbugs/5820553)
