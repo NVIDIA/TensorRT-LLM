@@ -18,7 +18,6 @@ from functools import partial
 from typing import List
 
 import pytest
-import ray
 import torch
 from transformers import AutoTokenizer
 from utils.llm_data import llm_models_root
@@ -130,39 +129,38 @@ def test_accuracy_with_allreduce_strategy(model_dir, sampler_type, allreduce_str
 
     llm_logprobs = []
     llm_responses = []
-    try:
-        kv_cache_config = KvCacheConfig(enable_block_reuse=False, free_gpu_memory_fraction=0.6)
-        llm = LLM(
-            model=model_dir,
-            backend="pytorch",
-            orchestrator_type="ray",
-            ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
-            kv_cache_config=kv_cache_config,
-            max_seq_len=2048,
-            max_batch_size=256,
-            max_num_tokens=8192,
-            tensor_parallel_size=4,
-            sampler_type=sampler_type,
-            allreduce_strategy=allreduce_strategy,
-        )
 
-        sampling_params = SamplingParams(temperature=1, top_p=1, max_tokens=1024, logprobs=1)
-        outputs = llm.generate(test_prompts, sampling_params)
+    kv_cache_config = KvCacheConfig(enable_block_reuse=False, free_gpu_memory_fraction=0.6)
+    llm = LLM(
+        model=model_dir,
+        backend="pytorch",
+        orchestrator_type="ray",
+        ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
+        kv_cache_config=kv_cache_config,
+        max_seq_len=2048,
+        max_batch_size=256,
+        max_num_tokens=8192,
+        tensor_parallel_size=4,
+        sampler_type=sampler_type,
+        allreduce_strategy=allreduce_strategy,
+    )
 
-        for output in outputs:
-            token_ids = output.outputs[0].token_ids
-            logprobs_list = output.outputs[0].logprobs  # list[dict[int, Logprob]]
-            # Extract logprob values from the list of dicts
-            logprob_values = [
-                logprobs[token_id].logprob for token_id, logprobs in zip(token_ids, logprobs_list)
-            ]
-            llm_responses.append(token_ids)
-            llm_logprobs.append(torch.tensor(logprob_values, dtype=torch.float32, device="cuda"))
-    finally:
-        if ray.is_initialized():
-            ray.shutdown()
+    sampling_params = SamplingParams(temperature=1, top_p=1, max_tokens=1024, logprobs=1)
+    outputs = llm.generate(test_prompts, sampling_params)
 
+    for output in outputs:
+        token_ids = output.outputs[0].token_ids
+        logprobs_list = output.outputs[0].logprobs  # list[dict[int, Logprob]]
+        # Extract logprob values from the list of dicts
+        logprob_values = [
+            logprobs[token_id].logprob for token_id, logprobs in zip(token_ids, logprobs_list)
+        ]
+        llm_responses.append(token_ids)
+        llm_logprobs.append(torch.tensor(logprob_values, dtype=torch.float32, device="cuda"))
+
+    del llm
     torch.cuda.empty_cache()
+
     input_ids, attention_mask, position_ids = RefHFModel.pad_data(test_prompts, llm_responses)
 
     # Split data across GPUs

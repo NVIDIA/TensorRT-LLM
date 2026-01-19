@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
-from typing import Any, Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -1244,13 +1244,10 @@ class recurrent_ref(nn.Module):
 
 class RefHFModel:
 
-    def __init__(self,
-                 model_dir: str,
-                 device_id: int = 0,
-                 additional_model_kargs: Optional[Dict[str, Any]] = None):
+    def __init__(self, model_dir: str, device_id: int = 0):
         self.device_id = device_id
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_dir, **(additional_model_kargs or {})).to(f"cuda:{device_id}")
+            model_dir, torch_dtype=torch.bfloat16).to(f"cuda:{device_id}")
 
     def generate_batch_with_padding(
         self,
@@ -1304,17 +1301,19 @@ class RefHFModel:
                     attention_mask=micro_attention_mask,
                     position_ids=micro_position_ids,
                 )
+
                 # Extract response logprobs for each sample in this micro batch
-                for i in range(outputs.logits.shape[0]):
+                micro_logits = outputs.logits  # [micro_batch_size, seq_len, vocab_size]
+                for i in range(micro_logits.shape[0]):
                     sample_idx = start_idx + i
                     response = responses[sample_idx]
                     response_len = len(response)
 
                     # Extract logits for predicting response tokens
                     # For predicting response[j], we need logits at position prompt_max_len-1+j
-                    response_logits = outputs.logits[i, prompt_max_len -
-                                                     1:prompt_max_len - 1 +
-                                                     response_len, :]
+                    response_logits = micro_logits[i, prompt_max_len -
+                                                   1:prompt_max_len - 1 +
+                                                   response_len, :]
                     if return_logits:
                         ref_results.append(response_logits)
                     else:
@@ -1335,7 +1334,7 @@ class RefHFModel:
                         ref_results.append(ref_logprob_for_tokens)
 
                 # Free memory immediately after processing each micro batch
-                del outputs
+                del outputs, micro_logits
                 torch.cuda.empty_cache()
 
         return ref_results
