@@ -4993,7 +4993,7 @@ class TestDeepSeekR1LongBenchV2(LlmapiAccuracyTestHarness):
             pytest.skip(f"Model directory {model_dir} does not exist")
 
         # Configure model settings
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
                                         enable_block_reuse=True,
                                         enable_partial_reuse=False,
                                         dtype="fp8")
