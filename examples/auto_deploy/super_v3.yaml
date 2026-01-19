@@ -44,3 +44,5 @@ transforms:
   fuse_mamba_a_log:
     stage: post_load_fusion
     enabled: true
+  fuse_fp8_moe:
+    allow_different_input_scales: true

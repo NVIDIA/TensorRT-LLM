@@ -655,9 +655,9 @@ def triton_quant_fp8_moe(
     w1_weight: torch.Tensor,  # [E, I, H] stacked FP8 weights
     w2_weight: torch.Tensor,  # [E, H, I] stacked FP8 weights
     w3_weight: torch.Tensor,  # unused for mlp style
-    w1_input_scale: torch.Tensor,  # [E] stacked input scales
-    w2_input_scale: torch.Tensor,  # [E] stacked input scales
-    w3_input_scale: torch.Tensor,  # unused
+    w1_input_scale_max: torch.Tensor,  # [1] max input scale (precomputed)
+    w2_input_scale_max: torch.Tensor,  # [1] max input scale (precomputed)
+    w3_input_scale_max: torch.Tensor,  # unused
     w1_weight_scale: torch.Tensor,  # [E] stacked weight scales
     w2_weight_scale: torch.Tensor,  # [E] stacked weight scales
     w3_weight_scale: torch.Tensor,  # unused
@@ -683,10 +683,11 @@ def triton_quant_fp8_moe(
     topk_weights = routing_weights.to(torch.float32).contiguous()
 
     # Weights are already stacked [E, ...] - just ensure contiguous and extract scales
+    # Input scales are precomputed max values (consistent with trtllm backend)
     w1_q = w1_weight.contiguous()
     w2_q = w2_weight.contiguous()
-    a1_scale = w1_input_scale[0].to(torch.float32).reshape(1).contiguous()
-    a2_scale = w2_input_scale[0].to(torch.float32).reshape(1).contiguous()
+    a1_scale = w1_input_scale_max.to(torch.float32).reshape(1).contiguous()
+    a2_scale = w2_input_scale_max.to(torch.float32).reshape(1).contiguous()
     b1_scale = w1_weight_scale.to(torch.float32).contiguous()
     b2_scale = w2_weight_scale.to(torch.float32).contiguous()
 
@@ -747,16 +748,16 @@ def triton_quant_fp8_moe(
 
 
 @triton_quant_fp8_moe.register_fake
-def triton_quant_fp8_moe(
+def triton_quant_fp8_moe_fake(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
     w1_weight: torch.Tensor,
     w2_weight: torch.Tensor,
     w3_weight: torch.Tensor,
-    w1_input_scale: torch.Tensor,
-    w2_input_scale: torch.Tensor,
-    w3_input_scale: torch.Tensor,
+    w1_input_scale_max: torch.Tensor,
+    w2_input_scale_max: torch.Tensor,
+    w3_input_scale_max: torch.Tensor,
     w1_weight_scale: torch.Tensor,
     w2_weight_scale: torch.Tensor,
     w3_weight_scale: torch.Tensor,
