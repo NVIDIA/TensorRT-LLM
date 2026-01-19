@@ -163,9 +163,9 @@ def _test_moe_worker(
             ref_fused_moe.cuda(f"cuda:{mapping.rank}")
 
             # Evaluate the outputs
-            def _run_forward(x, router_logits):
+            def _run_forward(x, router_logits, skip_ref=False):
                 with torch.inference_mode():
-                    ref_output = ref_fused_moe.forward(x, router_logits)
+                    ref_output = None if skip_ref else ref_fused_moe.forward(x, router_logits)
                     if isinstance(moe_load_balancer, MoeLoadBalancer):
                         with MoeLoadBalancerIterContext(moe_load_balancer):
                             output = fused_moe.forward(
@@ -178,6 +178,9 @@ def _test_moe_worker(
                 torch.cuda.synchronize()
                 return ref_output, output
 
+            if isinstance(moe_load_balancer, MoeLoadBalancer):
+                moe_load_balancer.set_iter_info(enable_statistic=True, enable_update_weights=True)
+
             ref_output, output = _run_forward(x, router_logits)
             ref_fused_moe.check_accuracy(output, ref_output)
 
@@ -188,7 +191,8 @@ def _test_moe_worker(
                 )
                 extra_steps = 2
                 for _ in range(extra_steps):
-                    _ = _run_forward(x, router_logits)
+                    _, output = _run_forward(x, router_logits, skip_ref=True)
+                    ref_fused_moe.check_accuracy(output, ref_output)
                 assert moe_load_balancer.iter_id == extra_steps + 1, (
                     "Iter id should be equal to extra steps + 1 after multiple iterations"
                 )
@@ -353,7 +357,7 @@ def test_moe_multi_gpu(comm_method_type, moe_backend, quant_algo):
 @pytest.mark.parametrize(
     "num_slots",
     [
-        144,
+        8,
     ],
     ids=lambda val: f"num_slots={val}",
 )
