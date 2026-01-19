@@ -11,9 +11,10 @@ from torch.fx import GraphModule, Node
 
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
+from ...utils._graph import delete_all_unused_submodules, eliminate_dead_code
 from ...utils.cuda_mem_tracker import cuda_memory_tracker
 from ...utils.logger import ad_logger
-from ...utils.node_utils import extract_param_names_from_node, is_linear_op, is_op
+from ...utils.node_utils import extract_weight_name, is_linear_op, is_op
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
 
@@ -36,7 +37,7 @@ def _insert_fused_gemm(gm: GraphModule, idx: int, parent_node: Node, linear_node
     y2 = y[:, out1:out1+out2]
     """
     # some info we need
-    keys_unfused = [extract_param_names_from_node(n)[0] for n in linear_nodes]
+    keys_unfused = [extract_weight_name(n) for n in linear_nodes]
     params_unfused = [gm.get_parameter(k) for k in keys_unfused]
     sizes_unfused = [p.size(0) for p in params_unfused]
     key_fused = f"fused_weight_{idx}"
@@ -75,8 +76,8 @@ def _insert_fused_gemm(gm: GraphModule, idx: int, parent_node: Node, linear_node
         n.replace_all_uses_with(get_split_node)
 
     # Clean up deleted modules to save GPU memory
-    gm.graph.eliminate_dead_code()
-    gm.delete_all_unused_submodules()
+    eliminate_dead_code(gm)
+    delete_all_unused_submodules(gm)
 
 
 def check_same_children(parent_node: Node, is_desired_child: Callable[[Node], bool]) -> bool:
@@ -128,7 +129,7 @@ class QuantizationFusionMixin(ABC):
     def _insert_fused_quant_gemm(
         self, gm: GraphModule, idx: int, parent_node: Node, linear_nodes: List[Node]
     ):
-        keys_unfused = [extract_param_names_from_node(n)[0] for n in linear_nodes]
+        keys_unfused = [extract_weight_name(n) for n in linear_nodes]
         params_unfused = [gm.get_parameter(k) for k in keys_unfused]
         sizes_unfused = [p.size(0) for p in params_unfused]
         key_fused = f"fused_weight_{idx}"
@@ -185,8 +186,8 @@ class QuantizationFusionMixin(ABC):
             n.replace_all_uses_with(get_split_node)
 
         # Clean up deleted modules to save GPU memory
-        gm.graph.eliminate_dead_code()
-        gm.delete_all_unused_submodules()
+        eliminate_dead_code(gm)
+        delete_all_unused_submodules(gm)
 
     def _apply_fusion_pass(
         self,

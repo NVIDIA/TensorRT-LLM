@@ -103,17 +103,14 @@ def _remap_mistral_yarn_args(config: dict) -> dict:
         "apply_scale": "apply_yarn_scaling",
     }
     yarn_config = config.get("yarn") or {}
-    config["rope_parameters"] = {
+    config["rope_scaling"] = {
         "rope_type": "yarn",
         "mscale_all_dim": 1,
     }
 
-    if rope_theta := config.pop("rope_theta", None):
-        config["rope_parameters"]["rope_theta"] = rope_theta
-
     for old_name, new_name in yarn_config_map.items():
         if old_name in yarn_config:
-            config["rope_parameters"][new_name] = yarn_config.pop(old_name)
+            config["rope_scaling"][new_name] = yarn_config.pop(old_name)
 
     assert len(yarn_config) == 0, f"Unparsed yarn config: {yarn_config}"
 
@@ -340,5 +337,6 @@ class MistralConfigLoader(BaseConfigLoader):
         from tensorrt_llm._torch.models.modeling_mistral_large3 import Mistral3Gate
 
         model_config.pretrained_config.gate_cls = Mistral3Gate
+        model_config.pretrained_config.input_processor_type = "mistral_large_3"
         model_config._frozen = True
         return model_config

@@ -6,6 +6,7 @@ from typing import List, NamedTuple, Optional, Tuple, Union
 
 import torch
 from pydantic import BaseModel
+from strenum import StrEnum
 
 from tensorrt_llm.bindings import executor as tllme
 from tensorrt_llm.logger import logger
@@ -44,6 +45,18 @@ class LogprobParams(NamedTuple):
     drop_context_logits: bool = False
     # Drop the geneation_logits once the logprobs are computed
     drop_generation_logits: bool = False
+
+
+class LogprobMode(StrEnum):
+    RAW = "raw"
+    """
+    Return the raw log probabilities, i.e., the log probabilities calculated directly from the model output logits.
+    """
+    PROCESSED = "processed"
+    """
+    Return the processed log probabilities, i.e., the log probabilities after applying sampling parameters,
+    such as temperature, top-k, top-p, etc.
+    """
 
 
 class LogitsProcessor(ABC):
@@ -172,7 +185,9 @@ class SamplingParams:
         min_p (float, optional): scale the most likely token to determine the minimum token probability. None means using C++ runtime default 0.0. Defaults to None.
         beam_width_array (List[int], optional): The array of beam width using in Variable-Beam-Width-Search. Defaults to None.
 
-        logprobs (int, optional): Number of log probabilities to return per output token. Defaults to None.
+        logprobs (int, optional): Number of log probabilities to return per output token. When set to 0, return only the sampled token's log probability.
+                                  When set to K>0, return top-K log probabilities + the sampled token's log probability (last entry) if it's not in the Top-K. Defaults to None.
+        logprobs_mode (LogprobMode): The mode of log probabilities to return. Defaults to LogprobMode.RAW.
         prompt_logprobs (int, optional): Number of log probabilities to return per prompt token. Defaults to None.
         return_context_logits (bool): Controls if Result should contain the context logits. Defaults to False.
         return_generation_logits (bool): Controls if Result should contain the generation logits. Defaults to False.
@@ -219,6 +234,7 @@ class SamplingParams:
     n: int = 1
     best_of: Optional[int] = None
     use_beam_search: bool = False
+    logprobs_mode: LogprobMode = LogprobMode.RAW
 
     # Keep the below fields in sync with tllme.SamplingConfig or maintin the mapping table.
     top_k: Optional[int] = None
@@ -321,6 +337,8 @@ class SamplingParams:
                 f"under the greedy decoding."
             )
 
+        self.logprobs_mode = LogprobMode(self.logprobs_mode)
+
         if self.truncate_prompt_tokens is not None and self.truncate_prompt_tokens < 1:
             raise ValueError(
                 f"truncate_prompt_tokens must be >= 1, got {self.truncate_prompt_tokens}"
@@ -329,8 +347,11 @@ class SamplingParams:
         if self.guided_decoding is not None:
             self.guided_decoding._validate()
 
-        # correct types as users might pass in logprob=True for Top-1 logprobs
-        self.logprobs = self.logprobs and int(self.logprobs)
+        # correct types as users might pass in logprob=True for Top-0 logprobs and logprobs=False for no logprobs
+        if self.logprobs is False:
+            self.logprobs = None
+        if self.logprobs is True:
+            self.logprobs = 0
         self.prompt_logprobs = self.prompt_logprobs and int(self.prompt_logprobs)
 
     # NB: Static, because downstream code only holds instances of
@@ -373,14 +394,6 @@ class SamplingParams:
         if self.end_id is None:
             self.end_id = tokenizer.eos_token_id
             self.pad_id = tokenizer.pad_token_id
-            # kimi_k2 model uses the eos_token_id in generation config
-            if (
-                hf_model_config is not None
-                and hf_model_config.model_type == "kimi_k2"
-                and generation_config is not None
-                and isinstance(generation_config.eos_token_id, int)
-            ):
-                self.end_id = generation_config.eos_token_id
 
             if self.pad_id is None:
                 self.pad_id = self.end_id
@@ -400,24 +413,20 @@ class SamplingParams:
             strs = [self.stop] if isinstance(self.stop, str) else self.stop
             self._stop_word_ids = [_encode(tokenizer, s, add_special_tokens) for s in strs]
 
-        # add generation_config to stop word list, only in qwen3-next now
-        if (
-            hf_model_config is not None
-            and hf_model_config.model_type == "qwen3_next"
-            and generation_config is not None
-            and isinstance(generation_config.eos_token_id, List)
-            and all(isinstance(i, int) for i in generation_config.eos_token_id)
-        ):
-            if self._stop_word_ids:
-                all_stop_tokens_id = set(i for sublist in self._stop_word_ids for i in sublist)
-                from_generation_stop_tokens = [
-                    i for i in generation_config.eos_token_id if i not in all_stop_tokens_id
-                ]
+        # Add eos_token_id in generation_config to stop_token_ids
+        # The eos_token_id in generation_config are really mean to stop the text generation.
+        if generation_config is not None and generation_config.eos_token_id is not None:
+            if isinstance(generation_config.eos_token_id, int):
+                generation_config.eos_token_id = [generation_config.eos_token_id]
+            # else is always List[int]
 
-                if from_generation_stop_tokens:
-                    self._stop_word_ids.append(from_generation_stop_tokens)
-            else:
-                self._stop_word_ids = [generation_config.eos_token_id]
+            if not self.stop_token_ids:
+                self.stop_token_ids = []
+            for stop_token in generation_config.eos_token_id:
+                if stop_token != self.end_id and stop_token not in self.stop_token_ids:
+                    self.stop_token_ids.append(stop_token)
+            if not self.stop_token_ids:
+                self.stop_token_ids = None
 
         return self
 
@@ -506,7 +515,7 @@ class SamplingParams:
         config_kwargs = {f: getattr(self, f) for f in fields}
 
         if is_pytorch_backend:
-            config_kwargs["return_log_probs"] = bool(self.logprobs)
+            config_kwargs["return_log_probs"] = self.logprobs is not None
             if self.prompt_logprobs and not self.return_context_logits:
                 logger.info(
                     "Since prompt_logprobs is requested but return_context_logits is False, "

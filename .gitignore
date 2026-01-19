@@ -40,6 +40,8 @@ tensorrt_llm/libs
 tensorrt_llm/bindings.*.so
 tensorrt_llm/bindings.pyi
 tensorrt_llm/bindings/**/*.pyi
+tensorrt_llm/tensorrt_llm_transfer_agent_binding.*.so
+tensorrt_llm/tensorrt_llm_transfer_agent_binding.pyi
 tensorrt_llm/deep_ep/
 tensorrt_llm/deep_ep_cpp_tllm.*.so
 tensorrt_llm/deep_ep_cpp_tllm.pyi
@@ -63,12 +65,14 @@ docs/source/**/*.rst
 .coverage.*
 results_trt/
 llm-test-workspace/
+ad-test-workspace/
 
 # build/debug
 *.safetensors
 */tllm_debug/**
 *.patch
 !cpp/tensorrt_llm/deep_ep/*.patch
+examples/disaggregated/slurm/benchmark/logs/
 
 # Generated files
 cpp/include/tensorrt_llm/executor/version.h
@@ -76,6 +80,7 @@ cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmha_v2_cu/
 cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/cubin/fmha_cubin.h
 cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/cubin/fmha_cubin.cpp
 .devcontainer/.env
+/examples/layer_wise_benchmarks/autotuner_cache/
 /examples/layer_wise_benchmarks/profiles/
 
 # User config files

@@ -51,6 +51,7 @@ TEST_PROJECT_NAME = f"{PROJECT_ROOT}-ci-{MODE}-test_info"
 JOB_MACHINE_PROJECT_NAME = f"{PROJECT_ROOT}-ci-{MODE}-job_machine_info"
 FAILED_STEP_PROJECT_NAME = f"{PROJECT_ROOT}-ci-{MODE}-failed_step_info"
 PR_PROJECT_NAME = f"{PROJECT_ROOT}-ci-{MODE}-pr_info"
+PERF_SANITY_PROJECT_NAME = f"{PROJECT_ROOT}-ci-{MODE}-perf_sanity_info"
 
 READ_ACCESS_PROJECT_NAME = [
     JOB_PROJECT_NAME,
@@ -59,9 +60,12 @@ READ_ACCESS_PROJECT_NAME = [
     JOB_MACHINE_PROJECT_NAME,
     FAILED_STEP_PROJECT_NAME,
     PR_PROJECT_NAME,
+    PERF_SANITY_PROJECT_NAME,
 ]
 
-WRITE_ACCESS_PROJECT_NAME = []
+WRITE_ACCESS_PROJECT_NAME = [
+    PERF_SANITY_PROJECT_NAME,
+]
 
 DISABLE_OPEN_SEARCH_DB_FOR_LOCAL_TEST = False
 
@@ -278,6 +282,67 @@ class OpenSearchDB:
             f"Fail to queryFromOpenSearchDB after {retry_time} retry: {url}, json: {json_data_dump}, error: {res.text}"
         )
         return None
+
+    @staticmethod
+    def queryPerfDataFromOpenSearchDB(project_name,
+                                      must_clauses,
+                                      size=DEFAULT_QUERY_SIZE):
+        """
+        Query perf data from OpenSearchDB using must clauses.
+
+        :param project_name: Name of the project.
+        :param must_clauses: List of must clauses for query.
+        :param size: Query size.
+        :return: list of data dicts, empty list if no data, None on error.
+        """
+        if DISABLE_OPEN_SEARCH_DB_FOR_LOCAL_TEST:
+            return []
+        if must_clauses is None:
+            must_clauses = []
+        if not isinstance(must_clauses, list):
+            OpenSearchDB.logger.info(
+                f"Invalid must_clauses type: {type(must_clauses).__name__}")
+            return None
+
+        json_data = {
+            "query": {
+                "bool": {
+                    "must": must_clauses
+                }
+            },
+            "size": size,
+        }
+
+        data_list = []
+        try:
+            res = OpenSearchDB.queryFromOpenSearchDB(json_data, project_name)
+            if res is None:
+                OpenSearchDB.logger.info(
+                    f"Failed to query from {project_name}, returned no response"
+                )
+                return None
+            payload = res.json().get("hits", {}).get("hits", [])
+            if len(payload) == 0:
+                OpenSearchDB.logger.info(
+                    f"No data found in {project_name}, returned empty list")
+                return []
+            for hit in payload:
+                data_dict = hit.get("_source", {})
+                data_dict["_id"] = hit.get("_id", "")
+                if data_dict["_id"] == "":
+                    OpenSearchDB.logger.info(
+                        f"Failed to query from {project_name}, returned data with no _id"
+                    )
+                    return None
+                data_list.append(data_dict)
+            OpenSearchDB.logger.info(
+                f"Successfully queried from {project_name}, queried {len(data_list)} entries"
+            )
+            return data_list
+        except Exception as e:
+            OpenSearchDB.logger.warning(
+                f"Failed to query from {project_name}, returned error: {e}")
+            return None
 
     @staticmethod
     def queryBuildIdFromOpenSearchDB(job_name, last_days=DEFAULT_LOOKBACK_DAYS):

@@ -4,7 +4,7 @@ metadata:
   - GB200
   - GB300
 server_configs:
-  # 1k1k configs
+  # 1k1k configs - DEP4 with CUTLASS, MTP1
   - name: "r1_fp4_v2_dep4_mtp1_1k1k"
     model_name: "deepseek_r1_0528_fp4_v2"
     tensor_parallel_size: 4
@@ -31,14 +31,22 @@ server_configs:
       decoding_type: 'MTP'
       num_nextn_predict_layers: 1
     client_configs:
-      - name: "con2048_iter10_1k1k"
+      - name: "con2048_iter5_1k1k"
         concurrency: 2048
+        iterations: 5
+        isl: 1024
+        osl: 1024
+        random_range_ratio: 0.8
+        backend: "openai"
+      - name: "con1024_iter10_1k1k"
+        concurrency: 1024
         iterations: 10
         isl: 1024
         osl: 1024
         random_range_ratio: 0.2
         backend: "openai"
 
+  # 1k1k configs - TEP4 with TRTLLM, MTP3
   - name: "r1_fp4_v2_tep4_mtp3_1k1k"
     model_name: "deepseek_r1_0528_fp4_v2"
     tensor_parallel_size: 4
@@ -66,9 +74,10 @@ server_configs:
         iterations: 10
         isl: 1024
         osl: 1024
-        random_range_ratio: 0.2
+        random_range_ratio: 0.8
         backend: "openai"
 
+  # 1k1k configs - TP4 with TRTLLM, MTP3
   - name: "r1_fp4_v2_tp4_mtp3_1k1k"
     model_name: "deepseek_r1_0528_fp4_v2"
     tensor_parallel_size: 4
@@ -96,10 +105,17 @@ server_configs:
         iterations: 10
         isl: 1024
         osl: 1024
+        random_range_ratio: 0.8
+        backend: "openai"
+      - name: "con2_iter10_1k1k"
+        concurrency: 2
+        iterations: 10
+        isl: 1024
+        osl: 1024
         random_range_ratio: 0.2
         backend: "openai"
 
-  # 8k1k configs
+  # 8k1k configs - DEP4 with CUTLASS, MTP1
   - name: "r1_fp4_v2_dep4_mtp1_8k1k"
     model_name: "deepseek_r1_0528_fp4_v2"
     tensor_parallel_size: 4
@@ -126,14 +142,22 @@ server_configs:
       decoding_type: 'MTP'
       num_nextn_predict_layers: 1
     client_configs:
-      - name: "con2048_iter10_8k1k"
+      - name: "con2048_iter5_8k1k"
         concurrency: 2048
+        iterations: 5
+        isl: 8192
+        osl: 1024
+        random_range_ratio: 0.2
+        backend: "openai"
+      - name: "con256_iter10_8k1k"
+        concurrency: 256
         iterations: 10
         isl: 8192
         osl: 1024
         random_range_ratio: 0.2
         backend: "openai"
 
+  # 8k1k configs - TEP4 with TRTLLM, MTP3
   - name: "r1_fp4_v2_tep4_mtp3_8k1k"
     model_name: "deepseek_r1_0528_fp4_v2"
     tensor_parallel_size: 4
@@ -164,6 +188,7 @@ server_configs:
         random_range_ratio: 0.2
         backend: "openai"
 
+  # 8k1k configs - TP4 with TRTLLM, MTP3
   - name: "r1_fp4_v2_tp4_mtp3_8k1k"
     model_name: "deepseek_r1_0528_fp4_v2"
     tensor_parallel_size: 4
@@ -193,8 +218,15 @@ server_configs:
         osl: 1024
         random_range_ratio: 0.2
         backend: "openai"
+      - name: "con2_iter10_8k1k"
+        concurrency: 2
+        iterations: 10
+        isl: 8192
+        osl: 1024
+        random_range_ratio: 0.2
+        backend: "openai"
 
-  # 1k8k configs
+  # 1k8k configs - DEP4 with CUTLASS, MTP1
   - name: "r1_fp4_v2_dep4_mtp1_1k8k"
     model_name: "deepseek_r1_0528_fp4_v2"
     tensor_parallel_size: 4
@@ -221,14 +253,15 @@ server_configs:
       decoding_type: 'MTP'
       num_nextn_predict_layers: 1
     client_configs:
-      - name: "con2048_iter10_1k8k"
+      - name: "con2048_iter5_1k8k"
         concurrency: 2048
-        iterations: 10
+        iterations: 5
         isl: 1024
         osl: 8192
-        random_range_ratio: 0.2
+        random_range_ratio: 0.8
         backend: "openai"
 
+  # 1k8k configs - TEP4 with TRTLLM, MTP3
   - name: "r1_fp4_v2_tep4_mtp3_1k8k"
     model_name: "deepseek_r1_0528_fp4_v2"
     tensor_parallel_size: 4
@@ -256,9 +289,10 @@ server_configs:
         iterations: 10
         isl: 1024
         osl: 8192
-        random_range_ratio: 0.2
+        random_range_ratio: 0.8
         backend: "openai"
 
+  # 1k8k configs - TP4 with TRTLLM, MTP3
   - name: "r1_fp4_v2_tp4_mtp3_1k8k"
     model_name: "deepseek_r1_0528_fp4_v2"
     tensor_parallel_size: 4
@@ -286,5 +320,5 @@ server_configs:
         iterations: 10
         isl: 1024
         osl: 8192
-        random_range_ratio: 0.2
+        random_range_ratio: 0.8
         backend: "openai"

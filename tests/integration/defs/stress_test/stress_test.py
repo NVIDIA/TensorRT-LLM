@@ -44,6 +44,7 @@ import pandas as pd
 import pytest
 import requests
 import yaml
+from defs.common import parse_gsm8k_output
 from defs.conftest import get_device_count, get_device_memory, llm_models_root
 from defs.trt_test_alternative import (Popen, cleanup_process_tree, print_info,
                                        print_warning)
@@ -805,7 +806,7 @@ def create_aiperf_command(model_name,
         str(concurrency),
         "--warmup-request-count",
         str(warmup_request_count),
-        "--verbose",
+        # "--verbose",
     ]
 
 
@@ -1067,35 +1068,6 @@ def format_time(seconds: int) -> str:
         return f"{seconds}s"
 
 
-def parse_accuracy_from_lm_eval_output(output_text: str) -> float:
-    """
-    Parse accuracy value from lm_eval output for GSM8K flexible-extract exact_match
-
-    Args:
-        output_text: The output text from lm_eval command
-
-    Returns:
-        float: The accuracy value (0.7582 in the example)
-    """
-    import re
-
-    # Look for the specific pattern: |gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.7559|±  |0.0118|
-    patterns = [
-        r'flexible-extract\|\s+\d+\|exact_match\|\↑\s+\|(\d+\.\d+)',
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, output_text)
-        if match:
-            accuracy_value = float(match.group(1))
-            print_info(f"Extracted accuracy value: {accuracy_value}")
-            return accuracy_value
-
-    print_warning("Could not find accuracy value in lm_eval output")
-    print_warning(f"Output text: {output_text}")
-    return None
-
-
 def run_accuracy_test(model_path: str,
                       server_config: ServerConfig,
                       stress_config: StressTestConfig,
@@ -1155,7 +1127,7 @@ def run_accuracy_test(model_path: str,
 
             # Parse accuracy value from output
             output_text = result.stdout
-            accuracy_value = parse_accuracy_from_lm_eval_output(output_text)
+            accuracy_value = parse_gsm8k_output(output_text)
             return True, accuracy_value
         else:
             print_warning(
@@ -1173,15 +1145,21 @@ def run_accuracy_test(model_path: str,
         return False, None
 
 
-def extract_stress_test_metrics(artifacts_dir="./artifacts",
-                                current_model=None):
+def extract_stress_test_metrics(artifacts_dir=None, current_model=None):
     """
     Extract stress test metrics from the artifacts directory
 
     Args:
-        artifacts_dir (str): Path to the artifacts directory
+        artifacts_dir (str): Path to the artifacts directory. If None, defaults to
+                            the 'artifacts' directory at the defs level (parent of stress_test)
         current_model (str, optional): If provided, only analyze artifacts for this model
     """
+    # Set default artifacts_dir relative to this script's location
+    # The artifacts are at defs/artifacts/, one level up from stress_test/
+    if artifacts_dir is None:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        artifacts_dir = os.path.join(script_dir, "..", "artifacts")
+
     # Find all profile_export_aiperf.json files in the artifacts directory
     json_files = glob(os.path.join(artifacts_dir,
                                    "**/profile_export_aiperf.json"),
@@ -1239,17 +1217,25 @@ def extract_stress_test_metrics(artifacts_dir="./artifacts",
                                             {}).get("avg", 0)
                 tokThroughput = results.get("output_token_throughput",
                                             {}).get("avg", 0)
-                conCurrency = results.get("input_config", {}).get(
-                    "perf_analyzer", {}).get("stimulus",
-                                             {}).get("concurrency", 0)
+                conCurrency = results.get("input_config",
+                                          {}).get("loadgen",
+                                                  {}).get("concurrency", 0)
+                if conCurrency == 0:
+                    conCurrency = results.get("input_config", {}).get(
+                        "perf_analyzer", {}).get("stimulus",
+                                                 {}).get("concurrency", 0)
 
                 # Try to determine model name from directory structure first
                 if first_dir in model_name_map:
                     modelName = model_name_map[first_dir]
                 else:
                     # Fall back to model name from JSON if we can't extract from directory
-                    modelName = results.get("input_config",
-                                            {}).get("model", ["unknown"])
+                    modelName = results.get("input_config", {}).get(
+                        "endpoint", {}).get("model_names", None)
+                    if modelName is None:
+                        modelName = results.get("input_config",
+                                                {}).get("model_names",
+                                                        ["unknown"])
                     modelName = modelName[0] if isinstance(modelName,
                                                            list) else modelName
 

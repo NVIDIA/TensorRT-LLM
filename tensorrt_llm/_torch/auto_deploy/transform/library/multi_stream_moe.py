@@ -266,6 +266,14 @@ def _execute_op_in_aux_stream(
             if input_node.target == torch.ops.aten.view.default:
                 target_input_node = input_node
                 break
+            # Look through dtype cast nodes (aten.to) to find the view node
+            if input_node.target == torch.ops.aten.to:
+                for nested_input in input_node.all_input_nodes:
+                    if nested_input.target == torch.ops.aten.view.default:
+                        target_input_node = nested_input
+                        break
+                if target_input_node is not None:
+                    break
 
         assert target_input_node is not None, f"Target input node not found for node {n}"
         with graph.inserting_before(target_input_node):
@@ -283,10 +291,6 @@ def _execute_op_in_aux_stream(
         n.replace_all_uses_with(new_node)
         graph.erase_node(n)
         num_replaced += 1
-    if num_replaced:
-        graph.eliminate_dead_code()
-        graph.lint()
-        gm.recompile()
 
     return gm, num_replaced
 
@@ -314,8 +318,8 @@ class MultiStreamMOE(BaseTransform):
         info = TransformInfo(
             skipped=False,
             num_matches=num_matches,
-            is_clean=False,
-            has_valid_shapes=False,
+            is_clean=num_matches == 0,
+            has_valid_shapes=num_matches == 0,
         )
 
         return gm, info

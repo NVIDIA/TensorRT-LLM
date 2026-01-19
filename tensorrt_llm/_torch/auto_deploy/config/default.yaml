@@ -48,6 +48,8 @@ transforms:
   match_rope_layout:
     stage: pattern_matcher
     expected_layout: bsnd
+  match_rmsnorm_pattern:
+    stage: pattern_matcher
   ############################################################################################
   # RUN TRANSFORMATIONS ON STANDARDIZED GRAPH REPRESENTATION
   ############################################################################################
@@ -126,6 +128,9 @@ transforms:
     stage: post_load_fusion
     enabled: true
     backend: trtllm
+  fuse_nvfp4_moe:
+    stage: post_load_fusion
+    enabled: true
   fuse_allreduce_residual_rmsnorm:
     stage: post_load_fusion
   # TODO (lucaslie): add backend selection as part of configurable inference optimizers
@@ -146,7 +151,7 @@ transforms:
   ############################################################################################
   visualize_namespace:
     stage: visualize
-    enabled: false # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/8460
+    enabled: false
   ############################################################################################
   # SWITCH TO CACHED+FLATTENED ATTENTION + INITIALIZE CACHES
   ############################################################################################

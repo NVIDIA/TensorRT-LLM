@@ -3,21 +3,19 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import torch.nn.functional as F
-from torch import nn
 
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
 from ..distributed.ops import allgather
 from ..model_config import ModelConfig
-from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import (DEFAULT_BEAM_IDX, SampleState,
                                   SampleStateTensors, TorchSampler, add_token,
                                   int_tensor)
 from ..pyexecutor.scheduler import ScheduledRequests
-from .interface import SpecMetadata, get_force_num_accepted_tokens
+from .interface import SpecMetadata, SpecWorkerBase
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
@@ -217,7 +215,7 @@ class MTPSampler(TorchSampler):
 
     SampleState = SampleStateMTP
 
-    @dataclass(frozen=True, kw_only=True)
+    @dataclass(kw_only=True)
     class Store(TorchSampler.Store):
         new_tokens: torch.Tensor
         next_new_tokens: torch.Tensor
@@ -349,15 +347,17 @@ class MTPSampler(TorchSampler):
                               sampler_event=sampler_event)
 
 
-class MTPWorker(nn.Module):
+class MTPWorker(SpecWorkerBase):
 
     def __init__(self, spec_config: "MTPDecodingConfig", model_config=None):
         super().__init__()
         self.spec_config = spec_config
         self.model_config = model_config
         self.is_thop = False
-        self.guided_decoder: Optional[CapturableGuidedDecoder] = None
-        self.force_num_accepted_tokens = get_force_num_accepted_tokens()
+
+    @property
+    def max_draft_len(self) -> int:
+        return self.spec_config.num_nextn_predict_layers
 
     def forward(
         self,
@@ -552,38 +552,6 @@ class MTPWorker(nn.Module):
 
         return {
             'logits': raw_logits,
-            'new_tokens': accepted_tokens,
-            'new_tokens_lens': num_accepted_tokens,
-            'next_draft_tokens': next_draft_tokens,
-            'next_new_tokens': next_new_tokens
-        }
-
-    def skip_forward(
-        self,
-        input_ids,
-        position_ids,
-        hidden_states,
-        logits,
-        attn_metadata,
-        spec_metadata,
-        draft_model,
-    ):
-        batch_size = attn_metadata.num_seqs
-        mtp_num_modules = self.spec_config.num_nextn_predict_layers
-        accepted_tokens = torch.empty((batch_size, (mtp_num_modules + 1)),
-                                      dtype=torch.int,
-                                      device=logits.device)
-        num_accepted_tokens = torch.ones(batch_size,
-                                         dtype=torch.int,
-                                         device=logits.device)
-        next_draft_tokens = torch.empty((batch_size, mtp_num_modules),
-                                        dtype=torch.int,
-                                        device=logits.device)
-        next_new_tokens = torch.empty((batch_size, (mtp_num_modules + 1)),
-                                      dtype=torch.int,
-                                      device=logits.device)
-        return {
-            'logits': logits,
             'new_tokens': accepted_tokens,
             'new_tokens_lens': num_accepted_tokens,
             'next_draft_tokens': next_draft_tokens,
@@ -889,8 +857,8 @@ class MTPWorker(nn.Module):
                     logits, spec_metadata.draft_tokens, target_tokens_cache,
                     mtp_num_modules, batch_size, num_contexts, logits.shape[-1])
             else:
-                # Do greedy sampling for the input logits
-                target_tokens = torch.argmax(logits, dim=-1)
+                target_tokens = self._sample_tokens_for_batch(
+                    logits, spec_metadata, num_contexts, batch_size)
 
                 # context
                 accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts]
@@ -1172,11 +1140,6 @@ class MTPWorker(nn.Module):
             draft_tokens = torch.argmax(logits, dim=-1).type(torch.int32)
 
         return draft_tokens
-
-    def set_guided_decoder(self,
-                           guided_decoder: CapturableGuidedDecoder) -> bool:
-        self.guided_decoder = guided_decoder
-        return True
 
 
 class MTPEagleWorker(MTPWorker):

@@ -63,9 +63,10 @@ pytestCommand=$(set_value_in_command "TRTLLM_WHL_PATH" "$trtllmWhlPath" "$pytest
 # Only the first process will save the coverage config file
 if [ $SLURM_PROCID -eq 0 ]; then
     sed -i "s|---wheel_path---|$trtllmWhlPath|g" "$coverageConfigFile"
+else
+    # Sleep 30 seconds to wait for the coverage config file to be saved
+    sleep 30
 fi
-# Sleep 10 seconds to wait for the coverage config file to be saved
-sleep 10
 
 containerPipLLMLibPath=$(pip3 show tensorrt_llm | grep "Location" | awk -F ":" '{ gsub(/ /, "", $2); print $2"/tensorrt_llm/libs"}')
 containerPipLLMLibPath=$(echo "$containerPipLLMLibPath" | sed 's/[[:space:]]+/_/g')
@@ -95,10 +96,37 @@ echo "Full Command: $pytestCommand"
     done
  fi
 
-eval $pytestCommand
-echo "Rank${SLURM_PROCID} Pytest finished execution"
+# Turn off "exit on error" so the following lines always run
+set +e
 
-if [ $SLURM_PROCID -eq 0 ] && [ "$perfMode" = "true" ] && [[ "$stageName" != *Perf-Sanity* ]]; then
+pytest_exit_code=0
+perf_check_exit_code=0
+perf_report_exit_code=0
+
+eval $pytestCommand
+pytest_exit_code=$?
+echo "Rank${SLURM_PROCID} Pytest finished execution with exit code $pytest_exit_code"
+
+# DEBUG: Diagnose intermittent "unrecognized arguments" failure (Exit Code 4)
+# Remove this after the issue is resolved
+if [ $pytest_exit_code -eq 4 ]; then
+    echo "DEBUG: Pytest failed with usage error (exit code 4)"
+    echo "DEBUG: Directory state at $(pwd):"
+    ls -l
+    echo "DEBUG: Directory state at $llmSrcNode/tests/integration/defs:"
+    ls -l $llmSrcNode/tests/integration/defs
+
+    echo "DEBUG: conftest.py content:"
+    md5sum $llmSrcNode/tests/integration/defs/conftest.py
+
+    echo "DEBUG: pytest.ini content:"
+    md5sum $llmSrcNode/tests/integration/defs/pytest.ini
+
+    echo "DEBUG: Check importability of conftest.py"
+    python3 -c "import sys; sys.path.insert(0, '.'); import conftest; print('DEBUG: conftest imported successfully')"
+fi
+
+if [ $SLURM_PROCID -eq 0 ] && [ "$perfMode" = "true" ]; then
     if [[ "$stageName" == *PyTorch* ]]; then
         basePerfFilename="base_perf_pytorch.csv"
     else
@@ -109,15 +137,28 @@ if [ $SLURM_PROCID -eq 0 ] && [ "$perfMode" = "true" ] && [[ "$stageName" != *Pe
     python3 $llmSrcNode/tests/integration/defs/perf/sanity_perf_check.py \
         $stageName/perf_script_test_results.csv \
         $basePerfPath
-    echo "Check Perf Result"
+    perf_check_exit_code=$?
+
+    echo "Create Perf Report"
     python3 $llmSrcNode/tests/integration/defs/perf/create_perf_comparison_report.py \
         --output_path $stageName/report.pdf \
         --files $stageName/perf_script_test_results.csv \
         $basePerfPath
+    perf_report_exit_code=$?
+    echo "Rank${SLURM_PROCID} Perf report finished execution with exit code $perf_report_exit_code"
+
+    if [ "$perf_check_exit_code" -eq 0 ] && [ "$perf_report_exit_code" -ne 0 ]; then
+        perf_check_exit_code=$perf_report_exit_code
+    fi
+    echo "Rank${SLURM_PROCID} Perf check finished execution with exit code $perf_check_exit_code"
 fi
 
-if [ $SLURM_PROCID -eq 0 ] && [ "$perfMode" = "true" ] && [[ "$stageName" == *Perf-Sanity* ]]; then
-    echo "Check Perf-Sanity Result"
-    python3 $llmSrcNode/tests/integration/defs/perf/perf_regression_check.py \
-        $jobWorkspace
+if [ "$pytest_exit_code" -ne 0 ]; then
+    final_exit_code=$pytest_exit_code
+elif [ "$perf_check_exit_code" -ne 0 ]; then
+    final_exit_code=$perf_check_exit_code
+else
+    final_exit_code=0
 fi
+echo "Rank${SLURM_PROCID} Final Slurm run finished execution with exit code $final_exit_code"
+exit $final_exit_code

@@ -21,18 +21,18 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels::ar_fusion
 {
 
-__global__ void lamport_initialize_kernel(float* ptr, int size)
+__global__ void lamport_initialize_kernel(float* ptr, size_t size)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= size)
         return;
     ptr[idx] = -0.f;
 }
 
-void lamport_initialize(void* ptr, int bytes, cudaStream_t stream)
+void lamport_initialize(void* ptr, size_t bytes, cudaStream_t stream)
 {
-    int grid_size = (bytes + 127) / 128;
-    lamport_initialize_kernel<<<grid_size, 128, 0, stream>>>(reinterpret_cast<float*>(ptr), bytes / sizeof(float));
+    int grid_size = static_cast<int>((bytes + 1023) / 1024);
+    lamport_initialize_kernel<<<grid_size, 1024, 0, stream>>>(reinterpret_cast<float*>(ptr), bytes / sizeof(float));
 }
 
 Workspace::Workspace(int rank, int tp_size, int max_token_num, int hidden_dim,
@@ -45,10 +45,11 @@ Workspace::Workspace(int rank, int tp_size, int max_token_num, int hidden_dim,
     int device_id;
     TLLM_CUDA_CHECK(cudaGetDevice(&device_id));
     m_buffer_mgr = std::make_shared<tensorrt_llm::runtime::BufferManager>(m_cuda_stream);
-    int buffer_size = tp_size * max_token_num * hidden_dim * sizeof(half);
-    int flag_size = tp_size * kBarrierFlagCount * sizeof(int);
-    int lamport_comm_size = tp_size * std::max(kOneShotMaxToken, max_token_num) * hidden_dim * sizeof(half);
-    int lamport_buffer_size = 3 * lamport_comm_size;
+    size_t buffer_size = tp_size * max_token_num * hidden_dim * sizeof(half);
+    size_t flag_size = tp_size * kBarrierFlagCount * sizeof(int);
+    size_t lamport_comm_size
+        = static_cast<size_t>(tp_size) * std::max(kOneShotMaxToken, max_token_num) * hidden_dim * sizeof(half);
+    size_t lamport_buffer_size = 3 * lamport_comm_size;
     for (auto size : {buffer_size, flag_size, lamport_buffer_size})
     {
         m_ipc_mem_handles.emplace_back(size, *m_buffer_mgr, m_world_config, p2p_supported);
@@ -61,20 +62,20 @@ Workspace::Workspace(int rank, int tp_size, int max_token_num, int hidden_dim,
             workspace.push_back(ipc_mem_handle.getCommPtrs()[r]);
         }
     }
-    // atomic flag read counter
-    // kernel_flag_ptr[0] = 0;
-    // non-lamport flag
-    // kernel_flag_ptr[1] = 0;
-    // lamport flag
-    // kernel_flag_ptr[2] = 0;
-    // lamport triple buffer offset
-    // kernel_flag_ptr[3] = lamport_comm_size;
-    // lamport clear size
-    // kernel_flag_ptr[4] = 0;
-    TLLM_CUDA_CHECK(cudaMalloc(&m_flag_d_ptr, 5 * sizeof(int)));
-    std::vector<int> h_data{0, 0, 0, lamport_comm_size, 0};
-    TLLM_CUDA_CHECK(cudaMemcpy(m_flag_d_ptr, h_data.data(), 5 * sizeof(int), cudaMemcpyHostToDevice));
+    // flag_buffer[0], atomic flag read counter
+    // flag_buffer[1], non-lamport flag
+    // flag_buffer[2], lamport flag
+    TLLM_CUDA_CHECK(cudaMalloc(&m_flag_d_ptr, 3 * sizeof(int)));
+    std::vector<int> h_flag_data{0, 0, 0};
+    TLLM_CUDA_CHECK(cudaMemcpy(m_flag_d_ptr, h_flag_data.data(), 3 * sizeof(int), cudaMemcpyHostToDevice));
     workspace.push_back(m_flag_d_ptr);
+    // layout_buffer[0], clear size for next lamport kernel
+    // layout_buffer[1], triple buffer offset for lamport kernel
+    TLLM_CUDA_CHECK(cudaMalloc(&m_layout_d_ptr, 2 * sizeof(int64_t)));
+    std::vector<int64_t> h_layout_data{0, static_cast<int64_t>(lamport_comm_size)};
+    TLLM_CUDA_CHECK(cudaMemcpy(m_layout_d_ptr, h_layout_data.data(), 2 * sizeof(int64_t), cudaMemcpyHostToDevice));
+    workspace.push_back(m_layout_d_ptr);
+
     TLLM_CUDA_CHECK(cudaMalloc(&m_workspace, workspace.size() * sizeof(void*)));
     TLLM_CUDA_CHECK(
         cudaMemcpy(m_workspace, workspace.data(), workspace.size() * sizeof(void*), cudaMemcpyHostToDevice));
@@ -86,6 +87,10 @@ Workspace::~Workspace()
     if (m_flag_d_ptr)
     {
         TLLM_CUDA_CHECK(cudaFree(m_flag_d_ptr));
+    }
+    if (m_layout_d_ptr)
+    {
+        TLLM_CUDA_CHECK(cudaFree(m_layout_d_ptr));
     }
     if (m_workspace)
     {
