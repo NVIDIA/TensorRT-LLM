@@ -169,6 +169,7 @@ MODEL_PATH_DICT = {
     "mistral_small_v3.1_24b": "Mistral-Small-3.1-24B-Instruct-2503",
     "gpt_oss_120b_fp4": "gpt_oss/gpt-oss-120b",
     "gpt_oss_20b_fp4": "gpt_oss/gpt-oss-20b",
+    "gpt_oss_120b_eagle3": "gpt_oss/gpt-oss-120b-Eagle3",
     "nemotron_nano_12b_v2": "NVIDIA-Nemotron-Nano-12B-v2",
     "nvidia_nemotron_nano_9b_v2_nvfp4": "NVIDIA-Nemotron-Nano-9B-v2-NVFP4",
     "starcoder2_7b": "starcoder2-7b",
