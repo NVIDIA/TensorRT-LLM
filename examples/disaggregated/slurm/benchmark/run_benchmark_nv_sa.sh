@@ -151,6 +151,7 @@ if [ "${ucx_warmup_requests}" -gt 0 ]; then
         --ignore-eos \
         --non-streaming
     echo "UCX warmup done"
+fi
 
 # Run benchmarks
 echo "Starting benchmark..."
