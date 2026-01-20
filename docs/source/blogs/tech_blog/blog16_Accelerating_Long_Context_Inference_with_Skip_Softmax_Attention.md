@@ -1,8 +1,8 @@
 # Accelerating Long-Context Inference with Skip Softmax Attention
 
-In the previous [tech blog](https://github.com/heyuhhh/TensorRT-LLM/blob/user/yuhangh/add_sprase_attention_tech_blog/docs/source/blogs/tech_blog/blog15_Sparse_Attention_in_TensorRT-LLM.md) (TODO: Update link), we introduced the framework to support sparse attention in TensorRT-LLM. The methods we covered, no matter KV cache compression after the context phase, or the sparse tokens prediction in the generation phase, all require some **runtime** modifications. Therefore, they are relatively complex to implement and apply. More importantly, the additional operations compared to the full attention brings computational overhead, which would be detrimental to the performance gain of the core attention computation. Whether those methods are beneficial depends on the specific scenarios, e.g., if the context length is not long enough, enabling those methods may result in negative performance impact. On the other hand, Skip Softmax is only an approximation method of the attention kernel computation, making it compatible with nearly all the other features, such as FP8 attention, KV cache reuse, chunked prefill etc.
+In the previous [tech blog](https://github.com/heyuhhh/TensorRT-LLM/blob/user/yuhangh/add_sprase_attention_tech_blog/docs/source/blogs/tech_blog/blog15_Sparse_Attention_in_TensorRT-LLM.md) (TODO: Update link), we introduced the framework to support sparse attention in TensorRT-LLM. The methods we covered, no matter KV cache compression after the context phase, or the sparse tokens prediction in the generation phase, all require some **runtime** modifications. Therefore, they are relatively complex to implement and apply. More importantly, the additional operations compared to the full attention brings computational overhead, which would be detrimental to the performance gain of the core attention computation. Whether those methods are beneficial depends on the specific scenarios, e.g., if the context length is not long enough, enabling those methods may result in negative performance impact.
 
-In this blog, we introduce **Skip Softmax Attention**, a drop-in sparse attention technique that is designed to accelerate the existing pretrained models that use standard attention mechanisms like MHA, GQA, or MLA. Skip Softmax Attention based on top of the Flash Attention algorithm and only requires modifying the existing **attention kernels**. Due to this simplicity, the end-to-end performance gain is more predictable.image.png
+In this blog, we introduce **Skip Softmax Attention**, a drop-in sparse attention technique that is designed to accelerate the existing pretrained models that use standard attention mechanisms like MHA, GQA, or MLA. Skip Softmax Attention based on top of the Flash Attention algorithm and only requires modifying the existing **attention kernels**. Due to this simplicity, the end-to-end performance gain is more predictable. In addition, it is only an approximation method of the attention kernel computation, making it compatible with nearly all the other features, such as FP8 attention, KV cache reuse, chunked prefill etc.
 
 ## Method Overview
 
@@ -93,10 +93,35 @@ Skip Softmax Attention is supported on both Hopper and Blackwell GPUs, based on 
 
 ### Kernel Performance
 
-We provide the performance data of the attention kernels under different achieved sparsity by specifying the threshold. The micro-benchmarking is performed under these configs: q_heads=64, kv_heads=4, head_dim=128, seqlen=16k/64k. Both BF16 and FP8 attention are supported.
+We provide the performance data of the attention kernels under different achieved sparsity by specifying the threshold. The micro-benchmarking is performed under these configs: q_heads=64, kv_heads=4, head_dim=128, seqlen=16k/64k. Both BF16 and FP8 attention are supported. For prefilling, batch size is set to 1; for decoding, batch size is 64.
 
-As a reference, the baseline performance without Skip Softmax Attention is listed below:
+As a reference, the baseline performance data **without** Skip Softmax Attention are listed below (you can fill in the numbers).
 
+**Prefill Baseline:**
+
+| GPU | Seqlen | Precision | TFLOP/s | Duration µs |
+|:---:|:-----:|:---------:|--------:|--------------:|
+| H200 | 16k | BF16 | 594.05 | 7403.50 |
+| H200 | 16k | FP8  | 852.81 | 5157.12 |
+| H200 | 64k | BF16 | 610.30 | 115301.89 |
+| H200 | 64k | FP8  | 873.60 | 80550.30 |
+| B200 | 16k | BF16 | 1029.13 | 4273.56 |
+| B200 | 16k | FP8  | 1523.57 | 2886.67 |
+| B200 | 64k | BF16 | 1038.26 | 67775.65 |
+| B200 | 64k | FP8  | 1621.41  | 43399.72 |
+
+**Decode Baseline:**
+
+| GPU | Seqlen | Precision | Bandwidth TB/s | Duration µs |
+|:---:|:-----:|:---------:|-----------------:|--------------:|
+| H200 | 16k | BF16 | 4.391 | 489.06 |
+| H200 | 16k | FP8  | 3.158 | 340.01 |
+| H200 | 64k | BF16 | 4.410 | 1947.83 |
+| H200 | 64k | FP8  | 3.221 | 1333.43 |
+| B200 | 16k | BF16 | 7.082 | 303.23 |
+| B200 | 16k | FP8  | 5.457 | 196.76 |
+| B200 | 64k | BF16 | 7.102 | 1209.51 |
+| B200 | 64k | FP8  | 5.683 | 755.76 |
 
 The following figures plot **speedup vs. achieved sparsity**.
 
