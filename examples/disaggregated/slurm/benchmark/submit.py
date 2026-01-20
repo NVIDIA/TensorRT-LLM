@@ -487,7 +487,8 @@ def submit_job(config, log_dir, dry_run):
 
     # record ${SLURM_JOB_NODELIST} to ${log_dir}/8_done_job_id.txt
     done_cmd = [
-        "echo", "${SLURM_JOB_NODELIST}", ">", f"{log_dir}/8_done_${{SLURM_JOB_ID}}.txt"
+        "echo", "${SLURM_JOB_NODELIST}", ">",
+        f"{log_dir}/8_done_${{SLURM_JOB_ID}}.txt"
     ]
     client_cmds.append(" ".join(done_cmd))
 
