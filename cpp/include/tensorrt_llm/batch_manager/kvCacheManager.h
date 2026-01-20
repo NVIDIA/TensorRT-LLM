@@ -1037,6 +1037,9 @@ private:
     SizeType32 mIndexerKCacheQuantBlockSize;
     // Index head dim for indexer K cache
     SizeType32 mIndexerKCacheIndexHeadDim;
+
+    // Mutex for the next blocks
+    std::mutex mNextBlocksMutex;
 };
 
 class BlockManager
