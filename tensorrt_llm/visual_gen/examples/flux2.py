@@ -29,10 +29,11 @@ from common import (
     setup_distributed,
     validate_parallel_config,
 )
-from diffusers import Flux2Pipeline
+from visual_gen.pipelines.flux2_pipeline import ditFlux2Pipeline
+
+from visual_gen.layers import apply_visual_gen_linear
 
 import visual_gen
-from visual_gen.models.transformers.flux2_transformer import ditFlux2Transformer2DModel
 from visual_gen.utils import cudagraph_wrapper, get_logger
 
 logger = get_logger(__name__)
@@ -40,21 +41,32 @@ logger = get_logger(__name__)
 
 def load_and_setup_pipeline(args):
     """Load and configure the Flux pipeline."""
+
+    if args.enable_cuda_graph:
+            assert args.attn_type != "sage-attn", "sage-attn has accuracy issue when enable cudagraph"
+            assert not (
+                args.enable_async_cpu_offload or args.enable_sequential_cpu_offload or args.enable_model_cpu_offload
+            ), "CudaGraph is not supported when using cpu offload"
+    
     # Create dit configuration
     dit_configs = create_dit_config(args)
+    # Apply dit configuration
     visual_gen.setup_configs(**dit_configs)
+    # Load pipe
+    pipe = ditFlux2Pipeline.from_pretrained(args.model_path, torch_dtype=torch.bfloat16, **dit_configs)
 
-    # Load transformer
-    transformer = ditFlux2Transformer2DModel.from_pretrained(
-        args.model_path, subfolder="transformer", torch_dtype=torch.bfloat16
-    )
-    pipe = Flux2Pipeline.from_pretrained(args.model_path, transformer=transformer, torch_dtype=torch.bfloat16)
+    if args.enable_nvfp4_dynamic_quant:
+        assert args.linear_recipe != "dynamic" "Linear recipe must be static if enable_nvfp4_dynamic_quant=True"
+        assert args.linear_type != "flashinfer-nvfp4-cutlass" "Linear type must be flashinfer-nvfp4-cutlass if enable_nvfp4_dynamic_quant=True"
+        
+        exclude_pattern = r"^(?!.*(embedder|norm_out|proj_out|to_add_out|to_added_qkv|stream)).*"
+        apply_visual_gen_linear(pipe.transformer, load_parameters=True, quantize_weights=True, exclude_pattern=exclude_pattern)
 
+    if args.enable_cuda_graph:
+        pipe.enable_cuda_graph()
+        
     # Setup distributed training and CPU offload
     local_rank, world_size = setup_distributed()
-
-    if not args.disable_torch_compile:
-        pipe.transformer = torch.compile(pipe.transformer, mode=args.torch_compile_mode)
 
     # Flux CPU offload configuration (no text encoder offloading for Flux)
     model_wise = None  # Flux doesn't offload text encoder
@@ -86,13 +98,6 @@ def run_inference(pipe, args, enable_autotuner: bool = False):
             autotuner_dir = generate_autotuner_dir(args)
         autotuning(inference_fn, autotuner_dir)
 
-    if args.enable_cuda_graph:
-        assert args.attn_type != "sage-attn", "sage-attn has accuracy issue when enable cudagraph"
-        assert not (
-            args.enable_async_cpu_offload or args.enable_sequential_cpu_offload or args.enable_model_cpu_offload
-        ), "CudaGraph is not supported when using cpu offload"
-        pipe.transformer.forward = cudagraph_wrapper(pipe.transformer.forward)
-
     image, elapsed_time = benchmark_inference(
         inference_fn,
         warmup=True,
@@ -115,7 +120,8 @@ def main():
         height=1024,
         width=1024,
         guidance_scale=4,
-        teacache_thresh=0.6,
+        enable_nvfp4_dynamic_quant=False,
+        enable_cuda_graph=True
     )
 
     args = parser.parse_args()

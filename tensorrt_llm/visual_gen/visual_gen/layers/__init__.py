@@ -37,7 +37,6 @@ def apply_visual_gen_linear(model: nn.Module,
 ):  
     # check if amax_values and to_input_scale are both None or both not None
     assert (amax_values is None) == (to_input_scale is None)
-    
     exclude_pattern_ = re.compile(exclude_pattern)
     
     # Collect all linear modules to replace first to avoid modifying during iteration
@@ -75,6 +74,7 @@ def apply_visual_gen_linear(model: nn.Module,
 def apply_visual_gen_norm(model: nn.Module, rmsnorm: list = [], layernorm: list = [], load_parameters: bool = False):
     rmsnorm_modules_to_replace = []
     layernorm_modules_to_replace = []
+    
     for name, module in model.named_modules():
         is_rmsnorm, is_layernorm = False, False
         suffix_name = name.split(".")[-1]

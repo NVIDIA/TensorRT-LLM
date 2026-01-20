@@ -40,7 +40,6 @@ from visual_gen.configs.op_manager import LinearOpManager
 from visual_gen.configs.parallel import VAEParallelConfig
 from visual_gen.configs.pipeline import PipelineConfig
 from visual_gen.layers.linear import ditLinear
-from visual_gen.layers import apply_visual_gen_linear
 from visual_gen.models.transformers.flux2_transformer import ditFlux2Transformer2DModel
 from visual_gen.pipelines.base_pipeline import ditBasePipeline
 from visual_gen.utils.logger import get_logger
@@ -60,43 +59,6 @@ else:
 
 
 class ditFlux2Pipeline(Flux2Pipeline, ditBasePipeline):
-    
-    def load_flux_2_dynamic_quantization(
-        model_id: str,
-        torch_dtype: torch.dtype,
-        exclude_pattern: Optional[str] = None,
-        warm_up: Optional[bool] = True,
-        enable_cuda_graph: Optional[bool] = True,
-        device: Optional[torch.device] = torch.device("cuda"),
-        **dit_configs,
-    ):
-        pipe = ditFlux2Pipeline.from_pretrained(model_id, torch_dtype=torch_dtype, **dit_configs)
-        apply_visual_gen_linear(pipe.transformer, load_parameters=True, quantize_weights=True, exclude_pattern=exclude_pattern)
-        pipe.to(device)
-        if enable_cuda_graph:
-            if TeaCacheConfig.enable_teacache():
-                logger.info("capturing cuda graph for teacache..")
-                pipe.transformer.run_pre_processing = cudagraph_wrapper(
-                pipe.transformer.run_pre_processing
-                )
-                pipe.transformer.run_teacache_check = cudagraph_wrapper(
-                    pipe.transformer.run_teacache_check
-                )
-                pipe.transformer.run_transformer_blocks = cudagraph_wrapper(
-                    pipe.transformer.run_transformer_blocks
-                )
-                pipe.transformer.run_post_processing = cudagraph_wrapper(
-                    pipe.transformer.run_post_processing
-                )
-            else:
-                logger.info("capturing cuda graph..")
-                pipe.transformer.forward = cudagraph_wrapper(pipe.transformer.forward)
-        if warm_up:
-            logger.info("warm_up")
-            pipe(prompt="test", num_inference_steps=50)
-            logger.info("warm_up completed")
-
-        return pipe
 
     def _set_teacache_coefficients(self, **kwargs) -> None:
             teacache_configs = kwargs.pop("teacache", None)
@@ -141,6 +103,27 @@ class ditFlux2Pipeline(Flux2Pipeline, ditBasePipeline):
             logger.warning("VAE parallel is not supported for FluxPipeline")
 
         self._set_teacache_coefficients(**kwargs)
+            
+
+    def enable_cuda_graph(self):
+        if TeaCacheConfig.enable_teacache():
+            logger.info("capturing cuda graph for teacache..")
+            self.transformer.run_pre_processing = cudagraph_wrapper(
+                self.transformer.run_pre_processing
+                )
+            self.transformer.run_teacache_check = cudagraph_wrapper(
+                self.transformer.run_teacache_check
+            )
+            self.transformer.run_transformer_blocks = cudagraph_wrapper(
+                self.transformer.run_transformer_blocks
+            )
+            self.transformer.run_post_processing = cudagraph_wrapper(
+                self.transformer.run_post_processing
+            )
+        else:
+            logger.info("capturing cuda graph..")
+            self.transformer.forward = cudagraph_wrapper(self.transformer.forward)
+
 
     def load_fp4_weights(self, path, svd_weight_name_table):
         weights_table = load_file(path)
@@ -176,7 +159,6 @@ class ditFlux2Pipeline(Flux2Pipeline, ditBasePipeline):
             TeaCacheConfig.set_config(
                     num_steps=num_inference_steps
             )
-
             if TeaCacheConfig.cutoff_steps() > TeaCacheConfig.num_steps():
                 logger.warning("Number of cutoff_steps > num_steps.")
 

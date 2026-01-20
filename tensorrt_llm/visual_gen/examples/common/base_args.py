@@ -166,6 +166,9 @@ class BaseArgumentParser:
             help="Torch compile mode",
         )
 
+        # nvfp4 for flux2
+        self.parser.add_argument("--enable_nvfp4_dynamic_quant", action="store_true", help="Enable nvfp4 dynamic quantization for flux2")
+
         # CudaGraph
         self.parser.add_argument("--enable_cuda_graph", action="store_true", help="Enable cuda graph")
 
@@ -196,6 +199,8 @@ class BaseArgumentParser:
         self.parser.add_argument("--enable_teacache", action="store_true", help="Enable teacache")
         self.parser.add_argument("--teacache_thresh", type=float, default=0.2, help="Threshold for teacache")
         self.parser.add_argument("--use_ret_steps", action="store_true", help="Use ret steps for teacache")
+        self.parser.add_argument("--ret_steps", type=int, default=0, help="Step index to start using teacache")
+        self.parser.add_argument("--cutoff_steps", type=int, default=50, help="Step index to stop using TeaCache")
 
         # QKV fusion args
         self.parser.add_argument(

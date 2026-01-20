@@ -157,7 +157,6 @@ class ditFlux2Transformer2DModel(Flux2Transformer2DModel, ditBaseTransformer):
         super().__init__(*args, **kwargs)
         # In init stage, model ckpt are not loaded, so we don't need to load the parameters.
         apply_visual_gen_linear(self, load_parameters=False, quantize_weights=False)
-        apply_visual_gen_norm(self, load_parameters=False)
         for name, module in self.named_modules():
             if hasattr(module, "set_processor"):
                 if isinstance(module.get_processor(), Flux2AttnProcessor):
@@ -345,7 +344,7 @@ class ditFlux2Transformer2DModel(Flux2Transformer2DModel, ditBaseTransformer):
             If `return_dict` is True, an [`~models.transformer_2d.Transformer2DModelOutput`] is returned, otherwise a
             `tuple` where the first element is the sample tensor.
         """
-
+        
         # 0. Handle input arguments
         if joint_attention_kwargs is not None:
             joint_attention_kwargs = joint_attention_kwargs.copy()

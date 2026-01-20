@@ -142,6 +142,8 @@ def create_dit_config(args) -> Dict[str, Any]:
             "enable_teacache": args.enable_teacache,
             "use_ret_steps": args.use_ret_steps,
             "teacache_thresh": args.teacache_thresh,
+            "ret_steps": args.ret_steps,
+            "cutoff_steps": args.cutoff_steps,
         },
     }
 
