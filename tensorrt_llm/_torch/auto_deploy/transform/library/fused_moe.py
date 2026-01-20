@@ -9,7 +9,7 @@ from torch.fx import GraphModule, Node
 
 from tensorrt_llm._torch.utils import ActivationType
 
-from ...custom_ops.quant import TRTLLM_NVFP4_SCALING_VECTOR_SIZE
+from ...custom_ops.quant import TRTLLM_NVFP4_PACKING_FACTOR, TRTLLM_NVFP4_SCALING_VECTOR_SIZE
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils._graph import delete_all_unused_submodules, eliminate_dead_code
@@ -1690,14 +1690,13 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
             # as they share the same intermediate dimension.
             target_intermediate = fc1_weight_blockscale_fp8_stacked.shape[1]
             TRTLLM_NVFP4_SCALING_VECTOR_NUM_ELEMENTS = TRTLLM_NVFP4_SCALING_VECTOR_SIZE
-            NVFP4_PACKING_FACTOR = 2
-            TRTLLM_NVFP4_SCALING_BYTE_SIZE = (
-                TRTLLM_NVFP4_SCALING_VECTOR_NUM_ELEMENTS // NVFP4_PACKING_FACTOR
+            TRTLLM_NVFP4_SCALING_BYTES_SIZE = (
+                TRTLLM_NVFP4_SCALING_VECTOR_NUM_ELEMENTS // TRTLLM_NVFP4_PACKING_FACTOR
             )
             target_n_blocks = target_intermediate // TRTLLM_NVFP4_SCALING_VECTOR_NUM_ELEMENTS
             padded_target_n_blocks = (
-                math.ceil(target_n_blocks / TRTLLM_NVFP4_SCALING_BYTE_SIZE)
-                * TRTLLM_NVFP4_SCALING_BYTE_SIZE
+                math.ceil(target_n_blocks / TRTLLM_NVFP4_SCALING_BYTES_SIZE)
+                * TRTLLM_NVFP4_SCALING_BYTES_SIZE
             )
             fc2_blocks_pad = padded_target_n_blocks - fc2_weight_blockscale_fp8_stacked.shape[2]
 
@@ -1718,7 +1717,7 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
                 )
             fc2_expert_weights = torch.nn.functional.pad(
                 fc2_expert_weights,
-                (0, fc1_pad_size // NVFP4_PACKING_FACTOR, 0, 0),
+                (0, fc1_pad_size // TRTLLM_NVFP4_PACKING_FACTOR, 0, 0),
                 mode="constant",
                 value=0,
             ).view(torch.uint8)

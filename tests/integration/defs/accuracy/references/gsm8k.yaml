@@ -180,6 +180,9 @@ nvidia/Nemotron-MOE:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 86.884
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 63.268
 nvidia/Llama-3.1-Nemotron-Nano-8B-v1:
   - accuracy: 37.15
   - quant_algo: FP8

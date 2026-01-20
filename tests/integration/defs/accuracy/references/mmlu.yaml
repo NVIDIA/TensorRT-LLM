@@ -284,6 +284,9 @@ nvidia/Nemotron-MOE:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 73.879
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 70.879
 microsoft/Phi-4-mini-instruct:
   - accuracy: 68.98
   - quant_algo: FP8
