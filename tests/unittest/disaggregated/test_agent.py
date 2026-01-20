@@ -1,4 +1,6 @@
 from dataclasses import dataclass, field
+from unittest import TestCase
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -10,8 +12,24 @@ from tensorrt_llm._torch.disaggregation.base.agent import (
     RegMemoryDescs,
     TransferOp,
     TransferRequest,
+    TransferStatus,
 )
 from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
+
+
+class TestTransferStatus(TestCase):
+    def test_mock_transfer_status(self):
+        mock_transfer_status = Mock(spec=TransferStatus)
+        mock_transfer_status.is_completed.return_value = True
+        self.assertTrue(mock_transfer_status.is_completed())
+        mock_transfer_status.is_completed.assert_called_once()
+        mock_transfer_status.wait.return_value = True
+        timeout_values = [None, 1000, 5000]
+        for timeout in timeout_values:
+            with self.subTest(timeout=timeout):
+                result = mock_transfer_status.wait(timeout_ms=timeout)
+                self.assertTrue(result)
+                mock_transfer_status.wait.assert_called_with(timeout_ms=timeout)
 
 
 def _convert_to_memory_descs(reg_descs: RegMemoryDescs) -> MemoryDescs:

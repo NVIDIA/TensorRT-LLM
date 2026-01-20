@@ -24,9 +24,11 @@ class BindingsNixlTransferStatus(TransferStatus):
         return self._cpp_status.is_completed()
 
     @nvtx_range("BindingsNixlTransferStatus.wait")
-    def wait(self) -> bool:
+    def wait(self, timeout_ms=None) -> bool:
         """Wait for transfer to complete (releases GIL)."""
-        return self._cpp_status.wait() == TransferState.SUCCESS
+        if timeout_ms is None:
+            timeout_ms = -1
+        return self._cpp_status.wait(timeout_ms) == TransferState.SUCCESS
 
 
 class BindingsNixlTransferAgent(BaseTransferAgent):

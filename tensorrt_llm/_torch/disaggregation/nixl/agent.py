@@ -1,6 +1,6 @@
 from tensorrt_llm.logger import logger
 
-from ..base.agent import _force_py_nixl_kv_transfer
+from ..base.agent import use_pure_python_transfer_agent
 
 """NIXL Transfer Agent implementations.
 
@@ -23,24 +23,21 @@ def _load_agent(module_name, required_attributes):
     return None
 
 
-_py_agent = _load_agent(
-    module_name="tensorrt_llm._torch.disaggregation.nixl._agent_py",
-    required_attributes=["NixlTransferAgent", "NixlTransferStatus"],
-)
+NixlTransferStatus, NixlTransferAgent = None, None
 
-_cpp_agent = _load_agent(
-    module_name="tensorrt_llm._torch.disaggregation.nixl._agent_cpp",
-    required_attributes=["BindingsNixlTransferAgent", "BindingsNixlTransferStatus"],
-)
-
-# Determine which Transfer Agent implementation to use
-if _cpp_agent and not _force_py_nixl_kv_transfer():
-    NixlTransferStatus = _cpp_agent.BindingsNixlTransferStatus
-    NixlTransferAgent = _cpp_agent.BindingsNixlTransferAgent
-    logger.info("Using C++ NIXL Transfer Agent implementation.")
-elif _py_agent:
+if use_pure_python_transfer_agent():
+    _py_agent = _load_agent(
+        module_name="tensorrt_llm._torch.disaggregation.nixl._agent_py",
+        required_attributes=["NixlTransferAgent", "NixlTransferStatus"],
+    )
+    assert _py_agent is not None, "Failed to load pure Python NIXL Transfer Agent."
     NixlTransferStatus = _py_agent.NixlTransferStatus
     NixlTransferAgent = _py_agent.NixlTransferAgent
-    logger.info("Using Python NIXL Transfer Agent implementation.")
 else:
-    raise ImportError("Both C++ and Python NIXL Transfer Agents failed to load.")
+    _cpp_agent = _load_agent(
+        module_name="tensorrt_llm._torch.disaggregation.nixl._agent_cpp",
+        required_attributes=["BindingsNixlTransferAgent", "BindingsNixlTransferStatus"],
+    )
+    assert _cpp_agent is not None, "Failed to load C++ NIXL Transfer Agent bindings."
+    NixlTransferStatus = _cpp_agent.BindingsNixlTransferStatus
+    NixlTransferAgent = _cpp_agent.BindingsNixlTransferAgent
