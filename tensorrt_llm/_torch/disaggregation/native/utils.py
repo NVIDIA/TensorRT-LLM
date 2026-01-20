@@ -1,13 +1,18 @@
+from tensorrt_llm import logger
+
+
 def get_local_ip() -> str:
     try:
         import socket
 
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("8.8.8.8", 80))
+            s.connect(("10.255.255.255", 1))
             ip = s.getsockname()[0]
             if not ip.startswith("127."):
                 return ip
+
     except OSError:
+        logger.error("Failed to get local IP via UDP socket method.")
         pass
 
     try:
@@ -21,6 +26,7 @@ def get_local_ip() -> str:
                     if not ip.startswith("127.") and not ip.startswith("169.254"):
                         return ip
     except Exception:
+        logger.error("Failed to get local IP via netifaces.")
         pass
 
     try:
@@ -29,6 +35,7 @@ def get_local_ip() -> str:
         if not ip.startswith("127."):
             return ip
     except OSError:
+        logger.error("Failed to get local IP via hostname resolution.")
         pass
 
     return "127.0.0.1"

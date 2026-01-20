@@ -1,4 +1,5 @@
 import time
+from enum import Enum
 
 from nixl import nixl_agent, nixl_agent_config, nixl_xfer_handle  # noqa: E402
 
@@ -8,30 +9,39 @@ from tensorrt_llm._utils import nvtx_range
 from ..base.agent import BaseTransferAgent, RegMemoryDescs, TransferRequest, TransferStatus
 
 
-class NixlTransferStatus(TransferStatus):
-    """TransferStatus using Python nixl library."""
+class TransferState(Enum):
+    PENDING = "PENDING"
+    PROCESSING = "PROC"
+    DONE = "DONE"
+    ERROR = "ERROR"
 
+
+class NixlTransferStatus(TransferStatus):
     def __init__(self, agent: nixl_agent, handle: nixl_xfer_handle):
         self.agent = agent
         self.handle = handle
 
     def is_completed(self):
-        status = self.agent.check_xfer_state(self.handle)
-        return status == "DONE"
+        status = TransferState(self.agent.check_xfer_state(self.handle))
+        return status == TransferState.DONE
 
-    def wait(self):
-        status = "PROC"
-        sleep_time = 0.0001  # 0.1ms
-        max_sleep_time = 0.01  # 10ms
-        while status == "PROC":
-            status = self.agent.check_xfer_state(self.handle)
-            if status == "ERROR":
-                return False  # transfer failed
-            # sleep(0.1)
-            # sleep to release GIL
+    def wait(self, timeout_ms=None):
+        start_time = time.time()
+        status = TransferState.PROCESSING
+        sleep_time = 0.0001  # 0.1ms in seconds
+        max_sleep_time = 0.01  # 10ms in seconds
+
+        timeout = timeout_ms / 1000 if timeout_ms is not None else None
+
+        while status == TransferState.PROCESSING:
+            status = TransferState(self.agent.check_xfer_state(self.handle))
+            if status == TransferState.ERROR:
+                return False  # Transfer failed
+            if timeout is not None and (time.time() - start_time > timeout):
+                return False  # Timeout
             time.sleep(sleep_time)
             sleep_time = min(sleep_time * 2, max_sleep_time)
-        return True
+        return status == TransferState.DONE
 
 
 class NixlTransferAgent(BaseTransferAgent):
@@ -95,5 +105,6 @@ class NixlTransferAgent(BaseTransferAgent):
             sync_message,
         )
         status = self.agent.transfer(handle)
-        assert status != "ERROR"
+        if status == "ERROR":
+            raise RuntimeError("NIXL transfer initialization failed.")
         return NixlTransferStatus(self.agent, handle)
