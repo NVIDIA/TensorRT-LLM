@@ -547,16 +547,11 @@ def stress_test(config,
     else:
         stress_config = None
 
-    # Check if port is available (more reliable than just health check)
+    # Check if port is available
     is_available, port_error = is_port_available(test_server_config.port,
                                                  test_server_config.host)
-    if not is_available:
-        raise RuntimeError(
-            f"Cannot start server: {port_error}. "
-            f"Please run 'fuser -k {test_server_config.port}/tcp' to free the port, "
-            f"or check if another process is using this port.")
 
-    # Also check if a healthy server is already running (different scenario)
+    # Check if server is already running
     is_healthy, _ = check_server_health(test_server_config.url,
                                         test_server_config.health_check_timeout)
     if is_healthy:
@@ -1259,30 +1254,29 @@ def extract_stress_test_metrics(artifacts_dir=None, current_model=None):
             with open(json_file, "r") as f:
                 results = json.load(f)
 
-                # Use `or {}` to handle both missing keys AND explicit null values
-                reqThroughput = (results.get("request_throughput")
-                                 or {}).get("avg", 0)
-                tokThroughput = (results.get("output_token_throughput")
-                                 or {}).get("avg", 0)
-
-                # Get concurrency from input_config.loadgen or input_config.perf_analyzer.stimulus
-                input_config = results.get("input_config") or {}
-                conCurrency = (input_config.get("loadgen")
-                               or {}).get("concurrency", 0)
+                reqThroughput = results.get("request_throughput",
+                                            {}).get("avg", 0)
+                tokThroughput = results.get("output_token_throughput",
+                                            {}).get("avg", 0)
+                conCurrency = results.get("input_config",
+                                          {}).get("loadgen",
+                                                  {}).get("concurrency", 0)
                 if conCurrency == 0:
-                    conCurrency = ((input_config.get("perf_analyzer")
-                                    or {}).get("stimulus")
-                                   or {}).get("concurrency", 0)
+                    conCurrency = results.get("input_config", {}).get(
+                        "perf_analyzer", {}).get("stimulus",
+                                                 {}).get("concurrency", 0)
 
                 # Try to determine model name from directory structure first
                 if first_dir in model_name_map:
                     modelName = model_name_map[first_dir]
                 else:
                     # Fall back to model name from JSON if we can't extract from directory
-                    endpoint = (input_config.get("endpoint") or {})
-                    modelName = endpoint.get("model_names", None)
+                    modelName = results.get("input_config", {}).get(
+                        "endpoint", {}).get("model_names", None)
                     if modelName is None:
-                        modelName = input_config.get("model_names", ["unknown"])
+                        modelName = results.get("input_config",
+                                                {}).get("model_names",
+                                                        ["unknown"])
                     modelName = modelName[0] if isinstance(modelName,
                                                            list) else modelName
 
