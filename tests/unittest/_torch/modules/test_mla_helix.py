@@ -355,7 +355,7 @@ def _make_latent_cache_gen(
 ):
     if rank == 0:
         assert ref_attn_metadata is not None
-        kv_cache_block_offsets = ref_attn_metadata.host_kv_cache_block_offsets
+        kv_cache_block_offsets = ref_attn_metadata.kv_cache_manager.host_kv_cache_block_offsets
         kv_buffer = ref_attn_metadata.kv_cache_manager.get_buffers(0)
         ret = input_ctx_bs.new_empty(
             (world_size - 1, input_ctx_bs.shape[0], mla.kv_lora_rank + mla.qk_rope_head_dim)

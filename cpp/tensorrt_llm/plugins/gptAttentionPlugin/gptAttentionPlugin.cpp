@@ -858,7 +858,6 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
 
     int max_blocks_per_sequence = 0;
     kernels::KVBlockArray::DataType* block_offsets = nullptr;
-    kernels::KVBlockArray::DataType* host_block_offsets = nullptr;
     void* host_primary_pool_pointer = nullptr;
     void* host_secondary_pool_pointer = nullptr;
     if (useKVCache() && mPagedKVCache)
@@ -880,10 +879,6 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
 
         block_offsets
             = reinterpret_cast<kernels::KVBlockArray::DataType*>(inputs[getIdx(IdxEntry::KV_CACHE_BLOCK_OFFSETS)])
-            + poolOffset + seqOffset;
-
-        host_block_offsets
-            = reinterpret_cast<kernels::KVBlockArray::DataType*>(inputs[getIdx(IdxEntry::HOST_KV_CACHE_BLOCK_OFFSETS)])
             + poolOffset + seqOffset;
 
         auto const* const typed_host_pool_pointers
@@ -1046,7 +1041,6 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         common_enqueue_params.max_past_kv_length = max_context_kv_len;
         EnqueueContextParams<T> enqueue_params{common_enqueue_params};
         enqueue_params.attention_packed_mask = attention_packed_mask;
-        enqueue_params.host_block_offsets = host_block_offsets;
         enqueue_params.batch_size = batch_size;
         enqueue_params.mrope_rotary_cos_sin = mrope_rotary_cos_sin;
         enqueue_params.total_kv_len = enqueue_params.num_tokens;
