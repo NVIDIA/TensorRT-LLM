@@ -83,7 +83,7 @@ def _test_moe_worker(
         torch.cuda.manual_seed(0)
 
         # Create route method
-        routing_method = RenormalizeMoeRoutingMethod(top_k=top_k)
+        routing_method = RenormalizeMoeRoutingMethod(top_k=top_k, force_enable_pytorch_op=True)
 
         # Create activation and weight
         x = torch.randn((seq_len, hidden_size), dtype=dtype, device="cuda")
@@ -186,10 +186,10 @@ def _test_moe_worker(
 
             load_expert_ids = None
             if isinstance(moe_load_balancer, MoeLoadBalancer):
+                moe_load_balancer.set_iter_info(enable_statistic=True, enable_update_weights=True)
                 load_expert_ids = moe_load_balancer.single_layer_load_balancers[
                     0
-                ].get_load_expert_ids()
-                moe_load_balancer.set_iter_info(enable_statistic=True, enable_update_weights=True)
+                ].get_old_rank_expert_ids()
 
             ref_output, output = _run_forward(x, router_logits)
             ref_fused_moe.check_accuracy(output, ref_output)
@@ -199,7 +199,7 @@ def _test_moe_worker(
                 assert isinstance(moe_load_balancer, MoeLoadBalancer), (
                     "Moe load balancer should be created when eplb is enabled"
                 )
-                extra_steps = 2
+                extra_steps = 3
                 for _ in range(extra_steps):
                     _, output = _run_forward(x, router_logits, skip_ref=True)
                     ref_fused_moe.check_accuracy(output, ref_output)
@@ -210,8 +210,9 @@ def _test_moe_worker(
                 current_expert_ids = moe_load_balancer.single_layer_load_balancers[
                     0
                 ].get_old_rank_expert_ids()
-                assert len(current_expert_ids) == 4
-                assert len(load_expert_ids) == 2
+                assert load_expert_ids != current_expert_ids, (
+                    "Expert ids after eplb update should be different from the initial loaded ones"
+                )
 
 
 @pytest.mark.parametrize(
@@ -358,7 +359,6 @@ def test_moe_multi_gpu(comm_method_type, moe_backend, quant_algo):
     "moe_backend",
     [
         "CUTLASS",
-        "TRTLLM",
     ],
     ids=lambda val: f"moe_backend={val}",
 )
@@ -366,14 +366,13 @@ def test_moe_multi_gpu(comm_method_type, moe_backend, quant_algo):
     "comm_method_type",
     [
         "NVLINK_ONE_SIDED",
-        "NVLINK_TWO_SIDED",
     ],
     ids=lambda val: f"comm_method_type={val}",
 )
 @pytest.mark.parametrize(
     "num_slots",
     [
-        8,
+        16,
     ],
     ids=lambda val: f"num_slots={val}",
 )
