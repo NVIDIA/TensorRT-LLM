@@ -15,6 +15,10 @@ withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LL
 }
 LLM_ROOT = "llm"
 
+BOT_REPO = "https://gitlab-master.nvidia.com/ftp/llm-bloom-bot.git"
+BOT_REVISION = "main"
+BOT_ROOT = "bot"
+
 // LLM repository configuration
 withCredentials([string(credentialsId: 'default-scan-repo', variable: 'DEFAULT_SCAN_REPO')]) {
     SCAN_REPO = "${DEFAULT_SCAN_REPO}"
@@ -836,6 +840,12 @@ def collectTestResults(pipeline, testFilter)
 {
     collectResultPodSpec = createKubernetesPodConfig("", "agent")
     trtllm_utils.launchKubernetesPod(pipeline, collectResultPodSpec, "alpine", {
+        if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+            stage("Update GitHub Tag") {
+                sh "which git || apk add --no-cache git"
+                updateGithubTagCommit(pipeline)
+            }
+        }
         stage ("Collect Test Result") {
             sh "rm -rf **/*.xml *.tar.gz"
 
@@ -1311,6 +1321,144 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
 
     parallelJobs.failFast = enableFailFast
     pipeline.parallel parallelJobs
+}
+
+/**
+ * Get the list of failed stages in the current pipeline
+ * @return List of failed stages, or null if retrieval fails
+ */
+def getFailedStages() {
+    def status = sh(
+        script: """rm -f failed_stages.json failed_stages_error.txt && \
+        python3 ${BOT_ROOT}/bin/failures.py \
+            --jenkins-url ${JENKINS_URL} \
+            --build-path ${env.JOB_NAME} \
+            --build-number ${env.BUILD_NUMBER} \
+            --json \
+            > failed_stages.json 2>failed_stages_error.txt""",
+        returnStatus: true,
+        label: "Checking failed stages in build #${env.BUILD_NUMBER}"
+    )
+
+    if (status != 0) {
+        echo "WARNING: Failed to get failed stages. Check failed_stages_error.txt for details."
+        return null
+    }
+
+    def failedResult = readJSON file: "failed_stages.json", returnPojo: true
+    def failedStageList = failedResult["failed_stage_list"] ?: []
+
+    echo "Found ${failedStageList.size()} failed stages"
+    return failedStageList
+}
+
+/**
+ * Check if all failed stages are post-merge stages
+ * @param failedStageList List of failed stage names
+ * @return true if all failures are post-merge stages (or no failures), false otherwise
+ */
+def areAllFailuresPostMerge(failedStageList) {
+    if (!failedStageList) {
+        echo "No failed stages found. All tests passed."
+        return true
+    }
+
+    def premergeFailedStages = failedStageList.findAll {
+        !it.contains("Post-Merge") && !it.contains("post-merge")
+    }
+
+    if (premergeFailedStages.isEmpty()) {
+        echo "All ${failedStageList.size()} failed stages are post-merge: ${failedStageList.join(', ')}"
+        return true
+    }
+
+    echo "Found ${premergeFailedStages.size()} pre-merge failed stages: ${premergeFailedStages.join(', ')}"
+    return false
+}
+
+/**
+ * Create or update GitHub tag for the latest stable commit
+ * @return true if tag is successfully created, false otherwise
+ */
+def createGithubTag() {
+    def commitSha = env.gitlabCommit
+    def prNumber = globalVars[GITHUB_PR_API_URL].split('/').last()
+    def targetBranch = env.gitlabTargetBranch ?: (globalVars[TARGET_BRANCH] ?: "main")
+    def tagName = "latest-ci-stable-commit-${targetBranch}"
+
+    echo "Creating tag '${tagName}' at commit ${commitSha} for PR #${prNumber}"
+
+    withCredentials([
+        usernamePassword(
+            credentialsId: 'github-cred-trtllm-ci',
+            usernameVariable: 'GITHUB_USER',
+            passwordVariable: 'GITHUB_TOKEN'
+        )
+    ]) {
+        def tagResult = sh(
+            script: """
+                git config --global user.email "trtllm-ci@nvidia.com"
+                git config --global user.name "TRT-LLM CI"
+
+                # Delete existing tag if present
+                git tag -d ${tagName} 2>/dev/null || true
+                git push origin :refs/tags/${tagName} 2>/dev/null || true
+
+                # Create new tag
+                git tag -a ${tagName} ${commitSha} -m "Pre-merge tests passed for PR #${prNumber}"
+                git push https://${GITHUB_TOKEN}@github.com/NVIDIA/TensorRT-LLM.git ${tagName}
+            """,
+            returnStatus: true,
+            label: "Creating GitHub tag ${tagName}"
+        )
+
+        if (tagResult == 0) {
+            echo "Successfully created GitHub tag: ${tagName}"
+            return true
+        }
+
+        echo "WARNING: Failed to create GitHub tag: ${tagName}"
+        return false
+    }
+}
+
+/**
+ * Check if pre-merge tests passed and update GitHub tag accordingly
+ * @param pipeline Pipeline object
+ * @return true if tag is successfully updated, false otherwise
+ */
+def updateGithubTagCommit(pipeline) {
+    if (!globalVars[GITHUB_PR_API_URL]) {
+        echo "Not a GitHub PR. Skip updating GitHub tag."
+        return false
+    }
+
+    def buildResult = currentBuild.result ?: 'SUCCESS'
+    echo "Build result: ${buildResult}"
+
+    // Fast path: If pipeline is SUCCESS, update tag directly
+    if (buildResult == 'SUCCESS') {
+        echo "Pipeline succeeded. Updating GitHub tag..."
+        return createGithubTag()
+    }
+
+    // Slow path: Check if only post-merge stages failed
+    echo "Pipeline not successful. Analyzing failed stages..."
+    trtllm_utils.checkoutSource(BOT_REPO, BOT_REVISION, BOT_ROOT)
+
+    def failedStageList = getFailedStages()
+    if (!failedStageList) {
+        echo "Failed to retrieve failed stages. Skip updating tag."
+        return false
+    }
+
+    if (!areAllFailuresPostMerge(failedStageList)) {
+        echo "Pre-merge tests failed. Skip updating GitHub tag."
+        return false
+    }
+
+    echo "Only post-merge stages failed. Updating GitHub tag..."
+    return createGithubTag()
 }
 
 pipeline {
