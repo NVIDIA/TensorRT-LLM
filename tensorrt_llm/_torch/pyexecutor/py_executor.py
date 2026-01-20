@@ -19,6 +19,8 @@ try:
 except ImportError:
     from cuda import cudart
 
+from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
+    MambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManagerType, request_context)
 from tensorrt_llm._utils import (customized_gc_thresholds, is_trace_enabled,
@@ -105,8 +107,6 @@ class BatchState:
     iter_start_time: float = 0
     iter_stats: IterationStats = None
     ctx_transmission_reqs: list[LlmRequest] = None
-    attn_metadata: 'TrtllmAttentionMetadata' = None
-    scheduled_batch: 'ScheduledRequests' = None
 
 
 @dataclasses.dataclass
@@ -1326,10 +1326,8 @@ class PyExecutor:
                             self.model_engine, 'kv_cache_dtype_byte_size', None)
 
                         self.resource_manager.update_resources(
-                            previous_scheduled_batch,
-                            attn_metadata,
-                            kv_cache_dtype_byte_size,
-                            sample_state=previous_batch.sample_state)
+                            previous_scheduled_batch, attn_metadata,
+                            kv_cache_dtype_byte_size)
 
                         self._remove_inflight_ids(previous_batch)
 
@@ -1576,10 +1574,8 @@ class PyExecutor:
                         self.model_engine, 'kv_cache_dtype_byte_size', None)
 
                     self.resource_manager.update_resources(
-                        scheduled_batch,
-                        attn_metadata,
-                        kv_cache_dtype_byte_size,
-                        sample_state=sample_state)
+                        scheduled_batch, attn_metadata,
+                        kv_cache_dtype_byte_size)
                     if self.enable_kv_cache_events:
                         self._add_kv_cache_events()
 
@@ -1796,6 +1792,8 @@ class PyExecutor:
                     else:
                         previous_tensors_device = self.previous_batch and self.previous_batch.sample_state and self.previous_batch.sample_state.device
 
+                    if self.previous_batch is not None:
+                        self._update_mamba_cache_manager_for_previous_batch()
                     batch_outputs = self._forward_step(
                         scheduled_batch, previous_tensors_device,
                         num_accepted_tokens_device)
@@ -1845,9 +1843,7 @@ class PyExecutor:
                         sample_state=sample_state,
                         iter_start_time=iter_start_time,
                         iter_stats=iter_stats,
-                        ctx_transmission_reqs=ctx_transmission_reqs,
-                        attn_metadata=attn_metadata_to_save,
-                        scheduled_batch=scheduled_batch)
+                        ctx_transmission_reqs=ctx_transmission_reqs)
 
                 if self.kv_cache_transceiver and self.async_transfer_manager.has_any_inflight_requests(
                 ):
@@ -1946,6 +1942,9 @@ class PyExecutor:
 
         return result_tensors, num_accepted_tokens
 
+
+# ==i iteration=
+
     def _process_previous_batch(self):
         if self.kv_cache_transceiver and self.previous_batch.ctx_transmission_reqs:
             for req in self.previous_batch.ctx_transmission_reqs:
@@ -1953,24 +1952,32 @@ class PyExecutor:
 
         self._handle_canceled_requests()
         finished_requests = self._handle_responses()
-        # use saved scheduled_batch, because sample_state.scheduled_requests might have been updated
-        scheduled_requests = getattr(
-            self.previous_batch, 'scheduled_batch',
-            self.previous_batch.sample_state.scheduled_requests)
-        # use saved attn_metadata in previous_batch, instead of current model_engine's
-        attn_metadata = getattr(self.previous_batch, 'attn_metadata', None)
+        scheduled_requests = self.previous_batch.sample_state.scheduled_requests
+        attn_metadata = getattr(self.model_engine, 'attn_metadata', None)
         kv_cache_dtype_byte_size = getattr(self.model_engine,
                                            'kv_cache_dtype_byte_size', None)
         self.resource_manager.update_resources(scheduled_requests,
                                                attn_metadata,
                                                kv_cache_dtype_byte_size,
-                                               self.previous_batch.sample_state)
+                                               update_mamba_cache_manager=False)
         if self.enable_kv_cache_events:
             self._add_kv_cache_events()
 
         if self.enable_iter_perf_stats:
             self._process_iter_stats(finished_requests, self.active_requests,
                                      self.previous_batch)
+
+    def _update_mamba_cache_manager_for_previous_batch(self):
+        if not isinstance(
+                self.resource_manager.get_resource_manager(
+                    ResourceManagerType.KV_CACHE_MANAGER),
+                MambaHybridCacheManager):
+            return
+        scheduled_requests = self.previous_batch.sample_state.scheduled_requests
+        kv_cache_manager = self.resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER)
+        kv_cache_manager.update_resources_for_mamba_cache_manager(
+            scheduled_requests, sample_state=self.previous_batch.sample_state)
 
     def _forward_step_inter_pp(self, scheduled_batch) -> SampleState:
         self._forward_step(scheduled_batch)
