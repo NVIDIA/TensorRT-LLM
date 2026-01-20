@@ -53,7 +53,7 @@ ordered-set
 peft
 patchelf
 einops
-flashinfer-python>=0.3.0,<0.4.0
+flashinfer-python~=0.6.0
 opencv-python-headless
 xgrammar==0.1.25
 llguidance==0.7.29
@@ -74,7 +74,7 @@ nvidia-cutlass-dsl==4.3.4; python_version >= "3.10"
 plotly
 numexpr<2.14.0 # WAR for attempted use of nonexistent numpy.typing
 partial_json_parser
-apache-tvm-ffi==0.1.4 # used for reduce nvidia-cutlass-dsl host overhead
+apache-tvm-ffi==0.1.6 # used for reduce nvidia-cutlass-dsl host overhead
 torch-c-dlpack-ext==0.1.3 # used for reduce nvidia-cutlass-dsl host overhead, optional package for improved torch tensor calling perf
 mistral-common==1.8.6
 torchao>=0.14.1
