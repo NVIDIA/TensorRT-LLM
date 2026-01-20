@@ -734,7 +734,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         tile_idx_to_mn_limit: cute.Tensor,
         token_id_mapping_tensor: cute.Tensor,
         num_non_exiting_tiles: cute.Tensor,
-        alpha: cute.Tensor,
+        alpha: Union[cute.Tensor, Tuple[cute.Tensor, ...]],
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
@@ -944,6 +944,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         tma_atoms_sfb = tuple(tma_atoms_sfb)
         tma_tensors_sfb = tuple(tma_tensors_sfb)
 
+        # Handle alpha tuple (convert to tuple if single tensor)
+        alpha_tuple = alpha if isinstance(alpha, tuple) else (alpha,)
+
         b_copy_size = cute.size_in_bytes(self.b_dtype, b_smem_layout)
         sfb_copy_size = cute.size_in_bytes(self.sf_dtype, sfb_smem_layout)
         self.num_tma_load_bytes = (b_copy_size + sfb_copy_size) * atom_thr_size
@@ -1080,7 +1083,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             tile_idx_to_mn_limit,
             token_id_mapping_tensor,
             num_non_exiting_tiles,
-            alpha,
+            alpha_tuple,
             self.cluster_layout_vmnk,
             self.cluster_layout_sfb_vmnk,
             self.a_smem_layout_staged,
@@ -1164,7 +1167,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         tile_idx_to_mn_limit: cute.Tensor,
         token_id_mapping_tensor: cute.Tensor,
         num_non_exiting_tiles: cute.Tensor,
-        alpha: cute.Tensor,
+        alpha_tuple: Tuple[cute.Tensor, ...],
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -2592,9 +2595,30 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 #
                 # Get alpha for current group
                 #
-
                 expert_idx = mma_tile_coord_mnl[2]
-                alpha_val = alpha[expert_idx]
+
+                # Select alpha from correct tensor based on expert_idx
+                if cutlass.const_expr(self.num_b_tensors == 1):
+                    alpha_val = alpha_tuple[0][expert_idx]
+                else:
+                    if expert_idx < self.b_tensor_l_offsets[1]:
+                        local_idx = expert_idx - self.b_tensor_l_offsets[0]
+                        alpha_val = alpha_tuple[0][local_idx]
+                    elif (
+                        cutlass.const_expr(self.num_b_tensors >= 2)
+                        and expert_idx < self.b_tensor_l_offsets[2]
+                    ):
+                        local_idx = expert_idx - self.b_tensor_l_offsets[1]
+                        alpha_val = alpha_tuple[1][local_idx]
+                    elif (
+                        cutlass.const_expr(self.num_b_tensors >= 3)
+                        and expert_idx < self.b_tensor_l_offsets[3]
+                    ):
+                        local_idx = expert_idx - self.b_tensor_l_offsets[2]
+                        alpha_val = alpha_tuple[2][local_idx]
+                    else:
+                        local_idx = expert_idx - self.b_tensor_l_offsets[3]
+                        alpha_val = alpha_tuple[3][local_idx]
 
                 #
                 # Slice to per mma tile index
@@ -3637,6 +3661,152 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             token_id_mapping,
             num_non_exiting_tiles,
             alpha,
+            max_active_clusters=max_active_clusters,
+            stream=stream,
+            epilogue_op=epilogue_op,
+        )
+
+    @cute.jit
+    def wrapper_multi_b(
+        self,
+        a_ptr: cute.Pointer,
+        b_ptr_tuple: Tuple[cute.Pointer, ...],
+        a_sf_ptr: cute.Pointer,
+        b_sf_ptr_tuple: Tuple[cute.Pointer, ...],
+        c_ptr: cute.Pointer,
+        c_sf_ptr: cute.Pointer,
+        alpha_ptr_tuple: Tuple[cute.Pointer, ...],
+        tile_idx_to_group_idx_ptr: cute.Pointer,
+        tile_idx_to_mn_limit_ptr: cute.Pointer,
+        token_id_mapping_ptr: cute.Pointer,
+        num_non_exiting_tiles_ptr: cute.Pointer,
+        global_sf_ptr: cute.Pointer,
+        orig_m: cutlass.Int64,
+        m: cutlass.Int64,
+        n: cutlass.Int64,
+        k: cutlass.Int64,
+        tile_size: cutlass.Constexpr,
+        scaling_vector_size: cutlass.Constexpr,
+        max_active_clusters: cutlass.Constexpr,
+        stream: cuda.CUstream,
+        epilogue_op: cutlass.Constexpr = lambda x: x,
+    ):
+        """Wrapper for multi-B tensor support.
+
+        b_ptr_tuple, b_sf_ptr_tuple, and alpha_ptr_tuple contain pointers for each B tensor.
+        L sizes are configured via b_tensor_l_sizes in __init__.
+        """
+        scale_k = k // scaling_vector_size
+        interm_size = n // 2
+        num_tiles = m // tile_size
+        total_l = self.b_tensor_l_offsets[self.num_b_tensors]
+
+        a = cute.make_tensor(
+            a_ptr, layout=cute.make_ordered_layout((orig_m, k, 1), order=(1, 0, 2))
+        )
+        a_sf = cute.make_tensor(
+            a_sf_ptr, layout=cute.make_ordered_layout((orig_m, scale_k, 1), order=(1, 0, 2))
+        )
+        c = cute.make_tensor(
+            c_ptr, layout=cute.make_ordered_layout((m, interm_size, 1), order=(1, 0, 2))
+        )
+        c_sf = cute.make_tensor(
+            c_sf_ptr,
+            layout=cute.make_ordered_layout(
+                (32, 4, m // 128, 4, interm_size // (scaling_vector_size * 4), total_l),
+                order=(2, 1, 4, 0, 3, 5),
+            ),
+        )
+
+        # Create B and alpha tensors using const_expr conditions
+        l_0 = self.b_tensor_l_sizes[0]
+        alpha_0 = cute.make_tensor(alpha_ptr_tuple[0], layout=cute.make_layout((l_0,)))
+        b_0 = cute.make_tensor(
+            b_ptr_tuple[0], layout=cute.make_ordered_layout((n, k, l_0), order=(1, 0, 2))
+        )
+        b_sf_0 = cute.make_tensor(
+            b_sf_ptr_tuple[0],
+            layout=cute.make_ordered_layout(
+                (32, 4, n // 128, 4, scale_k // 4, l_0), order=(2, 1, 4, 0, 3, 5)
+            ),
+        )
+        b_tuple = [b_0]
+        b_sf_tuple = [b_sf_0]
+        alpha_tuple = [alpha_0]
+
+        if cutlass.const_expr(self.num_b_tensors >= 2):
+            l_1 = self.b_tensor_l_sizes[1]
+            alpha_1 = cute.make_tensor(alpha_ptr_tuple[1], layout=cute.make_layout((l_1,)))
+            b_1 = cute.make_tensor(
+                b_ptr_tuple[1], layout=cute.make_ordered_layout((n, k, l_1), order=(1, 0, 2))
+            )
+            b_sf_1 = cute.make_tensor(
+                b_sf_ptr_tuple[1],
+                layout=cute.make_ordered_layout(
+                    (32, 4, n // 128, 4, scale_k // 4, l_1), order=(2, 1, 4, 0, 3, 5)
+                ),
+            )
+            b_tuple.append(b_1)
+            b_sf_tuple.append(b_sf_1)
+            alpha_tuple.append(alpha_1)
+
+        if cutlass.const_expr(self.num_b_tensors >= 3):
+            l_2 = self.b_tensor_l_sizes[2]
+            alpha_2 = cute.make_tensor(alpha_ptr_tuple[2], layout=cute.make_layout((l_2,)))
+            b_2 = cute.make_tensor(
+                b_ptr_tuple[2], layout=cute.make_ordered_layout((n, k, l_2), order=(1, 0, 2))
+            )
+            b_sf_2 = cute.make_tensor(
+                b_sf_ptr_tuple[2],
+                layout=cute.make_ordered_layout(
+                    (32, 4, n // 128, 4, scale_k // 4, l_2), order=(2, 1, 4, 0, 3, 5)
+                ),
+            )
+            b_tuple.append(b_2)
+            b_sf_tuple.append(b_sf_2)
+            alpha_tuple.append(alpha_2)
+
+        if cutlass.const_expr(self.num_b_tensors >= 4):
+            l_3 = self.b_tensor_l_sizes[3]
+            alpha_3 = cute.make_tensor(alpha_ptr_tuple[3], layout=cute.make_layout((l_3,)))
+            b_3 = cute.make_tensor(
+                b_ptr_tuple[3], layout=cute.make_ordered_layout((n, k, l_3), order=(1, 0, 2))
+            )
+            b_sf_3 = cute.make_tensor(
+                b_sf_ptr_tuple[3],
+                layout=cute.make_ordered_layout(
+                    (32, 4, n // 128, 4, scale_k // 4, l_3), order=(2, 1, 4, 0, 3, 5)
+                ),
+            )
+            b_tuple.append(b_3)
+            b_sf_tuple.append(b_sf_3)
+            alpha_tuple.append(alpha_3)
+
+        tile_idx_to_group_idx = cute.make_tensor(
+            tile_idx_to_group_idx_ptr, layout=cute.make_layout((num_tiles,))
+        )
+        tile_idx_to_mn_limit = cute.make_tensor(
+            tile_idx_to_mn_limit_ptr, layout=cute.make_layout((num_tiles,))
+        )
+        token_id_mapping = cute.make_tensor(token_id_mapping_ptr, layout=cute.make_layout((m,)))
+        num_non_exiting_tiles = cute.make_tensor(
+            num_non_exiting_tiles_ptr, layout=cute.make_layout((1,))
+        )
+        global_sf = cute.make_tensor(global_sf_ptr, layout=cute.make_layout((1,)))
+
+        return self(
+            a,
+            tuple(b_tuple),
+            c,
+            a_sf,
+            tuple(b_sf_tuple),
+            c_sf,
+            global_sf,
+            tile_idx_to_group_idx,
+            tile_idx_to_mn_limit,
+            token_id_mapping,
+            num_non_exiting_tiles,
+            tuple(alpha_tuple),
             max_active_clusters=max_active_clusters,
             stream=stream,
             epilogue_op=epilogue_op,
