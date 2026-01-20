@@ -606,11 +606,19 @@ class KVCacheManager(BaseResourceManager):
             self.update_kv_cache_draft_token_location(scheduled_batch,
                                                       attn_metadata,
                                                       kv_cache_dtype_byte_size)
-        # rewind kv cache
+
+        # Rewind KV cache for requests with rejected draft tokens.
+        # Skip:
+        # - GENERATION_COMPLETE: finished requests
+        # - CONTEXT_INIT: requests whose state was reset after being paused with KV cache freed.
+        #   With overlap scheduler, the scheduler pauses a request and frees KV cache at iteration N,
+        #   while the previous batch (N-1) is still trying to update the KV cache after forward pass.
         for request in scheduled_batch.generation_requests:
-            if request.state != LlmRequestState.GENERATION_COMPLETE:
-                if request.py_rewind_len > 0:
-                    self.rewind_kv_cache(request, request.py_rewind_len)
+            if request.state in (LlmRequestState.GENERATION_COMPLETE,
+                                 LlmRequestState.CONTEXT_INIT):
+                continue
+            if request.py_rewind_len > 0:
+                self.rewind_kv_cache(request, request.py_rewind_len)
 
         # For context requests, we store the blocks for reuse.
         for request in scheduled_batch.context_requests:
