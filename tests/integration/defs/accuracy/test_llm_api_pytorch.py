@@ -22,7 +22,7 @@ import torch
 from datasets import load_dataset
 from mpi4py.futures import MPIPoolExecutor
 import asyncio
-import warnings
+
 
 def patch_mpi_pool_session_for_env(mocker, env_vars: dict):
     """
@@ -3192,6 +3192,8 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
         assert len(long_token_list) > 0, "No valid samples found"
         return long_token_list
 
+    @pytest.mark.filterwarnings("ignore:.*Calling super.*encode.*add_special_tokens.*:UserWarning")
+    @pytest.mark.filterwarnings("ignore:.*configuration is not supported by the fused routing kernel.*:UserWarning")
     def test_nvfp4_longseq_trtllm_moe_stress(self, mocker):
         """
         Long-sequence MoE stress test with PDL enabled.
@@ -3202,16 +3204,6 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
 
         RCCA: https://nvbugspro.nvidia.com/bug/5661741
         """
-        warnings.filterwarnings(
-            "ignore",
-            message=r".*Calling super\(\)\.encode with \{'add_special_tokens': False\}.*",
-            module=r".*tokenization_kimi.*",
-        )
-        warnings.filterwarnings(
-            "ignore",
-            message=r".*configuration is not supported by the fused routing kernel.*",
-            module=r".*fused_moe\.routing.*",
-        )
         patch_mpi_pool_session_for_env(mocker, {"TRTLLM_ENABLE_PDL": "1"})
         config = self._get_kimi_k2_config()
 
@@ -3273,6 +3265,8 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
 
             # Accuracy evaluation removed to avoid timeouts in CI
 
+    @pytest.mark.filterwarnings("ignore:.*Calling super.*encode.*add_special_tokens.*:UserWarning")
+    @pytest.mark.filterwarnings("ignore:.*configuration is not supported by the fused routing kernel.*:UserWarning")
     def test_nvfp4_longseq_trtllm_moe_async_cancel(self, mocker):
         """
         Long-sequence MoE async streaming test with cancellation.
@@ -3282,16 +3276,6 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
 
         RCCA: https://nvbugspro.nvidia.com/bug/5661741
         """
-        warnings.filterwarnings(
-            "ignore",
-            message=r".*Calling super\(\)\.encode with \{'add_special_tokens': False\}.*",
-            module=r".*tokenization_kimi.*",
-        )
-        warnings.filterwarnings(
-            "ignore",
-            message=r".*configuration is not supported by the fused routing kernel.*",
-            module=r".*fused_moe\.routing.*",
-        )
         patch_mpi_pool_session_for_env(mocker, {"TRTLLM_ENABLE_PDL": "1"})
         config = self._get_kimi_k2_config()
 
