@@ -47,11 +47,13 @@ parser_keywords = [
     ("torchCompare", "at::native::<unnamed>::CompareFunctor<"),
     ("torchCopy", "at::native::bfloat16_copy_kernel_cuda"),
     ("torchCopy", "at::native::direct_copy_kernel_cuda("),
+    ("torchDiv", "at::native::binary_internal::DivFunctor<"),
     ("torchFill", "at::native::FillFunctor"),
     ("torchIndexPut", "at::native::index_put_kernel_impl<"),
     ("torchMul", "at::native::binary_internal::MulFunctor<"),
     ("torchPow", "at::native::<unnamed>::pow_tensor_scalar_kernel_impl<"),
     ("torchReduceSum", ["at::native::reduce_kernel<", "at::native::sum_functor<"]),
+    ("torchScatterGather", "void at::native::_scatter_gather_elementwise_kernel<"),
     ("torchSigmoid", "at::native::sigmoid_kernel_cuda"),
     ("torchWhere", "at::native::<unnamed>::where_kernel_impl("),
 ]
