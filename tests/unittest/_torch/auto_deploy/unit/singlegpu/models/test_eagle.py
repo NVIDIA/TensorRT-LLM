@@ -20,7 +20,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
-from _model_test_utils import get_model_path, get_small_model_config
+from _model_test_utils import get_small_model_config
 from build_and_run_ad import ExperimentConfig, main
 from transformers import AutoConfig
 
@@ -30,9 +30,9 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_eagle import (
     Eagle3Model,
 )
 from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
+from tests.test_common.llm_data import hf_id_to_local_model_dir
 
 EAGLE_MODEL_HUB_ID = "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B"
-EAGLE_MODEL_SUBPATH = "EAGLE3-LLaMA3.1-Instruct-8B"
 
 
 ###############################################################################
@@ -143,7 +143,7 @@ def test_eagle_model_torch_export():
     print("Test: EagleModel torch.export")
     print("=" * 80)
 
-    eagle_model_path = get_model_path(EAGLE_MODEL_SUBPATH)
+    eagle_model_path = hf_id_to_local_model_dir(EAGLE_MODEL_HUB_ID)
     if eagle_model_path is None:
         pytest.skip("Eagle model not found (LLM_MODELS_ROOT not set or model missing)")
 
