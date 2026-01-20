@@ -74,8 +74,23 @@ class ditFlux2Pipeline(Flux2Pipeline, ditBasePipeline):
         apply_visual_gen_linear(pipe.transformer, load_parameters=True, quantize_weights=True, exclude_pattern=exclude_pattern)
         pipe.to(device)
         if enable_cuda_graph:
-            logger.info("capturing cuda graph..")
-            pipe.transformer.forward = cudagraph_wrapper(pipe.transformer.forward)
+            if TeaCacheConfig.enable_teacache():
+                logger.info("capturing cuda graph for teacache..")
+                pipe.transformer.run_pre_processing = cudagraph_wrapper(
+                pipe.transformer.run_pre_processing
+                )
+                pipe.transformer.run_teacache_check = cudagraph_wrapper(
+                    pipe.transformer.run_teacache_check
+                )
+                pipe.transformer.run_transformer_blocks = cudagraph_wrapper(
+                    pipe.transformer.run_transformer_blocks
+                )
+                pipe.transformer.run_post_processing = cudagraph_wrapper(
+                    pipe.transformer.run_post_processing
+                )
+            else:
+                logger.info("capturing cuda graph..")
+                pipe.transformer.forward = cudagraph_wrapper(pipe.transformer.forward)
         if warm_up:
             logger.info("warm_up")
             pipe(prompt="test", num_inference_steps=50)

@@ -33,6 +33,7 @@ from visual_gen.layers import ditAttnProcessor, apply_visual_gen_linear, apply_v
 from visual_gen.utils import dit_sp_gather, dit_sp_split, get_logger
 from visual_gen.configs.diffusion_cache import TeaCacheConfig
 from visual_gen.models.transformers.base_transformer import ditBaseTransformer
+from visual_gen.models.utils import disable_weight_management
 
 logger = get_logger(__name__)
 
@@ -170,6 +171,145 @@ class ditFlux2Transformer2DModel(Flux2Transformer2DModel, ditBaseTransformer):
                 else:
                     logger.warning(f"Unknown attn processor: {type(module.get_processor())} for {name}")
 
+
+    def run_pre_processing(
+        self,
+        hidden_states: torch.Tensor,
+        lora_scale: float,
+        encoder_hidden_states: torch.Tensor = None,
+        timestep: torch.LongTensor = None,
+        img_ids: torch.Tensor = None,
+        txt_ids: torch.Tensor = None,
+        guidance: torch.Tensor = None,
+        joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+    ):
+        # dit Split Start #
+        hidden_states = dit_sp_split(hidden_states, dim=1)
+        encoder_hidden_states = dit_sp_split(encoder_hidden_states, dim=1)
+        img_ids = dit_sp_split(img_ids, dim=1)
+        txt_ids = dit_sp_split(txt_ids, dim=1)
+        # dit Split End #
+
+        if USE_PEFT_BACKEND:
+            # weight the lora layers by setting `lora_scale` for each PEFT layer
+            scale_lora_layers(self, lora_scale)
+        else:
+            if joint_attention_kwargs is not None and joint_attention_kwargs.get("scale", None) is not None:
+                logger.warning(
+                    "Passing `scale` via `joint_attention_kwargs` when not using the PEFT backend is ineffective."
+                )
+
+        num_txt_tokens = encoder_hidden_states.shape[1]
+
+        # 1. Calculate timestep embedding and modulation parameters
+        timestep = timestep.to(hidden_states.dtype) * 1000
+        guidance = guidance.to(hidden_states.dtype) * 1000
+
+        temb = self.time_guidance_embed(timestep, guidance)
+
+        double_stream_mod_img = self.double_stream_modulation_img(temb)
+        double_stream_mod_txt = self.double_stream_modulation_txt(temb)
+        single_stream_mod = self.single_stream_modulation(temb)[0]
+
+        # 2. Input projection for image (hidden_states)
+        hidden_states = self.x_embedder(hidden_states)
+        
+        return hidden_states, encoder_hidden_states, temb, double_stream_mod_img, double_stream_mod_txt, single_stream_mod, img_ids, txt_ids
+
+
+    def run_teacache_check(self, hidden_states, double_stream_mod_img):
+        img_mod1, _ = double_stream_mod_img
+        img_mod1_shift, img_mod1_scale, _ = img_mod1
+        
+        with disable_weight_management():
+            img_modulated = self.transformer_blocks[0].norm1_context(hidden_states)
+        
+        return (1 + img_mod1_scale) * img_modulated + img_mod1_shift
+
+    def run_post_processing(self, hidden_states, temb):
+        hidden_states = self.norm_out(hidden_states, temb)
+        output = self.proj_out(hidden_states)
+        return output
+
+    def run_transformer_blocks(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        img_ids: torch.Tensor,
+        txt_ids: torch.Tensor,
+        double_stream_mod_img: tuple,
+        double_stream_mod_txt: tuple,
+        single_stream_mod: tuple,
+        joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+    ):
+        num_txt_tokens = encoder_hidden_states.shape[1]
+        
+        # text encoder
+        encoder_hidden_states = self.context_embedder(encoder_hidden_states)
+
+        # 3. Calculate RoPE embeddings from image and text tokens
+        if img_ids.ndim == 3:
+            img_ids = img_ids[0]
+        if txt_ids.ndim == 3:
+            txt_ids = txt_ids[0]
+
+        image_rotary_emb = self.pos_embed(img_ids)
+        text_rotary_emb = self.pos_embed(txt_ids)
+        concat_rotary_emb = (
+            torch.cat([text_rotary_emb[0], image_rotary_emb[0]], dim=0),
+            torch.cat([text_rotary_emb[1], image_rotary_emb[1]], dim=0),
+        )
+
+        # 4. Double Stream Transformer Blocks
+        for index_block, block in enumerate(self.transformer_blocks):
+            if torch.is_grad_enabled() and self.gradient_checkpointing:
+                encoder_hidden_states, hidden_states = self._gradient_checkpointing_func(
+                    block,
+                    hidden_states,
+                    encoder_hidden_states,
+                    double_stream_mod_img,
+                    double_stream_mod_txt,
+                    concat_rotary_emb,
+                    joint_attention_kwargs,
+                )
+            else:
+                encoder_hidden_states, hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    temb_mod_params_img=double_stream_mod_img,
+                    temb_mod_params_txt=double_stream_mod_txt,
+                    image_rotary_emb=concat_rotary_emb,
+                    joint_attention_kwargs=joint_attention_kwargs,
+                )
+
+        # Concatenate text and image streams for single-block inference
+        hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+
+        # 5. Single Stream Transformer Blocks
+        for index_block, block in enumerate(self.single_transformer_blocks):
+            if torch.is_grad_enabled() and self.gradient_checkpointing:
+                hidden_states = self._gradient_checkpointing_func(
+                    block,
+                    hidden_states,
+                    None,
+                    single_stream_mod,
+                    concat_rotary_emb,
+                    joint_attention_kwargs,
+                )
+            else:
+                hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=None,
+                    temb_mod_params=single_stream_mod,
+                    image_rotary_emb=concat_rotary_emb,
+                    joint_attention_kwargs=joint_attention_kwargs,
+                )
+        
+        # Remove text tokens from concatenated stream
+        hidden_states = hidden_states[:, num_txt_tokens:, ...]
+        
+        return hidden_states
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -205,12 +345,6 @@ class ditFlux2Transformer2DModel(Flux2Transformer2DModel, ditBaseTransformer):
             If `return_dict` is True, an [`~models.transformer_2d.Transformer2DModelOutput`] is returned, otherwise a
             `tuple` where the first element is the sample tensor.
         """
-        # dit Split Start #
-        hidden_states = dit_sp_split(hidden_states, dim=1)
-        encoder_hidden_states = dit_sp_split(encoder_hidden_states, dim=1)
-        img_ids = dit_sp_split(img_ids, dim=1)
-        txt_ids = dit_sp_split(txt_ids, dim=1)
-        # dit Split End #
 
         # 0. Handle input arguments
         if joint_attention_kwargs is not None:
@@ -218,112 +352,41 @@ class ditFlux2Transformer2DModel(Flux2Transformer2DModel, ditBaseTransformer):
             lora_scale = joint_attention_kwargs.pop("scale", 1.0)
         else:
             lora_scale = 1.0
+        # dit Split Start #
+        hidden_states, encoder_hidden_states, temb, double_stream_mod_img, double_stream_mod_txt, single_stream_mod, img_ids, txt_ids = self.run_pre_processing(
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            lora_scale=lora_scale,
+            timestep=timestep,
+            img_ids=img_ids,
+            txt_ids=txt_ids,
+            guidance=guidance,
+            joint_attention_kwargs=joint_attention_kwargs
+        )
 
-        if USE_PEFT_BACKEND:
-            # weight the lora layers by setting `lora_scale` for each PEFT layer
-            scale_lora_layers(self, lora_scale)
-        else:
-            if joint_attention_kwargs is not None and joint_attention_kwargs.get("scale", None) is not None:
-                logger.warning(
-                    "Passing `scale` via `joint_attention_kwargs` when not using the PEFT backend is ineffective."
-                )
-
-        num_txt_tokens = encoder_hidden_states.shape[1]
-
-        # 1. Calculate timestep embedding and modulation parameters
-        timestep = timestep.to(hidden_states.dtype) * 1000
-        guidance = guidance.to(hidden_states.dtype) * 1000
-
-        temb = self.time_guidance_embed(timestep, guidance)
-
-        double_stream_mod_img = self.double_stream_modulation_img(temb)
-        double_stream_mod_txt = self.double_stream_modulation_txt(temb)
-        single_stream_mod = self.single_stream_modulation(temb)[0]
-
-        # 2. Input projection for image (hidden_states) and conditioning text (encoder_hidden_states)
-        # image encoder
-        hidden_states = self.x_embedder(hidden_states)
         should_calc=True
         
         if TeaCacheConfig.enable_teacache():
-            img_mod1, _ = double_stream_mod_img
-            img_mod1_shift, img_mod1_scale, _ = img_mod1
-            img_modulated = self.transformer_blocks[0].norm1_context(hidden_states) # norm1 or norm1_context
-            img_modulated = (1 + img_mod1_scale) * img_modulated + img_mod1_shift
+            img_modulated = self.run_teacache_check(hidden_states, double_stream_mod_img)
             should_calc, hidden_states = self._calc_teacache_distance(img_modulated, hidden_states)
 
         print(should_calc)
         if should_calc:
             original_hidden_states = hidden_states.clone()
-            # text encoder
-            encoder_hidden_states = self.context_embedder(encoder_hidden_states)
-
-            # 3. Calculate RoPE embeddings from image and text tokens
-            # NOTE: the below logic means that we can't support batched inference with images of different resolutions or
-            # text prompts of differents lengths. Is this a use case we want to support?
-            if img_ids.ndim == 3:
-                img_ids = img_ids[0]
-            if txt_ids.ndim == 3:
-                txt_ids = txt_ids[0]
-
-            image_rotary_emb = self.pos_embed(img_ids)
-            text_rotary_emb = self.pos_embed(txt_ids)
-            concat_rotary_emb = (
-                torch.cat([text_rotary_emb[0], image_rotary_emb[0]], dim=0),
-                torch.cat([text_rotary_emb[1], image_rotary_emb[1]], dim=0),
+            hidden_states = self.run_transformer_blocks(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                img_ids=img_ids,
+                txt_ids=txt_ids,
+                double_stream_mod_img=double_stream_mod_img,
+                double_stream_mod_txt=double_stream_mod_txt,
+                single_stream_mod=single_stream_mod,
+                joint_attention_kwargs=joint_attention_kwargs
             )
-
-            # 4. Double Stream Transformer Blocks
-            for index_block, block in enumerate(self.transformer_blocks):
-                if torch.is_grad_enabled() and self.gradient_checkpointing:
-                    encoder_hidden_states, hidden_states = self._gradient_checkpointing_func(
-                        block,
-                        hidden_states,
-                        encoder_hidden_states,
-                        double_stream_mod_img,
-                        double_stream_mod_txt,
-                        concat_rotary_emb,
-                        joint_attention_kwargs,
-                    )
-                else:
-                    encoder_hidden_states, hidden_states = block(
-                        hidden_states=hidden_states,
-                        encoder_hidden_states=encoder_hidden_states,
-                        temb_mod_params_img=double_stream_mod_img,
-                        temb_mod_params_txt=double_stream_mod_txt,
-                        image_rotary_emb=concat_rotary_emb,
-                        joint_attention_kwargs=joint_attention_kwargs,
-                    )
-            # Concatenate text and image streams for single-block inference
-            hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
-
-            # 5. Single Stream Transformer Blocks
-            for index_block, block in enumerate(self.single_transformer_blocks):
-                if torch.is_grad_enabled() and self.gradient_checkpointing:
-                    hidden_states = self._gradient_checkpointing_func(
-                        block,
-                        hidden_states,
-                        None,
-                        single_stream_mod,
-                        concat_rotary_emb,
-                        joint_attention_kwargs,
-                    )
-                else:
-                    hidden_states = block(
-                        hidden_states=hidden_states,
-                        encoder_hidden_states=None,
-                        temb_mod_params=single_stream_mod,
-                        image_rotary_emb=concat_rotary_emb,
-                        joint_attention_kwargs=joint_attention_kwargs,
-                    )
-            
-            # Remove text tokens from concatenated stream
-            hidden_states = hidden_states[:, num_txt_tokens:, ...]
             self._update_teacache_residual(original_hidden_states, hidden_states)
 
         # 6. Output layers
-        hidden_states = self.norm_out(hidden_states, temb)
-        output = self.proj_out(hidden_states)
+        output = self.run_post_processing(hidden_states, temb)
 
         # dit Gather Start #
         output = dit_sp_gather(output, dim=1)
