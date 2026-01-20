@@ -10,6 +10,7 @@
 # limitations under the License.
 
 import copy
+import time
 import types
 from collections import defaultdict
 from dataclasses import dataclass
@@ -48,7 +49,11 @@ from tensorrt_llm.llmapi.llm_args import (
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase
 
 from ...._utils import get_free_port, mpi_rank, mpi_world_size
+from ....bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from ....bindings.internal.batch_manager import CacheType
+
+if ENABLE_MULTI_DEVICE:
+    from mpi4py import MPI
 from ....mapping import Mapping
 from ...distributed import Distributed
 from ...pyexecutor.model_engine import ModelEngine, PyTorchModelEngine
@@ -518,8 +523,34 @@ class ADEngine(ModelEngine):
             device=device,
         )
 
-        # build model
+        # build model with timing measurements
+        local_start_time = time.time()
+
+        if ENABLE_MULTI_DEVICE and mpi_world_size() > 1:
+            comm = MPI.COMM_WORLD
+            global_start_time = comm.allreduce((local_start_time, mpi_rank()), op=MPI.MINLOC)
+        else:
+            global_start_time = local_start_time
+
         self.model = get_inference_model(self.cache_seq_interface)
+
+        local_end_time = time.time()
+
+        local_transform_time = local_end_time - local_start_time
+        ad_logger.info(f"[Rank {mpi_rank()}] Transform time: {local_transform_time:.2f}s")
+
+        if ENABLE_MULTI_DEVICE and mpi_world_size() > 1:
+            comm = MPI.COMM_WORLD
+            global_end_time = comm.allreduce((local_end_time, mpi_rank()), op=MPI.MAXLOC)
+        else:
+            global_end_time = local_end_time
+
+        if mpi_rank() == 0:
+            total_transform_time = global_end_time - global_start_time
+            ad_logger.info(
+                f"[Total Elapsed Time for AutoDeploy Transforms] : {total_transform_time:.2f}s"
+            )
+
         # start fresh with fixed seed
         torch.manual_seed(42)
 
