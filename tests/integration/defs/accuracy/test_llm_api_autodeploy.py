@@ -313,7 +313,6 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @pytest.mark.skip("Skipping FP8 test until it is supported")
     @pytest.mark.skip_less_device_memory(180000)
     @pytest.mark.parametrize("world_size", [1, 4, 8])
     def test_fp8(self, world_size):
