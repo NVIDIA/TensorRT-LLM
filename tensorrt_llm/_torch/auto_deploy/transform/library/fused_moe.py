@@ -1,3 +1,4 @@
+import math
 from collections import defaultdict
 from functools import partial
 from typing import Dict, List, Literal, Optional, Tuple, Type
@@ -8,6 +9,7 @@ from torch.fx import GraphModule, Node
 
 from tensorrt_llm._torch.utils import ActivationType
 
+from ...custom_ops.quant import TRTLLM_NVFP4_SCALING_VECTOR_SIZE
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils._graph import delete_all_unused_submodules, eliminate_dead_code
@@ -1679,29 +1681,46 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
         new_key_fc2_alpha = f"nvfp4_moe_w2_alpha_stacked_{fused_key_counter}"
 
         # Pad fc1_expert_weights to match the already padded scales
-        pad_size = fc1_weight_blockscale_fp8_stacked.shape[1] - fc1_expert_weights.shape[1]
-        if pad_size > 0:
+        fc1_pad_size = fc1_weight_blockscale_fp8_stacked.shape[1] - fc1_expert_weights.shape[1]
+        if fc1_pad_size > 0:
             fc1_expert_weights = torch.nn.functional.pad(
-                fc1_expert_weights, (0, 0, 0, pad_size), mode="constant", value=0
+                fc1_expert_weights, (0, 0, 0, fc1_pad_size), mode="constant", value=0
             )
-            # need to update fc2 scales and weightes to match the padded size
-            # unswizzle fc2 scales
-            fc2_blockscale_shape = list(fc2_weight_blockscale_fp8_stacked.shape)
-            fc2_blockscale_shape[2] = fc2_blockscale_shape[2] + pad_size // 16
-            # fc2_blockscale_shape[2] = fc2_blockscale_shape[2] // 128 * 128
-            fc2_weight_blockscale_fp8_stacked = torch.ops.trtllm.block_scale_interleave_reverse(
-                fc2_weight_blockscale_fp8_stacked.view(torch.uint8)
+            # Need to update fc2 scales and weights to match the padded size of fc1,
+            # as they share the same intermediate dimension.
+            target_intermediate = fc1_weight_blockscale_fp8_stacked.shape[1]
+            TRTLLM_NVFP4_SCALING_VECTOR_NUM_ELEMENTS = TRTLLM_NVFP4_SCALING_VECTOR_SIZE
+            NVFP4_PACKING_FACTOR = 2
+            TRTLLM_NVFP4_SCALING_BYTE_SIZE = (
+                TRTLLM_NVFP4_SCALING_VECTOR_NUM_ELEMENTS // NVFP4_PACKING_FACTOR
             )
-            fc2_weight_blockscale_fp8_stacked = torch.nn.functional.pad(
-                fc2_weight_blockscale_fp8_stacked, (0, pad_size // 16), mode="constant", value=0
+            target_n_blocks = target_intermediate // TRTLLM_NVFP4_SCALING_VECTOR_NUM_ELEMENTS
+            padded_target_n_blocks = (
+                math.ceil(target_n_blocks / TRTLLM_NVFP4_SCALING_BYTE_SIZE)
+                * TRTLLM_NVFP4_SCALING_BYTE_SIZE
             )
-            fc2_weight_blockscale_fp8_stacked = (
-                torch.ops.trtllm.block_scale_interleave(fc2_weight_blockscale_fp8_stacked)
-                .view(torch.float8_e4m3fn)
-                .reshape(fc2_blockscale_shape)
-            )
+            fc2_blocks_pad = padded_target_n_blocks - fc2_weight_blockscale_fp8_stacked.shape[2]
+
+            if fc2_blocks_pad > 0:
+                # unswizzle fc2 scales
+                fc2_blockscale_shape = list(fc2_weight_blockscale_fp8_stacked.shape)
+                fc2_blockscale_shape[2] = padded_target_n_blocks
+                fc2_weight_blockscale_fp8_stacked = torch.ops.trtllm.block_scale_interleave_reverse(
+                    fc2_weight_blockscale_fp8_stacked.view(torch.uint8)
+                )
+                fc2_weight_blockscale_fp8_stacked = torch.nn.functional.pad(
+                    fc2_weight_blockscale_fp8_stacked, (0, fc2_blocks_pad), mode="constant", value=0
+                )
+                fc2_weight_blockscale_fp8_stacked = (
+                    torch.ops.trtllm.block_scale_interleave(fc2_weight_blockscale_fp8_stacked)
+                    .view(torch.float8_e4m3fn)
+                    .reshape(fc2_blockscale_shape)
+                )
             fc2_expert_weights = torch.nn.functional.pad(
-                fc2_expert_weights, (0, pad_size // 2, 0, 0), mode="constant", value=0
+                fc2_expert_weights,
+                (0, fc1_pad_size // NVFP4_PACKING_FACTOR, 0, 0),
+                mode="constant",
+                value=0,
             ).view(torch.uint8)
 
         # FP4 weights are already packed as uint8, don't convert dtype
