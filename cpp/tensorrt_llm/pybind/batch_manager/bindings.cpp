@@ -136,6 +136,7 @@ void initBindings(pybind11::module_& m)
         .def_readwrite("max_new_tokens", &GenLlmReq::mMaxNewTokens)
         .def_readwrite("sampling_config", &GenLlmReq::mSamplingConfig)
         .def_property("state", &GenLlmReq::getState, &GenLlmReq::setState)
+        .def_property_readonly("state_value", [](GenLlmReq const& self) { return static_cast<int>(self.getState()); })
         .def_property("streaming", &GenLlmReq::isStreaming, &GenLlmReq::setStreaming)
         .def_readwrite("end_id", &GenLlmReq::mEndId)
         .def_readwrite("pad_id", &GenLlmReq::mPadId)
@@ -165,6 +166,7 @@ void initBindings(pybind11::module_& m)
         .def("set_finished_reason", &GenLlmReq::setFinishedReason, py::arg("finish_reason"), py::arg("beam"))
         .def_property_readonly("is_finished", &GenLlmReq::isFinished)
         .def_property_readonly("is_finished_due_to_length", &GenLlmReq::isFinishedDueToLength)
+        .def_property_readonly("is_finished_due_to_cancellation", &GenLlmReq::isFinishedDueToCancellation)
         .def_property(
             "context_current_position", &GenLlmReq::getContextCurrentPosition, &GenLlmReq::setContextCurrentPosition)
         .def_property_readonly("prepopulated_prompt_len", &GenLlmReq::getPrepopulatedPromptLen)
@@ -180,6 +182,7 @@ void initBindings(pybind11::module_& m)
             "is_disagg_generation_transmission_complete", &GenLlmReq::isDisaggGenerationTransmissionComplete)
         .def_property_readonly(
             "is_disagg_generation_transmission_in_progress", &GenLlmReq::isDisaggGenerationTransmissionInProgress)
+        .def_property_readonly("is_encoder_init_state", &GenLlmReq::isEncoderInitState)
         .def_property_readonly("is_context_init_state", &GenLlmReq::isContextInitState)
         .def_property_readonly("is_generation_in_progress_state", &GenLlmReq::isGenerationInProgressState)
         .def_property_readonly("is_disagg_context_transmission_state", &GenLlmReq::isDisaggContextTransmissionState)
@@ -258,7 +261,20 @@ void initBindings(pybind11::module_& m)
             })
         .def_property("is_dummy_request", &GenLlmReq::isDummyRequest, &GenLlmReq::setIsDummyRequest)
         .def_property_readonly("return_perf_metrics", &GenLlmReq::getReturnPerfMetrics)
-        .def_property("use_draft_model", &GenLlmReq::useDraftModel, &GenLlmReq::setUseDraftModel);
+        .def_property("use_draft_model", &GenLlmReq::useDraftModel, &GenLlmReq::setUseDraftModel)
+        .def("get_unique_tokens", py::overload_cast<GenLlmReq::SizeType32>(&GenLlmReq::getUniqueTokens, py::const_),
+            py::arg("beam"))
+        .def("get_unique_tokens", py::overload_cast<>(&GenLlmReq::getUniqueTokens, py::const_))
+        .def("get_encoder_unique_tokens",
+            [](GenLlmReq& self)
+            {
+                auto const& encoderUniqueTokens = self.getEncoderUniqueTokens();
+                if (encoderUniqueTokens.has_value() && encoderUniqueTokens.value())
+                {
+                    return std::optional<GenLlmReq::VecUniqueTokens>(*encoderUniqueTokens.value());
+                }
+                return std::optional<GenLlmReq::VecUniqueTokens>(std::nullopt);
+            });
 
     py::classh<tb::LlmRequest, GenLlmReq>(m, "LlmRequest", pybind11::dynamic_attr())
         .def(py::init<>(

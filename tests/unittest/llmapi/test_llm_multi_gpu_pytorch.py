@@ -66,7 +66,7 @@ def test_llama_7b_multi_lora_tp2():
         cuda_graph_config=None)
 
 
-@skip_ray
+@skip_ray  # https://nvbugs/5727075
 @pytest.mark.gpu2
 def test_phi3_lora_fused_modules_output_on_tp2_identical_to_tp1() -> None:
     check_phi3_lora_fused_modules_output_tp2_identical_to_tp1(

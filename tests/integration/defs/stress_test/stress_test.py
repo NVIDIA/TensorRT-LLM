@@ -806,7 +806,7 @@ def create_aiperf_command(model_name,
         str(concurrency),
         "--warmup-request-count",
         str(warmup_request_count),
-        "--verbose",
+        # "--verbose",
     ]
 
 
@@ -1145,15 +1145,21 @@ def run_accuracy_test(model_path: str,
         return False, None
 
 
-def extract_stress_test_metrics(artifacts_dir="./artifacts",
-                                current_model=None):
+def extract_stress_test_metrics(artifacts_dir=None, current_model=None):
     """
     Extract stress test metrics from the artifacts directory
 
     Args:
-        artifacts_dir (str): Path to the artifacts directory
+        artifacts_dir (str): Path to the artifacts directory. If None, defaults to
+                            the 'artifacts' directory at the defs level (parent of stress_test)
         current_model (str, optional): If provided, only analyze artifacts for this model
     """
+    # Set default artifacts_dir relative to this script's location
+    # The artifacts are at defs/artifacts/, one level up from stress_test/
+    if artifacts_dir is None:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        artifacts_dir = os.path.join(script_dir, "..", "artifacts")
+
     # Find all profile_export_aiperf.json files in the artifacts directory
     json_files = glob(os.path.join(artifacts_dir,
                                    "**/profile_export_aiperf.json"),
@@ -1211,17 +1217,25 @@ def extract_stress_test_metrics(artifacts_dir="./artifacts",
                                             {}).get("avg", 0)
                 tokThroughput = results.get("output_token_throughput",
                                             {}).get("avg", 0)
-                conCurrency = results.get("input_config", {}).get(
-                    "perf_analyzer", {}).get("stimulus",
-                                             {}).get("concurrency", 0)
+                conCurrency = results.get("input_config",
+                                          {}).get("loadgen",
+                                                  {}).get("concurrency", 0)
+                if conCurrency == 0:
+                    conCurrency = results.get("input_config", {}).get(
+                        "perf_analyzer", {}).get("stimulus",
+                                                 {}).get("concurrency", 0)
 
                 # Try to determine model name from directory structure first
                 if first_dir in model_name_map:
                     modelName = model_name_map[first_dir]
                 else:
                     # Fall back to model name from JSON if we can't extract from directory
-                    modelName = results.get("input_config",
-                                            {}).get("model", ["unknown"])
+                    modelName = results.get("input_config", {}).get(
+                        "endpoint", {}).get("model_names", None)
+                    if modelName is None:
+                        modelName = results.get("input_config",
+                                                {}).get("model_names",
+                                                        ["unknown"])
                     modelName = modelName[0] if isinstance(modelName,
                                                            list) else modelName
 

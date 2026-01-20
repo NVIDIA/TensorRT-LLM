@@ -111,10 +111,10 @@ public:
             requestId, llmRequest, pinOnRelease);
     }
 
-    std::optional<tbk::KVCacheBlock::IdType> storeBlocksForReuse(tb::LlmRequest::RequestIdType requestId,
+    std::vector<tbk::KVCacheBlock::IdType> storeBlocksForReuse(tb::LlmRequest::RequestIdType requestId,
         tensorrt_llm::common::OptionalRef<tb::LlmRequest const> llmRequest, bool pinBlocks) override
     {
-        PYBIND11_OVERLOAD_PURE(std::optional<tbk::KVCacheBlock::IdType>, tbk::BaseKVCacheManager, storeBlocksForReuse,
+        PYBIND11_OVERLOAD_PURE(std::vector<tbk::KVCacheBlock::IdType>, tbk::BaseKVCacheManager, storeBlocksForReuse,
             requestId, llmRequest, pinBlocks);
     }
 
@@ -485,6 +485,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
         .def("store_context_blocks", &BaseKVCacheManager::storeContextBlocks, py::call_guard<py::gil_scoped_release>())
         .def("store_blocks_for_reuse", &BaseKVCacheManager::storeBlocksForReuse,
             py::call_guard<py::gil_scoped_release>())
+        .def("find_new_context_block", &BaseKVCacheManager::findNewContextBlock, py::arg("unique_tokens"),
+            py::arg("llm_request"), py::call_guard<py::gil_scoped_release>())
         .def("get_cache_block_ids", &BaseKVCacheManager::getCacheBlockIds, py::call_guard<py::gil_scoped_release>())
         .def("get_batch_cache_block_ids", &BaseKVCacheManager::getBatchCacheBlockIds,
             py::call_guard<py::gil_scoped_release>())
@@ -519,7 +521,14 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
             py::arg("enable_partial_reuse") = true, py::arg("copy_on_partial_reuse") = true,
             py::arg("kv_connector_manager") = nullptr, py::arg("enable_indexer_k_cache") = false,
             py::arg("indexer_k_cache_quant_block_size") = 128, py::arg("indexer_k_cache_index_head_dim") = 0,
-            py::call_guard<py::gil_scoped_release>());
+            py::call_guard<py::gil_scoped_release>())
+        .def(
+            "scheduling_has_free_blocks",
+            [](tbk::KVCacheManager& self, SizeType32 numRequired, SizeType32 windowSize)
+            { return self.getBlockManager().schedulingHasFreeBlocks(numRequired, windowSize); },
+            py::arg("num_required"), py::arg("window_size"), py::call_guard<py::gil_scoped_release>())
+        .def_property_readonly(
+            "is_variable_window", [](tbk::KVCacheManager& self) { return self.getBlockManager().isVariableWindow(); });
 }
 
 void tb::BasePeftCacheManagerBindings::initBindings(py::module_& m)

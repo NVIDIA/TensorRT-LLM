@@ -1,8 +1,8 @@
 # Multi-stage Dockerfile
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch
 ARG TRITON_IMAGE=nvcr.io/nvidia/tritonserver
-ARG BASE_TAG=25.10-py3
-ARG TRITON_BASE_TAG=25.10-py3
+ARG BASE_TAG=25.12-py3
+ARG TRITON_BASE_TAG=25.12-py3
 ARG DEVEL_IMAGE=devel
 
 FROM ${BASE_IMAGE}:${BASE_TAG} AS base
@@ -147,6 +147,7 @@ RUN --mount=type=cache,target=/root/.cache/pip --mount=type=bind,from=wheel,sour
     pip install /tmp/wheel/tensorrt_llm*.whl
 
 COPY README.md ./
+COPY --from=wheel /src/tensorrt_llm/build/tensorrt_llm*.whl ./
 COPY docs docs
 COPY cpp/include include
 

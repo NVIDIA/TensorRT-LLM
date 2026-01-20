@@ -132,6 +132,7 @@ void initBindings(nb::module_& m)
         .def_rw("max_new_tokens", &GenLlmReq::mMaxNewTokens)
         .def_rw("sampling_config", &GenLlmReq::mSamplingConfig)
         .def_prop_rw("state", &GenLlmReq::getState, &GenLlmReq::setState)
+        .def_prop_ro("state_value", [](GenLlmReq const& self) { return static_cast<int>(self.getState()); })
         .def_prop_rw("streaming", &GenLlmReq::isStreaming, &GenLlmReq::setStreaming)
         .def_rw("end_id", &GenLlmReq::mEndId)
         .def_rw("pad_id", &GenLlmReq::mPadId)
@@ -161,6 +162,7 @@ void initBindings(nb::module_& m)
         .def("set_finished_reason", &GenLlmReq::setFinishedReason, nb::arg("finish_reason"), nb::arg("beam"))
         .def_prop_ro("is_finished", &GenLlmReq::isFinished)
         .def_prop_ro("is_finished_due_to_length", &GenLlmReq::isFinishedDueToLength)
+        .def_prop_ro("is_finished_due_to_cancellation", &GenLlmReq::isFinishedDueToCancellation)
         .def_prop_rw(
             "context_current_position", &GenLlmReq::getContextCurrentPosition, &GenLlmReq::setContextCurrentPosition)
         .def_prop_ro("prepopulated_prompt_len", &GenLlmReq::getPrepopulatedPromptLen)
@@ -174,6 +176,7 @@ void initBindings(nb::module_& m)
         .def_prop_ro("is_disagg_generation_transmission_complete", &GenLlmReq::isDisaggGenerationTransmissionComplete)
         .def_prop_ro(
             "is_disagg_generation_transmission_in_progress", &GenLlmReq::isDisaggGenerationTransmissionInProgress)
+        .def_prop_ro("is_encoder_init_state", &GenLlmReq::isEncoderInitState)
         .def_prop_ro("is_context_init_state", &GenLlmReq::isContextInitState)
         .def_prop_ro("is_generation_in_progress_state", &GenLlmReq::isGenerationInProgressState)
         .def_prop_ro("is_disagg_context_transmission_state", &GenLlmReq::isDisaggContextTransmissionState)
@@ -252,7 +255,20 @@ void initBindings(nb::module_& m)
             })
         .def_prop_rw("is_dummy_request", &GenLlmReq::isDummyRequest, &GenLlmReq::setIsDummyRequest)
         .def_prop_ro("return_perf_metrics", &GenLlmReq::getReturnPerfMetrics)
-        .def_prop_rw("use_draft_model", &GenLlmReq::useDraftModel, &GenLlmReq::setUseDraftModel);
+        .def_prop_rw("use_draft_model", &GenLlmReq::useDraftModel, &GenLlmReq::setUseDraftModel)
+        .def("get_unique_tokens", nb::overload_cast<GenLlmReq::SizeType32>(&GenLlmReq::getUniqueTokens, nb::const_),
+            nb::arg("beam"))
+        .def("get_unique_tokens", nb::overload_cast<>(&GenLlmReq::getUniqueTokens, nb::const_))
+        .def("get_encoder_unique_tokens",
+            [](GenLlmReq& self)
+            {
+                auto const& encoderUniqueTokens = self.getEncoderUniqueTokens();
+                if (encoderUniqueTokens.has_value() && encoderUniqueTokens.value())
+                {
+                    return std::optional<GenLlmReq::VecUniqueTokens>(*encoderUniqueTokens.value());
+                }
+                return std::optional<GenLlmReq::VecUniqueTokens>(std::nullopt);
+            });
 
     nb::class_<tb::LlmRequest, GenLlmReq>(m, "LlmRequest", nb::dynamic_attr())
         .def(

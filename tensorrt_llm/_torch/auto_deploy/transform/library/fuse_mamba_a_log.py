@@ -213,5 +213,5 @@ class FuseMambaALog(BaseTransform):
             skipped=False,
             num_matches=num_matches,
             is_clean=num_matches == 0,
-            has_valid_shapes=True,
+            has_valid_shapes=num_matches == 0,
         )

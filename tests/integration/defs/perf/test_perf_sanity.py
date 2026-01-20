@@ -23,10 +23,9 @@ import re
 import socket
 import subprocess
 import time
-from typing import Dict, List, NamedTuple, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import pytest
-import requests
 import yaml
 from test_common.http_utils import wait_for_endpoint_ready
 
@@ -54,15 +53,18 @@ MODEL_PATH_DICT = {
     "deepseek_r1_0528_fp8": "DeepSeek-R1/DeepSeek-R1-0528/",
     "deepseek_r1_0528_fp4": "DeepSeek-R1/DeepSeek-R1-0528-FP4/",
     "deepseek_r1_0528_fp4_v2": "DeepSeek-R1/DeepSeek-R1-0528-FP4-v2/",
+    "deepseek_v32_fp4": "DeepSeek-V3.2-Exp-FP4-v2",
     "gpt_oss_120b_fp4": "gpt_oss/gpt-oss-120b",
+    "k2_thinking_fp4": "Kimi-K2-Thinking-NVFP4",
 }
 
-SUPPORTED_GPU_TYPE = [
-    "B200",
-    "B300",
-    "GB200",
-    "GB300",
-]
+SUPPORTED_GPU_MAPPING = {
+    "GB200": "gb200",
+    "GB300": "gb300",
+    "B200": "b200",
+    "B300": "b300",
+    "H200": "h200",
+}
 
 DEFAULT_TIMEOUT = 7200
 
@@ -124,6 +126,7 @@ class ServerConfig:
         self.model_name = server_config_data["model_name"]
         self.model_path = ""
         self.env_vars = env_vars
+        self.disagg_run_type = server_config_data.get("disagg_run_type", "aggr")
 
         # Extract optional fields with defaults
         self.tp = server_config_data.get("tensor_parallel_size", 1)
@@ -209,7 +212,7 @@ class ServerConfig:
         else:
             self.eagle3_layers_to_capture = []
         self.max_draft_len = speculative_config.get("max_draft_len", 0)
-        self.speculative_model_dir = speculative_config.get("speculative_model_dir", "")
+        self.speculative_model = speculative_config.get("speculative_model", "")
 
         # match_mode: "config" (default) or "scenario"
         self.match_mode = server_config_data.get("match_mode", "config")
@@ -220,9 +223,12 @@ class ServerConfig:
             "concurrency",
             "name",
             "model_name",
+            "disagg_run_type",
             "gpus",
             "gpus_per_node",
+            "match_mode",
             "client_configs",
+            "match_mode",
         ]
         self.extra_llm_api_config_data = {
             k: v for k, v in server_config_data.items() if k not in exclude_keys
@@ -234,7 +240,7 @@ class ServerConfig:
         """Generate server command."""
         model_dir = get_model_dir(self.model_name)
         self.model_path = model_dir if os.path.exists(model_dir) else self.model_name
-        config_filename = f"extra-llm-api-config.{self.name}.yml"
+        config_filename = f"extra-llm-api-config.{self.disagg_run_type}.{self.name}.yml"
         config_path = os.path.join(output_dir, config_filename)
 
         numa_bind_cmd = []
@@ -333,7 +339,7 @@ class ServerConfig:
             "l_num_nextn_predict_layers": self.num_nextn_predict_layers,
             "s_eagle3_layers_to_capture": ",".join(map(str, self.eagle3_layers_to_capture)),
             "l_max_draft_len": self.max_draft_len,
-            "s_speculative_model_dir": self.speculative_model_dir,
+            "s_speculative_model_dir": self.speculative_model,
             "s_server_log_link": "",
             "s_server_env_var": self.env_vars,
         }
@@ -343,15 +349,15 @@ class ServerConfig:
         """Generate extra-llm-api-config.yml content."""
         config_data = dict(self.extra_llm_api_config_data)
 
-        # Handle speculative_model_dir path conversion
+        # Handle speculative_model path conversion
         if (
             "speculative_config" in config_data
-            and "speculative_model_dir" in config_data["speculative_config"]
+            and "speculative_model" in config_data["speculative_config"]
         ):
-            spec_model_dir = config_data["speculative_config"]["speculative_model_dir"]
-            if spec_model_dir:
-                config_data["speculative_config"]["speculative_model_dir"] = os.path.join(
-                    llm_models_root(), spec_model_dir
+            spec_model = config_data["speculative_config"]["speculative_model"]
+            if spec_model:
+                config_data["speculative_config"]["speculative_model"] = os.path.join(
+                    llm_models_root(), spec_model
                 )
 
         return yaml.dump(config_data, default_flow_style=False, sort_keys=False)
@@ -370,6 +376,7 @@ class ClientConfig:
         self.backend = client_config_data.get("backend", "openai")
         self.use_chat_template = client_config_data.get("use_chat_template", False)
         self.streaming = client_config_data.get("streaming", True)
+        self.trust_remote_code = client_config_data.get("trust_remote_code", True)
         self.model_path = ""
         self.env_vars = env_vars
 
@@ -404,7 +411,6 @@ class ClientConfig:
             str(self.osl),
             "--random-range-ratio",
             str(self.random_range_ratio),
-            "--trust-remote-code",
             "--ignore-eos",
             "--percentile-metrics",
             "ttft,tpot,itl,e2el",
@@ -419,6 +425,8 @@ class ClientConfig:
             benchmark_cmd.append("--use-chat-template")
         if not self.streaming:
             benchmark_cmd.append("--non-streaming")
+        if self.trust_remote_code:
+            benchmark_cmd.append("--trust-remote-code")
         return benchmark_cmd
 
     def to_env(self) -> Dict[str, str]:
@@ -448,6 +456,7 @@ class ClientConfig:
             "s_backend": self.backend,
             "b_use_chat_template": self.use_chat_template,
             "b_streaming": self.streaming,
+            "b_trust_remote_code": self.trust_remote_code,
             "s_client_log_link": "",
             "s_client_env_vars": self.env_vars,
         }
@@ -517,7 +526,10 @@ class AggrTestCmds(NamedTuple):
                 )
 
             wait_for_endpoint_ready(
-                f"http://{server_hostname}:{server_port}/health", timeout=self.timeout
+                f"http://{server_hostname}:{server_port}/health",
+                timeout=self.timeout,
+                check_files=[server_file_path],
+                server_proc=server_proc,
             )
 
             # Run all clients for this server
@@ -667,25 +679,6 @@ class DisaggTestCmds(NamedTuple):
                 break
             time.sleep(10)
 
-    def wait_for_endpoint_ready(self, url: str):
-        """Wait for endpoint to be ready."""
-        start = time.monotonic()
-        while True:
-            elapsed_time = time.monotonic() - start
-            if elapsed_time > self.timeout:
-                print_error(
-                    f"Timeout waiting for endpoint {url} to be ready after {self.timeout} seconds"
-                )
-                break
-            print_info(f"Waiting for endpoint {url} to be ready, elapsed time: {elapsed_time}s")
-            try:
-                time.sleep(10)
-                if requests.get(url).status_code == 200:
-                    print_info(f"endpoint {url} is ready")
-                    return
-            except Exception as err:
-                print_info(f"endpoint {url} is not ready, with exception: {err}")
-
     def run_cmd(self, server_idx: int) -> List[str]:
         """Run commands for a server and return outputs."""
         outputs = []
@@ -693,7 +686,6 @@ class DisaggTestCmds(NamedTuple):
         port = get_free_port()
 
         ctx_cmd, gen_cmd, disagg_cmd = self.server_cmds[server_idx]
-
         if "CTX" in self.disagg_serving_type or "GEN" in self.disagg_serving_type:
             self._generate_hostname_file(server_idx, port)
             server_file_path = os.path.join(
@@ -702,7 +694,6 @@ class DisaggTestCmds(NamedTuple):
             is_ctx = "CTX" in self.disagg_serving_type
             server_cmd = ctx_cmd if is_ctx else gen_cmd
             server_cmd = add_host_port_to_cmd(server_cmd, self.hostname, port)
-
             try:
                 print_info(
                     f"Starting server. disagg_serving_type: {self.disagg_serving_type} cmd is {server_cmd}"
@@ -724,7 +715,6 @@ class DisaggTestCmds(NamedTuple):
             disagg_server_file_path = os.path.join(
                 self.output_dir, f"trtllm-serve.{server_idx}.{self.disagg_serving_type}.log"
             )
-
             try:
                 self._generate_disagg_server_config(server_idx, port)
                 print_info(f"Starting disagg server. cmd is {disagg_cmd}")
@@ -746,8 +736,25 @@ class DisaggTestCmds(NamedTuple):
                 disagg_server_hostname, disagg_server_port = (
                     self._get_disagg_server_hostname_and_port(server_idx)
                 )
-                self.wait_for_endpoint_ready(
-                    f"http://{disagg_server_hostname}:{disagg_server_port}/health"
+                server_files = [
+                    os.path.join(self.output_dir, f"trtllm-serve.{server_idx}.DISAGG_SERVER.log"),
+                ]
+                for ctx_idx in range(self.num_ctx_servers):
+                    server_files.append(
+                        os.path.join(
+                            self.output_dir, f"trtllm-serve.{server_idx}.CTX_{ctx_idx}.log"
+                        )
+                    )
+                for gen_idx in range(self.num_gen_servers):
+                    server_files.append(
+                        os.path.join(
+                            self.output_dir, f"trtllm-serve.{server_idx}.GEN_{gen_idx}.log"
+                        )
+                    )
+                wait_for_endpoint_ready(
+                    f"http://{disagg_server_hostname}:{disagg_server_port}/health",
+                    timeout=self.timeout,
+                    check_files=server_files,
                 )
 
                 # Run all clients for this server
@@ -799,7 +806,6 @@ class PerfSanityTestConfig:
 
     def __init__(self, test_case_name: str, output_dir: str):
         self._output_dir = output_dir
-        self._test_results: Dict[int, Dict[str, float]] = {}
         self._perf_results: Dict[int, List[Dict[str, float]]] = {}
 
         # Parse test case name
@@ -815,18 +821,16 @@ class PerfSanityTestConfig:
         def get_gpu_type() -> str:
             try:
                 output = subprocess.check_output(
-                    ["nvidia-smi", "-L"], stderr=subprocess.DEVNULL, text=True
+                    "nvidia-smi -q | grep 'Product Name' | head -1",
+                    shell=True,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
                 )
-                first_line = output.strip().split("\n")[0]
-                gpu_models = SUPPORTED_GPU_TYPE
-                for model in gpu_models:
-                    if model in first_line:
-                        if model.startswith("B") and not model.startswith("GB"):
-                            return f"dgx_{model.lower()}"
-                        return model.lower()
+                model = output.split()[-1]
+                return SUPPORTED_GPU_MAPPING.get(model, "unsupported")
             except (subprocess.CalledProcessError, FileNotFoundError, IndexError):
                 print_error("Failed to get GPU type")
-            return ""
+            return "unsupported"
 
         assert len(labels) > 1, "perf_sanity test must have a config file!"
         is_disagg = "disagg" in labels[0]
@@ -977,6 +981,7 @@ class PerfSanityTestConfig:
             "name": config_file_base_name,
             "model_name": model_name,
             "gpus_per_node": gpus_per_node,
+            "disagg_run_type": "ctx",
             **worker_config.get("ctx", {}),
         }
 
@@ -986,6 +991,7 @@ class PerfSanityTestConfig:
             "name": config_file_base_name,
             "model_name": model_name,
             "gpus_per_node": gpus_per_node,
+            "disagg_run_type": "gen",
             **worker_config.get("gen", {}),
         }
 
@@ -1028,13 +1034,13 @@ class PerfSanityTestConfig:
 
     def get_commands(self):
         """Get commands based on runtime."""
-        perf_sanity_output_dir = os.path.join(self._output_dir, self._test_param_labels)
-        os.makedirs(perf_sanity_output_dir, exist_ok=True)
+        self.perf_sanity_output_dir = os.path.join(self._output_dir, self._test_param_labels)
+        os.makedirs(self.perf_sanity_output_dir, exist_ok=True)
 
         if self.runtime == "aggr_server":
-            return self._get_aggr_commands(perf_sanity_output_dir)
+            return self._get_aggr_commands(self.perf_sanity_output_dir)
         elif self.runtime == "multi_node_disagg_server":
-            return self._get_disagg_commands(perf_sanity_output_dir)
+            return self._get_disagg_commands(self.perf_sanity_output_dir)
 
     def _get_aggr_commands(self, output_dir: str):
         """Get commands for aggregated server."""
@@ -1047,7 +1053,7 @@ class PerfSanityTestConfig:
 
             # Generate extra-llm-api-config.yml
             config_content = server_config.generate_extra_llm_api_config()
-            config_filename = f"extra-llm-api-config.{server_config.name}.yml"
+            config_filename = f"extra-llm-api-config.aggr.{server_config.name}.yml"
             config_path = os.path.join(output_dir, config_filename)
             with open(config_path, "w") as f:
                 f.write(config_content)
@@ -1080,7 +1086,9 @@ class PerfSanityTestConfig:
             ctx_cmd = ctx_config.to_cmd(output_dir, numa_bind, "CTX")
             if "CTX" in disagg_serving_type:
                 config_content = ctx_config.generate_extra_llm_api_config()
-                config_path = os.path.join(output_dir, "extra-llm-api-config.ctx.yml")
+                config_path = os.path.join(
+                    output_dir, f"extra-llm-api-config.ctx.{ctx_config.name}.yml"
+                )
                 with open(config_path, "w") as f:
                     f.write(config_content)
 
@@ -1088,7 +1096,9 @@ class PerfSanityTestConfig:
             gen_cmd = gen_config.to_cmd(output_dir, numa_bind, "GEN")
             if "GEN" in disagg_serving_type:
                 config_content = gen_config.generate_extra_llm_api_config()
-                config_path = os.path.join(output_dir, "extra-llm-api-config.gen.yml")
+                config_path = os.path.join(
+                    output_dir, f"extra-llm-api-config.gen.{gen_config.name}.yml"
+                )
                 with open(config_path, "w") as f:
                     f.write(config_content)
 
@@ -1165,44 +1175,59 @@ class PerfSanityTestConfig:
         if failed_requests_match:
             failed_count = int(failed_requests_match.group(1))
             if failed_count > 0:
-                print_error(f"Benchmark output contains {failed_count} failed requests.")
-                raise Exception(f"Benchmark has {failed_count} failed requests")
+                error_msg = f"Benchmark output contains {failed_count} failed requests."
+                raise Exception(error_msg)
 
         # Check for explicit failure markers
         if "!FAILED REQUESTS!" in output or "!CHECK LOG FOR ERRORS!" in output:
-            print_error("Benchmark output contains failure markers.")
-            raise Exception("Benchmark output contains failure markers")
+            error_msg = "Benchmark output contains failure markers."
+            raise Exception(error_msg)
 
     def get_perf_result(self, outputs: Dict[int, List[str]]):
         """Parse performance results from outputs."""
-        self._perf_results = {}
 
-        for server_idx, server_outputs in outputs.items():
-            self._perf_results[server_idx] = []
-
-            for output in server_outputs:
-                metrics = {}
+        def parse_metrics_from_output(output: str) -> Optional[Dict[str, float]]:
+            """Parse all metrics from a single output string."""
+            metrics = {}
+            for line in output.split("\n"):
                 for metric_type, regex in PERF_METRIC_LOG_QUERIES.items():
-                    regex_matches = [regex.search(line) for line in output.split("\n")]
-                    for match in regex_matches:
-                        if match:
-                            value = None
-                            for i in range(1, len(match.groups()) + 1):
-                                if match.group(i) is not None:
-                                    value = match.group(i)
-                                    break
-                            if value is not None:
-                                metrics[metric_type] = float(value)
-                                break
+                    if metric_type in metrics:
+                        continue
+                    match = regex.search(line)
+                    if match:
+                        metrics[metric_type] = float(match.group(1))
+                        break
+            return metrics
 
+        self._perf_results = {}
+        for server_idx, client_configs in self.server_client_configs.items():
+            self._perf_results[server_idx] = []
+            server_outputs = outputs.get(server_idx, [])
+            for output in server_outputs:
+                metrics = parse_metrics_from_output(output)
                 self._perf_results[server_idx].append(metrics)
 
-        # Also populate _test_results for upload (flattened view)
-        cmd_idx = 0
-        for server_idx in sorted(self._perf_results.keys()):
-            for client_metrics in self._perf_results[server_idx]:
-                self._test_results[cmd_idx] = client_metrics
-                cmd_idx += 1
+    def check_test_failure(self):
+        """Check if any server failed based on perf results."""
+        error_msg = ""
+        for server_idx, client_configs in self.server_client_configs.items():
+            server_perf_results = self._perf_results.get(server_idx, [])
+            if len(server_perf_results) != len(client_configs):
+                error_msg += (
+                    f"Server {server_idx}'s perf results number: {len(server_perf_results)} "
+                    f"is not equal to client number: {len(client_configs)}. "
+                )
+            for client_idx, metrics in enumerate(server_perf_results):
+                if len(metrics) != len(PERF_METRIC_LOG_QUERIES):
+                    error_msg += (
+                        f"Some metrics in Server {server_idx} Client {client_idx} are missing. "
+                        f"The broken metrics is {metrics}. "
+                    )
+
+        if error_msg:
+            raise Exception(error_msg)
+
+        print_info("All servers passed")
 
     def upload_test_results_to_database(self):
         """Upload test results and baseline to database."""
@@ -1219,25 +1244,27 @@ class PerfSanityTestConfig:
             return {add_prefix(key, prefix_name): value for key, value in config_dict.items()}
 
         match_keys = []
+        is_scenario_mode = False
 
         if self.runtime == "aggr_server":
             job_config = get_job_info()
             is_post_merge = job_config["b_is_post_merge"]
             new_data_dict = {}
             cmd_idx = 0
-
             for server_idx, client_configs in self.server_client_configs.items():
                 server_config = self.server_configs[server_idx]
                 server_config_dict = server_config.to_db_data()
+                server_perf_results = self._perf_results.get(server_idx, [])
+                # Skip if server failed
+                if len(server_perf_results) != len(client_configs):
+                    cmd_idx += len(client_configs)
+                    continue
 
-                for client_config in client_configs:
+                for client_idx, client_config in enumerate(client_configs):
                     client_config_dict = client_config.to_db_data()
 
                     # Skip if metrics missing
-                    if cmd_idx not in self._test_results or not all(
-                        metric_name in self._test_results[cmd_idx]
-                        for metric_name in PERF_METRIC_LOG_QUERIES
-                    ):
+                    if server_perf_results[client_idx] is None:
                         print_info(
                             f"Skipped posting command {cmd_idx}'s test results since some metrics are missing."
                         )
@@ -1257,18 +1284,18 @@ class PerfSanityTestConfig:
                     new_data["s_test_case_name"] = f"{server_config.name}-{client_config.name}"
 
                     for metric_name in PERF_METRIC_LOG_QUERIES:
-                        if metric_name in self._test_results[cmd_idx]:
-                            new_data[f"d_{metric_name}"] = self._test_results[cmd_idx][metric_name]
+                        new_data[f"d_{metric_name}"] = server_perf_results[client_idx][metric_name]
 
                     add_id(new_data)
                     new_data_dict[cmd_idx] = new_data
                     cmd_idx += 1
 
                     if not match_keys:
-                        match_keys.extend(["s_gpu_type", "s_runtime"])
                         if server_config.match_mode == "scenario":
                             match_keys = SCENARIO_MATCH_FIELDS.copy()
+                            is_scenario_mode = True
                         else:
+                            match_keys.extend(["s_gpu_type", "s_runtime"])
                             match_keys.extend(server_config.to_match_keys())
                             match_keys.extend(client_config.to_match_keys())
 
@@ -1285,12 +1312,16 @@ class PerfSanityTestConfig:
             for server_idx, (ctx_config, gen_config, disagg_config) in enumerate(
                 self.server_configs
             ):
-                for client_config in self.server_client_configs[server_idx]:
+                client_configs = self.server_client_configs[server_idx]
+                server_perf_results = self._perf_results.get(server_idx, [])
+                # Skip if server failed
+                if len(server_perf_results) != len(client_configs):
+                    cmd_idx += len(client_configs)
+                    continue
+
+                for client_idx, client_config in enumerate(client_configs):
                     # Skip if metrics missing
-                    if cmd_idx not in self._test_results or not all(
-                        metric_name in self._test_results[cmd_idx]
-                        for metric_name in PERF_METRIC_LOG_QUERIES
-                    ):
+                    if server_perf_results[client_idx] is None:
                         print_info(
                             f"Skipped posting command {cmd_idx}'s test results since some metrics are missing."
                         )
@@ -1323,8 +1354,7 @@ class PerfSanityTestConfig:
                     new_data["s_test_case_name"] = f"{disagg_config.name}-{client_config.name}"
 
                     for metric_name in PERF_METRIC_LOG_QUERIES:
-                        if metric_name in self._test_results[cmd_idx]:
-                            new_data[f"d_{metric_name}"] = self._test_results[cmd_idx][metric_name]
+                        new_data[f"d_{metric_name}"] = server_perf_results[client_idx][metric_name]
 
                     add_id(new_data)
                     new_data_dict[cmd_idx] = new_data
@@ -1376,7 +1406,11 @@ class PerfSanityTestConfig:
             # Upload the new perf data and baseline data to database
             post_new_perf_data(new_baseline_data_dict, new_data_dict)
 
-        check_perf_regression(new_data_dict)
+        check_perf_regression(
+            new_data_dict,
+            fail_on_regression=is_scenario_mode,
+            output_dir=self.perf_sanity_output_dir,
+        )
 
 
 # Perf sanity test case parameters
@@ -1478,6 +1512,9 @@ def test_e2e(output_dir, perf_sanity_test_case):
 
     # Parse performance results
     config.get_perf_result(outputs)
+
+    # Check for test failures
+    config.check_test_failure()
 
     # Upload results to database
     config.upload_test_results_to_database()

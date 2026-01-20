@@ -215,7 +215,7 @@ class MTPSampler(TorchSampler):
 
     SampleState = SampleStateMTP
 
-    @dataclass(frozen=True, kw_only=True)
+    @dataclass(kw_only=True)
     class Store(TorchSampler.Store):
         new_tokens: torch.Tensor
         next_new_tokens: torch.Tensor
@@ -552,38 +552,6 @@ class MTPWorker(SpecWorkerBase):
 
         return {
             'logits': raw_logits,
-            'new_tokens': accepted_tokens,
-            'new_tokens_lens': num_accepted_tokens,
-            'next_draft_tokens': next_draft_tokens,
-            'next_new_tokens': next_new_tokens
-        }
-
-    def skip_forward(
-        self,
-        input_ids,
-        position_ids,
-        hidden_states,
-        logits,
-        attn_metadata,
-        spec_metadata,
-        draft_model,
-    ):
-        batch_size = attn_metadata.num_seqs
-        mtp_num_modules = self.spec_config.num_nextn_predict_layers
-        accepted_tokens = torch.empty((batch_size, (mtp_num_modules + 1)),
-                                      dtype=torch.int,
-                                      device=logits.device)
-        num_accepted_tokens = torch.ones(batch_size,
-                                         dtype=torch.int,
-                                         device=logits.device)
-        next_draft_tokens = torch.empty((batch_size, mtp_num_modules),
-                                        dtype=torch.int,
-                                        device=logits.device)
-        next_new_tokens = torch.empty((batch_size, (mtp_num_modules + 1)),
-                                      dtype=torch.int,
-                                      device=logits.device)
-        return {
-            'logits': logits,
             'new_tokens': accepted_tokens,
             'new_tokens_lens': num_accepted_tokens,
             'next_draft_tokens': next_draft_tokens,
