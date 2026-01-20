@@ -2655,7 +2655,7 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
             for beam_idx in range(self.max_beam_width):
                 new_tokens = padded_tokens[request_idx, beam_idx]
                 for step_idx in range(draft_token_length + 1):
-                    size_per_step = new_tokens.size(0) - draft_token_length + step_idx
+                    size_per_step = max_len + step_idx
                     matches = []
                     for word, L in zip(words_device, lens):
                         truncated_seq = new_tokens[size_per_step - L : size_per_step]
