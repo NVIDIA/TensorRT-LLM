@@ -415,15 +415,15 @@ void initConfigBindings(pybind11::module_& m)
         .def(py::pickle(guidedDecodingConfigGetstate, guidedDecodingConfigSetstate));
 
     auto cacheTransceiverConfigGetstate = [](tle::CacheTransceiverConfig const& self)
-    { return py::make_tuple(self.getBackendType(), self.getMaxTokensInBuffer()); };
+    { return py::make_tuple(self.getBackendType(), self.getMaxTokensInBuffer(), self.getKvTransferTimeoutMs()); };
     auto cacheTransceiverConfigSetstate = [](py::tuple const& state)
     {
-        if (state.size() != 2)
+        if (state.size() != 3)
         {
             throw std::runtime_error("Invalid CacheTransceiverConfig state!");
         }
-        return tle::CacheTransceiverConfig(
-            state[0].cast<tle::CacheTransceiverConfig::BackendType>(), state[1].cast<std::optional<size_t>>());
+        return tle::CacheTransceiverConfig(state[0].cast<tle::CacheTransceiverConfig::BackendType>(),
+            state[1].cast<std::optional<size_t>>(), state[2].cast<std::optional<int>>());
     };
 
     py::enum_<tle::CacheTransceiverConfig::BackendType>(m, "CacheTransceiverBackendType")
@@ -431,6 +431,7 @@ void initConfigBindings(pybind11::module_& m)
         .value("MPI", tle::CacheTransceiverConfig::BackendType::MPI)
         .value("UCX", tle::CacheTransceiverConfig::BackendType::UCX)
         .value("NIXL", tle::CacheTransceiverConfig::BackendType::NIXL)
+        .value("MOONCAKE", tle::CacheTransceiverConfig::BackendType::MOONCAKE)
         .def("from_string",
             [](std::string const& str)
             {
@@ -442,16 +443,26 @@ void initConfigBindings(pybind11::module_& m)
                     return tle::CacheTransceiverConfig::BackendType::UCX;
                 if (str == "NIXL" || str == "nixl")
                     return tle::CacheTransceiverConfig::BackendType::NIXL;
+                if (str == "MOONCAKE" || str == "mooncake")
+                    return tle::CacheTransceiverConfig::BackendType::MOONCAKE;
                 throw std::runtime_error("Invalid backend type: " + str);
             });
 
     py::class_<tle::CacheTransceiverConfig>(m, "CacheTransceiverConfig")
-        .def(py::init<std::optional<tle::CacheTransceiverConfig::BackendType>, std::optional<size_t>>(),
-            py::arg("backend") = std::nullopt, py::arg("max_tokens_in_buffer") = std::nullopt)
+        .def(py::init<std::optional<tle::CacheTransceiverConfig::BackendType>, std::optional<size_t>,
+                 std::optional<int>, std::optional<int>>(),
+            py::arg("backend") = std::nullopt, py::arg("max_tokens_in_buffer") = std::nullopt,
+            py::arg("kv_transfer_timeout_ms") = std::nullopt,
+            py::arg("kv_transfer_sender_future_timeout_ms") = std::nullopt)
         .def_property(
             "backend", &tle::CacheTransceiverConfig::getBackendType, &tle::CacheTransceiverConfig::setBackendType)
         .def_property("max_tokens_in_buffer", &tle::CacheTransceiverConfig::getMaxTokensInBuffer,
             &tle::CacheTransceiverConfig::setMaxTokensInBuffer)
+        .def_property("kv_transfer_timeout_ms", &tle::CacheTransceiverConfig::getKvTransferTimeoutMs,
+            &tle::CacheTransceiverConfig::setKvTransferTimeoutMs)
+        .def_property("kv_transfer_sender_future_timeout_ms",
+            &tle::CacheTransceiverConfig::getKvTransferSenderFutureTimeoutMs,
+            &tle::CacheTransceiverConfig::setKvTransferSenderFutureTimeoutMs)
         .def(py::pickle(cacheTransceiverConfigGetstate, cacheTransceiverConfigSetstate));
 
     auto executorConfigGetState = [](py::object const& self)

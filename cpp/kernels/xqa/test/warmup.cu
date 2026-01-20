@@ -12,7 +12,15 @@ __global__ void kernel_warmup(uint64_t cycles)
 
 void warmup(cudaDeviceProp const& prop, float ms, cudaStream_t stream = nullptr)
 {
+#if CUDA_VERSION >= 13000
+    int device;
+    checkCuda(cudaGetDevice(&device));
+    int clockRateKHz;
+    checkCuda(cudaDeviceGetAttribute(&clockRateKHz, cudaDevAttrClockRate, device));
+    uint64_t const nbCycles = std::round(clockRateKHz * ms); // clockRate is in kHz
+#else
     uint64_t const nbCycles = std::round(prop.clockRate * ms); // clockRate is in kHz
+#endif
     kernel_warmup<<<16, 128, 0, stream>>>(nbCycles);
     checkCuda(cudaGetLastError());
 }

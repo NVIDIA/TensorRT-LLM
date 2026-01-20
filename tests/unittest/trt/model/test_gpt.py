@@ -56,7 +56,7 @@ class TestGPT(unittest.TestCase):
             activation_function=hidden_act,
             n_layer=n_layer,
             max_length=max_length,
-            torch_dtype=dtype,
+            dtype=dtype,
         )
         gpt_config.n_kv_head = gpt_config.n_head
         hf_gpt = GPT2LMHeadModel(gpt_config).cuda().eval()

@@ -58,7 +58,7 @@ EagleDecodeDraftTokensPlugin::EagleDecodeDraftTokensPlugin(void const* data, siz
     read(d, mTopKSampling);
     TLLM_CHECK_WITH_INFO(d == a + length,
         "Expected length (%d) != real length (%d). This is often "
-        "caused by using different TensorRT-LLM version to build "
+        "caused by using different TensorRT LLM version to build "
         "engine and run engine.",
         static_cast<int>(length), static_cast<int>(d - a));
 }

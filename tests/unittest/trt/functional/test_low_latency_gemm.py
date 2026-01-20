@@ -56,11 +56,11 @@ class TestLowLatencyGemm(unittest.TestCase):
         net = builder.create_network()
         net.plugin_config.low_latency_gemm_plugin = "fp8"
         with tensorrt_llm.net_guard(net):
-            # Init TensorRT-LLM tensor for x
+            # Init TensorRT LLM tensor for x
             x_tensor = Tensor(name='x',
                               shape=x.shape,
                               dtype=str_dtype_to_trt('fp8'))
-            # Init TensorRT-LLM tensor for w
+            # Init TensorRT LLM tensor for w
             w_tensor = Tensor(name='w',
                               shape=w.shape,
                               dtype=str_dtype_to_trt('fp8'))

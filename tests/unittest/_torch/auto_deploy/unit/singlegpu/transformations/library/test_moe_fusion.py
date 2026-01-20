@@ -368,3 +368,51 @@ def test_moe_fusion():
         num_param_nodes_fused < num_param_nodes
     ), f"""number of parameter nodes after fusion {num_param_nodes_fused} <
         number of parameter nodes before fusion {num_param_nodes}"""
+
+
+def test_fuse_moe_cleanup():
+    # Ensure deterministic allocations and a clean slate
+    torch.manual_seed(1234)
+    torch.cuda.manual_seed(1234)
+    torch.cuda.empty_cache()
+
+    device = "cuda"
+    dtype = torch.bfloat16
+
+    # Build model and export to GraphModule (pre-fusion)
+    model = MoEOpModel().to(device=device, dtype=dtype)
+    x = model.get_input(device=device, dtype=dtype)
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+
+    # Count parameters and measure memory before fusion
+    num_param_nodes_before = len(list(gm.named_parameters()))
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    mem_before = torch.cuda.memory_allocated()
+
+    # Apply MoE fusion which should stack weights and clean up unstacked params
+    # We need to ensure the cleanup is done as part of the transformation to avoid OOM during the transformation itself.
+    gm_transformed = InferenceOptimizer(
+        None,
+        {
+            "fuse_moe": {
+                "stage": "post_load_fusion",
+                "run_graph_cleanup": False,  # verify cleanup is done as part of the transformation
+                "run_shape_prop": False,  # shape_prop can also trigger cleanup
+            },
+        },
+    )(None, gm)
+
+    # Ensure that parameter count decreased after fusion (unstacked params cleaned)
+    num_param_nodes_after = len(list(gm_transformed.named_parameters()))
+    assert num_param_nodes_after < num_param_nodes_before, (
+        f"Expected fewer parameters after fusion: before={num_param_nodes_before}, after={num_param_nodes_after}"
+    )
+
+    # Memory should not increase after fusion/cleanup
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    mem_after = torch.cuda.memory_allocated()
+    assert mem_after <= mem_before, (
+        f"CUDA memory increased after fusion: before={mem_before} after={mem_after}"
+    )

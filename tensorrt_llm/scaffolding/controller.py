@@ -67,7 +67,7 @@ class NativeGenerationController(Controller):
             for key, value in self.sampling_params.items():
                 if getattr(task, key) is None:
                     setattr(task, key, value)
-            task.streaming = self.streaming
+            task.streaming_output_flag = self.streaming
 
         yield tasks
 
@@ -230,15 +230,16 @@ class MajorityVoteController(Controller):
         yield ParallelProcess(generation_controllers, tasks_list,
                               generation_kwargs_list)
 
-        candidates = [tasks[0].output_str for tasks in tasks_list]
         majority_index, majority_answer = self.majority_vote(
-            candidates, **majority_vote_kwargs)
+            tasks_list, **majority_vote_kwargs)
 
         assert isinstance(majority_answer, str), "majority_vote failed"
         # The task returned by majority vote does not have output_tokens and logits.
         tasks[0].result = tasks_list[majority_index][0].result
 
-    def majority_vote(self, candidates: List[str], **kwargs) -> Tuple[int, str]:
+    def majority_vote(self, candidates_tasks: List[List[Task]],
+                      **kwargs) -> Tuple[int, str]:
+        candidates = [tasks[0].output_str for tasks in candidates_tasks]
         return get_digit_majority_vote_result(candidates)
 
 

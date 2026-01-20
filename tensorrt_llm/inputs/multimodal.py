@@ -9,6 +9,7 @@ import torch
 from blake3 import blake3
 from torchvision.transforms import ToPILImage
 
+import tensorrt_llm
 from tensorrt_llm.logger import logger
 
 # Default hasher
@@ -404,13 +405,18 @@ class MultimodalParams:
     def to_device(self,
                   element: str,
                   device: str,
-                  pin_memory: bool = False) -> None:
+                  pin_memory: bool = False,
+                  target_keywords: Optional[List[str]] = None) -> None:
         """Move specified multimodal data element to target device.
 
         Args:
             element: Element to move (only "multimodal_data" is supported)
             device: Target device (e.g., "cuda", "cpu")
-            pin_memory: Whether to pin memory for faster transfers
+            pin_memory: Whether to pin memory for asynchronous transfers
+            target_keywords: Optional list of keyword paths to filter which data to move.
+                    Each string can be a simple key or dot-separated path
+                    (e.g., ["image.pixel_values", "mrope_config"])
+                    If provided, only data matching these paths will be moved to device.
 
         Raises:
             ValueError: If element is not "multimodal_data" or device is invalid
@@ -425,34 +431,99 @@ class MultimodalParams:
         if data is None:
             return  # Nothing to move
 
-        transformed_data = self._apply_tensor_operation(data,
-                                                        "to_device",
-                                                        device=device,
-                                                        pin_memory=pin_memory)
+        # If keyword is specified, only move data for those keyword paths
+        if target_keywords is not None:
+            if not isinstance(data, dict):
+                raise ValueError(
+                    f"multimodal_data must be a dictionary when keyword is specified, "
+                    f"got {type(data)}")
+
+            # Process multiple keyword paths
+            transformed_data = self._move_multiple_paths_to_device(
+                data, target_keywords, device, pin_memory)
+        else:
+            # Move all data as before
+            transformed_data = self._apply_tensor_operation(
+                data, "to_device", device=device, pin_memory=pin_memory)
+
         setattr(self, element, transformed_data)
+
+    def _move_multiple_paths_to_device(self, data: Dict[str, Any],
+                                       target_keywords: List[str], device: str,
+                                       pin_memory: bool) -> Dict[str, Any]:
+        """Move multiple nested data paths to device.
+
+        Args:
+            data: The multimodal data dictionary
+            target_keywords: List of keyword paths (can be dot-separated)
+            device: Target device
+            pin_memory: Whether to pin memory
+
+        Returns:
+            Updated data dictionary with specified paths moved to device
+        """
+        result = data
+        for keyword_path in target_keywords:
+            # Parse each keyword path
+            if '.' in keyword_path:
+                key_path = keyword_path.split('.')
+            else:
+                key_path = [keyword_path]
+
+            # Navigate to the target location and move data
+            current = result
+            parent_path = key_path[:-1]
+            target_key = key_path[-1]
+
+            # Navigate to the parent dictionary
+            for key in parent_path:
+                if not isinstance(current, dict) or key not in current:
+                    # Path doesn't exist, skip this keyword path
+                    break
+                current = current[key]
+            else:
+                # Check if the target key exists and move it to device
+                if isinstance(current, dict) and target_key in current:
+                    current[target_key] = self._apply_tensor_operation(
+                        current[target_key],
+                        "to_device",
+                        device=device,
+                        pin_memory=pin_memory)
+
+        return result
 
     def strip_for_generation(self) -> None:
         """Strip multimodal data for generation processing.
 
-        Keeps only mrope_config and removes all other multimodal data
+        Keeps only mrope_position_deltas and removes all other multimodal data
         (embeddings, images, etc.) as they're not needed during generation.
         """
         if not self.multimodal_data:
             return
 
-        # Extract mrope_config before clearing
-        mrope_config = None
+        # Extract mrope_position_deltas before clearing
+        mrope_position_deltas = None
         if 'mrope_config' in self.multimodal_data:
             mrope_config = self.multimodal_data['mrope_config']
+            if isinstance(mrope_config,
+                          dict) and 'mrope_position_deltas' in mrope_config:
+                mrope_position_deltas = mrope_config['mrope_position_deltas']
 
-        # Clear all data and restore only mrope_config if it exists
+        # Clear all data and restore only position deltas if they exist
         self.multimodal_data = {}
-        if mrope_config is not None:
-            self.multimodal_data['mrope_config'] = mrope_config
+        if mrope_position_deltas is not None:
+            self.multimodal_data['mrope_config'] = {
+                'mrope_position_deltas': mrope_position_deltas
+            }
 
     def has_content(self) -> bool:
         """Check if this object contains any multimodal data."""
         return bool(self.multimodal_input or self.multimodal_data)
+
+
+@dataclass
+class MultimodalServerConfig():
+    media_io_kwargs: Optional[dict] = None
 
 
 # adopt from vllm : https://github.com/vllm-project/vllm/blob/main/vllm/vllm/multimodal/hash.py
@@ -489,6 +560,13 @@ def apply_mm_hashes(mm_data: Dict[str, Any],
         elif isinstance(image, list):
             # Hash each frame with a separator to avoid collisions between [A,B] and [AB]
             for frame in image:
+                hasher.update(b"<frame>")
+                if isinstance(frame, torch.Tensor):
+                    frame = frame.detach().cpu().contiguous()
+                hasher.update(serialize_item(frame))
+        elif isinstance(image, tensorrt_llm.inputs.utils.VideoData):
+            frames = image.frames
+            for frame in frames:
                 hasher.update(b"<frame>")
                 if isinstance(frame, torch.Tensor):
                     frame = frame.detach().cpu().contiguous()
@@ -557,6 +635,8 @@ def find_mm_token_lengths(mm_data: Dict[str, Any],
                     image=item, )
                 modality_token_lengths.append(num_tokens)
             elif modality == "video":
+                if isinstance(item, tensorrt_llm.inputs.utils.VideoData):
+                    item = item.frames
                 assert isinstance(item, list), "Video must be a list of frames"
                 if isinstance(item[0], torch.Tensor):
                     item = [ToPILImage()(frame) for frame in item]
@@ -593,6 +673,7 @@ def find_mm_token_positions(
         num_mm_tokens: List of contiguous chunk lengths for each multimodal item
         vocab_size: Size of the model's vocabulary (used to identify tokens > vocab_size)
         mm_token_ids: Specific token IDs that represent multimodal tokens
+        mm_special_token_ids: Specific token IDs that represent special multimodal tokens
 
     Returns:
         List of starting positions for each contiguous multimodal token
@@ -603,7 +684,7 @@ def find_mm_token_positions(
             "Provide either mm_token_ids or vocab_size to find multimodal token positions"
         )
     if mm_token_ids is not None and vocab_size is not None:
-        logger.warning(
+        logger.debug(
             "Both mm_token_ids and vocab_size are provided, using mm_token_ids and ignoring vocab_size"
         )
 
@@ -614,13 +695,25 @@ def find_mm_token_positions(
         elif isinstance(input_ids, np.ndarray):
             input_ids = torch.from_numpy(input_ids)
 
-    # Create mask for multimodal tokens
+    # Create mask for multimodal tokens including special tokens if provided
     if mm_token_ids is None:
         mm_mask = input_ids >= vocab_size
+        if mm_special_token_ids is not None:
+            mm_special_token_ids = mm_special_token_ids.to(
+                device=input_ids.device, dtype=input_ids.dtype)
+            mm_mask = mm_mask | torch.isin(input_ids, mm_special_token_ids)
     else:
+        mm_token_ids = mm_token_ids.to(device=input_ids.device,
+                                       dtype=input_ids.dtype)
         if mm_token_ids.ndim != 1:
             raise ValueError("mm_token_ids must be a 1D tensor")
-        mm_token_ids = torch.unique(mm_token_ids)
+        if mm_special_token_ids is not None:
+            mm_special_token_ids = mm_special_token_ids.to(
+                device=input_ids.device, dtype=input_ids.dtype)
+            mm_token_ids = torch.unique(
+                torch.cat([mm_token_ids, mm_special_token_ids]))
+        else:
+            mm_token_ids = torch.unique(mm_token_ids)
         mm_mask = torch.isin(input_ids, mm_token_ids)
 
     # If no multimodal tokens found, return empty list

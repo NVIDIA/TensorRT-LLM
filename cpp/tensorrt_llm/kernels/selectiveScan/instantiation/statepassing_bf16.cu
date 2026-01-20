@@ -15,15 +15,16 @@
  */
 
 #include "../statepassing.h"
+#include "tensorrt_llm/common/config.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
 GetStatePassingKernelFunc getStatePassingKernel_bf16 = getStatePassingKernel<bf16_t>;
 
 } // namespace kernels
-} // namespace tensorrt_llm
 
+TRTLLM_NAMESPACE_END
 // vim: ts=2 sw=2 sts=2 et sta

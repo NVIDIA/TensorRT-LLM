@@ -18,9 +18,7 @@ llm = LLM(
     attn_page_size=64, # page size for attention (tokens_per_block, should be == max_seq_len for triton)
     skip_loading_weights=False,
     model_factory="AutoModelForCausalLM", # choose appropriate model factory
-    mla_backend="MultiHeadLatentAttention", # for models that support MLA
     free_mem_ratio=0.8, # fraction of available memory for cache
-    simple_shard_only=False, # tensor parallelism sharding strategy
     max_seq_len=<MAX_SEQ_LEN>,
     max_batch_size=<MAX_BATCH_SIZE>,
 )

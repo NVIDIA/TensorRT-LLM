@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
@@ -24,8 +25,8 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -99,8 +100,18 @@ struct MlaParams
     float const* dequant_scale_kv;
     float host_bmm1_scale;
 
+    // Is it absorption mode?
+    bool absorption_mode = false;
+
     // For FP8 context qkv quantization
     float const* quant_scale_qkv = nullptr;
+
+    // for Helix parallelism: the rotary position offsets [b]
+    int32_t const* helix_position_offsets{nullptr};
+
+    // for Helix parallelism: whether the current rank is inactive, shape [b]
+    // (the current query tokens are not appended to this rank's KV cache)
+    bool const* helix_is_inactive_rank{nullptr};
 };
 
 template <typename T, typename KVCacheBuffer>
@@ -123,4 +134,5 @@ void invokeMLARopeAppendPagedKVAssignQ(KVBlockArray& kv_cache, T* q_ptr, T* late
     float2 const* cos_sin_cache, size_t head_num, int nope_size, int rope_size, int lora_size,
     float const* kv_scale_orig_quant_ptr, cudaStream_t stream);
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

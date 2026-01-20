@@ -13,12 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
+# Disable UCC to WAR allgather issue before NGC PyTorch 25.12 upgrade.
+os.environ["OMPI_MCA_coll_ucc_enable"] = "0"
+
 
 def _add_trt_llm_dll_directory():
     import platform
     on_windows = platform.system() == "Windows"
     if on_windows:
-        import os
         import sysconfig
         from pathlib import Path
         os.add_dll_directory(
@@ -27,11 +31,41 @@ def _add_trt_llm_dll_directory():
 
 _add_trt_llm_dll_directory()
 
+
+def _preload_python_lib():
+    """
+    Preload Python library.
+
+    On Linux, the python executable links to libpython statically,
+    so the dynamic library `libpython3.x.so` is not loaded.
+    When using virtual environment on top of non-system Python installation,
+    our libraries installed under `$VENV_PREFIX/lib/python3.x/site-packages/`
+    have difficulties loading `$PREFIX/lib/libpython3.x.so.1.0` on their own,
+    since venv does not symlink `libpython3.x.so` into `$VENV_PREFIX/lib/`,
+    and the relative path from `$VENV_PREFIX` to `$PREFIX` is arbitrary.
+
+    We preload the libraries here since the Python executable under `$PREFIX/bin`
+    can easily find the library.
+    """
+    import platform
+    on_linux = platform.system() == "Linux"
+    if on_linux:
+        import sys
+        from ctypes import cdll
+        v_major, v_minor, *_ = sys.version_info
+        pythonlib = f'libpython{v_major}.{v_minor}.so'
+        _ = cdll.LoadLibrary(pythonlib + '.1.0')
+        _ = cdll.LoadLibrary(pythonlib)
+
+
+_preload_python_lib()
+
 import sys
 
-# Need to import xgrammar before tensorrt_llm library,
-# otherwise `MemoryError: std::bad_alloc` pattern error will be raised.
-import xgrammar  # noqa
+# Need to import torch before tensorrt_llm library, otherwise some shared binary files
+# cannot be found for the public PyTorch, raising errors like:
+# ImportError: libc10.so: cannot open shared object file: No such file or directory
+import torch  # noqa
 
 import tensorrt_llm._torch.models as torch_models
 import tensorrt_llm.functional as functional
@@ -47,11 +81,10 @@ from ._utils import (default_gpus_per_node, local_mpi_rank, local_mpi_size,
                      mpi_barrier, mpi_comm, mpi_rank, mpi_world_size,
                      set_mpi_comm, str_dtype_to_torch, str_dtype_to_trt,
                      torch_dtype_to_trt)
-from .auto_parallel import AutoParallelConfig, auto_parallel
 from .builder import BuildConfig, Builder, BuilderConfig, build
 from .disaggregated_params import DisaggregatedParams
 from .functional import Tensor, constant
-from .llmapi import LLM, MultimodalEncoder
+from .llmapi import LLM, AsyncLLM, MultimodalEncoder
 from .llmapi.llm_args import LlmArgs, TorchLlmArgs, TrtLlmArgs
 from .logger import logger
 from .mapping import Mapping
@@ -100,11 +133,10 @@ __all__ = [
     'Module',
     'functional',
     'models',
-    'auto_parallel',
-    'AutoParallelConfig',
     'quantization',
     'tools',
     'LLM',
+    'AsyncLLM',
     'MultimodalEncoder',
     'LlmArgs',
     'TorchLlmArgs',
@@ -118,6 +150,6 @@ __all__ = [
 
 _init()
 
-print(f"[TensorRT-LLM] TensorRT-LLM version: {__version__}")
+print(f"[TensorRT-LLM] TensorRT LLM version: {__version__}")
 
 sys.stdout.flush()

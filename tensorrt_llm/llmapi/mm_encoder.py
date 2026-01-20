@@ -51,8 +51,10 @@ class MultimodalEncoder(_TorchLLM):
         # Multimodal special handling:
         # 1. Default load_tokenizer may fail because MM has different tokenizer configuration. Hence we initialize it inside input processor
         # 2. May need to modify model weights for MM (e.g., resize vocab embedding). We must do such operation via input processor's __init__
+        checkpoint_format = getattr(self.args, "checkpoint_format", None)
         self.input_processor = create_input_processor(self._hf_model_dir,
-                                                      self.tokenizer)
+                                                      self.tokenizer,
+                                                      checkpoint_format)
         self._tokenizer = self.input_processor.tokenizer
 
         assert isinstance(self.args, TorchLlmArgs)
@@ -99,14 +101,8 @@ class MultimodalEncoder(_TorchLLM):
 
         inputs = [prompt_inputs(i) for i in inputs]
 
-        def _item_at(maybe_batched: Union[Any, Sequence[Any]], pos: int) -> Any:
-            if isinstance(maybe_batched, list):
-                return maybe_batched[pos]
-            else:
-                return maybe_batched
-
         futures = []
-        for i, request_inputs in enumerate(inputs):
+        for request_inputs in inputs:
             future = self.generate_async(request_inputs)
             futures.append(future)
 

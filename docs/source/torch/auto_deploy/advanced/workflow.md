@@ -12,15 +12,18 @@ from tensorrt_llm._torch.auto_deploy import LLM
 llm = LLM(
     model=<HF_MODEL_CARD_OR_DIR>,
     world_size=<DESIRED_WORLD_SIZE>,
-    compile_backend="torch-compile",
-    model_kwargs={"num_hidden_layers": 2}, # test with smaller model configuration
-    attn_backend="flashinfer", # choose between "triton" and "flashinfer"
-    attn_page_size=64, # page size for attention (tokens_per_block, should be == max_seq_len for triton)
-    skip_loading_weights=False,
     model_factory="AutoModelForCausalLM", # choose appropriate model factory
-    mla_backend="MultiHeadLatentAttention", # for models that support MLA
-    free_mem_ratio=0.8, # fraction of available memory for cache
-    simple_shard_only=False, # tensor parallelism sharding strategy
+    model_kwargs={"num_hidden_layers": 2}, # test with smaller model configuration
+    transforms={
+        "insert_cached_attention": {"backend": "flashinfer"},  # or "triton"
+        "insert_cached_mla_attention": {"backend": "MultiHeadLatentAttention"},
+        "resize_kv_cache": {"free_mem_ratio": 0.8},
+        "compile_model": {"backend": "torch-compile"},
+        "detect_sharding": {"simple_shard_only": False},
+
+    },
+    attn_page_size=64, # page size for attention
+    skip_loading_weights=False,
     max_seq_len=<MAX_SEQ_LEN>,
     max_batch_size=<MAX_BATCH_SIZE>,
 )

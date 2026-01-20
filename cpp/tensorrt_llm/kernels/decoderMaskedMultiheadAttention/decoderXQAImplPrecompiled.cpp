@@ -15,6 +15,7 @@
  */
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplPrecompiled.h"
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/workspace.h"
@@ -33,7 +34,9 @@
 
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
 
 class XQAKernelList
@@ -44,7 +47,7 @@ public:
     XQAKernelList(Data_type type, unsigned int sm)
         : mDriver(tensorrt_llm::common::CUDADriverWrapper::getInstance())
         , mDataType(type)
-        , mKernelMetaCount(sizeof(sXqaKernelMetaInfo) / sizeof(sXqaKernelMetaInfo[0]))
+        , mKernelMetaCount(sXqaKernelMetaInfoSize)
         , mKernelMeta(&sXqaKernelMetaInfo[0])
         , mSM(sm)
     {
@@ -258,7 +261,7 @@ public:
         invokeQKVPreprocessing<T, KVCacheBuffer>(preprocessingParams, stream);
         sync_check_cuda_error(stream);
 
-        XQAKernelRuntimeHashKey hash_key = getRuntimeHashKeyFromXQAParams(xqaParams, false);
+        XQAKernelRuntimeHashKey hash_key = getRuntimeHashKeyFromXQAParams(xqaParams, false, mSM);
         auto const findIter = mFunctions.find(hash_key);
 
         TLLM_CHECK_WITH_INFO(findIter != mFunctions.end(), "XQAKernelFunc not found.");
@@ -490,6 +493,10 @@ bool DecoderXQAImplPrecompiled::shouldUse(XQAParams const& xqaParams, bool forCo
     {
         SUPPORT_RETURN_FALSE("streaming-llm");
     }
+    if (xqaParams.skip_softmax_threshold_scale_factor != 0)
+    {
+        SUPPORT_RETURN_FALSE("skip_softmax_threshold_scale_factor");
+    }
 
     // OPTIMIZE: For the standard generation-phase MHA, there are still extra limitations.
     // NOTE: Medusa mode = Multi_query_tokens > 1.
@@ -557,4 +564,6 @@ void DecoderXQAImplPrecompiled::runWithKVBlockArray(
     runDispatchBuffer<KVBlockArray>(xqa_params, kv_block_array, stream);
 }
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

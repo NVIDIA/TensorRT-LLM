@@ -83,7 +83,7 @@ def preprocess_test_list_lines(test_list, lines, mako_opts={}):
     return lines
 
 
-def parse_test_list_lines(test_list, lines, test_prefix):
+def parse_test_list_lines(test_list, lines, test_prefix, convert_unittest=True):
     """Parses the lines of a test list. Test names returned contain all values within square brackets. Does not process
     each test id value.
 
@@ -102,7 +102,22 @@ def parse_test_list_lines(test_list, lines, test_prefix):
         if s.startswith("full:"):
             s = s.lstrip("full:")
             if test_prefix:
-                if test_prefix.split('-')[0] in s:
+                # Check for SM version pattern (e.g., sm90, sm89, sm100)
+                sm_match = re.match(r'sm(\d+)/', s)
+                if sm_match:
+                    sm_version = int(sm_match.group(1))
+                    # Get current SM version
+                    try:
+                        from .conftest import get_sm_version
+                        current_sm = get_sm_version()
+                        # If SM versions match, replace with test_prefix
+                        if sm_version == current_sm:
+                            s = s.replace(f'sm{sm_version}',
+                                          test_prefix.split('-')[0])
+                    except Exception:
+                        # If can't get SM version, skip SM-based filtering
+                        pass
+                elif test_prefix.split('-')[0] in s:
                     s = s.replace(test_prefix.split('-')[0], test_prefix)
             return s
         elif test_prefix:
@@ -146,19 +161,21 @@ def parse_test_list_lines(test_list, lines, test_prefix):
                                  test_list, lineno, reason_raw))
                 break
 
-        # extract full:XXX/ prefix
-        full_prefix = ""
-        match = re.match(r'(full:.*?/)(.+)', test_name)
-        if match:
-            full_prefix = match.group(1)
-            test_name = match.group(2)
+        if convert_unittest:
+            # extract full:XXX/ prefix
+            full_prefix = ""
+            match = re.match(r'(full:.*?/)(.+)', test_name)
+            if match:
+                full_prefix = match.group(1)
+                test_name = match.group(2)
 
-        # convert unittest to actual test name
-        if test_name.startswith("unittest/"):
-            test_name = f"test_unittests.py::test_unittests_v2[{test_name}]"
+            # convert unittest to actual test name
+            if test_name.startswith("unittest/"):
+                test_name = f"test_unittests.py::test_unittests_v2[{test_name}]"
 
-        # combine back
-        test_name = full_prefix + test_name
+            # combine back
+            test_name = full_prefix + test_name
+
         test_name = parse_test_name(test_name)
 
         return (test_name, marker, reason, timeout)
@@ -573,9 +590,10 @@ def handle_corrections(corrections, test_prefix):
 
 def record_invalid_tests(output_file, corrections):
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
-    with open(output_file, "w") as f:
+    with open(output_file, "a") as f:
         invalid_tests = {"invalid": list(corrections.keys())}
         json.dump(invalid_tests, f)
+        f.write("\n")
 
 
 def parse_and_validate_test_list(
@@ -585,8 +603,6 @@ def parse_and_validate_test_list(
     check_for_corrections,
 ):
     test_prefix = config.getoption("--test-prefix")
-    apply_test_list_correction = config.getoption(
-        "--apply-test-list-correction")
     test_names, test_name_to_marker_dict = parse_test_list(
         test_list, test_prefix)
 
@@ -597,6 +613,8 @@ def parse_and_validate_test_list(
             TestCorrectionMode.EXACT_MATCH,
         )
 
+        apply_test_list_correction = config.getoption(
+            "--apply-test-list-correction")
         if apply_test_list_correction and corrections:
             apply_test_list_corrections(test_list, corrections, items,
                                         test_prefix)

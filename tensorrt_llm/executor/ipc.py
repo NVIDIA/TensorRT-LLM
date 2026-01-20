@@ -1,7 +1,9 @@
+import asyncio
 import hashlib
 import hmac
 import os
 import pickle  # nosec B403
+import threading
 import time
 import traceback
 from queue import Queue
@@ -13,8 +15,8 @@ import zmq.asyncio
 from tensorrt_llm.logger import logger
 
 from .._utils import nvtx_mark, nvtx_range_debug
-from ..llmapi.utils import (ManagedThread, enable_llm_debug, print_colored,
-                            print_colored_debug)
+from ..llmapi.utils import (ManagedThread, enable_llm_debug, logger_debug,
+                            print_colored)
 
 
 class ZeroMqQueue:
@@ -24,6 +26,8 @@ class ZeroMqQueue:
         zmq.PAIR: "PAIR",
         zmq.PULL: "PULL",
         zmq.PUSH: "PUSH",
+        zmq.ROUTER: "ROUTER",
+        zmq.DEALER: "DEALER",
     }
 
     def __init__(self,
@@ -55,9 +59,20 @@ class ZeroMqQueue:
         self._setup_done = False
         self.name = name
         self.socket = self.context.socket(socket_type)
+        self.socket.set_hwm(0)
+
+        # For ROUTER sockets, track the last identity to enable replies. For now we assume there is only one client in our case.
+        self._last_identity = None
 
         self.hmac_key = address[1] if address is not None else None
         self.use_hmac_encryption = use_hmac_encryption
+
+        self._setup_lock = threading.Lock()
+
+        # Thread safety debugging
+        self._zmq_thread_id = None
+        self._zmq_debug_enabled = os.environ.get('TLLM_LLMAPI_ZMQ_DEBUG',
+                                                 '0') != '0'
 
         # Check HMAC key condition
         if self.use_hmac_encryption and not self.is_server and self.hmac_key is None:
@@ -68,14 +83,14 @@ class ZeroMqQueue:
                 "Server and client should not receive HMAC key when encryption is disabled"
             )
 
-        if (socket_type == zmq.PAIR
-                and self.is_server) or socket_type == zmq.PULL:
+        if (socket_type == zmq.PAIR and self.is_server
+            ) or socket_type == zmq.PULL or socket_type == zmq.ROUTER:
             self.socket.bind(
                 self.address_endpoint
             )  # Binds to the address and occupy a port immediately
             self.address_endpoint = self.socket.getsockopt(
                 zmq.LAST_ENDPOINT).decode()
-            print_colored_debug(
+            logger_debug(
                 f"Server [{name}] bound to {self.address_endpoint} in {self.socket_type_str[socket_type]}\n",
                 "green")
 
@@ -87,18 +102,44 @@ class ZeroMqQueue:
             self.address = (self.address_endpoint, self.hmac_key)
 
     def setup_lazily(self):
+        # Early return if setup is already done
         if self._setup_done:
             return
-        self._setup_done = True
 
-        if not self.is_server:
-            print_colored_debug(
-                f"Client [{self.name}] connecting to {self.address_endpoint} in {self.socket_type_str[self.socket_type]}\n",
-                "green")
-            self.socket.connect(self.address_endpoint)
+        with self._setup_lock:
+            if self._setup_done:
+                return
+            self._setup_done = True
 
-        self.poller = zmq.Poller()
-        self.poller.register(self.socket, zmq.POLLIN)
+            if not self.is_server:
+                logger_debug(
+                    f"Client [{self.name}] connecting to {self.address_endpoint} in {self.socket_type_str[self.socket_type]}\n",
+                    "green")
+                self.socket.connect(self.address_endpoint)
+
+            self.poller = zmq.Poller()
+            self.poller.register(self.socket, zmq.POLLIN)
+
+    def _check_thread_safety(self):
+        """Check if the current thread is the same as the thread that first used the socket."""
+        if not self._zmq_debug_enabled:
+            return
+
+        current_thread_id = threading.get_ident()
+
+        if self._zmq_thread_id is None:
+            # First call - capture the thread ID
+            self._zmq_thread_id = current_thread_id
+            logger_debug(
+                f"ZMQ socket [{self.name}] initialized on thread {current_thread_id}",
+                "cyan")
+        elif self._zmq_thread_id != current_thread_id:
+            # Thread mismatch - raise error
+            raise RuntimeError(
+                f"ZMQ thread safety violation detected in [{self.name}]: "
+                f"Socket created on thread {self._zmq_thread_id}, "
+                f"but accessed from thread {current_thread_id}. "
+                f"ZMQ sockets are not thread-safe!")
 
     def poll(self, timeout: int) -> bool:
         """
@@ -106,6 +147,7 @@ class ZeroMqQueue:
             timeout (int): Timeout in seconds
         """
         self.setup_lazily()
+        self._check_thread_safety()
 
         events = dict(self.poller.poll(timeout=timeout * 1000))
         if self.socket in events and events[self.socket] == zmq.POLLIN:
@@ -113,16 +155,16 @@ class ZeroMqQueue:
         else:
             return False
 
-    def put(self, obj: Any):
+    def put(self, obj: Any, routing_id: Optional[bytes] = None):
         self.setup_lazily()
+        self._check_thread_safety()
         with nvtx_range_debug("send", color="blue", category="IPC"):
-            if self.use_hmac_encryption:
-                # Send pickled data with HMAC appended
-                data = pickle.dumps(obj)  # nosec B301
-                signed_data = self._sign_data(data)
-                self.socket.send(signed_data)
+            if self.use_hmac_encryption or self.socket_type == zmq.ROUTER:
+                # Need manual serialization for encryption or ROUTER multipart
+                data = self._prepare_data(obj)
+                self._send_data(data, routing_id=routing_id)
             else:
-                # Send data without HMAC
+                # Standard socket without encryption - use pyobj directly
                 self.socket.send_pyobj(obj)
 
     def put_noblock(self,
@@ -143,12 +185,12 @@ class ZeroMqQueue:
         assert retry >= 0 and retry <= 10, "Retry must be between 0 and 10, adjust the wait_time if needed"
 
         self.setup_lazily()
+        self._check_thread_safety()
         with nvtx_range_debug("send", color="blue", category="IPC"):
-            data = pickle.dumps(obj)  # nosec B301
-            if self.use_hmac_encryption:
-                data = self._sign_data(data)
+
+            data = self._prepare_data(obj)
             try:
-                self.socket.send(data, flags=zmq.NOBLOCK)
+                self._send_data(data, flags=zmq.NOBLOCK)
             except zmq.Again:
                 if retry > 0:
                     time.sleep(wait_time)
@@ -156,16 +198,16 @@ class ZeroMqQueue:
                 else:
                     logger.error(f"Failed to send object: {obj}")
 
-    async def put_async(self, obj: Any):
+    async def put_async(self, obj: Any, routing_id: Optional[bytes] = None):
         self.setup_lazily()
+        self._check_thread_safety()
         try:
-            if self.use_hmac_encryption:
-                # Send pickled data with HMAC appended
-                data = pickle.dumps(obj)  # nosec B301
-                signed_data = self._sign_data(data)
-                await self.socket.send(signed_data)
+            if self.use_hmac_encryption or self.socket_type == zmq.ROUTER:
+                # Need manual serialization for encryption or ROUTER multipart
+                data = self._prepare_data(obj)
+                await self._send_data_async(data, routing_id=routing_id)
             else:
-                # Send data without HMAC
+                # Standard socket without encryption
                 await self.socket.send_pyobj(obj)
         except TypeError as e:
             logger.error(f"Cannot pickle {obj}")
@@ -177,47 +219,84 @@ class ZeroMqQueue:
 
         nvtx_mark("ipc.send", color="blue", category="IPC")
 
+    async def put_async_noblock(self, obj: Any):
+        self.setup_lazily()
+        self._check_thread_safety()
+        try:
+            if self.use_hmac_encryption:
+                data = pickle.dumps(obj)  # nosec B301
+                signed_data = self._sign_data(data)
+                await self.socket.send(signed_data, flags=zmq.NOBLOCK)
+            else:
+                await self.socket.send_pyobj(obj, flags=zmq.NOBLOCK)
+        except Exception as e:
+            logger.error(f"Error sending object: {e}")
+            logger.error(traceback.format_exc())
+            raise e
+
     def get(self) -> Any:
         self.setup_lazily()
-
-        if self.use_hmac_encryption:
-            # Receive signed data with HMAC
-            signed_data = self.socket.recv()
-
-            # Split data and HMAC
-            data = signed_data[:-32]
-            actual_hmac = signed_data[-32:]
-
-            # Verify HMAC
-            if not self._verify_hmac(data, actual_hmac):
-                raise RuntimeError("HMAC verification failed")
-
-            obj = pickle.loads(data)  # nosec B301
-        else:
-            # Receive data without HMAC
-            obj = self.socket.recv_pyobj()
-        return obj
+        self._check_thread_safety()
+        return self._recv_data()
 
     async def get_async(self) -> Any:
         self.setup_lazily()
+        self._check_thread_safety()
+        return await self._recv_data_async()
 
-        if self.use_hmac_encryption:
-            # Receive signed data with HMAC
-            signed_data = await self.socket.recv()
+    async def get_async_noblock(self,
+                                timeout: float = 0.5,
+                                return_identity: bool = False) -> Any:
+        """Get data with timeout using polling to avoid message drops.
 
-            # Split data and HMAC
-            data = signed_data[:-32]
-            actual_hmac = signed_data[-32:]
+        This method uses ZMQ's NOBLOCK flag with polling instead of asyncio.wait_for
+        to prevent cancelling recv operations which can cause message drops.
 
-            # Verify HMAC
-            if not self._verify_hmac(data, actual_hmac):
-                raise RuntimeError("HMAC verification failed")
+        Args:
+            timeout: Timeout in seconds
+            return_identity: Whether to return the identity of the sender (for ROUTER sockets)
 
-            obj = pickle.loads(data)  # nosec B301
-        else:
-            # Receive data without HMAC
-            obj = await self.socket.recv_pyobj()
-        return obj
+        Returns:
+            The received object, or (object, identity) if return_identity is True
+
+        Raises:
+            asyncio.TimeoutError: If timeout is reached without receiving data
+        """
+        self.setup_lazily()
+        self._check_thread_safety()
+
+        # Use polling loop instead of asyncio.wait_for to avoid cancelling recv
+        # which can cause message drops
+        deadline = asyncio.get_event_loop().time() + timeout
+        while True:
+            try:
+                # Try non-blocking receive
+                if self.socket_type == zmq.ROUTER:
+                    identity, data = await self.socket.recv_multipart(
+                        flags=zmq.NOBLOCK)
+                    self._last_identity = identity
+                    obj = self._parse_data(data)
+                    if return_identity:
+                        return obj, identity
+                    else:
+                        return obj
+                else:
+                    if self.use_hmac_encryption:
+                        data = await self.socket.recv(flags=zmq.NOBLOCK)
+                        obj = self._parse_data(data)
+                    else:
+                        obj = await self.socket.recv_pyobj(flags=zmq.NOBLOCK)
+
+                    if return_identity:
+                        return obj, None
+                    else:
+                        return obj
+            except zmq.Again:
+                # No message available yet
+                if asyncio.get_event_loop().time() >= deadline:
+                    raise asyncio.TimeoutError()
+                # Short sleep to avoid busy-waiting
+                await asyncio.sleep(0.01)
 
     def close(self):
         if self.socket:
@@ -240,6 +319,128 @@ class ZeroMqQueue:
 
     def __del__(self):
         self.close()
+
+    def _prepare_data(self, obj: Any) -> bytes:
+        """Serialize object and optionally add HMAC signature."""
+        data = pickle.dumps(obj)  # nosec B301
+        if self.use_hmac_encryption:
+            return self._sign_data(data)
+        return data
+
+    def _parse_data(self, data: bytes) -> Any:
+        """Parse data and optionally verify HMAC signature."""
+        if self.use_hmac_encryption:
+            # Split data and HMAC
+            message_data = data[:-32]
+            actual_hmac = data[-32:]
+
+            # Verify HMAC
+            if not self._verify_hmac(message_data, actual_hmac):
+                raise RuntimeError("HMAC verification failed")
+
+            return pickle.loads(message_data)  # nosec B301
+        else:
+            return pickle.loads(data)  # nosec B301
+
+    def _send_data(self,
+                   data: bytes,
+                   flags: int = 0,
+                   routing_id: Optional[bytes] = None):
+        """Send data using appropriate API based on socket type."""
+        if self.socket_type == zmq.ROUTER:
+            identity = routing_id if routing_id is not None else self._last_identity
+            if identity is None:
+                raise ValueError("ROUTER socket requires identity")
+            self.socket.send_multipart([identity, data], flags=flags)
+        else:
+            self.socket.send(data, flags=flags)
+
+    async def _send_data_async(self,
+                               data: bytes,
+                               routing_id: Optional[bytes] = None):
+        """Async version of _send_data."""
+        if self.socket_type == zmq.ROUTER:
+            identity = routing_id if routing_id is not None else self._last_identity
+            if identity is None:
+                raise ValueError("ROUTER socket requires identity")
+            await self.socket.send_multipart([identity, data])
+        else:
+            await self.socket.send(data)
+
+    def _recv_data(self, return_identity: bool = False) -> Any:
+        """Receive data using appropriate API based on socket type."""
+        if self.socket_type == zmq.ROUTER:
+            identity, data = self.socket.recv_multipart()
+            self._last_identity = identity  # Store for replies
+            obj = self._parse_data(data)
+            if return_identity:
+                return obj, identity
+            return obj
+        else:
+            if self.use_hmac_encryption:
+                data = self.socket.recv()
+                obj = self._parse_data(data)
+            else:
+                obj = self.socket.recv_pyobj()
+
+            if return_identity:
+                return obj, None
+            return obj
+
+    async def _recv_data_async(self, return_identity: bool = False) -> Any:
+        """Async version of _recv_data."""
+        if self.socket_type == zmq.ROUTER:
+            identity, data = await self.socket.recv_multipart()
+            self._last_identity = identity  # Store for replies
+            obj = self._parse_data(data)
+            if return_identity:
+                return obj, identity
+            return obj
+        else:
+            if self.use_hmac_encryption:
+                data = await self.socket.recv()
+                obj = self._parse_data(data)
+            else:
+                obj = await self.socket.recv_pyobj()
+
+            if return_identity:
+                return obj, None
+            return obj
+
+    def notify_with_retry(self, message, max_retries=5, timeout=1):
+        """
+        Notify with automatic retry on failure (for DEALER socket pattern).
+
+        Args:
+            message: Message to send
+            max_retries: Maximum retry attempts (default: 5)
+            timeout: Timeout in seconds for each attempt (default: 1)
+
+        Returns:
+            bool: True if acknowledgment received, False if failed after all retries
+        """
+        if self.socket_type != zmq.DEALER:
+            raise ValueError(
+                "notify_with_retry is only supported for DEALER socket for now")
+
+        self._check_thread_safety()
+        retry_count = 0
+
+        while retry_count < max_retries:
+            try:
+                self.put(message)
+                # Wait for ACK with timeout
+                if self.poll(timeout):
+                    self.get()
+                    return True
+                else:
+                    retry_count += 1
+
+            except Exception as e:
+                logger.error(f"Failed to notify with retry: {e}")
+                retry_count += 1
+
+        return False
 
 
 IpcQueue = ZeroMqQueue

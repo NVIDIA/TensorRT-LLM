@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List, Optional, Set
+from typing import TYPE_CHECKING, Dict, List, Optional, Set
 
 import torch
 from torch import nn
@@ -7,13 +7,16 @@ from torch import nn
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
-from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
-from .interface import SpecMetadata
+from .interface import SpecMetadata, SpecWorkerBase
 from .mtp import MTPSampler
+from .spec_tree_manager import SpecTreeManager
+
+if TYPE_CHECKING:
+    from ...llmapi.llm_args import EagleDecodingConfig
 
 
 class Eagle3ResourceManager(BaseResourceManager):
@@ -31,21 +34,45 @@ class Eagle3ResourceManager(BaseResourceManager):
         self.hidden_size = hidden_size
         self.max_num_requests = max_num_requests
         self.max_seq_len = max_seq_len
-        self.slot_manager = SlotManager(max_num_requests)
+        # There could be dummy request for padding batch when using CUDA graph.
+        # Reserve one more slot for the dummy request.
+        slot_size = self.max_seq_len + 1
+        self.slot_manager = SlotManager(slot_size)
+        # This class is reused by MTP_EAGLE
+        from ...llmapi.llm_args import EagleDecodingConfig
+
+        if isinstance(config, EagleDecodingConfig):
+            self.max_total_draft_tokens = config.max_total_draft_tokens
+        else:
+            self.max_total_draft_tokens = self.max_draft_len
 
         # empty hidden states tensor
-        max_num_tokens = min(max_num_tokens,
-                             max_num_requests * self.max_seq_len)
+        max_num_tokens = min(max_num_tokens, max_num_requests *
+                             self.max_seq_len) + (self.max_total_draft_tokens +
+                                                  1) * max_num_requests
+
         self.hidden_states = torch.empty(
             (max_num_tokens, self.hidden_size * config.num_capture_layers),
             dtype=self.dtype,
             device='cuda')
         # sequence length, only used for metadata preparation
-        self.seq_lens = {i: 0 for i in range(max_num_requests)}
+        self.seq_lens = {i: 0 for i in range(slot_size)}
         # start indices of each slot
-        self.start_indices = {i: 0 for i in range(max_num_requests)}
+        self.start_indices = {i: 0 for i in range(slot_size)}
         # whether the next draft forward is the first
         self.is_first_draft = True
+        self.spec_tree_manager = None
+
+        if isinstance(config,
+                      EagleDecodingConfig) and config.eagle_choices is not None:
+            self.spec_tree_manager = SpecTreeManager(
+                max_num_requests=self.max_num_requests,
+                use_dynamic_tree=config.use_dynamic_tree,
+                max_draft_len=self.max_draft_len,
+                max_total_draft_tokens=self.max_total_draft_tokens,
+                eagle_choices=config.eagle_choices,
+                dynamic_tree_max_topK=config.dynamic_tree_max_topK,
+            )
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         context_batch = scheduled_batch.context_requests
@@ -94,12 +121,19 @@ class Eagle3SpecMetadata(SpecMetadata):
     eagle3_resource_manager: Optional[Eagle3ResourceManager] = None
     is_mtp_eagle: bool = False
 
+    eagle_choices: Optional[List[List[int]]] = None
+    max_total_draft_tokens: int = 0
+    # This is to store the request type and accepted path for each request.
+    # For each request, {key: request_ids, value: accepted_path}
+    # 'accepted_path' is a list of accepted tokens indices.
+    request_accepted_path: Optional[Dict[int, List[int]]] = None
+
     def __post_init__(self):
         if self.is_draft_model:
             self.layers_to_capture = (self.num_layers - 1, )
         elif self.layers_to_capture is None:
             if self.num_layers == 1 or self.is_mtp_eagle:
-                self.layers_to_capture = (self.num_layers - 1, )
+                self.layers_to_capture = (-1, )
             else:
                 if self.num_layers <= 5:
                     raise ValueError(
@@ -108,6 +142,10 @@ class Eagle3SpecMetadata(SpecMetadata):
                                           self.num_layers - 4)
         else:
             self.layers_to_capture = sorted(list(self.layers_to_capture))
+            if self.layers_to_capture[0] == -1:
+                self.layers_to_capture = self.layers_to_capture[1:] + [
+                    self.layers_to_capture.pop(0)
+                ]
         self.num_capture_layers = len(self.layers_to_capture)
 
         # Initialize to 0 to avoid reading uninitialized memory during warmup
@@ -120,8 +158,13 @@ class Eagle3SpecMetadata(SpecMetadata):
         self.hidden_states_read_indices_host = None
         self.hidden_states_write_indices_host = None
 
+        if self.eagle_choices is not None:
+            self.is_spec_dec_tree = True
+            self.is_spec_dec_dynamic_tree = False
+
     def prepare(self):
         is_first_draft = self.eagle3_resource_manager.is_first_draft
+        spec_tree_manager = self.eagle3_resource_manager.spec_tree_manager
         # Update start indices
         # Here, we assume the sequence lengths (seq_lens) during the draft model
         # forward will not exceed those of the target model. So pre-allocate
@@ -132,20 +175,59 @@ class Eagle3SpecMetadata(SpecMetadata):
                 slot_id = self.eagle3_resource_manager.slot_manager.get_slot(
                     req_id)
                 self.eagle3_resource_manager.start_indices[slot_id] = start_idx
-                start_idx += seq_len
+                # Make sure that the space between two requests is at least max_total_draft_tokens + 1.
+                start_idx += max(seq_len, self.max_total_draft_tokens + 1)
+                assert start_idx < self.eagle3_resource_manager.hidden_states.shape[
+                    0], f"start_idx {start_idx} is greater than hidden_states.shape[0] {self.eagle3_resource_manager.hidden_states.shape[0]}"
+
         # Prepare hidden states gather ids
         hidden_states_read_indices = []
         hidden_states_write_indices = []
         for req_id, seq_len in zip(self.request_ids, self.seq_lens):
             slot_id = self.eagle3_resource_manager.slot_manager.get_slot(req_id)
             start_idx = self.eagle3_resource_manager.start_indices[slot_id]
+            # 1) target model or (is_first_draft and is_linear_tree)
             # If this is the first draft or the target model forward, we need to
-            # read/write all of the hidden states, otherwise, only read the last token
-            if is_first_draft or not self.is_draft_model:
+            # read/write all of the hidden states
+            if not self.is_draft_model or (is_first_draft
+                                           and spec_tree_manager is None):
                 hidden_states_read_indices.extend(
                     list(range(start_idx, start_idx + seq_len)))
                 hidden_states_write_indices.extend(
                     list(range(start_idx, start_idx + seq_len)))
+            # 2）is_first_draft and draft_token_tree
+            # After target model forward, some draft tokens will be accepted.
+            # These draft tokens' hidden states will be used for draft model's first drafter layer.
+            elif is_first_draft and spec_tree_manager is not None:
+                assert req_id in self.request_accepted_path.keys(
+                ), f"Request {req_id} not found in request_accepted_path"
+                # 'node_idx + 1' is because we '-1' in sampler.py for kv cache rewind. Now we add it back.
+                accepted_path = [
+                    node_idx + 1
+                    for node_idx in self.request_accepted_path[req_id]
+                ]
+
+                if accepted_path == []:
+                    # Case 1: This is a context request, We need to read all the hidden states.
+                    # Case 2: This is a generation request, but no accepted tokens are accepted. Actually only the first token's hidden states is needed. The others are just padding tokens.
+                    hidden_states_read_indices.extend(
+                        list(range(start_idx, start_idx + seq_len)))
+                else:
+                    # This is a generation request. And there are draft tokens accepted.
+                    # We only read the accepted tokens' hidden states.
+                    accepted_path = [0] + accepted_path  # add the root node
+                    accepted_path_pad = accepted_path + [0] * (
+                        seq_len - len(accepted_path))
+                    assert len(accepted_path_pad) == seq_len
+                    hidden_states_read_indices.extend([
+                        start_idx + accepted_draft_token_offset
+                        for accepted_draft_token_offset in accepted_path_pad
+                    ])
+
+                # For the write indices, we just write all the hidden states.
+                hidden_states_write_indices.extend(
+                    list(range(start_idx, start_idx + seq_len)))
+            # otherwise: only read the last token
             else:
                 old_seq_len = self.eagle3_resource_manager.seq_lens[slot_id]
                 hidden_states_read_indices.append(start_idx + old_seq_len - 1)
@@ -274,14 +356,16 @@ class Eagle3OneModelSampler(MTPSampler):
         super().__init__(args, nextn=args.max_draft_len)
 
 
-class Eagle3OneModelWorker(nn.Module):
+class Eagle3OneModelWorker(SpecWorkerBase):
 
     def __init__(self, spec_config: "EagleDecodingConfig", mapping: Mapping):
         super().__init__()
         self.spec_config = spec_config
-        self.max_draft_len = self.spec_config.max_draft_len
         self.mapping = mapping
-        self.guided_decoder: Optional[CapturableGuidedDecoder] = None
+
+    @property
+    def max_draft_len(self) -> int:
+        return self.spec_config.max_draft_len
 
     # Skip torch.compile for now since current Torch is not compatible with Triton 3.4
     # @torch.compile(options={"max-autotune": True})
@@ -316,6 +400,7 @@ class Eagle3OneModelWorker(nn.Module):
 
         # Predict draft tokens
         next_draft_tokens = []
+        original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
         for i in range(self.max_draft_len):
             if i == 0:
                 start_ids_gen = (spec_metadata.batch_indices_cuda[:num_gens] *
@@ -335,6 +420,13 @@ class Eagle3OneModelWorker(nn.Module):
                 self.guided_decoder.add_draft_batch(new_tokens,
                                                     num_accepted_tokens,
                                                     draft_step=i)
+
+            # Update attn_metadata.all_rank_num_tokens for attention DP
+            if original_all_rank_num_tokens is not None:
+                if i == 0:
+                    attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
+                elif spec_metadata.all_rank_num_seqs is not None:
+                    attn_metadata.all_rank_num_tokens = spec_metadata.all_rank_num_seqs
 
             hidden_states, hidden_states_to_save = draft_model.model(**inputs)
 
@@ -377,8 +469,6 @@ class Eagle3OneModelWorker(nn.Module):
             elif hasattr(attn_metadata, 'kv_lens_cuda'):
                 attn_metadata.kv_lens_cuda[:batch_size] += 1
             # support attention dp
-            if spec_metadata.all_rank_num_tokens is not None:
-                spec_metadata.all_rank_num_tokens = spec_metadata.all_rank_num_seqs
             inputs = {
                 "input_ids": new_draft_token,
                 "position_ids": position_ids,
@@ -391,6 +481,9 @@ class Eagle3OneModelWorker(nn.Module):
         # restore attn_metadata to support cuda graph
         attn_metadata.restore_from_spec_dec()
         attn_metadata.on_update()
+        # restore all_rank_num_tokens for attention DP
+        if original_all_rank_num_tokens is not None:
+            attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
 
         # prepare next new tokens to support overlap scheduler
         next_new_tokens = accepted_tokens[
@@ -430,8 +523,9 @@ class Eagle3OneModelWorker(nn.Module):
                                          dtype=torch.int,
                                          device=logits.device)
 
-        # Do greedy sampling for the input logits
-        target_tokens = torch.argmax(logits, dim=-1)
+        # Sample tokens using per-request sampling parameters
+        target_tokens = self._sample_tokens_for_batch(logits, spec_metadata,
+                                                      num_contexts, batch_size)
         # context
         accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts]
 
@@ -444,6 +538,12 @@ class Eagle3OneModelWorker(nn.Module):
         num_accepted_tokens[num_contexts:] += torch.cumprod(
             (draft_tokens == gen_target_tokens[:, :self.max_draft_len]).int(),
             dim=-1).sum(1)
+        # Check for environment variable override
+        if self.force_num_accepted_tokens != 0:
+            # total tokens per iteration = accepted draft tokens + 1 target token
+            force_total_tokens = min(self.force_num_accepted_tokens + 1,
+                                     self.max_draft_len + 1)
+            num_accepted_tokens[num_contexts:] = force_total_tokens
         return accepted_tokens, num_accepted_tokens
 
     def draft_decoder(
@@ -452,7 +552,7 @@ class Eagle3OneModelWorker(nn.Module):
         draft_model: nn.Module,
     ):
         '''
-        Sampling draft tokens.
+        Sampling draft tokens with support for non-greedy sampling.
 
         Args:
             logits: torch.Tensor
@@ -467,6 +567,9 @@ class Eagle3OneModelWorker(nn.Module):
                 Draft token ids. Flattened.
         '''
 
+        # Note: using greedy for draft tokens is a bit easier to implement and
+        # faster. It doesn't affect the final output and seems to have a negligible
+        # impact on AR.
         draft_tokens = torch.argmax(logits, dim=-1)
 
         # Apply d2t (offsets between draft model dictionary and main model dictionary).
@@ -520,8 +623,3 @@ class Eagle3OneModelWorker(nn.Module):
             "attn_metadata": attn_metadata,
             "spec_metadata": spec_metadata,
         }
-
-    def set_guided_decoder(self,
-                           guided_decoder: CapturableGuidedDecoder) -> bool:
-        self.guided_decoder = guided_decoder
-        return True

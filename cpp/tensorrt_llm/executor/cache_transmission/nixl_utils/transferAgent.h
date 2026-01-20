@@ -45,7 +45,7 @@ public:
 
     [[nodiscard]] bool isCompleted() const override;
 
-    void wait() const override;
+    [[nodiscard]] TransferState wait(int64_t timeout_ms = -1) const override;
 
 private:
     nixlAgent* mRawAgent{};
@@ -84,9 +84,9 @@ public:
 
     [[nodiscard]] std::unordered_map<std::string, std::vector<SyncMessage>> getNotifiedSyncMessages() override;
 
-    ConnectionInfoType getConnectionInfo() override;
+    ConnectionInfoType getLocalConnectionInfo() override;
 
-    void connectRemoteAgent(std::string const& name, ConnectionInfoType const& connectionInfo) override;
+    void loadRemoteAgent(std::string const& name, ConnectionInfoType const& connectionInfo) override;
 
     bool checkRemoteDescs(std::string const& name, MemoryDescs const& memoryDescs) override;
 

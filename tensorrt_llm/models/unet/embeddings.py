@@ -66,7 +66,7 @@ def get_timestep_embedding(timesteps,
     else:
         emb = concat([sin(emb), cos(emb)], dim=1)
 
-    #TODO Enable below logic when TensorRT-LLM supports pad feature.
+    #TODO Enable below logic when TensorRT LLM supports pad feature.
     # zero pad
     # if embedding_dim % 2 == 1:
     #     emb = torch.nn.functional.pad(emb, (0, 1, 0, 0))

@@ -1,10 +1,10 @@
 # Using Dev Containers
 
-The TensorRT-LLM repository contains a [Dev Containers](https://containers.dev/)
+The TensorRT LLM repository contains a [Dev Containers](https://containers.dev/)
 configuration in `.devcontainer`. These files are intended for
 use with [Visual Studio Code](https://code.visualstudio.com/).
 
-Due to the various container options supported by TensorRT-LLM (see
+Due to the various container options supported by TensorRT LLM (see
 [](/installation/build-from-source-linux.md) and
 <https://github.com/NVIDIA/TensorRT-LLM/tree/main/docker>), the Dev
 Container configuration also offers some degree of customization.

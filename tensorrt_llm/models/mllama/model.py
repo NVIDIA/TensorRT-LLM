@@ -21,7 +21,6 @@ import torch
 
 from tensorrt_llm._common import default_net
 from tensorrt_llm._utils import numpy_to_torch, str_dtype_to_torch
-from tensorrt_llm.bindings import KVCacheType
 from tensorrt_llm.functional import (Conditional, LayerNormPositionType,
                                      LayerNormType, MLPType,
                                      PositionEmbeddingType, Tensor, assertion,
@@ -32,6 +31,7 @@ from tensorrt_llm.layers import (MLP, Attention, AttentionMaskParams,
                                  ColumnLinear, Embedding, FusedGatedMLP,
                                  GatedMLP, GroupNorm, KeyValueCacheParams,
                                  LayerNorm, LoraParams, RmsNorm)
+from tensorrt_llm.llmapi.kv_cache_type import KVCacheType
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules,
                                       use_lora)

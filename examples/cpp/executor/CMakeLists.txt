@@ -91,6 +91,9 @@ if(${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "11.8")
   )
 endif()
 
+add_subdirectory(${TRTLLM_DIR}/3rdparty 3rdparty)
+FetchContent_MakeAvailable(cxxopts)
+
 # tensorrt_llm shared lib
 add_library(tensorrt_llm SHARED IMPORTED)
 set_property(TARGET tensorrt_llm PROPERTY IMPORTED_LOCATION ${TRTLLM_LIB_PATH})
@@ -125,8 +128,8 @@ target_link_libraries(executorExampleLogitsProcessor
 
 # Advanced
 if(NOT TARGET cxxopts::cxxopts)
-  set(CXXOPTS_SRC_DIR ${TRTLLM_DIR}/3rdparty/cxxopts)
-  add_subdirectory(${CXXOPTS_SRC_DIR} ${CMAKE_CURRENT_BINARY_DIR}/cxxopts)
+  add_subdirectory(${CMAKE_BINARY_DIR}/_deps/cxxopts-src
+                   ${CMAKE_CURRENT_BINARY_DIR}/cxxopts)
 endif()
 
 add_executable(executorExampleAdvanced executorExampleAdvanced.cpp)

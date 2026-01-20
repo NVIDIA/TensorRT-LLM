@@ -135,10 +135,12 @@ def _load_tokenizer(tokenizer_dir: Optional[str] = None,
                     tokenizer_type: Optional[str] = None):
     if vocab_file is None:
         if 'whisper' in model_name.lower():
-            tokenizer = AutoTokenizer.from_pretrained('openai/whisper-large-v3',
-                                                      language='english',
-                                                      task='transcribe',
-                                                      predict_timestamps=False)
+            tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_dir or 'openai/whisper-large-v3',
+                language='english',
+                task='transcribe',
+                predict_timestamps=False,
+            )
         elif tokenizer_type == 'language_adapter':
             tokenizer = None
         else:
@@ -304,6 +306,7 @@ def add_common_args(parser):
     parser.add_argument('--repetition_penalty', type=float, default=1.0)
     parser.add_argument('--presence_penalty', type=float, default=0.0)
     parser.add_argument('--frequency_penalty', type=float, default=0.0)
+    parser.add_argument('--prompt_ignore_length', type=int, default=0)
     parser.add_argument('--min_p', type=float, default=0.0)
     parser.add_argument('--beam_search_diversity_rate', type=float, default=0.0)
     parser.add_argument('--random_seed', type=int, default=0)
@@ -358,7 +361,7 @@ def add_common_args(parser):
         default=None,
         nargs="+",
         help=
-        'The attention window size that controls the sliding window attention / cyclic kv cache behavior'
+        'The attention window size that controls the sliding window attention kv cache behavior'
     )
     parser.add_argument(
         '--multi_block_mode',

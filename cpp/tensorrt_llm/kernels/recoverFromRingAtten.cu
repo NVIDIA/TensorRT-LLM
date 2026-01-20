@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/kernels/recoverFromRingAtten.h"
 
@@ -23,8 +24,8 @@
 
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -53,6 +54,10 @@ __global__ void reduce4ring_attention(
     float* softmax_sum = softmax_stats + 1;
     float* max = softmax_stats;
 
+#ifdef __NVCC_DIAG_PRAGMA_SUPPORT__
+#pragma nv_diag_suppress static_var_with_dynamic_init
+// https://nvidia.github.io/cccl/libcudacxx/extended_api/synchronization_primitives/barrier.html
+#endif
     __shared__ cuda::barrier<cuda::thread_scope::thread_scope_block> barrier;
     if (block.thread_rank() == 0)
     {
@@ -113,11 +118,6 @@ template <typename Tout>
 void invokeRecoverFromRA(Tout* accu_output, float* accu_softmax_stats, Tout* output, float* softmax_stats, int b, int s,
     int h, int d, int* cu_seqlens, cudaStream_t stream)
 {
-    float* accu_softmax_sum = accu_softmax_stats;
-    float* accu_softmax_max = accu_softmax_stats + b * s * h;
-    float* softmax_sum = softmax_stats;
-    float* softmax_max = softmax_stats + b * s * h;
-
     int threads_per_block = 128;
     int saturated_s_block_dim = 3000 / b + 1;
     s = s * h;
@@ -139,4 +139,5 @@ INSTANTIATE_RECOVER_RA(half);
 INSTANTIATE_RECOVER_RA(__nv_bfloat16);
 #endif
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

@@ -4,6 +4,278 @@
 
 All published functionality in the Release Notes has been fully tested and verified with known limitations documented. To share feedback about this release, access our [NVIDIA Developer Forum](https://forums.developer.nvidia.com/).
 
+## TensorRT-LLM Release 1.1
+
+### Key Features and Enhancements
+
+- **Model Support**
+  - Add GPT-OSS model support.
+  - Add Hunyuan-Dense model support. Thanks to the contribution from @sorenwu.
+  - Add Hunyuan-MoE model support. Thanks to the contribution from @qianbiaoxiang.
+  - Add Seed-OSS model support. Thanks to the contribution from @Nekofish-L.
+
+- **Features**
+  - **KV Cache & Context:**
+    - **Connector API:** Introduced a new KV Cache Connector API for state transfer in disaggregated serving.
+    - **Reuse & Offloading:** Enabled KV cache reuse for MLA (Multi-Head Latent Attention) and added examples for host offloading.
+    - **Salting:** Implemented KV cache salting for secure cache reuse.
+  - **Speculative Decoding:**
+    - **Guided Decoding Integration:** Enabled guided decoding to work in conjunction with speculative decoding (including 2-model and draft model chunked prefill).
+    - **Eagle:** Added multi-layer Eagle support and optimizations.
+  - **Disaggregated Serving:**
+    - Added support for Guided Decoding in disaggregated mode.
+    - Optimized KV cache transfer for uneven pipeline parallelism.
+  - **Performance:**
+    - **DeepEP:** Optimized low-precision (FP4) combined kernels and all-to-all communication.
+    - **AutoTuner:** Refactored tuning config and generalized tactic selection for better kernel performance.
+    - **CuteDSL:** Integrated CuteDSL NVFP4 grouped GEMM for Blackwell.
+  - **Hardware:**
+    - **B300/GB300:** Added support for B300/GB300.
+- **Benchmark**
+  - **New Benchmarks:**
+    - **Disaggregated Serving:** Added dedicated performance tests for disaggregated serving scenarios (`test_perf.py`).
+    - **Multimodal:** Enabled `benchmark_serving` support for multimodal models.
+    - **NIM:** Added specific performance test cases for NIM (NVIDIA Inference Microservices) integration.
+  - **Tooling Improvements:**
+    - **trtllm-bench:** Added support for sampler options, accurate device iteration timing, and improved data loading for benchmark datasets.
+    - **Metrics:** Enhanced reporting to include KV cache size metrics in benchmark results.
+    - **Scaffolding:** Added benchmark support for scaffolding examples.
+- **Documentation**
+  - **Deployment Guides:** Added comprehensive deployment guides for GPT-OSS, DeepSeek-R1, and VDR 1.0.
+  - **Feature Documentation:** Created new documentation for KV Cache Connector, LoRA feature usage, and AutoDeploy.
+  - **Tech Blogs:** Published blogs on "[Combining Guided Decoding and Speculative Decoding](./blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.md)" and "[ADP Balance Strategy](./blogs/tech_blog/blog10_ADP_Balance_Strategy.md)".
+  - **Quick Start:** Refined Quick Start guides with new links to ModelOpt checkpoints and updated installation steps (Linux/Windows).
+  - **API Reference:** Enhanced LLM API documentation by explicitly labeling stable vs. unstable APIs.
+  - **Performance:** Updated online benchmarking documentation and performance overview pages.
+  - **Examples:** Refined Slurm examples and added K2 tool calling examples.
+
+### Infrastructure Changes
+
+- The base Docker image for TensorRT-LLM is updated to `nvcr.io/nvidia/pytorch:25.10-py3`.
+- The base Docker image for TensorRT-LLM Backend is updated to `nvcr.io/nvidia/tritonserver:25.10-py3`.
+- The dependent public PyTorch version is updated to 2.9.0.
+- The dependent NVIDIA ModelOpt version is updated to 0.37.
+- The dependent xgrammar version is updated to 0.1.25.
+- The dependent transformers version is updated to 4.56.0.
+- The dependent NIXL version is updated to 0.5.0.
+
+### API Changes
+
+- **Breaking Change**: The C++ TRTLLM sampler is now enabled by default, replacing the legacy implementation. A new `sampler_type` argument has been introduced to `SamplingConfig` to explicitly control sampler selection.
+- **KV Cache Connector API:** Introduced a new KV Cache Connector API to facilitate state transfer between Disaggregated Serving workers (Context and Generation phases).
+- **LLM API Enhancements:**
+  - Added support for `prompt_logprobs` in the PyTorch backend.
+  - Standardized `topk` logprob returns across TRT and PyTorch backends.
+  - Added stable labels to arguments in the `LLM` class to better indicate API stability.
+- **Response API:** Added basic functionality for the Responses API to better handle streaming and non-streaming responses.
+- **Multimodal Inputs:** Updated the `MultimodalParams` API to support `SharedTensor`, improving memory management for visual language models.
+- **Wait and Cancel API:** Added tests and support for handling non-existent and completed request cancellations in the executor.
+
+### Fixed Issues
+
+- **DeepSeek-V3/R1:**
+  - Fixed potential hangs in DeepSeek-V3 pipelines by adjusting MNNVL configurations.
+  - Resolved illegal memory access errors in FP8 Scout and DeepSeek models.
+  - Fixed weight loading issues for DeepSeek-R1 W4A8 checkpoints (TP16 scenarios).
+- **Llama 4:** Fixed FP4 generation issues and corrected all-reduce operations in the last decoder layer.
+- **Mistral/Pixtral:** Fixed a batching bug in Mistral 3.1 where processing multiple requests with images in the same batch caused failures.
+- **Qwen:** Fixed Qwen2.5-VL failures related to CUDA graph padding and transformers version compatibility.
+- **Gemma:** Fixed out-of-bounds vector access for models with multiple layer types and resolved accuracy issues in Gemma 2.
+- **Speculative Decoding:**
+  - Fixed race conditions in one-model speculative decoding.
+  - Resolved CUDA graph warmup issues that caused failures when using speculative decoding.
+  - Fixed KV cache recompute logic in `draft_target` speculative decoding.
+- **MoE (Mixture of Experts):**
+  - Fixed OOM issues in fused MoE kernels by optimizing workspace pre-allocation.
+  - Corrected Cutlass MoE integration to fix accuracy issues on Blackwell hardware.
+  - Fixed W4A8 MoE kernel issues on Hopper architecture.
+- **General:**
+  - Fixed a potential hang caused by Python multiprocessing when prefetching weights.
+  - Resolved an issue where `torch.onnx.export` would fail with newer PyTorch versions by correctly falling back to non-dynamo modes.
+  - Fixed numerical stability issues for XQA kernels when using speculative decoding.
+  - Fixed a memory leak in the `cacheTransceiver` that could lead to hangs in disaggregated serving.
+
+### Known Issues
+
+- **GB300 Multi-Node:** Support for GB300 in multi-node configurations is currently in beta and not fully validated in this release. GB300 multi-node configurations have been validated in 1.2.0rc4+.
+
+
+## TensorRT-LLM Release 1.0
+
+TensorRT LLM 1.0 brings 2 major changes: the PyTorch-based architecture is now stable and the default experience, and the LLM API is now stable. For more details on new developments in 1.0, please see below.
+
+### Key Features and Enhancements
+- **Model Support**
+  - Add Mistral3.1 VLM model support
+  - Add TensorRT-Engine Qwen3 (dense) model support
+  - Add phi-4-multimodal model support
+  - Add EXAONE 4.0 model support
+  - Add Qwen3 MoE support to TensorRT backend
+
+- **Features**
+  - Add support for sm121
+  - Add LoRA support for Gemma3
+  - Support PyTorch LoRA adapter eviction
+  - Add LoRA support for PyTorch backend in trtllm-serve
+  - Add support of scheduling attention dp request
+  - Remove padding of FusedMoE in attention DP
+  - Support torch compile for attention dp
+  - Add KV events support for sliding window attention
+  - Add TRTLLM MoE nvfp4 cubins for mid-high concurrency; attention_dp for TRTLLM MoE
+  - Add Piecewise CUDA Graph support for MLA
+  - Support mutliCtasKvMode for high-throughput MLA kernels
+  - Enable kvcache to be reused during request generation
+  - Add ADP schedule balance optimization
+  - Add chunked prefill support for MLA (Blackwell)
+  - Enable Multi-block mode for Hopper spec dec XQA kernel
+  - Add vLLM KV Pool support for XQA kernel
+  - Allow sending more than 2GiB through MPI by using mpi4py.util.pkl5
+  - Add support for fused gate_up_proj scales for FP8 blockwise
+  - Support FP8 row-wise dense GEMM in torch flow
+  - Enable fp8 SwiGLU to minimize host overhead
+  - Add Deepseek R1 FP8 Support on Blackwell
+  - Add support for MXFP8xMXFP4 in pytorch
+  - Support nvfp4 model and fp8 kv cache for MLA chunked prefill (Blackwell)
+  - Opensource MOE MXFP8-MXFP4 implementation
+  - Add support for Modelopt fp8_pb_wo quantization scheme
+  - Support deepEP fp4 post quant all2all dispatch
+  - Fuse w4a8 moe pre-quant scale on Hopper
+  - Support Weight-Only-Quantization in PyTorch Workflow
+  - Add support for per expert activation scaling factors
+  - Add ReDrafter support for Qwen
+  - Enable CUDA Graph for Nemotron-H
+  - Add support for YARN in NemotronNAS models
+  - Switch to internal version of MMProjector in Gemma3
+  - Disable add special tokens for Llama3.3 70B
+  - Auto-enable ngram with concurrency <= 32
+  - Support turning on/off spec decoding dynamically
+  - Support structural tag in C++ runtime and upgrade xgrammar to 0.1.21
+  - Add support for external multimodal embeddings
+  - Add support for disaggregation with pp with pytorch backend
+  - Add status tags to LLM API reference
+  - Support JSON Schema in OpenAI-Compatible API
+  - Support chunked prefill on spec decode 2 model
+  - Add KV cache reuse support for multimodal models
+  - Support nanobind bindings
+  - Add support for two-model engine KV cache reuse
+  - Add Eagle-3 support for qwen3 dense model
+  - Migrate Eagle-3 and draft/target speculation to Drafter
+  - Enable guided decoding with overlap scheduler
+  - Support n-gram speculative decoding with disagg
+  - Add beam search support to the PyTorch Workflow
+  - Add LLGuidance Support for PyTorch Backend
+  - Add NGrams V2 support
+  - Add MTP support for Online EPLB
+  - Support disaggregated serving in TRTLLM Sampler
+  - Add core infrastructure to enable loading of custom checkpoint formats
+  - Support TRTLLM_DEEP_EP_TOKEN_LIMIT to allow run deep-ep on memory-constrained GPUs
+  - Use huge page mapping for host accessible memory on GB200
+  - Add user-provided speculative decoding support
+  - Add streaming scaffolding_llm.generate_async support
+  - Detokenize option in /v1/completions request
+  - Integrate TRT-LLM Gen FP4 block scale MoE with Pytorch workflow kernel autotuner
+  - Remove support for llmapi + TRT backend in Triton
+  - Add request_perf_metrics to triton LLMAPI backend
+  - Add support for Triton request cancellation
+
+- Benchmark:
+  - Add support for benchmarking individual gemms in MOE benchmark (#6080)
+  - Add speculative metrics for trtllm-bench
+  - Add the ability to write a request timeline for trtllm-bench
+  - Add no_kv_cache_reuse option and streaming support for trtllm-serve bench
+  - Add latency support for trtllm-bench
+  - Add Acceptance Rate calculation to benchmark_serving
+  - Add wide-ep benchmarking scripts
+  - Update trtllm-bench to support new Pytorch default
+  - Add support for TRTLLM CustomDataset
+  - Make benchmark_serving part of the library
+
+- Documentation:
+  - Refactored the doc structure to focus on the PyTorch workflow.
+  - Improved the LLMAPI and API reference documentation. Stable APIs are now protected and will remain consistent in subsequent versions following v1.0.
+  - Removed legacy documentation related to the TensorRT workflow.
+
+### Infrastructure Changes
+- The base Docker image for TensorRT-LLM is updated to `nvcr.io/nvidia/pytorch:25.06-py3`.
+- The base Docker image for TensorRT-LLM Backend is updated to `nvcr.io/nvidia/tritonserver:25.06-py3`.
+- The dependent NVIDIA ModelOpt version is updated to 0.33.
+- The dependent xgrammar version is updated to 0.1.21.
+- The dependent transformers version is updated to 4.53.1.
+
+### API Changes
+- **BREAKING CHANGE** Promote PyTorch to be the default LLM backend
+- **BREAKING CHANGE** Change default backend to PyTorch in trtllm-serve
+- **BREAKING CHANGE** Unify KvCacheConfig in LLM class for pytorch backend
+- **BREAKING CHANGE** Rename cuda_graph_config padding_enabled field
+- **BREAKING CHANGE** Rename mixed_sampler to enable_mixed_sampler
+- **BREAKING CHANGE** Rename LLM.autotuner_enabled to enable_autotuner
+- Add back allreduce_strategy parameter into TorchLlmArgs
+- Add LLmArgs option to force using dynamic quantization
+- Change default LoRA cache sizes and change peft_cache_config cache size fields to take effect when not explicitly set in lora_config
+- Remove deprecated LoRA LLM args, that are already specified in lora_config
+- Add request_perf_metrics to LLMAPI
+- Remove batch_manager::KvCacheConfig and use executor::KvCacheConfig instead
+- Remove TrtGptModelOptionalParams
+- Remove ptuning knobs from TorchLlmArgs
+
+
+### Fixed Issues
+- Fix illegal memory access in MLA (#6437)
+- Fix nemotronNAS loading for TP>1 (#6447)
+- Fix wide EP when using DeepEP with online EPLB (#6429)
+- Fix bugs caused by None attention_bias during Qwen3 model convert engine (#6344)
+- Fix PD + MTP + overlap scheduler accuracy issue (#6136)
+- Fix bug of Qwen3 when using fp4 on sm120 (#6065)
+- Fix TMA error with GEMM+AR on TP=2 (#6075)
+- Fix scaffolding aime test in test_e2e (#6140)
+- Fix KV Cache overrides in trtllm-bench (#6103)
+- Fix MOE benchmark to rotate buffers to prevent L2 cache reuse (#4135)
+- Fix eagle3 two model disaggregated serving test (#6014)
+- Fix chunked prefill + overlap scheduling (#5761)
+- Fix mgmn postprocess error (#5835)
+- Fallback to cubins for fp8 fmha kernels on Ada (#5779)
+- Fix disagg + speculative decoding (#5558)
+- Fix test_generate_with_seed CI failure. (#5772)
+- Fix prompt adapter TP2 case (#5782)
+- Fix disaggregate serving with attention DP (#4993)
+- Fix a quote error introduced in #5534 (#5816)
+- Fix the accuracy issue when reduce_fusion is enabled for GEMMA model. (#5801)
+- Fix lost requests for disaggregated serving (#5815)
+- Update unit tests: skip all_close assert for dropout in attention, increase tolerance for rope op test (#5855)
+- Fix GEMM+AR fusion on blackwell (#5563)
+- Fix llama4 multimodal support (#5809)
+- Fix Llama4 Scout FP4 crash issue (#5925)
+- Fix max batch size and max tokens in kv cache estimations for Nemotron-H (#5371)
+- Fix moe regression for sm120 (#5823)
+- Fix Qwen2.5VL FP8 support (#5029)
+- Fix the illegal memory access issue in moe gemm on SM120 (#5636)
+- Fix tileN cannot % 16==0 & support sm89 deepgemm bmm (#5531)
+- Fix incremental detokenization (#5825)
+- Fix MoE workspace info by storing Torch tensor itself instead of data_ptr (#5900)
+- Fix mistral unit tests due to transformers upgrade (#5904)
+- Fix the Llama3.1 405B hanging issue. (#5698) (#5925)
+- Fix Gemma3 unit tests due to transformers upgrade (#5921)
+- Fix alltoall for llama4 (apply_router_weight_on_input=True) (#5902)
+- Remove SpecConfig and fix thread leak issues (#5931)
+- Fast redux detection in trtllm gen routing kernel (#5941)
+- Fix cancel request logic (#5800)
+- Fix errors in wide-ep scripts (#5992)
+- Fix error in post-merge-tests (#5949)
+- Fix missing arg to alltoall_prepare_maybe_dispatch (#5669)
+- Fix attention DP doesn't work with embedding TP (#5642)
+- Fix broken cyclic reference detect (#5417)
+- Fix permission for local user issues in NGC docker container. (#5373)
+- Fix mtp vanilla draft inputs (#5568)
+- Fix mPtrExpertCounts allocation in MoE TRT-LLM backend (nvfp4) (#5519)
+- Fix block scale fp8 support for deepseek v3 on Blackwell. (#5514)
+- Fix the issue MoE autotune fallback failed to query default heuristic (#5520)
+- Fix the unexpected keyword argument 'streaming' (#5436)
+
+### Known Issues
+- When using disaggregated serving with pipeline parallelism and KV cache reuse, a hang can occur. This will be fixed in a future release. In the meantime, disabling KV cache reuse will fix this issue.
+- Running multi-node cases where each node has just a single GPU is known to fail. This will be addressed in a future release.
+- For the Llama 3.x and Llama 4 models, there is an issue with pipeline parallelism when using FP8 and NVFP4 weights. As a workaround, you can set the environment variable `export TRTLLM_LLAMA_EAGER_FUSION_DISABLED=1`.
+
 ## TensorRT-LLM Release 0.21.0
 
 ### Key Features and Enhancements

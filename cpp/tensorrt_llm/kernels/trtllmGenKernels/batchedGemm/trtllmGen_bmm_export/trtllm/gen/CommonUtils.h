@@ -26,6 +26,21 @@ namespace gen
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+//
+// TMA OOB optimization constants.
+//
+// CUDA Programming Guide states that "globalDim must be non-zero and less than or equal to 2^32".
+// In practice, the kernel acts funny with TMA shape of 2^32 so we use 2^31.
+constexpr unsigned long TmaDimMax = 1UL << 31;
+// Chosen so that LargeN * XLargeN * sizeof(dtype) >= 2^64 which causes overflow and effectively
+// becomes 0. As sizeof(dtype) can be as small as 0.5B, we choose LargeN = 2^30 and XLargeN = 2^35
+// so overflow can happen.
+constexpr unsigned long LargeN = 1UL << 30;
+// Used in TMA stride. Should be less than 2^40.
+constexpr unsigned long XLargeN = 1UL << 35;
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 template <typename T>
 inline T ceilDiv(T m, T n)
 {

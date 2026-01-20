@@ -50,8 +50,7 @@ def parse_requirements(filename: os.PathLike):
 
 def sanity_check():
     tensorrt_llm_path = Path(__file__).resolve().parent / "tensorrt_llm"
-    if not ((tensorrt_llm_path / "bindings").exists() or
-            (tensorrt_llm_path / "bindings.pyi").exists()):
+    if not (tensorrt_llm_path / "bindings").exists():
         raise ImportError(
             'The `bindings` module does not exist. Please check the package integrity. '
             'If you are attempting to use the pip development mode (editable installation), '
@@ -73,6 +72,17 @@ def get_version():
         raise RuntimeError(f"Could not set version from {version_file}")
 
     return version
+
+
+def get_license():
+    import sysconfig
+    platform_tag = sysconfig.get_platform()
+    if "x86_64" in platform_tag:
+        return ["LICENSE", "ATTRIBUTIONS-CPP-x86_64.md"]
+    elif "arm64" in platform_tag or "aarch64" in platform_tag:
+        return ["LICENSE", "ATTRIBUTIONS-CPP-aarch64.md"]
+    else:
+        raise RuntimeError(f"Unrecognized CPU architecture: {platform_tag}")
 
 
 class BinaryDistribution(Distribution):
@@ -103,21 +113,29 @@ else:
         'bin/executorWorker', 'libs/libtensorrt_llm.so', 'libs/libth_common.so',
         'libs/libnvinfer_plugin_tensorrt_llm.so',
         'libs/libtensorrt_llm_ucx_wrapper.so', 'libs/libdecoder_attention_0.so',
-        'libs/libtensorrt_llm_nixl_wrapper.so',
-        'libs/libdecoder_attention_1.so', 'libs/nvshmem/License.txt',
-        'libs/nvshmem/nvshmem_bootstrap_uid.so.3',
+        'libs/libtensorrt_llm_nixl_wrapper.so', 'libs/nixl/**/*',
+        'tensorrt_llm_transfer_agent_binding*.so',
+        'tensorrt_llm_transfer_agent_binding.pyi',
+        'libs/libtensorrt_llm_mooncake_wrapper.so', 'libs/ucx/**/*',
+        'libs/libpg_utils.so', 'libs/libdecoder_attention_1.so',
+        'libs/nvshmem/License.txt', 'libs/nvshmem/nvshmem_bootstrap_uid.so.3',
         'libs/nvshmem/nvshmem_transport_ibgda.so.103', 'bindings.*.so',
-        'deep_ep/LICENSE', 'deep_ep_cpp_tllm.*.so', "include/**/*",
-        'deep_gemm/LICENSE', 'deep_gemm/include/**/*', 'deep_gemm_cpp_tllm.*.so'
+        'deep_ep/LICENSE', 'deep_ep/*.py', 'deep_ep_cpp_tllm.*.so',
+        "include/**/*", 'deep_gemm/LICENSE', 'deep_gemm/include/**/*',
+        'deep_gemm/*.py', 'deep_gemm_cpp_tllm.*.so',
+        'scripts/install_tensorrt.sh', 'flash_mla/LICENSE', 'flash_mla/*.py',
+        'flash_mla_cpp_tllm.*.so'
     ]
 
 package_data += [
-    'bindings.pyi',
     'bindings/*.pyi',
     'tools/plugin_gen/templates/*',
     'bench/build/benchmark_config.yml',
     'evaluate/lm_eval_tasks/**/*',
     "_torch/auto_deploy/config/*.yaml",
+    # Include CUDA source for fused MoE align extension so runtime JIT can find it in wheels
+    '_torch/auto_deploy/custom_ops/fused_moe/moe_align_kernel.cu',
+    '_torch/auto_deploy/custom_ops/fused_moe/triton_fused_moe_configs/*'
 ]
 
 
@@ -145,16 +163,71 @@ def download_precompiled(workspace: str, version: str) -> str:
 
 def extract_from_precompiled(precompiled_location: str, package_data: List[str],
                              workspace: str) -> None:
-    """Extract package data (binaries and other materials) from a precompiled wheel to the working directory.
+    """Extract package data (binaries and other materials) from a precompiled wheel or local directory to the working directory.
     This allows skipping the compilation, and repackaging the binaries and Python files in the working directory to a new wheel.
+
+    Supports three source types:
+    - Local directory (git clone structure): e.g., /home/dev/TensorRT-LLM
+    - Local wheel file: e.g., /path/to/tensorrt_llm-*.whl
+    - Remote URL: Downloads and extracts from URL (wheel or tar.gz)
     """
     import fnmatch
+    import shutil
     import tarfile
     import zipfile
     from urllib.request import urlretrieve
 
     from setuptools.errors import SetupError
 
+    # Handle local directory (assuming repo structure)
+    if os.path.isdir(precompiled_location):
+        precompiled_location = os.path.abspath(precompiled_location)
+        print(
+            f"Using local directory as precompiled source: {precompiled_location}"
+        )
+        source_tensorrt_llm = os.path.join(precompiled_location, "tensorrt_llm")
+        if not os.path.isdir(source_tensorrt_llm):
+            raise SetupError(
+                f"Directory {precompiled_location} does not contain a tensorrt_llm folder."
+            )
+
+        # Walk through all files and match using fnmatch (consistent with wheel extraction)
+        for root, dirs, files in os.walk(source_tensorrt_llm):
+            for filename in files:
+                src_file = os.path.join(root, filename)
+                # Get path relative to precompiled_location (e.g., "tensorrt_llm/libs/libtensorrt_llm.so")
+                rel_path = os.path.relpath(src_file, precompiled_location)
+                dst_file = rel_path
+
+                # Skip yaml files
+                if dst_file.endswith(".yaml"):
+                    continue
+
+                # Skip .py files EXCEPT for generated C++ extension wrappers
+                # (deep_gemm, deep_ep, flash_mla Python files are generated during build)
+                if dst_file.endswith(".py"):
+                    allowed_dirs = ("tensorrt_llm/deep_gemm/",
+                                    "tensorrt_llm/deep_ep/",
+                                    "tensorrt_llm/flash_mla/")
+                    if not any(dst_file.startswith(d) for d in allowed_dirs):
+                        continue
+
+                # Check if file matches any pattern using fnmatch (same as wheel extraction)
+                for filename_pattern in package_data:
+                    if fnmatch.fnmatchcase(rel_path,
+                                           f"tensorrt_llm/{filename_pattern}"):
+                        break
+                else:
+                    continue
+
+                dst_dir = os.path.dirname(dst_file)
+                if dst_dir:
+                    os.makedirs(dst_dir, exist_ok=True)
+                print(f"Copying {rel_path} from local directory.")
+                shutil.copy2(src_file, dst_file)
+        return
+
+    # Handle local file or remote URL
     if os.path.isfile(precompiled_location):
         precompiled_path = precompiled_location
         print(f"Using local precompiled file: {precompiled_path}.")
@@ -188,8 +261,19 @@ def extract_from_precompiled(precompiled_location: str, package_data: List[str],
 
     with zipfile.ZipFile(wheel_path) as wheel:
         for file in wheel.filelist:
-            if file.filename.endswith((".py", ".yaml")):
+            # Skip yaml files
+            if file.filename.endswith(".yaml"):
                 continue
+
+            # Skip .py files EXCEPT for generated C++ extension wrappers
+            # (deep_gemm, deep_ep, flash_mla Python files are generated during build)
+            if file.filename.endswith(".py"):
+                allowed_dirs = ("tensorrt_llm/deep_gemm/",
+                                "tensorrt_llm/deep_ep/",
+                                "tensorrt_llm/flash_mla/")
+                if not any(file.filename.startswith(d) for d in allowed_dirs):
+                    continue
+
             for filename_pattern in package_data:
                 if fnmatch.fnmatchcase(file.filename,
                                        f"tensorrt_llm/{filename_pattern}"):
@@ -218,13 +302,19 @@ if use_precompiled:
 
 sanity_check()
 
+with open("README.md", "r", encoding="utf-8") as fh:
+    long_description = fh.read()
+
 # https://setuptools.pypa.io/en/latest/references/keywords.html
 setup(
     name='tensorrt_llm',
     version=get_version(),
-    description='TensorRT-LLM: A TensorRT Toolbox for Large Language Models',
-    long_description=
-    'TensorRT-LLM: A TensorRT Toolbox for Large Language Models',
+    description=
+    ('TensorRT LLM provides users with an easy-to-use Python API to define Large Language Models (LLMs) and supports '
+     'state-of-the-art optimizations to perform inference efficiently on NVIDIA GPUs.'
+     ),
+    long_description=long_description,
+    long_description_content_type="text/markdown",
     author="NVIDIA Corporation",
     url="https://github.com/NVIDIA/TensorRT-LLM",
     download_url="https://github.com/NVIDIA/TensorRT-LLM/tags",
@@ -242,6 +332,7 @@ setup(
     package_data={
         'tensorrt_llm': package_data,
     },
+    license_files=get_license(),
     entry_points={
         'console_scripts': [
             'trtllm-build=tensorrt_llm.commands.build:main',
@@ -260,4 +351,4 @@ setup(
     install_requires=required_deps,
     dependency_links=
     extra_URLs,  # Warning: Dependency links support has been dropped by pip 19.0
-    python_requires=">=3.7, <4")
+    python_requires=">=3.10, <4")

@@ -133,6 +133,9 @@ public:
         frequencyPenalty = fuseValues<FloatType>(
             configs, [&configs](size_t ci) { return configs[ci].frequencyPenalty; },
             layers::DefaultDecodingParams::getFrequencyPenalty());
+        promptIgnoreLength = fuseValues<SizeType32>(
+            configs, [&configs](size_t ci) { return configs[ci].promptIgnoreLength; },
+            layers::DefaultDecodingParams::getPromptIgnoreLength());
         noRepeatNgramSize = fuseValues<SizeType32>(
             configs, [&configs](size_t ci) { return configs[ci].noRepeatNgramSize; },
             layers::DefaultDecodingParams::getNoRepeatNgramSize());
@@ -224,6 +227,7 @@ public:
         SET_FROM_OPTIONAL(repetitionPenalty, RepetitionPenalty, FloatType)
         SET_FROM_OPTIONAL(presencePenalty, PresencePenalty, FloatType)
         SET_FROM_OPTIONAL(frequencyPenalty, FrequencyPenalty, FloatType)
+        SET_FROM_OPTIONAL(promptIgnoreLength, PromptIgnoreLength, SizeType32)
         SET_FROM_OPTIONAL(lengthPenalty, LengthPenalty, FloatType)
         SET_FROM_OPTIONAL(earlyStopping, EarlyStopping, SizeType32)
         SET_FROM_OPTIONAL(noRepeatNgramSize, NoRepeatNgramSize, SizeType32)
@@ -342,6 +346,7 @@ public:
     OptVec<FloatType> repetitionPenalty;   // [1] or [batchSize]
     OptVec<FloatType> presencePenalty;     // [1] or [batchSize]
     OptVec<FloatType> frequencyPenalty;    // [1] or [batchSize]
+    OptVec<SizeType32> promptIgnoreLength; // [1] or [batchSize]
     OptVec<SizeType32> noRepeatNgramSize;  // [1] or [batchSize]
 
     // probs
@@ -377,13 +382,14 @@ public:
             && temperature == other.temperature && originalTemperature == other.originalTemperature
             && minLength == other.minLength && repetitionPenalty == other.repetitionPenalty
             && presencePenalty == other.presencePenalty && frequencyPenalty == other.frequencyPenalty
-            && noRepeatNgramSize == other.noRepeatNgramSize && topK == other.topK && topP == other.topP
-            && randomSeed == other.randomSeed && topPDecay == other.topPDecay && topPMin == other.topPMin
-            && topPResetIds == other.topPResetIds && beamSearchDiversityRate == other.beamSearchDiversityRate
-            && lengthPenalty == other.lengthPenalty && earlyStopping == other.earlyStopping
-            && draftAcceptanceThreshold == other.draftAcceptanceThreshold && topKMedusaHeads == other.topKMedusaHeads
-            && normalizeLogProbs == other.normalizeLogProbs && outputLogProbs == other.outputLogProbs
-            && cumLogProbs == other.cumLogProbs && minP == other.minP && beamWidthArray == other.beamWidthArray;
+            && promptIgnoreLength == other.promptIgnoreLength && noRepeatNgramSize == other.noRepeatNgramSize
+            && topK == other.topK && topP == other.topP && randomSeed == other.randomSeed
+            && topPDecay == other.topPDecay && topPMin == other.topPMin && topPResetIds == other.topPResetIds
+            && beamSearchDiversityRate == other.beamSearchDiversityRate && lengthPenalty == other.lengthPenalty
+            && earlyStopping == other.earlyStopping && draftAcceptanceThreshold == other.draftAcceptanceThreshold
+            && topKMedusaHeads == other.topKMedusaHeads && normalizeLogProbs == other.normalizeLogProbs
+            && outputLogProbs == other.outputLogProbs && cumLogProbs == other.cumLogProbs && minP == other.minP
+            && beamWidthArray == other.beamWidthArray;
     }
 
     SizeType32 getNumReturnBeams() const

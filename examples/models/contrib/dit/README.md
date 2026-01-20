@@ -3,9 +3,9 @@ This document shows how to build and run a [DiT](https://arxiv.org/abs/2212.0974
 
 ## Overview
 
-The TensorRT-LLM DiT implementation can be found in [tensorrt_llm/models/dit/model.py](../../../../tensorrt_llm/models/dit/model.py). The TensorRT-LLM DiT example code is located in [`examples/dit`](./). There are main files to build and run DiT with TensorRT-LLM:
+The TensorRT LLM DiT implementation can be found in [tensorrt_llm/models/dit/model.py](../../../../tensorrt_llm/models/dit/model.py). The TensorRT LLM DiT example code is located in [`examples/dit`](./). There are main files to build and run DiT with TensorRT-LLM:
 
-* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert the DiT model into tensorrt-llm checkpoint format.
+* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert the DiT model into TensorRT LLM checkpoint format.
 * [`sample.py`](./sample.py) to generate images with TensorRT engine(s).
 
 ## Support Matrix
@@ -17,13 +17,13 @@ The TensorRT-LLM DiT implementation can be found in [tensorrt_llm/models/dit/mod
 
 ## Usage
 
-The TensorRT-LLM DiT example code locates at [examples/dit](./). It takes PyTorch weights as input, and builds the corresponding TensorRT engines. The number of TensorRT engines depends on the number of GPUs used to run inference.
+The TensorRT LLM DiT example code locates at [examples/dit](./). It takes PyTorch weights as input, and builds the corresponding TensorRT engines. The number of TensorRT engines depends on the number of GPUs used to run inference.
 
 ### Build DiT TensorRT engine(s)
 
 First, download the pretrained DiT-XL/2 PyTorch checkpoint from the official pytorch implementation repo [here](https://github.com/facebookresearch/DiT/tree/main?tab=readme-ov-file#sampling--), please review its license items before use.
 
-This checkpoint will be converted to the TensorRT-LLM checkpoint format by [`convert_checkpoint.py`](./convert_checkpoint.py). After that, we can build TensorRT engine(s) with the TensorRT-LLM checkpoint.
+This checkpoint will be converted to the TensorRT LLM checkpoint format by [`convert_checkpoint.py`](./convert_checkpoint.py). After that, we can build TensorRT engine(s) with the TensorRT LLM checkpoint.
 
 As for run inference with FP8 quantization, currently only linear layers are supported to be quantized. Make sure that scaling factors for weights are also stored in the quantized checkpoint.
 
@@ -57,7 +57,7 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_fp8/ \
 
 Set `--max_batch_size` to tell how many images at most you would like to generate. We disable `--remove_input_padding` since we don't need to padding DiT's patches. Besides, we disable `--bert_attention_plugin` for better performance, since the plugin's fmha is not supported for DiT's hidden size (72 for DiT-XL).
 
-After build, we can find a `./engine_output` directory, it is ready for running DiT model with TensorRT-LLM now.
+After build, we can find a `./engine_output` directory, it is ready for running DiT model with TensorRT LLM now.
 
 ### Build VAE TensorRT engine
 We can further accelerate VAE decoder by TensorRT.

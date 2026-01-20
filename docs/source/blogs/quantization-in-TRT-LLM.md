@@ -5,7 +5,7 @@ The deployment and inference speed of LLMs are often impeded by limitations in m
 In this blog, we provide an overview of the quantization features in TensorRT-LLM, share benchmark, and offer best practices of selecting the appropriate quantization methods tailored to your specific use case.
 
 ## Quantization in TensorRT-LLM
-TensorRT-LLM offers a best-in-class unified quantization toolkit to significantly speedup DL/GenAI deployment on NVIDIA hardware, while maintaining model accuracy. This toolkit is designed with easy-of-use in mind. You can follow [this user guide](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/quantization) to quantize [supported LLMs](../reference/support-matrix.md#models) with a few lines of codes. We currently focus on providing SOTA **Post-Training Quantization (PTQ)** and will soon expand to more model optimization techniques in the near future.
+TensorRT LLM offers a best-in-class unified quantization toolkit to significantly speedup DL/GenAI deployment on NVIDIA hardware, while maintaining model accuracy. This toolkit is designed with easy-of-use in mind. You can follow [this user guide](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/quantization) to quantize [supported LLMs](../reference/support-matrix.md#models) with a few lines of codes. We currently focus on providing SOTA **Post-Training Quantization (PTQ)** and will soon expand to more model optimization techniques in the near future.
 
 ## Benchmark
 
@@ -63,7 +63,7 @@ Based on specific use cases, users might have different tolerances on accuracy i
 \* The performance and impact are measured on 10+ popular LLMs. We'll follow up with more data points.
 ** Calibration time is subject to the actual model size.
 
-We note that TensorRT-LLM also offers INT8 and FP8 quantization for KV cache. KV cache differs from normal activation because it occupies non-negligible persistent memory under scenarios like large batch sizes or long context lengths. If you're using KV cache on Hopper & Ada GPUs, We recommend using FP8 KV cache over Int8 because the former has a lower accuracy impact than the latter in most tested cases. When switching from FP16 KV cache to FP8 KV cache, it also enables you to run 2-3x larger batch size on H100 machine for models like GPT-J which further brings about 1.5x performance benefit.
+We note that TensorRT LLM also offers INT8 and FP8 quantization for KV cache. KV cache differs from normal activation because it occupies non-negligible persistent memory under scenarios like large batch sizes or long context lengths. If you're using KV cache on Hopper & Ada GPUs, We recommend using FP8 KV cache over Int8 because the former has a lower accuracy impact than the latter in most tested cases. When switching from FP16 KV cache to FP8 KV cache, it also enables you to run 2-3x larger batch size on H100 machine for models like GPT-J which further brings about 1.5x performance benefit.
 
 ## What’s coming next
-TensorRT-LLM continues to make improvements on our quantization features, such as Int4-FP8 AWQ (W4A8) public examples and more model supports. Please stay tuned for our upcoming releases.
+TensorRT LLM continues to make improvements on our quantization features, such as Int4-FP8 AWQ (W4A8) public examples and more model supports. Please stay tuned for our upcoming releases.

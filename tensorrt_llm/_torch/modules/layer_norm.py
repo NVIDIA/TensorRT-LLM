@@ -18,6 +18,8 @@ from typing import Optional, Tuple, Union
 import torch
 from torch import nn
 
+from ..utils import maybe_compile
+
 
 class LayerNorm(nn.Module):
     """Layer normalization module with configurable weight and bias parameters.
@@ -65,6 +67,7 @@ class LayerNorm(nn.Module):
                                  persistent=False)
         self.variance_epsilon = eps
 
+    @maybe_compile(dynamic=True)
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -88,11 +91,11 @@ class LayerNorm(nn.Module):
 
         hidden_states = nn.functional.layer_norm(
             hidden_states,
-            hidden_states.shape[-1],
+            (hidden_states.shape[-1], ),
             weight=self.weight,
             bias=self.bias,
             eps=self.variance_epsilon,
-        )
+        ).to(input_dtype)
 
         if residual is ...:
             return hidden_states

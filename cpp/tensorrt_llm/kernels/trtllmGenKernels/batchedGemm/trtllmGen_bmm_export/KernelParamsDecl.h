@@ -32,64 +32,22 @@ struct KernelParams
     // Maximum number of CTAs in the batch-token dimension.
     static constexpr int MaxNumCtas = 2048;
 
-    // NOTE: TMA out-of-bounds optimization for MoE padded tokens:
-    //
-    // Originally the padded tokens is a 2D tensor [hiddenDim, ctaGridDimY * tileN] with stride [1,
-    // hiddenDim] and box size [tileM, tileN] at pointer p. We waste bandwidth bytes since we only
-    // want to load [0, batchEnd) out of the [0, tileN) box size: batchEnd is a runtime variable while
-    // box size needs to be fixed at compile time.
-    //
-    // To deal with this, we reshape the tensor to 3D: [hiddenDim, tileN, ctaGridDimY * tileN] with
-    // stride [1, hiddenDim, hiddenDim] and box size [tileM, tileN, 1]. For the original 2D
-    // tensor,
-    //
-    //   Offset Coords [ : , ctaIdxY * tileN ],
-    //   Box Sizes     [ : , tileN           ],
-    //   Coords Range  [ : , ctaIdxY * tileN : ctaIdxY * tileN + tileN],
-    //
-    // while we only want load the range [ctaIdxY * tileN, ctaIdxY * tileN + batchEnd), 1 <= batchEnd
-    // <= tileN
-    //
-    // For the reshaped 3D tensor,
-    //
-    //   Offset Coords [ : , tileN - batchEnd ,
-    //                       ctaIdxY * tileN + batchEnd ],
-    //   Box Sizes     [ : , tileN            ,
-    //                       1                          ],
-    //   Coords Range  [ : , tileN - batchEnd : min(tileN, 2 * tileN - batchEnd),
-    //                       ctaIdxY * tileN + batchEnd : ctaIdx * tileN + batchEnd + 1],
-    //
-    // while min(tileN, 2 * tileN - batchEnd) always evaluates to tileN. The unwanted tokens are
-    // essentially filtered out by utilizing the OOB feature of TMA. Since the 2nd and 3rd dimension
-    // has the same stride, we end up loading the following (adding the left and right end of the 2nd
-    // and 3rd dimension ranges):
-    //
-    //   Effective 2D Coords Range
-    //     [ : , tileN + ctaIdxY * tileN : tileN + ctaIdxY * tileN + batchEnd],
-    //
-    // This is exactly the same as the original range except for the offset tileN, thus we also need
-    // to offset the pointer in the opposite direction:
-    //
-    //     Ptr (p) -> Ptr (p - tileN * hiddenDim)
-    //
-    // Due to the restrictions of TMA unit, the above operations requires the TMA descriptor and the
-    // underlying buffer be constructed differently:
-    // - Requires valid buffer at (p - tileN * hidden) - needs prepending `tileN` tokens.
-    // - TMA outermost dimension must be extended by `tileN` or loads will OOB in the rightmost side.
-    // The latter is because when batchEnd == tileN, the offset coords in the 3rd dimension becomes
-    // ctaIdxY * tileN + tileN. When ctaIdxY = ctaGridDimY - 1, it becomes ((ctaGridDimY - 1) * tileN
-    // + tileN = ctaGridDimY * tileN which is equal to the 3rd dimension size and will be filtered
-    // out. That's why we need to extend the tensor size by tileN.
     //
     // TMA descriptor for A.
     // Must be setup using gemm::buildNdTmaDescriptor with shapes and strides from
     // makeTmaShapeStrideAbc.
     //
     // If batchM:
-    //    Logical shape is [sum(divUpMul(M[bi], tileM) for bi in B), K].
-    //    Logical strides are [K, 1].
-    //    Tile box shape is [tileM, tileK].
-    //    Tile box strides are [tileK, 1].
+    //    If batchStrideInTokens > 0:
+    //       Logical shape is [sum(divUpMul(M[bi], tileM) for bi in B), K].
+    //       Logical strides are [K, 1].
+    //       Tile box shape is [tileM, tileK].
+    //       Tile box strides are [tileK, 1].
+    //    Else // batchStrideInTokens == 0:
+    //       Logical shape is [M, K].
+    //       Logical strides are [K, 1].
+    //       Tile box shape is [tileM, tileK].
+    //       Tile box strides are [tileK, 1].
     //
     // If batchN:
     //    If layoutA is MatrixLayout::MajorK
@@ -135,10 +93,16 @@ struct KernelParams
     //       where blockK is 128B.
     //
     // If batchN:
-    //    Logical shape is [sum(divUpMul(N[bi], tileN) for bi in B), K].
-    //    Logical strides are [K, 1].
-    //    Tile box shape is [tileN, tileK].
-    //    Tile box strides are [tileK, 1].
+    //    If batchStrideInTokens > 0:
+    //       Logical shape is [sum(divUpMul(N[bi], tileN) for bi in B), K].
+    //       Logical strides are [K, 1].
+    //       Tile box shape is [tileN, tileK].
+    //       Tile box strides are [tileK, 1].
+    //    Else // batchStrideInTokens == 0:
+    //       Logical shape is [N, K].
+    //       Logical strides are [K, 1].
+    //       Tile box shape is [tileN, tileK].
+    //       Tile box strides are [tileK, 1].
     //
     // Dtype is set from options.mDtypeB.
     CUtensorMap tmaB[1];
@@ -495,6 +459,10 @@ struct KernelParams
     // If isStaticBatch == true, totalNumPaddedTokens is used, otherwise ptrTotalNumPaddedTokens.
     int32_t totalNumPaddedTokens;
 
+    // Total number of padded tokens - used as the stride for the output activation
+    // and C scaling factors. This is only used when isUniformNumTokensPerBatch is true.
+    int32_t totalNumOutputPaddedTokens;
+
     // A map from CTA index X/Y to batch index.
     // Check ptrCtaIdxXyToBatchIdx to see how it is computed.
     // If isStaticBatch == true, ctaIdxXyToBatchIdx is used, otherwise ptrCtaIdxXyToBatchIdx.
@@ -505,6 +473,14 @@ struct KernelParams
     // Check ptrCtaIdxXyToMnLimit to see how it is computed.
     // If isStaticBatch == true, ctaIdxXyToMnLimit is used, otherwise ptrCtaIdxXyToMnLimit.
     int32_t ctaIdxXyToMnLimit[MaxNumCtas];
+
+    // Total number of CTAs in the token dimension per batch.
+    // Used only when isUniformNumTokensPerBatch is true.
+    int32_t ctasInTokenDimPerBatch{0};
+
+    // Stride for the batched dimension in the number of CTAs.
+    // Used only when isUniformNumTokensPerBatch is true.
+    int32_t batchStrideInCtas{0};
 
     //////////////////////////////////////////////////////////////////////////////////////////////////
     //

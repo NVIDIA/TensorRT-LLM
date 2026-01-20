@@ -1,13 +1,18 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2011-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * SPDX-FileCopyrightText: Copyright (c) 2011-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #pragma once
@@ -344,7 +349,7 @@ inline __device__ void device_flash_attention_nl(Params const& params)
     fmha::Clear_accumulator<Acc_type_o, Cta_tile_o::WARPS_K>::apply(acc_o);
 
     // Flash attention updater
-    fmha::Tile_o_normalizer<Traits_o, Cta_tile_o, Kernel_traits::SAGE_ATTENTION> acc_o_normalizer;
+    fmha::Tile_o_normalizer<Traits_o, Cta_tile_o, Kernel_traits::SAGE_ATTENTION> acc_o_normalizer(params, binfo);
     if constexpr (Kernel_traits::SAGE_ATTENTION)
     {
         acc_o_normalizer.move_to_first_block(params, bidb, bidh);
@@ -709,6 +714,8 @@ inline __device__ void device_flash_attention_nl(Params const& params)
         }
     } // Inner loop over the key/value sequence length.
 
+    // Update the sum if attention sinks are used.
+    acc_o_normalizer.update_sum(global_max, global_sum);
     // Update acc_o of flash attention
     acc_o_normalizer.final_update(acc_o, global_sum);
 

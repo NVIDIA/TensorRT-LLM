@@ -1,0 +1,450 @@
+version: 0.0.1
+llm_perf_core:
+# ===============================================================================
+# Test Conditions Index
+# ===============================================================================
+# 1: All GPUs common tests
+# 2: L20, L40S, H100, H20, H200, GB200, B200, B300, GB300, RTX-6000D, RTX-6000-Server test cases
+# 3: A100, L20, L40S, H100, H20, H200
+# 4: A100, L40S, H100, H20, H200
+# 5: A100, H100, H20, H200 test cases
+# 6: L40S, H100, H200, H20 test cases
+# 7: H100, H200, H20 test cases
+# 8: L20, L40S, H100, H200, H20 test cases
+# 9: H100, H20, H200, GB200, B200, B300, GB300, RTX6000-D, RTX6000-Server test cases
+# 10: GB200, B200, B300, GB300, RTX6000-Server test cases
+# 11: B200, GB200, B300, GB300 test cases
+# 12: B200, B300 test cases
+# 13: H100, H20, H200, B200, B300 test cases
+# 14: H100, H20, H200, B200, B300, RTX-6000 Server test cases
+# 15: RTX-6000D, RTX-6000 Server test cases
+# 16: RTX6000-Server test cases
+# ===============================================================================
+
+
+# 1: All GPUs common tests
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 2
+  tests:
+  - perf/test_perf.py::test_perf[bielik_11b_v2.2_instruct-bench-pytorch-bfloat16-input_output_len:1000,1000-con:250]
+  - perf/test_perf.py::test_perf[mistral_small_v3.1_24b-bench-pytorch-bfloat16-input_output_len:1000,2000-reqs:500-con:200-gpus:2]
+  - perf/test_perf.py::test_perf[mistral_small_v3.1_24b-bench-pytorch-bfloat16-input_output_len:1000,2000-reqs:500-con:200]
+  - perf/test_perf.py::test_perf[mistral_small_v3.1_24b-bench-pytorch-bfloat16-maxbs:1-input_output_len:1000,2000-reqs:8-con:1-gpus:2]
+  - perf/test_perf.py::test_perf[mistral_small_v3.1_24b-bench-pytorch-bfloat16-maxbs:1-input_output_len:1000,2000-reqs:8-con:1]
+  - perf/test_perf.py::test_perf[mistral_small_v3.1_24b-bench-pytorch-bfloat16-maxbs:1-maxnt:20000-input_output_len:20000,2000-reqs:8-con:1-gpus:2] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[phi_4_multimodal_instruct-bench-pytorch-bfloat16-input_output_len:1000,1000-con:250]
+  - perf/test_perf.py::test_perf[phi_4_multimodal_instruct-bench-pytorch-bfloat16-input_output_len:128,128]
+  - perf/test_perf.py::test_perf[phi_4_multimodal_instruct-bench-pytorch-bfloat16-input_output_len:500,2000-con:250]
+  - perf/test_perf.py::test_perf[phi_4_multimodal_instruct-bench-pytorch-bfloat16-input_output_len:512,32]
+
+
+# 2: L20, L40S, H100, H20, H200, GB200, B200, B300, GB300, RTX-6000D, RTX-6000-Server test cases
+- condition:
+    terms:
+      supports_fp8: true
+  tests:
+  - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct_fp8-bench-pytorch-float8-input_output_len:2000,500]
+  - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct_fp8-bench-pytorch-float8-input_output_len:500,2000]
+  - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct_fp8-bench-pytorch-float8-input_output_len:128,128]
+
+
+# 3: A100, L20, L40S, H100, H20, H200
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 2
+      compute_capability:
+        lt: 10.0
+  tests:
+  # E2E trtllm-bench
+  #llama_v3.1_8b_instruct
+  #pytorch backend
+  - perf/test_perf.py::test_perf[llama_v3.1_8b-bench-pytorch-bfloat16-input_output_len:128,128]
+  - perf/test_perf.py::test_perf[llama_v3.1_8b-bench-pytorch-bfloat16-input_output_len:512,32]
+  - perf/test_perf.py::test_perf[llama_v3.1_8b-bench-pytorch-streaming-bfloat16-input_output_len:128,128]
+
+  - perf/test_perf.py::test_perf[qwen2_7b_instruct-bench-pytorch-float16-input_output_len:128,128]
+  - perf/test_perf.py::test_perf[starcoder2_3b-bench-pytorch-bfloat16-input_output_len:512,200]
+  - perf/test_perf.py::test_perf[starcoder2_3b-bench-pytorch-bfloat16-input_output_len:500,2000-con:50]
+  - perf/test_perf.py::test_perf[starcoder2_7b-bench-pytorch-bfloat16-input_output_len:500,2000-con:50]
+  - perf/test_perf.py::test_perf[starcoder2_15b-bench-pytorch-bfloat16-input_output_len:500,2000-con:100]
+  - perf/test_perf.py::test_perf[mistral_7b_v0.1-bench-pytorch-float16-input_output_len:128,128]
+
+  # Ministral-8B
+  - perf/test_perf.py::test_perf[ministral_8b-bench-pytorch-bfloat16-maxbs:1-maxnt:5000-input_output_len:5000,500-reqs:8-con:1]
+  - perf/test_perf.py::test_perf[ministral_8b-bench-pytorch-bfloat16-maxbs:1-input_output_len:500,2000-reqs:8-con:1]
+  - perf/test_perf.py::test_perf[ministral_8b-bench-pytorch-bfloat16-maxnt:5000-input_output_len:5000,500-reqs:500-con:250]
+  - perf/test_perf.py::test_perf[ministral_8b-bench-pytorch-bfloat16-input_output_len:500,2000-reqs:500-con:250]
+  # Ministral-8B LoRA tests (using dummy Mistral LoRA checkpoint)
+  - perf/test_perf.py::test_perf[ministral_8b-bench-pytorch-bfloat16-maxbs:2-maxnt:1024-input_output_len:128,128-loras:1-reqs:8-con:2]
+  # Phi-4-multimodal-instruct with chunked prefill and kv_cache_reuse
+  - perf/test_perf.py::test_perf[phi_4_multimodal_instruct-bench-pytorch-bfloat16-maxbs:48-maxnt:256-input_output_len:500,2000-con:250]
+  - perf/test_perf.py::test_perf[phi_4_multimodal_instruct-bench-pytorch-bfloat16-maxbs:128-maxnt:512-input_output_len:1000,1000-con:250]
+  # Bielik-11B-v2.2-Instruct
+  - perf/test_perf.py::test_perf[bielik_11b_v2.2_instruct-bench-pytorch-bfloat16-input_output_len:128,128]
+  - perf/test_perf.py::test_perf[bielik_11b_v2.2_instruct-bench-pytorch-bfloat16-input_output_len:512,32]
+  - perf/test_perf.py::test_perf[bielik_11b_v2.2_instruct-bench-pytorch-bfloat16-input_output_len:2000,2000-con:250]
+  #pytorch backend
+  - perf/test_perf.py::test_perf[phi_4_mini_instruct-bench-pytorch-bfloat16-input_output_len:500,2000]
+  - perf/test_perf.py::test_perf[phi_4_mini_instruct-bench-pytorch-bfloat16-input_output_len:2000,500]
+  - perf/test_perf.py::test_perf[phi_4_mini_instruct-bench-pytorch-bfloat16-input_output_len:128,128]
+  - perf/test_perf.py::test_perf[phi_4_mini_instruct-bench-pytorch-bfloat16-input_output_len:512,32]
+  # Mistral-Small-3.1-24B-Instruct-2503 with chunked prefill and kv_cache_reuse
+  - perf/test_perf.py::test_perf[mistral_small_v3.1_24b-bench-pytorch-bfloat16-maxbs:48-maxnt:256-input_output_len:1000,2000-reqs:500-con:200]
+  - perf/test_perf.py::test_perf[mistral_small_v3.1_24b-bench-pytorch-bfloat16-maxbs:128-maxnt:512-input_output_len:1000,2000-reqs:500-con:200]
+    #llama_v3.1_8b
+  - perf/test_perf.py::test_perf[llama_v3.1_8b-bench-pytorch-streaming-bfloat16-input_output_len:128,128-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.1_8b-bench-pytorch-bfloat16-maxbs:256-input_output_len:128,128-gpus:2]
+  #mixtral_8x7b_v0.1
+  #pytorch backend
+  - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1-bench-pytorch-float16-input_output_len:128,128-loras:8-gpus:2]
+  #llama_v3.2_1b
+  #pytorch backend
+  - perf/test_perf.py::test_perf[llama_v3.2_1b-bench-pytorch-bfloat16-input_output_len:2000,500-reqs:10-con:1-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.2_1b-bench-pytorch-bfloat16-input_output_len:500,2000-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.2_1b-bench-pytorch-bfloat16-input_output_len:128,128-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.2_1b-bench-pytorch-bfloat16-input_output_len:512,32-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.2_1b-bench-pytorch-bfloat16-input_output_len:512,200-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.2_1b-bench-pytorch-bfloat16-input_output_len:500,2000-reqs:10-con:1-gpus:2]
+  #Mistral-Small-3.1-24B-Instruct-2503
+  - perf/test_perf.py::test_perf[mistral_small_v3.1_24b-bench-pytorch-bfloat16-maxbs:4096-maxnt:20000-input_output_len:20000,2000-reqs:500-con:200-gpus:2] TIMEOUT(120)
+
+
+# 4: A100, L40S, H100, H20, H200
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+      compute_capability:
+        lt: 10.0
+  tests:
+  - perf/test_perf.py::test_perf[llama_v3.1_70b-bench-pytorch-streaming-bfloat16-input_output_len:128,128-gpus:4]
+  - perf/test_perf.py::test_perf[llama_v3.1_70b-bench-pytorch-streaming-bfloat16-input_output_len:512,32-gpus:4]
+  - perf/test_perf.py::test_perf[llama_v3.1_70b-bench-pytorch-bfloat16-input_output_len:128,128-gpus:4]
+  - perf/test_perf.py::test_perf[llama_v3.1_70b-bench-pytorch-bfloat16-input_output_len:512,32-gpus:4]
+
+# 5: A100, H100, H20, H200 test cases
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 8
+      compute_capability:
+        lt: 10.0
+      gpu_memory:
+        gt: 80000
+  tests:
+  - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1-bench-pytorch-float16-input_output_len:128,128-gpus:2]
+  - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1-bench-pytorch-streaming-float16-input_output_len:128,128-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.1_70b_instruct-bench-pytorch-bfloat16-input_output_len:2000,200-reqs:64-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v3.1_70b_instruct-bench-pytorch-streaming-bfloat16-input_output_len:2000,200-reqs:64-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct-bench-pytorch-bfloat16-input_output_len:500,2000-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct-bench-pytorch-bfloat16-input_output_len:2000,500-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v3.1_70b_instruct-bench-pytorch-bfloat16-input_output_len:200,2000-reqs:64-con:200-gpus:8]
+
+
+# 6: L40S, H100, H200, H20 test cases
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 8
+      compute_capability:
+        gt: 8.0
+        lte: 9.0
+  tests:
+  - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp8-bench-pytorch-float8-input_output_len:500,2000-gpus:4]
+  - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp8-bench-pytorch-float8-input_output_len:1000,1000-gpus:4]
+  - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp8-bench-pytorch-float8-input_output_len:2000,500-gpus:4]
+  - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp8-bench-pytorch-float8-input_output_len:128,128-gpus:4]
+  - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp8-bench-pytorch-float8-input_output_len:512,32-gpus:4]    #llama_v3.3_70b_instruct_fp8
+  - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp8-bench-pytorch-streaming-float8-input_output_len:512,32-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp8-bench-pytorch-float8-input_output_len:512,32-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp8-bench-pytorch-float8-input_output_len:2000,200-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp8-bench-pytorch-streaming-float8-input_output_len:2000,200-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v3.1_70b_instruct_fp8-bench-pytorch-float8-input_output_len:128,128-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v3.1_70b_instruct_fp8-bench-pytorch-float8-input_output_len:2000,200-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v3.1_70b_instruct_fp8-bench-pytorch-float8-input_output_len:1000,1000-gpus:8]
+
+
+# 7: H100, H200, H20 test cases
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 8
+      compute_capability:
+        gte: 9.0
+        lte: 9.0
+  tests:
+  # deepseek_v3_lite_fp8
+  - perf/test_perf.py::test_perf[deepseek_v3_lite_fp8-bench-pytorch-float8-input_output_len:2000,500]
+  - perf/test_perf.py::test_perf[deepseek_v3_lite_fp8-bench-pytorch-streaming-float8-input_output_len:2000,500]
+  - perf/test_perf.py::test_perf[deepseek_v3_lite_fp8-bench-pytorch-float8-input_output_len:500,2000]
+  - perf/test_perf.py::test_perf[deepseek_v3_lite_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048-kv_frac:0.85-input_output_len:3000,500-reqs:200]
+  - perf/test_perf.py::test_perf[deepseek_v3_lite_fp8-bench-pytorch-streaming-float8-input_output_len:128,128]
+  - perf/test_perf.py::test_perf[mistral_small_v3.1_24b-bench-pytorch-bfloat16-maxbs:4096-maxnt:20000-input_output_len:20000,2000-reqs:500-con:200] TIMEOUT(120)
+
+# 8: L20, L40S, H100, H200, H20 test cases
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 2
+      compute_capability:
+        gt: 8.0
+        lte: 9.0
+  tests:
+  #pytorch backend
+  - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct_fp8-bench-pytorch-float8-input_output_len:512,32]
+  - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct_fp8-bench-pytorch-float8-input_output_len:1000,1000]
+  - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct_fp8-bench-pytorch-float8-input_output_len:128,128-loras:1-reqs:100-con:2-gpus:1]
+  - perf/test_perf.py::test_perf[bielik_11b_v2.2_instruct_fp8-bench-pytorch-float8-input_output_len:1000,1000-con:250]
+  - perf/test_perf.py::test_perf[bielik_11b_v2.2_instruct_fp8-bench-pytorch-float8-input_output_len:2000,2000-con:250]
+  # Ministral-8B FP8
+  - perf/test_perf.py::test_perf[ministral_8b_fp8-bench-pytorch-float8-maxbs:1-maxnt:5000-input_output_len:5000,500-reqs:8-con:1]
+  - perf/test_perf.py::test_perf[ministral_8b_fp8-bench-pytorch-float8-maxbs:1-input_output_len:500,2000-reqs:8-con:1]
+  - perf/test_perf.py::test_perf[ministral_8b_fp8-bench-pytorch-float8-maxnt:5000-input_output_len:5000,500-reqs:500-con:250]
+  - perf/test_perf.py::test_perf[ministral_8b_fp8-bench-pytorch-float8-input_output_len:500,2000-reqs:500-con:250]
+    #mixtral_8x7b_v0.1_fp8 pytorch backend
+  - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1_instruct_fp8-bench-pytorch-float8-input_output_len:128,128-gpus:2]
+  - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1_instruct_fp8-bench-pytorch-float8-input_output_len:512,32-gpus:2]
+
+# 9: H100, H20, H200, GB200, B200, B300, GB300, RTX6000-D, RTX6000-Server test cases
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 2
+      compute_capability:
+        gte: 9.0
+        lte: 12.0
+  tests:
+  - perf/test_perf.py::test_perf[mistral_small_v3.1_24b-bench-pytorch-bfloat16-maxbs:1-maxnt:20000-input_output_len:20000,2000-reqs:8-con:1] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[phi_4_multimodal_instruct_audio-bench-pytorch-bfloat16-input_output_len:1000,1000-loras:1-con:250]
+  - perf/test_perf.py::test_perf[phi_4_multimodal_instruct_image-bench-pytorch-bfloat16-input_output_len:1000,1000-loras:1-con:250]
+  - perf/test_perf.py::test_perf[deepseek_v3_lite_fp8-bench-pytorch-float8-input_output_len:128,128]
+  - perf/test_perf.py::test_perf[qwen3_235b_a22b_fp8-bench-pytorch-float8-input_output_len:1000,2000-con:256-ep:8-gpus:8]
+
+
+# 10: GB200, B200, B300, GB300, RTX6000-Server test cases
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+      compute_capability:
+        gte: 10.0
+        lte: 12.0
+  tests:
+  - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct-bench-pytorch-bfloat16-input_output_len:128,128]
+  - perf/test_perf.py::test_perf[llama_v3.1_8b-bench-bfloat16-maxbs:256-input_output_len:512,32-quant:fp8]
+  - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct_fp8-bench-pytorch-streaming-float8-input_output_len:2000,500]
+  - perf/test_perf.py::test_perf[mistral_7b_v0.1-bench-float16-input_output_len:1000,1000-quant:fp8]
+  - perf/test_perf.py::test_perf[mistral_7b_v0.1-bench-float16-input_output_len:500,2000-quant:fp8]
+  - perf/test_perf.py::test_perf[deepseek_v3_lite_nvfp4-bench-pytorch-streaming-float4-maxbs:2048-maxnt:8192-input_output_len:256,256-reqs:200]
+  #Mistral-Small-3.1-24B-Instruct-2503
+  - perf/test_perf.py::test_perf[mistral_small_v3.1_24b-bench-pytorch-bfloat16-maxbs:4096-maxnt:20000-input_output_len:20000,2000-reqs:300-con:200] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[llama_v3.1_8b-bench-bfloat16-input_output_len:128,128-quant:nvfp4-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp8-bench-float8-maxbs:256-input_output_len:128,128-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp8-bench-float8-maxbs:256-input_output_len:512,32-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.1_70b_instruct_fp8-bench-pytorch-float8-maxbs:256-input_output_len:128,128-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp8-bench-pytorch-float8-maxbs:256-input_output_len:512,32-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp8-bench-pytorch-streaming-float8-maxbs:256-input_output_len:512,32-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v2_13b-bench-float16-input_output_len:128,128-loras:8-gpus:2]
+  #Mistral-Small-3.1-24B-Instruct-2503
+  - perf/test_perf.py::test_perf[mistral_small_v3.1_24b-bench-pytorch-bfloat16-maxbs:4096-maxnt:20000-input_output_len:20000,2000-reqs:300-con:200-gpus:2] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[starcoder_15b-bench-float16-input_output_len:512,200-gpus:4]
+  - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:512-input_output_len:128,128-ep:4-tp:4-gpus:4]
+  - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-streaming-float4-maxbs:512-input_output_len:128,128-ep:4-tp:4-gpus:4]
+  - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-float4-kv_frac:0.85-input_output_len:1000,1000-reqs:2000-ep:4-tp:4-gpus:4] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-float4-kv_frac:0.85-input_output_len:1000,2000-reqs:3000-ep:4-tp:4-gpus:4] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:1000-maxnt:5000-kv_frac:0.85-input_output_len:5000,500-reqs:20000-ep:4-tp:4-gpus:4] TIMEOUT(120)
+  #llama_v3.1_405b_instruct_fp4
+  - perf/test_perf.py::test_perf[llama_v3.1_405b_instruct_fp4-bench-pytorch-float4-kv_frac:0.85-input_output_len:128,128-gpus:4]
+  - perf/test_perf.py::test_perf[llama_v3.1_405b_instruct_fp4-bench-pytorch-float4-kv_frac:0.85-input_output_len:1000,1000-gpus:4]
+  - perf/test_perf.py::test_perf[llama_v3.1_405b_instruct_fp4-bench-pytorch-float4-maxbs:1024-maxnt:4096-kv_frac:0.85-input_output_len:1024,2048-gpus:4]
+  - perf/test_perf.py::test_perf[llama_v3.1_405b_instruct_fp4-bench-pytorch-float4-maxbs:4096-maxnt:20000-kv_frac:0.85-input_output_len:20000,2000-gpus:4] TIMEOUT(120)
+  #llama_v3.3_70b_instruct_fp4
+  - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp4-bench-pytorch-float4-input_output_len:128,128-gpus:4]
+  - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp4-bench-pytorch-float4-input_output_len:512,32-gpus:4]
+  - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp4-bench-pytorch-float4-maxbs:1024-maxnt:4096-kv_frac:0.85-input_output_len:1000,1000-reqs:1000-gpus:4]
+  - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp4-bench-pytorch-float4-maxbs:4096-maxnt:20000-kv_frac:0.85-input_output_len:20000,2000-reqs:200-gpus:4] TIMEOUT(120)
+  #llama_v4_scout_17b_16e_instruct_fp4
+  - perf/test_perf.py::test_perf[llama_v4_scout_17b_16e_instruct_fp4-bench-pytorch-float4-input_output_len:128,128-gpus:4]
+  - perf/test_perf.py::test_perf[llama_v4_scout_17b_16e_instruct_fp4-bench-pytorch-float4-maxbs:1024-maxnt:4096-kv_frac:0.85-input_output_len:500,2000-reqs:500-gpus:4]
+  - perf/test_perf.py::test_perf[llama_v4_scout_17b_16e_instruct_fp4-bench-pytorch-float4-maxbs:1024-maxnt:4096-kv_frac:0.85-input_output_len:1000,1000-reqs:500-gpus:4]
+  - perf/test_perf.py::test_perf[llama_v4_scout_17b_16e_instruct_fp4-bench-pytorch-float4-maxbs:4096-maxnt:20000-kv_frac:0.85-input_output_len:20000,2000-reqs:200-gpus:4] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[qwen3_235b_a22b_fp4-bench-pytorch-float4-input_output_len:1000,2000-con:512-ep:4-gpus:4]
+
+
+# 11: B200, GB200 B300, GB300 test cases
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+      compute_capability:
+        gte: 10.0
+        lte: 10.3
+  tests:
+  # for chunked prefill cases
+  - perf/test_perf.py::test_perf[deepseek_v3_lite_nvfp4-bench-pytorch-float4-maxbs:512-maxnt:2048-kv_frac:0.85-input_output_len:3000,500-reqs:200]
+  - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:512-maxnt:2048-kv_frac:0.85-input_output_len:5000,500-reqs:200-ep:4-tp:4-gpus:4] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:256-maxnt:1024-kv_frac:0.85-input_output_len:2000,2000-reqs:200-ep:4-tp:4-gpus:4] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:1000-maxnt:5000-kv_frac:0.85-input_output_len:5000,500-reqs:2000-ep:4-tp:4-gpus:4] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:32-maxnt:32768-input_output_len:8192,1024-reqs:20-con:1-ep:1-tp:4-gpus:4] TIMEOUT(120)
+
+# 12: B200, B300 test cases
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 8
+      compute_capability:
+        gte: 10.0
+        lte: 10.3
+  tests:
+  - perf/test_perf.py::test_perf[kimi_k2_nvfp4-bench-pytorch-float4-maxbs:16-input_output_len:128,128-reqs:20-con:1-ep:8-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[kimi_k2_nvfp4-bench-pytorch-float4-maxbs:256-input_output_len:2000,500-ep:8-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[kimi_k2_nvfp4-bench-pytorch-float4-maxbs:512-maxnt:2048-kv_frac:0.6-input_output_len:1000,1000-ep:8-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[kimi_k2_nvfp4-bench-pytorch-float4-maxbs:512-maxnt:2048-kv_frac:0.6-input_output_len:5000,500-reqs:2000-ep:8-tp:8-gpus:8] TIMEOUT(120)
+
+# 13: H100, H20, H200, B200, B300 test cases
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 8
+      compute_capability:
+        gte: 9.0
+        lt: 12.0
+  tests:
+  # E2E trtllm-bench
+  #mixtral_8x7b_v0.1_instruct
+  #pytorch backend
+  - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1_instruct-bench-pytorch-float16-input_output_len:128,128-reqs:64-gpus:8] # timeout for a100
+  - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1_instruct-bench-pytorch-float16-input_output_len:128,128-reqs:10-con:50-gpus:8] # timeout for a100
+  - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1_instruct-bench-pytorch-float16-input_output_len:128,128-reqs:10-con:1-gpus:8] # timeout for a100
+  # llama_v3.1_405b_fp8
+  #pytorch backend
+  - perf/test_perf.py::test_perf[llama_v3.1_405b_instruct_fp8-bench-pytorch-float8-maxbs:1-input_output_len:2000,500-reqs:8-con:1-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v3.1_405b_instruct_fp8-bench-pytorch-float8-maxbs:1024-maxnt:5000-kv_frac:0.85-input_output_len:5000,500-reqs:1500-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v3.1_405b_instruct_fp8-bench-pytorch-float8-maxbs:1024-maxnt:4096-kv_frac:0.85-input_output_len:1000,1000-reqs:3000-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v3.1_405b_instruct_fp8-bench-pytorch-float8-maxbs:4096-maxnt:20000-kv_frac:0.85-input_output_len:20000,2000-reqs:1000-tp:8-gpus:8] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[llama_v3.1_405b_instruct_fp8-bench-pytorch-float8-input_output_len:128,128-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v3.1_405b_instruct_fp8-bench-pytorch-float8-input_output_len:512,32-tp:8-gpus:8]
+  #llama_v3.3_70b_instruct_fp8
+  #pytorch backend
+  - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp8-bench-pytorch-float8-maxbs:4096-maxnt:20000-kv_frac:0.85-input_output_len:20000,2000-reqs:1000-tp:8-gpus:8] TIMEOUT(120)
+
+  #llama_v4_maverick_17b_128e_instruct_fp8
+  #pytorch backend
+  - perf/test_perf.py::test_perf[llama_v4_maverick_17b_128e_instruct_fp8-bench-pytorch-float8-maxbs:1024-maxnt:4096-kv_frac:0.85-input_output_len:2000,500-reqs:3000-ep:8-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v4_maverick_17b_128e_instruct_fp8-bench-pytorch-float8-maxbs:1024-maxnt:4096-kv_frac:0.85-input_output_len:500,2000-reqs:3000-ep:8-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v4_maverick_17b_128e_instruct_fp8-bench-pytorch-float8-maxbs:1024-maxnt:4096-kv_frac:0.85-input_output_len:1000,1000-reqs:3000-ep:8-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v4_maverick_17b_128e_instruct_fp8-bench-pytorch-float8-input_output_len:512,32-ep:8-tp:8-gpus:8]
+  # chunked attention case
+  - perf/test_perf.py::test_perf[llama_v4_maverick_17b_128e_instruct_fp8-bench-pytorch-float8-maxbs:1024-maxnt:20000-kv_frac:0.6-input_output_len:20000,2000-reqs:1000-ep:8-tp:8-gpus:8]
+
+  #llama_v4_scout_17b_16e_instruct_fp8
+  #pytorch backend
+  - perf/test_perf.py::test_perf[llama_v4_scout_17b_16e_instruct_fp8-bench-pytorch-float8-maxbs:1024-maxnt:5000-kv_frac:0.85-input_output_len:5000,500-reqs:3000-ep:8-tp:8-gpus:8] TIMEOUT(100)
+  - perf/test_perf.py::test_perf[llama_v4_scout_17b_16e_instruct_fp8-bench-pytorch-float8-maxbs:1024-maxnt:4096-kv_frac:0.85-input_output_len:500,2000-reqs:3000-ep:8-tp:8-gpus:8] TIMEOUT(100)
+  - perf/test_perf.py::test_perf[llama_v4_scout_17b_16e_instruct_fp8-bench-pytorch-float8-maxbs:1024-maxnt:4096-kv_frac:0.85-input_output_len:1000,1000-reqs:3000-ep:8-tp:8-gpus:8] TIMEOUT(100)
+  - perf/test_perf.py::test_perf[llama_v4_scout_17b_16e_instruct_fp8-bench-pytorch-float8-maxbs:1024-maxnt:20000-kv_frac:0.85-input_output_len:20000,2000-reqs:1000-ep:8-tp:8-gpus:8] TIMEOUT(100)
+  - perf/test_perf.py::test_perf[llama_v4_scout_17b_16e_instruct_fp8-bench-pytorch-float8-kv_frac:0.85-input_output_len:128,128-ep:8-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v4_scout_17b_16e_instruct_fp8-bench-pytorch-float8-kv_frac:0.85-input_output_len:512,32-ep:8-tp:8-gpus:8]
+
+  #llama_v4_scout_17b_16e_instruct
+  #pytorch backend
+  - perf/test_perf.py::test_perf[llama_v4_scout_17b_16e_instruct-bench-pytorch-bfloat16-input_output_len:128,128-ep:8-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v4_scout_17b_16e_instruct-bench-pytorch-streaming-bfloat16-input_output_len:128,128-ep:8-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v4_scout_17b_16e_instruct-bench-pytorch-bfloat16-input_output_len:500,2000-ep:8-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v4_scout_17b_16e_instruct-bench-pytorch-bfloat16-input_output_len:2000,500-ep:8-tp:8-gpus:8]
+  #deepseek_r1_fp8
+  #pytorch backend
+  - perf/test_perf.py::test_perf[deepseek_r1_fp8-bench-pytorch-float8-maxbs:32-input_output_len:128,128-ep:8-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[deepseek_r1_fp8-bench-pytorch-streaming-float8-maxbs:32-input_output_len:128,128-ep:8-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[deepseek_r1_fp8-bench-pytorch-float8-maxbs:1024-maxnt:4096-input_output_len:1000,1000-reqs:3000-ep:8-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[deepseek_r1_fp8-bench-pytorch-float8-maxbs:1-input_output_len:1000,2000-reqs:10-con:1-ep:4-tp:8-gpus:8] #min latency test
+  - perf/test_perf.py::test_perf[deepseek_r1_fp8-bench-pytorch-float8-maxbs:128-maxnt:1127-input_output_len:1000,2000-reqs:5120-con:1024-ep:8-tp:8-gpus:8] TIMEOUT(80) #max throughput test
+  - perf/test_perf.py::test_perf[deepseek_r1_0528_fp8-bench-pytorch-float8-input_output_len:1000,1000-reqs:20000-ep:8-tp:8-gpus:8] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_r1_0528_fp8-bench-pytorch-float8-input_output_len:1000,2000-reqs:3000-ep:8-tp:8-gpus:8] TIMEOUT(100)
+  # for chunked prefill cases
+  - perf/test_perf.py::test_perf[deepseek_r1_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048-kv_frac:0.85-input_output_len:5000,500-reqs:200-ep:8-tp:8-gpus:8] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_r1_fp8-bench-pytorch-float8-maxbs:256-maxnt:1024-kv_frac:0.85-input_output_len:2000,2000-reqs:200-ep:8-tp:8-gpus:8] TIMEOUT(120)
+  # qwen3_235b_a22b_fp8
+  - perf/test_perf.py::test_perf[qwen3_235b_a22b_fp8-bench-pytorch-float8-input_output_len:1000,2000-con:256-ep:8-gpus:8] TIMEOUT(60)
+
+
+# 14: H100, H20, H200, B200, B300, RTX-6000 Server test cases
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 8
+      compute_capability:
+        gte: 9.0
+        lte: 12.0
+  tests:
+  - perf/test_perf.py::test_perf[llama_v4_maverick_17b_128e_instruct_fp8-bench-pytorch-float8-input_output_len:128,128-ep:8-tp:8-gpus:8]
+
+
+# 15: RTX-6000D, RTX-6000 Server test cases
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 2
+      compute_capability:
+        gte: 12.0
+        lte: 12.0
+  tests:
+  - perf/test_perf.py::test_perf[llama_v3.1_8b-bench-bfloat16-input_output_len:128,128-quant:nvfp4]
+  - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct_fp8-bench-pytorch-float8-input_output_len:512,32-kv_cache_dtype:fp8]
+  - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct_fp4-bench-pytorch-float4-input_output_len:128,128]
+  - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct_fp4-bench-pytorch-float4-input_output_len:512,32-kv_cache_dtype:fp8]
+  #llama_v3.1_70b
+  - perf/test_perf.py::test_perf[llama_v3.1_70b-bench-pytorch-bfloat16-input_output_len:128,128-tp:2-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.1_70b_instruct_fp8-bench-pytorch-float8-input_output_len:128,128]
+  - perf/test_perf.py::test_perf[llama_v3.1_70b-bench-pytorch-bfloat16-maxbs:1-input_output_len:128,128-reqs:10-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.1_70b_instruct_fp8-bench-pytorch-float8-input_output_len:512,32-kv_cache_dtype:fp8]
+  - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp4-bench-pytorch-float4-input_output_len:128,128-tp:2-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp4-bench-pytorch-float4-input_output_len:512,32-kv_cache_dtype:fp8-tp:2-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp4-bench-pytorch-float4-input_output_len:500,2000-tp:2-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp4-bench-pytorch-float4-input_output_len:1000,1000-tp:2-gpus:2]
+  #llama_v3.3_nemotron_super_49b
+  - perf/test_perf.py::test_perf[llama_v3.3_nemotron_super_49b-bench-pytorch-bfloat16-input_output_len:128,128-tp:2-gpus:2]
+  #deepseek_v3_lite
+  - perf/test_perf.py::test_perf[deepseek_v3_lite_nvfp4-bench-pytorch-float4-input_output_len:128,128] #max throughput test
+  - perf/test_perf.py::test_perf[deepseek_v3_lite_nvfp4-bench-pytorch-streaming-float4-input_output_len:128,128]
+  #mixtral_8x7b_v0.1
+  - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1-bench-pytorch-float16-input_output_len:128,128-tp:2-gpus:2]
+  - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1_instruct_fp8-bench-pytorch-float8-input_output_len:128,128-tp:2-gpus:2]
+  - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1_instruct_fp4-bench-pytorch-float4-input_output_len:128,128-tp:2-gpus:2]
+  - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1_instruct_fp4-bench-pytorch-float4-input_output_len:128,128-kv_cache_dtype:fp8-tp:2-gpus:2]
+
+
+# 16: RTX6000-Server test cases
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 8
+      compute_capability:
+        gte: 12.0
+        lte: 12.0
+  tests:
+  - perf/test_perf.py::test_perf[llama_v3.3_nemotron_super_49b-bench-bfloat16-input_output_len:500,2000-quant:fp8-con:250-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v3.3_nemotron_super_49b_fp8-bench-pytorch-bfloat16-input_output_len:500,2000-con:250-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp4-bench-pytorch-float4-maxbs:1024-maxnt:4096-kv_frac:0.85-input_output_len:500,2000-reqs:3000-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp4-bench-pytorch-float4-maxbs:1024-maxnt:4096-kv_frac:0.85-input_output_len:1000,1000-reqs:3000-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v4_scout_17b_16e_instruct_fp4-bench-pytorch-float4-kv_frac:0.85-input_output_len:128,128-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v4_scout_17b_16e_instruct_fp4-bench-pytorch-float4-kv_frac:0.85-input_output_len:512,32-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v4_scout_17b_16e_instruct_fp4-bench-pytorch-float4-maxbs:1024-maxnt:4096-kv_frac:0.85-input_output_len:500,2000-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v4_scout_17b_16e_instruct_fp4-bench-pytorch-float4-maxbs:1024-maxnt:4096-kv_frac:0.85-input_output_len:1000,1000-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v4_maverick_17b_128e_instruct-bench-pytorch-bfloat16-input_output_len:128,128-ep:8-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v4_maverick_17b_128e_instruct-bench-pytorch-bfloat16-input_output_len:500,2000-ep:8-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v4_maverick_17b_128e_instruct-bench-pytorch-bfloat16-input_output_len:2000,500-ep:8-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v4_maverick_17b_128e_instruct-bench-pytorch-streaming-bfloat16-input_output_len:2000,500-ep:8-tp:8-gpus:8] TIMEOUT (40)
+  - perf/test_perf.py::test_perf[llama_v4_maverick_17b_128e_instruct_fp8-bench-pytorch-float8-input_output_len:500,2000-ep:8-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v4_maverick_17b_128e_instruct_fp8-bench-pytorch-float8-input_output_len:2000,500-ep:8-tp:8-gpus:8] TIMEOUT (40)
+  - perf/test_perf.py::test_perf[llama_v4_maverick_17b_128e_instruct_fp8-bench-pytorch-streaming-float8-input_output_len:2000,500-ep:8-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[qwen3_235b_a22b_fp4-bench-pytorch-float4-input_output_len:1000,2000-con:8-ep:8-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[qwen3_235b_a22b_fp4-bench-pytorch-float4-input_output_len:1000,2000-con:512-ep:8-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:1-input_output_len:1000,2000-reqs:10-ep:4-tp:8-gpus:8] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:384-maxnt:1536-input_output_len:1000,2000-reqs:10000-con:3072-ep:8-tp:8-gpus:8] TIMEOUT(120) #max throughput test
+  - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-streaming-float4-maxbs:512-maxnt:5220-input_output_len:4000,2000-reqs:512-ep:8-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[deepseek_v3_lite_nvfp4-bench-pytorch-float4-maxbs:1-input_output_len:1000,2000-reqs:10-ep:4-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[deepseek_v3_lite_nvfp4-bench-pytorch-float4-maxbs:384-maxnt:1536-input_output_len:1000,2000-reqs:10000-con:3072-ep:8-tp:8-gpus:8] TIMEOUT(120)

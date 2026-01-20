@@ -5,6 +5,7 @@
 nvidia-cudnn-cu12~=8.9; platform_machine == "x86_64"
 tensorrt_llm>=0.0.0.dev0
 flax~=0.8.0
+numpy<2
 # jax[cuda12_pip]~=0.4.19
 safetensors~=0.4.1
 sentencepiece>=0.1.99

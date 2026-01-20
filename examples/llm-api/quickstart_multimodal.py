@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import time
 
 from quickstart_advanced import add_llm_args, setup_llm
 
@@ -150,13 +151,10 @@ def parse_arguments():
     parser = argparse.ArgumentParser(
         description="Multimodal models with the PyTorch workflow.")
     parser = add_llm_args(parser)
+    parser.add_argument("--kv_cache_fraction", type=float, default=0.6)
     parser = add_multimodal_args(parser)
     parser = add_lora_args(parser)
     args = parser.parse_args()
-
-    if args.kv_cache_fraction is None:
-        args.kv_cache_fraction = 0.6  # lower the default kv cache fraction for multimodal
-
     return args
 
 
@@ -267,6 +265,14 @@ def main():
             print(
                 f"[{i}] Prompt: {output['user_input']!r}, Generated text: {output['assistant_response']!r}"
             )
+
+        if args.log_kv_cache_events:
+            time.sleep(1)  # Wait for events to be dispatched
+            events = llm.get_kv_cache_events(5)
+            print("=== KV_CACHE_EVENTS_START ===")
+            print(json.dumps(events, indent=2))
+            print("=== KV_CACHE_EVENTS_END ===")
+
         return
 
     # Original single-turn processing logic
@@ -275,6 +281,7 @@ def main():
         args.prompt = example_medias_and_prompts[args.modality]["prompt"]
     if args.media is None:
         args.media = example_medias_and_prompts[args.modality]["media"]
+
     inputs = default_multimodal_input_loader(tokenizer=llm.tokenizer,
                                              model_dir=str(llm._hf_model_dir),
                                              model_type=model_type,
@@ -284,7 +291,6 @@ def main():
                                              image_data_format=image_format,
                                              num_frames=args.num_frames,
                                              device=args.device)
-
     lora_request = None
     if args.load_lora:
         lora_request = model_class.lora_request(len(inputs), args.modality,
@@ -300,6 +306,21 @@ def main():
         prompt = args.prompt[i]
         generated_text = output.outputs[0].text
         print(f"[{i}] Prompt: {prompt!r}, Generated text: {generated_text!r}")
+        if args.return_context_logits:
+            print(f"[{i}] Context logits: {output.context_logits}")
+        if args.return_generation_logits:
+            print(
+                f"[{i}] Generation logits: {output.outputs[0].generation_logits}"
+            )
+        if args.logprobs:
+            print(f"[{i}] Logprobs: {output.outputs[0].logprobs}")
+
+    if args.log_kv_cache_events:
+        time.sleep(1)  # Wait for events to be dispatched
+        events = llm.get_kv_cache_events(5)
+        print("=== KV_CACHE_EVENTS_START ===")
+        print(json.dumps(events, indent=2))
+        print("=== KV_CACHE_EVENTS_END ===")
 
 
 if __name__ == "__main__":

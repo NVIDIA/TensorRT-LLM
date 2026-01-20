@@ -5,7 +5,23 @@ set -ex
 GITHUB_URL="https://github.com"
 if [ -n "${GITHUB_MIRROR}" ]; then
     GITHUB_URL=${GITHUB_MIRROR}
+    export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
 fi
+
+if [ -n "${GITHUB_MIRROR}" ]; then
+  BOOST_URL="https://urm.nvidia.com/artifactory/sw-dl-triton-generic-local/triton/ci-cd/binaries/boost/1.80.0/boost_1_80_0.tar.gz"
+else
+  BOOST_URL="https://archives.boost.io/release/1.80.0/source/boost_1_80_0.tar.gz"
+fi
+
+install_boost() {
+  # Install boost version >= 1.78 for boost::span
+  # Current libboost-dev apt packages are < 1.78, so install from tar.gz
+  wget --no-verbose --retry-connrefused --timeout=180 --tries=10 --continue -O /tmp/boost.tar.gz ${BOOST_URL} \
+    && tar xzf /tmp/boost.tar.gz -C /tmp \
+    && mv /tmp/boost_1_80_0/boost /usr/include/boost \
+    && rm -rf /tmp/boost_1_80_0 /tmp/boost.tar.gz
+}
 
 set_bash_env() {
   if [ ! -f ${BASH_ENV} ];then
@@ -83,6 +99,9 @@ install_python_rockylinux() {
   PYTHON_VERSION=$1
   PYTHON_MAJOR="3"
   PYTHON_URL="https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tgz"
+  if [ -n "${GITHUB_MIRROR}" ]; then
+    PYTHON_URL="https://urm.nvidia.com/artifactory/api/vcs/downloadTag/vcs-remote/python/cpython/v${PYTHON_VERSION}?ext=tar.gz"
+  fi
   dnf makecache --refresh
   dnf install \
     epel-release \
@@ -103,6 +122,9 @@ install_python_rockylinux() {
     -y
   echo "Installing Python ${PYTHON_VERSION}..."
   curl -L ${PYTHON_URL} | tar -zx -C /tmp
+  if [ -n "${GITHUB_MIRROR}" ]; then
+    mv /tmp/cpython-${PYTHON_VERSION} /tmp/Python-${PYTHON_VERSION}
+  fi
   cd /tmp/Python-${PYTHON_VERSION}
   bash -c "./configure --enable-shared --prefix=/opt/python/${PYTHON_VERSION} --enable-ipv6 \
     LDFLAGS=-Wl,-rpath=/opt/python/${PYTHON_VERSION}/lib,--disable-new-dtags && make -j$(nproc) && make install"
@@ -112,7 +134,7 @@ install_python_rockylinux() {
 }
 
 install_pyp_rockylinux() {
-  bash -c "pip3 install 'urllib3<2.0' pytest"
+  bash -c "pip3 install pytest"
 }
 
 install_gcctoolset_rockylinux() {
@@ -144,11 +166,13 @@ set_bash_env
 case "$ID" in
   ubuntu)
     init_ubuntu
+    install_boost
     ;;
   rocky)
     install_python_rockylinux $1
     install_pyp_rockylinux
     install_gcctoolset_rockylinux
+    install_boost
     ;;
   *)
     echo "Unable to determine OS..."

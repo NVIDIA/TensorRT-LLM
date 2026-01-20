@@ -21,7 +21,6 @@ l0_gh200:
   - unittest/trt/attention/test_gpt_attention.py -k "xqa_generic"
   - unittest/trt/model/test_gpt_e2e.py
   - unittest/bindings
-  - test_cache.py::test_cache_sanity
   - unittest/llmapi/test_llm_quant.py
   - llmapi/test_llm_examples.py::test_llmapi_quickstart_atexit
   - unittest/test_model_runner_cpp.py

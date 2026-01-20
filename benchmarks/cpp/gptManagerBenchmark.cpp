@@ -1056,7 +1056,7 @@ void benchmarkExecutor(std::optional<std::filesystem::path> const& decoderEngine
 int main(int argc, char* argv[])
 {
     cxxopts::Options options(
-        "TensorRT-LLM BatchManager Benchmark", "TensorRT-LLM BatchManager Benchmark for GPT and GPT-like models.");
+        "TensorRT LLM BatchManager Benchmark", "TensorRT LLM BatchManager Benchmark for GPT and GPT-like models.");
     options.add_options()("h,help", "Print usage");
     options.add_options()("engine_dir, decoder_engine_dir", "Directory that store the engines of decoder models.",
         cxxopts::value<std::string>());

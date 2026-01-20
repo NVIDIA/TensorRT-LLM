@@ -137,6 +137,24 @@ def demonstrate_multiple_sequences(prompt: str):
         print(f"Sequence {i+1}: {output.text}")
 
 
+def demonstrate_beam_search(prompt: str):
+    """Demonstrates beam search."""
+    print("\n🎯 === BEAM SEARCH ===")
+    beam_width = 2
+    llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+              max_beam_width=beam_width)
+
+    sampling_params = SamplingParams(
+        max_tokens=50,
+        use_beam_search=True,
+        n=beam_width,
+    )
+
+    response = llm.generate(prompt, sampling_params)
+    print(f"Prompt: {prompt}")
+    print(f"Response: {response.outputs[0].text}")
+
+
 def demonstrate_with_logprobs(prompt: str):
     """Demonstrates generation with log probabilities."""
     print("\n📊 === GENERATION WITH LOG PROBABILITIES ===")
@@ -161,7 +179,7 @@ def demonstrate_with_logprobs(prompt: str):
 
 def run_all_demonstrations(model_path: Optional[str] = None):
     """Run all sampling demonstrations."""
-    print("🚀 TensorRT-LLM Sampling Techniques Showcase")
+    print("🚀 TensorRT LLM Sampling Techniques Showcase")
     print("=" * 50)
 
     # Use the first prompt for most demonstrations
@@ -173,9 +191,8 @@ def run_all_demonstrations(model_path: Optional[str] = None):
     demonstrate_top_k_sampling(demo_prompt)
     demonstrate_top_p_sampling(demo_prompt)
     demonstrate_combined_sampling(demo_prompt)
-    # TODO[Superjomn]: enable them once pytorch backend supports
-    # demonstrate_multiple_sequences(llm, demo_prompt)
-    # demonstrate_beam_search(demo_prompt)
+    demonstrate_multiple_sequences(demo_prompt)
+    demonstrate_beam_search(demo_prompt)
     demonstrate_with_logprobs(demo_prompt)
 
     print("\n🎉 All sampling demonstrations completed!")
@@ -219,6 +236,8 @@ def main(model: Optional[str], demo: str, prompt: Optional[str]):
         demonstrate_combined_sampling(demo_prompt)
     elif demo == "multiple":
         demonstrate_multiple_sequences(demo_prompt)
+    elif demo == "beam":
+        demonstrate_beam_search(demo_prompt)
     elif demo == "logprobs":
         demonstrate_with_logprobs(demo_prompt)
     elif demo == "all":

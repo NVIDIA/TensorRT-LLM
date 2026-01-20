@@ -19,7 +19,6 @@ from .._common import default_net
 from .._utils import (QuantModeWrapper, get_init_params, numpy_to_torch,
                       release_gc, str_dtype_to_torch, str_dtype_to_trt,
                       trt_dtype_to_torch)
-from ..bindings import KVCacheType
 from ..bindings.executor import RuntimeDefaults
 from ..functional import (PositionEmbeddingType, Tensor, allgather, constant,
                           cp_split_plugin, gather_last_token_logits,
@@ -31,6 +30,7 @@ from ..layers.attention import Attention, BertAttention
 from ..layers.linear import ColumnLinear, Linear, RowLinear
 from ..layers.lora import Dora, Lora
 from ..layers.moe import MOE, MoeOOTB
+from ..llmapi.kv_cache_type import KVCacheType
 from ..logger import logger
 from ..mapping import Mapping
 from ..module import Module, ModuleList
@@ -98,6 +98,7 @@ class SpeculativeDecodingMode(IntFlag):
     EAGLE = auto()
     NGRAM = auto()
     USER_PROVIDED = auto()
+    SAVE_HIDDEN_STATES = auto()
     AUTO = auto()
 
     @staticmethod
@@ -120,6 +121,8 @@ class SpeculativeDecodingMode(IntFlag):
             return SpeculativeDecodingMode.USER_PROVIDED
         elif args.speculative_decoding_mode == "auto":
             return SpeculativeDecodingMode.AUTO
+        elif args.speculative_decoding_mode == "save_hidden_states":
+            return SpeculativeDecodingMode.SAVE_HIDDEN_STATES
         else:
             assert False, "Unknown speculative_decoding_mode " + args.speculative_decoding_mode
 
@@ -736,13 +739,12 @@ class PretrainedModel(Module,
             config.set_rank(rank)
 
         rank = config.mapping.rank
-        if config.mapping.auto_parallel:
-            rank = 0
-        elif config.mapping.cp_size > 1:
-            # tp_cp_pp rank -> tp_pp rank: because different cp ranks share the same ckpt
-            tp_size = config.mapping.tp_size
+        if config.mapping.cp_size > 1:
+            # cp_tp_pp rank -> tp_pp rank: because different cp ranks share the same ckpt.
             cp_size = config.mapping.cp_size
-            rank = rank % tp_size + rank // (tp_size * cp_size) * tp_size
+            # rank = pp_rank × tp_size × cp_size + tp_rank × cp_size + cp_rank.
+            # rank // cp_size is equivalent to pp_rank × tp_size + tp_rank.
+            rank = rank // cp_size
         weights_path = os.path.join(ckpt_dir, f'rank{rank}.safetensors')
 
         assert os.path.isfile(weights_path)
@@ -1304,7 +1306,7 @@ def unfuse_qkv_gemm(model: PretrainedModel) -> PretrainedModel:
 
     for name, layer in model.named_modules():
         if isinstance(layer, Attention) and not layer.cross_attention:
-            assert layer.tp_size == 1, "please disable manual tp when enable auto parallel"
+            assert layer.tp_size == 1, "unfuse_qkv_gemm requires tp_size == 1"
             if layer.qkv is None:
                 continue
             qkv_params = get_init_params(layer.qkv, ColumnLinear)
@@ -1963,7 +1965,7 @@ def save_config(config: PretrainedConfig, *, output_dir: str,
                 log: bool) -> None:
     config_path = Path(output_dir) / "config.json"
     if log:
-        logger.debug(f"Saving TensorRT-LLM configuration to {config_path}")
+        logger.debug(f"Saving TensorRT LLM configuration to {config_path}")
     config_path.parent.mkdir(exist_ok=True, parents=True)
     config_path.write_text(json.dumps(config.to_dict(), indent=4))
 

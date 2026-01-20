@@ -16,6 +16,7 @@
  */
 
 #include "envUtils.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/stringUtils.h"
@@ -25,7 +26,9 @@
 #include <optional>
 #include <string>
 
-namespace tensorrt_llm::common
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common
 {
 
 std::optional<int32_t> getIntEnv(char const* name)
@@ -246,7 +249,7 @@ bool getEnvUseTileSizeKv64ForTrtllmGen()
 bool getEnvEnablePDL()
 {
     static std::once_flag flag;
-    static bool enablePDL = false;
+    static bool enablePDL = true;
 
     std::call_once(flag,
         [&]()
@@ -254,7 +257,18 @@ bool getEnvEnablePDL()
             if (getSMVersion() >= 90)
             {
                 // PDL will be enabled by setting the env variables `TRTLLM_ENABLE_PDL` to `1`
-                enablePDL = getBoolEnv("TRTLLM_ENABLE_PDL");
+                char const* env = std::getenv("TRTLLM_ENABLE_PDL");
+                if (env)
+                {
+                    if (env[0] == '1' && env[1] == '\0')
+                    {
+                        enablePDL = true;
+                    }
+                    else if (env[0] == '0' && env[1] == '\0')
+                    {
+                        enablePDL = false;
+                    }
+                };
             }
         });
     return enablePDL;
@@ -276,6 +290,18 @@ bool getEnvUseNixlKvCache()
 {
     static bool const useNixlKvCache = getBoolEnv("TRTLLM_USE_NIXL_KVCACHE");
     return useNixlKvCache;
+}
+
+bool getEnvUseMooncakeKvCache()
+{
+    static bool const useMooncakeKvCache = getBoolEnv("TRTLLM_USE_MOONCAKE_KVCACHE");
+    return useMooncakeKvCache;
+}
+
+bool getEnvUseRoundRobinBlockDistForCP()
+{
+    static bool const useRoundRobinBlockDistForCP = getBoolEnv("TRTLLM_USE_ROUND_ROBIN_BLOCK_DIST_FOR_CP");
+    return useRoundRobinBlockDistForCP;
 }
 
 std::string getEnvUCXInterface()
@@ -312,22 +338,49 @@ std::string getEnvNixlInterface()
     return nixlInterface;
 }
 
+std::string getEnvNixlBackend()
+{
+    static std::once_flag flag;
+    static std::string nixlBackend;
+
+    std::call_once(flag,
+        [&]()
+        {
+            char const* nixl_backend = std::getenv("TRTLLM_NIXL_KVCACHE_BACKEND");
+            if (nixl_backend)
+            {
+                nixlBackend = nixl_backend;
+            }
+            else
+            {
+                // Default to UCX if not specified
+                nixlBackend = "UCX";
+            }
+        });
+    return nixlBackend;
+}
+
+std::string getEnvMooncakeInterface()
+{
+    static std::once_flag flag;
+    static std::string mooncakeInterface;
+
+    std::call_once(flag,
+        [&]()
+        {
+            char const* mooncake_interface = std::getenv("TRTLLM_MOONCAKE_INTERFACE");
+            if (mooncake_interface)
+            {
+                mooncakeInterface = mooncake_interface;
+            }
+        });
+    return mooncakeInterface;
+}
+
 bool getEnvDisaggLayerwise()
 {
     static bool const disaggLayerwise = getBoolEnv("TRTLLM_DISAGG_LAYERWISE");
     return disaggLayerwise;
-}
-
-bool getEnvDisableSelectiveCacheTransfer()
-{
-    static bool const disableSelectiveCacheTransfer = getBoolEnv("TRTLLM_DISABLE_SELECTIVE_CACHE_TRANSFER");
-    return disableSelectiveCacheTransfer;
-}
-
-bool getEnvParallelCacheSend()
-{
-    static bool const parallelCacheSend = getBoolEnv("TRTLLM_PARALLEL_CACHE_SEND");
-    return parallelCacheSend;
 }
 
 bool getEnvRequestKVCacheConcurrent()
@@ -392,7 +445,7 @@ size_t getEnvAllReduceWorkspaceSize()
     return workspaceSize;
 }
 
-std::string const& getEnvKVCacheTransferOutputPath()
+std::string const& getEnvKVCacheTimeOutputPath()
 {
     static std::string outputPath = getStrEnv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH").value_or("");
     return outputPath;
@@ -414,7 +467,7 @@ bool getEnvKVCacheTransferUseSyncBuffer()
 size_t getEnvKVCacheSendMaxConcurrenceNum()
 {
 
-    static size_t const maxConcurrenceNum = getUInt64Env("TRTLLM_KVCACHE_SEND_MAX_CONCURRENCY_NUM").value_or(2);
+    static size_t const maxConcurrenceNum = getUInt64Env("TRTLLM_KVCACHE_SEND_MAX_CONCURRENCY_NUM").value_or(1);
     return maxConcurrenceNum;
 }
 
@@ -446,6 +499,12 @@ size_t getEnvMemSizeForKVCacheTransferBuffer()
     return memSizeForKVCacheTransferBuffer;
 }
 
+bool getEnvKVCacheTransferAllBlocksForWindow()
+{
+    static bool const allBlocksForWindow = getBoolEnv("TRTLLM_KVCACHE_TRANSFER_ALL_BLOCKS_FOR_WINDOW");
+    return allBlocksForWindow;
+}
+
 uint16_t getEnvNixlPort()
 {
     static uint16_t const nixlPort = getUInt64Env("TRTLLM_NIXL_PORT").value_or(0);
@@ -462,4 +521,55 @@ bool getEnvDisableChunkedAttentionInGenPhase()
     return getBoolEnv("TRTLLM_DISABLE_CHUNKED_ATTENTION_IN_GEN_PHASE");
 }
 
-} // namespace tensorrt_llm::common
+bool getEnvMoeA2AOneBlockPerToken()
+{
+    // Default true; return false only if env set to "0"
+    static std::optional<int32_t> const val = getIntEnv("TLLM_MOE_A2A_ONE_BLOCK_PER_TOKEN");
+    if (!val.has_value())
+    {
+        return true;
+    }
+    return val.value() != 0;
+}
+
+static int sanitizeBlockSize(std::optional<int32_t> const& val)
+{
+    // Default 256 when not set or invalid
+    int block = val.value_or(256);
+    // Clamp to sane CUDA bounds and warp multiples
+    if (block <= 0)
+        block = 256;
+    if (block > 1024)
+        block = 1024;
+    // Round to nearest multiple of 32 (warp size)
+    block = (block + 31) / 32 * 32;
+    if (block == 0)
+        block = 256;
+    return block;
+}
+
+int getEnvMoeA2ADispatchBlockSize()
+{
+    static int const kBlock = sanitizeBlockSize(getIntEnv("TLLM_MOE_A2A_DISPATCH_BLOCK_SIZE"));
+    return kBlock;
+}
+
+int getEnvMoeA2ACombineBlockSize()
+{
+    static int const kBlock = sanitizeBlockSize(getIntEnv("TLLM_MOE_A2A_COMBINE_BLOCK_SIZE"));
+    return kBlock;
+}
+
+bool getEnvEplbForceGdrcopy()
+{
+    return getBoolEnv("TRTLLM_EPLB_FORCE_GDRCOPY");
+}
+
+bool getEnvPrintSkipSoftmaxStat()
+{
+    return getBoolEnv("TRTLLM_PRINT_SKIP_SOFTMAX_STAT");
+}
+
+} // namespace common
+
+TRTLLM_NAMESPACE_END

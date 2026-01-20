@@ -934,7 +934,7 @@ class TestSmoothQuant(unittest.TestCase):
             embd_pdrop=0,
             attn_pdrop=0,
             hidden_act='gelu',
-            torch_dtype=dtype,
+            dtype=dtype,
         )
         n_positions = configuration.n_positions
 

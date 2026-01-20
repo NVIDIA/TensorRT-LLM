@@ -15,11 +15,11 @@ import pygit2
 from docutils import nodes
 
 sys.path.insert(0, os.path.abspath('.'))
+sys.path.insert(0, os.path.abspath('_ext'))
 
-project = 'TensorRT-LLM'
+project = 'TensorRT LLM'
 copyright = '2025, NVidia'
 author = 'NVidia'
-branch_name = pygit2.Repository('.').head.shorthand
 html_show_sphinx = False
 
 # Get the git commit hash
@@ -44,14 +44,21 @@ version = version_module.__version__
 templates_path = ['_templates']
 exclude_patterns = ['performance/performance-tuning-guide/introduction.md']
 
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+CPP_XML_INDEX = os.path.abspath(
+    os.path.join(SCRIPT_DIR, "..", "cpp_docs", "xml", "index.xml"))
+HAS_CPP_XML = os.path.exists(CPP_XML_INDEX)
+if not HAS_CPP_XML:
+    exclude_patterns.append('_cpp_gen/**')
+
 extensions = [
     'sphinx.ext.duration',
     'sphinx.ext.autodoc',
     'sphinx.ext.autosummary',
     'sphinx.ext.viewcode',
     'sphinx.ext.napoleon',
+    'sphinx.ext.mathjax',
     'myst_parser',  # for markdown support
-    "breathe",
     'sphinx.ext.todo',
     'sphinx.ext.autosectionlabel',
     'sphinxarg.ext',
@@ -59,7 +66,11 @@ extensions = [
     'sphinx_copybutton',
     'sphinxcontrib.autodoc_pydantic',
     'sphinx_togglebutton',
+    'trtllm_config_selector',
 ]
+
+if HAS_CPP_XML:
+    extensions.append("breathe")
 
 autodoc_member_order = 'bysource'
 autodoc_pydantic_model_show_json = True
@@ -78,7 +89,7 @@ myst_url_schemes = {
     "https":
     None,
     "source":
-    "https://github.com/NVIDIA/TensorRT-LLM/tree/" + branch_name + "/{{path}}",
+    "https://github.com/NVIDIA/TensorRT-LLM/tree/" + commit_hash + "/{{path}}",
 }
 
 myst_heading_anchors = 4
@@ -86,6 +97,8 @@ myst_heading_anchors = 4
 myst_enable_extensions = [
     "deflist",
     "substitution",
+    "dollarmath",
+    "amsmath",
 ]
 
 myst_substitutions = {
@@ -138,12 +151,11 @@ html_theme_options = {
     ]
 }
 
-# ------------------------  C++ Doc related  --------------------------
-# Breathe configuration
-breathe_default_project = "TensorRT-LLM"
-breathe_projects = {"TensorRT-LLM": "../cpp_docs/xml"}
-
-SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+if HAS_CPP_XML:
+    breathe_default_project = "TensorRT-LLM"
+    breathe_projects = {"TensorRT-LLM": "../cpp_docs/xml"}
+else:
+    breathe_projects = {}
 
 CPP_INCLUDE_DIR = os.path.join(SCRIPT_DIR, '../../cpp/include/tensorrt_llm')
 CPP_GEN_DIR = os.path.join(SCRIPT_DIR, '_cpp_gen')
@@ -165,15 +177,19 @@ def tag_role(name, rawtext, text, lineno, inliner, options=None, content=None):
 
 
 def setup(app):
-    from helper import generate_examples, generate_llmapi
+    from helper import generate_examples, generate_llmapi, update_version
 
-    from tensorrt_llm.llmapi.utils import tag_llm_params
-    tag_llm_params()
+    try:
+        from tensorrt_llm.llmapi.utils import tag_llm_params
+        tag_llm_params()
+    except ImportError:
+        print("Warning: tensorrt_llm not available, skipping tag_llm_params")
 
     app.add_role('tag', tag_role)
 
     generate_examples()
     generate_llmapi()
+    update_version()
 
 
 def gen_cpp_doc(ofile_name: str, header_dir: str, summary: str):
@@ -200,10 +216,11 @@ Runtime
 .. It is also doable to automatically generate this file and list all the modules in the conf.py
     """.strip()
 
-# compile cpp doc
-subprocess.run(['mkdir', '-p', CPP_GEN_DIR])
-gen_cpp_doc(CPP_GEN_DIR + '/runtime.rst', CPP_INCLUDE_DIR + '/runtime',
-            runtime_summary)
+if HAS_CPP_XML:
+    # compile cpp doc
+    subprocess.run(['mkdir', '-p', CPP_GEN_DIR])
+    gen_cpp_doc(CPP_GEN_DIR + '/runtime.rst', CPP_INCLUDE_DIR + '/runtime',
+                runtime_summary)
 
 executor_summary = f"""
 Executor
@@ -214,6 +231,7 @@ Executor
 .. It is also doable to automatically generate this file and list all the modules in the conf.py
     """.strip()
 
-subprocess.run(['mkdir', '-p', CPP_GEN_DIR])
-gen_cpp_doc(CPP_GEN_DIR + '/executor.rst', CPP_INCLUDE_DIR + '/executor',
-            executor_summary)
+if HAS_CPP_XML:
+    subprocess.run(['mkdir', '-p', CPP_GEN_DIR])
+    gen_cpp_doc(CPP_GEN_DIR + '/executor.rst', CPP_INCLUDE_DIR + '/executor',
+                executor_summary)

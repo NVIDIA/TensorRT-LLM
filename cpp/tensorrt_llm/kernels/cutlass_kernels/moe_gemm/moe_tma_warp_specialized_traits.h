@@ -19,12 +19,15 @@
 #include "../include/moe_gemm_kernels.h"
 #include "cutlass/arch/mma_sm90.h"
 #include "cutlass_extensions/epilogue_helpers.h"
+#include "tensorrt_llm/common/config.h"
 
 #ifdef ENABLE_FP4
 #include <cuda_fp4.h>
 #endif
 
-namespace tensorrt_llm::kernels::cutlass_kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::cutlass_kernels
 {
 
 // Blackwell arch
@@ -34,7 +37,9 @@ template <typename T, typename WeightType, typename EpilogueTag = cutlass_extens
 constexpr bool isValidSM120MOESpecialisation()
 {
 #if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) // TODO Is there a better choice
-    return cutlass::platform::is_same<T, __nv_fp4_e2m1>::value && cutlass::platform::is_same<T, WeightType>::value
+    return ((cutlass::platform::is_same<T, __nv_fp4_e2m1>::value && cutlass::platform::is_same<T, WeightType>::value)
+               || (cutlass::platform::is_same<T, __nv_fp8_e4m3>::value
+                   && cutlass::platform::is_same<WeightType, __nv_fp4_e2m1>::value))
         && cutlass::platform::is_same<EpilogueTag, cutlass_extensions::EpilogueOpDefault>::value;
 #else
     return false; // CUTLASS_ARCH_MMA_SM100_SUPPORTED is set when Blackwell kernels are enabled
@@ -83,7 +88,8 @@ template <typename T, typename WeightType, typename EpilogueTag = cutlass_extens
 constexpr bool isValidTmaWarpSpecializedMOESpecialisation()
 {
     // Check at least one of the implementations are valid
-    return isValidBlackwellMOESpecialisation<T, WeightType, EpilogueTag, Fusion>()
+    return isValidSM120MOESpecialisation<T, WeightType>()
+        || isValidBlackwellMOESpecialisation<T, WeightType, EpilogueTag, Fusion>()
         || isValidHopperMOESpecialisation<T, WeightType, EpilogueTag, Fusion>();
 }
 
@@ -100,4 +106,6 @@ constexpr bool isValidAmpereMOESpecialisation()
 #endif
 }
 
-} // namespace tensorrt_llm::kernels::cutlass_kernels
+} // namespace kernels::cutlass_kernels
+
+TRTLLM_NAMESPACE_END

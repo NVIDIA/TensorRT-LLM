@@ -49,6 +49,7 @@ Please review the following before submitting your PR:
 - Any new dependencies have been scanned for license and vulnerabilities
 - [CODEOWNERS](https://github.com/NVIDIA/TensorRT-LLM/blob/main/.github/CODEOWNERS) updated if ownership changes
 - Documentation updated as needed
+- Update [tava architecture diagram](https://github.com/NVIDIA/TensorRT-LLM/blob/main/.github/tava_architecture_diagram.md) if there is a significant design change in PR.
 - The reviewers assigned automatically/manually are appropriate for the PR.
 
 

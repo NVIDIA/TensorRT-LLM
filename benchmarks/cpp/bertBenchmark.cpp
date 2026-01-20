@@ -135,7 +135,7 @@ void benchmarkBert(std::string const& modelName, std::filesystem::path const& da
 
 int main(int argc, char* argv[])
 {
-    cxxopts::Options options("TensorRT-LLM C++ Runtime Benchmark", "TensorRT-LLM C++ Runtime Benchmark for BERT.");
+    cxxopts::Options options("TensorRT LLM C++ Runtime Benchmark", "TensorRT LLM C++ Runtime Benchmark for BERT.");
     options.add_options()("h,help", "Print usage");
     options.add_options()(
         "m,model", "Model name specified for engines.", cxxopts::value<std::string>()->default_value("bert_base"));

@@ -467,7 +467,7 @@ def load_hf_qwen(model_dir: str, load_model_on_cpu: bool = False):
     model = model_cls.from_pretrained(
         model_dir,
         device_map='auto' if not load_model_on_cpu else 'cpu',
-        torch_dtype='auto',
+        dtype='auto',
         trust_remote_code=True)
     return model
 
@@ -996,7 +996,7 @@ def quantize(hf_model_dir: str,
     hf_model = model_cls.from_pretrained(
         hf_model_dir,
         device_map='auto',
-        torch_dtype='auto' if not use_smooth_quant else torch.float16,
+        dtype='auto' if not use_smooth_quant else torch.float16,
         trust_remote_code=True).half()
 
     os.environ["TOKENIZERS_PARALLELISM"] = os.environ.get(

@@ -66,10 +66,10 @@ Say we want to profile iterations 100 to 150 on a trtllm-bench/trtllm-serve run,
 #!/bin/bash
 
 # Prepare dataset for the benchmark
-python3 benchmarks/cpp/prepare_dataset.py \
-    --tokenizer=${MODEL_PATH} \
-    --stdout token-norm-dist --num-requests=${NUM_SAMPLES} \
-    --input-mean=1000 --output-mean=1000 --input-stdev=0 --output-stdev=0 > /tmp/dataset.txt
+trtllm-bench \
+    --model=${MODEL_PATH} prepare-dataset \
+    --output /tmp/dataset.txt token-norm-dist --num-requests=${NUM_SAMPLES} \
+    --input-mean=1000 --output-mean=1000 --input-stdev=0 --output-stdev=0
 
 # Benchmark and profile
 TLLM_PROFILE_START_STOP=100-150 nsys profile \

@@ -1,23 +1,27 @@
 #!/bin/bash
-set -u
+
+# Add error handling
 set -e
-set -x
+set -u
 trap 'echo "Error occurred at line $LINENO"; exit 1' ERR
 
 # Add parameter validation
-if [ "$#" -lt 7 ]; then
-    echo "Error: Missing required arguments"
-    echo "Usage: $0 isl osl multi_round model_name concurrency_list streaming log_path"
+if [ "$#" -lt 10 ]; then
+    echo "Error: Missing required arguments, got $# arguments, args: $@"
+    echo "Usage: $0 model_name dataset_file multi_round num_gen_servers concurrency_list streaming log_path hostname port ucx_warmup_requests"
     exit 1
 fi
 
-isl=$1
-osl=$2
+model_name=$1
+dataset_file=$2
 multi_round=$3
-model_name=$4
+num_gen_servers=$4
 concurrency_list=$5
 streaming=$6
 log_path=$7
+hostname=$8
+port=$9
+ucx_warmup_requests=${10}
 
 # check process id is not 0
 if [[ ${SLURM_PROCID} != "0" ]]; then
@@ -25,112 +29,125 @@ if [[ ${SLURM_PROCID} != "0" ]]; then
     exit 0
 fi
 
-config_file=${log_path}/server_config.yaml
-
-# check if the config file exists every 10 seconds timeout 1800 seconds
-timeout=1800
-start_time=$(date +%s)
-while [ ! -f ${config_file} ]; do
-    current_time=$(date +%s)
-    elapsed=$((current_time - start_time))
-    if [ $elapsed -ge $timeout ]; then
-        echo "Error: Config file ${config_file} not found within ${timeout} seconds"
-        exit 1
-    fi
-    if [ $((elapsed % 30)) -eq 0 ]; then
-        echo "Waiting for config file... (${elapsed}s elapsed)"
-    fi
-    sleep 10
-done
-
-# grep the host and port from the config file
-hostname=$(grep -i "hostname:" ${config_file} | awk '{print $2}')
-port=$(grep -i "port:" ${config_file} | awk '{print $2}')
-if [ -z "$hostname" ] || [ -z "$port" ]; then
-    echo "Error: Failed to extract hostname or port from config file"
-    exit 1
-fi
-echo "Hostname: ${hostname}, Port: ${port}"
-
-# download sharedgpt for benchmarking
-shared_gpt_path=/tmp/ShareGPT_V3_unfiltered_cleaned_split.json
-if [ ! -f ${shared_gpt_path} ]; then
-    echo "Downloading sharedgpt..."
-    wget https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json -O ${shared_gpt_path}
-fi
-
-# check server is health by curl every 10 seconds timeout 1800 seconds
-timeout=1800
-start_time=$(date +%s)
-while ! curl -s -o /dev/null -w "%{http_code}" http://${hostname}:${port}/health; do
-    current_time=$(date +%s)
-    elapsed=$((current_time - start_time))
-    if [ $elapsed -ge $timeout ]; then
-        echo "Error: Server is not healthy after ${timeout} seconds"
-        exit 1
-    fi
-    if [ $((elapsed % 30)) -eq 0 ]; then
-        echo "Waiting for server to be healthy... (${elapsed}s elapsed)"
-    fi
-    sleep 10
-done
-
-# try client
-
 do_get_logs(){
-    log_path=$1
-    output_folder=$2
+    local input_file=$1
+    local output_file=$2
+    local mode=$3
+    local start_line=$4
+    # check mode is ctx or gen
+    if [ "${mode}" = "ctx" ]; then
+        sed -n "${start_line},\$p" ${input_file} | grep -a "'num_generation_tokens': 0" > ${output_file} || true
+    elif [ "${mode}" = "gen" ]; then
+        sed -n "${start_line},\$p" ${input_file} | grep -a "'num_ctx_requests': 0, 'num_ctx_tokens': 0" > ${output_file} || true
+    else
+        echo "Invalid mode: ${mode}"
+        return 1
+    fi
+    return 0
+}
 
-    for gen_file in ${log_path}/output_gen_*.log; do
-        if [ -f "$gen_file" ]; then
-            index=$(basename "$gen_file" | sed 's/output_gen_\(.*\)\.log/\1/')
-            grep -a "'num_ctx_requests': 0, 'num_ctx_tokens': 0" "$gen_file" > "${output_folder}/gen_only_${index}.txt" || true
+do_process_all_logs(){
+    local input_folder=$1
+    local output_folder=$2
+    local mode=$3
+    if [ "${mode}" != "line" ] && [ "${mode}" != "log" ] && [ "${mode}" != "clean" ]; then
+        echo "Invalid mode: ${mode}"
+        exit 1
+    fi
+    local ctx_log
+    local ctx_num
+    local gen_log
+    local gen_num
+    local line_count
+    local start_line
+    for ctx_log in ${input_folder}/3_output_CTX_*.log; do
+        if [ -f "${ctx_log}" ]; then
+            ctx_num=$(basename "${ctx_log}" | sed 's/3_output_CTX_\([0-9]*\)\.log/\1/')
+            if [ "${mode}" = "line" ]; then
+                line_count=$(wc -l < ${ctx_log})
+                echo ${line_count} > ${output_folder}/ctx_only_line_${ctx_num}.txt
+            elif [ "${mode}" = "log" ]; then
+                if [ ! -f "${output_folder}/ctx_only_line_${ctx_num}.txt" ]; then
+                    start_line=0
+                else
+                    start_line=$(cat ${output_folder}/ctx_only_line_${ctx_num}.txt)
+                    rm -f ${output_folder}/ctx_only_line_${ctx_num}.txt
+                fi
+                do_get_logs ${ctx_log} ${output_folder}/ctx_only_${ctx_num}.txt "ctx" ${start_line}
+            elif [ "${mode}" = "clean" ]; then
+                rm -f ${ctx_log}
+            fi
         fi
     done
-
-    for ctx_file in ${log_path}/output_ctx_*.log; do
-        if [ -f "$ctx_file" ]; then
-            index=$(basename "$ctx_file" | sed 's/output_ctx_\(.*\)\.log/\1/')
-            grep -a "'num_generation_tokens': 0" "$ctx_file" > "${output_folder}/ctx_only_${index}.txt" || true
+    # process all the gen log files in the input folder
+    for gen_log in ${input_folder}/3_output_GEN_*.log; do
+        if [ -f "${gen_log}" ]; then
+            gen_num=$(basename "${gen_log}" | sed 's/3_output_GEN_\([0-9]*\)\.log/\1/')
+            if [ "${mode}" = "line" ]; then
+                line_count=$(wc -l < ${gen_log})
+                echo ${line_count} > ${output_folder}/gen_only_line_${gen_num}.txt
+            elif [ "${mode}" = "log" ]; then
+                if [ ! -f "${output_folder}/gen_only_line_${gen_num}.txt" ]; then
+                    start_line=0
+                else
+                    start_line=$(cat ${output_folder}/gen_only_line_${gen_num}.txt)
+                    rm -f ${output_folder}/gen_only_line_${gen_num}.txt
+                fi
+                do_get_logs ${gen_log} ${output_folder}/gen_only_${gen_num}.txt "gen" ${start_line}
+            elif [ "${mode}" = "clean" ]; then
+                rm -f ${gen_log}
+            fi
         fi
     done
 }
 
-# run the loadgen
-echo "Starting benchmark..."
-for concurrency in ${concurrency_list}; do
-    mkdir -p ${log_path}/concurrency_${concurrency}
-    max_count=$((${concurrency} * ${multi_round}))
-    echo "Running loadgen with concurrency: ${concurrency}, max_count: ${max_count}"
+mkdir -p ${log_path}/start_logs
+cp ${log_path}/3_output_CTX_*.log ${log_path}/start_logs/ 2>/dev/null || true
+cp ${log_path}/3_output_GEN_*.log ${log_path}/start_logs/ 2>/dev/null || true
+
+# warmup requests for ucx connections
+if [ "${ucx_warmup_requests}" -gt 0 ]; then
+    echo "warming up ucx connections with small requests... ${ucx_warmup_requests}"
     python -m tensorrt_llm.serve.scripts.benchmark_serving \
         --model ${model_name} \
-        --tokenizer ${model_name} \
         --dataset-name random \
-        --dataset-path ${shared_gpt_path} \
-        --random-input-len ${isl} \
-        --random-output-len ${osl} \
-        --random-prefix-len 0 \
-        --num-prompts ${max_count} \
-        --max-concurrency ${concurrency} \
+        --random-ids \
+        --random-input-len 100 \
+        --random-output-len 10 \
+        --num-prompts ${ucx_warmup_requests} \
         --host ${hostname} \
         --port ${port} \
         --ignore-eos \
-        --no-test-input \
-        $(if [ "${streaming}" = "false" ]; then echo "--non-streaming"; fi)
-
-    do_get_logs ${log_path} ${log_path}/concurrency_${concurrency}
-    echo "done for ${concurrency} in folder ${log_path}/concurrency_${concurrency}"
-done
-
-echo "Benchmark done, gracefully shutting down server and workers..."
-kill -9 $(ps aux | grep '[s]tart_server.sh' | awk '{print $2}') >/dev/null 2>&1 || true
-kill -9 $(ps aux | grep '[s]tart_worker.sh' | awk '{print $2}') >/dev/null 2>&1 || true
-kill -9 $(ps aux | grep '[t]rtllm-serve' | awk '{print $2}') >/dev/null 2>&1 || true
-sleep 20  # Give processes some time to clean up
-
-# Check if there are remaining processes
-if pgrep -f "trtllm-serve"; then
-    echo "Warning: Some processes may still be running"
-else
-    echo "All processes successfully terminated"
+        --non-streaming
+    echo "UCX warmup done"
 fi
+
+echo "Hostname: ${hostname}, Port: ${port}"
+echo "Starting benchmark..."
+for concurrency in ${concurrency_list}; do
+    concurrency=$((concurrency * num_gen_servers))
+    num_prompts=$((concurrency * multi_round))
+    echo "Benchmarking with concurrency ${concurrency} ... ${num_prompts} prompts"
+    mkdir -p ${log_path}/concurrency_${concurrency}
+    do_process_all_logs ${log_path}/ ${log_path}/concurrency_${concurrency} "line"
+    python -m tensorrt_llm.serve.scripts.benchmark_serving \
+        --model ${model_name} \
+        --backend openai \
+        --host ${hostname} \
+        --port ${port} \
+        --dataset-name "trtllm_custom" \
+        --dataset-path ${dataset_file} \
+        --num-prompts ${num_prompts} \
+        --max-concurrency ${concurrency} \
+        --trust-remote-code \
+        --ignore-eos \
+        --no-test-input \
+        --save-result \
+        --result-dir "${log_path}/concurrency_${concurrency}" \
+        --result-filename "result.json" \
+        --percentile-metrics "ttft,tpot,itl,e2el" \
+        $(if [ "${streaming}" = "false" ]; then echo "--non-streaming"; fi)
+    echo "Benchmark with concurrency ${concurrency} done"
+    do_process_all_logs ${log_path}/ ${log_path}/concurrency_${concurrency} "log"
+done
+# do_process_all_logs ${log_path}/ ${log_path}/concurrency_${concurrency} "clean"

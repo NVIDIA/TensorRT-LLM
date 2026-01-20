@@ -8,8 +8,8 @@ from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 
 @torch.inference_mode()
 def torch_ref_rms_norm_rope(qkv, num_heads_q, num_heads_k, num_heads_v,
-                            head_dim, eps, q_weight, k_weight, base, is_neox,
-                            position_ids):
+                            head_dim, rotary_dim, eps, q_weight, k_weight, base,
+                            is_neox, position_ids):
     """
     PyTorch reference implementation of RMSNorm+RoPE for verification.
 
@@ -22,6 +22,7 @@ def torch_ref_rms_norm_rope(qkv, num_heads_q, num_heads_k, num_heads_v,
         num_heads_k: Number of key heads
         num_heads_v: Number of value heads (unused for normalization/RoPE but needed for tensor splitting)
         head_dim: Dimension of each head
+        rotary_dim: Dimension for RoPE
         eps: Epsilon value for RMS normalization
         q_weight: RMSNorm weights for query [head_dim]
         k_weight: RMSNorm weights for key [head_dim]
@@ -65,7 +66,7 @@ def torch_ref_rms_norm_rope(qkv, num_heads_q, num_heads_k, num_heads_v,
 
     # Create and apply RotaryEmbedding module
     rope_params = RopeParams(
-        dim=head_dim,  # Set the rotary dimension to match the head dimension
+        dim=rotary_dim,  # Set the rotary dimension
         theta=base,  # Base value for RoPE calculations
         max_positions=8192  # Large enough for any reasonable hidden size
     )
@@ -88,10 +89,12 @@ num_heads_groups = [
     (16, 8, 8),  # Qwen3-0.6B, Qwen3-1.7B
     (32, 8, 8),  # Qwen3-4B, Qwen3-8B, Qwen3-30B-A3B
     (40, 8, 8),  # Qwen3-14B
-    (64, 8, 8)  # Qwen3-32B, Qwen3-235B-A22B
+    (64, 8, 8),  # Qwen3-32B, Qwen3-235B-A22B
+    (24, 8, 8),  # GLM 4.6
 ]
 num_tokens_list = [1, 3, 8, 32, 256]
 is_neox_list = [False, True]
+partial_rotary_factor_list = [1.0, 0.5]
 dtypes = [torch.bfloat16]  # TODO: support float16
 
 
@@ -100,8 +103,9 @@ dtypes = [torch.bfloat16]  # TODO: support float16
 @pytest.mark.parametrize("num_tokens", num_tokens_list)
 @pytest.mark.parametrize("is_neox", is_neox_list)
 @pytest.mark.parametrize("dtype", dtypes)
-def test_fused_qk_norm_rope(head_dim, num_heads_group, num_tokens, is_neox,
-                            dtype):
+@pytest.mark.parametrize("partial_rotary_factor", partial_rotary_factor_list)
+def test_fused_qk_norm_rope(head_dim, num_heads_group, num_tokens,
+                            partial_rotary_factor, is_neox, dtype):
     """
     Test the fused QK RMSNorm + RoPE operation with various configurations.
 
@@ -143,17 +147,20 @@ def test_fused_qk_norm_rope(head_dim, num_heads_group, num_tokens, is_neox,
     base = 10000.0
 
     factor, low, high, attention_factor = 1.0, 0, 0, 1.0
+    rotary_dim = int(head_dim * partial_rotary_factor)
     # Run the custom fusedQKNormRope operation
     torch.ops.trtllm.fused_qk_norm_rope(qkv, num_heads_q, num_heads_k,
-                                        num_heads_v, head_dim, eps, q_weight,
-                                        k_weight, base, is_neox, position_ids,
-                                        factor, low, high, attention_factor)
+                                        num_heads_v, head_dim, rotary_dim, eps,
+                                        q_weight, k_weight, base, is_neox,
+                                        position_ids, factor, low, high,
+                                        attention_factor, True)
     output = qkv  # This op is inplace
 
-    # Compute reference output using TensorRT-LLM modules
+    # Compute reference output using TensorRT LLM modules
     ref_output = torch_ref_rms_norm_rope(qkv_copy, num_heads_q, num_heads_k,
-                                         num_heads_v, head_dim, eps, q_weight,
-                                         k_weight, base, is_neox, position_ids)
+                                         num_heads_v, head_dim, rotary_dim, eps,
+                                         q_weight, k_weight, base, is_neox,
+                                         position_ids)
 
     # Compare outputs from custom kernel vs reference implementation
     torch.testing.assert_close(

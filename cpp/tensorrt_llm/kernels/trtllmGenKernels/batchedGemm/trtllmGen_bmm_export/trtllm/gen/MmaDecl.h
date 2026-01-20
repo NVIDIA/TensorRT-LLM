@@ -16,10 +16,14 @@
  */
 #pragma once
 
-#include "CommonUtils.h"
 #include <cassert>
 #include <cstdint>
 #include <string>
+#ifndef TLLM_GEN_EXPORT_INTERFACE
+#include "trtllm/gen/CommonUtils.h"
+#else  // TLLM_GEN_EXPORT_INTERFACE
+#include "CommonUtils.h"
+#endif // TLLM_GEN_EXPORT_INTERFACE
 
 namespace batchedGemm
 {
@@ -89,12 +93,15 @@ inline std::string mmaKindToString(MmaKind mmaKind)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// function to get the TMEM column stride per group (i.e., 64 K elements)
-inline int32_t getTmemColStridePerGroup(int32_t tileMn, int32_t mmaK)
+// Get the TMEM column stride per group (i.e. kGroupSize * blockSize K elements)
+inline int32_t getTmemColStridePerGroup(int32_t tileMn, int32_t mmaK, int32_t kGroupSize)
 {
-    // Calculate the stride of TMEM column for every 64 elements in the K dimension
-    int32_t div = 2 * ceilDiv(tileMn, 64);
-    return mmaK == 96 ? std::max(4, div) : div;
+    int32_t colStride = 2 * ceilDiv(tileMn, 64);
+    if (mmaK == 96)
+    {
+        colStride = std::max(4, colStride);
+    }
+    return colStride;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

@@ -93,6 +93,24 @@ enum class BiasType : uint32_t
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Type of the element-wise activation to apply after the Gemm
+enum class EltwiseActType
+{
+    None = 0,
+    // Gelu is defined as the following operation:
+    // act = x0 * phi(x0)
+    // where x0 is the output of the Gemm
+    // phi is the CDF of standard normal distribution approximated by
+    // phi(x) = 0.5 * (1 + tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)))
+    Gelu,
+    // Relu2 (also known as squared Relu) is defined as the following operation:
+    // act = relu(x0) ^ 2
+    // where x0 is the output of the Gemm.
+    Relu2,
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 enum class TileScheduler
 {
     // Static scheduler (Non-persistent).
@@ -100,6 +118,24 @@ enum class TileScheduler
     // Dynamic persistent scheduler. This is either based on an atomically incremented global work id
     // prior to SM100 archs, or the HW supported work id scheduler based on UGETNEXTWORKID for SM100+.
     Persistent,
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+enum class CtaSwizzleType : uint32_t
+{
+    // Rasterize CTAs along the M dimension.
+    RasterizeAlongM = 0,
+    // Rasterize CTAs along the N dimension.
+    RasterizeAlongN,
+    // Swizzle CTAs in zig-zag pattern along M dimension, Zig-zag width is 2.
+    ZigZagAlongM2,
+    // Swizzle CTAs in zig-zag pattern along N dimension, Zig-zag width is 2.
+    ZigZagAlongN2,
+    // Swizzle CTAs in zig-zag pattern along M dimension, Zig-zag width is 4.
+    ZigZagAlongM4,
+    // Swizzle CTAs in zig-zag pattern along N dimension, Zig-zag width is 4.
+    ZigZagAlongN4,
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

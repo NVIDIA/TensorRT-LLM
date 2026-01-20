@@ -104,7 +104,7 @@ class BuildCache:
         Get the build step for engine building.
         '''
         build_config_str = json.dumps(self.prune_build_config_for_cache_key(
-            build_config.to_dict()),
+            build_config.model_dump(mode="json")),
                                       sort_keys=True)
 
         kwargs_str = json.dumps(kwargs, sort_keys=True)
@@ -140,8 +140,7 @@ class BuildCache:
 
     @staticmethod
     def prune_build_config_for_cache_key(build_config: dict) -> dict:
-        # The BuildCache will be disabled once auto_pp is enabled, so 'auto_parallel_config' should be removed
-        black_list = ['auto_parallel_config', 'dry_run']
+        black_list = ['dry_run']
         dic = build_config.copy()
         for key in black_list:
             if key in dic:

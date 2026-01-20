@@ -1,0 +1,24 @@
+[project]
+name = "unknown-package"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "TensorRT LLM [90828364+tensorrt-cicd@users.noreply.github.com]"}
+]
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "tiktoken (>=0.12.0,<0.13.0)",
+    "datasets (==3.1.0)",
+    "kaldialign (>=0.9.3,<0.10.0)",
+    "openai-whisper (>=20250625,<20250626)",
+    "librosa (>=0.11.0,<0.12.0)",
+    "soundfile (>=0.13.1,<0.14.0)",
+    "safetensors (>=0.7.0,<0.8.0)",
+    "transformers (>=4.57.6,<5.0.0)",
+    "janus (>=2.0.0,<3.0.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"

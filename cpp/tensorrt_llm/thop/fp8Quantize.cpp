@@ -20,13 +20,15 @@
 
 #include <ATen/cuda/EmptyTensor.h>
 
+TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
 using Fp8BlockScaleGemmRunnerPtr
     = std::unique_ptr<tensorrt_llm::kernels::fp8_blockscale_gemm::CutlassFp8BlockScaleGemmRunnerInterface>;
 
-std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128(at::Tensor const& self)
+std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128(at::Tensor const& self, bool use_ue8m0)
 {
     CHECK_TH_CUDA(self);
     CHECK_CONTIGUOUS(self);
@@ -64,7 +66,7 @@ std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128(at::Tensor const& self)
     auto stream = at::cuda::getCurrentCUDAStream(self.get_device());
 
     mGemmRunner.fp8CS1x128(
-        act_buffer, act_scale_buffer, reinterpret_cast<__nv_bfloat16 const*>(self.data_ptr()), n, m, stream);
+        act_buffer, act_scale_buffer, reinterpret_cast<__nv_bfloat16 const*>(self.data_ptr()), n, m, stream, use_ue8m0);
 
     // Post-process the scale tensor for sm100 gemm/moe kernel
     if (tensorrt_llm::common::isSM100Family())
@@ -135,14 +137,16 @@ std::tuple<at::Tensor, at::Tensor> fp8_batched_quantize_1x128_permute102(at::Ten
 }
 } // namespace torch_ext
 
+TRTLLM_NAMESPACE_END
+
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.def("fp8_quantize_1x128(Tensor input) -> (Tensor, Tensor)");
+    m.def("fp8_quantize_1x128(Tensor input, bool use_ue8m0=False) -> (Tensor, Tensor)");
     m.def("fp8_batched_quantize_1x128_permute102(Tensor input) -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("fp8_quantize_1x128", &torch_ext::fp8_quantize_1x128);
-    m.impl("fp8_batched_quantize_1x128_permute102", &torch_ext::fp8_batched_quantize_1x128_permute102);
+    m.impl("fp8_quantize_1x128", &tensorrt_llm::torch_ext::fp8_quantize_1x128);
+    m.impl("fp8_batched_quantize_1x128_permute102", &tensorrt_llm::torch_ext::fp8_batched_quantize_1x128_permute102);
 }

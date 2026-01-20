@@ -17,8 +17,9 @@ from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
-from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             register_auto_model)
+from ..speculative import SpecMetadata
+from .modeling_speculative import SpecDecOneEngineForCausalLM
+from .modeling_utils import DecoderModel, register_auto_model
 
 
 def _ffn_mult_to_intermediate_size(ffn_mult: float, n_embd: int) -> int:
@@ -117,6 +118,7 @@ class NemotronNASDecoderLayer(DecoderLayer):
                  block_config: Dict[str, Any], layer_idx: int):
         super().__init__()
         config = model_config.pretrained_config
+        self.layer_idx = layer_idx
         self.block_config = block_config
         if not self.block_config.attention.no_op:
             self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
@@ -150,6 +152,7 @@ class NemotronNASDecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
         if not self.block_config.attention.no_op:
@@ -177,6 +180,11 @@ class NemotronNASDecoderLayer(DecoderLayer):
                 hidden_states, residual = self.post_attention_layernorm(
                     hidden_states, residual)
             hidden_states = self.mlp(hidden_states, **kwargs)
+
+        # Capture hidden states for speculative decoding
+        if spec_metadata is not None:
+            spec_metadata.maybe_capture_hidden_states(self.layer_idx,
+                                                      hidden_states, residual)
 
         return hidden_states, residual
 
@@ -238,6 +246,7 @@ class NemotronNASModel(DecoderModel):
         input_ids: Optional[torch.IntTensor] = None,
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
         lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
@@ -259,6 +268,7 @@ class NemotronNASModel(DecoderModel):
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
                 residual=residual,
+                spec_metadata=spec_metadata,
                 lora_params=lora_params,
             )
 
@@ -267,11 +277,8 @@ class NemotronNASModel(DecoderModel):
 
 
 @register_auto_model("DeciLMForCausalLM")
-class NemotronNASForCausalLM(DecoderModelForCausalLM[NemotronNASModel,
-                                                     PretrainedConfig]):
+class NemotronNASForCausalLM(SpecDecOneEngineForCausalLM[NemotronNASModel,
+                                                         PretrainedConfig]):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
-        super().__init__(NemotronNASModel(model_config),
-                         config=model_config,
-                         hidden_size=model_config.pretrained_config.hidden_size,
-                         vocab_size=model_config.pretrained_config.vocab_size)
+        super().__init__(NemotronNASModel(model_config), model_config)

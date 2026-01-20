@@ -62,6 +62,48 @@ def setup_moe_test(dtype, num_experts):
     )
 
 
+def setup_bmm_moe_test(dtype, num_experts):
+    """Setup for stacked MoE with topk=1 in TRT-LLM format."""
+    SEQ_LEN = 8
+    HIDDEN_SIZE = 64
+    INTERMEDIATE_SIZE = 32
+    NUM_EXPERTS = num_experts
+    TOP_K = 1  # Llama4 stacked pattern requires topk=1
+
+    torch.manual_seed(1234)
+    torch.cuda.manual_seed(1234)
+    x = torch.rand(SEQ_LEN, HIDDEN_SIZE, dtype=dtype).cuda() * 0.1
+
+    router_logits = torch.randn((SEQ_LEN, NUM_EXPERTS), dtype=torch.float32).cuda()
+    routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+    final_scales, selected_experts = torch.topk(routing_weights, TOP_K, dim=-1)
+    final_scales = final_scales / final_scales.sum(dim=-1, keepdim=True)
+    final_scales = final_scales.to(x.dtype)
+
+    # TRT-LLM format: gate_up is (2*I, H), down is (H, I)
+    w3_w1_stacked_weight = torch.empty(
+        (NUM_EXPERTS, INTERMEDIATE_SIZE * 2, HIDDEN_SIZE), dtype=dtype
+    ).cuda()
+    w2_stacked_weight = torch.empty(
+        (NUM_EXPERTS, HIDDEN_SIZE, INTERMEDIATE_SIZE), dtype=dtype
+    ).cuda()
+
+    for expert_id in range(NUM_EXPERTS):
+        w31 = torch.rand(INTERMEDIATE_SIZE * 2, HIDDEN_SIZE, dtype=dtype).cuda() * 0.1
+        w2 = torch.rand(HIDDEN_SIZE, INTERMEDIATE_SIZE, dtype=dtype).cuda() * 0.1
+        # TRT-LLM format: concat w3 and w1 along intermediate dim
+        w3_w1_stacked_weight.data[expert_id].copy_(w31)  # (2*I, H)
+        w2_stacked_weight.data[expert_id].copy_(w2)  # (H, I)
+
+    return (
+        x,
+        selected_experts,
+        final_scales,
+        w3_w1_stacked_weight,
+        w2_stacked_weight,
+    )
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_moe_op_run(dtype):
     num_experts = 3

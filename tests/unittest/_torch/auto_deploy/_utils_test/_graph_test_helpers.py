@@ -1,5 +1,5 @@
 import copy
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -8,9 +8,12 @@ from _torch_test_utils import all_close, reset_parameters
 from torch.export import export
 from torch.fx import GraphModule
 
-from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import SequenceInfo
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactory
+from tensorrt_llm._torch.auto_deploy.models.factory import (
+    FullModelExportInfo,
+    ModelFactory,
+    SubModuleExportInfo,
+)
 from tensorrt_llm._torch.auto_deploy.transform.library.sharding import ShardingTransformInfo
 
 
@@ -37,46 +40,8 @@ class FakeFactory(ModelFactory):
     def get_quant_config(self):
         return self.quant_config
 
-
-class SequenceEmbeddingInfo(SequenceInfo):
-    """A sequence info object for testing that replaces the input_ids with an embedding tensor.
-
-    This is useful to run tests without the tokenizer in the loop.
-    """
-
-    def _add_hidden_dim(self, input_ids: Sequence[Sequence[Any]]) -> torch.Tensor:
-        return torch.rand(
-            *input_ids.shape,
-            self.hidden_size,
-            device=self.device,
-            dtype=self.dtype,
-        )
-
-    def __init__(self, *args, hidden_size: int, dtype: torch.dtype, **kwargs):
-        self._initialized = False
-        super().__init__(*args, **kwargs)
-
-        # overwrite input_ids with an embedding tensor and run reset again
-        self.hidden_size = hidden_size
-        self.dtype = dtype
-        self._args_device["input_ids"] = self._add_hidden_dim(self._args_device["input_ids"])
-        self._args_host["input_ids"] = self._args_device["input_ids"].cpu()
-        self._initialized = True
-        self.reset()
-
-    def nest_sequences(self, input_ids: Sequence[Sequence[Any]], *args, **kwargs) -> None:
-        # convert input_ids to an embedding tensor if needed
-        if not (isinstance(input_ids, torch.Tensor) and input_ids.ndim == 3) and self._initialized:
-            # first convert to a list of tensors
-            input_embeds = [
-                torch.tensor(ids, device=self.device, dtype=self.dtype) for ids in input_ids
-            ]
-            # then add the hidden dimension to every tensor
-            input_embeds = [self._add_hidden_dim(ids) for ids in input_embeds]
-        else:
-            input_embeds = input_ids
-
-        super().nest_sequences(input_embeds, *args, **kwargs)
+    def get_export_infos(self, model: nn.Module) -> List[SubModuleExportInfo]:
+        return [FullModelExportInfo()]
 
 
 def count_parameters(model: torch.nn.Module):
@@ -261,6 +226,12 @@ def run_sharding_pattern_detection_test(
         detected_transformations: List of detected transformation configurations
         expected_transformations: List of expected transformation configurations
     """
+    # Remove config field from transformations
+    for transform in detected_transformations:
+        transform.config = None
+    for transform in expected_transformations:
+        transform.config = None
+
     # Convert to sets for unordered comparison
     detected_set = set(detected_transformations)
     expected_set = set(expected_transformations)

@@ -1,0 +1,117 @@
+# SLURM Configuration
+slurm:
+  script_file: "disaggr_torch.slurm"
+  partition: "<partition>"
+  account: "<account>"
+  job_time: "02:00:00"
+  job_name: "<job_name>"
+  extra_args: "" # Cluster specific arguments, e.g. "--gres=gpu:4 --exclude=node1,node2"
+  numa_bind: true # Only enable for GB200/GB300 NVL72
+
+# Benchmark Mode
+benchmark:
+  mode: "e2e"  # Options: e2e, gen_only
+  use_nv_sa_benchmark: false  # Whether to use NVIDIA SA benchmark script
+  multi_round: 8  # Number of benchmark rounds
+  benchmark_ratio: 0.8  # Benchmark ratio
+  streaming: true  # Enable streaming mode
+  concurrency_list: "1024"
+  input_length: 8196  # Input sequence length
+  output_length: 1024  # Output sequence length
+  dataset_file: "<dataset_file>"
+
+# Hardware Configuration
+hardware:
+  gpus_per_node: 4  # Modify this with your hardware configuration
+  num_ctx_servers: 1  # Number of context servers
+  num_gen_servers: 1  # Number of generation servers
+
+# Environment Configuration
+environment:
+  container_mount: "<container_mount>"  # Format: path1:path1,path2:path2
+  container_image: "<container_image>"
+  model_path: "<model_path>"
+  trtllm_repo: "<trtllm_repo>"
+  build_wheel: false  # Don't build the wheel when launching multiple jobs
+  trtllm_wheel_path: ""  # Path to pre-built TensorRT-LLM wheel. If provided, install from this wheel instead
+  work_dir: "<full_path_to_work_dir>"
+  worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes"
+  server_env_var: "TRTLLM_SERVER_DISABLE_GC=1"
+
+# Profiling Configuration
+profiling:
+  nsys_on: false  # Set to true to enable profiling
+  ctx_profile_range: "10-30"  # Set TLLM_PROFILE_START_STOP for ctx workers
+  gen_profile_range: "200-250"  # Set TLLM_PROFILE_START_STOP for gen workers
+
+# Accuracy Configuration
+accuracy:
+  enable_accuracy_test: false  # Set to true to enable accuracy evaluation
+  tasks:
+    gsm8k:
+      model: "local-completions"  # Model type for lm_eval
+      model_args_extra: "num_concurrent=512,max_retries=3,tokenized_requests=false,timeout=7200,max_gen_toks=16384"
+      extra_kwargs:
+        trust_remote_code: true
+
+worker_config:
+  gen:
+    tensor_parallel_size: 32
+    moe_expert_parallel_size: 32
+    enable_attention_dp: true
+    enable_lm_head_tp_in_adp: true
+    pipeline_parallel_size: 1
+    max_batch_size: 128
+    max_num_tokens: 512
+    max_seq_len: 9236
+    cuda_graph_config:
+      enable_padding: true
+      batch_sizes:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+    print_iter_log: true
+    kv_cache_config:
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.6
+      dtype: fp8
+    moe_config:
+      backend: WIDEEP
+      use_low_precision_moe_combine: true
+      load_balancer:
+        num_slots: 288
+        layer_updates_per_iter: 1
+    cache_transceiver_config:
+      max_tokens_in_buffer: 8448
+      backend: DEFAULT
+    stream_interval: 20
+    num_postprocess_workers: 4
+    speculative_config:
+      decoding_type: MTP
+      num_nextn_predict_layers: 3
+  ctx:
+    max_batch_size: 1
+    max_num_tokens: 8448
+    max_seq_len: 8212
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 4
+    enable_attention_dp: true
+    pipeline_parallel_size: 1
+    print_iter_log: true
+    cuda_graph_config: null
+    disable_overlap_scheduler: true
+    kv_cache_config:
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.75
+      dtype: fp8
+    cache_transceiver_config:
+      max_tokens_in_buffer: 8448
+      backend: DEFAULT
+    speculative_config:
+      decoding_type: MTP
+      num_nextn_predict_layers: 3

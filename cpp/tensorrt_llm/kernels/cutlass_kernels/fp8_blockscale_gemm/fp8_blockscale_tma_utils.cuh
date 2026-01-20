@@ -15,6 +15,9 @@
  */
 
 #pragma once
+
+#include "tensorrt_llm/common/config.h"
+
 #include <cuda.h>
 #include <cudaTypedefs.h>
 #include <cuda_fp8.h>
@@ -24,7 +27,9 @@
 #include <cuda/barrier>
 #include <cute/arch/util.hpp>
 
-namespace tensorrt_llm::kernels::fp8_blockscale_gemm
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::fp8_blockscale_gemm
 {
 
 template <class T>
@@ -89,12 +94,8 @@ PFN_cuTensorMapEncodeTiled_v12000 get_cuTensorMapEncodeTiled()
     // Get pointer to cuTensorMapEncodeTiled
     cudaDriverEntryPointQueryResult driver_status;
     void* cuTensorMapEncodeTiled_ptr = nullptr;
-#if (__CUDACC_VER_MAJOR__ >= 12 && __CUDACC_VER_MINOR__ >= 5)
     cudaGetDriverEntryPointByVersion(
         "cuTensorMapEncodeTiled", &cuTensorMapEncodeTiled_ptr, 12000, cudaEnableDefault, &driver_status);
-#else
-    cudaGetDriverEntryPoint("cuTensorMapEncodeTiled", &cuTensorMapEncodeTiled_ptr, cudaEnableDefault, &driver_status);
-#endif
 
     if (driver_status != cudaDriverEntryPointSuccess)
     {
@@ -142,4 +143,6 @@ __device__ uint64_t mbarrier_arrive_1_expect_tx_cta(void* smem_ptr, uint32_t tx_
     return state;
 }
 
-} // namespace tensorrt_llm::kernels::fp8_blockscale_gemm
+} // namespace kernels::fp8_blockscale_gemm
+
+TRTLLM_NAMESPACE_END

@@ -9,6 +9,7 @@ import torch
 from utils.runtime_defaults import assert_runtime_defaults_are_parsed_correctly
 
 import tensorrt_llm.bindings as _tb
+from tensorrt_llm.llmapi.kv_cache_type import KVCacheType
 from tensorrt_llm.mapping import Mapping
 
 
@@ -85,12 +86,24 @@ def test_model_config():
     assert model_config.use_packed_input
 
     assert model_config.kv_cache_type is not None
+    # Test with C++ enums directly
     for enum_val in [
             _tb.KVCacheType.CONTINUOUS, _tb.KVCacheType.PAGED,
             _tb.KVCacheType.DISABLED
     ]:
         model_config.kv_cache_type = enum_val
         assert model_config.kv_cache_type == enum_val
+
+    # Test with Python enums converted to C++
+    for py_enum in [
+            KVCacheType.CONTINUOUS, KVCacheType.PAGED, KVCacheType.DISABLED
+    ]:
+        model_config.kv_cache_type = py_enum.to_cpp()
+        # Verify it was set correctly by comparing with C++ enum
+        assert model_config.kv_cache_type == getattr(_tb.KVCacheType,
+                                                     py_enum.name)
+        # Also verify round-trip conversion works
+        assert KVCacheType.from_cpp(model_config.kv_cache_type) == py_enum
 
     assert model_config.tokens_per_block == 64
     tokens_per_block = 1024

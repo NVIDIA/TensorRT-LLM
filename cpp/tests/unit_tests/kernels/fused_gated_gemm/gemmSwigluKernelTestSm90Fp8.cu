@@ -243,7 +243,7 @@ Result run(std::string description, Options& options, Buffers& buffers)
     auto can_implement = device_gemm.can_implement(arguments);
     if (can_implement != cutlass::Status::kSuccess)
     {
-        throw std::runtime_error("[TensorRT-LLM Error][fusedGatedGemm Runner]");
+        throw std::runtime_error("[TensorRT LLM Error][fusedGatedGemm Runner]");
     }
 
     // Initialize CUTLASS kernel with arguments and workspace pointer
@@ -481,7 +481,7 @@ int main(int argc, char const** argv)
 #ifdef COMPILE_HOPPER_TMA_GEMMS
     Result hopperFp8 = run<Gemm>(std::string("Hopper fp8 swiglu"), options, buffers);
 #else  // COMPILE_HOPPER_TMA_GEMMS
-    std::cout << "[TensorRT-LLm Error][GemmSwigluKernelTestSm90Fp8] Please recompile with support for hopper by "
+    std::cout << "[TensorRT LLM Error][GemmSwigluKernelTestSm90Fp8] Please recompile with support for hopper by "
                  "passing 90-real as an arch to build_wheel.py."
               << std::endl;
 #endif // COMPILE_HOPPER_TMA_GEMMS

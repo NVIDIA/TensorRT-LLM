@@ -64,17 +64,17 @@ class TestSmoothQuantGemm(unittest.TestCase):
         if use_plugin:
             network.plugin_config.smooth_quant_gemm_plugin = dtype
         with tensorrt_llm.net_guard(network):
-            # Init TensorRT-LLM tensor for mat1
+            # Init TensorRT LLM tensor for mat1
             x = Tensor(name='x',
                        shape=mat1.shape,
                        dtype=tensorrt_llm._utils.str_dtype_to_trt("int8"))
-            # Init TensorRT-LLM tensor for mat2
+            # Init TensorRT LLM tensor for mat2
             y = Tensor(name='y',
                        shape=mat2.shape,
                        dtype=tensorrt_llm._utils.str_dtype_to_trt("int8"))
-            # Init TensorRT-LLM tensor for per token scaling
+            # Init TensorRT LLM tensor for per token scaling
             scale_a = tensorrt_llm.functional.constant(scale_a_torch.numpy())
-            # Init TensorRT-LLM tensor for per channel scaling
+            # Init TensorRT LLM tensor for per channel scaling
             scale_b = tensorrt_llm.functional.constant(scale_b_torch.numpy())
             # Get output tensor for SQ gemm
             output = smooth_quant_gemm(x, y, scale_a, scale_b,

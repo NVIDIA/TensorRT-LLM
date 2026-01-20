@@ -1,0 +1,35 @@
+version: 0.0.1
+l0_dgx_b200_perf_sanity:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 8
+        lte: 8
+    wildcards:
+      gpu:
+      - '*b200*'
+      linux_distribution_name: ubuntu*
+      cpu: x86_64
+    terms:
+      stage: post_merge
+      backend: pytorch
+      orchestrator: mpi
+  tests:
+  # deepseek_r1_fp8_blackwell
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp8_blackwell-r1_fp8_tp8_mtp3_1k1k]
+  # - perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp8_blackwell-r1_fp8_dep8_mtp1_1k1k] TIMEOUT (90) # failed
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp8_blackwell-r1_fp8_tp8_mtp3_8k1k]
+  # - perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp8_blackwell-r1_fp8_dep8_mtp1_8k1k] TIMEOUT (90) # failed
+  # deepseek_r1_fp4_v2_blackwell
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp4_v2_blackwell-r1_fp4_v2_tp4_mtp3_1k1k]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp4_v2_blackwell-r1_fp4_v2_tp4_mtp3_8k1k]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp4_v2_blackwell-r1_fp4_v2_dep8_mtp1_1k1k] TIMEOUT (90)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp4_v2_blackwell-r1_fp4_v2_dep8_mtp1_8k1k] TIMEOUT (90)
+  # deepseek_v32_fp4_blackwell
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_v32_fp4_blackwell-v32_fp4_tep8_mtp3_8k1k]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_v32_fp4_blackwell-v32_fp4_dep8_mtp1_8k1k] TIMEOUT (90)
+  # k2_thinking_fp4_blackwell
+  # - perf/test_perf_sanity.py::test_e2e[aggr_upload-k2_thinking_fp4_blackwell-k2_thinking_fp4_tep8_8k1k] # failed
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-k2_thinking_fp4_blackwell-k2_thinking_fp4_dep8_8k1k] TIMEOUT (90)
+  # - perf/test_perf_sanity.py::test_e2e[aggr_upload-k2_thinking_fp4_blackwell-k2_thinking_fp4_tep8_32k8k] TIMEOUT (90) # failed
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-k2_thinking_fp4_blackwell-k2_thinking_fp4_dep8_32k8k] TIMEOUT (120)

@@ -572,11 +572,14 @@ size_t GPTAttentionPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* in
         = isCrossAttention() ? cross_kv_length : (useKVCache() ? inputs[getIdx(IdxEntry::CACHE_INDIR)].dims.d[2] : 0);
     int const max_num_tokens
         = mRemovePadding ? inputs[getIdx(IdxEntry::QKV_TENSOR)].dims.d[0] : max_num_seq * max_context_length;
+    int const max_blocks_per_sequence
+        = (useKVCache() && mPagedKVCache) ? inputs[getIdx(IdxEntry::KV_CACHE_BLOCK_OFFSETS)].dims.d[3] : 0;
+
     size_t const context_workspace_size
         = getWorkspaceSizeForContext(type, max_num_seq, max_context_length, cross_kv_length, max_num_tokens);
 
-    size_t const generation_workspace_size
-        = getWorkspaceSizeForGeneration(type, max_num_seq, max_kv_cache_length, max_num_tokens);
+    size_t const generation_workspace_size = getWorkspaceSizeForGeneration(
+        type, max_num_seq, max_kv_cache_length, max_num_tokens, max_blocks_per_sequence);
 
     size_t attention_input_workspace_size = 0;
 
@@ -855,7 +858,6 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
 
     int max_blocks_per_sequence = 0;
     kernels::KVBlockArray::DataType* block_offsets = nullptr;
-    kernels::KVBlockArray::DataType* host_block_offsets = nullptr;
     void* host_primary_pool_pointer = nullptr;
     void* host_secondary_pool_pointer = nullptr;
     if (useKVCache() && mPagedKVCache)
@@ -877,10 +879,6 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
 
         block_offsets
             = reinterpret_cast<kernels::KVBlockArray::DataType*>(inputs[getIdx(IdxEntry::KV_CACHE_BLOCK_OFFSETS)])
-            + poolOffset + seqOffset;
-
-        host_block_offsets
-            = reinterpret_cast<kernels::KVBlockArray::DataType*>(inputs[getIdx(IdxEntry::HOST_KV_CACHE_BLOCK_OFFSETS)])
             + poolOffset + seqOffset;
 
         auto const* const typed_host_pool_pointers
@@ -1043,7 +1041,6 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         common_enqueue_params.max_past_kv_length = max_context_kv_len;
         EnqueueContextParams<T> enqueue_params{common_enqueue_params};
         enqueue_params.attention_packed_mask = attention_packed_mask;
-        enqueue_params.host_block_offsets = host_block_offsets;
         enqueue_params.batch_size = batch_size;
         enqueue_params.mrope_rotary_cos_sin = mrope_rotary_cos_sin;
         enqueue_params.total_kv_len = enqueue_params.num_tokens;

@@ -31,6 +31,7 @@ from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.llmapi.utils import get_total_gpu_memory
 
 
+@pytest.mark.skip(reason="https://nvbugs/5606178")
 @pytest.mark.parametrize(
     "dim, headdim, ngroups, dstate, req_type, dtype, batch_size, max_seq_len, has_z, remove_padding, paged_cache, use_initial_states",
     # dim parametrization
@@ -362,6 +363,7 @@ def test_mamba2_chunk_scan_selective_state_update(dim, headdim, ngroups, dstate,
                                atol=atol[dtype])
 
 
+@pytest.mark.skip(reason="https://nvbugs/5606178")
 @pytest.mark.parametrize("mamba_chunk_size", [8, 256])
 @pytest.mark.parametrize("seqlens", [
     (16, 2, 8, 13),

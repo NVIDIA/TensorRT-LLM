@@ -76,7 +76,7 @@ def parse_arguments():
     parser.add_argument('--output_dir',
                         type=str,
                         default='tllm_checkpoint',
-                        help='The path to save the TensorRT-LLM checkpoint')
+                        help='The path to save the TensorRT LLM checkpoint')
     parser.add_argument(
         '--workers',
         type=int,
@@ -639,7 +639,7 @@ if __name__ == '__main__':
 
     hf_config = AutoConfig.from_pretrained(args.model_dir)
     hf_model = AutoModelForCausalLM.from_pretrained(args.model_dir,
-                                                    torch_dtype="auto")
+                                                    dtype="auto")
 
     config = {
         'architecture': hf_config.architectures[0],

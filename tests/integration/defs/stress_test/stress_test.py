@@ -13,8 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Stress test script for inference of model using TensorRT-LLM with PyTorch/TRT backend.
-This script is used for stress testing inference performance using trtllm-serve and genai-perf.
+Stress test script for inference of model using TensorRT LLM with PyTorch/TRT backend.
+This script is used for stress testing inference performance using trtllm-serve and aiperf.
+
+The script supports three test modes:
+1. "stress-test": Runs performance test followed by stress test
+2. "stress-stage-alone": Runs only stress test with customized parameters
+3. "stress-test-with-accuracy": Runs performance test, stress test, and accuracy tests (GSM8K)
+
+Accuracy testing is performed using lm_eval with GSM8K dataset:
+- Baseline accuracy test: Run before stress test to establish baseline
+- Post-stress accuracy test: Run after stress test to verify accuracy stability
+
+Usage example for accuracy testing:
+    pytest tests/integration/defs/stress_test/stress_test.py::test_run_stress_test[stress-test-with-accuracy]
 """
 import contextlib
 import json
@@ -32,13 +44,14 @@ import pandas as pd
 import pytest
 import requests
 import yaml
+from defs.common import parse_gsm8k_output
 from defs.conftest import get_device_count, get_device_memory, llm_models_root
 from defs.trt_test_alternative import (Popen, cleanup_process_tree, print_info,
                                        print_warning)
 
-# Install genai-perf in requirements-dev.txt will affect triton and pytorch version mismatch
-# def genai_perf_install():
-#     """Ensures genai-perf is installed without affecting the global environment"""
+# Install aiperf in requirements-dev.txt will affect triton and pytorch version mismatch
+# def aiperf_install():
+#     """Ensures aiperf is installed without affecting the global environment"""
 
 #     import os
 #     import subprocess
@@ -50,7 +63,7 @@ from defs.trt_test_alternative import (Popen, cleanup_process_tree, print_info,
 
 #     if not os.path.exists(requirements_file):
 #         with open(requirements_file, "w") as f:
-#             f.write("genai-perf\n")
+#             f.write("aiperf\n")
 
 #     subprocess.check_call(
 #         [sys.executable, "-m", "pip", "install", "-r", requirements_file])
@@ -96,7 +109,7 @@ class ModelConfig:
 
     @property
     def model_name(self) -> str:
-        """Extract model name from model_dir for genai-perf"""
+        """Extract model name from model_dir for aiperf"""
         return os.path.basename(self.model_dir)
 
 
@@ -126,17 +139,25 @@ class StressTestConfig:
     customized_stress_concurrency: int = 128
     customized_stress_request_rate: int = 20
 
+    # Accuracy test parameters
+    enable_accuracy_test: bool = False  # Enable accuracy testing with GSM8K
+    accuracy_test_timeout: int = 1200  # 20 minutes timeout for accuracy tests
+    accuracy_test_concurrency: int = 512  # Concurrency for accuracy tests
+    accuracy_test_max_retries: int = 3  # Max retries for accuracy tests
+    accuracy_test_max_gen_toks: int = 256  # Max generation tokens for accuracy tests
+    accuracy_test_max_length: int = 4096  # Max input length for accuracy tests
+
     @property
     def request_count_stress_test(self) -> int:
         """Calculate request count for stress test"""
-        # Cannot set exact stress time in genai-perf test, WR is set the stress_time as customized value to get request count
+        # Cannot set exact stress time in aiperf test, WR is set the stress_time as customized value to get request count
         stress_request_count = self.customized_stress_request_rate * self.customized_stress_time
         return stress_request_count
 
 
 @dataclass(frozen=True)
 class PerformanceParams:
-    """Dataclass to store test parameters for genai-perf"""
+    """Dataclass to store test parameters for aiperf"""
     input_len_mean: int = 64  # customized for tinyllama and llama-v3-8b-instruct-hf
     input_len_std: int = 16
     output_len_mean: int = 128  # customized for tinyllama and llama-v3-8b-instruct-hf
@@ -320,8 +341,10 @@ def check_server_health(server_url: str,
         return False, f"Unexpected error during health check: {str(e)}"
 
 
-@pytest.mark.parametrize("test_mode", ["stress-test", "stress-stage-alone"],
-                         ids=lambda x: x)
+@pytest.mark.parametrize(
+    "test_mode",
+    ["stress-test", "stress-stage-alone", "stress-test-with-accuracy"],
+    ids=lambda x: x)
 @pytest.mark.parametrize("backend", ["trt", "pytorch"], ids=lambda x: x)
 @pytest.mark.parametrize("capacity_scheduler_policy",
                          ["GUARANTEED_NO_EVICT", "MAX_UTILIZATION"],
@@ -387,7 +410,7 @@ def stress_test(config,
                 server_config=None,
                 stress_time=None,
                 stress_timeout=None):
-    """Test LLM model performance using trtllm-serve and genai-perf.
+    """Test LLM model performance using trtllm-serve and aiperf.
 
     This function supports multiple testing modes controlled by the --test-mode option:
     - "stress-test": Runs the measure capacity stage first, then the stress stage,
@@ -404,10 +427,10 @@ def stress_test(config,
         stress_time: Optional stress time in seconds, overrides the default in StressTestConfig
         stress_timeout: Optional stress timeout in seconds, overrides the default in StressTestConfig
     """
-    # Ensure genai-perf is installed
-    # genai_perf_install()
-    # Import genai-perf - needed after installation to make sure it's available
-    # import genai_perf  # noqa: F401
+    # Ensure aiperf is installed
+    # aiperf_install()
+    # Import aiperf - needed after installation to make sure it's available
+    # import aiperf  # noqa: F401
 
     # Test mode handling - determine which tests to run
     if test_mode == "stress-test":
@@ -416,9 +439,14 @@ def stress_test(config,
     elif test_mode == "stress-stage-alone":
         run_performance = False
         run_stress = True
+    elif test_mode == "stress-test-with-accuracy":
+        run_performance = True
+        run_stress = True
     else:
-        pytest.skip(f"Skipping test for unsupported mode: {test_mode}. "
-                    f"Supported modes: stress-test, stress-stage-alone")
+        pytest.skip(
+            f"Skipping test for unsupported mode: {test_mode}. "
+            f"Supported modes: stress-test, stress-stage-alone, stress-test-with-accuracy"
+        )
         return
 
     # Skip if not enough GPU memory
@@ -458,9 +486,9 @@ def stress_test(config,
             pp_size=test_server_config.pp_size,
             ep_size=8,  # DeepSeek-V3 or DeepSeek-R1 specific ep_size
             max_batch_size=
-            161,  # DeepSeek-V3 or DeepSeek-R1 specific max_batch_size
+            2048,  # DeepSeek-V3 or DeepSeek-R1 specific max_batch_size
             max_num_tokens=
-            1160,  # DeepSeek-V3 or DeepSeek-R1 specific max_num_tokens
+            2048,  # DeepSeek-V3 or DeepSeek-R1 specific max_num_tokens
             kv_cache_free_gpu_memory_fraction=
             0.7,  # DeepSeek-V3 or DeepSeek-R1 specific kv_cache fraction
             capacity_scheduler_policy=test_server_config.
@@ -472,8 +500,12 @@ def stress_test(config,
 
     # Create a StressTestConfig with customized time parameters if provided
     if run_stress:
+        # Enable accuracy test for stress-test-with-accuracy mode
+        enable_accuracy = (test_mode == "stress-test-with-accuracy")
+
         stress_config = StressTestConfig(model_config=config,
-                                         server_config=test_server_config)
+                                         server_config=test_server_config,
+                                         enable_accuracy_test=enable_accuracy)
 
         # Override stress_time and stress_timeout if provided
         if stress_time is not None:
@@ -482,7 +514,8 @@ def stress_test(config,
                 server_config=test_server_config,
                 stress_time=stress_time,
                 stress_timeout=stress_timeout
-                if stress_timeout is not None else stress_time * 2)
+                if stress_timeout is not None else stress_time * 2,
+                enable_accuracy_test=enable_accuracy)
     else:
         stress_config = None
 
@@ -557,7 +590,7 @@ def stress_test(config,
         str(test_server_config.max_num_tokens),
         "--kv_cache_free_gpu_memory_fraction",
         str(test_server_config.kv_cache_free_gpu_memory_fraction),
-        "--extra_llm_api_options",
+        "--config",
         extra_llm_options_path,
     ])
 
@@ -632,6 +665,12 @@ def stress_test(config,
             print_info(
                 f"Server is running with model {model_name}. Starting tests...")
 
+            # Run baseline accuracy test first if enabled
+            baseline_accuracy_success = True
+            if stress_config and stress_config.enable_accuracy_test:
+                baseline_accuracy_success, baseline_accuracy_value = run_accuracy_test(
+                    model_path, test_server_config, stress_config, "baseline")
+
             # Run performance test first if enabled
             stage2_output = None  # Initialize stage2_output to None
             if run_performance:
@@ -664,23 +703,69 @@ def stress_test(config,
                              stress_config,
                              None,
                              request_counter=request_counter)
+
+            # Run post-stress accuracy test if enabled
+            post_stress_accuracy_success = True
+            if stress_config and stress_config.enable_accuracy_test:
+                post_stress_accuracy_success, post_stress_accuracy_value = run_accuracy_test(
+                    model_path, test_server_config, stress_config,
+                    "post_stress")
+
+                # Report accuracy test results
+                if baseline_accuracy_success and post_stress_accuracy_success:
+                    print_info("=== ACCURACY TEST SUMMARY ===")
+                    print_info("✓ Baseline accuracy test: PASSED")
+                    print_info("✓ Post-stress accuracy test: PASSED")
+
+                    # Compare accuracy values if both are available
+                    if baseline_accuracy_value is not None and post_stress_accuracy_value is not None:
+                        accuracy_drop = baseline_accuracy_value - post_stress_accuracy_value
+                        accuracy_drop_percentage = (
+                            accuracy_drop / baseline_accuracy_value) * 100
+
+                        print_info(
+                            f"Baseline accuracy: {baseline_accuracy_value:.4f}")
+                        print_info(
+                            f"Post-stress accuracy: {post_stress_accuracy_value:.4f}"
+                        )
+                        print_info(
+                            f"Accuracy drop: {accuracy_drop:.4f} ({accuracy_drop_percentage:.2f}%)"
+                        )
+
+                        # Define threshold for significant accuracy drop (e.g., 5%)
+                        accuracy_drop_threshold = 0.05  # 5%
+                        # Assert that accuracy drop is within acceptable threshold
+                        assert accuracy_drop_percentage <= (
+                            accuracy_drop_threshold * 100
+                        ), f"Accuracy drop {accuracy_drop_percentage:.2f}% exceeds threshold {accuracy_drop_threshold * 100}%"
+                        print_info(
+                            "✓ Model accuracy appears stable under stress conditions"
+                        )
+                else:
+                    print_warning("=== ACCURACY TEST SUMMARY ===")
+                    if not baseline_accuracy_success:
+                        print_warning("✗ Baseline accuracy test: FAILED")
+                    if not post_stress_accuracy_success:
+                        print_warning("✗ Post-stress accuracy test: FAILED")
+                    print_warning(
+                        "Model accuracy may be affected by stress conditions")
     finally:
         # Clean up temp yaml file
         if os.path.exists(extra_llm_options_path):
             os.unlink(extra_llm_options_path)
 
 
-def create_genai_perf_command(model_name,
-                              model_path,
-                              request_count,
-                              concurrency,
-                              input_len_mean=PerformanceParams.input_len_mean,
-                              input_len_std=PerformanceParams.input_len_std,
-                              output_len_mean=PerformanceParams.output_len_mean,
-                              output_len_std=PerformanceParams.output_len_std,
-                              warmup_request_count=10):
+def create_aiperf_command(model_name,
+                          model_path,
+                          request_count,
+                          concurrency,
+                          input_len_mean=PerformanceParams.input_len_mean,
+                          input_len_std=PerformanceParams.input_len_std,
+                          output_len_mean=PerformanceParams.output_len_mean,
+                          output_len_std=PerformanceParams.output_len_std,
+                          warmup_request_count=10):
     """
-    Create a command list for genai-perf with standardized parameters.
+    Create a command list for aiperf with standardized parameters.
 
     Args:
         model_name: Name of the model
@@ -694,10 +779,10 @@ def create_genai_perf_command(model_name,
         warmup_request_count: Number of warmup requests
 
     Returns:
-        List of command-line arguments for genai-perf
+        List of command-line arguments for aiperf
     """
     return [
-        "genai-perf",
+        "aiperf",
         "profile",
         "-m",
         model_name,
@@ -721,20 +806,20 @@ def create_genai_perf_command(model_name,
         str(concurrency),
         "--warmup-request-count",
         str(warmup_request_count),
-        "--verbose",
+        # "--verbose",
     ]
 
 
-def run_genai_perf_process(cmd,
-                           test_start_time,
-                           test_timeout,
-                           server_config,
-                           request_counter=None):
+def run_aiperf_process(cmd,
+                       test_start_time,
+                       test_timeout,
+                       server_config,
+                       request_counter=None):
     """
-    Run a genai-perf process and monitor both the process and server health.
+    Run a aiperf process and monitor both the process and server health.
 
     Args:
-        cmd: Command list to execute genai-perf
+        cmd: Command list to execute aiperf
         test_start_time: Start time of the test
         test_timeout: Timeout for the test in seconds
         server_config: Server configuration object
@@ -743,7 +828,7 @@ def run_genai_perf_process(cmd,
     Returns:
         Boolean indicating whether the process completed successfully
     """
-    # Start genai-perf process with our context manager
+    # Start aiperf process with our context manager
     with launch_process(cmd,
                         start_new_session=True,
                         filter_pattern=None,
@@ -752,16 +837,16 @@ def run_genai_perf_process(cmd,
         last_health_check = time.time()
         process_completed = False
 
-        # Monitor both the server and genai-perf process
+        # Monitor both the server and aiperf process
         while process.poll() is None:
             current_time = time.time()
 
-            # Check if genai-perf is still running but exceeded timeout
+            # Check if aiperf is still running but exceeded timeout
             elapsed_time = current_time - test_start_time
             if elapsed_time > test_timeout:
                 cleanup_process_tree(process, has_session=True)
                 raise RuntimeError(
-                    f"genai-perf test timed out after {test_timeout} seconds")
+                    f"aiperf test timed out after {test_timeout} seconds")
 
             # Check server health periodically
             if current_time - last_health_check > server_config.health_check_timeout:
@@ -785,20 +870,20 @@ def run_genai_perf_process(cmd,
 
             time.sleep(0.5)
 
-        # Check final status of genai-perf process
+        # Check final status of aiperf process
         retcode = process.poll()
         if retcode is not None:
             if retcode != 0:
                 cleanup_process_tree(process, has_session=True)
                 raise RuntimeError(
-                    f"genai-perf exited with non-zero code: {retcode}")
+                    f"aiperf exited with non-zero code: {retcode}")
             else:
-                print_info("genai-perf completed successfully")
+                print_info("aiperf completed successfully")
                 process_completed = True
         else:
             cleanup_process_tree(process, has_session=True)
             raise RuntimeError(
-                "genai-perf did not complete normally, will terminate")
+                "aiperf did not complete normally, will terminate")
 
     return process_completed
 
@@ -837,8 +922,8 @@ def measure_capacity_stage(model_name,
             f"Running test {test_index+1}/{total_tests}: concurrency={concurrency}, request_count={request_count}"
         )
 
-        # Prepare genai-perf command
-        cmd = create_genai_perf_command(
+        # Prepare aiperf command
+        cmd = create_aiperf_command(
             model_name=model_name,
             model_path=model_path,
             request_count=request_count,
@@ -849,10 +934,10 @@ def measure_capacity_stage(model_name,
             output_len_std=performance_params.output_len_std,
             warmup_request_count=10)
 
-        # Run genai-perf process
-        process_completed = run_genai_perf_process(
-            cmd, test_start_time, performance_params.test_timeout,
-            server_config, request_counter)
+        # Run aiperf process
+        process_completed = run_aiperf_process(cmd, test_start_time,
+                                               performance_params.test_timeout,
+                                               server_config, request_counter)
 
         # Increment completed tests counter if the process completed successfully
         if process_completed:
@@ -932,8 +1017,8 @@ def stress_stage(model_name,
     if request_counter:
         request_counter.reset()
 
-    # Prepare genai-perf command
-    cmd = create_genai_perf_command(
+    # Prepare aiperf command
+    cmd = create_aiperf_command(
         model_name=model_name,
         model_path=model_path,
         request_count=request_count,
@@ -944,10 +1029,9 @@ def stress_stage(model_name,
         output_len_std=PerformanceParams.output_len_std,
         warmup_request_count=10)
 
-    # Start genai-perf process
-    process_completed = run_genai_perf_process(cmd, test_start_time,
-                                               test_timeout, server_config,
-                                               request_counter)
+    # Start aiperf process
+    process_completed = run_aiperf_process(cmd, test_start_time, test_timeout,
+                                           server_config, request_counter)
 
     test_end_time = time.time()
     duration = int(test_end_time - test_start_time)
@@ -984,23 +1068,106 @@ def format_time(seconds: int) -> str:
         return f"{seconds}s"
 
 
-def extract_stress_test_metrics(artifacts_dir="./artifacts",
-                                current_model=None):
+def run_accuracy_test(model_path: str,
+                      server_config: ServerConfig,
+                      stress_config: StressTestConfig,
+                      test_phase: str = "baseline") -> tuple[bool, float]:
+    """
+    Run accuracy test using lm_eval with GSM8K dataset
+
+    Args:
+        model_path: Path of the model being tested
+        server_config: Server configuration containing URL and port
+        stress_config: Stress test configuration containing accuracy test parameters
+        test_phase: Phase of the test ("baseline" or "post_stress")
+
+    Returns:
+        tuple: (Boolean indicating whether the accuracy test completed successfully, accuracy value)
+    """
+    if not stress_config.enable_accuracy_test:
+        print_info(f"Skipping accuracy test for {test_phase} phase (disabled)")
+        return True, None
+
+    print_info(f"=== Running {test_phase.upper()} ACCURACY TEST (GSM8K) ===")
+
+    # Create lm_eval command
+    lm_eval_cmd = [
+        "lm_eval", "--model", "local-completions", "--tasks", "gsm8k",
+        "--model_args",
+        f"model={model_path},base_url={server_config.url}/v1/completions,"
+        f"num_concurrent={stress_config.accuracy_test_concurrency},"
+        f"max_retries={stress_config.accuracy_test_max_retries},"
+        f"tokenized_requests=False,"
+        f"timeout={stress_config.accuracy_test_timeout},"
+        f"max_gen_toks={stress_config.accuracy_test_max_gen_toks},"
+        f"max_length={stress_config.accuracy_test_max_length}",
+        "--trust_remote_code"
+    ]
+
+    test_start_time = time.time()
+    accuracy_value = None
+
+    try:
+        # Run lm_eval process with timeout monitoring
+        print_info(f"Running lm_eval command: {' '.join(lm_eval_cmd)}")
+
+        # Use subprocess.run to capture output directly
+        result = subprocess.run(lm_eval_cmd,
+                                capture_output=True,
+                                text=True,
+                                timeout=stress_config.accuracy_test_timeout)
+
+        # Check if process completed successfully
+        if result.returncode == 0:
+            test_end_time = time.time()
+            duration = int(test_end_time - test_start_time)
+            print_info(
+                f"{test_phase.capitalize()} accuracy test completed successfully in {format_time(duration)}"
+            )
+
+            # Parse accuracy value from output
+            output_text = result.stdout
+            accuracy_value = parse_gsm8k_output(output_text)
+            return True, accuracy_value
+        else:
+            print_warning(
+                f"lm_eval exited with non-zero code: {result.returncode}")
+            print_warning(f"stderr: {result.stderr}")
+            return False, None
+
+    except subprocess.TimeoutExpired:
+        print_warning(
+            f"Accuracy test timed out after {stress_config.accuracy_test_timeout} seconds"
+        )
+        return False, None
+    except Exception as e:
+        print_warning(f"Error during {test_phase} accuracy test: {str(e)}")
+        return False, None
+
+
+def extract_stress_test_metrics(artifacts_dir=None, current_model=None):
     """
     Extract stress test metrics from the artifacts directory
 
     Args:
-        artifacts_dir (str): Path to the artifacts directory
+        artifacts_dir (str): Path to the artifacts directory. If None, defaults to
+                            the 'artifacts' directory at the defs level (parent of stress_test)
         current_model (str, optional): If provided, only analyze artifacts for this model
     """
-    # Find all profile_export_genai_perf.json files in the artifacts directory
+    # Set default artifacts_dir relative to this script's location
+    # The artifacts are at defs/artifacts/, one level up from stress_test/
+    if artifacts_dir is None:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        artifacts_dir = os.path.join(script_dir, "..", "artifacts")
+
+    # Find all profile_export_aiperf.json files in the artifacts directory
     json_files = glob(os.path.join(artifacts_dir,
-                                   "**/profile_export_genai_perf.json"),
+                                   "**/profile_export_aiperf.json"),
                       recursive=True)
 
     if not json_files:
         raise RuntimeError(
-            "No profile_export_genai_perf.json files found in the artifacts directory"
+            "No profile_export_aiperf.json files found in the artifacts directory"
         )
 
     # Get a list of directory names in the artifacts directory
@@ -1050,17 +1217,25 @@ def extract_stress_test_metrics(artifacts_dir="./artifacts",
                                             {}).get("avg", 0)
                 tokThroughput = results.get("output_token_throughput",
                                             {}).get("avg", 0)
-                conCurrency = results.get("input_config", {}).get(
-                    "perf_analyzer", {}).get("stimulus",
-                                             {}).get("concurrency", 0)
+                conCurrency = results.get("input_config",
+                                          {}).get("loadgen",
+                                                  {}).get("concurrency", 0)
+                if conCurrency == 0:
+                    conCurrency = results.get("input_config", {}).get(
+                        "perf_analyzer", {}).get("stimulus",
+                                                 {}).get("concurrency", 0)
 
                 # Try to determine model name from directory structure first
                 if first_dir in model_name_map:
                     modelName = model_name_map[first_dir]
                 else:
                     # Fall back to model name from JSON if we can't extract from directory
-                    modelName = results.get("input_config",
-                                            {}).get("model", ["unknown"])
+                    modelName = results.get("input_config", {}).get(
+                        "endpoint", {}).get("model_names", None)
+                    if modelName is None:
+                        modelName = results.get("input_config",
+                                                {}).get("model_names",
+                                                        ["unknown"])
                     modelName = modelName[0] if isinstance(modelName,
                                                            list) else modelName
 
@@ -1117,8 +1292,7 @@ def extract_stress_test_metrics(artifacts_dir="./artifacts",
 
         range_val = max_val - min_val
         if range_val == 0:
-            raise ValueError(
-                "Please check OutputTokenThroughput from genai-perf")
+            raise ValueError("Please check OutputTokenThroughput from aiperf")
         else:
             normalized_df.loc[
                 normalized_df["Model"] == model_name,

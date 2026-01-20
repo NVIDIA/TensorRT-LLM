@@ -289,6 +289,8 @@ class TestMixtral8x7BInstruct(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/Mixtral-8x7B-Instruct-v0.1"
 
     @skip_post_blackwell
+    @pytest.mark.skip_less_device(2)
+    @pytest.mark.skip_less_device_memory(80000)
     def test_awq_tp2(self):
         quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_AWQ)
         with LLM(self.MODEL_PATH,
@@ -469,7 +471,7 @@ class TestEagleVicuna_7B_v1_3(LlmapiAccuracyTestHarness):
 
     speculative_config = EagleDecodingConfig(
         max_draft_len=63,
-        speculative_model_dir=f"{llm_models_root()}/EAGLE-Vicuna-7B-v1.3",
+        speculative_model=f"{llm_models_root()}/EAGLE-Vicuna-7B-v1.3",
         num_eagle_layers=4,
         max_non_leaves_per_layer=10,
                             eagle_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], \
@@ -495,7 +497,7 @@ class TestEagle2Vicuna_7B_v1_3(LlmapiAccuracyTestHarness):
 
     speculative_config = EagleDecodingConfig(
         max_draft_len=63,
-        speculative_model_dir=f"{llm_models_root()}/EAGLE-Vicuna-7B-v1.3",
+        speculative_model=f"{llm_models_root()}/EAGLE-Vicuna-7B-v1.3",
         num_eagle_layers=4,
         max_non_leaves_per_layer=10,
         use_dynamic_tree=True,
@@ -510,6 +512,7 @@ class TestEagle2Vicuna_7B_v1_3(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+@pytest.mark.skip_device_not_contain(["A100", "H100"])
 class TestStarCoder2_7B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "bigcode/starcoder2-7b"
     MODEL_PATH = f"{llm_models_root()}/starcoder2-7b"

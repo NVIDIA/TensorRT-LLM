@@ -1,6 +1,6 @@
 .tag {
-  padding: 2px 5px;
-  border-radius: 4px;
+  padding: 2px 3px;
+  border-radius: 3px;
   font-size: 0.8em;
   margin-right: 5px;
   color: #000;
@@ -9,7 +9,7 @@
 code.beta {
   display: inline-block;
   background-color: #6c757d;
-  color: #999;
+  color: #fff;
 }
 
 code.prototype {
@@ -21,5 +21,11 @@ code.prototype {
 code.deprecated {
   display: inline-block;
   background-color: red;
+  color: #fff;
+}
+
+code.stable {
+  display: inline-block;
+  background-color: #28a745;
   color: #fff;
 }

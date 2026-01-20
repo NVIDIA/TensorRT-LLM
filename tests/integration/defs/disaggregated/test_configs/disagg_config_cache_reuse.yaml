@@ -1,7 +1,6 @@
 hostname: localhost
 port: 8000
 model: TinyLlama/TinyLlama-1.1B-Chat-v1.0
-free_gpu_memory_fraction: 0.15
 backend: "pytorch"
 cuda_graph_config: null
 disable_overlap_scheduler: True
@@ -14,6 +13,7 @@ context_servers:
     enable_block_reuse: True
     enable_partial_reuse: True
     event_buffer_max_size: 1024
+    free_gpu_memory_fraction: 0.15
   cache_transceiver_config:
     backend: DEFAULT
   urls:

@@ -1,0 +1,17 @@
+[project]
+name = "auto-deploy-examples"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "TensorRT LLM [90828364+tensorrt-cicd@users.noreply.github.com]"}
+]
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "ai-edge-model-explorer (>=0.1.14)",
+    "lm-eval[api] (==0.4.5)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"

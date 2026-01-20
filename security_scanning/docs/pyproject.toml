@@ -1,0 +1,23 @@
+[project]
+name = "docs"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "TensorRT LLM [90828364+tensorrt-cicd@users.noreply.github.com]"}
+]
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "sphinx (>=7.0)",
+    "sphinx-argparse (>=0.5.2,<0.6.0)",
+    "sphinx-click (>=6.2.0,<7.0.0)",
+    "nvidia-sphinx-theme (>=0.0.9.post1,<0.0.10)",
+    "breathe (>=4.36.0,<5.0.0)",
+    "sphinx-copybutton (>=0.5.2,<0.6.0)",
+    "autodoc-pydantic (>=2.2.0,<3.0.0)",
+    "sphinx-togglebutton (>=0.4.4,<0.5.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"

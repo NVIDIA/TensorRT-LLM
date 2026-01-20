@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include <cublasLt.h>
 #include <cublas_v2.h>
@@ -24,8 +25,8 @@
 #include <optional>
 #include <string>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace common
 {
 
@@ -83,6 +84,22 @@ public:
         int const lda, void const* B, int const ldb, void* C, int const ldc, float f_alpha, float f_beta,
         cublasLtMatmulAlgo_t const& algo, bool hasAlgo, bool usingCublasLt);
 
+#ifdef ENABLE_CUBLASLT_FP4_GEMM
+    /********************** Block-Scaled GEMMs **********************/
+    // Generic block-scaled GEMM interface supporting FP4, FP8, and other quantized formats
+    // that require per-block scaling factors (a_sf, b_sf)
+
+    // Uses default/heuristic algorithm
+    void BlockScaleGemm(cublasOperation_t transa, cublasOperation_t transb, int const m, int const n, int const k,
+        void const* A, int const lda, void const* B, int const ldb, void* C, int const ldc, void const* a_sf,
+        void const* b_sf, float const* alpha);
+
+    // Uses specified algorithm (for autotuning)
+    void BlockScaleGemm(cublasOperation_t transa, cublasOperation_t transb, int const m, int const n, int const k,
+        void const* A, int const lda, void const* B, int const ldb, void* C, int const ldc, void const* a_sf,
+        void const* b_sf, float const* alpha, cublasLtMatmulAlgo_t const* algo);
+#endif
+
     void stridedBatchedGemm(cublasOperation_t transa, cublasOperation_t transb, int const m, int const n, int const k,
         void const* A, int const lda, const int64_t strideA, void const* B, int const ldb, const int64_t strideB,
         void* C, int const ldc, const int64_t strideC, int const batchCount, float const f_alpha = 1.0f,
@@ -120,6 +137,9 @@ public:
 #ifdef ENABLE_FP8
     void setFP8GemmConfig(cudaDataType_t outputType = CUDA_R_16F);
 #endif
+#ifdef ENABLE_CUBLASLT_FP4_GEMM
+    void setFP4GemmConfig(cudaDataType_t outputType = CUDA_R_16BF);
+#endif
 
     void setStream(cudaStream_t stream);
 
@@ -130,6 +150,7 @@ public:
     void createDescriptors(cublasOperation_t transa, cublasOperation_t transb, int const m, int const n, int const k,
         int const lda, int const ldb, int const ldc, int8_t fastAcc = 0);
     void setScaleDescriptors(void* scale_a, void* scale_b);
+    void setBiasDescriptor(void* bias);
     void destroyDescriptors();
 
     cublasHandle_t getCublasHandle()
@@ -141,8 +162,28 @@ public:
     {
         return *(this->mCublasLtHandle);
     }
+
+    cublasLtMatmulDesc_t getOperationDesc() const
+    {
+        return mOperationDesc;
+    }
+
+    cublasLtMatrixLayout_t getADesc() const
+    {
+        return mADesc;
+    }
+
+    cublasLtMatrixLayout_t getBDesc() const
+    {
+        return mBDesc;
+    }
+
+    cublasLtMatrixLayout_t getCDesc() const
+    {
+        return mCDesc;
+    }
 };
 
 } // namespace common
 
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

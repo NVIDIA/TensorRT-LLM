@@ -1,6 +1,6 @@
 # GPT-NeoX
 
-This document explains how to build the [GPT-NeoX](https://huggingface.co/EleutherAI/gpt-neox-20b) model using TensorRT-LLM and run on a single GPU and a single node with
+This document explains how to build the [GPT-NeoX](https://huggingface.co/EleutherAI/gpt-neox-20b) model using TensorRT LLM and run on a single GPU and a single node with
 multiple GPUs.
 
 - [GPT-NeoX](#gpt-neox)
@@ -8,21 +8,21 @@ multiple GPUs.
   - [Support Matrix](#support-matrix)
   - [Usage](#usage)
     - [1. Download weights from HuggingFace (HF) Transformers](#1-download-weights-from-huggingface-hf-transformers)
-    - [2. Convert weights from HF Transformers to TensorRT-LLM format](#2-convert-weights-from-hf-transformers-to-tensorrt-llm-format)
+    - [2. Convert weights from HF Transformers to TensorRT LLM format](#2-convert-weights-from-hf-transformers-to-tensorrt-llm-format)
     - [3. Build TensorRT engine(s)](#3-build-tensorrt-engines)
     - [4. Summarization using the GPT-NeoX model](#4-summarization-using-the-gpt-neox-model)
   - [Apply groupwise quantization GPTQ](#apply-groupwise-quantization-gptq)
     - [1. Download weights from HuggingFace (HF)](#1-download-weights-from-huggingface-hf)
     - [2. Generating quantized weights](#2-generating-quantized-weights)
-    - [3. Convert weights from HF Transformers to TensorRT-LLM format](#3-convert-weights-from-hf-transformers-to-tensorrt-llm-format)
+    - [3. Convert weights from HF Transformers to TensorRT LLM format](#3-convert-weights-from-hf-transformers-to-tensorrt-llm-format)
     - [4. Build TensorRT engine(s)](#4-build-tensorrt-engines)
     - [5. Summarization using the GPT-NeoX model](#5-summarization-using-the-gpt-neox-model)
 
 ## Overview
 
-The TensorRT-LLM GPT-NeoX implementation can be found in [`tensorrt_llm/models/gptneox/model.py`](../../tensorrt_llm/models/gptneox/model.py). The TensorRT-LLM GPT-NeoX example code is located in [`examples/models/contrib/gptneox`](./). There is one main file:
+The TensorRT LLM GPT-NeoX implementation can be found in [`tensorrt_llm/models/gptneox/model.py`](../../tensorrt_llm/models/gptneox/model.py). The TensorRT LLM GPT-NeoX example code is located in [`examples/models/contrib/gptneox`](./). There is one main file:
 
-* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert a checkpoint from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT-LLM format.
+* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert a checkpoint from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT LLM format.
 
 In addition, there are two shared files in the parent folder [`examples`](../../../) for inference and evaluation:
 
@@ -37,7 +37,7 @@ In addition, there are two shared files in the parent folder [`examples`](../../
 
 ## Usage
 
-The TensorRT-LLM GPT-NeoX example code locates at [examples/models/contrib/gptneox](./). It takes HF weights as input, and builds the corresponding TensorRT engines. The number of TensorRT engines depends on the number of GPUs used to run inference.
+The TensorRT LLM GPT-NeoX example code locates at [examples/models/contrib/gptneox](./). It takes HF weights as input, and builds the corresponding TensorRT engines. The number of TensorRT engines depends on the number of GPUs used to run inference.
 
 ### 1. Download weights from HuggingFace (HF) Transformers
 
@@ -52,7 +52,7 @@ pip install -r requirements.txt
 git clone https://huggingface.co/EleutherAI/gpt-neox-20b gptneox_model
 ```
 
-### 2. Convert weights from HF Transformers to TensorRT-LLM format
+### 2. Convert weights from HF Transformers to TensorRT LLM format
 
 If you want to use Int8 weight only quantization, just need to add `--use_weight_only` flag.
 
@@ -117,7 +117,7 @@ trtllm-build --checkpoint_dir ./gptneox/20B/trt_ckpt/int8_wo/2-gpu/ \
 
 ### 4. Summarization using the GPT-NeoX model
 
-The following section describes how to run a TensorRT-LLM GPT-NeoX model to summarize the articles from the
+The following section describes how to run a TensorRT LLM GPT-NeoX model to summarize the articles from the
 [cnn_dailymail](https://huggingface.co/datasets/abisee/cnn_dailymail) dataset. For each summary, the script can compute the
 [ROUGE](https://en.wikipedia.org/wiki/ROUGE_(metric)) scores and use the `ROUGE-1` score to validate the implementation.
 The script can also perform the same summarization using the HF GPT-NeoX model.
@@ -164,7 +164,7 @@ In this example, the weights are quantized using [GPTQ-for-LLaMa](https://github
 sh gptq_convert.sh
 ```
 
-### 3. Convert weights from HF Transformers to TensorRT-LLM format
+### 3. Convert weights from HF Transformers to TensorRT LLM format
 
 To apply groupwise quantization GPTQ, addition command-line flags need to be passed to `convert_checkpoint.py`:
 Here `--quant_ckpt_path` flag specifies the output safetensors of `gptq_convert.sh` script.

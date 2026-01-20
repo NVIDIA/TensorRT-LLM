@@ -22,8 +22,6 @@
 
 #ifdef TLLM_ENABLE_CUDA
 #include <cuda.h>
-#include <cutlass/cutlass.h>
-#include <cutlass/half.h>
 #endif
 
 namespace batchedGemm
@@ -40,8 +38,9 @@ namespace tg = trtllm::gen;
 
 #ifdef TLLM_ENABLE_CUDA
 
-inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, tg::MmaKind mmaKind, std::vector<uint64_t> const& shapes,
-    std::vector<uint64_t> const& strides, std::vector<int32_t> const& tileShapes, void* gmemAddr, bool doSwizzle = true)
+inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, std::vector<uint64_t> const& shapes,
+    std::vector<uint64_t> const& strides, std::vector<int32_t> const& tileShapes, void* gmemAddr, bool doPad,
+    bool doSwizzle = true)
 {
     // The multiplication factor of the data padding in SMEM.
     int32_t padMultiplier = 1;
@@ -64,17 +63,15 @@ inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, tg::MmaKind mmaKind, st
     {
         tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B;
     }
-    else if (dtype == tg::Dtype::MxE2m1)
+    else if (dtype == tg::Dtype::MxE2m1 || dtype == tg::Dtype::MxInt4)
     {
-        if (mmaKind == tg::MmaKind::MxFp8Fp6Fp4)
+        if (doPad)
         {
             padMultiplier = 2;
             tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B;
         }
         else
         {
-            // Note: this is used with the MMA kind MxFp4NvFp4 and also when casting to a higher-precision
-            // type such as Bfloat16 before the MMA.
             tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B;
         }
     }
@@ -184,7 +181,7 @@ inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, tg::MmaKind mmaKind, st
         char const* errorString;
         cuGetErrorString(result, &errorString);
         std::stringstream ss;
-        ss << "Error: Failed to initialize the TMA descriptor " << result << std::endl;
+        ss << "Error: Failed to initialize the TMA descriptor. " << errorString << std::endl;
 
         ss << "tmaFormat: " << static_cast<int>(tmaDataFormat) << " dim: " << dim << " gmem: " << gmemAddr << std::endl;
 
@@ -228,10 +225,14 @@ inline CUtensorMap buildSfTmaDescriptor(tg::Dtype dtype, std::vector<uint64_t> c
     std::vector<uint64_t> const& strides, std::vector<uint32_t> const& tileShapes, void* gmemAddr)
 {
     CUtensorMap desc{};
-    CUtensorMapDataType tmaDataFormat;
+    CUtensorMapDataType tmaDataFormat{};
     if (dtype == tg::Dtype::E4m3 || dtype == tg::Dtype::UE8m0)
     {
         tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_UINT8;
+    }
+    else if (dtype == tg::Dtype::Bfloat16)
+    {
+        tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
     }
     else
     {
@@ -288,7 +289,7 @@ inline CUtensorMap buildSfTmaDescriptor(tg::Dtype dtype, std::vector<uint64_t> c
         char const* errorString;
         cuGetErrorString(result, &errorString);
         std::stringstream ss;
-        ss << "Error: Failed to initialize the TMA descriptor for SF " << errorString << std::endl;
+        ss << "Error: Failed to initialize the TMA descriptor for SF. " << errorString << std::endl;
 
         ss << "tmaFormat: " << static_cast<int>(tmaDataFormat) << " dim: " << dim << " gmem: " << gmemAddr << std::endl;
 

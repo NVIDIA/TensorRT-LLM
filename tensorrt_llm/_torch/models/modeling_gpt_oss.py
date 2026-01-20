@@ -1,5 +1,5 @@
 import os
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 import torch
 from torch import nn
@@ -7,6 +7,7 @@ from torch.nn.parameter import Parameter
 from tqdm import tqdm
 from transformers import GptOssConfig
 
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 
 from ..attention_backend import AttentionMetadata
@@ -23,7 +24,7 @@ from ..modules.embedding import Embedding
 # isort: off
 from ..modules.fused_moe import (MoE, MoEWeightLoadingMode,
                                  RenormalizeMoeRoutingMethod, TritonFusedMoE,
-                                 TRTLLMGenFusedMoE, create_moe)
+                                 create_moe)
 from ..modules.fused_moe.routing import (get_cached_perfect_router_logits,
                                          precompute_common_perfect_router_logits
                                          )
@@ -33,8 +34,10 @@ from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
 from ..utils import Fp4QuantizedTensor
 from .modeling_speculative import SpecDecOneEngineForCausalLM
-from .modeling_utils import (DecoderModel, duplicate_kv_weight, filter_weights,
-                             register_auto_model)
+from .modeling_utils import DecoderModel, filter_weights, register_auto_model
+
+# Use TinyGEMM when the number of tokens is not larger than this threshold
+MIN_LATENCY_TINYGEMM_NUM_TOKENS = 128
 
 
 class AttentionBlock(Attention):
@@ -43,6 +46,8 @@ class AttentionBlock(Attention):
         self,
         config: ModelConfig[GptOssConfig],
         layer_idx: int = 0,
+        reduce_output: bool = True,
+        use_custom_cublas_mm: bool = False,
     ):
         pretrained_config = config.pretrained_config
 
@@ -75,6 +80,8 @@ class AttentionBlock(Attention):
             config=config,
             q_scaling=1.0,
             attention_chunk_size=None,
+            reduce_output=reduce_output,
+            use_custom_cublas_mm=use_custom_cublas_mm,
         )
 
         # Only apply sliding window to every other layer
@@ -127,12 +134,16 @@ class MLPBlock(torch.nn.Module):
         config: ModelConfig[GptOssConfig],
         layer_idx: int,
         reduce_results: bool = True,
+        use_custom_cublas_mm: bool = False,
     ):
         super().__init__()
 
         self.config = config  # Store config as instance variable
         pretrained_config = config.pretrained_config
         self.num_experts = pretrained_config.num_local_experts
+        moe_load_balancer_config = config.moe_load_balancer
+        self.num_slots = moe_load_balancer_config.num_slots if moe_load_balancer_config and moe_load_balancer_config.num_slots else self.num_experts
+
         self.layer_idx = layer_idx
         self.enable_attention_dp = config.mapping.enable_attention_dp
         self.mapping = config.mapping
@@ -146,20 +157,22 @@ class MLPBlock(torch.nn.Module):
             out_features=pretrained_config.num_local_experts,
             bias=True,
             dtype=pretrained_config.torch_dtype,
-            use_custom_cublas_mm=
-            False,  # TODO: check perf & cublass mm can not support bias.
+            use_custom_cublas_mm=use_custom_cublas_mm,
         )
 
         self.routing_method = RenormalizeMoeRoutingMethod(
-            top_k=pretrained_config.num_experts_per_tok)
+            top_k=pretrained_config.num_experts_per_tok,
+            output_dtype=torch.bfloat16
+            if config.moe_backend.upper() == "TRTLLM" else torch.float32)
+
         self.swiglu_alpha = torch.tensor(
-            [1.702] * (self.num_experts // config.mapping.moe_ep_size),
+            [1.702] * (self.num_slots // config.mapping.moe_ep_size),
             dtype=torch.float32).cuda()
         self.swiglu_beta = torch.tensor(
-            [1.0] * (self.num_experts // config.mapping.moe_ep_size),
+            [1.0] * (self.num_slots // config.mapping.moe_ep_size),
             dtype=torch.float32).cuda()
         self.swiglu_limit = torch.tensor(
-            [7.0] * (self.num_experts // config.mapping.moe_ep_size),
+            [7.0] * (self.num_slots // config.mapping.moe_ep_size),
             dtype=torch.float32).cuda()
         # Prepare MoE creation parameters
         moe_params = {
@@ -216,10 +229,27 @@ class MLPBlock(torch.nn.Module):
             device=device,
             dtype=pretrained_config.torch_dtype)
 
+    def compute_gate_output(self,
+                            x: torch.Tensor,
+                            lora_params: Optional[dict] = None) -> torch.Tensor:
+        # Skip tinygemm2 optimization when LoRA is active (tinygemm2 doesn't support LoRA)
+        use_tinygemm = (get_sm_version() in [90, 100, 103]
+                        and x.shape[0] <= MIN_LATENCY_TINYGEMM_NUM_TOKENS
+                        and (lora_params is None or not bool(lora_params)))
+
+        if use_tinygemm:
+            weight = self.gate.weight
+            bias = self.gate.bias
+            g = torch.ops.trtllm.tinygemm2(x, weight, bias)
+        else:
+            g = self.gate(x, lora_params=lora_params, layer_idx=self.layer_idx)
+        return g
+
     def forward_normal(
         self,
         x: torch.Tensor,
-        residual: Optional[torch.Tensor] = None
+        residual: Optional[torch.Tensor] = None,
+        lora_params: Optional[dict] = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         orig_shape = x.shape
         hidden_dim = orig_shape[-1]
@@ -228,7 +258,7 @@ class MLPBlock(torch.nn.Module):
         # t = self.norm(x) was done in the parent block
         t = x
 
-        g = self.gate(t)
+        g = self.compute_gate_output(t, lora_params=lora_params)
         # Use ideal load balanced logits if enabled, otherwise use gate output
         if os.environ.get('ENABLE_PERFECT_ROUTER', '0') == '1':
             # WARNING: This discards the learned gate output and uses ideal logits for perfect load balancing
@@ -247,7 +277,8 @@ class MLPBlock(torch.nn.Module):
         self,
         x: torch.Tensor,
         attn_metadata: AttentionMetadata,
-        residual: Optional[torch.Tensor] = None
+        residual: Optional[torch.Tensor] = None,
+        lora_params: Optional[dict] = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         orig_shape = x.shape
         hidden_dim = orig_shape[-1]
@@ -260,10 +291,10 @@ class MLPBlock(torch.nn.Module):
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
 
         if self.mapping.tp_size > 1 and all_rank_num_tokens is not None:
-            if (isinstance(self.experts, (TRTLLMGenFusedMoE, TritonFusedMoE))):
+            if (isinstance(self.experts, (TritonFusedMoE))):
                 t = allgather(t, self.mapping, dim=0, sizes=all_rank_num_tokens)
 
-        g = self.gate(t)
+        g = self.compute_gate_output(t, lora_params=lora_params)
         # Use ideal load balanced logits if enabled, otherwise use gate output
         if os.environ.get('ENABLE_PERFECT_ROUTER', '0') == '1':
             # WARNING: This discards the learned gate output and uses ideal logits for perfect load balancing
@@ -273,7 +304,7 @@ class MLPBlock(torch.nn.Module):
             g = self._create_ideal_expert_load_balanced_logits(
                 num_tokens=num_tokens, num_experts=num_experts, device=x.device)
 
-        # Let CutlassFusedMoE handle allgather internally
+        # Let CutlassFusedMoE and TRTLLMGenFusedMoE handle allgather internally
         # Pass the normalized tensor (t) as input to experts, not x
         expert_output = self.experts(x=t,
                                      router_logits=g,
@@ -287,12 +318,13 @@ class MLPBlock(torch.nn.Module):
         self,
         x: torch.Tensor,
         attn_metadata: AttentionMetadata,
-        residual: Optional[torch.Tensor] = None
+        residual: Optional[torch.Tensor] = None,
+        lora_params: Optional[dict] = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.enable_attention_dp:
-            return self.forward_attn_dp(x, attn_metadata, residual)
+            return self.forward_attn_dp(x, attn_metadata, residual, lora_params)
         else:
-            return self.forward_normal(x, residual)
+            return self.forward_normal(x, residual, lora_params)
 
 
 class TransformerBlock(DecoderLayer):
@@ -301,6 +333,7 @@ class TransformerBlock(DecoderLayer):
         self,
         config: ModelConfig[GptOssConfig],
         layer_idx: int,
+        use_custom_cublas_mm: bool = False,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -315,14 +348,20 @@ class TransformerBlock(DecoderLayer):
             eps=pretrained_config.rms_norm_eps,
             dtype=pretrained_config.torch_dtype)
 
-        self.attn = AttentionBlock(config, layer_idx)
+        self.attn = AttentionBlock(config,
+                                   layer_idx,
+                                   reduce_output=False,
+                                   use_custom_cublas_mm=use_custom_cublas_mm)
 
         self.post_attention_layernorm = RMSNorm(
             hidden_size=pretrained_config.hidden_size,
             eps=pretrained_config.rms_norm_eps,
             dtype=pretrained_config.torch_dtype)
 
-        self.mlp = MLPBlock(config, layer_idx, reduce_results=not self.is_tp)
+        self.mlp = MLPBlock(config,
+                            layer_idx,
+                            reduce_results=False,
+                            use_custom_cublas_mm=use_custom_cublas_mm)
 
         self.mapping = config.mapping
 
@@ -332,9 +371,12 @@ class TransformerBlock(DecoderLayer):
             dtype=pretrained_config.torch_dtype)
 
         # setup for tp
-        self.allreduce = AllReduce(mapping=config.mapping,
-                                   strategy=config.allreduce_strategy,
-                                   dtype=config.pretrained_config.torch_dtype)
+        self.allreduce = None
+        if self.is_tp:
+            self.allreduce = AllReduce(
+                mapping=config.mapping,
+                strategy=config.allreduce_strategy,
+                dtype=config.pretrained_config.torch_dtype)
 
     def forward_normal(
         self,
@@ -343,6 +385,7 @@ class TransformerBlock(DecoderLayer):
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor] = ...,
         spec_metadata: Optional[SpecMetadata] = None,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
@@ -353,10 +396,14 @@ class TransformerBlock(DecoderLayer):
                                 hidden_states,
                                 attn_metadata,
                                 residual=residual,
+                                lora_params=lora_params,
                                 **kwargs)
         x, residual = self.post_attention_layernorm(x, residual)
 
-        x, residual = self.mlp(x, attn_metadata, residual)
+        x, residual = self.mlp(x,
+                               attn_metadata,
+                               residual,
+                               lora_params=lora_params)
 
         if spec_metadata is not None:
             spec_metadata.maybe_capture_hidden_states(self.layer_idx, x,
@@ -372,6 +419,7 @@ class TransformerBlock(DecoderLayer):
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor] = ...,
         spec_metadata: Optional[SpecMetadata] = None,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
@@ -384,6 +432,7 @@ class TransformerBlock(DecoderLayer):
             attn_metadata,
             residual=residual,
             all_reduce_params=AllReduceParams(enable_allreduce=False),
+            lora_params=lora_params,
             **kwargs)
 
         x, residual = self.allreduce(
@@ -396,7 +445,10 @@ class TransformerBlock(DecoderLayer):
                 trigger_completion_at_end=False,
             ))
 
-        x, residual = self.mlp(x, attn_metadata, residual)
+        x, residual = self.mlp(x,
+                               attn_metadata,
+                               residual,
+                               lora_params=lora_params)
 
         if spec_metadata is not None and spec_metadata.is_layer_capture(
                 self.layer_idx):
@@ -432,6 +484,7 @@ class TransformerBlock(DecoderLayer):
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor] = ...,
         spec_metadata: Optional[SpecMetadata] = None,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if self.is_tp:
@@ -443,6 +496,7 @@ class TransformerBlock(DecoderLayer):
                         attn_metadata,
                         residual,
                         spec_metadata=spec_metadata,
+                        lora_params=lora_params,
                         **kwargs)
 
 
@@ -455,6 +509,11 @@ class Transformer(DecoderModel):
         # Triton MoE kernels require installing Triton main branch,
         # which may be incompatible with torch.compile due to version mismatch.
         enable_torch_compile_for_embedding = model_config.moe_backend != "TRITON"
+
+        # Use custom cublas since we need LUT to tune the perf.
+        prop = torch.cuda.get_device_properties(0)
+        sm_version = prop.major * 10 + prop.minor
+        self.use_custom_cublas_mm = sm_version == 121
 
         if model_config.mapping.enable_attention_dp:
             # When attention_dp is enabled, we cannot do all_reduce since
@@ -476,6 +535,7 @@ class Transformer(DecoderModel):
                 gather_output=True,
                 enable_torch_compile_for_embedding=
                 enable_torch_compile_for_embedding,
+                use_custom_cublas_mm=self.use_custom_cublas_mm,
             )
         # For modeling_speculative, different name expected
         self.embed_tokens = self.embedding
@@ -483,6 +543,7 @@ class Transformer(DecoderModel):
             TransformerBlock(
                 model_config,
                 layer_idx,
+                use_custom_cublas_mm=self.use_custom_cublas_mm,
             ) for layer_idx in range(config.pretrained_config.num_hidden_layers)
         ])
         self.norm = RMSNorm(
@@ -498,7 +559,7 @@ class Transformer(DecoderModel):
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         spec_metadata: Optional[SpecMetadata] = None,
-        mrope_config: Optional[Tuple[torch.Tensor, int]] = None,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -515,8 +576,8 @@ class Transformer(DecoderModel):
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
                 residual=residual,
-                mrope_config=mrope_config,
                 spec_metadata=spec_metadata,
+                lora_params=lora_params,
             )
 
         return hidden_states
@@ -564,6 +625,8 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
         if model_config.pretrained_config.torch_dtype is None:
             model_config.pretrained_config.torch_dtype = torch.bfloat16
 
+        assert model_config.mapping.pp_size == 1, "Pipeline parallelism is not supported."
+
         super().__init__(
             Transformer(model_config),
             model_config=model_config,
@@ -575,6 +638,15 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
 
         quant_config = self.model_config.quant_config
         if quant_config.exclude_modules:
+            if quant_config.quant_algo == "NVFP4":
+                quant_config.exclude_modules = [
+                    'block.*.attn.qkv',
+                    'block.*.attn.out',
+                    'block.*.mlp.gate',
+                    'embedding',
+                    'unembedding',
+                ]
+
             for i, module in enumerate(quant_config.exclude_modules):
                 names = module.split(".")
                 if names[-1] in params_map_reverse:
@@ -589,16 +661,14 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
                 module.create_weights()
 
     def load_weights(self, weights: Dict):
-        is_ori_model = True
-        for k, v in weights.items():
-            if 'q_proj' in k:
-                is_ori_model = False
+        is_nvfp4 = self.model_config.quant_config.quant_mode.has_nvfp4()
 
-        if is_ori_model:
-            self.load_ori_weights(weights)
+        if is_nvfp4:
+            self.load_nvfp4_weights(weights)
         else:
             self.load_hf_weights(weights)
 
+    def post_load_weights(self):
         for idx, layer in enumerate(
                 self.model.block[:self.config.num_hidden_layers]):
             if idx == 0:
@@ -622,6 +692,18 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
             module_weights = {}
             for k, v in self.hf_params_map.items():
                 name = name.replace(k, v)
+
+            # Special case: ConfigurableMoE.backend (TRTLLMGenFusedMoE)
+            # Currently saved MoE weights don't include 'backend' in their names.
+            # After MoE refactoring, ConfigurableMoE now has a backend submodule,
+            # and weights loading is done in the backend, so module name includes '.backend'.
+            # We need to use parent module name (without .backend) to match saved weight names.
+            # After MoE refactoring is fully complete, all paths will follow this branch.
+            names = name.split('.')
+            if names[-1] == "backend" and isinstance(module, MoE):
+                # Backend is under experts module (ConfigurableMoE wrapper)
+                name = '.'.join(names[:-1])
+
             module_weights = filter_weights(name, weights)
 
             if isinstance(module, MoE):
@@ -734,176 +816,107 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
                     if p is not None:
                         p.data.copy_(module_weights[n][:])
 
-    def load_ori_weights(self, weights: Dict):
-        head_dim = self.config.head_dim
-        num_q_head = self.config.num_attention_heads
-        num_kv_head = self.config.num_key_value_heads
+    def load_nvfp4_weights(self, weights: Dict):
         num_expert = self.config.num_local_experts
-        enable_attention_dp = self.model_config.mapping.enable_attention_dp
-        tp_size = self.model_config.mapping.tp_size
 
         for name, module in tqdm(list(self.named_modules()),
                                  desc="Loading weights"):
             if len(module._parameters) <= 0 or name.startswith("draft_model"):
                 continue
-            names = name.split(".")
+
             module_weights = {}
-            if names[-1] in self.params_map:
-                names[-1] = self.params_map[names[-1]]
+            for k, v in self.hf_params_map.items():
+                name = name.replace(k, v)
 
-            # Drop the first "model" prefix
-            if names[0] == 'model':
-                name = '.'.join(names[1:])
-            else:
-                name = '.'.join(names)
+            names = name.split('.')
+            if names[-1] == "backend" and isinstance(module, MoE):
+                # Backend is under experts module (ConfigurableMoE wrapper)
+                name = '.'.join(names[:-1])
+
             module_weights = filter_weights(name, weights)
+
             if isinstance(module, MoE):
-                # [num_experts, intermediate_size * 2, hidden_size]
-                gate_up_proj = filter_weights(name.replace("experts", "mlp1"),
-                                              weights)
-                # [num_experts, intermediate_size, hidden_size]
-                down_proj = filter_weights(name.replace("experts", "mlp2"),
-                                           weights)
-                try:
-                    # Official MXFP4 ckpt.
-                    gate_up_weight = gate_up_proj['weight.blocks'].flatten(
-                        -2, -1)
-                    gate, up = gate_up_weight[:, ::2, :], gate_up_weight[:, 1::
-                                                                         2, :]
-                    gate_up_weight = torch.cat([gate, up], dim=-2)
-                    gate_up_bias = gate_up_proj['bias']
-                    gate, up = gate_up_bias[:, ::2], gate_up_bias[:, 1::2]
-                    gate_up_bias = torch.cat([gate, up], dim=-1)
-                    moe_weights = {
-                        'gate_up_proj': [
-                            gate_up_weight[i, :, :].transpose(0, 1)
-                            for i in range(num_expert)
-                        ],
-                        'down_proj': [
-                            down_proj['weight.blocks'].flatten(
-                                -2, -1)[i, :, :].transpose(0, 1)
-                            for i in range(num_expert)
-                        ],
-                        'gate_up_proj.bias':
-                        [gate_up_bias[i, :] for i in range(num_expert)],
-                        'down_proj.bias':
-                        [down_proj['bias'][i, :] for i in range(num_expert)]
-                    }
-                except:
-                    # For BF16 ckpt.
-                    moe_weights = {
-                        'gate_up_proj': [
-                            gate_up_proj['weight'][i, :, :].transpose(0, 1).to(
-                                self.model.dtype) for i in range(num_expert)
-                        ],
-                        'down_proj': [
-                            down_proj['weight'][i, :, :].transpose(0, 1).to(
-                                self.model.dtype) for i in range(num_expert)
-                        ],
-                        'gate_up_proj.bias':
-                        [gate_up_proj['bias'][i, :] for i in range(num_expert)],
-                        'down_proj.bias':
-                        [down_proj['bias'][i, :] for i in range(num_expert)]
-                    }
-                # Only for Official MXFP4 ckpt.
-                if 'weight.scales' in gate_up_proj:
-                    gate_up_weight_scale = gate_up_proj['weight.scales']
-                    gate, up = gate_up_weight_scale[:, ::
-                                                    2, :], gate_up_weight_scale[:,
-                                                                                1::
-                                                                                2, :]
-                    gate_up_weight_scale = torch.cat([gate, up], dim=-2)
+                assert getattr(module, "quant_config", None) is not None and \
+                   module.quant_config.quant_mode.has_nvfp4()
+                gate_up = module_weights.get('gate_up_proj', None)
+                down = module_weights.get('down_proj', None)
+                gate_up_bias = module_weights.get('gate_up_proj_bias', None)
+                down_bias = module_weights.get('down_proj_bias', None)
+
+                def deinterleave(tensor):
+                    g, u = tensor[..., ::2], tensor[..., 1::2]
+                    return torch.cat([g, u], dim=-1)
+
+                gate_up = deinterleave(gate_up)
+                gate_up_bias = deinterleave(gate_up_bias)
+
+                # Only fp32 bias is supported for NVFP4 MoE.
+                if gate_up_bias.dtype != torch.float32:
+                    gate_up_bias = gate_up_bias.to(torch.float32)
+                if down_bias.dtype != torch.float32:
+                    down_bias = down_bias.to(torch.float32)
+
+                moe_weights = {}
+                if gate_up is not None:
+                    moe_weights['gate_up_proj'] = [
+                        gate_up[i, :, :] for i in range(num_expert)
+                    ]
+                if down is not None:
+                    moe_weights['down_proj'] = [
+                        down[i, :, :] for i in range(num_expert)
+                    ]
+                if gate_up_bias is not None:
+                    moe_weights['gate_up_proj.bias'] = [
+                        gate_up_bias[i, :] for i in range(num_expert)
+                    ]
+                if down_bias is not None:
+                    moe_weights['down_proj.bias'] = [
+                        down_bias[i, :] for i in range(num_expert)
+                    ]
+
+                # Per-expert block scales (transpose to expected layout)
+                if 'gate_up_proj_weight_scale' in module_weights:
+                    gu_ws = module_weights['gate_up_proj_weight_scale']
+                    gu_ws = deinterleave(gu_ws)
                     moe_weights['gate_up_proj_weight_scale'] = [
-                        gate_up_weight_scale[i, :, :].transpose(0, 1)
-                        for i in range(num_expert)
+                        gu_ws[i, :, :] for i in range(num_expert)
                     ]
-
-                    if self.model_config.quant_config.quant_algo == 'W4A16_MXFP4':
-                        for i in range(num_expert):
-                            moe_weights[f"{i}.w1.weight_scale_inv"] = gate[
-                                i, :, :]
-                            moe_weights[f"{i}.w3.weight_scale_inv"] = up[
-                                i, :, :]
-
-                if 'weight.scales' in down_proj:
+                if 'down_proj_weight_scale' in module_weights:
+                    dp_ws = module_weights['down_proj_weight_scale']
                     moe_weights['down_proj_weight_scale'] = [
-                        down_proj['weight.scales'][i, :, :].transpose(0, 1)
-                        for i in range(num_expert)
+                        dp_ws[i, :, :] for i in range(num_expert)
                     ]
 
-                    if self.model_config.quant_config.quant_algo == 'W4A16_MXFP4':
-                        for i in range(num_expert):
-                            moe_weights[f"{i}.w2.weight_scale_inv"] = down_proj[
-                                'weight.scales'][i, :, :]
+                # Module-level globals for NVFP4 loaders
+                for src_key in [
+                        'gate_up_proj_weight_scale_2',
+                        'down_proj_weight_scale_2',
+                        'gate_up_proj_input_scale',
+                        'down_proj_input_scale',
+                ]:
+                    if src_key in module_weights:
+                        moe_weights[src_key] = module_weights[src_key]
 
                 module.load_weights(weights=[moe_weights])
             elif hasattr(module, "load_weights"):
-                # Load Attention module weights.
                 if 'qkv' in name:
-                    q_weight = module_weights['weight'][:head_dim *
-                                                        num_q_head, :]
-                    k_weight = module_weights['weight'][head_dim *
-                                                        num_q_head:head_dim *
-                                                        (num_q_head +
-                                                         num_kv_head), :]
-                    v_weight = module_weights['weight'][-head_dim *
-                                                        num_kv_head:, :]
-                    q_bias = module_weights['bias'][:head_dim * num_q_head]
-                    k_bias = module_weights['bias'][head_dim *
-                                                    num_q_head:head_dim *
-                                                    (num_q_head + num_kv_head)]
-                    v_bias = module_weights['bias'][-head_dim * num_kv_head:]
-
-                    # Handle KV weight duplication for GQA
-                    tensors_need_duplication = ['weight', 'bias']
-                    if module.quant_config.quant_mode.has_mxfp4():
-                        tensors_need_duplication.append('weight_scale')
-
-                    # Duplicate KV weights if needed
-                    tensor_parallel_size = tp_size if not enable_attention_dp else 1
-
-                    k_weight_dict = {'weight': k_weight, 'bias': k_bias}
-                    v_weight_dict = {'weight': v_weight, 'bias': v_bias}
-
-                    if 'weight_scale' in module_weights:
-                        k_weight_dict['weight_scale'] = module_weights[
-                            'weight_scale'][head_dim * num_q_head:head_dim *
-                                            (num_q_head + num_kv_head), :]
-                        v_weight_dict['weight_scale'] = module_weights[
-                            'weight_scale'][-head_dim * num_kv_head:, :]
-
-                    k_weight_dict = {
-                        k: (duplicate_kv_weight(
-                            weight=v,
-                            num_kv_heads=num_kv_head,
-                            tensor_parallel_size=tensor_parallel_size)
-                            if k in tensors_need_duplication else v)
-                        for k, v in k_weight_dict.items()
-                    }
-
-                    v_weight_dict = {
-                        k: (duplicate_kv_weight(
-                            weight=v,
-                            num_kv_heads=num_kv_head,
-                            tensor_parallel_size=tensor_parallel_size)
-                            if k in tensors_need_duplication else v)
-                        for k, v in v_weight_dict.items()
-                    }
-
-                    qkv_weights = [{
-                        'weight': q_weight,
-                        'bias': q_bias
-                    }, k_weight_dict, v_weight_dict]
-                    module.load_weights(weights=qkv_weights)
+                    # For qkv_proj
+                    q_weight_bias = filter_weights(
+                        name.replace('qkv_proj', 'q_proj'), weights)
+                    k_weight_bias = filter_weights(
+                        name.replace('qkv_proj', 'k_proj'), weights)
+                    v_weight_bias = filter_weights(
+                        name.replace('qkv_proj', 'v_proj'), weights)
+                    module.load_weights(
+                        weights=[q_weight_bias, k_weight_bias, v_weight_bias])
                 else:
-                    # Dense & gate & sinks
+                    # For o_proj, sinks.
                     module.load_weights(weights=[module_weights])
             else:
-                # Load LN weights.
-                if names[-1].endswith("layernorm") and names[-3] == "block":
-                    # skip loading weights for the fused norms
+                # Load four LN weights (attn.norm, mlp.norm, input_layernorm, post_attention_layernorm).
+                if 'next_layer_layernorm' in name:
                     continue
+
                 for n, p in module._parameters.items():
                     if p is not None:
-                        p.data.copy_(module_weights[n.replace(
-                            "weight", "scale")][:])
+                        p.data.copy_(module_weights[n][:])

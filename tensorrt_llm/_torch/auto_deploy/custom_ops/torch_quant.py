@@ -4,6 +4,7 @@ import torch
 
 from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import (
     cutlass_fp4_scale_to_modelopt_fp4_scale,
+    unpack_uint8_to_int4_weight_2d,
 )
 
 # FP4 tables (E2M1)
@@ -276,3 +277,45 @@ def torch_fake_quant_nvfp4_linear(
     weight_zp: List[torch.Tensor],
 ) -> torch.Tensor:
     return torch.ops.aten.linear(input, weight_quantized.repeat(1, 2).to(input.dtype), bias)
+
+
+@torch.library.custom_op("auto_deploy::torch_fake_quant_int4_linear", mutates_args=())
+def torch_fake_quant_int4_linear(
+    input: torch.Tensor,  # [..., K]
+    weight_quantized: torch.Tensor,  # [N//2, K] unit8 (packed)
+    bias: Optional[torch.Tensor],  # [N] or None
+    input_scale: List[torch.Tensor],  # [ pre_quant_scale ]
+    weight_scale: List[torch.Tensor],  # [ weight_scale ]
+    input_zp: List[torch.Tensor],
+    weight_zp: List[torch.Tensor],
+) -> torch.Tensor:
+    BLOCK_SIZE = 128
+    # activation pre-scale
+    pre_quant_scale = input_scale[0].to(dtype=input.dtype)
+    x_scaled = torch.mul(input, pre_quant_scale)
+
+    q_int4 = unpack_uint8_to_int4_weight_2d(weight_quantized, weight_scale[0])  # (N,K), int8
+    amax_2d = (weight_scale[0] * 7.0).to(input.dtype)  # (N, K//128)
+
+    scale_blocks = (7.0 / amax_2d).to(torch.float32)  # (N, K//128)
+    scale_full = scale_blocks.repeat_interleave(BLOCK_SIZE, dim=1)  # (N,K)
+
+    # Dequantize
+    w_deq = (q_int4.to(torch.float32) / scale_full).to(input.dtype)
+
+    return torch.ops.auto_deploy.torch_linear_simple.default(x_scaled, w_deq, bias)
+
+
+@torch_fake_quant_int4_linear.register_fake
+def _fake(
+    input: torch.Tensor,
+    weight_quantized: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    input_scale: List[torch.Tensor],
+    weight_scale: List[torch.Tensor],
+    input_zp: List[torch.Tensor],
+    weight_zp: List[torch.Tensor],
+) -> torch.Tensor:
+    N_half = weight_quantized.shape[-2]
+    N = N_half * 2
+    return torch.empty((*input.shape[:-1], N), dtype=input.dtype, device=input.device)

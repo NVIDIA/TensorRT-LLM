@@ -63,15 +63,15 @@ args:
     num_hidden_layers: 12
     hidden_size: 1024
   world_size: 4
-  compile_backend: torch-compile
-  attn_backend: triton
   max_seq_len: 2048
   max_batch_size: 16
   transforms:
-    sharding:
-      strategy: auto
-    quantization:
-      enabled: false
+    detect_sharding:
+      support_partial_config: true
+    insert_cached_attention:
+      backend: triton
+    compile_model:
+      backend: torch-compile
 
 prompt:
   batch_size: 8
@@ -79,13 +79,6 @@ prompt:
     max_tokens: 150
     temperature: 0.8
     top_k: 50
-
-benchmark:
-  enabled: true
-  num: 20
-  bs: 4
-  isl: 1024
-  osl: 256
 ```
 
 Create an additional override file (e.g., `production.yaml`):
@@ -94,11 +87,10 @@ Create an additional override file (e.g., `production.yaml`):
 # production.yaml
 args:
   world_size: 8
-  compile_backend: torch-opt
   max_batch_size: 32
-
-benchmark:
-  enabled: false
+  transforms:
+    compile_model:
+      backend: torch-opt
 ```
 
 Then use these configurations:
@@ -107,18 +99,18 @@ Then use these configurations:
 # Using single YAML config
 python build_and_run_ad.py \
   --model "meta-llama/Meta-Llama-3.1-8B-Instruct" \
-  --yaml-configs my_config.yaml
+  --yaml-extra my_config.yaml
 
 # Using multiple YAML configs (deep merged in order, later files have higher priority)
 python build_and_run_ad.py \
   --model "meta-llama/Meta-Llama-3.1-8B-Instruct" \
-  --yaml-configs my_config.yaml production.yaml
+  --yaml-extra my_config.yaml production.yaml
 
 # Targeting nested AutoDeployConfig with separate YAML
 python build_and_run_ad.py \
   --model "meta-llama/Meta-Llama-3.1-8B-Instruct" \
-  --yaml-configs my_config.yaml \
-  --args.yaml-configs autodeploy_overrides.yaml
+  --yaml-extra my_config.yaml \
+  --args.yaml-extra autodeploy_overrides.yaml
 ```
 
 ## Configuration Precedence and Deep Merging
@@ -126,7 +118,7 @@ python build_and_run_ad.py \
 The configuration system follows a precedence order in which higher priority sources override lower priority ones:
 
 1. **CLI Arguments** (highest priority) - Direct command line arguments
-1. **YAML Configs** - Files specified via `--yaml-configs` and `--args.yaml-configs`
+1. **YAML Configs** - Files specified via `--yaml-extra` and `--args.yaml-extra`
 1. **Default Settings** (lowest priority) - Built-in defaults from the config classes
 
 **Deep Merging**: Unlike simple overwriting, deep merging recursively combines nested dictionaries. For example:
@@ -152,14 +144,112 @@ args:
 **Nested Config Behavior**: When using nested configurations, outer YAML configuration files become initialization settings for inner objects, giving them higher precedence:
 
 ```bash
-# The outer yaml-configs affects the entire ExperimentConfig
-# The inner args.yaml-configs affects only the AutoDeployConfig
+# The outer yaml-extra affects the entire ExperimentConfig
+# The inner args.yaml-extra affects only the AutoDeployConfig
 python build_and_run_ad.py \
   --model "meta-llama/Meta-Llama-3.1-8B-Instruct" \
-  --yaml-configs experiment_config.yaml \
-  --args.yaml-configs autodeploy_config.yaml \
+  --yaml-extra experiment_config.yaml \
+  --args.yaml-extra autodeploy_config.yaml \
   --args.world-size=8  # CLI override beats both YAML configs
 ```
+
+## Sharding configuration
+
+The `detect_sharding` transform automatically detects and applies sharding strategies to the model. It supports multiple sharding sources and dimensions, allowing flexible configuration for different model architectures and parallelism strategies.
+
+### Configuration Parameters
+
+The `detect_sharding` transform accepts the following configuration parameters:
+
+#### `simple_shard_only` (bool, default: `false`)
+
+When set to `true`, forces simple sharding (row-wise sharding with all-gather) for all linear layers, bypassing more sophisticated column/row sharding strategies. This is useful when you want a uniform sharding approach across all layers or when debugging sharding issues.
+
+#### `sharding_source` (list, default: `['manual', 'factory', 'heuristic']`)
+
+Specifies the priority order of sharding sources. The order matters: if multiple sources try to apply sharding to the same layer, only the first one in the list will be applied. The available sources are:
+
+- **`'manual'`**: Uses manually provided sharding configuration via `manual_config` parameter
+- **`'factory'`**: Uses factory-provided sharding configuration (e.g., from HuggingFace model configs)
+- **`'heuristic'`**: Uses automatic heuristic-based sharding detection based on layer patterns
+
+Example: If both `manual` and `heuristic` try to apply sharding to layer L, only the `manual` transformation will be applied since it appears first in the list.
+
+#### `support_partial_config` (bool, default: `true`)
+
+When `true`, allows partial sharding configurations where not all layers need to be specified in the manual or factory config. Layers not explicitly configured will be handled by heuristic sharding or left unsharded. When `false`, the configuration must specify all layers or it will be invalidated and skipped.
+
+#### `sharding_dims` (list, default: `['tp', 'ep', 'bmm']`)
+
+Specifies which sharding dimensions to apply during heuristic sharding. The available dimensions are:
+
+- **`'tp'`**: Tensor parallelism - applies column/row sharding for standard transformer layers
+- **`'ep'`**: Expert parallelism - shards experts across ranks for Mixture-of-Experts (MoE) models
+- **`'bmm'`**: Batch matrix multiplication sharding - shards batch matrix multiplication operations
+- **`'ssm'`**: State space model sharding - applies specialized sharding for Mamba/SSM layers
+
+You can enable multiple dimensions simultaneously. For example, `['tp', 'ep']` will apply both tensor parallelism and expert parallelism.
+
+#### `process_grid` (dict, default: `None`)
+
+Specifies a 2D device mesh for hybrid EP+TP parallelism.
+
+- NOTE 1: This grid applies only to the MoE layers. Attention, Mamba, and MLP layers are unaffected.
+- NOTE 2: The order of the keys matters. Process grid's layout is in the generalized column-major order,
+  that is, the last dimension is stride-one.
+- NOTE 3: `ep * tp` must be equal to the provided world size. Otherwise, the mesh will be considered invalid,
+  and 1D ep-only parallelism will be applied.
+
+Example:
+
+```
+    process_grid: {'ep': 2, 'tp': 2}
+```
+
+If `world_size == 4`, ranks \[0,1\] and \[2,3\] will create two EP groups. Experts will be distributed across these two
+groups, and internally, TP=2 column-row sharding will be applied.
+
+#### `requires_shape_prop` (bool, default: `true`)
+
+Whether shape propagation is required before applying this transform. Shape propagation enables the transform to make informed decisions about sharding strategies based on tensor dimensions.
+
+### Manual TP Sharding Configuration
+
+For advanced users, you can provide a manual sharding configuration. An example of such setting:
+
+```yaml
+args:
+  transforms:
+    detect_sharding:
+      manual_config:
+        head_dim: 128
+        tp_plan:
+          # mamba SSM layers
+          in_proj: mamba
+          out_proj: rowwise
+          # attention layers
+          q_proj: colwise
+          k_proj: colwise
+          v_proj: colwise
+          o_proj: rowwise
+          # NOTE: for performance reason, consider not sharding the following
+          # layers at all. Commenting out the following layers will replicate
+          # them across ranks.
+          # MLP and shared experts in MoE layers
+          gate_proj: colwise
+          up_proj: colwise
+          down_proj: rowwise
+          # MoLE: latent projections: simple shard
+          fc1_latent_proj: gather
+          fc2_latent_proj: gather
+```
+
+The `tp_plan` dictionary maps layer names (using module paths with wildcard `*` support) to sharding strategies:
+
+- **`colwise`**: Column-wise sharding (splits the weight matrix along columns)
+- **`rowwise`**: Row-wise sharding (splits the weight matrix along rows)
+- **`mamba`**: Specialized sharding for Mamba SSM layers
+- **`gather`**: Simple shard with row-wise sharding and all-gather operation
 
 ## Built-in Default Configuration
 

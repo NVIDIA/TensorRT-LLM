@@ -14,13 +14,14 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/beamSearchKernels.h"
 
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -355,4 +356,5 @@ template void printLogProbs<float>(float const* x, int const nBS, int const nBMI
 template void printLogProbs<half>(half const* x, int const nBS, int const nBMIn, int const nBM, int const nV);
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

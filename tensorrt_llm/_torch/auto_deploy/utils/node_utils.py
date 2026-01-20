@@ -2,11 +2,15 @@
 
 import operator
 from dataclasses import dataclass
+from enum import Enum
+from functools import partial
 from typing import Callable, Iterable, List, Optional, Tuple, Union
 
 import torch
+from pydantic import BaseModel, ConfigDict
+from torch import nn
 from torch._ops import OpOverload, OpOverloadPacket
-from torch.fx import Graph, GraphModule, Node
+from torch.fx import GraphModule, Node
 
 from .logger import ad_logger
 
@@ -26,6 +30,39 @@ except ImportError:
 
 OpOrOverload = Union[OpOverloadPacket, OpOverload]
 OperatorLike = Union[OpOrOverload, Callable]
+
+
+class LayerType(Enum):
+    """Enum for layer type."""
+
+    ATTENTION = "attention"
+    SSM = "ssm"
+    MLP = "mlp"
+    MOE = "moe"
+    MLA = "mla"
+    UNKNOWN = "unknown"
+
+
+class LayerSubgraph(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    opening_nodes: List[Node]
+    subgraph_nodes: List[Node]
+    terminating_node: Union[Node, None]
+    layer_type: LayerType
+    min_local_shape: int = 1
+
+
+class WeightNode(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    node: Node
+    tensor: torch.Tensor
+    node_key: str
+    submod: nn.Module
+
+
+class WeightNodes(BaseModel):
+    weights: list[WeightNode]
+    biases: list[WeightNode]
 
 
 @dataclass
@@ -106,10 +143,28 @@ def get_quantization_params_from_linear_node(linear_op: torch.fx.node.Node):
     return input_params, weight_params, output_params
 
 
-def extract_weight_node(mm_node: Node) -> int:
-    """Extracts the weight node from the given linear or BMM node. We assume torch.bmm(activation, weight)"""
+def extract_weight_name(node: Node) -> str:
+    weight_nodes = extract_weight_nodes(node)
+    return weight_nodes.weights[0].node_key
 
-    def find_get_attr_node(node: Node) -> Node:
+
+def get_param_or_buffer(tensor_name: str, gm: GraphModule) -> torch.Tensor:
+    if tensor_name in dict(gm.named_parameters()):
+        return gm.get_parameter(tensor_name)
+    elif tensor_name in dict(gm.named_buffers()):
+        return gm.get_buffer(tensor_name)
+    else:
+        raise KeyError(f"Tensor {tensor_name} not found in the graph")
+
+
+def extract_weight_nodes(node: Node) -> WeightNodes:
+    """Extracts the list of weight node and optional bias node from the given parametrized node"""
+    gm = node.graph.owning_module
+    param_names = {name for name, _ in gm.named_parameters()}.union(
+        {name for name, _ in gm.named_buffers()}
+    )
+
+    def find_get_attr_node(weight_node: Node) -> Node:
         """Recursively traverse inputs of allowed nodes to find a node with 'get_attr' op."""
         # If node is a get_attr node return node
         # List of nodes allowed in between a get_attr node and the matmul node
@@ -118,52 +173,73 @@ def extract_weight_node(mm_node: Node) -> int:
             torch.ops.aten.view.default,
         }
 
-        if node.op == "get_attr":
-            return node
+        if (
+            weight_node.op == "get_attr"
+            and weight_node.target in param_names
+            and has_shape(weight_node)
+            and len(shape(weight_node)) > 0
+        ):
+            return weight_node
 
         # If node is not in the list of allowable ops then return None
-        if node.target not in allowed_ops:
+        if weight_node.target not in allowed_ops:
             return None
 
-        for input_node in node.all_input_nodes:
+        for input_node in weight_node.all_input_nodes:
             result = find_get_attr_node(input_node)
             if result:
                 return result
         return None
 
-    weight_node = mm_node.args[1]
-    # for modelopt quantized graph, there will be a quantize_op
-    _, weight_params, _ = get_quantization_params_from_linear_node(mm_node)
-    weight_node = weight_params.input_node if weight_params else weight_node
+    if is_op(node, torch.ops.aten.bmm):
+        # no bias for bmm
+        weight_node = find_get_attr_node(node.args[1])
+        return WeightNodes(
+            weights=[
+                WeightNode(
+                    node=node.args[1],
+                    node_key=weight_node.target,
+                    tensor=get_param_or_buffer(weight_node.target, gm),
+                    submod=gm.get_submodule(weight_node.target.rpartition(".")[0]),
+                )
+            ],
+            biases=[],
+        )
+    # for other parametrized nodes, we need to find the weight node
+    else:
+        all_weight_nodes = [
+            attr_node
+            for n in node.all_input_nodes
+            if (attr_node := find_get_attr_node(n)) is not None
+        ]
+        # separate weight nodes and bias nodes
+        bias_nodes = [n for n in all_weight_nodes if n.target.endswith("bias")]
+        weight_nodes = [n for n in all_weight_nodes if n not in bias_nodes]
+        weight_nodes = [
+            WeightNode(
+                node=n,
+                node_key=n.target,
+                submod=gm.get_submodule(n.target.rpartition(".")[0]),
+                tensor=get_param_or_buffer(n.target, gm),
+            )
+            for n in weight_nodes
+        ]
+        bias_nodes = [
+            WeightNode(
+                node=n,
+                node_key=n.target,
+                submod=gm.get_submodule(n.target.rpartition(".")[0]),
+                tensor=get_param_or_buffer(n.target, gm),
+            )
+            for n in bias_nodes
+        ]
+    return WeightNodes(weights=weight_nodes, biases=bias_nodes)
 
-    return find_get_attr_node(weight_node)
 
-
-def num_users_of_weight_node(mm_node: Node) -> int:
-    """Returns the number of users of the weight node of the given matmul node."""
-    weight_node = extract_weight_node(mm_node)
+def num_users_of_weight_node(node: Node) -> int:
+    """Returns the number of users of the weight node of the given parametrized node."""
+    weight_node = extract_weight_nodes(node).weights[0].node
     return len(weight_node.users) if weight_node is not None else 0
-
-
-def extract_param_names_from_lin_node(mm_node: Node) -> Tuple[str, Optional[str]]:
-    """Extracts the name of the parameter associated with the given matmul node.
-
-    Args:
-        mm_node: Matmul node in the graph.
-    """
-    weight_node = extract_weight_node(mm_node)
-
-    assert weight_node, "Cannot identify weight parameter of linear node."
-
-    # Map arg to named parameter
-    weight_name = weight_node.target
-
-    # check for bias
-    bias_node = mm_node.args[2] if len(mm_node.args) > 2 else None
-    assert bias_node is None or bias_node.op == "get_attr"
-    bias_name = bias_node.target if bias_node is not None else None
-
-    return weight_name, bias_name
 
 
 def get_op_overload_packet(node: Union[OpOverloadPacket, OpOverload]) -> OpOverloadPacket:
@@ -206,6 +282,7 @@ def filtered_nodes(
     nodes: Iterable[Node],
     target: Union[Callable[[Node], bool], Union[OperatorLike, Iterable[OperatorLike]]] = None,
     ops: Union[OperatorLike, Iterable[OperatorLike]] = None,
+    prune_dangling: bool = False,
 ) -> Iterable[Node]:
     """Iterate over nodes that are filtered by the given operations or target function.
 
@@ -238,13 +315,79 @@ def filtered_nodes(
     if callable(target) and not isinstance(target, (OpOverloadPacket, OpOverload)):
         for node in nodes:
             if target(node):
+                if prune_dangling and len(successors(node, depth=3)) < 3:
+                    continue
                 yield node
+    elif isinstance(target, Iterable) and all(isinstance(t, Callable) for t in target):
+        for node in nodes:
+            for t in target:
+                if t(node):
+                    if prune_dangling and len(successors(node, depth=3)) < 3:
+                        continue
+                    yield node
+                    break
     else:
         # Handle the case where target or ops contains operations
         operations = ops if ops is not None else target
         for node in nodes:
             if is_op(node, operations):
+                if prune_dangling and len(successors(node, depth=3)) < 3:
+                    continue
                 yield node
+
+
+def is_any_lin_op(node: Node) -> bool:
+    return is_linear_op(node) or is_fake_quantized_linear_op(node)
+
+
+def is_fp4_op(node: Node) -> bool:
+    return is_op(
+        node,
+        [
+            torch.ops.auto_deploy.torch_quant_nvfp4_linear,
+            torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear,
+        ],
+    )
+
+
+def is_any_moe_op(node: Node) -> bool:
+    return is_op(
+        node,
+        ops=[
+            torch.ops.auto_deploy.torch_moe,
+            torch.ops.auto_deploy.torch_quant_fp8_moe,
+            torch.ops.auto_deploy.torch_quant_nvfp4_moe,
+            torch.ops.auto_deploy.triton_mxfp4_moe,
+        ],
+    )
+
+
+def is_any_ssm_op(node: Node) -> bool:
+    return is_op(
+        node,
+        ops=[
+            torch.ops.auto_deploy.torch_ssm,
+        ],
+    )
+
+
+def is_any_conv_op(node: Node) -> bool:
+    return is_op(
+        node,
+        ops=[
+            torch.ops.auto_deploy.torch_causal_conv1d,
+        ],
+    )
+
+
+def is_any_attention_op(node: Node) -> bool:
+    return is_op(
+        node,
+        ops=[
+            torch.ops.auto_deploy.torch_attention_sdpa,
+            torch.ops.auto_deploy.torch_attention,
+        ],
+    )
 
 
 def is_linear_op(node: Node) -> bool:
@@ -276,18 +419,16 @@ def is_bmm_op(node: Node) -> bool:
 
 
 def is_dist_op(node: Node) -> bool:
-    """Check if the node is a distributed op."""
+    """Check if the node is a distributed op (torch or trtllm backend)."""
     dist_ops = {
+        # PyTorch backend ops
         torch.ops.auto_deploy.torch_dist_all_gather,
         torch.ops.auto_deploy.torch_dist_all_reduce,
+        # TRT-LLM backend ops
+        torch.ops.auto_deploy.trtllm_dist_all_gather,
+        torch.ops.auto_deploy.trtllm_dist_all_reduce,
     }
     return is_op(node, dist_ops)
-
-
-def get_all_input_output_nodes(graph: Graph) -> Tuple[List[Node], List[Node]]:
-    input_nodes: List[Node] = graph.find_nodes(op="placeholder")
-    output_nodes: List[Node] = graph.find_nodes(op="output")
-    return (input_nodes, output_nodes)
 
 
 def get_user_if_pattern_match(node, ops, numusers, user_idx: int = 0):
@@ -321,9 +462,10 @@ def identify_regions_between_residuals(gm: GraphModule) -> List[Node]:
     for node in gm.graph.nodes:
         if input_id_node is None and node.op == "placeholder":
             input_id_node = node
-        output_node = node
+        if node.op == "output":
+            output_node = node
     assert input_id_node, "Could not find input node"
-    assert output_node.op == "output", "Could not find output node"
+    assert output_node, "Could not find output node"
 
     # start list of boundary nodes
     boundary_nodes = [input_id_node]
@@ -358,24 +500,96 @@ def identify_regions_between_residuals(gm: GraphModule) -> List[Node]:
     return boundary_nodes
 
 
+def get_all_layer_subgraphs(gm: GraphModule) -> List[List[Node]]:
+    """
+    Get subgraphs corresponding to all consecutive layers (attention, MLP, SSM, MoE) in the graph.
+
+    Assumptions:
+        1. each layer (each subgraph) is contained between a list of opening
+        linear layers (e.g., q/k/v_proj, gate/up_proj, in_proj, etc.) and a single closing linear layer
+        (e.g., out_proj, down_proj, etc.)
+        2. all layers are connected in sequence, there are no "parallel" layers.
+
+    Consequence:
+        1. We can linearize both all linear nodes in the graph and the layers itself, having a single
+        linear history and define layers by the indices of corresponding opening and closing linear nodes,
+        with no overlap between layers.
+        E.g., if layer i is defined between linear nodes start_i and end_i, then all linear nodes between
+        start_i and end_i necessarily belong to layer i.
+        2. It does not mean that every linear node in the graph belongs to a layer, that is. Then, if:
+            end_i < start_{{i+1}}, then all linear nodes in[end_i + 1, start_{{i+1}} - 1] do not belong
+            to any layer, and are marked as "unprocessed".
+    Note:
+        The interesting case is MoE with shared experts. In this case, there are two parallel paths:
+        1. Routed experts
+        2. Shared experts
+        In this case, "shared experts" path will be marked as an MLP layer, and "routed experts" path will
+        be "unprocessed". This is desired, since routed experts should not be sharded by the TP transform,
+        but a corresponding EP/BMM transforms.
+    """
+
+    assert gm.graph.nodes, "Graph is empty"
+    layer_subgraphs = []
+    linear_nodes = list(filtered_nodes(gm.graph.nodes, is_any_lin_op))
+    unprocessed_linear_nodes = set(linear_nodes)
+    assert len(linear_nodes) > 0, "Could not find any linear nodes in the graph"
+
+    terminating_indices = [-1]
+    last_lin_index = terminating_indices[-1] + 1
+
+    # for each linear node, find its layer subgraph defined as regions between consecutive linear nodes
+    while last_lin_index < len(linear_nodes):
+        # opening is the list of linear nodes
+        # layer_subgraph is the list of nodes between the opening and closing linear nodes
+        # closing is the last linear node in the layer
+        layer_subgraph = get_layer_after_linear_node(linear_nodes, terminating_indices)
+        if layer_subgraph.opening_nodes is not None and len(layer_subgraph.opening_nodes) > 0:
+            unprocessed_linear_nodes -= (
+                set(layer_subgraph.opening_nodes)
+                | set([layer_subgraph.terminating_node])
+                | set(layer_subgraph.subgraph_nodes)
+            )
+            layer_subgraphs.append(layer_subgraph)
+        last_lin_index = terminating_indices[-1] + 1
+
+    # unprocessed linear nodes can be "simple sharded".
+    return layer_subgraphs, unprocessed_linear_nodes
+
+
 def bfs(
-    node: Node, target: Callable, attr_next: str = "users", boundary: Optional[Node] = None
-) -> Node:
-    queue = [node]
+    node: Node,
+    target: Callable,
+    attr_next: str = "users",
+    boundary: Optional[Node] = None,
+    include_root: bool = True,
+) -> Tuple[Node, int]:
+    """
+    Breadth-first search of the graph.
+    Returns the found node and the depth of the node.
+    """
+    depth = 0
+    queue_at_depth = [node]
+    queue_at_depth_next = []
     visited = set()
-    while queue:
-        cur_node = queue.pop(0)
+    while queue_at_depth or queue_at_depth_next:
+        cur_node = queue_at_depth.pop(0)
         if boundary is not None and cur_node == boundary:
             continue  # Skip the boundary node.
-        if target(cur_node):
-            return cur_node
-        for next_node in getattr(cur_node, attr_next):
-            if boundary is not None and next_node == boundary:
-                continue  # Do not expand past the boundary.
-            if next_node not in visited:
-                visited.add(next_node)
-                queue.append(next_node)
-    raise RuntimeError(f"Could not find node with target condition {target}.")
+        if target(cur_node) and (include_root or depth > 0):
+            return cur_node, depth
+        if hasattr(cur_node, attr_next):
+            for next_node in getattr(cur_node, attr_next):
+                if boundary is not None and next_node == boundary:
+                    continue  # Do not expand past the boundary.
+                if next_node not in visited:
+                    visited.add(next_node)
+                    queue_at_depth_next.append(next_node)
+        if not queue_at_depth:
+            queue_at_depth = queue_at_depth_next
+            queue_at_depth_next = []
+            depth += 1
+
+    return None, -1
 
 
 def extract_output_tuple(node: Node, count: int = 2):
@@ -435,3 +649,352 @@ def extract_op_args(node: Node, *arg_names):
         raise RuntimeError(f"Could not find a value for '{name}' on op {op}")
 
     return [_get(n) for n in arg_names]
+
+
+def predecessors(
+    node: Node,
+    depth: int = 1,
+    include: Optional[Callable[[Node], bool]] = None,
+    exclude: Optional[Callable[[Node], bool]] = None,
+) -> List[Node]:
+    """
+    Build predecessor tree of node by recursively traversing node.args up to depth depth.
+    If include is provided, only include nodes that satisfy the condition.
+    If exclude is provided, exclude nodes that satisfy the condition.
+    """
+    preds = []
+    seen = set()
+    for arg in node.all_input_nodes:
+        if ((not include) or (include and include(arg))) and (not exclude or not exclude(arg)):
+            if arg not in seen:
+                preds.append(arg)
+                seen.add(arg)
+        if depth > 1:
+            for p in predecessors(arg, depth - 1, include, exclude):
+                if p not in seen:
+                    preds.append(p)
+                    seen.add(p)
+    return preds
+
+
+def successors(
+    node: Node,
+    depth: int = 1,
+    include: Optional[Callable[[Node], bool]] = None,
+    exclude: Optional[Callable[[Node], bool]] = None,
+) -> List[Node]:
+    """
+    Build successor tree of node by recursively traversing node.users up to depth depth.
+    If include is provided, only include nodes that satisfy the condition.
+    If exclude is provided, exclude nodes that satisfy the condition.
+    """
+    succs = []
+    seen = set()
+    for user in node.users:
+        if ((not include) or (include and include(user))) and (not exclude or not exclude(user)):
+            if user not in seen:
+                succs.append(user)
+                seen.add(user)
+        if depth > 1:
+            for s in successors(user, depth - 1, include, exclude):
+                if s not in seen:
+                    succs.append(s)
+                    seen.add(s)
+    return succs
+
+
+def subgraph(
+    sources: Optional[list[Node]] = None,
+    sinks: Optional[list[Node]] = None,
+    include: Optional[Callable[[Node], bool]] = None,
+    exclude: Optional[Callable[[Node], bool]] = None,
+    boundary_condition: Optional[Callable[[Node], bool]] = None,
+) -> List[Node]:
+    """
+    Returns a list of nodes in a subgraph in computation DAG defined as either:
+    1. all nodes succeeding any of the node in sources and preceding any of the
+      nodes in sinks. In this case, it is built by a BFS traversal from sinks,
+      where the sources list acts as a boundary. We do it in this order (and not
+      from sources to sinks) to include nodes like weights or other inputs (they
+      are not successors of sinks, so otherwise they wouldn't be included).
+    2. all nodes succeeding any of the node in sources, bounded by (BFS search
+      not extending further than) boundary_condition.
+    3. all nodes preceding any of the nodes in sinks, bounded by (BFS search
+      not extending further than) boundary_condition.
+
+    Optionally, include or exclude conditions may be specified to include [exclude]
+      only nodes that meet [don't meet] certain condition.
+
+    """
+    subgraph_nodes = []
+    seen = set()
+
+    # differentiate between cases 1, 2, and 3 by checking if sinks and sources are provided
+    if sinks is not None and sources is not None:
+        # case 1
+        queue = list(sinks)
+        start_nodes = set(sinks)
+        sources_set = set(sources)
+        # Initialize queue with sinks and mark them as seen
+        for node in sinks:
+            if node not in seen:
+                seen.add(node)
+        if boundary_condition is None:
+
+            def boundary_condition(n):
+                return n in sources_set
+
+        attr_next = "all_input_nodes"
+    elif sources is not None:
+        # case 2
+        assert boundary_condition is not None, "boundary_condition must be provided for case 2"
+        # Initialize queue with sinks and mark them as seen
+        queue = list(sources)
+        start_nodes = set(sources)
+        attr_next = "users"
+    elif sinks is not None:
+        # case 3
+        assert boundary_condition is not None, "boundary_condition must be provided for case 3"
+        # Initialize queue with sinks and mark them as seen
+        queue = list(sinks)
+        start_nodes = set(sinks)
+        attr_next = "all_input_nodes"
+    else:
+        raise ValueError("Either sinks or sources must be provided")
+
+    # BFS traversal from sinks backwards through predecessors
+    while queue:
+        node = queue.pop(0)
+
+        # Check if node should be included based on filters
+        should_include = True
+        if include is not None and not include(node):
+            should_include = False
+        if exclude is not None and exclude(node):
+            should_include = False
+
+        if should_include and node not in start_nodes:
+            subgraph_nodes.append(node)
+
+        # Stop traversal at boundary - don't explore their predecessors
+        if boundary_condition(node) and node not in start_nodes:
+            continue
+
+        # Traverse to predecessor nodes (all inputs to this node)
+        for arg in getattr(node, attr_next):
+            if isinstance(arg, Node) and arg not in seen:
+                seen.add(arg)
+                queue.append(arg)
+
+    return subgraph_nodes
+
+
+def get_weight_shape(node: Node, dim: Optional[int] = None) -> Optional[Union[int, List[int]]]:
+    """Get the shape of the weight node."""
+    if not is_any_lin_op(node):
+        return None
+    s = list(shape(extract_weight_nodes(node).weights[0].node))
+    if len(s) == 0:
+        return None
+    if is_fp4_op(node):
+        # FP4 weights are packed as uint8 type with 2 FP4 values per element
+        s[-1] *= 2
+    if dim is None:
+        return s
+    else:
+        return s[dim]
+
+
+def get_layer_after_linear_node(
+    linear_nodes: List[Node],
+    terminating_indices: List[int],
+    match_on_shapes: bool = True,
+    enforce_strict_linear_history: bool = True,
+) -> LayerSubgraph:
+    """
+    Get the next model layer.
+    The previous layer was closed by the terminating linear node with index terminating_indices[-1].
+
+    Since we assume a layer is always terminated by a single linear node, we iteratively query subgraph
+    and check for the condition len(lin_nodes_in_subgraph) == 1. If a given linear node
+    linear_nodes[start_lin_index] does not have a corresponding single sink linear node, it will
+    be classified as "unprocessed", and the next linear node is picked as a candidate to open
+    a new layer.
+
+    match_on_shapes explanation: We assume that the opening linear weights have shape [hidden, embedding],
+       where, while hidden may vary from layer to layer (e.g., MLP, MoE, latent projections) may have
+       different hidden sizes, the embedding size is the property of the model across all layers.
+       Similarly, the unique closing linear weight should have shape [embedding, hidden], to map back
+       from the hidden space to the embedding space.
+       If match_on_shapes is True, we require that the opening_layer.shape[-1] == closing_layer.shape[0]
+       If match_on_shapes is False, we only require the topological connectivity and uniqueness of
+       closing_layer being the only sink.
+    Why it matters: For MLA, activation X goes through the latent space projection, following:
+        Q = norm(X @ W_q_a) @ W_q_b   # <- two linear projections
+        KV = norm(X @ W_kv_a) @ W_kv_b  # <- two linear projections
+        Without match_on_shapes, we would treat norm(X @ W_q_a) @ W_q_b as entire MLP layer and apply
+        column-row sharding to it. That would result with Q not being sharded, but replicated (after MLP all-reduce),
+        and the entire attention computation being replicated.
+        With match_on_shapes, the entire MLA will be treated as a single layer, with the o_proj as the
+        unique closing linear node.
+
+    Args:
+        linear_nodes: List of linear nodes in the graph.
+        terminating_indices: List of indices of terminating linear nodes.
+        match_on_shapes: If True, the layer is matched on shapes of the nodes.
+            If False, the layer is matched on the nodes themselves.
+    Returns:
+        LayerSubgraph: The layer subgraph.
+    """
+
+    def boundary_condition(
+        node: Node, embd: Optional[int] = None, dim: Optional[int] = None
+    ) -> bool:
+        if embd is not None and dim is not None:
+            return (
+                # match on embedding size
+                (is_any_lin_op(node) and get_weight_shape(node, dim=dim) == embd)
+                or is_any_moe_op(node)
+                or is_op(node, ops=[torch.ops.aten.sym_size, torch.ops.aten.bmm])
+            )
+        else:
+            return (
+                is_any_lin_op(node)
+                or is_any_moe_op(node)
+                or is_op(node, ops=[torch.ops.aten.sym_size, torch.ops.aten.bmm])
+            )
+
+    def filter_condition(node: Node, embd: Optional[int] = None, dim: Optional[int] = None) -> bool:
+        if embd is not None and dim is not None:
+            return is_any_lin_op(node) and get_weight_shape(node, dim=dim) == embd
+        else:
+            return is_any_lin_op(node)
+
+    lin_nodes_in_subgraph = []
+    start_lin_index = terminating_indices[-1] + 1
+    while len(lin_nodes_in_subgraph) != 1:
+        if start_lin_index >= len(linear_nodes):
+            terminating_indices.append(len(linear_nodes))
+            return LayerSubgraph(
+                opening_nodes=[],
+                subgraph_nodes=[],
+                terminating_node=None,
+                layer_type=LayerType.UNKNOWN,
+            )
+        if match_on_shapes:
+            # get embedding size of the opening linear node
+            embd = get_weight_shape(linear_nodes[start_lin_index], dim=-1)
+            # partial init boundary_condition and filter_condition
+            boundary_condition = partial(boundary_condition, embd=embd, dim=0)
+            filter_condition = partial(filter_condition, embd=embd, dim=0)
+
+        forward_subgraph = subgraph(
+            sources=[linear_nodes[start_lin_index]], boundary_condition=boundary_condition
+        )
+        lin_nodes_in_subgraph = list(filtered_nodes(forward_subgraph, filter_condition))
+        start_lin_index += 1
+    start_lin_index -= 1
+    terminating_linear_node = lin_nodes_in_subgraph[0]
+
+    # for backward pass, match embedding on the dim=0
+    if match_on_shapes:
+        boundary_condition = partial(boundary_condition, embd=embd, dim=-1)
+        filter_condition = partial(filter_condition, embd=embd, dim=-1)
+    backward_subgraph = subgraph(
+        sinks=[terminating_linear_node], boundary_condition=boundary_condition
+    )
+    # get all opening linear nodes
+    opening_linear_nodes = list(filtered_nodes(backward_subgraph, filter_condition))
+
+    if enforce_strict_linear_history:
+        # opening nodes must succeed last terminating node
+        last_terminating_index = terminating_indices[-1]
+        opening_linear_nodes = [
+            n for n in opening_linear_nodes if linear_nodes.index(n) > last_terminating_index
+        ]
+
+    # subgraph_nodes should not include opening nodes.
+    # the entire layer =  opening_nodes + subgraph_nodes + terminating_node,
+    # with these three sets being disjoint.
+    interior_nodes = [
+        n
+        for n in set(backward_subgraph).union(forward_subgraph)
+        if n not in set(opening_linear_nodes).union([terminating_linear_node])
+    ]
+    ssm_nodes = list(filtered_nodes(interior_nodes, is_any_ssm_op))
+    attention_nodes = list(filtered_nodes(interior_nodes, is_any_attention_op))
+    intermediate_lin_nodes = list(filtered_nodes(interior_nodes, is_any_lin_op))
+
+    layer_type = LayerType.MLP
+    min_local_shape = 1
+    if len(ssm_nodes) > 0:
+        assert len(ssm_nodes) == 1, "SSM layer must have exactly one SSM node"
+        layer_type = LayerType.SSM
+        # determine head size
+        min_local_shape = shape(ssm_nodes[0])[-1]
+    if len(attention_nodes) > 0:
+        assert len(attention_nodes) == 1, "Attention layer must have exactly one attention node"
+        layer_type = LayerType.ATTENTION
+        # determine head size
+        min_local_shape = shape(attention_nodes[0])[-1]
+    if len(intermediate_lin_nodes) > 0:
+        assert len(intermediate_lin_nodes) == 2, (
+            "MLA layer must have exactly two intermediate linear nodes"
+        )
+        assert len(attention_nodes) == 1, "MLA layer must have exactly one attention node"
+        layer_type = LayerType.MLA
+
+    layer_subgraph = LayerSubgraph(
+        opening_nodes=opening_linear_nodes,
+        subgraph_nodes=interior_nodes,
+        terminating_node=terminating_linear_node,
+        layer_type=layer_type,
+        min_local_shape=min_local_shape,
+    )
+    assert linear_nodes[start_lin_index] in opening_linear_nodes, (
+        "Linear node not found in opening linear nodes"
+    )
+
+    # return the index of the terminating linear node
+    if terminating_linear_node == linear_nodes[-1]:
+        terminating_index = len(linear_nodes)
+    else:
+        terminating_index = (
+            start_lin_index + len(opening_linear_nodes) + len(intermediate_lin_nodes)
+        )
+
+    if enforce_strict_linear_history:
+        if terminating_index < len(linear_nodes):
+            assert linear_nodes[terminating_index] == terminating_linear_node, (
+                "ill-formed layer subgraph"
+            )
+        terminating_indices.append(terminating_index)
+    # otherwise, we are done. We processed the last linear node.
+    return layer_subgraph
+
+
+def has_shape(node: Node) -> bool:
+    return hasattr(node, "meta") and "val" in node.meta and hasattr(node.meta["val"], "shape")
+
+
+def shape(node: Node) -> Tuple[int, ...]:
+    if not has_shape(node):
+        return None
+    return node.meta["val"].shape
+
+
+def get_weight_tensor(node: Node) -> torch.Tensor:
+    """Extract the weight tensor from a node within a GraphModule."""
+    weight_nodes = extract_weight_nodes(node)
+    return weight_nodes.weights[0].tensor
+
+
+def draw_graph(gm: GraphModule, filename: str):
+    """
+    Dump graphmodule to SVG file using PyTorch's built-in drawer.
+    """
+    from torch.fx.passes.graph_drawer import FxGraphDrawer
+
+    drawer = FxGraphDrawer(gm, filename)
+    with open(f"{filename}.svg", "wb") as f:
+        f.write(drawer.get_dot_graph().create_svg())

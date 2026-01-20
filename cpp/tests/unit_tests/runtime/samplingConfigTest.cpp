@@ -37,17 +37,18 @@ void test(bool const useExternalDraftTokensConfig, SizeType32 beamWidth = 1, std
     std::optional<RandomSeedType> randomSeed = no, std::optional<FloatType> temperature = no,
     std::optional<SizeType32> minLength = no, std::optional<FloatType> beamSearchDiversityRate = no,
     std::optional<FloatType> repetitionPenalty = no, std::optional<FloatType> presencePenalty = no,
-    std::optional<FloatType> frequencyPenalty = no, std::optional<FloatType> lengthPenalty = no,
-    std::optional<SizeType32> earlyStopping = no, std::optional<SizeType32> noRepeatNgramSize = no,
-    std::optional<SizeType32> numReturnSequences = no, std::optional<FloatType> minP = no,
-    std::optional<std::vector<SizeType32>> beamWidthArray = no)
+    std::optional<FloatType> frequencyPenalty = no, std::optional<SizeType32> promptIgnoreLength = no,
+    std::optional<FloatType> lengthPenalty = no, std::optional<SizeType32> earlyStopping = no,
+    std::optional<SizeType32> noRepeatNgramSize = no, std::optional<SizeType32> numReturnSequences = no,
+    std::optional<FloatType> minP = no, std::optional<std::vector<SizeType32>> beamWidthArray = no)
 {
-    // 19 parameters for SamplingConfig, from `beamWidth` to `beamWidthArray`
+    // 20 parameters for SamplingConfig, from `beamWidth` to `beamWidthArray`
     try
     {
         te::SamplingConfig execSamplingCfg(beamWidth, topK, topP, topPMin, topPResetIds, topPDecay, randomSeed,
             temperature, minLength, beamSearchDiversityRate, repetitionPenalty, presencePenalty, frequencyPenalty,
-            lengthPenalty, earlyStopping, noRepeatNgramSize, numReturnSequences, minP, beamWidthArray);
+            promptIgnoreLength, lengthPenalty, earlyStopping, noRepeatNgramSize, numReturnSequences, minP,
+            beamWidthArray);
         std::optional<te::ExternalDraftTokensConfig> specCfg = std::nullopt;
         if (useExternalDraftTokensConfig)
         {
@@ -110,18 +111,20 @@ TEST(samplingConfigTest, validInputs)
     test(false, 1, no, no, no, no, no, no, no, no, no, no, 1.f);
     // Frequency penalty
     test(false, 1, no, no, no, no, no, no, no, no, no, no, no, 1.f);
+    // Prompt ignore length
+    test(false, 1, no, no, no, no, no, no, no, no, no, no, no, no, 1);
     // Length penalty
-    test(false, 1, no, no, no, no, no, no, no, no, no, no, no, no, 1.f);
-    // Early stopping
     test(false, 1, no, no, no, no, no, no, no, no, no, no, no, no, no, 1.f);
+    // Early stopping
+    test(false, 1, no, no, no, no, no, no, no, no, no, no, no, no, no, no, 1.f);
     // No repeat ngram size
-    test(false, 1, no, no, no, no, no, no, no, no, no, no, no, no, no, no, 2);
+    test(false, 1, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, 2);
     // NumReturnSequences
-    test(false, 4, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, 2);
-    // MinP, 18 arguments
-    test(false, 1, no, 0.9, no, no, no, no, no, no, no, no, no, no, no, no, no, no, 0.5f);
+    test(false, 4, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, 2);
+    // MinP, 19 arguments
+    test(false, 1, no, 0.9, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, 0.5f);
     // BeamWidthArray
-    test(false, 5, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no,
+    test(false, 5, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no,
         std::vector<SizeType32>{2, 3, 4, 5});
 
     // All parameters
@@ -139,6 +142,7 @@ TEST(samplingConfigTest, validInputs)
         te::FloatType repetitionPenalty{0.5f};
         te::FloatType presencePenalty{0.5f};
         te::FloatType frequencyPenalty{0.5f};
+        te::SizeType32 promptIgnoreLength{1};
         te::FloatType lengthPenalty{0.5f};
         te::SizeType32 earlyStopping{1};
         te::SizeType32 noRepeatNgramSize{5};
@@ -148,7 +152,8 @@ TEST(samplingConfigTest, validInputs)
 
         te::SamplingConfig execSamplingCfg(beamWidth, topK, topP, topPMin, topPResetIds, topPDecay, randomSeed,
             temperature, minLength, beamSearchDiversityRate, repetitionPenalty, presencePenalty, frequencyPenalty,
-            lengthPenalty, earlyStopping, noRepeatNgramSize, numReturnSequences, minP, beamWidthArray);
+            promptIgnoreLength, lengthPenalty, earlyStopping, noRepeatNgramSize, numReturnSequences, minP,
+            beamWidthArray);
         te::ExternalDraftTokensConfig specCfg({1}, no, 0.5f);
         tr::SamplingConfig samplingCfg(execSamplingCfg, specCfg);
         EXPECT_EQ(samplingCfg.beamWidth, execSamplingCfg.getBeamWidth());
@@ -166,6 +171,7 @@ TEST(samplingConfigTest, validInputs)
         EXPECT_THAT(samplingCfg.repetitionPenalty.value(), testing::ElementsAre(repetitionPenalty));
         EXPECT_THAT(samplingCfg.presencePenalty.value(), testing::ElementsAre(presencePenalty));
         EXPECT_THAT(samplingCfg.frequencyPenalty.value(), testing::ElementsAre(frequencyPenalty));
+        EXPECT_THAT(samplingCfg.promptIgnoreLength.value(), testing::ElementsAre(promptIgnoreLength));
         EXPECT_THAT(samplingCfg.lengthPenalty.value(), testing::ElementsAre(lengthPenalty));
         EXPECT_THAT(samplingCfg.earlyStopping.value(), testing::ElementsAre(earlyStopping));
         EXPECT_THAT(samplingCfg.noRepeatNgramSize.value(), testing::ElementsAre(noRepeatNgramSize));

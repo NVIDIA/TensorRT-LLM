@@ -1,0 +1,21 @@
+env_overrides:
+  TRTLLM_ENABLE_PDL: 1
+  NCCL_GRAPH_REGISTER: 0
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 4
+enable_attention_dp: false
+kv_cache_config:
+  dtype: fp8
+  free_gpu_memory_fraction: 0.85
+print_iter_log: true
+stream_interval: 20
+num_postprocess_workers: 4
+moe_config:
+  backend: TRTLLM
+tensor_parallel_size: 1
+moe_expert_parallel_size: 1
+trust_remote_code: true
+backend: pytorch
+max_num_tokens: 20000
+max_seq_len: 9236
