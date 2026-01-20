@@ -2074,84 +2074,220 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         )
                     else:
                         # Multi-B tensor - select based on expert_idx
-                        if expert_idx < self.b_tensor_l_offsets[1]:
-                            local_l = expert_idx - self.b_tensor_l_offsets[0]
-                            tBgB_slice = tBgB_0[(None, mma_tile_coord_mnl[1], None, local_l)]
-                            tBgSFB_slice = tBgSFB_0[(None, slice_n, None, local_l)]
-                            cute.copy(
-                                tma_atoms_b[0],
-                                tBgB_slice[(None, b_producer_state.count)],
-                                tBsB_pipe,
-                                tma_bar_ptr=tma_bar,
-                                mcast_mask=b_full_mcast_mask,
-                            )
-                            cute.copy(
-                                tma_atoms_sfb[0],
-                                tBgSFB_slice[(None, b_producer_state.count)],
-                                tBsSFB_pipe,
-                                tma_bar_ptr=tma_bar,
-                                mcast_mask=sfb_full_mcast_mask,
-                            )
-                        elif (
-                            cutlass.const_expr(self.num_b_tensors >= 2)
-                            and expert_idx < self.b_tensor_l_offsets[2]
-                        ):
-                            local_l = expert_idx - self.b_tensor_l_offsets[1]
-                            tBgB_slice = tBgB_1[(None, mma_tile_coord_mnl[1], None, local_l)]
-                            tBgSFB_slice = tBgSFB_1[(None, slice_n, None, local_l)]
-                            cute.copy(
-                                tma_atoms_b[1],
-                                tBgB_slice[(None, b_producer_state.count)],
-                                tBsB_pipe,
-                                tma_bar_ptr=tma_bar,
-                                mcast_mask=b_full_mcast_mask,
-                            )
-                            cute.copy(
-                                tma_atoms_sfb[1],
-                                tBgSFB_slice[(None, b_producer_state.count)],
-                                tBsSFB_pipe,
-                                tma_bar_ptr=tma_bar,
-                                mcast_mask=sfb_full_mcast_mask,
-                            )
-                        elif (
-                            cutlass.const_expr(self.num_b_tensors >= 3)
-                            and expert_idx < self.b_tensor_l_offsets[3]
-                        ):
-                            local_l = expert_idx - self.b_tensor_l_offsets[2]
-                            tBgB_slice = tBgB_2[(None, mma_tile_coord_mnl[1], None, local_l)]
-                            tBgSFB_slice = tBgSFB_2[(None, slice_n, None, local_l)]
-                            cute.copy(
-                                tma_atoms_b[2],
-                                tBgB_slice[(None, b_producer_state.count)],
-                                tBsB_pipe,
-                                tma_bar_ptr=tma_bar,
-                                mcast_mask=b_full_mcast_mask,
-                            )
-                            cute.copy(
-                                tma_atoms_sfb[2],
-                                tBgSFB_slice[(None, b_producer_state.count)],
-                                tBsSFB_pipe,
-                                tma_bar_ptr=tma_bar,
-                                mcast_mask=sfb_full_mcast_mask,
-                            )
+                        # Use nested const_expr ifs to avoid index out of range at compile time
+                        if cutlass.const_expr(self.num_b_tensors == 2):
+                            # Exactly 2 B tensors
+                            if expert_idx < self.b_tensor_l_offsets[1]:
+                                local_l_0 = expert_idx - self.b_tensor_l_offsets[0]
+                                cute.copy(
+                                    tma_atoms_b[0],
+                                    tBgB_0[
+                                        (
+                                            None,
+                                            mma_tile_coord_mnl[1],
+                                            b_producer_state.count,
+                                            local_l_0,
+                                        )
+                                    ],
+                                    tBsB_pipe,
+                                    tma_bar_ptr=tma_bar,
+                                    mcast_mask=b_full_mcast_mask,
+                                )
+                                cute.copy(
+                                    tma_atoms_sfb[0],
+                                    tBgSFB_0[(None, slice_n, b_producer_state.count, local_l_0)],
+                                    tBsSFB_pipe,
+                                    tma_bar_ptr=tma_bar,
+                                    mcast_mask=sfb_full_mcast_mask,
+                                )
+                            else:
+                                local_l_1 = expert_idx - self.b_tensor_l_offsets[1]
+                                cute.copy(
+                                    tma_atoms_b[1],
+                                    tBgB_1[
+                                        (
+                                            None,
+                                            mma_tile_coord_mnl[1],
+                                            b_producer_state.count,
+                                            local_l_1,
+                                        )
+                                    ],
+                                    tBsB_pipe,
+                                    tma_bar_ptr=tma_bar,
+                                    mcast_mask=b_full_mcast_mask,
+                                )
+                                cute.copy(
+                                    tma_atoms_sfb[1],
+                                    tBgSFB_1[(None, slice_n, b_producer_state.count, local_l_1)],
+                                    tBsSFB_pipe,
+                                    tma_bar_ptr=tma_bar,
+                                    mcast_mask=sfb_full_mcast_mask,
+                                )
+                        elif cutlass.const_expr(self.num_b_tensors == 3):
+                            # Exactly 3 B tensors
+                            if expert_idx < self.b_tensor_l_offsets[1]:
+                                local_l_0 = expert_idx - self.b_tensor_l_offsets[0]
+                                cute.copy(
+                                    tma_atoms_b[0],
+                                    tBgB_0[
+                                        (
+                                            None,
+                                            mma_tile_coord_mnl[1],
+                                            b_producer_state.count,
+                                            local_l_0,
+                                        )
+                                    ],
+                                    tBsB_pipe,
+                                    tma_bar_ptr=tma_bar,
+                                    mcast_mask=b_full_mcast_mask,
+                                )
+                                cute.copy(
+                                    tma_atoms_sfb[0],
+                                    tBgSFB_0[(None, slice_n, b_producer_state.count, local_l_0)],
+                                    tBsSFB_pipe,
+                                    tma_bar_ptr=tma_bar,
+                                    mcast_mask=sfb_full_mcast_mask,
+                                )
+                            elif expert_idx < self.b_tensor_l_offsets[2]:
+                                local_l_1 = expert_idx - self.b_tensor_l_offsets[1]
+                                cute.copy(
+                                    tma_atoms_b[1],
+                                    tBgB_1[
+                                        (
+                                            None,
+                                            mma_tile_coord_mnl[1],
+                                            b_producer_state.count,
+                                            local_l_1,
+                                        )
+                                    ],
+                                    tBsB_pipe,
+                                    tma_bar_ptr=tma_bar,
+                                    mcast_mask=b_full_mcast_mask,
+                                )
+                                cute.copy(
+                                    tma_atoms_sfb[1],
+                                    tBgSFB_1[(None, slice_n, b_producer_state.count, local_l_1)],
+                                    tBsSFB_pipe,
+                                    tma_bar_ptr=tma_bar,
+                                    mcast_mask=sfb_full_mcast_mask,
+                                )
+                            else:
+                                local_l_2 = expert_idx - self.b_tensor_l_offsets[2]
+                                cute.copy(
+                                    tma_atoms_b[2],
+                                    tBgB_2[
+                                        (
+                                            None,
+                                            mma_tile_coord_mnl[1],
+                                            b_producer_state.count,
+                                            local_l_2,
+                                        )
+                                    ],
+                                    tBsB_pipe,
+                                    tma_bar_ptr=tma_bar,
+                                    mcast_mask=b_full_mcast_mask,
+                                )
+                                cute.copy(
+                                    tma_atoms_sfb[2],
+                                    tBgSFB_2[(None, slice_n, b_producer_state.count, local_l_2)],
+                                    tBsSFB_pipe,
+                                    tma_bar_ptr=tma_bar,
+                                    mcast_mask=sfb_full_mcast_mask,
+                                )
                         else:
-                            local_l = expert_idx - self.b_tensor_l_offsets[3]
-                            tBgB_slice = tBgB_3[(None, mma_tile_coord_mnl[1], None, local_l)]
-                            tBgSFB_slice = tBgSFB_3[(None, slice_n, None, local_l)]
-                            cute.copy(
-                                tma_atoms_b[3],
-                                tBgB_slice[(None, b_producer_state.count)],
-                                tBsB_pipe,
-                                tma_bar_ptr=tma_bar,
-                                mcast_mask=b_full_mcast_mask,
-                            )
-                            cute.copy(
-                                tma_atoms_sfb[3],
-                                tBgSFB_slice[(None, b_producer_state.count)],
-                                tBsSFB_pipe,
-                                tma_bar_ptr=tma_bar,
-                                mcast_mask=sfb_full_mcast_mask,
-                            )
+                            # 4 B tensors
+                            if expert_idx < self.b_tensor_l_offsets[1]:
+                                local_l_0 = expert_idx - self.b_tensor_l_offsets[0]
+                                cute.copy(
+                                    tma_atoms_b[0],
+                                    tBgB_0[
+                                        (
+                                            None,
+                                            mma_tile_coord_mnl[1],
+                                            b_producer_state.count,
+                                            local_l_0,
+                                        )
+                                    ],
+                                    tBsB_pipe,
+                                    tma_bar_ptr=tma_bar,
+                                    mcast_mask=b_full_mcast_mask,
+                                )
+                                cute.copy(
+                                    tma_atoms_sfb[0],
+                                    tBgSFB_0[(None, slice_n, b_producer_state.count, local_l_0)],
+                                    tBsSFB_pipe,
+                                    tma_bar_ptr=tma_bar,
+                                    mcast_mask=sfb_full_mcast_mask,
+                                )
+                            elif expert_idx < self.b_tensor_l_offsets[2]:
+                                local_l_1 = expert_idx - self.b_tensor_l_offsets[1]
+                                cute.copy(
+                                    tma_atoms_b[1],
+                                    tBgB_1[
+                                        (
+                                            None,
+                                            mma_tile_coord_mnl[1],
+                                            b_producer_state.count,
+                                            local_l_1,
+                                        )
+                                    ],
+                                    tBsB_pipe,
+                                    tma_bar_ptr=tma_bar,
+                                    mcast_mask=b_full_mcast_mask,
+                                )
+                                cute.copy(
+                                    tma_atoms_sfb[1],
+                                    tBgSFB_1[(None, slice_n, b_producer_state.count, local_l_1)],
+                                    tBsSFB_pipe,
+                                    tma_bar_ptr=tma_bar,
+                                    mcast_mask=sfb_full_mcast_mask,
+                                )
+                            elif expert_idx < self.b_tensor_l_offsets[3]:
+                                local_l_2 = expert_idx - self.b_tensor_l_offsets[2]
+                                cute.copy(
+                                    tma_atoms_b[2],
+                                    tBgB_2[
+                                        (
+                                            None,
+                                            mma_tile_coord_mnl[1],
+                                            b_producer_state.count,
+                                            local_l_2,
+                                        )
+                                    ],
+                                    tBsB_pipe,
+                                    tma_bar_ptr=tma_bar,
+                                    mcast_mask=b_full_mcast_mask,
+                                )
+                                cute.copy(
+                                    tma_atoms_sfb[2],
+                                    tBgSFB_2[(None, slice_n, b_producer_state.count, local_l_2)],
+                                    tBsSFB_pipe,
+                                    tma_bar_ptr=tma_bar,
+                                    mcast_mask=sfb_full_mcast_mask,
+                                )
+                            else:
+                                local_l_3 = expert_idx - self.b_tensor_l_offsets[3]
+                                cute.copy(
+                                    tma_atoms_b[3],
+                                    tBgB_3[
+                                        (
+                                            None,
+                                            mma_tile_coord_mnl[1],
+                                            b_producer_state.count,
+                                            local_l_3,
+                                        )
+                                    ],
+                                    tBsB_pipe,
+                                    tma_bar_ptr=tma_bar,
+                                    mcast_mask=b_full_mcast_mask,
+                                )
+                                cute.copy(
+                                    tma_atoms_sfb[3],
+                                    tBgSFB_3[(None, slice_n, b_producer_state.count, local_l_3)],
+                                    tBsSFB_pipe,
+                                    tma_bar_ptr=tma_bar,
+                                    mcast_mask=sfb_full_mcast_mask,
+                                )
 
                     b_producer_state.advance()
                     peek_ab_empty_status = cutlass.Boolean(1)
@@ -2598,27 +2734,35 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 expert_idx = mma_tile_coord_mnl[2]
 
                 # Select alpha from correct tensor based on expert_idx
+                # Initialize alpha_val first to avoid DSL "None prior to if" error
+                alpha_val = alpha_tuple[0][expert_idx - self.b_tensor_l_offsets[0]]
                 if cutlass.const_expr(self.num_b_tensors == 1):
-                    alpha_val = alpha_tuple[0][expert_idx]
-                else:
-                    if expert_idx < self.b_tensor_l_offsets[1]:
-                        local_idx = expert_idx - self.b_tensor_l_offsets[0]
-                        alpha_val = alpha_tuple[0][local_idx]
-                    elif (
-                        cutlass.const_expr(self.num_b_tensors >= 2)
+                    pass  # Already initialized above
+                elif cutlass.const_expr(self.num_b_tensors == 2):
+                    if expert_idx >= self.b_tensor_l_offsets[1]:
+                        alpha_val = alpha_tuple[1][expert_idx - self.b_tensor_l_offsets[1]]
+                elif cutlass.const_expr(self.num_b_tensors == 3):
+                    if (
+                        expert_idx >= self.b_tensor_l_offsets[1]
                         and expert_idx < self.b_tensor_l_offsets[2]
                     ):
-                        local_idx = expert_idx - self.b_tensor_l_offsets[1]
-                        alpha_val = alpha_tuple[1][local_idx]
+                        alpha_val = alpha_tuple[1][expert_idx - self.b_tensor_l_offsets[1]]
+                    elif expert_idx >= self.b_tensor_l_offsets[2]:
+                        alpha_val = alpha_tuple[2][expert_idx - self.b_tensor_l_offsets[2]]
+                else:
+                    # 4 B tensors
+                    if (
+                        expert_idx >= self.b_tensor_l_offsets[1]
+                        and expert_idx < self.b_tensor_l_offsets[2]
+                    ):
+                        alpha_val = alpha_tuple[1][expert_idx - self.b_tensor_l_offsets[1]]
                     elif (
-                        cutlass.const_expr(self.num_b_tensors >= 3)
+                        expert_idx >= self.b_tensor_l_offsets[2]
                         and expert_idx < self.b_tensor_l_offsets[3]
                     ):
-                        local_idx = expert_idx - self.b_tensor_l_offsets[2]
-                        alpha_val = alpha_tuple[2][local_idx]
-                    else:
-                        local_idx = expert_idx - self.b_tensor_l_offsets[3]
-                        alpha_val = alpha_tuple[3][local_idx]
+                        alpha_val = alpha_tuple[2][expert_idx - self.b_tensor_l_offsets[2]]
+                    elif expert_idx >= self.b_tensor_l_offsets[3]:
+                        alpha_val = alpha_tuple[3][expert_idx - self.b_tensor_l_offsets[3]]
 
                 #
                 # Slice to per mma tile index
