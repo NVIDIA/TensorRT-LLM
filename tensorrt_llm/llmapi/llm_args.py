@@ -840,6 +840,38 @@ class KvCacheConnectorConfig(StrictBaseModel):
         ..., description="The class name of the worker within the module.")
 
 
+class LayerwiseBenchmarksConfig(StrictBaseModel):
+    """
+    Configuration for layer-wise benchmarks calibration.
+    """
+    calibration_mode: Literal["NONE", "MARK", "COLLECT"] = Field(
+        default="NONE",
+        description=
+        "Instruct the layer-wise benchmarks calibrator to work on MARK mode, or COLLECT mode",
+        status="prototype")
+
+    calibration_file_path: Optional[str] = Field(
+        default=None,
+        description=
+        "The file path which the layer-wise benchmarks calibrator saves to or loads from",
+        status="prototype")
+
+    calibration_layer_indices: Optional[List[int]] = Field(
+        default=None,
+        description=
+        "Layer indices to filter. If None, all layers are collected in COLLECT mode.",
+        status="prototype")
+
+    @model_validator(mode='after')
+    def validate_calibration_file_path(self) -> 'LayerwiseBenchmarksConfig':
+        if self.calibration_mode in ["COLLECT", "REPLAY"
+                                     ] and not self.calibration_file_path:
+            raise ValueError(
+                f"Expect calibration_file_path not to be empty when work on {self.calibration_mode} mode"
+            )
+        return self
+
+
 class MedusaDecodingConfig(DecodingBaseConfig):
     medusa_choices: Optional[List[List[int]]] = None
     num_medusa_heads: Optional[int] = None
@@ -3011,23 +3043,9 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
-    layer_wise_benchmarks_calibrator_mode: Literal[
-        "NONE", "MARK", "COLLECT"] = Field(
-            default="NONE",
-            description=
-            "Instruct the layer-wise benchmarks calibrator to work on MARK mode, or COLLECT mode",
-            status="prototype")
-
-    layer_wise_benchmarks_calibrator_file_path: Optional[str] = Field(
-        default=None,
-        description=
-        "The file path which the layer-wise benchmarks calibrator saves to or loads from",
-        status="prototype")
-
-    layer_wise_benchmarks_layer_indices: Optional[List[int]] = Field(
-        default=None,
-        description=
-        "Layer indices to filter. If None, all layers are collected in COLLECT mode.",
+    layerwise_benchmarks_config: LayerwiseBenchmarksConfig = Field(
+        default_factory=LayerwiseBenchmarksConfig,
+        description="Configuration for layer-wise benchmarks calibration.",
         status="prototype")
 
     @property
@@ -3345,17 +3363,6 @@ class TorchLlmArgs(BaseLlmArgs):
         if self.ray_placement_config is not None and self.orchestrator_type != "ray":
             raise ValueError(
                 "ray_placement_config is only supported with orchestrator_type='ray'"
-            )
-        return self
-
-    @model_validator(mode='after')
-    def validate_layer_wise_benchmarks_calibrator_file_path(
-            self) -> 'TorchLlmArgs':
-        if self.layer_wise_benchmarks_calibrator_mode in [
-                "COLLECT", "REPLAY"
-        ] and not self.layer_wise_benchmarks_calibrator_file_path:
-            raise ValueError(
-                f"Expect layer_wise_benchmarks_calibrator_file_path not to be empty when work on {self.layer_wise_benchmarks_calibrator_mode} mode"
             )
         return self
 

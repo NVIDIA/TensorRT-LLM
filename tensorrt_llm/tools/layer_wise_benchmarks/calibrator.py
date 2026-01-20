@@ -184,13 +184,14 @@ class Calibrator:
             }
 
         # Placeholder buffer for CUDA Graphs (actual data copied in pre_step)
+        self.MAX_TOPK_AND_MIN_SLOTS = 32
         self._slots_buffer_gpu = (
             torch.arange(
                 self.MAX_SLOTS_BUFFER_SIZE,
                 dtype=self.SLOTS_DTYPE,
                 device="cuda",
             )
-            % 32
+            % self.MAX_TOPK_AND_MIN_SLOTS
         )
         self._use_eager_mode = False
 
@@ -431,6 +432,14 @@ class Calibrator:
                 raise ValueError(
                     f"Shape mismatch during replay: expected {expected_shape}, "
                     f"got {list(token_selected_slots.shape)}"
+                )
+        else:
+            if (
+                num_slots < self.MAX_TOPK_AND_MIN_SLOTS
+                or token_selected_slots.shape[-1] > self.MAX_TOPK_AND_MIN_SLOTS
+            ):
+                raise ValueError(
+                    "Invalid initial replayed_slots, please adjust `MAX_TOPK_AND_MIN_SLOTS`"
                 )
 
         if self._started or torch.cuda.is_current_stream_capturing():
