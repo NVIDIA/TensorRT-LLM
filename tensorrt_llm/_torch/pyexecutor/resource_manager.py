@@ -135,7 +135,10 @@ def get_pp_layers(
     pp_layers = mapping.pp_layers(total_num_layers)
     if layer_mask is not None:
         pp_layers = [i for i in pp_layers if layer_mask[i]]
-    if spec_config is not None:
+    # Only add speculative layers when layer_mask is not provided.
+    # When layer_mask is provided, the caller explicitly controls which layers
+    # to include, so we should not add extra layers automatically.
+    if spec_config is not None and layer_mask is None:
         num_spec_layers = get_num_spec_layers(spec_config)
         total_num_layers += num_spec_layers
         if mapping.is_last_pp_rank():

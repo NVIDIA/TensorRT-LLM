@@ -478,6 +478,15 @@ class KvCacheCreator:
         mapping = self._mapping
         assert model_engine.model.model_config.is_generation, "Only construct KV cache for generation models."
 
+        # When using separate draft KV cache in one-model speculative decoding,
+        # use layer_mask to include only target layers. The draft layers should
+        # only be in the separate draft KV cache manager.
+        # We still pass spec_config so that num_extra_kv_tokens is calculated.
+        layer_mask = None
+        if self._should_create_separate_draft_kv_cache():
+            num_target_layers = model_engine.model.model_config.pretrained_config.num_hidden_layers
+            layer_mask = [True] * num_target_layers
+
         kv_cache_manager = _create_kv_cache_manager(
             model_engine=model_engine,
             kv_cache_manager_cls=self._kv_cache_manager_cls,
@@ -493,6 +502,7 @@ class KvCacheCreator:
             kv_connector_manager=self._kv_connector_manager,
             estimating_kv_cache=estimating_kv_cache,
             execution_stream=self._execution_stream,
+            layer_mask=layer_mask,
         )
 
         # KVCacheManager (Non-draft) modifies the max_seq_len field, update it to self
