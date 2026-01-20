@@ -773,6 +773,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 dtype=torch.int8,
             )
 
+        self.kv_cache_block_offsets = None
+        self.host_kv_cache_block_offsets = None
+        self.draft_kv_cache_block_offsets = None
+        self.draft_host_kv_cache_block_offsets = None
         if self.kv_cache_manager is not None:
             self.kv_cache_block_offsets = self.get_empty(
                 buffers,

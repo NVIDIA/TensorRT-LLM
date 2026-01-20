@@ -644,10 +644,8 @@ class SpecWorkerBase(nn.Module, ABC):
 
         # Switch to draft KV cache manager and its block offsets
         attn_metadata.kv_cache_manager = draft_kv_cache_manager
-        if hasattr(attn_metadata, 'draft_kv_cache_block_offsets'
-                   ) and attn_metadata.draft_kv_cache_block_offsets is not None:
-            attn_metadata.kv_cache_block_offsets = attn_metadata.draft_kv_cache_block_offsets
-            attn_metadata.host_kv_cache_block_offsets = attn_metadata.draft_host_kv_cache_block_offsets
+        attn_metadata.kv_cache_block_offsets = attn_metadata.draft_kv_cache_block_offsets
+        attn_metadata.host_kv_cache_block_offsets = attn_metadata.draft_host_kv_cache_block_offsets
 
         try:
             yield
