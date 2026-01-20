@@ -443,9 +443,9 @@ void initBindings(pybind11::module_& m)
         py::call_guard<py::gil_scoped_release>());
 
     py::class_<tensorrt_llm::runtime::McastGPUBuffer>(m, "McastGPUBuffer")
-        .def(py::init<size_t, uint32_t, uint32_t, uint32_t, uint32_t, bool>(), py::arg("buf_size"),
-            py::arg("group_size"), py::arg("group_rank"), py::arg("split_color"), py::arg("device_idx"),
-            py::arg("mn_nvlink"), py::call_guard<py::gil_scoped_release>())
+        .def(py::init<size_t, uint32_t, uint32_t, uint32_t, bool, int64_t>(), py::arg("buf_size"),
+            py::arg("group_size"), py::arg("group_rank"), py::arg("device_idx"), py::arg("mn_nvlink"),
+            py::arg("mpi_comm_fortran_handle"), py::call_guard<py::gil_scoped_release>())
         .def("get_uc_buffer", &tensorrt_llm::runtime::McastGPUBuffer::getUCBuffer,
             py::call_guard<py::gil_scoped_release>())
         .def("get_mc_buffer", &tensorrt_llm::runtime::McastGPUBuffer::getMCBuffer,

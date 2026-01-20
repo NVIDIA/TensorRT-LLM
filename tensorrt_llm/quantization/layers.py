@@ -1967,7 +1967,11 @@ class Fp8RowwiseAttention(Module):
         lora_layer_params=None,
         all_reduce_params: Optional[AllReduceParams] = None,
     ):
-        assert lora_layer_params is None, f"lora is not supported on {self.__class__.__name__} now"
+        assert lora_layer_params is None, (
+            f"LoRA is not supported by {self.__class__.__name__} (e.g., --use_fp8_rowwise). "
+            "If you need LoRA support, please use a non-quantized (e.g., bf16) attention implementation. "
+            "See https://github.com/NVIDIA/TensorRT-LLM/issues/2603 for details."
+        )
         qkv = self.qkv(hidden_states)
 
         alibi_slopes = None

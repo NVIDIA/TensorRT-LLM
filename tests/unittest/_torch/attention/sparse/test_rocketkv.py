@@ -61,7 +61,7 @@ def test_model(backend, model_name, attention_backend):
     current_file = os.path.abspath(__file__)
     current_dir = os.path.dirname(os.path.dirname(
         os.path.dirname(current_file)))
-    input_file = f'{current_dir}/multi_gpu/test_star_attention_input.jsonl'
+    input_file = f'{current_dir}/multi_gpu/NIAH_simple_data.jsonl'
     with open(input_file, 'r') as f:
         for line in f:
             sample = json.loads(line)
