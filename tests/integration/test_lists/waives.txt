@@ -396,7 +396,7 @@ accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus[ep4-mt
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[dep4_latency_moe_cutlass-torch_compile=True] SKIP (https://nvbugs/5819021)
 accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4[latency_moe_cutlass] SKIP (https://nvbugs/5740377)
 accuracy/test_llm_api_pytorch.py::TestLlama4ScoutInstruct::test_fp4[tp4-cuda_graph=True] SKIP (https://nvbugs/5820734)
-llmapi/test_llm_examples.py::test_llmapi_tensorrt_engine SKIP (https://nvbugs/5800646)
+llmapi/test_llm_examples.py::test_llmapi_tensorrt_engine SKIP (https://nvbugs/5820553)
 unittest/_torch/misc/test_autotuner.py::test_autotuner_distributed_strategy[2-DistributedTuningStrategy.INDEPENDENT] SKIP (https://nvbugs/5823194)
 accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_guided_decoding[xgrammar-mtp_nextn=0] SKIP (https://nvbugs/5748600)
 accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_guided_decoding[llguidance-mtp_nextn=0] SKIP (https://nvbugs/5748600)
