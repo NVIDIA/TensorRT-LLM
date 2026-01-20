@@ -77,6 +77,14 @@ def get_safetensors_metadata(model_name_or_path):
     safetensors_index_file = Path(model_path) / SAFETENSORS_INDEX_FILE
     safetensor_metadata = None
 
+    def except_handler():
+        logger.error(
+            f"Failed to get safetensors metadata for {model_name_or_path}, attempting to get from Huggingface..."
+        )
+        if safetensor_metadata is None:
+            safetensor_metadata = huggingface_hub.get_safetensors_metadata(
+                model_name_or_path)
+
     try:
         if safetensors_single_file.exists():
             logger.info(
@@ -125,14 +133,10 @@ def get_safetensors_metadata(model_name_or_path):
             raise RuntimeError(
                 f"'{model_name_or_path}' is not a safetensors repo. Couldn't find '{SAFETENSORS_INDEX_FILE}' or '{SAFETENSORS_SINGLE_FILE}' files."
             )
-    except:
-        logger.error(
-            f"Failed to get safetensors metadata for {model_name_or_path}, attempting to get from Huggingface..."
-        )
-        if safetensor_metadata is None:
-            safetensor_metadata = huggingface_hub.get_safetensors_metadata(
-                model_name_or_path)
-
+    except RuntimeError:
+        except_handler()
+    except json.JSONDecodeError:
+        except_handler()
     return safetensor_metadata
 
 
