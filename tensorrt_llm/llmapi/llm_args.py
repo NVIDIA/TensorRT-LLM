@@ -3043,7 +3043,7 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
-    layerwise_benchmarks_config: LayerwiseBenchmarksConfig = Field(
+    layer_wise_benchmarks_config: LayerwiseBenchmarksConfig = Field(
         default_factory=LayerwiseBenchmarksConfig,
         description="Configuration for layer-wise benchmarks calibration.",
         status="prototype")

@@ -356,10 +356,11 @@ def create_py_executor(
     validate_feature_combination(llm_args, model_engine, llm_args.sampler_type)
 
     calibrator = get_calibrator()
-    layerwise_benchmarks_config = llm_args.layerwise_benchmarks_config
-    calibrator.init(layerwise_benchmarks_config.calibration_mode,
-                    layerwise_benchmarks_config.calibration_file_path, mapping,
-                    dist, layerwise_benchmarks_config.calibration_layer_indices)
+    layer_wise_benchmarks_config = llm_args.layer_wise_benchmarks_config
+    calibrator.init(layer_wise_benchmarks_config.calibration_mode,
+                    layer_wise_benchmarks_config.calibration_file_path, mapping,
+                    dist,
+                    layer_wise_benchmarks_config.calibration_layer_indices)
     model_engine.model = calibrator.maybe_wrap_model(model_engine.model)
 
     if has_draft_model_engine:
