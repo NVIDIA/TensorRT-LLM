@@ -2089,6 +2089,7 @@ class Linear(nn.Module):
         disable_deep_gemm: bool = False,
         fused_weight_shard_indices_mapping: Optional[dict] = None,
         nvfp4_allowed_backends: Optional[List[str]] = None,
+        enable_gemm_allreduce_fusion: bool = True,
     ):
         """
         Args:
@@ -2171,7 +2172,7 @@ class Linear(nn.Module):
         self.use_fused_gemm_allreduce = all([
             self.reduce_output, mpi_enabled, dtype_supported,
             in_features_aligned, out_features_aligned, tp_valid, quant_valid,
-            device_supported, nvls_supported
+            device_supported, nvls_supported, enable_gemm_allreduce_fusion
         ])
 
         self.enable_cuda_core = False
