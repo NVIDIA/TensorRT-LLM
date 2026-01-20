@@ -52,7 +52,11 @@ ordered-set
 peft
 patchelf
 einops
+<<<<<<< Updated upstream
 flashinfer-python~=0.6.0
+=======
+flashinfer-python>=0.6.1
+>>>>>>> Stashed changes
 opencv-python-headless
 xgrammar==0.1.25
 llguidance==0.7.29
