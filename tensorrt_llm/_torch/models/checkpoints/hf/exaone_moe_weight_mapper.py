@@ -25,7 +25,7 @@ class ExaoneMoeWeightMapper(HfWeightMapper):
             "mtp.pre_fc_norm_hidden": "hnorm",
         }
 
-    def preprocess_weights(self, weights: dict) -> dict:
+    def preprocess_weights(self, weights: dict):
         mtp_layer_offset = self.config.pretrained_config.num_hidden_layers
 
         for name in list(weights.keys()):

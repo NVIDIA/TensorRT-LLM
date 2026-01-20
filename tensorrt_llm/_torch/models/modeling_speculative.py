@@ -735,10 +735,7 @@ class MTPDraftModel(nn.Module):
                                       is_separate_draft_engine=True)
         elif model_type in ["exaone_moe"]:
             from .modeling_exaone_moe import ExaoneMoeMTP
-            mtp_layer = ExaoneMoeMTP(model_config,
-                                     layer_idx,
-                                     aux_stream_dict,
-                                     is_separate_draft_engine=True)
+            mtp_layer = ExaoneMoeMTP(model_config, layer_idx, aux_stream_dict)
 
         else:
             raise ValueError(
