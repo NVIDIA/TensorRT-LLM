@@ -840,8 +840,13 @@ def collectTestResults(pipeline, testFilter)
 {
     collectResultPodSpec = createKubernetesPodConfig("", "agent")
     trtllm_utils.launchKubernetesPod(pipeline, collectResultPodSpec, "alpine", {
-        if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+        if (env.JOB_NAME ==~ /.*PostMerge.*/ || true) {
             stage("Update GitHub Tag") {
+                // TEST: Print environment variables
+                echo "[TEST] JOB_NAME=${env.JOB_NAME}, BUILD_NUMBER=${env.BUILD_NUMBER}"
+                echo "[TEST] gitlabCommit=${env.gitlabCommit}, gitlabTargetBranch=${env.gitlabTargetBranch}"
+                echo "[TEST] GITHUB_PR_API_URL=${globalVars[GITHUB_PR_API_URL]}, TARGET_BRANCH=${globalVars[TARGET_BRANCH]}"
+
                 sh "which git || apk add --no-cache git"
                 updateGithubTagCommit(pipeline)
             }
@@ -1328,6 +1333,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
  * @return List of failed stages, or null if retrieval fails
  */
 def getFailedStages() {
+    // TEST: Print script info
+    echo "[TEST] Calling ${BOT_ROOT}/bin/failures.py for build ${env.BUILD_NUMBER}"
     def status = sh(
         script: """rm -f failed_stages.json failed_stages_error.txt && \
         python3 ${BOT_ROOT}/bin/failures.py \
@@ -1340,6 +1347,8 @@ def getFailedStages() {
         label: "Checking failed stages in build #${env.BUILD_NUMBER}"
     )
 
+    // TEST: Print script result
+    echo "[TEST] failures.py exit status: ${status}"
     if (status != 0) {
         echo "WARNING: Failed to get failed stages. Check failed_stages_error.txt for details."
         return null
@@ -1349,6 +1358,8 @@ def getFailedStages() {
     def failedStageList = failedResult["failed_stage_list"] ?: []
 
     echo "Found ${failedStageList.size()} failed stages"
+    // TEST: Print stage list
+    echo "[TEST] Failed stages: ${failedStageList.join(', ')}"
     return failedStageList
 }
 
@@ -1366,6 +1377,9 @@ def areAllFailuresPostMerge(failedStageList) {
     def premergeFailedStages = failedStageList.findAll {
         !it.contains("Post-Merge") && !it.contains("post-merge")
     }
+
+    // TEST: Print analysis result
+    echo "[TEST] Total: ${failedStageList.size()}, Post-merge: ${failedStageList.size() - premergeFailedStages.size()}, Pre-merge: ${premergeFailedStages.size()}"
 
     if (premergeFailedStages.isEmpty()) {
         echo "All ${failedStageList.size()} failed stages are post-merge: ${failedStageList.join(', ')}"
@@ -1387,6 +1401,11 @@ def createGithubTag() {
     def tagName = "latest-ci-stable-commit-${targetBranch}"
 
     echo "Creating tag '${tagName}' at commit ${commitSha} for PR #${prNumber}"
+    // TEST: Print tag parameters
+    echo "[TEST] commitSha=${commitSha}, prNumber=${prNumber}, targetBranch=${targetBranch}, tagName=${tagName}"
+
+    // TEST MODE: DRY RUN - Comment out next line to enable real push
+    echo "[TEST] DRY RUN MODE: Would create tag but skipping actual push"; return true
 
     withCredentials([
         usernamePassword(
@@ -1428,6 +1447,8 @@ def createGithubTag() {
  * @return true if tag is successfully updated, false otherwise
  */
 def updateGithubTagCommit(pipeline) {
+    // TEST: Print check result
+    echo "[TEST] Checking GITHUB_PR_API_URL: ${globalVars[GITHUB_PR_API_URL]}"
     if (!globalVars[GITHUB_PR_API_URL]) {
         echo "Not a GitHub PR. Skip updating GitHub tag."
         return false
@@ -1438,15 +1459,21 @@ def updateGithubTagCommit(pipeline) {
 
     // Fast path: If pipeline is SUCCESS, update tag directly
     if (buildResult == 'SUCCESS') {
+        echo "[TEST] Fast path: Pipeline SUCCESS"
         echo "Pipeline succeeded. Updating GitHub tag..."
         return createGithubTag()
     }
 
     // Slow path: Check if only post-merge stages failed
+    echo "[TEST] Slow path: Checking failed stages"
     echo "Pipeline not successful. Analyzing failed stages..."
+    // TEST: Print BOT repo info
+    echo "[TEST] BOT_REPO=${BOT_REPO}, BOT_REVISION=${BOT_REVISION}, BOT_ROOT=${BOT_ROOT}"
     trtllm_utils.checkoutSource(BOT_REPO, BOT_REVISION, BOT_ROOT)
 
     def failedStageList = getFailedStages()
+    // TEST: Print failed stages
+    echo "[TEST] Failed stages count: ${failedStageList ? failedStageList.size() : 0}"
     if (!failedStageList) {
         echo "Failed to retrieve failed stages. Skip updating tag."
         return false
