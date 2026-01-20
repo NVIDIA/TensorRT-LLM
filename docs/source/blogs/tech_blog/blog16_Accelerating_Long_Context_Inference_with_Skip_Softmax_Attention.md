@@ -83,7 +83,7 @@ The evaluation results are summarized in the table below:
 | 0.8             | 46.50                     | 37.21                        |
 | 0.9             | 45.97                       | 37.21                        |
 
-(Note that the number of samples in LongBench V2 is very small (~200), so the result is subject to large variance. You will see non-monotonic relationship between sparsity and accuracy. We recommend to look at LongBench V1 for inspecting the accuracy loss trend.)
+Note that the number of samples in LongBench V2 is very small (~200), so the result is subject to large variance. You will see non-monotonic relationship between sparsity and accuracy. We recommend to look at LongBench V1 (~5000 samples) for inspecting the accuracy loss trend.
 
 These results demonstrate that Skip Softmax Attention is safe to use without significant accuracy degradation.
 
@@ -97,7 +97,7 @@ We provide the performance data of the attention kernels under different achieve
 
 As a reference, the baseline performance data **without** Skip Softmax Attention are listed below (you can fill in the numbers).
 
-**Prefill Baseline:**
+**Prefill Baseline (we report compute performance in TFLOP/s):**
 
 | GPU | Seqlen | Precision | TFLOP/s | Duration µs |
 |:---:|:-----:|:---------:|--------:|--------------:|
@@ -110,9 +110,9 @@ As a reference, the baseline performance data **without** Skip Softmax Attention
 | B200 | 64k | BF16 | 1038.26 | 67775.65 |
 | B200 | 64k | FP8  | 1621.41  | 43399.72 |
 
-**Decode Baseline:**
+**Decode Baseline (we report memory bandwidth in TB/s):**
 
-| GPU | Seqlen | Precision | Bandwidth TB/s | Duration µs |
+| GPU | Seqlen | Precision | TB/s | Duration µs |
 |:---:|:-----:|:---------:|-----------------:|--------------:|
 | H200 | 16k | BF16 | 4.391 | 489.06 |
 | H200 | 16k | FP8  | 3.158 | 340.01 |
@@ -123,9 +123,7 @@ As a reference, the baseline performance data **without** Skip Softmax Attention
 | B200 | 64k | BF16 | 7.102 | 1209.51 |
 | B200 | 64k | FP8  | 5.683 | 755.76 |
 
-The following figures plot **speedup vs. achieved sparsity**.
-
-**Kernel performance (grouped by GPU):**
+The following figures plot **speedup vs. achieved sparsity**, on top of the baseline performance:
 
 <table style="width: 100%; border: 0;">
   <tr>
@@ -146,16 +144,14 @@ The following figures plot **speedup vs. achieved sparsity**.
   </tr>
 </table>
 
-For prefilling, the maximum speedup is ~1.8x. Another advantage of Skip Softmax Attention is that it can further boost performance on top of FP8 attention,.
+Skip Softmax Attention could further boost the performance of FP8 attention, though the gain is less significant compared to BF16.
 
 
 ### End-to-end Performance
 
-We also benchmark the end-to-end performance to demonstrate the benefit of Skip Softmax Attention. Due to the quadratic complexity of the attention, the TTFT in long-context scenarios is often a severe blocker for real-world usage. Skip Softmax Attention can significantly reduce the TTFT by accelerating the prefilling kernel, and the TPOT can also be reduced if the context length is long enough.  
+We benchmark the end-to-end performance to demonstrate the benefit of Skip Softmax Attention. Due to the quadratic complexity of the attention, the TTFT in long-context scenarios is often a severe blocker for real-world usage. Skip Softmax Attention can significantly reduce the TTFT by accelerating the prefilling kernel, and the TPOT can also be reduced if the context length is long enough. The experiemnt is conducted on a single H200 or B200 GPU, using the exact same dataset as the accuracy evaluation.
 
-E2E benchmark could be performed using `trtllm-bench` (see the reproduction section for the exact commands).
-LongBench V1
-avg ISL = 10k
+**LongBench V1, avg ISL=10k, OSL=6:**
 
 | Target Sparsity | TTFT/ms (H200) | TPOT/ms (H200) | TTFT/ms (B200) | TPOT/ms (B200) |
 |:--------------:|------------------:|-----------------:|--------------------:|--------------------:|
@@ -166,9 +162,9 @@ avg ISL = 10k
 | 0.8            | 8778.14           | 1622.27          | 4531.42             | 870.22              |
 | 0.9            | 8618.86           | 1596.62          | 4475.78             | 861.18              |
 
+LongBench V1 results are reported with concurrency 64. Due to the nature of in-flight batching, the decoding requests might be piggybacked with the prefilling requests, so the TPOT is relatively high.
 
-LongBench V2
-avg ISL = 130k
+**LongBench V2, avg ISL=130k, OSL=200:**
 
 | Target Sparsity | TTFT/ms (H200) | TPOT/ms (H200) | TTFT/ms (B200) | TPOT/ms (B200) |
 |:--------------:|------------------:|-----------------:|--------------------:|--------------------:|
@@ -179,8 +175,11 @@ avg ISL = 130k
 | 0.8            | 14465.74          | 8.41             | 6192.77             | 6.26                |
 | 0.9            | 13791.37          | 8.40             | 6043.06             | 6.27                |
 
+Due to the extremely long context length, we only run LongBench V2 with concurrency 1. In this scenario, the prefilling/decoding is better separated and we can observe how is TTFT/TPOT affected by the sparsity. Note that the speedup for decoding is less pronounced under small batch size. Small batch size and small number of heads (with TP) are more close to real-world usage for long-context serving due to the limit of SLO, and we are actively optimizing the decoding performance under such scenarios.
 
 ## Reproduction
+
+We provide the commands to reproduce the results in the previous context, as a showcase of how to evaluate the accuracy and benchmark the performance for Skip Softmax Attention.
 
 ### Accuracy evaluation (LongBench V1/V2)
 > Please manually `pip install lm_eval==0.4.9.2` before reproducing the results. There is a known bug in the current version of `lm_eval` in `requirements-dev.txt`.
@@ -188,47 +187,59 @@ avg ISL = 130k
 Both LongBench V1 and V2 are integrated into the TensorRT-LLM accuracy test suite, `trtllm-eval`. Here are the example scripts to run the accuracy evaluation:
 
 ```bash
-# Run LongBench V1 with a single GPU.
+# Dump the extra LLM API options YAML file.
 cat >extra_llm_api_options.yaml <<EOF
+kv_cache_config:
+    free_gpu_memory_fraction: 0.8
 sparse_attention_config:
     algorithm: skip_softmax
     threshold_scale_factor:
         prefill: ${thr_prefill}
         decode: ${thr_decode}
 EOF
-trtllm-eval --model Qwen/Qwen3-30B-A3B-Instruct-2507 --max_batch_size 256 --max_num_tokens 100000 --kv_cache_free_gpu_memory_fraction 0.8 --extra_llm_api_options extra_llm_api_options.yaml longbench_v1
 ```
 
 ```bash
-# Run LongBench V2.
-# Due to the long sequence length of the prompts and long evaluation time, we use 8 GPUs.
-cat >extra_llm_api_options.yaml <<EOF
-cuda_graph_config: null
-sparse_attention_config:
-    algorithm: skip_softmax
-    threshold_scale_factor:
-        prefill: ${thr_prefill}
-        decode: ${thr_decode}
-moe_config:
-    max_num_tokens: 32768  # Chunk MoE execution to avoid OOM.
-EOF
+# Evaluate LongBench V1.
 trtllm-eval --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
---max_batch_size 1 --max_num_tokens 262144 --tp_size 8 --ep_size 1 \
---kv_cache_free_gpu_memory_fraction 0.8 --extra_llm_api_options extra_llm_api_options.yaml \
+ --max_batch_size 64 --max_num_tokens 100000 \
+ --extra_llm_api_options extra_llm_api_options.yaml \
+ longbench_v1 \
+ --output_dir ${OUTPUT_DIR}  # Dump dataset for perf benching
+```
+
+```bash
+# Evaluate LongBench V2.
+trtllm-eval --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
+--max_batch_size 1 --max_num_tokens 262144 \
+--extra_llm_api_options extra_llm_api_options.yaml \
 longbench_v2 \
---length medium \
---max_output_length 256 --max_input_length 262144
+--length medium \  # Medium subset of LongBench V2
+--max_input_length 256000 \  # Truncate the prompt length to 256k
+--output_dir ${OUTPUT_DIR}  # Dump dataset for perf benching
 ```
 
 ### End-to-end performance (TTFT/TPOT)
-We can export the LongBench V1 and V2 dataset for performance benchmarking by adding `--dump_as_text` and `--dump_path` when running `trtllm-eval`. After getting the data of format required by `trtllm-bench`, we can do E2E using:
+The option `--output_dir` in `trtllm-eval` will dump the dataset in the format required by `trtllm-bench` as `dumped_ids.json`. After getting the data, we can perform end-to-end benchmarking:
 
 ```bash
-trtllm-bench --model Qwen/Qwen3-30B-A3B-Instruct-2507 --throughput --dataset ${longbench_v1_dataset} --concurrency 256 --max_batch_size 256 --max_num_tokens 100000 --extra_llm_api_options extra_llm_api_options.yaml --warmup 0 --streaming --report_json longbench_v1_perf.json
+# Benchmark on LongBench V1.
+trtllm-bench --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
+throughput --dataset ${OUTPUT_DIR}/dumped_ids.json \
+--concurrency 64 --max_batch_size 64 --max_num_tokens 100000 \
+--extra_llm_api_options extra_llm_api_options.yaml \
+--warmup 0 --streaming \
+--report_json ${OUTPUT_DIR}/report.json
 ```
 
 ```bash
-trtllm-bench --model Qwen/Qwen3-30B-A3B-Instruct-2507 --throughput --dataset ${longbench_v2_dataset} --concurrency 1 --tp 8 --ep 1 --max_batch_size 1 --max_num_tokens 262144 --extra_llm_api_options extra_llm_api_options.yaml --warmup 0 --streaming --report_json longbench_v2_perf.json
+# Benchmark on LongBench V2.
+trtllm-bench --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
+throughput --dataset ${OUTPUT_DIR}/dumped_ids.json \
+--concurrency 1 --max_batch_size 1 --max_num_tokens 262144 \
+--extra_llm_api_options extra_llm_api_options.yaml \
+--warmup 0 --streaming \
+--report_json ${OUTPUT_DIR}/report.json
 ```
 
 
