@@ -299,15 +299,16 @@ def test_triton_quant_fp8_moe_matches_torch_quant_fp8_moe(early_exit):
 
     # Input scales (tensor-wise, replicated per expert for interface compatibility)
     x_scale = x.abs().max().item() / FP8_MAX
-    w1_input_scale_tensor = torch.full((E,), x_scale, device=device, dtype=torch.float32)
+    # Input scales: precomputed max values with shape [1] (new API)
+    w1_input_scale_max = torch.tensor([x_scale], device=device, dtype=torch.float32)
 
     # Compute intermediate activation scale by simulating first GEMM + ReLU^2
     # This ensures w2_input_scale matches the actual activation magnitude
     with torch.no_grad():
         # Simulate the first GEMM: quantize input, do FP8 matmul, apply ReLU^2
-        x_q = (x / w1_input_scale_tensor[0]).clamp(FP8_MIN, FP8_MAX).to(torch.float8_e4m3fn)
+        x_q = (x / w1_input_scale_max.item()).clamp(FP8_MIN, FP8_MAX).to(torch.float8_e4m3fn)
         # Dequantize and compute output for a sample
-        x_dq = x_q[:8].to(torch.float32) * w1_input_scale_tensor[0].item()
+        x_dq = x_q[:8].to(torch.float32) * w1_input_scale_max.item()
         w1_dq = w1_fp8_stacked[0].to(torch.float32) * w1_weight_scale[0].item()
         sample_out = torch.nn.functional.linear(x_dq.to(dtype), w1_dq.to(dtype))
         sample_act = torch.square(torch.nn.functional.relu(sample_out))
@@ -315,11 +316,11 @@ def test_triton_quant_fp8_moe_matches_torch_quant_fp8_moe(early_exit):
         # Ensure scale is not too small
         intermediate_scale = max(intermediate_scale, 1e-6)
 
-    w2_input_scale_tensor = torch.full((E,), intermediate_scale, device=device, dtype=torch.float32)
+    w2_input_scale_max = torch.tensor([intermediate_scale], device=device, dtype=torch.float32)
 
     # Convert scales to lists for torch_quant_fp8_moe reference
-    w1_input_scale_list = [w1_input_scale_tensor[0].clone() for _ in range(E)]
-    w2_input_scale_list = [w2_input_scale_tensor[0].clone() for _ in range(E)]
+    w1_input_scale_list = [w1_input_scale_max[0].clone() for _ in range(E)]
+    w2_input_scale_list = [w2_input_scale_max[0].clone() for _ in range(E)]
     w1_weight_scale_list = [w1_weight_scale[e].clone() for e in range(E)]
     w2_weight_scale_list = [w2_weight_scale[e].clone() for e in range(E)]
 
@@ -327,7 +328,7 @@ def test_triton_quant_fp8_moe_matches_torch_quant_fp8_moe(early_exit):
     w3_fp8_list = [torch.empty((1, 1), device=device, dtype=torch.float8_e4m3fn) for _ in range(E)]
     w3_fp8_stacked = torch.stack(w3_fp8_list).contiguous()
     w3_input_scale_list = [torch.ones((), device=device, dtype=torch.float32) for _ in range(E)]
-    w3_input_scale_tensor = torch.ones((E,), device=device, dtype=torch.float32)
+    w3_input_scale_max = torch.ones((1,), device=device, dtype=torch.float32)
     w3_weight_scale_list = [torch.ones((), device=device, dtype=torch.float32) for _ in range(E)]
     w3_weight_scale_tensor = torch.ones((E,), device=device, dtype=torch.float32)
 
@@ -352,7 +353,7 @@ def test_triton_quant_fp8_moe_matches_torch_quant_fp8_moe(early_exit):
     # Create equal routing weights
     routing_weights = torch.ones((M, top_k), device=device, dtype=torch.float32) / top_k
 
-    # Triton FP8 quantized MoE (uses stacked tensors)
+    # Triton FP8 quantized MoE (uses stacked tensors with precomputed max input scales)
     out_triton = torch.ops.auto_deploy.triton_quant_fp8_moe(
         x,
         selected_experts.to(torch.int32),
@@ -360,9 +361,9 @@ def test_triton_quant_fp8_moe_matches_torch_quant_fp8_moe(early_exit):
         w1_fp8_stacked,
         w2_fp8_stacked,
         w3_fp8_stacked,
-        w1_input_scale_tensor,
-        w2_input_scale_tensor,
-        w3_input_scale_tensor,
+        w1_input_scale_max,  # [1] precomputed max
+        w2_input_scale_max,  # [1] precomputed max
+        w3_input_scale_max,  # [1] precomputed max (unused)
         w1_weight_scale,
         w2_weight_scale,
         w3_weight_scale_tensor,
@@ -389,3 +390,142 @@ def test_triton_quant_fp8_moe_matches_torch_quant_fp8_moe(early_exit):
     )
 
     torch.testing.assert_close(out_triton, out_torch, rtol=1e-2, atol=1e-2)
+
+
+@skip_pre_hopper
+@pytest.mark.parametrize("allow_different_input_scales", [False, True])
+@pytest.mark.parametrize("scales_identical", [True, False])
+def test_triton_fp8_moe_different_input_scales(allow_different_input_scales, scales_identical):
+    """
+    Test triton FP8 MoE behavior with different/identical input scales.
+
+    Tests the allow_different_input_scales config option:
+    - When scales_identical=True: should always work
+    - When scales_identical=False and allow_different_input_scales=False: should fail with assertion
+    - When scales_identical=False and allow_different_input_scales=True: should work (uses max)
+    """
+    import torch.fx as fx
+
+    from tensorrt_llm._torch.auto_deploy.transform.library.fused_moe import _stack_fp8_moe_weights
+
+    torch.manual_seed(0)
+
+    batch_size, num_experts, top_k = 4, 2, 2
+    hidden_size, intermediate_size = 128, 128
+    # Use non-gated MLP (Relu2) because triton backend only supports non-gated MLP
+    is_gated_mlp = False
+    act_fn = ActivationType.Relu2
+
+    # Generate test data
+    x = torch.randn(batch_size, hidden_size, dtype=torch.bfloat16, device="cuda") * 0.5
+
+    # Simple routing: distribute tokens across experts
+    selected_experts = torch.zeros((batch_size, top_k), dtype=torch.int64, device="cuda")
+    for i in range(batch_size):
+        selected_experts[i, 0] = i % num_experts
+        selected_experts[i, 1] = (i + 1) % num_experts
+    routing_weights = torch.ones((batch_size, top_k), device="cuda", dtype=torch.float32) / top_k
+
+    # Create per-expert weights and scales (non-gated MLP, no w3)
+    # Use random FP8 data directly - we're testing transform logic, not quantization accuracy
+    w1_weight, w2_weight = [], []
+    w1_input_scale, w2_input_scale = [], []
+    w1_weight_scale, w2_weight_scale = [], []
+
+    for expert_id in range(num_experts):
+        # Random FP8 weights
+        w1_fp8 = torch.randn(intermediate_size, hidden_size, device="cuda").to(torch.float8_e4m3fn)
+        w2_fp8 = torch.randn(hidden_size, intermediate_size, device="cuda").to(torch.float8_e4m3fn)
+        w1_weight.append(w1_fp8)
+        w2_weight.append(w2_fp8)
+
+        # Random weight scales (shape [1])
+        w1_weight_scale.append(torch.tensor([0.1], dtype=torch.float32, device="cuda"))
+        w2_weight_scale.append(torch.tensor([0.1], dtype=torch.float32, device="cuda"))
+
+        # Input scales: either identical or different per expert (shape [1])
+        if scales_identical:
+            inp_scale = torch.tensor([1.0], dtype=torch.float32, device="cuda")
+        else:
+            # Different input scales per expert - big variance to test max() behavior
+            inp_scale = torch.tensor([0.5 + 0.5 * expert_id], dtype=torch.float32, device="cuda")
+
+        w1_input_scale.append(inp_scale)
+        w2_input_scale.append(inp_scale)
+
+    # Create a module with the FP8 MoE op
+    class FP8MoEModule(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            for i in range(num_experts):
+                self.register_buffer(f"w1_{i}", w1_weight[i])
+                self.register_buffer(f"w2_{i}", w2_weight[i])
+                self.register_buffer(f"w1_iscale_{i}", w1_input_scale[i])
+                self.register_buffer(f"w2_iscale_{i}", w2_input_scale[i])
+                self.register_buffer(f"w1_wscale_{i}", w1_weight_scale[i])
+                self.register_buffer(f"w2_wscale_{i}", w2_weight_scale[i])
+
+        def forward(self, x, selected_experts, routing_weights):
+            return torch.ops.auto_deploy.torch_quant_fp8_moe(
+                x,
+                selected_experts,
+                routing_weights,
+                [getattr(self, f"w1_{i}") for i in range(num_experts)],
+                [getattr(self, f"w2_{i}") for i in range(num_experts)],
+                [],  # w3 is empty for non-gated MLP
+                [getattr(self, f"w1_iscale_{i}") for i in range(num_experts)],
+                [getattr(self, f"w2_iscale_{i}") for i in range(num_experts)],
+                [],  # w3 input scale is empty for non-gated MLP
+                [getattr(self, f"w1_wscale_{i}") for i in range(num_experts)],
+                [getattr(self, f"w2_wscale_{i}") for i in range(num_experts)],
+                [],  # w3 weight scale is empty for non-gated MLP
+                is_gated_mlp=is_gated_mlp,
+                act_fn=act_fn,
+            )
+
+    module = FP8MoEModule().cuda()
+    gm = fx.symbolic_trace(module)
+
+    # Compute reference output from original graph before transformation
+    with torch.inference_mode():
+        ref_output = gm(x, selected_experts, routing_weights)
+
+    # Expected behavior:
+    # - scales_identical=True: always works
+    # - scales_identical=False, allow_different_input_scales=False: assertion error
+    # - scales_identical=False, allow_different_input_scales=True: works with max()
+
+    if not scales_identical and not allow_different_input_scales:
+        # Should fail with assertion error
+        with pytest.raises(AssertionError, match="input scales should have the same value"):
+            _stack_fp8_moe_weights(
+                gm, backend="triton", allow_different_input_scales=allow_different_input_scales
+            )
+    else:
+        # Should succeed
+        num_transformed = _stack_fp8_moe_weights(
+            gm, backend="triton", allow_different_input_scales=allow_different_input_scales
+        )
+        gm.recompile()
+
+        assert num_transformed == 1, f"Expected 1 transform, got {num_transformed}"
+
+        # Verify that max() is used when scales differ
+        if not scales_identical:
+            expected_max_w1_input_scale = torch.stack(w1_input_scale).max()
+            actual_w1_input_max = getattr(gm, "quant_moe_w1_input_scale_max_0").squeeze()
+
+            assert torch.allclose(actual_w1_input_max, expected_max_w1_input_scale), (
+                f"w1 input scale max mismatch. Got {actual_w1_input_max}, expected {expected_max_w1_input_scale}"
+            )
+
+        # Run the transformed graph and compare to reference output
+        with torch.inference_mode():
+            output = gm(x, selected_experts, routing_weights)
+            assert output.shape == ref_output.shape, (
+                f"Output shape mismatch: {output.shape} vs {ref_output.shape}"
+            )
+
+            assert torch.allclose(output, ref_output, rtol=0.05, atol=0.05), (
+                f"Output mismatch. rtol=0.05, atol=0.05. Max diff: {(output - ref_output).abs().max()}"
+            )

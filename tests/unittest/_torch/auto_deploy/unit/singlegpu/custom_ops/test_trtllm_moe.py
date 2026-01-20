@@ -1004,14 +1004,13 @@ def test_stack_nvfp4_moe_weights_transform_relu2(hidden_size, intermediate_size)
     torch.testing.assert_close(ref_output, transformed_output, rtol=tol, atol=tol)
 
 
-@pytest.mark.parametrize("backend", ["trtllm", "triton"])
 @pytest.mark.parametrize("allow_different_input_scales", [False, True])
 @pytest.mark.parametrize("scales_identical", [True, False])
 @pytest.mark.skipif(
     not fp8_compatible() or not trtllm_ops_available(),
     reason="Requires fp8 and trtllm support",
 )
-def test_fp8_moe_different_input_scales(backend, allow_different_input_scales, scales_identical):
+def test_fp8_moe_different_input_scales(allow_different_input_scales, scales_identical):
     """
     Test FP8 MoE behavior with different/identical input scales.
 
@@ -1028,7 +1027,7 @@ def test_fp8_moe_different_input_scales(backend, allow_different_input_scales, s
 
     batch_size, num_experts, top_k = 4, 2, 2
     hidden_size, intermediate_size = 128, 128
-    # Use non-gated MLP (Relu2) because triton backend only supports non-gated MLP
+    # Use non-gated MLP (Relu2) for this test
     is_gated_mlp = False
     act_fn = ActivationType.Relu2
 
@@ -1110,12 +1109,12 @@ def test_fp8_moe_different_input_scales(backend, allow_different_input_scales, s
         # Should fail with assertion error
         with pytest.raises(AssertionError, match="input scales should have the same value"):
             _stack_fp8_moe_weights(
-                gm, backend=backend, allow_different_input_scales=allow_different_input_scales
+                gm, backend="trtllm", allow_different_input_scales=allow_different_input_scales
             )
     else:
         # Should succeed
         num_transformed = _stack_fp8_moe_weights(
-            gm, backend=backend, allow_different_input_scales=allow_different_input_scales
+            gm, backend="trtllm", allow_different_input_scales=allow_different_input_scales
         )
         gm.recompile()
 
@@ -1124,10 +1123,7 @@ def test_fp8_moe_different_input_scales(backend, allow_different_input_scales, s
         # Verify that max() is used when scales differ
         if not scales_identical:
             expected_max_w1_input_scale = torch.stack(w1_input_scale).max()
-            if backend == "trtllm":
-                actual_w1_input_max = getattr(gm, "quant_moe_fc1_act_scale_max_0")
-            else:
-                actual_w1_input_max = getattr(gm, "quant_moe_w1_input_scale_max_0").squeeze()
+            actual_w1_input_max = getattr(gm, "quant_moe_fc1_act_scale_max_0")
 
             assert torch.allclose(actual_w1_input_max, expected_max_w1_input_scale), (
                 f"w1 input scale max mismatch. Got {actual_w1_input_max}, expected {expected_max_w1_input_scale}"
