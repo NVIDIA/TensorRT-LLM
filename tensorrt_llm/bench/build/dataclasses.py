@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import Optional, Literal
 from pydantic import AliasPath, BaseModel, Field, AliasChoices, model_validator
 import huggingface_hub
@@ -61,55 +62,67 @@ def parse_safetensors_file_metadata(model_path, filename):
 
 def get_safetensors_metadata(model_name_or_path):
     """ Read the safetensors metadata from HF model. """
-    if os.path.isdir(model_name_or_path):
-        if os.path.exists(
-                os.path.join(model_name_or_path, SAFETENSORS_SINGLE_FILE)):
-            file_metadata = parse_safetensors_file_metadata(
-                model_path=model_name_or_path, filename=SAFETENSORS_SINGLE_FILE)
-            return SafetensorsRepoMetadata(
-                metadata=None,
-                sharded=False,
-                weight_map={
-                    tensor_name: SAFETENSORS_SINGLE_FILE
-                    for tensor_name in file_metadata.tensors.keys()
-                },
-                files_metadata={SAFETENSORS_SINGLE_FILE: file_metadata},
-            )
-        elif os.path.exists(
-                os.path.join(model_name_or_path, SAFETENSORS_INDEX_FILE)):
-            with open(os.path.join(model_name_or_path,
-                                   SAFETENSORS_INDEX_FILE)) as f:
-                index = json.load(f)
+    # To robustly get the model path (directory on disk) from either a model name or local path,
+    # use huggingface_hub's `hf_hub_download` or `snapshot_download` utilities. For entire repos, use `snapshot_download`.
+    # Here is the standard way:
 
-            weight_map = index.get("weight_map", {})
+    model_path = Path(model_name_or_path)
+    if not model_path.is_dir():
+        from huggingface_hub import snapshot_download
 
-            # Fetch metadata per shard
-            files_metadata = {}
+        model_path = Path(snapshot_download(model_name_or_path))
 
-            def _parse(filename: str) -> None:
-                files_metadata[filename] = parse_safetensors_file_metadata(
-                    model_path=model_name_or_path, filename=filename)
+    safetensors_single_file = Path(model_path) / SAFETENSORS_SINGLE_FILE
+    safetensors_index_file = Path(model_path) / SAFETENSORS_INDEX_FILE
+    safetensor_metadata = None
 
-            thread_map(
-                _parse,
-                set(weight_map.values()),
-                desc="Parse safetensors files",
-                tqdm_class=hf_tqdm,
-            )
+    if safetensors_single_file.exists():
+        file_metadata = parse_safetensors_file_metadata(
+            model_path=model_name_or_path, filename=SAFETENSORS_SINGLE_FILE)
+        safetensor_metadata = SafetensorsRepoMetadata(
+            metadata=None,
+            sharded=False,
+            weight_map={
+                tensor_name: SAFETENSORS_SINGLE_FILE
+                for tensor_name in file_metadata.tensors.keys()
+            },
+            files_metadata={SAFETENSORS_SINGLE_FILE: file_metadata},
+        )
+    elif safetensors_index_file.exists():
+        with open(os.path.join(model_name_or_path,
+                               SAFETENSORS_INDEX_FILE)) as f:
+            index = json.load(f)
 
-            return SafetensorsRepoMetadata(
-                metadata=index.get("metadata", None),
-                sharded=True,
-                weight_map=weight_map,
-                files_metadata=files_metadata,
-            )
-        else:
-            # Not a safetensors repo
-            raise RuntimeError(
-                f"'{model_name_or_path}' is not a safetensors repo. Couldn't find '{SAFETENSORS_INDEX_FILE}' or '{SAFETENSORS_SINGLE_FILE}' files."
-            )
+        weight_map = index.get("weight_map", {})
+
+        # Fetch metadata per shard
+        files_metadata = {}
+
+        def _parse(filename: str) -> None:
+            files_metadata[filename] = parse_safetensors_file_metadata(
+                model_path=model_name_or_path, filename=filename)
+
+        thread_map(
+            _parse,
+            set(weight_map.values()),
+            desc="Parse safetensors files",
+            tqdm_class=hf_tqdm,
+        )
+
+        safetensor_metadata = SafetensorsRepoMetadata(
+            metadata=index.get("metadata", None),
+            sharded=True,
+            weight_map=weight_map,
+            files_metadata=files_metadata,
+        )
     else:
-        return huggingface_hub.get_safetensors_metadata(model_name_or_path)
+        # Not a safetensors repo
+        raise RuntimeError(
+            f"'{model_name_or_path}' is not a safetensors repo. Couldn't find '{SAFETENSORS_INDEX_FILE}' or '{SAFETENSORS_SINGLE_FILE}' files."
+        )
+
+    if safetensor_metadata is None:
+        return huggingface_hub.get_safetensors_metadata(model_path)
 
 
 class ModelConfig(BaseModel):
