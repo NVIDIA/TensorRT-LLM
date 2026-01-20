@@ -66,7 +66,6 @@ class ditFlux2Pipeline(Flux2Pipeline, ditBasePipeline):
         torch_dtype: torch.dtype,
         exclude_pattern: Optional[str] = None,
         warm_up: Optional[bool] = True,
-        enable_compile: Optional[bool] = True,
         enable_cuda_graph: Optional[bool] = True,
         device: Optional[torch.device] = torch.device("cuda"),
         **dit_configs,
@@ -74,9 +73,6 @@ class ditFlux2Pipeline(Flux2Pipeline, ditBasePipeline):
         pipe = ditFlux2Pipeline.from_pretrained(model_id, torch_dtype=torch_dtype, **dit_configs)
         apply_visual_gen_linear(pipe.transformer, load_parameters=True, quantize_weights=True, exclude_pattern=exclude_pattern)
         pipe.to(device)
-        if enable_compile:
-            logger.info("compiling...")
-            torch.compile(pipe.transformer)
         if enable_cuda_graph:
             logger.info("capturing cuda graph..")
             pipe.transformer.forward = cudagraph_wrapper(pipe.transformer.forward)
@@ -128,7 +124,7 @@ class ditFlux2Pipeline(Flux2Pipeline, ditBasePipeline):
 
         if not VAEParallelConfig.disable_parallel_vae:
             logger.warning("VAE parallel is not supported for FluxPipeline")
-            
+
         self._set_teacache_coefficients(**kwargs)
 
     def load_fp4_weights(self, path, svd_weight_name_table):
