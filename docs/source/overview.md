@@ -51,14 +51,6 @@ TensorRT LLM strives to support the most popular models on **Day 0**.
 - **[Guided Decoding](./features/guided-decoding.md)**: Advanced sampling with stop words, bad words, and custom constraints
 - **[Disaggregated Serving (Beta)](./features/disagg-serving.md)**: Separate context and generation phases across different GPUs for optimal resource utilization
 
-### 🔧 **Latest GPU Architecture Support**
-
-TensorRT LLM supports the full spectrum of NVIDIA GPU architectures:
-- **NVIDIA Blackwell**: B200, GB200, B300, GB300, DGX Spark
-- **NVIDIA Hopper**: H100, H200, GH200
-- **NVIDIA Ada Lovelace**: L20, L40/L40S
-- **NVIDIA Ampere**: A100
-
 ## What Can You Do With TensorRT LLM?
 
 Whether you're building the next generation of AI applications, optimizing existing LLM deployments, or exploring the frontiers of large language model technology, TensorRT LLM provides the tools, performance, and flexibility you need to succeed in the era of generative AI.To get started, refer to the {ref}`quick-start-guide`.
