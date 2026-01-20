@@ -264,8 +264,7 @@ class Deepseekv3RoutingImpl:
                         "The configuration is not supported by the fused routing kernel. We have to use the original pytorch implementation."
                     )
                 self.is_fused = False
-        elif (num_experts > 512 or (self.top_k > 8 and self.top_k != 22)
-              or self.topk_group == 1):
+        elif num_experts > 512 or (self.top_k > 8 and self.top_k != 22):
             # We have special implementation for n_group == 1, top_k == 22 and num_experts == 512 for Nemotron Super v3.
             if self.is_fused:
                 warnings.warn(
@@ -273,19 +272,22 @@ class Deepseekv3RoutingImpl:
                 )
             self.is_fused = False
 
-        if self.n_group == 1 and self.topk_group == 1:
-            scores, scores_with_bias = self.get_scores(logits,
-                                                       e_score_correction_bias)
-            _, topk_indices = torch.topk(scores_with_bias, k=self.top_k, dim=1)
-            topk_values = torch.gather(scores, dim=1,
-                                       index=topk_indices).type_as(scores)
+        if not self.is_fused:
+            # Short path for n_group == 1 and topk_group == 1.
+            if self.n_group == 1 and self.topk_group == 1:
+                scores, scores_with_bias = self.get_scores(
+                    logits, e_score_correction_bias)
+                _, topk_indices = torch.topk(scores_with_bias,
+                                             k=self.top_k,
+                                             dim=1)
+                topk_values = torch.gather(scores, dim=1,
+                                           index=topk_indices).type_as(scores)
+                topk_values_sum = torch.sum(topk_values, dim=-1,
+                                            keepdim=True) + 1e-20
+                topk_values = topk_values / topk_values_sum * self.routed_scaling_factor
+                return topk_values, topk_indices
 
-            # Normalize and scale.
-            topk_values_sum = torch.sum(topk_values, dim=-1,
-                                        keepdim=True) + 1e-20
-            topk_values = topk_values / topk_values_sum * self.routed_scaling_factor
-            return topk_values, topk_indices
-        elif not self.is_fused:
+            # General case with pytorch implementation.
             scores, scores_with_bias = self.get_scores(logits,
                                                        e_score_correction_bias)
             scores_shape = list(scores_with_bias.shape)
