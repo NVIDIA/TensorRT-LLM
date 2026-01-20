@@ -377,6 +377,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         ... )
     """
 
+    # Maximum number of B tensors supported
+    MAX_B_TENSORS = 4
+
     def __init__(
         self,
         sf_vec_size: int,
@@ -385,6 +388,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         vectorized_f32: bool,
         topk: cutlass.Int64,
         raster_along_m: bool = False,
+        b_tensor_l_sizes: Optional[Tuple[int, ...]] = None,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with
         gather operation and SwiGLU fusion.
@@ -420,6 +424,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :type vectorized_f32: bool
         :param topk: Number of experts selected per token (used for token ID mapping).
         :type topk: cutlass.Int64
+        :param b_tensor_l_sizes: Optional tuple of L sizes for each B tensor.
+            E.g., (8, 8, 16) means 3 B tensors with L=8, 8, 16. Sum equals total L.
+            If None, single B tensor mode (backward compatible).
+        :type b_tensor_l_sizes: Optional[Tuple[int, ...]]
         """
 
         self.sf_vec_size = sf_vec_size
@@ -501,6 +509,26 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         self.num_tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
         self.vectorized_f32 = vectorized_f32
+
+        # Multi-B tensor configuration
+        if b_tensor_l_sizes is None:
+            self.num_b_tensors = 1
+            self.b_tensor_l_sizes = None
+            # Offsets padded for safe indexing in kernel
+            self.b_tensor_l_offsets = (0,) + (2**30,) * self.MAX_B_TENSORS
+        else:
+            assert len(b_tensor_l_sizes) <= self.MAX_B_TENSORS, (
+                f"Max {self.MAX_B_TENSORS} B tensors, got {len(b_tensor_l_sizes)}"
+            )
+            self.num_b_tensors = len(b_tensor_l_sizes)
+            self.b_tensor_l_sizes = b_tensor_l_sizes
+            offsets = [0]
+            for l_size in b_tensor_l_sizes:
+                offsets.append(offsets[-1] + l_size)
+            # Pad to MAX_B_TENSORS + 1 for safe indexing
+            while len(offsets) < self.MAX_B_TENSORS + 1:
+                offsets.append(2**30)
+            self.b_tensor_l_offsets = tuple(offsets)
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -696,10 +724,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
     def __call__(
         self,
         a: cute.Tensor,
-        b: cute.Tensor,
+        b: Union[cute.Tensor, Tuple[cute.Tensor, ...]],
         c: cute.Tensor,
         sfa: cute.Tensor,
-        sfb: cute.Tensor,
+        sfb: Union[cute.Tensor, Tuple[cute.Tensor, ...]],
         sfc_tensor: Optional[cute.Tensor],
         norm_const_tensor: Optional[cute.Tensor],
         tile_idx_to_expert_idx: cute.Tensor,
@@ -774,11 +802,14 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         """
         # Setup static attributes before smem/grid/tma computation
         self.a_dtype: Type[cutlass.Numeric] = a.element_type
-        self.b_dtype: Type[cutlass.Numeric] = b.element_type
+        # Handle tuple of B tensors
+        b_tuple = b if isinstance(b, tuple) else (b,)
+        sfb_tuple = sfb if isinstance(sfb, tuple) else (sfb,)
+        self.b_dtype: Type[cutlass.Numeric] = b_tuple[0].element_type
         self.c_dtype: Type[cutlass.Numeric] = c.element_type
         self.sf_dtype: Type[cutlass.Numeric] = sfa.element_type
         self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
-        self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
+        self.b_major_mode = utils.LayoutEnum.from_tensor(b_tuple[0]).mma_major_mode()
         self.c_layout = utils.LayoutEnum.from_tensor(c)
 
         # Check if input data types are compatible with MMA instruction
@@ -788,10 +819,28 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         # Setup attributes that dependent on gemm inputs
         self._setup_attributes()
 
-        # Setup sfb tensor by filling B tensor to scale factor atom layout
-        # ((Atom_N, Rest_N),(Atom_K, Rest_K),RestL)
-        sfb_layout = blockscaled_utils.tile_atom_to_shape_SF(b.shape, self.sf_vec_size)
-        sfb = cute.make_tensor(sfb.iterator, sfb_layout)
+        # Setup sfb tensors - create layout for each B tensor (use const_expr, not loop)
+        sfb_layout_0 = blockscaled_utils.tile_atom_to_shape_SF(b_tuple[0].shape, self.sf_vec_size)
+        sfb_tensor_0 = cute.make_tensor(sfb_tuple[0].iterator, sfb_layout_0)
+        sfb_tensors = [sfb_tensor_0]
+        if cutlass.const_expr(self.num_b_tensors >= 2):
+            sfb_layout_1 = blockscaled_utils.tile_atom_to_shape_SF(
+                b_tuple[1].shape, self.sf_vec_size
+            )
+            sfb_tensors.append(cute.make_tensor(sfb_tuple[1].iterator, sfb_layout_1))
+        if cutlass.const_expr(self.num_b_tensors >= 3):
+            sfb_layout_2 = blockscaled_utils.tile_atom_to_shape_SF(
+                b_tuple[2].shape, self.sf_vec_size
+            )
+            sfb_tensors.append(cute.make_tensor(sfb_tuple[2].iterator, sfb_layout_2))
+        if cutlass.const_expr(self.num_b_tensors >= 4):
+            sfb_layout_3 = blockscaled_utils.tile_atom_to_shape_SF(
+                b_tuple[3].shape, self.sf_vec_size
+            )
+            sfb_tensors.append(cute.make_tensor(sfb_tuple[3].iterator, sfb_layout_3))
+        sfb_tuple = tuple(sfb_tensors)
+        # Backward compat alias
+        sfb = sfb_tuple[0]
 
         # Setup sfc tensor by filling C tensor to scale factor atom layout
         self.generate_sfc = sfc_tensor is not None and norm_const_tensor is not None
@@ -821,51 +870,79 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         )
         atom_thr_size = cute.size(tiled_mma.thr_id.shape)
 
-        # Setup TMA load for B
+        # Setup TMA ops (shared across all B tensors)
         b_op = sm100_utils.cluster_shape_to_tma_atom_B(self.cluster_shape_mn, tiled_mma.thr_id)
-        b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, None, 0))
-        tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
-            b_op,
-            b,
-            b_smem_layout,
-            self.mma_tiler,
-            tiled_mma,
-            self.cluster_layout_vmnk.shape,
-        )
-
-        # Setup TMA load for SFB
         sfb_op = sm100_utils.cluster_shape_to_tma_atom_SFB(self.cluster_shape_mn, tiled_mma.thr_id)
+        b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, None, 0))
         sfb_smem_layout = cute.slice_(self.sfb_smem_layout_staged, (None, None, None, 0))
-        tma_atom_sfb, tma_tensor_sfb = cute.nvgpu.make_tiled_tma_atom_B(
-            sfb_op,
-            sfb,
-            sfb_smem_layout,
-            self.mma_tiler_sfb,
-            tiled_mma_sfb,
-            self.cluster_layout_sfb_vmnk.shape,
-            internal_type=cutlass.Int16,
-        )
 
-        # This modifies the layout to handle overlapping 256x(# of scale factors for a single column of B (nNSF))
-        # logical blocks for SFB when cta_tile_shape_n=192.
-        if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 192):
-            x = tma_tensor_sfb.stride[0][1]
-            y = cute.ceil_div(tma_tensor_sfb.shape[0][1], 4)
+        # Helper to create TMA for one B tensor
+        def _make_tma_b(b_tensor, sfb_tensor):
+            atom_b, tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
+                b_op,
+                b_tensor,
+                b_smem_layout,
+                self.mma_tiler,
+                tiled_mma,
+                self.cluster_layout_vmnk.shape,
+            )
+            atom_sfb, tensor_sfb = cute.nvgpu.make_tiled_tma_atom_B(
+                sfb_op,
+                sfb_tensor,
+                sfb_smem_layout,
+                self.mma_tiler_sfb,
+                tiled_mma_sfb,
+                self.cluster_layout_sfb_vmnk.shape,
+                internal_type=cutlass.Int16,
+            )
+            # Handle overlapping layout for SFB when cta_tile_shape_n=192
+            if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 192):
+                x = tensor_sfb.stride[0][1]
+                y = cute.ceil_div(tensor_sfb.shape[0][1], 4)
+                new_shape = (
+                    (tensor_sfb.shape[0][0], ((2, 2), y)),
+                    tensor_sfb.shape[1],
+                    tensor_sfb.shape[2],
+                )
+                x_times_3 = 3 * x
+                new_stride = (
+                    (tensor_sfb.stride[0][0], ((x, x), x_times_3)),
+                    tensor_sfb.stride[1],
+                    tensor_sfb.stride[2],
+                )
+                tensor_sfb = cute.make_tensor(
+                    tensor_sfb.iterator, cute.make_layout(new_shape, stride=new_stride)
+                )
+            return atom_b, tensor_b, atom_sfb, tensor_sfb
 
-            new_shape = (
-                (tma_tensor_sfb.shape[0][0], ((2, 2), y)),
-                tma_tensor_sfb.shape[1],
-                tma_tensor_sfb.shape[2],
-            )
-            # Use right multiplication for ScaledBasis (3 * x instead of x * 3)
-            x_times_3 = 3 * x
-            new_stride = (
-                (tma_tensor_sfb.stride[0][0], ((x, x), x_times_3)),
-                tma_tensor_sfb.stride[1],
-                tma_tensor_sfb.stride[2],
-            )
-            tma_tensor_sfb_new_layout = cute.make_layout(new_shape, stride=new_stride)
-            tma_tensor_sfb = cute.make_tensor(tma_tensor_sfb.iterator, tma_tensor_sfb_new_layout)
+        # Create TMA for all B tensors (use const_expr, not loop)
+        atom_b_0, tensor_b_0, atom_sfb_0, tensor_sfb_0 = _make_tma_b(b_tuple[0], sfb_tuple[0])
+        tma_atoms_b = [atom_b_0]
+        tma_tensors_b = [tensor_b_0]
+        tma_atoms_sfb = [atom_sfb_0]
+        tma_tensors_sfb = [tensor_sfb_0]
+        if cutlass.const_expr(self.num_b_tensors >= 2):
+            atom_b_1, tensor_b_1, atom_sfb_1, tensor_sfb_1 = _make_tma_b(b_tuple[1], sfb_tuple[1])
+            tma_atoms_b.append(atom_b_1)
+            tma_tensors_b.append(tensor_b_1)
+            tma_atoms_sfb.append(atom_sfb_1)
+            tma_tensors_sfb.append(tensor_sfb_1)
+        if cutlass.const_expr(self.num_b_tensors >= 3):
+            atom_b_2, tensor_b_2, atom_sfb_2, tensor_sfb_2 = _make_tma_b(b_tuple[2], sfb_tuple[2])
+            tma_atoms_b.append(atom_b_2)
+            tma_tensors_b.append(tensor_b_2)
+            tma_atoms_sfb.append(atom_sfb_2)
+            tma_tensors_sfb.append(tensor_sfb_2)
+        if cutlass.const_expr(self.num_b_tensors >= 4):
+            atom_b_3, tensor_b_3, atom_sfb_3, tensor_sfb_3 = _make_tma_b(b_tuple[3], sfb_tuple[3])
+            tma_atoms_b.append(atom_b_3)
+            tma_tensors_b.append(tensor_b_3)
+            tma_atoms_sfb.append(atom_sfb_3)
+            tma_tensors_sfb.append(tensor_sfb_3)
+        tma_atoms_b = tuple(tma_atoms_b)
+        tma_tensors_b = tuple(tma_tensors_b)
+        tma_atoms_sfb = tuple(tma_atoms_sfb)
+        tma_tensors_sfb = tuple(tma_tensors_sfb)
 
         b_copy_size = cute.size_in_bytes(self.b_dtype, b_smem_layout)
         sfb_copy_size = cute.size_in_bytes(self.sf_dtype, sfb_smem_layout)
@@ -990,11 +1067,11 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             tiled_mma,
             tiled_mma_sfb,
             a,
-            tma_atom_b,
-            tma_tensor_b,
+            tma_atoms_b,  # Tuple of TMA atoms for B
+            tma_tensors_b,  # Tuple of TMA tensors for B
             sfa,
-            tma_atom_sfb,
-            tma_tensor_sfb,
+            tma_atoms_sfb,  # Tuple of TMA atoms for SFB
+            tma_tensors_sfb,  # Tuple of TMA tensors for SFB
             tma_atom_c,
             tma_tensor_c,
             sfc_tensor,
@@ -1074,11 +1151,11 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         tiled_mma: cute.TiledMma,
         tiled_mma_sfb: cute.TiledMma,
         mA_mkl: cute.Tensor,
-        tma_atom_b: cute.CopyAtom,
-        mB_nkl: cute.Tensor,
+        tma_atoms_b: Tuple[cute.CopyAtom, ...],
+        mB_nkl_tuple: Tuple[cute.Tensor, ...],
         mSFA_mkl: cute.Tensor,
-        tma_atom_sfb: cute.CopyAtom,
-        mSFB_nkl: cute.Tensor,
+        tma_atoms_sfb: Tuple[cute.CopyAtom, ...],
+        mSFB_nkl_tuple: Tuple[cute.Tensor, ...],
         tma_atom_c: cute.CopyAtom,
         mC_mnl: cute.Tensor,
         mSFC_mnl: Optional[cute.Tensor],
@@ -1109,8 +1186,18 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         # Prefetch tma desc
         #
         if warp_idx == self.tma_b_warp_id:
-            cpasync.prefetch_descriptor(tma_atom_b)
-            cpasync.prefetch_descriptor(tma_atom_sfb)
+            # Prefetch TMA descriptors for all B tensors using const_expr conditions
+            cpasync.prefetch_descriptor(tma_atoms_b[0])
+            cpasync.prefetch_descriptor(tma_atoms_sfb[0])
+            if cutlass.const_expr(self.num_b_tensors >= 2):
+                cpasync.prefetch_descriptor(tma_atoms_b[1])
+                cpasync.prefetch_descriptor(tma_atoms_sfb[1])
+            if cutlass.const_expr(self.num_b_tensors >= 3):
+                cpasync.prefetch_descriptor(tma_atoms_b[2])
+                cpasync.prefetch_descriptor(tma_atoms_sfb[2])
+            if cutlass.const_expr(self.num_b_tensors >= 4):
+                cpasync.prefetch_descriptor(tma_atoms_b[3])
+                cpasync.prefetch_descriptor(tma_atoms_sfb[3])
             cpasync.prefetch_descriptor(tma_atom_c)
 
         use_2cta_instrs = cute.size(tiled_mma.thr_id.shape) == 2
@@ -1270,22 +1357,52 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         gA_mkl = cute.local_tile(
             mA_mkl, cute.slice_(self.cta_tile_shape_mnk, (None, 0, None)), (None, None, None)
         )
-        # (bN, bK, loopN, loopK, loopL)
-        gB_nkl = cute.local_tile(
-            mB_nkl, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
+        # (bN, bK, loopN, loopK, loopL) - Use const_expr conditions for tuple indexing
+        gB_nkl_0 = cute.local_tile(
+            mB_nkl_tuple[0], cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
         )
+        if cutlass.const_expr(self.num_b_tensors >= 2):
+            gB_nkl_1 = cute.local_tile(
+                mB_nkl_tuple[1], cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
+            )
+        if cutlass.const_expr(self.num_b_tensors >= 3):
+            gB_nkl_2 = cute.local_tile(
+                mB_nkl_tuple[2], cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
+            )
+        if cutlass.const_expr(self.num_b_tensors >= 4):
+            gB_nkl_3 = cute.local_tile(
+                mB_nkl_tuple[3], cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
+            )
 
         # (bM, bK, RestM, RestK, RestL)
         gSFA_mkl = cute.local_tile(
             mSFA_mkl, cute.slice_(self.cta_tile_shape_mnk_sfa, (None, 0, None)), (None, None, None)
         )
 
-        # (bN, bK, RestN, RestK, RestL)
-        gSFB_nkl = cute.local_tile(
-            mSFB_nkl,
+        # (bN, bK, RestN, RestK, RestL) - Use const_expr conditions for tuple indexing
+        gSFB_nkl_0 = cute.local_tile(
+            mSFB_nkl_tuple[0],
             cute.slice_(self.mma_tiler_sfb, (0, None, None)),
             (None, None, None),
         )
+        if cutlass.const_expr(self.num_b_tensors >= 2):
+            gSFB_nkl_1 = cute.local_tile(
+                mSFB_nkl_tuple[1],
+                cute.slice_(self.mma_tiler_sfb, (0, None, None)),
+                (None, None, None),
+            )
+        if cutlass.const_expr(self.num_b_tensors >= 3):
+            gSFB_nkl_2 = cute.local_tile(
+                mSFB_nkl_tuple[2],
+                cute.slice_(self.mma_tiler_sfb, (0, None, None)),
+                (None, None, None),
+            )
+        if cutlass.const_expr(self.num_b_tensors >= 4):
+            gSFB_nkl_3 = cute.local_tile(
+                mSFB_nkl_tuple[3],
+                cute.slice_(self.mma_tiler_sfb, (0, None, None)),
+                (None, None, None),
+            )
 
         gToken_ml = cute.local_tile(
             token_id_mapping_tensor, cute.slice_(self.cta_tile_shape_mnk, (None, 0, 0)), (None,)
@@ -1302,43 +1419,106 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         #
         thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
         thr_mma_sfb = tiled_mma_sfb.get_slice(mma_tile_coord_v)
-        # (MMA, MMA_N, MMA_K, loopN, loopK, loopL)
-        tCgB = thr_mma.partition_B(gB_nkl)
-        # (MMA, MMA_N, MMA_K, RestN, RestK, RestL)
-        tCgSFB = thr_mma_sfb.partition_B(gSFB_nkl)
+        # (MMA, MMA_N, MMA_K, loopN, loopK, loopL) - const_expr conditions
+        tCgB_0 = thr_mma.partition_B(gB_nkl_0)
+        if cutlass.const_expr(self.num_b_tensors >= 2):
+            tCgB_1 = thr_mma.partition_B(gB_nkl_1)
+        if cutlass.const_expr(self.num_b_tensors >= 3):
+            tCgB_2 = thr_mma.partition_B(gB_nkl_2)
+        if cutlass.const_expr(self.num_b_tensors >= 4):
+            tCgB_3 = thr_mma.partition_B(gB_nkl_3)
+        # (MMA, MMA_N, MMA_K, RestN, RestK, RestL) - const_expr conditions
+        tCgSFB_0 = thr_mma_sfb.partition_B(gSFB_nkl_0)
+        if cutlass.const_expr(self.num_b_tensors >= 2):
+            tCgSFB_1 = thr_mma_sfb.partition_B(gSFB_nkl_1)
+        if cutlass.const_expr(self.num_b_tensors >= 3):
+            tCgSFB_2 = thr_mma_sfb.partition_B(gSFB_nkl_2)
+        if cutlass.const_expr(self.num_b_tensors >= 4):
+            tCgSFB_3 = thr_mma_sfb.partition_B(gSFB_nkl_3)
         # (MMA, MMA_M, MMA_N, loopM, loopN, loopL)
         tCgC = thr_mma.partition_C(gC_mnl)
 
         #
         # Partition global/shared tensor for TMA load B
         #
-        # TMA load B partition_S/D
         b_cta_layout = cute.make_layout(cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape)
-        # ((atom_v, rest_v), STAGE)
-        # ((atom_v, rest_v), loopM, loopK, loopL)
-        tBsB, tBgB = cpasync.tma_partition(
-            tma_atom_b,
-            block_in_cluster_coord_vmnk[1],
-            b_cta_layout,
-            cute.group_modes(sB, 0, 3),
-            cute.group_modes(tCgB, 0, 3),
-        )
-
-        # TMA load SFB partition_S/D
         sfb_cta_layout = cute.make_layout(
             cute.slice_(cluster_layout_sfb_vmnk, (0, None, 0, 0)).shape
         )
-        # ((atom_v, rest_v), STAGE)
-        # ((atom_v, rest_v), RestN, RestK, RestL)
-        tBsSFB, tBgSFB = cute.nvgpu.cpasync.tma_partition(
-            tma_atom_sfb,
+        sB_grouped = cute.group_modes(sB, 0, 3)
+        sSFB_grouped = cute.group_modes(sSFB, 0, 3)
+
+        # TMA partition for B tensor 0
+        tBsB_0, tBgB_0 = cpasync.tma_partition(
+            tma_atoms_b[0],
+            block_in_cluster_coord_vmnk[1],
+            b_cta_layout,
+            sB_grouped,
+            cute.group_modes(tCgB_0, 0, 3),
+        )
+        tBsSFB_0, tBgSFB_0 = cute.nvgpu.cpasync.tma_partition(
+            tma_atoms_sfb[0],
             block_in_cluster_coord_sfb_vmnk[1],
             sfb_cta_layout,
-            cute.group_modes(sSFB, 0, 3),
-            cute.group_modes(tCgSFB, 0, 3),
+            sSFB_grouped,
+            cute.group_modes(tCgSFB_0, 0, 3),
         )
-        tBsSFB = cute.filter_zeros(tBsSFB)
-        tBgSFB = cute.filter_zeros(tBgSFB)
+        tBsSFB_0 = cute.filter_zeros(tBsSFB_0)
+        tBgSFB_0 = cute.filter_zeros(tBgSFB_0)
+
+        # TMA partition for B tensor 1 (tBsB shared memory partition is same for all, use _ to ignore)
+        if cutlass.const_expr(self.num_b_tensors >= 2):
+            _, tBgB_1 = cpasync.tma_partition(
+                tma_atoms_b[1],
+                block_in_cluster_coord_vmnk[1],
+                b_cta_layout,
+                sB_grouped,
+                cute.group_modes(tCgB_1, 0, 3),
+            )
+            _, tBgSFB_1 = cute.nvgpu.cpasync.tma_partition(
+                tma_atoms_sfb[1],
+                block_in_cluster_coord_sfb_vmnk[1],
+                sfb_cta_layout,
+                sSFB_grouped,
+                cute.group_modes(tCgSFB_1, 0, 3),
+            )
+            tBgSFB_1 = cute.filter_zeros(tBgSFB_1)
+
+        # TMA partition for B tensor 2
+        if cutlass.const_expr(self.num_b_tensors >= 3):
+            _, tBgB_2 = cpasync.tma_partition(
+                tma_atoms_b[2],
+                block_in_cluster_coord_vmnk[1],
+                b_cta_layout,
+                sB_grouped,
+                cute.group_modes(tCgB_2, 0, 3),
+            )
+            _, tBgSFB_2 = cute.nvgpu.cpasync.tma_partition(
+                tma_atoms_sfb[2],
+                block_in_cluster_coord_sfb_vmnk[1],
+                sfb_cta_layout,
+                sSFB_grouped,
+                cute.group_modes(tCgSFB_2, 0, 3),
+            )
+            tBgSFB_2 = cute.filter_zeros(tBgSFB_2)
+
+        # TMA partition for B tensor 3
+        if cutlass.const_expr(self.num_b_tensors >= 4):
+            _, tBgB_3 = cpasync.tma_partition(
+                tma_atoms_b[3],
+                block_in_cluster_coord_vmnk[1],
+                b_cta_layout,
+                sB_grouped,
+                cute.group_modes(tCgB_3, 0, 3),
+            )
+            _, tBgSFB_3 = cute.nvgpu.cpasync.tma_partition(
+                tma_atoms_sfb[3],
+                block_in_cluster_coord_sfb_vmnk[1],
+                sfb_cta_layout,
+                sSFB_grouped,
+                cute.group_modes(tCgSFB_3, 0, 3),
+            )
+            tBgSFB_3 = cute.filter_zeros(tBgSFB_3)
 
         #
         # Partition shared/tensor memory tensor for TiledMMA_A/B/C
@@ -1849,19 +2029,12 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     tile_info[1],
                     tile_info[2],
                 )
-                #
-                # Slice to per mma tile index
-                #
-                # ((atom_v, rest_v), loopK)
-                tBgB_slice = tBgB[(None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])]
+                expert_idx = mma_tile_coord_mnl[2]
 
                 # Apply SFB slicing hack when cta_tile_shape_n=64
                 slice_n = mma_tile_coord_mnl[1]
                 if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 64):
                     slice_n = mma_tile_coord_mnl[1] // 2
-
-                # ((atom_v, rest_v), RestK)
-                tBgSFB_slice = tBgSFB[(None, slice_n, None, mma_tile_coord_mnl[2])]
 
                 # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt
                 b_producer_state.reset_count()
@@ -1872,35 +2045,111 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 # Tma load loop
                 #
                 for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
-                    # Conditionally wait for B buffer empty
                     b_pipeline.producer_acquire(b_producer_state, peek_ab_empty_status)
-
-                    tBgB_k = tBgB_slice[(None, b_producer_state.count)]
-                    tBgSFB_k = tBgSFB_slice[(None, b_producer_state.count)]
-                    tBsB_pipe = tBsB[(None, b_producer_state.index)]
-                    tBsSFB_pipe = tBsSFB[(None, b_producer_state.index)]
-
+                    tBsB_pipe = tBsB_0[(None, b_producer_state.index)]
+                    tBsSFB_pipe = tBsSFB_0[(None, b_producer_state.index)]
                     tma_bar = b_pipeline.producer_get_barrier(b_producer_state)
 
-                    # TMA load B
-                    cute.copy(
-                        tma_atom_b,
-                        tBgB_k,
-                        tBsB_pipe,
-                        tma_bar_ptr=tma_bar,
-                        mcast_mask=b_full_mcast_mask,
-                    )
+                    # Select correct B tensor based on expert_idx
+                    if cutlass.const_expr(self.num_b_tensors == 1):
+                        # Single B tensor - original logic
+                        tBgB_slice = tBgB_0[(None, mma_tile_coord_mnl[1], None, expert_idx)]
+                        tBgSFB_slice = tBgSFB_0[(None, slice_n, None, expert_idx)]
+                        cute.copy(
+                            tma_atoms_b[0],
+                            tBgB_slice[(None, b_producer_state.count)],
+                            tBsB_pipe,
+                            tma_bar_ptr=tma_bar,
+                            mcast_mask=b_full_mcast_mask,
+                        )
+                        cute.copy(
+                            tma_atoms_sfb[0],
+                            tBgSFB_slice[(None, b_producer_state.count)],
+                            tBsSFB_pipe,
+                            tma_bar_ptr=tma_bar,
+                            mcast_mask=sfb_full_mcast_mask,
+                        )
+                    else:
+                        # Multi-B tensor - select based on expert_idx
+                        if expert_idx < self.b_tensor_l_offsets[1]:
+                            local_l = expert_idx - self.b_tensor_l_offsets[0]
+                            tBgB_slice = tBgB_0[(None, mma_tile_coord_mnl[1], None, local_l)]
+                            tBgSFB_slice = tBgSFB_0[(None, slice_n, None, local_l)]
+                            cute.copy(
+                                tma_atoms_b[0],
+                                tBgB_slice[(None, b_producer_state.count)],
+                                tBsB_pipe,
+                                tma_bar_ptr=tma_bar,
+                                mcast_mask=b_full_mcast_mask,
+                            )
+                            cute.copy(
+                                tma_atoms_sfb[0],
+                                tBgSFB_slice[(None, b_producer_state.count)],
+                                tBsSFB_pipe,
+                                tma_bar_ptr=tma_bar,
+                                mcast_mask=sfb_full_mcast_mask,
+                            )
+                        elif (
+                            cutlass.const_expr(self.num_b_tensors >= 2)
+                            and expert_idx < self.b_tensor_l_offsets[2]
+                        ):
+                            local_l = expert_idx - self.b_tensor_l_offsets[1]
+                            tBgB_slice = tBgB_1[(None, mma_tile_coord_mnl[1], None, local_l)]
+                            tBgSFB_slice = tBgSFB_1[(None, slice_n, None, local_l)]
+                            cute.copy(
+                                tma_atoms_b[1],
+                                tBgB_slice[(None, b_producer_state.count)],
+                                tBsB_pipe,
+                                tma_bar_ptr=tma_bar,
+                                mcast_mask=b_full_mcast_mask,
+                            )
+                            cute.copy(
+                                tma_atoms_sfb[1],
+                                tBgSFB_slice[(None, b_producer_state.count)],
+                                tBsSFB_pipe,
+                                tma_bar_ptr=tma_bar,
+                                mcast_mask=sfb_full_mcast_mask,
+                            )
+                        elif (
+                            cutlass.const_expr(self.num_b_tensors >= 3)
+                            and expert_idx < self.b_tensor_l_offsets[3]
+                        ):
+                            local_l = expert_idx - self.b_tensor_l_offsets[2]
+                            tBgB_slice = tBgB_2[(None, mma_tile_coord_mnl[1], None, local_l)]
+                            tBgSFB_slice = tBgSFB_2[(None, slice_n, None, local_l)]
+                            cute.copy(
+                                tma_atoms_b[2],
+                                tBgB_slice[(None, b_producer_state.count)],
+                                tBsB_pipe,
+                                tma_bar_ptr=tma_bar,
+                                mcast_mask=b_full_mcast_mask,
+                            )
+                            cute.copy(
+                                tma_atoms_sfb[2],
+                                tBgSFB_slice[(None, b_producer_state.count)],
+                                tBsSFB_pipe,
+                                tma_bar_ptr=tma_bar,
+                                mcast_mask=sfb_full_mcast_mask,
+                            )
+                        else:
+                            local_l = expert_idx - self.b_tensor_l_offsets[3]
+                            tBgB_slice = tBgB_3[(None, mma_tile_coord_mnl[1], None, local_l)]
+                            tBgSFB_slice = tBgSFB_3[(None, slice_n, None, local_l)]
+                            cute.copy(
+                                tma_atoms_b[3],
+                                tBgB_slice[(None, b_producer_state.count)],
+                                tBsB_pipe,
+                                tma_bar_ptr=tma_bar,
+                                mcast_mask=b_full_mcast_mask,
+                            )
+                            cute.copy(
+                                tma_atoms_sfb[3],
+                                tBgSFB_slice[(None, b_producer_state.count)],
+                                tBsSFB_pipe,
+                                tma_bar_ptr=tma_bar,
+                                mcast_mask=sfb_full_mcast_mask,
+                            )
 
-                    # TMA load SFB
-                    cute.copy(
-                        tma_atom_sfb,
-                        tBgSFB_k,
-                        tBsSFB_pipe,
-                        tma_bar_ptr=tma_bar,
-                        mcast_mask=sfb_full_mcast_mask,
-                    )
-
-                    # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt + k_tile + 1
                     b_producer_state.advance()
                     peek_ab_empty_status = cutlass.Boolean(1)
                     if b_producer_state.count < k_tile_cnt:
