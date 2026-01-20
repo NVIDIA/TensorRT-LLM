@@ -3311,14 +3311,14 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             long_token_list = self._build_long_sequences(llm, config["target_len"])
 
-            async_batch_size = 1
-            num_async_batches = 1
+            async_batch_size = 6
+            num_async_batches = 3
             cancel_ratio = 0.5
             num_samples = len(long_token_list)
 
             async def handle_one_request(async_gen, async_batch_idx, req_idx, should_cancel):
                 chunks_received = 0
-                max_chunks_before_cancel = 1
+                max_chunks_before_cancel = 5
                 try:
                     async for chunk in async_gen:
                         chunks_received += 1
