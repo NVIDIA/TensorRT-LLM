@@ -10,7 +10,7 @@ import tempfile
 import time
 from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import openai
 import pytest
