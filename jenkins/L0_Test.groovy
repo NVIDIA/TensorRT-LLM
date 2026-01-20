@@ -140,17 +140,8 @@ EOF_TIMEOUT_XML
                 }
             }
             // Download normal test results
-            def resultsFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/results.xml"
+            def resultsFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/results*.xml"
             downloadResultSucceed = Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -P ${remote.port} -r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${resultsFilePath} ${stageName}/", returnStatus: true, numRetries: 3) == 0
-
-            // Download all results-sub-unittests-*.xml files from remote directory to local ${stageName} directory
-            def subUnittestsPattern = "/home/svc_tensorrt/bloom/scripts/${nodeName}/results-sub-unittests-*.xml"
-            def downloadSubUnittestsSucceed = Utils.exec(
-                pipeline,
-                script: "sshpass -p '${remote.passwd}' scp -P ${remote.port} -r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${subUnittestsPattern} ${stageName}/",
-                returnStatus: true,
-                numRetries: 3
-            ) == 0
 
             // Download perf test results
             def perfResultsBasePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}"
@@ -172,8 +163,8 @@ EOF_TIMEOUT_XML
                 downloadPerfResultSucceed = Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -P ${remote.port} -r -p ${COMMON_SSH_OPTIONS} ${scpSources} ${stageName}/", returnStatus: true, numRetries: 3) == 0
             }
 
-            echo "hasTimeoutTest: ${hasTimeoutTest}, downloadResultSucceed: ${downloadResultSucceed}, downloadSubUnittestsSucceed: ${downloadSubUnittestsSucceed}, downloadPerfResultSucceed: ${downloadPerfResultSucceed}"
-            if (hasTimeoutTest || downloadResultSucceed || downloadSubUnittestsSucceed || downloadPerfResultSucceed) {
+            echo "hasTimeoutTest: ${hasTimeoutTest}, downloadResultSucceed: ${downloadResultSucceed}, downloadPerfResultSucceed: ${downloadPerfResultSucceed}"
+            if (hasTimeoutTest || downloadResultSucceed || downloadPerfResultSucceed) {
                 sh "ls ${stageName}"
                 echo "Upload test results."
                 sh "tar -czvf results-${stageName}.tar.gz ${stageName}/"
@@ -187,7 +178,7 @@ EOF_TIMEOUT_XML
             }
         }
 
-        if (hasTimeoutTest || downloadResultSucceed || downloadSubUnittestsSucceed) {
+        if (hasTimeoutTest || downloadResultSucceed) {
             junit(allowEmptyResults: true, testResults: "${stageName}/results*.xml")
         }
     }
