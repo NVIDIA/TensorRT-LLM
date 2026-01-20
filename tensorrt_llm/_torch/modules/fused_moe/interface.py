@@ -553,6 +553,10 @@ class MoE(nn.Module):
         assert hasattr(
             self.quant_method, 'pre_reload_weights'
         ), "pre_reload_weights is not supported for this quant method"
+        if self._using_load_balancer():
+            raise NotImplementedError(
+                "Weight reloading is not compatible with Expert Parallel Load Balancer (EPLB). "
+            )
         self.quant_method.pre_reload_weights(self)
 
     @abstractmethod

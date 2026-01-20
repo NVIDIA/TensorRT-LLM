@@ -334,11 +334,13 @@ class FusedMoEMethodBase(ABC):
                      weight_loading_mode: MoEWeightLoadingMode,
                      allow_partial_loading: bool = False):
         if allow_partial_loading:
-            assert isinstance(
-                self, (UnquantizedFusedMoEMethod, FP8QDQFusedMoEMethod,
-                       DeepSeekFP8BlockScalesFusedMoEMethod,
-                       DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm)
-            ), "Partial loading is only supported for unquantized and FP8 models"
+            if not isinstance(self,
+                              (UnquantizedFusedMoEMethod, FP8QDQFusedMoEMethod,
+                               DeepSeekFP8BlockScalesFusedMoEMethod,
+                               DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm)):
+                raise NotImplementedError(
+                    f"Partial loading is not supported for {type(self).__name__}"
+                )
         additional_kargs = {}
         if "allow_partial_loading" in inspect.getfullargspec(
                 self.load_expert_weights_to_dst).args:
