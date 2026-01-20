@@ -218,6 +218,21 @@ l0_dgx_b200:
   - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_fp8[4]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_bf16
   - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_fp8[4]
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 8
+        lte: 8
+    wildcards:
+      gpu:
+      - '*b200*'
+      linux_distribution_name: ubuntu*
+      cpu: x86_64
+    terms:
+      stage: pre_merge
+      backend: autodeploy
+      orchestrator: mpi
+  tests:
   - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_fp8[8]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_nvfp4[1]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_nvfp4[2]
