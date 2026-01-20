@@ -20,7 +20,6 @@ from typing import Optional, Tuple, TypeAlias, Union, cast
 import torch
 from torch import nn
 
-
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..utils import Fp4QuantizedTensor
 
@@ -87,8 +86,7 @@ class RMSNorm(nn.Module):
                     f"layeridx={getattr(self, 'layer_idx', None)} RMSNorm NVFP4 output requested "
                     "but no `nvfp4_scale` is attached; ")
             else:
-                from torch.ops.trtllm import \
-                    fused_add_rms_norm_quant
+                from torch.ops.trtllm import fused_add_rms_norm_quant
 
                 orig_shape = tuple(hidden_states.shape)
                 n = int(orig_shape[-1])
@@ -96,11 +94,11 @@ class RMSNorm(nn.Module):
                 res_2d = residual.reshape(-1, n)
                 gamma = self.weight
 
-                def _ensure_contiguous_with_dtype(t: torch.Tensor,
-                                                    key: str):
+                def _ensure_contiguous_with_dtype(t: torch.Tensor, key: str):
                     if t.dtype != hs_2d.dtype:
                         raise ValueError(
-                            f"RMSNorm NVFP4 fused path: casting {key} from {t.dtype} to {hs_2d.dtype}.")
+                            f"RMSNorm NVFP4 fused path: casting {key} from {t.dtype} to {hs_2d.dtype}."
+                        )
                         t = t.to(dtype=hs_2d.dtype)
                     return t.contiguous()
 
@@ -134,8 +132,9 @@ class RMSNorm(nn.Module):
 
                 hidden_states_fused = Fp4QuantizedTensor(
                     normed_fp4_u8, sf_fused)
-                return (hidden_states_fused, residual_out
-                        ) if return_residual else hidden_states_fused
+                return (
+                    hidden_states_fused,
+                    residual_out) if return_residual else hidden_states_fused
 
         if IS_FLASHINFER_AVAILABLE:
             from ..custom_ops import (flashinfer_fused_add_rmsnorm,
