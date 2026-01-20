@@ -505,9 +505,8 @@ class AutoTunerProfilingCache:
                 fcntl.flock(f, fcntl.LOCK_SH)
                 current_cache_contents = json.load(f)
                 self._deserialize_metadata(current_cache_contents["metadata"])
-                assert f"rank_{rank}" in current_cache_contents, f"Rank {rank} cache not found in {file_path}"
             self.cache = self._deserialize_cache_data(
-                current_cache_contents[f'rank_{rank}'])
+                current_cache_contents.get(f'rank_{rank}', {}))
             logger.info(
                 f"[AutoTuner] Successfully loaded cache from {file_path} using JSON format"
             )
