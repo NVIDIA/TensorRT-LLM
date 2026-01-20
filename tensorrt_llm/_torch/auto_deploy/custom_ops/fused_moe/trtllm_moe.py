@@ -578,3 +578,98 @@ def trtllm_quant_nvfp4_moe_fused_fake(
     apply_routing_on_input: bool = False,
 ) -> torch.Tensor:
     return torch.empty_like(x)
+
+
+@torch.library.custom_op("auto_deploy::trtllm_quant_hf_fp8_block_scale_moe_fused", mutates_args=())
+def trtllm_quant_hf_fp8_block_scale_moe_fused(
+    x: torch.Tensor,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    fc1_expert_weights: torch.Tensor,
+    fc2_expert_weights: torch.Tensor,
+    fc1_weight_scale: torch.Tensor,
+    fc2_weight_scale: torch.Tensor,
+    is_gated_mlp: bool = True,
+    act_fn: int = int(ActivationType.Silu),
+) -> torch.Tensor:
+    """TensorRT-LLM Cutlass FP8 Block Scale MoE for HuggingFace FineGrainedFP8 format.
+
+    This op uses the DeepSeek FP8 block scale format which is compatible with HF FP8.
+    Activations are quantized dynamically at runtime (no pre-computed activation scales).
+
+    Computes (per expert):
+        For gated_mlp:
+            y = (act(x @ w1.T) * (x @ w3.T)) @ w2.T  # act := SiLU
+        For mlp:
+            y = act(x @ w1.T) @ w2.T                 # act := ReLU^2
+
+    Notes:
+        - FC1 implements: fc1_output = (act(x @ w1.T) * (x @ w3.T)) or fc1_output = act(x @ w1.T)
+        - FC2 implements: fc2_output = fc1_output @ w2.T
+        - FC1 weights are concatenated w3 and w1 if gated_mlp, otherwise w1
+        - Uses per-block weight scales (128x128 blocks)
+        - Activation quantization happens dynamically inside the kernel
+
+    Parameters:
+        x: BF16/FP16 input tensor of shape (B, H) or (B, S, H)
+        selected_experts: Expert indices (B*S, TOP_K)
+        routing_weights: Routing weights (B*S, TOP_K)
+        fc1_expert_weights: FC1 FP8 weights [E, 2*I, H] for gated_mlp, [E, I, H] for mlp
+        fc2_expert_weights: FC2 FP8 weights [E, H, I]
+        fc1_weight_scale: FC1 block weight scales [E, 2*I/128, H/128] or [E, I/128, H/128]
+        fc2_weight_scale: FC2 block weight scales [E, H/128, I/128]
+        is_gated_mlp: True for gated_mlp, False for mlp
+        act_fn: ActivationType.Silu for gated_mlp, ActivationType.Relu2 for mlp
+
+    Returns:
+        Output tensor of shape (B, H) or (B, S, H)
+    """
+    _validate_mlp_style_and_act_fn(is_gated_mlp, act_fn)
+    act_fn = ActivationType.Swiglu if act_fn == ActivationType.Silu else act_fn
+
+    # Store original shape and flatten to 2D
+    x_shape = x.shape
+    x2d = x.view(-1, x_shape[-1])
+
+    # Ensure contiguous tensors with correct dtypes
+    # TRTLLM kernel expects float32 for routing_weights
+    selected_experts = selected_experts.int().contiguous()
+    routing_weights = routing_weights.to(torch.float32).contiguous()
+
+    # For DeepSeek FP8 block scales, quant_scales is a tuple of (fc_weight_scales, proj_weight_scales)
+    # The kernel handles dynamic activation quantization internally
+    quant_scales = (fc1_weight_scale, fc2_weight_scale)
+
+    # Call fused_moe with DeepSeek FP8 block scale mode
+    output = torch.ops.trtllm.fused_moe(
+        x2d,
+        selected_experts,
+        routing_weights,
+        fc1_expert_weights=fc1_expert_weights.contiguous(),
+        fc1_expert_biases=None,
+        fc2_expert_weights=fc2_expert_weights.contiguous(),
+        fc2_expert_biases=None,
+        output_dtype=x.dtype,
+        quant_scales=quant_scales,
+        activation_type=act_fn,
+        use_deepseek_fp8_block_scale=True,
+    )
+
+    # Restore original shape
+    return output[0].view(x_shape)
+
+
+@trtllm_quant_hf_fp8_block_scale_moe_fused.register_fake
+def trtllm_quant_hf_fp8_block_scale_moe_fused_fake(
+    x: torch.Tensor,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    fc1_expert_weights: torch.Tensor,
+    fc2_expert_weights: torch.Tensor,
+    fc1_weight_scale: torch.Tensor,
+    fc2_weight_scale: torch.Tensor,
+    is_gated_mlp: bool = True,
+    act_fn: int = int(ActivationType.Silu),
+) -> torch.Tensor:
+    _validate_mlp_style_and_act_fn(is_gated_mlp, act_fn)
+    return torch.empty_like(x)
