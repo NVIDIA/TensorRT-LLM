@@ -3154,10 +3154,6 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
             task = GSM8K(model_name)
             task.evaluate(llm)
     
-    @skip_pre_blackwell
-    @pytest.mark.skip_less_device(8)
-    @pytest.mark.skip_less_device_memory(120000)
-    @pytest.mark.timeout(14400)
     def _get_kimi_k2_config(self):
         """Common configuration for Kimi-K2 RCCA tests (bug 5661741)."""
         return {
@@ -3192,6 +3188,10 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
         assert len(long_token_list) > 0, "No valid samples found"
         return long_token_list
 
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_device_memory(120000)
+    @pytest.mark.timeout(14400)
     @pytest.mark.filterwarnings("ignore:.*Calling super.*encode.*add_special_tokens.*:UserWarning")
     @pytest.mark.filterwarnings("ignore:.*configuration is not supported by the fused routing kernel.*:UserWarning")
     def test_nvfp4_longseq_trtllm_moe_stress(self, mocker):
@@ -3247,6 +3247,10 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
                     assert len(token_ids) > 0
                     assert not all(tid == 0 for tid in token_ids)
 
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_device_memory(120000)
+    @pytest.mark.timeout(14400)
     @pytest.mark.filterwarnings("ignore:.*Calling super.*encode.*add_special_tokens.*:UserWarning")
     @pytest.mark.filterwarnings("ignore:.*configuration is not supported by the fused routing kernel.*:UserWarning")
     def test_nvfp4_longseq_trtllm_moe_async_cancel(self, mocker):
