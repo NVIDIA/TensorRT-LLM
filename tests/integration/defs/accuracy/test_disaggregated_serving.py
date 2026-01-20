@@ -125,7 +125,7 @@ def run_accuracy_test(llm: "DuckLLM",
             kwargs = extra_evaluator_kwargs.get(test_set, {})
         else:
             kwargs = {}
-        task.evaluate(llm, **kwargs)
+        task.evaluate(llm, extra_evaluator_kwargs=kwargs)
     elapsed_time = time.time() - start_time
     if elapsed_time > timeout:
         pytest.fail(
