@@ -141,8 +141,9 @@ class _StrategyImpls:
             *,
             group_logit_indices: Optional[torch.Tensor],
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-            probs = self._prepare_probs_with_temperature(logits, group_logit_indices, None)
-            new_tokens, _ = greedy_search_sampling_batch(probs, return_probs=False)
+            if group_logit_indices is not None:
+                logits = torch.index_select(logits, 0, group_logit_indices)  # ensures copy
+            new_tokens, probs = greedy_search_sampling_batch(logits, return_probs=True)
             return new_tokens, probs
 
         @classmethod
@@ -240,6 +241,9 @@ class _StrategyImpls:
             return True
 
     class GreedyWithProbs(StrategyImplWithProbs):
+        def __init__(self):
+            self._temperature = None
+
         @override
         @classmethod
         def from_strategies(
@@ -425,6 +429,9 @@ class _StrategyImpls:
             return False
 
     class GreedySampleOnly(StrategyImplSampleOnly):
+        def __init__(self):
+            self._temperature = None
+
         @override
         @classmethod
         def from_strategies(
@@ -722,7 +729,7 @@ class FlashInferGroupedStrategySampler(GroupedStrategySampler[Type[_StrategyImpl
         generator: Optional[torch.Generator] = None,
         return_probs: bool,
         group_metadata: StrategyMetadata | None = None,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         if hasattr(group_key, "static_beam_width_in"):
             beam_width_in = group_key.static_beam_width_in
         else:
@@ -735,9 +742,16 @@ class FlashInferGroupedStrategySampler(GroupedStrategySampler[Type[_StrategyImpl
         assert return_probs == group_key.computes_probs()
 
         strategy_impl_cls = group_key
-        return strategy_impl_cls.from_strategies(strategies, cuda_device=logits.device).sample(
+        sampling_object = strategy_impl_cls.from_strategies(strategies, cuda_device=logits.device)
+        next_tokens, softmax = sampling_object.sample(
             logits,
             group_logit_indices=group_logit_indices,
             generator=generator,
             group_metadata=group_metadata,
         )
+        temperature = (
+            sampling_object._temperature.unsqueeze(-1)
+            if sampling_object._temperature is not None
+            else None
+        )
+        return next_tokens, softmax, temperature

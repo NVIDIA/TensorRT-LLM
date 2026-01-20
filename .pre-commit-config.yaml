@@ -951,7 +951,6 @@ common-files: &common_files |
         tests/unittest/_torch/attention/test_attention_no_cache.py |
         tests/unittest/_torch/attention/test_attention.py |
         tests/unittest/_torch/attention/test_flashinfer_attention.py |
-        tests/unittest/_torch/attention/test_flashinfer_star_attn.py |
         tests/unittest/_torch/attention/test_vanilla_attention.py |
         tests/unittest/_torch/compilation/test_add_norm.py |
         tests/unittest/_torch/debugger/test_debugger_addon.py |
@@ -1004,7 +1003,6 @@ common-files: &common_files |
         tests/unittest/_torch/multi_gpu/test_mnnvl_allreduce.py |
         tests/unittest/_torch/multi_gpu/test_mnnvl_memory.py |
         tests/unittest/_torch/multi_gpu/test_moe_a2a.py |
-        tests/unittest/_torch/multi_gpu/test_star_attention.py |
         tests/unittest/_torch/multi_gpu/test_user_buffers.py |
         tests/unittest/_torch/multimodal/test_external_embedding.py |
         tests/unittest/_torch/multimodal/test_find_num_image_tokens.py |
@@ -1022,7 +1020,6 @@ common-files: &common_files |
         tests/unittest/_torch/ray_orchestrator/single_gpu/test_cache_transceiver_comm.py |
         tests/unittest/_torch/sampler/test_beam_search.py |
         tests/unittest/_torch/sampler/test_best_of_n.py |
-        tests/unittest/_torch/sampler/test_return_logits.py |
         tests/unittest/_torch/sampler/test_torch_multi_arange.py |
         tests/unittest/_torch/sampler/test_trtllm_sampler.py |
         tests/unittest/_torch/speculative/test_draft_target.py |
@@ -1398,7 +1395,7 @@ repos:
         exclude: |
             (?x)^(.*cubin.cpp | .*cubin.h)$
     -   id: check-yaml
-        args: [--allow-multiple-documents]
+        args: [--allow-multiple-documents, --unsafe]
         exclude: ".*/gitlab/.*.yml"
     -   id: trailing-whitespace
         exclude: '\.(patch|md)$'

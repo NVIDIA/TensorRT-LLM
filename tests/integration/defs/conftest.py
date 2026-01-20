@@ -83,7 +83,7 @@ def wget(url, out):
 def llm_models_root() -> str:
     """Return LLM_MODELS_ROOT path if it is set in env, assert when it's set but not a valid path."""
 
-    root = Path("/home/scratch.trt_llm_data/llm-models/")
+    root = Path("/home/scratch.trt_llm_data_ci/llm-models/")
     if "LLM_MODELS_ROOT" in os.environ:
         root = Path(os.environ.get("LLM_MODELS_ROOT"))
 

@@ -4,6 +4,7 @@ import pytest
 import torch
 import torch.distributed as dist
 from _dist_test_utils import get_device_counts
+from utils.util import getSMVersion
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe.mxfp4_moe import (
     IS_TRITON_KERNELS_AVAILABLE,
@@ -109,6 +110,10 @@ def _run_mxfp4_mlp_ep_dtype_test(num_experts: int, topk: int, rank: int, world_s
     torch.testing.assert_close(part_out, ref_out, rtol=5e-2, atol=5e-2, equal_nan=True)
 
 
+@pytest.mark.skipif(
+    getSMVersion() != 90,
+    reason="triton_mxfp4_moe is only supported in Hopper architecture",
+)
 @pytest.mark.skipif(
     not IS_TRITON_KERNELS_AVAILABLE,
     reason="triton_kernels unavailable",
