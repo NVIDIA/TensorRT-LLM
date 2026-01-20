@@ -370,7 +370,6 @@ class ditFlux2Transformer2DModel(Flux2Transformer2DModel, ditBaseTransformer):
             img_modulated = self.run_teacache_check(hidden_states, double_stream_mod_img)
             should_calc, hidden_states = self._calc_teacache_distance(img_modulated, hidden_states)
 
-        print(should_calc)
         if should_calc:
             original_hidden_states = hidden_states.clone()
             hidden_states = self.run_transformer_blocks(
