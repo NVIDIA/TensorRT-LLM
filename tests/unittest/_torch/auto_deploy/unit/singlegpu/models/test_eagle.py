@@ -122,7 +122,9 @@ def test_build_ad_eagle(use_mock_eagle3):
     experiment_config = get_small_model_config(EAGLE_MODEL_HUB_ID, **llm_extra_args)
     experiment_config["args"]["runtime"] = "demollm"
     experiment_config["args"]["world_size"] = 0
-    experiment_config["args"]["tokenizer"] = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+    experiment_config["args"]["tokenizer"] = hf_id_to_local_model_dir(
+        "meta-llama/Meta-Llama-3.1-8B-Instruct"
+    )
 
     print(f"Experiment Config: {experiment_config}")
     experiment_config = ExperimentConfig(**experiment_config)
