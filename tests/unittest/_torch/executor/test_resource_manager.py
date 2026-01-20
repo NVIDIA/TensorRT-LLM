@@ -581,7 +581,7 @@ class TestResourceManager(unittest.TestCase):
         """
         return KvCacheConfig(**params)
 
-    def test_calculate_max_num_blocks_from_cpp(self):
+    def test_calculate_max_num_blocks_for_vswa(self):
         # Construct a minimal mapping (single-rank, no TP/PP)
         mapping = Mapping(world_size=1, tp_size=1, pp_size=1)
 
@@ -651,7 +651,7 @@ class TestResourceManager(unittest.TestCase):
                     kv_cache_config_params)
                 with patch('torch.cuda.mem_get_info',
                            return_value=(fixed_free_mem, fixed_total_mem)):
-                    # Create a real KVCacheManager, it will run calculate_max_num_blocks_from_cpp in __init__
+                    # Create a real KVCacheManager, it will run calculate_max_num_blocks_for_vswa in __init__
                     manager = KVCacheManager(
                         kv_cache_config=kv_cache_config,
                         kv_cache_type=tensorrt_llm.bindings.internal.
