@@ -10,7 +10,7 @@ The idea of Skip Softmax Attention is to compare the local maximum ($\tilde{m}_i
 $$
    \tilde{m}_i^{(j)} - m_i^{(j)} < \lambda.
 $$
-In this way, we can indirectly control the sparsity via the threshold. Note that the threshold is inversely proportional to the context length, i.e., the longer the context, the smaller the threshold is needed to achieve the same sparsity.
+In this way, we can indirectly control the sparsity via the threshold. As described in the [paper](https://arxiv.org/pdf/2512.12087), the threshold is set to be inversely proportional to the context length, i.e., the longer the context, the smaller the threshold is needed to achieve the same sparsity.
 
 The method is fully dynamic, and can be applied to both the prefilling and decoding. The algorithm of Skip Softmax Attention is described in the paper [BLASST: Dynamic Blocked Attention Sparsity via Softmax Thresholding](https://arxiv.org/pdf/2512.12087). We have also published a [Developer Blog](https://developer.nvidia.com/blog/accelerating-long-context-inference-with-skip-softmax-in-nvidia-tensorrt-llm/) for explanation. Please refer to these resources for in-depth dive into the algorithm details. We will focus on the application of Skip Softmax Attention in TensorRT-LLM to accelerate long-context inference.
 
@@ -70,7 +70,7 @@ The actual threshold value equals the `threshold_scale_factor` divided by the co
 | 0.9             | 1418.14                      | 863.14                       |
 
 ## Accuracy Evaluation
-We evaluate the accuracy of Skip Softmax Attention using LongBench V1 and V2. LongBench V1 is a comprehensive benchmark for medium-to-long context understanding, comprising prompts typically at the scale of 10k tokens. LongBench V2 is a harder benchmark that contains longer sequences, and we test up to 256k due to the limit of the native context window of the model. Both versions are integrated into the TensorRT-LLM accuracy test suite, `trtllm-eval`. Here are the example scripts to run the accuracy evaluation:
+We evaluate the accuracy of Skip Softmax Attention using LongBench V1 and V2. LongBench V1 is a comprehensive benchmark for medium-to-long context understanding, with average sequence length of 10k tokens. LongBench V2 is a harder benchmark that contains longer sequences, and we pick its `medium` subset and truncate the prompt length to 256k due to the limit of the native context window of the model. The average sequence length of LongBench V2 is 130k tokens.
 
 The evaluation results are summarized in the table below:
 
@@ -93,35 +93,29 @@ Skip Softmax Attention is supported on both Hopper and Blackwell GPUs, based on 
 
 ### Kernel Performance
 
-We benchmarked the performance of the attention kernels under different achieved sparsity by specifying the threshold.
+We provide the performance data of the attention kernels under different achieved sparsity by specifying the threshold. The micro-benchmarking is performed under these configs: q_heads=64, kv_heads=4, head_dim=128, seqlen=16k/64k. Both BF16 and FP8 attention are supported.
 
-The following figures plot **speedup vs. achieved sparsity** (curves are colored by sequence length, consistent across figures).
+As a reference, the baseline performance without Skip Softmax Attention is listed below:
 
-**Prefill kernel performance:**
+
+The following figures plot **speedup vs. achieved sparsity**.
+
+**Kernel performance (grouped by GPU):**
 
 <table style="width: 100%; border: 0;">
   <tr>
     <td style="width: 50%; padding: 0 8px; vertical-align: top;">
       <p align="center"><b>Hopper (H200)</b></p>
+      <p align="center"><b>Prefill</b></p>
       <img src="../media/tech_blog16_hopper_prefill.png" alt="Hopper prefill speedup vs sparsity" style="width: 100%; min-width: 280px; display: block; margin: auto;" />
-    </td>
-    <td style="width: 50%; padding: 0 8px; vertical-align: top;">
-      <p align="center"><b>Blackwell (B200)</b></p>
-      <img src="../media/tech_blog16_blackwell_prefill.png" alt="Blackwell prefill speedup vs sparsity" style="width: 100%; min-width: 280px; display: block; margin: auto;" />
-    </td>
-  </tr>
-</table>
-
-**Decode kernel performance:**
-
-<table style="width: 100%; border: 0;">
-  <tr>
-    <td style="width: 50%; padding: 0 8px; vertical-align: top;">
-      <p align="center"><b>Hopper (H200)</b></p>
+      <p align="center"><b>Decode</b></p>
       <img src="../media/tech_blog16_hopper_decode.png" alt="Hopper decode speedup vs sparsity" style="width: 100%; min-width: 280px; display: block; margin: auto;" />
     </td>
     <td style="width: 50%; padding: 0 8px; vertical-align: top;">
       <p align="center"><b>Blackwell (B200)</b></p>
+      <p align="center"><b>Prefill</b></p>
+      <img src="../media/tech_blog16_blackwell_prefill.png" alt="Blackwell prefill speedup vs sparsity" style="width: 100%; min-width: 280px; display: block; margin: auto;" />
+      <p align="center"><b>Decode</b></p>
       <img src="../media/tech_blog16_blackwell_decode.png" alt="Blackwell decode speedup vs sparsity" style="width: 100%; min-width: 280px; display: block; margin: auto;" />
     </td>
   </tr>
@@ -138,33 +132,35 @@ E2E benchmark could be performed using `trtllm-bench` (see the reproduction sect
 LongBench V1
 avg ISL = 10k
 
-| Target Sparsity | TTFT/ms (Hopper) | TPOT/ms (Hopper) | TTFT/ms (Blackwell) | TPOT/ms (Blackwell) | LongBench V1 Accuracy |
-|:--------------:|------------------:|-----------------:|--------------------:|--------------------:|----------------------:|
-| 0.0            | 9419.61           | 1731.80          | 4997.07             | 955.49              | 47.77                 |
-| 0.5            | 9321.41           | 1712.62          | 4701.96             | 899.31              | 47.43                 |
-| 0.6            | 9226.75           | 1701.59          | 4680.72             | 895.33              | 47.47                 |
-| 0.7            | 9065.09           | 1672.45          | 4634.84             | 889.68              | 47.21                 |
-| 0.8            | 8778.14           | 1622.27          | 4531.42             | 870.22              | 46.50                 |
-| 0.9            | 8618.86           | 1596.62          | 4475.78             | 861.18              | 45.97                 |
+| Target Sparsity | TTFT/ms (H200) | TPOT/ms (H200) | TTFT/ms (B200) | TPOT/ms (B200) |
+|:--------------:|------------------:|-----------------:|--------------------:|--------------------:|
+| 0.0            | 9419.61           | 1731.80          | 4997.07             | 955.49              |
+| 0.5            | 9321.41           | 1712.62          | 4701.96             | 899.31              |
+| 0.6            | 9226.75           | 1701.59          | 4680.72             | 895.33              |
+| 0.7            | 9065.09           | 1672.45          | 4634.84             | 889.68              |
+| 0.8            | 8778.14           | 1622.27          | 4531.42             | 870.22              |
+| 0.9            | 8618.86           | 1596.62          | 4475.78             | 861.18              |
 
 
 LongBench V2
 avg ISL = 130k
 
-| Target Sparsity | TTFT/ms (Hopper) | TPOT/ms (Hopper) | TTFT/ms (Blackwell) | TPOT/ms (Blackwell) | LongBench V2 Accuracy |
-|:--------------:|------------------:|-----------------:|--------------------:|--------------------:|----------------------:|
-| 0.0            | 16277.58          | 9.32             | 7370.71             | 6.34                | 36.28                 |
-| 0.5            | 15487.28          | 8.57             | 6655.98             | 6.30                | 38.14                 |
-| 0.6            | 15020.24          | 8.57             | 6431.65             | 6.25                | 39.53                 |
-| 0.7            | 14921.12          | 8.42             | 6355.43             | 6.24                | 39.53                 |
-| 0.8            | 14465.74          | 8.41             | 6192.77             | 6.26                | 37.21                 |
-| 0.9            | 13791.37          | 8.40             | 6043.06             | 6.27                | 37.21                 |
+| Target Sparsity | TTFT/ms (H200) | TPOT/ms (H200) | TTFT/ms (B200) | TPOT/ms (B200) |
+|:--------------:|------------------:|-----------------:|--------------------:|--------------------:|
+| 0.0            | 16277.58          | 9.32             | 7370.71             | 6.34                |
+| 0.5            | 15487.28          | 8.57             | 6655.98             | 6.30                |
+| 0.6            | 15020.24          | 8.57             | 6431.65             | 6.25                |
+| 0.7            | 14921.12          | 8.42             | 6355.43             | 6.24                |
+| 0.8            | 14465.74          | 8.41             | 6192.77             | 6.26                |
+| 0.9            | 13791.37          | 8.40             | 6043.06             | 6.27                |
 
 
 ## Reproduction
 
 ### Accuracy evaluation (LongBench V1/V2)
 > Please manually `pip install lm_eval==0.4.9.2` before reproducing the results. There is a known bug in the current version of `lm_eval` in `requirements-dev.txt`.
+
+Both LongBench V1 and V2 are integrated into the TensorRT-LLM accuracy test suite, `trtllm-eval`. Here are the example scripts to run the accuracy evaluation:
 
 ```bash
 # Run LongBench V1 with a single GPU.
@@ -209,9 +205,6 @@ trtllm-bench --model Qwen/Qwen3-30B-A3B-Instruct-2507 --throughput --dataset ${l
 ```bash
 trtllm-bench --model Qwen/Qwen3-30B-A3B-Instruct-2507 --throughput --dataset ${longbench_v2_dataset} --concurrency 1 --tp 8 --ep 1 --max_batch_size 1 --max_num_tokens 262144 --extra_llm_api_options extra_llm_api_options.yaml --warmup 0 --streaming --report_json longbench_v2_perf.json
 ```
-
-TODO: Fill data.
-
 
 
 TODO: Compare with MInference.
