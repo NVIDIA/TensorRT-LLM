@@ -75,6 +75,9 @@ RUN GITHUB_MIRROR=${GITHUB_MIRROR} \
 COPY constraints.txt /tmp/constraints.txt
 RUN pip3 install --no-cache-dir -r /tmp/constraints.txt && rm /tmp/constraints.txt
 
+# Remove nbconvert to avoid the nbconvert vulnerability issue in the base NGC PyTorch image.
+RUN pip3 uninstall -y nbconvert || true
+
 # Install UCX, NIXL, etcd
 # TODO: Combine these into the main install.sh script
 RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install_ucx.sh && \
