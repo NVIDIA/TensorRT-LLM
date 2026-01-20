@@ -38,6 +38,7 @@
 #include "tensorrt_llm/nanobind/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/nanobind/batch_manager/kvCacheConnector.h"
 #include "tensorrt_llm/nanobind/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/nanobind/batch_manager/kvCacheManagerV2Utils.h"
 #include "tensorrt_llm/nanobind/batch_manager/llmRequest.h"
 #include "tensorrt_llm/nanobind/common/tllmExceptions.h"
 #include "tensorrt_llm/nanobind/executor/bindings.h"
@@ -131,6 +132,8 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
     auto mInternalRuntime = mInternal.def_submodule("runtime", "Runtime internal bindings");
     auto mInternalTesting = mInternal.def_submodule("testing", "Testing internal bindings");
     auto mInternalBatchManager = mInternal.def_submodule("batch_manager", "Batch manager internal bindings");
+    auto mInternalBatchManagerKvCacheV2Utils
+        = mInternalBatchManager.def_submodule("kv_cache_manager_v2_utils", "KV Cache Manager V2 Utils bindings");
     auto mInternalThop = mInternal.def_submodule("thop", "Torch op internal bindings");
     auto mExceptions = m.def_submodule("exceptions", "Exceptions internal bindings");
 
@@ -502,6 +505,7 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
     tb::kv_cache_manager::KVCacheManagerBindings::initBindings(mInternalBatchManager);
     tb::BasePeftCacheManagerBindings::initBindings(mInternalBatchManager);
     tb::CacheTransceiverBindings::initBindings(mInternalBatchManager);
+    tb::kv_cache_manager_v2::KVCacheManagerV2UtilsBindings::initBindings(mInternalBatchManagerKvCacheV2Utils);
 
     auto mInternalAlgorithms = mInternal.def_submodule("algorithms", "Algorithms internal bindings");
     tpb::algorithms::initBindings(mInternalAlgorithms);
