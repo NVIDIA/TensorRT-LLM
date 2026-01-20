@@ -20,7 +20,6 @@ from typing import Optional, Tuple, TypeAlias, Union, cast
 import torch
 from torch import nn
 
-from tensorrt_llm.logger import logger
 
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..utils import Fp4QuantizedTensor
@@ -88,97 +87,55 @@ class RMSNorm(nn.Module):
                     f"layeridx={getattr(self, 'layer_idx', None)} RMSNorm NVFP4 output requested "
                     "but no `nvfp4_scale` is attached; ")
             else:
+                from torch.ops.trtllm import \
+                    fused_add_rms_norm_quant
 
-                def _can_use_fused_kernel() -> Tuple[bool, str]:
-                    if not hidden_states.is_cuda or not residual.is_cuda:
-                        return False, "inputs must be CUDA tensors"
-                    if not self.weight.is_cuda:
-                        return False, "gamma/weight must be a CUDA tensor"
-                    if hidden_states.ndim < 2:
-                        return False, "input must have rank >= 2"
-                    if hidden_states.shape != residual.shape:
-                        return False, f"input/residual shape mismatch: {tuple(hidden_states.shape)} vs {tuple(residual.shape)}"
-                    n = int(hidden_states.shape[-1])
-                    if self.weight.ndim != 1 or int(self.weight.numel()) != n:
-                        return False, f"gamma/weight must be 1D with numel == hidden_size ({n}), got shape={tuple(self.weight.shape)}"
-                    # Match the underlying C++ op: fp16/bf16 only (no fp8).
-                    if hidden_states.dtype not in (torch.float16,
-                                                   torch.bfloat16):
-                        return False, f"unsupported dtype {hidden_states.dtype} (expected fp16/bf16)"
-                    if n % 16 != 0:
-                        return False, f"hidden size must be divisible by 16 (got {n})"
-                    # Kernel constraints (see fusedAddRMSNormQuant.cpp).
-                    if n < 2048 or n > 16384:
-                        return False, f"hidden size must be in [2048, 16384] (got {n})"
-                    # SM90+ only.
-                    major, _minor = torch.cuda.get_device_capability(
-                        hidden_states.device)
-                    if major < 9:
-                        return False, f"requires SM90+ GPU, got SM{major}{_minor}"
-                    # Scale tensor constraints.
-                    if (nvfp4_scale is not None
-                            and ((not nvfp4_scale.is_cuda) or nvfp4_scale.dtype
-                                 != torch.float32 or nvfp4_scale.numel() != 1)):
-                        return False, f"nvfp4_scale must be a CUDA float32 tensor with numel==1 (got dtype={getattr(nvfp4_scale, 'dtype', None)}, device={getattr(nvfp4_scale, 'device', None)}, numel={getattr(nvfp4_scale, 'numel', lambda: None)()})"
-                    return True, ""
+                orig_shape = tuple(hidden_states.shape)
+                n = int(orig_shape[-1])
+                hs_2d = hidden_states.reshape(-1, n).contiguous()
+                res_2d = residual.reshape(-1, n)
+                gamma = self.weight
 
-                ok, reason = _can_use_fused_kernel()
-                if not ok:
+                def _ensure_contiguous_with_dtype(t: torch.Tensor,
+                                                    key: str):
+                    if t.dtype != hs_2d.dtype:
+                        raise ValueError(
+                            f"RMSNorm NVFP4 fused path: casting {key} from {t.dtype} to {hs_2d.dtype}.")
+                        t = t.to(dtype=hs_2d.dtype)
+                    return t.contiguous()
+
+                res_2d = _ensure_contiguous_with_dtype(res_2d, "residual")
+                gamma = _ensure_contiguous_with_dtype(gamma, "gamma")
+
+                if hs_2d.device != res_2d.device or hs_2d.device != gamma.device:
                     raise RuntimeError(
-                        "RMSNorm NVFP4 fused path disabled due to unsupported inputs "
-                        f"(falling back to unfused RMSNorm): {reason}")
-                else:
-                    from ..custom_ops.torch_custom_ops import \
-                        fused_add_rms_norm_quant
-
-                    orig_shape = tuple(hidden_states.shape)
-                    n = int(orig_shape[-1])
-                    hs_2d = hidden_states.reshape(-1, n).contiguous()
-                    res_2d = residual.reshape(-1, n)
-                    gamma = self.weight
-
-                    def _ensure_contiguous_with_dtype(t: torch.Tensor,
-                                                      key: str):
-                        if t.dtype != hs_2d.dtype:
-                            logger.warning_once(
-                                f"RMSNorm NVFP4 fused path: casting {key} from {t.dtype} to {hs_2d.dtype}.",
-                                key=f"rmsnorm_nvfp4_cast_{key}",
-                            )
-                            t = t.to(dtype=hs_2d.dtype)
-                        return t.contiguous()
-
-                    res_2d = _ensure_contiguous_with_dtype(res_2d, "residual")
-                    gamma = _ensure_contiguous_with_dtype(gamma, "gamma")
-
-                    if hs_2d.device != res_2d.device or hs_2d.device != gamma.device:
-                        raise RuntimeError(
-                            "RMSNorm NVFP4 fused path requires all tensors on the same device. "
-                            f"Got input={hs_2d.device}, residual={res_2d.device}, gamma={gamma.device}."
-                        )
-
-                    sf_scale = nvfp4_scale.contiguous(
-                    ) if nvfp4_scale is not None else None
-
-                    normed_fp4_i32, residual_out_2d, sf_fused = fused_add_rms_norm_quant(
-                        hs_2d,
-                        res_2d,
-                        gamma,
-                        sf_scale,
-                        True,
-                        eps=self.variance_epsilon,
+                        "RMSNorm NVFP4 fused path requires all tensors on the same device. "
+                        f"Got input={hs_2d.device}, residual={res_2d.device}, gamma={gamma.device}."
                     )
-                    normed_fp4_u8 = normed_fp4_i32.view(torch.uint8)
-                    if len(orig_shape) != 2:
-                        normed_fp4_u8 = normed_fp4_u8.reshape(
-                            *orig_shape[:-1], n // 2)
-                        residual_out = residual_out_2d.reshape(orig_shape)
-                    else:
-                        residual_out = residual_out_2d
 
-                    hidden_states_fused = Fp4QuantizedTensor(
-                        normed_fp4_u8, sf_fused)
-                    return (hidden_states_fused, residual_out
-                            ) if return_residual else hidden_states_fused
+                sf_scale = nvfp4_scale.contiguous(
+                ) if nvfp4_scale is not None else None
+
+                normed_fp4_i32, residual_out_2d, sf_fused = fused_add_rms_norm_quant(
+                    hs_2d,
+                    res_2d,
+                    gamma,
+                    sf_scale,
+                    True,
+                    eps=self.variance_epsilon,
+                )
+                normed_fp4_u8 = normed_fp4_i32.view(torch.uint8)
+                if len(orig_shape) != 2:
+                    normed_fp4_u8 = normed_fp4_u8.reshape(
+                        *orig_shape[:-1], n // 2)
+                    residual_out = residual_out_2d.reshape(orig_shape)
+                else:
+                    residual_out = residual_out_2d
+
+                hidden_states_fused = Fp4QuantizedTensor(
+                    normed_fp4_u8, sf_fused)
+                return (hidden_states_fused, residual_out
+                        ) if return_residual else hidden_states_fused
 
         if IS_FLASHINFER_AVAILABLE:
             from ..custom_ops import (flashinfer_fused_add_rmsnorm,
