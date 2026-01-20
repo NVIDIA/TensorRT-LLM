@@ -484,6 +484,13 @@ def submit_job(config, log_dir, dry_run):
                 f"&> {log_dir}/7_accuracy_eval_{task}.log"
             ]
             client_cmds.append(" ".join(accuracy_prefix + accuracy_cmd))
+
+    # record ${SLURM_JOB_NODELIST} to ${log_dir}/8_done_job_id.txt
+    done_cmd = [
+        "echo", "${SLURM_JOB_NODELIST}", ">", f"{log_dir}/8_done_${{SLURM_JOB_ID}}.txt"
+    ]
+    client_cmds.append(" ".join(done_cmd))
+
     with open(os.path.join(log_dir, "client_cmds.sh"), "w") as f:
         f.write("\n".join(client_cmds) + "\n")
 
