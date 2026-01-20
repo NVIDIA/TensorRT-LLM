@@ -1326,6 +1326,7 @@ def remove_original_experts(gm: GraphModule, weight_lists: List[List[Node]]) -> 
             else:
                 continue
 
+
 def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "triton"]) -> int:
     """
     Stack per-expert FP8 weights and scales by materializing stacked tensors as parameters.
