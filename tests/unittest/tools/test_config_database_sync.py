@@ -25,7 +25,7 @@ REPO_ROOT = Path(__file__).parent.parent.parent.parent.resolve()
 
 # Dynamically load generate_config_table module without modifying sys.path
 _spec = importlib.util.spec_from_file_location(
-    "generate_config_table", REPO_ROOT / "scripts" / "generate_config_table.py"
+    "generate_config_table", REPO_ROOT / "scripts" / "config_database" / "generate_config_table.py"
 )
 _module = importlib.util.module_from_spec(_spec)
 sys.modules[_spec.name] = _module
@@ -37,7 +37,7 @@ RecipeList = _module.RecipeList
 # Dynamically load generate_config_database_tests module without modifying sys.path
 _db_spec = importlib.util.spec_from_file_location(
     "generate_config_database_tests",
-    REPO_ROOT / "scripts" / "generate_config_database_tests.py",
+    REPO_ROOT / "scripts" / "config_database" / "generate_config_database_tests.py",
 )
 _db_module = importlib.util.module_from_spec(_db_spec)
 sys.modules[_db_spec.name] = _db_module
@@ -79,7 +79,7 @@ class TestConfigDatabaseSync(unittest.TestCase):
             existing_content.strip(),
             generated_content.strip(),
             "config_table.rst is not synchronized with lookup.yaml. "
-            "Please run 'python3 scripts/generate_config_table.py' from the repo root to update it.",
+            "Please run 'python3 scripts/config_database/generate_config_table.py' from the repo root to update it.",
         )
 
     def test_config_db_json_generation(self):
@@ -185,7 +185,7 @@ class TestConfigDatabaseSync(unittest.TestCase):
                 existing_test_list.strip(),
                 generated_test_list.strip(),
                 f"{TEST_LIST_PATH} is not synchronized with lookup.yaml. "
-                "Please run 'python3 scripts/generate_config_database_tests.py' from the repo root.",
+                "Please run 'python3 scripts/config_database/generate_config_database_tests.py' from the repo root.",
             )
 
             generated_config_files = {}
@@ -198,7 +198,7 @@ class TestConfigDatabaseSync(unittest.TestCase):
                 set(existing_config_files.keys()),
                 set(generated_config_files.keys()),
                 "Mismatch in config database config files. "
-                "Please run 'python scripts/generate_config_database_tests.py' from the repo root.",
+                "Please run 'python scripts/config_database/generate_config_database_tests.py' from the repo root.",
             )
 
             # Compare each config file
@@ -207,7 +207,7 @@ class TestConfigDatabaseSync(unittest.TestCase):
                     existing_config_files[filename].strip(),
                     generated_config_files[filename].strip(),
                     f"{filename} is not synchronized with lookup.yaml. "
-                    "Please run 'python scripts/generate_config_database_tests.py' from the repo root.",
+                    "Please run 'python scripts/config_database/generate_config_database_tests.py' from the repo root.",
                 )
 
 

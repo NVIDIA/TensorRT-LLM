@@ -1471,7 +1471,7 @@ repos:
         stages: [commit-msg]
     -   id: sort-lookup-yaml
         name: Sort database lookup.yaml
-        entry: ./scripts/sort_lookup_yaml.py examples/configs/database/lookup.yaml
+        entry: ./scripts/config_database/sort_lookup_yaml.py examples/configs/database/lookup.yaml
         language: script
         files: examples/configs/database/lookup\.yaml$
         pass_filenames: false

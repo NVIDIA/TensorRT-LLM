@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
@@ -24,7 +25,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
-REPO_ROOT = SCRIPT_DIR.parent
+REPO_ROOT = SCRIPT_DIR.parent.parent
 
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -251,11 +252,32 @@ def generate_json(yaml_path, output_file):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Generate config table documentation from YAML database"
+    )
+    parser.add_argument(
+        "--generate-rst",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Generate RST output (default: True, use --no-generate-rst to disable)",
+    )
+    parser.add_argument(
+        "--generate-json",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Generate JSON output (default: True, use --no-generate-json to disable)",
+    )
+    args = parser.parse_args()
+
     yaml_path = Path(DATABASE_LIST_PATH)
     if not yaml_path.exists():
         print(f"Error: YAML file not found at {yaml_path}", file=sys.stderr)
         sys.exit(1)
+
     output_path = REPO_ROOT / "docs/source/deployment-guide/config_table.rst"
     json_output_path = REPO_ROOT / "docs/source/_static/config_db.json"
-    generate_rst(yaml_path, output_file=output_path)
-    generate_json(yaml_path, output_file=json_output_path)
+
+    if args.generate_rst:
+        generate_rst(yaml_path, output_file=output_path)
+    if args.generate_json:
+        generate_json(yaml_path, output_file=json_output_path)
