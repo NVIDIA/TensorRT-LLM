@@ -113,6 +113,7 @@ def generate()
 def sonar_scan()
 {
     container("alpine") {
+        sh "mkdir -p $JENKINS_HOME"
         def scannerHome = tool 'sonarScanner'
         sh "apt update"
         sh "apt install -y git git-lfs openjdk-17-jdk"
