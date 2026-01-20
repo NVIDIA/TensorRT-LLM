@@ -4,6 +4,20 @@ In the previous [tech blog](https://github.com/heyuhhh/TensorRT-LLM/blob/user/yu
 
 In this blog, we introduce **Skip Softmax Attention**, a drop-in sparse attention technique that is designed to accelerate the existing pretrained models that use standard attention mechanisms like MHA, GQA, or MLA. Skip Softmax Attention based on top of the Flash Attention algorithm and only requires modifying the existing **attention kernels**. Due to this simplicity, the end-to-end performance gain is more predictable. In addition, it is only an approximation method of the attention kernel computation, making it compatible with nearly all the other features, such as FP8 attention, KV cache reuse, chunked prefill etc.
 
+## Table of Contents
+- [Accelerating Long-Context Inference with Skip Softmax Attention](#accelerating-long-context-inference-with-skip-softmax-attention)
+  - [Table of Contents](#table-of-contents)
+  - [Method Overview](#method-overview)
+  - [Example Usage](#example-usage)
+  - [Accuracy Evaluation](#accuracy-evaluation)
+  - [Performance Benchmark](#performance-benchmark)
+    - [Kernel Performance](#kernel-performance)
+    - [End-to-end Performance](#end-to-end-performance)
+  - [Reproduction](#reproduction)
+    - [Accuracy evaluation (LongBench V1/V2)](#accuracy-evaluation-longbench-v1v2)
+    - [End-to-end performance (TTFT/TPOT)](#end-to-end-performance-ttfttpot)
+  - [Conclusion](#conclusion)
+
 ## Method Overview
 
 The idea of Skip Softmax Attention is to compare the local maximum ($\tilde{m}_i^{(j)}$) of $Q \cdot K^T$ with the running global maximum ($m_i^{(j)}$), and skip the softmax (exp) and BMM2 calculation for blocks that are below a certain threshold $\lambda$:
@@ -215,12 +229,12 @@ trtllm-eval --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
 --max_batch_size 1 --max_num_tokens 262144 \
 --extra_llm_api_options extra_llm_api_options.yaml \
 longbench_v2 \
- # Medium subset of LongBench V2
- --length medium \
- # Truncate the prompt length to 256k
- --max_input_length 256000 \
- # Dump dataset for perf benching
- --output_dir ${OUTPUT_DIR}
+# Medium subset of LongBench V2
+--length medium \
+# Truncate the prompt length to 256k
+--max_input_length 256000 \
+# Dump dataset for perf benching
+--output_dir ${OUTPUT_DIR}
 ```
 
 ### End-to-end performance (TTFT/TPOT)
