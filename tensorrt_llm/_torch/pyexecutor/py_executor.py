@@ -6,6 +6,7 @@ import threading
 import time
 import traceback
 from contextlib import contextmanager
+from enum import IntEnum
 from queue import Queue
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -66,11 +67,15 @@ PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_START_STOP"
 # Set to a path to save detailed tracing of PyTorch operations.
 PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
 
-# Unique tag base to avoid collisions with token/logits comms
-TERMINATION_COMM_TAG = 20000
-PP_COMM_TAG_SCHEDULE_RESULT = 20001
-PP_COMM_TAG_EXECUTED_BATCH_NUM = 20002
-PP_COMM_TAG_SAMPLE_STATE = 20003
+
+class PPCommTag(IntEnum):
+    """
+    Unique tags for pipeline parallelism communication.
+    """
+    TERMINATION = 20000
+    SCHEDULE_RESULT = 20001
+    EXECUTED_BATCH_NUM = 20002
+    SAMPLE_STATE = 20003
 
 
 @functools.cache
@@ -957,7 +962,7 @@ class PyExecutor:
         if not self.dist.is_first_pp_rank:
             with nvtx_range("recv_schedule_from_prev_pp"):
                 serializable_schedule = self.dist.recv_object(
-                    self.dist.prev_pp_rank, PP_COMM_TAG_SCHEDULE_RESULT)
+                    self.dist.prev_pp_rank, PPCommTag.SCHEDULE_RESULT)
 
         # Propagate the schedule result to the next PP rank except the last PP rank.
         if not self.dist.is_last_pp_rank:
@@ -967,7 +972,7 @@ class PyExecutor:
                 self.send_schedule_handles[
                     microbatch_id] = self.dist.isend_object(
                         serializable_schedule, self.dist.next_pp_rank,
-                        PP_COMM_TAG_SCHEDULE_RESULT)
+                        PPCommTag.SCHEDULE_RESULT)
 
         if scheduled_batch is None:
             scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = serializable_schedule.to_scheduler_result(
@@ -1241,7 +1246,7 @@ class PyExecutor:
                     with nvtx_range("recv_expected_batch_num"):
                         executed_batch_num = self.dist.recv_object(
                             src=self.dist.prev_pp_rank,
-                            tag=PP_COMM_TAG_EXECUTED_BATCH_NUM,
+                            tag=PPCommTag.EXECUTED_BATCH_NUM,
                         )
                 if not self.dist.is_last_pp_rank:
                     self.wait_on_pp_send_handles(
@@ -1251,7 +1256,7 @@ class PyExecutor:
                             microbatch_id] = self.dist.isend_object(
                                 executed_batch_num,
                                 dest=self.dist.next_pp_rank,
-                                tag=PP_COMM_TAG_EXECUTED_BATCH_NUM,
+                                tag=PPCommTag.EXECUTED_BATCH_NUM,
                             )
 
                 # Handle executed batches.
@@ -1301,7 +1306,7 @@ class PyExecutor:
         if previous_batch is None:
             return
 
-        tag = PP_COMM_TAG_SAMPLE_STATE
+        tag = PPCommTag.SAMPLE_STATE
         microbatch_id = previous_batch.microbatch_id
         sample_state = previous_batch.sample_state
         requests = sample_state.scheduled_requests.all_requests()
@@ -3013,7 +3018,7 @@ class DisaggPPTerminationHandler:
         self._pending_termination = {}
         self._terminating_iteration = 0
         self._send_handle = None
-        self._comm_tag = TERMINATION_COMM_TAG
+        self._comm_tag = PPCommTag.TERMINATION
 
     def terminate(self, request: LlmRequest):
         self._pending_termination[request.py_request_id] = request

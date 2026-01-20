@@ -230,6 +230,11 @@ class PyResult:
 
     @dataclass
     class Diff:
+        """
+        Diff is used to track the changes of the PyResult.
+        It is designed to incrementally sync the PyResult to other ranks
+        by `get_diff` on one rank and `apply_diff` on other ranks.
+        """
         exclude_last_generation_logits: Optional[bool] = None
         context_logits_list: List[torch.Tensor] = field(default_factory=list)
         generation_logits_list: List[torch.Tensor] = field(default_factory=list)
