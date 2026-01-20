@@ -22,6 +22,7 @@ import torch
 from datasets import load_dataset
 from mpi4py.futures import MPIPoolExecutor
 import asyncio
+import warnings
 
 def patch_mpi_pool_session_for_env(mocker, env_vars: dict):
     """
@@ -3271,6 +3272,16 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
 
         RCCA: https://nvbugspro.nvidia.com/bug/5661741
         """
+        warnings.filterwarnings(
+            "ignore",
+            message=r".*Calling super\(\)\.encode with \{'add_special_tokens': False\}.*",
+            module=r".*tokenization_kimi.*",
+        )
+        warnings.filterwarnings(
+            "ignore",
+            message=r".*configuration is not supported by the fused routing kernel.*",
+            module=r".*fused_moe\.routing.*",
+        )
         patch_mpi_pool_session_for_env(mocker, {"TRTLLM_ENABLE_PDL": "1"})
         config = self._get_kimi_k2_config()
 
@@ -3324,9 +3335,14 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
                     print(f"[Async] Starting batch {async_batch_idx + 1}/{num_async_batches}")
 
                     sampling_params = SamplingParams(max_tokens=50, temperature=0.8, top_p=0.95)
-                    async_results = llm.generate_async(
-                        batch_inputs, sampling_params=sampling_params, streaming=True
-                    )
+                    async_results = [
+                        llm.generate_async(
+                            prompt_inputs,
+                            sampling_params=sampling_params,
+                            streaming=True,
+                        )
+                        for prompt_inputs in batch_inputs
+                    ]
 
                     tasks = []
                     for req_idx, async_gen in enumerate(async_results):
