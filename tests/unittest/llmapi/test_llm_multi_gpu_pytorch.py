@@ -47,10 +47,10 @@ def test_llama_7b_lora_tp2():
                                         kv_cache_config=global_kv_cache_config)
 
 
-@pytest.mark.gpu2
-@pytest.mark.skip(reason="https://nvbugs/5682551")
+@pytest.mark.gpu4
+@skip_ray  # https://nvbugs/5682551
 @test_lora_with_and_without_cuda_graph
-def test_llama_7b_multi_lora_tp2(cuda_graph_config):
+def test_llama_7b_multi_lora_tp4(cuda_graph_config):
     # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
     # (1) specify lora_target_modules, or
     # (2) provide a lora_dir to infer the lora_target_modules.
@@ -61,7 +61,7 @@ def test_llama_7b_multi_lora_tp2(cuda_graph_config):
     check_llama_7b_multi_lora_from_request_test_harness(
         LLM,
         lora_config=lora_config,
-        tensor_parallel_size=2,
+        tensor_parallel_size=4,
         kv_cache_config=global_kv_cache_config,
         cuda_graph_config=cuda_graph_config)
 
