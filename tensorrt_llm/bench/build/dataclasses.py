@@ -78,7 +78,7 @@ def get_safetensors_metadata(model_name_or_path):
 
     if safetensors_single_file.exists():
         file_metadata = parse_safetensors_file_metadata(
-            model_path=model_name_or_path, filename=SAFETENSORS_SINGLE_FILE)
+            model_path=model_path, filename=SAFETENSORS_SINGLE_FILE)
         safetensor_metadata = SafetensorsRepoMetadata(
             metadata=None,
             sharded=False,
@@ -89,8 +89,7 @@ def get_safetensors_metadata(model_name_or_path):
             files_metadata={SAFETENSORS_SINGLE_FILE: file_metadata},
         )
     elif safetensors_index_file.exists():
-        with open(os.path.join(model_name_or_path,
-                               SAFETENSORS_INDEX_FILE)) as f:
+        with open(os.path.join(model_path, SAFETENSORS_INDEX_FILE)) as f:
             index = json.load(f)
 
         weight_map = index.get("weight_map", {})
@@ -100,7 +99,7 @@ def get_safetensors_metadata(model_name_or_path):
 
         def _parse(filename: str) -> None:
             files_metadata[filename] = parse_safetensors_file_metadata(
-                model_path=model_name_or_path, filename=filename)
+                model_path=model_path, filename=filename)
 
         thread_map(
             _parse,
@@ -122,7 +121,10 @@ def get_safetensors_metadata(model_name_or_path):
         )
 
     if safetensor_metadata is None:
-        return huggingface_hub.get_safetensors_metadata(model_path)
+        safetensor_metadata = huggingface_hub.get_safetensors_metadata(
+            model_name_or_path)
+
+    return safetensor_metadata
 
 
 class ModelConfig(BaseModel):
