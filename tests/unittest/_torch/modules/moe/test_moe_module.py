@@ -89,8 +89,8 @@ def _test_moe_worker(
         x = torch.randn((seq_len, hidden_size), dtype=dtype, device="cuda")
         if enable_eplb:
             # Here we create same router_logits for all tokens to force the eplb update weights
-            router_logits = torch.randn((1, num_experts), dtype=dtype, device="cuda").expand(
-                seq_len, num_experts
+            router_logits = torch.randn((1, num_experts), dtype=dtype, device="cuda").repeat(
+                seq_len, 1
             )
         else:
             router_logits = torch.randn((seq_len, num_experts), dtype=dtype, device="cuda")
