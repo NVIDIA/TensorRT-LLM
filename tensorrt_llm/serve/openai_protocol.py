@@ -489,7 +489,7 @@ class ChatCompletionResponse(OpenAIBaseModel):
     object: Literal["chat.completion"] = "chat.completion"
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str
-    choices: List[CompletionResponseChoice]
+    choices: List[ChatCompletionResponseChoice]
     usage: UsageInfo
     # Add prompt_tokens_ids to the response to remove the tokenization
     # in the generation server in disaggreated serving

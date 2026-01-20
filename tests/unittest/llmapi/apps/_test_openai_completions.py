@@ -456,8 +456,12 @@ async def test_completion_with_invalid_logit_bias(
     await invalid_logit_bias_helper(async_client, model_name, 'completions')
 
 
-def test_completion_logprobs(client: openai.OpenAI, model_name: str):
+def test_completion_logprobs(client: openai.OpenAI, model_name: str,
+                             backend: str, num_postprocess_workers: int):
     """Test completion with logprobs enabled (non-streaming)."""
+    if backend == "trt" and num_postprocess_workers > 0:
+        pytest.skip("Logprobs is not supported in TRT processpool mode")
+
     prompt = "Hello, my name is"
 
     completion = client.completions.create(
@@ -498,8 +502,12 @@ def test_completion_logprobs(client: openai.OpenAI, model_name: str):
 
 @pytest.mark.asyncio(loop_scope="module")
 async def test_completion_logprobs_streaming(async_client: openai.AsyncOpenAI,
-                                             model_name: str):
+                                             backend: str, model_name: str,
+                                             num_postprocess_workers: int):
     """Test completion with logprobs enabled (streaming)."""
+    if backend == "trt" and num_postprocess_workers > 0:
+        pytest.skip("Logprobs is not supported in TRT processpool mode")
+
     prompt = "Hello, my name is"
 
     # First get non-streaming result for comparison
@@ -547,42 +555,6 @@ async def test_completion_logprobs_streaming(async_client: openai.AsyncOpenAI,
     for logprob in all_token_logprobs:
         assert logprob is not None
         assert logprob <= 0
-
-
-# @pytest.mark.asyncio(loop_scope="module")
-# @pytest.mark.parametrize("echo", [True, False])
-# async def test_completion_logprobs_with_echo(async_client: openai.AsyncOpenAI,
-#                                              model_name: str, echo: bool):
-#     """Test completion logprobs work correctly with echo parameter."""
-#     prompt = "Hello, my name is"
-
-#     completion = await async_client.completions.create(
-#         model=model_name,
-#         prompt=prompt,
-#         max_tokens=5,
-#         temperature=0.0,
-#         logprobs=1,
-#         echo=echo,
-#     )
-
-#     choice = completion.choices[0]
-#     assert choice.logprobs is not None
-
-#     logprobs = choice.logprobs
-#     assert len(logprobs.tokens) == len(logprobs.token_logprobs)
-#     assert len(logprobs.tokens) == len(logprobs.text_offset)
-#     assert len(logprobs.tokens) > 0
-
-#     # When echo is True, the output includes the prompt tokens
-#     # so we expect more tokens in the output
-#     if echo:
-#         # The echoed output should have more tokens than just the generated ones
-#         assert len(logprobs.tokens) >= 5
-
-#     # Verify all logprobs are valid
-#     for token_logprob in logprobs.token_logprobs:
-#         assert token_logprob is not None
-#         assert token_logprob <= 0
 
 
 def test_completion_cached_tokens(client: openai.OpenAI, model_name: str,
