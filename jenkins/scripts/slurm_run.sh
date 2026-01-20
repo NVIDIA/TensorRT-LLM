@@ -73,12 +73,14 @@ containerPipLLMLibPath=$(echo "$containerPipLLMLibPath" | sed 's/[[:space:]]+/_/
 containerLDLibPath=$LD_LIBRARY_PATH
 containerLDLibPath=$(echo "$containerLDLibPath" | sed 's/[[:space:]]+/_/g')
 if [[ "$containerLDLibPath" != *"$containerPipLLMLibPath"* ]]; then
-  containerLDLibPath="$containerPipLLMLibPath:$containerLDLibPath"
-  containerLDLibPath="${containerLDLibPath%:}"
+    containerLDLibPath="$containerPipLLMLibPath:$containerLDLibPath"
+    containerLDLibPath="${containerLDLibPath%:}"
 fi
 export LD_LIBRARY_PATH=$containerLDLibPath
 echo "Library Path:"
 echo "$LD_LIBRARY_PATH"
+
+echo "Environment Variables (Before):"
 env | sort
 
 echo "Full Command: $pytestCommand"
@@ -88,22 +90,56 @@ echo "Full Command: $pytestCommand"
 # when running under a single-node srun environment.
 # TODO: check if we can take advantage of --export=None arg when execute srun instead
 # of unset them in the script
- if [ "${SLURM_JOB_NUM_NODES:-1}" -eq 1 ]; then
-    for v in ${!PMI@} ${!PMIX@} ${!MPI@} ${!OMPI@} ${!SLURM@}; do
-        if [ "$v" != "SLURM_PROCID" ]; then
+if [ "${SLURM_JOB_NUM_NODES:-1}" -eq 1 ]; then
+    # Unset MPI/SLURM variables except essential SLURM vars needed for testing and debugging
+    # Pad with spaces for exact matching
+    keep_vars=" SLURM_PROCID SLURM_LOCALID SLURM_NODEID SLURMD_NODENAME "
+    keep_vars+="SLURM_JOB_ID SLURM_JOB_NAME SLURM_JOB_NUM_NODES SLURM_JOB_NODELIST SLURM_RESTART_COUNT "
+    keep_vars+="SLURM_CPUS_ON_NODE SLURM_GPUS_ON_NODE SLURM_GPUS_PER_NODE "
+    keep_vars+="SLURM_CLUSTER_NAME SLURM_JOB_PARTITION SLURM_JOB_ACCOUNT SLURM_JOB_USER "
+    keep_vars+="SLURM_SUBMIT_DIR SLURM_SUBMIT_HOST "
+
+    for v in $(env | grep -E "^(OMPI_|PMIX_|PMI_|SLURM_|MPI_|UCX_|I_MPI_|HYDRA_|KMP_|MPICH_|MV2_|CRAY_)" | cut -d= -f1); do
+        # Use bash native string matching (avoid forking echo/grep per variable)
+        if [[ "$keep_vars" != *" $v "* ]]; then
             unset "$v"
         fi
     done
- fi
+
+    # Force UCX to use TCP and CUDA IPC, disable InfiniBand
+    export UCX_TLS=tcp,cuda_copy,cuda_ipc
+    export NCCL_IB_DISABLE=1
+
+    # Prevent NCCL from loading external network plugins (avoids hangs)
+    export NCCL_NET_PLUGIN=none
+
+    # Configure OpenMPI for shared memory/loopback
+    export OMPI_MCA_btl=vader,self
+
+    # Disable UCX Multi-Node NVLink and use stable rendezvous protocol
+    export UCX_CUDA_IPC_ENABLE_MNNVL=n
+    export UCX_RNDV_SCHEME=put_zcopy
+fi
+
+echo "Environment Variables (After):"
+env | sort
+
+# Attempt to avoid "unrecognized arguments" failure (Exit Code 4) from relaunching
+find . -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
+find . -name "*.pyc" -delete 2>/dev/null || true
+rm -rf .pytest_cache 2>/dev/null || true
+export PYTHONPATH=$llmSrcNode/tests/integration:$llmSrcNode/examples/auto_deploy:${PYTHONPATH:-}
 
 # Turn off "exit on error" so the following lines always run
 set +e
+trap - ERR
 
 pytest_exit_code=0
 perf_check_exit_code=0
 perf_report_exit_code=0
 
-eval $pytestCommand
+# "-c pytest.ini" is attempt to avoid "unrecognized arguments" failure (Exit Code 4) from relaunching
+eval $pytestCommand -c pytest.ini
 pytest_exit_code=$?
 echo "Rank${SLURM_PROCID} Pytest finished execution with exit code $pytest_exit_code"
 
@@ -138,6 +174,7 @@ if [ $SLURM_PROCID -eq 0 ] && [ "$perfMode" = "true" ]; then
         $stageName/perf_script_test_results.csv \
         $basePerfPath
     perf_check_exit_code=$?
+    echo "Rank${SLURM_PROCID} Check perf result finished execution with exit code $perf_check_exit_code"
 
     echo "Create Perf Report"
     python3 $llmSrcNode/tests/integration/defs/perf/create_perf_comparison_report.py \
@@ -145,7 +182,7 @@ if [ $SLURM_PROCID -eq 0 ] && [ "$perfMode" = "true" ]; then
         --files $stageName/perf_script_test_results.csv \
         $basePerfPath
     perf_report_exit_code=$?
-    echo "Rank${SLURM_PROCID} Perf report finished execution with exit code $perf_report_exit_code"
+    echo "Rank${SLURM_PROCID} Create perf report finished execution with exit code $perf_report_exit_code"
 
     if [ "$perf_check_exit_code" -eq 0 ] && [ "$perf_report_exit_code" -ne 0 ]; then
         perf_check_exit_code=$perf_report_exit_code
