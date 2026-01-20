@@ -1,14 +1,14 @@
-"""Tests for global RMSNorm sharding detection and transformation.
+"""Tests for RMSNorm sharding detection and transformation.
 
 This module tests that the sharding transform correctly detects and transforms
 torch_rmsnorm ops based on weight shape:
 
 1. Full hidden norm (weight shape = [num_heads * head_dim]):
-   - Detected as global QK norm → replaced with sharded_rmsnorm
-   - Weight is column-sharded
+   - Detected as needing sharding → replaced with sharded_rmsnorm
+   - Weight is sharded
 
 2. Per-head norm (weight shape = [head_dim], like GLM):
-   - NOT detected as global QK norm → stays as local torch_rmsnorm
+   - NOT detected as needing sharding → stays as local torch_rmsnorm
    - No transformation needed
 
 These are graph-level unit tests that verify the transform logic.
@@ -103,15 +103,15 @@ def count_ops(gm, op) -> int:
 # =============================================================================
 
 
-class TestGlobalRMSNormShardingTransform:
+class TestRMSNormShardingTransform:
     """Tests for the sharding transform on RMSNorm ops."""
 
-    def test_full_hidden_norm_transformed_to_global(self):
+    def test_full_hidden_norm_transformed_to_sharded(self):
         """Test that full hidden norm RMSNorm ops are replaced with sharded_rmsnorm.
 
         When weight shape = [hidden_size] (matches q_proj output dim):
         - torch_rmsnorm should be replaced with sharded_rmsnorm
-        - Weight should be column-sharded
+        - Weight should be sharded
         """
         model = SimpleAttentionWithQKNorm(use_full_hidden_norm=True).to("cuda", dtype=torch.float16)
         x = torch.randn(1, 8, 64, device="cuda", dtype=torch.float16)
@@ -121,9 +121,9 @@ class TestGlobalRMSNormShardingTransform:
 
         # Check before transform
         before_rmsnorm = count_ops(gm, torch.ops.auto_deploy.torch_rmsnorm.default)
-        before_global = count_ops(gm, torch.ops.auto_deploy.sharded_rmsnorm.default)
+        before_sharded = count_ops(gm, torch.ops.auto_deploy.sharded_rmsnorm.default)
         assert before_rmsnorm == 2, f"Expected 2 torch_rmsnorm before, got {before_rmsnorm}"
-        assert before_global == 0, f"Expected 0 sharded_rmsnorm before, got {before_global}"
+        assert before_sharded == 0, f"Expected 0 sharded_rmsnorm before, got {before_sharded}"
 
         # Apply sharding transform with world_size=2
         optimizer = InferenceOptimizer(
@@ -152,11 +152,11 @@ class TestGlobalRMSNormShardingTransform:
 
         # Check after transform
         after_rmsnorm = count_ops(gm_transformed, torch.ops.auto_deploy.torch_rmsnorm.default)
-        after_global = count_ops(gm_transformed, torch.ops.auto_deploy.sharded_rmsnorm.default)
+        after_sharded = count_ops(gm_transformed, torch.ops.auto_deploy.sharded_rmsnorm.default)
 
         # The QK norms (weight matching q/k output dims) should be transformed
-        assert after_global == 2, (
-            f"Expected 2 sharded_rmsnorm after transform, got {after_global}. "
+        assert after_sharded == 2, (
+            f"Expected 2 sharded_rmsnorm after transform, got {after_sharded}. "
             f"Remaining torch_rmsnorm: {after_rmsnorm}"
         )
 
@@ -208,12 +208,12 @@ class TestGlobalRMSNormShardingTransform:
 
         # Check after transform
         after_rmsnorm = count_ops(gm_transformed, torch.ops.auto_deploy.torch_rmsnorm.default)
-        after_global = count_ops(gm_transformed, torch.ops.auto_deploy.sharded_rmsnorm.default)
+        after_sharded = count_ops(gm_transformed, torch.ops.auto_deploy.sharded_rmsnorm.default)
 
-        # Per-head norms should NOT be transformed to global
-        assert after_global == 0, (
-            f"Expected 0 sharded_rmsnorm for per-head norm, got {after_global}"
+        # Per-head norms should NOT be transformed to sharded
+        assert after_sharded == 0, (
+            f"Expected 0 sharded_rmsnorm for per-head norm, got {after_sharded}"
         )
         # The original rmsnorm ops should still be present (or fewer if some were removed)
-        # Note: Some rmsnorm ops may be removed/transformed for other reasons, but none should become global
-        print(f"After transform: {after_rmsnorm} torch_rmsnorm, {after_global} sharded_rmsnorm")
+        # Note: Some rmsnorm ops may be removed/transformed for other reasons, but none should become sharded
+        print(f"After transform: {after_rmsnorm} torch_rmsnorm, {after_sharded} sharded_rmsnorm")
