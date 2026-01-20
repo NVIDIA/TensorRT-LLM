@@ -3011,6 +3011,25 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
+    layer_wise_benchmarks_calibrator_mode: Literal[
+        "NONE", "MARK", "COLLECT"] = Field(
+            default="NONE",
+            description=
+            "Instruct the layer-wise benchmarks calibrator to work on MARK mode, or COLLECT mode",
+            status="prototype")
+
+    layer_wise_benchmarks_calibrator_file_path: Optional[str] = Field(
+        default=None,
+        description=
+        "The file path which the layer-wise benchmarks calibrator saves to or loads from",
+        status="prototype")
+
+    layer_wise_benchmarks_layer_indices: Optional[List[int]] = Field(
+        default=None,
+        description=
+        "Layer indices to filter. If None, all layers are collected in COLLECT mode.",
+        status="prototype")
+
     @property
     def quant_config(self) -> QuantConfig:
         if self._quant_config is None:
@@ -3326,6 +3345,17 @@ class TorchLlmArgs(BaseLlmArgs):
         if self.ray_placement_config is not None and self.orchestrator_type != "ray":
             raise ValueError(
                 "ray_placement_config is only supported with orchestrator_type='ray'"
+            )
+        return self
+
+    @model_validator(mode='after')
+    def validate_layer_wise_benchmarks_calibrator_file_path(
+            self) -> 'TorchLlmArgs':
+        if self.layer_wise_benchmarks_calibrator_mode in [
+                "COLLECT", "REPLAY"
+        ] and not self.layer_wise_benchmarks_calibrator_file_path:
+            raise ValueError(
+                f"Expect layer_wise_benchmarks_calibrator_file_path not to be empty when work on {self.layer_wise_benchmarks_calibrator_mode} mode"
             )
         return self
 

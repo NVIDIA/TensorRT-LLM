@@ -441,8 +441,22 @@ class Runner:
                 checkpoint_dir=pretrained_model_name_or_path, checkpoint_loader=checkpoint_loader
             )
 
-        self.layers = [model.model.layers[i] for i in layer_indices]
+        def forward(position_ids, hidden_states, attn_metadata, residual, **kwargs):
+            # TODO: to be more general, we should call DecoderModel.forward
+            residual_fusion = hasattr(model.model.layers[0], "next_layer_layernorm")
+            for layer in model.model.layers:
+                if residual_fusion:
+                    hidden_states, residual = layer(
+                        position_ids, hidden_states, attn_metadata, residual, **kwargs
+                    )
+                else:
+                    hidden_states = layer(position_ids, hidden_states, attn_metadata, **kwargs)
+            return hidden_states, residual
+
+        model.forward = forward
+
         self.model_config = model.model_config
+        self.model = model
 
     @staticmethod
     @contextlib.contextmanager
@@ -643,27 +657,20 @@ class Runner:
             kwargs["mamba_metadata"] = mamba_metadata
 
         def run_pack(*, check=False):
-            output = hidden_states, residual
             with model_extra_attrs(self.model_config.extra_attrs):
                 get_model_extra_attrs()["attention_metadata"] = weakref.ref(attn_metadata)
                 with torch.inference_mode():
-                    # TODO: to be more general, we should call DecoderModel.forward
-                    for layer in self.layers:
-                        residual_fusion = hasattr(layer, "next_layer_layernorm")
-                        if residual_fusion:
-                            output = layer(
-                                position_ids, output[0], attn_metadata, output[1], **kwargs
-                            )
-                        else:
-                            output = layer(position_ids, output[0], attn_metadata, **kwargs), None
+                    hidden_states_out, residual_out = self.model(
+                        position_ids, hidden_states, attn_metadata, residual, **kwargs
+                    )
             if check:
-                if output[0].isnan().any():
+                if hidden_states_out.isnan().any():
                     raise ValueError("Has nan, please fix weights initialization")
-                if output[0].isinf().any():
+                if hidden_states_out.isinf().any():
                     raise ValueError("Has inf, please fix weights initialization")
-                if (output[0] == 0).sum() > 0.5 * output[0].numel():
+                if (hidden_states_out == 0).sum() > 0.5 * hidden_states_out.numel():
                     raise ValueError("Too many zeros, please fix weights initialization")
-            return output
+            return hidden_states_out, residual_out
 
         return run_pack
 
@@ -690,7 +697,7 @@ class Runner:
             else 0
         )
         moe_modules = []
-        for layer in self.layers:
+        for layer in self.model.model.layers:
             if layer.__class__.__name__ == "NemotronHLayer":
                 if layer.layer_type == "E":
                     moe_modules.append(layer.mixer.experts)

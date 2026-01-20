@@ -39,6 +39,7 @@ from tensorrt_llm._torch.modules.fused_moe.routing import BaseMoeRoutingMethod
 from tensorrt_llm._torch.utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
 from .communication import (
     AllGatherReduceScatter,
@@ -626,6 +627,9 @@ class ConfigurableMoE(MoE):
         if token_selected_slots is not None:
             ExpertStatistic.set_layer(self.layer_idx)
             ExpertStatistic.maybe_add_info(self.num_slots, token_selected_slots)
+        token_selected_slots = get_calibrator().maybe_collect_or_replay_slots(
+            self.num_slots, token_selected_slots
+        )
 
         # ========== Step 3.5: Communication Prepare Phase (BEFORE quantization) ==========
         # NVLINK two-sided has a prepare phase to gather EPLB statistics

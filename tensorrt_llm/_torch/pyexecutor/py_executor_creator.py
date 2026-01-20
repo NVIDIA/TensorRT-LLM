@@ -24,6 +24,7 @@ from tensorrt_llm.llmapi.tokenizer import (TokenizerBase,
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization import QuantAlgo
+from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
 from ..attention_backend.interface import AttentionRuntimeFeatures
 from ..attention_backend.trtllm import TrtllmAttention
@@ -353,6 +354,12 @@ def create_py_executor(
         )
 
     validate_feature_combination(llm_args, model_engine, llm_args.sampler_type)
+
+    calibrator = get_calibrator()
+    calibrator.init(llm_args.layer_wise_benchmarks_calibrator_mode,
+                    llm_args.layer_wise_benchmarks_calibrator_file_path,
+                    mapping, dist, llm_args.layer_wise_benchmarks_layer_indices)
+    model_engine.model = calibrator.maybe_wrap_model(model_engine.model)
 
     if has_draft_model_engine:
         with allocation_scope(ExecutorMemoryType.MODEL_ENGINE_DRAFT,
