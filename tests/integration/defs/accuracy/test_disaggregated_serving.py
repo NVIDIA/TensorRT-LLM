@@ -114,7 +114,7 @@ def run_accuracy_test(llm: "DuckLLM",
                       extra_evaluator_kwargs: Optional[Dict[Union[str, type],
                                                             Dict[str,
                                                                  Any]]] = None,
-                      timeout: int = 1200):
+                      timeout: int = DEFAULT_ACC_EVALUATION_TIMEOUT):
     start_time = time.time()
     for test_set in test_sets:
         if isinstance(test_set, str):
