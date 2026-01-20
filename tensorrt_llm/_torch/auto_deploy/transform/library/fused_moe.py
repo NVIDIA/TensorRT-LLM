@@ -1393,8 +1393,9 @@ def _stack_fp8_moe_weights(
 
         fc2_expert_weights = w2_stacked
 
-        # Precompute max input scales and dequant scales to avoid runtime computation
-        # We use max scale to handle different input scales per expert
+        # For optimization reasons, we precompute a few additional arguments to the trtllm_quant_fp8_moe_fused op
+        # to avoid computing them at runtime.
+        # We use max scale to handle different input scales per expert (if enabled).
         fc1_act_scale_max = fc1_act_scale.max()
         fc2_act_scale_max = w2_input_scale_stacked.max()
         fc1_dequant = (w1_weight_scale_stacked * w1_input_scale_stacked.max()).squeeze()

@@ -134,7 +134,7 @@ def trtllm_quant_fp8_moe_fused(
         routing_weights: Routing weights (B*S, TOP_K)
         fc1_expert_weights: FC1 weights [E, 2*I, H] for gated_mlp, [E, I, H] for mlp
         fc2_expert_weights: FC2 weights [E, H, I]
-        fc1_act_scale_max: FC1 activation scale max (scalar, precomputed)
+        fc1_act_scale_max: FC1 activation scale max (scalar)
         fc1_dequant_scale: FC1 dequant scale [E]
         fc2_act_scale_reciprocal: FC2 activation scale reciprocal (scalar)
         fc2_dequant_scale: FC2 dequant scale [E]
