@@ -443,8 +443,9 @@ class Runner:
 
         def forward(position_ids, hidden_states, attn_metadata, residual, **kwargs):
             # TODO: to be more general, we should call DecoderModel.forward
-            residual_fusion = hasattr(model.model.layers[0], "next_layer_layernorm")
-            for layer in model.model.layers:
+            residual_fusion = hasattr(model.model.layers[layer_indices[0]], "next_layer_layernorm")
+            for layer_idx in layer_indices:
+                layer = model.model.layers[layer_idx]
                 if residual_fusion:
                     hidden_states, residual = layer(
                         position_ids, hidden_states, attn_metadata, residual, **kwargs
@@ -697,10 +698,13 @@ class Runner:
             else 0
         )
         moe_modules = []
-        for layer in self.model.model.layers:
+        for layer_idx in self.layer_indices:
+            layer = self.model.model.layers[layer_idx]
             if layer.__class__.__name__ == "NemotronHLayer":
                 if layer.layer_type == "E":
                     moe_modules.append(layer.mixer.experts)
+            elif layer.__class__.__name__ in ["GatedMLP"]:
+                pass
             else:
                 moe_modules.append(layer.mlp.experts)
 
