@@ -140,7 +140,8 @@ def test_llm_return_logprobs_streaming_tp2(prompt_logprobs, logprobs,
     ],
 )
 def test_llm_get_stats_pp2(return_context_logits, enable_chunked_prefill,
-                           enable_iter_req_stats):
+                           enable_iter_req_stats, monkeypatch):
+    monkeypatch.setenv("TLLM_PP_ASYNC_BROADCAST_SAMPLE_STATE", "0")
     llm_get_stats_test_harness(
         tp_size=1,
         pp_size=2,
@@ -161,7 +162,8 @@ def test_llm_get_stats_pp2(return_context_logits, enable_chunked_prefill,
     ],
 )
 def test_llm_get_stats_pp4(return_context_logits, enable_chunked_prefill,
-                           enable_iter_req_stats):
+                           enable_iter_req_stats, monkeypatch):
+    monkeypatch.setenv("TLLM_PP_ASYNC_BROADCAST_SAMPLE_STATE", "0")
     llm_get_stats_test_harness(
         tp_size=1,
         pp_size=4,

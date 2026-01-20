@@ -2,16 +2,16 @@ import dataclasses
 import datetime
 import functools
 import os
-import pickle  # nosec B403
 import threading
 import time
 import traceback
 from contextlib import contextmanager
+from enum import IntEnum
+from queue import Queue
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 
-from tensorrt_llm._torch.expert_statistic import ExpertStatistic
 from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
 
 try:
@@ -19,10 +19,9 @@ try:
 except ImportError:
     from cuda import cudart
 
-from tensorrt_llm._torch.pyexecutor.resource_manager import (
-    ResourceManagerType, request_context)
 from tensorrt_llm._utils import (customized_gc_thresholds, is_trace_enabled,
-                                 nvtx_range, trace_func)
+                                 mpi_comm, nvtx_range,
+                                 set_thread_local_mpi_comm, trace_func)
 from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             FinishReason, InflightBatchingStats,
                                             IterationStats, KvCacheStats,
@@ -37,6 +36,7 @@ from tensorrt_llm.mapping import CpType
 from tensorrt_llm.runtime.generation import CUASSERT
 
 from ..distributed import Distributed
+from ..expert_statistic import ExpertStatistic
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.decoder_layer import DecoderLayer
 from ..speculative.drafter import Drafter
@@ -52,7 +52,8 @@ from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
                           LlmResponse, get_draft_token_length)
 from .model_engine import ModelEngine
-from .resource_manager import ResourceManager
+from .resource_manager import (ResourceManager, ResourceManagerType,
+                               request_context)
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors)
 from .scheduler import (RequestScheduler, ScheduledRequests,
@@ -66,10 +67,15 @@ PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_START_STOP"
 # Set to a path to save detailed tracing of PyTorch operations.
 PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
 
-# Unique tag base to avoid collisions with token/logits comms
-TERMINATION_COMM_TAG_BASE = 20000
-PP_COMM_TAG_SCHEDULE_RESULT = 21000
-PP_COMM_TAG_SAMPLE_STATE_BASE = 21001
+
+class PPCommTag(IntEnum):
+    """
+    Unique tags for pipeline parallelism communication.
+    """
+    TERMINATION = 20000
+    SCHEDULE_RESULT = 20001
+    EXECUTED_BATCH_NUM = 20002
+    SAMPLE_STATE = 20003
 
 
 @functools.cache
@@ -115,6 +121,7 @@ class BatchStatePP(BatchState):
 
 
 class PyExecutor:
+    MIN_ASYNC_MICRO_BATCH_NUM = 1024
 
     def __init__(self,
                  resource_manager,
@@ -244,16 +251,18 @@ class PyExecutor:
             os.environ.get("TLLM_BENCHMARK_REQ_QUEUES_SIZE", 0))
 
         # list of requests in each PP micro batch
-        self.num_micro_batches = self.dist.pp_size
+        self.num_micro_batches = max(self.dist.pp_size,
+                                     self.MIN_ASYNC_MICRO_BATCH_NUM)
         self.micro_batches: List[BatchStatePP
                                  | None] = [None] * self.num_micro_batches
         self.send_handles = [None] * self.num_micro_batches
         # schedule handle for PP to propagate the first PP rank's schedule result
-        self.send_schedule_handler = None
+        self.send_schedule_handles = [None] * self.num_micro_batches
+        self.send_expected_batch_num_handles = [None] * self.num_micro_batches
+        self.unhandled_batch_counter = 0
         self.pp_scheduler_max_retry_count = int(
             os.environ.get("TLLM_PP_SCHEDULER_MAX_RETRY_COUNT", 10))
         self.sample_stream = torch.cuda.Stream()
-        self.start_sample_event = torch.cuda.Event()
         self.finish_sample_event = torch.cuda.Event()
 
         # Set of request IDs that are currently in flight across all micro batches.
@@ -322,6 +331,8 @@ class PyExecutor:
 
         if self.dist.pp_size > 1:
             self.event_loop = self._executor_loop_pp
+            self.pp_async_broadcast_sample_state = os.environ.get(
+                "TLLM_PP_ASYNC_BROADCAST_SAMPLE_STATE", "1") == "1"
         else:
             self.event_loop = self._executor_loop if self.disable_overlap_scheduler else self._executor_loop_overlap
         if is_trace_enabled("TLLM_TRACE_EXECUTOR_LOOP"):
@@ -399,7 +410,22 @@ class PyExecutor:
 
     def start_worker(self):
         with self.worker_lock:
-            if self.worker_started == False:
+            if not self.worker_started:
+                if self.dist.pp_size > 1:
+                    self.executed_batch_queue: Queue[BatchStatePP] = Queue(
+                        maxsize=self.num_micro_batches)
+                    self.executed_batch_response_queue: Queue[
+                        BatchStatePP] = Queue(maxsize=-1)
+                    broadcast_sample_state_loop = self._broadcast_sample_state_loop
+                    if is_trace_enabled("TLLM_TRACE_EXECUTOR_LOOP"):
+                        broadcast_sample_state_loop = trace_func(
+                            broadcast_sample_state_loop)
+                    self.broadcast_sample_state_handler = threading.Thread(
+                        target=broadcast_sample_state_loop,
+                        daemon=True,
+                        name="broadcast_sample_state_handler",
+                    )
+                    self.broadcast_sample_state_handler.start()
                 self.worker_thread = threading.Thread(
                     target=self._event_loop_wrapper, daemon=True)
                 self.worker_thread.start()
@@ -497,6 +523,9 @@ class PyExecutor:
             logger.error("Hang detected, shutting down immediately.")
             return
         self.worker_thread.join()
+        if self.dist.pp_size > 1:
+            self.executed_batch_queue.put(None)
+            self.broadcast_sample_state_handler.join()
         self.worker_started = False
         for manager in self.resource_manager.resource_managers.values():
             if manager:
@@ -896,41 +925,58 @@ class PyExecutor:
 
     def _executor_loop_cleanup(self):
 
-        for h in self.send_handles:
-            if h is not None:
-                h.wait()
+        for i in range(self.num_micro_batches):
+            self.wait_on_pp_send_handles(self.send_handles, i)
+            self.wait_on_pp_send_handles(self.send_schedule_handles, i)
+            self.wait_on_pp_send_handles(self.send_expected_batch_num_handles,
+                                         i)
 
         with self.response_cv:
             self.is_shutdown = True
             self.response_cv.notify_all()
         self.shutdown_event.set()
 
-    def _pp_schedule_and_propagate(self):
+    def _pp_schedule_and_propagate(self, microbatch_id: int):
         """The first PP rank schedules the requests and propagates the result to all other PP ranks."""
 
-        # The first PP rank schedules the requests, other ranks receive the schedule result from the previous PP rank.
-        if self.dist.is_first_pp_rank:
+        # For TP cases, the first rank schedules the requests.
+        # For DP cases, the first PP rank schedules the requests.
+        scheduled_batch = None
+        serializable_schedule = None
+        is_tp_broadcast = self.dist.tp_size > 1 and not self.enable_attention_dp
+        if self.dist.rank == 0 or (self.dist.is_first_pp_rank
+                                   and not is_tp_broadcast):
             scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
             )
             serializable_schedule = SerializableSchedulerOutput.from_scheduler_result(
                 scheduled_batch, fitting_disagg_gen_init_requests,
                 num_fitting_reqs)
-        else:
+
+        # Broadcast within first tp group before send/recv chain to other tp groups
+        if self.dist.is_first_pp_rank and is_tp_broadcast:
+            with nvtx_range("tp_broadcast_schedule"):
+                serializable_schedule = self.dist.tp_cp_broadcast(
+                    serializable_schedule, root=0)
+
+        # Other ranks receive the schedule result from the previous PP rank.
+        if not self.dist.is_first_pp_rank:
             with nvtx_range("recv_schedule_from_prev_pp"):
                 serializable_schedule = self.dist.recv_object(
-                    self.dist.prev_pp_rank, PP_COMM_TAG_SCHEDULE_RESULT)
-            scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = serializable_schedule.to_scheduler_result(
-                self.active_requests)
+                    self.dist.prev_pp_rank, PPCommTag.SCHEDULE_RESULT)
 
         # Propagate the schedule result to the next PP rank except the last PP rank.
         if not self.dist.is_last_pp_rank:
-            if self.send_schedule_handler is not None:
-                with nvtx_range("wait_send_schedule_handler"):
-                    self.send_schedule_handler.wait()
+            self.wait_on_pp_send_handles(self.send_schedule_handles,
+                                         microbatch_id)
             with nvtx_range("send_schedule_to_next_pp"):
-                self.send_schedule_handler = self.dist.isend_object(
-                    serializable_schedule, self.dist.next_pp_rank,
-                    PP_COMM_TAG_SCHEDULE_RESULT)
+                self.send_schedule_handles[
+                    microbatch_id] = self.dist.isend_object(
+                        serializable_schedule, self.dist.next_pp_rank,
+                        PPCommTag.SCHEDULE_RESULT)
+
+        if scheduled_batch is None:
+            scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = serializable_schedule.to_scheduler_result(
+                self.active_requests)
         return scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs
 
     def _pp_retry_until_can_schedule(self, scheduled_batch):
@@ -994,6 +1040,13 @@ class PyExecutor:
                 # Fetch new requests from request queue
                 new_requests = self._fetch_and_activate_new_requests()
                 if self.should_stop_processing:
+                    while self.unhandled_batch_counter > 0:
+                        with nvtx_range("get_executed_batch"):
+                            executed_batch = self.executed_batch_response_queue.get(
+                            )
+                        self._handle_executed_batch(executed_batch)
+                        self.unhandled_batch_counter -= 1
+
                     break
 
                 self._handle_control_request()
@@ -1011,8 +1064,8 @@ class PyExecutor:
 
                 # Stage 0: first PP rank schedules requests and propagates the result to all other PP ranks.
                 scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._pp_schedule_and_propagate(
-                )
-                if not self.dist.is_first_pp_rank:
+                    microbatch_id)
+                if self.dist.rank != 0:
                     # Retry until current rank can run first PP's schedule result.
                     self._pp_retry_until_can_schedule(scheduled_batch)
                     # Run scheduler locally because scheduler may change llm requests' state.
@@ -1104,9 +1157,9 @@ class PyExecutor:
                                     name: tensor.clone()
                                     for name, tensor in batch_outputs.items()
                                 }
-                                self.start_sample_event.record()
+                                self.sample_stream.wait_stream(
+                                    torch.cuda.current_stream())
                                 with torch.cuda.stream(self.sample_stream):
-                                    self.start_sample_event.wait()
                                     sample_state = self._sample_async(
                                         scheduled_batch, batch_outputs_copy)
                                     self.finish_sample_event.record()
@@ -1138,9 +1191,14 @@ class PyExecutor:
                     self.micro_batches[microbatch_id] = batch_state
 
                 # sync sampler for previous microbatch to start new sample state comm chain.
-                prev_microbatch_id = (microbatch_id -
-                                      1) % self.num_micro_batches
-                previous_batch = self.micro_batches[prev_microbatch_id]
+                if self.dist.is_last_pp_rank:
+                    prev_microbatch_id = (microbatch_id -
+                                          1) % self.num_micro_batches
+                    previous_batch = self.micro_batches[prev_microbatch_id]
+                elif can_queue:
+                    previous_batch = self.previous_batch
+                else:
+                    previous_batch = None
                 if previous_batch is not None:
                     with nvtx_range("sync_previous_sampler_event"):
                         previous_batch.sample_state.sampler_event.synchronize()
@@ -1148,105 +1206,203 @@ class PyExecutor:
                 # Stage 2: Communicate sample state for previous batch between ranks
                 # send/recv chain: (pp_size - 1) -> 0 -> 1 -> ... -> (pp_size - 2)
                 # intermediate ranks: send/recv sample state for next microbatch to allow overlap
-                offset = -1 if self.dist.is_last_pp_rank else 1
+                offset = -1 if self.dist.is_last_pp_rank else (
+                    1 - self.dist.pp_size)
                 prev_microbatch_id = (microbatch_id +
                                       offset) % self.num_micro_batches
                 previous_batch = self.micro_batches[prev_microbatch_id]
-                tag = PP_COMM_TAG_SAMPLE_STATE_BASE + prev_microbatch_id
                 if previous_batch is not None:
-                    sample_state = previous_batch.sample_state
-                    if not self.dist.is_last_pp_rank:
-                        # Receive tokens from previous pp rank (w.r.t model forward direction)
-                        with nvtx_range("recv_sample_state"):
-                            sample_state.host = self.dist.recv_object(
-                                src=self.dist.prev_pp_rank,
-                                tag=tag,
+                    self.executed_batch_queue.put(previous_batch)
+                    self.unhandled_batch_counter += 1
+
+                dequeue_counter = 0
+                executed_batch_num = 0
+
+                # The first rank determines the number of executed batches.
+                if self.dist.rank == 0:
+                    executed_batches = []
+                    if self.pp_async_broadcast_sample_state:
+                        # Wait for at least one batch to finish if no new request is available.
+                        must_get = not can_queue
+                    else:
+                        must_get = True
+                    while not self.executed_batch_response_queue.empty() or (
+                            must_get and self.unhandled_batch_counter > 0):
+                        with nvtx_range("get_executed_batch"):
+                            executed_batches.append(
+                                self.executed_batch_response_queue.get())
+                        dequeue_counter += 1
+                        must_get = False
+                    executed_batch_num = dequeue_counter
+
+                # Broadcast the number of executed batches to other ranks.
+                if self.dist.is_first_pp_rank and self.dist.tp_size > 1:
+                    with nvtx_range("tp_broadcast_executed_batch_num"):
+                        executed_batch_num = self.dist.tp_cp_broadcast(
+                            executed_batch_num,
+                            root=0,
+                        )
+                if not self.dist.is_first_pp_rank:
+                    with nvtx_range("recv_expected_batch_num"):
+                        executed_batch_num = self.dist.recv_object(
+                            src=self.dist.prev_pp_rank,
+                            tag=PPCommTag.EXECUTED_BATCH_NUM,
+                        )
+                if not self.dist.is_last_pp_rank:
+                    self.wait_on_pp_send_handles(
+                        self.send_expected_batch_num_handles, microbatch_id)
+                    with nvtx_range("send_expected_batch_num"):
+                        self.send_expected_batch_num_handles[
+                            microbatch_id] = self.dist.isend_object(
+                                executed_batch_num,
+                                dest=self.dist.next_pp_rank,
+                                tag=PPCommTag.EXECUTED_BATCH_NUM,
                             )
 
-                    # Send tokens to next pp rank (w.r.t model forward direction)
-                    # Second last rank does not need to since last rank has original decoded tokens
-                    if not self.dist.is_second_last_pp_rank:
-                        self.wait_on_pp_send_handles(prev_microbatch_id)
-                        with nvtx_range("send_sample_state"):
-                            self.send_handles[
-                                prev_microbatch_id] = self.dist.isend_object(
-                                    sample_state.host,
-                                    dest=self.dist.next_pp_rank,
-                                    tag=tag)
-
-                # Stage 3: Finalize previous batch that finished sample state communication
-                # In last pp rank, stage 2 and 3 process different previous batches
-                prev_microbatch_id = (microbatch_id +
-                                      1) % self.num_micro_batches
-                previous_batch = self.micro_batches[prev_microbatch_id]
-                finished_requests = []
-                if previous_batch is not None:
-                    with torch.cuda.nvtx.range("_handle_previous_batch_pp"):
-                        sample_state = previous_batch.sample_state
-                        sample_state.scheduled_requests.context_requests = previous_batch.finished_ctx_reqs
-                        self._update_requests(previous_batch.sample_state)
-
-                        if self.block_reuse_enabled and not self.kv_cache_manager.is_vswa and self.kv_cache_transceiver:
-                            for req in previous_batch.scheduled_ctx_reqs:
-                                if req.is_context_only_request and (
-                                        req.is_context_finished
-                                        or req.is_finished_due_to_length
-                                ) and not req.is_finished_due_to_cancellation:
-                                    block_id = self.kv_cache_manager.store_blocks_for_reuse(
-                                        req, True)
-                                    self.ctx_in_transmission_requests[
-                                        req.py_request_id] = (
-                                            (req, block_id,
-                                             self.ctx_in_transmission_counter))
-
-                        if self.kv_cache_transceiver:
-                            self._send_disagg_ctx_cache(
-                                previous_batch.scheduled_ctx_reqs)
-                        self._handle_canceled_requests()
-
-                        self._handle_logits_communication(
-                            previous_batch, prev_microbatch_id)
-
-                        finished_requests = self._handle_responses()
-                        previous_scheduled_batch = previous_batch.sample_state.scheduled_requests
-                        attn_metadata = getattr(self.model_engine,
-                                                'attn_metadata', None)
-                        kv_cache_dtype_byte_size = getattr(
-                            self.model_engine, 'kv_cache_dtype_byte_size', None)
-                        self.resource_manager.update_resources(
-                            previous_scheduled_batch, attn_metadata,
-                            kv_cache_dtype_byte_size)
-
-                        self._remove_inflight_ids(previous_batch)
-
-                    self.wait_on_pp_send_handles(prev_microbatch_id)
-                    self.micro_batches[prev_microbatch_id] = None
-
-                if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
-                    self._check_kv_transfer_timeout()
-                    self._terminate_disagg_ctx_finished_requests()
-
-                if self._disagg_pp_termination_handler is not None:
-                    self._disagg_pp_termination_handler.terminate_pending_requests(
-                    )
+                # Handle executed batches.
+                if self.dist.rank != 0:
+                    while dequeue_counter < executed_batch_num:
+                        with nvtx_range("get_executed_batch"):
+                            executed_batch = self.executed_batch_response_queue.get(
+                            )
+                        self._handle_executed_batch(executed_batch)
+                        dequeue_counter += 1
+                else:
+                    for executed_batch in executed_batches:
+                        self._handle_executed_batch(executed_batch)
+                self.unhandled_batch_counter -= executed_batch_num
 
                 # march forward in microbatch slots
+                if can_queue:
+                    self.previous_batch = batch_state
+                self.micro_batches[prev_microbatch_id] = None
                 microbatch_id = (microbatch_id + 1) % self.num_micro_batches
-
-                if self.enable_iter_perf_stats and previous_batch is not None:
-                    sample_state = previous_batch.sample_state
-                    sample_state.scheduled_requests.context_requests = previous_batch.scheduled_ctx_reqs
-                    self._process_iter_stats(finished_requests,
-                                             self.active_requests,
-                                             previous_batch, microbatch_id)
-
                 self.iter_counter += 1
 
+    def _broadcast_sample_state_loop(self):
+        logger.debug(
+            f"Starting broadcast sample state loop for pp_rank {self.dist.pp_rank}"
+        )
+        torch.cuda.set_device(self.device_id)
+        # ensure the context is created, otherwise, some MPI calls will fail.
+        CUASSERT(cudart.cudaSetDevice(self.device_id))
+        # Acquiring pkl5.Intracomm's send/recv locks from both executor loop thread
+        # and this thread will cause perf drop and even deadlock.
+        # We create new MPI comm to avoid these issues.
+        logger.info(
+            "Create new MPI comm for broadcast sample state thread to avoid deadlock."
+        )
+        new_mpi_comm = mpi_comm().Dup()
+        set_thread_local_mpi_comm(new_mpi_comm)
+        while True:
+            previous_batch = self.executed_batch_queue.get()
+            if previous_batch is None:
+                break
+            self._broadcast_sample_state(previous_batch)
+        set_thread_local_mpi_comm(None)
+        new_mpi_comm.Free()
+
+    def _broadcast_sample_state(self, previous_batch: Optional[BatchStatePP]):
+        if previous_batch is None:
+            return
+
+        tag = PPCommTag.SAMPLE_STATE
+        microbatch_id = previous_batch.microbatch_id
+        sample_state = previous_batch.sample_state
+        requests = sample_state.scheduled_requests.all_requests()
+
+        if not self.dist.is_last_pp_rank:
+            # Receive tokens from previous pp rank (w.r.t model forward direction)
+            with nvtx_range("recv_sample_state"):
+                sample_state.host, py_result_diffs = self.dist.recv_object(
+                    src=self.dist.prev_pp_rank,
+                    tag=tag,
+                )
+
+            for request, py_result_diff in zip(requests, py_result_diffs):
+                request.py_result.apply_diff(py_result_diff)
+
+        self.executed_batch_response_queue.put(previous_batch)
+
+        # Send tokens to next pp rank (w.r.t model forward direction)
+        # Second last rank does not need to since last rank has original decoded tokens
+        if not self.dist.is_second_last_pp_rank:
+            py_result_diffs = []
+            for request in requests:
+                diff = request.py_result.get_diff()
+                py_result_diffs.append(diff)
+                request.py_result.reset_diff()
+            self.wait_on_pp_send_handles(self.send_handles, microbatch_id)
+            with nvtx_range("send_sample_state"):
+                self.send_handles[microbatch_id] = self.dist.isend_object(
+                    (sample_state.host, py_result_diffs),
+                    dest=self.dist.next_pp_rank,
+                    tag=tag,
+                )
+
+    def _handle_executed_batch(self, previous_batch: Optional[BatchStatePP]):
+        # Stage 3: Finalize previous batch that finished sample state communication
+        # In last pp rank, stage 2 and 3 process different previous batches
+        finished_requests = []
+        if previous_batch is not None:
+            with torch.cuda.nvtx.range("_handle_previous_batch_pp"):
+                sample_state = previous_batch.sample_state
+                sample_state.scheduled_requests.context_requests = previous_batch.finished_ctx_reqs
+                self._update_requests(previous_batch.sample_state)
+
+                if self.block_reuse_enabled and not self.kv_cache_manager.is_vswa and self.kv_cache_transceiver:
+                    for req in previous_batch.scheduled_ctx_reqs:
+                        if req.is_context_only_request and (
+                                req.is_context_finished
+                                or req.is_finished_due_to_length
+                        ) and not req.is_finished_due_to_cancellation:
+                            block_id = self.kv_cache_manager.store_blocks_for_reuse(
+                                req, True)
+                            self.ctx_in_transmission_requests[
+                                req.py_request_id] = (
+                                    (req, block_id,
+                                     self.ctx_in_transmission_counter))
+
+                if self.kv_cache_transceiver:
+                    self._send_disagg_ctx_cache(
+                        previous_batch.scheduled_ctx_reqs)
+                self._handle_canceled_requests()
+
+                finished_requests = self._handle_responses()
+                previous_scheduled_batch = previous_batch.sample_state.scheduled_requests
+                attn_metadata = getattr(self.model_engine, 'attn_metadata',
+                                        None)
+                kv_cache_dtype_byte_size = getattr(self.model_engine,
+                                                   'kv_cache_dtype_byte_size',
+                                                   None)
+                self.resource_manager.update_resources(
+                    previous_scheduled_batch, attn_metadata,
+                    kv_cache_dtype_byte_size)
+
+                self._remove_inflight_ids(previous_batch)
+
+        if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
+            self._check_kv_transfer_timeout()
+            self._terminate_disagg_ctx_finished_requests()
+
+        if self._disagg_pp_termination_handler is not None:
+            self._disagg_pp_termination_handler.terminate_pending_requests()
+
+        if self.enable_iter_perf_stats and previous_batch is not None:
+            sample_state = previous_batch.sample_state
+            sample_state.scheduled_requests.context_requests = previous_batch.scheduled_ctx_reqs
+            self._process_iter_stats(
+                finished_requests,
+                self.active_requests,
+                previous_batch,
+                previous_batch.microbatch_id % self.dist.pp_size,
+            )
+
     @nvtx_range("wait_on_pp_send_handles")
-    def wait_on_pp_send_handles(self, microbatch_id):
-        if self.send_handles[microbatch_id] is not None:
-            self.send_handles[microbatch_id].wait()
-            self.send_handles[microbatch_id] = None
+    def wait_on_pp_send_handles(self, send_handles, microbatch_id):
+        if send_handles[microbatch_id] is not None:
+            send_handles[microbatch_id].wait()
+            send_handles[microbatch_id] = None
 
     def _can_queue(self, scheduled_batch):
 
@@ -2725,41 +2881,6 @@ class PyExecutor:
                                                                       counter -
                                                                       1))
 
-    def _handle_logits_communication(self, previous_batch, prev_microbatch_id):
-        """Handle logits communication between pipeline parallel ranks.
-
-        If logits were requested, the last PP rank sends to the first PP rank (who sends responses)
-        the logits of the requests that have finished.
-
-        Args:
-            previous_batch: The previous batch state
-            prev_microbatch_id: The microbatch ID for the previous batch
-        """
-        # NOTE: If the rank processing the logits ever becomes the same as
-        # the rank sending the responses, this code can be removed.
-        finished_reqs = [
-            r for r in
-            previous_batch.sample_state.scheduled_requests.all_requests()
-            if r.state == LlmRequestState.GENERATION_COMPLETE and (
-                r.py_return_context_logits or r.py_return_generation_logits
-                or r.py_additional_outputs is not None)
-        ]
-        if self.dist.is_first_pp_rank and len(finished_reqs):
-            finished_reqs_py_results = [r.py_result for r in finished_reqs]
-            finished_reqs_py_results = self.dist.recv_object(
-                src=self.dist.prev_pp_rank,
-                tag=prev_microbatch_id,
-            )
-            for req, py_result in zip(finished_reqs, finished_reqs_py_results):
-                req.py_result = py_result
-
-        elif self.dist.is_last_pp_rank and len(finished_reqs):
-            self.wait_on_pp_send_handles(prev_microbatch_id)
-            self.send_handles[prev_microbatch_id] = self.dist.isend_object(
-                [r.py_result for r in finished_reqs],
-                dest=self.dist.next_pp_rank,
-                tag=prev_microbatch_id)
-
     def _await_any_response(self,
                             timeout: Optional[float] = None
                             ) -> List[LlmResponse]:
@@ -2899,7 +3020,7 @@ class DisaggPPTerminationHandler:
         self._pending_termination = {}
         self._terminating_iteration = 0
         self._send_handle = None
-        self._comm_tag = TERMINATION_COMM_TAG_BASE
+        self._comm_tag = PPCommTag.TERMINATION
 
     def terminate(self, request: LlmRequest):
         self._pending_termination[request.py_request_id] = request
