@@ -579,7 +579,8 @@ class FP8QDQLinearMethod(LinearMethodBase):
                 assert len(v_scale) != 0
                 copy_weight(
                     module.kv_scales,
-                    torch.tensor([1.0, max(k_scale), max(v_scale)], dtype=torch.float32))
+                    torch.tensor(
+                        [1.0, max(k_scale), max(v_scale)], dtype=torch.float32))
                 module.inv_kv_scales.data = 1.0 / module.kv_scales
 
     def load_weights_fused_gate_up_linear(self, module: Linear,
@@ -1093,7 +1094,8 @@ class NVFP4LinearMethod(LinearMethodBase):
                 assert len(v_scale) != 0
                 copy_weight(
                     module.kv_scales,
-                    torch.tensor([1.0, max(k_scale), max(v_scale)], dtype=torch.float32))
+                    torch.tensor(
+                        [1.0, max(k_scale), max(v_scale)], dtype=torch.float32))
                 module.inv_kv_scales.data = 1.0 / module.kv_scales
 
     def load_weights_fused_gate_up_linear(self, module: Linear,
