@@ -171,6 +171,134 @@ You will receive three reports, each containing kernel timing statistics grouped
 2. A CSV report at `profiles/report_np4_rank0.csv`
 3. An HTML report at `profiles/report_np4_rank0.html`
 
+## Performance calibrating
+
+1. Run end-to-end serving in COLLECT mode, and capture the nsys profile. This generates a calibration file.
+
+   The example runs `trtllm-bench` and captures the generation phase.
+
+   > Note: All example commands in "Performance calibrating" section should be executed in a Docker container or Slurm container.
+
+   ```bash
+   model_path="$LLM_MODELS_ROOT/DeepSeek-R1/DeepSeek-R1-0528-FP4-v2/"
+   NP=4
+   BATCH_SIZE=32
+   
+   python3 ../../benchmarks/cpp/prepare_dataset.py \
+       --tokenizer=${model_path} --stdout token-norm-dist --num-requests=$(($BATCH_SIZE*$NP)) \
+       --input-mean=8192 --output-mean=1024 --input-stdev=0 --output-stdev=0 >dataset.jsonl
+   
+   cat <<EOF >config.yaml
+   enable_attention_dp: true
+   layerwise_benchmarks_config:
+       calibration_mode: COLLECT
+       calibration_file_path: profiles/calibration_data.json
+   moe_config:
+       backend: CUTLASS
+   print_iter_log: true
+   speculative_config:
+       decoding_type: MTP
+       num_nextn_predict_layers: 3
+   EOF
+   
+   mkdir -p profiles
+   
+   TLLM_PROFILE_START_STOP=$(($BATCH_SIZE + 10))-$(($BATCH_SIZE + 35)) \
+   NP=$NP ./mpi_launch.sh middleware/mpi_env_from_ompi \
+   nsys profile \
+       -t cuda,nvtx \
+       --cpuctxsw none --cuda-event-trace false \
+       --cuda-graph-trace node \
+       -c cudaProfilerApi --capture-range-end stop \
+       -o profiles/report_e2e_collect_rank%q{RANK}.nsys-rep \
+       --force-overwrite true \
+   trtllm-llmapi-launch \
+   trtllm-bench \
+       --model deepseek-ai/DeepSeek-V3 \
+       --model_path ${model_path} \
+       throughput \
+       --tp $NP \
+       --ep $NP \
+       --warmup 0 \
+       --dataset dataset.jsonl \
+       --max_batch_size $BATCH_SIZE \
+       --max_num_tokens 10240 \
+       --disable_chunked_context \
+       --num_requests $(($BATCH_SIZE*$NP)) \
+       --concurrency $(($BATCH_SIZE*$NP)) \
+       --config config.yaml
+   ```
+
+2. If the end-to-end serving uses CUDA Graphs, run it again in MARK mode without CUDA Graphs, and also capture the nsys profile.
+
+   ```bash
+   model_path="$LLM_MODELS_ROOT/DeepSeek-R1/DeepSeek-R1-0528-FP4-v2/"
+   NP=4
+   BATCH_SIZE=32
+   
+   cat <<EOF >config.yaml
+   cuda_graph_config: null
+   enable_attention_dp: true
+   layerwise_benchmarks_config:
+       calibration_mode: MARK
+   moe_config:
+       backend: CUTLASS
+   print_iter_log: true
+   speculative_config:
+       decoding_type: MTP
+       num_nextn_predict_layers: 3
+   EOF
+   
+   TLLM_PROFILE_START_STOP=$(($BATCH_SIZE + 10))-$(($BATCH_SIZE + 35)) \
+   NP=$NP ./mpi_launch.sh middleware/mpi_env_from_ompi \
+   nsys profile \
+       -t cuda,nvtx \
+       --cpuctxsw none --cuda-event-trace false \
+       --cuda-graph-trace node \
+       -c cudaProfilerApi --capture-range-end stop \
+       -o profiles/report_e2e_mark_rank%q{RANK}.nsys-rep \
+       --force-overwrite true \
+   trtllm-llmapi-launch \
+   trtllm-bench \
+       --model deepseek-ai/DeepSeek-V3 \
+       --model_path ${model_path} \
+       throughput \
+       --tp $NP \
+       --ep $NP \
+       --warmup 0 \
+       --dataset dataset.jsonl \
+       --max_batch_size $BATCH_SIZE \
+       --max_num_tokens 10240 \
+       --disable_chunked_context \
+       --num_requests $(($BATCH_SIZE*$NP)) \
+       --concurrency $(($BATCH_SIZE*$NP)) \
+       --config config.yaml
+   ```
+
+3. Run layer-wise benchmarks with the calibration file which is obtained by step 1.
+
+   ```bash
+   NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --model "$LLM_MODELS_ROOT/DeepSeek-R1/DeepSeek-R1-0528-FP4-v2" --load-format AUTO --layer-indices 5,6,7 --batch-size 32 --seq-len-q 4 --seq-len-kv-cache 8316 --balance-method NotModified --replay-file-path profiles/calibration_data.json --replay-start 47 --replay-stop 67
+   ```
+
+4. Parse end-to-end profiles with `parse_e2e.py`, and parse layer-wise benchmarks profiles with `parse.py`.
+
+   ```bash
+   seq 0 3 | xargs -I% python3 parse_e2e.py --eager-trace profiles/report_e2e_mark_rank%.nsys-rep --graph-trace profiles/report_e2e_collect_rank%.nsys-rep --layer-indices 5,6,7 --warmup-times 5 -o profiles/report_e2e_mark_rank%.json
+   seq 0 3 | xargs -I% python3 parse.py --world-size 4 --rank %
+   ```
+
+5. Run `correlation.py` to generate the correlation report.
+
+   ```bash
+   python3 correlation.py --reference profiles/report_e2e_mark_rank0.json $(seq 1 3 | xargs -I% echo "--target profiles/report_e2e_mark_rank%.json") $(seq 0 3 | xargs -I% echo "--target profiles/report_np4_rank%.json") -o profiles/correlation.html
+   ```
+
+Limitations:
+
+1. Pipeline parallelism is not supported.
+2. MoE backend CUTLASS, and WIDEEP are supported.
+
 ## Developer utilities
 
 1. Less startup time when debug a model
