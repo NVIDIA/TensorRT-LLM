@@ -19,7 +19,8 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 import torch
 
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
+                                                        LlmRequestState)
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager, get_pp_layers)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -30,6 +31,7 @@ from tensorrt_llm.mapping import Mapping
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import \
         AttentionMetadata
+    from tensorrt_llm._torch.pyexecutor.sampler import SampleState
 
 GB = 1 << 30
 
@@ -322,43 +324,6 @@ class MambaCacheManager(BaseResourceManager):
 
         torch.cuda.empty_cache()
 
-    def _extract_num_accepted_draft_tokens(
-            self, sample_state: Optional["SampleState"],
-            generation_requests: list) -> Optional[torch.Tensor]:
-        """Extract num_accepted_draft_tokens from sample_state due to overlap scheduler
-
-        Args:
-            sample_state: Sample state containing new_tokens_lens for MTP
-            generation_requests: List of generation requests
-
-        Returns:
-            Tensor of num_accepted_draft_tokens ordered by generation_requests, or None if not available
-        """
-        if sample_state is None:
-            return None
-
-        if not hasattr(sample_state, 'device'):
-            return None
-
-        sample_state_device = sample_state.device
-        if not hasattr(sample_state_device, 'new_tokens_lens'):
-            return None
-
-        if len(generation_requests) == 0:
-            return None
-
-        # for MTP, new_tokens_lens is num_accepted_tokens
-        # need to subtract 1 to get num_accepted_draft_tokens (because it contains 1 golden token)
-        # extract num_accepted_draft_tokens from generation_requests in order
-        seq_slots = torch.tensor(
-            [req.py_seq_slot for req in generation_requests],
-            dtype=torch.int64,
-            device='cuda')
-        num_accepted_draft_tokens = sample_state_device.new_tokens_lens[
-            seq_slots] - 1
-
-        return num_accepted_draft_tokens
-
     def _update_speculative_mamba_states(
             self, num_accepted_draft_tokens: torch.Tensor,
             state_indices_tensor: torch.Tensor):
@@ -375,9 +340,6 @@ class MambaCacheManager(BaseResourceManager):
 
         """
         request_number = num_accepted_draft_tokens.shape[0]
-        if request_number == 0:
-            return
-        state_indices_tensor = state_indices_tensor[:request_number]
         intermediate_state_indices = torch.arange(
             request_number,
             dtype=torch.int32,
@@ -427,34 +389,43 @@ class MambaCacheManager(BaseResourceManager):
             sample_state: Sample state from previous iteration, contains new_tokens_lens for MTP
         """
 
-        if not self.is_speculative() or attn_metadata is None:
+        if not self.is_speculative():
+            return
+        num_decodes = len(scheduled_batch.generation_requests)
+
+        if num_decodes == 0:
             return
 
-        num_prefills = attn_metadata.num_contexts
-        num_decodes = attn_metadata.seq_lens.shape[0] - num_prefills
-
-        if num_decodes == 0 or len(scheduled_batch.generation_requests) == 0:
+        num_accepted_draft_tokens = []
+        state_indices_updated = []
+        if sample_state is not None:
+            # for overlap scheduler, use sample_state to get num_accepted_draft_tokens for previous iteration because sampler update is not called when this function is called
+            for req in scheduled_batch.generation_requests:
+                if req.state != LlmRequestState.GENERATION_COMPLETE:
+                    new_tokens_lens = sample_state.host.new_tokens_lens[
+                        req.py_seq_slot]
+                    num_accepted_draft_tokens.append(new_tokens_lens - 1)
+                    state_indices_updated.append(
+                        self.mamba_cache_index[req.py_request_id])
+        else:
+            for req in scheduled_batch.generation_requests:
+                if req.state == LlmRequestState.GENERATION_COMPLETE:
+                    continue
+                num_accepted_draft_tokens.append(
+                    req.py_num_accepted_draft_tokens)
+                state_indices_updated.append(
+                    self.mamba_cache_index[req.py_request_id])
+        if len(state_indices_updated) == 0:
             return
 
-        batch_split_size = [num_prefills, num_decodes]
-
-        state_indices = attn_metadata.kv_cache_manager.get_state_indices(
-        )[:num_prefills + num_decodes]
-
-        _, state_indices_d = torch.split(state_indices, batch_split_size)
-
-        # get num_accepted_draft_tokens from sample_state
-        num_accepted_draft_tokens = self._extract_num_accepted_draft_tokens(
-            sample_state, scheduled_batch.generation_requests)
-
-        assert num_accepted_draft_tokens is not None, \
-            "Failed to extract num_accepted_draft_tokens from sample_state"
-
-        num_accepted_draft_tokens_to_use = num_accepted_draft_tokens[:
-                                                                     num_decodes]
-
-        self._update_speculative_mamba_states(num_accepted_draft_tokens_to_use,
-                                              state_indices_d)
+        num_accepted_draft_tokens = torch.tensor(num_accepted_draft_tokens,
+                                                 dtype=torch.int32,
+                                                 device='cuda')
+        state_indices_updated = torch.tensor(state_indices_updated,
+                                             dtype=torch.int32,
+                                             device='cuda')
+        self._update_speculative_mamba_states(num_accepted_draft_tokens,
+                                              state_indices_updated)
 
 
 class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
@@ -549,9 +520,22 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
                          scheduled_batch: ScheduledRequests,
                          attn_metadata: "AttentionMetadata" = None,
                          kv_cache_dtype_byte_size: float = None,
-                         sample_state: Optional["SampleState"] = None):
-        MambaCacheManager.update_resources(self, scheduled_batch, attn_metadata,
-                                           kv_cache_dtype_byte_size,
-                                           sample_state)
+                         update_mamba_cache_manager: bool = True):
+        # for non-overlap scheduler, update mamba cache manager and kv cache manager
+        # for overlap scheduler, only updtae kv cache manager, and will call update_resources_for_mamba_cache_manager to update mamba cache manager
+        if update_mamba_cache_manager:
+            MambaCacheManager.update_resources(
+                self,
+                scheduled_batch,
+                attn_metadata,
+                kv_cache_dtype_byte_size,
+            )
         KVCacheManager.update_resources(self, scheduled_batch, attn_metadata,
-                                        kv_cache_dtype_byte_size, sample_state)
+                                        kv_cache_dtype_byte_size)
+
+    def update_resources_for_mamba_cache_manager(
+            self, scheduled_batch: ScheduledRequests,
+            sample_state: "SampleState"):
+        MambaCacheManager.update_resources(self,
+                                           scheduled_batch,
+                                           sample_state=sample_state)
