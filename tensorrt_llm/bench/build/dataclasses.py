@@ -78,12 +78,22 @@ def get_safetensors_metadata(model_name_or_path):
     safetensor_metadata = None
 
     def except_handler():
+        nonlocal safetensor_metadata
+
         logger.error(
             f"Failed to get safetensors metadata for {model_name_or_path}, attempting to get from Huggingface..."
         )
-        if safetensor_metadata is None:
+        hub_offline = os.environ.get("HF_HUB_OFFLINE", None)
+
+        # Check if we're offline -- if we are, we can't get the metadata from Huggingface
+        if safetensor_metadata is None and not hub_offline:
+            # If we're not offline, try to get the metadata from Huggingface
             safetensor_metadata = huggingface_hub.get_safetensors_metadata(
                 model_name_or_path)
+
+        # If we still don't have the metadata, raise an error
+        if safetensor_metadata is None:
+            raise
 
     try:
         if safetensors_single_file.exists():
