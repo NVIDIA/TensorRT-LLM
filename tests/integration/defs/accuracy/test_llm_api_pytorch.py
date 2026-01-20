@@ -3202,6 +3202,16 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
 
         RCCA: https://nvbugspro.nvidia.com/bug/5661741
         """
+        warnings.filterwarnings(
+            "ignore",
+            message=r".*Calling super\(\)\.encode with \{'add_special_tokens': False\}.*",
+            module=r".*tokenization_kimi.*",
+        )
+        warnings.filterwarnings(
+            "ignore",
+            message=r".*configuration is not supported by the fused routing kernel.*",
+            module=r".*fused_moe\.routing.*",
+        )
         patch_mpi_pool_session_for_env(mocker, {"TRTLLM_ENABLE_PDL": "1"})
         config = self._get_kimi_k2_config()
 
@@ -3213,21 +3223,21 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
             enable_chunked_prefill=True,
             trust_remote_code=True,
             kv_cache_config=config["kv_cache_config"],
-            max_num_tokens=4096,
+            max_num_tokens=8192,
             max_seq_len=262144,
-            max_batch_size=8,
+            max_batch_size=32,
             enable_attention_dp=True,
         ) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             long_token_list = self._build_long_sequences(llm, config["target_len"])
 
-            samples_per_batch = 1  # Number of samples per batch
+            samples_per_batch = 8  
             sampling_params_greedy = SamplingParams(max_tokens=8)
             sampling_params_sampling = SamplingParams(max_tokens=8, temperature=0.8, top_p=0.95)
 
-            max_duration_sec = 1800
-            max_batch_count = 1    # Maximum number of batches to run
-            min_batch_count = 1    # Minimum batches before allowing early exit
+            max_duration_sec = 1.5 * 3600
+            max_batch_count = 25
+            min_batch_count = 8 
             start_time = time.time()
             num_samples = len(long_token_list)
 
