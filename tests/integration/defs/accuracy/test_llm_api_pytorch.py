@@ -3029,7 +3029,7 @@ class TestGLM4_5Air(LlmapiAccuracyTestHarness):
         if mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
 
-        with LLM(f"{llm_models_root()}/GLM-4.5-Air-NVFP4-KV-cache-FP8",
+        with LLM(f"{llm_models_root()}/glm-4.5-air-fp4",
                  max_batch_size=max_batch_size,
                  tensor_parallel_size=tp_size,
                  pipeline_parallel_size=pp_size,
@@ -3053,7 +3053,7 @@ class TestGLM4_5Air(LlmapiAccuracyTestHarness):
     def test_nvfp4_2_model_mtp(self, tp_size, cuda_graph, overlap_scheduler,
                                chunked_prefill, max_batch_size, moe_backend):
 
-        model_path = f"{llm_models_root()}/GLM-4.5-Air-NVFP4-KV-cache-FP8"
+        model_path = f"{llm_models_root()}/glm-4.5-air-fp4"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.70)
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
