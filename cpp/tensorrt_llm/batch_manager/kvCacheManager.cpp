@@ -416,6 +416,7 @@ void KVCacheBlock::setPrevBlockInSeq(BlockPtr prevBlock)
 
 void KVCacheBlock::addNextBlock(BlockKey const& blockKey, BlockPtr block)
 {
+    std::lock_guard<std::mutex> lock(mNextBlocksMutex);
     if (mNextBlocks.find(blockKey) == mNextBlocks.end())
     {
         mNextBlocks[blockKey] = std::move(block);
@@ -476,11 +477,13 @@ void KVCacheBlock::freeLeafBlock()
 
 void KVCacheBlock::removeNextBlock(BlockKey const& blockKey)
 {
+    std::lock_guard<std::mutex> lock(mNextBlocksMutex);
     mNextBlocks.erase(blockKey);
 }
 
 void KVCacheBlock::freeDescendantsRecursively()
 {
+    std::lock_guard<std::mutex> lock(mNextBlocksMutex);
     bool hasChildren = !mNextBlocks.empty();
     if (hasChildren)
     {
