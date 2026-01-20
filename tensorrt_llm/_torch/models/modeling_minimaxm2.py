@@ -20,9 +20,11 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
+from ..distributed import AllReduce
 from ..models.modeling_utils import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
@@ -114,6 +116,40 @@ class MiniMaxM2MoE(nn.Module):
         return final_hidden_states
 
 
+# We use all_reduce across all tp gpus to get the rms norm variance sum
+class MiniMaxRMSNorm(nn.Module):
+    def __init__(
+        self, *, hidden_size: int, eps: float, mapping: Mapping, dtype: torch.dtype = torch.bfloat16
+    ):
+        super().__init__()
+        self.mapping = mapping
+        # for attention input, tp_size * hidden_size = head_num * head_size
+        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=dtype, requires_grad=False))
+        self.hidden_size = hidden_size
+        self.eps = eps
+        self.dtype = dtype
+        self.all_reduce = AllReduce(mapping=self.mapping)
+
+    # TODO: add load weights method
+    def load_weights(self, weights: Dict):
+        assert len(weights) == 1
+        slice_width = self.hidden_size
+        slice_start = self.mapping.tp_rank * slice_width
+        slice_end = slice_start + slice_width
+        self.weight.copy_(weights["weight"][slice_start:slice_end].to(self.weight.dtype))
+
+    def forward(self, hidden_states: torch.Tensor):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        variance = self.all_reduce(variance) / self.mapping.tp_size
+
+        hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
+        hidden_states = self.weight * hidden_states.to(input_dtype)
+        return hidden_states
+
+
 # It's a little bit tricky to implement special qk norm
 # because rms dim is hidden_size * num_heads, not hidden_size, after qkv linear,
 # the result size is hidden_size * num_heads / tp_size.
@@ -148,17 +184,30 @@ class MiniMaxM2Attention(Attention):
             dtype=config.torch_dtype,
             config=model_config,
         )
-
-        self.q_norm = RMSNorm(
-            hidden_size=self.q_size * self.tp_size,
-            eps=config.rms_norm_eps,
-            dtype=config.torch_dtype,
-        )
-        self.k_norm = RMSNorm(
-            hidden_size=self.kv_size * self.tp_size,
-            eps=config.rms_norm_eps,
-            dtype=config.torch_dtype,
-        )
+        if self.qkv_proj.mapping.tp_size > 1:
+            self.q_norm = MiniMaxRMSNorm(
+                hidden_size=self.q_size,
+                eps=config.rms_norm_eps,
+                mapping=self.qkv_proj.mapping,
+                dtype=config.torch_dtype,
+            )
+            self.k_norm = MiniMaxRMSNorm(
+                hidden_size=self.kv_size,
+                eps=config.rms_norm_eps,
+                mapping=self.qkv_proj.mapping,
+                dtype=config.torch_dtype,
+            )
+        else:
+            self.q_norm = RMSNorm(
+                hidden_size=self.q_size * self.tp_size,
+                eps=config.rms_norm_eps,
+                dtype=config.torch_dtype,
+            )
+            self.k_norm = RMSNorm(
+                hidden_size=self.kv_size * self.tp_size,
+                eps=config.rms_norm_eps,
+                dtype=config.torch_dtype,
+            )
 
     def apply_qk_norm(self, q, k):
         if self.qkv_proj.mapping.tp_size > 1:
