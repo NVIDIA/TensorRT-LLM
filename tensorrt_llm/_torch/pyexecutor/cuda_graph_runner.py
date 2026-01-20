@@ -448,7 +448,8 @@ class CUDAGraphRunner:
                 max_num_draft_tokens=runtime_draft_len,
                 use_mrope=self.config.use_mrope,
                 max_beam_width=self.config.max_beam_width,
-                draft_kv_cache_manager=draft_kv_cache_manager)[0]
+                draft_kv_cache_manager=draft_kv_cache_manager)
+
             if self.padding_dummy_request is None:
                 return 0
             else:

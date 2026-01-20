@@ -313,6 +313,11 @@ def create_py_executor(
         has_draft_model_engine = spec_config.spec_dec_mode.has_draft_model()
         has_spec_drafter = spec_config.spec_dec_mode.has_spec_drafter()
 
+        # WAR for https://nvbugs/5807902
+        # Disable separate draft KV cache in disaggregated mode
+        if cache_transceiver_config is not None or kv_connector_config is not None:
+            spec_config._allow_separate_draft_kv_cache = False
+
     # chunk_unit_size may be changed to 64 when using flash mla
     attn_runtime_features = AttentionRuntimeFeatures(
         chunked_prefill=enable_chunked_context,

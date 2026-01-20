@@ -627,11 +627,13 @@ class SpecWorkerBase(nn.Module, ABC):
     @contextmanager
     def draft_kv_cache_context(self, attn_metadata, draft_kv_cache_manager):
         """
-        Context manager to temporarily switch to draft KV cache manager.
+        Context manager to temporarily switch to draft KV cache manager in one-engine speculative decoding.
 
         This swaps both the kv_cache_manager reference AND the block offset tensors,
-        since the main and draft KV caches have different block layouts.
+        since the target and draft KV caches have different block layouts.
         """
+
+        # draft_kv_cache_manager is None if using two-engine speculative decoding or not enabling separate draft KV cache.
         if draft_kv_cache_manager is None:
             yield
             return
@@ -648,10 +650,8 @@ class SpecWorkerBase(nn.Module, ABC):
 
         # Switch to draft KV cache manager and its block offsets
         attn_metadata.kv_cache_manager = draft_kv_cache_manager
-        if hasattr(attn_metadata, 'draft_kv_cache_block_offsets'
-                   ) and attn_metadata.draft_kv_cache_block_offsets is not None:
-            attn_metadata.kv_cache_block_offsets = attn_metadata.draft_kv_cache_block_offsets
-            attn_metadata.host_kv_cache_block_offsets = attn_metadata.draft_host_kv_cache_block_offsets
+        attn_metadata.kv_cache_block_offsets = attn_metadata.draft_kv_cache_block_offsets
+        attn_metadata.host_kv_cache_block_offsets = attn_metadata.draft_host_kv_cache_block_offsets
 
         try:
             yield

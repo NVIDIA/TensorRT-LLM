@@ -679,6 +679,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     helix_is_inactive_rank: Optional[torch.Tensor] = None
     helix_is_inactive_rank_cpu: Optional[torch.Tensor] = None
 
+    # Block offsets for the target and draft KV caches
+    kv_cache_block_offsets: Optional[torch.Tensor] = None
+    host_kv_cache_block_offsets: Optional[torch.Tensor] = None
+    draft_kv_cache_block_offsets: Optional[torch.Tensor] = None
+    draft_host_kv_cache_block_offsets: Optional[torch.Tensor] = None
+
     @property
     def max_seq_len(self) -> int:
         """
@@ -806,9 +812,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     device='cpu',
                     pin_memory=True,
                 )
-            else:
-                self.draft_kv_cache_block_offsets = None
-                self.draft_host_kv_cache_block_offsets = None
+
             if self.enable_flash_mla:
                 self.block_ids_per_seq = self.get_empty(
                     buffers,

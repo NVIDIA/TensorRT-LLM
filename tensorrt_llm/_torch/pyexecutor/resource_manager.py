@@ -1900,7 +1900,8 @@ class KVCacheManagerV2(BaseResourceManager):
             max_num_draft_tokens: int = 0,
             use_mrope: bool = False,
             max_beam_width: int = 1,
-            num_extra_decoding_steps: int = 0):
+            num_extra_decoding_steps: int = 0,
+            draft_kv_cache_manager: Optional['BaseResourceManager'] = None):
 
         beam_width = max_beam_width
         requests = []

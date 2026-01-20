@@ -482,10 +482,10 @@ class KvCacheCreator:
         # use layer_mask to include only target layers. The draft layers should
         # only be in the separate draft KV cache manager.
         # We still pass spec_config so that num_extra_kv_tokens is calculated.
-        layer_mask = None
+        spec_dec_layer_mask = None
         if self._should_create_separate_draft_kv_cache():
             num_target_layers = model_engine.model.model_config.pretrained_config.num_hidden_layers
-            layer_mask = [True] * num_target_layers
+            spec_dec_layer_mask = [True] * num_target_layers
 
         kv_cache_manager = _create_kv_cache_manager(
             model_engine=model_engine,
@@ -502,7 +502,7 @@ class KvCacheCreator:
             kv_connector_manager=self._kv_connector_manager,
             estimating_kv_cache=estimating_kv_cache,
             execution_stream=self._execution_stream,
-            layer_mask=layer_mask,
+            layer_mask=spec_dec_layer_mask,
         )
 
         # KVCacheManager (Non-draft) modifies the max_seq_len field, update it to self
@@ -553,7 +553,8 @@ class KvCacheCreator:
         # Create layer_mask: False for target layers, True for draft layers.
         # This ensures the draft KV cache manager uses the correct layer indices
         # (e.g., layers 32, 33, ... instead of 0, 1, ...).
-        layer_mask = [False] * target_num_layers + [True] * num_draft_layers
+        spec_dec_layer_mask = [False
+                               ] * target_num_layers + [True] * num_draft_layers
 
         # Get the appropriate KV cache manager class for the draft model
         draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
@@ -578,7 +579,7 @@ class KvCacheCreator:
             model_config=self._draft_config,
             dtype=self._draft_config.pretrained_config.torch_dtype,
             is_draft=True,
-            layer_mask=layer_mask,
+            layer_mask=spec_dec_layer_mask,
             num_layers=num_draft_layers,
         )
 

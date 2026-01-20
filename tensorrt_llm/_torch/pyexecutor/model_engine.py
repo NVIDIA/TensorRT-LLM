@@ -568,8 +568,8 @@ class PyTorchModelEngine(ModelEngine):
         return self.max_beam_width > 1
 
     def _get_draft_kv_cache_manager(
-            self,
-            resource_manager: ResourceManager) -> Optional[KVCacheManager]:
+        self, resource_manager: ResourceManager
+    ) -> Optional[Union[KVCacheManager, KVCacheManagerV2]]:
         """
         Returns the draft KV cache manager only in one-model speculative decoding
         mode where the target model manages a separate draft KV cache.
@@ -1101,6 +1101,9 @@ class PyTorchModelEngine(ModelEngine):
         if requests is None:
             return None
 
+        available_tokens = kv_cache_manager.get_num_available_tokens(
+            batch_size=batch_size, max_num_draft_tokens=draft_len)
+
         # Also consider draft KV cache capacity when it exists
         if draft_kv_cache_manager is not None:
             draft_available_tokens = draft_kv_cache_manager.get_num_available_tokens(
@@ -1135,7 +1138,7 @@ class PyTorchModelEngine(ModelEngine):
             use_mrope=self.use_mrope,
             max_beam_width=self.max_beam_width,
             num_extra_decoding_steps=num_extra_decoding_steps,
-            draft_kv_cache_manager=draft_kv_cache_manager)[0]
+            draft_kv_cache_manager=draft_kv_cache_manager)
 
         if max_seq_len_request is None:
             for r in requests:
@@ -1167,9 +1170,10 @@ class PyTorchModelEngine(ModelEngine):
                     req.py_draft_tokens = []
 
     def _set_up_attn_metadata(
-            self,
-            kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2],
-            draft_kv_cache_manager: Optional[Union[KVCacheManager, KVCacheManagerV2]] = None):
+        self,
+        kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2],
+        draft_kv_cache_manager: Optional[Union[KVCacheManager,
+                                               KVCacheManagerV2]] = None):
         enable_context_mla_with_cached_kv = is_mla(
             self.model.model_config.pretrained_config) and (
                 self.attn_runtime_features.cache_reuse
