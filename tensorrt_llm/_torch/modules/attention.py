@@ -331,11 +331,11 @@ class Attention(nn.Module):
                              key="sparse_attention_config")
 
             if config.sparse_attention_config.algorithm == "rocket":
-                logger.info_once("disable rope_fusion for RocketKV.")
+                logger.warning("disable rope_fusion for RocketKV.")
                 self.rope_fusion = False
 
         if self.rope_fusion and not attn_cls.support_fused_rope():
-            logger.info_once(
+            logger.warning(
                 "rope_fusion is true but the attention backend does not support it. Will disable rope_fusion."
             )
             self.rope_fusion = False
