@@ -280,7 +280,7 @@ std::tuple<std::vector<torch::Tensor>, int64_t> moeA2ADispatchOp(torch::Tensor c
         = tensorrt_llm::common::getEnvMoeA2AOneBlockPerToken(); // TODO: Decide this based on the workload
     params.ep_size = static_cast<int>(epSize);
     params.ep_rank = static_cast<int>(epRank);
-    params.num_experts_per_rank = static_cast<int>(numExperts) / static_cast<int>(epSize);
+    params.num_experts = static_cast<int>(numExperts);
     params.local_num_tokens = static_cast<int>(localNumTokens);
     params.max_tokens_per_rank = static_cast<int>(runtimeMaxTokensPerRank);
     params.top_k = static_cast<int>(topK);

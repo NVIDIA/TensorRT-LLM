@@ -373,7 +373,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
     const DispatchKernelPointers ptrs,                                      // Struct containing all kernel pointers
     int num_payloads,                                                       // Number of payloads
     int max_tokens_per_rank,                                                // Maximum tokens per rank
-    int local_num_tokens, int rank_id, int ep_size, int num_experts_per_rank)
+    int local_num_tokens, int rank_id, int ep_size, int num_experts)
 {
 
     int thread_idx = ThreadingPolicy::offset();
@@ -411,6 +411,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
         }
 
         uint64_t already_copied = 0;
+        int num_experts_per_rank = num_experts / ep_size;
         for (int k = 0; k < TOP_K; k++)
         {
             int expert_id = token_selected_experts[local_token_idx * TOP_K + k];
@@ -624,7 +625,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
         SWITCH_TOP_K(params.top_k, TOP_K,
             moeA2ADispatchKernel<BlockPolicy, TOP_K><<<grid_size, kBlockSize, shared_bytes, params.stream>>>(
                 params.token_selected_experts, kernel_ptrs, params.num_payloads, params.max_tokens_per_rank,
-                params.local_num_tokens, params.ep_rank, params.ep_size, params.num_experts_per_rank))
+                params.local_num_tokens, params.ep_rank, params.ep_size, params.num_experts))
     }
     else
     {
@@ -638,7 +639,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
         SWITCH_TOP_K(params.top_k, TOP_K,
             moeA2ADispatchKernel<WarpPolicy, TOP_K><<<grid_size, kBlockSize, shared_bytes, params.stream>>>(
                 params.token_selected_experts, kernel_ptrs, params.num_payloads, params.max_tokens_per_rank,
-                params.local_num_tokens, params.ep_rank, params.ep_size, params.num_experts_per_rank))
+                params.local_num_tokens, params.ep_rank, params.ep_size, params.num_experts))
     }
 }
 
