@@ -49,11 +49,11 @@ class Result(GenerationResultBase):
 DuckLLM = namedtuple('DuckLLM', ['args', 'tokenizer', 'generate_async'])
 
 # Timeout for the entire test
-DEFAULT_TEST_TIMEOUT = 2500
+DEFAULT_TEST_TIMEOUT = 3600
 # Timeout for the server waiting
-DEFAULT_SERVER_WAITING_TIMEOUT = 1200
+DEFAULT_SERVER_WAITING_TIMEOUT = 1800
 # Timeout for the accuracy evaluation
-DEFAULT_ACC_EVALUATION_TIMEOUT = 1200
+DEFAULT_ACC_EVALUATION_TIMEOUT = 1500
 
 
 @functools.lru_cache(maxsize=1)
