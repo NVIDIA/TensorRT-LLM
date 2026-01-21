@@ -84,53 +84,49 @@ class RMSNorm(nn.Module):
                 raise ValueError(
                     f"layeridx={getattr(self, 'layer_idx', None)} RMSNorm NVFP4 output requested "
                     "but no `nvfp4_scale` is attached; ")
-            else:
-                orig_shape = tuple(hidden_states.shape)
-                n = int(orig_shape[-1])
-                hs_2d = hidden_states.reshape(-1, n).contiguous()
-                res_2d = residual.reshape(-1, n)
-                gamma = self.weight
 
-                def _ensure_contiguous_with_dtype(t: torch.Tensor, key: str):
-                    if t.dtype != hs_2d.dtype:
-                        raise ValueError(
-                            f"RMSNorm NVFP4 fused path: casting {key} from {t.dtype} to {hs_2d.dtype}."
-                        )
-                        t = t.to(dtype=hs_2d.dtype)
-                    return t.contiguous()
+            orig_shape = tuple(hidden_states.shape)
+            n = int(orig_shape[-1])
+            hs_2d = hidden_states.reshape(-1, n).contiguous()
+            res_2d = residual.reshape(-1, n)
+            gamma = self.weight
 
-                res_2d = _ensure_contiguous_with_dtype(res_2d, "residual")
-                gamma = _ensure_contiguous_with_dtype(gamma, "gamma")
-
-                if hs_2d.device != res_2d.device or hs_2d.device != gamma.device:
-                    raise RuntimeError(
-                        "RMSNorm NVFP4 fused path requires all tensors on the same device. "
-                        f"Got input={hs_2d.device}, residual={res_2d.device}, gamma={gamma.device}."
+            def _ensure_contiguous_with_dtype(t: torch.Tensor, key: str):
+                if t.dtype != hs_2d.dtype:
+                    raise ValueError(
+                        f"RMSNorm NVFP4 fused path: casting {key} from {t.dtype} to {hs_2d.dtype}."
                     )
+                return t.contiguous()
 
-                sf_scale = nvfp4_scale.contiguous(
-                ) if nvfp4_scale is not None else None
+            res_2d = _ensure_contiguous_with_dtype(res_2d, "residual")
+            gamma = _ensure_contiguous_with_dtype(gamma, "gamma")
 
-                normed_fp4_i32, residual_out_2d, sf_fused = torch.ops.trtllm.fused_add_rms_norm_quant(
-                    hs_2d,
-                    res_2d,
-                    gamma,
-                    sf_scale,
-                    True,
-                    eps=self.variance_epsilon,
+            if hs_2d.device != res_2d.device or hs_2d.device != gamma.device:
+                raise RuntimeError(
+                    "RMSNorm NVFP4 fused path requires all tensors on the same device. "
+                    f"Got input={hs_2d.device}, residual={res_2d.device}, gamma={gamma.device}."
                 )
-                normed_fp4_u8 = normed_fp4_i32.view(torch.uint8)
-                if len(orig_shape) != 2:
-                    normed_fp4_u8 = normed_fp4_u8.reshape(
-                        *orig_shape[:-1], n // 2)
-                    residual_out = residual_out_2d.reshape(orig_shape)
-                else:
-                    residual_out = residual_out_2d
 
-                hidden_states_fused = Fp4QuantizedTensor(
-                    normed_fp4_u8, sf_fused)
-                return (hidden_states_fused,
-                        residual_out) if has_residual else hidden_states_fused
+            sf_scale = nvfp4_scale.contiguous()
+
+            normed_fp4_i32, residual_out_2d, sf_fused = torch.ops.trtllm.fused_add_rms_norm_quant(
+                hs_2d,
+                res_2d,
+                gamma,
+                sf_scale,
+                True,
+                eps=self.variance_epsilon,
+            )
+            normed_fp4_u8 = normed_fp4_i32.view(torch.uint8)
+            if len(orig_shape) != 2:
+                normed_fp4_u8 = normed_fp4_u8.reshape(*orig_shape[:-1], n // 2)
+                residual_out = residual_out_2d.reshape(orig_shape)
+            else:
+                residual_out = residual_out_2d
+
+            hidden_states_fused = Fp4QuantizedTensor(normed_fp4_u8, sf_fused)
+            return (hidden_states_fused,
+                    residual_out) if has_residual else hidden_states_fused
 
         if IS_FLASHINFER_AVAILABLE:
             from ..custom_ops import (flashinfer_fused_add_rmsnorm,

@@ -1876,38 +1876,6 @@ def record_stream(tensor: torch.Tensor, stream_id: int) -> None:
     tensor.record_stream(stream)
 
 
-def fused_add_rms_norm_quant(
-    input: torch.Tensor,
-    residual: torch.Tensor,
-    gamma: torch.Tensor,
-    sf_scale: Optional[torch.Tensor],
-    use_rms_norm: bool = True,
-    eps: float = 1e-6,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fused Add + RMSNorm/LayerNorm + FP4 Quantization kernel.
-
-    Args:
-        input: [M, N] input tensor (fp16/bf16)
-        residual: [M, N] residual tensor (fp16/bf16)
-        gamma: [N] normalization weight (fp16/bf16)
-        sf_scale: [1] optional scale factor for FP4 quantization (float32)
-        use_rms_norm: if True use RMSNorm, else use LayerNorm
-        eps: epsilon for normalization
-
-    Returns:
-        normed_output_fp4: [M, N/8] FP4 quantized normalized output (int32, packed)
-        output: [M, N] pre-norm output (input + residual), same dtype as input
-        sf_out: scale factors for FP4 quantization (uint8), swizzled layout
-
-    Note:
-        This kernel requires SM90 (Hopper) or SM100 (Blackwell) GPU.
-        Hidden dimension N must be >= 2048 and <= 16384.
-    """
-    return torch.ops.trtllm.fused_add_rms_norm_quant(input, residual, gamma,
-                                                     sf_scale, use_rms_norm,
-                                                     eps)
-
-
 class Fp4GemmAllreduceRunner(TunableRunner):
     runner_dict = dict()
     tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
