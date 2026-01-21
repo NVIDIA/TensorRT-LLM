@@ -282,15 +282,12 @@ def compare_logprobs(logprobs_list, ref_new_token_logprobs_list):
 def test_accuracy_with_allreduce_strategy(model_dir, sampler_type, allreduce_strategy):
     """Test accuracy with different allreduce strategies.
 
-    The default allreduce_strategy (AUTO) produced wrong logprobs with large batch size,
-    causing VeRL integration to fail to converge. There may be an issue with the
-    customAllReduce kernels.
-
-    Tracked: NVBug (https://nvbugs/5727691)
+    This test validates that both NCCL and AUTO allreduce strategies produce
+    correct logprobs compared to HuggingFace reference implementation.
 
     Expected behavior:
         - allreduce_strategy="NCCL": Accuracy assertion PASSES
-        - allreduce_strategy="AUTO": Accuracy assertion FAILS
+        - allreduce_strategy="AUTO": Accuracy assertion PASSES
     """
     model_dir = str(llm_models_root() / model_dir)
 
@@ -401,8 +398,4 @@ def test_accuracy_with_allreduce_strategy(model_dir, sampler_type, allreduce_str
     torch.cuda.empty_cache()
 
     # Compare LLM logprobs vs HF reference
-    if allreduce_strategy == "AUTO":
-        with pytest.raises(AssertionError, match=r"Final Min diff: .* is below threshold -2\.30"):
-            compare_logprobs(llm_logprobs, ref_new_token_logprobs)
-    else:
-        compare_logprobs(llm_logprobs, ref_new_token_logprobs)
+    compare_logprobs(llm_logprobs, ref_new_token_logprobs)

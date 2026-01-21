@@ -91,9 +91,9 @@ do_process_all_logs(){
     local gen_num
     local line_count
     local start_line
-    for ctx_log in ${input_folder}/output_ctx_*.log; do
+    for ctx_log in ${input_folder}/3_output_CTX_*.log; do
         if [ -f "${ctx_log}" ]; then
-            ctx_num=$(basename "${ctx_log}" | sed 's/output_ctx_\([0-9]*\)\.log/\1/')
+            ctx_num=$(basename "${ctx_log}" | sed 's/3_output_CTX_\([0-9]*\)\.log/\1/')
             if [ "${mode}" = "line" ]; then
                 line_count=$(wc -l < ${ctx_log})
                 echo ${line_count} > ${output_folder}/ctx_only_line_${ctx_num}.txt
@@ -111,9 +111,9 @@ do_process_all_logs(){
         fi
     done
     # process all the gen log files in the input folder
-    for gen_log in ${input_folder}/output_gen_*.log; do
+    for gen_log in ${input_folder}/3_output_GEN_*.log; do
         if [ -f "${gen_log}" ]; then
-            gen_num=$(basename "${gen_log}" | sed 's/output_gen_\([0-9]*\)\.log/\1/')
+            gen_num=$(basename "${gen_log}" | sed 's/3_output_GEN_\([0-9]*\)\.log/\1/')
             if [ "${mode}" = "line" ]; then
                 line_count=$(wc -l < ${gen_log})
                 echo ${line_count} > ${output_folder}/gen_only_line_${gen_num}.txt
@@ -130,11 +130,20 @@ do_process_all_logs(){
             fi
         fi
     done
+    if [ "${mode}" = "clean" ]; then
+        if [ -d "${tmp_start_logs}" ]; then
+            mkdir -p ${log_path}/start_logs
+            cp ${tmp_start_logs}/3_output_CTX_*.log ${log_path}/start_logs/ 2>/dev/null || true
+            cp ${tmp_start_logs}/3_output_GEN_*.log ${log_path}/start_logs/ 2>/dev/null || true
+            rm -rf ${tmp_start_logs}
+        fi
+    fi
 }
 
-mkdir -p ${log_path}/start_logs
-cp ${log_path}/output_ctx_*.log ${log_path}/start_logs/ 2>/dev/null || true
-cp ${log_path}/output_gen_*.log ${log_path}/start_logs/ 2>/dev/null || true
+tmp_start_logs=/tmp/${SLURM_JOB_ID}/start_logs
+mkdir -p ${tmp_start_logs}
+cp ${log_path}/3_output_CTX_*.log ${tmp_start_logs}/ 2>/dev/null || true
+cp ${log_path}/3_output_GEN_*.log ${tmp_start_logs}/ 2>/dev/null || true
 
 # warmup requests for ucx connections
 if [ "${ucx_warmup_requests}" -gt 0 ]; then
@@ -160,8 +169,8 @@ for concurrency in ${concurrency_list}; do
     num_prompts=$((concurrency * multi_round))
     output_dir="${log_path}/concurrency_${concurrency}"
     echo "Benchmarking with concurrency ${concurrency} ... ${num_prompts} prompts"
-    do_process_all_logs ${log_path}/ ${log_path}/concurrency_${concurrency} "line"
     mkdir -p "${output_dir}"
+    do_process_all_logs ${log_path}/ ${log_path}/concurrency_${concurrency} "line"
 
     python "${BENCH_SCRIPT}" \
         --model "${model_name}" \

@@ -503,7 +503,7 @@ TrtGptModelInflightBatching::~TrtGptModelInflightBatching()
 {
     if (mCacheTransceiver)
     {
-        mCacheTransceiver->checkContextTransferStatus(true);
+        mCacheTransceiver->checkContextTransferStatus(1, true);
         TLLM_CHECK_WITH_INFO(mCacheTransceiver->checkGenTransferComplete(), "Generation transfer not complete");
     }
     if (mAsyncSendWaitThread)
@@ -932,7 +932,7 @@ void TrtGptModelInflightBatching::forwardSync()
     }
     if (mCacheTransceiver)
     {
-        mCacheTransceiver->checkContextTransferStatus(0);
+        mCacheTransceiver->checkContextTransferStatus(0, true);
     }
     ++mIterCounter;
 
@@ -1025,7 +1025,7 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
                 mIterCounter);
             if (mCacheTransceiver)
             {
-                mCacheTransceiver->checkContextTransferStatus(1);
+                mCacheTransceiver->checkContextTransferStatus(1, true);
                 // will free kvCache in next iteration.
             }
         }

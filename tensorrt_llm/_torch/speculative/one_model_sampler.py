@@ -1,6 +1,7 @@
 from typing import Optional
 
 import torch
+from flashinfer.sampling import top_k_top_p_sampling_from_logits
 
 
 def forward_native(
@@ -78,6 +79,9 @@ def sampling_batch_spec_dec_one_model(
     temperatures: torch.Tensor,
     top_k: torch.Tensor,
     top_p: torch.Tensor,
+    use_flashinfer: bool = False,
+    seed: Optional[int] = None,
+    offset: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     CUDA-graph compatible sampling. Supports mixed sampling params.
@@ -87,5 +91,7 @@ def sampling_batch_spec_dec_one_model(
     sampling is opt-in for now.
     """
     logits = apply_temperature(logits, temperatures)
+    if use_flashinfer:
+        return top_k_top_p_sampling_from_logits(logits, top_k, top_p, seed=seed, offset=offset)
     random_sampled = forward_native(logits, top_k, top_p)
     return random_sampled

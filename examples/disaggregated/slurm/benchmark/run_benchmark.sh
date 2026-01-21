@@ -99,11 +99,20 @@ do_process_all_logs(){
             fi
         fi
     done
+    if [ "${mode}" = "clean" ]; then
+        if [ -d "${tmp_start_logs}" ]; then
+            mkdir -p ${log_path}/start_logs
+            cp ${tmp_start_logs}/3_output_CTX_*.log ${log_path}/start_logs/ 2>/dev/null || true
+            cp ${tmp_start_logs}/3_output_GEN_*.log ${log_path}/start_logs/ 2>/dev/null || true
+            rm -rf ${tmp_start_logs}
+        fi
+    fi
 }
 
-mkdir -p ${log_path}/start_logs
-cp ${log_path}/3_output_CTX_*.log ${log_path}/start_logs/ 2>/dev/null || true
-cp ${log_path}/3_output_GEN_*.log ${log_path}/start_logs/ 2>/dev/null || true
+tmp_start_logs=/tmp/${SLURM_JOB_ID}/start_logs
+mkdir -p ${tmp_start_logs}
+cp ${log_path}/3_output_CTX_*.log ${tmp_start_logs}/ 2>/dev/null || true
+cp ${log_path}/3_output_GEN_*.log ${tmp_start_logs}/ 2>/dev/null || true
 
 # warmup requests for ucx connections
 if [ "${ucx_warmup_requests}" -gt 0 ]; then
