@@ -534,6 +534,12 @@ def to_dot(
     try:
         dot.render(save_path, cleanup=True)
         ad_logger.info(f"Diagram saved: {save_path}.{format}")
+
+        # Also save .dot source file if format is not already dot
+        if format != "dot":
+            dot.save(save_path + ".dot")
+            ad_logger.info(f"DOT source saved: {save_path}.dot")
+
         with open(save_path + ".txt", "w") as f:
             f.write(str(graph_module.graph))
     except Exception as e:
@@ -599,7 +605,7 @@ def _get_node_label(graph_module: GraphModule, node: fx.Node) -> str:
     elif node.op == "get_attr":
         attr_name = str(node.target).split(".")[-1] if "." in str(node.target) else str(node.target)
         label = attr_name
-        # Try to get actual dtype from state_dict/parameters
+        # Try to get actual dtype and value/shape from state_dict/parameters
         try:
             # Traverse the attribute path to get the actual tensor
             target_path = str(node.target)
@@ -608,7 +614,15 @@ def _get_node_label(graph_module: GraphModule, node: fx.Node) -> str:
                 obj = getattr(obj, attr)
             if isinstance(obj, torch.Tensor):
                 dtype_str = str(obj.dtype).replace("torch.", "")
-                label = f"{attr_name}\n({dtype_str})"
+                # Distinguish between scalar and tensor
+                if obj.numel() == 1:
+                    # Scalar: type=<dtype>\n<value>
+                    value = obj.item()
+                    label = f"{attr_name}\n{dtype_str}\n{value}"
+                else:
+                    # Tensor: type=<dtype>(shape)
+                    shape_dims = ", ".join(str(d) for d in obj.shape)
+                    label = f"{attr_name}\n{dtype_str}[{shape_dims}]"
         except (AttributeError, RuntimeError):
             pass  # Keep original label if attribute not found
     elif node.op == "placeholder":
