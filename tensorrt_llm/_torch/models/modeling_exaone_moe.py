@@ -516,8 +516,6 @@ class ExaoneMoeMTP(ExaoneMoeDecoderLayer):
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
-        # if self.model_config.mapping.rank == 0:
-        #     print(f"[TRT-LLM DEBUG] ExaoneMoeMTP forward input_ids: {input_ids}")
         def norm_embeds():
             return self.enorm(embed_tokens(input_ids))
 
@@ -648,8 +646,9 @@ class ExaoneMoeForCausalLM(SpecDecOneEngineForCausalLM[ExaoneMoeModel, ExaoneMoE
             and model_config.spec_config.spec_dec_mode.is_mtp_one_model()
         ):
             # NOTE: K-EXAONE does not contain the 'num_nextn_predict_layers' field,
-            # which should be equal to 1. Manually set the value here.
-            model_config.pretrained_config.num_nextn_predict_layers = 1
+            # which should be equal to 1. Manually set the value here if not present.
+            if not hasattr(model_config.pretrained_config, "num_nextn_predict_layers"):
+                model_config.pretrained_config.num_nextn_predict_layers = 1
 
         super().__init__(
             model=ExaoneMoeModel(model_config),
@@ -668,9 +667,7 @@ class ExaoneMoeForCausalLM(SpecDecOneEngineForCausalLM[ExaoneMoeModel, ExaoneMoE
                     "No MTP module is in given checkpoint. Please check if the checkpoint supports the MTP layer "
                     "(`num_nextn_predict_layers`)."
                 )
-            if ckpt_nextn == 1 and not model_config.spec_config.use_mtp_vanilla:
-                pass
-            else:
+            if ckpt_nextn > 1 or model_config.spec_config.use_mtp_vanilla:
                 # modify the QuantConfig to support duplicated mtp layers
                 if model_config.quant_config.exclude_modules is not None:
                     extend_exclude_modules = []

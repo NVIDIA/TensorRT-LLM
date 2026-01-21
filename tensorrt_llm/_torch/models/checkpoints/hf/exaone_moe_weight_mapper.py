@@ -28,7 +28,7 @@ class ExaoneMoeWeightMapper(HfWeightMapper):
     def preprocess_weights(self, weights: dict):
         mtp_layer_offset = self.config.pretrained_config.num_hidden_layers
 
-        for name in list(weights.keys()):
+        for name in weights.keys():
             if name.startswith("mtp.layers."):
                 # mtp.layers.{idx}.* -> model.layers.{offset + idx}.*
                 _, _, mtp_layer_idx, module_name = name.split(".", 3)
@@ -62,7 +62,6 @@ class ExaoneMoeWeightMapper(HfWeightMapper):
                 if new_weight_name.endswith(".weight_scale_inv"):
                     weight_value = weight_value.squeeze()
                 updated_module_weights[new_weight_name] = weight_value
-            del module_weights
             module.load_weights(
                 weights=[updated_module_weights], allow_partial_loading=allow_partial_loading
             )

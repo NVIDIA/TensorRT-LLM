@@ -360,6 +360,7 @@ class ModelConfig(Generic[TConfig]):
             else:
                 quant_config.exclude_modules = default_exclude
 
+        # NOTE: This is for llm-compressor's quantized checkpoints.
         elif hf_quant_config.get("quant_method") == "compressed-tensors":
             config_groups = hf_quant_config.get("config_groups")
             if config_groups is None:
@@ -368,34 +369,39 @@ class ModelConfig(Generic[TConfig]):
 
             weights_quant_config = config_groups["group_0"]["weights"]
             inputs_quant_config = config_groups["group_0"]["input_activations"]
+            weights_quant_strategy = weights_quant_config["strategy"]
+            inputs_quant_strategy = inputs_quant_config["strategy"]
 
             if weights_quant_config["num_bits"] == 8:
-                if weights_quant_config["strategy"] == "channel":
-                    if inputs_quant_config["strategy"] != "token":
+                if weights_quant_strategy == "channel":
+                    if inputs_quant_strategy != "token":
                         raise ValueError(
-                            f"Unsupported inputs_quant_strategy: {inputs_quant_config['strategy']}."
+                            f"Unsupported inputs_quant_strategy: {inputs_quant_strategy}."
                         )
                     quant_config.quant_algo = QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN
-                elif weights_quant_config["strategy"] == "block":
-                    if inputs_quant_config["strategy"] != "group":
+                elif weights_quant_strategy == "block":
+                    if inputs_quant_strategy != "group":
                         raise ValueError(
-                            f"Unsupported inputs_quant_strategy: {inputs_quant_config['strategy']}."
+                            f"Unsupported inputs_quant_strategy: {inputs_quant_strategy}."
                         )
                     quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
                     group_size = inputs_quant_config["group_size"]
+
+                    # NOTE: TRT-LLM only supports group_size=128 for FP8_BLOCK_SCALES.
                     if group_size != 128:
                         raise ValueError(
-                            f"Unsupported group_size: {group_size}.")
+                            f"Unsupported group_size: {group_size}. Supported: 128."
+                        )
                     quant_config.group_size = group_size
 
                 else:
                     raise ValueError(
-                        f"Unsupported weights_quant_strategy: {weights_quant_config['strategy']}."
-                    )
+                        f"Unsupported weights_quant_strategy: {weights_quant_strategy}. "
+                        "Supported strategies: 'channel', 'block'.")
             else:
                 raise ValueError(
-                    f"Unsupported quant_bits: {weights_quant_config['num_bits']}."
-                )
+                    f"Unsupported quant_bits: {weights_quant_config['num_bits']}. "
+                    "Supported: 8.")
 
             quant_config.exclude_modules = hf_quant_config.get("ignore", [])
         return quant_config, layer_quant_config
