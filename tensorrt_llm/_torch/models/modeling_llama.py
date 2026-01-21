@@ -803,7 +803,7 @@ class LlamaDecoderLayer(DecoderLayer):
                     scale=scale,
                     eps=self.post_attention_layernorm.variance_epsilon,
                 ))
-            if self.is_nvfp4:
+            if fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4:
                 act_fp4, act_sf, residual = all_reduce_output
                 hidden_states = Fp4QuantizedTensor(act_fp4, act_sf)
             else:
