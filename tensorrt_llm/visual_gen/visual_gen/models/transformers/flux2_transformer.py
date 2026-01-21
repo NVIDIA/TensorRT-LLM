@@ -221,7 +221,7 @@ class ditFlux2Transformer2DModel(Flux2Transformer2DModel, ditBaseTransformer):
         img_mod1_shift, img_mod1_scale, _ = img_mod1
         
         with disable_weight_management():
-            img_modulated = self.transformer_blocks[0].norm1_context(hidden_states)
+            img_modulated = self.transformer_blocks[0].norm1(hidden_states)
         
         return (1 + img_mod1_scale) * img_modulated + img_mod1_shift
 
