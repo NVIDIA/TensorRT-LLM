@@ -205,17 +205,17 @@ class GatherGroupedGemmInputsHelper(GroupedGemmInputsHelper):
     - permuted_idx_to_expanded_idx specifies the gather pattern
     - Shape inference uses permuted_idx_to_expanded_idx size instead of a size
 
-    Input tensor layout:
-        0: a                       - Original input activation (not permuted)
-        1: b                       - Weight tensor
-        2: a_sf                    - Scale factor for a
-        3: b_sf                    - Scale factor for b
-        4: alpha                   - Per-expert scaling factor
-        5: tile_idx_to_group_idx   - Tile to expert mapping
-        6: tile_idx_to_mn_limit    - Tile M/N limits
-        7: permuted_idx_to_expanded_idx        - Token permutation mapping
-        8: num_non_exiting_tiles   - Number of valid tiles
-        9: global_sf               - Global scale factor
+    Input layout (positions 1, 3, 4 are lists for multi-B support):
+        0: a                               - tensor, original input activation
+        1: b_list                          - list of tensors, weight tensors
+        2: a_sf                            - tensor, scale factor for a
+        3: b_sf_list                       - list of tensors, scale factors for b
+        4: alpha_list                      - list of tensors, per-expert scaling factors
+        5: tile_idx_to_group_idx           - tensor, tile to expert mapping
+        6: tile_idx_to_mn_limit            - tensor, tile M/N limits
+        7: permuted_idx_to_expanded_idx    - tensor, token permutation mapping
+        8: num_non_exiting_tiles           - tensor, number of valid tiles
+        9: global_sf                       - tensor, global scale factor
     """
     # Override: use permuted_idx_to_expanded_idx for shape inference
     IDX_PERMUTED_IDX_TO_EXPANDED_IDX = 7
@@ -259,7 +259,7 @@ class GatherGroupedGemmInputsHelper(GroupedGemmInputsHelper):
             permuted_idx_to_expanded_idx.append(self.pad_val)
         return permuted_idx_to_expanded_idx
 
-    def inputs_pre_hook(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+    def inputs_pre_hook(self, inputs: List) -> List:
         """Pre-hook for gather-based SwiGLU fusion kernel.
 
         Generates:
@@ -267,9 +267,22 @@ class GatherGroupedGemmInputsHelper(GroupedGemmInputsHelper):
             - tile_idx_to_mn_limit
             - permuted_idx_to_expanded_idx (for gather operation)
             - num_non_exiting_tiles
+
+        Input layout (positions 1, 3, 4 are lists):
+            0: a                               - tensor
+            1: b_list                          - list of tensors
+            2: a_sf                            - tensor
+            3: b_sf_list                       - list of tensors
+            4: alpha_list                      - list of tensors
+            5: tile_idx_to_group_idx           - tensor
+            6: tile_idx_to_mn_limit            - tensor
+            7: permuted_idx_to_expanded_idx    - tensor
+            8: num_non_exiting_tiles           - tensor
+            9: global_sf                       - tensor
         """
-        a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx, tile_idx_to_mn_limit, \
-            permuted_idx_to_expanded_idx, num_non_exiting_tiles, global_sf = inputs
+        a, b_list, a_sf, b_sf_list, alpha_list, tile_idx_to_group_idx, \
+            tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, \
+            num_non_exiting_tiles, global_sf = inputs
         # Verify permuted_idx_to_expanded_idx index matches the class constant
         assert inputs[
             self.
@@ -309,7 +322,7 @@ class GatherGroupedGemmInputsHelper(GroupedGemmInputsHelper):
             [num_non_exiting_tiles_val],
             dtype=num_non_exiting_tiles.dtype,
             device=num_non_exiting_tiles.device)
-        return (a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx,
+        return (a, b_list, a_sf, b_sf_list, alpha_list, tile_idx_to_group_idx,
                 tile_idx_to_mn_limit, permuted_idx_to_expanded_idx,
                 num_non_exiting_tiles, global_sf)
 
@@ -1825,13 +1838,23 @@ if IS_CUTLASS_DSL_AVAILABLE:
         kernel_cache = dict()
         tuning_config_cache = dict()
 
+        # Maximum number of B tensors supported (must match kernel's MAX_B_TENSORS)
+        MAX_B_TENSORS = 4
+
         def __init__(self,
                      num_experts: int,
                      top_k: int,
                      num_local_experts: int,
                      local_expert_offset: int,
                      tile_size: int,
-                     scaling_vector_size: int = 16):
+                     scaling_vector_size: int = 16,
+                     b_tensor_l_sizes: Optional[Tuple[int, ...]] = None):
+            """Initialize the runner.
+
+            Args:
+                b_tensor_l_sizes: Tuple of L sizes for each B tensor in multi-B mode.
+                    None for single-B mode. Used for kernel cache key.
+            """
             super().__init__()
             self.num_experts = num_experts
             self.top_k = top_k
@@ -1843,6 +1866,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 )
             self.tile_size = tile_size
             self.scaling_vector_size = scaling_vector_size
+            self.b_tensor_l_sizes = b_tensor_l_sizes
 
             if (sm_version := get_sm_version()) not in (100, 103):
                 raise ValueError(
@@ -1862,19 +1886,24 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.local_expert_offset,
                 self.tile_size,
                 self.scaling_vector_size,
+                self.b_tensor_l_sizes,
             )
 
         def get_valid_tactics(
             self,
-            inputs: List[torch.Tensor],
+            inputs: List,
             profile: OptimizationProfile,
             **kwargs,
         ) -> List[Tuple[int, int]]:
-            a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, *_ = inputs
+            # Tuning uses layout: a, b_list, a_sf, b_sf_list, alpha_list, ...
+            a = inputs[0]
+            b_list = inputs[1]  # List of B tensors
+            permuted_idx_to_expanded_idx = inputs[7]
             # m is the permuted size from permuted_idx_to_expanded_idx, not from a
             m = permuted_idx_to_expanded_idx.size(0)
             k = a.size(1) * 2
-            l, n = b.size(0), b.size(1)
+            l = sum(bi.size(0) for bi in b_list)
+            n = b_list[0].size(1)
 
             mma_tiler_mn_candidates = [(self.tile_size, 128),
                                        (self.tile_size, 256)]
@@ -1914,6 +1943,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                                        self.num_local_experts,
                                                        self.local_expert_offset,
                                                        self.tile_size)
+                # Tuning uses layout:
+                # a, b_list, a_sf, b_sf_list, alpha_list, tile_idx, tile_mn_limit, permuted_idx, ...
+                # Constraint indices adjusted for list inputs at positions 1, 3, 4
                 self.__class__.tuning_config_cache[key] = TuningConfig(
                     # Use permuted_idx_to_expanded_idx (IDX_SHAPE_INFER) for tuning
                     dynamic_tensor_specs=(DynamicTensorSpec(
@@ -1934,41 +1966,60 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 )
             return self.__class__.tuning_config_cache[key]
 
-        def forward(self, inputs: List[torch.Tensor],
+        def forward(self, inputs: List,
                     tactic: Optional[tuple]) -> torch.Tensor:
-            a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, global_sf = inputs
-            # Verify permuted_idx_to_expanded_idx index matches the class constant
-            assert inputs[
-                GatherGroupedGemmInputsHelper.
-                IDX_PERMUTED_IDX_TO_EXPANDED_IDX] is permuted_idx_to_expanded_idx
+            """Forward pass supporting both single tensor and list inputs.
+
+            Input layout (positions 1, 3, 4 are lists for multi-B support):
+                0: a                               - tensor
+                1: b_list                          - list of tensors
+                2: a_sf                            - tensor
+                3: b_sf_list                       - list of tensors
+                4: alpha_list                      - list of tensors
+                5: tile_idx_to_group_idx           - tensor
+                6: tile_idx_to_mn_limit            - tensor
+                7: permuted_idx_to_expanded_idx    - tensor
+                8: num_non_exiting_tiles           - tensor
+                9: global_sf                       - tensor
+            """
+            a, b_list, a_sf, b_sf_list, alpha_list, tile_idx_to_group_idx, \
+                tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, \
+                num_non_exiting_tiles, global_sf = inputs
+
+            num_b = len(b_list)
+            is_multi_b = num_b > 1
+            b_tensor_l_sizes = tuple(bi.size(0)
+                                     for bi in b_list) if is_multi_b else None
+
+            b0 = b_list[0]  # Use first B for shape inference
+
+            # Verify input dtypes and dimensions
             assert a.dtype == torch.float4_e2m1fn_x2
             assert a.dim() == 2
-            assert b.dtype == torch.float4_e2m1fn_x2
-            assert b.dim() == 3
+            assert b0.dtype == torch.float4_e2m1fn_x2
+            assert b0.dim() == 3
             assert a_sf.dtype == torch.uint8
             assert a_sf.dim() == 2
-            assert b_sf.dtype == torch.uint8
-            assert b_sf.dim() == 3
-            assert alpha.dtype == torch.float32
-            assert alpha.dim() == 1
+            assert b_sf_list[0].dtype == torch.uint8
+            assert b_sf_list[0].dim() == 3
+            assert alpha_list[0].dtype == torch.float32
+            assert alpha_list[0].dim() == 1
 
             # a.size(0) is orig_m (original input size before gather)
             # permuted_idx_to_expanded_idx.size(0) is m (permuted size after gather)
             orig_m, k = a.size(0), a.size(1) * 2
             m = permuted_idx_to_expanded_idx.size(0)
-            l, n = b.size(0), b.size(1)
+            n = b0.size(1)
+            l = sum(bi.size(0) for bi in b_list)
             scale_k = k // self.scaling_vector_size
             interm_size = n // 2
+
             assert m % self.tile_size == 0
             assert k % (self.scaling_vector_size * 4) == 0
             assert n % (self.scaling_vector_size * 4 * 2) == 0
-            assert b.size(2) * 2 == k
+            assert b0.size(2) * 2 == k
             assert a_sf.size(0) == orig_m
             assert a_sf.size(1) == scale_k
-            assert b_sf.size(0) == l
-            assert b_sf.size(1) == n
-            assert b_sf.size(2) == scale_k
-            assert alpha.size(0) == l
 
             num_tiles = m // self.tile_size
             assert tile_idx_to_group_idx.dtype == torch.int32
@@ -1982,29 +2033,29 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert global_sf.dtype == torch.float32
             assert global_sf.numel() == 1
 
+            # Allocate output tensors
             c = torch.empty(m, interm_size // 2, dtype=a.dtype, device=a.device)
             c_sf = torch.empty(m * interm_size // self.scaling_vector_size,
                                dtype=a_sf.dtype,
                                device=a_sf.device)
 
+            # Create common pointers
             a_ptr = make_ptr(cutlass.Float4E2M1FN,
                              a.data_ptr(),
-                             cute.AddressSpace.gmem,
-                             assumed_align=32)
-            b_ptr = make_ptr(cutlass.Float4E2M1FN,
-                             b.data_ptr(),
                              cute.AddressSpace.gmem,
                              assumed_align=32)
             a_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
                                 a_sf.data_ptr(),
                                 cute.AddressSpace.gmem,
                                 assumed_align=16)
-            b_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
-                                b_sf.data_ptr(),
+            c_ptr = make_ptr(cutlass.Float4E2M1FN,
+                             c.data_ptr(),
+                             cute.AddressSpace.gmem,
+                             assumed_align=32)
+            c_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                                c_sf.data_ptr(),
                                 cute.AddressSpace.gmem,
                                 assumed_align=16)
-            alpha_ptr = make_ptr(cutlass.Float32, alpha.data_ptr(),
-                                 cute.AddressSpace.gmem)
             tile_idx_to_group_idx_ptr = make_ptr(
                 cutlass.Int32, tile_idx_to_group_idx.data_ptr(),
                 cute.AddressSpace.gmem)
@@ -2019,14 +2070,33 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cute.AddressSpace.gmem)
             global_sf_ptr = make_ptr(cutlass.Float32, global_sf.data_ptr(),
                                      cute.AddressSpace.gmem)
-            c_ptr = make_ptr(cutlass.Float4E2M1FN,
-                             c.data_ptr(),
-                             cute.AddressSpace.gmem,
-                             assumed_align=32)
-            c_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
-                                c_sf.data_ptr(),
-                                cute.AddressSpace.gmem,
-                                assumed_align=16)
+
+            # Create B tensor pointers (tuple for multi-B, single for single-B)
+            b_ptr = tuple(
+                make_ptr(cutlass.Float4E2M1FN,
+                         bi.data_ptr(),
+                         cute.AddressSpace.gmem,
+                         assumed_align=32)
+                for bi in b_list) if is_multi_b else make_ptr(
+                    cutlass.Float4E2M1FN,
+                    b0.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=32)
+            b_sf_ptr = tuple(
+                make_ptr(cutlass.Float8E4M3FN,
+                         bsfi.data_ptr(),
+                         cute.AddressSpace.gmem,
+                         assumed_align=16)
+                for bsfi in b_sf_list) if is_multi_b else make_ptr(
+                    cutlass.Float8E4M3FN,
+                    b_sf_list[0].data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16)
+            alpha_ptr = tuple(
+                make_ptr(cutlass.Float32, ai.data_ptr(), cute.AddressSpace.gmem)
+                for ai in alpha_list) if is_multi_b else make_ptr(
+                    cutlass.Float32, alpha_list[0].data_ptr(),
+                    cute.AddressSpace.gmem)
 
             torch_stream = torch.cuda.current_stream()
             stream = cuda.CUstream(torch_stream.cuda_stream)
@@ -2040,8 +2110,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert mma_tiler_mn[
                 0] == self.tile_size, f"Tactic ({tactic}) is incompatible with tile size ({self.tile_size})"
 
+            # Cache key includes b_tensor_l_sizes (None for single-B, tuple for multi-B)
             cache_key = (self.scaling_vector_size, self.tile_size, self.top_k,
-                         mma_tiler_mn, cluster_shape_mn, raster_along_m)
+                         mma_tiler_mn, cluster_shape_mn, raster_along_m,
+                         b_tensor_l_sizes)
+
+            # Compile kernel if not cached
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
                     sf_vec_size=self.scaling_vector_size,
@@ -2050,31 +2124,28 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     vectorized_f32=True,
                     topk=self.top_k,
                     raster_along_m=raster_along_m,
+                    b_tensor_l_sizes=b_tensor_l_sizes,
                 )
-                # Compute max active clusters on current device
                 hardware_info = cutlass.utils.HardwareInfo()
                 max_active_clusters = hardware_info.get_max_active_clusters(
                     cluster_shape_mn[0] * cluster_shape_mn[1])
 
+                # Choose wrapper function based on mode
+                wrapper_fn = gemm.wrapper_multi_b if is_multi_b else gemm.wrapper
+
+                # Build compile arguments - differs only in B tensor args and l parameter
+                compile_args = [
+                    a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, c_sf_ptr,
+                    alpha_ptr, tile_idx_to_group_idx_ptr,
+                    tile_idx_to_mn_limit_ptr, permuted_idx_to_expanded_idx_ptr,
+                    num_non_exiting_tiles_ptr, global_sf_ptr, orig_m, m, n, k
+                ]
+                if not is_multi_b:
+                    compile_args.append(l)  # Single-B needs l parameter
+
                 compiled_gemm = cute.compile(
-                    gemm.wrapper,
-                    a_ptr,
-                    b_ptr,
-                    a_sf_ptr,
-                    b_sf_ptr,
-                    c_ptr,
-                    c_sf_ptr,
-                    alpha_ptr,
-                    tile_idx_to_group_idx_ptr,
-                    tile_idx_to_mn_limit_ptr,
-                    permuted_idx_to_expanded_idx_ptr,
-                    num_non_exiting_tiles_ptr,
-                    global_sf_ptr,
-                    orig_m,
-                    m,
-                    n,
-                    k,
-                    l,
+                    wrapper_fn,
+                    *compile_args,
                     tile_size=self.tile_size,
                     scaling_vector_size=self.scaling_vector_size,
                     max_active_clusters=max_active_clusters,
@@ -2084,26 +2155,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
             else:
                 compiled_gemm = self.__class__.kernel_cache[cache_key]
 
-            compiled_gemm(
-                a_ptr,
-                b_ptr,
-                a_sf_ptr,
-                b_sf_ptr,
-                c_ptr,
-                c_sf_ptr,
-                alpha_ptr,
-                tile_idx_to_group_idx_ptr,
-                tile_idx_to_mn_limit_ptr,
-                permuted_idx_to_expanded_idx_ptr,
-                num_non_exiting_tiles_ptr,
-                global_sf_ptr,
-                orig_m,
-                m,
-                n,
-                k,
-                l,
-                stream=stream,
-            )
+            # Execute kernel - same args as compile (without constexpr params)
+            exec_args = [
+                a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, c_sf_ptr, alpha_ptr,
+                tile_idx_to_group_idx_ptr, tile_idx_to_mn_limit_ptr,
+                permuted_idx_to_expanded_idx_ptr, num_non_exiting_tiles_ptr,
+                global_sf_ptr, orig_m, m, n, k
+            ]
+            if not is_multi_b:
+                exec_args.append(l)  # Single-B needs l parameter
+
+            compiled_gemm(*exec_args, stream=stream)
+
             return c, c_sf
 
     @torch.library.custom_op(
@@ -2112,10 +2175,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
         device_types="cuda")
     def cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell(
         input: torch.Tensor,
-        weight: torch.Tensor,
+        weight: List[torch.Tensor],
         input_scale: torch.Tensor,
-        weight_scale: torch.Tensor,
-        alpha: torch.Tensor,
+        weight_scale: List[torch.Tensor],
+        alpha: List[torch.Tensor],
         tile_idx_to_group_idx: torch.Tensor,
         tile_idx_to_mn_limit: torch.Tensor,
         permuted_idx_to_expanded_idx: torch.Tensor,
@@ -2128,11 +2191,22 @@ if IS_CUTLASS_DSL_AVAILABLE:
         tile_size: int,
         scaling_vector_size: int = 16,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """CuteDSL-based NVFP4 gather grouped GEMM with SwiGLU fusion.
+
+        Args:
+            weight: List of B tensors. Single-B mode: [b], multi-B mode: [b0, b1, ...].
+            weight_scale: List of scale tensors, matching weight.
+            alpha: List of alpha tensors, matching weight.
+        """
         tuner = AutoTuner.get()
+
+        # Infer b_tensor_l_sizes from weight
+        b_tensor_l_sizes = tuple(w.size(0)
+                                 for w in weight) if len(weight) > 1 else None
 
         runner = Sm100BlockScaledContiguousGatherGroupedGemmSwigluFusionRunner(
             num_experts, top_k, num_local_experts, local_expert_offset,
-            tile_size, scaling_vector_size)
+            tile_size, scaling_vector_size, b_tensor_l_sizes)
         inputs = [
             input, weight, input_scale, weight_scale, alpha,
             tile_idx_to_group_idx, tile_idx_to_mn_limit,
@@ -2145,17 +2219,19 @@ if IS_CUTLASS_DSL_AVAILABLE:
             runner.get_tuning_config(),
             inputs,
         )
-        output = runner(inputs, tactic=best_tactic)
+
+        # Call forward with inputs list
+        output = runner.forward(inputs, tactic=best_tactic)
         return output
 
     @torch.library.register_fake(
         "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell")
     def _(
         input: torch.Tensor,
-        weight: torch.Tensor,
+        weight: List[torch.Tensor],
         input_scale: torch.Tensor,
-        weight_scale: torch.Tensor,
-        alpha: torch.Tensor,
+        weight_scale: List[torch.Tensor],
+        alpha: List[torch.Tensor],
         tile_idx_to_group_idx: torch.Tensor,
         tile_idx_to_mn_limit: torch.Tensor,
         permuted_idx_to_expanded_idx: torch.Tensor,
@@ -2169,7 +2245,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         scaling_vector_size: int = 16,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         m = permuted_idx_to_expanded_idx.size(0)
-        n = weight.size(1)
+        n = weight[0].size(1)
         interm_size = n // 2
         output = torch.empty(m,
                              interm_size // 2,

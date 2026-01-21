@@ -865,10 +865,10 @@ def test_nvfp4_gather_grouped_gemm_swiglu_blackwell(
     # Call gather kernel
     c, c_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell(
         a,
-        b_interleaved,
+        [b_interleaved],
         a_sf_unswizzled,
-        b_sf_interleaved,
-        alpha,
+        [b_sf_interleaved],
+        [alpha],
         tile_idx_to_group_idx,
         tile_idx_to_mn_limit,
         permuted_idx_to_expanded_idx,

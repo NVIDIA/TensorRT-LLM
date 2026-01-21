@@ -483,10 +483,10 @@ class CuteDslFusedMoE(CutlassFusedMoE):
 
         x, x_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell(
             input=x.view(torch.float4_e2m1fn_x2),
-            weight=self.w3_w1_weight.view(torch.float4_e2m1fn_x2),
+            weight=[self.w3_w1_weight.view(torch.float4_e2m1fn_x2)],
             input_scale=x_sf.view(torch.uint8),
-            weight_scale=self.quant_scales.fc1_weight_block.view(torch.uint8),
-            alpha=self.quant_scales.fc1_global,
+            weight_scale=[self.quant_scales.fc1_weight_block.view(torch.uint8)],
+            alpha=[self.quant_scales.fc1_global],
             tile_idx_to_group_idx=tile_idx_to_expert_idx,
             tile_idx_to_mn_limit=tile_idx_to_mn_limit,
             permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
