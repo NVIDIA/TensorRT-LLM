@@ -7,13 +7,14 @@ import time
 import pytest
 import requests
 import yaml
+from defs.common import get_free_port_in_ci
 from defs.conftest import llm_models_root, skip_no_hopper
 from defs.trt_test_alternative import popen, print_error, print_info
 from openai import OpenAI
 from requests.exceptions import RequestException
 
 
-def check_server_ready(http_port="8000", timeout_timer=600, sleep_interval=5):
+def check_server_ready(http_port, timeout_timer=600, sleep_interval=5):
     timer = 0
     while timer <= timeout_timer:
         try:
@@ -49,7 +50,7 @@ def wait_for_log(log_queue, expected_log, timeout=10):
     return False
 
 
-def check_openai_chat_completion(http_port="8000",
+def check_openai_chat_completion(http_port,
                                  model_name="TinyLlama-1.1B-Chat-v1.0"):
     """
     Test the launched trtllm-serve server using OpenAI client.
@@ -127,6 +128,7 @@ def test_config_file_loading(serve_test_root, config_flag):
     assert os.path.exists(
         model_path), f"model_path does not exist: {model_path}"
 
+    port = get_free_port_in_ci()
     cmd = [
         "trtllm-serve",
         "serve",
@@ -134,7 +136,7 @@ def test_config_file_loading(serve_test_root, config_flag):
         "--host",
         "0.0.0.0",
         "--port",
-        "8000",
+        str(port),
         "--backend",
         "pytorch",
         config_flag,
@@ -143,11 +145,11 @@ def test_config_file_loading(serve_test_root, config_flag):
 
     print_info(f"Launching trtllm-serve with {config_flag}...")
     with popen(cmd):
-        check_server_ready()
+        check_server_ready(http_port=port)
         # Extract model name from the model path for consistency
         model_name = model_path.split('/')[-1]  # "Qwen3-30B-A3B-FP8"
         # Test the server with OpenAI chat completion
-        check_openai_chat_completion(model_name=model_name)
+        check_openai_chat_completion(http_port=port, model_name=model_name)
 
 
 @skip_no_hopper
@@ -170,7 +172,7 @@ def test_env_overrides_pdl(tmp_path):
             }
         }))
 
-    port = 8001
+    port = get_free_port_in_ci()
     env = os.environ.copy()
     # Pre-load with 0 to verify override works
     env.update({
@@ -198,7 +200,7 @@ def test_env_overrides_pdl(tmp_path):
             [output_queue.put(line) for line in iter(proc.stdout.readline, '')],
             daemon=True).start()
 
-        check_server_ready(http_port=str(port), timeout_timer=300)
+        check_server_ready(http_port=port, timeout_timer=300)
         response = OpenAI(base_url=f"http://localhost:{port}/v1",
                           api_key="tensorrt_llm").chat.completions.create(
                               model="TinyLlama-1.1B-Chat-v1.0",
