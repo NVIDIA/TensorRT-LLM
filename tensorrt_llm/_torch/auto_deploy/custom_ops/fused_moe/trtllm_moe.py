@@ -20,8 +20,12 @@ import torch
 from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.quant import (
     TRTLLM_NVFP4_SCALING_VECTOR_SIZE,
 )
+<<<<<<< HEAD
 from tensorrt_llm._torch.auto_deploy.utils.mapping_utils import deserialize_mapping
 from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
+=======
+from tensorrt_llm._torch.modules.fused_moe.routing import RoutingMethodType
+>>>>>>> d17461ce7 (added unit test)
 from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm._utils import is_sm_100f
@@ -655,6 +659,10 @@ def trtllm_quant_hf_fp8_block_scale_moe_fused(
         # Blackwell kernel expects bfloat16 for topk_weights
         routing_weights_bf16 = routing_weights.to(torch.bfloat16).contiguous()
 
+        # Blackwell kernel expects float32 for weight scales
+        fc1_weight_scale_f32 = fc1_weight_scale.to(torch.float32).contiguous()
+        fc2_weight_scale_f32 = fc2_weight_scale.to(torch.float32).contiguous()
+
         # Call Blackwell fp8_block_scale_moe_runner with pre-computed routing
         output = torch.ops.trtllm.fp8_block_scale_moe_runner(
             None,  # routing_logits - not needed when topk_weights/topk_ids provided
@@ -662,9 +670,9 @@ def trtllm_quant_hf_fp8_block_scale_moe_fused(
             x_fp8,
             x_sf,
             fc1_expert_weights.contiguous(),
-            fc1_weight_scale.contiguous(),
+            fc1_weight_scale_f32,
             fc2_expert_weights.contiguous(),
-            fc2_weight_scale.contiguous(),
+            fc2_weight_scale_f32,
             num_experts,
             top_k,
             None,  # n_group - default 0 (no grouped routing)
@@ -673,7 +681,7 @@ def trtllm_quant_hf_fp8_block_scale_moe_fused(
             0,  # local_expert_offset - default 0 (no EP sharding)
             num_experts,  # local_num_experts - same as num_experts (no EP sharding)
             None,  # routed_scaling_factor - default 1.0
-            0,  # routing_method_type - RoutingMethodType.Default (not used with pre-computed routing)
+            RoutingMethodType.Renormalize,  # routing weights already pre-computed, type just needs a supported value
             topk_weights=routing_weights_bf16,
             topk_ids=selected_experts,
         )
