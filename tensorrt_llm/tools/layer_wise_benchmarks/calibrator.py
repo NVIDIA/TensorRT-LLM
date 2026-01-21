@@ -75,35 +75,31 @@ class Calibrator:
         self.mode = Mode.NONE
         self._started = False
 
-    def init(self, mode: str, file_path: str, mapping, dist, layer_indices):
+    def init(self, mode: str, file_path: str, layer_indices: list[int], mapping, dist):
         """Initialize the calibrator.
 
         Args:
             mode: One of "NONE", "MARK", "COLLECT", "REPLAY".
             file_path: Path to the calibration data file.
-            mapping: Tensor parallel mapping containing rank and world_size.
-            dist: Distributed communication wrapper.
             layer_indices: Optional list of layer indices to filter.
                           COLLECT mode: If None, all layers are collected.
                           REPLAY mode: Cannot be None.
+            mapping: Tensor parallel mapping containing rank and world_size.
+            dist: Distributed communication wrapper.
         """
         self.mode = Mode[mode]
-        self._file_path = file_path
-        self._dist = dist
 
         if self.mode == Mode.COLLECT:
-            self._init_collect_mode(layer_indices)
+            self._init_collect_mode(file_path, layer_indices, dist)
 
         if self.mode == Mode.REPLAY:
-            self._init_replay_mode(file_path, mapping, layer_indices)
+            self._init_replay_mode(file_path, layer_indices, mapping)
 
-    def _init_collect_mode(self, layer_indices):
-        """Initialize buffers for COLLECT mode.
-
-        Args:
-            layer_indices: Optional list of layer indices to filter.
-        """
+    def _init_collect_mode(self, file_path, layer_indices, dist):
+        """Initialize buffers for COLLECT mode."""
+        self._file_path = file_path
         self._layer_indices = layer_indices
+        self._dist = dist
 
         # Metadata list that `_metadata_idx_gpu` indexes into
         self._metadata_list = []
@@ -121,14 +117,8 @@ class Calibrator:
             device="cuda",
         )
 
-    def _init_replay_mode(self, file_path: str, mapping, layer_indices):
-        """Initialize replay database from file.
-
-        Args:
-            file_path: Path to the calibration data file.
-            mapping: Tensor parallel mapping containing rank and world_size.
-            layer_indices: List of layer indices to filter.
-        """
+    def _init_replay_mode(self, file_path, layer_indices, mapping):
+        """Initialize replay database from file."""
         with open(file_path) as f:
             data = json.load(f)
 

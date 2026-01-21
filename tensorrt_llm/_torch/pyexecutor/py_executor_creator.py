@@ -358,9 +358,9 @@ def create_py_executor(
     calibrator = get_calibrator()
     layer_wise_benchmarks_config = llm_args.layer_wise_benchmarks_config
     calibrator.init(layer_wise_benchmarks_config.calibration_mode,
-                    layer_wise_benchmarks_config.calibration_file_path, mapping,
-                    dist,
-                    layer_wise_benchmarks_config.calibration_layer_indices)
+                    layer_wise_benchmarks_config.calibration_file_path,
+                    layer_wise_benchmarks_config.calibration_layer_indices,
+                    mapping, dist)
     model_engine.model = calibrator.maybe_wrap_model(model_engine.model)
 
     if has_draft_model_engine:

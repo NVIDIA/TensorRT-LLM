@@ -189,7 +189,7 @@ logger.info("Layer-wise benchmarks: Create runner  ... Done")
 
 calibrator = get_calibrator()
 if args.replay_file_path:
-    calibrator.init("REPLAY", args.replay_file_path, mapping, None, args.layer_indices)
+    calibrator.init("REPLAY", args.replay_file_path, args.layer_indices, mapping, None)
     if args.replay_start_iter is None:
         replay_start_iter, replay_stop_iter = calibrator.get_replay_iteration_range()
     else:
@@ -198,7 +198,7 @@ if args.replay_file_path:
         f"Layer-wise benchmarks: Replay iteration range [{replay_start_iter}, {replay_stop_iter}]"
     )
 else:
-    calibrator.init("NONE", None, mapping, None, args.layer_indices)
+    calibrator.init("NONE", None, args.layer_indices, mapping, None)
     replay_start_iter, replay_stop_iter = 1, 1  # To avoid None in mathematics
 calibrator.maybe_wrap_model(runner.model)
 
