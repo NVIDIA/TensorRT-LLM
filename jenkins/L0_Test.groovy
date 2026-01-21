@@ -701,6 +701,13 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                         if (fileExists('/dev/gdrdrv')) {
                             dockerArgs += " --device=/dev/gdrdrv:/dev/gdrdrv"
                         }
+                        if (fileExists('/home/scratch.trt_llm_data_ci')) {
+                            dockerArgs += " -v /home/scratch.trt_llm_data_ci:/scratch.trt_llm_data:ro "
+                        } else if (fileExists('/home/scratch.trt_llm_data')) {
+                            dockerArgs += " -v /home/scratch.trt_llm_data:/scratch.trt_llm_data:ro "
+                        } else {
+                            error "Please specified a trt_llm test data volume"
+                        }
                     }
                 }
 
@@ -710,7 +717,6 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                     "--entrypoint=\"\" " +
                     "--security-opt seccomp=unconfined " +
                     "-u root:root " +
-                    "-v /home/scratch.trt_llm_data_ci:/scratch.trt_llm_data:ro " +
                     "-v /tmp/ccache:${CCACHE_DIR}:rw " +
                     "-v /tmp/pipcache/http-v2:/root/.cache/pip/http-v2:rw " +
                     "--cap-add=SYSLOG"
@@ -1855,7 +1861,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     server: 10.117.145.14
                     path: /vol/scratch1/scratch.michaeln_blossom
     """
-    if (type.contains("6000d") || type.contains("gh200")) {
+    /* if (type.contains("6000d") || type.contains("gh200")) {
         // rtx-pro-6000d and gh200 nodes are located in Austin DC, we use the FlexCache to speed up the data access.
         llmModelVolume = """
                 - name: scratch-trt-llm-data
@@ -1863,7 +1869,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     server: 10.20.162.212
                     path: /vol/scratch26/scratch.trt_llm_data
         """
-    }
+    }*/ // Using blossom pvc temporarily due to slow access for the flex cache in Austin
 
     def podConfig = [
         cloud: targetCloud,
