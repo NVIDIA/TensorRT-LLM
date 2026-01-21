@@ -111,6 +111,11 @@ public:
     static void serialize(kv_cache::CacheState const& state, std::ostream& os);
     [[nodiscard]] static size_t serializedSize(kv_cache::CacheState const& state);
 
+    // RnnCacheState
+    [[nodiscard]] static rnn_cache::RnnCacheState deserializeRnnCacheState(std::istream& is);
+    static void serialize(rnn_cache::RnnCacheState const& state, std::ostream& os);
+    [[nodiscard]] static size_t serializedSize(rnn_cache::RnnCacheState const& state);
+
     // DataTransceiverState
     [[nodiscard]] static DataTransceiverState deserializeDataTransceiverState(std::istream& is);
     [[nodiscard]] static DataTransceiverState deserializeDataTransceiverState(std::vector<char>& buffer);
