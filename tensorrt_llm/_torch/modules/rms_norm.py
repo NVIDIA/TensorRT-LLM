@@ -86,8 +86,6 @@ class RMSNorm(nn.Module):
                     f"layeridx={getattr(self, 'layer_idx', None)} RMSNorm NVFP4 output requested "
                     "but no `nvfp4_scale` is attached; ")
             else:
-                from torch.ops.trtllm import fused_add_rms_norm_quant
-
                 orig_shape = tuple(hidden_states.shape)
                 n = int(orig_shape[-1])
                 hs_2d = hidden_states.reshape(-1, n).contiguous()
@@ -114,7 +112,7 @@ class RMSNorm(nn.Module):
                 sf_scale = nvfp4_scale.contiguous(
                 ) if nvfp4_scale is not None else None
 
-                normed_fp4_i32, residual_out_2d, sf_fused = fused_add_rms_norm_quant(
+                normed_fp4_i32, residual_out_2d, sf_fused = torch.ops.trtllm.fused_add_rms_norm_quant(
                     hs_2d,
                     res_2d,
                     gamma,
