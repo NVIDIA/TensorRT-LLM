@@ -38,7 +38,6 @@ class Eagle3ResourceManager(BaseResourceManager):
         # Reserve one more slot for the dummy request.
         slot_size = self.max_seq_len + 1
         self.slot_manager = SlotManager(slot_size)
-        # This class is reused by MTP_EAGLE
         from ...llmapi.llm_args import EagleDecodingConfig
 
         if isinstance(config, EagleDecodingConfig):
@@ -119,7 +118,6 @@ class Eagle3SpecMetadata(SpecMetadata):
     is_draft_model: bool = False
     is_first_draft: bool = False
     eagle3_resource_manager: Optional[Eagle3ResourceManager] = None
-    is_mtp_eagle: bool = False
 
     eagle_choices: Optional[List[List[int]]] = None
     max_total_draft_tokens: int = 0
@@ -132,7 +130,7 @@ class Eagle3SpecMetadata(SpecMetadata):
         if self.is_draft_model:
             self.layers_to_capture = (self.num_layers - 1, )
         elif self.layers_to_capture is None:
-            if self.num_layers == 1 or self.is_mtp_eagle:
+            if self.num_layers == 1:
                 self.layers_to_capture = (-1, )
             else:
                 if self.num_layers <= 5:

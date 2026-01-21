@@ -287,7 +287,7 @@ def create_py_executor(
                 f"Falling back to greedy decoding for {spec_config.decoding_type}. If you "
                 "want to use non-greedy sampling, please set allow_advanced_sampling=True."
             )
-        elif spec_config.spec_dec_mode.is_mtp_one_model():
+        elif spec_config.spec_dec_mode.is_mtp():
             logger.warning(
                 "Advanced sampling is not supported for MTP yet - this will be added soon."
             )
@@ -404,9 +404,6 @@ def create_py_executor(
                 is_draft_model=True,
                 drafting_loop_wrapper=drafting_loop_wrapper,
             )
-            # For DeepseekV3 MTP, we need to set the num_hidden_layers to 1 for the draft model
-            if spec_config.spec_dec_mode.is_mtp_eagle():
-                draft_model_engine.model.model_config.pretrained_config.num_hidden_layers = 1
             draft_model_engine.load_weights_from_target_model(
                 model_engine.model)
     else:

@@ -714,8 +714,8 @@ class MTPForCausalLM(nn.Module):
                     f"Model type {model_type} not supported for MTP")
 
         spec_dec_mode = model_config.spec_config.spec_dec_mode
-        assert spec_dec_mode.is_mtp_one_model()
-        mtp_num_layers = 1 if spec_dec_mode.is_mtp_eagle_one_model(
+        assert spec_dec_mode.is_mtp()
+        mtp_num_layers = 1 if spec_dec_mode.is_mtp_eagle(
         ) else model_config.spec_config.num_nextn_predict_layers
 
         moe_load_balancer_set_repeated_for_next_layer(
@@ -892,12 +892,10 @@ def get_draft_model(model_config, draft_config, lm_head, model):
                 f"Unsupported eagle3 model architecture: {spec_dec_mode.eagle3_model_arch}"
             )
 
-    elif spec_dec_mode.is_mtp_one_model():
+    elif spec_dec_mode.is_mtp():
         return MTPForCausalLM(model_config,
                               model_config.pretrained_config.num_hidden_layers,
                               lm_head, model)
-    elif spec_dec_mode.is_mtp_eagle():
-        return MTPDraftModelForCausalLM(model_config)
     else:
         raise NotImplementedError(
             f"get_draft_model does not support speculative decoding mode {spec_dec_mode}."

@@ -980,10 +980,7 @@ class Glm4MoeForCausalLM(SpecDecOneEngineForCausalLM[Glm4Model, PretrainedConfig
         super().__init__(model=Glm4Model(model_config), model_config=model_config)
 
         self.model_nextn = 0
-        if (
-            model_config.spec_config is not None
-            and model_config.spec_config.spec_dec_mode.is_mtp_one_model()
-        ):
+        if model_config.spec_config is not None and model_config.spec_config.spec_dec_mode.is_mtp():
             model_nextn = model_config.spec_config.num_nextn_predict_layers
             ckpt_nextn = self.config.num_nextn_predict_layers
             self.num_hidden_layers = self.config.num_hidden_layers

@@ -1128,6 +1128,7 @@ class MTPDecodingConfig(DecodingBaseConfig):
     relaxed_topk: int = 1
     relaxed_delta: float = 0.
     use_mtp_vanilla: bool = False
+    # NOTE: this flag is deprecated and will be ignored at runtime.
     mtp_eagle_one_model: bool = True
 
     # TODO: remove this after distinguishing `max_draft_len` and `num_nextn_predict_layers`
@@ -1147,6 +1148,12 @@ class MTPDecodingConfig(DecodingBaseConfig):
             self.max_total_draft_tokens = kwargs[
                 'num_nextn_predict_layers']  # Current MTP only support linear tree
 
+        if not self.mtp_eagle_one_model:
+            logger.warning(
+                "2-model style MTP is no longer supported. The mtp_eagle_one_model "
+                "flag will be removed in a future release. Falling back to 1-model MTP for now."
+            )
+
     @classmethod
     def from_dict(cls, data: dict):
         out = cls(**data)
@@ -1160,18 +1167,10 @@ class MTPDecodingConfig(DecodingBaseConfig):
         return backend == "pytorch"
 
     @functools.cached_property
-    def num_capture_layers(self) -> int:
-        if not self.use_mtp_vanilla and not self.mtp_eagle_one_model:
-            return 1
-        return 0
-
-    @functools.cached_property
     def spec_dec_mode(self):
         from tensorrt_llm._torch.speculative.interface import \
             SpeculativeDecodingMode as TorchSpeculativeDecodingMode
-        if self.num_nextn_predict_layers_from_model_config == 1 and not self.use_mtp_vanilla and self.mtp_eagle_one_model:
-            return TorchSpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL
-        elif self.num_nextn_predict_layers_from_model_config == 1 and not self.use_mtp_vanilla and not self.mtp_eagle_one_model:
+        if self.num_nextn_predict_layers_from_model_config == 1 and not self.use_mtp_vanilla:
             return TorchSpeculativeDecodingMode.MTP_EAGLE
         return TorchSpeculativeDecodingMode.MTP
 

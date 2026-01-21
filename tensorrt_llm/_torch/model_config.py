@@ -619,7 +619,7 @@ class ModelConfig(Generic[TConfig]):
         num_layers = self.pretrained_config.num_hidden_layers
         num_attention_layers = self.get_num_attention_layers()
         if (self.spec_config is not None
-                and self.spec_config.spec_dec_mode.is_mtp_one_model()):
+                and self.spec_config.spec_dec_mode.is_mtp()):
             num_layers += self.spec_config.num_nextn_predict_layers
             num_attention_layers += self.spec_config.num_nextn_predict_layers
 
