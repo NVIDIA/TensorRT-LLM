@@ -56,31 +56,9 @@ class TestSupportedModelsSync(unittest.TestCase):
         )
 
     def test_supported_models_matrix_invariants(self):
-        """Catch support-matrix drift early (ordering, duplication, footnotes)."""
+        """Catch support-matrix drift early (duplication, footnotes)."""
         repo_root = Path(__file__).resolve().parents[3]
         module = _load_model_support_matrix_module(repo_root)
-
-        self.assertEqual(
-            set(module.KEY_MODEL_ARCH_ORDER),
-            set(module.KEY_MODEL_MATRIX.keys()),
-            "KEY_MODEL_ARCH_ORDER must match KEY_MODEL_MATRIX keys (no missing/extra rows).",
-        )
-        self.assertEqual(
-            set(module.MULTIMODAL_ARCH_ORDER),
-            set(module.MULTIMODAL_MATRIX.keys()),
-            "MULTIMODAL_ARCH_ORDER must match MULTIMODAL_MATRIX keys (no missing/extra rows).",
-        )
-
-        self.assertEqual(
-            len(module.KEY_MODEL_ARCH_ORDER),
-            len(set(module.KEY_MODEL_ARCH_ORDER)),
-            "KEY_MODEL_ARCH_ORDER contains duplicate architectures.",
-        )
-        self.assertEqual(
-            len(module.MULTIMODAL_ARCH_ORDER),
-            len(set(module.MULTIMODAL_ARCH_ORDER)),
-            "MULTIMODAL_ARCH_ORDER contains duplicate architectures.",
-        )
 
         architectures = [m.architecture for m in module.SUPPORTED_MODELS_PYTORCH]
         self.assertEqual(

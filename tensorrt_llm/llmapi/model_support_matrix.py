@@ -306,15 +306,6 @@ KEY_MODEL_MATRIX: Mapping[str, Mapping[Feature, FeatureCell]] = {
     },
 }
 
-KEY_MODEL_ARCH_ORDER: Tuple[str, ...] = (
-    "DeepseekV3ForCausalLM",
-    "DeepseekV32ForCausalLM",
-    "Qwen3MoeForCausalLM",
-    "Qwen3NextForCausalLM",
-    "Llama4ForConditionalGeneration",
-    "GptOssForCausalLM",
-)
-
 KEY_MODEL_FOOTNOTES: Tuple[str, ...] = (
     "[^1]: Chunked Prefill for MLA can only be enabled on SM100/SM103.",
     "[^2]: KV cache reuse for MLA can only be enabled on SM90/SM100/SM103 and in BF16/FP8 KV cache dtype.",
@@ -453,19 +444,6 @@ MULTIMODAL_MATRIX: Mapping[str, Mapping[Feature, FeatureCell]] = {
     },
 }
 
-MULTIMODAL_ARCH_ORDER: Tuple[str, ...] = (
-    "Gemma3ForConditionalGeneration",
-    "HCXVisionForCausalLM",
-    "LlavaLlamaModel",
-    "LlavaNextForConditionalGeneration",
-    "Llama4ForConditionalGeneration",
-    "Mistral3ForConditionalGeneration",
-    "NemotronH_Nano_VL_V2",
-    "Phi4MMForCausalLM",
-    "Qwen2VLForConditionalGeneration",
-    "Qwen2_5_VLForConditionalGeneration",
-)
-
 
 def get_cell(architecture: str, feature: Feature) -> Optional[FeatureCell]:
     row = MULTIMODAL_MATRIX.get(architecture)
@@ -551,8 +529,7 @@ def render_supported_models_markdown() -> str:
 
     key_headers = ["Model Architecture/Feature"] + [feature.value for feature in KEY_MODEL_FEATURES]
     key_rows: List[List[str]] = []
-    for arch in KEY_MODEL_ARCH_ORDER:
-        cells = KEY_MODEL_MATRIX.get(arch, {})
+    for arch, cells in KEY_MODEL_MATRIX.items():
         arch_footnote = KEY_MODEL_ARCH_FOOTNOTES.get(arch, "")
         arch_cell = f"`{arch}` {arch_footnote}".rstrip() if arch_footnote else f"`{arch}`"
         key_rows.append(
@@ -570,8 +547,7 @@ def render_supported_models_markdown() -> str:
 
     mm_headers = ["Model Architecture/Feature"] + [feature.value for feature in MULTIMODAL_FEATURES]
     mm_rows: List[List[str]] = []
-    for arch in MULTIMODAL_ARCH_ORDER:
-        cells = MULTIMODAL_MATRIX.get(arch, {})
+    for arch, cells in MULTIMODAL_MATRIX.items():
         mm_rows.append(
             [f"`{arch}`"]
             + [cells.get(feature, FeatureCell()).render() for feature in MULTIMODAL_FEATURES]
