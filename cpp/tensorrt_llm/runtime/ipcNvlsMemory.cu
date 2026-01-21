@@ -434,7 +434,7 @@ bool ipcNvlsSupported()
     TLLM_CUDA_CHECK(cudaDriverGetVersion(&cuda_driver_version));
     if (cuda_driver_version < 12010)
     {
-        TLLM_LOG_DEBUG("CUDA Driver version < 12010");
+        TLLM_LOG_ERROR("CUDA Driver version < 12010");
         return false;
     }
 
@@ -448,7 +448,7 @@ bool ipcNvlsSupported()
         CUCHECK(cuDeviceGetAttribute(&multicast_supported, CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED, current_dev));
         if (!multicast_supported)
         {
-            TLLM_LOG_DEBUG("CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED not supported on GPU%d.", cuda_dev);
+            TLLM_LOG_ERROR("CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED not supported on GPU%d.", cuda_dev);
             return false;
         }
     }
