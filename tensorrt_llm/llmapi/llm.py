@@ -861,7 +861,7 @@ class BaseLLM:
 
     def _try_load_hf_model_config(
             self) -> Optional[transformers.PretrainedConfig]:
-        model_dir = self._hf_model_dir if self._hf_model_dir is not None else self.args.model
+        model_dir = getattr(self, '_hf_model_dir', None) or self.args.model
         return ModelLoader.load_hf_model_config(
             model_dir, trust_remote_code=self.args.trust_remote_code)
 
