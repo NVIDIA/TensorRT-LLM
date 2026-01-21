@@ -357,47 +357,119 @@ private:
     executor::DataTransceiverState mSelfState;
 };
 
-class CacheReceiver
+/// @brief Base implementation class for cache receivers (KV and RNN).
+/// Contains common threading infrastructure and queue management.
+class BaseCacheReceiverImpl
+{
+public:
+    using RequestIdType = LlmRequest::RequestIdType;
+
+    /// @brief Constructor with common initialization.
+    BaseCacheReceiverImpl(executor::kv_cache::ConnectionManager* manager, std::unique_ptr<BaseCacheFormatter> formatter,
+        SizeType32 selfIndex);
+
+    virtual ~BaseCacheReceiverImpl();
+
+    // Non-copyable, non-movable
+    BaseCacheReceiverImpl(BaseCacheReceiverImpl const&) = delete;
+    BaseCacheReceiverImpl& operator=(BaseCacheReceiverImpl const&) = delete;
+    BaseCacheReceiverImpl(BaseCacheReceiverImpl&&) = delete;
+    BaseCacheReceiverImpl& operator=(BaseCacheReceiverImpl&&) = delete;
+
+    /// @brief Asynchronously send a request to receive data.
+    [[nodiscard]] std::future<void> receiveAsync(LlmRequest& llmRequest);
+
+    /// @brief Synchronously receive data using formatter.
+    void receiveSync(TransferSession& session);
+
+    /// @brief Cancel the request.
+    bool cancelRequest(LlmRequest const& llmRequest);
+
+    /// @brief Receive ready signal from sender.
+    bool receiveReadySignal(TransferSession& session);
+
+    /// @brief Send request information - pure virtual, implemented by derived classes.
+    [[nodiscard]] virtual TransferSession sendRequestInfo(LlmRequest const& llmRequest) = 0;
+
+protected:
+    /// @brief Accessor for the self state - derived classes own their state.
+    [[nodiscard]] virtual executor::DataTransceiverState& getSelfState() = 0;
+    [[nodiscard]] virtual executor::DataTransceiverState const& getSelfState() const = 0;
+
+    struct RequestAndPromise
+    {
+        LlmRequest* mRequest;
+        std::unique_ptr<std::promise<void>> mPromise;
+
+        RequestAndPromise();
+        RequestAndPromise(LlmRequest* request, std::unique_ptr<std::promise<void>>&& promise);
+        RequestAndPromise(RequestAndPromise const&) = delete;
+        RequestAndPromise(RequestAndPromise&& other) noexcept;
+        RequestAndPromise& operator=(RequestAndPromise&& other) noexcept;
+    };
+
+    struct AsyncResource
+    {
+        std::deque<RequestAndPromise> mRequestsQueue;
+        std::mutex mMtxForQueue;
+        std::condition_variable mCVforQueue;
+        std::atomic<bool> mTerminate{false};
+    };
+
+    struct ReceiveCacheResource
+    {
+        runtime::BufferManager mBufferManager;
+        runtime::CudaEvent mCudaEvent;
+
+        ReceiveCacheResource(runtime::BufferManager&& bufferManager, runtime::CudaEvent cudaEvent);
+    };
+
+    /// @brief Get or create receive cache resource for a request.
+    [[nodiscard]] std::unique_ptr<ReceiveCacheResource> const& getReceiveCacheResource(LlmRequest const& llmRequest);
+
+    /// @brief Send request info to a connection (non-agent path).
+    void sendRequestInfoToConnection(executor::kv_cache::Connection const* connection, RequestInfo const& info);
+
+    // Common members accessible to derived classes
+    executor::kv_cache::ConnectionManager* mManager;
+    std::unique_ptr<BaseCacheFormatter> mFormatter;
+    runtime::BufferManager mBufferManager;
+    std::atomic<bool> mTerminate{false};
+    int mDeviceId{-1};
+
+private:
+    // Thread management
+    void requestSync(LlmRequest& llmRequest);
+    [[nodiscard]] std::future<void> requestAndReceiveAsyncMultiThreads(LlmRequest& llmRequest);
+    void request(AsyncResource& resource);
+
+    // Thread-related members
+    static constexpr char const* kDefaultProcessInfo = "default";
+    std::vector<std::future<void>> mRequestFutures;
+    std::unordered_map<std::string, std::unique_ptr<AsyncResource>> mInstanceToAsyncResource;
+    std::unordered_map<std::string, std::unique_ptr<ReceiveCacheResource>> mProcessToResources;
+    std::mutex mProcessIoResouceMutex;
+    std::ofstream mMeasuresFile;
+    std::mutex mMeasuresFileMutex;
+};
+
+/// @brief KV cache receiver - inherits from BaseCacheReceiverImpl with KV-specific logic.
+class CacheReceiver : public BaseCacheReceiverImpl
 {
 public:
     /// @brief Constructor.
     CacheReceiver(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
         SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter);
 
-    CacheReceiver() = default;
+    /// @brief Send request information - KV-specific implementation.
+    [[nodiscard]] TransferSession sendRequestInfo(LlmRequest const& llmRequest) override;
 
-    /// @brief Asynchronously send a request to receive data.
-    /// @param llmRequest Request object. Its data should be in an allocated but unwritten state when called, and the
-    /// data for this request should remain intact only after future synchronization.
-    /// @return Once the data is fully received, the future object will become valid.
-    [[nodiscard]] virtual std::future<void> receiveAsync(LlmRequest& llmRequest) const;
-
-    virtual TransferSession sendRequestInfo(LlmRequest const& llmRequest);
-
-    virtual void receiveSync(TransferSession& session);
-
-    /// @brief Cancel the request.
-    /// @param llmRequest Request object.
-    /// @return Whether the request is cancelled.
-    virtual bool cancelRequest(LlmRequest const& llmRequest);
-
-    /// @brief Receive ready signal.
-    /// @param session The session object.
-    /// @return Whether the request is ready to be received.
-    virtual bool receiveReadySignal(TransferSession& session);
-
-    /// @brief Destructor.
-    virtual ~CacheReceiver();
+protected:
+    [[nodiscard]] executor::DataTransceiverState& getSelfState() override;
+    [[nodiscard]] executor::DataTransceiverState const& getSelfState() const override;
 
 private:
-    class Impl;
-
-    struct ImplDeleter
-    {
-        void operator()(Impl*);
-    };
-
-    std::unique_ptr<Impl, ImplDeleter> mImpl;
+    executor::DataTransceiverState mSelfState;
 };
 
 } // namespace tensorrt_llm::batch_manager
