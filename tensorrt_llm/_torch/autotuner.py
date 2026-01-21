@@ -1105,7 +1105,10 @@ class AutoTuner:
 
         disable_short_profile = os.environ.get(
             "TLLM_AUTOTUNER_DISABLE_SHORT_PROFILE", "0") == "1"
-        if fewer_repeat_avg_time > short_profile_threshold_ms and not disable_short_profile:
+
+        # Disable this feature for merged tuning strategy to avoid potential hang due to asymmetric tuning.
+        if fewer_repeat_avg_time > short_profile_threshold_ms and not disable_short_profile \
+            and tuning_config.distributed_tuning_strategy != DistributedTuningStrategy.MERGE:
             # directly use the few repeat estimated time to avoid redundant profiling
             avg_time = fewer_repeat_avg_time
         else:
