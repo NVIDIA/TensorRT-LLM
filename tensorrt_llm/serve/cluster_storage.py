@@ -5,9 +5,10 @@ from dataclasses import dataclass
 from enum import IntEnum
 from functools import wraps
 from typing import Callable, Dict, List, Optional
+from urllib.parse import urlparse
 
 import aiohttp
-import etcd3
+import pyetcd as etcd3
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -455,14 +456,25 @@ def handle_etcd_error(return_on_error: bool | None):
 
 class Etcd3ClusterStorage(ClusterStorage):
 
+    @staticmethod
+    def _connect(cluster_uri: str) -> etcd3.MultiEndpointEtcd3Client:
+        logger.info(f"Connecting to {cluster_uri}")
+        endpoints = []
+        for url in cluster_uri.split(","):
+            parsed_url = urlparse(url)
+            endpoints.append(
+                etcd3.Endpoint(parsed_url.hostname,
+                               parsed_url.port,
+                               secure=False))
+        return etcd3.MultiEndpointEtcd3Client(endpoints, timeout=10)
+
     def __init__(self,
                  cluster_uri: str,
                  cluster_name: str,
                  one_single_lease: bool = False,
                  **kwargs):
-        cluster_uri = cluster_uri.replace("etcd://", "")
-        self._host, self._port = cluster_uri.rsplit(":", 1)
-        self._client = etcd3.client(self._host, self._port)
+        self._cluster_uri = cluster_uri
+        self._client = self._connect(self._cluster_uri)
         self._leases = {}
         self._instance_lease = None
         self._watch_handles = {}
@@ -486,8 +498,7 @@ class Etcd3ClusterStorage(ClusterStorage):
         return self._client
 
     def reconnect(self):
-        logger.info(f"Reconnecting to {self._host}:{self._port}")
-        self._client = etcd3.client(self._host, self._port)
+        self._client = self._connect(self._cluster_uri)
 
     async def start(self):
         # nothing to do

@@ -6,7 +6,7 @@ from tensorrt_llm.llmapi.disagg_utils import MetadataServerConfig
 from tensorrt_llm.logger import logger
 
 try:
-    import etcd3
+    import pyetcd as etcd3
 except Exception as e:
     logger.warning(f"etcd3 is not installed correctly: {e}")
 

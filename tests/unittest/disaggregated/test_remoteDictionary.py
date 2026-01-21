@@ -5,7 +5,7 @@ import subprocess
 import time
 import unittest
 
-import etcd3
+import pyetcd as etcd3
 
 from tensorrt_llm.serve.metadata_server import EtcdDictionary
 
