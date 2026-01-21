@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch._ops import OpOverloadPacket
@@ -123,6 +123,7 @@ def _triton_cached_ssm(
     # CONSTANTS
     time_step_limit: List[float],
     chunk_size: int,
+    decode_kernel: str,  # Backend for decode: 'triton' or 'flashinfer'
 ) -> torch.Tensor:
     """Flattened cached SSM transform op that respects slot-indexed state caches.
 
@@ -205,19 +206,40 @@ def _triton_cached_ssm(
         A_full = A[..., None, None].expand(num_heads, head_dim, ssm_state_size)
         D_full = D[..., None].expand(num_heads, head_dim)
 
-        y_decode = selective_state_update(
-            ssm_state_cache,
-            x_decode,
-            dt_hp,
-            A_full,
-            B_decode,
-            C_decode,
-            D=D_full,
-            z=None,
-            dt_bias=dt_bias_hp,
-            dt_softplus=True,
-            state_batch_indices=slot_idx_decode,
-        )  # [nd, H, D]
+        # Use decode_kernel parameter to select backend
+        if decode_kernel == "flashinfer":
+            import flashinfer
+
+            # FlashInfer expects int32 state_batch_indices.
+            slot_idx_decode_i32 = slot_idx_decode.to(torch.int32)
+            y_decode = flashinfer.mamba.selective_state_update(
+                # batch_states,
+                ssm_state_cache,
+                x_decode,
+                dt_hp,
+                A_full,
+                B_decode,
+                C_decode,
+                D=D_full,
+                z=None,
+                dt_bias=dt_bias_hp,
+                dt_softplus=True,
+                state_batch_indices=slot_idx_decode_i32,
+            )
+        else:
+            y_decode = selective_state_update(
+                ssm_state_cache,
+                x_decode,
+                dt_hp,
+                A_full,
+                B_decode,
+                C_decode,
+                D=D_full,
+                z=None,
+                dt_bias=dt_bias_hp,
+                dt_softplus=True,
+                state_batch_indices=slot_idx_decode,
+            )  # [nd, H, D]
 
     # Dispatch return logic
     if num_prefill > 0 and num_decode > 0:
@@ -258,6 +280,7 @@ def _triton_cached_ssm_fake(
     # CONSTANTS
     time_step_limit: List[float],
     chunk_size: int,
+    decode_kernel: str,  # Backend for decode: 'triton' or 'flashinfer'
 ):
     # Return a correctly-shaped tensor for tracing with fake tensors
     return torch.empty_like(
@@ -338,8 +361,12 @@ class TritonBackendSSM(AttentionDescriptor):
         return {"ssm_state_cache": _get_ssm_cache}
 
     @classmethod
-    def get_constants(cls, source_attn_node: Node) -> List[Constant]:
+    def get_constants(
+        cls, source_attn_node: Node, transform_config: Optional[Dict[str, Any]] = None
+    ) -> List[Constant]:
         time_step_limit, chunk_size = extract_op_args(
             source_attn_node, "time_step_limit", "chunk_size"
         )
-        return [time_step_limit, chunk_size]
+        # Extract decode_kernel from transform config (default to "triton")
+        decode_kernel = (transform_config or {}).get("decode_kernel", "triton")
+        return [time_step_limit, chunk_size, decode_kernel]

@@ -991,14 +991,5 @@ def test_stack_nvfp4_moe_weights_transform_relu2(hidden_size, intermediate_size)
     # Run the transformed graph
     transformed_output = gm(x, selected_experts, routing_weights)
 
-    # Get the registered parameters after transform
-    fc1_act_scale = getattr(gm, "nvfp4_moe_w3_w1_input_scale_stacked_0", None)
-    fc1_alpha = getattr(gm, "nvfp4_moe_w1_alpha_stacked_0", None)
-    if fc1_act_scale is not None:
-        print(f"fc1_act_scale (after transform): {fc1_act_scale}, shape: {fc1_act_scale.shape}")
-    if fc1_alpha is not None:
-        print(f"fc1_alpha (after transform): {fc1_alpha}, shape: {fc1_alpha.shape}")
-
-    # Should be close for FP4 quantization (gated MLP may have slightly larger diff due to alpha handling)
     tol = 1e-3
     torch.testing.assert_close(ref_output, transformed_output, rtol=tol, atol=tol)
