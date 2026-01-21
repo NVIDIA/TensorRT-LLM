@@ -24,6 +24,7 @@ from tensorrt_llm._torch.auto_deploy.utils.mapping_utils import deserialize_mapp
 from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
 from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm._utils import is_sm_100f
 
 
 def _check_moe_alltoall(mapping_config: str, max_num_tokens: int) -> Tuple[Mapping | None, bool]:
@@ -608,7 +609,8 @@ def trtllm_quant_hf_fp8_block_scale_moe_fused(
         - FC2 implements: fc2_output = fc1_output @ w2.T
         - FC1 weights are concatenated w3 and w1 if gated_mlp, otherwise w1
         - Uses per-block weight scales (128x128 blocks)
-        - Activation quantization happens dynamically inside the kernel
+        - On Hopper (SM90): Activation quantization happens dynamically inside the kernel
+        - On Blackwell (SM100+): Uses fp8_block_scale_moe_runner with external activation quantization
 
     Parameters:
         x: BF16/FP16 input tensor of shape (B, H) or (B, S, H)
@@ -632,31 +634,80 @@ def trtllm_quant_hf_fp8_block_scale_moe_fused(
     x2d = x.view(-1, x_shape[-1])
 
     # Ensure contiguous tensors with correct dtypes
-    # TRTLLM kernel expects float32 for routing_weights
     selected_experts = selected_experts.int().contiguous()
-    routing_weights = routing_weights.to(torch.float32).contiguous()
 
-    # For DeepSeek FP8 block scales, quant_scales is a tuple of (fc_weight_scales, proj_weight_scales)
-    # The kernel handles dynamic activation quantization internally
-    quant_scales = (fc1_weight_scale, fc2_weight_scale)
+    if is_sm_100f():
+        # --- Blackwell (SM100+) Path ---
+        # Uses fp8_block_scale_moe_runner with pre-computed routing (topk_weights/topk_ids)
 
-    # Call fused_moe with DeepSeek FP8 block scale mode
-    output = torch.ops.trtllm.fused_moe(
-        x2d,
-        selected_experts,
-        routing_weights,
-        fc1_expert_weights=fc1_expert_weights.contiguous(),
-        fc1_expert_biases=None,
-        fc2_expert_weights=fc2_expert_weights.contiguous(),
-        fc2_expert_biases=None,
-        output_dtype=x.dtype,
-        quant_scales=quant_scales,
-        activation_type=act_fn,
-        use_deepseek_fp8_block_scale=True,
-    )
+        # Quantize activations externally (Blackwell kernel expects FP8 input)
+        x_fp8, x_sf = torch.ops.trtllm.fp8_quantize_1x128(x2d)
 
-    # Restore original shape
-    return output[0].view(x_shape)
+        # Infer parameters from weight shapes
+        num_experts = fc1_expert_weights.shape[0]
+        top_k = selected_experts.shape[-1]
+        # For gated MLP, fc1 weights have shape [E, 2*I, H], so intermediate_size = shape[1] // 2
+        # For non-gated MLP, fc1 weights have shape [E, I, H], so intermediate_size = shape[1]
+        intermediate_size = (
+            fc1_expert_weights.shape[1] // 2 if is_gated_mlp else fc1_expert_weights.shape[1]
+        )
+
+        # Blackwell kernel expects bfloat16 for topk_weights
+        routing_weights_bf16 = routing_weights.to(torch.bfloat16).contiguous()
+
+        # Call Blackwell fp8_block_scale_moe_runner with pre-computed routing
+        output = torch.ops.trtllm.fp8_block_scale_moe_runner(
+            None,  # routing_logits - not needed when topk_weights/topk_ids provided
+            None,  # routing_bias - not needed for pre-computed routing
+            x_fp8,
+            x_sf,
+            fc1_expert_weights.contiguous(),
+            fc1_weight_scale.contiguous(),
+            fc2_expert_weights.contiguous(),
+            fc2_weight_scale.contiguous(),
+            num_experts,
+            top_k,
+            None,  # n_group - default 0 (no grouped routing)
+            None,  # topk_group - default 0
+            intermediate_size,
+            0,  # local_expert_offset - default 0 (no EP sharding)
+            num_experts,  # local_num_experts - same as num_experts (no EP sharding)
+            None,  # routed_scaling_factor - default 1.0
+            0,  # routing_method_type - RoutingMethodType.Default (not used with pre-computed routing)
+            topk_weights=routing_weights_bf16,
+            topk_ids=selected_experts,
+        )
+
+        # Restore original shape
+        return output.view(x_shape)
+    else:
+        # --- Hopper (SM90) Path ---
+        # Uses fused_moe with DeepSeek FP8 block scale mode (activation quant inside kernel)
+
+        # TRTLLM kernel expects float32 for routing_weights
+        routing_weights = routing_weights.to(torch.float32).contiguous()
+
+        # For DeepSeek FP8 block scales, quant_scales is a tuple of (fc_weight_scales, proj_weight_scales)
+        # The kernel handles dynamic activation quantization internally
+        quant_scales = (fc1_weight_scale, fc2_weight_scale)
+
+        # Call fused_moe with DeepSeek FP8 block scale mode
+        output = torch.ops.trtllm.fused_moe(
+            x2d,
+            selected_experts,
+            routing_weights,
+            fc1_expert_weights=fc1_expert_weights.contiguous(),
+            fc1_expert_biases=None,
+            fc2_expert_weights=fc2_expert_weights.contiguous(),
+            fc2_expert_biases=None,
+            output_dtype=x.dtype,
+            quant_scales=quant_scales,
+            activation_type=act_fn,
+            use_deepseek_fp8_block_scale=True,
+        )
+
+        # Restore original shape
+        return output[0].view(x_shape)
 
 
 @trtllm_quant_hf_fp8_block_scale_moe_fused.register_fake
