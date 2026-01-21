@@ -2019,7 +2019,7 @@ def _shard_attention_rmsnorm(
     valid_sizes = set()
     for lin_node in linear_nodes:
         try:
-            wkey, _ = extract_param_names_from_node(lin_node)
+            wkey = extract_weight_name(lin_node)
             w = gm.get_parameter(wkey)
             valid_sizes.add(w.shape[0])  # q: num_heads*head_dim, k/v: num_kv_heads*head_dim
         except (AttributeError, AssertionError):
