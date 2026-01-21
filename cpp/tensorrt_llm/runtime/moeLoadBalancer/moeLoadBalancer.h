@@ -145,6 +145,7 @@ public:
 
     std::vector<std::vector<int>> getOldRankExpertIds() const
     {
+        // This API is only used in test_moe_module to check expert placement.
         return mCpuPlacementInfo.oldRankExpertIds;
     }
 
