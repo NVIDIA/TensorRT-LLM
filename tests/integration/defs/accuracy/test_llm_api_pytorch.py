@@ -4993,7 +4993,7 @@ class TestDeepSeekR1LongBenchV2(LlmapiAccuracyTestHarness):
             pytest.skip(f"Model directory {model_dir} does not exist")
 
         # Configure model settings
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
                                         enable_block_reuse=True,
                                         enable_partial_reuse=False,
                                         dtype="fp8")
@@ -5319,6 +5319,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     EXTRA_EVALUATOR_KWARGS = dict(chat_template_kwargs=dict(
         enable_thinking=False))
 
+    @skip_pre_hopper
     @pytest.mark.skip_less_device_memory(64000)
     @pytest.mark.skip_less_mpi_world_size(4)
     @pytest.mark.parametrize(
