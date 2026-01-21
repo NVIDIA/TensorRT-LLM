@@ -65,11 +65,16 @@ class NVLinkOneSided(Communication):
     RECV_COUNTERS_OFFSET_INDEX = None
     DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX = None
     COMBINE_COMPLETION_FLAGS_OFFSET_INDEX = None
+    EPLB_GATHERED_STATS_OFFSET_INDEX = None
     PAYLOAD_DATA_OFFSET_INDEX = None
 
     @staticmethod
-    def get_aux_data_size(ep_size: int, max_num_tokens: int) -> int:
-        return torch.ops.trtllm.moe_a2a_get_aux_data_size(ep_size, max_num_tokens)
+    def get_aux_data_size(
+        ep_size: int, max_num_tokens: int, num_experts: int, enable_eplb: bool
+    ) -> int:
+        return torch.ops.trtllm.moe_a2a_get_aux_data_size(
+            ep_size, max_num_tokens, num_experts, enable_eplb
+        )
 
     @staticmethod
     def calculate_required_workspace_size(
@@ -78,12 +83,16 @@ class NVLinkOneSided(Communication):
         max_num_tokens: int,
         hidden_size: int,
         dtype: torch.dtype,
+        num_experts: int,
+        enable_eplb: bool = False,
         extra_payload_bytes_per_token: int = 0,
     ) -> int:
         element_size = dtype.itemsize
 
         # Auxiliary data size
-        workspace_size = NVLinkOneSided.get_aux_data_size(ep_size, max_num_tokens)
+        workspace_size = NVLinkOneSided.get_aux_data_size(
+            ep_size, max_num_tokens, num_experts, enable_eplb
+        )
 
         # Dispatch needs workspace for [ep_size, max_tokens] tokens,
         # but due to the variety of quantization recipes, we cannot know the exact size, so we conservatively estimate assuming no quantization.
@@ -124,6 +133,9 @@ class NVLinkOneSided(Communication):
             cls.COMBINE_COMPLETION_FLAGS_OFFSET_INDEX = int(
                 thop.MOE_A2A_COMBINE_COMPLETION_FLAGS_OFFSET_INDEX
             )
+            cls.EPLB_GATHERED_STATS_OFFSET_INDEX = int(
+                thop.MOE_A2A_EPLB_GATHERED_STATS_OFFSET_INDEX
+            )
             cls.PAYLOAD_DATA_OFFSET_INDEX = int(thop.MOE_A2A_PAYLOAD_DATA_OFFSET_INDEX)
 
     def __init__(
@@ -135,6 +147,7 @@ class NVLinkOneSided(Communication):
         payload_in_workspace: bool = False,
         hidden_size: Optional[int] = None,
         dtype: Optional[torch.dtype] = None,
+        enable_eplb: bool = False,
     ):
         """
         Initialize NVLinkOneSided with workspace allocation.
@@ -147,6 +160,7 @@ class NVLinkOneSided(Communication):
             payload_in_workspace: If True, final_hidden_states is already in workspace
             hidden_size: Hidden dimension size (optional, for auto workspace calculation)
             dtype: Data type (optional, for auto workspace calculation)
+            enable_eplb: Whether to support EPLB statistics gathering
         """
         super().__init__(mapping)
 
@@ -158,6 +172,7 @@ class NVLinkOneSided(Communication):
         self.top_k = top_k
         self.max_num_tokens_per_rank = max_num_tokens_per_rank
         self.payload_in_workspace = payload_in_workspace
+        self.enable_eplb = enable_eplb
 
         # Initialize constants from C++
         self._init_constants()
@@ -166,7 +181,13 @@ class NVLinkOneSided(Communication):
         auto_workspace_size = None
         if hidden_size is not None and dtype is not None:
             auto_workspace_size = self.calculate_required_workspace_size(
-                self.ep_size, self.top_k, max_num_tokens_per_rank, hidden_size, dtype
+                self.ep_size,
+                self.top_k,
+                max_num_tokens_per_rank,
+                hidden_size,
+                dtype,
+                num_experts=self.num_experts,
+                enable_eplb=self.enable_eplb,
             )
         workspace_mb_env = os.environ.get("TRTLLM_MOE_A2A_WORKSPACE_MB")
         if workspace_mb_env:
@@ -200,6 +221,8 @@ class NVLinkOneSided(Communication):
                 self.ep_rank,
                 self.ep_size,
                 self.max_num_tokens_per_rank,
+                self.num_experts,
+                self.enable_eplb,
             )
             NVLinkOneSided._WORKSPACE = {
                 "workspace_size_per_rank": self.workspace_size_per_rank,
@@ -230,10 +253,7 @@ class NVLinkOneSided(Communication):
         self.max_num_tokens_per_rank = self._WORKSPACE["max_num_tokens_per_rank"]
 
         # Initialize dispatch state
-        self._dispatch_state = {}
-
-        # Internal state
-        self._state: str = "idle"  # idle | dispatched
+        self._dispatch_state = {"phase": "idle"}
 
         # Invalid token expert ID (default to -1), the kernels in TRTLLM-gen is hard-code to support -1 only.
         self.invalid_token_expert_id: int = -1
@@ -304,23 +324,31 @@ class NVLinkOneSided(Communication):
         if token_final_scales is not None:
             payloads.append(token_final_scales)
 
-        recv_buffers, combine_payload_offset = torch.ops.trtllm.moe_a2a_dispatch(
-            token_selected_slots,
-            payloads,
-            self.workspace,
-            self.moe_a2a_metainfo,
-            runtime_max_tokens_per_rank,
-            self.ep_rank,
-            self.ep_size,
-            self.top_k,
-            self.num_experts,
+        eplb_local_stats = kwargs.get("eplb_local_stats")
+        if eplb_local_stats is not None and not self.enable_eplb:
+            raise ValueError("eplb_local_stats provided but enable_eplb is False")
+
+        recv_buffers, combine_payload_offset, eplb_gathered_stats = (
+            torch.ops.trtllm.moe_a2a_dispatch(
+                token_selected_slots,
+                payloads,
+                self.workspace,
+                self.moe_a2a_metainfo,
+                runtime_max_tokens_per_rank,
+                self.ep_rank,
+                self.ep_size,
+                self.top_k,
+                self.num_experts,
+                eplb_local_stats,
+            )
         )
-
-        self._state = "dispatched"
-
+        if eplb_gathered_stats.numel() == 0:
+            eplb_gathered_stats = None
+        self._dispatch_state["eplb_gathered_stats"] = eplb_gathered_stats
         self._dispatch_state["combine_payload_offset"] = int(combine_payload_offset)
         self._dispatch_state["local_num_tokens"] = token_selected_slots.size(0)
         self._dispatch_state["runtime_max_tokens_per_rank"] = runtime_max_tokens_per_rank
+        self._dispatch_state["phase"] = "dispatched"
 
         # Extract results from recv_buffers
         # Payload order matches input:
@@ -363,6 +391,13 @@ class NVLinkOneSided(Communication):
             token_final_scales_recv,
         )
 
+    def get_eplb_gathered_statistics(self) -> Optional[torch.Tensor]:
+        """
+        Return gathered EPLB statistics from the last dispatch, if available.
+        """
+        assert self.enable_eplb, "EPLB is not enabled"
+        return self._dispatch_state.get("eplb_gathered_stats")
+
     def combine(
         self,
         final_hidden_states: torch.Tensor,
@@ -380,7 +415,7 @@ class NVLinkOneSided(Communication):
             Combined output tensor [local_num_tokens, hidden_size]
 
         """
-        if self._state != "dispatched":
+        if self._dispatch_state.get("phase") != "dispatched":
             raise RuntimeError("combine called before a successful dispatch")
 
         local_num_tokens = self._dispatch_state.get("local_num_tokens")
@@ -423,8 +458,7 @@ class NVLinkOneSided(Communication):
         )
 
         # Reset state for next round
-        self._state = "idle"
-        self._dispatch_state.clear()
+        self._dispatch_state = {"phase": "idle"}
 
         return output
 
@@ -444,7 +478,7 @@ class NVLinkOneSided(Communication):
         Returns:
             Tensor view into workspace [ep_size, max_tokens_per_rank, hidden_size]
         """
-        if self._state != "dispatched":
+        if self._dispatch_state.get("phase") != "dispatched":
             raise RuntimeError(
                 "get_combine_payload_tensor_in_workspace called before a successful dispatch"
             )

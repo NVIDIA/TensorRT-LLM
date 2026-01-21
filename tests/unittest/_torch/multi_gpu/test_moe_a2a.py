@@ -226,7 +226,8 @@ def make_bfloat16_payloads(
 
 def run_moe_a2a_dispatch_single_rank(ep_size, all_num_tokens, top_k,
                                      workspace_size_per_rank, num_experts,
-                                     hidden_size, invalid_token_expert_id):
+                                     hidden_size, invalid_token_expert_id,
+                                     enable_eplb):
     """Worker function for MPIPoolExecutor."""
     rank = tllm.mpi_rank()
     torch.cuda.set_device(rank)
@@ -242,8 +243,12 @@ def run_moe_a2a_dispatch_single_rank(ep_size, all_num_tokens, top_k,
         # Create MoeAlltoAll manager
         max_num_tokens = max(all_num_tokens)
 
-        moe_a2a = MoeAlltoAll(mapping, max_num_tokens, top_k, num_experts,
-                              workspace_size_per_rank)
+        moe_a2a = MoeAlltoAll(mapping,
+                              max_num_tokens,
+                              top_k,
+                              num_experts,
+                              workspace_size_per_rank,
+                              enable_eplb=enable_eplb)
 
         # Get the number of tokens for this specific rank (same as single-GPU)
         rank_local_tokens = all_num_tokens[rank]
@@ -254,12 +259,19 @@ def run_moe_a2a_dispatch_single_rank(ep_size, all_num_tokens, top_k,
         payloads, expert_id_payload_index = make_nvfp4_payloads(
             rank_local_tokens, hidden_size, top_k, rank, token_selected_experts)
 
+        eplb_local_stats = None
+        if enable_eplb:
+            eplb_local_stats = (
+                torch.arange(num_experts, dtype=torch.int32, device="cuda") +
+                rank * 1000)
+
         recv_tensors = moe_a2a.dispatch(
             token_selected_experts,
             payloads,
             max_num_tokens,
             invalid_token_expert_id=invalid_token_expert_id,
-            expert_id_payload_index=expert_id_payload_index)
+            expert_id_payload_index=expert_id_payload_index,
+            eplb_local_stats=eplb_local_stats)
 
         # Verify completion flags after dispatch
         completion_flags_offset = moe_a2a.metainfo[MoeAlltoAll._METAINFO_INDEX[
@@ -303,10 +315,16 @@ def run_moe_a2a_dispatch_single_rank(ep_size, all_num_tokens, top_k,
                 max_num_tokens, top_k).cpu()
 
         # Return results to be collected (move to CPU for MPI transfer)
+        eplb_gathered_stats = moe_a2a._state.eplb_gathered_stats
+        if eplb_gathered_stats is not None:
+            eplb_gathered_stats = eplb_gathered_stats.cpu()
+        if eplb_local_stats is not None:
+            eplb_local_stats = eplb_local_stats.cpu()
+
         return (token_selected_experts.cpu(), [p.cpu() for p in payloads],
-                [rt.cpu()
-                 for rt in recv_tensors], send_counters, topk_send_indices,
-                topk_target_ranks, recv_counters, expert_id_payload_index)
+                [rt.cpu() for rt in recv_tensors], send_counters,
+                topk_send_indices, topk_target_ranks, recv_counters,
+                expert_id_payload_index, eplb_local_stats, eplb_gathered_stats)
     except Exception:
         traceback.print_exc()
         raise
@@ -473,26 +491,32 @@ class TestMoEAlltoAll:
         enabled=False
     )  # MPI pool executors have known thread cleanup timing issues
     @pytest.mark.parametrize(
-        "mpi_pool_executor,all_num_tokens,top_k",
+        "mpi_pool_executor,all_num_tokens,top_k,enable_eplb",
         [
             # (num_workers, all_num_tokens, top_k)
             # Basic configurations
-            (4, [32, 32, 32, 32], 2),  # Four ranks with uniform distribution
+            (4, [32, 32, 32, 32], 2, False
+             ),  # Four ranks with uniform distribution
             (4, [16, 32, 64, 48
-                 ], 2),  # Four ranks with non-uniform distribution
-            (2, [100, 50], 2),  # Two ranks with different loads
+                 ], 2, False),  # Four ranks with non-uniform distribution
+            (2, [100, 50], 2, False),  # Two ranks with different loads
             (8, [10, 20, 30, 40, 50, 60, 70, 80
-                 ], 2),  # Eight ranks with increasing load
+                 ], 2, False),  # Eight ranks with increasing load
 
             # Different top_k values
-            (4, [32, 32, 32, 32], 4),  # Four ranks with top_k = 4
-            (4, [32, 32, 32, 32], 8),  # Four ranks with top_k = 8
+            (4, [32, 32, 32, 32], 4, False),  # Four ranks with top_k = 4
+            (4, [32, 32, 32, 32], 8, False),  # Four ranks with top_k = 8
 
             # Edge cases
-            (4, [1, 1, 1, 1], 2),  # Four ranks with single token per rank
+            (4, [1, 1, 1, 1], 2, False
+             ),  # Four ranks with single token per rank
+
+            # EPLB stats path
+            (4, [32, 32, 32, 32], 2, True),
         ],
         indirect=["mpi_pool_executor"])
-    def test_dispatch(self, mpi_pool_executor, all_num_tokens, top_k):
+    def test_dispatch(self, mpi_pool_executor, all_num_tokens, top_k,
+                      enable_eplb):
         """Test MoE A2A dispatch with MNNVL across multiple GPUs"""
 
         try:
@@ -521,8 +545,8 @@ class TestMoEAlltoAll:
         results = mpi_pool_executor.map(
             run_moe_a2a_dispatch_single_rank,
             *zip(*[(ep_size, all_num_tokens, top_k, workspace_size_per_rank,
-                    num_experts, hidden_size, invalid_token_expert_id)] *
-                 ep_size),
+                    num_experts, hidden_size, invalid_token_expert_id,
+                    enable_eplb)] * ep_size),
         )
 
         # Collect results from all ranks (same as single-GPU collecting from emulated ranks)
@@ -538,6 +562,8 @@ class TestMoEAlltoAll:
         all_recv_counters = [r[6] for r in all_results]
         all_expert_id_payload_index = [r[7] for r in all_results]
         expert_id_payload_index = all_expert_id_payload_index[0]
+        all_eplb_local_stats = [r[8] for r in all_results]
+        all_eplb_gathered_stats = [r[9] for r in all_results]
 
         assert all(i == expert_id_payload_index
                    for i in all_expert_id_payload_index
@@ -550,6 +576,15 @@ class TestMoEAlltoAll:
                         all_recv_counters, ep_size, all_num_tokens, top_k,
                         num_experts, expert_id_payload_index,
                         invalid_token_expert_id)
+
+        if enable_eplb:
+            expected_stats = torch.stack(all_eplb_local_stats, dim=0)
+            for rank in range(ep_size):
+                gathered_stats = all_eplb_gathered_stats[rank]
+                assert gathered_stats is not None
+                assert torch.equal(
+                    gathered_stats,
+                    expected_stats), (f"Rank {rank} gathered_stats mismatch")
 
     @pytest.mark.skipif(torch.cuda.device_count() < 8,
                         reason='needs at least 8 GPUs to run multi-GPU test')

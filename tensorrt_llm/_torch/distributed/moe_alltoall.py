@@ -25,6 +25,7 @@ class _A2AState:
     phase: str = "idle"  # idle | dispatched
     local_num_tokens: int | None = None
     combine_payload_offset: int | None = None
+    eplb_gathered_stats: torch.Tensor | None = None
 
 
 class MoeAlltoAll:
@@ -41,9 +42,10 @@ class MoeAlltoAll:
     _METAINFO_INDEX: Dict[str, int] | None = None
 
     @staticmethod
-    def get_aux_data_size(ep_size: int, max_num_tokens: int) -> int:
+    def get_aux_data_size(ep_size: int, max_num_tokens: int, num_experts: int,
+                          enable_eplb: bool) -> int:
         return torch.ops.trtllm.moe_a2a_get_aux_data_size(
-            ep_size, max_num_tokens)
+            ep_size, max_num_tokens, num_experts, enable_eplb)
 
     @staticmethod
     def calculate_required_workspace_size(
@@ -52,11 +54,14 @@ class MoeAlltoAll:
             max_num_tokens: int,
             hidden_size: int,
             dtype: torch.dtype,
+            num_experts: int,
+            enable_eplb: bool,
             extra_payload_bytes_per_token: int = 0) -> int:
         element_size = dtype.itemsize
 
         # Auxiliary data size
-        workspace_size = MoeAlltoAll.get_aux_data_size(ep_size, max_num_tokens)
+        workspace_size = MoeAlltoAll.get_aux_data_size(ep_size, max_num_tokens,
+                                                       num_experts, enable_eplb)
 
         # Dispatch needs workspace for [ep_size, max_tokens] tokens,
         # but due to the variety of quantization recipes, we cannot know the exact size, so we conservatively estimate assuming no quantization.
@@ -103,6 +108,8 @@ class MoeAlltoAll:
                 int(thop.MOE_A2A_TOPK_TARGET_RANKS_OFFSET_INDEX),
                 "TOPK_SEND_INDICES_OFFSET_INDEX":
                 int(thop.MOE_A2A_TOPK_SEND_INDICES_OFFSET_INDEX),
+                "EPLB_GATHERED_STATS_OFFSET_INDEX":
+                int(thop.MOE_A2A_EPLB_GATHERED_STATS_OFFSET_INDEX),
                 "PAYLOAD_DATA_OFFSET_INDEX":
                 int(thop.MOE_A2A_PAYLOAD_DATA_OFFSET_INDEX),
                 "NUM_METAINFO_FIELDS":
@@ -116,6 +123,7 @@ class MoeAlltoAll:
         top_k: int,
         num_experts: int,
         workspace_size_per_rank: int,
+        enable_eplb: bool = False,
     ):
         """
         Initialize MoeAlltoAll with workspace allocation.
@@ -149,6 +157,7 @@ class MoeAlltoAll:
 
         self.top_k = top_k
         self.num_experts = num_experts
+        self.enable_eplb = enable_eplb
         if not isinstance(self.top_k, int) or self.top_k <= 0:
             raise ValueError("top_k must be a positive int")
         if not isinstance(self.num_experts, int) or self.num_experts <= 0:
@@ -165,6 +174,8 @@ class MoeAlltoAll:
                 self.ep_rank,
                 self.ep_size,
                 self.max_num_tokens,
+                self.num_experts,
+                self.enable_eplb,
             )
             MoeAlltoAll._WORKSPACE = {
                 "workspace_size_per_rank": workspace_size_per_rank,
@@ -196,7 +207,8 @@ class MoeAlltoAll:
                  input_payloads: list[torch.Tensor],
                  runtime_max_tokens_per_rank: int,
                  invalid_token_expert_id: Optional[int] = None,
-                 expert_id_payload_index: Optional[int] = None):
+                 expert_id_payload_index: Optional[int] = None,
+                 eplb_local_stats: Optional[torch.Tensor] = None):
         """
         Perform MoE all-to-all dispatch operation.
 
@@ -206,19 +218,36 @@ class MoeAlltoAll:
             runtime_max_tokens_per_rank: Maximum of the number of tokens of each DP rank's local batch.
             invalid_token_expert_id: If not None, set the token_selected_experts of the invalid tokens to this expert id. This is used to notify the MoE to skip these tokens for GroupGEMM.
             expert_id_payload_index: The index of token_selected_experts in the input_payloads. Must be provided if invalid_token_expert_id is not None.
+            eplb_local_stats: (Optional) [num_experts] tensor containing local statistics for EPLB
 
         Returns:
             recv_tensors: List of tensors received, each has shape [ep_size, max_tokens_per_rank, payload_num_elements_per_token]
         """
         assert self._state.phase == "idle", "dispatch called twice without an intervening combine"
         assert runtime_max_tokens_per_rank <= self.max_num_tokens, "runtime_max_tokens_per_rank must not exceed max_num_tokens"
-        recv_tensors, combine_payload_offset = torch.ops.trtllm.moe_a2a_dispatch(
-            token_selected_experts, input_payloads, self.workspace,
-            self.metainfo, runtime_max_tokens_per_rank, self.ep_rank,
-            self.ep_size, self.top_k, self.num_experts)
+        if eplb_local_stats is not None and not self.enable_eplb:
+            raise ValueError(
+                "eplb_local_stats provided but enable_eplb is False")
+
+        recv_tensors, combine_payload_offset, eplb_gathered_stats = torch.ops.trtllm.moe_a2a_dispatch(
+            token_selected_experts,
+            input_payloads,
+            self.workspace,
+            self.metainfo,
+            runtime_max_tokens_per_rank,
+            self.ep_rank,
+            self.ep_size,
+            self.top_k,
+            self.num_experts,
+            eplb_local_stats,
+        )
+        if eplb_gathered_stats.numel() == 0:
+            eplb_gathered_stats = None
+
         # Update state together after successful dispatch
         self._state.local_num_tokens = token_selected_experts.size(0)
         self._state.combine_payload_offset = combine_payload_offset
+        self._state.eplb_gathered_stats = eplb_gathered_stats
         self._state.phase = "dispatched"
 
         if invalid_token_expert_id is not None:

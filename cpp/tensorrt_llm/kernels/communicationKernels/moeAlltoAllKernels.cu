@@ -361,14 +361,10 @@ __global__ void moeA2APrepareDispatchKernel(
 }
 
 // ============================================================================
-// Generic Dispatch Kernel Implementation
-// One warp per token design:
-// - Each CTA has 256 threads = 8 warps
-// - Each warp independently processes one token and all its payloads
-// - Better GPU utilization and reduced synchronization overhead
+// Dispatch Kernels
 // ============================================================================
 
-template <typename ThreadingPolicy, int TOP_K>
+template <typename ThreadingPolicy, int TOP_K, bool EPLB_STATS>
 __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [local_num_tokens, TOP_K]
     const DispatchKernelPointers ptrs,                                      // Struct containing all kernel pointers
     int num_payloads,                                                       // Number of payloads
@@ -502,6 +498,21 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
                 ptrs.recv_counters[target_rank][rank_id] = send_count;
             }
 
+            if constexpr (EPLB_STATS)
+            {
+                // Write local stats into peer buffers before the release fence below.
+#pragma unroll 1
+                for (int target_rank = 0; target_rank < ep_size; ++target_rank)
+                {
+                    int* target_stats = ptrs.eplb_gathered_stats[target_rank];
+                    for (int expert_id = lane_id; expert_id < num_experts; expert_id += warpSize)
+                    {
+                        int stat_val = ptrs.eplb_local_stats[expert_id];
+                        target_stats[rank_id * num_experts + expert_id] = stat_val;
+                    }
+                }
+            }
+
 #if !DISABLE_SYNC_FOR_PROFILING
             uint32_t expected_value = *ptrs.flag_val;
 
@@ -589,6 +600,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
     for (int target_rank = 0; target_rank < params.ep_size; target_rank++)
     {
         kernel_ptrs.recv_counters[target_rank] = params.recv_counters[target_rank];
+        kernel_ptrs.eplb_gathered_stats[target_rank] = params.eplb_gathered_stats[target_rank];
         for (int payload = 0; payload < params.num_payloads; payload++)
         {
             kernel_ptrs.recv_buffers[target_rank][payload] = params.recv_buffers[target_rank][payload];
@@ -607,6 +619,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
     kernel_ptrs.local_token_counter = params.local_token_counter;
     kernel_ptrs.topk_target_ranks = params.topk_target_ranks;
     kernel_ptrs.topk_send_indices = params.topk_send_indices;
+    kernel_ptrs.eplb_local_stats = params.eplb_local_stats;
 
     int const kBlockSize = tensorrt_llm::common::getEnvMoeA2ADispatchBlockSize();
     constexpr int kWarpSize = 32;
@@ -622,10 +635,12 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
             grid_size = 1;
         }
         int shared_bytes = 2 * params.top_k * (int) sizeof(int);
-        SWITCH_TOP_K(params.top_k, TOP_K,
-            moeA2ADispatchKernel<BlockPolicy, TOP_K><<<grid_size, kBlockSize, shared_bytes, params.stream>>>(
-                params.token_selected_experts, kernel_ptrs, params.num_payloads, params.max_tokens_per_rank,
-                params.local_num_tokens, params.ep_rank, params.ep_size, params.num_experts))
+        SWITCH_BOOL(params.enable_eplb, EPLB_STATS,
+            SWITCH_TOP_K(params.top_k, TOP_K,
+                moeA2ADispatchKernel<BlockPolicy, TOP_K, EPLB_STATS>
+                <<<grid_size, kBlockSize, shared_bytes, params.stream>>>(params.token_selected_experts, kernel_ptrs,
+                    params.num_payloads, params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank,
+                    params.ep_size, params.num_experts)))
     }
     else
     {
@@ -636,10 +651,12 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
             grid_size = 1;
         }
         int shared_bytes = 2 * kWarpsPerBlock * params.top_k * (int) sizeof(int);
-        SWITCH_TOP_K(params.top_k, TOP_K,
-            moeA2ADispatchKernel<WarpPolicy, TOP_K><<<grid_size, kBlockSize, shared_bytes, params.stream>>>(
-                params.token_selected_experts, kernel_ptrs, params.num_payloads, params.max_tokens_per_rank,
-                params.local_num_tokens, params.ep_rank, params.ep_size, params.num_experts))
+        SWITCH_BOOL(params.enable_eplb, EPLB_STATS,
+            SWITCH_TOP_K(params.top_k, TOP_K,
+                moeA2ADispatchKernel<WarpPolicy, TOP_K, EPLB_STATS>
+                <<<grid_size, kBlockSize, shared_bytes, params.stream>>>(params.token_selected_experts, kernel_ptrs,
+                    params.num_payloads, params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank,
+                    params.ep_size, params.num_experts)))
     }
 }
 
