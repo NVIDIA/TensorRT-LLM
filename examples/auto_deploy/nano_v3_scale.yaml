@@ -37,6 +37,7 @@ transforms:
         # MoLE: latent projections: simple shard
         "fc1_latent_proj": "gather"
         "fc2_latent_proj": "gather"
+  #TODO: Enable after #10608 is fixed
   multi_stream_moe:
     stage: compile
     enabled: false
