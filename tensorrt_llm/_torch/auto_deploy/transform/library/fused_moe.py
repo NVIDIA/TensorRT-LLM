@@ -1529,10 +1529,14 @@ def _stack_fp8_moe_weights(
             )
         )
         # Check if input scales are identical across experts
-        w1_scales_identical = torch.all(w1_input_scale_stacked[0] == w1_input_scale_stacked).item()
-        w2_scales_identical = torch.all(w2_input_scale_stacked[0] == w2_input_scale_stacked).item()
+        w1_input_scales_identical = torch.all(
+            w1_input_scale_stacked[0] == w1_input_scale_stacked
+        ).item()
+        w2_input_scales_identical = torch.all(
+            w2_input_scale_stacked[0] == w2_input_scale_stacked
+        ).item()
 
-        if not w1_scales_identical or not w2_scales_identical:
+        if not w1_input_scales_identical or not w2_input_scales_identical:
             if allow_different_input_scales:
                 # Issue warning once and continue - max() will be used
                 ad_logger.warning_once(
@@ -1542,11 +1546,11 @@ def _stack_fp8_moe_weights(
                 )
             else:
                 # Fail with assertion
-                assert w1_scales_identical, (
+                assert w1_input_scales_identical, (
                     "All w1 input scales should have the same value. "
                     "Set allow_different_input_scales=True to allow different scales (uses max)."
                 )
-                assert w2_scales_identical, (
+                assert w2_input_scales_identical, (
                     "All w2 input scales should have the same value. "
                     "Set allow_different_input_scales=True to allow different scales (uses max)."
                 )

@@ -219,3 +219,5 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml', 'llama4_maverick_lite.yaml']
 - name: nvidia/NVIDIA-Nemotron-3-Super-120B-BF16-BF16KV-010726
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml','super_v3.yaml']
+- name: nvidia/NVIDIA-Nemotron-3-Super-120B-FP8-FP8KV-011226
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml','super_v3.yaml']
