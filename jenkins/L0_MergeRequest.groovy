@@ -119,6 +119,7 @@ def DEBUG_MODE = "debug"
 @Field
 def DETAILED_LOG = "detailed_log"
 
+@Field
 def testFilter = [
     (REUSE_TEST): gitlabParamsFromBot.get(REUSE_TEST, null),
     (REUSE_STAGE_LIST): trimForStageList(gitlabParamsFromBot.get(REUSE_STAGE_LIST, null)?.tokenize(',')),
@@ -138,6 +139,7 @@ def testFilter = [
     (DETAILED_LOG): gitlabParamsFromBot.get(DETAILED_LOG, false),
 ]
 
+@Field
 String reuseBuild = gitlabParamsFromBot.get('reuse_build', null)
 
 @Field
@@ -150,6 +152,7 @@ def ACTION_INFO = "action_info"
 def IMAGE_KEY_TO_TAG = "image_key_to_tag"
 @Field
 def TARGET_BRANCH = "target_branch"
+@Field
 def globalVars = [
     (GITHUB_PR_API_URL): gitlabParamsFromBot.get('github_pr_api_url', null),
     (CACHED_CHANGED_FILE_LIST): null,
