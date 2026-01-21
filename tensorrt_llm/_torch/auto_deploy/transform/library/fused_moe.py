@@ -12,8 +12,9 @@ from tensorrt_llm._torch.utils import ActivationType
 from ...custom_ops.quant import TRTLLM_NVFP4_PACKING_FACTOR, TRTLLM_NVFP4_SCALING_VECTOR_SIZE
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
-from ...utils._graph import delete_all_unused_submodules, eliminate_dead_code
+from ...utils._graph import delete_all_unused_submodules, eliminate_dead_code, get_attr_by_name
 from ...utils.cuda_mem_tracker import cuda_memory_tracker
+from ...utils.module import get_submodule_of_param
 from ...utils.node_utils import bfs, extract_op_args, identify_regions_between_residuals, is_op
 from ..interface import (
     BaseTransform,
@@ -1302,29 +1303,21 @@ def remove_original_experts(gm: GraphModule, weight_lists: List[List[Node]]) -> 
         gm: The GraphModule containing the expert submodules
         weight_lists: List of weight node lists (e.g., [w1_list, w2_list, w3_list])
     """
-    from tensorrt_llm._torch.auto_deploy.utils._graph import get_attr_by_name
+    # Flatten all weight lists/
+    weight_lists_flat = [w for weights in weight_lists for w in weights]
 
-    # Flatten all weight lists
-    all_weights = []
-    for weight_list in weight_lists:
-        all_weights.extend(weight_list)
-
-    for w in all_weights:
-        if w.op == "get_attr" and isinstance(w.target, str):
-            w_param = get_attr_by_name(gm, w.target)
-            if w_param is not None:
-                owner_module_path, _, param_name = w.target.rpartition(".")
-                if param_name != "weight":
-                    continue
-                owner_module = gm.get_submodule(owner_module_path)
-                owner_param = get_attr_by_name(owner_module, param_name)
-                if owner_param is w_param:
-                    gm.delete_submodule(owner_module_path)
-                else:
-                    # param w is not owned by owner_module, skip
-                    continue
+    for w in weight_lists_flat:
+        w_param = get_attr_by_name(gm, w.target)
+        if w_param is not None:
+            owner_module, owner_module_path, param_name = get_submodule_of_param(gm, w.target)
+            owner_param = get_attr_by_name(owner_module, param_name)
+            if owner_param is w_param:
+                gm.delete_submodule(owner_module_path)
             else:
+                # param w is not owned by owner_module, skip
                 continue
+        else:
+            continue
 
 
 def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "triton"]) -> int:
@@ -1556,12 +1549,6 @@ def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "
             if input_node.op == "get_attr" and len(input_node.users) == 0:
                 graph.erase_node(input_node)
         remove_original_experts(gm, [w1_list, w2_list, w3_list])
-
-    # Clean up after processing all nodes
-    # eliminate_dead_code will remove unused get_attr nodes, then delete_all_unused_submodules
-    # will remove the parameters/buffers that are no longer referenced
-    eliminate_dead_code(gm)
-    delete_all_unused_submodules(gm)
 
     return fused_key_counter
 
