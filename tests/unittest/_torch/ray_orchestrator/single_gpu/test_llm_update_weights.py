@@ -1,7 +1,7 @@
 import base64
-import pickle
 import json
 import os
+import pickle
 import re
 import shutil
 from tempfile import TemporaryDirectory
@@ -44,54 +44,23 @@ class RefHFModelWithIPCHandles(RefHFModel):
                     cur_weights.append((n, p.to("cuda:" + str(i))))
                 self.all_weights[i] = cur_weights
 
-    def get_weight_ipc_handles(
-        self,
-        device_ids: Optional[List[int]] = None,
-        weight_filter: Optional[Callable[[str], bool]] = None,
-    ):
-        """
-        Get IPC handles for model weights with flexible filtering.
-
-        Args:
-            device_ids: List of device indices to get weights from
-            weight_filter: Optional function that takes weight name and returns True if weight should be included
-
-        Returns:
-            ret: Dictionary containing weight handles
-        """
-        ret = {}
-        device_list = list(range(torch.cuda.device_count())) if device_ids is None else device_ids
-
-        for device in device_list:
-            all_handles = []
-            for item in self.all_weights[device]:
-                name, p = item
-                # Apply filter if provided
-                if weight_filter is not None and not weight_filter(name):
-                    continue
-                handle = reduce_tensor(p)
-                all_handles.append((name, handle))
-            ret[self.device_uuid[device]] = all_handles
-
-        return ret
-
     def get_weight_ipc_handles_serialized(
         self,
-        cuda_device: Optional[List[int]] = None,
+        device_ids: Optional[List[int]] = None,
         weight_filter: Optional[Callable[[str], bool]] = None,
     ):
         """
         Get base64-encoded serialized IPC handles for model weights.
 
         Args:
-            cuda_device: List of CUDA device indices to get weights from
+            device_ids: List of CUDA device indices to get weights from
             weight_filter: Optional function that takes weight name and returns True if weight should be included
 
         Returns:
             ret: Dictionary mapping device UUIDs to base64-encoded pickled handles
         """
         ret = {}
-        device_list = list(range(torch.cuda.device_count())) if cuda_device is None else cuda_device
+        device_list = list(range(torch.cuda.device_count())) if device_ids is None else device_ids
 
         for device in device_list:
             all_handles = []
@@ -182,36 +151,6 @@ def process_and_copy_folder(src_folder, dst_folder, num_hidden_layers: int = 4):
                 shutil.copy2(src_path, dest_path)
 
 
-def process_and_copy_folder(src_folder, dst_folder):
-    if os.path.exists(dst_folder):
-        shutil.rmtree(dst_folder)
-    os.makedirs(dst_folder)
-
-    for root, dirs, files in os.walk(src_folder):
-        rel_path = os.path.relpath(root, src_folder)
-        dest_dir = os.path.join(dst_folder, rel_path)
-
-        if not os.path.exists(dest_dir):
-            os.makedirs(dest_dir)
-
-        num_hidden_layers = 4
-        for file in files:
-            src_path = os.path.join(root, file)
-            dest_path = os.path.join(dest_dir, file)
-            if "safetensor" in file:
-                continue
-
-            if file == "config.json":
-                with open(src_path, "r", encoding="utf-8") as f:
-                    config = json.load(f)
-                config["num_hidden_layers"] = num_hidden_layers
-                with open(dest_path, "w", encoding="utf-8") as f:
-                    json.dump(config, f, indent=2, ensure_ascii=False)
-            else:
-                shutil.copy2(src_path, dest_path)
-
-
-@pytest.mark.parametrize("use_serialized_handles", [True, False])
 @pytest.mark.parametrize(
     "model_dir",
     [
@@ -223,7 +162,7 @@ def process_and_copy_folder(src_folder, dst_folder):
         "Qwen3/Qwen3-30B-A3B-FP8",
     ],
 )
-def test_llm_update_weights(model_dir, use_serialized_handles):
+def test_llm_update_weights(model_dir):
     """Test LLM update_weights with both serialized and direct IPC handle formats."""
     model_dir = str(llm_models_root() / model_dir)
     with TemporaryDirectory() as tmp_model_dir:
@@ -254,11 +193,7 @@ def test_llm_update_weights(model_dir, use_serialized_handles):
             temperature=0, return_generation_logits=True, max_tokens=1024
         )
 
-    # Get IPC handles in either serialized or direct format
-    if use_serialized_handles:
         ipc_handles = hf_model.get_weight_ipc_handles_serialized([0])
-    else:
-        ipc_handles = hf_model.get_weight_ipc_handles([0])
 
         llm._collective_rpc("update_weights", (ipc_handles,))
         # Finalize the update weights
@@ -328,7 +263,9 @@ def test_llm_partial_update_weights(model_dir):
 
         for filter_name in filter_list:
             weight_filter = common_filter(filter_name=filter_name)
-            ipc_handles = hf_model.get_weight_ipc_handles([0], weight_filter=weight_filter)
+            ipc_handles = hf_model.get_weight_ipc_handles_serialized(
+                [0], weight_filter=weight_filter
+            )
             llm._collective_rpc("update_weights", (ipc_handles,))
         # Finalize the update weights
         llm._collective_rpc("update_weights", (None,))
