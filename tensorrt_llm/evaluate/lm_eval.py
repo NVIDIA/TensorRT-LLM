@@ -136,9 +136,6 @@ class LmEvalWrapper(TemplateLM):
                             disable=disable_tqdm):
             prompt, gen_kwargs = request.args
             sampling_params = self._get_sampling_params(gen_kwargs)
-            sampling_params._setup(self.llm.tokenizer,
-                                   self.llm._hf_model_config,
-                                   self.llm._generation_config)
             output = self.llm.generate_async(prompt,
                                              sampling_params=sampling_params,
                                              streaming=self.streaming)
@@ -317,9 +314,6 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
             prompt["multi_modal_data"] = {"image": images}
 
             sampling_params = self._get_sampling_params(gen_kwargs)
-            sampling_params._setup(self.llm.tokenizer,
-                                   self.llm._hf_model_config,
-                                   self.llm._generation_config)
             output = self.llm.generate_async(prompt,
                                              sampling_params=sampling_params,
                                              streaming=self.streaming)
