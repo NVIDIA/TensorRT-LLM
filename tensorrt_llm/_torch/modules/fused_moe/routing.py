@@ -1,11 +1,11 @@
 import math
+import threading
 import warnings
 from enum import IntEnum
 from typing import Callable, Dict, Optional, Type
 
 import torch
 import torch.nn.functional as F
-import threading
 from torch import nn
 
 from tensorrt_llm.llmapi.utils import enable_llm_debug
@@ -629,25 +629,23 @@ class RenormalizeNaiveMoeRoutingMethod(RenormalizeMoeRoutingMethod):
         return RoutingMethodType.RenormalizeNaive
 
 
-
-
 class AdaptiveKMoeRoutingMethod(BaseMoeRoutingMethod):
     """
     Entropy-based Adaptive-K routing for MoE models.
-    
+
     Dynamically selects the number of experts (K) based on routing entropy:
     - Low entropy (confident routing) -> fewer experts -> save compute
     - High entropy (uncertain routing) -> more experts -> maintain quality
-    
+
     Validated results:
     - Mixtral 8x7B: 52.5% compute reduction
     - Qwen-MoE: 32.4% compute reduction
     - OLMoE-1B-7B: 24.7% compute reduction
-    
+
     Reference: "Entropy-Guided Dynamic Expert Selection in MoE Models" (arXiv 2026)
     Author: Gabriele Balsamo (gabriele.balsamo30@gmail.com)
     """
-    
+
     def __init__(
         self,
         k_min: int = 2,
@@ -657,7 +655,7 @@ class AdaptiveKMoeRoutingMethod(BaseMoeRoutingMethod):
     ):
         """
         Initialize Adaptive-K routing.
-        
+
         Args:
             k_min: Minimum experts to use (for confident/low-entropy routing)
             k_max: Maximum experts to use (for uncertain/high-entropy routing)
@@ -675,72 +673,76 @@ class AdaptiveKMoeRoutingMethod(BaseMoeRoutingMethod):
         self.k_values = [k_min, (k_min + k_max) // 2, k_max]
         self.entropy_thresholds = entropy_thresholds or [1.3, 1.7]
         self.output_dtype = output_dtype
-        
+
         # Statistics tracking
         self._k_counts = {k: 0 for k in self.k_values}
         self._total_tokens = 0
         self._entropy_sum = 0.0
         self._stats_lock = threading.Lock()
         self._collect_stats = True  # Set to False for production to avoid overhead
-    
+
     def compute_entropy(self, probs: torch.Tensor) -> torch.Tensor:
         """Compute entropy of routing distribution: H = -sum(p * log(p))"""
         eps = 1e-9
         return -torch.sum(probs * torch.log(probs + eps), dim=-1)
-    
+
     def select_k_per_token(self, entropy: torch.Tensor) -> torch.Tensor:
         """Select K value for each token based on entropy thresholds."""
         k = torch.full_like(entropy, self.k_values[-1], dtype=torch.int32)
         for i in range(len(self.entropy_thresholds) - 1, -1, -1):
-            k = torch.where(entropy < self.entropy_thresholds[i], self.k_values[i], k)
+            k = torch.where(entropy < self.entropy_thresholds[i],
+                            self.k_values[i], k)
         return k
-    
-    def apply(self, router_logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+
+    def apply(self,
+              router_logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Apply adaptive-K routing to router logits.
-        
+
         Args:
             router_logits: Router output [num_tokens, num_experts]
-            
+
         Returns:
             Tuple of:
                 - token_selected_experts: [num_tokens, k_max] expert indices (int32)
                 - token_final_scales: [num_tokens, k_max] routing weights
-                
+
         Note: Returns k_max experts per token for tensor shape compatibility.
         Tokens with lower K have zero weights for unused expert slots.
         """
         num_tokens, num_experts = router_logits.shape
         device = router_logits.device
-        
+
         # Compute routing probabilities
         probs = F.softmax(router_logits.to(self.output_dtype), dim=-1)
-        
+
         # Compute entropy per token
         entropy = self.compute_entropy(probs)
-        
+
         # Select K per token based on entropy
         k_per_token = self.select_k_per_token(entropy)
-        
+
         # Get top-k_max experts (we'll mask unused ones)
         topk_values, topk_indices = torch.topk(probs, k=self.k_max, dim=-1)
-        
+
         # Create mask for valid experts based on per-token K
         k_range = torch.arange(self.k_max, device=device).unsqueeze(0)
         valid_mask = k_range < k_per_token.unsqueeze(1)
-        
+
         # Zero out weights for invalid expert slots
-        masked_values = torch.where(valid_mask, topk_values, torch.zeros_like(topk_values))
-        
+        masked_values = torch.where(valid_mask, topk_values,
+                                    torch.zeros_like(topk_values))
+
         # Renormalize weights (only over valid experts)
         weight_sum = masked_values.sum(dim=-1, keepdim=True) + 1e-9
         normalized_values = masked_values / weight_sum
-        
+
         # Update statistics (for monitoring)
         self._update_stats(k_per_token, entropy)
-        
-        return topk_indices.to(torch.int32), normalized_values.to(self.output_dtype)
-    
+
+        return topk_indices.to(torch.int32), normalized_values.to(
+            self.output_dtype)
+
     def _update_stats(self, k_per_token: torch.Tensor, entropy: torch.Tensor):
         """Update internal statistics for monitoring compute savings (thread-safe)."""
         if not self._collect_stats:
@@ -750,15 +752,23 @@ class AdaptiveKMoeRoutingMethod(BaseMoeRoutingMethod):
                 self._k_counts[k] += (k_per_token == k).sum().item()
             self._total_tokens += k_per_token.numel()
             self._entropy_sum += entropy.sum().item()
-    
+
     def get_stats(self) -> dict:
         """Get routing statistics including compute savings."""
         if self._total_tokens == 0:
-            return {"k_distribution": {}, "mean_entropy": 0.0, "total_tokens": 0}
-        
-        k_dist = {k: count / self._total_tokens * 100 for k, count in self._k_counts.items()}
-        avg_k = sum(k * (count / self._total_tokens) for k, count in self._k_counts.items())
-        
+            return {
+                "k_distribution": {},
+                "mean_entropy": 0.0,
+                "total_tokens": 0
+            }
+
+        k_dist = {
+            k: count / self._total_tokens * 100
+            for k, count in self._k_counts.items()
+        }
+        avg_k = sum(k * (count / self._total_tokens)
+                    for k, count in self._k_counts.items())
+
         return {
             "k_distribution": k_dist,
             "mean_entropy": self._entropy_sum / self._total_tokens,
@@ -767,7 +777,7 @@ class AdaptiveKMoeRoutingMethod(BaseMoeRoutingMethod):
             "baseline_k": self.k_max,
             "compute_savings_pct": (1 - avg_k / self.k_max) * 100
         }
-    
+
     def reset_stats(self):
         """Reset statistics."""
         self._k_counts = {k: 0 for k in self.k_values}
@@ -775,7 +785,7 @@ class AdaptiveKMoeRoutingMethod(BaseMoeRoutingMethod):
         self._entropy_sum = 0.0
         self._stats_lock = threading.Lock()
         self._collect_stats = True  # Set to False for production to avoid overhead
-    
+
     @property
     def routing_method_type(self) -> RoutingMethodType:
         return RoutingMethodType.AdaptiveK
