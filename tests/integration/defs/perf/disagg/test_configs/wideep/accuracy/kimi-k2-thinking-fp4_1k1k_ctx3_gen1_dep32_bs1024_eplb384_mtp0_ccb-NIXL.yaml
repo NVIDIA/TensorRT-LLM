@@ -10,10 +10,10 @@ metadata:
   dataset_file: disagg_datasets/kimi-k2-1024-1024-20000-ratio-1_for_serve.json
   accuracy:
     datasets:
-    - dataset_name: gsm8k
-      expected_value: 0.9454
+    - dataset_name: gpqa_diamond_cot_zeroshot
+      expected_value: 0.65
       threshold_type: hypothesis_test
-      filter_type: flexible-extract
+      filter_type: strict-match
 slurm:
   script_file: disaggr_torch.slurm
   partition: <partition>
@@ -23,7 +23,8 @@ slurm:
   extra_args: "--gres=gpu:4"
   numa_bind: true
 benchmark:
-  mode: gen_only
+  enable_benchmark: false
+  mode: e2e
   use_nv_sa_benchmark: false
   multi_round: 8
   benchmark_ratio: 1.0
@@ -47,9 +48,16 @@ profiling:
   nsys_on: false
 accuracy:
   enable_accuracy_test: true
-  model: local-completions
-  tasks: gsm8k
-  model_args_extra: num_concurrent=512,max_retries=3,tokenized_requests=false,timeout=1200,max_gen_toks=256,max_length=4096
+  env_var:
+    HF_HOME: <hf_home_path>
+  tasks:
+    gpqa_diamond_local:
+      model: "local-chat-completions"
+      model_args_extra: "num_concurrent=512,max_retries=3,tokenized_requests=false,timeout=7200,max_gen_toks=16384"
+      extra_kwargs:
+        apply_chat_template: true
+        trust_remote_code: true
+        custom_config: <repo_path>/tests/integration/lm_eval_configs/gpqa_diamond_local.yaml
 worker_config:
   gen:
     enable_layerwise_nvtx_marker: true
@@ -58,30 +66,16 @@ worker_config:
     enable_attention_dp: true
     enable_lm_head_tp_in_adp: false
     pipeline_parallel_size: 1
-    max_batch_size: 1024
-    max_num_tokens: 1024
-    max_seq_len: 5120
+    max_batch_size: 512
+    max_num_tokens: 512
+    max_seq_len: 16384
     cuda_graph_config:
       enable_padding: true
-      batch_sizes:
-      - 1
-      - 2
-      - 4
-      - 8
-      - 16
-      - 32
-      - 64
-      - 128
-      - 256
-      - 512
-      - 768
-      - 1024
-      - 2048
-      - 1024
+      max_batch_size: 512
     print_iter_log: true
     kv_cache_config:
       enable_block_reuse: false
-      free_gpu_memory_fraction: 0.8
+      free_gpu_memory_fraction: 0.85
       dtype: fp8
     moe_config:
       backend: WIDEEP
@@ -97,9 +91,9 @@ worker_config:
     trust_remote_code: true
   ctx:
     enable_layerwise_nvtx_marker: true
-    max_batch_size: 8
+    max_batch_size: 32
     max_num_tokens: 8448
-    max_seq_len: 5120
+    max_seq_len: 8448
     tensor_parallel_size: 4
     moe_expert_parallel_size: 4
     enable_attention_dp: true

@@ -169,6 +169,7 @@ MODEL_PATH_DICT = {
     "mistral_small_v3.1_24b": "Mistral-Small-3.1-24B-Instruct-2503",
     "gpt_oss_120b_fp4": "gpt_oss/gpt-oss-120b",
     "gpt_oss_20b_fp4": "gpt_oss/gpt-oss-20b",
+    "nemotron_nano_3_30b_fp8": "Nemotron-Nano-3-30B-A3.5B-FP8-KVFP8-dev",
     "nemotron_nano_12b_v2": "NVIDIA-Nemotron-Nano-12B-v2",
     "nvidia_nemotron_nano_9b_v2_nvfp4": "NVIDIA-Nemotron-Nano-9B-v2-NVFP4",
     "starcoder2_7b": "starcoder2-7b",
@@ -236,6 +237,11 @@ TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=
     "llama_v3.3_nemotron_super_49b_fp8",
     "llama_v3.1_nemotron_ultra_253b",
     "llama_v3.1_nemotron_ultra_253b_fp8",
+}
+
+# Autodeploy model configs - maps model name to config file path (relative to TRT-LLM root)
+AUTODEPLOY_MODEL_CONFIGS = {
+    "nemotron_nano_3_30b_fp8": "examples/auto_deploy/nano_v3.yaml",
 }
 
 
@@ -1408,7 +1414,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 os.makedirs(os.path.dirname(autodeploy_config_path),
                             exist_ok=True)
 
-            # Create _autodeploy specific configuration
+            # Default autodeploy config
             autodeploy_config = {
                 'transforms': {
                     'compile_model': {
@@ -1421,6 +1427,15 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 'runtime': self._config.extra_runtime,
                 'skip_loading_weights': self._config.skip_loading_weights
             }
+
+            # If model has a curated config, use it instead
+            if self._config.model_name in AUTODEPLOY_MODEL_CONFIGS:
+                config_file = os.path.join(
+                    self._llm_root,
+                    AUTODEPLOY_MODEL_CONFIGS[self._config.model_name])
+                if os.path.exists(config_file):
+                    with open(config_file, 'r') as f:
+                        autodeploy_config = yaml.safe_load(f)
 
             print_info(f"_autodeploy model config: {autodeploy_config}")
             with open(autodeploy_config_path, 'w') as f:

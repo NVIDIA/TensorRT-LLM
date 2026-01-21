@@ -113,6 +113,7 @@ l0_dgx_b200:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_nvfp4_multi_gpus[baseline_pp4_mtp1] TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_nvfp4_multi_gpus_chunked_prefill[baseline_fp8kv] TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestMistralLarge3_675B::test_fp8[latency_moe_deepgemm] TIMEOUT (60)
+  - test_e2e.py::test_deepseek_r1_mtp_bench TIMEOUT(60) # Cover https://nvbugs/5670108
 - condition:
     ranges:
       system_gpu_count:
@@ -199,7 +200,7 @@ l0_dgx_b200:
   - unittest/_torch/multi_gpu_modeling -k "deepseek"
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[pp4-fp8kv=True-attn_backend=TRTLLM-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=CUTEDSL-mtp_nextn=2-ep4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
-  - accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp4_tp2pp2[torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp4_tp2pp2[torch_compile=False-enable_gemm_allreduce_fusion=False]
 # ------------- AutoDeploy Backend Stages ---------------
 - condition:
     ranges:
@@ -218,4 +219,6 @@ l0_dgx_b200:
   tests:
   - unittest/_torch/auto_deploy/unit/multigpu
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[False-4]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_bf16
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_bf16
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_fp8[4]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_fp8[8]

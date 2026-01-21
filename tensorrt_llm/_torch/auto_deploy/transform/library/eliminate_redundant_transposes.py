@@ -110,10 +110,6 @@ class EliminateRedundantTransposes(BaseTransform):
                 original_input.replace_all_uses_with(new_contiguous_node)
                 new_contiguous_node.replace_input_with(new_contiguous_node, original_input)
 
-        # Clean up the graph
-        if nodes_to_eliminate:
-            gm.graph.eliminate_dead_code()
-
         info = TransformInfo(
             skipped=False,
             num_matches=len(nodes_to_eliminate),

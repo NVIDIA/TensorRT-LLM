@@ -1304,6 +1304,11 @@ TEST_P(AsymmetricalCacheTest, TestCase)
     {
         GTEST_SKIP() << "Temporarily skipping cache transceiver tests with NIXL and MOONCAKE backend for CP.";
     }
+    if (isIndexerKCache && tensorrt_llm::common::getEnvUseMooncakeKvCache())
+    {
+        // https://nvbugs/5760737
+        GTEST_SKIP() << "Temporarily skipping cache transceiver tests with Mooncake backend for Indexer KCache.";
+    }
     std::vector<int> lenList = {30, 10, 60, 80};
     if (genCp > 1)
     {

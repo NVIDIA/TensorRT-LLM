@@ -86,7 +86,7 @@ if [ -n "${trtllm_wheel_path}" ]; then
     if ! srun --container-name=${container_name} \
         --container-mounts=${container_mount} --no-container-mount-home \
         --mpi=pmix --overlap -N $SLURM_NNODES --ntasks-per-node=1 \
-        bash -c "pip install ${trtllm_wheel_path}" \
+        bash -c "pip install ${trtllm_wheel_path}[devel]" \
         &> ${full_logdir}/2_install.log; then
         cleanup_on_failure "TensorRT-LLM wheel installation failed. Check ${full_logdir}/2_install.log for details"
     fi
@@ -117,16 +117,23 @@ elif [ -d "${trtllm_repo}" ]; then
     if ! srun --container-name=${container_name} \
         --container-mounts=${container_mount} --no-container-mount-home \
         --mpi=pmix --overlap -N $SLURM_NNODES --ntasks-per-node=1 \
-        bash -c "cd ${trtllm_repo} && pip install -e ." \
+        bash -c "cd ${trtllm_repo} && pip install -e .[devel]" \
         &> ${full_logdir}/2_install.log; then
         cleanup_on_failure "TensorRT-LLM installation failed. Check ${full_logdir}/2_install.log for details"
     fi
     echo "TensorRT-LLM installation completed successfully"
 else
     echo "trtllm_wheel_path and trtllm_repo are not provided, will use the installed TensorRT-LLM from the container"
-    if [ -v TRT_LLM_GIT_COMMIT ]; then
-        echo "TRT_LLM_GIT_COMMIT: ${TRT_LLM_GIT_COMMIT}"
+    # get_env file is in the same directory as this script
+    get_env_file=${work_dir}/get_env.py
+    if ! srun --container-name=${container_name} \
+        --container-mounts=${container_mount} --no-container-mount-home \
+        --mpi=pmix --overlap -N 1 --ntasks-per-node=1 \
+        bash -c "python ${get_env_file} -e ${full_logdir}/env_vars.json" \
+        &> ${full_logdir}/2_get_env.log; then
+        cleanup_on_failure "Failed to get TensorRT-LLM environment variables. Check ${full_logdir}/2_get_env.log for details"
     fi
+    echo "TensorRT-LLM environment variables saved to ${full_logdir}/env_vars.json"
 fi
 
 # Get node lists and replace the placeholder with the actual node names

@@ -433,7 +433,8 @@ def fp4_row_linear_allreduce_run_single_rank(func, tp_size, seq_len,
                          indirect=True,
                          ids=lambda x: f"tp_size:{x}")
 def test_fp4_row_linear_allreduce(seq_len, output_size, hidden_size, dtype,
-                                  mpi_pool_executor):
+                                  mpi_pool_executor, monkeypatch):
+    monkeypatch.setenv("TRTLLM_GEMM_ALLREDUCE_FUSION_ENABLED", "1")
     torch.manual_seed(42)
     tp_size = mpi_pool_executor.num_workers
 
