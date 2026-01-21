@@ -20,8 +20,9 @@ from torch.fx import GraphModule
 
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
+from ...utils._graph import run_shape_prop
 from ...utils.logger import ad_logger
-from ...utils.node_utils import is_op
+from ...utils.node_utils import is_op, sync_weight_meta_dtype
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
 
@@ -138,13 +139,32 @@ class AdaptToEdgeLLM(BaseTransform):
                 num_changed += 1
         return num_changed
 
-    def _to_float16(self, gm: GraphModule) -> None:
-        """Convert all model parameters and buffers to float16 precision.
+    def _to_float16(self, gm: GraphModule) -> int:
+        """Convert floating point type parameters and buffers to float16
+        precision.
+
+        This preserves lower precision dtypes (e.g., float8_e4m3fn for
+        quantized weights) while converting higher precision dtypes (e.g.,
+        bfloat16, float32, float64) to float16 for EdgeLLM compatibility.
 
         Args:
             gm: The GraphModule to convert.
+
+        Returns:
+            Number of tensors converted from higher precision dtypes to
+            float16.
         """
-        gm.half()
+        num_converted = 0
+        dtypes = [torch.float32, torch.float64, torch.bfloat16]
+        for _name, param in gm.named_parameters():
+            if param.dtype in dtypes:
+                param.data = param.data.to(torch.float16)
+                num_converted += 1
+        for _name, buffer in gm.named_buffers():
+            if buffer.dtype in dtypes:
+                buffer.data = buffer.data.to(torch.float16)
+                num_converted += 1
+        return num_converted
 
     def _apply(
         self,
@@ -153,14 +173,25 @@ class AdaptToEdgeLLM(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        self._to_float16(gm)
+        """Apply EdgeLLM adaptation: convert to FP16 and insert necessary casts."""
+        num_converted = self._to_float16(gm)
+        num_synced = sync_weight_meta_dtype(gm)
+        ad_logger.info(f"Converted {num_converted} float32 tensors to float16")
+        ad_logger.info(f"Synced {num_synced} weight meta dtypes")
         logits_cast = self._add_cast_after_last_linear(gm)
         assert logits_cast is not None, "Failed to add cast after last linear"
         num_attn_casts = self._insert_cast_after_attn_reshape(gm)
         num_bfloat16_casts = self._change_cast_bfloat16_to_float16(gm)
+
+        # NOTE(yoco) Run shape without lift_to_meta()
+        # If we run shape inference with has_valid_shapes=True,
+        # it will fail because it will lift some placeholder to meta
+        # and cause a device mismatch error.
+        run_shape_prop(gm)
+
         ad_logger.info(f"Changed {num_bfloat16_casts} bfloat16 casts to float16")
         ad_logger.info(f"Adapted EdgeLLM model (inserted {num_attn_casts} attention casts)")
 
         return gm, TransformInfo(
-            skipped=False, num_matches=num_attn_casts, is_clean=False, has_valid_shapes=True
+            skipped=False, num_matches=num_attn_casts, is_clean=False, has_valid_shapes=False
         )
