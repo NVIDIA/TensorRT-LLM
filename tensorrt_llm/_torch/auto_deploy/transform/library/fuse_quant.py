@@ -215,7 +215,7 @@ def _register_quant_fp4_linear_patterns(patterns: ADPatternMatcherPass) -> None:
     alpha = torch.tensor(1.2345, device="meta", dtype=torch.float32)
 
     cutlass_len = N * (K_eff // 16)  # 32 * (64/16) = 128
-    cutlass_vec = torch.randint(0, 255, (cutlass_len,), device="meta", dtype=torch.uint8)
+    cutlass_vec = torch.randint(0, 255, (cutlass_len,), device="meta", dtype=torch.float8_e4m3fn)
 
     # no-bias variant
     dummy_args_fp4_1 = [
