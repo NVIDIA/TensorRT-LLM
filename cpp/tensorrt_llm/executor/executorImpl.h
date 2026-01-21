@@ -180,16 +180,17 @@ private:
 
     IdType generateReqId(Request const& request)
     {
-        if (request.getDisaggRequestId().has_value())
+        // If the request has a disaggregated request id, prefer it.
+        if (request.getDisaggRequestId().has_value() && request.getDisaggRequestId().value() > kMaxLocalReqId)
         {
             return request.getDisaggRequestId().value();
         }
-        return generateReqId();
+        // Otherwise, generate a local request id in range [1, kMaxLocalReqId).
+        return generateLocalReqId();
     }
 
-    IdType generateReqId()
+    IdType generateLocalReqId()
     {
-        static constexpr IdType kMaxLocalReqId = 1ULL << 42U;
         return (mLastReqId++ % kMaxLocalReqId);
     }
 
@@ -325,7 +326,10 @@ private:
 
     IdType mLastReqId = 1;
 
-    static constexpr IdType mTerminateReqId = 0;
+    static constexpr IdType kTerminateReqId = 0;
+    // Request id > kMaxLocalReqId is reserved for disaggregated requests.
+    // This max ID is also in Python side.
+    static constexpr IdType kMaxLocalReqId = 1ULL << 42U;
 
     BatchingType mBatchingType;
     bool mIsSchedulerMaxUtilization;

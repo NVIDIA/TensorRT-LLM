@@ -917,7 +917,7 @@ std::vector<IdType> Executor::Impl::enqueueRequests(common::ArrayView<Request co
                 childReqIds.reserve(numChildRequests);
                 for (int childId = 0; childId < numChildRequests; childId++)
                 {
-                    childReqIds.emplace_back(generateReqId());
+                    childReqIds.emplace_back(generateLocalReqId());
                     TLLM_LOG_DEBUG("Add new child request with id %d", childReqIds.back());
                 }
             }
@@ -1319,7 +1319,7 @@ std::vector<RequestWithId> Executor::Impl::getLeaderNewReqWithIds(
         return reqWithIds;
     }
 
-    if (mQueuedRequests.front().id == mTerminateReqId)
+    if (mQueuedRequests.front().id == kTerminateReqId)
     {
         reqWithIds.emplace_back(std::move(mQueuedRequests.front()));
         mQueuedRequests.pop_front();
@@ -1468,7 +1468,7 @@ std::tuple<Executor::Impl::RequestList, double> Executor::Impl::fetchNewRequests
     double newActiveRequestsQueueLatencyMS{0.};
     for (auto& reqWithId : reqWithIds)
     {
-        if (reqWithId.id == mTerminateReqId)
+        if (reqWithId.id == kTerminateReqId)
         {
             mShutdown = true;
             mResponsesCv.notify_all();
@@ -2357,7 +2357,6 @@ void Executor::Impl::executionLoop()
                 }
             }
         }
-
         if (!activeRequests.empty())
         {
             forwardAsync(activeRequests);
@@ -2411,7 +2410,7 @@ void Executor::Impl::enqueueTerminateRequest()
     {
         std::scoped_lock<std::mutex> lck(mQueuedReqMtx);
         Request dummyReq({1}, 1);
-        RequestWithId reqWithId{std::move(dummyReq), mTerminateReqId};
+        RequestWithId reqWithId{std::move(dummyReq), kTerminateReqId};
         mQueuedRequests.emplace_back(reqWithId);
     }
     mQueuedReqCv.notify_one();
