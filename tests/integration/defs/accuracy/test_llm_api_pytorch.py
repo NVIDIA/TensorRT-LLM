@@ -3161,7 +3161,7 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
             "model_path": f"{llm_models_root()}/Kimi-K2-Thinking-NVFP4",
             "kv_cache_config": KvCacheConfig(
                 dtype="fp8",
-                free_gpu_memory_fraction=0.9,
+                free_gpu_memory_fraction=0.75,
                 enable_block_reuse=True,
                 enable_partial_reuse=False,
                 event_buffer_max_size=1024,
