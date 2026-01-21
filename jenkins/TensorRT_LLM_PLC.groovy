@@ -136,8 +136,8 @@ pipeline {
     }
     options {
         skipDefaultCheckout()
-        // to better analyze the time for each step/test
         timestamps()
+        timeout(time: 60, unit: 'MINUTES')
     }
 
     triggers {
