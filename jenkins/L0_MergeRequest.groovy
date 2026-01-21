@@ -10,24 +10,26 @@ import org.jsoup.Jsoup
 import org.jenkinsci.plugins.pipeline.modeldefinition.Utils as jUtils
 
 // LLM repository configuration
+@Field String LLM_REPO
 withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
     LLM_REPO = env.gitlabSourceRepoHttpUrl ? env.gitlabSourceRepoHttpUrl : "${DEFAULT_LLM_REPO}"
 }
-LLM_ROOT = "llm"
+@Field String LLM_ROOT = "llm"
 
-BOT_REPO = "https://gitlab-master.nvidia.com/ftp/llm-bloom-bot.git"
-BOT_REVISION = "main"
-BOT_ROOT = "bot"
+@Field String BOT_REPO = "https://gitlab-master.nvidia.com/ftp/llm-bloom-bot.git"
+@Field String BOT_REVISION = "main"
+@Field String BOT_ROOT = "bot"
 
 // LLM repository configuration
+@Field String SCAN_REPO
 withCredentials([string(credentialsId: 'default-scan-repo', variable: 'DEFAULT_SCAN_REPO')]) {
     SCAN_REPO = "${DEFAULT_SCAN_REPO}"
 }
-SCAN_COMMIT = "main"
-SCAN_ROOT = "scan"
+@Field String SCAN_COMMIT = "main"
+@Field String SCAN_ROOT = "scan"
 
-ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
-UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
+@Field String ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
+@Field String UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 
 // Container configuration
 def getContainerURIs()
@@ -49,14 +51,15 @@ def getContainerURIs()
 }
 
 // Stage choices
-STAGE_CHOICE_NORMAL = "normal"
-STAGE_CHOICE_SKIP = "skip"
-STAGE_CHOICE_IGNORE = "ignore"
+@Field String STAGE_CHOICE_NORMAL = "normal"
+@Field String STAGE_CHOICE_SKIP = "skip"
+@Field String STAGE_CHOICE_IGNORE = "ignore"
 
-RELESE_CHECK_CHOICE = env.releaseCheckChoice ? env.releaseCheckChoice : STAGE_CHOICE_NORMAL
-X86_TEST_CHOICE = env.x86TestChoice ? env.x86TestChoice : STAGE_CHOICE_NORMAL
-SBSA_TEST_CHOICE = env.SBSATestChoice ? env.SBSATestChoice : STAGE_CHOICE_NORMAL
+@Field String RELESE_CHECK_CHOICE = env.releaseCheckChoice ? env.releaseCheckChoice : STAGE_CHOICE_NORMAL
+@Field String X86_TEST_CHOICE = env.x86TestChoice ? env.x86TestChoice : STAGE_CHOICE_NORMAL
+@Field String SBSA_TEST_CHOICE = env.SBSATestChoice ? env.SBSATestChoice : STAGE_CHOICE_NORMAL
 
+@Field
 def gitlabParamsFromBot = [:]
 
 if (env.gitlabTriggerPhrase)
@@ -66,10 +69,13 @@ if (env.gitlabTriggerPhrase)
 
 // "Fail Fast" feature is enabled by default for the pre-merge pipeline.
 // "Fail Fast" feature is always disabled for the post-merge pipeline.
+@Field
 boolean enableFailFast = !(env.JOB_NAME ==~ /.*PostMerge.*/ || env.JOB_NAME ==~ /.*Dependency_Testing_TRT.*/) && !gitlabParamsFromBot.get("disable_fail_fast", false)
 
+@Field
 boolean isReleaseCheckMode = (gitlabParamsFromBot.get("run_mode", "full") == "release_check")
 
+@Field
 BUILD_STATUS_NAME = isReleaseCheckMode ? "Jenkins Release Check" : "Jenkins Full Build"
 
 def trimForStageList(stageNameList)
@@ -162,6 +168,7 @@ def globalVars = [
 ]
 
 // If not running all test stages in the L0 pre-merge, we will not update the GitLab status at the end.
+@Field
 boolean enableUpdateGitlabStatus =
     !testFilter[ENABLE_SKIP_TEST] &&
     !testFilter[ONLY_MULTI_GPU_TEST] &&
