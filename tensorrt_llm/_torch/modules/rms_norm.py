@@ -74,12 +74,11 @@ class RMSNorm(nn.Module):
             _ArgumentNotSpecifiedSentinelType] = _ARGUMENT_NOT_SPECIFIED_SENTINEL,
     ) -> Union[torch.Tensor, Fp4QuantizedTensor, Tuple[Union[
             torch.Tensor, Fp4QuantizedTensor], Optional[torch.Tensor]]]:
-        return_residual = True
-        if residual is self._ARGUMENT_NOT_SPECIFIED_SENTINEL:
-            return_residual = False
+        has_residual = residual is not self._ARGUMENT_NOT_SPECIFIED_SENTINEL
+        if not has_residual:
             residual = None
 
-        if self.is_nvfp4 and residual is not None and not self.use_gemma:
+        if self.is_nvfp4 and has_residual and not self.use_gemma:
             nvfp4_scale = getattr(self, "nvfp4_scale", None)
             if nvfp4_scale is None:
                 raise ValueError(
@@ -130,9 +129,8 @@ class RMSNorm(nn.Module):
 
                 hidden_states_fused = Fp4QuantizedTensor(
                     normed_fp4_u8, sf_fused)
-                return (
-                    hidden_states_fused,
-                    residual_out) if return_residual else hidden_states_fused
+                return (hidden_states_fused,
+                        residual_out) if has_residual else hidden_states_fused
 
         if IS_FLASHINFER_AVAILABLE:
             from ..custom_ops import (flashinfer_fused_add_rmsnorm,
@@ -172,7 +170,7 @@ class RMSNorm(nn.Module):
                 hidden_states = (self.weight +
                                  1) * hidden_states.to(input_dtype)
 
-        if return_residual:
+        if has_residual:
             return hidden_states, cast(Optional[torch.Tensor], residual)
         else:
             return hidden_states
