@@ -268,6 +268,8 @@ def _response_format_to_guided_decoding_params(
                     "end": "",
                 },
             ],
+            "stop_after_first":
+            True,
         }
     else:
         # Force thinking and then trigger user constraint
