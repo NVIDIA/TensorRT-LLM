@@ -573,6 +573,19 @@ class PyTorchModelEngine(ModelEngine):
 
     @staticmethod
     def warmup_with_kv_cache_cleanup(method):
+        """
+        Decorator for warmup methods that cleans up NaNs/Infs in KV Cache after warmup execution.
+
+        Why this is needed:
+        - Our attention kernel uses multiplication by zero to mask out invalid tokens within
+          the same page. Since NaN/Inf * 0 = NaN, any NaNs/Infs in these invalid KV areas
+          will persist after masking.
+        - These NaNs/Infs propagate to outputs and subsequent KV Cache entries, corrupting
+          future computations with higher probability.
+        - During warmup, we execute with placeholder data rather than actual valid inputs,
+          which can introduce NaNs/Infs into KV Cache pages and cause random, hard-to-debug
+          accuracy issues.
+        """
 
         @functools.wraps(method)
         def wrapper(self, resource_manager: ResourceManager, *args, **kwargs):

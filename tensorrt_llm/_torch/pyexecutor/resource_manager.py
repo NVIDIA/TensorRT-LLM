@@ -3,7 +3,6 @@ import enum
 import math
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict, deque
-from contextlib import suppress
 from typing import (TYPE_CHECKING, Dict, Iterable, List, Optional, Set, Tuple,
                     Union)
 
@@ -944,6 +943,7 @@ class KVCacheManager(BaseResourceManager):
 
     def check_invalid_values_in_kv_cache(self,
                                          fill_with_zero: bool = False) -> bool:
+        some_checks_unavailable = False
         has_invalid_values = torch.tensor([False],
                                           dtype=torch.bool,
                                           device=torch.cuda.current_device())
@@ -952,15 +952,21 @@ class KVCacheManager(BaseResourceManager):
             # process in chunks of 256 pages to avoid OoM
             for i in range(0, buffer.shape[0], 256):
                 buffer_slice = buffer[i:i + 256]
-                with suppress(NotImplementedError):
-                    # fp8 don't have isinf, fp4 don't have isnan and isinf
+                try:
                     has_invalid_values.logical_or_(
                         torch.isnan(buffer_slice).any())
                     has_invalid_values.logical_or_(
                         torch.isinf(buffer_slice).any())
+                except NotImplementedError:
+                    some_checks_unavailable = True
             if fill_with_zero:
                 buffer.zero_()
         torch.cuda.synchronize()
+
+        if some_checks_unavailable:
+            logger.warning(
+                "`torch.isnan` or `torch.isinf` is not implemented for current kv cache dtype, related checks are skipped"
+            )
         return bool(has_invalid_values)
 
     def get_unique_primary_pool(self) -> torch.Tensor:
