@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from ..speculative.interface import SpecMetadata
     from ..speculative.spec_tree_manager import SpecTreeManager
 
+from tensorrt_llm._torch.attention_backend import trtllm_gen
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
@@ -30,7 +31,7 @@ _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = os.environ.get(
     "TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "0") == "1"
 
 if _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION:
-    from .trtllm_gen import attention as trtllm_gen_attention
+    from .trtllm_gen import trtllm_gen_attention
 
 
 @dataclass(kw_only=True, init=False)
@@ -500,7 +501,39 @@ class TrtllmAttentionWrapper:
         if self.print_skip_softmax_stat:
             self.skip_softmax_stat.zero_()
 
-        if _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION:
+        out_scale = self.out_scale_sf if self.use_nvfp4_output else self.out_scale
+
+        if _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION and trtllm_gen.is_supported(
+                num_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                dtype=q.dtype,
+                kv_cache_dtype=k.dtype if k is not None else
+            (v.dtype if v is not None else q.dtype),
+                out_dtype=output.dtype,
+                mask_type=int(mask_type),
+                has_alibi=(self.position_embedding_type == 4
+                           or self.position_embedding_type == 5),
+                is_padded=False,
+                use_paged_kv_cache=(self.kv_cache_block_offsets is not None),
+                tokens_per_block=self.tokens_per_block,
+                beam_width=self.beam_width,
+                position_shift_enabled=False,
+                sink_token_length=self.sink_token_length,
+                cross_attention=False,
+                cyclic_attention_window_size=self.attention_window_size,
+                max_attention_window_size=self.attention_window_size,
+                is_spec_decoding=spec_decoding_bool_params[0]
+                if spec_decoding_bool_params else False,
+                is_mla_enable=self.is_mla_enable,
+                is_fused_qkv=is_fused_qkv,
+                update_kv_cache=update_kv_cache,
+                has_rotary_inv_freq=(self.rotary_inv_freq is not None),
+                has_rotary_cos_sin=(self.rotary_cos_sin is not None),
+                has_kv_scale=(self.kv_scale_orig_quant is not None
+                              or self.kv_scale_quant_orig is not None),
+                has_cross_kv=False,
+        )[0]:
             trtllm_gen_attention(
                 q,
                 k,
@@ -520,7 +553,7 @@ class TrtllmAttentionWrapper:
                 self.cache_indirection,
                 self.kv_scale_orig_quant,
                 self.kv_scale_quant_orig,
-                self.out_scale_sf if self.use_nvfp4_output else self.out_scale,
+                out_scale,
                 self.rotary_inv_freq,
                 self.rotary_cos_sin,
                 self.latent_cache,
@@ -601,7 +634,7 @@ class TrtllmAttentionWrapper:
                 self.cache_indirection,
                 self.kv_scale_orig_quant,
                 self.kv_scale_quant_orig,
-                self.out_scale_sf if self.use_nvfp4_output else self.out_scale,
+                out_scale,
                 self.rotary_inv_freq,
                 self.rotary_cos_sin,
                 self.latent_cache,
