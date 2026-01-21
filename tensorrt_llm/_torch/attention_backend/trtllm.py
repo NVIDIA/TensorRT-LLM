@@ -27,8 +27,9 @@ from .interface import (AttentionBackend, AttentionInputType, AttentionMask,
                         RopeParams)
 
 # Enable TRTLLM-Gen attention backend via environment variable.
-_TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = os.environ.get(
-    "TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "0") == "1"
+# _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = os.environ.get(
+#     "TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "0") == "1"
+_TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = True
 
 if _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION:
     from .trtllm_gen import trtllm_gen_attention
