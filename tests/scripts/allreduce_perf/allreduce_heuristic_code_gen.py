@@ -176,7 +176,7 @@ def main():
     parser.add_argument("--enable_auto", action="store_true", default=False)
 
     args = parser.parse_args()
-    tp_size_list = [2]
+    tp_size_list = [2, 4, 8]
 
     # Process the benchmark data
     # combine all the data into one dataframe

@@ -167,6 +167,7 @@ class ConfigurableMoE(MoE):
             swiglu_limit=kwargs.get("swiglu_limit"),
             init_load_balancer=False,
             without_comm=True,
+            activation_type=self.activation_type,
         )
 
         self.validate_backend(backend)
