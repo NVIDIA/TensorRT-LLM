@@ -1550,8 +1550,11 @@ def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "
             )
 
         node.replace_all_uses_with(new_node)
+        input_nodes = node.all_input_nodes
         graph.erase_node(node)
-        eliminate_dead_code(gm)
+        for input_node in input_nodes:
+            if input_node.op == "get_attr" and len(input_node.users) == 0:
+                graph.erase_node(input_node)
         remove_original_experts(gm, [w1_list, w2_list, w3_list])
 
     # Clean up after processing all nodes
