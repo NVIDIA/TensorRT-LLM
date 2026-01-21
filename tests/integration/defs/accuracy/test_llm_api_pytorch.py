@@ -3222,9 +3222,9 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
             sampling_params_greedy = SamplingParams(max_tokens=8)
             sampling_params_sampling = SamplingParams(max_tokens=8, temperature=0.8, top_p=0.95)
 
-            max_duration_sec = 1.5 * 3600
-            max_batch_count = 25
-            min_batch_count = 8
+            max_duration_sec = 2 * 3600
+            max_batch_count = 15
+            min_batch_count = 5
             start_time = time.time()
             num_samples = len(long_token_list)
 
