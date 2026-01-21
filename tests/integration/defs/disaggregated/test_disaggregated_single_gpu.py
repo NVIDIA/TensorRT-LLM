@@ -184,7 +184,11 @@ def verify_disaggregated(model, generation_overlap, enable_cuda_graph, prompt,
 
     port_name = mpi_publish_name()
 
-    with MPIPoolExecutor(max_workers=2, env={"UCX_TLS": "^ib"}) as executor:
+    with MPIPoolExecutor(max_workers=2,
+                         env={
+                             "UCX_TLS": "^ib",
+                             "UCX_MM_ERROR_HANDLING": "y"
+                         }) as executor:
         futures = []
         try:
             for worker_arg in worker_args:
@@ -330,7 +334,11 @@ def test_disaggregated_llama_context_capacity(model, enable_cuda_graph,
 
     prompt = "European Union is a political and economic union of 27 countries. The European Union is headquartered in Brussels, Belgium. The first president of the European Union was Jean-Claude Juncker. The current president is Ursula von der Leyen. The European Union is a major economic and political entity."
 
-    with MPIPoolExecutor(max_workers=2, env={"UCX_TLS": "^ib"}) as executor:
+    with MPIPoolExecutor(max_workers=2,
+                         env={
+                             "UCX_TLS": "^ib",
+                             "UCX_MM_ERROR_HANDLING": "y"
+                         }) as executor:
         futures = []
         try:
             for worker_arg in worker_args:
@@ -440,6 +448,7 @@ def test_disaggregated_spec_dec_batch_slot_limit(model, spec_dec_model_path,
     with MPIPoolExecutor(max_workers=2,
                          env={
                              "UCX_TLS": "^ib",
+                             "UCX_MM_ERROR_HANDLING": "y",
                              "OMPI_MCA_rmaps_base_oversubscribe": "1"
                          },
                          mpi_info=mpi_info) as executor:

@@ -86,7 +86,7 @@ class TestStrategySelection:
         is_context_init_state: bool  # Torch sampler accesses this, but it does not affect this test
 
         def get_beam_width_by_iter(
-            self, for_next_iteration: bool
+            self, for_next_iteration: bool = False
         ) -> int:  # Torch sampler accesses this, but it does not affect this test
             return self.sampling_config.beam_width
 
@@ -445,11 +445,21 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
             def py_return_context_logits(self) -> bool:
                 return self._return_context_logits
 
+            def get_beam_width_by_iter(
+                self, for_next_iteration: bool = False
+            ) -> int:  # Torch sampler accesses this, but it does not affect this test
+                return self.sampling_config.beam_width
+
         class GenRequestMock:
             def __init__(self, draft_len: int):
                 self.is_context_init_state = False
                 self.py_draft_tokens = torch.empty(draft_len, dtype=torch.int32, device=device)
                 self.sampling_config = SamplingConfig(beam_width=1)
+
+            def get_beam_width_by_iter(
+                self, for_next_iteration: bool = False
+            ) -> int:  # Torch sampler accesses this, but it does not affect this test
+                return self.sampling_config.beam_width
 
         class ScheduledRequestsMock:
             @property
