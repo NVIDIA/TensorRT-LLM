@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,9 +15,10 @@
 import json
 import os
 from pathlib import Path
-from typing import Optional, Tuple, Type
+from typing import Optional, Sequence, Tuple, Type
 
 import torch
+from onnx import TensorProto, helper
 from onnxscript import ir, opset20
 from pydantic import Field
 from torch.export import Dim
@@ -27,6 +28,7 @@ from ...models import hf
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.logger import ad_logger
+from ...utils.node_utils import sync_weight_meta_dtype
 from ..interface import (
     BaseTransform,
     SharedConfig,
@@ -59,12 +61,14 @@ class ExportToONNXConfig(TransformConfig):
 def _translate_rope_op(
     q: ir.Tensor, k: ir.Tensor, cos: ir.Tensor, sin: ir.Tensor, unsqueeze_dim: int
 ):
+    """Translate RoPE operation to ONNX custom op."""
     return _onnx_schemas.auto_deploy_opset.rope_with_explicit_cos_sin(
         q, k, cos, sin, unsqueeze_dim=unsqueeze_dim
     )
 
 
 def _translate_simple_linear_op(input: ir.Tensor, weight: ir.Tensor, bias: Optional[ir.Tensor]):
+    """Translate linear operation to ONNX MatMul + optional Add."""
     weight = opset20.Transpose(weight, perm=[1, 0])
     if bias is None:
         return opset20.MatMul(input, weight)
@@ -72,6 +76,7 @@ def _translate_simple_linear_op(input: ir.Tensor, weight: ir.Tensor, bias: Optio
 
 
 def _translate_gather_nd_op(data: ir.Tensor, indices: ir.Tensor, batch_dims: int):
+    """Translate GatherND operation to ONNX GatherND op."""
     return opset20.GatherND(data, indices, batch_dims=batch_dims)
 
 
@@ -149,6 +154,86 @@ def _translate_torch_attention_op(
     )
 
 
+def _get_fp8e4m3fn_zero_point(zp: Sequence[ir.Tensor]) -> ir.Tensor:
+    """Return zero point tensor, creating FP8 zero constant if zp is empty.
+
+    Args:
+        zp: Sequence of zero point tensors. If non-empty, returns zp[0].
+            If empty or None, creates and returns a FP8 zero constant.
+
+    Returns:
+        Zero point tensor for QuantizeLinear/DequantizeLinear ops.
+
+    Note:
+        Currently, the zero point for FP8 fake quantized is not supported.
+    """
+    if zp is not None and len(zp) > 0:
+        raise ValueError("Currently, the zero point for FP8 fake quantized is not supported")
+
+    # Create FP8 zero constant when zp is empty/None
+    fp8_const_proto = helper.make_tensor(
+        name="fp8_zero_point",
+        data_type=TensorProto.FLOAT8E4M3FN,
+        dims=[1],
+        vals=[0.0],
+    )
+    return opset20.Constant(value=fp8_const_proto)
+
+
+def _translate_fake_quant_fp8_linear_op(
+    input: ir.Tensor,
+    weight_quantized: ir.Tensor,
+    bias: Optional[ir.Tensor],
+    input_scale: Sequence[ir.Tensor],
+    weight_scale: Sequence[ir.Tensor],
+    input_zp: Sequence[ir.Tensor],
+    weight_zp: Sequence[ir.Tensor],
+):
+    """
+    ONNX translation for FP8 fake quantized linear operation.
+
+    Converts torch_fake_quant_fp8_linear to standard ONNX ops:
+    - Input: QuantizeLinear -> DequantizeLinear (fake quantization)
+    - Weight: DequantizeLinear (weight is already FP8)
+    - Linear: Transpose + MatMul + Add(bias)
+
+    Note 1: This is a translation function for torch.onnx.export's custom_translation_table,
+    so it should NOT have @script() decorator.
+
+    Note 2: The result quanted type is defined by input zp, and it should be float8_e4m3fn.
+    However, onnxscript does not support torch.float8_e4m3fn type, so we need to use the
+    onnxscript's Constant op to create the zero point.
+    """
+
+    if len(input_scale) != 1 or len(weight_scale) != 1:
+        raise ValueError(
+            f"FP8 fake quantized linear requires exactly one scale per tensor, "
+            f"got input_scale={len(input_scale)}, weight_scale={len(weight_scale)}"
+        )
+    s_in = input_scale[0]
+    s_w = weight_scale[0]
+
+    # Get zero points (creates FP8 zero constant if empty)
+    input_zp = _get_fp8e4m3fn_zero_point(input_zp)
+    weight_zp = _get_fp8e4m3fn_zero_point(weight_zp)
+
+    # Input fake quantization: quantize to FP8, then dequantize back
+    input_q = opset20.QuantizeLinear(input, s_in, y_zero_point=input_zp)
+    input_dq = opset20.DequantizeLinear(input_q, s_in, x_zero_point=input_zp)
+
+    # Weight dequantization (weight is already FP8)
+    weight_dq = opset20.DequantizeLinear(weight_quantized, s_w, x_zero_point=weight_zp)
+
+    # Linear: Transpose weight [N, K] -> [K, N], then MatMul
+    weight_t = opset20.Transpose(weight_dq, perm=[1, 0])
+    out = opset20.MatMul(input_dq, weight_t)
+
+    if bias is not None:
+        out = opset20.Add(out, bias)
+
+    return out
+
+
 @TransformRegistry.register("export_to_onnx")
 class ExportToONNX(BaseTransform):
     """Transform that exports a PyTorch GraphModule to ONNX format for deployment.
@@ -223,37 +308,55 @@ class ExportToONNX(BaseTransform):
 
         # Build dynamic_shapes for dynamo export
         # For dynamo, we need to specify dynamic dimensions for each input tensor
-        dynamic_shapes = {}
-        dynamic_shapes["input_ids"] = {
-            0: Dim("batch_size", min=0, max=cm.info.max_batch_size),
-            1: Dim("seq_len", min=0, max=cm.info.max_seq_len),
-        }
-        # Add dynamic shapes for context_lengths and rope_rotary_cos_sin
-        dynamic_shapes["context_lengths"] = {
-            0: Dim("batch_size", min=0, max=cm.info.max_batch_size)
-        }
-        dynamic_shapes["rope_rotary_cos_sin"] = {
-            0: Dim("rope_batch_size", min=1, max=16),
-            1: Dim("max_position_embeddings", min=1, max=4096),
-        }
-        dynamic_shapes["kvcache_start_index"] = {
-            0: Dim("kv_cache_start_batch_size", min=0, max=cm.info.max_batch_size)
-        }
-        # Add dynamic shapes for past_key_values
-        num_layers = len(
-            gm.graph.find_nodes(
-                op="call_function", target=torch.ops.auto_deploy.torch_onnx_attention_plugin.default
-            )
-        )
-        for i in range(num_layers):
-            dynamic_shapes[f"past_key_values_{i}"] = {
-                0: Dim("batch_size", min=0, max=cm.info.max_batch_size),
+        #
+        # IMPORTANT: The order of keys in dynamic_shapes dict must match the order of
+        # placeholders in graph.inputs. This is because PyTorch's ONNX exporter internally
+        # flattens the dynamic_shapes dict to a list using _flatten_dynamic_shapes_to_axes(),
+        # and then zips it with graph.inputs by index in create_rename_mapping().
+        # If the order doesn't match, it will try to access wrong dimensions and cause
+        # IndexError (e.g., accessing shape[1] on a 1D tensor).
+        #
+        # Python 3.7+ guarantees dict preserves insertion order, so we must add keys
+        # in the same order as placeholders appear in the graph.
+        # Reusable Dim factories
+        batch_dim = Dim("batch_size", min=0, max=cm.info.max_batch_size)
+        seq_dim = Dim("seq_len", min=0, max=cm.info.max_seq_len)
+
+        # Dynamic shape specs: pattern -> shape_spec
+        # Pattern can be exact string or prefix with "*" suffix
+        shape_specs = {
+            "context_lengths": {0: batch_dim},
+            "kvcache_start_index": {
+                0: Dim("kv_cache_start_batch_size", min=0, max=cm.info.max_batch_size)
+            },
+            "rope_rotary_cos_sin": {
+                0: Dim("rope_batch_size", min=1, max=16),
+                1: Dim("max_position_embeddings", min=1, max=4096),
+            },
+            "past_key_values_*": {
+                0: batch_dim,
                 3: Dim("past_len", min=1, max=4096),
-            }
-        dynamic_shapes["last_token_ids"] = {
-            0: Dim("batch_size", min=0, max=cm.info.max_batch_size),
-            1: Dim("num_selected_tokens", min=1, max=cm.info.max_seq_len),
+            },
+            "last_token_ids": {
+                0: batch_dim,
+                1: Dim("num_selected_tokens", min=1, max=cm.info.max_seq_len),
+            },
+            "inputs_embeds": {0: batch_dim, 1: seq_dim},
         }
+
+        def match_shape_spec(name: str) -> Optional[dict]:
+            """Match placeholder name against shape specs (exact or prefix)."""
+            if name in shape_specs:
+                return shape_specs[name]
+            for pattern, spec in shape_specs.items():
+                if pattern.endswith("*") and name.startswith(pattern[:-1]):
+                    return spec
+            return None
+
+        dynamic_shapes = {}
+        for ph in placeholders:
+            if spec := match_shape_spec(ph.name):
+                dynamic_shapes[ph.name] = spec
 
         # Create custom translation table for ONNX export
         # Map torch custom ops to their corresponding onnxscript translation functions
@@ -271,6 +374,8 @@ class ExportToONNX(BaseTransform):
             # After fuse rope attention
             torch.ops.auto_deploy.torch_onnx_attention_plugin.default: _translate_rope_attention_op,
             torch.ops.auto_deploy.torch_onnx_gather_nd.default: _translate_gather_nd_op,
+            # FP8 quantized linear
+            torch.ops.auto_deploy.torch_fake_quant_fp8_linear.default: _translate_fake_quant_fp8_linear_op,
         }
 
         # Prepare output names
@@ -402,6 +507,11 @@ class ExportToONNX(BaseTransform):
 
         # Step 1: Export all auxiliary JSON files (config, tokenizer, chat template)
         self._export_json_files(gm, cm, factory, shared_config)
+
+        # Step 1.5: Sync .meta["val"] dtype with actual state_dict dtype for weight nodes
+        # This ensures ONNX export sees the correct dtype (e.g., FP8) instead of the
+        # dtype from tracing time (e.g., FP16)
+        sync_weight_meta_dtype(gm)
 
         # Step 2: Export the ONNX model with dynamic shapes
         success = self._export_onnx_model(gm, cm, factory, shared_config)
