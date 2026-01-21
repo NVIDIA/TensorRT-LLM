@@ -642,7 +642,8 @@ public:
     void startScheduling();
 
     //! \brief Assign blocks for new sequence. Try to reuse blocks.
-    void addSequence(
+    //! \return The number of tokens that were matched/prepopulated from cache (prepopulatedPromptLen)
+    SizeType32 addSequence(
         GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks, LlmRequest& llmRequest);
 
     //! \brief Assign blocks for new sequence. Does not try to reuse blocks.
@@ -1091,7 +1092,8 @@ public:
 
     void allocatePools(bool useUvm);
 
-    void addSequence(GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks,
+    //! \return The number of tokens that were matched/prepopulated from cache (prepopulatedPromptLen)
+    SizeType32 addSequence(GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks,
         LlmRequest& llmRequest, SizeType32 windowSize);
 
     //! \brief Assign blocks for a new sequence.
