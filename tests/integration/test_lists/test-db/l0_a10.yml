@@ -238,8 +238,8 @@ l0_a10:
   - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle[cuda_graph=True-chunked_context=False-typical_acceptance=True] # 5 mins
   - accuracy/test_llm_api.py::TestEagleVicuna_7B_v1_3::test_auto_dtype
   - accuracy/test_llm_api.py::TestEagle2Vicuna_7B_v1_3::test_auto_dtype
-  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-MAX_UTILIZATION-trt-stress-test]
   - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-GUARANTEED_NO_EVICT-trt-stress-test]
+  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-MAX_UTILIZATION-pytorch-stress-test]
   - test_e2e.py::test_gpt3_175b_1layers_build_only # 6 mins
   - examples/test_chatglm.py::test_llm_glm_4_9b_single_gpu_summary[glm-4-9b-disable_weight_only]
   - unittest/trt/model/test_mamba.py # 3 mins
@@ -259,8 +259,8 @@ l0_a10:
       stage: post_merge
       backend: pytorch
   tests:
-  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-MAX_UTILIZATION-pytorch-stress-test]
   - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-GUARANTEED_NO_EVICT-pytorch-stress-test]
+  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-MAX_UTILIZATION-pytorch-stress-test]
 - condition:
     ranges:
       system_gpu_count:
