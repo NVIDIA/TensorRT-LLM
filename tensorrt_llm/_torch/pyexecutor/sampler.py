@@ -980,8 +980,8 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         # Tensors necessary for all sampling methods
         new_tokens = int_tensor(self.NEW_TOKENS_SHAPE)
         finish_reasons = int_tensor(self.NEW_TOKENS_SHAPE)
-        max_lengths_tensor=int_tensor(self.max_num_sequences)
-        end_ids=int_tensor(self.max_num_sequences)
+        max_lengths_tensor = int_tensor(self.max_num_sequences)
+        end_ids = int_tensor(self.max_num_sequences)
 
         # Only used for logprobs processing or beam search
         sampled_log_probs = torch.empty(self.LOGPROBS_SHAPE, device="cuda", dtype=torch.float32)
@@ -1082,6 +1082,9 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
                     FinishReason.CANCELLED,
                 ]  # `in FinishReason` clashes with PyBind11: `TypeError: 'pybind11_type' object is not iterable`
             }
+            self._max_tokens_offset = torch.arange(
+                1, self.max_tokens + 1, device="cuda", dtype=torch.int32
+            ).view(-1, 1, 1)
 
         self._grouped_sampler_cls: Type[GroupedStrategySampler]
         if IS_FLASHINFER_AVAILABLE and not args.disable_flashinfer_sampling:
@@ -2864,12 +2867,9 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
             A tensor of shape (max_tokens, len(requests), max_beam_width)
             where each element is True if the sequence is at or beyond the max length, False otherwise
         """
-        lengths_tensor = (
-            seq_lens.view(1, -1, 1)
-            + torch.arange(
-                1, self.max_tokens + 1, device=seq_lens.device, dtype=seq_lens.dtype
-            ).view(-1, 1, 1)
-        ).expand(self.max_tokens, -1, self.max_beam_width)
+        lengths_tensor = (seq_lens.view(1, -1, 1) + self._max_tokens_offset).expand(
+            self.max_tokens, -1, self.max_beam_width
+        )
         max_lengths_tensor = max_seq_lens.view(1, -1, 1).expand(
             self.max_tokens, -1, self.max_beam_width
         )
