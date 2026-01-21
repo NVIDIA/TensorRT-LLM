@@ -1706,8 +1706,6 @@ class PyExecutor:
                     else:
                         previous_tensors_device = self.previous_batch and self.previous_batch.sample_state and self.previous_batch.sample_state.device
 
-                    if self.previous_batch is not None:
-                        self._update_mamba_cache_manager_for_previous_batch()
                     batch_outputs = self._forward_step(
                         scheduled_batch, previous_tensors_device,
                         num_accepted_tokens_device)
@@ -1744,6 +1742,21 @@ class PyExecutor:
                                                       batch_outputs)
                     assert sample_state is not None, "Sampling failed"
 
+                    # For overlap scheduler: update mamba cache immediately after sampling
+                    # This must be done BEFORE _update_request_states which may change request states
+                    if isinstance(
+                            self.resource_manager.get_resource_manager(
+                                ResourceManagerType.KV_CACHE_MANAGER),
+                            MambaHybridCacheManager):
+                        kv_cache_manager = self.resource_manager.get_resource_manager(
+                            ResourceManagerType.KV_CACHE_MANAGER)
+
+                        # Execute update in the same stream as forward to avoid synchronization overhead
+                        # and ensure correct ordering without explicit wait_stream
+                        with torch.cuda.stream(self.execution_stream):
+                            kv_cache_manager.update_resources_for_mamba_cache_manager(
+                                scheduled_batch, sample_state=sample_state)
+
                     # Handle guided decoder errors after _sample_async to avoid state conflicts.
                     # If called before, failed requests would be marked as GENERATION_COMPLETE,
                     # causing _sample_async to fail when accessing context_chunk_size property.
@@ -1767,6 +1780,7 @@ class PyExecutor:
                     # save attn_metadata and scheduled_batch for next iteration's update_resources
                     attn_metadata_to_save = getattr(self.model_engine,
                                                     'attn_metadata', None)
+
                     self.previous_batch = BatchState(
                         sample_state=sample_state,
                         iter_start_time=iter_start_time,

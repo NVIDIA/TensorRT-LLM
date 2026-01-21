@@ -407,14 +407,20 @@ class MambaCacheManager(BaseResourceManager):
                     num_accepted_draft_tokens.append(new_tokens_lens - 1)
                     state_indices_updated.append(
                         self.mamba_cache_index[req.py_request_id])
+                else:
+                    num_accepted_draft_tokens.append(-1)
+                    state_indices_updated.append(-1)
         else:
             for req in scheduled_batch.generation_requests:
-                if req.state == LlmRequestState.GENERATION_COMPLETE:
-                    continue
-                num_accepted_draft_tokens.append(
-                    req.py_num_accepted_draft_tokens)
-                state_indices_updated.append(
-                    self.mamba_cache_index[req.py_request_id])
+                if req.state != LlmRequestState.GENERATION_COMPLETE:
+
+                    num_accepted_draft_tokens.append(
+                        req.py_num_accepted_draft_tokens)
+                    state_indices_updated.append(
+                        self.mamba_cache_index[req.py_request_id])
+                else:
+                    num_accepted_draft_tokens.append(-1)
+                    state_indices_updated.append(-1)
         if len(state_indices_updated) == 0:
             return
 
