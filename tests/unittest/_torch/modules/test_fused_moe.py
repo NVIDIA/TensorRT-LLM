@@ -1050,7 +1050,7 @@ def test_fused_moe_fp8_blockwise_deepgemm(dtype,
 
 @skip_pre_blackwell
 @pytest.mark.parametrize(
-    "dtype, num_experts, seq_len, hidden_size, RoutingMethodCls, WeightLoadingMode, use_cute_dsl_fp8",
+    "dtype, num_experts, seq_len, hidden_size, RoutingMethodCls, WeightLoadingMode",
     product(
         [torch.bfloat16],
         [72],
@@ -1058,7 +1058,6 @@ def test_fused_moe_fp8_blockwise_deepgemm(dtype,
         [2560],
         [DefaultMoeRoutingMethod],
         [MoEWeightLoadingMode.VANILLA, MoEWeightLoadingMode.FUSED_GATE_UP_PROJ],
-        [False, True],
     ),
 )
 def test_fused_moe_fp8_blockwise_cute_dsl(dtype,
@@ -1067,7 +1066,6 @@ def test_fused_moe_fp8_blockwise_cute_dsl(dtype,
                                           hidden_size,
                                           RoutingMethodCls,
                                           WeightLoadingMode,
-                                          use_cute_dsl_fp8,
                                           mapping=None):
     SEQ_LEN = seq_len
     HIDDEN_SIZE = hidden_size
@@ -1157,7 +1155,6 @@ def test_fused_moe_fp8_blockwise_cute_dsl(dtype,
         reduce_results=True,
         model_config=ModelConfig(quant_config=quant_config, mapping=mapping),
         weight_loading_mode=WeightLoadingMode,
-        use_cute_dsl_fp8=use_cute_dsl_fp8,
     )
     fused_moe.cuda()
     fused_moe.load_weights([weights])
