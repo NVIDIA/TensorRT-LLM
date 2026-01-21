@@ -603,6 +603,73 @@ size_t Serialization::serializedSize(kv_cache::CacheState const& state)
     return totalSize;
 }
 
+// RnnCacheState
+rnn_cache::RnnCacheState Serialization::deserializeRnnCacheState(std::istream& is)
+{
+    using RnnCacheState = rnn_cache::RnnCacheState;
+    auto dState = su::deserialize<decltype(RnnCacheState::ModelConfig::mDState)>(is);
+    auto dConv = su::deserialize<decltype(RnnCacheState::ModelConfig::mDConv)>(is);
+    auto hiddenSize = su::deserialize<decltype(RnnCacheState::ModelConfig::mHiddenSize)>(is);
+    auto headDim = su::deserialize<decltype(RnnCacheState::ModelConfig::mHeadDim)>(is);
+    auto convDimSize = su::deserialize<decltype(RnnCacheState::ModelConfig::mConvDimSize)>(is);
+    auto nGroups = su::deserialize<decltype(RnnCacheState::ModelConfig::mNGroups)>(is);
+    auto numLayers = su::deserialize<decltype(RnnCacheState::ModelConfig::mNumLayers)>(is);
+    auto numHeads = su::deserialize<decltype(RnnCacheState::ModelConfig::mNumHeads)>(is);
+    auto tensorParallelism = su::deserialize<decltype(RnnCacheState::ParallelConfig::mTensorParallelism)>(is);
+    auto pipelineParallelism = su::deserialize<decltype(RnnCacheState::ParallelConfig::mPipelineParallelism)>(is);
+    auto enableAttentionDP = su::deserialize<decltype(RnnCacheState::ParallelConfig::mEnableAttentionDP)>(is);
+    auto DPrank = su::deserialize<decltype(RnnCacheState::ParallelConfig::mDPrank)>(is);
+    auto DPsize = su::deserialize<decltype(RnnCacheState::ParallelConfig::mDPsize)>(is);
+    auto rnnLayerNumPerPP = su::deserialize<decltype(RnnCacheState::ParallelConfig::mRnnLayerNumPerPP)>(is);
+    auto convStateDataType = su::deserialize<decltype(RnnCacheState::mConvStateDataType)>(is);
+    auto ssmStateDataType = su::deserialize<decltype(RnnCacheState::mSsmStateDataType)>(is);
+    return RnnCacheState{dState, dConv, hiddenSize, headDim, convDimSize, nGroups, numLayers, numHeads,
+        tensorParallelism, pipelineParallelism, enableAttentionDP, DPrank, DPsize, rnnLayerNumPerPP, convStateDataType,
+        ssmStateDataType};
+}
+
+void Serialization::serialize(rnn_cache::RnnCacheState const& state, std::ostream& os)
+{
+    su::serialize(state.mModelConfig.mDState, os);
+    su::serialize(state.mModelConfig.mDConv, os);
+    su::serialize(state.mModelConfig.mHiddenSize, os);
+    su::serialize(state.mModelConfig.mHeadDim, os);
+    su::serialize(state.mModelConfig.mConvDimSize, os);
+    su::serialize(state.mModelConfig.mNGroups, os);
+    su::serialize(state.mModelConfig.mNumLayers, os);
+    su::serialize(state.mModelConfig.mNumHeads, os);
+    su::serialize(state.mParallelConfig.mTensorParallelism, os);
+    su::serialize(state.mParallelConfig.mPipelineParallelism, os);
+    su::serialize(state.mParallelConfig.mEnableAttentionDP, os);
+    su::serialize(state.mParallelConfig.mDPrank, os);
+    su::serialize(state.mParallelConfig.mDPsize, os);
+    su::serialize(state.mParallelConfig.mRnnLayerNumPerPP, os);
+    su::serialize(state.mConvStateDataType, os);
+    su::serialize(state.mSsmStateDataType, os);
+}
+
+size_t Serialization::serializedSize(rnn_cache::RnnCacheState const& state)
+{
+    size_t totalSize = 0;
+    totalSize += su::serializedSize(state.mModelConfig.mDState);
+    totalSize += su::serializedSize(state.mModelConfig.mDConv);
+    totalSize += su::serializedSize(state.mModelConfig.mHiddenSize);
+    totalSize += su::serializedSize(state.mModelConfig.mHeadDim);
+    totalSize += su::serializedSize(state.mModelConfig.mConvDimSize);
+    totalSize += su::serializedSize(state.mModelConfig.mNGroups);
+    totalSize += su::serializedSize(state.mModelConfig.mNumLayers);
+    totalSize += su::serializedSize(state.mModelConfig.mNumHeads);
+    totalSize += su::serializedSize(state.mParallelConfig.mTensorParallelism);
+    totalSize += su::serializedSize(state.mParallelConfig.mPipelineParallelism);
+    totalSize += su::serializedSize(state.mParallelConfig.mEnableAttentionDP);
+    totalSize += su::serializedSize(state.mParallelConfig.mDPrank);
+    totalSize += su::serializedSize(state.mParallelConfig.mDPsize);
+    totalSize += su::serializedSize(state.mParallelConfig.mRnnLayerNumPerPP);
+    totalSize += su::serializedSize(state.mConvStateDataType);
+    totalSize += su::serializedSize(state.mSsmStateDataType);
+    return totalSize;
+}
+
 // DataTransceiverState
 
 DataTransceiverState Serialization::deserializeDataTransceiverState(std::vector<char>& buffer)
@@ -625,6 +692,11 @@ DataTransceiverState Serialization::deserializeDataTransceiverState(std::istream
     {
         state.setCacheState(std::move(cacheState).value());
     }
+    auto rnnCacheState = su::deserialize<decltype(DataTransceiverState::mRnnCacheState)>(is);
+    if (rnnCacheState)
+    {
+        state.setRnnCacheState(std::move(rnnCacheState).value());
+    }
     return state;
 }
 
@@ -632,6 +704,7 @@ void Serialization::serialize(DataTransceiverState const& state, std::ostream& o
 {
     su::serialize(state.mCommState, os);
     su::serialize(state.mCacheState, os);
+    su::serialize(state.mRnnCacheState, os);
 }
 
 std::vector<char> Serialization::serialize(DataTransceiverState const& state)
@@ -650,6 +723,7 @@ size_t Serialization::serializedSize(DataTransceiverState const& state)
     size_t totalSize = 0;
     totalSize += su::serializedSize(state.mCommState);
     totalSize += su::serializedSize(state.mCacheState);
+    totalSize += su::serializedSize(state.mRnnCacheState);
     return totalSize;
 }
 

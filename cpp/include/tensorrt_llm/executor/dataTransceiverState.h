@@ -424,6 +424,130 @@ private:
 
 } // namespace kv_cache
 
+namespace rnn_cache
+{
+
+// RNN/Mamba Cache State
+class RnnCacheState final
+{
+public:
+    struct ModelConfig
+    {
+        SizeType32 mDState;      // SSM state dimension
+        SizeType32 mDConv;       // Conv state dimension (convKernel - 1)
+        SizeType32 mHiddenSize;  // Hidden dimension
+        SizeType32 mHeadDim;     // Head dimension (0 for Mamba1, >0 for Mamba2)
+        SizeType32 mConvDimSize; // Conv dimension size
+        SizeType32 mNGroups;     // Number of groups (for Mamba2)
+        SizeType32 mNumLayers;   // Number of layers
+        SizeType32 mNumHeads;    // Number of heads
+
+        [[nodiscard]] bool operator==(ModelConfig const& other) const noexcept
+        {
+            return mDState == other.mDState && mDConv == other.mDConv && mHiddenSize == other.mHiddenSize
+                && mHeadDim == other.mHeadDim && mConvDimSize == other.mConvDimSize && mNGroups == other.mNGroups
+                && mNumLayers == other.mNumLayers && mNumHeads == other.mNumHeads;
+        }
+    };
+
+    struct ParallelConfig
+    {
+        SizeType32 mTensorParallelism;
+        SizeType32 mPipelineParallelism;
+        bool mEnableAttentionDP;
+        SizeType32 mDPrank;
+        SizeType32 mDPsize;
+        // Number of RNN layers per pipeline parallelism rank
+        std::vector<SizeType32> mRnnLayerNumPerPP;
+
+        [[nodiscard]] bool operator==(ParallelConfig const& other) const noexcept
+        {
+            return mTensorParallelism == other.mTensorParallelism && mPipelineParallelism == other.mPipelineParallelism
+                && mEnableAttentionDP == other.mEnableAttentionDP && mDPrank == other.mDPrank
+                && mDPsize == other.mDPsize && mRnnLayerNumPerPP == other.mRnnLayerNumPerPP;
+        }
+    };
+
+    RnnCacheState(ModelConfig modelConfig, ParallelConfig parallelConfig, nvinfer1::DataType convStateDataType,
+        nvinfer1::DataType ssmStateDataType)
+        : mModelConfig(std::move(modelConfig))
+        , mParallelConfig(std::move(parallelConfig))
+        , mConvStateDataType(convStateDataType)
+        , mSsmStateDataType(ssmStateDataType)
+    {
+    }
+
+    RnnCacheState(SizeType32 dState, SizeType32 dConv, SizeType32 hiddenSize, SizeType32 headDim,
+        SizeType32 convDimSize, SizeType32 nGroups, SizeType32 numLayers, SizeType32 numHeads,
+        SizeType32 tensorParallelism, SizeType32 pipelineParallelism, bool enableAttentionDP, int DPrank, int DPsize,
+        std::vector<SizeType32> rnnLayerNumPerPP, nvinfer1::DataType convStateDataType,
+        nvinfer1::DataType ssmStateDataType)
+        : mModelConfig{dState, dConv, hiddenSize, headDim, convDimSize, nGroups, numLayers, numHeads}
+        , mParallelConfig{tensorParallelism, pipelineParallelism, enableAttentionDP, DPrank, DPsize,
+              std::move(rnnLayerNumPerPP)}
+        , mConvStateDataType(convStateDataType)
+        , mSsmStateDataType(ssmStateDataType)
+    {
+    }
+
+    [[nodiscard]] bool operator==(RnnCacheState const& other) const noexcept
+    {
+        return mModelConfig == other.mModelConfig && mParallelConfig == other.mParallelConfig
+            && mConvStateDataType == other.mConvStateDataType && mSsmStateDataType == other.mSsmStateDataType;
+    }
+
+    [[nodiscard]] ModelConfig const& getModelConfig() const
+    {
+        return mModelConfig;
+    }
+
+    [[nodiscard]] ParallelConfig const& getParallelConfig() const
+    {
+        return mParallelConfig;
+    }
+
+    [[nodiscard]] nvinfer1::DataType getConvStateDataType() const
+    {
+        return mConvStateDataType;
+    }
+
+    [[nodiscard]] nvinfer1::DataType getSsmStateDataType() const
+    {
+        return mSsmStateDataType;
+    }
+
+    [[nodiscard]] std::string toString() const
+    {
+        std::stringstream sstring;
+        sstring << "RnnCacheState:\n";
+        sstring << "  dState:" << mModelConfig.mDState << "\n";
+        sstring << "  dConv:" << mModelConfig.mDConv << "\n";
+        sstring << "  hiddenSize:" << mModelConfig.mHiddenSize << "\n";
+        sstring << "  headDim:" << mModelConfig.mHeadDim << "\n";
+        sstring << "  convDimSize:" << mModelConfig.mConvDimSize << "\n";
+        sstring << "  nGroups:" << mModelConfig.mNGroups << "\n";
+        sstring << "  numLayers:" << mModelConfig.mNumLayers << "\n";
+        sstring << "  numHeads:" << mModelConfig.mNumHeads << "\n";
+        sstring << "  tp:" << mParallelConfig.mTensorParallelism << "\n";
+        sstring << "  pp:" << mParallelConfig.mPipelineParallelism << "\n";
+        sstring << "  enableAttentionDP:" << mParallelConfig.mEnableAttentionDP << "\n";
+        sstring << "  dpRank:" << mParallelConfig.mDPrank << "\n";
+        sstring << "  dpSize:" << mParallelConfig.mDPsize << "\n";
+        sstring << "  convStateDataType:" << static_cast<int32_t>(mConvStateDataType) << "\n";
+        sstring << "  ssmStateDataType:" << static_cast<int32_t>(mSsmStateDataType) << "\n";
+        return sstring.str();
+    }
+
+private:
+    friend class tensorrt_llm::executor::Serialization;
+    ModelConfig mModelConfig;
+    ParallelConfig mParallelConfig;
+    nvinfer1::DataType mConvStateDataType;
+    nvinfer1::DataType mSsmStateDataType;
+};
+
+} // namespace rnn_cache
+
 class DataTransceiverState final
 {
 public:
@@ -455,9 +579,25 @@ public:
         return mCommState;
     }
 
+    void setRnnCacheState(rnn_cache::RnnCacheState state)
+    {
+        mRnnCacheState = std::move(state);
+    }
+
+    [[nodiscard]] std::optional<rnn_cache::RnnCacheState> const& getRnnCacheState() const noexcept
+    {
+        return mRnnCacheState;
+    }
+
+    [[nodiscard]] bool hasRnnCacheState() const noexcept
+    {
+        return mRnnCacheState.has_value();
+    }
+
     [[nodiscard]] bool operator==(DataTransceiverState const& other) const noexcept
     {
-        return mCacheState == other.mCacheState && mCommState == other.mCommState;
+        return mCacheState == other.mCacheState && mCommState == other.mCommState
+            && mRnnCacheState == other.mRnnCacheState;
     }
 
     [[nodiscard]] std::string toString() const
@@ -471,6 +611,10 @@ public:
         {
             sstring << mCommState.value().toString();
         }
+        if (mRnnCacheState)
+        {
+            sstring << mRnnCacheState.value().toString();
+        }
         return sstring.str();
     }
 
@@ -478,6 +622,7 @@ private:
     friend class Serialization;
     std::optional<kv_cache::CacheState> mCacheState;
     std::optional<kv_cache::CommState> mCommState;
+    std::optional<rnn_cache::RnnCacheState> mRnnCacheState; // is this needed?
 };
 
 } // namespace tensorrt_llm::executor
