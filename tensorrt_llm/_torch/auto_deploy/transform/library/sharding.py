@@ -1357,7 +1357,6 @@ def _insert_sharded_moe(
     num_experts = len(args[3])
 
     experts_per_rank = num_experts // ep_size
-    # ad_logger.info(f"MoE sharding: Experts per rank: {experts_per_rank}, EP rank: {ep_rank}, EP size: {ep_size}")
 
     with gm.graph.inserting_before(node):
         lower = experts_per_rank * ep_rank
