@@ -229,6 +229,8 @@ class PyExecutor:
         self.block_reuse_enabled = True if self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse else False
         self.enable_kv_cache_events = self.kv_cache_manager is not None and self.kv_cache_manager.event_buffer_max_size > 0
         self.enable_kv_cache_reuse = self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse
+        self.is_mamba_hybrid_cache = isinstance(self.kv_cache_manager,
+                                                MambaHybridCacheManager)
 
         self.max_input_len = max_input_len
         # _executor_loop private data
@@ -1744,19 +1746,13 @@ class PyExecutor:
 
                     # For overlap scheduler: update mamba cache immediately after sampling
                     # This must be done BEFORE _update_request_states which may change request states
-                    if isinstance(
-                            self.resource_manager.get_resource_manager(
-                                ResourceManagerType.KV_CACHE_MANAGER),
-                            MambaHybridCacheManager):
-                        kv_cache_manager = self.resource_manager.get_resource_manager(
-                            ResourceManagerType.KV_CACHE_MANAGER)
-
+                    if self.is_mamba_hybrid_cache:
                         # Execute update in the same stream as forward to avoid synchronization overhead
                         # Wait for sampling to complete before switching to execution_stream
                         self.execution_stream.wait_stream(
                             torch.cuda.current_stream())
                         with torch.cuda.stream(self.execution_stream):
-                            kv_cache_manager.update_resources_for_mamba_cache_manager(
+                            self.kv_cache_manager.update_resources_for_mamba_cache_manager(
                                 scheduled_batch, sample_state=sample_state)
 
                     # Handle guided decoder errors after _sample_async to avoid state conflicts.
