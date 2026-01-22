@@ -58,7 +58,6 @@ private:
 };
 
 /// @brief KV Cache specific transfer buffer manager.
-/// Inherits common buffer management from BaseTransBufferManager.
 class CacheTransBufferManager : public BaseTransBufferManager
 {
 public:
