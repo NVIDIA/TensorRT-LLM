@@ -1532,7 +1532,9 @@ def _insert_sharded_mxfp4_mlp_ep(
 
     # Add a dist all-reduce after the op (sum partial results across EP ranks)
     with gm.graph.inserting_after(node):
-        red = gm.graph.call_function(torch.ops.auto_deploy.torch_dist_all_reduce, args=(node,))
+        red = gm.graph.call_function(
+            torch.ops.auto_deploy.torch_dist_all_reduce, args=(node, config.allreduce_strategy.name)
+        )
         node.replace_all_uses_with(red)
         # keep dataflow: red(input=node)
         red.replace_input_with(red, node)
