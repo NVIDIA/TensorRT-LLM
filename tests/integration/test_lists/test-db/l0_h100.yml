@@ -431,8 +431,9 @@ l0_h100:
   - unittest/_torch/auto_deploy/unit/singlegpu
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[False-1]
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[True-1]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[False]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[True]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[False-triton_ssm]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[False-flashinfer_ssm]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[True-triton_ssm]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_fp8
   - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_bf16
   - examples/test_ad_speculative_decoding.py::test_autodeploy_spec_dec_output[draft_target]
