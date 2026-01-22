@@ -53,12 +53,7 @@ def load_and_setup_pipeline(args):
     # Apply dit configuration
     visual_gen.setup_configs(**dit_configs)
     # Load config
-    exclude_pattern = exclude_pattern = (
-        r".*(embedder|norm_out|proj_out|to_add_out|to_added_qkv|stream).*"
-        if args.linear_recipe == "dynamic"
-        else r".*"
-    )
-    quantize_weights = True if args.linear_recipe == "dynamic" else False
+    exclude_pattern = r".*(embedder|norm_out|proj_out|to_add_out|to_added_qkv|stream).*"
     # Load ditFlux2Transformer2DModel
     transformer = ditFlux2Transformer2DModel.from_pretrained(
         args.model_path,
@@ -77,7 +72,7 @@ def load_and_setup_pipeline(args):
     apply_visual_gen_linear(
         pipe.transformer,
         load_parameters=True,
-        quantize_weights=quantize_weights,
+        quantize_weights=True,
         exclude_pattern=exclude_pattern,
     )
 
@@ -139,6 +134,7 @@ def main():
         height=1024,
         width=1024,
         guidance_scale=4,
+        teacache_thresh=0.6,
         attn_type="cudnn-attn",
     )
 
