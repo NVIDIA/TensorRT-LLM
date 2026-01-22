@@ -38,8 +38,6 @@ class DraftTargetOneModelSpecMetadata(SpecMetadata):
     max_num_tokens: int = 0
     # The index of the batch inputs
     batch_indices_cuda: Optional[torch.Tensor] = None
-    # Whether to allow advanced sampling (temperature, top-k, top-p)
-    allow_advanced_sampling: bool = False
 
     def __post_init__(self):
         self.batch_indices_cuda = torch.empty(
@@ -47,14 +45,6 @@ class DraftTargetOneModelSpecMetadata(SpecMetadata):
             dtype=torch.int,
             device="cuda",
         )
-
-        # DraftTarget one-model only supports linear tree currently
-        self.is_spec_dec_tree = False
-        self.is_spec_dec_dynamic_tree = False
-
-    def is_layer_capture(self, layer_id: int):
-        """DraftTarget does not capture any hidden states from the target model."""
-        return False
 
     def prepare(self):
         """Prepare the metadata before model forward."""
@@ -65,12 +55,6 @@ class DraftTargetOneModelSpecMetadata(SpecMetadata):
         self.batch_indices_cuda[:num_seqs].copy_(batch_indices, non_blocking=True)
         # Adjust num_tokens for generation phase
         self.num_tokens -= (self.num_generations) * self.max_draft_len
-
-    def maybe_capture_hidden_states(
-        self, layer_id: int, hidden_states: torch.Tensor, residual: Optional[torch.Tensor] = None
-    ) -> None:
-        """DraftTarget does not capture any hidden states from the target model."""
-        pass
 
 
 class DraftTargetOneModelSampler(MTPSampler):
@@ -142,8 +126,7 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
 
         raw_logits = logits
 
-        if self.guided_decoder is not None:
-            self.guided_decoder.execute(logits)
+        self._execute_guided_decoder_if_present(logits)
 
         # Sample and accept draft tokens
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
@@ -151,7 +134,7 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
         )
 
         # Save the old attn_metadata for restoration later
-        attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
+        self._prepare_attn_metadata_for_spec_dec(attn_metadata)
 
         # Prepare inputs for the draft model forward
         position_ids = position_ids.squeeze(0)
@@ -245,16 +228,18 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
         next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
 
         # Restore attn_metadata
-        attn_metadata.restore_from_spec_dec()
-        attn_metadata.on_update()
+        self._restore_attn_metadata_from_spec_dec(attn_metadata)
         if original_all_rank_num_tokens is not None:
             attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
 
         # Prepare next new tokens for overlap scheduler
-        next_new_tokens = accepted_tokens[
-            spec_metadata.batch_indices_cuda[:batch_size], num_accepted_tokens - 1
-        ].unsqueeze(1)
-        next_new_tokens = torch.concat([next_new_tokens, next_draft_tokens], dim=1)
+        next_new_tokens = self._prepare_next_new_tokens(
+            accepted_tokens,
+            next_draft_tokens,
+            spec_metadata.batch_indices_cuda,
+            batch_size,
+            num_accepted_tokens,
+        )
 
         attn_metadata.use_spec_decoding = True
 
@@ -289,40 +274,11 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
 
-        if logits.dim() == 1:
-            logits = logits.unsqueeze(0)
-
-        # Initialize return buffers
-        accepted_tokens = torch.empty(
-            (batch_size, (self.max_draft_len + 1)), dtype=torch.int, device=logits.device
-        )
-        num_accepted_tokens = torch.ones(batch_size, dtype=torch.int, device=logits.device)
-
-        # Sample tokens using per-request sampling parameters
-        target_tokens = self._sample_tokens_for_batch(
-            logits, spec_metadata, num_contexts, batch_size
-        )
-
-        # Context requests: just take the sampled token
-        accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts]
-
-        # Generation requests: verify draft tokens
-        gen_target_tokens = target_tokens[num_contexts:].reshape(num_gens, self.max_draft_len + 1)
-        accepted_tokens[num_contexts:, :] = gen_target_tokens
-
         draft_tokens = spec_metadata.draft_tokens.reshape(num_gens, self.max_draft_len)
 
-        # Count consecutive matching tokens
-        num_accepted_tokens[num_contexts:] += torch.cumprod(
-            (draft_tokens == gen_target_tokens[:, : self.max_draft_len]).int(), dim=-1
-        ).sum(1)
-
-        # Check for environment variable override
-        if self.force_num_accepted_tokens != 0:
-            force_total_tokens = min(self.force_num_accepted_tokens + 1, self.max_draft_len + 1)
-            num_accepted_tokens[num_contexts:] = force_total_tokens
-
-        return accepted_tokens, num_accepted_tokens
+        return self._sample_and_accept_draft_tokens_base(
+            logits, draft_tokens, num_contexts, batch_size, spec_metadata
+        )
 
     def draft_decoder(self, logits: torch.Tensor) -> torch.Tensor:
         """
@@ -337,9 +293,7 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
         Returns:
             Sampled draft token ids
         """
-        draft_tokens = torch.argmax(logits, dim=-1)
-        draft_tokens = draft_tokens.type(torch.int32)
-        return draft_tokens
+        return self._draft_sampler_greedy(logits)
 
     def prepare_drafter_inputs(
         self,
