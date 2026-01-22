@@ -551,10 +551,10 @@ def test_nvfp4_grouped_gemm_finalize_blackwell(
 
     c = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_blackwell(
         a,
-        b,
+        [b],
         a_sf,
-        b_sf,
-        alpha,
+        [b_sf],
+        [alpha],
         tile_idx_to_group_idx,
         tile_idx_to_mn_limit,
         permuted_idx_to_expanded_idx,

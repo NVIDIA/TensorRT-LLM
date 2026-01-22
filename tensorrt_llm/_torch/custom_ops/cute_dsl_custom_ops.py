@@ -890,8 +890,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             **kwargs,
         ) -> List[Tuple[int, int]]:
             a, b, *_ = inputs
+            b_list = b if isinstance(b, (list, tuple)) else [b]
             m, k = a.size(0), a.size(1) * 2
-            l, n = b.size(0), b.size(1)
+            l = sum(bi.size(0) for bi in b_list)
+            n = b_list[0].size(1)
 
             mma_tiler_mn_candidates = [(self.tile_size, 128),
                                        (self.tile_size, 256)]
@@ -1140,7 +1142,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      local_expert_offset: int,
                      tile_size: int,
                      output_dtype: torch.dtype,
-                     scaling_vector_size: int = 16):
+                     scaling_vector_size: int = 16,
+                     b_tensor_l_sizes: Optional[Tuple[int, ...]] = None):
             super().__init__()
             self.num_experts = num_experts
             self.top_k = top_k
@@ -1151,6 +1154,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert output_dtype == torch.bfloat16
             self.output_dtype = output_dtype
             self.scaling_vector_size = scaling_vector_size
+            self.b_tensor_l_sizes = b_tensor_l_sizes
 
             if (sm_version := get_sm_version()) not in (100, 103):
                 raise ValueError(
@@ -1171,6 +1175,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.tile_size,
                 self.output_dtype,
                 self.scaling_vector_size,
+                self.b_tensor_l_sizes,
             )
 
         def get_valid_tactics(
@@ -1179,9 +1184,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             profile: OptimizationProfile,
             **kwargs,
         ) -> List[Tuple[int, int]]:
-            a, b, *_ = inputs
+            a, b_list, *_ = inputs
+            if not isinstance(b_list, (list, tuple)):
+                raise TypeError("weight must be a list of tensors")
             m, k = a.size(0), a.size(1) * 2
-            l, n = b.size(0), b.size(1)
+            l = sum(bi.size(0) for bi in b_list)
+            n = b_list[0].size(1)
 
             mma_tiler_mn_candidates = [(self.tile_size, 128),
                                        (self.tile_size, 256)]
@@ -1240,29 +1248,48 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         def forward(self, inputs: List[torch.Tensor],
                     tactic: Optional[tuple]) -> torch.Tensor:
-            a, b, a_sf, b_sf, alpha, c, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales = inputs
+            a, b_list, a_sf, b_sf_list, alpha_list, c, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales = inputs
+            if not isinstance(b_list, (list, tuple)):
+                raise TypeError("weight must be a list of tensors")
+            if not isinstance(b_sf_list, (list, tuple)):
+                raise TypeError("weight_scale must be a list of tensors")
+            if not isinstance(alpha_list, (list, tuple)):
+                raise TypeError("alpha must be a list of tensors")
+            assert len(b_list) == len(b_sf_list) == len(alpha_list)
+            num_b = len(b_list)
+            is_multi_b = num_b > 1
+            b_tensor_l_sizes = tuple(bi.size(0)
+                                     for bi in b_list) if is_multi_b else None
+
+            b0 = b_list[0]
+            b_sf0 = b_sf_list[0]
+            alpha0 = alpha_list[0]
             assert a.dtype == torch.float4_e2m1fn_x2
             assert a.dim() == 2
-            assert b.dtype == torch.float4_e2m1fn_x2
-            assert b.dim() == 3
+            assert b0.dtype == torch.float4_e2m1fn_x2
+            assert b0.dim() == 3
             assert a_sf.dtype == torch.uint8
             assert a_sf.dim() == 1
-            assert b_sf.dtype == torch.uint8
-            assert b_sf.dim() == 3
-            assert alpha.dtype == torch.float32
-            assert alpha.dim() == 1
+            assert b_sf0.dtype == torch.uint8
+            assert b_sf0.dim() == 3
+            assert alpha0.dtype == torch.float32
+            assert alpha0.dim() == 1
 
             m, k = a.size(0), a.size(1) * 2
-            l, n = b.size(0), b.size(1)
+            l = sum(bi.size(0) for bi in b_list)
+            n = b0.size(1)
             scale_k = k // self.scaling_vector_size
             assert m % self.tile_size == 0
             assert k % (self.scaling_vector_size * 4) == 0
-            assert b.size(2) * 2 == k
+            assert b0.size(2) * 2 == k
             assert a_sf.size(0) == m * scale_k
-            assert b_sf.size(0) == l
-            assert b_sf.size(1) == n
-            assert b_sf.size(2) == scale_k
-            assert alpha.size(0) == l
+            for bi, bsfi, ai in zip(b_list, b_sf_list, alpha_list):
+                assert bi.size(1) == n
+                assert bi.size(2) * 2 == k
+                assert bsfi.size(0) == bi.size(0)
+                assert bsfi.size(1) == n
+                assert bsfi.size(2) == scale_k
+                assert ai.size(0) == bi.size(0)
 
             assert c.dtype == self.output_dtype
             assert c.dim() == 2
@@ -1286,20 +1313,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                              a.data_ptr(),
                              cute.AddressSpace.gmem,
                              assumed_align=32)
-            b_ptr = make_ptr(cutlass.Float4E2M1FN,
-                             b.data_ptr(),
-                             cute.AddressSpace.gmem,
-                             assumed_align=32)
             a_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
                                 a_sf.data_ptr(),
                                 cute.AddressSpace.gmem,
                                 assumed_align=16)
-            b_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
-                                b_sf.data_ptr(),
-                                cute.AddressSpace.gmem,
-                                assumed_align=16)
-            alpha_ptr = make_ptr(cutlass.Float32, alpha.data_ptr(),
-                                 cute.AddressSpace.gmem)
             tile_idx_to_group_idx_ptr = make_ptr(
                 cutlass.Int32, tile_idx_to_group_idx.data_ptr(),
                 cute.AddressSpace.gmem)
@@ -1320,6 +1337,31 @@ if IS_CUTLASS_DSL_AVAILABLE:
                              cute.AddressSpace.gmem,
                              assumed_align=16)
 
+            b_ptr = tuple(
+                make_ptr(cutlass.Float4E2M1FN,
+                         bi.data_ptr(),
+                         cute.AddressSpace.gmem,
+                         assumed_align=32)
+                for bi in b_list) if is_multi_b else make_ptr(
+                    cutlass.Float4E2M1FN,
+                    b0.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=32)
+            b_sf_ptr = tuple(
+                make_ptr(cutlass.Float8E4M3FN,
+                         bsfi.data_ptr(),
+                         cute.AddressSpace.gmem,
+                         assumed_align=16)
+                for bsfi in b_sf_list) if is_multi_b else make_ptr(
+                    cutlass.Float8E4M3FN,
+                    b_sf0.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16)
+            alpha_ptr = tuple(
+                make_ptr(cutlass.Float32, ai.data_ptr(), cute.AddressSpace.gmem)
+                for ai in alpha_list) if is_multi_b else make_ptr(
+                    cutlass.Float32, alpha0.data_ptr(), cute.AddressSpace.gmem)
+
             torch_stream = torch.cuda.current_stream()
             stream = cuda.CUstream(torch_stream.cuda_stream)
 
@@ -1333,21 +1375,22 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 0] == self.tile_size, f"Tactic ({tactic}) is incompatible with tile size ({self.tile_size})"
 
             cache_key = (self.scaling_vector_size, self.tile_size, mma_tiler_mn,
-                         cluster_shape_mn, raster_along_m)
+                         cluster_shape_mn, raster_along_m, b_tensor_l_sizes)
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
                     sf_vec_size=self.scaling_vector_size,
                     mma_tiler_mn=mma_tiler_mn,
                     cluster_shape_mn=cluster_shape_mn,
                     raster_along_m=raster_along_m,
+                    b_tensor_l_sizes=b_tensor_l_sizes,
                 )
                 # Compute max active clusters on current device
                 hardware_info = cutlass.utils.HardwareInfo()
                 max_active_clusters = hardware_info.get_max_active_clusters(
                     cluster_shape_mn[0] * cluster_shape_mn[1])
 
-                compiled_gemm = cute.compile(
-                    gemm.wrapper,
+                wrapper_fn = gemm.wrapper_multi_b if is_multi_b else gemm.wrapper
+                compile_args = [
                     a_ptr,
                     b_ptr,
                     a_sf_ptr,
@@ -1362,9 +1405,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     m,
                     n,
                     k,
-                    l,
-                    num_tokens,
-                    self.top_k,
+                ]
+                if not is_multi_b:
+                    compile_args.append(l)
+                compile_args.extend([num_tokens, self.top_k])
+
+                compiled_gemm = cute.compile(
+                    wrapper_fn,
+                    *compile_args,
                     tile_size=self.tile_size,
                     scaling_vector_size=self.scaling_vector_size,
                     max_active_clusters=max_active_clusters,
@@ -1374,7 +1422,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             else:
                 compiled_gemm = self.__class__.kernel_cache[cache_key]
 
-            compiled_gemm(
+            exec_args = [
                 a_ptr,
                 b_ptr,
                 a_sf_ptr,
@@ -1389,11 +1437,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 m,
                 n,
                 k,
-                l,
-                num_tokens,
-                self.top_k,
-                stream=stream,
-            )
+            ]
+            if not is_multi_b:
+                exec_args.append(l)
+            exec_args.extend([num_tokens, self.top_k])
+            compiled_gemm(*exec_args, stream=stream)
             return c
 
     @torch.library.custom_op(
@@ -1402,10 +1450,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
         device_types="cuda")
     def cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell(
         input: torch.Tensor,
-        weight: torch.Tensor,
+        weight: List[torch.Tensor],
         input_scale: torch.Tensor,
-        weight_scale: torch.Tensor,
-        alpha: torch.Tensor,
+        weight_scale: List[torch.Tensor],
+        alpha: List[torch.Tensor],
         output: torch.Tensor,
         tile_idx_to_group_idx: torch.Tensor,
         tile_idx_to_mn_limit: torch.Tensor,
@@ -1422,9 +1470,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
     ) -> None:
         tuner = AutoTuner.get()
 
+        b_tensor_l_sizes = tuple(w.size(0)
+                                 for w in weight) if len(weight) > 1 else None
         runner = Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner(
             num_experts, top_k, num_local_experts, local_expert_offset,
-            tile_size, output_dtype, scaling_vector_size)
+            tile_size, output_dtype, scaling_vector_size, b_tensor_l_sizes)
 
         inputs = [
             input, weight, input_scale, weight_scale, alpha, output,
@@ -1447,10 +1497,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
         device_types="cuda")
     def cute_dsl_nvfp4_grouped_gemm_finalize_blackwell(
         input: torch.Tensor,
-        weight: torch.Tensor,
+        weight: List[torch.Tensor],
         input_scale: torch.Tensor,
-        weight_scale: torch.Tensor,
-        alpha: torch.Tensor,
+        weight_scale: List[torch.Tensor],
+        alpha: List[torch.Tensor],
         tile_idx_to_group_idx: torch.Tensor,
         tile_idx_to_mn_limit: torch.Tensor,
         permuted_idx_to_expanded_idx: torch.Tensor,
@@ -1465,7 +1515,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         scaling_vector_size: int = 16,
     ) -> torch.Tensor:
         num_tokens = token_final_scales.size(0)
-        n = weight.size(1)
+        n = weight[0].size(1)
         output = torch.zeros(num_tokens,
                              n,
                              dtype=output_dtype,
@@ -1496,10 +1546,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
         "trtllm::cute_dsl_nvfp4_grouped_gemm_finalize_blackwell")
     def _(
         input: torch.Tensor,
-        weight: torch.Tensor,
+        weight: List[torch.Tensor],
         input_scale: torch.Tensor,
-        weight_scale: torch.Tensor,
-        alpha: torch.Tensor,
+        weight_scale: List[torch.Tensor],
+        alpha: List[torch.Tensor],
         tile_idx_to_group_idx: torch.Tensor,
         tile_idx_to_mn_limit: torch.Tensor,
         permuted_idx_to_expanded_idx: torch.Tensor,
@@ -1514,7 +1564,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         scaling_vector_size: int = 16,
     ) -> torch.Tensor:
         num_tokens = token_final_scales.size(0)
-        n = weight.size(1)
+        n = weight[0].size(1)
         return torch.empty(num_tokens,
                            n,
                            dtype=output_dtype,
