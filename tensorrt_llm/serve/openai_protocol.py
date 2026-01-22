@@ -37,6 +37,7 @@ from typing_extensions import Annotated, Required, TypeAlias, TypedDict
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import GuidedDecodingParams, SamplingParams
+from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 
 
 def _logit_bias_to_embedding_bias(logit_bias: Optional[Dict[str, float]],
@@ -192,40 +193,113 @@ class CompletionStreamResponse(OpenAIBaseModel):
 
 
 def _response_format_to_guided_decoding_params(
-    response_format: Optional[ResponseFormat]
+    response_format: Optional[ResponseFormat],
+    reasoning_parser: Optional[str] = None,
 ) -> Optional[GuidedDecodingParams]:
     if response_format is None:
-        return None
+        guided_decoding_params = None
     elif response_format.type == "text":
-        return None
+        guided_decoding_params = None
     elif response_format.type == "json":
         if response_format.schema is None:
             raise ValueError(
-                "The 'schema' field is required when response_format.type is 'json'."
+                f"response_format.schema is required for response_format.type == {response_format.type!r}, but got None."
             )
-        return GuidedDecodingParams(json=response_format.schema)
+        guided_decoding_params = GuidedDecodingParams(
+            json=response_format.schema)
     elif response_format.type == "json_schema":
         if response_format.json_schema is None:
             raise ValueError(
-                "The 'json_schema' field is required when response_format.type is 'json_schema'."
+                f"response_format.json_schema is required for response_format.type == {response_format.type!r}, but got None."
             )
-        return GuidedDecodingParams(json=response_format.json_schema)
+        guided_decoding_params = GuidedDecodingParams(
+            json=response_format.json_schema)
     elif response_format.type == "json_object":
-        return GuidedDecodingParams(json_object=True)
+        guided_decoding_params = GuidedDecodingParams(json_object=True)
     elif response_format.type == "regex":
-        return GuidedDecodingParams(regex=response_format.regex)
+        if response_format.regex is None:
+            raise ValueError(
+                f"response_format.regex is required for response_format.type == {response_format.type!r}, but got None."
+            )
+        guided_decoding_params = GuidedDecodingParams(
+            regex=response_format.regex)
     elif response_format.type == "ebnf":
-        return GuidedDecodingParams(grammar=response_format.ebnf)
+        if response_format.ebnf is None:
+            raise ValueError(
+                f"response_format.ebnf is required for response_format.type == {response_format.type!r}, but got None."
+            )
+        guided_decoding_params = GuidedDecodingParams(
+            grammar=response_format.ebnf)
     elif response_format.type == "structural_tag":
-        return GuidedDecodingParams(
+        guided_decoding_params = GuidedDecodingParams(
             structural_tag=response_format.model_dump_json(by_alias=True,
                                                            exclude_none=True))
     else:
         raise ValueError(f"Unsupported response format: {response_format.type}")
 
+    if guided_decoding_params is None or reasoning_parser is None:
+        return guided_decoding_params
+
+    if guided_decoding_params.structural_tag is not None:
+        return guided_decoding_params
+
+    # Adapt guided_decoding_params for reasoning parser
+    if guided_decoding_params.json is not None:
+        content = {
+            "type": "json_schema",
+            "json_schema": guided_decoding_params.json
+        }
+    elif guided_decoding_params.json_object:
+        content = {"type": "json_schema", "json_schema": {"type": "object"}}
+    elif guided_decoding_params.regex is not None:
+        content = {"type": "regex", "pattern": guided_decoding_params.regex}
+    elif guided_decoding_params.grammar is not None:
+        content = {"type": "grammar", "grammar": guided_decoding_params.grammar}
+
+    if reasoning_parser == "gpt_oss":
+        # Trigger user constraint by final channel
+        stag_format = {
+            "type":
+            "triggered_tags",
+            "triggers": ["<|start|>assistant<|channel|>final<|message|>"],
+            "tags": [
+                {
+                    "begin": "<|start|>assistant<|channel|>final<|message|>",
+                    "content": content,
+                    "end": "",
+                },
+            ],
+            "stop_after_first":
+            True,
+        }
+    else:
+        # Force thinking and then trigger user constraint
+        parser = ReasoningParserFactory.create_reasoning_parser(
+            reasoning_parser)
+        stag_format = {
+            "type":
+            "sequence",
+            "elements": [
+                {
+                    "type": "tag",
+                    "begin": parser.reasoning_start,
+                    "content": {
+                        "type": "any_text"
+                    },
+                    "end": parser.reasoning_end,
+                },
+                content,
+            ],
+        }
+
+    stag_format = ResponseFormat(type="structural_tag", format=stag_format)
+    return GuidedDecodingParams(structural_tag=stag_format.model_dump_json(
+        by_alias=True, exclude_none=True))
+
 
 def _response_format_text_config_to_guided_decoding_params(
-    text_format: Optional[ResponseFormatTextConfig]
+    text_format: Optional[ResponseFormatTextConfig],
+    reasoning_parser: Optional[str] = None,
 ) -> Optional[GuidedDecodingParams]:
     if text_format is None:
         return None
@@ -233,7 +307,8 @@ def _response_format_text_config_to_guided_decoding_params(
     resp_format = ResponseFormat(type=text_format.type,
                                  json_schema=getattr(text_format, "schema_",
                                                      None))
-    return _response_format_to_guided_decoding_params(resp_format)
+    return _response_format_to_guided_decoding_params(
+        resp_format, reasoning_parser=reasoning_parser)
 
 
 class CompletionRequest(OpenAIBaseModel):
@@ -650,6 +725,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     def to_sampling_params(self,
                            vocab_size: int = 32000,
                            gather_generation_logits: bool = False,
+                           reasoning_parser: Optional[str] = None,
                            backend: Optional[str] = None) -> SamplingParams:
         sampling_params = SamplingParams(
             frequency_penalty=self.frequency_penalty,
@@ -680,7 +756,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             spaces_between_special_tokens=self.spaces_between_special_tokens,
             truncate_prompt_tokens=self.truncate_prompt_tokens,
             guided_decoding=_response_format_to_guided_decoding_params(
-                self.response_format),
+                self.response_format, reasoning_parser=reasoning_parser),
 
             # logits_bias
             embedding_bias=_logit_bias_to_embedding_bias(
@@ -810,6 +886,7 @@ class ResponsesRequest(OpenAIBaseModel):
     def to_sampling_params(
         self,
         default_sampling_params: Optional[dict] = None,
+        reasoning_parser: Optional[str] = None,
     ) -> SamplingParams:
         max_tokens = None
         if self.max_output_tokens is not None:
@@ -828,7 +905,7 @@ class ResponsesRequest(OpenAIBaseModel):
         guided_decoding = None
         if self.text is not None and self.text.format is not None:
             guided_decoding = _response_format_text_config_to_guided_decoding_params(
-                self.text.format)
+                self.text.format, reasoning_parser=reasoning_parser)
 
         return SamplingParams(
             temperature=temperature,
