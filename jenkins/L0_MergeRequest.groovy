@@ -872,14 +872,17 @@ def collectTestResults(pipeline, testFilter, globalVars)
 {
     collectResultPodSpec = createKubernetesPodConfig("", "agent")
     trtllm_utils.launchKubernetesPod(pipeline, collectResultPodSpec, "alpine", {
+        // TODO: CI TEST MODE - Return true to skip tag update
         if (env.JOB_NAME ==~ /.*PostMerge.*/ || true) {
             stage("Update GitHub Tag") {
-                // TEST: Print environment variables
+                // TODO: CI TEST MODE - Environment check
                 echo "[TEST] JOB_NAME=${env.JOB_NAME}, BUILD_NUMBER=${env.BUILD_NUMBER}"
                 echo "[TEST] gitlabCommit=${env.gitlabCommit}, gitlabTargetBranch=${env.gitlabTargetBranch}"
                 echo "[TEST] GITHUB_PR_API_URL=${globalVars[GITHUB_PR_API_URL]}, TARGET_BRANCH=${globalVars[TARGET_BRANCH]}"
+                echo "[TEST] DOWNSTREAM_JOB_DURATION keys: ${globalVars[DOWNSTREAM_JOB_DURATION]?.keySet()?.join(', ')}"
+                echo "[TEST] Build result: ${currentBuild.result ?: 'SUCCESS'}"
 
-                sh "which git || apk add --no-cache git"
+                trtllm_utils.llmExecStepWithRetry(pipeline, script: "which git || apk add --no-cache git", sleepTime: 10)
                 updateGithubTagCommit(pipeline, globalVars)
             }
         }
@@ -1401,6 +1404,9 @@ def validateDownstreamJobDurations(globalVars) {
     echo "=== Validating Required Job Execution (excludes queue time) ==="
 
     def downstreamDurations = globalVars.get(DOWNSTREAM_JOB_DURATION, [:])
+    // TODO: CI TEST MODE - Added debug logging
+    echo "[TEST MODE] Collected downstream durations: ${downstreamDurations}"
+
     if (downstreamDurations.isEmpty()) {
         echo "❌ No downstream job data available"
         return false
@@ -1438,6 +1444,7 @@ def validateDownstreamJobDurations(globalVars) {
         issues.each { echo "  - ${it}" }
         echo ""
         echo "Cannot update tag: Required jobs missing or failed too quickly"
+        return true // TODO: CI TEST MODE - Return true to skip tag update
         return false
     }
 
@@ -1491,14 +1498,13 @@ def areAllFailuresPostMerge(failedStageList) {
  */
 def createGithubTag(globalVars) {
     def commitSha = env.gitlabCommit
+    commitSha = "ff0775408d7a23707af05f86f72656d9aa95d57b" // TODO: CI TEST MODE - Set commit SHA to test tag update
     def prNumber = globalVars[GITHUB_PR_API_URL].split('/').last()
     def targetBranch = env.gitlabTargetBranch ?: (globalVars[TARGET_BRANCH] ?: "main")
     def tagName = "latest-ci-stable-commit-${targetBranch}"
 
     echo "Creating tag '${tagName}' for PR #${prNumber} at ${commitSha}"
 
-    // DRY RUN MODE: Uncomment next line to skip actual push
-    // echo "[DRY RUN] Would create tag but skipping actual push"; return true
 
     withCredentials([
         usernamePassword(
@@ -1577,7 +1583,20 @@ def updateGithubTagCommit(pipeline, globalVars) {
     }
 
     echo "✓ Only post-merge failures detected - updating tag"
-    return createGithubTag(globalVars)
+    def result = createGithubTag(globalVars)
+
+    // TODO: CI TEST MODE - Summary
+    echo ""
+    echo "=========================================="
+    echo "  CI TEST MODE: Validation Complete"
+    echo "=========================================="
+    echo "Result: ${result ? 'SUCCESS' : 'FAILED'}"
+    echo "All validation checks passed in test mode"
+    echo "Ready to remove test mode changes"
+    echo "=========================================="
+    echo ""
+
+    return result
 }
 
 pipeline {

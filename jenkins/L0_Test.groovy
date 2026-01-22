@@ -3909,6 +3909,7 @@ pipeline {
             steps
             {
                 script {
+                    sh "cd aaa"
                     launchTestListCheck(this)
                 }
             }
