@@ -15,6 +15,7 @@
 import asyncio
 import os
 import sys
+from unittest import mock
 import time
 
 import pytest
@@ -3153,45 +3154,9 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
             task = GSM8K(model_name)
             task.evaluate(llm)
 
-    def _get_kimi_k2_config(self):
-        """Common configuration for Kimi-K2 RCCA tests (bug 5661741)."""
-        return {
-            "model_name":
-            "moonshotai/Kimi-K2-Thinking",
-            "model_path":
-            f"{llm_models_root()}/Kimi-K2-Thinking-NVFP4",
-            "kv_cache_config":
-            KvCacheConfig(
-                dtype="fp8",
-                free_gpu_memory_fraction=0.75,
-                enable_block_reuse=True,
-                enable_partial_reuse=False,
-                event_buffer_max_size=1024,
-            ),
-            "target_len":
-            250000,
-        }
-
-    def _build_long_sequences(self, llm, target_len):
-        """Build long token sequences from dataset."""
-        tokenizer = llm.tokenizer
-        dataset = load_dataset("Crystalcareai/Code-feedback-sharegpt-renamed",
-                               split="train[:2000]")
-        long_token_list = []
-        for row in dataset:
-            msg = row["messages"][0]["value"]
-            tokens = tokenizer.encode(msg, add_special_tokens=False)
-            if not tokens:
-                continue
-            repeat = target_len // len(tokens) + 1
-            long_tokens = (tokens * repeat)[:target_len]
-            long_token_list.append(long_tokens)
-        assert len(long_token_list) > 0, "No valid samples found"
-        return long_token_list
-
     @skip_pre_blackwell
     @pytest.mark.skip_less_device(8)
-    @pytest.mark.skip_less_device_memory(120000)
+    @pytest.mark.skip_less_device_memory(183000)
     @pytest.mark.timeout(14400)
     @pytest.mark.filterwarnings(
         "ignore:.*Calling super.*encode.*add_special_tokens.*:UserWarning")
@@ -3204,24 +3169,45 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
         RCCA: https://nvbugspro.nvidia.com/bug/5661741
         """
         patch_mpi_pool_session_for_env(mocker, {"TRTLLM_ENABLE_PDL": "1"})
-        config = self._get_kimi_k2_config()
+        model_path = f"{llm_models_root()}/Kimi-K2-Thinking-NVFP4"
+        target_len = 250000
+        kv_cache_config = KvCacheConfig(
+            dtype="fp8",
+            free_gpu_memory_fraction=0.75,
+            enable_block_reuse=True,
+            enable_partial_reuse=False,
+            event_buffer_max_size=1024,
+        )
 
         with LLM(
-                config["model_path"],
+                model_path,
                 tensor_parallel_size=8,
                 moe_expert_parallel_size=4,
                 moe_config=MoeConfig(backend="TRTLLM"),
                 enable_chunked_prefill=True,
                 trust_remote_code=True,
-                kv_cache_config=config["kv_cache_config"],
+                kv_cache_config=kv_cache_config,
                 max_num_tokens=8192,
                 max_seq_len=262144,
                 max_batch_size=32,
                 enable_attention_dp=True,
         ) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
-            long_token_list = self._build_long_sequences(
-                llm, config["target_len"])
+
+            # Build long token sequences from dataset
+            tokenizer = llm.tokenizer
+            dataset = load_dataset("Crystalcareai/Code-feedback-sharegpt-renamed",
+                                   split="train[:2000]")
+            long_token_list = []
+            for row in dataset:
+                msg = row["messages"][0]["value"]
+                tokens = tokenizer.encode(msg, add_special_tokens=False)
+                if not tokens:
+                    continue
+                repeat = target_len // len(tokens) + 1
+                long_tokens = (tokens * repeat)[:target_len]
+                long_token_list.append(long_tokens)
+            assert len(long_token_list) > 0, "No valid samples found"
 
             samples_per_batch = 8
             sampling_params_greedy = SamplingParams(max_tokens=8)
@@ -3229,17 +3215,10 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
                                                       temperature=0.8,
                                                       top_p=0.95)
 
-            max_duration_sec = 2 * 3600
-            max_batch_count = 15
-            min_batch_count = 5
-            start_time = time.time()
             num_samples = len(long_token_list)
+            max_batch_count = 15
 
             for batch_idx in range(max_batch_count):
-                elapsed = time.time() - start_time
-                if elapsed >= max_duration_sec and batch_idx >= min_batch_count:
-                    break
-
                 start_idx = (batch_idx * samples_per_batch) % num_samples
                 indices = [(start_idx + i) % num_samples
                            for i in range(samples_per_batch)]
@@ -3259,7 +3238,7 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_device(8)
-    @pytest.mark.skip_less_device_memory(120000)
+    @pytest.mark.skip_less_device_memory(183000)
     @pytest.mark.timeout(14400)
     @pytest.mark.filterwarnings(
         "ignore:.*Calling super.*encode.*add_special_tokens.*:UserWarning")
@@ -3272,24 +3251,45 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
         RCCA: https://nvbugspro.nvidia.com/bug/5661741
         """
         patch_mpi_pool_session_for_env(mocker, {"TRTLLM_ENABLE_PDL": "1"})
-        config = self._get_kimi_k2_config()
+        model_path = f"{llm_models_root()}/Kimi-K2-Thinking-NVFP4"
+        target_len = 250000
+        kv_cache_config = KvCacheConfig(
+            dtype="fp8",
+            free_gpu_memory_fraction=0.75,
+            enable_block_reuse=True,
+            enable_partial_reuse=False,
+            event_buffer_max_size=1024,
+        )
 
         with LLM(
-                config["model_path"],
+                model_path,
                 tensor_parallel_size=8,
                 moe_expert_parallel_size=4,
                 moe_config=MoeConfig(backend="TRTLLM"),
                 enable_chunked_prefill=True,
                 trust_remote_code=True,
-                kv_cache_config=config["kv_cache_config"],
+                kv_cache_config=kv_cache_config,
                 max_num_tokens=4096,
                 max_seq_len=262144,
                 max_batch_size=8,
                 enable_attention_dp=True,
         ) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
-            long_token_list = self._build_long_sequences(
-                llm, config["target_len"])
+
+            # Build long token sequences from dataset
+            tokenizer = llm.tokenizer
+            dataset = load_dataset("Crystalcareai/Code-feedback-sharegpt-renamed",
+                                   split="train[:2000]")
+            long_token_list = []
+            for row in dataset:
+                msg = row["messages"][0]["value"]
+                tokens = tokenizer.encode(msg, add_special_tokens=False)
+                if not tokens:
+                    continue
+                repeat = target_len // len(tokens) + 1
+                long_tokens = (tokens * repeat)[:target_len]
+                long_token_list.append(long_tokens)
+            assert len(long_token_list) > 0, "No valid samples found"
 
             async_batch_size = 6
             num_async_batches = 3
