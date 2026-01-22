@@ -14,6 +14,8 @@ import transformers
 from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
 
+from tensorrt_llm._torch.models.feature_types import Feature as SupportFeature
+from tensorrt_llm._torch.models.modeling_utils import is_feature_unsupported
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.inputs.data import TextPrompt
 from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams
@@ -44,8 +46,6 @@ from .llm_args import (TORCH_LLMARGS_EXPLICIT_DOCSTRING,
                        PybindMirror, TorchLlmArgs, TrtLlmArgs)
 from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig,
                         LlmBuildStats, ModelLoader, _ModelRuntimeContext)
-from .model_support_matrix import Feature as SupportFeature
-from .model_support_matrix import is_feature_unsupported
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
 from .tokenizer import TokenizerBase, _xgrammar_tokenizer_info
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import

@@ -1653,8 +1653,42 @@ class DeepseekV3Model(DecoderModel):
         return hidden_states
 
 
-@register_auto_model("DeepseekV32ForCausalLM")
-@register_auto_model("DeepseekV3ForCausalLM")
+@register_auto_model(
+    "DeepseekV32ForCausalLM",
+    supported=[
+        "overlap_scheduler",
+        "cuda_graph",
+        "attention_dp",
+        "disaggregated_serving",
+        "chunked_prefill",
+        "mtp",
+        "torch_sampler",
+        "tllm_cpp_sampler",
+        "kv_cache_reuse",
+        "logits_post_processor",
+        "guided_decoding",
+    ],
+    unsupported=["eagle3_one_model", "eagle3_two_model"],
+    not_applicable=["sliding_window"],
+)
+@register_auto_model(
+    "DeepseekV3ForCausalLM",
+    supported=[
+        "overlap_scheduler",
+        "cuda_graph",
+        "attention_dp",
+        "disaggregated_serving",
+        "chunked_prefill",
+        "mtp",
+        "torch_sampler",
+        "tllm_cpp_sampler",
+        "kv_cache_reuse",
+        "logits_post_processor",
+        "guided_decoding",
+    ],
+    unsupported=["eagle3_one_model", "eagle3_two_model"],
+    not_applicable=["sliding_window"],
+)
 class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                                                         PretrainedConfig]):
 

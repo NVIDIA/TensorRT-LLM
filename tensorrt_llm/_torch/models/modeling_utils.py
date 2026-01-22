@@ -617,21 +617,103 @@ class DecoderModelForCausalLM(nn.Module,
         return inferred_max_seq_len
 
 
+from .feature_types import ALL_FEATURES, Feature, SupportStatus
+
 MODEL_CLASS_MAPPING = {}
 MODEL_CLASS_VISION_ENCODER_MAPPING = {}
 MODEL_CLASS_MAPPER_MAPPING = {}
 MODEL_CLASS_CHECKPOINT_WEIGHT_LOADER_DEFAULT_MAPPING = {}
 MODEL_CLASS_CONFIG_LOADER_DEFAULT_MAPPING = {}
 CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING = {}
+# Mapping of architecture name to feature support status (feature_id -> SupportStatus)
+MODEL_CLASS_FEATURES_MAPPING: Dict[str, Dict[str, SupportStatus]] = {}
 
 
-def register_auto_model(name: str):
+def register_auto_model(
+    name: str,
+    supported: Optional[List[str]] = None,
+    unsupported: Optional[List[str]] = None,
+    not_applicable: Optional[List[str]] = None,
+):
+    """Decorator to register a model class with optional feature support metadata.
+
+    Args:
+        name: The HuggingFace architecture name (e.g., "DeepseekV3ForCausalLM")
+        supported: List of feature IDs that are supported (SupportStatus.YES)
+        unsupported: List of feature IDs that are not supported (SupportStatus.NO)
+        not_applicable: List of feature IDs that are N/A for this model (SupportStatus.NA)
+
+    Omitted features default to SupportStatus.UNTESTED.
+
+    Example:
+        @register_auto_model("DeepseekV3ForCausalLM",
+            supported=["overlap_scheduler", "chunked_prefill", "kv_cache_reuse"],
+            unsupported=["eagle3_one_model", "eagle3_two_model"],
+            not_applicable=["sliding_window"],
+        )
+        class DeepseekV3ForCausalLM(...):
+            ...
+    """
 
     def decorator(cls):
         MODEL_CLASS_MAPPING[name] = cls
+
+        # Build feature mapping from string lists
+        features: Dict[str, SupportStatus] = {}
+        for feature_id in (supported or []):
+            if feature_id not in ALL_FEATURES:
+                raise ValueError(f"Unknown feature ID: {feature_id}")
+            features[feature_id] = SupportStatus.YES
+        for feature_id in (unsupported or []):
+            if feature_id not in ALL_FEATURES:
+                raise ValueError(f"Unknown feature ID: {feature_id}")
+            features[feature_id] = SupportStatus.NO
+        for feature_id in (not_applicable or []):
+            if feature_id not in ALL_FEATURES:
+                raise ValueError(f"Unknown feature ID: {feature_id}")
+            features[feature_id] = SupportStatus.NA
+
+        if features:
+            MODEL_CLASS_FEATURES_MAPPING[name] = features
         return cls
 
     return decorator
+
+
+def get_status(architecture: str, feature: Feature) -> Optional[SupportStatus]:
+    """Get the support status of a feature for an architecture.
+
+    Queries MODEL_CLASS_FEATURES_MAPPING (populated by @register_auto_model
+    decorators). Returns None if the architecture or feature is not found.
+
+    Args:
+        architecture: The HuggingFace architecture name (e.g., "DeepseekV3ForCausalLM")
+        feature: The Feature enum member to query
+
+    Returns:
+        SupportStatus if found, None otherwise (treated as UNTESTED)
+    """
+    features = MODEL_CLASS_FEATURES_MAPPING.get(architecture)
+    if features is not None:
+        # feature.value is the string ID (e.g., "chunked_prefill")
+        status = features.get(feature.value)
+        if status is not None:
+            return status
+    return None
+
+
+def is_feature_unsupported(architecture: str, feature: Feature) -> bool:
+    """Return True if the feature is explicitly unsupported (NO or N/A) for this architecture.
+
+    Args:
+        architecture: The HuggingFace architecture name
+        feature: The Feature enum member to check
+
+    Returns:
+        True if feature status is NO or N/A, False otherwise (including if unknown/UNTESTED)
+    """
+    status = get_status(architecture, feature)
+    return status in (SupportStatus.NO, SupportStatus.NA)
 
 
 def register_vision_encoder(

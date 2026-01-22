@@ -22,18 +22,23 @@ Tests are designed to be matrix-agnostic - they test the fallback
 mechanism itself, not specific model/feature combinations.
 """
 
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
+from tensorrt_llm._torch.models.feature_types import Feature, SupportStatus
 from tensorrt_llm.llmapi.llm import BaseLLM
-from tensorrt_llm.llmapi.model_support_matrix import (
-    KEY_MODEL_MATRIX,
-    MULTIMODAL_MATRIX,
-    Feature,
-    SupportStatus,
-)
+
+# Import doc-specific matrices from docs/source/helper.py
+# Add docs/source to path temporarily for import
+_docs_source = Path(__file__).parent.parent.parent.parent / "docs" / "source"
+sys.path.insert(0, str(_docs_source))
+from helper import KEY_MODEL_MATRIX, MULTIMODAL_MATRIX  # noqa: E402
+
+sys.path.remove(str(_docs_source))
 
 
 def _make_mock_llm(

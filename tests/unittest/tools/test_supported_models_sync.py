@@ -21,13 +21,14 @@ from pathlib import Path
 
 
 def _render_supported_models_markdown(repo_root: Path) -> str:
-    module = _load_model_support_matrix_module(repo_root)
+    module = _load_docs_helper_module(repo_root)
     return module.render_supported_models_markdown()
 
 
-def _load_model_support_matrix_module(repo_root: Path):
-    module_path = repo_root / "tensorrt_llm/llmapi/model_support_matrix.py"
-    spec = importlib.util.spec_from_file_location("tllm_model_support_matrix", module_path)
+def _load_docs_helper_module(repo_root: Path):
+    """Load docs/source/helper.py which contains the doc generation code."""
+    module_path = repo_root / "docs/source/helper.py"
+    spec = importlib.util.spec_from_file_location("docs_helper", module_path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Failed to load {module_path}")
     module = importlib.util.module_from_spec(spec)
@@ -58,7 +59,7 @@ class TestSupportedModelsSync(unittest.TestCase):
     def test_supported_models_matrix_invariants(self):
         """Catch support-matrix drift early (duplication, footnotes)."""
         repo_root = Path(__file__).resolve().parents[3]
-        module = _load_model_support_matrix_module(repo_root)
+        module = _load_docs_helper_module(repo_root)
 
         architectures = [m.architecture for m in module.SUPPORTED_MODELS_PYTORCH]
         self.assertEqual(
