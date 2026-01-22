@@ -47,4 +47,22 @@ methods:
         annotation: str
         default: inspect._empty
     return_annotation: bool
+  load_quant_config_from_dtypes_json:
+    parameters:
+      dtypes_json_file:
+        annotation: str
+        default: inspect._empty
+      moe_backend:
+        annotation: str
+        default: inspect._empty
+    return_annotation: tuple
+  update_from_model_ckpt:
+    parameters:
+      model_ckpt_path:
+        annotation: str
+        default: inspect._empty
+      moe_backend:
+        annotation: str
+        default: inspect._empty
+    return_annotation: tuple
 properties: {}

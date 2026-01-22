@@ -5,7 +5,6 @@ from pathlib import Path
 import pytest
 
 from tensorrt_llm._tensorrt_engine import LLM
-from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
 from tensorrt_llm.llmapi.llm_utils import CalibConfig, QuantAlgo, QuantConfig
 
@@ -114,12 +113,13 @@ def test_quant_cfg_from_quant_cfg_json():
             }
         }
 
-        hf_quant_config_file = model_dir / "hf_quant_config.json"
+        hf_quant_config_file = Path(model_dir / "hf_quant_config.json")
         with open(hf_quant_config_file, 'w') as f:
             json.dump(hf_quant_config_content, f)
 
-        quant_config, layer_quant_config = ModelConfig.load_modelopt_quant_config(
-            hf_quant_config_file, model_dir, None)
+        quant_config = QuantConfig()
+        is_quant_config_changed, layer_quant_config = quant_config.update_from_model_ckpt(
+            model_ckpt_path=model_dir, moe_backend=None)
 
         # Verify quant_cfg.json was loaded
         assert quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
@@ -157,11 +157,13 @@ def test_quant_cfg_from_hf_quant_config():
                 }
             }
         }
-        hf_quant_config_file = model_dir / "hf_quant_config.json"
+        hf_quant_config_file = Path(model_dir / "hf_quant_config.json")
         with open(hf_quant_config_file, 'w') as f:
             json.dump(hf_quant_config_content, f)
-        quant_config, layer_quant_config = ModelConfig.load_modelopt_quant_config(
-            hf_quant_config_file, model_dir, None)
+
+        quant_config = QuantConfig()
+        is_quant_config_changed, layer_quant_config = quant_config.update_from_model_ckpt(
+            model_ckpt_path=model_dir, moe_backend=None)
 
         # Verify layer configs
         assert quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
