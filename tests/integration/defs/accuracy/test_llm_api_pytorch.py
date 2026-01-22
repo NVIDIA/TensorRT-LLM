@@ -16,7 +16,6 @@ import asyncio
 import os
 import sys
 from unittest import mock
-import time
 
 import pytest
 import torch
@@ -3196,8 +3195,9 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
 
             # Build long token sequences from dataset
             tokenizer = llm.tokenizer
-            dataset = load_dataset("Crystalcareai/Code-feedback-sharegpt-renamed",
-                                   split="train[:2000]")
+            dataset = load_dataset(
+                "Crystalcareai/Code-feedback-sharegpt-renamed",
+                split="train[:2000]")
             long_token_list = []
             for row in dataset:
                 msg = row["messages"][0]["value"]
@@ -3278,8 +3278,9 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
 
             # Build long token sequences from dataset
             tokenizer = llm.tokenizer
-            dataset = load_dataset("Crystalcareai/Code-feedback-sharegpt-renamed",
-                                   split="train[:2000]")
+            dataset = load_dataset(
+                "Crystalcareai/Code-feedback-sharegpt-renamed",
+                split="train[:2000]")
             long_token_list = []
             for row in dataset:
                 msg = row["messages"][0]["value"]
