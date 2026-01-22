@@ -27,6 +27,7 @@ from mpi4py.futures import MPIPoolExecutor
 from transformers.configuration_utils import PretrainedConfig
 from utils.util import getSMVersion
 
+import tensorrt_llm.bindings.internal.runtime as _tbr
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe import RenormalizeMoeRoutingMethod, create_moe
 from tensorrt_llm._torch.modules.fused_moe.moe_load_balancer import (
@@ -342,7 +343,10 @@ def test_moe_multi_gpu(comm_method_type, moe_backend, quant_algo):
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 GPUs to run this test")
-@pytest.mark.skip_device_not_contain(["GB200"])
+@pytest.mark.skipif(
+    not _tbr.is_host_accessible_device_memory_supported(),
+    reason="needs support of host accessible device memory",
+)
 @pytest.mark.parametrize(
     "quant_algo",
     [
