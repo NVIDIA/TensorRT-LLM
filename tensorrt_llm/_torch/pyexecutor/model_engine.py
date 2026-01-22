@@ -597,7 +597,7 @@ class PyTorchModelEngine(ModelEngine):
         self._run_torch_compile_warmup(resource_manager)
         self._run_autotuner_warmup(resource_manager)
         self._run_cuda_graph_warmup(resource_manager)
-        if not kv_cache_manager.is_estimating_kv_cache and not self.is_draft_model:
+        if not self.is_draft_model:
             # Run extra general warmup to warmup memory pool before running real requests.
             self._general_warmup(resource_manager, reverse=True)
 
