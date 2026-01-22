@@ -44,6 +44,8 @@ from .llm_args import (TORCH_LLMARGS_EXPLICIT_DOCSTRING,
                        PybindMirror, TorchLlmArgs, TrtLlmArgs)
 from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig,
                         LlmBuildStats, ModelLoader, _ModelRuntimeContext)
+from .model_support_matrix import Feature as SupportFeature
+from .model_support_matrix import is_feature_unsupported
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
 from .tokenizer import TokenizerBase, _xgrammar_tokenizer_info
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
@@ -251,6 +253,55 @@ class BaseLLM:
 
         exception_handler.register(self, 'shutdown')
         atexit.register(LLM._shutdown_wrapper, weakref.ref(self))
+
+    def _apply_model_feature_fallbacks(self) -> None:
+        if not getattr(self.args, "auto_disable_unsupported_features", False):
+            return
+        cfg = getattr(self, "_hf_model_config", None)
+        if cfg is None:
+            return
+        archs = getattr(cfg, "architectures", None)
+        if not (isinstance(archs, (list, tuple)) and archs
+                and isinstance(archs[0], str)):
+            return
+        arch = archs[0]
+
+        def _disable(feature: SupportFeature, attr: str) -> None:
+            if is_feature_unsupported(arch, feature):
+                logger.warning(
+                    f"{arch}: {feature.value} unsupported; disabling {attr}")
+                return True
+            return False
+
+        kv_cfg = getattr(self.args, "kv_cache_config", None)
+        if kv_cfg and getattr(kv_cfg, "enable_block_reuse", False):
+            if _disable(SupportFeature.KV_CACHE_REUSE,
+                        "kv_cache_config.enable_block_reuse"):
+                kv_cfg.enable_block_reuse = False
+
+        if getattr(self.args, "enable_chunked_prefill", False):
+            if _disable(SupportFeature.CHUNKED_PREFILL,
+                        "enable_chunked_prefill"):
+                self.args.enable_chunked_prefill = False
+
+        if getattr(self.args, "enable_attention_dp", False):
+            if _disable(SupportFeature.ATTENTION_DP, "enable_attention_dp"):
+                self.args.enable_attention_dp = False
+
+        if hasattr(self.args, "disable_overlap_scheduler"
+                   ) and not self.args.disable_overlap_scheduler:
+            if _disable(SupportFeature.OVERLAP_SCHEDULER,
+                        "disable_overlap_scheduler"):
+                self.args.disable_overlap_scheduler = True
+
+        if getattr(self.args, "cuda_graph_config", None) is not None:
+            if _disable(SupportFeature.CUDA_GRAPH, "cuda_graph_config"):
+                self.args.cuda_graph_config = None
+
+        if getattr(self.args, "guided_decoding_backend", None) is not None:
+            if _disable(SupportFeature.GUIDED_DECODING,
+                        "guided_decoding_backend"):
+                self.args.guided_decoding_backend = None
 
     @property
     @set_api_status("beta")
@@ -810,7 +861,9 @@ class BaseLLM:
 
     def _try_load_hf_model_config(
             self) -> Optional[transformers.PretrainedConfig]:
-        return ModelLoader.load_hf_model_config(self.args.model)
+        model_dir = getattr(self, '_hf_model_dir', None) or self.args.model
+        return ModelLoader.load_hf_model_config(
+            model_dir, trust_remote_code=self.args.trust_remote_code)
 
     @set_api_status("beta")
     def shutdown(self) -> None:
@@ -922,6 +975,7 @@ class _TrtLLM(BaseLLM):
         # It should also be before bindings ExecutorConfig, which may depend on tokenizer info.
         self._tokenizer = self._try_load_tokenizer()
         self._hf_model_config = self._try_load_hf_model_config()
+        self._apply_model_feature_fallbacks()
         self._generation_config = self._try_load_generation_config()
 
         # Multimodal special handling:
@@ -1116,6 +1170,7 @@ class _TorchLLM(BaseLLM):
         # It should also be before bindings ExecutorConfig, which may depend on tokenizer info.
         self._tokenizer = self._try_load_tokenizer()
         self._hf_model_config = self._try_load_hf_model_config()
+        self._apply_model_feature_fallbacks()
         self._generation_config = self._try_load_generation_config()
 
         # Multimodal special handling:

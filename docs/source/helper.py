@@ -2,6 +2,7 @@ import importlib.util
 import logging
 import os
 import re
+import sys
 from dataclasses import dataclass
 from itertools import chain, groupby
 from pathlib import Path
@@ -343,6 +344,34 @@ def generate_llmapi():
         content += "\n".join(options) + "\n\n"
     with open(doc_path, "w+") as f:
         f.write(content)
+
+
+def generate_supported_models():
+    """Regenerate `docs/source/models/supported-models.md` from in-code matrix."""
+    root_dir = Path(__file__).parent.parent.parent.resolve()
+    doc_path = root_dir / "docs/source/models/supported-models.md"
+
+    module_path = root_dir / "tensorrt_llm/llmapi/model_support_matrix.py"
+    spec = importlib.util.spec_from_file_location("tllm_model_support_matrix",
+                                                  module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Failed to load {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    # Needed for dataclasses/type evaluation during module exec.
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    content = module.render_supported_models_markdown()
+
+    prev = ""
+    if doc_path.exists():
+        with open(doc_path, "r") as f:
+            prev = f.read()
+    if prev != content:
+        doc_path.parent.mkdir(parents=True, exist_ok=True)
+        logging.warning(f"Writing {doc_path}")
+        with open(doc_path, "w") as f:
+            f.write(content)
 
 
 def update_version():

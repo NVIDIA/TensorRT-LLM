@@ -2133,6 +2133,14 @@ class BaseLlmArgs(StrictBaseModel):
         "[EXPERIMENTAL] Environment variable overrides. NOTE: import-time-cached env vars in the code won't update unless the code fetches them from os.environ on demand.",
         status="prototype")
 
+    auto_disable_unsupported_features: bool = Field(
+        default=False,
+        description=
+        "[BETA] Automatically disable features (e.g., chunked prefill, KV cache reuse) "
+        "that are not supported by the model architecture. When enabled, unsupported "
+        "features are silently disabled with a warning instead of causing errors.",
+        status="beta")
+
     @field_validator('env_overrides', mode='before')
     @classmethod
     def coerce_env_overrides_to_str(cls, v):
