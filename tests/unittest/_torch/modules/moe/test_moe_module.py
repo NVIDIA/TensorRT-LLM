@@ -240,9 +240,8 @@ def _test_moe_worker(
     ],
     ids=lambda val: f"dtype={val}",
 )
-def test_moe(dtype, moe_backend, quant_algo, mocker):
+def test_moe(dtype, moe_backend, quant_algo):
     # Enable configurable moe by default
-    mocker.patch.dict(os.environ, {"ENABLE_CONFIGURABLE_MOE": "1"})
     if moe_backend == "TRTLLM":
         if dtype == torch.float16 and quant_algo == QuantAlgo.NVFP4:
             pytest.skip("TRTLLM NVFP4 MoE backend does not support float16 yet")
@@ -267,9 +266,6 @@ def _test_moe_multi_gpu(
         for custom_path in custom_paths:
             if custom_path.endswith("tests/unittest") and custom_path not in sys.path:
                 sys.path.append(custom_path)
-
-        # Enable configurable moe by default
-        os.environ["ENABLE_CONFIGURABLE_MOE"] = "1"
 
         # Set comm method
         os.environ["TRTLLM_FORCE_COMM_METHOD"] = comm_method_type
