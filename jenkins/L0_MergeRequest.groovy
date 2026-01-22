@@ -28,8 +28,10 @@ withCredentials([string(credentialsId: 'default-scan-repo', variable: 'DEFAULT_S
 @Field String SCAN_COMMIT = "main"
 @Field String SCAN_ROOT = "scan"
 
-@Field String ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
-@Field String UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
+// Note: These variables access 'env' which is only available during pipeline execution
+// so they cannot be @Field with initialization
+ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
+UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 
 // Container configuration
 def getContainerURIs()
@@ -55,9 +57,10 @@ def getContainerURIs()
 @Field String STAGE_CHOICE_SKIP = "skip"
 @Field String STAGE_CHOICE_IGNORE = "ignore"
 
-@Field String RELESE_CHECK_CHOICE = env.releaseCheckChoice ? env.releaseCheckChoice : STAGE_CHOICE_NORMAL
-@Field String X86_TEST_CHOICE = env.x86TestChoice ? env.x86TestChoice : STAGE_CHOICE_NORMAL
-@Field String SBSA_TEST_CHOICE = env.SBSATestChoice ? env.SBSATestChoice : STAGE_CHOICE_NORMAL
+// Note: These variables access 'env' which is only available during pipeline execution
+RELESE_CHECK_CHOICE = env.releaseCheckChoice ? env.releaseCheckChoice : STAGE_CHOICE_NORMAL
+X86_TEST_CHOICE = env.x86TestChoice ? env.x86TestChoice : STAGE_CHOICE_NORMAL
+SBSA_TEST_CHOICE = env.SBSATestChoice ? env.SBSATestChoice : STAGE_CHOICE_NORMAL
 
 @Field
 def gitlabParamsFromBot = [:]
@@ -69,13 +72,11 @@ if (env.gitlabTriggerPhrase)
 
 // "Fail Fast" feature is enabled by default for the pre-merge pipeline.
 // "Fail Fast" feature is always disabled for the post-merge pipeline.
-@Field
+// Note: These variables access 'env' which is only available during pipeline execution
 boolean enableFailFast = !(env.JOB_NAME ==~ /.*PostMerge.*/ || env.JOB_NAME ==~ /.*Dependency_Testing_TRT.*/) && !gitlabParamsFromBot.get("disable_fail_fast", false)
 
-@Field
 boolean isReleaseCheckMode = (gitlabParamsFromBot.get("run_mode", "full") == "release_check")
 
-@Field
 BUILD_STATUS_NAME = isReleaseCheckMode ? "Jenkins Release Check" : "Jenkins Full Build"
 
 def trimForStageList(stageNameList)
@@ -168,7 +169,7 @@ def globalVars = [
 ]
 
 // If not running all test stages in the L0 pre-merge, we will not update the GitLab status at the end.
-@Field
+// Note: Depends on testFilter which depends on env
 boolean enableUpdateGitlabStatus =
     !testFilter[ENABLE_SKIP_TEST] &&
     !testFilter[ONLY_MULTI_GPU_TEST] &&
