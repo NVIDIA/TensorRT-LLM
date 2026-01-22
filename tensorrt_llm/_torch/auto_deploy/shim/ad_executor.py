@@ -378,27 +378,30 @@ def maybe_pad_for_cuda_graph(func):
         else:
             all_rank_info = [[can_run_cuda_graph, can_pad, batch_size]]
 
-        # now let's check if we can run cuda graph and pad the batch for all ranks
+        # now let's check if we can in principle run cuda graph across all ranks
         can_run_cuda_graph_all = all(r_info[0] for r_info in all_rank_info)
-        max_batch_size = max(r_info[2] for r_info in all_rank_info)
 
-        # let's check if all ranks can pad the batch if they need to
-        can_pad_all = all(r_info[1] or (r_info[2] == max_batch_size) for r_info in all_rank_info)
-
-        # fall back if we cannot run cudagraph
-        if not (can_run_cuda_graph_all and can_pad_all):
+        if not can_run_cuda_graph_all:
             return _call_func()
 
-        # check if cudagraph batch size is available
+        # get closest cudagraph batch size based on max_batch_size across ALL ranks
         # NOTE: we assume uniform cudagraph batch sizes across all ranks ensuring all ranks get the
         # same closest cudagraph batch size here based on the max batch size across all ranks
-        closest_cg_bs = _round_up_to_closest(self.cuda_graph_batch_sizes, max_batch_size)
+        max_batch_size = max(r_info[2] for r_info in all_rank_info)
+        cg_batch_size = _round_up_to_closest(self.cuda_graph_batch_sizes, max_batch_size)
 
-        if closest_cg_bs is None:
+        if cg_batch_size is None:
+            return _call_func()
+
+        # let's check if all ranks can pad the batch if they need to
+        can_pad_all = all(r_info[1] or (r_info[2] == cg_batch_size) for r_info in all_rank_info)
+
+        # fall back if we cannot run cudagraph due to padding issues
+        if not can_pad_all:
             return _call_func()
 
         # check actual amount of padding needed
-        num_padding = closest_cg_bs - batch_size
+        num_padding = cg_batch_size - batch_size
 
         # we should only hit this point for either of these conditions
         assert num_padding == 0 or (num_padding > 0 and self.padding_dummy_request is not None), (
