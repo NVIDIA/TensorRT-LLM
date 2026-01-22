@@ -53,7 +53,7 @@ from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import \
     IS_TRITON_KERNELS_AVAILABLE
 from tensorrt_llm.llmapi import (AutoDecodingConfig, CudaGraphConfig,
                                  DeepSeekSparseAttentionConfig,
-                                 EagleDecodingConfig, KvCacheConfig, MoeConfig,
+                                 Eagle3DecodingConfig, KvCacheConfig, MoeConfig,
                                  MTPDecodingConfig, NGramDecodingConfig,
                                  RocketSparseAttentionConfig, SamplingParams,
                                  SkipSoftmaxAttentionConfig, TorchCompileConfig)
@@ -290,9 +290,9 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         target_model_dir = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
 
         draft_len = 4
-        spec_config = EagleDecodingConfig(max_draft_len=draft_len,
-                                          speculative_model=eagle_model_dir,
-                                          eagle3_one_model=eagle3_one_model)
+        spec_config = Eagle3DecodingConfig(max_draft_len=draft_len,
+                                           speculative_model=eagle_model_dir,
+                                           eagle3_one_model=eagle3_one_model)
 
         with LLM(model=target_model_dir,
                  **pytorch_config,
@@ -382,7 +382,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
         cuda_graph_config = CudaGraphConfig(enable_padding=True)
-        spec_config = EagleDecodingConfig(
+        spec_config = Eagle3DecodingConfig(
             max_draft_len=3,
             speculative_model=f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B",
             eagle3_one_model=eagle3_one_model)
@@ -634,9 +634,9 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
         model_path = f"{llm_models_root()}/modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8"
         eagle_model_dir = f"{llm_models_root()}/EAGLE3-LLaMA3.3-Instruct-70B"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
-        spec_config = EagleDecodingConfig(max_draft_len=3,
-                                          speculative_model=eagle_model_dir,
-                                          eagle3_one_model=eagle3_one_model)
+        spec_config = Eagle3DecodingConfig(max_draft_len=3,
+                                           speculative_model=eagle_model_dir,
+                                           eagle3_one_model=eagle3_one_model)
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
         pytorch_config = dict(
             disable_overlap_scheduler=not eagle3_one_model,
@@ -3567,9 +3567,9 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
         target_model_dir = f"{llm_models_root()}/Qwen3/Qwen3-8B"
 
         draft_len = 4
-        spec_config = EagleDecodingConfig(max_draft_len=draft_len,
-                                          speculative_model=eagle_model_dir,
-                                          eagle3_one_model=eagle3_one_model)
+        spec_config = Eagle3DecodingConfig(max_draft_len=draft_len,
+                                           speculative_model=eagle_model_dir,
+                                           eagle3_one_model=eagle3_one_model)
 
         llm = LLM(model=target_model_dir,
                   **pytorch_config,
@@ -3937,7 +3937,7 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
                                         enable_block_reuse=not eagle3)
         spec_config = None
         if eagle3:
-            spec_config = EagleDecodingConfig(
+            spec_config = Eagle3DecodingConfig(
                 max_draft_len=2,
                 speculative_model=
                 f"{llm_models_root()}/Qwen3/qwen3-235B-eagle3/",
@@ -3985,7 +3985,7 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
                                         enable_block_reuse=not eagle3)
         spec_config = None
         if eagle3:
-            spec_config = EagleDecodingConfig(
+            spec_config = Eagle3DecodingConfig(
                 max_draft_len=2,
                 speculative_model=
                 f"{llm_models_root()}/Qwen3/qwen3-235B-eagle3/",
@@ -4637,10 +4637,10 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
         eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
         draft_len = 3
-        spec_config = EagleDecodingConfig(max_draft_len=draft_len,
-                                          speculative_model=eagle_model_dir,
-                                          eagle3_one_model=one_model,
-                                          allow_advanced_sampling=True)
+        spec_config = Eagle3DecodingConfig(max_draft_len=draft_len,
+                                           speculative_model=eagle_model_dir,
+                                           eagle3_one_model=one_model,
+                                           allow_advanced_sampling=True)
 
         max_seq_len = MAX_INPUT_LEN + MAX_OUTPUT_LEN
         llm = LLM(self.MODEL_PATH,
@@ -4703,10 +4703,10 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
         eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
         draft_len = 3
-        spec_config = EagleDecodingConfig(max_draft_len=draft_len,
-                                          speculative_model=eagle_model_dir,
-                                          eagle3_one_model=one_model,
-                                          allow_advanced_sampling=True)
+        spec_config = Eagle3DecodingConfig(max_draft_len=draft_len,
+                                           speculative_model=eagle_model_dir,
+                                           eagle3_one_model=one_model,
+                                           allow_advanced_sampling=True)
 
         max_seq_len = MAX_INPUT_LEN + MAX_OUTPUT_LEN
         llm = LLM(self.MODEL_PATH,
@@ -4767,10 +4767,10 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
         eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
         draft_len = 3
-        spec_config = EagleDecodingConfig(max_draft_len=draft_len,
-                                          speculative_model=eagle_model_dir,
-                                          eagle3_one_model=one_model,
-                                          allow_advanced_sampling=True)
+        spec_config = Eagle3DecodingConfig(max_draft_len=draft_len,
+                                           speculative_model=eagle_model_dir,
+                                           eagle3_one_model=one_model,
+                                           allow_advanced_sampling=True)
 
         max_seq_len = MAX_INPUT_LEN + MAX_OUTPUT_LEN
         llm = LLM(self.MODEL_PATH,
@@ -4826,9 +4826,9 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
         eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
         draft_len = 3
-        spec_config = EagleDecodingConfig(max_draft_len=draft_len,
-                                          speculative_model=eagle_model_dir,
-                                          eagle3_one_model=one_model)
+        spec_config = Eagle3DecodingConfig(max_draft_len=draft_len,
+                                           speculative_model=eagle_model_dir,
+                                           eagle3_one_model=one_model)
 
         max_seq_len = MAX_INPUT_LEN + MAX_OUTPUT_LEN
         llm = LLM(self.MODEL_PATH,
@@ -5307,7 +5307,7 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
                                         enable_block_reuse=not eagle3)
         spec_config = None
         if eagle3:
-            spec_config = EagleDecodingConfig(
+            spec_config = Eagle3DecodingConfig(
                 max_draft_len=2,
                 speculative_model=
                 f"{llm_models_root()}/Mistral-Large-3-675B/Mistral-Large-3-675B-Instruct-2512-Eagle/",
@@ -5358,7 +5358,7 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
                                         enable_block_reuse=not eagle3)
         spec_config = None
         if eagle3:
-            spec_config = EagleDecodingConfig(
+            spec_config = Eagle3DecodingConfig(
                 max_draft_len=2,
                 speculative_model=
                 f"{llm_models_root()}/Mistral-Large-3-675B/Mistral-Large-3-675B-Instruct-2512-Eagle/",

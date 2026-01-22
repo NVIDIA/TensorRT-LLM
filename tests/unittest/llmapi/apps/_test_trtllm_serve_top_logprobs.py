@@ -64,7 +64,7 @@ async def test_chat_completion_top5_logprobs(async_client: openai.AsyncOpenAI,
     # Test top_logprobs
     chat_completion = await async_client.chat.completions.create(
         model=model_name,
-        messages=messages,
+        messages=messages,  # type: ignore[arg-type]
         max_completion_tokens=10,
         temperature=0.0,
         logprobs=True,
@@ -81,3 +81,38 @@ async def test_chat_completion_top5_logprobs(async_client: openai.AsyncOpenAI,
         assert logprob_content.bytes is not None
         assert logprob_content.top_logprobs is not None
         assert len(logprob_content.top_logprobs) == 5
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_completion_top5_logprobs(async_client: openai.AsyncOpenAI,
+                                        model_name: str):
+    prompt = "Hello, my name is"
+
+    completion = await async_client.completions.create(model=model_name,
+                                                       prompt=prompt,
+                                                       max_tokens=5,
+                                                       temperature=0.0,
+                                                       logprobs=5,
+                                                       extra_body={
+                                                           "ignore_eos": True,
+                                                       })
+
+    choice = completion.choices[0]
+    logprobs = choice.logprobs
+    assert logprobs is not None
+    assert logprobs.tokens is not None
+    assert logprobs.token_logprobs is not None
+    assert logprobs.top_logprobs is not None
+
+    assert len(logprobs.tokens) == len(logprobs.token_logprobs) == len(
+        logprobs.top_logprobs)
+    assert len(logprobs.tokens) > 0
+
+    for token, token_logprob, token_top_logprobs in zip(logprobs.tokens,
+                                                        logprobs.token_logprobs,
+                                                        logprobs.top_logprobs):
+        assert token is not None
+        assert token_logprob is not None
+        assert token_logprob <= 0
+        assert token_top_logprobs is not None
+        assert len(token_top_logprobs) == 5

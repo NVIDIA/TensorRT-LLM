@@ -376,7 +376,10 @@ class CompletionRequest(OpenAIBaseModel):
 
     # doc: end-completion-extra-params
 
-    def to_sampling_params(self, vocab_size: int = 32000) -> SamplingParams:
+    def to_sampling_params(self,
+                           vocab_size: int = 32000,
+                           gather_generation_logits: bool = False,
+                           backend: Optional[str] = None) -> SamplingParams:
         sampling_params = SamplingParams(
             best_of=self.best_of,
             frequency_penalty=self.frequency_penalty,
@@ -416,17 +419,26 @@ class CompletionRequest(OpenAIBaseModel):
 
             # completion-extra-params
             add_special_tokens=self.add_special_tokens,
-
-            # TODO: migrate to use logprobs and prompt_logprobs
-            _return_log_probs=bool(self.logprobs),
         )
+        if self.logprobs:
+            if backend == "pytorch":
+                sampling_params.logprobs = self.logprobs
+            else:
+                if gather_generation_logits:
+                    sampling_params.logprobs = self.logprobs
+                elif self.logprobs > 1:
+                    raise ValueError(
+                        "`logprobs` must be 1 or `gather_generation_logits` must be `True` to use `logprobs` > 1"
+                    )
+                else:
+                    sampling_params._return_log_probs = True
         return sampling_params
 
     @model_validator(mode="before")
     @classmethod
     def check_logprobs(cls, data):
-        if data.get("logprobs"):
-            raise ValueError("logprobs is not supported")
+        if (logprobs := data.get("logprobs")) is not None and logprobs < 0:
+            raise ValueError("logprobs must be positive or zero")
         return data
 
     @model_validator(mode="before")

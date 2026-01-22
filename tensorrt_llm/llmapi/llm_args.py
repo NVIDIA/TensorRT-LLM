@@ -715,6 +715,8 @@ class DecodingBaseConfig(StrictBaseModel):
     _allow_chain_drafter: bool = PrivateAttr(True)
     # If set, drafting uses greedy sampling, irrespective of sampling parameters.
     _allow_greedy_draft_tokens: bool = PrivateAttr(True)
+    # Internal: record decoding_type alias used during parsing (for warnings).
+    _decoding_type_alias: Optional[str] = PrivateAttr(default=None)
 
     @field_validator('draft_len_schedule')
     @classmethod
@@ -762,13 +764,14 @@ class DecodingBaseConfig(StrictBaseModel):
         return v
 
     @classmethod
-    def from_dict(cls, data: dict):
+    def from_dict(cls, data: dict, backend: Optional[str] = None):
         # dispatch to the correct decoding config
         decoding_type = data.get("decoding_type")
         config_classes = {
             "MTP": MTPDecodingConfig,
             "Medusa": MedusaDecodingConfig,
             "Eagle": EagleDecodingConfig,
+            "Eagle3": Eagle3DecodingConfig,
             "Lookahead": LookaheadDecodingConfig,
             "NGram": NGramDecodingConfig,
             "DraftTarget": DraftTargetDecodingConfig,
@@ -776,6 +779,14 @@ class DecodingBaseConfig(StrictBaseModel):
             "UserProvided": UserProvidedDecodingConfig,
             "AUTO": AutoDecodingConfig,
         }
+
+        backend = backend.lower() if isinstance(backend, str) else backend
+        if decoding_type == "Eagle" and backend in ("pytorch", "_autodeploy"):
+            data = dict(data)
+            data.pop("decoding_type")
+            spec_cfg = Eagle3DecodingConfig(**data)
+            spec_cfg._decoding_type_alias = "Eagle"
+            return spec_cfg
 
         config_class = config_classes.get(decoding_type)
         if config_class is None:
@@ -988,6 +999,10 @@ class EagleDecodingConfig(DecodingBaseConfig):
         if self.eagle_choices is None and self.use_dynamic_tree is False:
             return True
         return False
+
+
+class Eagle3DecodingConfig(EagleDecodingConfig):
+    decoding_type: ClassVar[str] = "Eagle3"
 
 
 class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
@@ -2530,6 +2545,11 @@ class TrtLlmArgs(BaseLlmArgs):
                     decoding_mode=DecodingMode.Medusa(),
                     medusa_choices=self.speculative_config.medusa_choices)
 
+            elif isinstance(self.speculative_config, Eagle3DecodingConfig):
+                raise ValueError(
+                    "speculative_config.decoding_type 'Eagle3' is only supported on the PyTorch backend. "
+                    "Use decoding_type 'Eagle' for the TensorRT backend.")
+
             elif isinstance(self.speculative_config, EagleDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0
                 assert self.speculative_config.speculative_model is not None, "EAGLE3 draft model must be specified."
@@ -3046,6 +3066,14 @@ class TorchLlmArgs(BaseLlmArgs):
                     f"support backend {self.backend}")
 
             if isinstance(self.speculative_config, EagleDecodingConfig):
+                if (getattr(self.speculative_config, "_decoding_type_alias",
+                            None) == "Eagle" or type(self.speculative_config)
+                        is EagleDecodingConfig):
+                    logger.warning(
+                        "speculative_config.decoding_type 'Eagle' is not supported on the PyTorch backend; only 'Eagle3' is supported. "
+                        "'Eagle' is treated as 'Eagle3' for backward compatibility. "
+                        "EAGLE (v1/v2) draft checkpoints are incompatible with Eagle3—use an Eagle3 draft model."
+                    )
                 assert self.speculative_config.max_draft_len > 0
                 assert self.speculative_config.speculative_model is not None, "EAGLE3 draft model must be specified."
             elif isinstance(self.speculative_config, NGramDecodingConfig):
@@ -3337,8 +3365,14 @@ def update_llm_args_with_extra_dict(
         if field_name in llm_args_dict:
             # Some fields need to be converted manually.
             if field_name in ["speculative_config", "sparse_attention_config"]:
-                llm_args_dict[field_name] = field_type.from_dict(
-                    llm_args_dict[field_name])
+                if field_name == "speculative_config":
+                    backend = llm_args_dict.get("backend") or llm_args.get(
+                        "backend")
+                    llm_args_dict[field_name] = field_type.from_dict(
+                        llm_args_dict[field_name], backend=backend)
+                else:
+                    llm_args_dict[field_name] = field_type.from_dict(
+                        llm_args_dict[field_name])
             else:
                 llm_args_dict[field_name] = field_type(
                     **llm_args_dict[field_name])

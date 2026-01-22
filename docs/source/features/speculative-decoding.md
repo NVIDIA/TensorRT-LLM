@@ -59,14 +59,14 @@ The following draft model checkpoints can be used for EAGLE 3:
 * Other models, including `gpt-oss-120b` and `Qwen3`: check out the [Speculative Decoding Modules](https://huggingface.co/collections/nvidia/speculative-decoding-modules) collection from NVIDIA.
 
 ```python
-from tensorrt_llm.llmapi import EagleDecodingConfig
+from tensorrt_llm.llmapi import Eagle3DecodingConfig
 
 # Enable to use the faster one-model implementation for Llama 4.
 eagle3_one_model = False
 model = "meta-llama/Llama-3.1-8B-Instruct"
 speculative_model = "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B"
 
-speculative_config = EagleDecodingConfig(
+speculative_config = Eagle3DecodingConfig(
     max_draft_len=3,
     speculative_model=speculative_model,
     eagle3_one_model=eagle3_one_model)
@@ -141,9 +141,11 @@ llm = LLM("/path/to/target_model", speculative_config=speculative_config)
 Speculative decoding options must be specified via `--config config.yaml` for both `trtllm-bench` and `trtllm-serve`. All speculative decoding options can be specified in this YAML file. An additional `decoding_type` option is used to specify the type of speculation to use. The available options are:
 
 * `MTP`
-* `Eagle` (for EAGLE 3)
+* `Eagle3`
 * `NGram`
 * `DraftTarget`
+
+> Note: The PyTorch backend supports only `Eagle3`. `decoding_type: Eagle` is accepted as a backward-compatible alias for `Eagle3`, but EAGLE (v1/v2) draft checkpoints are incompatible.
 
 The rest of the argument names/valid values are the same as in their corresponding configuration class described in the Quick Start section. For example, a YAML configuration could look like this:
 
@@ -160,7 +162,7 @@ speculative_config:
 # Or using a local path
 disable_overlap_scheduler: true
 speculative_config:
-  decoding_type: Eagle
+  decoding_type: Eagle3
   max_draft_len: 4
   speculative_model: /path/to/draft/model
 ```
