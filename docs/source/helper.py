@@ -2,8 +2,8 @@ import importlib.util
 import logging
 import os
 import re
+import sys
 from dataclasses import dataclass
-from enum import Enum
 from itertools import chain, groupby
 from pathlib import Path
 from typing import List, Mapping, Optional, Sequence, Tuple
@@ -18,68 +18,29 @@ import pygit2
 # (get_status, is_feature_unsupported functions).
 
 
-class SupportStatus(str, Enum):
-    """Feature support status for a model architecture."""
-    YES = "Yes"
-    NO = "No"
-    UNTESTED = "Untested"
-    NA = "N/A"
+def _load_feature_types():
+    """Load feature_types.py directly (stdlib-only, no torch dependency).
 
-
-class Feature(str, Enum):
-    """Features that can be enabled/disabled for model architectures.
-
-    The enum value is the feature ID string.
+    This avoids importing tensorrt_llm which would trigger torch imports
+    that aren't available in documentation build environments.
     """
-    OVERLAP_SCHEDULER = "overlap_scheduler"
-    CUDA_GRAPH = "cuda_graph"
-    ATTENTION_DP = "attention_dp"
-    DISAGGREGATED_SERVING = "disaggregated_serving"
-    CHUNKED_PREFILL = "chunked_prefill"
-    MTP = "mtp"
-    EAGLE3_ONE_MODEL_ENGINE = "eagle3_one_model"
-    EAGLE3_TWO_MODEL_ENGINE = "eagle3_two_model"
-    TORCH_SAMPLER = "torch_sampler"
-    TLLM_CPP_SAMPLER = "tllm_cpp_sampler"
-    KV_CACHE_REUSE = "kv_cache_reuse"
-    SLIDING_WINDOW_ATTENTION = "sliding_window"
-    LOGITS_POST_PROCESSOR = "logits_post_processor"
-    GUIDED_DECODING = "guided_decoding"
-    EPD_DISAGG_SERVING = "epd_disagg_serving"
-    MODALITY_LANGUAGE = "modality_language"
-    MODALITY_IMAGE = "modality_image"
-    MODALITY_VIDEO = "modality_video"
-    MODALITY_AUDIO = "modality_audio"
-    MODALITY = "modality"  # Legacy for doc rendering
-
-    @property
-    def description(self) -> str:
-        """Human-readable description for documentation."""
-        return _FEATURE_DESCRIPTIONS.get(self.value, self.value)
+    module_path = Path(
+        __file__
+    ).parent.parent.parent / "tensorrt_llm/_torch/models/feature_types.py"
+    spec = importlib.util.spec_from_file_location("feature_types", module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Failed to load {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    # Required for dataclasses to work correctly in Python 3.14+
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
-_FEATURE_DESCRIPTIONS = {
-    "overlap_scheduler": "Overlap Scheduler",
-    "cuda_graph": "CUDA Graph",
-    "attention_dp": "Attention Data Parallelism",
-    "disaggregated_serving": "Disaggregated Serving",
-    "chunked_prefill": "Chunked Prefill",
-    "mtp": "MTP",
-    "eagle3_one_model": "EAGLE-3(One Model Engine)",
-    "eagle3_two_model": "EAGLE-3(Two Model Engine)",
-    "torch_sampler": "Torch Sampler",
-    "tllm_cpp_sampler": "TLLM C++ Sampler",
-    "kv_cache_reuse": "KV Cache Reuse",
-    "sliding_window": "Sliding Window Attention",
-    "logits_post_processor": "Logits Post Processor",
-    "guided_decoding": "Guided Decoding",
-    "epd_disagg_serving": "EPD Disaggregated Serving",
-    "modality_language": "Modality: Language",
-    "modality_image": "Modality: Image",
-    "modality_video": "Modality: Video",
-    "modality_audio": "Modality: Audio",
-    "modality": "Modality",
-}
+# Import Feature and SupportStatus from the canonical source
+_feature_types = _load_feature_types()
+SupportStatus = _feature_types.SupportStatus
+Feature = _feature_types.Feature
 
 
 @dataclass(frozen=True)
