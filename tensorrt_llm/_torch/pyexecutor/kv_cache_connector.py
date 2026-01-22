@@ -311,7 +311,8 @@ class KvCacheConnectorSchedulerOutputRequest:
                                        req.context_chunk_size)
         else:
             computed_position = len(tokens) - 1
-            num_scheduled_tokens = 1 + get_draft_token_length(req)  # Specdec with draft tokens is not supported yet.
+            num_scheduled_tokens = 1 + get_draft_token_length(
+                req)  # Specdec with draft tokens is not supported yet.
 
         return RequestData(req.request_id, new_tokens, new_block_ids,
                            computed_position, num_scheduled_tokens)
