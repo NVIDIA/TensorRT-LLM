@@ -19,6 +19,7 @@
 
 #include "tensorrt_llm/batch_manager/cacheFormatter.h"
 #include "tensorrt_llm/batch_manager/common.h"
+#include "tensorrt_llm/batch_manager/rnnCacheTransBuffer.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
@@ -34,7 +35,8 @@ class TransferSession;
 namespace rnn_state_manager
 {
 class RnnStateManager;
-}
+class RnnCacheTransBufferManager;
+} // namespace rnn_state_manager
 
 /// @brief RNN Cache Formatter for formatting/unformatting RNN states during transfer.
 class RnnCacheFormatter : public kv_cache_manager::BaseCacheFormatter
@@ -47,8 +49,9 @@ public:
 
     /// @brief Constructor.
     /// @param rnnStateManager Pointer to the RNN state manager.
-    /// @param selfState The RNN cache state of this instance.
-    RnnCacheFormatter(rnn_state_manager::RnnStateManager* rnnStateManager, RnnCacheState selfState);
+    /// @param rnnCacheTransBufferManager Pointer to the RNN cache transfer buffer manager.
+    RnnCacheFormatter(rnn_state_manager::RnnStateManager* rnnStateManager,
+        rnn_state_manager::RnnCacheTransBufferManager* rnnCacheTransBufferManager);
 
     /// @brief Format RNN states for sending.
     /// @param session The transfer session.
@@ -127,7 +130,7 @@ public:
 
 private:
     rnn_state_manager::RnnStateManager* mRnnStateManager;
-    RnnCacheState mSelfState;
+    rnn_state_manager::RnnCacheTransBufferManager* mRnnCacheTransBufferManager;
 };
 
 /// @brief Calculate target ranks for RNN cache transfer.
