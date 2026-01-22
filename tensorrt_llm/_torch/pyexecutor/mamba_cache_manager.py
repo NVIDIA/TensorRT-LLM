@@ -199,6 +199,37 @@ class MambaCacheManager(BaseResourceManager):
         # save mamba state indices for requests
         self.state_indices_list: List[int] = []
 
+        # Pre-allocated buffers for overlap scheduler to avoid GPU-CPU sync
+        # These buffers eliminate per-iteration tensor creation overhead
+        self._max_batch_size = max_batch_size
+        # Pinned CPU buffers for fast async H2D transfers
+        self._slots_cpu_buffer = torch.empty(max_batch_size,
+                                             dtype=torch.int32,
+                                             pin_memory=True)
+        self._cache_indices_cpu_buffer = torch.empty(max_batch_size,
+                                                     dtype=torch.int32,
+                                                     pin_memory=True)
+        self._batch_indices_cpu_buffer = torch.empty(max_batch_size,
+                                                     dtype=torch.int32,
+                                                     pin_memory=True)
+        # Pre-allocated CUDA buffers
+        self._slots_device_buffer = torch.empty(max_batch_size,
+                                                dtype=torch.int32,
+                                                device=device)
+        self._cache_indices_device_buffer = torch.empty(max_batch_size,
+                                                        dtype=torch.int32,
+                                                        device=device)
+        self._num_accepted_device_buffer = torch.empty(max_batch_size,
+                                                       dtype=torch.int32,
+                                                       device=device)
+        self._batch_indices_device_buffer = torch.empty(max_batch_size,
+                                                        dtype=torch.int32,
+                                                        device=device)
+        # Pre-allocated intermediate index buffer (used in non-overlap path)
+        self._intermediate_indices_buffer = torch.arange(max_batch_size,
+                                                         dtype=torch.int32,
+                                                         device=device)
+
     def _prepare_mamba_cache_blocks(self, request_ids: List[int]):
         self.state_indices_list.clear()
         for r in request_ids:
@@ -323,11 +354,18 @@ class MambaCacheManager(BaseResourceManager):
         torch.cuda.empty_cache()
 
     def _update_speculative_mamba_states(
-            self, num_accepted_draft_tokens: torch.Tensor,
-            state_indices_tensor: torch.Tensor):
+            self,
+            num_accepted_draft_tokens: torch.Tensor,
+            state_indices_tensor: torch.Tensor,
+            batch_indices_tensor: Optional[torch.Tensor] = None,
+            num_valid_requests: int = -1):
         """Update Mamba states after MTP verification
 
         Copy the states of accepted speculative steps from the intermediate cache to the main cache.
+        This implementation avoids GPU-CPU synchronization by:
+        1. Using pre-allocated buffers instead of creating tensors
+        2. Passing num_valid_requests from CPU to avoid checking tensor values
+        3. Using index_select and scatter operations that work on contiguous valid entries
 
         Args:
             num_accepted_draft_tokens: Number of accepted steps for each request, shape [request_number]
@@ -335,13 +373,17 @@ class MambaCacheManager(BaseResourceManager):
                                 request 2 accepts 3 steps, request 3 accepts 1 step
             state_indices_tensor: Main cache index for each request, shape [request_number]
                                 e.g.: [5, 12, 3, 7] means 4 requests use main cache slots 5, 12, 3, 7
+            batch_indices_tensor: Original batch position of each request (for overlap path).
+                                e.g.: [0, 2, 3] means these were at positions 0, 2, 3 in the original batch.
+                                This is used to index into the intermediate state cache.
+            num_valid_requests: Number of valid (non -1) requests at the START of the tensors.
+                              When >= 0, we can skip GPU-CPU sync by using this CPU-side count.
+                              When -1, fall back to processing all entries (for non-overlap path).
 
         """
         request_number = num_accepted_draft_tokens.shape[0]
-        intermediate_state_indices = torch.arange(
-            request_number,
-            dtype=torch.int32,
-            device=state_indices_tensor.device)
+        if request_number == 0:
+            return
 
         conv_states = self.mamba_cache.conv
         ssm_states = self.mamba_cache.temporal
@@ -349,17 +391,48 @@ class MambaCacheManager(BaseResourceManager):
         intermediate_state_cache = self.mamba_cache.intermediate_ssm
         intermediate_conv_window_cache = self.mamba_cache.intermediate_conv_window
 
-        valid_mask = num_accepted_draft_tokens >= 0
+        if num_valid_requests >= 0:
+            # Overlap scheduler path: valid requests are packed at the start
+            # No GPU-CPU sync needed since we know the count from CPU
+            if num_valid_requests == 0:
+                return
 
-        # if no valid accepted tokens (all -1), return
-        if not valid_mask.any():
-            return
+            # Use the batch indices to index into intermediate state cache
+            # These are the original batch positions where intermediate states were stored
+            assert batch_indices_tensor is not None, \
+                "batch_indices_tensor required for overlap scheduler path"
 
-        dst_state_indices = state_indices_tensor[valid_mask].to(torch.int64)
-        src_state_indices = intermediate_state_indices[valid_mask].to(
-            torch.int64)
-        last_steps = num_accepted_draft_tokens[valid_mask].to(torch.int64)
+            # Slice to only valid entries (no masking needed, they're contiguous)
+            dst_state_indices = state_indices_tensor[:num_valid_requests].to(
+                torch.int64)
+            # Use batch indices as source indices into intermediate cache
+            src_state_indices = batch_indices_tensor[:num_valid_requests].to(
+                torch.int64)
+            last_steps = num_accepted_draft_tokens[:num_valid_requests].to(
+                torch.int64)
+        else:
+            # Non-overlap scheduler path: need to handle sparse valid entries
+            # Use pre-allocated buffer for intermediate indices (0, 1, 2, ...)
+            intermediate_state_indices = self._intermediate_indices_buffer[:
+                                                                           request_number]
 
+            valid_mask = num_accepted_draft_tokens >= 0
+
+            # Get valid indices - this may cause sync but only in non-overlap path
+            valid_indices = torch.nonzero(valid_mask, as_tuple=True)[0]
+
+            if valid_indices.numel() == 0:
+                return
+
+            dst_state_indices = state_indices_tensor[valid_indices].to(
+                torch.int64)
+            # In non-overlap path, intermediate states are at positions matching the batch order
+            src_state_indices = intermediate_state_indices[valid_indices].to(
+                torch.int64)
+            last_steps = num_accepted_draft_tokens[valid_indices].to(
+                torch.int64)
+
+        # Gather from intermediate cache and scatter to main cache
         accepted_ssm_state = intermediate_state_cache[:, src_state_indices,
                                                       last_steps]
         ssm_states[:, dst_state_indices, :] = accepted_ssm_state.to(
@@ -379,6 +452,10 @@ class MambaCacheManager(BaseResourceManager):
         """Update Mamba cache resources
 
         After the verification phase of speculative decoding, update the intermediate cache state to the main cache.
+        This implementation avoids GPU-CPU synchronization by:
+        1. Using pre-allocated pinned CPU buffers and CUDA buffers
+        2. Packing valid requests at the start of buffers to avoid masking
+        3. Using non-blocking transfers from pinned memory
 
         Args:
             scheduled_batch: Scheduled batch requests
@@ -394,47 +471,55 @@ class MambaCacheManager(BaseResourceManager):
         if num_decodes == 0:
             return
 
-        num_accepted_draft_tokens = []
-        state_indices_updated = []
         if sample_state is not None:
-            # for overlap scheduler, use sample_state to get num_accepted_draft_tokens for previous iteration because sampler update is not called when this function is called
-            valid_slots = []
-            valid_cache_indices = []
+            # Overlap scheduler path: use sample_state to get num_accepted_draft_tokens
+            # Pack valid requests at the start to avoid GPU masking operations
 
-            for req in scheduled_batch.generation_requests:
+            # Count valid requests and pack them at the start (CPU-side, no sync)
+            # Also track original batch position for indexing into intermediate state cache
+            num_valid = 0
+            for batch_idx, req in enumerate(
+                    scheduled_batch.generation_requests):
                 if req.state != LlmRequestState.GENERATION_COMPLETE:
-                    valid_slots.append(req.py_seq_slot)
-                    valid_cache_indices.append(
-                        self.mamba_cache_index[req.py_request_id])
-                else:
-                    valid_slots.append(-1)
-                    valid_cache_indices.append(-1)
+                    self._slots_cpu_buffer[num_valid] = req.py_seq_slot
+                    self._cache_indices_cpu_buffer[
+                        num_valid] = self.mamba_cache_index[req.py_request_id]
+                    # Track original batch position - intermediate states are stored here
+                    self._batch_indices_cpu_buffer[num_valid] = batch_idx
+                    num_valid += 1
 
-            if len(valid_cache_indices) == 0:
+            if num_valid == 0:
                 return
 
-            # Perform all operations on GPU to avoid synchronization overhead
-            slots_tensor = torch.tensor(valid_slots,
-                                        dtype=torch.int32,
-                                        device='cuda')
-            state_indices_updated = torch.tensor(valid_cache_indices,
-                                                 dtype=torch.int32,
-                                                 device='cuda')
+            # Non-blocking copy from pinned memory to pre-allocated CUDA buffers
+            self._slots_device_buffer[:num_valid].copy_(
+                self._slots_cpu_buffer[:num_valid], non_blocking=True)
+            self._cache_indices_device_buffer[:num_valid].copy_(
+                self._cache_indices_cpu_buffer[:num_valid], non_blocking=True)
+            self._batch_indices_device_buffer[:num_valid].copy_(
+                self._batch_indices_cpu_buffer[:num_valid], non_blocking=True)
 
-            # Use device version of new_tokens_lens and perform indexing on GPU
-            valid_mask = slots_tensor >= 0
-            num_accepted_draft_tokens = torch.full((len(valid_slots), ),
-                                                   -1,
-                                                   dtype=torch.int32,
-                                                   device='cuda')
-            if valid_mask.any():
-                num_accepted_draft_tokens[
-                    valid_mask] = sample_state.device.new_tokens_lens[
-                        slots_tensor[valid_mask]] - 1
+            # Compute num_accepted_draft_tokens on GPU using pre-allocated buffer
+            # new_tokens_lens[slot] - 1 gives num_accepted_draft_tokens
+            slots_view = self._slots_device_buffer[:num_valid]
+            self._num_accepted_device_buffer[:num_valid] = \
+                sample_state.device.new_tokens_lens[slots_view] - 1
+
+            # Call update with packed valid entries, batch indices, and known count
+            self._update_speculative_mamba_states(
+                self._num_accepted_device_buffer[:num_valid],
+                self._cache_indices_device_buffer[:num_valid],
+                batch_indices_tensor=self._batch_indices_device_buffer[:
+                                                                       num_valid],
+                num_valid_requests=num_valid)
         else:
+            # Non-overlap scheduler path: fall back to original logic
+            # This path allows sync since it's not performance critical
+            num_accepted_draft_tokens = []
+            state_indices_updated = []
+
             for req in scheduled_batch.generation_requests:
                 if req.state != LlmRequestState.GENERATION_COMPLETE:
-
                     num_accepted_draft_tokens.append(
                         req.py_num_accepted_draft_tokens)
                     state_indices_updated.append(
@@ -446,14 +531,24 @@ class MambaCacheManager(BaseResourceManager):
             if len(state_indices_updated) == 0:
                 return
 
-            num_accepted_draft_tokens = torch.tensor(num_accepted_draft_tokens,
-                                                     dtype=torch.int32,
-                                                     device='cuda')
-            state_indices_updated = torch.tensor(state_indices_updated,
-                                                 dtype=torch.int32,
-                                                 device='cuda')
-        self._update_speculative_mamba_states(num_accepted_draft_tokens,
-                                              state_indices_updated)
+            # Use pinned memory for faster transfer
+            num_reqs = len(state_indices_updated)
+            self._cache_indices_cpu_buffer[:num_reqs].copy_(
+                torch.tensor(state_indices_updated, dtype=torch.int32))
+            self._cache_indices_device_buffer[:num_reqs].copy_(
+                self._cache_indices_cpu_buffer[:num_reqs], non_blocking=True)
+
+            num_accepted_tensor = torch.tensor(num_accepted_draft_tokens,
+                                               dtype=torch.int32,
+                                               pin_memory=True)
+            self._num_accepted_device_buffer[:num_reqs].copy_(
+                num_accepted_tensor, non_blocking=True)
+
+            # Use -1 to indicate non-overlap path (sparse valid entries)
+            self._update_speculative_mamba_states(
+                self._num_accepted_device_buffer[:num_reqs],
+                self._cache_indices_device_buffer[:num_reqs],
+                num_valid_requests=-1)
 
 
 class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
