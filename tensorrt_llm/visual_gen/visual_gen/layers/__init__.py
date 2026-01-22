@@ -35,11 +35,36 @@ def apply_visual_gen_linear(
     load_parameters: bool = True,
     quantize_weights: bool = True,
     exclude_pattern: str = r".*",
-    amax_values: dict[str, float] | None = None,
-    to_input_scale: Callable | None = None,
 ):
+    """Replace selected ``torch.nn.Linear`` modules in ``model`` with :class:`~visual_gen.layers.ditLinear`.
+
+    This helper traverses ``model`` collects all matching ``nn.Linear`` modules and replace them  in-place
+    with a ``ditLinear`` created from the original module.
+
+    Parameters
+    ----------
+    model:
+        Root module whose ``nn.Linear`` submodules will be replaced in-place.
+    load_parameters:
+        Passed through to :meth:`visual_gen.layers.ditLinear.from_linear`. If ``True``, parameters
+        from the original Linear layer are copied into the new module.
+    quantize_weights:
+        If ``True``, invokes ``select_linear_impl()`` on each created ``ditLinear`` (under
+        ``torch.no_grad()``), enabling weight quantization.
+    exclude_pattern:
+        Regex used to *exclude* modules by name. A module is replaced only if it does **not** match.
+
+    Returns:
+    -------
+    None
+        The function mutates ``model`` in-place.
+
+    Raises:
+    ------
+    AssertionError
+        If exactly one of ``amax_values`` or ``to_input_scale`` is provided.
+    """
     # check if amax_values and to_input_scale are both None or both not None
-    assert (amax_values is None) == (to_input_scale is None)
     exclude_pattern_ = re.compile(exclude_pattern)
 
     # Collect all linear modules to replace first to avoid modifying during iteration
@@ -58,14 +83,6 @@ def apply_visual_gen_linear(
             parent = getattr(parent, attr)
         module = getattr(parent, attrs[-1])
         linear = ditLinear.from_linear(module, load_parameters)
-        if amax_values is not None:
-            linear.amax_values = amax_values[name + ".input_quantizer"]
-        if to_input_scale is not None:
-            linear.input_scale = to_input_scale(linear.amax_values)
-            print(
-                f"[visual_gen] {name} input_scale: {linear.input_scale}, amax_values: {linear.amax_values}"
-            )
-            linear.use_real_input_scale = True
         # must under no_grad to avoid memory leak
         if quantize_weights:
             with torch.no_grad():
