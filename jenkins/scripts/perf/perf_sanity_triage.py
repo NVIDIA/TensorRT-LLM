@@ -13,6 +13,7 @@ sys.path.insert(0, sys.path[0] + "/..")
 from open_search_db import OpenSearchDB
 
 QUERY_LOOKBACK_DAYS = 90
+LOOKBACK_JOBS = 30
 MAX_QUERY_SIZE = 3000
 MAX_TEST_CASES_PER_MSG = 5
 POST_SLACK_MSG_RETRY_TIMES = 5
@@ -99,39 +100,68 @@ def post_perf_data(data_list, project_name):
         return False
 
 
-def get_regression_data_by_job_id(data_list, query_job_number):
-    """Returns a dict with job_id as key and list of regression data as value.
+def get_regression_dict(data_list, query_job_number, lookback_job_number=LOOKBACK_JOBS):
+    """Returns a dict with job_id as key and list of regression tuples as value.
 
+    Each tuple is (s_test_case, history_regression_job_ids, data).
     Only returns the latest query_job_number jobs.
     """
     if data_list is None or len(data_list) == 0:
         return {}
 
+    def get_test_case_name(data):
+        return data.get("s_test_case_name") or "Unknown"
+
     # Group data by job_id
-    job_data_dict = {}
+    job_test_dict = {}
     for data in data_list:
-        job_id = data.get("s_job_id", "")
-        if job_id == "":
+        raw_job_id = data.get("s_job_id", "")
+        if raw_job_id == "":
             continue
-        if job_id not in job_data_dict:
-            job_data_dict[job_id] = []
-        job_data_dict[job_id].append(data)
+        try:
+            job_id = int(raw_job_id)
+        except (TypeError, ValueError):
+            continue
+        job_test_dict.setdefault(job_id, []).append(data)
 
-    # Sort job_ids by the latest ts_created in each group (descending)
-    def get_latest_timestamp(job_id):
-        timestamps = [d.get("ts_created", 0) for d in job_data_dict[job_id]]
-        return max(timestamps) if timestamps else 0
+    if not job_test_dict:
+        return {}
 
-    sorted_job_ids = sorted(job_data_dict.keys(), key=get_latest_timestamp, reverse=True)
+    # Sort job_ids (descending: latest -> oldest)
+    sorted_job_id_list = sorted(job_test_dict.keys(), reverse=True)
 
-    # Only keep the latest query_job_number jobs
-    latest_job_ids = sorted_job_ids[:query_job_number]
+    # Build test_case -> job_ids dict
+    test_job_dict = {}
+    for job_id, data_list in job_test_dict.items():
+        for data in data_list:
+            test_case = get_test_case_name(data)
+            if not test_case:
+                continue
+            test_job_dict.setdefault(test_case, set()).add(job_id)
 
-    result = {}
+    # Sort job ids for each test case (descending: latest -> oldest)
+    for test_case, job_id_set in list(test_job_dict.items()):
+        test_job_dict[test_case] = sorted(job_id_set, reverse=True)
+
+    # Only keep the latest query_job_number jobs in the result
+    latest_job_ids = sorted_job_id_list[:query_job_number]
+
+    regression_dict = {}
     for job_id in latest_job_ids:
-        result[job_id] = job_data_dict[job_id]
+        entries = []
+        for data in job_test_dict.get(job_id, []):
+            test_case = get_test_case_name(data)
+            if not test_case:
+                continue
+            history_ids = test_job_dict.get(test_case, [])
+            lower_bound = job_id - lookback_job_number + 1
+            history_regression_job_ids = [
+                jid for jid in history_ids if lower_bound <= jid <= job_id
+            ]
+            entries.append((test_case, history_regression_job_ids, data))
+        regression_dict[job_id] = entries
 
-    return result
+    return regression_dict
 
 
 def process_regression_message(regression_dict):
@@ -142,12 +172,12 @@ def process_regression_message(regression_dict):
     if not regression_dict:
         return []
 
-    # Flatten all test cases into a list with (job_id, idx, data) tuples
+    # Flatten all test cases into a list with (job_id, idx, data, history_job_ids) tuples
     all_test_cases = []
     for job_id, data_list in regression_dict.items():
-        sorted_data_list = sorted(data_list, key=lambda x: x.get("s_test_case_name", ""))
-        for idx, data in enumerate(sorted_data_list, start=1):
-            all_test_cases.append((job_id, idx, data))
+        sorted_data_list = sorted(data_list, key=lambda x: x[0])
+        for idx, (test_case_name, history_job_ids, data) in enumerate(sorted_data_list, start=1):
+            all_test_cases.append((job_id, idx, data, history_job_ids, test_case_name))
 
     # Split into chunks of MAX_TEST_CASES_PER_MSG
     chunks = []
@@ -159,7 +189,7 @@ def process_regression_message(regression_dict):
     for chunk in chunks:
         msg_parts = []
         current_job_id = None
-        for job_id, idx, data in chunk:
+        for job_id, idx, data, history_job_ids, test_case_name in chunk:
             # Add job header when switching to a new job_id
             if job_id != current_job_id:
                 if msg_parts:
@@ -168,9 +198,12 @@ def process_regression_message(regression_dict):
                 msg_parts.append(job_header)
                 current_job_id = job_id
 
-            test_case_name = data.get("s_test_case_name", "N/A")
             regression_info = data.get("s_regression_info", "N/A")
             msg_parts.append(f"*REGRESSION TEST CASE {idx}: {test_case_name}*\n")
+            history_text = (
+                ", ".join(str(jid) for jid in history_job_ids) if history_job_ids else "N/A"
+            )
+            msg_parts.append(f"  History Regression Job IDs: {history_text}\n")
             for part in regression_info.split(","):
                 part = part.strip()
                 if part and "baseline_id" not in part:
@@ -288,7 +321,7 @@ def main():
             print("Failed to query regression data")
             return
 
-        regression_dict = get_regression_data_by_job_id(data_list, args.query_job_number)
+        regression_dict = get_regression_dict(data_list, args.query_job_number)
         messages = process_regression_message(regression_dict)
         send_regression_message(messages, args.channel_id, args.bot_token)
     elif args.operation.strip().upper().startswith("UPDATE"):

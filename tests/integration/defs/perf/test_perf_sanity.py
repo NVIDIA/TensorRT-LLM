@@ -56,6 +56,7 @@ MODEL_PATH_DICT = {
     "deepseek_v32_fp4": "DeepSeek-V3.2-Exp-FP4-v2",
     "gpt_oss_120b_fp4": "gpt_oss/gpt-oss-120b",
     "k2_thinking_fp4": "Kimi-K2-Thinking-NVFP4",
+    "qwen3_235b_a22b_fp4": "Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",  # Qwen3-235B-A22B-FP4
 }
 
 SUPPORTED_GPU_MAPPING = {
@@ -67,6 +68,9 @@ SUPPORTED_GPU_MAPPING = {
 }
 
 DEFAULT_TIMEOUT = 7200
+
+AGGR_CONFIG_FOLDER = "tests/scripts/perf-sanity"
+DISAGG_CONFIG_FOLDER = "tests/integration/defs/perf/disagg/test_configs/disagg/perf-sanity"
 
 # Regex patterns for parsing benchmark output metrics
 # Key is the metric name used in database (e.g., "mean_e2el", "seq_throughput")
@@ -97,9 +101,12 @@ def get_model_dir(model_name: str) -> str:
     return ""
 
 
-def get_dataset_path() -> str:
-    """Get dataset path for benchmark."""
-    return os.path.join(llm_models_root(), "datasets", "ShareGPT_V3_unfiltered_cleaned_split.json")
+def get_dataset_dir(dataset_file: Optional[str]) -> str:
+    """Get dataset directory path from dataset file."""
+    if not dataset_file or dataset_file == "<dataset_file>":
+        return ""
+    # return os.path.join(llm_models_root(), "datasets", "ShareGPT_V3_unfiltered_cleaned_split.json")
+    return os.path.join(llm_models_root(), dataset_file)
 
 
 def to_env_dict(env_vars: str) -> Dict[str, str]:
@@ -141,6 +148,7 @@ class ServerConfig:
         self.disable_overlap_scheduler = server_config_data.get("disable_overlap_scheduler", False)
         self.num_postprocess_workers = server_config_data.get("num_postprocess_workers", 0)
         self.stream_interval = server_config_data.get("stream_interval", 10)
+        self.print_iter_log = server_config_data.get("print_iter_log", False)
         self.attn_backend = server_config_data.get("attn_backend", "TRTLLM")
         self.enable_chunked_prefill = server_config_data.get("enable_chunked_prefill", False)
         self.enable_attention_dp = server_config_data.get("enable_attention_dp", False)
@@ -213,6 +221,7 @@ class ServerConfig:
             self.eagle3_layers_to_capture = []
         self.max_draft_len = speculative_config.get("max_draft_len", 0)
         self.speculative_model = speculative_config.get("speculative_model", "")
+        self.eagle3_one_model = speculative_config.get("eagle3_one_model", False)
 
         # match_mode: "config" (default) or "scenario"
         self.match_mode = server_config_data.get("match_mode", "config")
@@ -340,6 +349,7 @@ class ServerConfig:
             "s_eagle3_layers_to_capture": ",".join(map(str, self.eagle3_layers_to_capture)),
             "l_max_draft_len": self.max_draft_len,
             "s_speculative_model_dir": self.speculative_model,
+            "b_eagle3_one_model": self.eagle3_one_model,
             "s_server_log_link": "",
             "s_server_env_var": self.env_vars,
         }
@@ -366,7 +376,13 @@ class ServerConfig:
 class ClientConfig:
     """Configurations of benchmark client."""
 
-    def __init__(self, client_config_data: dict, model_name: str, env_vars: str = ""):
+    def __init__(
+        self,
+        client_config_data: dict,
+        model_name: str,
+        dataset_file: str = "",
+        env_vars: str = "",
+    ):
         self.model_name = model_name
         self.concurrency = client_config_data.get("concurrency", 1)
         self.iterations = client_config_data.get("iterations", 1)
@@ -378,6 +394,7 @@ class ClientConfig:
         self.streaming = client_config_data.get("streaming", True)
         self.trust_remote_code = client_config_data.get("trust_remote_code", True)
         self.model_path = ""
+        self.dataset_file = dataset_file
         self.env_vars = env_vars
 
         # Generate default name if not provided
@@ -389,7 +406,7 @@ class ClientConfig:
         """Generate benchmark command."""
         model_dir = get_model_dir(self.model_name)
         self.model_path = model_dir if os.path.exists(model_dir) else self.model_name
-        dataset_path = get_dataset_path()
+        dataset_path = get_dataset_dir(self.dataset_file)
         benchmark_cmd = [
             "python",
             "-m",
@@ -398,9 +415,6 @@ class ClientConfig:
             self.model_path,
             "--tokenizer",
             self.model_path,
-            "--dataset-name",
-            "random",
-            "--random-ids",
             "--num-prompts",
             str(self.concurrency * self.iterations),
             "--max-concurrency",
@@ -412,12 +426,23 @@ class ClientConfig:
             "--random-range-ratio",
             str(self.random_range_ratio),
             "--ignore-eos",
+            "--no-test-input",
             "--percentile-metrics",
             "ttft,tpot,itl,e2el",
         ]
         if dataset_path and os.path.exists(dataset_path):
+            benchmark_cmd.append("--dataset-name")
+            benchmark_cmd.append("trtllm_custom")
             benchmark_cmd.append("--dataset-path")
             benchmark_cmd.append(dataset_path)
+            print_info(f"Dataset: {dataset_path} exists. Use trtllm_custom dataset for benchmark.")
+        else:
+            benchmark_cmd.append("--dataset-name")
+            benchmark_cmd.append("random")
+            benchmark_cmd.append("--random-ids")
+            print_info(
+                f"Dataset: {dataset_path} is not provided or does not exist. Use random dataset for benchmark."
+            )
         if self.backend:
             benchmark_cmd.append("--backend")
             benchmark_cmd.append(self.backend)
@@ -840,7 +865,7 @@ class PerfSanityTestConfig:
         if is_disagg:
             # For disagg: disagg_upload-deepseek-r1-fp4_8k1k_ctx1_gen1_dep32_bs128_eplb0_mtp0_ccb-UCX
             self.runtime = "multi_node_disagg_server"
-            self.config_dir = "tests/integration/defs/perf/disagg/test_configs/disagg/perf"
+            self.config_dir = DISAGG_CONFIG_FOLDER
             config_base = "-".join(labels[1:])
             self.config_file = (
                 f"{config_base}.yaml" if not config_base.endswith(".yaml") else config_base
@@ -849,7 +874,7 @@ class PerfSanityTestConfig:
         else:
             # For aggr: aggr_upload-config_yml or aggr_upload-config_yml-server_config_name
             self.runtime = "aggr_server"
-            self.config_dir = "tests/scripts/perf-sanity"
+            self.config_dir = AGGR_CONFIG_FOLDER
             config_base = labels[1]
             self.config_file = (
                 f"{config_base}.yaml"
@@ -922,7 +947,10 @@ class PerfSanityTestConfig:
             client_configs = []
             for client_config_data in server_config_data["client_configs"]:
                 client_config = ClientConfig(
-                    client_config_data, server_config_data["model_name"], client_env_var
+                    client_config_data,
+                    server_config_data["model_name"],
+                    dataset_file="",
+                    env_vars=client_env_var,
                 )
                 client_configs.append(client_config)
 
@@ -955,6 +983,7 @@ class PerfSanityTestConfig:
         assert model_name, "model_name is required in metadata section"
 
         benchmark_mode = benchmark.get("mode", "e2e")
+        dataset_file = benchmark.get("dataset_file", "")
         if "gen_only" in benchmark_mode:
             hardware["num_ctx_servers"] = 0
 
@@ -1027,7 +1056,12 @@ class PerfSanityTestConfig:
                 "use_chat_template": False,
                 "streaming": benchmark.get("streaming", True),
             }
-            client_config = ClientConfig(client_config_data, model_name, client_env_var)
+            client_config = ClientConfig(
+                client_config_data,
+                model_name,
+                dataset_file=dataset_file,
+                env_vars=client_env_var,
+            )
             client_configs.append(client_config)
 
         self.server_client_configs = {0: client_configs}
@@ -1416,9 +1450,6 @@ class PerfSanityTestConfig:
 # Perf sanity test case parameters
 AGG_TEST_TYPES = ["aggr_upload", "aggr"]
 DISAGG_TEST_TYPES = ["disagg_upload", "disagg"]
-
-AGGR_CONFIG_FOLDER = "tests/scripts/perf-sanity"
-DISAGG_CONFIG_FOLDER = "tests/integration/defs/perf/disagg/test_configs/disagg/perf"
 
 
 def get_server_config_names(yaml_path: str) -> List[str]:

@@ -38,6 +38,9 @@ def get_hardware_config(config, benchmark_mode):
     nodes_per_ctx_server = (gpus_per_ctx_server + gpus_per_node - 1) // gpus_per_node
     nodes_per_gen_server = (gpus_per_gen_server + gpus_per_node - 1) // gpus_per_node
 
+    gpus_per_node_per_ctx_server = min(gpus_per_ctx_server, gpus_per_node)
+    gpus_per_node_per_gen_server = min(gpus_per_gen_server, gpus_per_node)
+
     total_nodes = num_ctx_servers * nodes_per_ctx_server + num_gen_servers * nodes_per_gen_server
     total_gpus = total_nodes * gpus_per_node
 
@@ -49,6 +52,8 @@ def get_hardware_config(config, benchmark_mode):
         "gpus_per_gen_server": gpus_per_gen_server,
         "nodes_per_ctx_server": nodes_per_ctx_server,
         "nodes_per_gen_server": nodes_per_gen_server,
+        "gpus_per_node_per_ctx_server": gpus_per_node_per_ctx_server,
+        "gpus_per_node_per_gen_server": gpus_per_node_per_gen_server,
         "total_nodes": total_nodes,
         "total_gpus": total_gpus,
     }
@@ -153,7 +158,7 @@ def get_config_yaml(test_list_path, llm_src):
         "disagg",
         "test_configs",
         "disagg",
-        "perf",
+        "perf-sanity",
         f"{config_base_name}.yaml",
     )
     if not os.path.exists(config_yaml_path):
@@ -257,6 +262,8 @@ def main():
             f"export gpusPerGenServer={hardware_config['gpus_per_gen_server']}",
             f"export nodesPerCtxServer={hardware_config['nodes_per_ctx_server']}",
             f"export nodesPerGenServer={hardware_config['nodes_per_gen_server']}",
+            f"export gpusPerfNodePerfCtxServer={hardware_config['gpus_per_node_per_ctx_server']}",
+            f"export gpusPerfNodePerfGenServer={hardware_config['gpus_per_node_per_gen_server']}",
             f"export totalNodes={hardware_config['total_nodes']}",
             f"export totalGpus={hardware_config['total_gpus']}",
         ]
