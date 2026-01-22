@@ -392,6 +392,7 @@ setup(
     keywords="nvidia tensorrt deeplearning inference",
     package_data={
         'tensorrt_llm': package_data,
+        'triton_kernels': ['LICENSE'],
     },
     license_files=get_license(),
     entry_points={
