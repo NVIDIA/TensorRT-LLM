@@ -256,6 +256,9 @@ class ModelLoader:
                     f"Fallback to regular model init: {traceback.format_exc(limit=10)}\n"
                 )
                 model = AutoModelForCausalLM.from_config(config)
+            finally:
+                if 'memo' in locals():
+                    del memo
 
             model.to("cuda")
             rank_model_storage = get_rank_model_storage(model)
