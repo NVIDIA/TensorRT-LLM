@@ -29,11 +29,11 @@ from diffusers.models.transformers.transformer_flux2 import (
 )
 from diffusers.utils import USE_PEFT_BACKEND, scale_lora_layers, unscale_lora_layers
 
-from visual_gen.layers import ditAttnProcessor, apply_visual_gen_linear, apply_visual_gen_norm
-from visual_gen.utils import dit_sp_gather, dit_sp_split, get_logger
 from visual_gen.configs.diffusion_cache import TeaCacheConfig
+from visual_gen.layers import ditAttnProcessor
 from visual_gen.models.transformers.base_transformer import ditBaseTransformer
 from visual_gen.models.utils import disable_weight_management
+from visual_gen.utils import dit_sp_gather, dit_sp_split, get_logger
 
 logger = get_logger(__name__)
 
@@ -89,7 +89,11 @@ class ditFlux2AttnProcessor(ditAttnProcessor):
 
         if encoder_hidden_states is not None:
             encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
-                [encoder_hidden_states.shape[1], hidden_states.shape[1] - encoder_hidden_states.shape[1]], dim=1
+                [
+                    encoder_hidden_states.shape[1],
+                    hidden_states.shape[1] - encoder_hidden_states.shape[1],
+                ],
+                dim=1,
             )
             encoder_hidden_states = attn.to_add_out(encoder_hidden_states)
 
@@ -156,7 +160,6 @@ class ditFlux2Transformer2DModel(Flux2Transformer2DModel, ditBaseTransformer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # In init stage, model ckpt are not loaded, so we don't need to load the parameters.
-        apply_visual_gen_linear(self, load_parameters=False, quantize_weights=False)
         for name, module in self.named_modules():
             if hasattr(module, "set_processor"):
                 if isinstance(module.get_processor(), Flux2AttnProcessor):
@@ -168,8 +171,9 @@ class ditFlux2Transformer2DModel(Flux2Transformer2DModel, ditBaseTransformer):
                     attn_processor.name = name
                     module.set_processor(attn_processor)
                 else:
-                    logger.warning(f"Unknown attn processor: {type(module.get_processor())} for {name}")
-
+                    logger.warning(
+                        f"Unknown attn processor: {type(module.get_processor())} for {name}"
+                    )
 
     def run_pre_processing(
         self,
@@ -193,12 +197,13 @@ class ditFlux2Transformer2DModel(Flux2Transformer2DModel, ditBaseTransformer):
             # weight the lora layers by setting `lora_scale` for each PEFT layer
             scale_lora_layers(self, lora_scale)
         else:
-            if joint_attention_kwargs is not None and joint_attention_kwargs.get("scale", None) is not None:
+            if (
+                joint_attention_kwargs is not None
+                and joint_attention_kwargs.get("scale", None) is not None
+            ):
                 logger.warning(
                     "Passing `scale` via `joint_attention_kwargs` when not using the PEFT backend is ineffective."
                 )
-
-        num_txt_tokens = encoder_hidden_states.shape[1]
 
         # 1. Calculate timestep embedding and modulation parameters
         timestep = timestep.to(hidden_states.dtype) * 1000
@@ -212,17 +217,25 @@ class ditFlux2Transformer2DModel(Flux2Transformer2DModel, ditBaseTransformer):
 
         # 2. Input projection for image (hidden_states)
         hidden_states = self.x_embedder(hidden_states)
-        
-        return hidden_states, encoder_hidden_states, temb, double_stream_mod_img, double_stream_mod_txt, single_stream_mod, img_ids, txt_ids
 
+        return (
+            hidden_states,
+            encoder_hidden_states,
+            temb,
+            double_stream_mod_img,
+            double_stream_mod_txt,
+            single_stream_mod,
+            img_ids,
+            txt_ids,
+        )
 
     def run_teacache_check(self, hidden_states, double_stream_mod_img):
         img_mod1, _ = double_stream_mod_img
         img_mod1_shift, img_mod1_scale, _ = img_mod1
-        
+
         with disable_weight_management():
             img_modulated = self.transformer_blocks[0].norm1(hidden_states)
-        
+
         return (1 + img_mod1_scale) * img_modulated + img_mod1_shift
 
     def run_post_processing(self, hidden_states, temb):
@@ -242,7 +255,7 @@ class ditFlux2Transformer2DModel(Flux2Transformer2DModel, ditBaseTransformer):
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
     ):
         num_txt_tokens = encoder_hidden_states.shape[1]
-        
+
         # text encoder
         encoder_hidden_states = self.context_embedder(encoder_hidden_states)
 
@@ -303,10 +316,10 @@ class ditFlux2Transformer2DModel(Flux2Transformer2DModel, ditBaseTransformer):
                     image_rotary_emb=concat_rotary_emb,
                     joint_attention_kwargs=joint_attention_kwargs,
                 )
-        
+
         # Remove text tokens from concatenated stream
         hidden_states = hidden_states[:, num_txt_tokens:, ...]
-        
+
         return hidden_states
 
     def forward(
@@ -320,8 +333,7 @@ class ditFlux2Transformer2DModel(Flux2Transformer2DModel, ditBaseTransformer):
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         return_dict: bool = True,
     ) -> Union[torch.Tensor, Transformer2DModelOutput]:
-        """
-        The [`FluxTransformer2DModel`] forward method.
+        """The [`FluxTransformer2DModel`] forward method.
 
         Args:
             hidden_states (`torch.Tensor` of shape `(batch_size, image_sequence_length, in_channels)`):
@@ -344,7 +356,6 @@ class ditFlux2Transformer2DModel(Flux2Transformer2DModel, ditBaseTransformer):
             If `return_dict` is True, an [`~models.transformer_2d.Transformer2DModelOutput`] is returned, otherwise a
             `tuple` where the first element is the sample tensor.
         """
-        
         # 0. Handle input arguments
         if joint_attention_kwargs is not None:
             joint_attention_kwargs = joint_attention_kwargs.copy()
@@ -352,7 +363,16 @@ class ditFlux2Transformer2DModel(Flux2Transformer2DModel, ditBaseTransformer):
         else:
             lora_scale = 1.0
         # dit Split Start #
-        hidden_states, encoder_hidden_states, temb, double_stream_mod_img, double_stream_mod_txt, single_stream_mod, img_ids, txt_ids = self.run_pre_processing(
+        (
+            hidden_states,
+            encoder_hidden_states,
+            temb,
+            double_stream_mod_img,
+            double_stream_mod_txt,
+            single_stream_mod,
+            img_ids,
+            txt_ids,
+        ) = self.run_pre_processing(
             hidden_states=hidden_states,
             encoder_hidden_states=encoder_hidden_states,
             lora_scale=lora_scale,
@@ -360,11 +380,11 @@ class ditFlux2Transformer2DModel(Flux2Transformer2DModel, ditBaseTransformer):
             img_ids=img_ids,
             txt_ids=txt_ids,
             guidance=guidance,
-            joint_attention_kwargs=joint_attention_kwargs
+            joint_attention_kwargs=joint_attention_kwargs,
         )
 
-        should_calc=True
-        
+        should_calc = True
+
         if TeaCacheConfig.enable_teacache():
             img_modulated = self.run_teacache_check(hidden_states, double_stream_mod_img)
             should_calc, hidden_states = self._calc_teacache_distance(img_modulated, hidden_states)
@@ -379,7 +399,7 @@ class ditFlux2Transformer2DModel(Flux2Transformer2DModel, ditBaseTransformer):
                 double_stream_mod_img=double_stream_mod_img,
                 double_stream_mod_txt=double_stream_mod_txt,
                 single_stream_mod=single_stream_mod,
-                joint_attention_kwargs=joint_attention_kwargs
+                joint_attention_kwargs=joint_attention_kwargs,
             )
             self._update_teacache_residual(original_hidden_states, hidden_states)
 
