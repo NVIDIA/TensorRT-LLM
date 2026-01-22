@@ -16,6 +16,7 @@
 
 import torch
 import torch.distributed as dist
+import visual_gen
 from common import (
     BaseArgumentParser,
     autotuning,
@@ -29,42 +30,57 @@ from common import (
     setup_distributed,
     validate_parallel_config,
 )
-from visual_gen.pipelines.flux2_pipeline import ditFlux2Pipeline
-
 from visual_gen.layers import apply_visual_gen_linear
-
-import visual_gen
-from visual_gen.utils import cudagraph_wrapper, get_logger
+from visual_gen.models.transformers.flux2_transformer import ditFlux2Transformer2DModel
+from visual_gen.pipelines.flux2_pipeline import ditFlux2Pipeline
+from visual_gen.utils import get_logger
 
 logger = get_logger(__name__)
 
 
 def load_and_setup_pipeline(args):
     """Load and configure the Flux pipeline."""
-
     if args.enable_cuda_graph:
-            assert args.attn_type != "sage-attn", "sage-attn has accuracy issue when enable cudagraph"
-            assert not (
-                args.enable_async_cpu_offload or args.enable_sequential_cpu_offload or args.enable_model_cpu_offload
-            ), "CudaGraph is not supported when using cpu offload"
-    
+        assert args.attn_type != "sage-attn", "sage-attn has accuracy issue when enable cudagraph"
+        assert not (
+            args.enable_async_cpu_offload
+            or args.enable_sequential_cpu_offload
+            or args.enable_model_cpu_offload
+        ), "CudaGraph is not supported when using cpu offload"
+
     # Create dit configuration
     dit_configs = create_dit_config(args)
     # Apply dit configuration
     visual_gen.setup_configs(**dit_configs)
     # Load pipe
-    pipe = ditFlux2Pipeline.from_pretrained(args.model_path, torch_dtype=torch.bfloat16, **dit_configs)
+    transformer = ditFlux2Transformer2DModel.from_pretrained(
+        args.model_path, subfolder="transformer", torch_dtype=torch.bfloat16, low_cpu_mem_usage=True
+    )
+    pipe = ditFlux2Pipeline.from_pretrained(
+        args.model_path, transformer=transformer, torch_dtype=torch.bfloat16, **dit_configs
+    )
 
     if args.enable_nvfp4_dynamic_quant:
-        assert args.linear_recipe != "dynamic" "Linear recipe must be static if enable_nvfp4_dynamic_quant=True"
-        assert args.linear_type != "flashinfer-nvfp4-cutlass" "Linear type must be flashinfer-nvfp4-cutlass if enable_nvfp4_dynamic_quant=True"
-        
+        assert (
+            args.linear_recipe != "dynamic"
+            "Linear recipe must be static if enable_nvfp4_dynamic_quant=True"
+        )
+        assert (
+            args.linear_type != "flashinfer-nvfp4-cutlass"
+            "Linear type must be flashinfer-nvfp4-cutlass if enable_nvfp4_dynamic_quant=True"
+        )
+
         exclude_pattern = r"^(?!.*(embedder|norm_out|proj_out|to_add_out|to_added_qkv|stream)).*"
-        apply_visual_gen_linear(pipe.transformer, load_parameters=True, quantize_weights=True, exclude_pattern=exclude_pattern)
+        apply_visual_gen_linear(
+            pipe.transformer,
+            load_parameters=True,
+            quantize_weights=True,
+            exclude_pattern=exclude_pattern,
+        )
 
     if args.enable_cuda_graph:
         pipe.enable_cuda_graph()
-        
+
     # Setup distributed training and CPU offload
     local_rank, world_size = setup_distributed()
 
@@ -121,7 +137,7 @@ def main():
         width=1024,
         guidance_scale=4,
         enable_nvfp4_dynamic_quant=False,
-        enable_cuda_graph=True
+        enable_cuda_graph=True,
     )
 
     args = parser.parse_args()

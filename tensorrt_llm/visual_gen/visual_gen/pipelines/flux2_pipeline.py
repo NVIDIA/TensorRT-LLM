@@ -4,7 +4,8 @@
 # Adapted from: https://github.com/ali-vilab/TeaCache
 # @article{
 #   title={Timestep Embedding Tells: It's Time to Cache for Video Diffusion Model},
-#   author={Liu, Feng and Zhang, Shiwei and Wang, Xiaofeng and Wei, Yujie and Qiu, Haonan and Zhao, Yuzhong and Zhang, Yingya and Ye, Qixiang and Wan, Fang},
+#   author={Liu, Feng and Zhang, Shiwei and Wang, Xiaofeng and Wei, Yujie and Qiu, Haonan and Zhao, Yuzhong and Zhang,
+#           Yingya and Ye, Qixiang and Wan, Fang},
 #   journal={arXiv preprint arXiv:2411.19108},
 #   year={2024}
 # }
@@ -25,13 +26,17 @@
 # limitations under the License.
 
 import gc
-from typing import Any, Callable, Dict, List, Optional, Union, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
-import torch
 import PIL
+import torch
 from diffusers import Flux2Pipeline
-from diffusers.pipelines.flux2.pipeline_flux2 import Flux2PipelineOutput, retrieve_timesteps, compute_empirical_mu
+from diffusers.pipelines.flux2.pipeline_flux2 import (
+    Flux2PipelineOutput,
+    compute_empirical_mu,
+    retrieve_timesteps,
+)
 from diffusers.utils import is_torch_xla_available
 from safetensors.torch import load_file
 
@@ -42,10 +47,8 @@ from visual_gen.configs.pipeline import PipelineConfig
 from visual_gen.layers.linear import ditLinear
 from visual_gen.models.transformers.flux2_transformer import ditFlux2Transformer2DModel
 from visual_gen.pipelines.base_pipeline import ditBasePipeline
-from visual_gen.utils.logger import get_logger
 from visual_gen.utils import cudagraph_wrapper
-from huggingface_hub import snapshot_download
-from safetensors.torch import load_file
+from visual_gen.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -59,26 +62,25 @@ else:
 
 
 class ditFlux2Pipeline(Flux2Pipeline, ditBasePipeline):
-
     def _set_teacache_coefficients(self, **kwargs) -> None:
-            teacache_configs = kwargs.pop("teacache", None)
-            
-            if teacache_configs is not None:
-                logger.debug("Setting up TeaCache configuration")
-                self.transformer.teacache_coefficients = [
-                    1.04582360e+02,
-                    -6.87605554e+00,
-                    -8.61659379e-02,
-                    5.37600252e-02
-                ]
-                TeaCacheConfig.set_config(
-                    enable_teacache=teacache_configs.pop("enable_teacache", False),
-                    teacache_thresh=teacache_configs.pop("teacache_thresh", 0.),
-                    use_ret_steps=teacache_configs.pop("use_ret_steps", False),
-                    ret_steps=teacache_configs.pop("ret_steps", 0),
-                    cutoff_steps=teacache_configs.pop("cutoff_steps", 50),
-                    cnt=0
-                )
+        teacache_configs = kwargs.pop("teacache", None)
+
+        if teacache_configs is not None:
+            logger.debug("Setting up TeaCache configuration")
+            self.transformer.teacache_coefficients = [
+                1.04582360e02,
+                -6.87605554e00,
+                -8.61659379e-02,
+                5.37600252e-02,
+            ]
+            TeaCacheConfig.set_config(
+                enable_teacache=teacache_configs.pop("enable_teacache", False),
+                teacache_thresh=teacache_configs.pop("teacache_thresh", 0.0),
+                use_ret_steps=teacache_configs.pop("use_ret_steps", False),
+                ret_steps=teacache_configs.pop("ret_steps", 0),
+                cutoff_steps=teacache_configs.pop("cutoff_steps", 50),
+                cnt=0,
+            )
 
     def _after_load(self, pretrained_model_name_or_path, *args, **kwargs) -> None:
         """Post-processing hook after load model checkpoints in 'from_pretrained' method."""
@@ -86,12 +88,13 @@ class ditFlux2Pipeline(Flux2Pipeline, ditBasePipeline):
             logger.debug("Loading ditFlux2Transformer2DModel from diffusers transformer")
             torch_dtype = kwargs.get("torch_dtype", torch.float32)
             self.transformer = ditFlux2Transformer2DModel.from_pretrained(
-                pretrained_model_name_or_path, subfolder="transformer", torch_dtype=torch_dtype, low_cpu_mem_usage=True
+                pretrained_model_name_or_path,
+                subfolder="transformer",
+                torch_dtype=torch_dtype,
+                low_cpu_mem_usage=True,
             )
             gc.collect()
             torch.cuda.empty_cache()
-        else:
-            logger.debug("Using ditWanTransformer3DModel from kwargs for transformer")
 
         self._fuse_qkv(self.transformer)
 
@@ -103,14 +106,13 @@ class ditFlux2Pipeline(Flux2Pipeline, ditBasePipeline):
             logger.warning("VAE parallel is not supported for FluxPipeline")
 
         self._set_teacache_coefficients(**kwargs)
-            
 
     def enable_cuda_graph(self):
         if TeaCacheConfig.enable_teacache():
             logger.info("capturing cuda graph for teacache..")
             self.transformer.run_pre_processing = cudagraph_wrapper(
                 self.transformer.run_pre_processing
-                )
+            )
             self.transformer.run_teacache_check = cudagraph_wrapper(
                 self.transformer.run_teacache_check
             )
@@ -123,7 +125,6 @@ class ditFlux2Pipeline(Flux2Pipeline, ditBasePipeline):
         else:
             logger.info("capturing cuda graph..")
             self.transformer.forward = cudagraph_wrapper(self.transformer.forward)
-
 
     def load_fp4_weights(self, path, svd_weight_name_table):
         weights_table = load_file(path)
@@ -154,11 +155,9 @@ class ditFlux2Pipeline(Flux2Pipeline, ditBasePipeline):
         text_encoder_out_layers: Tuple[int] = (10, 20, 30),
         caption_upsample_temperature: float = None,
     ):
-        #setup teacache num_steps
+        # setup teacache num_steps
         if TeaCacheConfig.enable_teacache():
-            TeaCacheConfig.set_config(
-                    num_steps=num_inference_steps
-            )
+            TeaCacheConfig.set_config(num_steps=num_inference_steps)
             if TeaCacheConfig.cutoff_steps() > TeaCacheConfig.num_steps():
                 logger.warning("Number of cutoff_steps > num_steps.")
 
@@ -184,9 +183,12 @@ class ditFlux2Pipeline(Flux2Pipeline, ditBasePipeline):
         else:
             batch_size = prompt_embeds.shape[0]
 
-
         batch_size, prompt, _, prompt_embeds, _ = self.dit_dp_split(
-            batch_size, prompt, None, prompt_embeds, None
+            batch_size,
+            prompt,
+            None,
+            prompt_embeds,
+            None,
         )
 
         device = self._execution_device
@@ -194,7 +196,10 @@ class ditFlux2Pipeline(Flux2Pipeline, ditBasePipeline):
         # 3. prepare text embeddings
         if caption_upsample_temperature:
             prompt = self.upsample_prompt(
-                prompt, images=image, temperature=caption_upsample_temperature, device=device
+                prompt,
+                images=image,
+                temperature=caption_upsample_temperature,
+                device=device,
             )
 
         if "text_encoder" in PipelineConfig.model_wise_offloading:
@@ -203,7 +208,7 @@ class ditFlux2Pipeline(Flux2Pipeline, ditBasePipeline):
                 self.text_encoder.to(torch.cuda.current_device())
             if hasattr(self, "text_encoder_2"):
                 self.text_encoder_2.to(torch.cuda.current_device())
-            
+
         prompt_embeds, text_ids = self.encode_prompt(
             prompt=prompt,
             prompt_embeds=prompt_embeds,
@@ -240,7 +245,12 @@ class ditFlux2Pipeline(Flux2Pipeline, ditBasePipeline):
                 multiple_of = self.vae_scale_factor * 2
                 image_width = (image_width // multiple_of) * multiple_of
                 image_height = (image_height // multiple_of) * multiple_of
-                img = self.image_processor.preprocess(img, height=image_height, width=image_width, resize_mode="crop")
+                img = self.image_processor.preprocess(
+                    img,
+                    height=image_height,
+                    width=image_width,
+                    resize_mode="crop",
+                )
                 condition_images.append(img)
                 height = height or image_height
                 width = width or image_width
@@ -273,8 +283,15 @@ class ditFlux2Pipeline(Flux2Pipeline, ditBasePipeline):
             )
 
         # 6. Prepare timesteps
-        sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
-        if hasattr(self.scheduler.config, "use_flow_sigmas") and self.scheduler.config.use_flow_sigmas:
+        sigmas = (
+            np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
+            if sigmas is None
+            else sigmas
+        )
+        if (
+            hasattr(self.scheduler.config, "use_flow_sigmas")
+            and self.scheduler.config.use_flow_sigmas
+        ):
             sigmas = None
         image_seq_len = latents.shape[1]
         mu = compute_empirical_mu(image_seq_len=image_seq_len, num_steps=num_inference_steps)
@@ -309,7 +326,9 @@ class ditFlux2Pipeline(Flux2Pipeline, ditBasePipeline):
                 latent_image_ids = latent_ids
 
                 if image_latents is not None:
-                    latent_model_input = torch.cat([latents, image_latents], dim=1).to(self.transformer.dtype)
+                    latent_model_input = torch.cat([latents, image_latents], dim=1).to(
+                        self.transformer.dtype
+                    )
                     latent_image_ids = torch.cat([latent_ids, image_latent_ids], dim=1)
 
                 inputs_dict = {
@@ -328,7 +347,7 @@ class ditFlux2Pipeline(Flux2Pipeline, ditBasePipeline):
                     current_denoising_step=i,
                     num_inference_steps=num_inference_steps,
                     do_classifier_free_guidance=False,
-                    cfg_positive_inputs=inputs_dict
+                    cfg_positive_inputs=inputs_dict,
                 )
 
                 noise_pred = noise_pred[:, : latents.size(1) :]
@@ -352,7 +371,9 @@ class ditFlux2Pipeline(Flux2Pipeline, ditBasePipeline):
                     prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
 
                 # call the callback, if provided
-                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                if i == len(timesteps) - 1 or (
+                    (i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0
+                ):
                     progress_bar.update()
 
                 if XLA_AVAILABLE:
@@ -367,9 +388,14 @@ class ditFlux2Pipeline(Flux2Pipeline, ditBasePipeline):
         else:
             latents = self._unpack_latents_with_ids(latents, latent_ids)
 
-            latents_bn_mean = self.vae.bn.running_mean.view(1, -1, 1, 1).to(latents.device, latents.dtype)
-            latents_bn_std = torch.sqrt(self.vae.bn.running_var.view(1, -1, 1, 1) + self.vae.config.batch_norm_eps).to(
+            latents_bn_mean = self.vae.bn.running_mean.view(1, -1, 1, 1).to(
                 latents.device, latents.dtype
+            )
+            latents_bn_std = torch.sqrt(
+                self.vae.bn.running_var.view(1, -1, 1, 1) + self.vae.config.batch_norm_eps
+            ).to(
+                device=latents.device,
+                dtype=latents.dtype,
             )
             latents = latents * latents_bn_std + latents_bn_mean
             latents = self._unpatchify_latents(latents)
