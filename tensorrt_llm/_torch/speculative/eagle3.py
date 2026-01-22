@@ -377,15 +377,14 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
         raw_logits = logits
 
-        if self.guided_decoder is not None:
-            self.guided_decoder.execute(logits)
+        self._execute_guided_decoder_if_present(logits)
 
         # Sample and accept tokens
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
             logits, attn_metadata, spec_metadata)
 
         # Save the old attn_metadata and spec_metadata
-        attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
+        self._prepare_attn_metadata_for_spec_dec(attn_metadata)
 
         # Prepare inputs for the 1st draft model forward
         position_ids = position_ids.squeeze(0)
@@ -479,18 +478,15 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
 
         # restore attn_metadata to support cuda graph
-        attn_metadata.restore_from_spec_dec()
-        attn_metadata.on_update()
+        self._restore_attn_metadata_from_spec_dec(attn_metadata)
         # restore all_rank_num_tokens for attention DP
         if original_all_rank_num_tokens is not None:
             attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
 
         # prepare next new tokens to support overlap scheduler
-        next_new_tokens = accepted_tokens[
-            spec_metadata.batch_indices_cuda[:batch_size],
-            num_accepted_tokens - 1].unsqueeze(1)
-        next_new_tokens = torch.concat([next_new_tokens, next_draft_tokens],
-                                       dim=1)
+        next_new_tokens = self._prepare_next_new_tokens(
+            accepted_tokens, next_draft_tokens,
+            spec_metadata.batch_indices_cuda, batch_size, num_accepted_tokens)
 
         attn_metadata.use_spec_decoding = True
 
@@ -512,39 +508,13 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
 
-        if logits.dim() == 1:
-            logits = logits.unsqueeze(0)
-
-        # The return buffer
-        accepted_tokens = torch.empty((batch_size, (self.max_draft_len + 1)),
-                                      dtype=torch.int,
-                                      device=logits.device)
-        num_accepted_tokens = torch.ones(batch_size,
-                                         dtype=torch.int,
-                                         device=logits.device)
-
-        # Sample tokens using per-request sampling parameters
-        target_tokens = self._sample_tokens_for_batch(logits, spec_metadata,
-                                                      num_contexts, batch_size)
-        # context
-        accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts]
-
-        # generation
-        gen_target_tokens = target_tokens[num_contexts:].reshape(
-            num_gens, self.max_draft_len + 1)
-        accepted_tokens[num_contexts:, :] = gen_target_tokens
+        # Reshape draft tokens for base implementation
         draft_tokens = spec_metadata.draft_tokens.reshape(
             num_gens, self.max_draft_len)
-        num_accepted_tokens[num_contexts:] += torch.cumprod(
-            (draft_tokens == gen_target_tokens[:, :self.max_draft_len]).int(),
-            dim=-1).sum(1)
-        # Check for environment variable override
-        if self.force_num_accepted_tokens != 0:
-            # total tokens per iteration = accepted draft tokens + 1 target token
-            force_total_tokens = min(self.force_num_accepted_tokens + 1,
-                                     self.max_draft_len + 1)
-            num_accepted_tokens[num_contexts:] = force_total_tokens
-        return accepted_tokens, num_accepted_tokens
+
+        # Use base implementation for strict acceptance
+        return self._sample_and_accept_draft_tokens_base(
+            logits, draft_tokens, num_contexts, batch_size, spec_metadata)
 
     def draft_decoder(
         self,
@@ -570,15 +540,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # Note: using greedy for draft tokens is a bit easier to implement and
         # faster. It doesn't affect the final output and seems to have a negligible
         # impact on AR.
-        draft_tokens = torch.argmax(logits, dim=-1)
-
-        # Apply d2t (offsets between draft model dictionary and main model dictionary).
-        if (d2t := getattr(draft_model.model, "d2t", None)) is not None:
-            draft_tokens = d2t[draft_tokens] + draft_tokens
-
-        draft_tokens = draft_tokens.type(torch.int32)
-
-        return draft_tokens
+        d2t = getattr(draft_model.model, "d2t", None)
+        return self._draft_sampler_greedy(logits, d2t)
 
     def prepare_1st_drafter_inputs(
         self,
@@ -601,14 +564,9 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         hidden_states = draft_model.apply_eagle3_fc(hidden_states)
 
         # context
-        input_ctx_ids = input_ids[:attn_metadata.num_ctx_tokens]
-        input_ids_ctx = torch.empty_like(input_ctx_ids,
-                                         dtype=torch.int32,
-                                         device="cuda")
-        input_ids_ctx[:-1].copy_(input_ctx_ids[1:])
-        input_ids_ctx[
-            spec_metadata.
-            gather_ids[:num_contexts]] = accepted_tokens[:num_contexts, 0]
+        input_ids_ctx = self._prepare_context_input_ids(
+            input_ids, attn_metadata.num_ctx_tokens, spec_metadata.gather_ids,
+            accepted_tokens, num_contexts)
 
         # generation
         input_ids_gen = accepted_tokens[num_contexts:, :].flatten()
