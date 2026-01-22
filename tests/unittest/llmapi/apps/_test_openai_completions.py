@@ -5,6 +5,7 @@ from typing import List
 
 import openai
 import pytest
+from utils.util import similar
 
 from ..test_llm import get_model_path
 from .openai_server import RemoteOpenAIServer
@@ -202,6 +203,39 @@ async def test_batch_completions_streaming(async_client: openai.AsyncOpenAI,
         choice = chunk.choices[0]
         texts[choice.index] += choice.text
     assert texts[0] == texts[1]
+
+
+@pytest.mark.asyncio(loop_scope="module")
+@pytest.mark.parametrize("prompts", [["Hello, my name is"] * 2])
+async def test_batch_completions_with_option_n_streaming(
+        async_client: openai.AsyncOpenAI, model_name, prompts):
+    # Use non-stream single generation as reference
+    completion_ref = await async_client.completions.create(
+        model=model_name,
+        prompt=prompts[0],
+        max_tokens=5,
+        temperature=0.0001,
+    )
+    text_ref = completion_ref.choices[0].text
+
+    # test n>1 with streaming
+    batch = await async_client.completions.create(
+        model=model_name,
+        prompt=prompts,
+        n=3,  # number of completions to generate for each prompt.
+        max_tokens=5,
+        temperature=0.0001,
+        stream=True,
+    )
+    texts = [""] * 6  # 2 prompts × 3 generations per prompt = 6 choices
+    async for chunk in batch:
+        assert len(chunk.choices) == 1
+        choice = chunk.choices[0]
+        texts[choice.index] += choice.text
+
+    # Check all generations are consistent with the reference
+    for text in texts:
+        assert similar(text, text_ref, threshold=0.8)
 
 
 @pytest.mark.asyncio(loop_scope="module")
