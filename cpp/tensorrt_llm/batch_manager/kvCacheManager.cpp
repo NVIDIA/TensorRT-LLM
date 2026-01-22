@@ -1464,9 +1464,8 @@ SizeType32 WindowBlockManager::addSequence(
     // the caller KVCacheManager::addSequence will use the minimum across all windows)
     auto const totalPrepopulatedLen = prepopulatedPromptLen + numConnectorMatchedTokens;
     TLLM_LOG_DEBUG(
-        "addSequence for window size %d: request %lu, inputLength %d, prepopulatedPromptLen %d, "
-        "numConnectorMatchedTokens %d",
-        mWindowSize, llmRequest.mRequestId, inputLength, prepopulatedPromptLen, numConnectorMatchedTokens);
+        "%s::addSequence: Request %lu, inputLength %d, prepopulatedPromptLen %d, numConnectorMatchedTokens %d",
+        mLogPrefix.c_str(), llmRequest.mRequestId, inputLength, prepopulatedPromptLen, numConnectorMatchedTokens);
     return totalPrepopulatedLen;
 }
 
@@ -2492,8 +2491,8 @@ void KVCacheManager::addSequence(
     // Set the prepopulated prompt length once using the minimum across all windows
     if (llmRequest && mEnableBlockReuse)
     {
-        TLLM_LOG_DEBUG("addSequence: request %lu, minPrepopulatedPromptLen %d", llmRequest->mRequestId,
-            minPrepopulatedPromptLen);
+        TLLM_LOG_DEBUG(
+            "%s::addSequence: Setting prepopulatedPromptLen to %d", mLogPrefix.c_str(), minPrepopulatedPromptLen);
         llmRequest->setPrepopulatedPromptLen(minPrepopulatedPromptLen, getTokensPerBlock());
     }
 
