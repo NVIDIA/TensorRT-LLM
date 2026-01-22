@@ -998,24 +998,24 @@ __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, uint8_t c
     if (payload_bytes == nullptr)
         return;
 
-    int slot_idx = ThreadingPolicy::token_idx();
+    int global_token_idx = ThreadingPolicy::token_idx();
 
-    int total_slots = ep_size * max_tokens_per_rank;
-    if (slot_idx >= total_slots)
+    int global_token_num = ep_size * max_tokens_per_rank;
+    if (global_token_idx >= global_token_num)
         return;
 
-    // Map global token to (source_rank, token_idx)
-    int source_rank = slot_idx / max_tokens_per_rank;
-    int token_idx = slot_idx % max_tokens_per_rank;
+    // Map global_token_idx to (rank_idx, local_token_idx)
+    int rank_idx = global_token_idx / max_tokens_per_rank;
+    int local_token_idx = global_token_idx % max_tokens_per_rank;
 
-    // Skip invalid tokens beyond per-source recv count
-    if (token_idx >= recv_counters[source_rank])
+    // Skip invalid tokens beyond per-rank recv count
+    if (local_token_idx >= recv_counters[rank_idx])
         return;
 
     // Calculate source and destination pointers for this token
-    size_t slot_offset = static_cast<size_t>(slot_idx) * bytes_per_token;
-    uint8_t* dst_ptr = recv_buffer_bytes + slot_offset;
-    uint8_t const* src_ptr = payload_bytes + slot_offset;
+    size_t offset = static_cast<size_t>(global_token_idx) * bytes_per_token;
+    uint8_t* dst_ptr = recv_buffer_bytes + offset;
+    uint8_t const* src_ptr = payload_bytes + offset;
 
     // Copy one token's data using vectorized copy with policy
     vectorized_copy<ThreadingPolicy>(dst_ptr, src_ptr, bytes_per_token);
@@ -1136,9 +1136,9 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params)
     }
 
     int bytes_per_token = params.elements_per_token * element_size;
-    int total_slots = params.prepare_payload == nullptr ? 1 : params.ep_size * params.max_tokens_per_rank;
-    int grid_size_warp = ceilDiv(total_slots, kWarpsPerBlock);
-    int grid_size_block = total_slots; // one block per token
+    int global_token_num = params.prepare_payload == nullptr ? 1 : params.ep_size * params.max_tokens_per_rank;
+    int grid_size_warp = ceilDiv(global_token_num, kWarpsPerBlock);
+    int grid_size_block = global_token_num; // one block per token
 
     if (params.one_block_per_token)
     {
