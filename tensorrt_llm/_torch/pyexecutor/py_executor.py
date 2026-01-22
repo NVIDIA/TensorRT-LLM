@@ -1835,6 +1835,8 @@ class PyExecutor:
                         iter_start_time=iter_start_time,
                         iter_stats=iter_stats,
                         ctx_transmission_reqs=ctx_transmission_reqs)
+                else:
+                    self.previous_batch = None
 
                 if self.kv_cache_transceiver and self.async_transfer_manager.has_any_inflight_requests(
                 ):
