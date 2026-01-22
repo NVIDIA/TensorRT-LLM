@@ -1542,7 +1542,7 @@ class PyExecutor:
                 can_queue, _ = self._can_queue(scheduled_batch)
                 if self.kv_connector_manager:
                     self.kv_connector_manager.handle_metadata()
-                if can_queue:
+                if can_queue: 
                     if self.kv_cache_transceiver:
                         # For generation requests which have completed KV cache transfer
                         self._prepare_disagg_gen_transmission_complete(
