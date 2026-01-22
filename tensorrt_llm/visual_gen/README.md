@@ -75,9 +75,10 @@ nvidia-smi --query-gpu=name,compute_cap
 
 ## 🚀 Installation
 
-Recommended docker: `nvcr.io/nvidia/tensorrt-llm/release:1.1.0rc4`
+Recommended docker: `nvcr.io/nvidia/tensorrt-llm/release:1.2.0rc4`
 
 ### Install
+Under this folder, i.e., `TensorRT-LLM/tensorrt_llm/visual_gen/`, run:
 ```bash
 pip install -e .
 ```
