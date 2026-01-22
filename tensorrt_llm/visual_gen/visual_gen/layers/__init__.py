@@ -20,11 +20,14 @@ from typing import Callable
 import torch
 from torch import nn
 
+from visual_gen.utils import get_logger
+
 from .attention import ditAttnProcessor
 from .linear import ditLinear
 from .norm import ditLayerNorm, ditRMSNorm
 
 __all__ = ["ditAttnProcessor", "ditLinear", "apply_visual_gen_linear"]
+logger = get_logger(__name__)
 
 
 def apply_visual_gen_linear(
@@ -44,6 +47,8 @@ def apply_visual_gen_linear(
     for name, module in model.named_modules():
         if isinstance(module, nn.Linear) and exclude_pattern_.match(name) is None:
             linear_modules_to_replace.append(name)
+
+    logger.info(f"Number of layers converted using visual_gen: {len(linear_modules_to_replace)}")
 
     # Replace linear modules
     for name in linear_modules_to_replace:
