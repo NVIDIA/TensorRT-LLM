@@ -79,6 +79,10 @@ class ZMQMessenger(MessengerInterface):
     }
 
     def __init__(self, mode: str, endpoint: Optional[str] = None) -> None:
+        if mode not in self.SOCKET_MODES:
+            raise ValueError(
+                f"Invalid mode '{mode}'. Allowed modes are {list(self.SOCKET_MODES.keys())}"
+            )
         self._context = zmq.Context()
         self._mode = mode
         self._socket = self._context.socket(self.SOCKET_MODES[mode])
@@ -90,6 +94,8 @@ class ZMQMessenger(MessengerInterface):
         self._initialize_control_sockets()
 
         if endpoint is None:
+            if mode in ["DEALER", "REQ"]:
+                raise ValueError("endpoint is required for DEALER/REQ modes")
             endpoint = f"tcp://{get_local_ip()}:*"
 
         if mode in ["ROUTER", "REP"]:
@@ -98,10 +104,6 @@ class ZMQMessenger(MessengerInterface):
         elif mode in ["DEALER", "REQ"]:
             self._socket.connect(endpoint)
             self._endpoint = endpoint
-        else:
-            raise ValueError(
-                f"Invalid mode '{mode}'. Allowed modes are {list(self.SOCKET_MODES.keys())}"
-            )
 
         logger.info(f"Initialized ZMQMessenger(mode={mode}, endpoint={self._endpoint})")
 
@@ -180,7 +182,7 @@ class ZMQMessenger(MessengerInterface):
                 logger.error(f"Error closing socket: {e}")
 
         with self._lock:
-            if self._closed or not self._listener_thread:
+            if self._closed:
                 return
             self._closed = True
             logger.debug("Stopping ZMQMessenger...")
@@ -188,6 +190,7 @@ class ZMQMessenger(MessengerInterface):
             self._stop_event.set()
             self._internal_socket.send(b"STOP")
             if self._listener_thread:
+                self._internal_socket.send(b"STOP")
                 self._listener_thread.join(timeout)
                 if self._listener_thread.is_alive():
                     logger.warning("Listener thread did not terminate within timeout")

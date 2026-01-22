@@ -41,13 +41,26 @@ class BindingsNixlTransferAgent(BaseTransferAgent):
     so trtllm can function normally even without NIXL.
     """
 
-    def __init__(self, name: str, use_prog_thread: bool = True, num_workers: int = 1):
+    def __init__(
+        self,
+        name: str,
+        use_prog_thread: bool = True,
+        num_threads: int = 1,
+        enable_telemetry: bool = False,
+        **kwargs,
+    ):
+        backend_params = kwargs
+        for key, value in backend_params.items():
+            backend_params[key] = str(value)
+        backend_params["num_threads"] = str(num_threads)
+
         config = BaseAgentConfig(
             name,
             use_prog_thread,
             multi_thread=False,
             use_listen_thread=False,
-            num_workers=num_workers,
+            enable_telemetry=enable_telemetry,
+            backend_params=backend_params,
         )
         self._cpp_agent = CppNixlTransferAgent(config)
         self.name = name

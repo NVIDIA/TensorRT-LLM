@@ -1,7 +1,7 @@
 import time
 from enum import Enum
 
-from nixl import nixl_agent, nixl_agent_config, nixl_xfer_handle  # noqa: E402
+from nixl import nixl_agent, nixl_agent_config, nixl_xfer_handle
 
 from tensorrt_llm._utils import nvtx_range
 
@@ -27,13 +27,13 @@ class NixlTransferStatus(TransferStatus):
 
     def wait(self, timeout_ms=None):
         start_time = time.time()
-        status = TransferState.PROCESSING
+        status = TransferState.PENDING
         sleep_time = 0.0001  # 0.1ms in seconds
         max_sleep_time = 0.01  # 10ms in seconds
 
         timeout = timeout_ms / 1000 if timeout_ms is not None else None
 
-        while status == TransferState.PROCESSING:
+        while status in (TransferState.PENDING, TransferState.PROCESSING):
             status = TransferState(self.agent.check_xfer_state(self.handle))
             if status == TransferState.ERROR:
                 return False  # Transfer failed
@@ -47,7 +47,7 @@ class NixlTransferStatus(TransferStatus):
 class NixlTransferAgent(BaseTransferAgent):
     """NixlTransferAgent using Python nixl library."""
 
-    def __init__(self, name: str, use_prog_thread: bool = True, num_workers: int = 1):
+    def __init__(self, name: str, use_prog_thread: bool = True, num_threads: int = 1, **kwargs):
         """
         Initialize NixlTransferAgent.
         :param name: Name of the agent.
@@ -57,11 +57,13 @@ class NixlTransferAgent(BaseTransferAgent):
         self.name = name
         self.backends = ["UCX"]
         agent_config = nixl_agent_config(
-            enable_prog_thread=use_prog_thread, backends=self.backends, num_threads=num_workers
+            enable_prog_thread=use_prog_thread, backends=self.backends, num_threads=num_threads
         )
         self.agent = nixl_agent(name, agent_config)
 
     def register_memory(self, descs: RegMemoryDescs):
+        if not descs.descs:
+            raise ValueError("descs.descs must not be empty")
         if isinstance(descs.descs[0], tuple):
             assert len(descs.descs[0]) == 4, f"Expected 4 elements per desc, got {descs.descs[0]}"
         reg_descs = self.agent.get_reg_descs(descs.descs, descs.type)
@@ -69,6 +71,8 @@ class NixlTransferAgent(BaseTransferAgent):
         self.agent.register_memory(reg_descs)
 
     def deregister_memory(self, descs: RegMemoryDescs):
+        if not descs.descs:
+            raise ValueError("descs.descs must not be empty")
         if isinstance(descs.descs[0], tuple):
             assert len(descs.descs[0]) == 4, f"Expected 4 elements per desc, got {descs.descs[0]}"
         reg_descs = self.agent.get_reg_descs(descs.descs, descs.type)

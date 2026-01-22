@@ -145,7 +145,6 @@ class TxSessionBase(ABC):
         """
         ...
 
-    @property
     @abstractmethod
     def close(self) -> None:
         """
@@ -193,7 +192,6 @@ class RxSessionBase(ABC):
         """Returns any exception that occurred during the session."""
         ...
 
-    @property
     @abstractmethod
     def close(self) -> None:
         """
