@@ -1861,7 +1861,10 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     server: 10.117.145.14
                     path: /vol/scratch1/scratch.michaeln_blossom
     """
-    /* if (type.contains("6000d") || type.contains("gh200")) {
+
+    // Due to Austin flex cache is not stable, remove gh200 temporarily.
+    // That means gh200 will use the default blossom pvc.
+    if (type.contains("6000d")) {
         // rtx-pro-6000d and gh200 nodes are located in Austin DC, we use the FlexCache to speed up the data access.
         llmModelVolume = """
                 - name: scratch-trt-llm-data
@@ -1869,7 +1872,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     server: 10.20.162.212
                     path: /vol/scratch26/scratch.trt_llm_data
         """
-    }*/ // Using blossom pvc temporarily due to slow access for the flex cache in Austin
+    }
 
     def podConfig = [
         cloud: targetCloud,
