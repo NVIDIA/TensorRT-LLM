@@ -43,6 +43,7 @@ from ...utils.node_utils import (
     extract_weight_nodes,
     filtered_nodes,
     get_all_layer_subgraphs,
+    get_all_weights_in_subgraph,
     get_layer_after_linear_node,
     is_any_attention_op,
     is_any_lin_op,
@@ -1058,31 +1059,6 @@ def _resolve_tp_cls_from_node(node: Node):
         except Exception:
             pass
     return WeightShardingInfo
-
-
-def _get_dim0_from_arg(gm: GraphModule, arg: Union[Node, torch.Tensor]) -> int:
-    """Helper to get the first dimension size of an argument (Node or Tensor)."""
-    if isinstance(arg, torch.Tensor):
-        return arg.shape[0]
-    if isinstance(arg, Node):
-        if arg.op == "get_attr":
-            # Traverse attributes to find the tensor
-            obj = gm
-            for atom in arg.target.split("."):
-                obj = getattr(obj, atom)
-            return obj.shape[0]
-        if "val" in arg.meta:
-            return shape(arg)[0]
-    raise ValueError(f"Cannot determine shape[0] for {arg}")
-
-
-def get_all_weights_in_subgraph(
-    sources: list[Node],
-    sinks: list[Node],
-):
-    """Get all weight nodes (get_attr nodes) in the subgraph between sources and sinks."""
-    weight_nodes = subgraph(sources, sinks, include=lambda n: n.op == "get_attr")
-    return weight_nodes
 
 
 def init_process_grid_from_config(
