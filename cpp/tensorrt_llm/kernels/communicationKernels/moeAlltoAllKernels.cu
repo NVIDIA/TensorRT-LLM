@@ -364,12 +364,12 @@ __global__ void moeA2APrepareDispatchKernel(
 // Dispatch Kernels
 // ============================================================================
 
-template <typename ThreadingPolicy, int TOP_K, bool EPLB_STATS>
+template <typename ThreadingPolicy, int TOP_K, bool ENABLE_EPLB>
 __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [local_num_tokens, TOP_K]
     const DispatchKernelPointers ptrs,                                      // Struct containing all kernel pointers
     int num_payloads,                                                       // Number of payloads
     int max_tokens_per_rank,                                                // Maximum tokens per rank
-    int local_num_tokens, int rank_id, int ep_size, int num_experts)
+    int local_num_tokens, int rank_id, int ep_size, int num_experts, int eplb_stats_num_experts)
 {
 
     int thread_idx = ThreadingPolicy::offset();
@@ -498,17 +498,17 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
                 ptrs.recv_counters[target_rank][rank_id] = send_count;
             }
 
-            if constexpr (EPLB_STATS)
+            if constexpr (ENABLE_EPLB)
             {
                 // Write local stats into peer buffers before the release fence below.
 #pragma unroll 1
                 for (int target_rank = 0; target_rank < ep_size; ++target_rank)
                 {
                     int* target_stats = ptrs.eplb_gathered_stats[target_rank];
-                    for (int expert_id = lane_id; expert_id < num_experts; expert_id += warpSize)
+                    for (int expert_id = lane_id; expert_id < eplb_stats_num_experts; expert_id += warpSize)
                     {
                         int stat_val = ptrs.eplb_local_stats[expert_id];
-                        target_stats[rank_id * num_experts + expert_id] = stat_val;
+                        target_stats[rank_id * eplb_stats_num_experts + expert_id] = stat_val;
                     }
                 }
             }
@@ -640,7 +640,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
                 moeA2ADispatchKernel<BlockPolicy, TOP_K, EPLB_STATS>
                 <<<grid_size, kBlockSize, shared_bytes, params.stream>>>(params.token_selected_experts, kernel_ptrs,
                     params.num_payloads, params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank,
-                    params.ep_size, params.num_experts)))
+                    params.ep_size, params.num_experts, params.eplb_stats_num_experts)))
     }
     else
     {
@@ -656,7 +656,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
                 moeA2ADispatchKernel<WarpPolicy, TOP_K, EPLB_STATS>
                 <<<grid_size, kBlockSize, shared_bytes, params.stream>>>(params.token_selected_experts, kernel_ptrs,
                     params.num_payloads, params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank,
-                    params.ep_size, params.num_experts)))
+                    params.ep_size, params.num_experts, params.eplb_stats_num_experts)))
     }
 }
 

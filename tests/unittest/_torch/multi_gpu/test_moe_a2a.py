@@ -243,12 +243,17 @@ def run_moe_a2a_dispatch_single_rank(ep_size, all_num_tokens, top_k,
         # Create MoeAlltoAll manager
         max_num_tokens = max(all_num_tokens)
 
-        moe_a2a = MoeAlltoAll(mapping,
-                              max_num_tokens,
-                              top_k,
-                              num_experts,
-                              workspace_size_per_rank,
-                              enable_eplb=enable_eplb)
+        eplb_stats_num_experts = (
+            num_experts // 2 if enable_eplb else None
+        )  # Use half of the experts for testing EPLB stats
+        moe_a2a = MoeAlltoAll(
+            mapping=mapping,
+            max_num_tokens=max_num_tokens,
+            top_k=top_k,
+            num_slots=num_experts,
+            workspace_size_per_rank=workspace_size_per_rank,
+            num_experts=eplb_stats_num_experts,
+        )
 
         # Get the number of tokens for this specific rank (same as single-GPU)
         rank_local_tokens = all_num_tokens[rank]
@@ -261,9 +266,9 @@ def run_moe_a2a_dispatch_single_rank(ep_size, all_num_tokens, top_k,
 
         eplb_local_stats = None
         if enable_eplb:
-            eplb_local_stats = (
-                torch.arange(num_experts, dtype=torch.int32, device="cuda") +
-                rank * 1000)
+            eplb_local_stats = (torch.arange(
+                eplb_stats_num_experts, dtype=torch.int32, device="cuda") +
+                                rank * 1000)
 
         recv_tensors = moe_a2a.dispatch(
             token_selected_experts,
@@ -671,8 +676,13 @@ def run_moe_a2a_dispatch_moe_combine_single_rank(ep_size, all_num_tokens, top_k,
                           world_size=ep_size)
 
         # Create MoeAlltoAll manager
-        moe_a2a = MoeAlltoAll(mapping, max_num_tokens, top_k, num_experts,
-                              workspace_size_per_rank)
+        moe_a2a = MoeAlltoAll(
+            mapping=mapping,
+            max_num_tokens=max_num_tokens,
+            top_k=top_k,
+            num_slots=num_experts,
+            workspace_size_per_rank=workspace_size_per_rank,
+        )
 
         rank_local_tokens = all_num_tokens[rank]
 

@@ -629,8 +629,6 @@ class ConfigurableMoE(MoE):
 
         # ========== Step 3.5: Communication Prepare Phase (BEFORE quantization) ==========
         # NVLINK two-sided has a prepare phase to gather EPLB statistics
-        # TODO: The abstract does not work well as NVLinkTwoSided gathers EPLB stats in prepare_dispatch,
-        # while NVLinkOneSided gathers EPLB stats in dispatch.
 
         local_statistic_tensor_for_dispatch = None
         eplb_dispatch_kwargs = {}
@@ -652,6 +650,8 @@ class ConfigurableMoE(MoE):
             if gathered_stats is not None:
                 gathered_stats = gathered_stats.view((self.mapping.moe_ep_size, self.num_experts))
                 self._load_balancer_update_statistic_with_gathered_statistic(gathered_stats)
+        # TODO: The abstract does not work well as NVLinkTwoSided gathers EPLB stats in prepare_dispatch,
+        # while NVLinkOneSided gathers EPLB stats in dispatch.
         elif self._is_using_nvlink_one_sided():
             if self.layer_load_balancer and is_last_call:
                 local_statistic_tensor_for_dispatch = (

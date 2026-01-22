@@ -144,17 +144,17 @@ class TRTLLMGenFusedMoE(MoE):
                         max_num_tokens,
                         hidden_size,
                         dtype,
-                        self.num_slots,
-                        enable_eplb=bool(self.layer_load_balancer),
+                        self.num_experts if self.layer_load_balancer else None,
                     )
 
                     self.moe_a2a = MoeAlltoAll(
                         mapping=self.mapping,
                         max_num_tokens=model_config.max_num_tokens,
                         top_k=self.routing_method.experts_per_token,
-                        num_experts=self.num_slots,
+                        num_slots=self.num_slots,
                         workspace_size_per_rank=workspace_size,
-                        enable_eplb=bool(self.layer_load_balancer))
+                        num_experts=self.num_experts
+                        if self.layer_load_balancer else None)
                 elif self.alltoall_method_type == AlltoallMethodType.DeepEP or self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
                     raise NotImplementedError(
                         "DeepEP and DeepEPLowLatency are not supported for TRTLLMGenFusedMoE yet"

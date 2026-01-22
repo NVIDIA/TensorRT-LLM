@@ -63,8 +63,8 @@ struct DispatchKernelPointers
     int* topk_send_indices; // dst index per k, -1 for duplicates
 
     // Optional: Statistics for EPLB
-    int const* eplb_local_stats;         // [num_experts]
-    int* eplb_gathered_stats[kMaxRanks]; // [ep_size, num_experts] per rank
+    int const* eplb_local_stats;         // [eplb_stats_num_experts]
+    int* eplb_gathered_stats[kMaxRanks]; // [ep_size, eplb_stats_num_experts] per rank
 };
 
 // Combine kernel pointers - non-const output in src_data_ptrs[0], const recv buffers
@@ -124,8 +124,9 @@ struct MoeA2ADispatchParams
 
     // Optional: Statistics for EPLB
     bool enable_eplb;                    // Whether to enable EPLB
-    int const* eplb_local_stats;         // [num_experts]
-    int* eplb_gathered_stats[kMaxRanks]; // [ep_size, num_experts] per rank
+    int eplb_stats_num_experts;          // Number of experts for EPLB stats
+    int const* eplb_local_stats;         // [eplb_stats_num_experts]
+    int* eplb_gathered_stats[kMaxRanks]; // [ep_size, eplb_stats_num_experts] per rank
 
     // CUDA stream
     cudaStream_t stream;

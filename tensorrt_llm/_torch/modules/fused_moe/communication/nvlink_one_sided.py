@@ -70,10 +70,12 @@ class NVLinkOneSided(Communication):
 
     @staticmethod
     def get_aux_data_size(
-        ep_size: int, max_num_tokens: int, num_experts: int, enable_eplb: bool
+        ep_size: int,
+        max_num_tokens: int,
+        eplb_stats_num_experts: Optional[int] = None,
     ) -> int:
         return torch.ops.trtllm.moe_a2a_get_aux_data_size(
-            ep_size, max_num_tokens, num_experts, enable_eplb
+            ep_size, max_num_tokens, eplb_stats_num_experts
         )
 
     @staticmethod
@@ -83,15 +85,14 @@ class NVLinkOneSided(Communication):
         max_num_tokens: int,
         hidden_size: int,
         dtype: torch.dtype,
-        num_experts: int,
-        enable_eplb: bool = False,
+        eplb_stats_num_experts: Optional[int] = None,
         extra_payload_bytes_per_token: int = 0,
     ) -> int:
         element_size = dtype.itemsize
 
         # Auxiliary data size
         workspace_size = NVLinkOneSided.get_aux_data_size(
-            ep_size, max_num_tokens, num_experts, enable_eplb
+            ep_size, max_num_tokens, eplb_stats_num_experts
         )
 
         # Dispatch needs workspace for [ep_size, max_tokens] tokens,
@@ -106,12 +107,11 @@ class NVLinkOneSided(Communication):
         # token_final_scales
         workspace_size += ep_size * max_num_tokens * top_k * 4
         workspace_size = pad_up(workspace_size, 128)
-        # extra payload bytes per token
-        workspace_size += ep_size * max_num_tokens * extra_payload_bytes_per_token
-        workspace_size = pad_up(workspace_size, 128)
-
         # Required workspace for combine [ep_size, max_tokens] tokens
         workspace_size += ep_size * max_num_tokens * hidden_size * element_size
+        workspace_size = pad_up(workspace_size, 128)
+        # extra payload bytes per token
+        workspace_size += ep_size * max_num_tokens * extra_payload_bytes_per_token
         workspace_size = pad_up(workspace_size, 128)
 
         return workspace_size
@@ -141,26 +141,28 @@ class NVLinkOneSided(Communication):
     def __init__(
         self,
         mapping: Mapping,
-        num_experts: int,
+        num_slots: int,
         top_k: int,
         max_num_tokens_per_rank: int,
         payload_in_workspace: bool = False,
         hidden_size: Optional[int] = None,
         dtype: Optional[torch.dtype] = None,
-        enable_eplb: bool = False,
+        num_experts: Optional[int] = None,
     ):
         """
         Initialize NVLinkOneSided with workspace allocation.
 
         Args:
             mapping: TensorRT-LLM Mapping object containing rank information
-            num_experts: Total number of experts
+            num_slots: Number of routing slots (token_selected_experts values are in [0, num_slots)).
+                Note: The terminology is mapped to `num_experts` in this class and the kernels.
             top_k: Number of experts per token
             max_num_tokens_per_rank: Maximum number of tokens per rank (for workspace allocation)
             payload_in_workspace: If True, final_hidden_states is already in workspace
             hidden_size: Hidden dimension size (optional, for auto workspace calculation)
             dtype: Data type (optional, for auto workspace calculation)
-            enable_eplb: Whether to support EPLB statistics gathering
+            num_experts: (Optional) Number of experts for EPLB stats (must be <= num_slots). DO NOT provide this parameter if EPLB is not enabled.
+                Note: The terminology is mapped to `eplb_stats_num_experts` in this class and the kernels.
         """
         super().__init__(mapping)
 
@@ -168,11 +170,20 @@ class NVLinkOneSided(Communication):
             raise RuntimeError("Currently NVLinkOneSided only supports pure EP for MoE.")
 
         # Store needed parameters
-        self.num_experts = num_experts
+        self.num_experts = num_slots
         self.top_k = top_k
         self.max_num_tokens_per_rank = max_num_tokens_per_rank
         self.payload_in_workspace = payload_in_workspace
-        self.enable_eplb = enable_eplb
+        if num_experts is not None:
+            assert num_experts > 0 and num_experts <= num_slots, (
+                "num_experts must be in (0, num_slots]"
+            )
+            tllm_logger.info(
+                "NVLinkOneSided AlltoAll: EPLB is enabled, with num_slots="
+                f"{num_slots} and num_experts={num_experts}"
+            )
+        self.enable_eplb = num_experts is not None
+        self.eplb_stats_num_experts = num_experts
 
         # Initialize constants from C++
         self._init_constants()
@@ -186,8 +197,7 @@ class NVLinkOneSided(Communication):
                 max_num_tokens_per_rank,
                 hidden_size,
                 dtype,
-                num_experts=self.num_experts,
-                enable_eplb=self.enable_eplb,
+                eplb_stats_num_experts=self.eplb_stats_num_experts,
             )
         workspace_mb_env = os.environ.get("TRTLLM_MOE_A2A_WORKSPACE_MB")
         if workspace_mb_env:
@@ -221,14 +231,14 @@ class NVLinkOneSided(Communication):
                 self.ep_rank,
                 self.ep_size,
                 self.max_num_tokens_per_rank,
-                self.num_experts,
-                self.enable_eplb,
+                self.eplb_stats_num_experts,
             )
             NVLinkOneSided._WORKSPACE = {
                 "workspace_size_per_rank": self.workspace_size_per_rank,
                 "max_num_tokens_per_rank": self.max_num_tokens_per_rank,
                 "ep_rank": self.ep_rank,
                 "ep_size": self.ep_size,
+                "eplb_stats_num_experts": self.eplb_stats_num_experts,
                 "mnnvl_mem": mnnvl_mem,
                 "workspace": workspace,
                 "metainfo": metainfo,
@@ -245,6 +255,9 @@ class NVLinkOneSided(Communication):
             )
             assert self._WORKSPACE["ep_size"] == self.ep_size, (
                 "reuse workspace with different ep_size"
+            )
+            assert self._WORKSPACE["eplb_stats_num_experts"] == self.eplb_stats_num_experts, (
+                "reuse workspace with different eplb_stats_num_experts"
             )
 
         self.mnnvl_mem = self._WORKSPACE["mnnvl_mem"]
@@ -325,8 +338,12 @@ class NVLinkOneSided(Communication):
             payloads.append(token_final_scales)
 
         eplb_local_stats = kwargs.get("eplb_local_stats")
-        if eplb_local_stats is not None and not self.enable_eplb:
-            raise ValueError("eplb_local_stats provided but enable_eplb is False")
+        if eplb_local_stats is not None:
+            assert self.enable_eplb, "eplb_local_stats provided but enable_eplb is False"
+            assert eplb_local_stats.dim() == 1, "eplb_local_stats must be a 1D tensor"
+            assert eplb_local_stats.size(0) == self.eplb_stats_num_experts, (
+                "eplb_local_stats size must match eplb_stats_num_experts"
+            )
 
         recv_buffers, combine_payload_offset, eplb_gathered_stats = (
             torch.ops.trtllm.moe_a2a_dispatch(
