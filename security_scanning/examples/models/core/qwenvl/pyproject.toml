@@ -15,7 +15,7 @@ dependencies = [
     "tiktoken (>=0.12.0,<0.13.0)",
     "einops (>=0.8.1,<0.9.0)",
     "matplotlib (>=3.10.8,<4.0.0)",
-    "torchvision (>=0.24.1,<0.25.0)"
+    "torchvision (>=0.25.0,<0.26.0)"
 ]
 
 

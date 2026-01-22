@@ -319,9 +319,6 @@ class Attention(nn.Module):
         self.fused_qkv_lora = LoraLayer([LoraModuleType.ATTENTION_QKV],
                                         [self.q_size + 2 * self.kv_size])
 
-        self.o_lora = LoraLayer([LoraModuleType.ATTENTION_DENSE],
-                                [self.hidden_size])
-
         # Whether to fuse RoPE into the attention OP.
         # If true, RoPE will be applied in self.attn.forward.
         # If false, RoPE will be applied in self.apply_rope.

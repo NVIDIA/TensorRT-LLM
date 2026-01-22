@@ -889,7 +889,6 @@ def _register_fake():
         host_context_lengths: torch.Tensor,
         num_contexts: int,
         kv_cache_block_offsets: Optional[torch.Tensor],
-        host_kv_cache_block_offsets: Optional[torch.Tensor],
         host_kv_cache_pool_pointers: Optional[torch.Tensor],
         host_kv_cache_pool_mapping: Optional[torch.Tensor],
         kv_scale_orig_quant: Optional[torch.Tensor],
@@ -917,3 +916,23 @@ def _register_fake():
         # This is a fake implementation for shape inference
         # The actual operation modifies fused_q and q_pe in-place
         return None
+
+    @torch.library.register_fake("trtllm::fused_add_rms_norm_quant")
+    def _(
+        input: torch.Tensor,
+        residual: torch.Tensor,
+        gamma: torch.Tensor,
+        sf_scale: Optional[torch.Tensor],
+        use_rms_norm: bool = True,
+        eps: float = 1e-5,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        m, n = input.shape
+        # normed_output_fp4: [M, N/8] as int32 (8 FP4 values packed per int32)
+        normed_output_fp4 = input.new_empty((m, n // 8), dtype=torch.int32)
+        # output: [M, N] pre-norm output, same dtype as input
+        output = input.new_empty((m, n), dtype=input.dtype)
+        # sf_out: scale factors, swizzled layout
+        sf_vec_size = 16
+        sf_size = ((m + 127) // 128) * 128 * ((n // sf_vec_size + 3) // 4) * 4
+        sf_out = input.new_empty((sf_size, ), dtype=torch.uint8)
+        return normed_output_fp4, output, sf_out

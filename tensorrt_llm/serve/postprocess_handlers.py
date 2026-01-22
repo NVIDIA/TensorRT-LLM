@@ -26,8 +26,8 @@ from .openai_protocol import (ChatCompletionLogProbs,
                               ChatCompletionResponseStreamChoice,
                               ChatCompletionStreamResponse,
                               ChatCompletionToolsParam, ChatMessage,
-                              CompletionRequest, CompletionResponse,
-                              CompletionResponseChoice,
+                              CompletionLogProbs, CompletionRequest,
+                              CompletionResponse, CompletionResponseChoice,
                               CompletionResponseStreamChoice,
                               CompletionStreamResponse, DeltaFunctionCall,
                               DeltaMessage, DeltaToolCall, FunctionCall,
@@ -394,6 +394,7 @@ class CompletionPostprocArgs(PostprocArgs):
     prompt_idx: int = 0
     detokenize: bool = True
     prompt: Optional[str] = None
+    return_logprobs: bool = False
     stream_options: Optional[StreamOptions] = None
 
     @classmethod
@@ -404,7 +405,41 @@ class CompletionPostprocArgs(PostprocArgs):
             num_choices=request.n if request.n else 1,
             stream_options=request.stream_options,
             detokenize=request.detokenize,
+            return_logprobs=bool(request.logprobs),
         )
+
+
+def create_completion_logprobs(token_ids: List[int],
+                               tokenizer: TransformersTokenizer,
+                               logprobs: List[float] | TokenLogprobs,
+                               initial_offset: int = 0) -> CompletionLogProbs:
+    assert len(token_ids) == len(logprobs), \
+            "token_ids and logprobs have different lengths"
+    text_offset = []
+    token_logprobs = []
+    top_logprobs_list = []
+    tokens = []
+    for token_id, logprob in zip(token_ids, logprobs):
+        if isinstance(logprob, dict):
+            token_logprobs.append(max(logprob[token_id].logprob, -9999.0))
+            top_logprobs_list.append({
+                tokenizer.decode(tid):
+                max(lp.logprob, -9999.0)
+                for tid, lp in logprob.items()
+            })
+        else:
+            token_logprobs.append(max(logprob, -9999.0))
+
+        token = tokenizer.decode(token_id)
+        if len(text_offset) == 0:
+            text_offset.append(initial_offset)
+        else:
+            text_offset.append(text_offset[-1] + len(token))
+        tokens.append(token)
+    return CompletionLogProbs(text_offset=text_offset,
+                              token_logprobs=token_logprobs,
+                              tokens=tokens,
+                              top_logprobs=top_logprobs_list)
 
 
 @nvtx_range_debug("completion_stream_post_processor")
@@ -433,6 +468,12 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase,
                                                 'avg_decoded_tokens_per_iter',
                                                 None),
         )
+        if args.return_logprobs:
+            logprobs = output.logprobs_diff
+            token_ids = output.token_ids_diff
+            choice.logprobs = create_completion_logprobs(
+                token_ids, args.tokenizer, logprobs, output._last_text_len)
+
         chunk = CompletionStreamResponse(model=args.model, choices=[choice])
         if include_continuous_usage:
             chunk.usage = UsageInfo(prompt_tokens=prompt_tokens,
@@ -488,6 +529,11 @@ def completion_response_post_processor(
                                                 'avg_decoded_tokens_per_iter',
                                                 None),
         )
+        if args.return_logprobs:
+            logprobs = output.logprobs
+            token_ids = output.token_ids
+            choice.logprobs = create_completion_logprobs(
+                token_ids, args.tokenizer, logprobs)
 
         completion_tokens += output.length
         choices.append(choice)

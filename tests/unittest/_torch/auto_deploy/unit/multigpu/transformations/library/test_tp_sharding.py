@@ -572,7 +572,9 @@ def _run_pattern_detection_job(
                             fused_weight_dims=None,
                         )
                     )
-                if len(node.args) > 1 and "norm_weight" in node.args[0].name:
+                if len(node.args) > 1 and (
+                    "norm_weight" in node.args[0].name or "a_log" in node.args[0].name
+                ):
                     expected_transformations.append(
                         WeightShardingInfo(
                             target_node=node.name,
