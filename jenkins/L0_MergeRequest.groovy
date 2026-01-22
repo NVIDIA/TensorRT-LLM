@@ -156,12 +156,38 @@ def ACTION_INFO = "action_info"
 def IMAGE_KEY_TO_TAG = "image_key_to_tag"
 @Field
 def TARGET_BRANCH = "target_branch"
+@Field
+def DOWNSTREAM_JOB_DURATION = "downstream_job_duration"
+
+// ========================================
+// GitHub Tag Update Configuration
+// ========================================
+// Jobs whose failures should NOT prevent GitHub tag updates
+@Field
+def IGNORED_JOBS_FOR_TAG = ["BuildDockerImages"]
+
+// Required pre-merge jobs and their minimum execution durations (minutes, excludes queue time)
+// For tag update to proceed:
+// 1. ALL jobs listed here MUST have been executed
+// 2. Each job MUST have run for at least the specified duration
+// If any job is missing or ran too quickly (startup failure), tag update is blocked
+@Field
+def MIN_JOB_DURATIONS = [
+    "Build-x86_64": 10,
+    "Build-SBSA": 10,
+    "Test-x86_64-Single-GPU": 50,
+    "Test-x86_64-Multi-GPU": 50,
+    "Test-SBSA-Single-GPU": 40,
+    "Test-SBSA-Multi-GPU": 40,
+]
+
 def globalVars = [
     (GITHUB_PR_API_URL): gitlabParamsFromBot.get('github_pr_api_url', null),
     (CACHED_CHANGED_FILE_LIST): null,
     (ACTION_INFO): gitlabParamsFromBot.get('action_info', null),
     (IMAGE_KEY_TO_TAG): [:],
     (TARGET_BRANCH): gitlabParamsFromBot.get('target_branch', null),
+    (DOWNSTREAM_JOB_DURATION): [:],
 ]
 
 // If not running all test stages in the L0 pre-merge, we will not update the GitLab status at the end.
@@ -1006,7 +1032,7 @@ def getCommonParameters()
     ]
 }
 
-def triggerJob(jobName, parameters, jenkinsUrl = "", credentials = "")
+def triggerJob(jobName, parameters, globalVars, jenkinsUrl = "", credentials = "")
 {
     if (jenkinsUrl == "" && env.localJobCredentials) {
         jenkinsUrl = env.JENKINS_URL
@@ -1023,6 +1049,7 @@ def triggerJob(jobName, parameters, jenkinsUrl = "", credentials = "")
             abortTriggeredJob: true,
         )
         status = handle.getBuildResult().toString()
+        globalVars[DOWNSTREAM_JOB_DURATION][jobName] = handle.getBuildDuration() / 1000 / 60 // Convert to minutes
     } else {
         def handle = build(
             job: jobName,
@@ -1031,6 +1058,7 @@ def triggerJob(jobName, parameters, jenkinsUrl = "", credentials = "")
         )
         echo "Triggered job: ${handle.absoluteUrl}"
         status = handle.result
+        globalVars[DOWNSTREAM_JOB_DURATION][jobName] = handle.duration / 1000 / 60 // Convert to minutes
     }
     return status
 }
@@ -1067,7 +1095,7 @@ def launchJob(jobName, reuseBuild, enableFailFast, globalVars, platform="x86_64"
 
     echo "Trigger ${jobName} job, params: ${parameters}"
 
-    def status = triggerJob(jobName, parameters)
+    def status = triggerJob(jobName, parameters, globalVars)
     if (status != "SUCCESS") {
         error "Downstream job did not succeed"
     }
@@ -1335,70 +1363,131 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
 }
 
 /**
- * Get the list of failed stages in the current pipeline
- * @return List of failed stages, or null if retrieval fails
+ * Retrieve failed stages from the current build using the bot's failures.py script
  */
 def getFailedStages() {
-    // TEST: Print script info
-    echo "[TEST] Calling ${BOT_ROOT}/bin/failures.py for build ${env.BUILD_NUMBER}"
     def status = sh(
-        script: """rm -f failed_stages.json failed_stages_error.txt && \
-        python3 ${BOT_ROOT}/bin/failures.py \
+        script: """python3 ${BOT_ROOT}/bin/failures.py \
             --jenkins-url ${JENKINS_URL} \
             --build-path ${env.JOB_NAME} \
             --build-number ${env.BUILD_NUMBER} \
-            --json \
-            > failed_stages.json 2>failed_stages_error.txt""",
-        returnStatus: true,
-        label: "Checking failed stages in build #${env.BUILD_NUMBER}"
+            --json > failed_stages.json 2>&1""",
+        returnStatus: true
     )
 
-    // TEST: Print script result
-    echo "[TEST] failures.py exit status: ${status}"
     if (status != 0) {
-        echo "WARNING: Failed to get failed stages. Check failed_stages_error.txt for details."
+        echo "WARNING: Failed to retrieve failed stages (exit code: ${status})"
         return null
     }
 
-    def failedResult = readJSON file: "failed_stages.json", returnPojo: true
-    def failedStageList = failedResult["failed_stage_list"] ?: []
-
-    echo "Found ${failedStageList.size()} failed stages"
-    // TEST: Print stage list
-    echo "[TEST] Failed stages: ${failedStageList.join(', ')}"
+    def failedStageList = readJSON(file: "failed_stages.json", returnPojo: true)["failed_stage_list"] ?: []
+    echo "Found ${failedStageList.size()} failed stage(s): ${failedStageList.join(', ')}"
     return failedStageList
 }
 
 /**
- * Check if all failed stages are post-merge stages
- * @param failedStageList List of failed stage names
- * @return true if all failures are post-merge stages (or no failures), false otherwise
+ * Validate that all required pre-merge jobs were executed with sufficient duration
+ *
+ * This ensures:
+ * 1. All jobs in MIN_JOB_DURATIONS were actually executed
+ * 2. Each job ran for at least the minimum required time
+ *
+ * If any required job is missing or ran too quickly (startup failure), tag update is blocked.
+ * This validation is INDEPENDENT of which stages failed - it's a completeness check.
+ *
+ * Note: Duration = actual execution time (queue time excluded)
+ */
+def validateDownstreamJobDurations(globalVars) {
+    echo "=== Validating Required Job Execution (excludes queue time) ==="
+
+    def downstreamDurations = globalVars.get(DOWNSTREAM_JOB_DURATION, [:])
+    if (downstreamDurations.isEmpty()) {
+        echo "❌ No downstream job data available"
+        return false
+    }
+
+    echo "Checking ${MIN_JOB_DURATIONS.size()} required job(s)..."
+
+    def issues = []
+    MIN_JOB_DURATIONS.each { requiredJobKey, minDuration ->
+        // Find matching job in downstream durations
+        def matchedEntry = downstreamDurations.find { actualJobName, duration ->
+            actualJobName.contains(requiredJobKey) || requiredJobKey.contains(actualJobName)
+        }
+
+        if (!matchedEntry) {
+            issues.add("${requiredJobKey}: Not executed (missing from downstream jobs)")
+            echo "❌ ${requiredJobKey}: NOT FOUND - job was not executed"
+            return
+        }
+
+        def actualJobName = matchedEntry.key
+        def actualDuration = matchedEntry.value
+
+        if (actualDuration < minDuration) {
+            issues.add("${requiredJobKey}: ${actualDuration}min < ${minDuration}min (likely startup failure)")
+            echo "❌ ${requiredJobKey}: Only ${actualDuration}min (expected ≥${minDuration}min)"
+        } else {
+            echo "✓ ${requiredJobKey}: ${actualDuration}min"
+        }
+    }
+
+    if (!issues.isEmpty()) {
+        echo ""
+        echo "❌ Validation FAILED - ${issues.size()} issue(s) detected:"
+        issues.each { echo "  - ${it}" }
+        echo ""
+        echo "Cannot update tag: Required jobs missing or failed too quickly"
+        return false
+    }
+
+    echo "✓ All ${MIN_JOB_DURATIONS.size()} required jobs executed successfully with sufficient duration"
+    return true
+}
+
+/**
+ * Check if all relevant failures are post-merge stages
+ *
+ * Returns true if:
+ * - No failed stages exist
+ * - All failures are from ignored jobs (e.g., BuildDockerImages)
+ * - All relevant failures are post-merge tests
  */
 def areAllFailuresPostMerge(failedStageList) {
     if (!failedStageList) {
-        echo "No failed stages found. All tests passed."
+        echo "✓ No failed stages"
         return true
     }
 
-    def premergeFailedStages = failedStageList.findAll {
+    // Filter out ignored jobs from the failed stage list
+    def relevantFailedStages = failedStageList.findAll { stageName ->
+        !IGNORED_JOBS_FOR_TAG.any { ignored -> stageName.contains(ignored) }
+    }
+
+    if (relevantFailedStages.isEmpty()) {
+        echo "✓ All failures are from ignored jobs"
+        return true
+    }
+
+    // Separate pre-merge and post-merge failures
+    def premergeFailures = relevantFailedStages.findAll {
         !it.contains("Post-Merge") && !it.contains("post-merge")
     }
+    def postmergeFailures = relevantFailedStages.size() - premergeFailures.size()
 
-    // TEST: Print analysis result
-    echo "[TEST] Total: ${failedStageList.size()}, Post-merge: ${failedStageList.size() - premergeFailedStages.size()}, Pre-merge: ${premergeFailedStages.size()}"
+    echo "Relevant failures: ${relevantFailedStages.size()} total (${premergeFailures.size()} pre-merge, ${postmergeFailures} post-merge)"
 
-    if (premergeFailedStages.isEmpty()) {
-        echo "All ${failedStageList.size()} failed stages are post-merge: ${failedStageList.join(', ')}"
+    if (premergeFailures.isEmpty()) {
+        echo "✓ Only post-merge failures: ${relevantFailedStages.join(', ')}"
         return true
     }
 
-    echo "Found ${premergeFailedStages.size()} pre-merge failed stages: ${premergeFailedStages.join(', ')}"
+    echo "❌ Found pre-merge failures: ${premergeFailures.join(', ')}"
     return false
 }
 
 /**
- * Create or update GitHub tag for the latest stable commit
- * @return true if tag is successfully created, false otherwise
+ * Create/update GitHub tag 'latest-ci-stable-commit-<branch>' for the current commit
  */
 def createGithubTag(globalVars) {
     def commitSha = env.gitlabCommit
@@ -1406,12 +1495,10 @@ def createGithubTag(globalVars) {
     def targetBranch = env.gitlabTargetBranch ?: (globalVars[TARGET_BRANCH] ?: "main")
     def tagName = "latest-ci-stable-commit-${targetBranch}"
 
-    echo "Creating tag '${tagName}' at commit ${commitSha} for PR #${prNumber}"
-    // TEST: Print tag parameters
-    echo "[TEST] commitSha=${commitSha}, prNumber=${prNumber}, targetBranch=${targetBranch}, tagName=${tagName}"
+    echo "Creating tag '${tagName}' for PR #${prNumber} at ${commitSha}"
 
-    // TEST MODE: DRY RUN - Comment out next line to enable real push
-    echo "[TEST] DRY RUN MODE: Would create tag but skipping actual push"; return true
+    // DRY RUN MODE: Uncomment next line to skip actual push
+    // echo "[DRY RUN] Would create tag but skipping actual push"; return true
 
     withCredentials([
         usernamePassword(
@@ -1454,44 +1541,42 @@ def createGithubTag(globalVars) {
  * @return true if tag is successfully updated, false otherwise
  */
 def updateGithubTagCommit(pipeline, globalVars) {
-    // TEST: Print check result
-    echo "[TEST] Checking GITHUB_PR_API_URL: ${globalVars[GITHUB_PR_API_URL]}"
     if (!globalVars[GITHUB_PR_API_URL]) {
-        echo "Not a GitHub PR. Skip updating GitHub tag."
+        echo "Not a GitHub PR - skipping tag update"
         return false
     }
 
     def buildResult = currentBuild.result ?: 'SUCCESS'
-    echo "Build result: ${buildResult}"
+    echo "=== GitHub Tag Update Check (${buildResult}) ==="
 
-    // Fast path: If pipeline is SUCCESS, update tag directly
+    // Fast path: SUCCESS -> update tag directly
     if (buildResult == 'SUCCESS') {
-        echo "[TEST] Fast path: Pipeline SUCCESS"
-        echo "Pipeline succeeded. Updating GitHub tag..."
+        echo "✓ Pipeline succeeded - updating tag"
         return createGithubTag(globalVars)
     }
 
-    // Slow path: Check if only post-merge stages failed
-    echo "[TEST] Slow path: Checking failed stages"
-    echo "Pipeline not successful. Analyzing failed stages..."
-    // TEST: Print BOT repo info
-    echo "[TEST] BOT_REPO=${BOT_REPO}, BOT_REVISION=${BOT_REVISION}, BOT_ROOT=${BOT_ROOT}"
+    // Slow path: Analyze failures
+    echo "Analyzing failures to determine if only post-merge tests failed..."
     trtllm_utils.checkoutSource(BOT_REPO, BOT_REVISION, BOT_ROOT)
 
+    // Step 1: Validate that all required jobs were executed with sufficient duration
+    if (!validateDownstreamJobDurations(globalVars)) {
+        return false
+    }
+
+    // Step 2: Check which stages failed
     def failedStageList = getFailedStages()
-    // TEST: Print failed stages
-    echo "[TEST] Failed stages count: ${failedStageList ? failedStageList.size() : 0}"
-    if (!failedStageList) {
-        echo "Failed to retrieve failed stages. Skip updating tag."
+    if (!failedStageList || failedStageList.isEmpty()) {
+        echo "❌ Cannot retrieve failure information - skipping tag update"
         return false
     }
 
+    // Step 3: Check if only post-merge tests failed
     if (!areAllFailuresPostMerge(failedStageList)) {
-        echo "Pre-merge tests failed. Skip updating GitHub tag."
         return false
     }
 
-    echo "Only post-merge stages failed. Updating GitHub tag..."
+    echo "✓ Only post-merge failures detected - updating tag"
     return createGithubTag(globalVars)
 }
 
