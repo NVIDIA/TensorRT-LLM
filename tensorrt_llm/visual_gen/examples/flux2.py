@@ -139,6 +139,7 @@ def main():
         height=1024,
         width=1024,
         guidance_scale=4,
+        attn_type="cudnn-attn",
     )
 
     args = parser.parse_args()
