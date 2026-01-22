@@ -144,8 +144,13 @@ EOF_TIMEOUT_XML
                 }
             }
             // Download normal test results
-            def resultsFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/results.xml"
-            downloadResultSucceed = Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -P ${remote.port} -r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${resultsFilePath} ${stageName}/", returnStatus: true, numRetries: 3) == 0
+            if (fileExists("${stageName}/results.xml")) {
+                echo "The results.xml file exists, skip the download step."
+                downloadResultSucceed = true
+            } else {
+                def resultsFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/results.xml"
+                downloadResultSucceed = Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -P ${remote.port} -r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${resultsFilePath} ${stageName}/", returnStatus: true, numRetries: 3) == 0
+            }
 
             // Download perf test results
             def perfResultsBasePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}"
@@ -962,6 +967,14 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             def scriptTrackPathLocal = Utils.createTempLocation(pipeline, "./slurm_track.sh")
             def scriptTrackPathNode = "${jobWorkspace}/${jobUID}-slurm_track.sh"
             def coverageConfigFile = "${jobWorkspace}/.coveragerc"
+            def scriptLaunchPrefix = ""
+            def testListPathLocal = ""
+            def srunArgs = []
+            def pytestCommandList = []
+            def scriptLaunchPrefixPathLocal = Utils.createTempLocation(pipeline, "./slurm_launch_prefix.sh")
+            def scriptLaunchSrunArgsPathLocal = Utils.createTempLocation(pipeline, "./slurm_srun_args.txt")
+            def scriptLaunchDraftPathLocal = "${llmSrcLocal}/jenkins/scripts/perf/disaggregated/slurm_launch_draft.sh"
+            def scriptSubmitLocalPath = "${llmSrcLocal}/jenkins/scripts/perf/disaggregated/submit.py"
 
             stage("Initialize Test") {
                 println("Selected Cluster: ${cluster.name}")
@@ -1004,7 +1017,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 // line is "Mako options:", maybe we can make it more generic, which
                 // if the line cannot be split by "=", just ignore that line.
                 def makoOptsJson = transformMakoArgsToJson(["Mako options:"] + makoArgs)
-                def testListPathLocal = renderTestDB(testList, llmSrcLocal, stageName, makoOptsJson)
+                testListPathLocal = renderTestDB(testList, llmSrcLocal, stageName, makoOptsJson)
                 Utils.copyFileToRemoteHost(
                     pipeline,
                     remote,
@@ -1051,7 +1064,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     pytestUtil = "$llmSrcNode/tensorrt_llm/llmapi/trtllm-llmapi-launch"
                 }
 
-                def pytestCommand = getPytestBaseCommandLine(
+                pytestCommandList = getPytestBaseCommandLine(
                     llmSrcNode,
                     stageName,
                     waivesListPathNode,
@@ -1066,7 +1079,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                       "--splits $splits",
                       "--group $splitId"
                     ]
-                ).join(" ")
+                )
+                def pytestCommand = pytestCommandList.join(" ")
 
                 // Generate Job Launch Script
                 def container = LLM_DOCKER_IMAGE.replace("urm.nvidia.com/", "urm.nvidia.com#")
@@ -1157,7 +1171,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     "export ${varName}=\"${escapedValue}\""
                 }.join('\n')
 
-                def scriptLaunchPrefix = """#!/bin/bash
+                scriptLaunchPrefix = """#!/bin/bash
                     #SBATCH ${exemptionComment}
                     #SBATCH --output=${slurmJobLogPath}
                     ${taskArgs.collect { "#SBATCH $it" }.join('\n')}
@@ -1193,11 +1207,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     if(nodeCount > 1) {
                         srunArgs.add("--mpi=pmix")
                     }
-
-                    def scriptLaunchPrefixPathLocal = Utils.createTempLocation(pipeline, "./slurm_launch_prefix.sh")
-                    def scriptLaunchSrunArgsPathLocal = Utils.createTempLocation(pipeline, "./slurm_srun_args.txt")
-                    def scriptLaunchDraftPathLocal = "${llmSrcLocal}/jenkins/scripts/perf/disaggregated/slurm_launch_draft.sh"
-                    def scriptSubmitLocalPath = "${llmSrcLocal}/jenkins/scripts/perf/disaggregated/submit.py"
 
                     pipeline.writeFile(file: scriptLaunchPrefixPathLocal, text: scriptLaunchPrefix)
                     pipeline.writeFile(file: scriptLaunchSrunArgsPathLocal, text: srunArgs.join(" "))
@@ -1289,26 +1298,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
             stage("[${stageName}] Run Pytest") {
                 // Submit the Slurm job
-                Utils.exec(
-                    pipeline,
-                    timeout: false,
-                    script: Utils.sshUserCmd(
-                        remote,
-                        scriptSubmitPathNode
-                    ),
-                    numRetries: 3
-                )
-
-                def slurmJobId = Utils.exec(
-                    pipeline,
-                    script: Utils.sshUserCmd(
-                        remote,
-                        "\"cat ${jobWorkspace}/slurm_job_id.txt\""
-                    ),
-                    returnStdout: true,
-                    numRetries: 3
-                ).trim()
-                Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobId}")
+                def slurmJobId = submitSlurmJobAndGetId(pipeline, remote, scriptSubmitPathNode, jobWorkspace)
 
                 def scriptTrack = """#!/bin/bash
                     set -xEeuo pipefail
@@ -1378,16 +1368,49 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     true
                 )
 
-                // Track the Slurm job
-                Utils.exec(
-                    pipeline,
-                    timeout: false,
-                    script: Utils.sshUserCmd(
+                try {
+                    // Track the Slurm job
+                    Utils.exec(
+                        pipeline,
+                        timeout: false,
+                        script: Utils.sshUserCmd(
+                            remote,
+                            scriptTrackPathNode
+                        ),
+                        numRetries: 3
+                    )
+                } catch (InterruptedException e) {
+                    throw e
+                } catch (Exception e) {
+                    def isRerunFailed = rerunFailedTestsForSlurm(
+                        pipeline,
+                        stageName,
+                        jobWorkspace,
                         remote,
-                        scriptTrackPathNode
-                    ),
-                    numRetries: 3
-                )
+                        llmSrcLocal,
+                        pytestCommandList,
+                        scriptLaunchPathLocal,
+                        scriptLaunchPathNode,
+                        scriptTrackPathLocal,
+                        scriptTrackPathNode,
+                        scriptSubmitLocalPath,
+                        scriptSubmitPathNode,
+                        scriptLaunchPrefixPathLocal,
+                        scriptLaunchSrunArgsPathLocal,
+                        scriptLaunchDraftPathLocal,
+                        scriptInstallPathNode,
+                        scriptRunPathNode,
+                        testListPathLocal,
+                        scriptTrack,
+                        scriptLaunchPrefix,
+                        disaggMode,
+                        srunArgs
+                    )
+                    if (isRerunFailed) {
+                        echo "Some tests still failed after rerun attempts, please check the test report."
+                        throw new Exception("Some tests still failed after rerun attempts, please check the test report.")
+                    }
+                }
             }
             echo "Finished test stage execution."
         }
@@ -1404,6 +1427,32 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             }
         }
     }
+}
+
+def submitSlurmJobAndGetId(pipeline, remote, scriptSubmitPathNode, jobWorkspace) {
+    // Submit the Slurm job
+    Utils.exec(
+        pipeline,
+        timeout: false,
+        script: Utils.sshUserCmd(
+            remote,
+            scriptSubmitPathNode
+        ),
+        numRetries: 3
+    )
+
+    def slurmJobId = Utils.exec(
+        pipeline,
+        script: Utils.sshUserCmd(
+            remote,
+            "\"cat ${jobWorkspace}/slurm_job_id.txt\""
+        ),
+        returnStdout: true,
+        numRetries: 3
+    ).trim()
+    Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobId}")
+
+    return slurmJobId
 }
 
 def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, runWithSbatch=false, skipInstallWheel=false, cpver="cp312")
@@ -2317,42 +2366,9 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
     sh "mkdir -p ${rerunDir}"
 
     // Generate rerun test lists
-    def failSignaturesList = trtllm_utils.getFailSignaturesList().join(",")
-    sh """
-        python3 ${llmSrc}/jenkins/scripts/test_rerun.py \
-        generate_rerun_tests_list \
-        --output-dir=${rerunDir}/ \
-        --input-file=${WORKSPACE}/${stageName}/${resultFileName} \
-        --fail-signatures='${failSignaturesList}'
-    """
-
-    // If there are some failed tests that cannot be rerun (e.g. test duration > 10 min and no known failure signatures),
-    // fail the stage immediately without attempting any reruns
-    def rerunTestList = "${rerunDir}/rerun_0.txt"
-    if (fileExists(rerunTestList)) {
-        sh "cat ${rerunTestList}"
-        echo "There are some failed tests that cannot be rerun, skip the rerun step."
-        return true
-    }
-
-    // If the stage has more than 5 failed tests, skip the rerun step
-    def validLineCount = 0
-    for (times in [1, 2]) {
-        def currentRerunTestList = "${rerunDir}/rerun_${times}.txt"
-        if (fileExists(currentRerunTestList)) {
-            count = sh(
-                script: "grep -v '^[[:space:]]*\$' ${currentRerunTestList} | wc -l",
-                returnStdout: true
-            ).trim().toInteger()
-            echo "Found ${count} ${testType} tests to rerun ${times} time(s)"
-            validLineCount += count
-        }
-    }
-    if (validLineCount > 5) {
-        echo "There are more than 5 failed ${testType} tests, skip the rerun step."
-        return true
-    } else if (validLineCount == 0) {
-        echo "No failed ${testType} tests need to be rerun, skip the rerun step."
+    def exitCode = generateRerunTestList(llmSrc, rerunDir, "${WORKSPACE}/${stageName}/${resultFileName}", testType)
+    if (exitCode != 0) {
+        echo "Failed to generate rerun test lists."
         return true
     }
 
@@ -2367,21 +2383,11 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
         sh "cat ${currentRerunTestList}"
         def xmlFile = "${rerunDir}/rerun_results_${times}.xml"
         // change the testCmdLine for rerun
-        def noNeedLine = ["--splitting-algorithm", "--splits", "--group", "--cov"]
-        def needToChangeLine = ["--test-list", "--csv", "--periodic-junit-xmlpath"]
-        def newTestCmdLine = testCmdLine.findAll { cmd ->
-            !noNeedLine.any { line -> cmd.contains(line) } && !needToChangeLine.any { line -> cmd.contains(line) }
-        }
-        newTestCmdLine += [
-            "--test-list=${currentRerunTestList}",
-            "--csv=${rerunDir}/rerun_report_${times}.csv",
-            "--periodic-junit-xmlpath ${xmlFile}",
-            "--reruns ${times - 1}"
-        ]
+        def newTestCmdLine = updatePytestCommandForRerun(testCmdLine, currentRerunTestList, rerunDir, xmlFile, times)
         try {
             sh """
                 cd ${llmSrc}/tests/integration/defs && \
-                ${newTestCmdLine.join(" ")}
+                ${newTestCmdLine}
             """
         } catch(InterruptedException e) {
             throw e
@@ -2397,6 +2403,234 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
 
     echo "isRerunFailed for ${testType}: ${isRerunFailed}"
     return isRerunFailed
+}
+
+def rerunFailedTestsForSlurm(
+    pipeline,
+    stageName,
+    jobWorkspace,
+    remote,
+    llmSrcLocal,
+    pytestCommandList,
+    scriptLaunchPathLocal,
+    scriptLaunchPathNode,
+    scriptTrackPathLocal,
+    scriptTrackPathNode,
+    scriptSubmitLocalPath,
+    scriptSubmitPathNode,
+    scriptLaunchPrefixPathLocal,
+    scriptLaunchSrunArgsPathLocal,
+    scriptLaunchDraftPathLocal,
+    scriptInstallPathNode,
+    scriptRunPathNode,
+    testListPathLocal,
+    scriptTrack,
+    scriptLaunchPrefix,
+    disaggMode,
+    srunArgs,
+    testType="regular"
+) {
+    // Download results.xml file from remote node
+    withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+        def resultFileRemotePath = "${jobWorkspace}/results.xml"
+        def downloadResultSucceed = Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -P ${remote.port} -r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${resultFileRemotePath} ${stageName}/", returnStatus: true, numRetries: 3) == 0
+        if (!downloadResultSucceed) {
+            echo "There is no results.xml file, skip the rerun step"
+            return true
+        }
+    }
+
+    def rerunDir = "${stageName}/rerun"
+    sh "mkdir -p ${rerunDir}"
+
+    // Generate rerun test lists
+    def exitCode = generateRerunTestList(llmSrcLocal, rerunDir, "${stageName}/results.xml", testType)
+    if (exitCode != 0) {
+        echo "Failed to generate rerun test lists."
+        return true
+    }
+
+    // Rerun tests
+    def isRerunFailed = false
+    for (times in [1, 2]) {
+        def currentRerunTestList = "${rerunDir}/rerun_${times}.txt"
+        if (!fileExists(currentRerunTestList)) {
+            echo "No failed tests need to be rerun ${times} time(s)"
+            continue
+        }
+        sh "cat ${currentRerunTestList}"
+
+        def rerunTestListPathNode = "${jobWorkspace}/rerun_${times}.txt"
+        def xmlFilePathNode = "${jobWorkspace}/rerun_results_${times}.xml"
+        def newPytestCommand = updatePytestCommandForRerun(pytestCommandList, rerunTestListPathNode, jobWorkspace, xmlFilePathNode, times)
+
+        // Match and replace the entire pytestCommand export line
+        scriptLaunchPrefix = scriptLaunchPrefix.replaceFirst(/export pytestCommand=.*/, """
+        export pytestCommand="$newPytestCommand"
+        """.replaceAll("(?m)^\\s*", ""))
+        echo "ScriptLaunchPrefix: ${scriptLaunchPrefix}"
+
+        if (disaggMode) {
+            pipeline.writeFile(file: scriptLaunchPrefixPathLocal, text: scriptLaunchPrefix)
+
+            // Output is the corresponding scriptLaunchPathLocal script under the disaggMode
+            sh """
+                python3 ${scriptSubmitLocalPath} \\
+                --run-ci \\
+                --llm-src ${llmSrcLocal} \\
+                --test-list ${testListPathLocal} \\
+                --draft-launch-sh ${scriptLaunchDraftPathLocal} \\
+                --launch-sh ${scriptLaunchPathLocal} \\
+                --run-sh ${scriptRunPathNode} \\
+                --install-sh ${scriptInstallPathNode} \\
+                --script-prefix ${scriptLaunchPrefixPathLocal} \\
+                --srun-args ${scriptLaunchSrunArgsPathLocal}
+            """
+        } else {
+            def scriptContent = """
+                ${scriptLaunchPrefix}
+                srun --kill-on-bad-exit=1 ${srunArgs.join(" ")} ${scriptRunPathNode}
+            """.replaceAll("(?m)^\\s*", "")
+            pipeline.writeFile(file: scriptLaunchPathLocal, text: scriptContent)
+        }
+
+        Utils.exec(pipeline, script: "echo \"Script for Slurm sbatch job to submit: \" && cat ${scriptLaunchPathLocal}")
+        Utils.copyFileToRemoteHost(
+            pipeline,
+            remote,
+            scriptLaunchPathLocal,
+            scriptLaunchPathNode,
+            true
+        )
+
+        // Submit the Slurm job
+        def slurmJobId = submitSlurmJobAndGetId(pipeline, remote, scriptSubmitPathNode, jobWorkspace)
+
+        // Copy rerun test list to job workspace
+        Utils.copyFileToRemoteHost(
+            pipeline,
+            remote,
+            currentRerunTestList,
+            rerunTestListPathNode
+        )
+
+        // Update the scriptTrack to track the new Slurm job
+        scriptTrack = scriptTrack.replaceFirst(/jobId=.*/, """
+        jobId="$slurmJobId"
+        """.replaceAll("(?m)^\\s*", ""))
+        echo "ScriptTrack: ${scriptTrack}"
+
+        pipeline.writeFile(file: scriptTrackPathLocal, text: scriptTrack)
+        Utils.exec(pipeline, script: "echo \"Script to track Slurm job and pull the log: \" && cat ${scriptTrackPathLocal}")
+        Utils.copyFileToRemoteHost(
+            pipeline,
+            remote,
+            scriptTrackPathLocal,
+            scriptTrackPathNode,
+            true
+        )
+
+        def error = null
+        try {
+            // Track the Slurm job
+            Utils.exec(
+                pipeline,
+                timeout: false,
+                script: Utils.sshUserCmd(
+                    remote,
+                    scriptTrackPathNode
+                ),
+                numRetries: 3
+            )
+        } catch (InterruptedException e) {
+            throw e
+        } catch (Exception e) {
+            error = e
+            isRerunFailed = true
+        } finally {
+            // Download results.xml file from remote node
+            withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+                def downloadRerunResultSucceed = Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -P ${remote.port} -r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${xmlFilePathNode} ${rerunDir}/", returnStatus: true, numRetries: 3) == 0
+                if (!downloadRerunResultSucceed) {
+                    echo "The ${testType} tests crashed when rerun attempt, Failed to download rerun results.xml file."
+                    throw error
+                } else if (error != null) {
+                    echo "The ${testType} tests still failed after rerun attempt."
+                }
+            }
+        }
+    }
+
+    // Generate rerun report and upload to artifact server
+    def inputFiles = ["${stageName}/results.xml",
+                  "${rerunDir}/rerun_results_1.xml",
+                  "${rerunDir}/rerun_results_2.xml"]
+    generateAndUploadRerunReport(llmSrcLocal, inputFiles, stageName, rerunDir)
+
+    updateResultsXmlWithRerunResults(llmSrcLocal, inputFiles, stageName)
+
+    echo "isRerunFailed for Slurm: ${isRerunFailed}"
+    return isRerunFailed
+}
+
+def generateRerunTestList(llmSrc, rerunDir, inputFile, testType) {
+    // Generate rerun test lists
+    def failSignaturesList = trtllm_utils.getFailSignaturesList().join(",")
+    def exitCode = sh(script: """
+        python3 ${llmSrc}/jenkins/scripts/test_rerun.py \
+        generate_rerun_tests_list \
+        --output-dir=${rerunDir}/ \
+        --input-file=${inputFile} \
+        --fail-signatures='${failSignaturesList}' \
+        --test-type='${testType}'
+    """, returnStdout: true, returnStatus: true)
+    return exitCode
+}
+
+def updatePytestCommandForRerun(commandList, rerunTestListPathNode, jobWorkspace, xmlFilePathNode, times) {
+    // change the testCmdLine for rerun
+    def noNeedLine = ["--splitting-algorithm", "--splits", "--group", "--cov"]
+    def needToChangeLine = ["--test-list", "--csv", "--periodic-junit-xmlpath"]
+    def newCommandList = commandList.findAll { cmd ->
+        !noNeedLine.any { line -> cmd.contains(line) } && !needToChangeLine.any { line -> cmd.contains(line) }
+    }
+    newCommandList += [
+        "--test-list=${rerunTestListPathNode}",
+        "--csv=${jobWorkspace}/rerun_report_${times}.csv",
+        "--periodic-junit-xmlpath=${xmlFilePathNode}",
+        "--reruns=${times - 1}"
+    ]
+    return newCommandList.join(" ")
+}
+
+def generateAndUploadRerunReport(llmSrc, inputFiles, stageName, rerunReportPath) {
+    // Generate rerun report
+    sh """
+        python3 ${llmSrc}/jenkins/scripts/test_rerun.py \
+        generate_rerun_report \
+        --output-file=${rerunReportPath}/rerun_results.xml \
+        --input-files=${inputFiles.join(",")}
+    """
+
+    // Upload rerun report to artifact server
+    if (fileExists("${rerunReportPath}/rerun_results.html")) {
+        trtllm_utils.uploadArtifacts(
+            "${rerunReportPath}/rerun_results.html",
+            "${UPLOAD_PATH}/rerun_reports/${stageName}_rerun_results.html"
+        )
+        echo "Test rerun report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/rerun_reports/${stageName}_rerun_results.html"
+    }
+}
+
+def updateResultsXmlWithRerunResults(llmSrc, inputFiles, resultsXmlPath) {
+    // Update original results xml file with rerun results xml files for junit
+    sh """
+        python3 ${llmSrc}/jenkins/scripts/test_rerun.py \
+        merge_junit_xmls \
+        --output-file=${resultsXmlPath}/results.xml \
+        --input-files=${inputFiles.join(",")} \
+        --deduplicate
+    """
 }
 
 def generateRerunReport(stageName, llmSrc) {
@@ -2503,31 +2737,11 @@ def generateRerunReport(stageName, llmSrc) {
 
     echo "Generating rerun report with input files: ${rerunResultFiles.join(',')}"
 
-    // Generate comprehensive rerun report
-    sh """
-        python3 ${llmSrc}/jenkins/scripts/test_rerun.py \
-        generate_rerun_report \
-        --output-file=${WORKSPACE}/${stageName}/rerun_results.xml \
-        --input-files=${rerunResultFiles.join(",")}
-    """
+    // Generate comprehensive rerun report and upload to artifact server
+    generateAndUploadRerunReport(llmSrc, rerunResultFiles, stageName, "${WORKSPACE}/${stageName}")
 
-    // Update original results xml file with all rerun results for junit
-    sh """
-        python3 ${llmSrc}/jenkins/scripts/test_rerun.py \
-        merge_junit_xmls \
-        --output-file=${WORKSPACE}/${stageName}/results.xml \
-        --input-files=${allInputFiles.join(",")} \
-        --deduplicate
-    """
-
-    // Upload rerun report
-    if (fileExists("${WORKSPACE}/${stageName}/rerun_results.html")) {
-        trtllm_utils.uploadArtifacts(
-            "${WORKSPACE}/${stageName}/rerun_results.html",
-            "${UPLOAD_PATH}/rerun_reports/${stageName}_rerun_results.html"
-        )
-        echo "Test rerun report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/rerun_reports/${stageName}_rerun_results.html"
-    }
+    // Update original results xml file with rerun results xml files for junit
+    updateResultsXmlWithRerunResults(llmSrc, allInputFiles, "${WORKSPACE}/${stageName}")
 
     // Remove isolation results since they are merged into results.xml
     sh "rm -rf ${WORKSPACE}/${stageName}/results_isolated_*.xml || true"
