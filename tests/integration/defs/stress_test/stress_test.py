@@ -583,6 +583,25 @@ def stress_test(config,
 
         extra_llm_options["enable_attention_dp"] = True
 
+        # Set MOE backend based on GPU architecture
+        # B200/GB200 (Blackwell, SM100+) with FP8 checkpoints needs to use DEEPGEMM backend
+        # H100/H200 (Hopper, SM90) with FP8 checkpoints uses CUTLASS backend (default)
+        # For NVFP4 checkpoints on Blackwell, TRTLLM or CUTLASS backend can be used
+        try:
+            import torch
+            if torch.cuda.is_available():
+                device_capability = torch.cuda.get_device_capability(0)
+                if device_capability[0] >= 10:
+                    extra_llm_options["moe_config"] = {
+                        "backend": "DEEPGEMM",
+                    }
+                    print_info(
+                        f"Detected GPU architecture is SM{device_capability[0]}{device_capability[1]}, "
+                        "using DEEPGEMM MOE backend for DeepSeek-R1")
+        except Exception as e:
+            print_warning(f"Failed to detect GPU architecture: {e}. "
+                          "Using default MOE backend (CUTLASS).")
+
         if config.backend == "pytorch":
             extra_llm_options.update({
                 "cuda_graph_config": {
