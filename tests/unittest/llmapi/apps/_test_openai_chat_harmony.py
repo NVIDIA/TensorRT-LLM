@@ -160,6 +160,7 @@ async def test_streaming(client: openai.AsyncOpenAI, model: str):
             "content": "Explain the theory of relativity in brief."
         }],
         stream=True,
+        extra_body={"top_k": 1},
     )
     collected_chunks = []
     collected_messages = []
