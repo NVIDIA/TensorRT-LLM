@@ -52,26 +52,34 @@ def load_and_setup_pipeline(args):
     dit_configs = create_dit_config(args)
     # Apply dit configuration
     visual_gen.setup_configs(**dit_configs)
-    # Load pipe
+    # Load config
+    exclude_pattern = exclude_pattern = (
+        r".*(embedder|norm_out|proj_out|to_add_out|to_added_qkv|stream).*"
+        if args.linear_recipe == "dynamic"
+        else r".*"
+    )
+    quantize_weights = True if args.linear_recipe == "dynamic" else False
+    # Load ditFlux2Transformer2DModel
     transformer = ditFlux2Transformer2DModel.from_pretrained(
-        args.model_path, subfolder="transformer", torch_dtype=torch.bfloat16, low_cpu_mem_usage=True
+        args.model_path,
+        subfolder="transformer",
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
     )
+    # Load pipeline
     pipe = ditFlux2Pipeline.from_pretrained(
-        args.model_path, transformer=transformer, torch_dtype=torch.bfloat16, **dit_configs
+        args.model_path,
+        transformer=transformer,
+        torch_dtype=torch.bfloat16,
+        **dit_configs,
     )
 
-    if args.linear_recipe == "dynamic":
-        assert args.linear_type != "flashinfer-nvfp4-cutlass", (
-            "Linear type must be flashinfer-nvfp4-cutlass if linear_recipe=dynamic"
-        )
-
-        exclude_pattern = r".*(embedder|norm_out|proj_out|to_add_out|to_added_qkv|stream).*"
-        apply_visual_gen_linear(
-            pipe.transformer,
-            load_parameters=True,
-            quantize_weights=True,
-            exclude_pattern=exclude_pattern,
-        )
+    apply_visual_gen_linear(
+        pipe.transformer,
+        load_parameters=True,
+        quantize_weights=quantize_weights,
+        exclude_pattern=exclude_pattern,
+    )
 
     if args.enable_cuda_graph:
         pipe.enable_cuda_graph()
@@ -131,7 +139,6 @@ def main():
         height=1024,
         width=1024,
         guidance_scale=4,
-        enable_cuda_graph=True,
     )
 
     args = parser.parse_args()
