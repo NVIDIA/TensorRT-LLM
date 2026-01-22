@@ -1,11 +1,12 @@
 import types
-from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 
 from ...executor.result import CompletionOutput
 from ...inputs.registry import DefaultInputProcessor, ExtraProcessedInputs
-from ...llmapi.llm import RequestOutput, _TorchLLM
+from ...llmapi.llm import BaseLLM, RequestOutput, _TorchLLM
 from ...llmapi.tokenizer import TokenizerBase, TransformersTokenizer, tokenizer_factory
 from ...sampling_params import SamplingParams
 from .distributed import common as dist_ad
@@ -112,9 +113,9 @@ class LLM(_TorchLLM):
             self._factory = self.args.create_factory()
         return self._factory
 
-    def __init__(self, *args, **kwargs):
-        kwargs["backend"] = "_autodeploy"
-        super().__init__(*args, **kwargs)
+    def __init__(self, model: Union[str, Path], **kwargs: Any) -> None:
+        args = LlmArgs(model=model, **kwargs)
+        BaseLLM.__init__(args)
 
     def _try_load_tokenizer(self) -> Optional[TokenizerBase]:
         if self.args.skip_tokenizer_init:
@@ -159,7 +160,7 @@ class DemoLLM(LLM):
     """
 
     def __init__(self, **kwargs):
-        self.args: LlmArgs = LlmArgs.from_kwargs(**kwargs)
+        self.args: LlmArgs = LlmArgs(**kwargs)
 
         self.mpi_session = None
         self.runtime_context = None

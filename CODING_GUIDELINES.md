@@ -408,6 +408,8 @@ foo.SomeClass()
 ##### Classes and Functions
 Use the [Google style](https://google.github.io/styleguide/pyguide.html), which can be parsed by Sphinx.
 
+When defining any user-facing configuration classes (e.g. `LlmArgs` or any class used in its fields), always use Pydantic classes rather than dataclasses or vanilla classes.
+
 #####  Attributes and Variables
 Attributes and variables can be documented inline. Attribute docstrings will be rendered under the docstring for the class. For example:
 ```python

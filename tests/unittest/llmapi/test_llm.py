@@ -217,18 +217,18 @@ def test_llm_args_invalid_usage():
     runtime_max_num_tokens = 2
 
     # Update build_config with warning msg if runtime arguments are passed.
-    llm_args = LlmArgs.from_kwargs(model='test-model',
-                                   max_batch_size=runtime_max_batch_size,
-                                   max_num_tokens=runtime_max_num_tokens)
+    llm_args = LlmArgs(model='test-model',
+                       max_batch_size=runtime_max_batch_size,
+                       max_num_tokens=runtime_max_num_tokens)
     assert llm_args.build_config.max_batch_size == runtime_max_batch_size
     assert llm_args.build_config.max_num_tokens == runtime_max_num_tokens
 
     # Conflict between build_config and runtime_params
     build_config = BuildConfig(max_batch_size=5, max_num_tokens=7)
-    llm_args = LlmArgs.from_kwargs(model='test-model',
-                                   build_config=build_config,
-                                   max_batch_size=runtime_max_batch_size,
-                                   max_num_tokens=runtime_max_num_tokens)
+    llm_args = LlmArgs(model='test-model',
+                       build_config=build_config,
+                       max_batch_size=runtime_max_batch_size,
+                       max_num_tokens=runtime_max_num_tokens)
     assert llm_args.build_config.max_batch_size == build_config.max_batch_size
     assert llm_args.build_config.max_num_tokens == build_config.max_num_tokens
 

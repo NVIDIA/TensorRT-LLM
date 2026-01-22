@@ -8,29 +8,24 @@ from pathlib import Path
 import click
 from click_option_group import (MutuallyExclusiveOptionGroup, OptionGroup,
                                 optgroup)
-from huggingface_hub import snapshot_download
 
 from tensorrt_llm.bench.benchmark import (GeneralExecSettings,
                                           generate_json_report,
-                                          get_general_cli_options, get_llm)
+                                          get_general_cli_options)
 from tensorrt_llm.bench.benchmark.utils.asynchronous import async_benchmark
-from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
-
-# isort: off
 from tensorrt_llm.bench.benchmark.utils.general import (
-    get_settings_from_engine, get_settings, ALL_SUPPORTED_BACKENDS)
-# isort: on
-from tensorrt_llm.bench.benchmark.utils.general import (
-    generate_warmup_dataset, update_sampler_args_with_extra_options)
-from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
+    ALL_SUPPORTED_BACKENDS, generate_warmup_dataset,
+    get_exec_settings_for_backend, update_sampler_args_with_extra_options)
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
 from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
                                            initialize_tokenizer,
                                            update_metadata_for_multimodal)
 from tensorrt_llm.llmapi import CapacitySchedulerPolicy
+from tensorrt_llm.llmapi.llm_create import create_llm_from_llm_args
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import SamplingParams
+from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
 
 
 @click.command(name="throughput")
@@ -299,16 +294,12 @@ def throughput_command(
     # Parameters from CLI
     image_data_format: str = params.get("image_data_format", "pt")
     data_device: str = params.get("data_device", "cpu")
-    no_skip_tokenizer_init: bool = params.get("no_skip_tokenizer_init", False)
 
     # Get general CLI options using the centralized function
     options: GeneralExecSettings = get_general_cli_options(params, bench_env)
     tokenizer = initialize_tokenizer(options.checkpoint_path)
 
     # Extract throughput-specific options not handled by GeneralExecSettings
-    max_batch_size = params.get("max_batch_size")
-    max_num_tokens = params.get("max_num_tokens")
-    enable_chunked_context: bool = params.get("enable_chunked_context")
     scheduler_policy: str = params.get("scheduler_policy")
 
     custom_module_dirs: list[Path] = params.pop("custom_module_dirs", [])
@@ -319,9 +310,6 @@ def throughput_command(
             logger.error(
                 f"Failed to import custom module from {custom_module_dir}: {e}")
             raise e
-
-    # Runtime kwargs and option tracking.
-    kwargs = {}
 
     # Dataset Loading and Preparation
     with open(options.dataset_path, "r") as dataset:
@@ -348,79 +336,26 @@ def throughput_command(
         logger.info(metadata.get_summary_for_print())
 
     # Engine configuration parsing
-    if options.backend and options.backend.lower(
-    ) in ALL_SUPPORTED_BACKENDS and options.backend.lower() != "tensorrt":
-        # If we're dealing with a model name, perform a snapshot download to
-        # make sure we have a local copy of the model.
-        if bench_env.checkpoint_path is None:
-            snapshot_download(options.model, revision=bench_env.revision)
+    exec_settings = get_exec_settings_for_backend(params, metadata, options,
+                                                  bench_env)
 
-        exec_settings = get_settings(params, metadata, bench_env.model,
-                                     bench_env.checkpoint_path)
-        kwargs_max_sql = options.max_seq_len or metadata.max_sequence_length
-        logger.info(f"Setting PyTorch max sequence length to {kwargs_max_sql}")
-        kwargs["max_seq_len"] = kwargs_max_sql
-    elif options.backend.lower() == "tensorrt":
-        assert options.max_seq_len is None, (
-            "max_seq_len is not a runtime parameter for C++ backend")
-        exec_settings, build_cfg = get_settings_from_engine(options.engine_dir)
-        engine_max_seq_len = build_cfg["max_seq_len"]
+    exec_settings.revision = bench_env.revision
+    exec_settings.iteration_log = options.iteration_log
 
-        # TODO: Verify that the engine can handle the max/min ISL/OSL.
-        if metadata.max_sequence_length > engine_max_seq_len:
-            raise RuntimeError(
-                f"Engine supports a max sequence of {engine_max_seq_len}. "
-                "Provided dataset contains a maximum sequence of "
-                f"{metadata.max_sequence_length}. Please rebuild a new engine "
-                "to support this dataset.")
-    else:
-        raise click.BadParameter(
-            f"{options.backend} is not a known backend, check help for available options.",
-            param_hint="backend")
+    # Update llm_args with runtime options
+    policy = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT if scheduler_policy == "guaranteed_no_evict" else CapacitySchedulerPolicy.MAX_UTILIZATION
+    exec_settings.llm_args.scheduler_config.capacity_scheduler_policy = policy
 
-    exec_settings["model"] = options.model
-    exec_settings["revision"] = bench_env.revision
-    engine_bs = exec_settings["settings_config"]["max_batch_size"]
-    engine_tokens = exec_settings["settings_config"]["max_num_tokens"]
-
-    # Runtime Options
-    runtime_max_bs = max_batch_size or engine_bs
-    runtime_max_tokens = max_num_tokens or engine_tokens
-
-    # Update configuration with runtime options
-    exec_settings["settings_config"][
-        "kv_cache_percent"] = options.kv_cache_percent
-    exec_settings["settings_config"]["max_batch_size"] = runtime_max_bs
-    exec_settings["settings_config"]["max_num_tokens"] = runtime_max_tokens
-    exec_settings["settings_config"]["beam_width"] = options.beam_width
-    exec_settings["settings_config"][
-        "scheduler_policy"] = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT if scheduler_policy == "guaranteed_no_evict" else CapacitySchedulerPolicy.MAX_UTILIZATION
-    exec_settings["settings_config"]["chunking"] = enable_chunked_context
-
-    # Dynamic runtime features.
-    exec_settings["settings_config"]["dynamic_max_batch_size"] = True
-
-    # LlmArgs
-    exec_settings["extra_llm_api_options"] = params.pop("extra_llm_api_options")
-    exec_settings["iteration_log"] = options.iteration_log
-
-    # Construct the runtime configuration dataclass.
-    runtime_config = RuntimeConfig(**exec_settings)
     llm = None
-
     try:
         logger.info("Setting up throughput benchmark.")
-        kwargs = kwargs | runtime_config.get_llm_args()
-        kwargs['skip_tokenizer_init'] = not no_skip_tokenizer_init
-        kwargs['backend'] = options.backend
-
-        llm = get_llm(runtime_config, kwargs)
+        llm = create_llm_from_llm_args(exec_settings.llm_args)
 
         sampler_args = {
             "end_id": options.eos_id,
             "pad_id": options.eos_id,
-            "n": options.beam_width,
-            "use_beam_search": options.beam_width > 1
+            "n": exec_settings.llm_args.max_beam_width,
+            "use_beam_search": exec_settings.llm_args.max_beam_width > 1
         }
         sampler_args = update_sampler_args_with_extra_options(
             sampler_args, params.pop("sampler_options"))
@@ -464,8 +399,8 @@ def throughput_command(
             # For multimodal models, we need to update the metadata with the correct input lengths
             metadata = update_metadata_for_multimodal(metadata, statistics)
 
-        report_utility = ReportUtility(statistics, metadata, runtime_config,
-                                       logger, kwargs, options.streaming)
+        report_utility = ReportUtility(statistics, metadata, exec_settings,
+                                       logger, options.streaming)
         # Generate reports for statistics, output tokens, and request info.
         generate_json_report(options.report_json,
                              report_utility.get_statistics_dict)

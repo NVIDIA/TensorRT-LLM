@@ -8,27 +8,23 @@ import click
 import yaml
 from click_option_group import (MutuallyExclusiveOptionGroup, OptionGroup,
                                 optgroup)
-from huggingface_hub import snapshot_download
 
 from tensorrt_llm.bench.benchmark import (generate_json_report,
-                                          get_general_cli_options, get_llm)
+                                          get_general_cli_options)
 from tensorrt_llm.bench.benchmark.utils.asynchronous import async_benchmark
-from tensorrt_llm.bench.benchmark.utils.general import generate_warmup_dataset
-from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
+from tensorrt_llm.bench.benchmark.utils.general import (
+    ALL_SUPPORTED_BACKENDS, generate_warmup_dataset,
+    get_exec_settings_for_backend, update_sampler_args_with_extra_options)
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
-from tensorrt_llm.llmapi import CapacitySchedulerPolicy
-from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
-
-# isort: off
-from tensorrt_llm.bench.benchmark.utils.general import (
-    get_settings_from_engine, get_settings,
-    update_sampler_args_with_extra_options, ALL_SUPPORTED_BACKENDS)
-# isort: on
 from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
                                            initialize_tokenizer,
                                            update_metadata_for_multimodal)
+from tensorrt_llm.llmapi import CapacitySchedulerPolicy
+from tensorrt_llm.llmapi.llm_args import CudaGraphConfig
+from tensorrt_llm.llmapi.llm_create import create_llm_from_llm_args
 from tensorrt_llm.logger import logger
+from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 from tensorrt_llm.sampling_params import SamplingParams
 
 
@@ -222,67 +218,25 @@ def latency_command(
         #       The accurate table for multimodal models will be logged after the benchmark is done.
         logger.info(metadata.get_summary_for_print())
 
-    # Engine configuration parsing for PyTorch backend
-    kwargs = {}
-    if options.backend and options.backend.lower(
-    ) in ALL_SUPPORTED_BACKENDS and options.backend.lower() != "tensorrt":
-        if bench_env.checkpoint_path is None:
-            snapshot_download(options.model, revision=bench_env.revision)
+    # Engine configuration parsing
+    exec_settings = get_exec_settings_for_backend(params, metadata, options,
+                                                  bench_env)
 
-        exec_settings = get_settings(params, metadata, bench_env.model,
-                                     bench_env.checkpoint_path)
-        kwargs_max_sql = options.max_seq_len or metadata.max_sequence_length
-        logger.info(f"Setting PyTorch max sequence length to {kwargs_max_sql}")
-        kwargs["max_seq_len"] = kwargs_max_sql
-    elif options.backend.lower() == "tensorrt":
-        assert options.max_seq_len is None, (
-            "max_seq_len is not a runtime parameter for C++ backend")
-        exec_settings, build_cfg = get_settings_from_engine(options.engine_dir)
-        engine_max_seq_len = build_cfg["max_seq_len"]
+    exec_settings.revision = bench_env.revision
 
-        if metadata.max_sequence_length > engine_max_seq_len:
-            raise RuntimeError(
-                f"Engine supports a max sequence of {engine_max_seq_len}. Provided "
-                "dataset contains a maximum sequence of "
-                f"{metadata.max_sequence_length}. Please rebuild a new engine to"
-                "support this dataset.")
-    else:
-        raise click.BadParameter(
-            f"{options.backend} is not a known backend, check help for available options.",
-            param_hint="backend")
-
-    exec_settings["model"] = options.model
-    exec_settings["revision"] = bench_env.revision
-    engine_tokens = exec_settings["settings_config"]["max_num_tokens"]
-
-    # Update configuration with runtime options
-    exec_settings["settings_config"][
-        "kv_cache_percent"] = options.kv_cache_percent
-    exec_settings["settings_config"]["max_batch_size"] = 1
-    exec_settings["settings_config"]["max_num_tokens"] = engine_tokens
-    exec_settings["settings_config"]["beam_width"] = options.beam_width
-    exec_settings["settings_config"]["chunking"] = False
-    exec_settings["settings_config"][
-        "scheduler_policy"] = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
-
-    # Performance options
-    exec_settings["performance_options"]["cuda_graphs"] = True
-    exec_settings["performance_options"]["multi_block_mode"] = True
-
-    exec_settings["extra_llm_api_options"] = params.get("extra_llm_api_options")
+    # Update llm_args with runtime options
+    llm_args = exec_settings.llm_args
+    llm_args.max_batch_size = 1
+    llm_args.cuda_graph_config = CudaGraphConfig(max_batch_size=1)
+    llm_args.enable_chunked_prefill = False
+    llm_args.scheduler_config.capacity_scheduler_policy = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
 
     # Decoding Options
     if medusa_choices is not None:
         with open(medusa_choices, "r") as medusa_yml:
-            exec_settings["decoding_config"]["medusa_choices"] = \
-                yaml.load(medusa_yml, Loader=yaml.SafeLoader)
-
-    # Construct the runtime configuration dataclass.
-    runtime_config = RuntimeConfig(**exec_settings)
-
-    llm = None
-    kwargs = kwargs | runtime_config.get_llm_args()
-    kwargs['backend'] = options.backend
+            medusa_choices_data = yaml.load(medusa_yml, Loader=yaml.SafeLoader)
+            if llm_args.decoding_config is not None:
+                llm_args.decoding_config.medusa_choices = medusa_choices_data
 
     # Set environment variables for setting runtime options.
     default_env_overrides = {
@@ -292,23 +246,22 @@ def latency_command(
         "TRTLLM_ENABLE_PDL": "1",
     }
     # Update defaults with existing overrides (user preference takes priority)
-    default_env_overrides.update(kwargs.get("env_overrides", {}))
-    kwargs["env_overrides"] = default_env_overrides
+    llm_args.env_overrides = default_env_overrides | llm_args.env_overrides
 
+    llm = None
     try:
         logger.info("Setting up latency benchmark.")
+        llm = create_llm_from_llm_args(llm_args)
 
-        llm = get_llm(runtime_config, kwargs)
-
-        ignore_eos = True if runtime_config.decoding_config.decoding_mode == SpeculativeDecodingMode.NONE else False
+        ignore_eos = True if llm_args.decoding_config.decoding_mode == SpeculativeDecodingMode.NONE else False
         eos_id = tokenizer.eos_token_id if not ignore_eos else -1
         pad_id = tokenizer.pad_token_id if not ignore_eos else -1
 
         sampler_args = {
             "end_id": eos_id,
             "pad_id": pad_id,
-            "n": options.beam_width,
-            "use_beam_search": options.beam_width > 1
+            "n": llm_args.max_beam_width,
+            "use_beam_search": llm_args.max_beam_width > 1
         }
 
         sampler_args = update_sampler_args_with_extra_options(
@@ -354,8 +307,8 @@ def latency_command(
             # For multimodal models, we need to update the metadata with the correct input lengths
             metadata = update_metadata_for_multimodal(metadata, statistics)
 
-        report_utility = ReportUtility(statistics, metadata, runtime_config,
-                                       logger, kwargs, True)
+        report_utility = ReportUtility(statistics, metadata, exec_settings,
+                                       logger, llm_args, True)
         # Generate reports for statistics, output tokens, and request info.
         generate_json_report(options.report_json,
                              report_utility.get_statistics_dict)
