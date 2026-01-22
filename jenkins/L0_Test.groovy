@@ -701,13 +701,13 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                         if (fileExists('/dev/gdrdrv')) {
                             dockerArgs += " --device=/dev/gdrdrv:/dev/gdrdrv"
                         }
-                        if (fileExists('/home/scratch.trt_llm_data_ci')) {
-                            dockerArgs += " -v /home/scratch.trt_llm_data_ci:/scratch.trt_llm_data:ro "
-                        } else if (fileExists('/home/scratch.trt_llm_data')) {
-                            dockerArgs += " -v /home/scratch.trt_llm_data:/scratch.trt_llm_data:ro "
-                        } else {
-                            error "Existing TRT-LLM data scratch mount points cannot be set up on the node"
-                        }
+                    }
+                    if (fileExists('/home/scratch.trt_llm_data_ci')) {
+                        dockerArgs += " -v /home/scratch.trt_llm_data_ci:/scratch.trt_llm_data:ro "
+                    } else if (fileExists('/home/scratch.trt_llm_data')) {
+                        dockerArgs += " -v /home/scratch.trt_llm_data:/scratch.trt_llm_data:ro "
+                    } else {
+                        error "Existing TRT-LLM data scratch mount points cannot be set up on the node"
                     }
                 }
 
