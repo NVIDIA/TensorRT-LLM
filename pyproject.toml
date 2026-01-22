@@ -10,6 +10,8 @@ build-backend = "setuptools.build_meta"
 ####################################################################################################
 [tool.isort]
 line_length = 80
+known_first_party = ["tensorrt_llm"]
+known_third_party = ["triton_kernels"]
 
 [tool.yapf]
 based_on_style = "pep8"
@@ -1459,6 +1461,7 @@ convention = "google"
 
 [tool.ruff.lint.isort]
 known-first-party = ["tensorrt_llm"]
+known-third-party = ["triton_kernels"]
 split-on-trailing-comma = false
 
 
