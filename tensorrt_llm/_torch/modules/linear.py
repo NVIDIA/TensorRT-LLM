@@ -2083,7 +2083,8 @@ class Linear(nn.Module):
         self.gather_output = gather_output
         self.force_dynamic_quantization = force_dynamic_quantization
         self.use_cute_dsl_blockscaling_mm = use_cute_dsl_blockscaling_mm
-        self.disable_deep_gemm = disable_deep_gemm
+        self.disable_deep_gemm = os.environ.get(
+            'TRTLLM_DISABLE_DEEP_GEMM_IN_LINEAR', disable_deep_gemm)
         self.fused_weight_shard_indices_mapping = fused_weight_shard_indices_mapping
 
         # Store NVFP4 GEMM allowed backends configuration
