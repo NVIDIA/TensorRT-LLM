@@ -33,9 +33,7 @@ if TYPE_CHECKING:
         AttentionMetadata
     from tensorrt_llm._torch.pyexecutor.sampler import SampleState
 
-from tensorrt_llm._torch.pyexecutor._util import GB
-
-
+GB = 1 << 30
 def get_tensor_size_bytes(tensor):
     """Calculate tensor size in bytes."""
     if isinstance(tensor, torch.Tensor):
