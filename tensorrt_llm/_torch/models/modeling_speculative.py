@@ -969,19 +969,17 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 self.draft_config.quant_config.kv_cache_quant_algo = \
                 model_config.quant_config.kv_cache_quant_algo
             elif spec_config.spec_dec_mode.is_draft_target_one_model():
-                # Load the draft model config for DraftTarget one-model
-                if spec_config.speculative_model_dir:
-                    self.draft_config = ModelConfig.from_pretrained(
-                        spec_config.speculative_model_dir,
-                        trust_remote_code=True,
-                        attn_backend=model_config.attn_backend,
-                        moe_backend=model_config.moe_backend,
-                        mapping=model_config.mapping,
-                        spec_config=None,  # Draft model doesn't need spec_config
-                        max_num_tokens=model_config.max_num_tokens,
-                        moe_max_num_tokens=model_config.moe_max_num_tokens)
-                    self.draft_config.quant_config.kv_cache_quant_algo = \
-                    model_config.quant_config.kv_cache_quant_algo
+                self.draft_config = ModelConfig.from_pretrained(
+                    spec_config.speculative_model,
+                    trust_remote_code=True,
+                    attn_backend=model_config.attn_backend,
+                    moe_backend=model_config.moe_backend,
+                    mapping=model_config.mapping,
+                    spec_config=None,  # Draft model doesn't need spec_config
+                    max_num_tokens=model_config.max_num_tokens,
+                    moe_max_num_tokens=model_config.moe_max_num_tokens)
+                self.draft_config.quant_config.kv_cache_quant_algo = \
+                model_config.quant_config.kv_cache_quant_algo
 
             self.use_separate_draft_kv_cache = should_use_separate_draft_kv_cache(
                 spec_config)
