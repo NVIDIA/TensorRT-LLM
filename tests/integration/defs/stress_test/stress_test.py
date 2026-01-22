@@ -397,6 +397,10 @@ def is_port_available(port: int,
         ModelConfig(model_dir="DeepSeek-R1/DeepSeek-R1",
                     tp_size=8,
                     memory_requirement=96),
+        # Configuration for DeepSeek-R1 model with NVFP4 checkpoints
+        ModelConfig(model_dir="DeepSeek-R1/DeepSeek-R1-0528-FP4",
+                    tp_size=8,
+                    memory_requirement=96),
     ],
     ids=lambda x: f"{os.path.basename(x.model_dir)}_tp{x.tp_size}")
 def test_run_stress_test(config, stress_time_timeout, backend,
@@ -583,21 +587,31 @@ def stress_test(config,
 
         extra_llm_options["enable_attention_dp"] = True
 
-        # Set MOE backend based on GPU architecture
-        # B200/GB200 (Blackwell, SM100+) with FP8 checkpoints needs to use DEEPGEMM backend
-        # H100/H200 (Hopper, SM90) with FP8 checkpoints uses CUTLASS backend (default)
-        # For NVFP4 checkpoints on Blackwell, TRTLLM or CUTLASS backend can be used
+        # Set MOE backend based on GPU architecture and checkpoint type
+        # B200/GB200 (Blackwell, SM100+) with FP8 checkpoints: use DEEPGEMM backend
+        # B200/GB200 (Blackwell, SM100+) with NVFP4 checkpoints: use TRTLLM backend
+        # H100/H200 (Hopper, SM90) with FP8 checkpoints: use CUTLASS backend (default)
         try:
             import torch
             if torch.cuda.is_available():
                 device_capability = torch.cuda.get_device_capability(0)
-                if device_capability[0] >= 10:
+                is_blackwell = device_capability[0] >= 10
+                is_nvfp4 = "FP4" in config.model_dir.upper()
+
+                if is_blackwell:
+                    if is_nvfp4:
+                        moe_backend = "TRTLLM"
+                    else:
+                        moe_backend = "DEEPGEMM"
+
                     extra_llm_options["moe_config"] = {
-                        "backend": "DEEPGEMM",
+                        "backend": moe_backend,
                     }
+                    checkpoint_type = "NVFP4" if is_nvfp4 else "FP8"
                     print_info(
-                        f"Detected GPU architecture is SM{device_capability[0]}{device_capability[1]}, "
-                        "using DEEPGEMM MOE backend for DeepSeek-R1")
+                        f"Detected GPU architecture is SM{device_capability[0]}{device_capability[1]} (Blackwell), "
+                        f"using {moe_backend} MOE backend for DeepSeek-R1/DeepSeek-V3 with {checkpoint_type} checkpoints"
+                    )
         except Exception as e:
             print_warning(f"Failed to detect GPU architecture: {e}. "
                           "Using default MOE backend (CUTLASS).")
