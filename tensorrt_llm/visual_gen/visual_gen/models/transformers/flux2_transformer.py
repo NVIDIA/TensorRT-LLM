@@ -1,7 +1,7 @@
 # Adapted from https://github.com/huggingface/diffusers/blob/edf36f5128abf3e6ecf92b5145115514363c58e6/src/diffusers/models/transformers/transformer_flux2.py
-# Copyright 2025 Black Forest Labs, The HuggingFace Team and The InstantX Team. All rights reserved.
+# Copyright 2026 Black Forest Labs, The HuggingFace Team and The InstantX Team. All rights reserved.
 #
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,7 +29,10 @@ from diffusers.models.transformers.transformer_flux2 import (
 )
 from diffusers.utils import USE_PEFT_BACKEND, scale_lora_layers, unscale_lora_layers
 
-from visual_gen.layers import ditAttnProcessor, apply_visual_gen_linear, apply_visual_gen_norm
+from visual_gen.configs.diffusion_cache import TeaCacheConfig
+from visual_gen.layers import ditAttnProcessor
+from visual_gen.models.transformers.base_transformer import ditBaseTransformer
+from visual_gen.models.utils import disable_weight_management
 from visual_gen.utils import dit_sp_gather, dit_sp_split, get_logger
 
 logger = get_logger(__name__)
@@ -86,7 +89,11 @@ class ditFlux2AttnProcessor(ditAttnProcessor):
 
         if encoder_hidden_states is not None:
             encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
-                [encoder_hidden_states.shape[1], hidden_states.shape[1] - encoder_hidden_states.shape[1]], dim=1
+                [
+                    encoder_hidden_states.shape[1],
+                    hidden_states.shape[1] - encoder_hidden_states.shape[1],
+                ],
+                dim=1,
             )
             encoder_hidden_states = attn.to_add_out(encoder_hidden_states)
 
@@ -149,12 +156,10 @@ class ditFlux2ParallelSelfAttnProcessor(ditAttnProcessor):
         return hidden_states
 
 
-class ditFlux2Transformer2DModel(Flux2Transformer2DModel):
+class ditFlux2Transformer2DModel(Flux2Transformer2DModel, ditBaseTransformer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # In init stage, model ckpt are not loaded, so we don't need to load the parameters.
-        apply_visual_gen_linear(self, load_parameters=False, quantize_weights=False)
-        apply_visual_gen_norm(self, load_parameters=False)
         for name, module in self.named_modules():
             if hasattr(module, "set_processor"):
                 if isinstance(module.get_processor(), Flux2AttnProcessor):
@@ -166,43 +171,21 @@ class ditFlux2Transformer2DModel(Flux2Transformer2DModel):
                     attn_processor.name = name
                     module.set_processor(attn_processor)
                 else:
-                    logger.warning(f"Unknown attn processor: {type(module.get_processor())} for {name}")
+                    logger.warning(
+                        f"Unknown attn processor: {type(module.get_processor())} for {name}"
+                    )
 
-    def forward(
+    def run_pre_processing(
         self,
         hidden_states: torch.Tensor,
+        lora_scale: float,
         encoder_hidden_states: torch.Tensor = None,
         timestep: torch.LongTensor = None,
         img_ids: torch.Tensor = None,
         txt_ids: torch.Tensor = None,
         guidance: torch.Tensor = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
-        return_dict: bool = True,
-    ) -> Union[torch.Tensor, Transformer2DModelOutput]:
-        """
-        The [`FluxTransformer2DModel`] forward method.
-
-        Args:
-            hidden_states (`torch.Tensor` of shape `(batch_size, image_sequence_length, in_channels)`):
-                Input `hidden_states`.
-            encoder_hidden_states (`torch.Tensor` of shape `(batch_size, text_sequence_length, joint_attention_dim)`):
-                Conditional embeddings (embeddings computed from the input conditions such as prompts) to use.
-            timestep ( `torch.LongTensor`):
-                Used to indicate denoising step.
-            block_controlnet_hidden_states: (`list` of `torch.Tensor`):
-                A list of tensors that if specified are added to the residuals of transformer blocks.
-            joint_attention_kwargs (`dict`, *optional*):
-                A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
-                `self.processor` in
-                [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
-            return_dict (`bool`, *optional*, defaults to `True`):
-                Whether or not to return a [`~models.transformer_2d.Transformer2DModelOutput`] instead of a plain
-                tuple.
-
-        Returns:
-            If `return_dict` is True, an [`~models.transformer_2d.Transformer2DModelOutput`] is returned, otherwise a
-            `tuple` where the first element is the sample tensor.
-        """
+    ):
         # dit Split Start #
         hidden_states = dit_sp_split(hidden_states, dim=1)
         encoder_hidden_states = dit_sp_split(encoder_hidden_states, dim=1)
@@ -210,23 +193,17 @@ class ditFlux2Transformer2DModel(Flux2Transformer2DModel):
         txt_ids = dit_sp_split(txt_ids, dim=1)
         # dit Split End #
 
-        # 0. Handle input arguments
-        if joint_attention_kwargs is not None:
-            joint_attention_kwargs = joint_attention_kwargs.copy()
-            lora_scale = joint_attention_kwargs.pop("scale", 1.0)
-        else:
-            lora_scale = 1.0
-
         if USE_PEFT_BACKEND:
             # weight the lora layers by setting `lora_scale` for each PEFT layer
             scale_lora_layers(self, lora_scale)
         else:
-            if joint_attention_kwargs is not None and joint_attention_kwargs.get("scale", None) is not None:
+            if (
+                joint_attention_kwargs is not None
+                and joint_attention_kwargs.get("scale", None) is not None
+            ):
                 logger.warning(
                     "Passing `scale` via `joint_attention_kwargs` when not using the PEFT backend is ineffective."
                 )
-
-        num_txt_tokens = encoder_hidden_states.shape[1]
 
         # 1. Calculate timestep embedding and modulation parameters
         timestep = timestep.to(hidden_states.dtype) * 1000
@@ -238,13 +215,51 @@ class ditFlux2Transformer2DModel(Flux2Transformer2DModel):
         double_stream_mod_txt = self.double_stream_modulation_txt(temb)
         single_stream_mod = self.single_stream_modulation(temb)[0]
 
-        # 2. Input projection for image (hidden_states) and conditioning text (encoder_hidden_states)
+        # 2. Input projection for image (hidden_states)
         hidden_states = self.x_embedder(hidden_states)
+
+        return (
+            hidden_states,
+            encoder_hidden_states,
+            temb,
+            double_stream_mod_img,
+            double_stream_mod_txt,
+            single_stream_mod,
+            img_ids,
+            txt_ids,
+        )
+
+    def run_teacache_check(self, hidden_states, double_stream_mod_img):
+        img_mod1, _ = double_stream_mod_img
+        img_mod1_shift, img_mod1_scale, _ = img_mod1
+
+        with disable_weight_management():
+            img_modulated = self.transformer_blocks[0].norm1(hidden_states)
+
+        return (1 + img_mod1_scale) * img_modulated + img_mod1_shift
+
+    def run_post_processing(self, hidden_states, temb):
+        hidden_states = self.norm_out(hidden_states, temb)
+        output = self.proj_out(hidden_states)
+        return output
+
+    def run_transformer_blocks(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        img_ids: torch.Tensor,
+        txt_ids: torch.Tensor,
+        double_stream_mod_img: tuple,
+        double_stream_mod_txt: tuple,
+        single_stream_mod: tuple,
+        joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+    ):
+        num_txt_tokens = encoder_hidden_states.shape[1]
+
+        # text encoder
         encoder_hidden_states = self.context_embedder(encoder_hidden_states)
 
         # 3. Calculate RoPE embeddings from image and text tokens
-        # NOTE: the below logic means that we can't support batched inference with images of different resolutions or
-        # text prompts of differents lengths. Is this a use case we want to support?
         if img_ids.ndim == 3:
             img_ids = img_ids[0]
         if txt_ids.ndim == 3:
@@ -278,6 +293,7 @@ class ditFlux2Transformer2DModel(Flux2Transformer2DModel):
                     image_rotary_emb=concat_rotary_emb,
                     joint_attention_kwargs=joint_attention_kwargs,
                 )
+
         # Concatenate text and image streams for single-block inference
         hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
 
@@ -300,12 +316,95 @@ class ditFlux2Transformer2DModel(Flux2Transformer2DModel):
                     image_rotary_emb=concat_rotary_emb,
                     joint_attention_kwargs=joint_attention_kwargs,
                 )
+
         # Remove text tokens from concatenated stream
         hidden_states = hidden_states[:, num_txt_tokens:, ...]
 
+        return hidden_states
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor = None,
+        timestep: torch.LongTensor = None,
+        img_ids: torch.Tensor = None,
+        txt_ids: torch.Tensor = None,
+        guidance: torch.Tensor = None,
+        joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+        return_dict: bool = True,
+    ) -> Union[torch.Tensor, Transformer2DModelOutput]:
+        """The [`FluxTransformer2DModel`] forward method.
+
+        Args:
+            hidden_states (`torch.Tensor` of shape `(batch_size, image_sequence_length, in_channels)`):
+                Input `hidden_states`.
+            encoder_hidden_states (`torch.Tensor` of shape `(batch_size, text_sequence_length, joint_attention_dim)`):
+                Conditional embeddings (embeddings computed from the input conditions such as prompts) to use.
+            timestep ( `torch.LongTensor`):
+                Used to indicate denoising step.
+            block_controlnet_hidden_states: (`list` of `torch.Tensor`):
+                A list of tensors that if specified are added to the residuals of transformer blocks.
+            joint_attention_kwargs (`dict`, *optional*):
+                A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
+                `self.processor` in
+                [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
+            return_dict (`bool`, *optional*, defaults to `True`):
+                Whether or not to return a [`~models.transformer_2d.Transformer2DModelOutput`] instead of a plain
+                tuple.
+
+        Returns:
+            If `return_dict` is True, an [`~models.transformer_2d.Transformer2DModelOutput`] is returned, otherwise a
+            `tuple` where the first element is the sample tensor.
+        """
+        # 0. Handle input arguments
+        if joint_attention_kwargs is not None:
+            joint_attention_kwargs = joint_attention_kwargs.copy()
+            lora_scale = joint_attention_kwargs.pop("scale", 1.0)
+        else:
+            lora_scale = 1.0
+        # dit Split Start #
+        (
+            hidden_states,
+            encoder_hidden_states,
+            temb,
+            double_stream_mod_img,
+            double_stream_mod_txt,
+            single_stream_mod,
+            img_ids,
+            txt_ids,
+        ) = self.run_pre_processing(
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            lora_scale=lora_scale,
+            timestep=timestep,
+            img_ids=img_ids,
+            txt_ids=txt_ids,
+            guidance=guidance,
+            joint_attention_kwargs=joint_attention_kwargs,
+        )
+
+        should_calc = True
+
+        if TeaCacheConfig.enable_teacache():
+            img_modulated = self.run_teacache_check(hidden_states, double_stream_mod_img)
+            should_calc, hidden_states = self._calc_teacache_distance(img_modulated, hidden_states)
+
+        if should_calc:
+            original_hidden_states = hidden_states.clone()
+            hidden_states = self.run_transformer_blocks(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                img_ids=img_ids,
+                txt_ids=txt_ids,
+                double_stream_mod_img=double_stream_mod_img,
+                double_stream_mod_txt=double_stream_mod_txt,
+                single_stream_mod=single_stream_mod,
+                joint_attention_kwargs=joint_attention_kwargs,
+            )
+            self._update_teacache_residual(original_hidden_states, hidden_states)
+
         # 6. Output layers
-        hidden_states = self.norm_out(hidden_states, temb)
-        output = self.proj_out(hidden_states)
+        output = self.run_post_processing(hidden_states, temb)
 
         # dit Gather Start #
         output = dit_sp_gather(output, dim=1)

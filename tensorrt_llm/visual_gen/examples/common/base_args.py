@@ -29,7 +29,9 @@ class BaseArgumentParser:
     def _add_base_args(self):
         """Add common arguments shared by all examples."""
         # Model and basic generation args
-        self.parser.add_argument("--model_path", type=str, help="Model path or HuggingFace model id")
+        self.parser.add_argument(
+            "--model_path", type=str, help="Model path or HuggingFace model id"
+        )
         self.parser.add_argument("--random_seed", type=int, default=42, help="Random seed")
         self.parser.add_argument("--output_path", type=str, default=None, help="Output path")
 
@@ -42,6 +44,7 @@ class BaseArgumentParser:
                 "default",
                 "auto",
                 "fivx",
+                "cudnn-attn",
                 "sage-attn",
                 "sparse-videogen",
                 "sparse-videogen2",
@@ -143,7 +146,9 @@ class BaseArgumentParser:
         self.parser.add_argument("--fsdp", type=int, default=1, help="FSDP size")
         self.parser.add_argument("--refiner_dp", type=int, default=1, help="Data parallel size")
         self.parser.add_argument("--refiner_tp", type=int, default=1, help="Tensor parallel size")
-        self.parser.add_argument("--refiner_ulysses", type=int, default=1, help="Ulysses parallel size")
+        self.parser.add_argument(
+            "--refiner_ulysses", type=int, default=1, help="Ulysses parallel size"
+        )
         self.parser.add_argument("--refiner_ring", type=int, default=1, help="Ring parallel size")
         self.parser.add_argument("--refiner_cp", type=int, default=1, help="Context parallel size")
         self.parser.add_argument("--refiner_cfg", type=int, default=1, help="CFG parallel size")
@@ -151,7 +156,9 @@ class BaseArgumentParser:
         self.parser.add_argument("--t5_fsdp", type=int, default=1, help="T5 FSDP size")
 
         # Torch compile args
-        self.parser.add_argument("--disable_torch_compile", action="store_true", help="Use torch compile")
+        self.parser.add_argument(
+            "--disable_torch_compile", action="store_true", help="Use torch compile"
+        )
         self.parser.add_argument(
             "--torch_compile_models",
             type=str,
@@ -167,14 +174,22 @@ class BaseArgumentParser:
         )
 
         # CudaGraph
-        self.parser.add_argument("--enable_cuda_graph", action="store_true", help="Enable cuda graph")
+        self.parser.add_argument(
+            "--enable_cuda_graph", action="store_true", help="Enable cuda graph"
+        )
 
         # CPU offload args
         self.parser.add_argument(
-            "--enable_sequential_cpu_offload", action="store_true", help="Enable sequential CPU offload"
+            "--enable_sequential_cpu_offload",
+            action="store_true",
+            help="Enable sequential CPU offload",
         )
-        self.parser.add_argument("--enable_model_cpu_offload", action="store_true", help="Enable model CPU offload")
-        self.parser.add_argument("--enable_async_cpu_offload", action="store_true", help="Enable visual_gen cpu offload")
+        self.parser.add_argument(
+            "--enable_model_cpu_offload", action="store_true", help="Enable model CPU offload"
+        )
+        self.parser.add_argument(
+            "--enable_async_cpu_offload", action="store_true", help="Enable visual_gen cpu offload"
+        )
         self.parser.add_argument(
             "--visual_gen_block_cpu_offload_stride",
             type=int,
@@ -183,7 +198,9 @@ class BaseArgumentParser:
         )
 
         # VAE parallel args
-        self.parser.add_argument("--disable_parallel_vae", action="store_true", help="Disable parallel VAE")
+        self.parser.add_argument(
+            "--disable_parallel_vae", action="store_true", help="Disable parallel VAE"
+        )
         self.parser.add_argument(
             "--parallel_vae_split_dim",
             type=str,
@@ -194,23 +211,43 @@ class BaseArgumentParser:
 
         # TeaCache args
         self.parser.add_argument("--enable_teacache", action="store_true", help="Enable teacache")
-        self.parser.add_argument("--teacache_thresh", type=float, default=0.2, help="Threshold for teacache")
-        self.parser.add_argument("--use_ret_steps", action="store_true", help="Use ret steps for teacache")
+        self.parser.add_argument(
+            "--teacache_thresh", type=float, default=0.2, help="Threshold for teacache"
+        )
+        self.parser.add_argument(
+            "--use_ret_steps", action="store_true", help="Use ret steps for teacache"
+        )
+        self.parser.add_argument(
+            "--ret_steps", type=int, default=0, help="Step index to start using teacache"
+        )
+        self.parser.add_argument(
+            "--cutoff_steps", type=int, default=50, help="Step index to stop using TeaCache"
+        )
 
         # QKV fusion args
         self.parser.add_argument(
-            "--disable_qkv_fusion", action="store_true", help="Don't fuse qkv, by default we will fuse qkv"
+            "--disable_qkv_fusion",
+            action="store_true",
+            help="Don't fuse qkv, by default we will fuse qkv",
         )
 
         # Generation args
-        self.parser.add_argument("--prompt", type=str, default="", help="Text prompt for generation")
-        self.parser.add_argument("--negative_prompt", type=str, default="", help="Negative prompt for generation")
+        self.parser.add_argument(
+            "--prompt", type=str, default="", help="Text prompt for generation"
+        )
+        self.parser.add_argument(
+            "--negative_prompt", type=str, default="", help="Negative prompt for generation"
+        )
         self.parser.add_argument("--height", type=int, default=512, help="Image/Video height")
         self.parser.add_argument("--width", type=int, default=512, help="Image/Video width")
         self.parser.add_argument("--guidance_scale", type=float, default=5.0, help="Guidance scale")
         self.parser.add_argument("--shift", type=int, default=5, help="Inference shift")
-        self.parser.add_argument("--num_inference_steps", type=int, default=50, help="Number of inference steps")
-        self.parser.add_argument("--num_warmup_steps", type=int, default=1, help="Number of warmup steps")
+        self.parser.add_argument(
+            "--num_inference_steps", type=int, default=50, help="Number of inference steps"
+        )
+        self.parser.add_argument(
+            "--num_warmup_steps", type=int, default=1, help="Number of warmup steps"
+        )
 
         # Sparse attention args
         self.parser.add_argument(
@@ -232,26 +269,42 @@ class BaseArgumentParser:
             choices=["default", "sage-attn"],
             help="High precision attention type to fallback",
         )
-        self.parser.add_argument("--sparsity", type=float, default=0.25, help="Sparsity for sparse attention")
         self.parser.add_argument(
-            "--max_sequence_length", type=int, default=512, help="Max sequence length of text encoder"
+            "--sparsity", type=float, default=0.25, help="Sparsity for sparse attention"
+        )
+        self.parser.add_argument(
+            "--max_sequence_length",
+            type=int,
+            default=512,
+            help="Max sequence length of text encoder",
         )
 
         # svd args
-        self.parser.add_argument("--svd_fp4_checkpoint_path", type=str, default="", help="SVD FP4 checkpoint path")
+        self.parser.add_argument(
+            "--svd_fp4_checkpoint_path", type=str, default="", help="SVD FP4 checkpoint path"
+        )
 
         # multiple prompts args
         self.parser.add_argument(
-            "--multiple_prompts", type=bool, default=False, help="Enable multiple prompts in json format as input"
+            "--multiple_prompts",
+            type=bool,
+            default=False,
+            help="Enable multiple prompts in json format as input",
         )
 
         # whether to enable profile
         self.parser.add_argument("--profile", action="store_true", help="Enable profile")
 
         # quantize args
-        self.parser.add_argument("--export_visual_gen_dit", action="store_true", help="Enable export quantized DIT")
-        self.parser.add_argument("--load_visual_gen_dit", action="store_true", help="Load quantized DIT")
-        self.parser.add_argument("--visual_gen_ckpt_path", type=str, default="visual_gen_dit", help="Quantized DIT path")
+        self.parser.add_argument(
+            "--export_visual_gen_dit", action="store_true", help="Enable export quantized DIT"
+        )
+        self.parser.add_argument(
+            "--load_visual_gen_dit", action="store_true", help="Load quantized DIT"
+        )
+        self.parser.add_argument(
+            "--visual_gen_ckpt_path", type=str, default="visual_gen_dit", help="Quantized DIT path"
+        )
 
         # 8-bit communication args
         self.parser.add_argument(
@@ -266,13 +319,24 @@ class BaseArgumentParser:
         )
         # svg2 args
         self.parser.add_argument(
-            "--num_q_centroids", "--qc", type=int, default=100, help="Number of query centroids for KMEANS_BLOCK."
+            "--num_q_centroids",
+            "--qc",
+            type=int,
+            default=100,
+            help="Number of query centroids for KMEANS_BLOCK.",
         )
         self.parser.add_argument(
-            "--num_k_centroids", "--kc", type=int, default=500, help="Number of key centroids for KMEANS_BLOCK."
+            "--num_k_centroids",
+            "--kc",
+            type=int,
+            default=500,
+            help="Number of key centroids for KMEANS_BLOCK.",
         )
         self.parser.add_argument(
-            "--top_p_kmeans", type=float, default=0.9, help="Top-p threshold for block selection in KMEANS_BLOCK."
+            "--top_p_kmeans",
+            type=float,
+            default=0.9,
+            help="Top-p threshold for block selection in KMEANS_BLOCK.",
         )
         self.parser.add_argument(
             "--min_kc_ratio",
@@ -296,13 +360,20 @@ class BaseArgumentParser:
     def add_video_args(self, default_num_frames: int = 33, default_fps: int = 16):
         """Add video generation arguments."""
         self.parser.add_argument(
-            "--num_frames", type=int, default=default_num_frames, help="Number of frames to generate"
+            "--num_frames",
+            type=int,
+            default=default_num_frames,
+            help="Number of frames to generate",
         )
-        self.parser.add_argument("--fps", type=int, default=default_fps, help="FPS for exported video")
+        self.parser.add_argument(
+            "--fps", type=int, default=default_fps, help="FPS for exported video"
+        )
 
     def add_image_input_args(self, default_image: str = ""):
         """Add image input arguments for image-to-video."""
-        self.parser.add_argument("--image", type=str, default=default_image, help="Input image URL or local path")
+        self.parser.add_argument(
+            "--image", type=str, default=default_image, help="Input image URL or local path"
+        )
 
     def set_defaults(self, **kwargs):
         """Set default values for arguments."""

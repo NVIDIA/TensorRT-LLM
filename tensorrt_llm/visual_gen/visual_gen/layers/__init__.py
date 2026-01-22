@@ -14,23 +14,40 @@
 # limitations under the License.
 
 import gc
+import re
+from typing import Optional
 
 import torch
 from torch import nn
+
+from visual_gen.utils import get_logger
 
 from .attention import ditAttnProcessor
 from .linear import ditLinear
 from .norm import ditLayerNorm, ditRMSNorm
 
 __all__ = ["ditAttnProcessor", "ditLinear", "apply_visual_gen_linear"]
+logger = get_logger(__name__)
 
 
-def apply_visual_gen_linear(model: nn.Module, load_parameters: bool = True, quantize_weights: bool = True):
+def apply_visual_gen_linear(
+    model: nn.Module,
+    load_parameters: bool = True,
+    quantize_weights: bool = True,
+    exclude_pattern: Optional[str] = None,
+):
+    exclude_pattern_ = re.compile(exclude_pattern) if exclude_pattern else None
+
     # Collect all linear modules to replace first to avoid modifying during iteration
     linear_modules_to_replace = []
     for name, module in model.named_modules():
-        if isinstance(module, nn.Linear):
+        if (
+            isinstance(module, nn.Linear)
+            and (exclude_pattern_ is None or exclude_pattern_.match(name) is None)
+        ):
             linear_modules_to_replace.append(name)
+
+    logger.info(f"Number of layers converted using visual_gen: {len(linear_modules_to_replace)}")
 
     # Replace linear modules
     for name in linear_modules_to_replace:
@@ -52,9 +69,12 @@ def apply_visual_gen_linear(model: nn.Module, load_parameters: bool = True, quan
     torch.cuda.empty_cache()
 
 
-def apply_visual_gen_norm(model: nn.Module, rmsnorm: list = [], layernorm: list = [], load_parameters: bool = False):
+def apply_visual_gen_norm(
+    model: nn.Module, rmsnorm: list = [], layernorm: list = [], load_parameters: bool = False
+):
     rmsnorm_modules_to_replace = []
     layernorm_modules_to_replace = []
+
     for name, module in model.named_modules():
         is_rmsnorm, is_layernorm = False, False
         suffix_name = name.split(".")[-1]

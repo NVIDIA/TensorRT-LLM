@@ -101,7 +101,6 @@ class DefaultLinear(BaseLinear):
         input_scale: torch.Tensor,
         weight_scale: torch.Tensor,
     ) -> torch.Tensor:
-        # print(f"DefaultLinear: input.dtype: {input.dtype}, weight.dtype: {weight.dtype}, bias.dtype: {bias.dtype}")
         return F.linear(input, weight, bias)
 
 
@@ -548,6 +547,9 @@ class ComfyKitchenNVFP4Linear(BaseLinear):
 
         if LinearOpManager.linear_recipe == "dynamic":
             input_scale_2 = 448.0 * 6.0 / torch.amax(torch.abs(input)).to(torch.float)
+        elif input_scale is not None:
+            # using user provided input_scale
+            input_scale_2 = input_scale
         else:
             input_scale_2 = self.input_scale_2
 
@@ -636,6 +638,9 @@ class FlashInferNVFP4Linear:
 
         if LinearOpManager.linear_recipe == "dynamic":
             input_global_sf = (448 * 6) / input.float().abs().nan_to_num().max()
+        elif input_scale is not None:
+            # using user provided input_scale
+            input_global_sf = input_scale
         else:
             # TODO: magic number for static quantization scale, it should be passed by a quantized ckpt
             input_global_sf = self.input_scale_2
