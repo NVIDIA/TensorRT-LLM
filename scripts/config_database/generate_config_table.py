@@ -146,7 +146,27 @@ def build_rows(yaml_path) -> list[RecipeRow]:
     return rows
 
 
-def generate_rst(yaml_path, output_file=None):
+def _read_file_if_exists(path: Path) -> str | None:
+    if path.exists():
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    return None
+
+
+def _write_if_changed(path: Path, content: str) -> bool:
+    """Write content to file only if it differs from existing content. Returns True if file was modified."""
+    existing = _read_file_if_exists(path)
+    if existing == content:
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+    print(f"Updated {path}")
+    return True
+
+
+def generate_rst(yaml_path, output_file=None) -> bool:
+    """Generate RST documentation. Returns True if file was modified (when output_file is provided)."""
     rows = build_rows(yaml_path)
     model_groups = defaultdict(list)
     for row in rows:
@@ -217,13 +237,14 @@ def generate_rst(yaml_path, output_file=None):
 
     output_text = "\n".join(lines)
     if output_file:
-        with open(output_file, "w") as f:
-            f.write(output_text)
+        return _write_if_changed(Path(output_file), output_text)
     else:
         print(output_text)
+        return False
 
 
-def generate_json(yaml_path, output_file):
+def generate_json(yaml_path, output_file) -> bool:
+    """Generate JSON documentation. Returns True if file was modified."""
     rows = build_rows(yaml_path)
 
     source_path = Path(yaml_path)
@@ -246,9 +267,8 @@ def generate_json(yaml_path, output_file):
         "entries": [asdict(r) for r in rows],
     }
 
-    with open(output_file, "w") as f:
-        json.dump(payload, f, indent=2, sort_keys=True)
-        f.write("\n")
+    content = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    return _write_if_changed(Path(output_file), content)
 
 
 if __name__ == "__main__":
@@ -277,7 +297,12 @@ if __name__ == "__main__":
     output_path = REPO_ROOT / "docs/source/deployment-guide/config_table.rst"
     json_output_path = REPO_ROOT / "docs/source/_static/config_db.json"
 
+    modified = False
     if args.generate_rst:
-        generate_rst(yaml_path, output_file=output_path)
+        if generate_rst(yaml_path, output_file=output_path):
+            modified = True
     if args.generate_json:
-        generate_json(yaml_path, output_file=json_output_path)
+        if generate_json(yaml_path, output_file=json_output_path):
+            modified = True
+
+    sys.exit(modified)

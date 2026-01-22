@@ -1475,3 +1475,17 @@ repos:
         language: script
         files: examples/configs/database/lookup\.yaml$
         pass_filenames: false
+    -   id: generate-config-database-tests
+        name: Generate config database tests
+        entry: python scripts/config_database/generate_config_database_tests.py
+        language: python
+        additional_dependencies: ['pyyaml', 'pydantic']
+        files: examples/configs/database/.*\.yaml$
+        pass_filenames: false
+    -   id: generate-config-table
+        name: Generate config table documentation
+        entry: python scripts/config_database/generate_config_table.py --no-generate-json
+        language: python
+        additional_dependencies: ['pyyaml', 'pydantic']
+        files: (examples/configs/database/.*\.yaml$|docs/source/deployment-guide/config_table\.rst$)
+        pass_filenames: false

@@ -22,12 +22,19 @@ This script:
 """
 
 import copy
+import sys
 from collections import defaultdict
 from pathlib import Path
 
 import yaml
 
-from examples.configs.database.database import (
+SCRIPT_DIR = Path(__file__).parent.resolve()
+REPO_ROOT = SCRIPT_DIR.parent.parent
+
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from examples.configs.database.database import (  # noqa: E402
     DATABASE_LIST_PATH,
     Recipe,
     RecipeList,
@@ -175,8 +182,28 @@ def generate_condition_entry(
     return {"condition": condition, "tests": tests}
 
 
-def generate_tests(test_list_path: Path = TEST_LIST_PATH, test_config_dir: Path = PERF_SANITY_DIR):
-    test_list_path.parent.mkdir(parents=True, exist_ok=True)
+def _read_file_if_exists(path: Path) -> str | None:
+    if path.exists():
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    return None
+
+
+def _write_if_changed(path: Path, content: str) -> bool:
+    """Write content to file only if it differs from existing content. Returns True if file was modified."""
+    existing = _read_file_if_exists(path)
+    if existing == content:
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+    print(f"Updated {path}")
+    return True
+
+
+def generate_tests(test_list_path: Path = TEST_LIST_PATH, test_config_dir: Path = PERF_SANITY_DIR) -> bool:
+    """Generate test config files and test list. Returns True if any files were modified."""
+    modified = False
 
     all_recipes = RecipeList.from_yaml(DATABASE_LIST_PATH)
     recipes = filter_to_key_recipes(all_recipes)
@@ -184,7 +211,6 @@ def generate_tests(test_list_path: Path = TEST_LIST_PATH, test_config_dir: Path 
 
     gpu_groups = group_recipes_by_gpu(recipes)
     condition_entries = []
-    config_files = {}
 
     for gpu_name in sorted(gpu_groups.keys()):
         gpu_recipes = gpu_groups[gpu_name]
@@ -196,11 +222,8 @@ def generate_tests(test_list_path: Path = TEST_LIST_PATH, test_config_dir: Path 
             aggr_config, default_flow_style=False, sort_keys=False, width=120
         )
 
-        with open(config_path, "w", encoding="utf-8") as f:
-            f.write(config_content)
-        print(f"Generated {config_path}")
-
-        config_files[config_path] = config_content
+        if _write_if_changed(config_path, config_content):
+            modified = True
 
         # Generate condition entries grouped by num_gpus
         num_gpus_groups = group_recipes_by_num_gpus(gpu_recipes)
@@ -228,11 +251,15 @@ def generate_tests(test_list_path: Path = TEST_LIST_PATH, test_config_dir: Path 
 # ===============================================================================
 
 """
-    with open(test_list_path, "w", encoding="utf-8") as f:
-        f.write(header)
-        yaml.dump(test_list, f, default_flow_style=False, sort_keys=False, width=120)
-    print(f"Generated {test_list_path}")
+    test_list_yaml = yaml.dump(test_list, default_flow_style=False, sort_keys=False, width=120)
+    test_list_content = header + test_list_yaml
+
+    if _write_if_changed(test_list_path, test_list_content):
+        modified = True
+
+    return modified
 
 
 if __name__ == "__main__":
-    generate_tests()
+    modified = generate_tests()
+    sys.exit(modified)
