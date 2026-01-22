@@ -3,7 +3,8 @@ from typing import Literal
 
 import click
 
-from tensorrt_llm.executor.utils import LlmLauncherEnvs
+from tensorrt_llm.executor.utils import (
+    LlmLauncherEnvs, get_spawn_proxy_process_ipc_hmac_key_env)
 from tensorrt_llm.llmapi.mpi_session import RemoteMpiCommSessionClient
 from tensorrt_llm.llmapi.utils import print_colored
 
@@ -13,8 +14,10 @@ def run_task(task_type: Literal["submit", "submit_sync"]):
     assert os.environ[
         LlmLauncherEnvs.
         TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR] is not None, "TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR is not set"
+    hmac_key = get_spawn_proxy_process_ipc_hmac_key_env()
     client = RemoteMpiCommSessionClient(
-        os.environ[LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR])
+        os.environ[LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR],
+        hmac_key=hmac_key)
 
     for task in tasks:
         if task_type == "submit":
