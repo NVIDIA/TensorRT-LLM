@@ -778,21 +778,32 @@ class LlamaDecoderLayer(DecoderLayer):
         )
         # Fully Connected
         if self.PRE_MLP_FUSION:
+            has_lora = bool(kwargs.get('lora_params'))
+
             if self.is_nvfp4 or self.is_fp8_quant:
-                scale = self.mlp.gate_up_proj.input_scale
+                # WAR: Skip FP8/NVFP4 quantization when LoRA is active
+                # since LoRA grouped_gemm does not support FP8 yet
+                # see: cpp/tensorrt_llm/thop/loraOp.cpp::lora_grouped_gemm
+                if has_lora:
+                    scale = None  # To prevent quantization
+                    fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM  # Use non-quantizing fusion
+                else:
+                    scale = self.mlp.gate_up_proj.input_scale
+                    fusion_op = self.pre_mlp_fusion_op
             else:
                 scale = None
+                fusion_op = self.pre_mlp_fusion_op
 
             all_reduce_output = self.all_reduce(
                 hidden_states,
                 all_reduce_params=AllReduceParams(
-                    fusion_op=self.pre_mlp_fusion_op,
+                    fusion_op=fusion_op,
                     residual=residual,
                     norm_weight=self.post_attention_layernorm.weight,
                     scale=scale,
                     eps=self.post_attention_layernorm.variance_epsilon,
                 ))
-            if self.is_nvfp4:
+            if fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4:
                 act_fp4, act_sf, residual = all_reduce_output
                 hidden_states = Fp4QuantizedTensor(act_fp4, act_sf)
             else:
@@ -841,24 +852,30 @@ class LlamaDecoderLayer(DecoderLayer):
                 # The next layernorm exists but it could be the last decoder layer.
                 # Adjust the scale and fusion pattern.
 
+                has_lora = bool(kwargs.get('lora_params'))
+
+                # WAR: Skip FP8/NVFP4 quantization when LoRA is active
+                # since LoRA grouped_gemm does not support FP8 yet
                 if not (self.next_attn is not None and (self.is_nvfp4
                                                    or self.is_fp8_quant)) \
-                or not hasattr(self.next_attn.qkv_proj, 'input_scale'):
+                or not hasattr(self.next_attn.qkv_proj, 'input_scale') \
+                or has_lora:
                     scale = None
-                    self.post_mlp_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
+                    post_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
                 else:
                     scale = self.next_attn.qkv_proj.input_scale
+                    post_fusion_op = self.post_mlp_fusion_op
 
                 all_reduce_output = self.all_reduce(
                     hidden_states,
                     all_reduce_params=AllReduceParams(
-                        fusion_op=self.post_mlp_fusion_op,
+                        fusion_op=post_fusion_op,
                         residual=residual,
                         norm_weight=self.next_layer_layernorm.weight,
                         scale=scale,
                         eps=self.next_layer_layernorm.variance_epsilon,
                     ))
-                if self.post_mlp_fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4:
+                if post_fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4:
                     act_fp4, act_sf, residual = all_reduce_output
                     hidden_states = Fp4QuantizedTensor(act_fp4, act_sf)
                 else:
