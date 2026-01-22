@@ -125,7 +125,6 @@ def DEBUG_MODE = "debug"
 @Field
 def DETAILED_LOG = "detailed_log"
 
-@Field
 def testFilter = [
     (REUSE_TEST): gitlabParamsFromBot.get(REUSE_TEST, null),
     (REUSE_STAGE_LIST): trimForStageList(gitlabParamsFromBot.get(REUSE_STAGE_LIST, null)?.tokenize(',')),
@@ -145,7 +144,6 @@ def testFilter = [
     (DETAILED_LOG): gitlabParamsFromBot.get(DETAILED_LOG, false),
 ]
 
-@Field
 String reuseBuild = gitlabParamsFromBot.get('reuse_build', null)
 
 @Field
@@ -158,7 +156,6 @@ def ACTION_INFO = "action_info"
 def IMAGE_KEY_TO_TAG = "image_key_to_tag"
 @Field
 def TARGET_BRANCH = "target_branch"
-@Field
 def globalVars = [
     (GITHUB_PR_API_URL): gitlabParamsFromBot.get('github_pr_api_url', null),
     (CACHED_CHANGED_FILE_LIST): null,
@@ -845,7 +842,7 @@ def getOnlyOneGroupChanged(pipeline, testFilter, globalVars) {
     return ""
 }
 
-def collectTestResults(pipeline, testFilter)
+def collectTestResults(pipeline, testFilter, globalVars)
 {
     collectResultPodSpec = createKubernetesPodConfig("", "agent")
     trtllm_utils.launchKubernetesPod(pipeline, collectResultPodSpec, "alpine", {
@@ -857,7 +854,7 @@ def collectTestResults(pipeline, testFilter)
                 echo "[TEST] GITHUB_PR_API_URL=${globalVars[GITHUB_PR_API_URL]}, TARGET_BRANCH=${globalVars[TARGET_BRANCH]}"
 
                 sh "which git || apk add --no-cache git"
-                updateGithubTagCommit(pipeline)
+                updateGithubTagCommit(pipeline, globalVars)
             }
         }
         stage ("Collect Test Result") {
@@ -1403,7 +1400,7 @@ def areAllFailuresPostMerge(failedStageList) {
  * Create or update GitHub tag for the latest stable commit
  * @return true if tag is successfully created, false otherwise
  */
-def createGithubTag() {
+def createGithubTag(globalVars) {
     def commitSha = env.gitlabCommit
     def prNumber = globalVars[GITHUB_PR_API_URL].split('/').last()
     def targetBranch = env.gitlabTargetBranch ?: (globalVars[TARGET_BRANCH] ?: "main")
@@ -1453,9 +1450,10 @@ def createGithubTag() {
 /**
  * Check if pre-merge tests passed and update GitHub tag accordingly
  * @param pipeline Pipeline object
+ * @param globalVars Global variables map
  * @return true if tag is successfully updated, false otherwise
  */
-def updateGithubTagCommit(pipeline) {
+def updateGithubTagCommit(pipeline, globalVars) {
     // TEST: Print check result
     echo "[TEST] Checking GITHUB_PR_API_URL: ${globalVars[GITHUB_PR_API_URL]}"
     if (!globalVars[GITHUB_PR_API_URL]) {
@@ -1470,7 +1468,7 @@ def updateGithubTagCommit(pipeline) {
     if (buildResult == 'SUCCESS') {
         echo "[TEST] Fast path: Pipeline SUCCESS"
         echo "Pipeline succeeded. Updating GitHub tag..."
-        return createGithubTag()
+        return createGithubTag(globalVars)
     }
 
     // Slow path: Check if only post-merge stages failed
@@ -1494,7 +1492,7 @@ def updateGithubTagCommit(pipeline) {
     }
 
     echo "Only post-merge stages failed. Updating GitHub tag..."
-    return createGithubTag()
+    return createGithubTag(globalVars)
 }
 
 pipeline {
@@ -1529,7 +1527,7 @@ pipeline {
         always {
             script {
                 if (!isReleaseCheckMode) {
-                    collectTestResults(this, testFilter)
+                    collectTestResults(this, testFilter, globalVars)
                 }
             }
         }
