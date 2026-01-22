@@ -50,6 +50,8 @@ set(SRCS
     promptTuningBuffers.cpp
     rnnStateBuffers.cpp
     rnnStateManager.cpp
+    rnnCacheFormatter.cpp
+    rnnCacheTransceiver.cpp
     runtimeBuffers.cpp
     sequenceSlotManager.cpp
     transformerBuffers.cpp
