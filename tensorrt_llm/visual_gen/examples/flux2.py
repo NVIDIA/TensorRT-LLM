@@ -60,17 +60,12 @@ def load_and_setup_pipeline(args):
         args.model_path, transformer=transformer, torch_dtype=torch.bfloat16, **dit_configs
     )
 
-    if args.enable_nvfp4_dynamic_quant:
-        assert (
-            args.linear_recipe != "dynamic"
-            "Linear recipe must be static if enable_nvfp4_dynamic_quant=True"
-        )
-        assert (
-            args.linear_type != "flashinfer-nvfp4-cutlass"
-            "Linear type must be flashinfer-nvfp4-cutlass if enable_nvfp4_dynamic_quant=True"
+    if args.linear_recipe == "dynamic":
+        assert args.linear_type != "flashinfer-nvfp4-cutlass", (
+            "Linear type must be flashinfer-nvfp4-cutlass if linear_recipe=dynamic"
         )
 
-        exclude_pattern = r"^(?!.*(embedder|norm_out|proj_out|to_add_out|to_added_qkv|stream)).*"
+        exclude_pattern = r".*(embedder|norm_out|proj_out|to_add_out|to_added_qkv|stream).*"
         apply_visual_gen_linear(
             pipe.transformer,
             load_parameters=True,
@@ -136,7 +131,6 @@ def main():
         height=1024,
         width=1024,
         guidance_scale=4,
-        enable_nvfp4_dynamic_quant=False,
         enable_cuda_graph=True,
     )
 
