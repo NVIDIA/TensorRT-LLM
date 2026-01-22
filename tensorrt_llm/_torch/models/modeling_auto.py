@@ -32,7 +32,8 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
         if hasattr(config.pretrained_config, "draft_vocab_size"):
             model_arch = "EAGLE3" + model_arch
         if model_arch in (
-                "DeepseekV3ForCausalLM", "Glm4MoeForCausalLM"
+                "DeepseekV3ForCausalLM", "Glm4MoeForCausalLM",
+                "ExaoneMoEForCausalLM"
         ) and config.spec_config is not None and config.spec_config.max_draft_len == 0:
             model_arch = "MTPDraftModelForCausalLM"
 
