@@ -1206,7 +1206,7 @@ private:
 
         if (ifFallbackToNCCL(seq_len, message_size_bytes, max_workspace_size))
         {
-            return AllReduceStrategyType::NCCL_SYMMETRIC;
+            return AllReduceStrategyType::NCCL;
         }
 
         // This rule based heuristic only chooses between NCCL_SYMMETRIC and MIN_LATENCY strategies.
