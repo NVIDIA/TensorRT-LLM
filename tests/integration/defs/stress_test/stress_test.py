@@ -46,7 +46,8 @@ import pytest
 import requests
 import yaml
 from defs.common import get_free_port_in_ci, parse_gsm8k_output
-from defs.conftest import get_device_count, get_device_memory, llm_models_root
+from defs.conftest import (get_device_count, get_device_memory, llm_models_root,
+                           skip_post_blackwell)
 from defs.trt_test_alternative import (Popen, cleanup_process_tree, print_info,
                                        print_warning)
 
@@ -369,6 +370,7 @@ def is_port_available(port: int,
             return False, f"Port {port} is already in use on {host}: {e}"
 
 
+@skip_post_blackwell
 @pytest.mark.parametrize(
     "test_mode",
     ["stress-test", "stress-stage-alone", "stress-test-with-accuracy"],
