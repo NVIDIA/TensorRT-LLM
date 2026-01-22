@@ -72,7 +72,6 @@ if (env.gitlabTriggerPhrase)
 
 // "Fail Fast" feature is enabled by default for the pre-merge pipeline.
 // "Fail Fast" feature is always disabled for the post-merge pipeline.
-// Note: These variables access 'env' which is only available during pipeline execution
 boolean enableFailFast = !(env.JOB_NAME ==~ /.*PostMerge.*/ || env.JOB_NAME ==~ /.*Dependency_Testing_TRT.*/) && !gitlabParamsFromBot.get("disable_fail_fast", false)
 
 boolean isReleaseCheckMode = (gitlabParamsFromBot.get("run_mode", "full") == "release_check")
@@ -169,7 +168,6 @@ def globalVars = [
 ]
 
 // If not running all test stages in the L0 pre-merge, we will not update the GitLab status at the end.
-// Note: Depends on testFilter which depends on env
 boolean enableUpdateGitlabStatus =
     !testFilter[ENABLE_SKIP_TEST] &&
     !testFilter[ONLY_MULTI_GPU_TEST] &&
