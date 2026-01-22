@@ -1752,7 +1752,9 @@ class PyExecutor:
                             ResourceManagerType.KV_CACHE_MANAGER)
 
                         # Execute update in the same stream as forward to avoid synchronization overhead
-                        # and ensure correct ordering without explicit wait_stream
+                        # Wait for sampling to complete before switching to execution_stream
+                        self.execution_stream.wait_stream(
+                            torch.cuda.current_stream())
                         with torch.cuda.stream(self.execution_stream):
                             kv_cache_manager.update_resources_for_mamba_cache_manager(
                                 scheduled_batch, sample_state=sample_state)

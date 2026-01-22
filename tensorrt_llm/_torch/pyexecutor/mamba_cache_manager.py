@@ -400,16 +400,39 @@ class MambaCacheManager(BaseResourceManager):
         state_indices_updated = []
         if sample_state is not None:
             # for overlap scheduler, use sample_state to get num_accepted_draft_tokens for previous iteration because sampler update is not called when this function is called
+            valid_slots = []
+            valid_cache_indices = []
+
             for req in scheduled_batch.generation_requests:
                 if req.state != LlmRequestState.GENERATION_COMPLETE:
-                    new_tokens_lens = sample_state.host.new_tokens_lens[
-                        req.py_seq_slot]
-                    num_accepted_draft_tokens.append(new_tokens_lens - 1)
-                    state_indices_updated.append(
+                    valid_slots.append(req.py_seq_slot)
+                    valid_cache_indices.append(
                         self.mamba_cache_index[req.py_request_id])
                 else:
-                    num_accepted_draft_tokens.append(-1)
-                    state_indices_updated.append(-1)
+                    valid_slots.append(-1)
+                    valid_cache_indices.append(-1)
+
+            if len(valid_cache_indices) == 0:
+                return
+
+            # Perform all operations on GPU to avoid synchronization overhead
+            slots_tensor = torch.tensor(valid_slots,
+                                        dtype=torch.int32,
+                                        device='cuda')
+            state_indices_updated = torch.tensor(valid_cache_indices,
+                                                 dtype=torch.int32,
+                                                 device='cuda')
+
+            # Use device version of new_tokens_lens and perform indexing on GPU
+            valid_mask = slots_tensor >= 0
+            num_accepted_draft_tokens = torch.full((len(valid_slots), ),
+                                                   -1,
+                                                   dtype=torch.int32,
+                                                   device='cuda')
+            if valid_mask.any():
+                num_accepted_draft_tokens[
+                    valid_mask] = sample_state.device.new_tokens_lens[
+                        slots_tensor[valid_mask]] - 1
         else:
             for req in scheduled_batch.generation_requests:
                 if req.state != LlmRequestState.GENERATION_COMPLETE:
@@ -421,15 +444,16 @@ class MambaCacheManager(BaseResourceManager):
                 else:
                     num_accepted_draft_tokens.append(-1)
                     state_indices_updated.append(-1)
-        if len(state_indices_updated) == 0:
-            return
 
-        num_accepted_draft_tokens = torch.tensor(num_accepted_draft_tokens,
+            if len(state_indices_updated) == 0:
+                return
+
+            num_accepted_draft_tokens = torch.tensor(num_accepted_draft_tokens,
+                                                     dtype=torch.int32,
+                                                     device='cuda')
+            state_indices_updated = torch.tensor(state_indices_updated,
                                                  dtype=torch.int32,
                                                  device='cuda')
-        state_indices_updated = torch.tensor(state_indices_updated,
-                                             dtype=torch.int32,
-                                             device='cuda')
         self._update_speculative_mamba_states(num_accepted_draft_tokens,
                                               state_indices_updated)
 
