@@ -186,7 +186,8 @@ def launch_server(
 
     backend = llm_args["backend"]
     model = llm_args["model"]
-    address_family = socket.AF_INET6 if ':' in host else socket.AF_INET
+    addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+    address_family = socket.AF_INET6 if all([info[0] == socket.AF_INET6 for info in addr_info]) else socket.AF_INET
     with socket.socket(address_family, socket.SOCK_STREAM) as s:
         # If disagg cluster config is provided and port is not specified, try to find a free port, otherwise try to bind to the specified port
         assert port > 0 or disagg_cluster_config is not None, "Port must be specified if disagg cluster config is not provided"
