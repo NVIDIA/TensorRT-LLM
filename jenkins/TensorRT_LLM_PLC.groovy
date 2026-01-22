@@ -31,6 +31,24 @@ def createKubernetesPodConfig()
                         memory: 32Gi
                         ephemeral-storage: 200Gi
                     imagePullPolicy: Always
+                  - name: docker
+                    image: urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:202505221445_docker_dind_withbash
+                    tty: true
+                    resources:
+                      requests:
+                        cpu: 16
+                        memory: 72Gi
+                        ephemeral-storage: 200Gi
+                      limits:
+                        cpu: 16
+                        memory: 256Gi
+                        ephemeral-storage: 200Gi
+                    imagePullPolicy: Always
+                    securityContext:
+                      privileged: true
+                      capabilities:
+                        add:
+                        - SYS_ADMIN
                 qosClass: Guaranteed
         """.stripIndent(),
     ]
@@ -61,6 +79,20 @@ def checkoutSource ()
     sh "git config --global user.email \"90828364+tensorrt-cicd@users.noreply.github.com\""
     sh "git config --global user.name \"TensorRT LLM\""
     trtllm_utils.checkoutSource(LLM_REPO, params.branchName, env.WORKSPACE, false, true)
+}
+
+def getPulseToken() {
+    def token
+    //Configure credential 'starfleet-client-id' under Jenkins Credential Manager
+    withCredentials([usernamePassword(
+        credentialsId: "NSPECT_CLIENT-prod",
+        usernameVariable: 'SF_CLIENT_ID',
+        passwordVariable: 'SF_CLIENT_SECRET'
+    )]) {
+        AuthHeader = sh(script: "echo -n $SF_CLIENT_ID:$SF_CLIENT_SECRET | base64 -w0", returnStdout: true).trim()
+        token= sh(script: "curl -s --request POST --header \"Authorization: Basic ${AuthHeader}\" --header \"Content-Type: application/x-www-form-urlencoded\" \"https://4ubglassowmtsi7ogqwarmut7msn1q5ynts62fwnr1i.ssa.nvidia.com/token?grant_type=client_credentials&scope=verify:nspectid%20sourcecode:blackduck%20update:report\" | jq \".access_token\" |  tr -d '\"'", returnStdout: true).trim()
+    }
+    return token
 }
 
 def generate()
@@ -125,6 +157,43 @@ def sonar_scan()
     }
 }
 
+def pulseScan() {
+    container("docker") {
+        sh "apk add jq curl"
+        def token = getPulseToken()
+        def LLM_REPO = "https://github.com/NVIDIA/TensorRT-LLM.git"
+        withCredentials([
+            usernamePassword(
+                credentialsId: "svc_tensorrt_gitlab_read_api_token",
+                usernameVariable: 'USERNAME',
+                passwordVariable: 'PASSWORD'
+            ),
+            string(credentialsId: 'default-git-url', variable: 'DEFAULT_GIT_URL')
+        ]) {
+            trtllm_utils.llmExecStepWithRetry(this, script: "docker login gitlab-master.nvidia.com:5005 -u ${USERNAME} -p ${PASSWORD}")
+        }
+        checkoutSource()
+        sh "cd ${env.WORKSPACE}"
+        docker.withRegistry('https://gitlab-master.nvidia.com:5005') {
+            docker.image("pstooling/pulse-group/pulse-open-source-scanner/pulse-oss-cli:stable")
+              .inside("--user 0 --privileged -v /var/run/docker.sock:/var/run/docker.sock") {
+                withEnv([
+                    "PULSE_NSPECT_ID=NSPECT-95LK-6FZF",
+                    "PULSE_BEARER_TOKEN=${token}",
+                    "PULSE_REPO_URL=${LLM_REPO}",
+                    "PULSE_SCAN_PROJECT=TRT-LLM",
+                    "PULSE_SCAN_PROJECT_VERSION=${params.branchName}",
+                    "PULSE_SCAN_VULNERABILITY_REPORT=nspect_scan_report.json"
+                ]) {
+                    sh 'pulse scan --no-fail .'
+                }
+              }
+        }
+        sh "ls"
+        sh "cat nspect_scan_report.json"
+    }
+}
+
 pipeline {
     agent {
         kubernetes createKubernetesPodConfig()
@@ -148,27 +217,36 @@ pipeline {
     }
 
     stages {
-        stage('TRT-LLM PLC Jobs') {
-            parallel {
-                stage("Generating Poetry Locks"){
-                    agent {
-                        kubernetes createKubernetesPodConfig()
-                    }
-                    steps
-                    {
-                        generate()
-                    }
-                }
-                stage("SonarQube Code Analysis"){
-                    agent {
-                        kubernetes createKubernetesPodConfig()
-                    }
-                    steps
-                    {
-                        sonar_scan()
-                    }
-                }
+        stage("Run Pulse Scan"){
+            agent {
+                kubernetes createKubernetesPodConfig()
+            }
+            steps
+            {
+                pulseScan()
             }
         }
+        //stage('TRT-LLM PLC Jobs') {
+            //parallel {
+                //stage("Generating Poetry Locks"){
+                    //agent {
+                        //kubernetes createKubernetesPodConfig()
+                    //}
+                    //steps
+                    //{
+                        //generate()
+                    //}
+                //}
+                //stage("SonarQube Code Analysis"){
+                    //agent {
+                        //kubernetes createKubernetesPodConfig()
+                    //}
+                    //steps
+                    //{
+                        //sonar_scan()
+                    //}
+                //}
+            //}
+        //}
     } // stages
 } // pipeline
