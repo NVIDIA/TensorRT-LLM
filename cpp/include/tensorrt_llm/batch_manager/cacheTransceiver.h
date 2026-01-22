@@ -277,4 +277,11 @@ private:
     void* mWrapperLibHandle{nullptr};
 };
 
+/// @brief Gather request IDs across all ranks in the communicator.
+/// @param comm The communicator to use for gathering.
+/// @param requestIds The local request IDs to gather.
+/// @return All request IDs from all ranks.
+std::vector<LlmRequest::RequestIdType> gatherRequestIds(
+    std::shared_ptr<CacheTransceiverComm> const& mComm, std::vector<LlmRequest::RequestIdType> const& requestIds);
+
 } // namespace tensorrt_llm::batch_manager

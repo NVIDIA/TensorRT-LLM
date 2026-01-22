@@ -193,7 +193,7 @@ TEST_F(RnnTargetIRanksTest, inquireSupport)
 
     // Use reinterpret_cast to pass a non-null dummy pointer (formatter only stores it, doesn't use it in
     // inquireSupport)
-    tbm::RnnCacheFormatter formatter(reinterpret_cast<tbm::rnn_state_manager::RnnStateManager*>(0x1), state1);
+    tbm::RnnCacheFormatter formatter(reinterpret_cast<tbm::rnn_state_manager::RnnStateManager*>(0x1));
 
     // Same TP, different PP -> should be supported
     EXPECT_TRUE(formatter.inquireSupport(state1, state2));

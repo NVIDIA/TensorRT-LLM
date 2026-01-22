@@ -27,9 +27,8 @@
 namespace tensorrt_llm::batch_manager
 {
 
-RnnCacheFormatter::RnnCacheFormatter(rnn_state_manager::RnnStateManager* rnnStateManager, RnnCacheState selfState)
+RnnCacheFormatter::RnnCacheFormatter(rnn_state_manager::RnnStateManager* rnnStateManager)
     : mRnnStateManager{rnnStateManager}
-    , mSelfState{std::move(selfState)}
 {
     TLLM_CHECK(mRnnStateManager != nullptr);
 }
@@ -98,9 +97,11 @@ std::vector<RnnCacheFormatter::SizeType32> RnnCacheFormatter::getCounterparts(
 std::vector<size_t> RnnCacheFormatter::pickRecvConnections(
     size_t numConnections, RnnCacheState const& selfConfig, SizeType32 selfIdx, RnnCacheState const& destConfig) const
 {
-    // TODO: Implement connection selection for RNN cache transfer
-    TLLM_THROW("RnnCacheFormatter::pickRecvConnections not yet implemented");
-    return {};
+    // no duplication for RNN so all ranks are valid
+    auto targetInfo = rnnTargetIRanks(destConfig, selfConfig, selfIdx);
+    std::vector<size_t> ret(numConnections);
+    std::iota(ret.begin(), ret.end(), 0);
+    return ret;
 }
 
 executor::kv_cache::TargetRanksInfo rnnTargetIRanks(executor::rnn_cache::RnnCacheState const& peerState,

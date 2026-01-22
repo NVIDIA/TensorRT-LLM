@@ -48,7 +48,7 @@ public:
     /// @brief Constructor.
     /// @param rnnStateManager Pointer to the RNN state manager.
     /// @param selfState The RNN cache state of this instance.
-    RnnCacheFormatter(rnn_state_manager::RnnStateManager* rnnStateManager, RnnCacheState selfState);
+    RnnCacheFormatter(rnn_state_manager::RnnStateManager* rnnStateManager);
 
     /// @brief Format RNN states for sending.
     /// @param session The transfer session.
@@ -127,7 +127,6 @@ public:
 
 private:
     rnn_state_manager::RnnStateManager* mRnnStateManager;
-    RnnCacheState mSelfState;
 };
 
 /// @brief Calculate target ranks for RNN cache transfer.
