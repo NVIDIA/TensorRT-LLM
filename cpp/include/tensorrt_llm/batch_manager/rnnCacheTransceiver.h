@@ -31,7 +31,8 @@ namespace tensorrt_llm::batch_manager
 namespace rnn_state_manager
 {
 class RnnStateManager;
-}
+class RnnCacheTransBufferManager;
+} // namespace rnn_state_manager
 
 /// @brief RNN cache sender - inherits from BaseCacheSenderImpl with RNN-specific logic.
 class RnnCacheSender : public BaseCacheSenderImpl
@@ -115,6 +116,8 @@ private:
     std::unique_ptr<executor::rnn_cache::RnnCacheState> mRnnCacheState;
     std::unique_ptr<executor::kv_cache::ConnectionManager> mManager;
     std::optional<executor::CacheTransceiverConfig> mCacheTransceiverConfig;
+    std::unique_ptr<rnn_state_manager::RnnCacheTransBufferManager> mRnnCacheTransBufferManager;
+    rnn_state_manager::RnnCacheTransBufferManager* mRnnCacheTransBufferManagerPtr{nullptr};
 
     static std::mutex mDllMutex;
     void* mWrapperLibHandle{nullptr};

@@ -140,7 +140,12 @@ RnnCacheTransceiver::RnnCacheTransceiver(rnn_state_manager::RnnStateManager* rnn
         backendType.has_value() && (backendType.value() != executor::CacheTransceiverConfig::BackendType::DEFAULT),
         " CacheTransceiverConfig::BackendType is not set.");
 
-    // std::optional<size_t> maxNumTokens = mCacheTransceiverConfig.value().getMaxTokensInBuffer();
+    std::optional<size_t> maxNumTokens = mCacheTransceiverConfig.value().getMaxTokensInBuffer();
+    mRnnCacheTransBufferManager
+        = std::make_unique<rnn_state_manager::RnnCacheTransBufferManager>(mRnnStateManager, maxNumTokens);
+    mRnnCacheTransBufferManagerPtr = mRnnCacheTransBufferManager.get();
+    // mRnnCacheTransBufferManagerPtr->setDtypes(*mRnnCacheState);
+
     if (backendType.value() == executor::CacheTransceiverConfig::BackendType::MPI)
     {
         mMpiWorldComm = std::addressof(tensorrt_llm::mpi::MpiComm::world());
@@ -170,7 +175,8 @@ RnnCacheTransceiver::RnnCacheTransceiver(rnn_state_manager::RnnStateManager* rnn
     }
 
     // Create formatter - for now without buffer manager (MPI doesn't need it for basic transfer)
-    auto makeFormatter = [this]() { return std::make_unique<RnnCacheFormatter>(mRnnStateManager); };
+    auto makeFormatter
+        = [this]() { return std::make_unique<RnnCacheFormatter>(mRnnStateManager, mRnnCacheTransBufferManagerPtr); };
 
     mCacheSender
         = std::make_unique<RnnCacheSender>(mManager.get(), *mRnnCacheState, worldConfig.getRank(), makeFormatter());

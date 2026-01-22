@@ -27,10 +27,13 @@
 namespace tensorrt_llm::batch_manager
 {
 
-RnnCacheFormatter::RnnCacheFormatter(rnn_state_manager::RnnStateManager* rnnStateManager)
+RnnCacheFormatter::RnnCacheFormatter(rnn_state_manager::RnnStateManager* rnnStateManager,
+    rnn_state_manager::RnnCacheTransBufferManager* rnnCacheTransBufferManager)
     : mRnnStateManager{rnnStateManager}
+    , mRnnCacheTransBufferManager{rnnCacheTransBufferManager}
 {
     TLLM_CHECK(mRnnStateManager != nullptr);
+    TLLM_CHECK(mRnnCacheTransBufferManager != nullptr);
 }
 
 void RnnCacheFormatter::format(TransferSession& session)
