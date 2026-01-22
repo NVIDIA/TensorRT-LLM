@@ -109,7 +109,7 @@ class ditFlux2Pipeline(Flux2Pipeline, ditBasePipeline):
 
     def enable_cuda_graph(self):
         if TeaCacheConfig.enable_teacache():
-            logger.info("capturing cuda graph for teacache..")
+            logger.info("capturing cuda graph for teacache...")
             self.transformer.run_pre_processing = cudagraph_wrapper(
                 self.transformer.run_pre_processing
             )
@@ -123,7 +123,7 @@ class ditFlux2Pipeline(Flux2Pipeline, ditBasePipeline):
                 self.transformer.run_post_processing
             )
         else:
-            logger.info("capturing cuda graph..")
+            logger.info("capturing cuda graph...")
             self.transformer.forward = cudagraph_wrapper(self.transformer.forward)
 
     def load_fp4_weights(self, path, svd_weight_name_table):
