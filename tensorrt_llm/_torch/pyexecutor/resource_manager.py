@@ -1475,10 +1475,15 @@ class ResourceManager:
                          update_mamba_cache_manager: bool = True):
         for _, resource_manager in self.resource_managers.items():
             if hasattr(resource_manager, "update_resources"):
-                if isinstance(resource_manager, KVCacheManager):
+                # Check if this is a MambaHybridCacheManager (has both Mamba and KV cache)
+                if type(resource_manager).__name__ == 'MambaHybridCacheManager':
                     resource_manager.update_resources(
                         scheduled_batch, attn_metadata,
                         kv_cache_dtype_byte_size, update_mamba_cache_manager)
+                elif isinstance(resource_manager, KVCacheManager):
+                    resource_manager.update_resources(
+                        scheduled_batch, attn_metadata,
+                        kv_cache_dtype_byte_size)
                 else:
                     resource_manager.update_resources(scheduled_batch)
 

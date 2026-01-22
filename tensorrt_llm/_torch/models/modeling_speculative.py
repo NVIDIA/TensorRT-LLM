@@ -738,14 +738,17 @@ class MTPDraftModel(nn.Module):
                                       is_separate_draft_engine=True)
         elif model_type in ["exaone_moe"]:
             from .modeling_exaone_moe import ExaoneMoeMTP
+            mtp_layer = ExaoneMoeMTP(model_config, layer_idx, aux_stream_dict)
 
         elif model_type == "nemotron_h":
             from .modeling_nemotron_h import NemotronHMTP
-                                     layer_idx,
-                                     aux_stream_dict,
-                                     is_separate_draft_engine=False)
+            mtp_layer = NemotronHMTP(model_config,
+                            layer_idx,
+                            aux_stream_dict,
+                            is_separate_draft_engine=False)
         else:
             raise ValueError(
+                f"MTPDraftModel does not support model_type: {model_type}")
         setattr(self, f"layers.{layer_idx}", mtp_layer)
         self.layers = mtp_layer
         self.layer_idx = layer_idx

@@ -64,7 +64,7 @@ class NemotronHHfWeightMapper(HfWeightMapper):
                     sublayer_idx, rest = match.groups()
                     key = f"model.layers.{config.num_hidden_layers}.layers.{sublayer_idx}.{rest}"
                 else:
-                    logger.warning(f"Failed to match MTP pattern for: {name}")
+                    logger.error(f"Failed to match MTP pattern for: {name}")
 
             if "A_log" in key:
                 key = key.replace("A_log", "A")

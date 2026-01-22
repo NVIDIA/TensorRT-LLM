@@ -495,7 +495,7 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
             model_nextn = model_config.spec_config.num_nextn_predict_layers
             ckpt_nextn = self.config.num_nextn_predict_layers
             self.num_hidden_layers = self.config.num_hidden_layers
-            assert ckpt_nextn > 0, "There is not MTP modules in the checkpoint."
+            assert ckpt_nextn > 0, "There are not MTP modules in the checkpoint."
             if ckpt_nextn == 1 and not model_config.spec_config.use_mtp_vanilla:
                 pass
             else:
@@ -520,31 +520,9 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
             self.epilogue.extend(self.draft_model.mtp_layers)
             self.epilogue.append(self.spec_worker)
 
-    def forward(
-        self,
-        attn_metadata: AttentionMetadata,
-        input_ids: torch.IntTensor = None,
-        position_ids: Optional[torch.IntTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        spec_metadata: Optional[SpecMetadata] = None,
-        return_context_logits: bool = False,
-        **kwargs,
-    ) -> torch.Tensor:
-        return super().forward(attn_metadata=attn_metadata,
-                               input_ids=input_ids,
-                               position_ids=position_ids,
-                               inputs_embeds=inputs_embeds,
-                               spec_metadata=spec_metadata,
-                               return_context_logits=return_context_logits,
-                               **kwargs)
-
     def load_weights(self, weights: Dict, weight_mapper: BaseWeightMapper):
         new_weights = weight_mapper.preprocess_weights(weights)
         super().load_weights(weights=new_weights, weight_mapper=weight_mapper)
-
-
-AutoConfig.register(NemotronHConfig.model_type, NemotronHConfig)
-
 
 class NemotronHMTPDecoderLayer(NemotronHLayer):
 
@@ -757,3 +735,5 @@ class NemotronHMTP(nn.Module):
                 attn_metadata=attn_metadata,
             )
         return hidden_states
+
+AutoConfig.register(NemotronHConfig.model_type, NemotronHConfig)

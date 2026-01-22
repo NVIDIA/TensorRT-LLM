@@ -27,8 +27,6 @@ from .ssd_chunk_state import (_chunk_cumsum_fwd, _chunk_state_fwd,
                               chunk_state_varlen)
 from .ssd_state_passing import _state_passing_fwd
 
-TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
-
 
 def is_int_pow_2(n):
     return isinstance(n, int) and n > 0 and (n & (n - 1)) == 0

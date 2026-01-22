@@ -291,6 +291,7 @@ class Mamba2Mixer(nn.Module):
             is_target_verify = attn_metadata.kv_cache_manager.is_speculative(
             ) and spec_metadata is not None
             if is_target_verify:
+                # TODO: support dynamic speculation, will add current_draft_len later
                 draft_token_num = spec_metadata.max_draft_len + 1
                 intermediate_conv_states = layer_cache.intermediate_conv_window
 
