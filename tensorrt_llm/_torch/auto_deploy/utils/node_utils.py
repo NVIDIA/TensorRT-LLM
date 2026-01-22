@@ -546,6 +546,9 @@ def get_all_layer_subgraphs(gm: GraphModule) -> List[List[Node]]:
     assert gm.graph.nodes, "Graph is empty"
     layer_subgraphs = []
     linear_nodes = list(filtered_nodes(gm.graph.nodes, is_any_lin_op))
+
+    # find the embedding size of this model. Extract it from the input of the first linear node.
+    embd = get_weight_shape(linear_nodes[0], dim=-1)
     unprocessed_linear_nodes = set(linear_nodes)
     assert len(linear_nodes) > 0, "Could not find any linear nodes in the graph"
 
@@ -557,7 +560,7 @@ def get_all_layer_subgraphs(gm: GraphModule) -> List[List[Node]]:
         # opening is the list of linear nodes
         # layer_subgraph is the list of nodes between the opening and closing linear nodes
         # closing is the last linear node in the layer
-        layer_subgraph = get_layer_after_linear_node(linear_nodes, terminating_indices)
+        layer_subgraph = get_layer_after_linear_node(linear_nodes, terminating_indices, embd=embd)
         if layer_subgraph.opening_nodes is not None and len(layer_subgraph.opening_nodes) > 0:
             unprocessed_linear_nodes -= (
                 set(layer_subgraph.opening_nodes)
@@ -823,6 +826,7 @@ def get_weight_shape(node: Node, dim: Optional[int] = None) -> Optional[Union[in
 def get_layer_after_linear_node(
     linear_nodes: List[Node],
     terminating_indices: List[int],
+    embd: Optional[int] = None,
     match_on_shapes: bool = True,
     enforce_strict_linear_history: bool = True,
 ) -> LayerSubgraph:
@@ -897,8 +901,9 @@ def get_layer_after_linear_node(
                 layer_type=LayerType.UNKNOWN,
             )
         if match_on_shapes:
-            # get embedding size of the opening linear node
-            embd = get_weight_shape(linear_nodes[start_lin_index], dim=-1)
+            if embd is None:
+                # get embedding size of the opening linear node
+                embd = get_weight_shape(linear_nodes[start_lin_index], dim=-1)
             # partial init boundary_condition and filter_condition
             boundary_condition = partial(boundary_condition, embd=embd, dim=0)
             filter_condition = partial(filter_condition, embd=embd, dim=0)
@@ -907,6 +912,18 @@ def get_layer_after_linear_node(
             sources=[linear_nodes[start_lin_index]], boundary_condition=boundary_condition
         )
         lin_nodes_in_subgraph = list(filtered_nodes(forward_subgraph, filter_condition))
+        if len(lin_nodes_in_subgraph) > 1:
+            # it means that probably we went over the boundary of the layer.
+            # It may happen e.g., with MoLE (latent MoE), with the closing latent fc2 projection,
+            # when the subgraph spanned over fc2 "spills" over consecutive layers.
+            # Then, wrap this single linear node in  LayerType.UNKNOWN and return.
+            terminating_indices.append(start_lin_index)
+            return LayerSubgraph(
+                opening_nodes=[linear_nodes[start_lin_index]],
+                subgraph_nodes=[],
+                terminating_node=linear_nodes[start_lin_index],
+                layer_type=LayerType.UNKNOWN,
+            )
         start_lin_index += 1
     start_lin_index -= 1
     terminating_linear_node = lin_nodes_in_subgraph[0]
@@ -939,25 +956,39 @@ def get_layer_after_linear_node(
     ssm_nodes = list(filtered_nodes(interior_nodes, is_any_ssm_op))
     attention_nodes = list(filtered_nodes(interior_nodes, is_any_attention_op))
     intermediate_lin_nodes = list(filtered_nodes(interior_nodes, is_any_lin_op))
+    intermediate_weight_nodes = list(
+        filtered_nodes(
+            interior_nodes, lambda n: is_weight_node(n) and not is_any_lin_op(list(n.users)[0])
+        )
+    )
 
     layer_type = LayerType.MLP
     min_local_shape = 1
     if len(ssm_nodes) > 0:
-        assert len(ssm_nodes) == 1, "SSM layer must have exactly one SSM node"
-        layer_type = LayerType.SSM
-        # determine head size
-        min_local_shape = shape(ssm_nodes[0])[-1]
-    if len(attention_nodes) > 0:
-        assert len(attention_nodes) == 1, "Attention layer must have exactly one attention node"
-        layer_type = LayerType.ATTENTION
-        # determine head size
-        min_local_shape = shape(attention_nodes[0])[-1]
-    if len(intermediate_lin_nodes) > 0:
-        assert len(intermediate_lin_nodes) == 2, (
-            "MLA layer must have exactly two intermediate linear nodes"
-        )
-        assert len(attention_nodes) == 1, "MLA layer must have exactly one attention node"
-        layer_type = LayerType.MLA
+        if len(ssm_nodes) == 1:
+            layer_type = LayerType.SSM
+            # determine head size
+            min_local_shape = shape(ssm_nodes[0])[-1]
+        else:
+            layer_type = LayerType.UNKNOWN
+    if len(attention_nodes) > 0 and layer_type != LayerType.UNKNOWN:
+        if len(attention_nodes) == 1:
+            layer_type = LayerType.ATTENTION
+            # determine head size
+            min_local_shape = shape(attention_nodes[0])[-1]
+        else:
+            layer_type = LayerType.UNKNOWN
+    if len(intermediate_lin_nodes) > 0 and layer_type != LayerType.UNKNOWN:
+        if len(intermediate_lin_nodes) == 2 and len(attention_nodes) == 1:
+            layer_type = LayerType.MLA
+        else:
+            layer_type = LayerType.UNKNOWN
+    # only SSM or MLA layers can have weight nodes in the interior nodes
+    # TODO: Minimax does have RMSNorm inside attention, we need to
+    # support it in the future.
+    if len(intermediate_weight_nodes) > 0:
+        if layer_type not in [LayerType.SSM, LayerType.MLA]:
+            layer_type = LayerType.UNKNOWN
 
     layer_subgraph = LayerSubgraph(
         opening_nodes=opening_linear_nodes,
