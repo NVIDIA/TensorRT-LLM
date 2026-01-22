@@ -4,7 +4,7 @@ import os
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Generic, List, Optional, TypeVar
+from typing import Any, Dict, Generic, List, Optional, TypeVar
 
 import filelock
 import torch
@@ -514,6 +514,56 @@ class ModelConfig(Generic[TConfig]):
         # Some checkpoints lack torch_dtype, populate with dtype
         pretrained_config.torch_dtype = getattr(pretrained_config, 'dtype',
                                                 None)
+
+        # Apply model_kwargs to override config parameters if provided
+        model_kwargs = kwargs.pop('model_kwargs', None)
+        if model_kwargs:
+
+            def _recursive_update_config(config: transformers.PretrainedConfig,
+                                         update_dict: Dict[str, Any]):
+                """
+                Recursively update a PretrainedConfig object with values from update_dict.
+                Args:
+                    config: PretrainedConfig object to update
+                    update_dict: Dictionary with values to update in the config
+                """
+                for key, value_new in update_dict.items():
+                    if not hasattr(config, key):
+                        logger.warning(
+                            f"model_kwargs key '{key}' not found in pretrained_config, ignoring."
+                        )
+                        continue
+
+                    target_value = getattr(config, key)
+
+                    # Handle nested PretrainedConfig objects when value is a dict
+                    if isinstance(value_new, dict) and isinstance(
+                            target_value, transformers.PretrainedConfig):
+                        # Recursively update the nested config
+                        logger.info(
+                            f"Recursively updating nested config: {key}")
+                        _recursive_update_config(target_value, value_new)
+                    elif (key in ["torch_dtype", "dtype"]
+                          and isinstance(value_new, str)
+                          and value_new != "auto"):
+                        # check special handling of torch_dtype (DEPRECATED!) and dtype keys to ensure we
+                        # use the correct torch.dtype object instead of a string.
+                        dtype = getattr(torch, value_new)
+                        assert isinstance(dtype,
+                                          torch.dtype), f"Invalid {dtype=}"
+                        setattr(config, key, dtype)
+                        logger.info(
+                            f"Applied model_kwargs: {key}={dtype} (previous value: {target_value})"
+                        )
+                    else:
+                        # Direct update for simple values
+                        setattr(config, key, value_new)
+                        logger.info(
+                            f"Applied model_kwargs: {key}={value_new} (previous value: {target_value})"
+                        )
+
+            _recursive_update_config(pretrained_config, model_kwargs)
+
         quant_config = QuantConfig()
         layer_quant_config = None
         moe_backend = kwargs.get('moe_backend', 'CUTLASS')
