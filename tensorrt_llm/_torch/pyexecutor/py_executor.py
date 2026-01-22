@@ -1817,16 +1817,10 @@ class PyExecutor:
                                                       batch_outputs)
                     assert sample_state is not None, "Sampling failed"
 
-                    # For overlap scheduler: update mamba cache immediately after sampling
-                    # This must be done BEFORE _update_request_states which may change request states
+                    # Update mamba cache immediately after sampling
                     if self.is_mamba_hybrid_cache:
-                        # Execute update in the same stream as forward to avoid synchronization overhead
-                        # Wait for sampling to complete before switching to execution_stream
-                        self.execution_stream.wait_stream(
-                            torch.cuda.current_stream())
-                        with torch.cuda.stream(self.execution_stream):
-                            self.kv_cache_manager.update_resources_for_mamba_cache_manager(
-                                scheduled_batch, sample_state=sample_state)
+                        self.kv_cache_manager.update_resources_for_mamba_cache_manager(
+                            scheduled_batch, sample_state=sample_state)
 
                     # Handle guided decoder errors after _sample_async to avoid state conflicts.
                     # If called before, failed requests would be marked as GENERATION_COMPLETE,
