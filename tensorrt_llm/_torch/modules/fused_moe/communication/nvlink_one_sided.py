@@ -306,7 +306,7 @@ class NVLinkOneSided(Communication):
             Tuple of (hidden_states, hidden_states_sf, token_selected_slots, token_final_scales)
             Each tensor has shape [ep_size, max_tokens_per_rank, ...]
         """
-        if self._state == "dispatched":
+        if self._dispatch_state.get("phase") == "dispatched":
             raise RuntimeError("dispatch called twice without an intervening combine")
 
         # Calculate runtime_max_tokens_per_rank from all_rank_num_tokens
