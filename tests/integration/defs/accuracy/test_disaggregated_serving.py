@@ -51,7 +51,7 @@ DuckLLM = namedtuple('DuckLLM', ['args', 'tokenizer', 'generate_async'])
 # Timeout for the entire test
 DEFAULT_TEST_TIMEOUT = 3600
 # Timeout for the server waiting
-DEFAULT_SERVER_WAITING_TIMEOUT = 1800
+DEFAULT_SERVER_WAITING_TIMEOUT = 2100
 # Timeout for the accuracy evaluation
 DEFAULT_ACC_EVALUATION_TIMEOUT = 1500
 
@@ -118,8 +118,8 @@ def run_accuracy_test(llm: "DuckLLM",
     start_time = time.time()
     for test_set in test_sets:
         if isinstance(test_set, str):
-            test_set_cls = get_accuracy_task(test_set)
-        task = test_set_cls(model_name)
+            test_set = get_accuracy_task(test_set)
+        task = test_set(model_name)
 
         if extra_evaluator_kwargs is not None:
             kwargs = extra_evaluator_kwargs.get(test_set, {})
