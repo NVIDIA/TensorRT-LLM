@@ -161,7 +161,7 @@ void initBindings(nb::module_& m)
         .def("set_finished_reason", &GenLlmReq::setFinishedReason, nb::arg("finish_reason"), nb::arg("beam"))
         .def_prop_ro("is_finished", &GenLlmReq::isFinished)
         .def_prop_ro("is_finished_due_to_length", &GenLlmReq::isFinishedDueToLength)
-        .def_prop_ro("is_finished_normal", &GenLlmReq::isFinishedNormal)
+        .def_prop_ro("is_finished_without_error", &GenLlmReq::isFinishedWithoutError)
         .def_prop_rw(
             "context_current_position", &GenLlmReq::getContextCurrentPosition, &GenLlmReq::setContextCurrentPosition)
         .def_prop_ro("prepopulated_prompt_len", &GenLlmReq::getPrepopulatedPromptLen)

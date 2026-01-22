@@ -1667,7 +1667,7 @@ public:
             [](auto reason) { return reason == executor::FinishReason::kLENGTH; });
     }
 
-    [[nodiscard]] bool isFinishedNormal() const noexcept
+    [[nodiscard]] bool isFinishedWithoutError() const noexcept
     {
         return std::all_of(mFinishReasons.begin(), mFinishReasons.end(),
             [](auto reason)
