@@ -1,23 +1,6 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 from typing import List
 
 import torch
-
-from tensorrt_llm._torch.modules.mamba.selective_state_update import selective_state_update
 
 from ..attention_interface import AttentionRegistry, MHACallable
 from .mamba_backend_common import (
@@ -29,8 +12,8 @@ from .mamba_backend_common import (
 )
 
 
-@torch.library.custom_op("auto_deploy::triton_cached_ssm", mutates_args={})
-def _triton_cached_ssm(
+@torch.library.custom_op("auto_deploy::flashinfer_cached_ssm", mutates_args={})
+def _flashinfer_cached_ssm(
     # INPUTS (dense but may be flattened across sequences)
     hidden_states: torch.Tensor,  # [b, s, num_heads, head_dim]
     A: torch.Tensor,  # [num_heads]
@@ -110,7 +93,11 @@ def _triton_cached_ssm(
             A_full,
             D_full,
         ) = decode_inputs
-        y_decode = selective_state_update(
+
+        import flashinfer
+
+        slot_idx_decode_i32 = slot_idx_decode.to(torch.int32)
+        y_decode = flashinfer.mamba.selective_state_update(
             ssm_state_cache,
             x_decode,
             dt_hp,
@@ -121,7 +108,7 @@ def _triton_cached_ssm(
             z=None,
             dt_bias=dt_bias_hp,
             dt_softplus=True,
-            state_batch_indices=slot_idx_decode,
+            state_batch_indices=slot_idx_decode_i32,
         )
 
     return _merge_ssm_outputs(
@@ -140,8 +127,8 @@ def _triton_cached_ssm(
     )
 
 
-@_triton_cached_ssm.register_fake
-def _triton_cached_ssm_fake(
+@_flashinfer_cached_ssm.register_fake
+def _flashinfer_cached_ssm_fake(
     # INPUTS (dense but may be flattened across sequences)
     hidden_states: torch.Tensor,  # [b, s, num_heads, head_dim]
     A: torch.Tensor,  # [num_heads]
@@ -173,8 +160,8 @@ def _triton_cached_ssm_fake(
     )
 
 
-@AttentionRegistry.register("triton_ssm")
-class TritonBackendSSM(BaseBackendSSM):
+@AttentionRegistry.register("flashinfer_ssm")
+class FlashinferBackendSSM(BaseBackendSSM):
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
-        return torch.ops.auto_deploy.triton_cached_ssm.default
+        return torch.ops.auto_deploy.flashinfer_cached_ssm.default

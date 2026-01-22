@@ -10,7 +10,7 @@ and operates on a purely functional paradigm that is compatible with the torch c
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Literal, Optional, Protocol, Sequence, Set, Tuple, Type, Union
+from typing import Dict, List, Literal, Optional, Protocol, Sequence, Set, Tuple, Type, Union
 
 import torch
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -1210,18 +1210,11 @@ class AttentionDescriptor(ABC):
         return {}
 
     @classmethod
-    def get_constants(
-        cls, source_attn_node: Node, transform_config: Optional[Dict[str, Any]] = None
-    ) -> List[Constant]:
+    def get_constants(cls, source_attn_node: Node) -> List[Constant]:
         """Provide a list of constant arguments to be passed to the attention op.
 
         The constant arguments are passed to the attention op as additional arguments after the
         caches and buffers. The constants are expected to be of type int, float, str, or None.
-
-        Args:
-            source_attn_node: The source attention node from the graph.
-            transform_config: Optional transform configuration dict. Can be used to pass
-                backend-specific options (e.g., decode_kernel for SSM).
         """
         return []
 

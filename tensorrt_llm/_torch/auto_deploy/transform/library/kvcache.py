@@ -55,11 +55,6 @@ class InsertCachedAttentionConfig(TransformConfig):
     cache_config: CacheConfig = Field(
         default_factory=CacheConfig, description="The custom cache configuration to use."
     )
-    decode_kernel: Optional[str] = Field(
-        default=None,
-        description="Kernel backend for decode phase (e.g., 'triton' or 'flashinfer'). "
-        "If set, will be exposed via AD_SSM_DECODE_BACKEND env var.",
-    )
 
 
 @TransformRegistry.register("insert_cached_attention")
@@ -242,12 +237,8 @@ class InsertCachedAttention(BaseTransform):
                     buffer_in_lookup[k] = self._process_cache_node(gm, k)
                 buffer_in_nodes.append(buffer_in_lookup[k])  # store buffer nodes for this op
 
-            # retrieve constants for attention_op (pass transform config for backend-specific options)
-            # Use try/except for backwards compatibility with descriptors that don't accept transform_config
-            try:
-                constants = attn_descriptor.get_constants(attn_node, self.config.model_dump())
-            except TypeError:
-                constants = attn_descriptor.get_constants(attn_node)
+            # retrieve constants for attention_op
+            constants = attn_descriptor.get_constants(attn_node)
 
             # insert cached attention replacement op
             self._insert_cached_attn_node(
