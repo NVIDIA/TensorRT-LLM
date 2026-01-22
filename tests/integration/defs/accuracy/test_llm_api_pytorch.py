@@ -3195,9 +3195,8 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
 
             # Build long token sequences from dataset
             tokenizer = llm.tokenizer
-            dataset = load_dataset(
-                "Crystalcareai/Code-feedback-sharegpt-renamed",
-                split="train[:2000]")
+            dataset_path = f"{llm_models_root()}/datasets/Crystalcareai/Code-feedback-sharegpt-renamed"
+            dataset = load_dataset(dataset_path, split="train[:2000]")
             long_token_list = []
             for row in dataset:
                 msg = row["messages"][0]["value"]
@@ -3278,9 +3277,8 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
 
             # Build long token sequences from dataset
             tokenizer = llm.tokenizer
-            dataset = load_dataset(
-                "Crystalcareai/Code-feedback-sharegpt-renamed",
-                split="train[:2000]")
+            dataset_path = f"{llm_models_root()}/datasets/Crystalcareai/Code-feedback-sharegpt-renamed"
+            dataset = load_dataset(dataset_path, split="train[:2000]")
             long_token_list = []
             for row in dataset:
                 msg = row["messages"][0]["value"]
