@@ -50,7 +50,6 @@ This directory contains various test configuration files:
 - `llm_function_core.txt` - Primary test list for single node multi-GPU scenarios (all new test cases should be added here)
 - `llm_function_core_sanity.txt` - Subset of examples for quick torch flow validation
 - `llm_function_multinode.txt` - Multi-node functional test cases
-- `llm_function_gb20x.txt` - GB20X release test cases
 - `llm_function_rtx6k.txt` - RTX 6000 series specific tests
 - `llm_function_l20.txt` - L20 specific tests, only contains single gpu cases
 
