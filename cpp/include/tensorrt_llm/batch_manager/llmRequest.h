@@ -1697,7 +1697,7 @@ public:
         return std::all_of(mFinishReasons.begin(), mFinishReasons.end(),
             [](auto reason) { return reason == executor::FinishReason::kCANCELLED; });
 
-    [[nodiscard]] bool isFinishedNormal() const noexcept
+    [[nodiscard]] bool isFinishedWithoutError() const noexcept
     {
         return std::all_of(mFinishReasons.begin(), mFinishReasons.end(),
             [](auto reason)
