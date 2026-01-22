@@ -23,7 +23,6 @@ from datasets import load_dataset
 from mpi4py.futures import MPIPoolExecutor
 
 
-
 def patch_mpi_pool_session_for_env(mocker, env_vars: dict):
     """
     Patch MpiPoolSession._start_mpi_pool to propagate environment variables to MPI child processes.
