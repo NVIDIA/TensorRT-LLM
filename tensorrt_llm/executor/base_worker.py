@@ -433,6 +433,8 @@ class BaseWorker(GenerationExecutor):
 
         context_phase_params = None
         request_type = tllm.RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION
+        disagg_request_id = 0
+
         if request.disaggregated_params is not None:
             assert (
                 not self._is_pytorch_backend
@@ -441,6 +443,7 @@ class BaseWorker(GenerationExecutor):
                 == "context_and_generation"
             ), "kv_cache_transceiver is disabled, please set 'cache_transceiver_config: backend:<backend_type>` in config file for disaggregated serving"
             request_type = request.disaggregated_params.get_request_type()
+            disagg_request_id = request.disaggregated_params.disagg_request_id
             if request_type == tllm.RequestType.REQUEST_TYPE_GENERATION_ONLY:
                 context_phase_params = request.disaggregated_params.get_context_phase_params(
                 )
@@ -559,7 +562,8 @@ class BaseWorker(GenerationExecutor):
                 kv_cache_retention_config=request.kv_cache_retention_config,
                 context_phase_params=context_phase_params,
                 type=request_type,
-                cache_salt_id=request.cache_salt_id)
+                cache_salt_id=request.cache_salt_id,
+                disagg_request_id=disagg_request_id)
             executor_request.py_num_logprobs = request.sampling_params.logprobs
             executor_request.py_lora_path = py_lora_path
             executor_request.py_logprobs_mode = request.sampling_params.logprobs_mode

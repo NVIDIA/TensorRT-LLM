@@ -317,9 +317,6 @@ class Attention(nn.Module):
         self.fused_qkv_lora = LoraLayer([LoraModuleType.ATTENTION_QKV],
                                         [self.q_size + 2 * self.kv_size])
 
-        self.o_lora = LoraLayer([LoraModuleType.ATTENTION_DENSE],
-                                [self.hidden_size])
-
         # Whether to fuse RoPE into the attention OP.
         # If true, RoPE will be applied in self.attn.forward.
         # If false, RoPE will be applied in self.apply_rope.
@@ -334,11 +331,11 @@ class Attention(nn.Module):
                              key="sparse_attention_config")
 
             if config.sparse_attention_config.algorithm == "rocket":
-                logger.info_once("disable rope_fusion for RocketKV.")
+                logger.warning("disable rope_fusion for RocketKV.")
                 self.rope_fusion = False
 
         if self.rope_fusion and not attn_cls.support_fused_rope():
-            logger.info_once(
+            logger.warning(
                 "rope_fusion is true but the attention backend does not support it. Will disable rope_fusion."
             )
             self.rope_fusion = False
