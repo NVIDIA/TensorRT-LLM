@@ -1862,8 +1862,8 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     path: /vol/scratch1/scratch.michaeln_blossom
     """
 
-    // Due to Austin flex cache is not stable, remove gh200 temporarily.
-    // That means gh200 will use the default blossom pvc.
+    // Austin FlexCache looks slow and unstable recently. Remove gh200 temporarily.
+    // That means gh200 nodes will use the default Blossom data scratch.
     if (type.contains("6000d")) {
         // rtx-pro-6000d and gh200 nodes are located in Austin DC, we use the FlexCache to speed up the data access.
         llmModelVolume = """
