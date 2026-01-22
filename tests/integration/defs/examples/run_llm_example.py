@@ -11,8 +11,14 @@ if __name__ == '__main__':
     ]
     sampling_params = SamplingParams(temperature=1.0, top_p=0.95)
 
-    model_path = Path(os.environ.get(
-        "LLM_MODELS_ROOT")) / "llama-models-v2/llama-v2-70b-chat-hf"
+    models_root = os.environ.get("LLM_MODELS_ROOT")
+    if not models_root:
+        raise RuntimeError(
+            "LLM_MODELS_ROOT is not set; please export it to the model root directory."
+        )
+    model_path = Path(models_root) / "llama-models-v2/llama-v2-70b-chat-hf"
+    if not model_path.exists():
+        raise FileNotFoundError(f"Model path not found: {model_path}")
     print(f'model_path: {model_path}')
 
     with LLM(model=str(model_path)) as llm:
