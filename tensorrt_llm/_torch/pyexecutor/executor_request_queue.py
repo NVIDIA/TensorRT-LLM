@@ -12,6 +12,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import torch
 
 from tensorrt_llm._utils import mpi_disabled, nvtx_range
+from tensorrt_llm.llmapi.disagg_utils import get_local_request_id
 from tensorrt_llm.mapping import CpType
 
 from ..distributed import Distributed
@@ -207,10 +208,15 @@ class ExecutorRequestQueue:
 
         return False
 
-    def _get_request_id(self):
-        # (next_request_id + 1) % UINT64_MAX
+    def _get_request_id(self, request: Optional[ExecutorRequest] = None):
+        # if request has a disagg_request_id, use it as request id so that
+        # corresponding context and generation requests have the same request id
+        if request and request.disagg_request_id and isinstance(
+                request.disagg_request_id, int):
+            return request.disagg_request_id
+
         current_id = self.next_request_id
-        self.next_request_id = (self.next_request_id + 1) & ((1 << 64) - 1)
+        self.next_request_id = get_local_request_id(current_id)
         return current_id
 
     def _generate_child_request_ids(
@@ -237,7 +243,7 @@ class ExecutorRequestQueue:
             assert self.active, "PyExecutor has already been shutdown."
             start_time = time.time()
             for request, query in requests_and_queries:
-                req_id = self._get_request_id()
+                req_id = self._get_request_id(request)
                 if self.enable_iter_perf_stats:
                     self.start_times[req_id] = start_time
                 child_req_ids = self._generate_child_request_ids(request)

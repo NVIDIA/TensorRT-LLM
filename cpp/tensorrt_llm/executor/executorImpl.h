@@ -178,9 +178,20 @@ private:
 
     void initializeLogitsPostProcessorBatched(LogitsPostProcessorConfig const& logitsProcConfig);
 
-    IdType generateReqId()
+    IdType generateReqId(Request const& request)
     {
-        return (mLastReqId++ % UINT64_MAX);
+        // If the request has a disaggregated request id, prefer it.
+        if (request.getDisaggRequestId().has_value() && request.getDisaggRequestId().value() > kMaxLocalReqId)
+        {
+            return request.getDisaggRequestId().value();
+        }
+        // Otherwise, generate a local request id in range [1, kMaxLocalReqId).
+        return generateLocalReqId();
+    }
+
+    IdType generateLocalReqId()
+    {
+        return (mLastReqId++ % kMaxLocalReqId);
     }
 
     std::vector<RequestWithId> getLeaderNewReqWithIds(
@@ -315,7 +326,10 @@ private:
 
     IdType mLastReqId = 1;
 
-    static constexpr IdType mTerminateReqId = 0;
+    static constexpr IdType kTerminateReqId = 0;
+    // Request id > kMaxLocalReqId is reserved for disaggregated requests.
+    // This max ID is also in Python side.
+    static constexpr IdType kMaxLocalReqId = 1ULL << 42U;
 
     BatchingType mBatchingType;
     bool mIsSchedulerMaxUtilization;

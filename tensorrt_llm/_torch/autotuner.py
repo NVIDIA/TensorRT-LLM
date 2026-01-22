@@ -505,9 +505,8 @@ class AutoTunerProfilingCache:
                 fcntl.flock(f, fcntl.LOCK_SH)
                 current_cache_contents = json.load(f)
                 self._deserialize_metadata(current_cache_contents["metadata"])
-                assert f"rank_{rank}" in current_cache_contents, f"Rank {rank} cache not found in {file_path}"
             self.cache = self._deserialize_cache_data(
-                current_cache_contents[f'rank_{rank}'])
+                current_cache_contents.get(f'rank_{rank}', {}))
             logger.info(
                 f"[AutoTuner] Successfully loaded cache from {file_path} using JSON format"
             )
@@ -1105,7 +1104,10 @@ class AutoTuner:
 
         disable_short_profile = os.environ.get(
             "TLLM_AUTOTUNER_DISABLE_SHORT_PROFILE", "0") == "1"
-        if fewer_repeat_avg_time > short_profile_threshold_ms and not disable_short_profile:
+
+        # Disable this feature for merged tuning strategy to avoid potential hang due to asymmetric tuning.
+        if fewer_repeat_avg_time > short_profile_threshold_ms and not disable_short_profile \
+            and tuning_config.distributed_tuning_strategy != DistributedTuningStrategy.MERGE:
             # directly use the few repeat estimated time to avoid redundant profiling
             avg_time = fewer_repeat_avg_time
         else:

@@ -42,7 +42,7 @@ public:
     using LoraReqTensors = std::tuple<LoraWeightsTensorPtr, LoraConfigTensorPtr>;
     using TaskIdType = std::int64_t;
     using PeftValues = std::vector<runtime::LoraCache::TaskLayerModuleConfig>;
-    using PeftTable = std::map<uint64_t, std::vector<runtime::LoraCache::TaskLayerModuleConfig>>;
+    using PeftTable = std::unordered_map<uint64_t, std::vector<runtime::LoraCache::TaskLayerModuleConfig>>;
 
     explicit LoraManager() {}
 
