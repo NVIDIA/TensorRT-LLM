@@ -510,6 +510,10 @@ def ring_wrapper(func):
                 + self.attn_impl.__class__.__name__
             )
 
+        cu_seqlens_q = kwargs.get("cu_seqlens_q", None)
+        if cu_seqlens_q is not None:
+            raise NotImplementedError("var_len_attention is not supported by ring wrapper")
+
         joint_seq_length = kwargs.get("joint_seq_length", 0)
         valid_joint_seq_length = kwargs.get("valid_joint_seq_length", None)
 
@@ -648,6 +652,10 @@ def cp_wrapper(func):
         if cp_size == 1:
             return func(self, query, key, value, tensor_layout, attn_mask, **kwargs)
 
+        cu_seqlens_q = kwargs.get("cu_seqlens_q", None)
+        if cu_seqlens_q is not None:
+            raise NotImplementedError("var_len_attention is not supported by cp wrapper")
+
         joint_seq_length = kwargs.get("joint_seq_length", 0)
 
         # Determine sequence dimension based on tensor layout
@@ -727,6 +735,7 @@ def joint_sequence_wrapper(func):
         In this case, image and text are used and the image part is splited but text part is not. So the shape is (B, S_splited_img + S_full_text, H, D)
         valid_joint_seq_length is the valid sequence length of the joint sequence, since the joint sequence is usually padded.
         """
+        
         joint_seq_length = kwargs.pop("joint_seq_length", 0)
         valid_joint_seq_length = kwargs.pop("valid_joint_seq_length", None)
         joint_strategy = kwargs.pop("joint_strategy", "none")

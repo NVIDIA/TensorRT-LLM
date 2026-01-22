@@ -113,6 +113,10 @@ class ditAttnProcessor:
         joint_seq_length=0,
         valid_joint_seq_length=None,
         joint_strategy="none",
+        cu_seqlens_q=None,
+        cu_seqlens_k=None,
+        max_seqlen_q=0,
+        max_seqlen_k=0,
     ):
         """
         :param joint_seq_length: The joint sequence length. Joint sequence means the part contians by every rank and not split along sequence dimension.
@@ -131,6 +135,10 @@ class ditAttnProcessor:
             "scale": scale,
             "enable_gqa": enable_gqa,
             "return_lse": return_lse,
+            "cu_seqlens_q": cu_seqlens_q,
+            "cu_seqlens_k": cu_seqlens_k,
+            "max_seqlen_q": max_seqlen_q,
+            "max_seqlen_k": max_seqlen_k,
         }
         if AttentionOpManager.attn_type == "auto" and auto_tuner is not None and auto_tuner.mode == "tuning":
             layer_name = self.name
