@@ -18,8 +18,8 @@ def _load_agent(module_name, required_attributes):
         module = __import__(module_name, fromlist=required_attributes, level=0)
         if all(hasattr(module, attr) for attr in required_attributes):
             return module
-    except ImportError:
-        logger.info("Failed to import module: %s", module_name)
+    except ImportError as e:
+        logger.info("Failed to import module: %s. Error: %s", module_name, str(e))
     return None
 
 

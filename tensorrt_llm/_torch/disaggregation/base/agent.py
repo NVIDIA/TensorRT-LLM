@@ -40,7 +40,7 @@ class TransferRequest:
     src_descs: MemoryDescs
     dst_descs: MemoryDescs
     remote_name: str
-    sync_message: str
+    sync_message: Optional[str] = None
 
 
 @dataclass

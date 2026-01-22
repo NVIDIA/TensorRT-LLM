@@ -11,7 +11,7 @@ def get_local_ip() -> str:
             if not ip.startswith("127."):
                 return ip
 
-    except OSError:
+    except (ImportError, OSError, ValueError):
         logger.error("Failed to get local IP via UDP socket method.")
         pass
 
@@ -25,8 +25,8 @@ def get_local_ip() -> str:
                     ip = addr.get("addr", "")
                     if not ip.startswith("127.") and not ip.startswith("169.254"):
                         return ip
-    except Exception:
-        logger.error("Failed to get local IP via netifaces.")
+    except (ImportError, OSError, ValueError) as e:
+        logger.error(f"Failed to get local IP via netifaces: {e}")
         pass
 
     try:
@@ -34,7 +34,7 @@ def get_local_ip() -> str:
         ip = socket.gethostbyname(hostname)
         if not ip.startswith("127."):
             return ip
-    except OSError:
+    except (OSError, ValueError):
         logger.error("Failed to get local IP via hostname resolution.")
         pass
 

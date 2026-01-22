@@ -93,6 +93,8 @@ def memory_type(request):
 def alloc(memory_manager, memory_size, memory_type):
     """Allocate memory for source and destination, based on the memory_size and memory_type parameters."""
     assert memory_size > 0, "Memory size must be a positive integer."
+    if memory_type == "VRAM" and not torch.cuda.is_available():
+        pytest.skip("CUDA not available for VRAM transfer tests")
     src_descs = memory_manager.allocate_memory(
         size=memory_size, name="src_mem", memory_type=memory_type
     )
@@ -152,7 +154,7 @@ def test_transfer_between_agents(
         sync_message=None,
     )
     transfer_status = transfer_agent_src.submit_transfer_requests(transfer_request)
-    transfer_status.wait()
+    assert transfer_status.wait(timeout_ms=5000), "Transfer did not complete within timeout."
 
     # Validate transfer completion
     assert transfer_status.is_completed(), "Transfer did not complete successfully."
