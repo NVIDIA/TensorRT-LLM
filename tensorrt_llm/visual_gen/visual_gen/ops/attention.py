@@ -34,13 +34,17 @@ from typing import Any, List, Optional
 
 import torch
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from visual_gen.configs.op_manager import AttentionOpManager, SparseVideogenConfig, SparseVideogenConfig2
+from visual_gen.configs.op_manager import (
+    AttentionOpManager,
+    SparseVideogenConfig,
+    SparseVideogenConfig2,
+)
 from visual_gen.configs.parallel import get_dit_parallel_config
 from visual_gen.configs.pipeline import PipelineConfig
 from visual_gen.utils.auto_tuner import TunableParam
 from visual_gen.utils.logger import get_logger
-from torch.nn.attention import SDPBackend, sdpa_kernel
 
 logger = get_logger(__name__)
 
@@ -99,7 +103,9 @@ class BaseAttn:
             k = k.permute(0, 2, 1, 3).contiguous()
             v = v.permute(0, 2, 1, 3).contiguous()
         else:
-            raise NotImplementedError(f"Unsupported tensor layout conversion: {src_layout} -> {dst_layout}")
+            raise NotImplementedError(
+                f"Unsupported tensor layout conversion: {src_layout} -> {dst_layout}"
+            )
         return q, k, v
 
     def _convert_output_layout(self, out, src_layout, dst_layout):
@@ -110,11 +116,17 @@ class BaseAttn:
             # [B, H, S, D] -> [B, S, H, D]
             out = out.permute(0, 2, 1, 3).contiguous()
         else:
-            raise NotImplementedError(f"Unsupported tensor layout conversion: {src_layout} -> {dst_layout}")
+            raise NotImplementedError(
+                f"Unsupported tensor layout conversion: {src_layout} -> {dst_layout}"
+            )
         return out
 
     def register_tunable_params(
-        self, value: Any, param_range: Optional[List[Any]], name: Optional[str], description: Optional[str]
+        self,
+        value: Any,
+        param_range: Optional[List[Any]],
+        name: Optional[str],
+        description: Optional[str],
     ):
         return TunableParam(value, param_range, name, description)
 
@@ -133,7 +145,9 @@ class BaseAttn:
         valid_query_length=None,
         valid_kv_length=None,
     ):
-        raise NotImplementedError("BaseAttn is not implemented, please implement it in the subclass")
+        raise NotImplementedError(
+            "BaseAttn is not implemented, please implement it in the subclass"
+        )
 
 
 @AttentionOpManager.register_attn("default")
@@ -151,8 +165,7 @@ class DefaultAttn(BaseAttn):
         return_lse=False,
         tensor_layout="HND",
     ):
-        """
-        Default attention is implemented with `F.scaled_dot_product_attention`
+        r"""Default attention is implemented with `F.scaled_dot_product_attention`.
 
         Args:
             query (Tensor): Query tensor; shape :math:`(N, ..., L, E)`.
@@ -186,9 +199,55 @@ class DefaultAttn(BaseAttn):
             raise NotImplementedError("Default attention not implemented for ring parallel")
         logger.debug("Using DefaultAttn")
         if tensor_layout == "NHD":
-            query, key, value = self._convert_qkv_layout(query, key, value, src_layout="NHD", dst_layout="HND")
+            query, key, value = self._convert_qkv_layout(
+                query, key, value, src_layout="NHD", dst_layout="HND"
+            )
 
-        with sdpa_kernel(backends=[SDPBackend.CUDNN_ATTENTION]):
+        output = F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+            is_causal=is_causal,
+            scale=scale,
+            enable_gqa=enable_gqa,
+        )
+
+        if tensor_layout == "NHD":
+            output = self._convert_output_layout(output, src_layout="HND", dst_layout="NHD")
+        return output
+
+
+@AttentionOpManager.register_attn("cudnn-attn")
+class CuDNNAttn(BaseAttn):
+    def __call__(
+        self,
+        query,
+        key,
+        value,
+        attn_mask=None,
+        dropout_p=0.0,
+        is_causal=False,
+        scale=None,
+        enable_gqa=False,
+        return_lse=False,
+        tensor_layout="HND",
+    ):
+        if tensor_layout not in ["HND", "NHD"]:
+            raise NotImplementedError("Tensor layout not supported for DefaultAttn")
+        if return_lse:
+            raise NotImplementedError("Return LSE is not supported for DefaultAttn")
+
+        if get_dit_parallel_config().ring_size() > 1:
+            raise NotImplementedError("Default attention not implemented for ring parallel")
+        logger.debug("Using DefaultAttn")
+        if tensor_layout == "NHD":
+            query, key, value = self._convert_qkv_layout(
+                query, key, value, src_layout="NHD", dst_layout="HND"
+            )
+
+        with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
             output = F.scaled_dot_product_attention(
                 query,
                 key,
@@ -231,16 +290,25 @@ class SageAttn(BaseAttn):
             raise NotImplementedError("GQA is not supported for Sage attention")
 
         origin_dtype = query.dtype
-        if query.dtype not in [torch.float16, torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2]:
+        if query.dtype not in [
+            torch.float16,
+            torch.bfloat16,
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        ]:
             logger.debug(f"SageAttn: query.dtype: {query.dtype}, converting to bfloat16")
             query = query.to(torch.bfloat16)
             key = key.to(torch.bfloat16)
             value = value.to(torch.bfloat16)
 
         if query.dtype == torch.float16 or query.dtype == torch.bfloat16:
-            assert query.shape[-1] % 8 == 0, "hidden size per attention head should be multiple of 8"
+            assert query.shape[-1] % 8 == 0, (
+                "hidden size per attention head should be multiple of 8"
+            )
         elif query.dtype == torch.float8_e4m3fn or query.dtype == torch.float8_e5m2:
-            assert query.shape[-1] % 16 == 0, "hidden size per attention head should be multiple of 16"
+            assert query.shape[-1] % 16 == 0, (
+                "hidden size per attention head should be multiple of 16"
+            )
 
         if sageattn is None:
             raise ImportError("SageAttention is not installed")
@@ -321,7 +389,9 @@ class SparseVideoGenAttn(BaseAttn):
         if enable_gqa:
             raise NotImplementedError("GQA is not supported for Sparse VideoGen attention")
         if tensor_layout not in ["HND", "NHD"]:
-            raise NotImplementedError(f"Tensor layout {tensor_layout} not supported for SparseVideoGenAttn")
+            raise NotImplementedError(
+                f"Tensor layout {tensor_layout} not supported for SparseVideoGenAttn"
+            )
 
         origin_dtype = query.dtype
         if query.dtype not in [torch.float16, torch.bfloat16]:
@@ -331,7 +401,9 @@ class SparseVideoGenAttn(BaseAttn):
             value = value.to(torch.bfloat16)
 
         if tensor_layout == "NHD":
-            query, key, value = self._convert_qkv_layout(query, key, value, src_layout="NHD", dst_layout="HND")
+            query, key, value = self._convert_qkv_layout(
+                query, key, value, src_layout="NHD", dst_layout="HND"
+            )
 
         cfg, num_heads, seq_len, dim = query.size()
 
@@ -341,18 +413,31 @@ class SparseVideoGenAttn(BaseAttn):
             self.svg_attn.frame_size,
         )
 
-        assert (
-            seq_len == context_length + num_frame * frame_size
-        ), f"Query Shape: {seq_len} is not equivalent to {context_length} + {num_frame} * {frame_size}"
+        assert seq_len == context_length + num_frame * frame_size, (
+            f"Query Shape: {seq_len} is not equivalent to {context_length} + {num_frame} * {frame_size}"
+        )
 
         sampled_mses = self.svg_attn.sample_mse(query, key, value)
         best_mask_idx = torch.argmin(sampled_mses, dim=0)
 
         output_hidden_states = torch.zeros_like(query)
-        query_out, key_out, value_out = torch.zeros_like(query), torch.zeros_like(key), torch.zeros_like(value)
+        query_out, key_out, value_out = (
+            torch.zeros_like(query),
+            torch.zeros_like(key),
+            torch.zeros_like(value),
+        )
 
         query_out, key_out, value_out = self.svg_attn.fast_sparse_head_placement(
-            query, key, value, query_out, key_out, value_out, best_mask_idx, context_length, num_frame, frame_size
+            query,
+            key,
+            value,
+            query_out,
+            key_out,
+            value_out,
+            best_mask_idx,
+            context_length,
+            num_frame,
+            frame_size,
         )
 
         hidden_states = self.svg_attn.sparse_flex_attention(
@@ -360,7 +445,12 @@ class SparseVideoGenAttn(BaseAttn):
         )
 
         self.svg_attn.fast_hidden_states_placement(
-            hidden_states, output_hidden_states, best_mask_idx, context_length, num_frame, frame_size
+            hidden_states,
+            output_hidden_states,
+            best_mask_idx,
+            context_length,
+            num_frame,
+            frame_size,
         )
 
         output = output_hidden_states.reshape(cfg, num_heads, seq_len, dim).contiguous()
@@ -422,7 +512,9 @@ class SparseVideoGenAttn2(BaseAttn):
             raise NotImplementedError("Return LSE is not supported for SparseVideoGen2Attn")
         if get_dit_parallel_config().ring_size() > 1:
             # todo: we can set `return_lse=True` to get the log-sum-exp value and then compute for ring parallel
-            raise NotImplementedError("Sparse VideoGen2 attention not implemented for ring parallel")
+            raise NotImplementedError(
+                "Sparse VideoGen2 attention not implemented for ring parallel"
+            )
         if attn_mask is not None:
             raise NotImplementedError("Attn mask not supported for Sparse VideoGen2 attention")
         if dropout_p != 0.0:
@@ -430,7 +522,9 @@ class SparseVideoGenAttn2(BaseAttn):
         if enable_gqa:
             raise NotImplementedError("GQA is not supported for Sparse VideoGen2 attention")
         if tensor_layout not in ["HND", "NHD"]:
-            raise NotImplementedError(f"Tensor layout {tensor_layout} not supported for SparseVideoGen2Attn")
+            raise NotImplementedError(
+                f"Tensor layout {tensor_layout} not supported for SparseVideoGen2Attn"
+            )
 
         origin_dtype = query.dtype
         if query.dtype not in [torch.float16, torch.bfloat16]:
@@ -440,7 +534,9 @@ class SparseVideoGenAttn2(BaseAttn):
             value = value.to(torch.bfloat16)
 
         if tensor_layout == "NHD":
-            query, key, value = self._convert_qkv_layout(query, key, value, src_layout="NHD", dst_layout="HND")
+            query, key, value = self._convert_qkv_layout(
+                query, key, value, src_layout="NHD", dst_layout="HND"
+            )
 
         cfg, num_heads, seq_len, dim = query.size()
         assert cfg == 1, "Batch size must be 1 for kmeans block sparse attention"
@@ -451,12 +547,12 @@ class SparseVideoGenAttn2(BaseAttn):
             self.sap_attn.frame_size,
         )
 
-        assert (
-            seq_len == context_length + num_frame * frame_size
-        ), f"Query Shape: {seq_len} is not equivalent to {context_length} + {num_frame} * {frame_size}"
+        assert seq_len == context_length + num_frame * frame_size, (
+            f"Query Shape: {seq_len} is not equivalent to {context_length} + {num_frame} * {frame_size}"
+        )
 
-        q_perm, k_perm, v_perm, dyn_map, qc_sz_s, kc_sz_s, q_sorted_indices = self.sap_attn.semantic_aware_permutation(
-            query, key, value
+        q_perm, k_perm, v_perm, dyn_map, qc_sz_s, kc_sz_s, q_sorted_indices = (
+            self.sap_attn.semantic_aware_permutation(query, key, value)
         )
 
         from svg.kernels.triton.permute import apply_inverse_permutation_triton
@@ -616,7 +712,9 @@ class TRTLLMAttn(BaseAttn):
             metadata=self.attention_metadata,
             attention_mask=attention_mask,
         )
-        attn_output = self.convert_output(attn_output, batch_size=batch_size, tensor_layout=tensor_layout)
+        attn_output = self.convert_output(
+            attn_output, batch_size=batch_size, tensor_layout=tensor_layout
+        )
         return attn_output
 
 
@@ -647,7 +745,9 @@ class FlashAttn3(BaseAttn):
             raise NotImplementedError("Tensor layout not supported for FlashAttn3")
 
         if tensor_layout == "HND":
-            query, key, value = self._convert_qkv_layout(query, key, value, src_layout="HND", dst_layout="NHD")
+            query, key, value = self._convert_qkv_layout(
+                query, key, value, src_layout="HND", dst_layout="NHD"
+            )
 
         # FA3 only supports float16 and bfloat16
         origin_dtype = query.dtype
@@ -721,9 +821,15 @@ class FlashAttn3FP8(BaseAttn):
             raise NotImplementedError("Tensor layout not supported for FlashAttn3")
 
         if tensor_layout == "HND":
-            query, key, value = self._convert_qkv_layout(query, key, value, src_layout="HND", dst_layout="NHD")
+            query, key, value = self._convert_qkv_layout(
+                query, key, value, src_layout="HND", dst_layout="NHD"
+            )
 
-        query, key, value = query.to(torch.float8_e4m3fn), key.to(torch.float8_e4m3fn), value.to(torch.float8_e4m3fn)
+        query, key, value = (
+            query.to(torch.float8_e4m3fn),
+            key.to(torch.float8_e4m3fn),
+            value.to(torch.float8_e4m3fn),
+        )
         output = flash_attn_interface.flash_attn_func(
             q=query,
             k=key,
@@ -790,7 +896,9 @@ class FlashAttn4(BaseAttn):
             raise NotImplementedError("Tensor layout not supported for FlashAttn4")
 
         if tensor_layout == "HND":
-            query, key, value = self._convert_qkv_layout(query, key, value, src_layout="HND", dst_layout="NHD")
+            query, key, value = self._convert_qkv_layout(
+                query, key, value, src_layout="HND", dst_layout="NHD"
+            )
 
         # FA4 only supports float16 and bfloat16
         origin_dtype = query.dtype
@@ -843,14 +951,28 @@ class TransformerEngineAttn(BaseAttn):
         self.recipe = DelayedScaling(fp8_dpa=True, fp8_mha=True)
 
     def _lazy_init(
-        self, num_attention_heads, kv_channels, num_gqa_groups, attn_mask_type, softmax_scale, warn_once_hnd
+        self,
+        num_attention_heads,
+        kv_channels,
+        num_gqa_groups,
+        attn_mask_type,
+        softmax_scale,
+        warn_once_hnd,
     ):
         if DotProductAttention is None:
             raise ImportError("TransformerEngine is not installed")
 
-        if (num_attention_heads, kv_channels, num_gqa_groups, attn_mask_type, softmax_scale) != self.traits:
+        if (
+            num_attention_heads,
+            kv_channels,
+            num_gqa_groups,
+            attn_mask_type,
+            softmax_scale,
+        ) != self.traits:
             if warn_once_hnd:
-                logger.warning("Potential performance loss: bhsd->bshd transposition will happen at attn op.")
+                logger.warning(
+                    "Potential performance loss: bhsd->bshd transposition will happen at attn op."
+                )
             self.attn_op = DotProductAttention(
                 num_attention_heads,
                 kv_channels,
@@ -898,10 +1020,14 @@ class TransformerEngineAttn(BaseAttn):
             attn_mask_type = "no_mask"
         else:
             attn_mask_type = "arbitrary"
-        self._lazy_init(num_attention_heads, kv_channels, num_gqa_groups, attn_mask_type, scale, warn_once_hnd)
+        self._lazy_init(
+            num_attention_heads, kv_channels, num_gqa_groups, attn_mask_type, scale, warn_once_hnd
+        )
 
         with fp8_autocast(enabled=self.enable_fp8, fp8_recipe=self.recipe):
-            out = self.attn_op(query, key, value, attention_mask=attn_mask).unflatten(-1, (-1, kv_channels))
+            out = self.attn_op(query, key, value, attention_mask=attn_mask).unflatten(
+                -1, (-1, kv_channels)
+            )
         if tensor_layout.upper() == "HND":
             out = out.transpose(1, 2)
         return out
@@ -938,7 +1064,9 @@ class FlashInferVx(BaseAttn):
 
         logger.debug("Using SageAttn for Blackwell")
         if tensor_layout not in ["HND", "NHD"]:
-            raise NotImplementedError(f"Tensor layout {tensor_layout} not supported for SageAttn for Blackwell")
+            raise NotImplementedError(
+                f"Tensor layout {tensor_layout} not supported for SageAttn for Blackwell"
+            )
         if attn_mask is not None:
             raise NotImplementedError("Attn mask not supported for Sage attention")
         if dropout_p != 0.0:
@@ -949,8 +1077,15 @@ class FlashInferVx(BaseAttn):
             raise NotImplementedError("Caucal mask is not supported by SageAttn for Blackwell yet")
 
         origin_dtype = query.dtype
-        if query.dtype not in [torch.float16, torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2]:
-            logger.debug(f"SageAttn for Blackwell: query.dtype: {query.dtype}, converting to bfloat16")
+        if query.dtype not in [
+            torch.float16,
+            torch.bfloat16,
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        ]:
+            logger.debug(
+                f"SageAttn for Blackwell: query.dtype: {query.dtype}, converting to bfloat16"
+            )
             query = query.to(torch.bfloat16)
             key = key.to(torch.bfloat16)
             value = value.to(torch.bfloat16)
@@ -962,7 +1097,9 @@ class FlashInferVx(BaseAttn):
             value = value.transpose(1, 2).contiguous()
 
         if query.shape[-1] not in [128, 256]:
-            raise RuntimeError(f"SageAttn for Blackwell only supports D=128 and D=256, got shape {query.shape}")
+            raise RuntimeError(
+                f"SageAttn for Blackwell only supports D=128 and D=256, got shape {query.shape}"
+            )
 
         output = self._sageattn(query, key, value, smooth=not return_lse, returnLse=return_lse)
         if return_lse:

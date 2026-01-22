@@ -44,6 +44,7 @@ class BaseArgumentParser:
                 "default",
                 "auto",
                 "fivx",
+                "cudnn-attn",
                 "sage-attn",
                 "sparse-videogen",
                 "sparse-videogen2",
