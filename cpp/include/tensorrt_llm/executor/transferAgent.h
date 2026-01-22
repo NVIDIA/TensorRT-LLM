@@ -296,7 +296,8 @@ struct BaseAgentConfig
     bool useProgThread;
     bool multiThread;
     bool useListenThread;
-    unsigned int numWorkers;
+    bool enableTelemetry;
+    std::unordered_map<std::string, std::string> backendParams;
 };
 
 class BaseTransferAgent

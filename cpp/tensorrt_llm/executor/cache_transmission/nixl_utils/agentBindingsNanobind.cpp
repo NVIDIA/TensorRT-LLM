@@ -26,10 +26,9 @@
 #endif
 
 #include <nanobind/nanobind.h>
-#include <nanobind/stl/function.h>
 #include <nanobind/stl/optional.h>
-#include <nanobind/stl/pair.h>
 #include <nanobind/stl/string.h>
+#include <nanobind/stl/tuple.h>
 #include <nanobind/stl/unordered_map.h>
 #include <nanobind/stl/vector.h>
 
@@ -69,6 +68,21 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
     // MemoryDescs class
     nb::class_<kvc::MemoryDescs>(m, "MemoryDescs")
         .def(nb::init<kvc::MemoryType, std::vector<kvc::MemoryDesc>>(), nb::arg("type"), nb::arg("descs"))
+        // Batch constructor from list of tuples: [(ptr, size, device_id), ...]
+        .def(
+            "__init__",
+            [](kvc::MemoryDescs* self, kvc::MemoryType type,
+                std::vector<std::tuple<uintptr_t, size_t, uint32_t>> const& tuples)
+            {
+                std::vector<kvc::MemoryDesc> descs;
+                descs.reserve(tuples.size());
+                for (auto const& [addr, len, deviceId] : tuples)
+                {
+                    descs.emplace_back(addr, len, deviceId);
+                }
+                new (self) kvc::MemoryDescs(type, std::move(descs));
+            },
+            nb::arg("type"), nb::arg("tuples"))
         .def_prop_ro("type", &kvc::MemoryDescs::getType)
         .def_prop_ro("descs", &kvc::MemoryDescs::getDescs);
 
@@ -113,17 +127,21 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
         .def(
             "__init__",
             [](kvc::BaseAgentConfig* self, std::string name, bool use_prog_thread, bool multi_thread,
-                bool use_listen_thread, unsigned int num_workers) {
-                new (self) kvc::BaseAgentConfig{
-                    std::move(name), use_prog_thread, multi_thread, use_listen_thread, num_workers};
+                bool use_listen_thread, bool enable_telemetry,
+                std::unordered_map<std::string, std::string> backend_params)
+            {
+                new (self) kvc::BaseAgentConfig{std::move(name), use_prog_thread, multi_thread, use_listen_thread,
+                    enable_telemetry, std::move(backend_params)};
             },
             nb::arg("name"), nb::arg("use_prog_thread") = true, nb::arg("multi_thread") = false,
-            nb::arg("use_listen_thread") = false, nb::arg("num_workers") = 1)
+            nb::arg("use_listen_thread") = false, nb::arg("enable_telemetry") = false,
+            nb::arg("backend_params") = std::unordered_map<std::string, std::string>{})
         .def_rw("name", &kvc::BaseAgentConfig::mName)
         .def_rw("use_prog_thread", &kvc::BaseAgentConfig::useProgThread)
         .def_rw("multi_thread", &kvc::BaseAgentConfig::multiThread)
         .def_rw("use_listen_thread", &kvc::BaseAgentConfig::useListenThread)
-        .def_rw("num_workers", &kvc::BaseAgentConfig::numWorkers);
+        .def_rw("enable_telemetry", &kvc::BaseAgentConfig::enableTelemetry)
+        .def_rw("backend_params", &kvc::BaseAgentConfig::backendParams);
 
     // BaseTransferAgent class (abstract base)
     nb::class_<kvc::BaseTransferAgent>(m, "BaseTransferAgent")

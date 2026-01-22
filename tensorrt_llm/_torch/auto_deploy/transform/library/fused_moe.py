@@ -1,3 +1,4 @@
+import math
 from collections import defaultdict
 from functools import partial
 from typing import Dict, List, Literal, Optional, Tuple, Type
@@ -8,6 +9,7 @@ from torch.fx import GraphModule, Node
 
 from tensorrt_llm._torch.utils import ActivationType
 
+from ...custom_ops.quant import TRTLLM_NVFP4_PACKING_FACTOR, TRTLLM_NVFP4_SCALING_VECTOR_SIZE
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils._graph import delete_all_unused_submodules, eliminate_dead_code
@@ -1627,14 +1629,13 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
             "w3_weight",
             "w1_input_scale",
             "w2_input_scale",
-            "w3_input_scale",
             "w1_weight_scale",
             "w2_weight_scale",
             "w3_weight_scale",
             "w1_alpha",
             "w2_alpha",
-            "w3_alpha",
             "is_gated_mlp",
+            "act_fn",
         )
 
     def _stack(param_list, dim=0, device=None, dtype=None):
@@ -1648,13 +1649,10 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
     def _prepare_args_cutlass_format_nvfp4():
         if is_gated_mlp:
             # For gated MLP, concatenate w1 and w3 as [w3, w1]
-            fc1_expert_weights = torch.cat(
-                [w3_stacked, w1_stacked], dim=1
-            ).contiguous()  # [E, 2*I, H]
-            fc1_act_scale = torch.cat(
-                [w3_input_scale_stacked, w1_input_scale_stacked], dim=1
-            ).contiguous()
-            fc1_alpha_stacked = torch.cat([w3_alpha_stacked, w1_alpha_stacked], dim=1).contiguous()
+            fc1_expert_weights = torch.cat([w3_stacked, w1_stacked], dim=1).contiguous()
+            # Expect w3 input scale and alpha to be the same as w1
+            fc1_act_scale = w1_input_scale_stacked
+            fc1_alpha_stacked = w1_alpha_stacked
             fc1_weight_blockscale_fp8_stacked = torch.cat(
                 [w3_weight_blockscale_fp8_stacked, w1_weight_blockscale_fp8_stacked], dim=1
             ).contiguous()
@@ -1666,6 +1664,7 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
 
         fc2_expert_weights = w2_stacked
         fc2_act_scale = w2_input_scale_stacked
+        fc2_weight_blockscale_fp8_stacked = w2_weight_blockscale_fp8_stacked
 
         new_key_fc1_expert_weights = f"nvfp4_moe_w3_w1_stacked_{fused_key_counter}"
         new_key_fc2_expert_weights = f"nvfp4_moe_w2_stacked_{fused_key_counter}"
@@ -1681,13 +1680,57 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
         new_key_fc1_alpha = f"nvfp4_moe_w1_alpha_stacked_{fused_key_counter}"
         new_key_fc2_alpha = f"nvfp4_moe_w2_alpha_stacked_{fused_key_counter}"
 
+        # Pad fc1_expert_weights to match the already padded scales
+        fc1_pad_size = fc1_weight_blockscale_fp8_stacked.shape[1] - fc1_expert_weights.shape[1]
+        if fc1_pad_size > 0:
+            fc1_expert_weights = torch.nn.functional.pad(
+                fc1_expert_weights, (0, 0, 0, fc1_pad_size), mode="constant", value=0
+            )
+            # Need to update fc2 scales and weights to match the padded size of fc1,
+            # as they share the same intermediate dimension.
+            target_intermediate = fc1_weight_blockscale_fp8_stacked.shape[1]
+            TRTLLM_NVFP4_SCALING_VECTOR_NUM_ELEMENTS = TRTLLM_NVFP4_SCALING_VECTOR_SIZE
+            TRTLLM_NVFP4_SCALING_BYTES_SIZE = (
+                TRTLLM_NVFP4_SCALING_VECTOR_NUM_ELEMENTS // TRTLLM_NVFP4_PACKING_FACTOR
+            )
+            target_n_blocks = target_intermediate // TRTLLM_NVFP4_SCALING_VECTOR_NUM_ELEMENTS
+            padded_target_n_blocks = (
+                math.ceil(target_n_blocks / TRTLLM_NVFP4_SCALING_BYTES_SIZE)
+                * TRTLLM_NVFP4_SCALING_BYTES_SIZE
+            )
+            fc2_blocks_pad = padded_target_n_blocks - fc2_weight_blockscale_fp8_stacked.shape[2]
+
+            if fc2_blocks_pad > 0:
+                # unswizzle fc2 scales
+                fc2_blockscale_shape = list(fc2_weight_blockscale_fp8_stacked.shape)
+                fc2_blockscale_shape[2] = padded_target_n_blocks
+                fc2_weight_blockscale_fp8_stacked = torch.ops.trtllm.block_scale_interleave_reverse(
+                    fc2_weight_blockscale_fp8_stacked.view(torch.uint8)
+                )
+                fc2_weight_blockscale_fp8_stacked = torch.nn.functional.pad(
+                    fc2_weight_blockscale_fp8_stacked, (0, fc2_blocks_pad), mode="constant", value=0
+                )
+                fc2_weight_blockscale_fp8_stacked = (
+                    torch.ops.trtllm.block_scale_interleave(fc2_weight_blockscale_fp8_stacked)
+                    .view(torch.float8_e4m3fn)
+                    .reshape(fc2_blockscale_shape)
+                )
+            fc2_expert_weights = torch.nn.functional.pad(
+                fc2_expert_weights,
+                (0, fc1_pad_size // TRTLLM_NVFP4_PACKING_FACTOR, 0, 0),
+                mode="constant",
+                value=0,
+            ).view(torch.uint8)
+
         # FP4 weights are already packed as uint8, don't convert dtype
         _register_parameter(gm, new_key_fc1_expert_weights, fc1_expert_weights)
         _register_parameter(gm, new_key_fc2_expert_weights, fc2_expert_weights)
         _register_parameter(
             gm, new_key_fc1_weight_blockscale_fp8, fc1_weight_blockscale_fp8_stacked
         )
-        _register_parameter(gm, new_key_fc2_weight_blockscale_fp8, w2_weight_blockscale_fp8_stacked)
+        _register_parameter(
+            gm, new_key_fc2_weight_blockscale_fp8, fc2_weight_blockscale_fp8_stacked
+        )
         _register_parameter(gm, new_key_fc1_act_scale, fc1_act_scale)
         _register_parameter(gm, new_key_fc2_act_scale, fc2_act_scale)
         _register_parameter(gm, new_key_fc1_alpha, fc1_alpha_stacked)
@@ -1707,7 +1750,11 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
                 graph.get_attr(new_key_fc1_alpha),
                 graph.get_attr(new_key_fc2_alpha),
             )
-        return args
+        kwargs = {
+            "is_gated_mlp": is_gated_mlp,
+            "act_fn": act_fn,
+        }
+        return args, kwargs
 
     fused_key_counter = 0
     graph = gm.graph
@@ -1727,14 +1774,13 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
             w3_list,
             w1_input_scale,
             w2_input_scale,
-            w3_input_scale,
             w1_weight_scale,
             w2_weight_scale,
             w3_weight_scale,
             w1_alpha,
             w2_alpha,
-            w3_alpha,
             is_gated_mlp,
+            act_fn,
         ) = _extract_op_args(node)
 
         # Stack the actual tensor values (fast, like in quantize_moe.py)
@@ -1746,7 +1792,6 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
         # Scales are buffers, not parameters
         w1_input_scale_stacked = _stack(w1_input_scale, dim=0)
         w2_input_scale_stacked = _stack(w2_input_scale, dim=0)
-        w3_input_scale_stacked = _stack(w3_input_scale, dim=0, device=device, dtype=dtype)
 
         # Use .view() not .to() to reinterpret bytes as float8, not value conversion
         w1_weight_blockscale_fp8_stacked = _stack(w1_weight_scale, dim=0).view(torch.float8_e4m3fn)
@@ -1757,9 +1802,8 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
 
         w1_alpha_stacked = _stack(w1_alpha, dim=0)
         w2_alpha_stacked = _stack(w2_alpha, dim=0)
-        w3_alpha_stacked = _stack(w3_alpha, dim=0, device=device, dtype=dtype)
 
-        args = _prepare_args_cutlass_format_nvfp4()
+        args, kwargs = _prepare_args_cutlass_format_nvfp4()
 
         fused_key_counter += 1
 
@@ -1768,7 +1812,7 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
             new_node = graph.call_function(
                 replacement_op,
                 args,
-                kwargs=node.kwargs,
+                kwargs=kwargs,
             )
 
         node.replace_all_uses_with(new_node)
