@@ -10,6 +10,7 @@ from torch import nn
 from tensorrt_llm._mnnvl_utils import HelixCpMnnvlMemory, MnnvlMemory
 from tensorrt_llm._torch.distributed.symm_mem_allreduce import \
     SymmetricMemoryAllReduce
+from tensorrt_llm._torch.utils import model_extra_attrs, set_model_extra_attrs
 from tensorrt_llm._utils import mpi_comm, mpi_disabled
 from tensorrt_llm.bindings import internal as _tllm_internal
 from tensorrt_llm.bindings.internal.runtime import McastGPUBuffer
@@ -690,7 +691,15 @@ class AllReduce(nn.Module):
         self.symm_mem_allreduce = None
         self._disable_mpi = mpi_disabled()
 
-        self.all_reduce_op = torch.ops.trtllm.allreduce_pg if self._disable_mpi else torch.ops.trtllm.allreduce
+        # For torch.compile path, the context manager will be ignored.
+        # Thus, we use set_model_extra_attrs to ensure the global is always initialized.
+        # For non-torch.compile path, this will update the existing attrs.
+        self.extra_attrs = {
+            'mapping': mapping,
+            'disable_mpi': self._disable_mpi
+        }
+        set_model_extra_attrs(self.extra_attrs)
+
         if self.mapping.tp_size > 1:
             # Initialize Symmetric Memory AllReduce if needed (before workspace allocation)
             if self.strategy == AllReduceStrategy.SYMM_MEM:
@@ -820,22 +829,7 @@ class AllReduce(nn.Module):
                                   AllReduceStrategy.SYMM_MEM):
             allreduce_strategy = AllReduceStrategy.AUTO
 
-        additional_args = {}
-        if self._disable_mpi:
-            # Get ProcessGroup from mapping
-            pg = self.mapping.tp_group_pg
-            assert pg is not None, "TP ProcessGroup not initialised"
-            additional_args = {
-                "rank": torch.distributed.get_rank(),
-                "pg": pg.boxed(),
-            }
-
-        # In case that AutoTuner brings potential perf regression
-        # TODO: Remove this if no perf regression is observed.
-        disable_allreduce_autotune = os.environ.get(
-            "TLLM_DISABLE_ALLREDUCE_AUTOTUNE", "0") == "1"
-
-        if allreduce_strategy == AllReduceStrategy.AUTO and not disable_allreduce_autotune and not self._disable_mpi:
+        with model_extra_attrs(self.extra_attrs):
             output = torch.ops.trtllm.tunable_allreduce(
                 input=input,
                 residual=all_reduce_params.residual,
@@ -849,22 +843,6 @@ class AllReduce(nn.Module):
                 eps=all_reduce_params.eps,
                 trigger_completion_at_end=all_reduce_params.
                 trigger_completion_at_end,
-            )
-        else:
-            output = self.all_reduce_op(
-                input=input,
-                residual=all_reduce_params.residual,
-                norm_weight=all_reduce_params.norm_weight,
-                scale=all_reduce_params.scale,
-                bias=all_reduce_params.bias,
-                workspace=self.workspace,
-                group=self.mapping.tp_group,
-                strategy=allreduce_strategy,
-                op=all_reduce_params.fusion_op,
-                eps=all_reduce_params.eps,
-                trigger_completion_at_end=all_reduce_params.
-                trigger_completion_at_end,
-                **additional_args,
             )
 
         return output if len(output) > 1 else output[0]

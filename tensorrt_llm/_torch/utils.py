@@ -90,6 +90,14 @@ def get_model_extra_attrs():
     return getattr(_model_extra_attrs, 'attrs', None)
 
 
+def set_model_extra_attrs(attrs: Dict) -> None:
+    existing = getattr(_model_extra_attrs, 'attrs', None)
+    if existing is None:
+        _model_extra_attrs.attrs = attrs.copy()
+    else:
+        existing.update(attrs)
+
+
 @contextlib.contextmanager
 def model_extra_attrs(attrs: Dict):
     old_attrs = getattr(_model_extra_attrs, 'attrs', None)
