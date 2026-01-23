@@ -4,6 +4,8 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 import torch.nn.functional as F
 
+from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
+    MambaHybridCacheManager
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
@@ -1182,6 +1184,16 @@ class MTPEagleWorker(MTPWorker):
         # Sample and verify draft tokens
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
             input_ids, logits, spec_metadata, attn_metadata)
+
+        if num_gens > 0 and isinstance(attn_metadata.kv_cache_manager,
+                                       MambaHybridCacheManager):
+            num_accepted_draft_tokens = num_accepted_tokens[num_contexts:] - 1
+            state_indices = attn_metadata.kv_cache_manager.get_state_indices(
+            )[:num_contexts + num_gens]
+            state_indices_d = state_indices[num_contexts:num_contexts +
+                                            num_gens]
+            attn_metadata.kv_cache_manager.update_mamba_states(
+                num_accepted_draft_tokens, state_indices_d)
 
         # Save the old attn_metadata and spec_metadata
         attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")

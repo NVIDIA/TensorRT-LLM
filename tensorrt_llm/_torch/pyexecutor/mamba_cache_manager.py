@@ -19,8 +19,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 import torch
 
-from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
-                                                        LlmRequestState)
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager, get_pp_layers)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -31,7 +30,6 @@ from tensorrt_llm.mapping import Mapping
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import \
         AttentionMetadata
-    from tensorrt_llm._torch.pyexecutor.sampler import SampleState
 
 GB = 1 << 30
 
@@ -200,6 +198,10 @@ class MambaCacheManager(BaseResourceManager):
                                                         dtype=torch.int32)
         # save mamba state indices for requests
         self.state_indices_list: List[int] = []
+        # save intermediate state indices for requests
+        self.intermediate_state_indices = torch.arange(max_batch_size,
+                                                       dtype=torch.int32,
+                                                       device=device)
 
     def _prepare_mamba_cache_blocks(self, request_ids: List[int]):
         self.state_indices_list.clear()
@@ -324,9 +326,8 @@ class MambaCacheManager(BaseResourceManager):
 
         torch.cuda.empty_cache()
 
-    def _update_speculative_mamba_states(
-            self, num_accepted_draft_tokens: torch.Tensor,
-            state_indices_tensor: torch.Tensor):
+    def update_mamba_states(self, num_accepted_draft_tokens: torch.Tensor,
+                            state_indices_tensor: torch.Tensor):
         """Update Mamba states after MTP verification
 
         Copy the states of accepted speculative steps from the intermediate cache to the main cache.
@@ -340,10 +341,6 @@ class MambaCacheManager(BaseResourceManager):
 
         """
         request_number = num_accepted_draft_tokens.shape[0]
-        intermediate_state_indices = torch.arange(
-            request_number,
-            dtype=torch.int32,
-            device=state_indices_tensor.device)
 
         conv_states = self.mamba_cache.conv
         ssm_states = self.mamba_cache.temporal
@@ -351,111 +348,18 @@ class MambaCacheManager(BaseResourceManager):
         intermediate_state_cache = self.mamba_cache.intermediate_ssm
         intermediate_conv_window_cache = self.mamba_cache.intermediate_conv_window
 
-        valid_mask = num_accepted_draft_tokens >= 0
-
-        # if no valid accepted tokens (all -1), return
-        if not valid_mask.any():
-            return
-
-        dst_state_indices = state_indices_tensor[valid_mask].to(torch.int64)
-        src_state_indices = intermediate_state_indices[valid_mask].to(
-            torch.int64)
-        last_steps = num_accepted_draft_tokens[valid_mask].to(torch.int64)
+        src_state_indices = self.intermediate_state_indices[:request_number]
 
         accepted_ssm_state = intermediate_state_cache[:, src_state_indices,
-                                                      last_steps]
-        ssm_states[:, dst_state_indices, :] = accepted_ssm_state.to(
+                                                      num_accepted_draft_tokens]
+        ssm_states[:, state_indices_tensor, :] = accepted_ssm_state.to(
             ssm_states.dtype, copy=False)
 
         accepted_conv_state = intermediate_conv_window_cache[:,
                                                              src_state_indices,
-                                                             last_steps]
-        conv_states[:, dst_state_indices, :] = accepted_conv_state.to(
+                                                             num_accepted_draft_tokens]
+        conv_states[:, state_indices_tensor, :] = accepted_conv_state.to(
             conv_states.dtype, copy=False)
-
-    def update_resources(self,
-                         scheduled_batch: ScheduledRequests,
-                         attn_metadata: "AttentionMetadata" = None,
-                         kv_cache_dtype_byte_size: float = None,
-                         sample_state: Optional["SampleState"] = None):
-        """Update Mamba cache resources
-
-        After the verification phase of speculative decoding, update the intermediate cache state to the main cache.
-
-        Args:
-            scheduled_batch: Scheduled batch requests
-            attn_metadata: Attention metadata
-            kv_cache_dtype_byte_size: KV cache data type byte size
-            sample_state: Sample state from previous iteration, contains new_tokens_lens for MTP
-        """
-
-        if not self.is_speculative():
-            return
-        num_decodes = len(scheduled_batch.generation_requests)
-
-        if num_decodes == 0:
-            return
-
-        num_accepted_draft_tokens = []
-        state_indices_updated = []
-        if sample_state is not None:
-            # for overlap scheduler, use sample_state to get num_accepted_draft_tokens for previous iteration because sampler update is not called when this function is called
-            valid_slots = []
-            valid_cache_indices = []
-
-            for req in scheduled_batch.generation_requests:
-                if req.state != LlmRequestState.GENERATION_COMPLETE:
-                    valid_slots.append(req.py_seq_slot)
-                    valid_cache_indices.append(
-                        self.mamba_cache_index[req.py_request_id])
-                else:
-                    valid_slots.append(-1)
-                    valid_cache_indices.append(-1)
-
-            if len(valid_cache_indices) == 0:
-                return
-
-            # Perform all operations on GPU to avoid synchronization overhead
-            slots_tensor = torch.tensor(valid_slots,
-                                        dtype=torch.int32,
-                                        device='cuda')
-            state_indices_updated = torch.tensor(valid_cache_indices,
-                                                 dtype=torch.int32,
-                                                 device='cuda')
-
-            # Use device version of new_tokens_lens and perform indexing on GPU
-            valid_mask = slots_tensor >= 0
-            num_accepted_draft_tokens = torch.full((len(valid_slots), ),
-                                                   -1,
-                                                   dtype=torch.int32,
-                                                   device='cuda')
-            if valid_mask.any():
-                num_accepted_draft_tokens[
-                    valid_mask] = sample_state.device.new_tokens_lens[
-                        slots_tensor[valid_mask]] - 1
-        else:
-            for req in scheduled_batch.generation_requests:
-                if req.state != LlmRequestState.GENERATION_COMPLETE:
-
-                    num_accepted_draft_tokens.append(
-                        req.py_num_accepted_draft_tokens)
-                    state_indices_updated.append(
-                        self.mamba_cache_index[req.py_request_id])
-                else:
-                    num_accepted_draft_tokens.append(-1)
-                    state_indices_updated.append(-1)
-
-            if len(state_indices_updated) == 0:
-                return
-
-            num_accepted_draft_tokens = torch.tensor(num_accepted_draft_tokens,
-                                                     dtype=torch.int32,
-                                                     device='cuda')
-            state_indices_updated = torch.tensor(state_indices_updated,
-                                                 dtype=torch.int32,
-                                                 device='cuda')
-        self._update_speculative_mamba_states(num_accepted_draft_tokens,
-                                              state_indices_updated)
 
 
 class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
@@ -549,23 +453,6 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
     def update_resources(self,
                          scheduled_batch: ScheduledRequests,
                          attn_metadata: "AttentionMetadata" = None,
-                         kv_cache_dtype_byte_size: float = None,
-                         update_mamba_cache_manager: bool = True):
-        # for non-overlap scheduler, update mamba cache manager and kv cache manager
-        # for overlap scheduler, only updtae kv cache manager, and will call update_resources_for_mamba_cache_manager to update mamba cache manager
-        if update_mamba_cache_manager:
-            MambaCacheManager.update_resources(
-                self,
-                scheduled_batch,
-                attn_metadata,
-                kv_cache_dtype_byte_size,
-            )
+                         kv_cache_dtype_byte_size: float = None):
         KVCacheManager.update_resources(self, scheduled_batch, attn_metadata,
                                         kv_cache_dtype_byte_size)
-
-    def update_resources_for_mamba_cache_manager(
-            self, scheduled_batch: ScheduledRequests,
-            sample_state: "SampleState"):
-        MambaCacheManager.update_resources(self,
-                                           scheduled_batch,
-                                           sample_state=sample_state)
