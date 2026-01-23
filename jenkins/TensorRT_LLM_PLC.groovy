@@ -95,18 +95,13 @@ def getPulseToken() {
     return token
 }
 
-def generate()
+def generateLockFiles(llmRepo, branchName)
 {
-    sh "pwd && ls -alh"
-
     container("alpine") {
         sh "apt update"
         sh "apt install -y python3-dev git curl git-lfs"
-        def LLM_REPO = getLLMRepo()
-        checkoutSource()
         sh "python3 --version"
         sh "curl -sSL https://install.python-poetry.org | python3 -"
-        sh "cd ${env.WORKSPACE}"
         sh "/root/.local/bin/poetry -h"
         sh "export PATH=\"/root/.local/bin:\$PATH\" && python3 scripts/generate_lock_file.py"
         def count = sh(script: "git status --porcelain security_scanning/ | wc -l", returnStdout: true).trim()
@@ -128,15 +123,15 @@ def generate()
             ]) {
                 def authedUrl
                 if (params.repoUrlKey == "tensorrt_llm_internal") {
-                    authedUrl = LLM_REPO.replaceFirst('https://', "https://svc_tensorrt:${GITLAB_API_TOKEN}@")
+                    authedUrl = llmRepo.replaceFirst('https://', "https://svc_tensorrt:${GITLAB_API_TOKEN}@")
                 } else {
-                    authedUrl = LLM_REPO.replaceFirst('https://', "https://svc_tensorrt:${GITHUB_API_TOKEN}@")
+                    authedUrl = llmRepo.replaceFirst('https://', "https://svc_tensorrt:${GITHUB_API_TOKEN}@")
                 }
                 sh "git remote set-url origin ${authedUrl}"
-                sh "git fetch origin ${params.branchName}"
+                sh "git fetch origin ${branchName}"
                 sh "git status"
-                sh "git rebase origin/${params.branchName}"
-                sh "git push origin HEAD:${params.branchName}"
+                sh "git rebase origin/${branchName}"
+                sh "git push origin HEAD:${branchName}"
             }
         }
     }
@@ -157,11 +152,10 @@ def sonar_scan()
     }
 }
 
-def pulseScan() {
+def pulseScan(llmRepo, branchName) {
     container("docker") {
         sh "apk add jq curl"
         def token = getPulseToken()
-        def LLM_REPO = "https://github.com/NVIDIA/TensorRT-LLM.git"
         withCredentials([
             usernamePassword(
                 credentialsId: "svc_tensorrt_gitlab_read_api_token",
@@ -172,17 +166,15 @@ def pulseScan() {
         ]) {
             trtllm_utils.llmExecStepWithRetry(this, script: "docker login gitlab-master.nvidia.com:5005 -u ${USERNAME} -p ${PASSWORD}")
         }
-        checkoutSource()
-        sh "cd ${env.WORKSPACE}"
         docker.withRegistry('https://gitlab-master.nvidia.com:5005') {
             docker.image("pstooling/pulse-group/pulse-open-source-scanner/pulse-oss-cli:stable")
               .inside("--user 0 --privileged -v /var/run/docker.sock:/var/run/docker.sock") {
                 withEnv([
                     "PULSE_NSPECT_ID=NSPECT-95LK-6FZF",
                     "PULSE_BEARER_TOKEN=${token}",
-                    "PULSE_REPO_URL=${LLM_REPO}",
+                    "PULSE_REPO_URL=${llmRepo}",
                     "PULSE_SCAN_PROJECT=TRT-LLM",
-                    "PULSE_SCAN_PROJECT_VERSION=${params.branchName}",
+                    "PULSE_SCAN_PROJECT_VERSION=${branchName}",
                     "PULSE_SCAN_VULNERABILITY_REPORT=nspect_scan_report.json"
                 ]) {
                     sh 'pulse scan --no-fail .'
@@ -208,6 +200,10 @@ pipeline {
         timestamps()
         timeout(time: 60, unit: 'MINUTES')
     }
+    environment {
+        LLM_REPO = getLLMRepo()
+        BRANCH_NAME = "${params.branchName}"
+    }
 
     triggers {
         parameterizedCron('''
@@ -217,36 +213,44 @@ pipeline {
     }
 
     stages {
-        stage("Run Pulse Scan"){
-            agent {
-                kubernetes createKubernetesPodConfig()
-            }
-            steps
-            {
-                pulseScan()
+        stage('TRT-LLM PLC Jobs') {
+            parallel {
+                stage("Source Code OSS Scanning"){
+                    agent {
+                        kubernetes createKubernetesPodConfig()
+                    }
+                    stages {
+                        stage("Prepare Environment"){
+                            steps
+                            {
+                                checkoutSource()
+                                sh "cd ${env.WORKSPACE}"
+                            }
+                        }
+                        stage("Generate Lock Files"){
+                            steps
+                            {
+                                generateLockFiles(env.LLM_REPO, env.BRANCH_NAME)
+                            }
+                        }
+                        stage("Run Pulse Scanning"){
+                            steps
+                            {
+                                pulseScan(env.LLM_REPO, env.BRANCH_NAME)
+                            }
+                        }
+                    }
+                }
+                stage("SonarQube Code Analysis"){
+                    agent {
+                        kubernetes createKubernetesPodConfig()
+                    }
+                    steps
+                    {
+                        sonar_scan()
+                    }
+                }
             }
         }
-        //stage('TRT-LLM PLC Jobs') {
-            //parallel {
-                //stage("Generating Poetry Locks"){
-                    //agent {
-                        //kubernetes createKubernetesPodConfig()
-                    //}
-                    //steps
-                    //{
-                        //generate()
-                    //}
-                //}
-                //stage("SonarQube Code Analysis"){
-                    //agent {
-                        //kubernetes createKubernetesPodConfig()
-                    //}
-                    //steps
-                    //{
-                        //sonar_scan()
-                    //}
-                //}
-            //}
-        //}
     } // stages
 } // pipeline
