@@ -49,6 +49,16 @@ POD_TIMEOUT_SECONDS_TEST = env.podTimeoutSeconds ? env.podTimeoutSeconds : "2160
 POD_TIMEOUT_SECONDS_BUILD = env.podTimeoutSeconds ? env.podTimeoutSeconds : "43200"
 POD_TIMEOUT_SECONDS_SLURM = env.podTimeoutSeconds ? env.podTimeoutSeconds : "79200"  // Use 22 hours to allow for 2 hour of buffer.
 
+// LLM data paths in container for Blossom
+@Field
+def austin_llm_data_path = "/vol/scratch1/scratch.trt_llm_data"
+@Field
+def sc_llm_data_path = "/mnt/sw-tensorrt-pvc/scratch.trt_llm_data"
+@Field
+def pdx_llm_data_path = "/vol/scratch1/scratch.trt_llm_data"
+@Field
+def llm_data = ""
+
 // Literals for easier access.
 @Field
 def TARNAME = "tarName"
@@ -94,7 +104,7 @@ TESTER_CORES = "12"
 TESTER_MEMORY = "96Gi"
 
 CCACHE_DIR="/mnt/sw-tensorrt-pvc/scratch.trt_ccache/llm_ccache"
-MODEL_CACHE_DIR="/scratch.trt_llm_data/llm-models"
+MODEL_CACHE_DIR=""
 
 // GPU types that require open driver
 REQUIRED_OPEN_DRIVER_TYPES = ["b100-ts2", "rtx-5080", "rtx-5090", "rtx-pro-6000", "rtx-pro-6000d"]
@@ -107,6 +117,7 @@ ENABLE_NGC_DEVEL_IMAGE_TEST = params.enableNgcDevelImageTest ?: false
 ENABLE_NGC_RELEASE_IMAGE_TEST = params.enableNgcReleaseImageTest ?: false
 
 COMMON_SSH_OPTIONS = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o TCPKeepAlive=no -o ServerAliveInterval=30 -o ServerAliveCountMax=20"
+
 
 def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String stageName){
     withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
@@ -827,8 +838,8 @@ def getPytestBaseCommandLine(
     def testCmdLine = [
         "LLM_ROOT=${llmSrc}",
         "LLM_BACKEND_ROOT=${llmSrc}/triton_backend",
-        "LLM_MODELS_ROOT=${MODEL_CACHE_DIR}",
-        "MODEL_CACHE_DIR=${MODEL_CACHE_DIR}",
+        "LLM_MODELS_ROOT=${llm_data}",
+        "MODEL_CACHE_DIR=${llm_data}",
         "COLUMNS=300",
         extraInternalEnv,
         portEnvVars,
@@ -1822,8 +1833,14 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     volumeMounts:
                     - name: dshm
                       mountPath: /dev/shm
-                    - name: scratch-trt-llm-data
-                      mountPath: /scratch.trt_llm_data
+                    - name: sc-trt-llm-data
+                      mountPath: ${sc_trt_llm_data_mount_path}
+                      readOnly: true
+                    - name: austin-trt-llm-data
+                      mountPath: ${austin_trt_llm_data_mount_path}
+                      readOnly: true
+                    - name: pdx-trt-llm-data
+                      mountPath: ${pdx_trt_llm_data_mount_path}
                       readOnly: true
                     - name: sw-tensorrt-pvc
                       mountPath: "/mnt/sw-tensorrt-pvc"
@@ -1850,30 +1867,19 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         """
     }
     def llmModelVolume = """
-                - name: scratch-trt-llm-data
+                - name: sc-trt-llm-data
                   nfs:
                     server: 10.117.145.14
                     path: /vol/scratch1/scratch.michaeln_blossom
-    """
-    if (type.contains("6000d") || type.contains("gh200")) {
-        // rtx-pro-6000d and gh200 nodes are located in Austin DC, we use the FlexCache to speed up the data access.
-        llmModelVolume = """
-                - name: scratch-trt-llm-data
+                - name: austin-trt-llm-data
                   nfs:
                     server: 10.20.162.212
                     path: /vol/scratch26/scratch.trt_llm_data
-        """
-    } else {
-        if (type.equals("rtx-pro-6000")) {
-            // rtx-pro-6000 nodes are located in PDX DC, we use the FlexCache to speed up the data access.
-            llmModelVolume = """
-                    - name: scratch-trt-llm-data
-                    nfs:
-                        server: ipp6-cdot01-fcache01
-                        path: /vol/fcscratch1/scratch.michaeln_blossom
-            """
-        }
-    }
+                - name: pdx-trt-llm-data
+                  nfs:
+                    server: ipp6-cdot01-fcache01
+                    path: /vol/fcscratch1/scratch.michaeln_blossom
+    """
 
     def podConfig = [
         cloud: targetCloud,
@@ -2631,8 +2637,19 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         sleep(10 * Math.random())
         sh "curl ifconfig.me || true"
         sh "nproc && free -g && hostname"
+        // Determine llm_data based on hostname
+        def hostname = sh(script: 'hostname -f', returnStdout: true).trim()
+        if (hostname.contains('ipp3')) {
+            llm_data = austin_llm_data_path
+        } else if (hostname.contains('ipp6')) {
+            llm_data = pdx_llm_data_path
+        } else {
+            llm_data = sc_llm_data_path
+        }
+        llm_data = "${llm_data}/llm-models"
+
         echoNodeAndGpuInfo(pipeline, stageName)
-        sh "cat ${MODEL_CACHE_DIR}/README"
+        sh "cat ${llm_data}/README"
         sh "nvidia-smi && nvidia-smi -q && nvidia-smi topo -m"
         sh "df -h"
 
@@ -2640,7 +2657,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         // init the huggingface cache from nfs, since the nfs is read-only, and HF_HOME needs to be writable, otherwise it will fail at creating file lock
         sh "mkdir -p ${HF_HOME} && ls -alh ${HF_HOME}"
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y rsync")
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "rsync -r ${MODEL_CACHE_DIR}/hugging-face-cache/ ${HF_HOME}/ && ls -lh ${HF_HOME}")
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "rsync -r ${llm_data}/hugging-face-cache/ ${HF_HOME}/ && ls -lh ${HF_HOME}")
         sh "df -h"
 
         // install package
@@ -3269,13 +3286,8 @@ def launchTestJobs(pipeline, testFilter)
         // "RTXPro6000-PyTorch-Post-Merge-1": ["rtx-pro-6000", "l0_rtx_pro_6000", 1, 1],
         // "RTXPro6000-4_GPUs-PyTorch-Post-Merge-1": ["rtx-pro-6000-x4", "l0_rtx_pro_6000", 1, 2, 4],
         // "RTXPro6000-4_GPUs-PyTorch-Post-Merge-2": ["rtx-pro-6000-x4", "l0_rtx_pro_6000", 2, 2, 4],
-<<<<<<< HEAD
-        "RTXPro6000D-PyTorch-1": ["rtx-pro-6000d", "l0_rtx_pro_6000", 1, 2],
-        "RTXPro6000D-PyTorch-2": ["rtx-pro-6000d", "l0_rtx_pro_6000", 2, 2],
-=======
         "RTXPro6000-PyTorch-Post-Merge-1": ["rtx-pro-6000", "l0_rtx_pro_6000", 1, 1],
         "RTXPro6000D-PyTorch-Post-Merge-1": ["rtx-pro-6000d", "l0_rtx_pro_6000", 1, 1],
->>>>>>> 47be38fb6 (Test for PDX flexcache)
         "RTXPro6000D-4_GPUs-PyTorch-Post-Merge-1": ["rtx-pro-6000d-x4", "l0_rtx_pro_6000", 1, 2, 4],
         "RTXPro6000D-4_GPUs-PyTorch-Post-Merge-2": ["rtx-pro-6000d-x4", "l0_rtx_pro_6000", 2, 2, 4],
     ]
