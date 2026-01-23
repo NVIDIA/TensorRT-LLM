@@ -28,9 +28,9 @@ namespace tensorrt_llm::batch_manager
 
 BaseTransBufferManager::BaseTransBufferManager(
     size_t transferBufferSize, nvinfer1::DataType dataType, std::optional<size_t> maxNumTokens)
-    : mBufferManager{std::make_shared<runtime::CudaStream>()}
+    : mDataType{dataType}
+    , mBufferManager{std::make_shared<runtime::CudaStream>()}
     , mMaxNumTokens{maxNumTokens}
-    , mDataType{dataType}
 {
     mTransferBufferSize = transferBufferSize;
     mOnlyUseDynamicBuffer = mTransferBufferSize == 0;
