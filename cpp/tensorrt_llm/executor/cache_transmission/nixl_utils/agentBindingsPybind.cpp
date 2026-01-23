@@ -66,6 +66,19 @@ PYBIND11_MODULE(tensorrt_llm_transfer_agent_binding, m)
     // MemoryDescs class
     py::class_<kvc::MemoryDescs>(m, "MemoryDescs")
         .def(py::init<kvc::MemoryType, std::vector<kvc::MemoryDesc>>(), py::arg("type"), py::arg("descs"))
+        // Batch constructor from list of tuples: [(ptr, size, device_id), ...]
+        .def(py::init(
+                 [](kvc::MemoryType type, std::vector<std::tuple<uintptr_t, size_t, uint32_t>> const& tuples)
+                 {
+                     std::vector<kvc::MemoryDesc> descs;
+                     descs.reserve(tuples.size());
+                     for (auto const& [addr, len, deviceId] : tuples)
+                     {
+                         descs.emplace_back(addr, len, deviceId);
+                     }
+                     return kvc::MemoryDescs(type, std::move(descs));
+                 }),
+            py::arg("type"), py::arg("tuples"))
         .def_property_readonly("type", &kvc::MemoryDescs::getType)
         .def_property_readonly("descs", &kvc::MemoryDescs::getDescs);
 
@@ -108,17 +121,20 @@ PYBIND11_MODULE(tensorrt_llm_transfer_agent_binding, m)
         .def(py::init<>())
         .def(py::init(
                  [](std::string name, bool use_prog_thread, bool multi_thread, bool use_listen_thread,
-                     unsigned int num_workers) {
-                     return kvc::BaseAgentConfig{
-                         std::move(name), use_prog_thread, multi_thread, use_listen_thread, num_workers};
+                     bool enable_telemetry, std::unordered_map<std::string, std::string> backend_params)
+                 {
+                     return kvc::BaseAgentConfig{std::move(name), use_prog_thread, multi_thread, use_listen_thread,
+                         enable_telemetry, std::move(backend_params)};
                  }),
             py::arg("name"), py::arg("use_prog_thread") = true, py::arg("multi_thread") = false,
-            py::arg("use_listen_thread") = false, py::arg("num_workers") = 1)
+            py::arg("use_listen_thread") = false, py::arg("enable_telemetry") = false,
+            py::arg("backend_params") = std::unordered_map<std::string, std::string>{})
         .def_readwrite("name", &kvc::BaseAgentConfig::mName)
         .def_readwrite("use_prog_thread", &kvc::BaseAgentConfig::useProgThread)
         .def_readwrite("multi_thread", &kvc::BaseAgentConfig::multiThread)
         .def_readwrite("use_listen_thread", &kvc::BaseAgentConfig::useListenThread)
-        .def_readwrite("num_workers", &kvc::BaseAgentConfig::numWorkers);
+        .def_readwrite("enable_telemetry", &kvc::BaseAgentConfig::enableTelemetry)
+        .def_readwrite("backend_params", &kvc::BaseAgentConfig::backendParams);
 
     // BaseTransferAgent class (abstract base)
     py::class_<kvc::BaseTransferAgent>(m, "BaseTransferAgent")

@@ -142,21 +142,24 @@ def test_base_agent_config_custom():
     use_prog_thread = True
     multi_thread = False
     use_listen_thread = True
-    num_workers = 4
+    enable_telemetry = True
+    backend_params = {"key1": "value1", "key2": "value2"}
 
     config = tab.BaseAgentConfig(
         name=name,
         use_prog_thread=use_prog_thread,
         multi_thread=multi_thread,
         use_listen_thread=use_listen_thread,
-        num_workers=num_workers,
+        enable_telemetry=enable_telemetry,
+        backend_params=backend_params,
     )
 
     assert config.name == name
     assert config.use_prog_thread == use_prog_thread
     assert config.multi_thread == multi_thread
     assert config.use_listen_thread == use_listen_thread
-    assert config.num_workers == num_workers
+    assert config.enable_telemetry == enable_telemetry
+    assert config.backend_params == backend_params
 
 
 def test_base_agent_config_readwrite():
@@ -175,8 +178,11 @@ def test_base_agent_config_readwrite():
     config.use_listen_thread = True
     assert config.use_listen_thread is True
 
-    config.num_workers = 8
-    assert config.num_workers == 8
+    config.enable_telemetry = True
+    assert config.enable_telemetry is True
+
+    config.backend_params = {"test_key": "test_value"}
+    assert config.backend_params == {"test_key": "test_value"}
 
 
 def test_transfer_request():

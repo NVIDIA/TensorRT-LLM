@@ -10,6 +10,7 @@ from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import fp4_global_scale
+from tensorrt_llm._torch.utils import ActivationType
 
 
 class BlockSparseTop2MLP(nn.Module):
@@ -416,3 +417,236 @@ def test_fuse_moe_cleanup():
     assert mem_after <= mem_before, (
         f"CUDA memory increased after fusion: before={mem_before} after={mem_after}"
     )
+
+
+class MoEOpModelNVFP4(nn.Module):
+    """MoE model using torch_quant_nvfp4_moe op for testing fusion to trtllm_quant_nvfp4_moe_fused.
+
+    This model creates weights with 3D block scales that are compatible with
+    the trtllm fused MoE kernel.
+    """
+
+    def __init__(
+        self,
+        hidden_size=512,  # Already aligned to all requirements (16, 128, etc.)
+        intermediate_size=256,  # Already aligned - no padding needed
+        num_experts=3,
+        top_k=2,
+        dtype=torch.bfloat16,
+        is_gated_mlp=True,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.dtype = dtype
+        self.is_gated_mlp = is_gated_mlp
+
+        # Constants for NVFP4 layout
+        NVFP4_BLOCK_SIZE = 16
+        NVFP4_PACK_FACTOR = 2
+        FLOAT8_E4M3_MAX = 448.0
+        FLOAT4_E2M1_MAX = 6.0
+
+        self.gate = nn.Linear(hidden_size, num_experts, dtype=dtype)
+
+        # Create sample input for scale computation
+        sample_input = torch.randn(2, hidden_size, dtype=dtype, device="cuda") * 0.01
+        inp_scale = fp4_global_scale(sample_input)
+
+        # Per-expert quantized weights and scales
+        self.w1_weight = nn.ParameterList()
+        self.w2_weight = nn.ParameterList()
+        self.w3_weight = nn.ParameterList() if is_gated_mlp else None
+
+        for i in range(num_experts):
+            w1_fp32 = torch.randn(intermediate_size, hidden_size, device="cuda", dtype=dtype) * 0.01
+            w2_fp32 = torch.randn(hidden_size, intermediate_size, device="cuda", dtype=dtype) * 0.01
+
+            # Compute global scales
+            w1_amax = torch.abs(w1_fp32).max().to(torch.float32)
+            w2_amax = torch.abs(w2_fp32).max().to(torch.float32)
+
+            scale_1 = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w1_amax
+            scale_2 = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w2_amax
+
+            # Quantize weights (non-swizzled layout)
+            w1_fp4, w1_bs = torch.ops.trtllm.fp4_quantize(w1_fp32, scale_1, NVFP4_BLOCK_SIZE, False)
+            w2_fp4, w2_bs = torch.ops.trtllm.fp4_quantize(w2_fp32, scale_2, NVFP4_BLOCK_SIZE, False)
+
+            # fp4_quantize pads block scales but not weights - infer padded dims from block scale size
+            _, w1_k_packed = w1_fp4.shape
+            _, w2_k_packed = w2_fp4.shape
+            w1_k_padded = w1_k_packed * NVFP4_PACK_FACTOR  # Convert from uint8 to FP4 element count
+            w2_k_padded = w2_k_packed * NVFP4_PACK_FACTOR
+
+            # Calculate padded N dimension from block scale tensor size
+            w1_n_padded = w1_bs.numel() // (w1_k_padded // NVFP4_BLOCK_SIZE)
+            w2_n_padded = w2_bs.numel() // (w2_k_padded // NVFP4_BLOCK_SIZE)
+
+            # Reshape block scales to 3D format [N_padded, K/block]
+            w1_bs_3d = w1_bs.view(w1_n_padded, w1_k_padded // NVFP4_BLOCK_SIZE)
+            w2_bs_3d = w2_bs.view(w2_n_padded, w2_k_padded // NVFP4_BLOCK_SIZE)
+
+            self.w1_weight.append(nn.Parameter(w1_fp4, requires_grad=False))
+            self.w2_weight.append(nn.Parameter(w2_fp4, requires_grad=False))
+
+            self.register_buffer(f"w1_input_scale_{i}", inp_scale)
+            self.register_buffer(f"w2_input_scale_{i}", inp_scale)
+            self.register_buffer(f"w1_weight_scale_{i}", w1_bs_3d.contiguous())
+            self.register_buffer(f"w2_weight_scale_{i}", w2_bs_3d.contiguous())
+            self.register_buffer(f"w1_alpha_{i}", 1.0 / (inp_scale * scale_1))
+            self.register_buffer(f"w2_alpha_{i}", 1.0 / (inp_scale * scale_2))
+
+            if is_gated_mlp:
+                w3_fp32 = (
+                    torch.randn(intermediate_size, hidden_size, device="cuda", dtype=dtype) * 0.01
+                )
+                w3_amax = torch.abs(w3_fp32).max().to(torch.float32)
+                scale_3 = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w3_amax
+                w3_fp4, w3_bs = torch.ops.trtllm.fp4_quantize(
+                    w3_fp32, scale_3, NVFP4_BLOCK_SIZE, False
+                )
+
+                # Infer padded dimensions for w3
+                _, w3_k_packed = w3_fp4.shape
+                w3_k_padded = w3_k_packed * NVFP4_PACK_FACTOR
+                w3_n_padded = w3_bs.numel() // (w3_k_padded // NVFP4_BLOCK_SIZE)
+                w3_bs_3d = w3_bs.view(w3_n_padded, w3_k_padded // NVFP4_BLOCK_SIZE)
+
+                self.w3_weight.append(nn.Parameter(w3_fp4, requires_grad=False))
+                self.register_buffer(f"w3_input_scale_{i}", inp_scale)
+                self.register_buffer(f"w3_weight_scale_{i}", w3_bs_3d.contiguous())
+                self.register_buffer(f"w3_alpha_{i}", 1.0 / (inp_scale * scale_3))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        router_logits = self.gate(x)
+        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+        routing_weights = routing_weights.to(x.dtype)
+
+        w1_list = list(self.w1_weight)
+        w2_list = list(self.w2_weight)
+        w3_list = list(self.w3_weight) if self.is_gated_mlp else []
+
+        w1_input_scale = [getattr(self, f"w1_input_scale_{i}") for i in range(self.num_experts)]
+        w2_input_scale = [getattr(self, f"w2_input_scale_{i}") for i in range(self.num_experts)]
+        w3_input_scale = (
+            [getattr(self, f"w3_input_scale_{i}") for i in range(self.num_experts)]
+            if self.is_gated_mlp
+            else []
+        )
+        w1_weight_scale = [getattr(self, f"w1_weight_scale_{i}") for i in range(self.num_experts)]
+        w2_weight_scale = [getattr(self, f"w2_weight_scale_{i}") for i in range(self.num_experts)]
+        w3_weight_scale = (
+            [getattr(self, f"w3_weight_scale_{i}") for i in range(self.num_experts)]
+            if self.is_gated_mlp
+            else []
+        )
+        w1_alpha = [getattr(self, f"w1_alpha_{i}") for i in range(self.num_experts)]
+        w2_alpha = [getattr(self, f"w2_alpha_{i}") for i in range(self.num_experts)]
+        w3_alpha = (
+            [getattr(self, f"w3_alpha_{i}") for i in range(self.num_experts)]
+            if self.is_gated_mlp
+            else []
+        )
+
+        out = torch.ops.auto_deploy.torch_quant_nvfp4_moe(
+            x,
+            selected_experts,
+            routing_weights,
+            w1_list,
+            w2_list,
+            w3_list,
+            w1_input_scale,
+            w2_input_scale,
+            w3_input_scale,
+            w1_weight_scale,
+            w2_weight_scale,
+            w3_weight_scale,
+            w1_alpha,
+            w2_alpha,
+            w3_alpha,
+            is_gated_mlp=self.is_gated_mlp,
+            act_fn=ActivationType.Silu if self.is_gated_mlp else ActivationType.Relu2,
+        )
+        return out
+
+    def get_input(self, device, dtype=torch.bfloat16):
+        return torch.randn(2, self.hidden_size, device=device, dtype=dtype) * 0.01
+
+
+@pytest.mark.skipif(
+    not fp4_compatible() or not trtllm_ops_available(),
+    reason="Requires FP4 + TRTLLM support",
+)
+@pytest.mark.parametrize("is_gated_mlp", [True, False], ids=["gated_mlp", "mlp"])
+@pytest.mark.parametrize(
+    "hidden_size,intermediate_size",
+    [
+        (512, 256),  # Standard aligned dimensions
+        (1024, 512),  # Larger aligned dimensions
+        (768, 384),  # Common transformer dimensions (divisible by 16)
+        (512, 128),  # Smaller intermediate
+        (256, 256),  # Equal dimensions
+    ],
+    ids=["512x256", "1024x512", "768x384", "512x128", "256x256"],
+)
+def test_nvfp4_moe_fusion(is_gated_mlp, hidden_size, intermediate_size):
+    """Test that torch_quant_nvfp4_moe fuses to trtllm_quant_nvfp4_moe_fused.
+
+    Note: This test uses swizzled block scales that are compatible with the fused trtllm kernel.
+    The non-fused op (torch_quant_nvfp4_moe) uses a different internal path that expects
+    non-swizzled scales, so we don't compare outputs between non-fused and fused.
+    Instead, we verify the fusion transformation works correctly and produces valid output.
+
+    Tests both gated MLP (with w3) and non-gated MLP (without w3) variants with various
+    hidden_size and intermediate_size configurations.
+    """
+    device = "cuda"
+    dtype = torch.bfloat16
+    torch.manual_seed(1234)
+    torch.cuda.manual_seed(1234)
+
+    model = MoEOpModelNVFP4(
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        dtype=dtype,
+        is_gated_mlp=is_gated_mlp,
+    ).to(device=device)
+    x = model.get_input(device=device, dtype=dtype)
+
+    # Export to GraphModule
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+
+    # Verify non-fused op is present before fusion
+    has_nonfused = any(
+        is_op(n, torch.ops.auto_deploy.torch_quant_nvfp4_moe) for n in gm.graph.nodes
+    )
+    assert has_nonfused, "Expected torch_quant_nvfp4_moe op before fusion"
+
+    # Apply NVFP4 MoE fusion
+    gm_transformed = InferenceOptimizer(
+        None,
+        {
+            "fuse_nvfp4_moe": {
+                "stage": "post_load_fusion",
+            },
+        },
+    )(None, gm)
+
+    # Verify fused op is present after fusion
+    has_fused = any(
+        is_op(n, torch.ops.auto_deploy.trtllm_quant_nvfp4_moe_fused)
+        for n in gm_transformed.graph.nodes
+    )
+    assert has_fused, "Expected trtllm_quant_nvfp4_moe_fused op after fusion"
+
+    # Run fused graph to verify it produces valid output (not NaN/Inf)
+    with torch.inference_mode():
+        fused_output = gm_transformed(x)
+
+    assert not torch.isnan(fused_output).any(), "Fused output contains NaN"
+    assert not torch.isinf(fused_output).any(), "Fused output contains Inf"

@@ -212,7 +212,7 @@ class GenerationExecutor(ABC):
 
         return futures
 
-    def _get_next_client_id(self):
+    def _get_next_client_id(self) -> int:
         # (self._last_client_id + 1) % UINT64_MAX
         self._last_client_id = (self._last_client_id + 1) & ((1 << 64) - 1)
         return self._last_client_id
