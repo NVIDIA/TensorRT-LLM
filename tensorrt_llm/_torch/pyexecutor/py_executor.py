@@ -104,7 +104,7 @@ class BatchState:
 
     iter_start_time: float = 0
     iter_stats: IterationStats = None
-    context_requests: list[LlmRequest] = None
+    all_requests: list[LlmRequest] = None
 
 
 @dataclasses.dataclass
@@ -1818,11 +1818,7 @@ class PyExecutor:
                                         (req, block_id,
                                          self.ctx_in_transmission_counter))
 
-                    ctx_transmission_reqs = self._send_disagg_ctx_cache(
-                        self.previous_batch.context_requests
-                    ) if self.kv_cache_transceiver else []
-                    for req in ctx_transmission_reqs:
-                        req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+                    self._send_kv_async(self.previous_batch.all_requests)
 
                 if self.drafter is not None and self.use_spec_decode and should_process_previous_batch:
                     # Cleanup previous draft resources used in the draft model
@@ -1848,9 +1844,6 @@ class PyExecutor:
 
                     self._update_request_states(scheduled_batch)
 
-                ctx_transmission_reqs = self._send_kv_async(
-                    scheduled_batch.all_requests())
-
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._process_previous_batch()
                 else:
@@ -1865,7 +1858,7 @@ class PyExecutor:
                         sample_state=sample_state,
                         iter_start_time=iter_start_time,
                         iter_stats=iter_stats,
-                        context_requests=scheduled_batch.context_requests)
+                        all_requests=scheduled_batch.all_requests())
                 elif not can_queue_this_rank:
                     # If the batch is empty on this rank, we need to clear the previous batch.
                     self.previous_batch = None
