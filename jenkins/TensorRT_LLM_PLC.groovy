@@ -183,6 +183,12 @@ def pulseScan(llmRepo, branchName) {
         }
         sh "ls"
         sh "cat nspect_scan_report.json"
+        withCredentials([string(credentialsId: 'trtllm_plc_slack_webhook', variable: 'PLC_SLACK_WEBHOOK')]) {
+            def jobPath = env.JOB_NAME.replaceAll("/", "%2F")
+            def pipelineUrl = "${env.JENKINS_URL}blue/organizations/jenkins/${jobPath}/detail/${jobPath}/${env.BUILD_NUMBER}/pipeline"
+            sh "export TRTLLM_PLC_WEBHOOK=${PLC_SLACK_WEBHOOK}"
+            sh "python ./jenkins/scripts/submit_vulnerability_report.py --build-url ${pipelineUrl}"
+        }
     }
 }
 
