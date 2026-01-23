@@ -229,7 +229,10 @@ class ConfigLoader:
         # Get current GPU type from environment if not specified
         if gpu_type is None:
             gpu_type = EnvManager.get_gpu_type()
-
+        
+        # GB200_LYRIS in also in the GB200 family
+        if gpu_type.startswith("GB200_"):
+            gpu_type = "GB200"
         configs = []
 
         if not self.base_dir.exists():
@@ -340,7 +343,6 @@ class ConfigLoader:
         metadata = config_data.get("metadata", {})
         model_name = metadata.get("model_name", "unknown")
         supported_gpus = metadata.get("supported_gpus", ["GB200", "GB300", "H100", "B200", "B300"])
-
         # Override config with environment variables (in memory only, do not write back)
         config_data = self._apply_env_overrides(config_data, model_name)
 
