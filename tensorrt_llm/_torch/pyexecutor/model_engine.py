@@ -3358,9 +3358,13 @@ class PyTorchModelEngine(ModelEngine):
                                                        no_cache=kv_cache_manager
                                                        is None)
             # attn_metadata now depends on spec_metadata since it determines the shape/content of spec_dec parameter Tensors
+            enable_mla = is_mla(self.model.model_config.pretrained_config)
             is_spec_dec_mode = spec_metadata.spec_dec_mode.attention_need_spec_dec_mode(
-                spec_resource_manager, self.is_draft_model, self.attn_backend,
-                self.model_is_wrapped)
+                spec_resource_manager,
+                self.is_draft_model,
+                self.attn_backend,
+                self.model_is_wrapped,
+                is_mla=enable_mla)
             attn_metadata.update_spec_dec_param(
                 batch_size=scheduled_requests.batch_size,
                 is_spec_decoding_enabled=is_spec_dec_mode,
