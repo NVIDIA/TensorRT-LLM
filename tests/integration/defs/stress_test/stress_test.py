@@ -393,14 +393,22 @@ def is_port_available(port: int,
                     memory_requirement=12),
         # Configuration for DeepSeek-V3 model
         ModelConfig(model_dir="DeepSeek-V3", tp_size=8, memory_requirement=96),
-        # Configuration for DeepSeek-R1 model
+        # Configuration for DeepSeek-R1 model with FP8 checkpoints (8 GPU setup)
         ModelConfig(model_dir="DeepSeek-R1/DeepSeek-R1",
                     tp_size=8,
                     memory_requirement=96),
-        # Configuration for DeepSeek-R1 model with NVFP4 checkpoints
+        # Configuration for DeepSeek-R1 model with FP8 checkpoints (4 GPU setup, requires GB300 288GB)
+        ModelConfig(model_dir="DeepSeek-R1/DeepSeek-R1",
+                    tp_size=4,
+                    memory_requirement=168),
+        # Configuration for DeepSeek-R1 model with NVFP4 checkpoints (8 GPU setup)
         ModelConfig(model_dir="DeepSeek-R1/DeepSeek-R1-0528-FP4",
                     tp_size=8,
                     memory_requirement=96),
+        # Configuration for DeepSeek-R1 model with NVFP4 checkpoints (4 GPU setup)
+        ModelConfig(model_dir="DeepSeek-R1/DeepSeek-R1-0528-FP4",
+                    tp_size=4,
+                    memory_requirement=168),
     ],
     ids=lambda x: f"{os.path.basename(x.model_dir)}_tp{x.tp_size}")
 def test_run_stress_test(config, stress_time_timeout, backend,
@@ -510,13 +518,14 @@ def stress_test(config,
                 36000  # 10 hours for DeepSeek-V3 or DeepSeek-R1, change this value if needed
             )
 
-    # For DeepSeek-V3 specific server parameters
+    # For DeepSeek-V3 or DeepSeek-R1 specific server parameters
     if "DeepSeek-V3" in config.model_dir or "DeepSeek-R1" in config.model_dir:
         test_server_config = ServerConfig(
             port=test_server_config.port,
             host=test_server_config.host,
             pp_size=test_server_config.pp_size,
-            ep_size=8,  # DeepSeek-V3 or DeepSeek-R1 specific ep_size
+            ep_size=config.
+            tp_size,  # ep_size matches tp_size for DeepSeek models
             max_batch_size=
             2048,  # DeepSeek-V3 or DeepSeek-R1 specific max_batch_size
             max_num_tokens=
