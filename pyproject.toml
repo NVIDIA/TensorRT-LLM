@@ -299,7 +299,6 @@ exclude = [
     "scripts/release_check.py",
     "scripts/rename_docker_images.py",
     "scripts/test_to_stage_mapping.py",
-    "setup.py",
     "tensorrt_llm/__init__.py",
     "tensorrt_llm/_ray_utils.py",
     "tensorrt_llm/_tensorrt_engine/__init__.py",
