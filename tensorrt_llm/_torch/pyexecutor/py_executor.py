@@ -1804,20 +1804,6 @@ class PyExecutor:
 
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._update_requests(self.previous_batch.sample_state)
-
-                    if self.block_reuse_enabled and not self.kv_cache_manager.is_vswa and self.kv_cache_transceiver:
-                        for req in self.previous_batch.sample_state.scheduled_requests.context_requests:
-                            if req.is_context_only_request and (
-                                    req.is_context_finished
-                                    or req.is_finished_due_to_length
-                            ) and not req.is_finished_due_to_cancellation:
-                                block_id = self.kv_cache_manager.store_blocks_for_reuse(
-                                    req, True)
-                                self.ctx_in_transmission_requests[
-                                    req.py_request_id] = (
-                                        (req, block_id,
-                                         self.ctx_in_transmission_counter))
-
                     self._send_kv_async(self.previous_batch.all_requests)
 
                 if self.drafter is not None and self.use_spec_decode and should_process_previous_batch:
