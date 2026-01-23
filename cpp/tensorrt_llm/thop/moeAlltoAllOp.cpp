@@ -589,7 +589,7 @@ torch::Tensor moeA2AGetCombinePayloadTensorOp(torch::Tensor const& workspace, in
 int64_t moeA2AGetAuxDataSizeOp(int64_t epSize, int64_t maxNumTokens, torch::optional<int64_t> eplbStatsNumExperts)
 {
     int64_t eplbStatsNumExpertsValue = eplbStatsNumExperts.value_or(0);
-    TORCH_CHECK(eplbStatsNumExpertsValue > 0, "eplb_stats_num_experts must be positive if not None.");
+    TORCH_CHECK(eplbStatsNumExpertsValue >= 0, "eplbStatsNumExperts must be positive if not None.");
     MoeA2ADataOffsets offsets = calculateOffsets(
         static_cast<int>(epSize), static_cast<int>(maxNumTokens), static_cast<int>(eplbStatsNumExpertsValue));
     return static_cast<int64_t>(offsets[PAYLOAD_DATA_OFFSET_INDEX]);
