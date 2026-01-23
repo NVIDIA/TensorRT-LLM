@@ -1140,6 +1140,20 @@ class MTPDecodingConfig(DecodingBaseConfig):
     begin_thinking_phase_token: int = 128798
     end_thinking_phase_token: int = 128799
 
+
+    # SA_SPEC config
+    use_sa_spec: Optional[bool] = Field(
+        default=False,
+        status="beta",
+        description="Combine with Suffix Automaton Decoding"
+    )
+    sa_spec_threshold: int = Field(
+        default=4,
+        description="The threshold for the Suffix Automaton Decoding. If the"
+                     " length of the suffix match exceeds the threshold, use"
+                     " the suffix automaton output for the next draft tokens."
+    )
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         if 'num_nextn_predict_layers' in kwargs:

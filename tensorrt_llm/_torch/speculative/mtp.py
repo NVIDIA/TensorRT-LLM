@@ -6,6 +6,9 @@ import torch.nn.functional as F
 
 from tensorrt_llm.mapping import Mapping
 
+import sa_spec
+
+
 from ..attention_backend import AttentionMetadata
 from ..distributed.ops import allgather
 from ..model_config import ModelConfig
@@ -871,6 +874,26 @@ class MTPWorker(SpecWorkerBase):
                     logits, draft_tokens, num_contexts, batch_size,
                     spec_metadata)
 
+        if self.spec_config.use_sa_spec:
+
+            # Initialize the output buffers
+            self.sa_match_len = torch.zeros(
+                (num_gens,), dtype=torch.int32, device="cuda"
+            )
+            self.sa_draft_tokens = torch.zeros(
+                (num_gens, mtp_num_modules), dtype=torch.int32, device="cuda"
+            )
+
+            self.sa_spec_index = 0
+
+            # Invoke a batch update of the suffix automaton states
+            # and get the next suffix draft tokens
+            if num_gens > 0:
+                sa_spec.extend(self.sa_match_len,
+                            self.sa_draft_tokens,
+                            accepted_tokens[num_contexts:],
+                            num_accepted_tokens[num_contexts:])
+
         return accepted_tokens, num_accepted_tokens
 
     def change_attn_metadata(self, num_accepted_tokens: torch.Tensor,
@@ -1120,6 +1143,20 @@ class MTPWorker(SpecWorkerBase):
         else:
             # Simple argmax if no TP or no model config
             draft_tokens = self._draft_sampler_greedy(logits)
+
+
+        
+        # select between MTP draft tokens and SA draft tokens
+        if self.spec_config.use_sa_spec and (num_gens := self.sa_match_len.shape[0]) > 0:
+            num_contexts = draft_tokens.shape[0] - num_gens
+
+            draft_tokens[num_contexts:] = torch.where(
+                self.sa_match_len >= self.spec_config.sa_spec_threshold,
+                self.sa_draft_tokens[:, self.sa_spec_index],
+                draft_tokens[num_contexts:]
+            )
+
+            self.sa_spec_index += 1
 
         return draft_tokens
 
