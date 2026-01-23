@@ -707,7 +707,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                     } else if (fileExists('/home/scratch.trt_llm_data')) {
                         dockerArgs += " -v /home/scratch.trt_llm_data:/scratch.trt_llm_data:ro "
                     } else {
-                        error "Existing TRT-LLM data scratch mount points cannot be set up on the node"
+                        echo "Existing TRT-LLM data scratch mount points cannot be set up in this cluster, ignore..."
                     }
                 }
 
