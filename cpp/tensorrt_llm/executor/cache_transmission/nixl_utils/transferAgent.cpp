@@ -374,22 +374,28 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
         }
         auto envPort = common::getEnvNixlPort();
         uint16_t port = envPort > 0 ? getIncrmentPort(envPort) : getAvailablePort();
-        nixlAgentConfig nixlConfig{
-            config.useProgThread, true, port, nixl_thread_sync_t::NIXL_THREAD_SYNC_DEFAULT, config.numWorkers};
+        uint32_t numWorker = config.backendParams.find("num_workers") != config.backendParams.end()
+            ? std::stoi(config.backendParams.at("num_workers"))
+            : 1;
+        nixlAgentConfig nixlConfig{config.useProgThread, true, port, nixl_thread_sync_t::NIXL_THREAD_SYNC_DEFAULT,
+            numWorker, 0, 10000, config.enableTelemetry};
         mAddress = getAvailableIP() + ":" + std::to_string(port);
         mRawAgent = std::make_unique<nixlAgent>(config.mName, std::move(nixlConfig));
     }
     else
     {
+        uint32_t numWorker = config.backendParams.find("num_workers") != config.backendParams.end()
+            ? std::stoi(config.backendParams.at("num_workers"))
+            : 1;
         mAddress.clear();
-        nixlAgentConfig nixlConfig{
-            config.useProgThread, false, 0, nixl_thread_sync_t::NIXL_THREAD_SYNC_DEFAULT, config.numWorkers};
+        nixlAgentConfig nixlConfig{config.useProgThread, false, 0, nixl_thread_sync_t::NIXL_THREAD_SYNC_DEFAULT,
+            numWorker, 0, 10000, config.enableTelemetry};
         mRawAgent = std::make_unique<nixlAgent>(config.mName, std::move(nixlConfig));
     }
 
     std::string nixlBackend = common::getEnvNixlBackend();
     // List of supported backends - extend this list as new backends are added
-    static const std::set<std::string> kSUPPORTED_BACKENDS = {"UCX", "LIBFABRIC"};
+    static std::set<std::string> const kSUPPORTED_BACKENDS = {"UCX", "LIBFABRIC"};
 
     if (kSUPPORTED_BACKENDS.find(nixlBackend) == kSUPPORTED_BACKENDS.end())
     {
@@ -400,6 +406,11 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
     TLLM_LOG_INFO("NixlTransferAgent::NixlTransferAgent using NIXL backend: %s", nixlBackend.c_str());
 
     nixl_b_params_t init1;
+    for (auto const& [key, value] : config.backendParams)
+    {
+        init1[key] = value;
+        TLLM_LOG_INFO("NixlTransferAgent::NixlTransferAgent backendParams: %s: %s", key.c_str(), value.c_str());
+    }
     nixl_mem_list_t mems1;
     status = mRawAgent->getPluginParams(nixlBackend.c_str(), mems1, init1);
     TLLM_CHECK(status == NIXL_SUCCESS);

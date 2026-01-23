@@ -6,7 +6,7 @@ from typing import Optional
 import click
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import (EagleDecodingConfig, KvCacheConfig,
+from tensorrt_llm.llmapi import (Eagle3DecodingConfig, KvCacheConfig,
                                  MTPDecodingConfig, NGramDecodingConfig)
 
 prompts = [
@@ -33,7 +33,7 @@ def run_MTP(model: Optional[str] = None):
 
 
 def run_Eagle3():
-    spec_config = EagleDecodingConfig(
+    spec_config = Eagle3DecodingConfig(
         max_draft_len=3,
         speculative_model="yuhuili/EAGLE3-LLaMA3.1-Instruct-8B",
         eagle3_one_model=True)

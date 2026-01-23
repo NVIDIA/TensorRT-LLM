@@ -113,6 +113,7 @@ def generate()
 def sonar_scan()
 {
     container("alpine") {
+        sh "mkdir -p $JENKINS_HOME"
         def scannerHome = tool 'sonarScanner'
         sh "apt update"
         sh "apt install -y git git-lfs openjdk-17-jdk"
@@ -135,8 +136,8 @@ pipeline {
     }
     options {
         skipDefaultCheckout()
-        // to better analyze the time for each step/test
         timestamps()
+        timeout(time: 60, unit: 'MINUTES')
     }
 
     triggers {
