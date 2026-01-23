@@ -8,6 +8,7 @@ from transformers import PretrainedConfig, WhisperConfig
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.base_config_loader import BaseConfigLoader
 from tensorrt_llm._torch.models.modeling_utils import register_config_loader
+from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -326,6 +327,15 @@ class MistralConfigLoader(BaseConfigLoader):
                 else:
                     block_size = (128, 128)
                 quant_config.group_size = block_size[0]
+
+        # model_kwargs is not supported for Mistral format checkpoints
+        # Extract it from kwargs to avoid passing to ModelConfig.__init__ (which doesn't accept it)
+        model_kwargs = kwargs.pop("model_kwargs", None)
+        if model_kwargs:
+            logger.warning(
+                "model_kwargs is not supported for Mistral format checkpoints. "
+                f"Ignoring model_kwargs: {model_kwargs}"
+            )
 
         kwargs.pop("trust_remote_code", None)  # ModelConfig does not have this input parameter
         model_config = ModelConfig(

@@ -456,3 +456,8 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
                          kv_cache_dtype_byte_size: float = None):
         KVCacheManager.update_resources(self, scheduled_batch, attn_metadata,
                                         kv_cache_dtype_byte_size)
+
+    def update_mamba_states(self, num_accepted_draft_tokens: torch.Tensor,
+                            state_indices_tensor: torch.Tensor):
+        MambaCacheManager.update_mamba_states(self, num_accepted_draft_tokens,
+                                              state_indices_tensor)

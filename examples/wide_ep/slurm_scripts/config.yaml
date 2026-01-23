@@ -47,9 +47,12 @@ profiling:
 # Accuracy Configuration
 accuracy:
   enable_accuracy_test: false  # Set to true to enable accuracy evaluation
-  model: "local-completions"  # Model type for lm_eval
-  tasks: "gsm8k"  # Evaluation tasks (comma-separated)
-  model_args_extra: "num_concurrent=512,max_retries=3,tokenized_requests=false,timeout=1200,max_gen_toks=256,max_length=4096"  # Extra model arguments for lm_eval
+  tasks:
+    gsm8k:
+      model: "local-completions"  # Model type for lm_eval
+      model_args_extra: "num_concurrent=512,max_retries=3,tokenized_requests=false,timeout=7200,max_gen_toks=16384"
+      extra_kwargs:
+        trust_remote_code: true
 
 worker_config:
   gen:

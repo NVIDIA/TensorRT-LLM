@@ -212,7 +212,7 @@ class GenerationExecutor(ABC):
 
         return futures
 
-    def _get_next_client_id(self):
+    def _get_next_client_id(self) -> int:
         # (self._last_client_id + 1) % UINT64_MAX
         self._last_client_id = (self._last_client_id + 1) & ((1 << 64) - 1)
         return self._last_client_id
@@ -221,7 +221,7 @@ class GenerationExecutor(ABC):
             self, request: GenerationRequest) -> Optional[LogprobParams]:
         """Store logprobs-related fields from request for the later logprob calculation."""
         logprob_params = None
-        if request.sampling_params.logprobs or request.sampling_params.prompt_logprobs:
+        if request.sampling_params.logprobs is not None or request.sampling_params.prompt_logprobs:
             logprob_params = LogprobParams(
                 logprobs=request.sampling_params.logprobs,
                 prompt_logprobs=request.sampling_params.prompt_logprobs,

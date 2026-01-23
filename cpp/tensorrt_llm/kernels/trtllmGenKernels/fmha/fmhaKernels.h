@@ -488,21 +488,6 @@ private:
                 selectKernelParams.mSelectNewKernel = true;
             }
 
-            // Disable skipsSoftmax when the sequence length per CTA is less than 1K or the data type is E4M3.
-            if (selectKernelParams.mSkipsSoftmaxWhenPossible && !isContextKernel(selectKernelParams.mKernelType))
-            {
-                // Compute the sequence length per CTA.
-                int const seqLenPerCta = (params.mMaxSeqLenKv + numCtasPerSeqKv - 1) / numCtasPerSeqKv;
-
-                if (seqLenPerCta < 1024)
-                {
-                    // Disable skipsSoftmax.
-                    selectKernelParams.mSkipsSoftmaxWhenPossible = false;
-                    // Need to select a different kernel.
-                    selectKernelParams.mSelectNewKernel = true;
-                }
-            }
-
             // Add the debug info when multiCtasKvMode is enabled.
             if (numCtasPerSeqKv > 1)
             {

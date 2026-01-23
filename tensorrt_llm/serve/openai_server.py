@@ -540,6 +540,7 @@ class OpenAIServer:
             sampling_params = request.to_sampling_params(
                 vocab_size=self.tokenizer.tokenizer.vocab_size,
                 gather_generation_logits=self.llm.args.gather_generation_logits,
+                reasoning_parser=self.llm.args.reasoning_parser,
                 backend=self.llm.args.backend)
             postproc_args = ChatPostprocArgs.from_request(request)
             disaggregated_params = to_llm_disaggregated_params(request.disaggregated_params)
@@ -916,7 +917,8 @@ class OpenAIServer:
                 request.stop_token_ids = harmony_stop_tokens
 
             sampling_params = request.to_sampling_params(
-                vocab_size=self.tokenizer.tokenizer.vocab_size)
+                vocab_size=self.tokenizer.tokenizer.vocab_size,
+                reasoning_parser="gpt_oss")
             sampling_params.detokenize = False  # Harmony adapter handles detokenization
 
             postproc_args = ChatCompletionPostprocArgs.from_request(request)
@@ -1018,6 +1020,7 @@ class OpenAIServer:
                 tokenizer=self.tokenizer if not self.use_harmony else None,
                 model_config=self.model_config if not self.use_harmony else None,
                 processor=self.processor if not self.use_harmony else None,
+                reasoning_parser=self.llm.args.reasoning_parser if not self.use_harmony else "gpt_oss",
             )
 
             streaming_processor = None

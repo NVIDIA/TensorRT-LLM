@@ -120,6 +120,7 @@ l0_dgx_h100:
   - accuracy/test_llm_api_pytorch.py::TestQwen3NextInstruct::test_bf16_4gpu[tp4ep4_cudagraph_overlap]
   - disaggregated/test_auto_scaling.py::test_service_discovery[etcd-round_robin]
   - disaggregated/test_auto_scaling.py::test_worker_restart[etcd-load_balancing]
+  - disaggregated/test_auto_scaling.py::test_worker_restart[etcd-round_robin]
   - disaggregated/test_auto_scaling.py::test_minimal_instances[etcd-round_robin]
   - disaggregated/test_auto_scaling.py::test_disagg_server_restart[etcd-round_robin]
   - disaggregated/test_auto_scaling.py::test_service_discovery[http-round_robin]
@@ -321,4 +322,6 @@ l0_dgx_h100:
   tests:
   - unittest/_torch/auto_deploy/unit/multigpu
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[False-4]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_bf16
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_bf16
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_fp8[4]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_fp8[8]

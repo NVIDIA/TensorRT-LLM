@@ -34,6 +34,10 @@ def is_int_pow_2(n):
     return isinstance(n, int) and n > 0 and (n & (n - 1)) == 0
 
 
+def is_int_pow_2(n):
+    return isinstance(n, int) and n > 0 and (n & (n - 1)) == 0
+
+
 def _mamba_chunk_scan_combined_fwd(
         x,
         dt,

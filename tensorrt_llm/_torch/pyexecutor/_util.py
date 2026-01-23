@@ -39,7 +39,7 @@ from .resource_manager import (KVCacheManager, PeftCacheManager,
 from .sampler import (EarlyStopSampler, EarlyStopWithMMResult, TorchSampler,
                       TRTLLMSampler)
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
-                        SimpleScheduler)
+                        SimpleScheduler, SimpleUnifiedScheduler)
 from .seq_slot_manager import SeqSlotManager
 
 GB = 1 << 30
@@ -852,15 +852,29 @@ def create_py_executor_instance(
     if scheduler_capacity == 1 and mapping.enable_attention_dp and kv_cache_manager:
         scheduler_capacity += 1
 
-    capacity_scheduler = BindCapacityScheduler(
-        scheduler_capacity,
-        kv_cache_manager.impl if kv_cache_manager is not None else None,
-        peft_cache_manager.impl if peft_cache_manager is not None else None,
-        scheduler_config.capacity_scheduler_policy,
-        two_step_lookahead=mapping.has_pp())
-    mb_scheduler = BindMicroBatchScheduler(max_batch_size, max_num_tokens,
-                                           ctx_chunk_config)
-    scheduler = SimpleScheduler(capacity_scheduler, mb_scheduler)
+    use_python_scheduler = os.getenv("TLLM_USE_PYTHON_SCHEDULER", "0") == "1"
+    if use_python_scheduler:
+        scheduler = SimpleUnifiedScheduler(
+            max_batch_size=max_batch_size,
+            max_num_tokens=max_num_tokens,
+            kv_cache_manager=kv_cache_manager.impl
+            if kv_cache_manager is not None else None,
+            peft_cache_manager=peft_cache_manager.impl
+            if peft_cache_manager is not None else None,
+            scheduler_policy=scheduler_config.capacity_scheduler_policy,
+            ctx_chunk_config=ctx_chunk_config,
+            two_step_lookahead=mapping.has_pp(),
+            scheduler_capacity=scheduler_capacity)
+    else:
+        capacity_scheduler = BindCapacityScheduler(
+            scheduler_capacity,
+            kv_cache_manager.impl if kv_cache_manager is not None else None,
+            peft_cache_manager.impl if peft_cache_manager is not None else None,
+            scheduler_config.capacity_scheduler_policy,
+            two_step_lookahead=mapping.has_pp())
+        mb_scheduler = BindMicroBatchScheduler(max_batch_size, max_num_tokens,
+                                               ctx_chunk_config)
+        scheduler = SimpleScheduler(capacity_scheduler, mb_scheduler)
 
     config = model_engine.model.model_config.pretrained_config
     attention_type = AttentionTypeCpp.MLA if is_mla(
@@ -1142,12 +1156,6 @@ def validate_feature_combination(llm_args, model_engine, sampler_type):
     ERR_MSG_TMPL = "{feature1} and {feature2} enabled together is not supported yet."
 
     CONFLICT_RULES = [
-        {
-            "features": ["mtp", "slide_window_attention"],
-            "message":
-            ERR_MSG_TMPL.format(feature1="mtp",
-                                feature2="slide_window_attention")
-        },
         {
             "features": ["trtllm_sampler", "mtp"],
             "message":

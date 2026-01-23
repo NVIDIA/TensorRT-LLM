@@ -168,6 +168,27 @@ def replace_env_in_file(log_dir, file_path, env_var):
     return tmp_dir
 
 
+def save_env_file(env_file, server_env_var, worker_env_var, ctx_worker_env_var,
+                  gen_worker_env_var):
+
+    def get_env_var_str(env_var_str):
+        env_data = {}
+        for env_var in env_var_str.split():
+            if '=' in env_var:
+                key, value = env_var.split('=', 1)
+                env_data[key] = value
+        return env_data
+
+    env_data = {}
+    env_data['server_env_var'] = get_env_var_str(server_env_var)
+    env_data['worker_env_var'] = get_env_var_str(worker_env_var)
+    env_data['ctx_worker_env_var'] = get_env_var_str(ctx_worker_env_var)
+    env_data['gen_worker_env_var'] = get_env_var_str(gen_worker_env_var)
+    with open(env_file, 'w') as f:
+        json.dump(env_data, f, indent=2)
+    print(f"Environment variables saved to {env_file}")
+
+
 def submit_job(config, log_dir, dry_run):
     # Extract configurations
     slurm_config = config['slurm']
@@ -178,6 +199,11 @@ def submit_job(config, log_dir, dry_run):
     env_config = config['environment']
     worker_config = config['worker_config']
     benchmark_config = config['benchmark']
+
+    if 'work_dir' in env_config and os.path.isdir(env_config['work_dir']):
+        script_dir = env_config['work_dir']
+    else:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
 
     # Set default accuracy configuration for backward compatibility
     if 'accuracy' not in config:
@@ -200,11 +226,15 @@ def submit_job(config, log_dir, dry_run):
     env_config.setdefault('worker_env_var', '')
     env_config.setdefault('server_env_var', '')
 
-    worker_env_var = env_config.get('worker_env_var')
-    server_env_var = env_config.get('server_env_var')
+    worker_env_var = env_config.get('worker_env_var', '')
+    ctx_worker_env_var = env_config.get('ctx_worker_env_var', '')
+    gen_worker_env_var = env_config.get('gen_worker_env_var', '')
+    server_env_var = env_config.get('server_env_var', '')
     if benchmark_config['mode'] == "gen_only_no_context":
         worker_env_var += " TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1"
         server_env_var += " TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1"
+    if benchmark_config['mode'] == "gen_only":
+        worker_env_var += " TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1"
 
     profiling_config = config.get('profiling', {})
     profiling_config.setdefault('nsys_on', False)
@@ -228,6 +258,8 @@ def submit_job(config, log_dir, dry_run):
     gen_pp_size = worker_config['gen'].get('pipeline_parallel_size', 1)
     gen_world_size = gen_tp_size * gen_cp_size * gen_pp_size
     gen_nodes = calculate_nodes(gen_world_size, gen_num, gpus_per_node)
+    ucx_warmup_requests = 2 * ctx_world_size * \
+        gen_world_size if benchmark_config['mode'] == "e2e" else 0
 
     total_nodes = ctx_nodes + gen_nodes
     total_tasks = total_nodes * gpus_per_node
@@ -251,8 +283,10 @@ def submit_job(config, log_dir, dry_run):
                                         {}).get('num_nextn_predict_layers', 0)
 
     # Create base log directory path
+    if 'log_dir' in env_config and env_config['log_dir']:
+        log_dir = env_config['log_dir']
     if log_dir is None:
-        log_base = os.path.join(env_config['work_dir'], "logs")
+        log_base = os.path.join(script_dir, "logs")
 
         date_prefix = datetime.now().strftime("%Y%m%d-%H%M%S")
         log_base = os.path.join(log_base, f"{date_prefix}/{isl}-{osl}")
@@ -266,12 +300,29 @@ def submit_job(config, log_dir, dry_run):
         # Create full log directory path
         log_dir = os.path.join(log_base, dir_suffix)
 
-    # Remove existing directory if it exists
+    # if trtllm_config.yaml exists, don't remove the directory, remove other files in the directory except trtllm_config.yaml
+    # also don't remove concurrency_* folders
     if os.path.exists(log_dir):
-        print(f"[WARNING] Removing existing log directory: {log_dir}")
-        shutil.rmtree(log_dir)
-    os.makedirs(log_dir)
+        if not os.path.exists(os.path.join(log_dir, 'trtllm_config.yaml')):
+            print(f"[WARNING] Removing existing log directory: {log_dir}")
+            shutil.rmtree(log_dir)
+        else:
+            print(
+                f"[WARNING] trtllm_config.yaml exists, not removing the directory: {log_dir}"
+            )
+            for file in os.listdir(log_dir):
+                if file != 'trtllm_config.yaml' and not file.startswith(
+                        'concurrency_'):
+                    if os.path.isdir(os.path.join(log_dir, file)):
+                        shutil.rmtree(os.path.join(log_dir, file))
+                    else:
+                        os.remove(os.path.join(log_dir, file))
+    os.makedirs(log_dir, exist_ok=True)
     print(f"Log will be saved to: {log_dir}")
+
+    # Save environment variables
+    save_env_file(os.path.join(log_dir, "env_vars.json"), server_env_var,
+                  worker_env_var, ctx_worker_env_var, gen_worker_env_var)
 
     # Setup config file paths and save worker configs
     ctx_config_path = os.path.join(log_dir, 'ctx_config.yaml')
@@ -300,6 +351,8 @@ def submit_job(config, log_dir, dry_run):
 
     container_name = "disaggr-test"
     start_server_cmds = []
+    container_mount_str = env_config['container_mount']
+    container_mount_str += f",{script_dir}:{script_dir}"
     # Generate start worker commands with placeholder hostnames
     for server_type in allocations.keys():
         for server_id in allocations[server_type].keys():
@@ -307,7 +360,11 @@ def submit_job(config, log_dir, dry_run):
             cuda_devices = ",".join([
                 str(device) for device in list(allocation["nodes"].values())[0]
             ])
-            cur_worker_env_var = worker_env_var + f" CUDA_VISIBLE_DEVICES={cuda_devices}"
+            cur_worker_env_var = worker_env_var + \
+                f" CUDA_VISIBLE_DEVICES={cuda_devices}" + \
+                (f" {ctx_worker_env_var}" if server_type == "CTX" else "") + \
+                (f" {gen_worker_env_var}" if server_type == "GEN" else "")
+            # Use script_dir for start_worker.sh
             cmd = [
                 "srun -l",
                 f"--nodelist {','.join(allocation['nodes'].keys())}",
@@ -316,9 +373,9 @@ def submit_job(config, log_dir, dry_run):
                 f"--ntasks-per-node {gpus_per_node}",
                 f"--container-image {env_config['container_image']}",
                 f"--container-name {container_name}",
-                f"--container-mounts {env_config['container_mount']}",
+                f"--container-mounts {container_mount_str}",
                 "--no-container-mount-home --mpi=pmix --overlap",
-                f"bash {os.path.join(env_config['work_dir'], 'start_worker.sh')}",
+                f"bash {os.path.join(script_dir, 'start_worker.sh')}",
                 server_type,
                 str(server_id),
                 env_config['model_path'],
@@ -336,26 +393,26 @@ def submit_job(config, log_dir, dry_run):
             ]
             start_server_cmds.append(" ".join(cmd))
 
-    # Generate start server commands
+    # Generate start server commands (use script_dir for start_server.sh)
     cmd = [
         "srun -l",
         f"--nodelist {disagg_server_hostname}",
         f"--container-name={container_name}",
         f"--container-image={env_config['container_image']}",
-        f"--container-mounts={env_config['container_mount']}",
+        f"--container-mounts={container_mount_str}",
         f"--no-container-mount-home --mpi=pmix --overlap -N 1 -n 1",
-        f"bash {env_config['work_dir']}/start_server.sh {os.path.join(log_dir, 'server_config.yaml')} \"{server_env_var}\"",
+        f"bash {os.path.join(script_dir, 'start_server.sh')} {os.path.join(log_dir, 'server_config.yaml')} \"{server_env_var}\"",
         f"&> {log_dir}/4_output_server.log &",
     ]
     start_server_cmds.append(" ".join(cmd))
 
-    # Generate wait server command
+    # Generate wait server command (use script_dir for wait_server.sh)
     cmd = [
         "srun -l",
         f"--container-name={container_name}",
-        f"--container-mounts={env_config['container_mount']}",
+        f"--container-mounts={container_mount_str}",
         f"--mpi=pmix --overlap -N 1 -n 1",
-        f"bash {env_config['work_dir']}/wait_server.sh {disagg_server_hostname} {disagg_server_port}",
+        f"bash {os.path.join(script_dir, 'wait_server.sh')} {disagg_server_hostname} {disagg_server_port}",
         f"&> {log_dir}/5_wait_server.log",
     ]
     start_server_cmds.append(" ".join(cmd))
@@ -363,14 +420,13 @@ def submit_job(config, log_dir, dry_run):
     with open(os.path.join(log_dir, "start_server_cmds.sh"), "w") as f:
         f.write("\n".join(start_server_cmds) + "\n")
 
-    # Generate client commands
+    # Generate client commands (use script_dir for benchmark scripts)
     client_cmds = []
     client_slurm_prefix = [
         f"srun -l --container-name={container_name}",
-        f"--container-mounts={env_config['container_mount']}",
+        f"--container-mounts={container_mount_str}",
         f"--mpi=pmix --overlap -N 1 -n 1",
     ]
-
     # Append benchmark commands
     if benchmark_config.get('enable_benchmark', True):
         env_var = config['benchmark'].get('env_var', {})
@@ -378,16 +434,21 @@ def submit_job(config, log_dir, dry_run):
             f"--export \"{convert_envs_to_str(env_var)}\""
         ]
         if benchmark_config['use_nv_sa_benchmark']:
+            if benchmark_config['mode'] == "gen_only":
+                print(
+                    f"[ERROR] SA benchmark client script is not supported for gen_only mode"
+                )
+                sys.exit(1)
             benchmark_cmd = [
-                f"bash {env_config['work_dir']}/run_benchmark_nv_sa.sh",
-                f"'{env_config['model_path']}' {isl} {osl} {benchmark_config['benchmark_ratio']} {benchmark_config['multi_round']} {gen_num} '{benchmark_config['concurrency_list']}' {benchmark_config['streaming']} '{log_dir}' {disagg_server_hostname} {disagg_server_port}",
+                f"bash {os.path.join(script_dir, 'run_benchmark_nv_sa.sh')}",
+                f"'{env_config['model_path']}' {isl} {osl} {benchmark_config['benchmark_ratio']} {benchmark_config['multi_round']} {gen_num} '{benchmark_config['concurrency_list']}' {benchmark_config['streaming']} '{log_dir}' {disagg_server_hostname} {disagg_server_port} {ucx_warmup_requests}",
                 f"&> {log_dir}/6_bench.log"
             ]
             client_cmds.append(" ".join(benchmark_prefix + benchmark_cmd))
         else:
             benchmark_cmd = [
-                f"bash {env_config['work_dir']}/run_benchmark.sh",
-                f"'{env_config['model_path']}' '{benchmark_config['dataset_file']}' {benchmark_config['multi_round']} {gen_num} '{benchmark_config['concurrency_list']}' {benchmark_config['streaming']} '{log_dir}' {disagg_server_hostname} {disagg_server_port}",
+                f"bash {os.path.join(script_dir, 'run_benchmark.sh')}",
+                f"'{env_config['model_path']}' '{benchmark_config['dataset_file']}' {benchmark_config['multi_round']} {gen_num} '{benchmark_config['concurrency_list']}' {benchmark_config['streaming']} '{log_dir}' {disagg_server_hostname} {disagg_server_port} {ucx_warmup_requests}",
                 f"&> {log_dir}/6_bench.log"
             ]
             client_cmds.append(" ".join(benchmark_prefix + benchmark_cmd))
@@ -423,8 +484,28 @@ def submit_job(config, log_dir, dry_run):
                 f"&> {log_dir}/7_accuracy_eval_{task}.log"
             ]
             client_cmds.append(" ".join(accuracy_prefix + accuracy_cmd))
+
+    # record ${SLURM_JOB_NODELIST} to ${log_dir}/8_done_job_id.txt
+    done_cmd = [
+        "echo", "${SLURM_JOB_NODELIST}", ">",
+        f"{log_dir}/8_done_${{SLURM_JOB_ID}}.txt"
+    ]
+    client_cmds.append(" ".join(done_cmd))
+
     with open(os.path.join(log_dir, "client_cmds.sh"), "w") as f:
         f.write("\n".join(client_cmds) + "\n")
+
+    # Resolve slurm script_file path
+    # If it's a relative path, make it relative to script_dir
+    slurm_script_file = slurm_config['script_file']
+    if not os.path.isabs(slurm_script_file):
+        slurm_script_file = os.path.join(script_dir, slurm_script_file)
+
+    # Verify the script file exists
+    if not os.path.exists(slurm_script_file):
+        print(f"[ERROR] SLURM script file not found: {slurm_script_file}",
+              file=sys.stderr)
+        sys.exit(1)
 
     # Prepare sbatch command
     # yapf: disable
@@ -437,21 +518,22 @@ def submit_job(config, log_dir, dry_run):
         f'--nodes={total_nodes}',
         f'--ntasks={total_tasks}',
         f'--ntasks-per-node={hw_config["gpus_per_node"]}',
-        *([] if not slurm_config['set_segment'] else [f'--segment={total_nodes}']),
+        *([] if not slurm_config['set_segment']
+          else [f'--segment={total_nodes}']),
         f'--output={log_dir}/slurm-%j.out',
         f'--error={log_dir}/slurm-%j.err',
         *([arg for arg in slurm_config['extra_args'].split() if arg]),
-        slurm_config['script_file'],
+        slurm_script_file,
 
         # Benchmark Configuration
         '--benchmark-mode', benchmark_config['mode'],
 
         # Environment and paths
         '--trtllm-repo', env_config['trtllm_repo'],
-        '--work-dir', env_config['work_dir'],
+        '--work-dir', script_dir,
         '--full-logdir', log_dir,
         '--container-name', container_name,
-        '--container-mount', env_config['container_mount'],
+        '--container-mount', container_mount_str,
         '--container-image', env_config['container_image'],
         '--build-wheel', str(env_config['build_wheel']).lower(),
         '--cuda-architectures', env_config['cuda_architectures'],

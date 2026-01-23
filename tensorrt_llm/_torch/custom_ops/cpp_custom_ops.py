@@ -889,7 +889,6 @@ def _register_fake():
         host_context_lengths: torch.Tensor,
         num_contexts: int,
         kv_cache_block_offsets: Optional[torch.Tensor],
-        host_kv_cache_block_offsets: Optional[torch.Tensor],
         host_kv_cache_pool_pointers: Optional[torch.Tensor],
         host_kv_cache_pool_mapping: Optional[torch.Tensor],
         kv_scale_orig_quant: Optional[torch.Tensor],

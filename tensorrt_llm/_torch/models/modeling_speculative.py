@@ -689,6 +689,9 @@ class MTPForCausalLM(nn.Module):
             case "deepseek_v3" | "deepseek_v32":
                 from .modeling_deepseekv3 import DeepseekV3MTP
                 mtp_layer = DeepseekV3MTP
+            case "exaone_moe":
+                from .modeling_exaone_moe import ExaoneMoeMTP
+                mtp_layer = ExaoneMoeMTP
             case "nemotron_h":
                 from .modeling_nemotron_h import NemotronHMTP
                 mtp_layer = NemotronHMTP
@@ -733,6 +736,10 @@ class MTPDraftModel(nn.Module):
                                       layer_idx,
                                       aux_stream_dict,
                                       is_separate_draft_engine=True)
+        elif model_type in ["exaone_moe"]:
+            from .modeling_exaone_moe import ExaoneMoeMTP
+            mtp_layer = ExaoneMoeMTP(model_config, layer_idx, aux_stream_dict)
+
         elif model_type == "nemotron_h":
             from .modeling_nemotron_h import NemotronHMTP
             mtp_layer = NemotronHMTP(model_config,
@@ -812,6 +819,10 @@ class MTPDraftModelForCausalLM(DecoderModelForCausalLM[MTPDraftModel,
                 from .modeling_deepseekv3 import DeepseekV3WeightLoader
                 weight_loader = DeepseekV3WeightLoader(self,
                                                        is_draft_model=True)
+            case "exaone_moe":
+                raise ValueError(
+                    f"Model type {model_type} not supported for MTP for two engine mode. Please use one engine mode instead."
+                )
             case _:
                 raise ValueError(
                     f"Model type {model_type} not supported for MTP")
@@ -851,7 +862,7 @@ class MTPDraftModelForCausalLM(DecoderModelForCausalLM[MTPDraftModel,
 
 
 def get_draft_model(model_config, draft_config, lm_head, model):
-    assert getattr(model_config, 'spec_config', None) != None
+    assert getattr(model_config, 'spec_config', None) is not None
     spec_dec_mode = model_config.spec_config.spec_dec_mode
     if spec_dec_mode.is_eagle3_one_model():
         if model_config.spec_config.eagle3_model_arch == "llama3":
@@ -955,7 +966,6 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             spec_metadata=spec_metadata,
             **kwargs,
         )
-
         if spec_metadata is not None and spec_metadata.is_layer_capture(
                 self.layer_idx):
             spec_metadata.maybe_capture_hidden_states(self.layer_idx,

@@ -407,6 +407,14 @@ class KVCacheManager(BaseResourceManager):
         self.num_pools = self.impl.num_pools
         self.max_blocks_per_seq = self.impl.max_blocks_per_seq
         self.enable_block_reuse = kv_cache_config.enable_block_reuse
+        self.host_kv_cache_block_offsets = torch.empty(self.num_pools,
+                                                       max_batch_size *
+                                                       max_beam_width,
+                                                       2,
+                                                       self.max_blocks_per_seq,
+                                                       dtype=torch.int32,
+                                                       pin_memory=True,
+                                                       device='cpu')
 
     def shutdown(self):
         self.impl.release_pools()
@@ -598,11 +606,19 @@ class KVCacheManager(BaseResourceManager):
             self.update_kv_cache_draft_token_location(scheduled_batch,
                                                       attn_metadata,
                                                       kv_cache_dtype_byte_size)
-        # rewind kv cache
+
+        # Rewind KV cache for requests with rejected draft tokens.
+        # Skip:
+        # - GENERATION_COMPLETE: finished requests
+        # - CONTEXT_INIT: requests whose state was reset after being paused with KV cache freed.
+        #   With overlap scheduler, the scheduler pauses a request and frees KV cache at iteration N,
+        #   while the previous batch (N-1) is still trying to update the KV cache after forward pass.
         for request in scheduled_batch.generation_requests:
-            if request.state != LlmRequestState.GENERATION_COMPLETE:
-                if request.py_rewind_len > 0:
-                    self.rewind_kv_cache(request, request.py_rewind_len)
+            if request.state in (LlmRequestState.GENERATION_COMPLETE,
+                                 LlmRequestState.CONTEXT_INIT):
+                continue
+            if request.py_rewind_len > 0:
+                self.rewind_kv_cache(request, request.py_rewind_len)
 
         # For context requests, we store the blocks for reuse.
         for request in scheduled_batch.context_requests:
@@ -650,7 +666,7 @@ class KVCacheManager(BaseResourceManager):
         accepted_draft_token_offsets, packed_accepted_draft_tokens_indices, rewind_draft_token_separate_adjustments = self.locate_accepted_draft_tokens(
             requests)
         past_key_value_lengths = attn_metadata.kv_lens_cuda[:len(requests)]
-        if attn_metadata.kv_cache_block_offsets is not None and attn_metadata.host_kv_cache_block_offsets is not None and attn_metadata.host_kv_cache_pool_pointers is not None and attn_metadata.host_kv_cache_pool_mapping is not None:
+        if attn_metadata.kv_cache_block_offsets is not None and attn_metadata.host_kv_cache_pool_pointers is not None and attn_metadata.host_kv_cache_pool_mapping is not None:
             use_paged_kv_cache = True
         else:
             use_paged_kv_cache = False
@@ -924,6 +940,34 @@ class KVCacheManager(BaseResourceManager):
     def get_indexer_k_cache_pool_data(self, layer_idx: int) -> torch.Tensor:
         result = self.impl.get_indexer_k_cache_pool_data(layer_idx)
         return result.view(result.shape[0], -1)
+
+    def check_invalid_values_in_kv_cache(self,
+                                         fill_with_zero: bool = False) -> bool:
+        some_checks_unavailable = False
+        has_invalid_values = torch.tensor([False],
+                                          dtype=torch.bool,
+                                          device=torch.cuda.current_device())
+        for layer_idx, layer_offset in self.layer_offsets.items():
+            buffer = self.impl.get_primary_pool_data(layer_offset)
+            # process in chunks of 256 pages to avoid OoM
+            for i in range(0, buffer.shape[0], 256):
+                buffer_slice = buffer[i:i + 256]
+                try:
+                    has_invalid_values.logical_or_(
+                        torch.isnan(buffer_slice).any())
+                    has_invalid_values.logical_or_(
+                        torch.isinf(buffer_slice).any())
+                except NotImplementedError:
+                    some_checks_unavailable = True
+            if fill_with_zero:
+                buffer.zero_()
+        torch.cuda.synchronize()
+
+        if some_checks_unavailable:
+            logger.warning(
+                "`torch.isnan` or `torch.isinf` is not implemented for current kv cache dtype, related checks are skipped"
+            )
+        return bool(has_invalid_values)
 
     def get_unique_primary_pool(self) -> torch.Tensor:
         return self.impl.get_unique_primary_pool()
@@ -1261,6 +1305,20 @@ class KVCacheManager(BaseResourceManager):
             return temp_attention_window_inputs
         else:
             return None
+
+    def copy_batch_block_offsets(self, dst_tensor: torch.Tensor,
+                                 request_ids: List[int], beam_width: int,
+                                 num_context: int, num_seqs: int):
+        self.impl.copy_batch_block_offsets(self.host_kv_cache_block_offsets,
+                                           request_ids[:num_context], 1, 0)
+        self.impl.copy_batch_block_offsets(self.host_kv_cache_block_offsets,
+                                           request_ids[num_context:],
+                                           beam_width, num_context)
+
+        for pool_idx in range(self.host_kv_cache_block_offsets.shape[0]):
+            dst_tensor[pool_idx, :num_seqs].copy_(
+                self.host_kv_cache_block_offsets[pool_idx, :num_seqs],
+                non_blocking=True)
 
     def reset_reuse_state(self):
         """Reset the reuse state of the KV cache manager."""

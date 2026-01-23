@@ -1,9 +1,9 @@
 import base64
-import pickle  # nosec B403
 from typing import Optional
 
 import torch
 
+from tensorrt_llm import serialization
 from tensorrt_llm._ray_utils import control_action_decorator
 from tensorrt_llm._torch.modules.fused_moe.moe_load_balancer import MoeLoadBalancer
 from tensorrt_llm._torch.utils import get_device_uuid
@@ -50,6 +50,13 @@ class WorkerExtension:
             Exception: Re-raises any exception encountered during weight update.
         """
         try:
+            if not hasattr(self.engine.model_engine.model, "first_pre_reload_weights"):
+                for module in self.engine.model_engine.model.modules():
+                    if hasattr(module, "pre_reload_weights") and not getattr(
+                        module, "_weights_removed", False
+                    ):
+                        module.pre_reload_weights()
+                setattr(self.engine.model_engine.model, "first_pre_reload_weights", True)
             if ipc_handles is not None:
                 logger.info("Update weights from IPC handles")
                 device_uuid = get_device_uuid(self.device_id)
@@ -62,8 +69,35 @@ class WorkerExtension:
                 serialized_handles = ipc_handles[device_uuid]
                 if isinstance(serialized_handles, str):
                     # Data is base64-encoded pickled bytes - deserialize it
+                    # using restricted unpickler from tensorrt_llm.serialization
                     logger.info("Deserializing base64-encoded weight handles")
-                    all_handles = pickle.loads(base64.b64decode(serialized_handles))  # nosec B301
+                    decoded_data = base64.b64decode(serialized_handles)
+                    # Allow basic builtins and all torch modules
+                    approved_imports = {
+                        "builtins": [
+                            "list",
+                            "tuple",
+                            "str",
+                            "int",
+                            "float",
+                            "bool",
+                            "bytes",
+                            "dict",
+                            "NoneType",
+                            "type",
+                        ],
+                    }
+                    all_handles = serialization.loads(
+                        decoded_data,
+                        approved_imports=approved_imports,
+                        approved_module_patterns=[r"^torch.*"],
+                    )
+
+                    # Verify the result is a list as expected
+                    if not isinstance(all_handles, list):
+                        raise ValueError(
+                            f"Deserialized data must be a list, got {type(all_handles).__name__} instead"
+                        )
                 else:
                     # Data is already in the correct format (backward compatibility)
                     all_handles = serialized_handles
@@ -82,6 +116,10 @@ class WorkerExtension:
             else:
                 logger.info("Finalize update weights")
                 for module in self.engine.model_engine.model.modules():
+                    if hasattr(module, "process_weights_after_loading") and not getattr(
+                        module, "_weights_removed", False
+                    ):
+                        module.process_weights_after_loading()
                     if hasattr(module, "post_load_weights") and not getattr(
                         module, "_weights_removed", False
                     ):
@@ -93,6 +131,7 @@ class WorkerExtension:
                     moe_load_balancer.finalize_model()
                     logger.info("moe_load_balancer finalize model done")
                 self.engine.reset_prefix_cache()
+                delattr(self.engine.model_engine.model, "first_pre_reload_weights")
 
         except Exception as e:
             logger.error("Encountered an error in update_weights")

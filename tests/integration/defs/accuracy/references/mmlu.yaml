@@ -235,11 +235,11 @@ Qwen3/Qwen3-235B-A22B:
     accuracy: 86
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
-    accuracy: 86
+    accuracy: 85.5
   - spec_dec_algo: Eagle
     quant_algo: NVFP4
     kv_cache_quant_algo: FP8
-    accuracy: 86
+    accuracy: 85.5
 Qwen3/Qwen3-Next-80B-A3B-Thinking:
   - accuracy: 86
 Qwen3/Qwen3-Next-80B-A3B-Instruct:
@@ -284,6 +284,9 @@ nvidia/Nemotron-MOE:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 73.879
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 70.879
 microsoft/Phi-4-mini-instruct:
   - accuracy: 68.98
   - quant_algo: FP8
@@ -349,10 +352,10 @@ mistral/Mistral-Large-3-675B:
   - spec_dec_algo: Eagle
     accuracy: 85.30
 nvidia/Nemotron-Super-V3:
-  - accuracy: 81.07
+  - accuracy: 80.00
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
-    accuracy: 78.22
+    accuracy: 77.80
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 77.56
