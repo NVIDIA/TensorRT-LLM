@@ -2583,14 +2583,24 @@ void KVCacheManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const& bl
 
 tle::RetentionPriority KVCacheManager::getPriorityByBlockId(KVCacheBlock::IdType blockId) const
 {
-    if (blockId >= 0 && blockId < mBlockManager.getMaxNumBlocks())
+    if (blockId < 0 || blockId >= mBlockManager.getMaxNumBlocks())
     {
-        BlockPtr const& block = mBlockManager.getBlockById(blockId);
+        TLLM_LOG_WARNING("getPriorityByBlockId: Invalid block ID %d (valid range: 0-%d)",
+            blockId, mBlockManager.getMaxNumBlocks() - 1);
+        return tle::KvCacheRetentionConfig::kDefaultRetentionPriority;
+    }
+
+    // Search for the block across all window sizes
+    for (auto const [windowSize, metadata] : mBlockManager.getWindowSizesMetadata())
+    {
+        BlockPtr const& block = mBlockManager.getBlockById(blockId, windowSize);
         if (block)
         {
             return block->getPriority();
         }
     }
+
+    TLLM_LOG_WARNING("getPriorityByBlockId: Block ID %d not found in any window size", blockId);
     return tle::KvCacheRetentionConfig::kDefaultRetentionPriority;
 }
 
