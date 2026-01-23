@@ -17,6 +17,8 @@
 Model pytorch/TRT yaml config for trtllm-bench perf tests
 """
 
+from ..conftest import llm_models_root
+
 
 def recursive_update(d, u):
     for k, v in u.items():
@@ -293,6 +295,32 @@ def get_model_yaml_config(model_label: str,
                 },
                 'stream_interval': 10,
                 'num_postprocess_workers': 4
+            }
+        },
+        # GPT-OSS 120B speculative decoding (Eagle3 draft)
+        {
+            'patterns': [
+                'gpt_oss_120b_fp4-bench-pytorch-streaming-float4-maxbs:1-maxnt:4096-input_output_len:2048,128-reqs:1-con:1',
+            ],
+            'config': {
+                'enable_attention_dp': False,
+                'disable_overlap_scheduler': False,
+                'enable_autotuner': False,
+                'enable_chunked_prefill': True,
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                },
+                'speculative_config': {
+                    'decoding_type':
+                    'Eagle',
+                    'max_draft_len':
+                    5,
+                    'speculative_model_dir':
+                    f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3",
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                },
             }
         },
         # Phi-4-multimodal-instruct with chunked prefill and kv_cache_reuse
