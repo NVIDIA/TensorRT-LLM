@@ -4,6 +4,8 @@ import torch
 from torch import nn
 from transformers import LlamaConfig, PretrainedConfig
 
+from tensorrt_llm.logger import logger
+
 from ...functional import PositionEmbeddingType
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
@@ -22,6 +24,18 @@ from ..utils import AuxStreamType
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM, TModel,
                              register_auto_model)
+
+
+def _ensure_draft_vocab_size(config: PretrainedConfig) -> None:
+    if hasattr(config,
+               "draft_vocab_size") and config.draft_vocab_size is not None:
+        return
+
+    logger.warning(
+        "Missing 'draft_vocab_size' in pretrained config; defaulting to 'vocab_size'. "
+        "Set 'draft_vocab_size' explicitly if the draft head uses a different vocabulary."
+    )
+    config.draft_vocab_size = config.vocab_size
 
 
 class Eagle3Attention(Attention):
@@ -417,9 +431,8 @@ class Eagle3ForCausalLM(DecoderModelForCausalLM[Eagle3DraftModel,
         model_config: ModelConfig[PretrainedConfig],
         start_layer_idx: int = 0,
     ):
-        draft_vocab_size = model_config.pretrained_config.vocab_size
-        if model_config.pretrained_config.draft_vocab_size is not None:
-            draft_vocab_size = model_config.pretrained_config.draft_vocab_size
+        config = model_config.pretrained_config
+        _ensure_draft_vocab_size(config)
 
         # Determine if we should use MLA attention based on config
         # MLA is used for DeepSeekV3-style models that have kv_lora_rank
@@ -435,8 +448,8 @@ class Eagle3ForCausalLM(DecoderModelForCausalLM[Eagle3DraftModel,
         super().__init__(
             draft_model,
             config=model_config,
-            hidden_size=model_config.pretrained_config.hidden_size,
-            vocab_size=draft_vocab_size,
+            hidden_size=config.hidden_size,
+            vocab_size=config.draft_vocab_size,
         )
         self.load_lm_head_from_target = True
 
@@ -598,6 +611,7 @@ class MistralLarge3DraftModel(DecoderModel):
 
 
 # We use MistralLarge3 as the base architecture for EAGLE3 draft layers
+# NOTE: Class name says "Eagle" not "Eagle3" to match checkpoint naming (e.g., "Mistral-Large-3-675B-Instruct-2512-Eagle")
 @register_auto_model("MistralLarge3EagleForCausalLM")
 class MistralLarge3EagleForCausalLM(DecoderModelForCausalLM):
 
@@ -689,6 +703,9 @@ class MTPForCausalLM(nn.Module):
             case "deepseek_v3" | "deepseek_v32":
                 from .modeling_deepseekv3 import DeepseekV3MTP
                 mtp_layer = DeepseekV3MTP
+            case "exaone_moe":
+                from .modeling_exaone_moe import ExaoneMoeMTP
+                mtp_layer = ExaoneMoeMTP
             case _:
                 raise ValueError(
                     f"Model type {model_type} not supported for MTP")
@@ -730,6 +747,10 @@ class MTPDraftModel(nn.Module):
                                       layer_idx,
                                       aux_stream_dict,
                                       is_separate_draft_engine=True)
+        elif model_type in ["exaone_moe"]:
+            from .modeling_exaone_moe import ExaoneMoeMTP
+            mtp_layer = ExaoneMoeMTP(model_config, layer_idx, aux_stream_dict)
+
         else:
             raise ValueError(
                 f"MTPDraftModel does not support model_type: {model_type}")
@@ -803,6 +824,10 @@ class MTPDraftModelForCausalLM(DecoderModelForCausalLM[MTPDraftModel,
                 from .modeling_deepseekv3 import DeepseekV3WeightLoader
                 weight_loader = DeepseekV3WeightLoader(self,
                                                        is_draft_model=True)
+            case "exaone_moe":
+                raise ValueError(
+                    f"Model type {model_type} not supported for MTP for two engine mode. Please use one engine mode instead."
+                )
             case _:
                 raise ValueError(
                     f"Model type {model_type} not supported for MTP")
@@ -842,7 +867,7 @@ class MTPDraftModelForCausalLM(DecoderModelForCausalLM[MTPDraftModel,
 
 
 def get_draft_model(model_config, draft_config, lm_head, model):
-    assert getattr(model_config, 'spec_config', None) != None
+    assert getattr(model_config, 'spec_config', None) is not None
     spec_dec_mode = model_config.spec_config.spec_dec_mode
     if spec_dec_mode.is_eagle3_one_model():
         if model_config.spec_config.eagle3_model_arch == "llama3":
@@ -946,7 +971,6 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             spec_metadata=spec_metadata,
             **kwargs,
         )
-
         if spec_metadata is not None and spec_metadata.is_layer_capture(
                 self.layer_idx):
             spec_metadata.maybe_capture_hidden_states(self.layer_idx,

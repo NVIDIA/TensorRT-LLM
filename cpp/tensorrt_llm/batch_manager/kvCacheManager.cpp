@@ -416,6 +416,7 @@ void KVCacheBlock::setPrevBlockInSeq(BlockPtr prevBlock)
 
 void KVCacheBlock::addNextBlock(BlockKey const& blockKey, BlockPtr block)
 {
+    std::lock_guard<std::mutex> lock(mNextBlocksMutex);
     if (mNextBlocks.find(blockKey) == mNextBlocks.end())
     {
         mNextBlocks[blockKey] = std::move(block);
@@ -425,6 +426,8 @@ void KVCacheBlock::addNextBlock(BlockKey const& blockKey, BlockPtr block)
 std::tuple<bool, SizeType32, BlockPtr> KVCacheBlock::findMatchingBlock(
     BlockKey const& blockKey, bool enablePartialReuse, bool copyOnPartialReuse) const
 {
+    std::lock_guard<std::mutex> lock(mNextBlocksMutex);
+
     if (blockKey.uniqueTokens.size() == 0 || mNextBlocks.size() == 0)
     {
         return {false, 0, nullptr};
@@ -474,11 +477,13 @@ void KVCacheBlock::freeLeafBlock()
 
 void KVCacheBlock::removeNextBlock(BlockKey const& blockKey)
 {
+    std::lock_guard<std::mutex> lock(mNextBlocksMutex);
     mNextBlocks.erase(blockKey);
 }
 
 void KVCacheBlock::freeDescendantsRecursively()
 {
+    std::lock_guard<std::mutex> lock(mNextBlocksMutex);
     bool hasChildren = !mNextBlocks.empty();
     if (hasChildren)
     {
@@ -1176,6 +1181,7 @@ std::optional<BlockKey> WindowBlockManager::findNewContextBlock(
     auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
     BlockKey ret;
     ret.loraTaskId = llmRequest.getLoraTaskId();
+    std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
     auto searchRoot = mCachedBlocksRoot;
     for (auto const& blockKey : blockKeys)
     {

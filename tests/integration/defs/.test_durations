@@ -831,7 +831,7 @@
     "test_e2e.py::test_mistral_e2e[use_py_session-remove_input_padding--]": 157.39577213302255,
     "test_e2e.py::test_mistral_large_hidden_vocab_size": 81.36711680702865,
     "test_e2e.py::test_openai_chat_example": 876.1966922096908,
-    "test_e2e.py::test_openai_chat_guided_decoding": 55.12449237401597,
+    "test_e2e.py::test_openai_chat_guided_decoding[meta-llama/Llama-3.1-8B-Instruct]": 55.12449237401597,
     "test_e2e.py::test_openai_chat_harmony": 1162.7252594940364,
     "test_e2e.py::test_openai_chat_multimodal_example": 215.8254322744906,
     "test_e2e.py::test_openai_consistent_chat": 0.0001894170418381691,
