@@ -376,8 +376,8 @@ class PyExecutor:
         self.sample_stream = torch.cuda.Stream()
         self.start_sample_event = torch.cuda.Event()
         self.finish_sample_event = torch.cuda.Event()
-        if self.pp_multi_stream_sample and isinstance(self.sampler,
-                                                      TRTLLMSampler):
+        if (self.dist.pp_size > 1 and self.pp_multi_stream_sample
+                and isinstance(self.sampler, TRTLLMSampler)):
             # TRTLLM sampler uses default stream for store and algorithms.
             # To enable multi-stream sampling, we need to re-initialize
             # the sampler store and algorithms on the sample stream.
