@@ -17,7 +17,7 @@ withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LL
 @Field String LLM_ROOT = "llm"
 
 @Field String BOT_REPO = "https://gitlab-master.nvidia.com/ftp/llm-bloom-bot.git"
-@Field String BOT_REVISION = "main"
+@Field String BOT_REVISION = "master"
 @Field String BOT_ROOT = "bot"
 
 // LLM repository configuration
