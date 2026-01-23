@@ -88,7 +88,7 @@ def get_balanced_selection_impl_random(
     ep_size: int,
 ):
     helper = GroupedGemmInputsHelper(num_experts, top_k, num_experts, 0, 128)
-    num_tokens_per_expert = helper.generate_num_tokens_per_expert(num_tokens)
+    num_tokens_per_expert = helper.generate_num_tokens_per_expert(num_tokens, approx_max_load=False)
     assert sum(num_tokens_per_expert) == num_tokens * top_k
     token_selected_experts = helper.generate_token_selected_experts(
         num_tokens, num_tokens_per_expert

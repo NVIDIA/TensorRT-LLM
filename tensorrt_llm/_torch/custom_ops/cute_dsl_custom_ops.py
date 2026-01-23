@@ -89,17 +89,33 @@ class GroupedGemmInputsHelper:
             self, input_shapes: List[torch.Size]) -> int:
         return self.infer_shape_max_num_tiles(input_shapes) * self.tile_size
 
-    def generate_num_tokens_per_expert(self, num_tokens: int) -> List[int]:
-        average_num_tokens_per_expert = num_tokens * self.top_k / self.num_experts
-        balance = 0
-        num_tokens_per_expert = []
-        for i in range(self.num_local_experts):
-            balance += average_num_tokens_per_expert
-            if balance <= 0:
-                continue
-            curr_num_tokens = math.ceil(balance)
-            num_tokens_per_expert.append(curr_num_tokens)
-            balance -= curr_num_tokens
+    def generate_num_tokens_per_expert(self,
+                                       num_tokens: int,
+                                       approx_max_load: bool = False
+                                       ) -> List[int]:
+        ep_size = self.num_experts // self.num_local_experts
+        average_num_tokens_per_rank = num_tokens * self.top_k / ep_size
+
+        if approx_max_load:
+            # https://en.wikipedia.org/wiki/Balls_into_bins_problem
+            # The constant c can be measured empirically, we choose 1.0 for simplicity.
+            c = 1.0
+            extra_num_tokens_on_curr_rank = c * math.sqrt(
+                average_num_tokens_per_rank * math.log(ep_size))
+            num_tokens_on_curr_rank = math.ceil(average_num_tokens_per_rank +
+                                                extra_num_tokens_on_curr_rank)
+        else:
+            num_tokens_on_curr_rank = math.ceil(average_num_tokens_per_rank)
+
+        num_tokens_on_curr_rank = min(num_tokens * self.top_k,
+                                      num_tokens_on_curr_rank)
+
+        base, remainder = divmod(num_tokens_on_curr_rank,
+                                 self.num_local_experts)
+        num_tokens_per_expert = [base + 1] * remainder + [base] * (
+            self.num_local_experts - remainder)
+        assert len(num_tokens_per_expert) == self.num_local_experts
+        assert sum(num_tokens_per_expert) == num_tokens_on_curr_rank
         return num_tokens_per_expert
 
     def generate_token_selected_experts(
@@ -147,7 +163,8 @@ class GroupedGemmInputsHelper:
     def inputs_pre_hook(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
         a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx, num_non_exiting_tiles, *others = inputs
         num_tokens = self.infer_num_tokens(a.size(0))
-        num_tokens_per_expert = self.generate_num_tokens_per_expert(num_tokens)
+        num_tokens_per_expert = self.generate_num_tokens_per_expert(
+            num_tokens, approx_max_load=True)
         token_selected_experts = self.generate_token_selected_experts(
             num_tokens, num_tokens_per_expert)
 
@@ -176,7 +193,8 @@ class GroupedGemmInputsHelper:
             self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
         a, b, a_sf, b_sf, alpha, output, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales = inputs
         num_tokens = self.infer_num_tokens(a.size(0))
-        num_tokens_per_expert = self.generate_num_tokens_per_expert(num_tokens)
+        num_tokens_per_expert = self.generate_num_tokens_per_expert(
+            num_tokens, approx_max_load=True)
         token_selected_experts = self.generate_token_selected_experts(
             num_tokens, num_tokens_per_expert)
 
@@ -244,7 +262,8 @@ class GatherGroupedGemmInputsHelper(GroupedGemmInputsHelper):
 
         max_num_permuted_tokens = permuted_idx_to_expanded_idx.size(0)
         num_tokens = self.infer_num_tokens(max_num_permuted_tokens)
-        num_tokens_per_expert = self.generate_num_tokens_per_expert(num_tokens)
+        num_tokens_per_expert = self.generate_num_tokens_per_expert(
+            num_tokens, approx_max_load=True)
         token_selected_experts = self.generate_token_selected_experts(
             num_tokens, num_tokens_per_expert)
 
