@@ -34,7 +34,7 @@ from transformers.configuration_utils import PretrainedConfig
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modules.fused_moe import RenormalizeMoeRoutingMethod, create_moe
+from tensorrt_llm._torch.modules.fused_moe import DeepSeekV3MoeRoutingMethod, create_moe
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -163,6 +163,9 @@ def run_benchmark(args):
     print(f"  Intermediate size: {args.intermediate_size}")
     print(f"  Num experts:       {args.num_experts}")
     print(f"  Top-K:             {args.top_k}")
+    print(f"  N-Group:           {args.n_group}")
+    print(f"  TopK-Group:        {args.topk_group}")
+    print(f"  Routed scaling:    {args.routed_scaling_factor}")
     print(f"  Sequence length:   {args.seq_len}")
     print(f"  Dtype:             {args.dtype}")
     print(f"  CUDA Graph:        {'enabled' if args.enable_cudagraph else 'disabled'}")
@@ -179,7 +182,10 @@ def run_benchmark(args):
         # Create input tensors
         x = torch.randn((args.seq_len, args.hidden_size), dtype=dtype, device="cuda")
         x_sf_global = (448 * 6) / x.abs().max().float()
-        router_logits = torch.randn((args.seq_len, args.num_experts), dtype=dtype, device="cuda")
+        # router_logits must be float32 for TRTLLM backend
+        router_logits = torch.randn(
+            (args.seq_len, args.num_experts), dtype=torch.float32, device="cuda"
+        )
 
         # Create weights
         print("\nCreating NVFP4 quantized weights...")
@@ -191,8 +197,17 @@ def run_benchmark(args):
             x_sf_global=x_sf_global,
         )
 
-        # Create MoE model
-        routing_method = RenormalizeMoeRoutingMethod(top_k=args.top_k)
+        # Create MoE model with DeepSeek R1 routing method
+        # DeepSeek R1 parameters: n_group=8, topk_group=4, routed_scaling_factor=2.5
+        # routing_bias must be bfloat16 for TRTLLM backend
+        e_score_correction_bias = torch.zeros(args.num_experts, dtype=dtype, device="cuda")
+        routing_method = DeepSeekV3MoeRoutingMethod(
+            top_k=args.top_k,
+            n_group=args.n_group,
+            topk_group=args.topk_group,
+            routed_scaling_factor=args.routed_scaling_factor,
+            callable_e_score_correction_bias=lambda: e_score_correction_bias,
+        )
         quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
 
         pretrained_config = PretrainedConfig()
@@ -282,26 +297,44 @@ def main():
     parser.add_argument(
         "--hidden_size",
         type=int,
-        default=4096,
-        help="Hidden size",
+        default=7168,
+        help="Hidden size (DeepSeek R1: 7168)",
     )
     parser.add_argument(
         "--intermediate_size",
         type=int,
-        default=14336,
-        help="Intermediate size (FFN dimension)",
+        default=2048,
+        help="Intermediate size (FFN dimension, DeepSeek R1: 2048)",
     )
     parser.add_argument(
         "--num_experts",
         type=int,
-        default=8,
-        help="Number of experts",
+        default=256,
+        help="Number of experts (DeepSeek R1: 256)",
     )
     parser.add_argument(
         "--top_k",
         type=int,
-        default=2,
-        help="Top-K experts to route to",
+        default=8,
+        help="Top-K experts to route to (DeepSeek R1: 8)",
+    )
+    parser.add_argument(
+        "--n_group",
+        type=int,
+        default=8,
+        help="Number of expert groups for DeepSeek routing (DeepSeek R1: 8)",
+    )
+    parser.add_argument(
+        "--topk_group",
+        type=int,
+        default=4,
+        help="Top-K groups for DeepSeek routing (DeepSeek R1: 4)",
+    )
+    parser.add_argument(
+        "--routed_scaling_factor",
+        type=float,
+        default=2.5,
+        help="Routed scaling factor for DeepSeek routing (DeepSeek R1: 2.5)",
     )
     parser.add_argument(
         "--seq_len",

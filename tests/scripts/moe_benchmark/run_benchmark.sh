@@ -14,7 +14,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Default parameters
+# Default parameters (DeepSeek R1 configuration)
 BACKENDS=("CUTLASS" "TRTLLM" "DENSEGEMM")
 SEQ_LEN=128
 HIDDEN_SIZE=7168
@@ -81,7 +81,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --backend BACKEND       Run specific backend (CUTLASS, TRTLLM, DENSEGEMM)"
             echo "  --seq-len N             Sequence length (default: 128)"
             echo "  --hidden-size N         Hidden size (default: 7168)"
-            echo "  --intermediate-size N   Intermediate size (default: 256)"
+            echo "  --intermediate-size N   Intermediate size (default: 2048)"
             echo "  --num-experts N         Number of experts (default: 256)"
             echo "  --top-k N               Top-K experts (default: 8)"
             echo "  --iterations N          Benchmark iterations (default: 100)"
