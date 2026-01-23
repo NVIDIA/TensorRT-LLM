@@ -303,9 +303,6 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[kimi_k2_nvfp4-bench-pytorch-float4-maxbs:256-input_output_len:2000,500-ep:8-tp:8-gpus:8]
   - perf/test_perf.py::test_perf[kimi_k2_nvfp4-bench-pytorch-float4-maxbs:512-maxnt:2048-kv_frac:0.6-input_output_len:1000,1000-ep:8-tp:8-gpus:8]
   - perf/test_perf.py::test_perf[kimi_k2_nvfp4-bench-pytorch-float4-maxbs:512-maxnt:2048-kv_frac:0.6-input_output_len:5000,500-reqs:2000-ep:8-tp:8-gpus:8] TIMEOUT(120)
-  # gpt_20b
-  - perf/test_perf.py::test_perf[gpt_20b-bench-float16-maxbs:8-input_output_len:128,128-reqs:80-gpus:8]
-  - perf/test_perf.py::test_perf[gpt_20b-bench-float16-maxbs:8-input_output_len:512,32-reqs:80-gpus:8]
 
   # llama_v3.1_405b_instruct_fp4
   - perf/test_perf.py::test_perf[llama_v3.1_405b_instruct_fp4-bench-pytorch-float4-kv_frac:0.85-input_output_len:128,128-tp:8-gpus:8]
@@ -318,15 +315,6 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[deepseek_r1_fp8-bench-pytorch-float8-maxbs:512-input_output_len:128,128-ep:8-tp:8-gpus:8]
   - perf/test_perf.py::test_perf[deepseek_r1_fp8-bench-pytorch-float8-maxbs:1-input_output_len:1000,2000-reqs:10-ep:4-tp:8-gpus:8]
   - perf/test_perf.py::test_perf[deepseek_r1_fp8-bench-pytorch-float8-maxbs:384-maxnt:1536-input_output_len:1000,2000-reqs:49152-con:3072-ep:8-tp:8-gpus:8]
-
-  # deepseek_r1_nvfp4
-  - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:512-input_output_len:128,128-ep:8-tp:8-gpus:8]
-  - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:1-input_output_len:1000,2000-reqs:10-ep:4-tp:8-gpus:8]
-  - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-streaming-float4-maxbs:1-input_output_len:1000,2000-reqs:10-ep:4-tp:8-gpus:8]
-  - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:384-maxnt:1536-input_output_len:1000,2000-reqs:49152-con:3072-ep:8-tp:8-gpus:8] TIMEOUT(120)
-  - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-streaming-float4-maxbs:384-maxnt:1536-input_output_len:1000,2000-reqs:49152-con:3072-ep:8-tp:8-gpus:8]
-  - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:512-maxnt:2048-kv_frac:0.85-input_output_len:5000,500-reqs:200-ep:8-tp:8-gpus:8] TIMEOUT(120)
-  - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:256-maxnt:1024-kv_frac:0.85-input_output_len:2000,2000-reqs:200-ep:8-tp:8-gpus:8] TIMEOUT(120)
 
   # deepseek_r1_0528_fp4
   - perf/test_perf.py::test_perf[deepseek_r1_0528_fp4-bench-pytorch-float4-kv_frac:0.85-input_output_len:1000,1000-reqs:20000-ep:8-tp:8-gpus:8] TIMEOUT(120)
