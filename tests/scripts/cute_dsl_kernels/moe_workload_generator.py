@@ -7,7 +7,7 @@ import safetensors.torch
 import torch
 
 from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import GroupedGemmInputsHelper
-from tensorrt_llm.tools.layer_wise_benchmarks.runner_utils import (
+from tensorrt_llm.tools.layer_wise_benchmarks.runner import (
     get_balanced_selection_impl_default,
     get_balanced_selection_impl_random,
 )
