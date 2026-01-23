@@ -19,8 +19,6 @@ try:
 except ImportError:
     from cuda import cudart
 
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
-    MambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManagerType, request_context)
 from tensorrt_llm._utils import (customized_gc_thresholds, is_trace_enabled,
@@ -348,8 +346,6 @@ class PyExecutor:
         self.block_reuse_enabled = True if self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse else False
         self.enable_kv_cache_events = self.kv_cache_manager is not None and self.kv_cache_manager.event_buffer_max_size > 0
         self.enable_kv_cache_reuse = self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse
-        self.is_mamba_hybrid_cache = isinstance(self.kv_cache_manager,
-                                                MambaHybridCacheManager)
 
         self.max_input_len = max_input_len
         # _executor_loop private data
@@ -1817,11 +1813,6 @@ class PyExecutor:
                                                       batch_outputs)
                     assert sample_state is not None, "Sampling failed"
 
-                    # Update mamba cache immediately after sampling
-                    if self.is_mamba_hybrid_cache:
-                        self.kv_cache_manager.update_resources_for_mamba_cache_manager(
-                            scheduled_batch, sample_state=sample_state)
-
                     # Handle guided decoder errors after _sample_async to avoid state conflicts.
                     # If called before, failed requests would be marked as GENERATION_COMPLETE,
                     # causing _sample_async to fail when accessing context_chunk_size property.
@@ -1957,8 +1948,7 @@ class PyExecutor:
                                            'kv_cache_dtype_byte_size', None)
         self.resource_manager.update_resources(scheduled_requests,
                                                attn_metadata,
-                                               kv_cache_dtype_byte_size,
-                                               update_mamba_cache_manager=False)
+                                               kv_cache_dtype_byte_size)
         if self.enable_kv_cache_events:
             self._add_kv_cache_events()
 

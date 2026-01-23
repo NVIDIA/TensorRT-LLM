@@ -326,21 +326,16 @@ class MambaCacheManager(BaseResourceManager):
 
         torch.cuda.empty_cache()
 
-    def update_mamba_states(self, num_accepted_draft_tokens: torch.Tensor,
-                            state_indices_tensor: torch.Tensor):
-        """Update Mamba states after MTP verification
-
-        Copy the states of accepted speculative steps from the intermediate cache to the main cache.
-
-        Args:
-            num_accepted_draft_tokens: Number of accepted steps for each request, shape [request_number]
-                          e.g.: [2, -1, 3, 1] means request 0 accepts 2 steps, request 1 rejects (-1),
-                                request 2 accepts 3 steps, request 3 accepts 1 step
-            state_indices_tensor: Main cache index for each request, shape [request_number]
-                                e.g.: [5, 12, 3, 7] means 4 requests use main cache slots 5, 12, 3, 7
-
-        """
-        request_number = num_accepted_draft_tokens.shape[0]
+    @torch.compile(options={"max-autotune": True})
+    def update_mamba_states(self, attn_metadata: "AttentionMetadata",
+                            num_accepted_tokens: torch.Tensor):
+        batch_size = attn_metadata.num_seqs
+        num_contexts = attn_metadata.num_contexts
+        num_gens = batch_size - num_contexts
+        num_accepted_draft_tokens = num_accepted_tokens[
+            num_contexts:num_contexts + num_gens] - 1
+        state_indices_d = self.state_indices[num_contexts:num_contexts +
+                                             num_gens]
 
         conv_states = self.mamba_cache.conv
         ssm_states = self.mamba_cache.temporal
@@ -348,18 +343,16 @@ class MambaCacheManager(BaseResourceManager):
         intermediate_state_cache = self.mamba_cache.intermediate_ssm
         intermediate_conv_window_cache = self.mamba_cache.intermediate_conv_window
 
-        src_state_indices = self.intermediate_state_indices[:request_number]
+        src_state_indices = self.intermediate_state_indices[:num_gens]
 
         accepted_ssm_state = intermediate_state_cache[:, src_state_indices,
                                                       num_accepted_draft_tokens]
-        ssm_states[:, state_indices_tensor, :] = accepted_ssm_state.to(
-            ssm_states.dtype, copy=False)
+        ssm_states[:, state_indices_d, :] = accepted_ssm_state
 
         accepted_conv_state = intermediate_conv_window_cache[:,
                                                              src_state_indices,
                                                              num_accepted_draft_tokens]
-        conv_states[:, state_indices_tensor, :] = accepted_conv_state.to(
-            conv_states.dtype, copy=False)
+        conv_states[:, state_indices_d, :] = accepted_conv_state
 
 
 class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
@@ -457,7 +450,7 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
         KVCacheManager.update_resources(self, scheduled_batch, attn_metadata,
                                         kv_cache_dtype_byte_size)
 
-    def update_mamba_states(self, num_accepted_draft_tokens: torch.Tensor,
-                            state_indices_tensor: torch.Tensor):
-        MambaCacheManager.update_mamba_states(self, num_accepted_draft_tokens,
-                                              state_indices_tensor)
+    def update_mamba_states(self, attn_metadata: "AttentionMetadata",
+                            num_accepted_tokens: torch.Tensor):
+        MambaCacheManager.update_mamba_states(self, attn_metadata,
+                                              num_accepted_tokens)
