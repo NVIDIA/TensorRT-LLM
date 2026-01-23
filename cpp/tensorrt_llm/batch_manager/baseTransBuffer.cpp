@@ -16,7 +16,7 @@
  */
 
 #include "baseTransBuffer.h"
-#include "cacheTransBuffer.h" // For FabricMemory
+#include "cacheTransBuffer.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/opUtils.h"
@@ -107,6 +107,7 @@ runtime::ITensor::SharedPtr BaseTransBufferManager::getRecvBuffer(std::optional<
     if (bufferId.has_value())
     {
         TLLM_CHECK(static_cast<size_t>(bufferId.value()) < mRecvBufferCount);
+        // TLLM_CHECK(mConcurrenceRecvResource.mBufferIndexFlag[bufferId.value()] == 1);
         return mConcurrenceRecvResource.mBuffers[bufferId.value()];
     }
     return nullptr;

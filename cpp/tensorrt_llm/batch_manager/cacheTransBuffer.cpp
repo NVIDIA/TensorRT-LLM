@@ -250,6 +250,7 @@ CacheTransBufferManager::CacheTransBufferManager(
         maxNumTokens)
     , mCacheManager{cacheManager}
 {
+    // TODO: FP4 dataSize
     TLLM_CHECK(mCacheManager);
     TLLM_LOG_INFO("CacheTransBufferManager created for KV cache");
 }
