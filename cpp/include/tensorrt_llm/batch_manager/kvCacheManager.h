@@ -1688,8 +1688,11 @@ public:
 
     /// @brief Get the retention priority of a block by its ID.
     /// @param blockId The ID of the block.
+    /// @param windowSize The attention window size this block belongs to.
     /// @return The retention priority of the block, or default priority if block not found.
-    [[nodiscard]] virtual executor::RetentionPriority getPriorityByBlockId(KVCacheBlock::IdType blockId) const = 0;
+    [[nodiscard]] virtual executor::RetentionPriority getPriorityByBlockId(
+        KVCacheBlock::IdType blockId, SizeType32 windowSize) const
+        = 0;
 };
 
 class KVCacheManager : public BaseKVCacheManager
@@ -1973,7 +1976,8 @@ public:
 
     void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) override;
 
-    [[nodiscard]] executor::RetentionPriority getPriorityByBlockId(KVCacheBlock::IdType blockId) const override;
+    [[nodiscard]] executor::RetentionPriority getPriorityByBlockId(
+        KVCacheBlock::IdType blockId, SizeType32 windowSize) const override;
 
     std::optional<KVCacheBlock::IdType> getLastBlockId(LlmRequest::RequestIdType requestId) const override;
 

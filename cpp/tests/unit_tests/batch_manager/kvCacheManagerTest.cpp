@@ -4031,15 +4031,15 @@ TEST_F(KVCacheManagerTest, GetPriorityByBlockId)
 
     // Test 1: Valid block ID should return the set priority (80)
     auto const validBlockId = cacheBlockIds[0];
-    auto const retrievedPriority = kvCacheManager.getPriorityByBlockId(validBlockId);
+    auto const retrievedPriority = kvCacheManager.getPriorityByBlockId(validBlockId, maxAttentionWindow);
     EXPECT_EQ(retrievedPriority, 80);
 
     // Test 2: Invalid block ID (negative) should return default priority
-    auto const invalidNegative = kvCacheManager.getPriorityByBlockId(-1);
+    auto const invalidNegative = kvCacheManager.getPriorityByBlockId(-1, maxAttentionWindow);
     EXPECT_EQ(invalidNegative, KvCacheRetentionConfig::kDefaultRetentionPriority);
 
     // Test 3: Invalid block ID (out of range) should return default priority
-    auto const invalidOutOfRange = kvCacheManager.getPriorityByBlockId(9999);
+    auto const invalidOutOfRange = kvCacheManager.getPriorityByBlockId(9999, maxAttentionWindow);
     EXPECT_EQ(invalidOutOfRange, KvCacheRetentionConfig::kDefaultRetentionPriority);
 }
 

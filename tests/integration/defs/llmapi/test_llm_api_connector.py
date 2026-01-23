@@ -505,12 +505,15 @@ def test_connector_priorities(enforce_single_worker, model_with_connector):
     assert len(request.priorities) == len(request.new_block_ids)
 
     # First block should have priority 80, second block should have priority 10
-    assert request.priorities[0] == 80, f"Expected priority 80 for block 0, got {request.priorities[0]}"
-    assert request.priorities[1] == 10, f"Expected priority 10 for block 1, got {request.priorities[1]}"
+    assert request.priorities[
+        0] == 80, f"Expected priority 80 for block 0, got {request.priorities[0]}"
+    assert request.priorities[
+        1] == 10, f"Expected priority 10 for block 1, got {request.priorities[1]}"
 
 
 @pytest.mark.threadleak(enabled=False)
-def test_connector_priorities_default(enforce_single_worker, model_with_connector):
+def test_connector_priorities_default(enforce_single_worker,
+                                      model_with_connector):
     """Test that priorities are None when no retention config is provided."""
     model_fn, scheduler, worker = model_with_connector
 

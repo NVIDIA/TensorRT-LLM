@@ -867,16 +867,24 @@ class KVCacheManager(BaseResourceManager):
     def get_last_block_id(self, request_id: int) -> int:
         return self.impl.get_last_block_id(request_id)
 
-    def get_priority_by_block_id(self, block_id: int) -> int:
+    def get_priority_by_block_id(self,
+                                 block_id: int,
+                                 window_size: Optional[int] = None) -> int:
         """Get the retention priority of a block by its ID.
 
         Args:
             block_id: The ID of the block.
+            window_size: The attention window size this block belongs to.
+                         Required for VSWA configurations with multiple window sizes.
 
         Returns:
             The retention priority of the block (0-100), or default priority (35) if not found.
         """
-        return self.impl.get_priority_by_block_id(block_id)
+        if window_size is None:
+            if len(self.max_attention_window_vec) > 1:
+                raise ValueError("window_size must be provided for VSWA")
+            window_size = self.max_attention_window_vec[0]
+        return self.impl.get_priority_by_block_id(block_id, window_size)
 
     def get_batch_cache_indices(
         self,
