@@ -51,7 +51,6 @@ def createKubernetesPodConfig()
                 qosClass: Guaranteed
         """.stripIndent(),
     ]
-
     return podConfig
 }
 
@@ -75,8 +74,6 @@ def checkoutSource ()
 {
     def LLM_REPO = getLLMRepo()
     sh "git config --global --add safe.directory ${env.WORKSPACE}"
-    sh "git config --global user.email \"90828364+tensorrt-cicd@users.noreply.github.com\""
-    sh "git config --global user.name \"TensorRT LLM\""
     trtllm_utils.checkoutSource(LLM_REPO, params.branchName, env.WORKSPACE, false, true)
 }
 
@@ -102,6 +99,9 @@ def generateLockFiles(llmRepo, branchName)
         sh "python3 --version"
         sh "curl -sSL https://install.python-poetry.org | python3 -"
         sh "/root/.local/bin/poetry -h"
+        sh "git config --global --add safe.directory ${env.WORKSPACE}"
+        sh "git config --global user.email \"90828364+tensorrt-cicd@users.noreply.github.com\""
+        sh "git config --global user.name \"TensorRT LLM\""
         sh "export PATH=\"/root/.local/bin:\$PATH\" && python3 scripts/generate_lock_file.py"
         def count = sh(script: "git status --porcelain security_scanning/ | wc -l", returnStdout: true).trim()
         echo "Changed/untracked file count: ${count}"
