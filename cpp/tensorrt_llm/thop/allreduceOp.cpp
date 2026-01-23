@@ -281,7 +281,7 @@ public:
     std::vector<torch::Tensor> run(torch::Tensor const& input, torch::optional<torch::Tensor> const& residual,
         torch::optional<torch::Tensor> const& norm_weight, torch::optional<torch::Tensor> const& scale,
         torch::optional<torch::Tensor> const& bias, bool trigger_completion_at_end,
-        torch::optional<torch::Tensor> workspace) noexcept
+        torch::optional<torch::Tensor> workspace)
     {
         size_t size = input.numel();
         size_t seq_len = input.size(0);
@@ -564,7 +564,7 @@ private:
 
     std::vector<torch::Tensor> runLowPrecisionAllReduce(torch::Tensor const& input,
         torch::optional<torch::Tensor> const& residual, torch::optional<torch::Tensor> const& norm_weight,
-        torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias) noexcept
+        torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias)
     {
 #ifdef ENABLE_FP8
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
@@ -632,8 +632,7 @@ private:
     std::vector<torch::Tensor> runFusionAllReduce(torch::Tensor const& input,
         torch::optional<torch::Tensor> const& residual, torch::optional<torch::Tensor> const& norm_weight,
         torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias,
-        bool trigger_completion_at_end, torch::optional<torch::Tensor> workspace,
-        AllReduceStrategyType strategy) noexcept
+        bool trigger_completion_at_end, torch::optional<torch::Tensor> workspace, AllReduceStrategyType strategy)
     {
         // Should handle only Lamport implementation
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
@@ -1206,7 +1205,7 @@ private:
 
         if (ifFallbackToNCCL(seq_len, message_size_bytes, max_workspace_size))
         {
-            return AllReduceStrategyType::NCCL_SYMMETRIC;
+            return AllReduceStrategyType::NCCL;
         }
 
         // This rule based heuristic only chooses between NCCL_SYMMETRIC and MIN_LATENCY strategies.
@@ -1232,7 +1231,8 @@ private:
 
     bool ifFallbackToNCCL(size_t seq_len, size_t message_size_bytes, size_t max_workspace_size)
     {
-        // If messageSize is greater than maxWorkspaceSize or topology is unsuitable, use NCCL_SYMMETRIC fallback.
+        // If messageSize is greater than maxWorkspaceSize or topology is unsuitable, use NCCL fallback.
+        // TODO: Use NCCL_SYMMETRIC once the memory allocation issue is resolved.
         if (message_size_bytes > max_workspace_size || !mIsP2PSupported || !mIsNVLINKSupported)
         {
             return true;
