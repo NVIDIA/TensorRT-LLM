@@ -373,6 +373,13 @@ def is_any_moe_op(node: Node) -> bool:
     )
 
 
+def is_residual_add(node: Node) -> bool:
+    if is_op(node, torch.ops.aten.add):
+        if len(list(filtered_nodes(node.args, is_any_lin_op))) == 1:
+            return True
+    return False
+
+
 def is_any_ssm_op(node: Node) -> bool:
     return is_op(
         node,
@@ -515,7 +522,7 @@ def identify_regions_between_residuals(gm: GraphModule) -> List[Node]:
     return boundary_nodes
 
 
-def get_all_layer_subgraphs(gm: GraphModule) -> List[List[Node]]:
+def get_all_layer_subgraphs(gm: GraphModule) -> tuple[List[LayerSubgraph], set[Node]]:
     """
     Get subgraphs corresponding to all consecutive layers (attention, MLP, SSM, MoE) in the graph.
 
@@ -875,12 +882,14 @@ def get_layer_after_linear_node(
                 (is_any_lin_op(node) and get_weight_shape(node, dim=dim) == embd)
                 or is_any_moe_op(node)
                 or is_op(node, ops=[torch.ops.aten.sym_size, torch.ops.aten.bmm])
+                or is_residual_add(node)
             )
         else:
             return (
                 is_any_lin_op(node)
                 or is_any_moe_op(node)
                 or is_op(node, ops=[torch.ops.aten.sym_size, torch.ops.aten.bmm])
+                or is_residual_add(node)
             )
 
     def filter_condition(node: Node, embd: Optional[int] = None, dim: Optional[int] = None) -> bool:
