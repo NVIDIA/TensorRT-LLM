@@ -50,7 +50,7 @@ from ..speculative import (SpecMetadata, get_num_extra_kv_tokens,
 from ..speculative.drafting_loops import BaseDraftingLoopWrapper
 from ..speculative.eagle3 import (Eagle3OneModelSpecMetadata,
                                   Eagle3ResourceManager, Eagle3SpecMetadata)
-from ..speculative.mtp import SampleStateTensorsMTP
+from ..speculative.mtp import SampleStateTensorsMTP, MTPSpecMetadata
 from ..speculative.utils import SpecDecodingTensor
 from ..utils import (get_model_extra_attrs,
                      set_per_request_piecewise_cuda_graph_flag,
@@ -2727,7 +2727,7 @@ class PyTorchModelEngine(ModelEngine):
                 num_accepted_draft_tokens)]
             if isinstance(spec_metadata, Eagle3SpecMetadata):
                 spec_metadata.request_accepted_path = request_accepted_path
-            if isinstance(spec_metadata, Eagle3OneModelSpecMetadata):
+            if isinstance(spec_metadata, (MTPSpecMetadata, Eagle3OneModelSpecMetadata)):
                 spec_metadata.populate_sampling_params_for_one_model(
                     scheduled_requests.all_requests())
             spec_metadata.prepare()
