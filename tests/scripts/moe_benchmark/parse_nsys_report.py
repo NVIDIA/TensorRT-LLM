@@ -206,9 +206,8 @@ def parse_nsys_report(sqlite_path: str, nvtx_range_name: str = "benchmark", verb
         conn.close()
         return
 
-    # Aggregate kernel times
-    kernel_times = defaultdict(lambda: {"count": 0, "total_ns": 0})
-
+    # First pass: collect all kernel instances with their durations, ordered by start time
+    kernel_instances = []
     for row in kernel_rows:
         name_id = row[kernel_col_indices[kernel_name_col]]
         name = string_lookup.get(name_id, name_id) if isinstance(name_id, int) else name_id
@@ -221,8 +220,47 @@ def parse_nsys_report(sqlite_path: str, nvtx_range_name: str = "benchmark", verb
             duration = row[kernel_col_indices[kernel_end_col]] - start
 
         if duration:
-            kernel_times[name]["count"] += 1
-            kernel_times[name]["total_ns"] += duration
+            kernel_instances.append({"name": name, "start": start, "duration": duration})
+
+    # Sort by start time
+    kernel_instances.sort(key=lambda x: x["start"])
+
+    # Count occurrences for each kernel name
+    name_counts = defaultdict(int)
+    for k in kernel_instances:
+        name_counts[k["name"]] += 1
+
+    # Find iteration count using GCD of all counts
+    all_counts = list(name_counts.values())
+    if all_counts:
+        from functools import reduce
+        from math import gcd
+
+        iteration_count = reduce(gcd, all_counts)
+    else:
+        iteration_count = 1
+
+    # Track occurrence index for each kernel name
+    name_occurrence = defaultdict(int)
+    kernel_times = defaultdict(lambda: {"count": 0, "total_ns": 0})
+
+    for k in kernel_instances:
+        name = k["name"]
+        duration = k["duration"]
+
+        # Check if this kernel appears multiple times per iteration
+        calls_per_iter = name_counts[name] // iteration_count if iteration_count > 0 else 1
+
+        if calls_per_iter > 1:
+            # Add suffix based on position within iteration
+            suffix_idx = name_occurrence[name] % calls_per_iter
+            display_name = f"{name}_{suffix_idx}"
+        else:
+            display_name = name
+
+        name_occurrence[name] += 1
+        kernel_times[display_name]["count"] += 1
+        kernel_times[display_name]["total_ns"] += duration
 
     # Print results
     total_kernel_time_ns = 0

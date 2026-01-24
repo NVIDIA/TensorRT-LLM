@@ -8,6 +8,7 @@
 #   ./run_benchmark.sh                    # Run all backends
 #   ./run_benchmark.sh --backend CUTLASS  # Run specific backend
 #   ./run_benchmark.sh --profile          # Enable nsys profiling
+#   ./run_benchmark.sh --sweep-seq-len    # Sweep seq_len: 1,2,4,8,16,32,48,64,...,512
 
 set -e
 
@@ -26,6 +27,7 @@ WARMUP=10
 ENABLE_CUDAGRAPH=true
 PROFILE=false
 OUTPUT_DIR="results"
+SWEEP_SEQ_LEN=false
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -70,6 +72,10 @@ while [[ $# -gt 0 ]]; do
             PROFILE=true
             shift
             ;;
+        --sweep-seq-len)
+            SWEEP_SEQ_LEN=true
+            shift
+            ;;
         --output-dir)
             OUTPUT_DIR=$2
             shift 2
@@ -88,6 +94,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --warmup N              Warmup iterations (default: 10)"
             echo "  --no-cudagraph          Disable CUDA Graph"
             echo "  --profile               Enable nsys profiling"
+            echo "  --sweep-seq-len         Sweep seq_len: 1,2,4,8,16,32,48,64,...,512"
             echo "  --output-dir DIR        Output directory for results (default: results)"
             echo "  -h, --help              Show this help message"
             exit 0
@@ -102,9 +109,24 @@ done
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
 
-# Build common arguments
-COMMON_ARGS="--seq_len $SEQ_LEN"
-COMMON_ARGS+=" --hidden_size $HIDDEN_SIZE"
+# Generate seq_len list for sweep mode
+# 1, 2, 4, 8, 16, 32, then 48, 64, 80, ..., 512 (step 16)
+generate_seq_lens() {
+    local seq_lens=(1 2 4 8 16 32)
+    for ((i=48; i<=512; i+=16)); do
+        seq_lens+=($i)
+    done
+    echo "${seq_lens[@]}"
+}
+
+if [ "$SWEEP_SEQ_LEN" = true ]; then
+    SEQ_LENS=($(generate_seq_lens))
+else
+    SEQ_LENS=($SEQ_LEN)
+fi
+
+# Build common arguments (without seq_len)
+COMMON_ARGS="--hidden_size $HIDDEN_SIZE"
 COMMON_ARGS+=" --intermediate_size $INTERMEDIATE_SIZE"
 COMMON_ARGS+=" --num_experts $NUM_EXPERTS"
 COMMON_ARGS+=" --top_k $TOP_K"
@@ -119,7 +141,12 @@ echo "============================================================"
 echo "NVFP4 MoE Benchmark"
 echo "============================================================"
 echo "Backends: ${BACKENDS[*]}"
-echo "Seq len: $SEQ_LEN, Hidden: $HIDDEN_SIZE, Intermediate: $INTERMEDIATE_SIZE"
+if [ "$SWEEP_SEQ_LEN" = true ]; then
+    echo "Seq len sweep: ${SEQ_LENS[*]}"
+else
+    echo "Seq len: $SEQ_LEN"
+fi
+echo "Hidden: $HIDDEN_SIZE, Intermediate: $INTERMEDIATE_SIZE"
 echo "Experts: $NUM_EXPERTS, Top-K: $TOP_K"
 echo "Iterations: $ITERATIONS, Warmup: $WARMUP"
 echo "CUDA Graph: $ENABLE_CUDAGRAPH"
@@ -128,36 +155,38 @@ echo "Output dir: $OUTPUT_DIR"
 echo "============================================================"
 echo ""
 
-# Run benchmark for each backend
+# Run benchmark for each backend and seq_len
 for BACKEND in "${BACKENDS[@]}"; do
-    echo "------------------------------------------------------------"
-    echo "Running benchmark: $BACKEND"
-    echo "------------------------------------------------------------"
+    for CUR_SEQ_LEN in "${SEQ_LENS[@]}"; do
+        echo "------------------------------------------------------------"
+        echo "Running benchmark: $BACKEND, seq_len=$CUR_SEQ_LEN"
+        echo "------------------------------------------------------------"
 
-    REPORT_NAME="${OUTPUT_DIR}/${BACKEND}_seq${SEQ_LEN}"
+        REPORT_NAME="${OUTPUT_DIR}/${BACKEND}_seq${CUR_SEQ_LEN}"
 
-    if [ "$PROFILE" = true ]; then
-        # Run with nsys profiling
-        # Use --cuda-graph-trace=node to trace CUDA Graph node executions
-        nsys profile -t cuda,nvtx -o "$REPORT_NAME" \
-            --force-overwrite true --export=sqlite \
-            --cuda-graph-trace=node \
-            python bench_nvfp4_moe.py --moe_backend "$BACKEND" $COMMON_ARGS \
-            2>&1 | tee "${REPORT_NAME}.log"
+        if [ "$PROFILE" = true ]; then
+            # Run with nsys profiling
+            # Use --cuda-graph-trace=node to trace CUDA Graph node executions
+            nsys profile -t cuda,nvtx -o "$REPORT_NAME" \
+                --force-overwrite true --export=sqlite \
+                --cuda-graph-trace=node \
+                python bench_nvfp4_moe.py --moe_backend "$BACKEND" --seq_len "$CUR_SEQ_LEN" $COMMON_ARGS \
+                2>&1 | tee "${REPORT_NAME}.log"
 
-        # Parse the report
-        if [ -f "${REPORT_NAME}.sqlite" ]; then
-            echo ""
-            echo "Parsing nsys report..."
-            python parse_nsys_report.py "${REPORT_NAME}.sqlite" | tee -a "${REPORT_NAME}.log"
+            # Parse the report
+            if [ -f "${REPORT_NAME}.sqlite" ]; then
+                echo ""
+                echo "Parsing nsys report..."
+                python parse_nsys_report.py "${REPORT_NAME}.sqlite" | tee -a "${REPORT_NAME}.log"
+            fi
+        else
+            # Run without profiling
+            python bench_nvfp4_moe.py --moe_backend "$BACKEND" --seq_len "$CUR_SEQ_LEN" $COMMON_ARGS \
+                2>&1 | tee "${REPORT_NAME}.log"
         fi
-    else
-        # Run without profiling
-        python bench_nvfp4_moe.py --moe_backend "$BACKEND" $COMMON_ARGS \
-            2>&1 | tee "${REPORT_NAME}.log"
-    fi
 
-    echo ""
+        echo ""
+    done
 done
 
 echo "============================================================"
