@@ -7,6 +7,7 @@ from _torch_test_utils import fp4_compatible, fp8_compatible, trtllm_ops_availab
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import fp4_global_scale
 from tensorrt_llm._torch.modules.fused_moe import MoE  # noqa: F401
+from tensorrt_llm._torch.utils import ActivationType
 
 
 def setup_moe_test(dtype, num_experts):
@@ -313,3 +314,106 @@ def test_fp4_moe_op_run(dtype):
     rtol, atol = 1.5, 1.0
     torch.testing.assert_close(output_torch_fp4_moe, output_torch_moe, rtol=rtol, atol=atol)
     torch.testing.assert_close(output_torch_fp4_moe, ref_output, rtol=rtol, atol=atol)
+
+
+def reference_gptoss_moe(
+    x, selected_experts, routing_weights, w1, w2, w3, w1_bias, w2_bias, w3_bias
+):
+    """
+    Reference implementation of GPT-OSS style MoE with SwigluBias activation.
+
+    SwigluBias: (up + 1) * (gate * sigmoid(alpha * gate)) with clamping
+    - alpha = 1.702
+    - limit = 7.0
+    """
+    alpha, limit = 1.702, 7.0
+    num_experts = len(w1)
+    output = torch.zeros_like(x)
+
+    for expert_id in range(num_experts):
+        batch_idx, nth_expert = torch.where(selected_experts == expert_id)
+        if len(batch_idx) == 0:
+            continue
+
+        expert_inputs = x[batch_idx]
+        gate = F.linear(expert_inputs, w1[expert_id], w1_bias[expert_id])
+        up = F.linear(expert_inputs, w3[expert_id], w3_bias[expert_id])
+        gate = gate.clamp(max=limit)
+        up = up.clamp(min=-limit, max=limit)
+        glu = gate * torch.sigmoid(alpha * gate)
+        hidden = (up + 1.0) * glu
+        out = F.linear(hidden, w2[expert_id], w2_bias[expert_id])
+
+        output.index_add_(0, batch_idx, routing_weights[batch_idx, nth_expert, None] * out)
+
+    return output
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("num_experts", [2, 4])
+def test_gptoss_style_moe(dtype, num_experts):
+    """
+    Test torch_moe with GPT-OSS style SwigluBias activation and biases.
+
+    This verifies that torch_moe can represent GPT-OSS MoE behavior using:
+    - act_fn=SwigluBias (alpha=1.702, limit=7.0, (up+1) offset)
+    - Soft routing over all experts
+    - Biases on all projections
+    """
+    seq_len = 8
+    hidden_size = 64
+    intermediate_size = 32
+
+    torch.manual_seed(1234)
+    torch.cuda.manual_seed(1234)
+
+    x = torch.rand(seq_len, hidden_size, dtype=dtype).cuda() * 0.1
+
+    router_logits = torch.randn(seq_len, num_experts, dtype=torch.float32).cuda()
+    routing_weights = F.softmax(router_logits, dim=1).to(dtype)
+
+    selected_experts = torch.arange(num_experts, device="cuda").unsqueeze(0).expand(seq_len, -1)
+
+    w1_weight, w2_weight, w3_weight = [], [], []
+    w1_bias, w2_bias, w3_bias = [], [], []
+    for _ in range(num_experts):
+        w1_weight.append(torch.rand(intermediate_size, hidden_size, dtype=dtype).cuda() * 0.1)
+        w2_weight.append(torch.rand(hidden_size, intermediate_size, dtype=dtype).cuda() * 0.1)
+        w3_weight.append(torch.rand(intermediate_size, hidden_size, dtype=dtype).cuda() * 0.1)
+        w1_bias.append(torch.rand(intermediate_size, dtype=dtype).cuda() * 0.01)
+        w2_bias.append(torch.rand(hidden_size, dtype=dtype).cuda() * 0.01)
+        w3_bias.append(torch.rand(intermediate_size, dtype=dtype).cuda() * 0.01)
+
+    w1_bias_stacked = torch.stack(w1_bias, dim=0)
+    w2_bias_stacked = torch.stack(w2_bias, dim=0)
+    w3_bias_stacked = torch.stack(w3_bias, dim=0)
+
+    with torch.inference_mode():
+        output = torch.ops.auto_deploy.torch_moe(
+            x,
+            selected_experts,
+            routing_weights,
+            w1_weight,
+            w2_weight,
+            w3_weight,
+            is_gated_mlp=True,
+            act_fn=int(ActivationType.SwigluBias),
+            w1_bias_stacked=w1_bias_stacked,
+            w2_bias_stacked=w2_bias_stacked,
+            w3_bias_stacked=w3_bias_stacked,
+        )
+
+    ref_output = reference_gptoss_moe(
+        x,
+        selected_experts,
+        routing_weights,
+        w1_weight,
+        w2_weight,
+        w3_weight,
+        w1_bias,
+        w2_bias,
+        w3_bias,
+    )
+
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, ref_output, rtol=1e-5, atol=1e-5)

@@ -1,4 +1,4 @@
-from typing import Callable, List
+from typing import Callable, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -6,24 +6,44 @@ import torch.nn.functional as F
 from tensorrt_llm._torch.utils import ActivationType
 
 
-def _resolve_torch_fn(act_fn: ActivationType) -> Callable[[torch.Tensor], torch.Tensor]:
+def _resolve_act_fn(act_fn: ActivationType, is_gated: bool = False):
     """
-    Returns an elementwise activation callable matching the given activation function.
-    Supported: ActivationType.Silu, ActivationType.Swiglu, ActivationType.Relu2
+    Returns an activation callable matching the given activation function.
+
+    Args:
+        act_fn: Activation type (Silu, Swiglu, Relu2, SwigluBias)
+        is_gated: If True, returns (gate, up) -> output for gated MLP.
+                  If False, returns (x) -> output for simple MLP.
+
+    Supported activations:
+        - Silu/Swiglu: silu(x) or silu(gate) * up
+        - Relu2: relu(x)^2 or relu(gate)^2
+        - SwigluBias: (up + 1) * (gate * sigmoid(1.702 * gate)) with clamping [GPT-OSS, gated only]
     """
-    assert act_fn in [ActivationType.Silu, ActivationType.Swiglu, ActivationType.Relu2], (
-        f"Unsupported activation '{ActivationType(act_fn).name}'. Use 'silu', 'swiglu' or 'relu2'."
-    )
-    torch_fn = None
     if act_fn == ActivationType.Silu or act_fn == ActivationType.Swiglu:
-        torch_fn = F.silu
+        return (lambda gate, up: F.silu(gate) * up) if is_gated else F.silu
+
     elif act_fn == ActivationType.Relu2:
+        return (
+            (lambda gate, up: torch.square(F.relu(gate)))
+            if is_gated
+            else (lambda x: torch.square(F.relu(x)))
+        )
 
-        def relu2(x: torch.Tensor) -> torch.Tensor:
-            return torch.square(F.relu(x))
+    elif act_fn == ActivationType.SwigluBias:
+        if not is_gated:
+            return F.silu  # Fallback for ungated case
+        # GPT-OSS style with fixed parameters
+        alpha, limit = 1.702, 7.0
 
-        torch_fn = relu2
-    return torch_fn
+        def swiglu_bias(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+            gate = gate.clamp(max=limit)
+            up = up.clamp(min=-limit, max=limit)
+            return (up + 1.0) * (gate * torch.sigmoid(alpha * gate))
+
+        return swiglu_bias
+
+    raise ValueError(f"Unsupported activation: {act_fn}")
 
 
 def _template_moe(
@@ -97,52 +117,83 @@ def torch_moe(
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
     apply_routing_on_input: bool = False,
+    w1_bias_stacked: Optional[torch.Tensor] = None,
+    w2_bias_stacked: Optional[torch.Tensor] = None,
+    w3_bias_stacked: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Unified Mixture-of-Experts (MoE) operator that uses a Mixtral-style dispatch
     (token routing + index_add_ accumulation) and a selectable per-expert MLP.
 
+    MLP Styles:
+        - is_gated_mlp=True (default, Mixtral/LLaMA style):
+            output = down_proj(act_fn(gate_proj(x), up_proj(x)))
+                   = W2 @ act_fn(W1 @ x, W3 @ x)
+
+        - is_gated_mlp=False (simple 2-layer MLP):
+            output = down_proj(act_fn(up_proj(x)))
+                   = W2 @ act_fn(W1 @ x)
+            Note: w3_weight is ignored in this mode.
+
     Parameters:
         x (torch.Tensor): Input tensor of shape (B, H) or (B, S, H), where B is the batch size,
             S is the sequence length, and H is the hidden size.
         selected_experts (torch.Tensor): A tensor of shape (B, TOP_K) or (B*S, TOP_K) containing the indices
-            of the selected experts for each token. Only experts within range [0,num_experts) is processed
+            of the selected experts for each token. Only experts within range [0,num_experts) is processed.
         routing_weights (torch.Tensor): A tensor of shape (B, TOP_K) or (B*S, TOP_K) containing the normalized
             routing weights for the selected experts.
-        w1_weight: List of per-expert weight tensors of up projection.
-        w2_weight: List of per-expert weight tensors of down projection.
-        w3_weight: List of per-expert weight tensors of gate projection.
-        is_gated_mlp: If True, use a gated MLP. If False, use a simple MLP.
+        w1_weight: List of per-expert weight tensors.
+            - If is_gated_mlp=True: gate projection (I, H), i.e., gate_proj.weight
+            - If is_gated_mlp=False: up projection (I, H), i.e., up_proj.weight
+        w2_weight: List of per-expert weight tensors of down projection (H, I), i.e., down_proj.weight
+        w3_weight: List of per-expert weight tensors of up projection (I, H), i.e., up_proj.weight
+            Only used when is_gated_mlp=True. Can be empty list [] when is_gated_mlp=False.
+        is_gated_mlp: If True, use gated MLP: act_fn(gate, up). If False, use simple MLP: act_fn(x).
         act_fn: Activation function applied inside the expert MLP.
-            Supported: ActivationType.Silu (default), ActivationType.Relu2 (ReLU then square).
-        apply_routing_on_input: If True, multiply routing weights with INPUT before MLP
-                                This means: silu(input * routing_weight)
-                                If False, multiply routing weights with OUTPUT after MLP
-                                This means: silu(input) * routing_weight
+            Supported: ActivationType.Silu (default), ActivationType.Swiglu, ActivationType.Relu2,
+                       ActivationType.SwigluBias (GPT-OSS style with alpha=1.702, limit=7.0).
+        apply_routing_on_input: If True, multiply routing weights with INPUT before MLP.
+                                If False, multiply routing weights with OUTPUT after MLP.
+        w1_bias_stacked: Optional stacked bias tensor (E, I).
+            - If is_gated_mlp=True: bias for gate projection
+            - If is_gated_mlp=False: bias for up projection
+        w2_bias_stacked: Optional stacked bias tensor for down projection (E, H).
+        w3_bias_stacked: Optional stacked bias tensor for up projection (E, I).
+            Only used when is_gated_mlp=True.
+
     Returns:
         torch.Tensor: Output tensor with the same shape as the input x.
     """
-    torch_act_fn = _resolve_torch_fn(act_fn)
+    act_fn_resolved = _resolve_act_fn(act_fn, is_gated=is_gated_mlp)
 
     mlps = []
     if is_gated_mlp:
-        # Standard per-expert list format with gated MLP
+
         def make_mlp(i: int):
-            W1 = w1_weight[i]  # (I, H)
-            W2 = w2_weight[i]  # (H, I)
-            W3 = w3_weight[i]  # (I, H)
+            W1 = w1_weight[i]  # (I, H) - gate
+            W2 = w2_weight[i]  # (H, I) - down
+            W3 = w3_weight[i]  # (I, H) - up
+            b1 = w1_bias_stacked[i] if w1_bias_stacked is not None else None
+            b2 = w2_bias_stacked[i] if w2_bias_stacked is not None else None
+            b3 = w3_bias_stacked[i] if w3_bias_stacked is not None else None
             return lambda inp: F.linear(
-                torch_act_fn(F.linear(inp.to(W1.dtype), W1)) * F.linear(inp.to(W3.dtype), W3), W2
+                act_fn_resolved(
+                    F.linear(inp.to(W1.dtype), W1, b1), F.linear(inp.to(W3.dtype), W3, b3)
+                ),
+                W2,
+                b2,
             )
 
         mlps = [make_mlp(i) for i in range(len(w1_weight))]
 
     else:
-        # Standard per-expert list format with simple MLP
+
         def make_mlp(i: int):
             W_up = w1_weight[i]  # (I, H)
             W_down = w2_weight[i]  # (H, I)
-            return lambda inp: F.linear(torch_act_fn(F.linear(inp, W_up)), W_down)
+            b_up = w1_bias_stacked[i] if w1_bias_stacked is not None else None
+            b_down = w2_bias_stacked[i] if w2_bias_stacked is not None else None
+            return lambda inp: F.linear(act_fn_resolved(F.linear(inp, W_up, b_up)), W_down, b_down)
 
         mlps = [make_mlp(i) for i in range(len(w1_weight))]
 
@@ -160,6 +211,9 @@ def torch_moe_fake(
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
     apply_routing_on_input: bool = False,
+    w1_bias_stacked: Optional[torch.Tensor] = None,
+    w2_bias_stacked: Optional[torch.Tensor] = None,
+    w3_bias_stacked: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -279,7 +333,7 @@ def torch_quant_fp8_moe(
             Supported: ActivationType.Silu (default), ActivationType.Relu2 (ReLU then square).
     """
 
-    torch_act_fn = _resolve_torch_fn(act_fn)
+    act_fn_resolved = _resolve_act_fn(act_fn, is_gated=is_gated_mlp)
 
     if is_gated_mlp:
 
@@ -299,7 +353,7 @@ def torch_quant_fp8_moe(
                     input_scale=w3_input_scale[i],
                     weight_scale=w3_weight_scale[i],
                 )
-                prod = torch_act_fn(gate_out) * up_out
+                prod = act_fn_resolved(gate_out, up_out)
                 return torch.ops.auto_deploy.torch_quant_fp8_linear(
                     prod,
                     w2_weight[i],
@@ -324,7 +378,7 @@ def torch_quant_fp8_moe(
                     weight_scale=w1_weight_scale[i],
                 )
                 return torch.ops.auto_deploy.torch_quant_fp8_linear(
-                    torch_act_fn(up_out),
+                    act_fn_resolved(up_out),
                     w2_weight[i],
                     bias=None,
                     input_scale=w2_input_scale[i],
@@ -414,7 +468,7 @@ def torch_quant_nvfp4_moe(
             Supported: ActivationType.Silu (default), ActivationType.Relu2 (ReLU then square).
     """
 
-    torch_act_fn = _resolve_torch_fn(act_fn)
+    act_fn_resolved = _resolve_act_fn(act_fn, is_gated=is_gated_mlp)
 
     if is_gated_mlp:
 
@@ -438,7 +492,7 @@ def torch_quant_nvfp4_moe(
                     weight_scale=w3_weight_scale[i],
                     alpha=w3_alpha[i],
                 )
-                prod = torch_act_fn(gate_out) * up_out
+                prod = act_fn_resolved(gate_out, up_out)
                 return torch.ops.auto_deploy.torch_quant_nvfp4_linear(
                     prod,
                     w2_weight[i],
@@ -467,7 +521,7 @@ def torch_quant_nvfp4_moe(
                     alpha=w1_alpha[i],
                 )
                 return torch.ops.auto_deploy.torch_quant_nvfp4_linear(
-                    torch_act_fn(up_out),
+                    act_fn_resolved(up_out),
                     w2_weight[i],
                     bias=None,
                     input_scale=w2_input_scale[i],
