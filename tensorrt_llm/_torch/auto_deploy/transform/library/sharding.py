@@ -1306,9 +1306,6 @@ def _shard_parameter_node(
     weight_nodes = extract_weight_nodes(node)
 
     for weight_node in weight_nodes.weights:
-        ad_logger.info(
-            f"Sharding weight node {weight_node.node_key} with shape {weight_node.tensor.shape}"
-        )
         _, weight_new_shape = shard_weight_tensor(
             gm=gm,
             weight_tensor=weight_node.tensor,
@@ -1332,9 +1329,6 @@ def _shard_parameter_node(
             )
 
     for bias_node in weight_nodes.biases:
-        ad_logger.info(
-            f"Sharding bias node {bias_node.node_key} with shape {bias_node.tensor.shape}"
-        )
         if dim == 0:
             # update bias for dim 0 --> we can handle it like the weight
             shard_weight_tensor(
