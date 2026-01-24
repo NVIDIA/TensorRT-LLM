@@ -185,6 +185,7 @@ l0_a10:
   - unittest/trt/attention/test_gpt_attention_IFB.py
   - unittest/trt/attention/test_gpt_attention_no_cache.py
   - examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-enable_attention_plugin-disable_weight_only-float16-nb:1-use_cpp_runtime]
+  - unittest/kv_cache_manager_v2_tests/ # 4 min
 - condition:
     ranges:
       system_gpu_count:
