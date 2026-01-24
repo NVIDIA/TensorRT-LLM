@@ -54,7 +54,7 @@ from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
 from .model_engine import ModelEngine
 from .resource_manager import ResourceManager
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
-                      SampleStateTensors)
+                      SampleStateTensors, TRTLLMSampler)
 from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput)
 
@@ -104,7 +104,7 @@ class BatchState:
 
     iter_start_time: float = 0
     iter_stats: IterationStats = None
-    ctx_transmission_reqs: list[LlmRequest] = None
+    all_requests: list[LlmRequest] = None
 
 
 @dataclasses.dataclass
@@ -371,9 +371,19 @@ class PyExecutor:
         self.send_schedule_handler = None
         self.pp_scheduler_max_retry_count = int(
             os.environ.get("TLLM_PP_SCHEDULER_MAX_RETRY_COUNT", 10))
+        self.pp_multi_stream_sample = os.environ.get(
+            "TRTLLM_PP_MULTI_STREAM_SAMPLE", "1") == "1"
         self.sample_stream = torch.cuda.Stream()
         self.start_sample_event = torch.cuda.Event()
         self.finish_sample_event = torch.cuda.Event()
+        if (self.dist.pp_size > 1 and self.pp_multi_stream_sample
+                and isinstance(self.sampler, TRTLLMSampler)):
+            # TRTLLM sampler uses default stream for store and algorithms.
+            # To enable multi-stream sampling, we need to re-initialize
+            # the sampler store and algorithms on the sample stream.
+            with torch.cuda.stream(self.sample_stream):
+                self.sampler._initialize_store()
+                self.sampler._instantiate_algorithms()
 
         # Set of request IDs that are currently in flight across all micro batches.
         # The scheduler will avoid scheduling requests that are already in flight.
@@ -1216,8 +1226,7 @@ class PyExecutor:
                                 guided_decoder_failed_requests = self.guided_decoder.execute(
                                     batch_outputs['logits'])
 
-                            if os.environ.get("TRTLLM_PP_MULTI_STREAM_SAMPLE",
-                                              "1") == "1":
+                            if self.pp_multi_stream_sample:
                                 # Wait for the previous sample to finish.
                                 self.finish_sample_event.wait()
                                 # Copy the batch outputs as sampler inputs
@@ -1805,6 +1814,7 @@ class PyExecutor:
 
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._update_requests(self.previous_batch.sample_state)
+                    self._send_kv_async(self.previous_batch.all_requests)
 
                 if self.drafter is not None and self.use_spec_decode and should_process_previous_batch:
                     # Cleanup previous draft resources used in the draft model
@@ -1832,9 +1842,6 @@ class PyExecutor:
 
                     self._update_request_states(scheduled_batch)
 
-                ctx_transmission_reqs = self._send_kv_async(
-                    scheduled_batch.all_requests())
-
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._process_previous_batch()
                 else:
@@ -1849,7 +1856,7 @@ class PyExecutor:
                         sample_state=sample_state,
                         iter_start_time=iter_start_time,
                         iter_stats=iter_stats,
-                        ctx_transmission_reqs=ctx_transmission_reqs)
+                        all_requests=scheduled_batch.all_requests())
                 elif not can_queue_this_rank:
                     # If the batch is empty on this rank, we need to clear the previous batch.
                     self.previous_batch = None
@@ -1952,10 +1959,6 @@ class PyExecutor:
         return result_tensors, num_accepted_tokens
 
     def _process_previous_batch(self):
-        if self.kv_cache_transceiver and self.previous_batch.ctx_transmission_reqs:
-            for req in self.previous_batch.ctx_transmission_reqs:
-                req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
-
         self._handle_canceled_requests()
         finished_requests = self._handle_responses()
         scheduled_requests = self.previous_batch.sample_state.scheduled_requests
