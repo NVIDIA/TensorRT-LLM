@@ -389,8 +389,7 @@ def torch_fake_quant_int4_gptq_linear(
     )
     weight = weight.reshape(weight.shape[0] * weight.shape[1], weight.shape[2])
 
-    # scales[g_idx] and zeros[g_idx] are per-group; cast to input dtype at the end
-    weights = scales[g_idx.long()] * (weight - zeros[g_idx.long()]).to(input.dtype)
+    weights = (scales[g_idx.long()] * (weight - zeros[g_idx.long()])).to(input.dtype)
 
     out = torch.matmul(x_2d, weights)
 

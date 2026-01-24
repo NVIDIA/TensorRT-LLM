@@ -5,6 +5,8 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: Qwen/Qwen2.5-0.5B-Instruct
   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
+- name: Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: Qwen/Qwen3-0.6B
   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 # DISABLED: TorchDynamo compilation error - fake tensor dispatch failure
