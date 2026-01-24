@@ -244,7 +244,7 @@ class PyExecutor:
                  max_num_sequences: int,
                  drafter: Optional[Drafter] = None,
                  disable_overlap_scheduler: bool = False,
-                 max_input_len: int = 0x3fffffff,
+                 max_input_len: int = 0x7fffffff,
                  max_batch_size: int = 8,
                  max_beam_width: int = 1,
                  max_draft_len: int = 0,
