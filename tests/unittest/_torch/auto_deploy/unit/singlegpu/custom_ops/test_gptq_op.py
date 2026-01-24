@@ -156,7 +156,13 @@ def test_gptq_vs_modelopt_qzeros_8_match(N, K, BLOCK_SIZE):
     input_zp_list, weight_zp_list = [torch.tensor(0)], [torch.tensor(0)]
 
     y_gptq = torch.ops.auto_deploy.torch_fake_quant_int4_gptq_linear(
-        x, qweight_gptq, qzeros, scales_gn
+        x,
+        qweight_gptq,
+        None,  # bias
+        [],  # input_scale
+        [scales_gn],  # weight_scale
+        [],  # input_zp
+        [qzeros],  # weight_zp
     )
     y_mo = torch.ops.auto_deploy.torch_fake_quant_int4_linear(
         x,
