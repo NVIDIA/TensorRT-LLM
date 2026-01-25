@@ -11,7 +11,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID, ExecutorRequestQueue, RequestQueueItem)
 from tensorrt_llm._torch.pyexecutor.request_utils import (
     balance_requests_across_ranks, get_from_waiting_queue,
-    merge_helix_requests, merge_requests)
+    merge_helix_requests, merge_requests, schedule_attention_dp_requests)
 from tensorrt_llm.bindings import executor as trtllm
 
 
@@ -517,60 +517,6 @@ def attention_dp_config():
     }
 
 
-def schedule_attention_dp_requests(new_requests, all_ranks_num_active_requests,
-                                   all_ranks_num_active_tokens, tp_size,
-                                   max_num_active_requests):
-    """
-    Helper function to test attention DP scheduling logic.
-    This mirrors the logic from PyExecutor._schedule_attention_dp_requests.
-    """
-    # Map from ranks to new requests
-    all_ranks_new_requests = {tp_rank: [] for tp_rank in range(tp_size)}
-
-    # Prioritize the requests that are not in relax mode
-    def get_relax_value(req_item):
-        scheduling_params = getattr(req_item.request, 'py_scheduling_params',
-                                    None)
-        if scheduling_params is None:
-            return True
-        return scheduling_params.attention_dp_relax
-
-    new_requests = sorted(new_requests, key=get_relax_value, reverse=True)
-
-    # Try to put the requests to the target dp rank until the max_num_active_requests is reached
-    remaining_unscheduled = []
-    for req_item in new_requests:
-        scheduled = False
-        scheduling_params = getattr(req_item.request, 'py_scheduling_params',
-                                    None)
-        if scheduling_params is not None:
-            target_dp_rank = scheduling_params.attention_dp_rank
-            if target_dp_rank is not None and all_ranks_num_active_requests[
-                    target_dp_rank] < max_num_active_requests:
-                all_ranks_num_active_requests[target_dp_rank] += 1
-                scheduled = True
-                all_ranks_new_requests[target_dp_rank].append(req_item)
-
-        if not scheduled:
-            remaining_unscheduled.append(req_item)
-
-    # Balance the remaining unscheduled requests across ranks
-    num_new_requests_all_ranks = len(remaining_unscheduled)
-    total_num_active_requests = sum(all_ranks_num_active_requests)
-    expected_num_active_requests = max(
-        (total_num_active_requests + num_new_requests_all_ranks + tp_size - 1)
-        // tp_size,
-        max(all_ranks_num_active_requests),
-    )
-
-    all_ranks_new_requests = balance_requests_across_ranks(
-        remaining_unscheduled, all_ranks_new_requests,
-        all_ranks_num_active_requests, all_ranks_num_active_tokens,
-        expected_num_active_requests)
-
-    return all_ranks_new_requests, expected_num_active_requests
-
-
 @pytest.fixture
 def all_ranks_num_active_requests():
     return [2, 1, 3, 0]  # 4 ranks
@@ -784,21 +730,24 @@ def test_schedule_attention_dp_requests_balance_requests_called(
                                                     attention_dp_relax=True))
 
     new_requests = [req1]
-    tp_size = attention_dp_config['tp_size']
-    max_num_active_requests = attention_dp_config['max_num_active_requests']
 
-    # Since schedule_attention_dp_requests is a local helper that uses the imported
-    # balance_requests_across_ranks, we test by verifying the output is consistent
-    # with what balance_requests_across_ranks would produce
-    all_ranks_new_requests, expected_num = schedule_attention_dp_requests(
-        new_requests, all_ranks_num_active_requests.copy(),
-        all_ranks_num_active_tokens.copy(), tp_size, max_num_active_requests)
+    with patch(
+            'tensorrt_llm._torch.pyexecutor.request_utils.balance_requests_across_ranks'
+    ) as mock_balance:
+        mock_balance.return_value = {0: [req1], 1: [], 2: [], 3: []}
 
-    # Verify that balance_requests_across_ranks was effectively called by checking results
-    # The request should be distributed to one of the ranks
-    total_assigned = sum(len(reqs) for reqs in all_ranks_new_requests.values())
-    assert total_assigned == 1  # One unscheduled request should be balanced
-    assert expected_num >= max(all_ranks_num_active_requests)
+        schedule_attention_dp_requests(
+            new_requests, all_ranks_num_active_requests,
+            all_ranks_num_active_tokens, attention_dp_config['tp_size'],
+            attention_dp_config['max_num_active_requests'])
+
+    # Check that balance_requests_across_ranks was called
+    mock_balance.assert_called_once()
+    call_args = mock_balance.call_args[0]
+    assert isinstance(call_args[0], list)
+    assert isinstance(call_args[1], dict)
+    assert call_args[2] == all_ranks_num_active_requests  # Third arg
+    assert call_args[3] == all_ranks_num_active_tokens  # Fourth arg
 
 
 def test_schedule_attention_dp_requests_no_scheduling_when_capacity_exceeded(

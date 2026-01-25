@@ -54,8 +54,8 @@ from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
                           LlmResponse, get_draft_token_length)
 from .model_engine import ModelEngine
 from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
-                            balance_requests_across_ranks,
-                            get_from_waiting_queue, merge_requests)
+                            get_from_waiting_queue, merge_requests,
+                            schedule_attention_dp_requests)
 from .resource_manager import ResourceManager
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors, TRTLLMSampler)
@@ -2205,54 +2205,11 @@ class PyExecutor:
         all_ranks_num_active_tokens: List[int]
     ) -> Dict[int, List[RequestQueueItem]]:
         """Schedule attention dp requests."""
-
-        # Map from ranks to new requests
-        all_ranks_new_requests = {
-            tp_rank: []
-            for tp_rank in range(self.dist.tp_size)
-        }
-
-        # Prioritize the requests that are not in relax mode
-        def get_relax_value(req_item):
-            scheduling_params = getattr(req_item.request,
-                                        'py_scheduling_params', None)
-            if scheduling_params is None:
-                return True
-            return scheduling_params.attention_dp_relax
-
-        new_requests = sorted(new_requests, key=get_relax_value, reverse=True)
-
-        # Try to put the requests to the target dp rank until the max_num_active_requests is reached
-        remaining_unscheduled = []
-        for req_item in new_requests:
-            scheduled = False
-            scheduling_params = getattr(req_item.request,
-                                        'py_scheduling_params', None)
-            if scheduling_params is not None:
-                target_dp_rank = scheduling_params.attention_dp_rank
-                if target_dp_rank is not None and all_ranks_num_active_requests[
-                        target_dp_rank] < self.max_num_active_requests:
-                    all_ranks_num_active_requests[target_dp_rank] += 1
-                    scheduled = True
-                    all_ranks_new_requests[target_dp_rank].append(req_item)
-
-            if not scheduled:
-                remaining_unscheduled.append(req_item)
-
-        # Balance the remaining unscheduled requests across ranks
-        num_new_requests_all_ranks = len(remaining_unscheduled)
-        total_num_active_requests = sum(all_ranks_num_active_requests)
-        self.expected_num_active_requests = max(
-            (total_num_active_requests + num_new_requests_all_ranks +
-             self.dist.tp_size - 1) // self.dist.tp_size,
-            max(all_ranks_num_active_requests),
-        )
-
-        all_ranks_new_requests = balance_requests_across_ranks(
-            remaining_unscheduled, all_ranks_new_requests,
-            all_ranks_num_active_requests, all_ranks_num_active_tokens,
-            self.expected_num_active_requests)
-
+        all_ranks_new_requests, self.expected_num_active_requests = \
+            schedule_attention_dp_requests(
+                new_requests, all_ranks_num_active_requests,
+                all_ranks_num_active_tokens, self.dist.tp_size,
+                self.max_num_active_requests)
         return all_ranks_new_requests
 
     def _handle_special_queue_items(

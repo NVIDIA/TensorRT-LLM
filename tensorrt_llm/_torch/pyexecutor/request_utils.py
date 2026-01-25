@@ -11,7 +11,7 @@ This module contains extracted utility functions that handle:
 import heapq
 import os
 from collections import deque, namedtuple
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -78,6 +78,78 @@ def attach_py_objects_to_requests(requests: List,
                 py_obj = req_obj_dict.get(item.id)
                 if py_obj is not None:
                     setattr(item.request, attr_name, py_obj)
+
+
+def schedule_attention_dp_requests(
+        new_requests: List[Any],
+        all_ranks_num_active_requests: List[int],
+        all_ranks_num_active_tokens: List[int],
+        tp_size: int,
+        max_num_active_requests: int
+) -> Tuple[Dict[int, List[Any]], int]:
+    """Schedule attention DP requests across ranks.
+
+    This function distributes requests across tensor parallel ranks for attention DP.
+    It first tries to assign requests to their target dp_rank (if specified and has capacity),
+    then balances the remaining requests across all ranks.
+
+    Args:
+        new_requests: List of RequestQueueItem to schedule.
+        all_ranks_num_active_requests: Number of active requests per rank (will be modified).
+        all_ranks_num_active_tokens: Number of active tokens per rank.
+        tp_size: Number of tensor parallel ranks.
+        max_num_active_requests: Maximum number of active requests per rank.
+
+    Returns:
+        Tuple of:
+            - all_ranks_new_requests: Dict mapping rank to list of assigned requests.
+            - expected_num_active_requests: Expected number of active requests per rank.
+    """
+    # Map from ranks to new requests
+    all_ranks_new_requests = {tp_rank: [] for tp_rank in range(tp_size)}
+
+    # Prioritize the requests that are not in relax mode
+    def get_relax_value(req_item):
+        scheduling_params = getattr(req_item.request, 'py_scheduling_params',
+                                    None)
+        if scheduling_params is None:
+            return True
+        return scheduling_params.attention_dp_relax
+
+    new_requests = sorted(new_requests, key=get_relax_value, reverse=True)
+
+    # Try to put the requests to the target dp rank until the max_num_active_requests is reached
+    remaining_unscheduled = []
+    for req_item in new_requests:
+        scheduled = False
+        scheduling_params = getattr(req_item.request, 'py_scheduling_params',
+                                    None)
+        if scheduling_params is not None:
+            target_dp_rank = scheduling_params.attention_dp_rank
+            if target_dp_rank is not None and all_ranks_num_active_requests[
+                    target_dp_rank] < max_num_active_requests:
+                all_ranks_num_active_requests[target_dp_rank] += 1
+                scheduled = True
+                all_ranks_new_requests[target_dp_rank].append(req_item)
+
+        if not scheduled:
+            remaining_unscheduled.append(req_item)
+
+    # Balance the remaining unscheduled requests across ranks
+    num_new_requests_all_ranks = len(remaining_unscheduled)
+    total_num_active_requests = sum(all_ranks_num_active_requests)
+    expected_num_active_requests = max(
+        (total_num_active_requests + num_new_requests_all_ranks + tp_size - 1)
+        // tp_size,
+        max(all_ranks_num_active_requests),
+    )
+
+    all_ranks_new_requests = balance_requests_across_ranks(
+        remaining_unscheduled, all_ranks_new_requests,
+        all_ranks_num_active_requests, all_ranks_num_active_tokens,
+        expected_num_active_requests)
+
+    return all_ranks_new_requests, expected_num_active_requests
 
 
 def balance_requests_across_ranks(
