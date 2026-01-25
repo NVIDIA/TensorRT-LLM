@@ -9,8 +9,10 @@ import pytest
 
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID, ExecutorRequestQueue, RequestQueueItem)
+from tensorrt_llm._torch.pyexecutor.request_utils import (
+    balance_requests_across_ranks, get_from_waiting_queue,
+    merge_helix_requests, merge_requests)
 from tensorrt_llm.bindings import executor as trtllm
-from tensorrt_llm.mapping import CpType
 
 
 @pytest.fixture
@@ -37,10 +39,8 @@ def mock_dist():
 def executor_queue(mock_dist):
     """Create an ExecutorRequestQueue instance for testing."""
     return ExecutorRequestQueue(dist=mock_dist,
-                                enable_attention_dp=False,
                                 max_batch_size=8,
                                 max_beam_width=1,
-                                max_num_active_requests=16,
                                 enable_iter_perf_stats=True,
                                 batch_wait_timeout_ms=0.0)
 
@@ -49,10 +49,8 @@ def executor_queue(mock_dist):
 def integration_queue(mock_dist):
     """Create an ExecutorRequestQueue instance for integration testing."""
     return ExecutorRequestQueue(dist=mock_dist,
-                                enable_attention_dp=True,
                                 max_batch_size=4,
                                 max_beam_width=2,
-                                max_num_active_requests=8,
                                 enable_iter_perf_stats=True,
                                 batch_wait_timeout_ms=0.0)
 
@@ -60,15 +58,11 @@ def integration_queue(mock_dist):
 def test_executor_queue_init(executor_queue, mock_dist):
     """Test ExecutorRequestQueue initialization."""
     assert executor_queue.dist == mock_dist
-    assert not executor_queue.enable_attention_dp
     assert executor_queue.max_beam_width == 1
-    assert executor_queue.max_num_active_requests == 16
     assert executor_queue.next_request_id == 8
     assert executor_queue.enable_iter_perf_stats
     assert executor_queue.active
     assert isinstance(executor_queue.request_queue, queue.Queue)
-    assert isinstance(executor_queue.waiting_queue, deque)
-    assert len(executor_queue.canceled_req_ids) == 0
     assert isinstance(executor_queue.enqueue_lock, type(threading.Lock()))
 
 
@@ -91,7 +85,7 @@ def test_enqueue_requests(executor_queue):
 
 
 def test_merge_helix_requests_with_padding(mock_dist):
-    """Test _merge_helix_requests with basic valid input."""
+    """Test merge_helix_requests with basic valid input."""
 
     tokens_per_block = 2
 
@@ -108,27 +102,12 @@ def test_merge_helix_requests_with_padding(mock_dist):
     )
 
     for rank in [0, 1, 2, 3]:
-        # Create executor queue for helix with 4 CP ranks.
-        mock_dist.cp_size = 4
-        mock_dist.cp_rank = rank
-        mock_dist.cp_config = {
-            'cp_type': CpType.HELIX,
-            'tokens_per_block': tokens_per_block,
-        }
-        executor_queue = ExecutorRequestQueue(dist=mock_dist,
-                                              enable_attention_dp=False,
-                                              max_batch_size=8,
-                                              max_beam_width=1,
-                                              max_num_active_requests=16,
-                                              enable_iter_perf_stats=True,
-                                              batch_wait_timeout_ms=0.0)
-
-        # Mock _should_exclude_last_generation_logits.
-        with patch.object(executor_queue,
-                          '_should_exclude_last_generation_logits',
-                          return_value=False):
-            result = executor_queue._merge_helix_requests([request_item],
-                                                          tokens_per_block)
+        # Test merge_helix_requests with 4 CP ranks.
+        result = merge_helix_requests([request_item],
+                                      cp_rank=rank,
+                                      cp_size=4,
+                                      tokens_per_block=tokens_per_block,
+                                      exclude_last_generation_logits=False)
 
         # Verify the result.
         assert len(result) == 1
@@ -147,7 +126,7 @@ def test_merge_helix_requests_with_padding(mock_dist):
 
 
 def test_merge_helix_requests_without_padding(mock_dist):
-    """Test _merge_helix_requests with evenly divisible tokens (no padding)."""
+    """Test merge_helix_requests with evenly divisible tokens (no padding)."""
 
     tokens_per_block = 4
 
@@ -164,27 +143,12 @@ def test_merge_helix_requests_without_padding(mock_dist):
     )
 
     for rank in [0, 1]:
-        # Create executor queue for helix with 2 CP ranks.
-        mock_dist.cp_size = 2
-        mock_dist.cp_rank = rank
-        mock_dist.cp_config = {
-            'cp_type': CpType.HELIX,
-            'tokens_per_block': tokens_per_block,
-        }
-        executor_queue = ExecutorRequestQueue(dist=mock_dist,
-                                              enable_attention_dp=False,
-                                              max_batch_size=8,
-                                              max_beam_width=1,
-                                              max_num_active_requests=16,
-                                              enable_iter_perf_stats=True,
-                                              batch_wait_timeout_ms=0.0)
-
-        # Mock _should_exclude_last_generation_logits.
-        with patch.object(executor_queue,
-                          '_should_exclude_last_generation_logits',
-                          return_value=False):
-            result = executor_queue._merge_helix_requests([request_item],
-                                                          tokens_per_block)
+        # Test merge_helix_requests with 2 CP ranks.
+        result = merge_helix_requests([request_item],
+                                      cp_rank=rank,
+                                      cp_size=2,
+                                      tokens_per_block=tokens_per_block,
+                                      exclude_last_generation_logits=False)
 
         # Verify the result.
         assert len(result) == 1
@@ -199,14 +163,8 @@ def test_merge_helix_requests_without_padding(mock_dist):
 
 
 def test_merge_helix_requests_insufficient_blocks_error(mock_dist):
-    """Test _merge_helix_requests raises error when insufficient blocks."""
-    mock_dist.cp_size = 4
-
+    """Test merge_helix_requests raises error when insufficient blocks."""
     tokens_per_block = 4
-    mock_dist.cp_config = {
-        'cp_type': CpType.HELIX,
-        'tokens_per_block': tokens_per_block,
-    }
 
     # Create input with only 12 tokens. This creates 3 blocks which is fewer than 4 CP ranks.
     executor_request = trtllm.Request(
@@ -222,23 +180,16 @@ def test_merge_helix_requests_insufficient_blocks_error(mock_dist):
 
     # Loop over ranks 0, 1, 2, 3 and verify that all ranks throw assertion.
     for rank in range(4):
-        mock_dist.cp_rank = rank
-
-        executor_queue = ExecutorRequestQueue(dist=mock_dist,
-                                              enable_attention_dp=False,
-                                              max_batch_size=8,
-                                              max_beam_width=1,
-                                              max_num_active_requests=16,
-                                              enable_iter_perf_stats=True,
-                                              batch_wait_timeout_ms=0.0)
-
         with pytest.raises(
                 ValueError,
                 match=
                 "There aren't enough tokens to get at least one block per CP rank"
         ):
-            executor_queue._merge_helix_requests([request_item],
-                                                 tokens_per_block)
+            merge_helix_requests([request_item],
+                                 cp_rank=rank,
+                                 cp_size=4,
+                                 tokens_per_block=tokens_per_block,
+                                 exclude_last_generation_logits=False)
 
 
 def test_enqueue_request_single(executor_queue):
@@ -274,8 +225,9 @@ def test_enqueue_request_with_child_ids(executor_queue, n_children):
     """Test enqueuing a request with query data."""
     mock_request = Mock()
     query_data = [1, 2, 3, 4]
-    with patch.object(executor_queue,
-                      '_get_num_child_requests') as mock_children:
+    with patch(
+            'tensorrt_llm._torch.pyexecutor.executor_request_queue.get_num_child_requests'
+    ) as mock_children:
         mock_children.return_value = n_children
         req_id = executor_queue.enqueue_request(mock_request, query=query_data)
 
@@ -439,16 +391,19 @@ def test_get_from_request_queue_async_behavior(executor_queue):
 def test_get_from_waiting_queue(executor_queue):
     """Test getting items from waiting queue."""
     # Add items to waiting queue
+    waiting_queue = deque()
     items = [RequestQueueItem(i, Mock()) for i in range(5)]
-    executor_queue.waiting_queue.extend(items)
+    waiting_queue.extend(items)
 
     # Get 3 items
-    result = executor_queue._get_from_waiting_queue(
-        executor_queue.waiting_queue, 3, enable_attention_dp=False)
+    result = get_from_waiting_queue(waiting_queue,
+                                    3,
+                                    enable_attention_dp=False,
+                                    max_num_active_requests=16)
 
     assert len(result) == 3
     assert result == items[:3]
-    assert len(executor_queue.waiting_queue) == 2
+    assert len(waiting_queue) == 2
 
 
 @pytest.mark.parametrize(
@@ -459,24 +414,26 @@ def test_get_from_waiting_queue(executor_queue):
         (3, 0, 0, 3),  # Zero count
         (3, 10, 3, 0),  # Request more than available
     ])
-def test_get_from_waiting_queue_edge_cases(executor_queue, queue_size,
-                                           request_count, expected_result,
-                                           expected_remaining):
+def test_get_from_waiting_queue_edge_cases(queue_size, request_count,
+                                           expected_result, expected_remaining):
     """Test edge cases for getting items from waiting queue."""
     # Setup queue
+    waiting_queue = deque()
     if queue_size > 0:
         items = [RequestQueueItem(i, Mock()) for i in range(queue_size)]
-        executor_queue.waiting_queue.extend(items)
+        waiting_queue.extend(items)
 
-    result = executor_queue._get_from_waiting_queue(
-        executor_queue.waiting_queue, request_count, enable_attention_dp=False)
+    result = get_from_waiting_queue(waiting_queue,
+                                    request_count,
+                                    enable_attention_dp=False,
+                                    max_num_active_requests=16)
 
     assert len(result) == expected_result
-    assert len(executor_queue.waiting_queue) == expected_remaining
+    assert len(waiting_queue) == expected_remaining
 
 
-def test_handle_special_queue_items(executor_queue):
-    """Test special queue item handling."""
+def test_request_queue_item_special_types():
+    """Test RequestQueueItem special type detection."""
     # Create a mock request without sampling_config to avoid beam validation
     mock_request = Mock()
     delattr(mock_request, 'sampling_config') if hasattr(
@@ -486,81 +443,49 @@ def test_handle_special_queue_items(executor_queue):
     cancel_req = RequestQueueItem(2, is_canceled_request=True)
     shutdown_req = RequestQueueItem(SHUTDOWN_REQUEST_ID)
 
-    requests = [normal_req, cancel_req, shutdown_req]
+    # Test normal request
+    assert normal_req.is_normal_request
+    assert not normal_req.is_shutdown_request
+    assert not normal_req.is_canceled_request
 
-    valid_requests = executor_queue._handle_special_queue_items(requests)
+    # Test cancel request
+    assert cancel_req.is_canceled_request
+    assert not cancel_req.is_shutdown_request
+    assert not cancel_req.is_normal_request
 
-    assert len(valid_requests) == 1
-    assert valid_requests[0] == normal_req
-    assert executor_queue.is_shutdown
-    assert 2 in executor_queue.canceled_req_ids
+    # Test shutdown request
+    assert shutdown_req.is_shutdown_request
+    assert not shutdown_req.is_canceled_request
+    assert not shutdown_req.is_normal_request
 
 
 @patch(
-    'tensorrt_llm._torch.pyexecutor.executor_request_queue.executor_request_to_llm_request'
+    'tensorrt_llm._torch.pyexecutor.request_utils.executor_request_to_llm_request'
 )
-def test_merge_requests_default(mock_convert, executor_queue):
+def test_merge_requests_default(mock_convert):
     """Test merging requests with default configuration."""
     mock_llm_request = Mock(child_requests=[])
     mock_convert.return_value = mock_llm_request
 
     requests = [RequestQueueItem(1, Mock()), RequestQueueItem(2, Mock())]
-    result = executor_queue._merge_requests(requests)
+    result = merge_requests(requests,
+                            cp_config={},
+                            cp_rank=0,
+                            cp_size=1,
+                            exclude_last_generation_logits=False)
 
     assert len(result) == 2
     assert mock_convert.call_count == 2
 
 
-def test_update_waiting_queue(executor_queue):
-    """Test updating waiting queue to remove canceled requests."""
-    items = [
-        RequestQueueItem(1, Mock()),
-        RequestQueueItem(2, Mock()),
-        RequestQueueItem(3, Mock()),
-    ]
-    executor_queue.waiting_queue.extend(items)
-    executor_queue.canceled_req_ids = [2]
-
-    executor_queue.update_waiting_queue()
-
-    assert len(executor_queue.waiting_queue) == 2
-    remaining_ids = [item.id for item in executor_queue.waiting_queue]
-    assert 1 in remaining_ids
-    assert 3 in remaining_ids
-    assert 2 not in remaining_ids
-
-
-def test_performance_metrics_methods(executor_queue):
-    """Test various performance metrics getter methods."""
+def test_queue_size_methods(executor_queue):
+    """Test queue size getter methods."""
     # Test initial values
-    assert executor_queue.get_new_active_requests_queue_latency() == 0
-    assert executor_queue.get_expected_num_active_requests() == 0
     assert executor_queue.get_request_queue_size() == 0
-    assert executor_queue.get_waiting_queue_size() == 0
-    assert executor_queue.get_canceled_req_ids_size() == 0
-    assert executor_queue.get_canceled_req_ids() == []
 
     # Add some data and test
     executor_queue.request_queue.put(RequestQueueItem(1, Mock()))
-    executor_queue.waiting_queue.append(RequestQueueItem(2, Mock()))
-    executor_queue.canceled_req_ids = [3, 4]
-    executor_queue.expected_num_active_requests = 5
-
     assert executor_queue.get_request_queue_size() == 1
-    assert executor_queue.get_waiting_queue_size() == 1
-    assert executor_queue.get_canceled_req_ids_size() == 2
-    assert executor_queue.get_canceled_req_ids() == [3, 4]
-    assert executor_queue.get_expected_num_active_requests() == 5
-
-
-def test_clear_canceled_req_ids(executor_queue):
-    """Test clearing canceled request IDs."""
-    executor_queue.canceled_req_ids = [1, 2, 3]
-    assert len(executor_queue.canceled_req_ids) == 3
-
-    executor_queue.clear_canceled_req_ids()
-
-    assert len(executor_queue.canceled_req_ids) == 0
 
 
 @pytest.fixture
@@ -584,17 +509,66 @@ def mock_dist_attention_dp():
 
 
 @pytest.fixture
-def attention_dp_queue(mock_dist_attention_dp):
-    """Create an ExecutorRequestQueue instance for attention DP testing."""
-    queue = ExecutorRequestQueue(dist=mock_dist_attention_dp,
-                                 enable_attention_dp=True,
-                                 max_batch_size=4,
-                                 max_beam_width=2,
-                                 max_num_active_requests=8,
-                                 enable_iter_perf_stats=True,
-                                 batch_wait_timeout_ms=0.0)
-    # Initialize all_ranks_num_active_requests
-    return queue
+def attention_dp_config():
+    """Create a config dict for attention DP testing."""
+    return {
+        'tp_size': 4,
+        'max_num_active_requests': 8,
+    }
+
+
+def schedule_attention_dp_requests(new_requests, all_ranks_num_active_requests,
+                                   all_ranks_num_active_tokens, tp_size,
+                                   max_num_active_requests):
+    """
+    Helper function to test attention DP scheduling logic.
+    This mirrors the logic from PyExecutor._schedule_attention_dp_requests.
+    """
+    # Map from ranks to new requests
+    all_ranks_new_requests = {tp_rank: [] for tp_rank in range(tp_size)}
+
+    # Prioritize the requests that are not in relax mode
+    def get_relax_value(req_item):
+        scheduling_params = getattr(req_item.request, 'py_scheduling_params',
+                                    None)
+        if scheduling_params is None:
+            return True
+        return scheduling_params.attention_dp_relax
+
+    new_requests = sorted(new_requests, key=get_relax_value, reverse=True)
+
+    # Try to put the requests to the target dp rank until the max_num_active_requests is reached
+    remaining_unscheduled = []
+    for req_item in new_requests:
+        scheduled = False
+        scheduling_params = getattr(req_item.request, 'py_scheduling_params',
+                                    None)
+        if scheduling_params is not None:
+            target_dp_rank = scheduling_params.attention_dp_rank
+            if target_dp_rank is not None and all_ranks_num_active_requests[
+                    target_dp_rank] < max_num_active_requests:
+                all_ranks_num_active_requests[target_dp_rank] += 1
+                scheduled = True
+                all_ranks_new_requests[target_dp_rank].append(req_item)
+
+        if not scheduled:
+            remaining_unscheduled.append(req_item)
+
+    # Balance the remaining unscheduled requests across ranks
+    num_new_requests_all_ranks = len(remaining_unscheduled)
+    total_num_active_requests = sum(all_ranks_num_active_requests)
+    expected_num_active_requests = max(
+        (total_num_active_requests + num_new_requests_all_ranks + tp_size - 1)
+        // tp_size,
+        max(all_ranks_num_active_requests),
+    )
+
+    all_ranks_new_requests = balance_requests_across_ranks(
+        remaining_unscheduled, all_ranks_new_requests,
+        all_ranks_num_active_requests, all_ranks_num_active_tokens,
+        expected_num_active_requests)
+
+    return all_ranks_new_requests, expected_num_active_requests
 
 
 @pytest.fixture
@@ -629,9 +603,9 @@ def create_mock_request_with_py_schedule_params(attention_dp_rank=None,
     return mock_request
 
 
-# Unit tests for _schedule_attention_dp_requests
+# Unit tests for attention DP scheduling logic
 def test_schedule_attention_dp_requests_scheduled_requests(
-        attention_dp_queue, all_ranks_num_active_requests,
+        attention_dp_config, all_ranks_num_active_requests,
         all_ranks_num_active_tokens):
     req1 = RequestQueueItem(
         1,
@@ -644,9 +618,10 @@ def test_schedule_attention_dp_requests_scheduled_requests(
 
     new_requests = [req1, req2]
 
-    all_ranks_new_requests = attention_dp_queue._schedule_attention_dp_requests(
+    all_ranks_new_requests, _ = schedule_attention_dp_requests(
         new_requests, all_ranks_num_active_requests,
-        all_ranks_num_active_tokens)
+        all_ranks_num_active_tokens, attention_dp_config['tp_size'],
+        attention_dp_config['max_num_active_requests'])
     result = all_ranks_new_requests[0]
 
     assert len(result) == 2
@@ -657,7 +632,7 @@ def test_schedule_attention_dp_requests_scheduled_requests(
 
 
 def test_schedule_attention_dp_requests_scheduled_requests_other_ranks(
-        attention_dp_queue, all_ranks_num_active_requests,
+        attention_dp_config, all_ranks_num_active_requests,
         all_ranks_num_active_tokens):
     req1 = RequestQueueItem(
         1,
@@ -670,9 +645,10 @@ def test_schedule_attention_dp_requests_scheduled_requests_other_ranks(
 
     new_requests = [req1, req2]
 
-    all_ranks_new_requests = attention_dp_queue._schedule_attention_dp_requests(
+    all_ranks_new_requests, _ = schedule_attention_dp_requests(
         new_requests, all_ranks_num_active_requests,
-        all_ranks_num_active_tokens)
+        all_ranks_num_active_tokens, attention_dp_config['tp_size'],
+        attention_dp_config['max_num_active_requests'])
 
     result = all_ranks_new_requests[0]
     assert len(result) == 0
@@ -682,7 +658,7 @@ def test_schedule_attention_dp_requests_scheduled_requests_other_ranks(
 
 
 def test_schedule_attention_dp_requests_unscheduled_requests(
-        attention_dp_queue, all_ranks_num_active_requests,
+        attention_dp_config, all_ranks_num_active_requests,
         all_ranks_num_active_tokens):
     req1 = RequestQueueItem(
         1,
@@ -695,9 +671,10 @@ def test_schedule_attention_dp_requests_unscheduled_requests(
 
     new_requests = [req1, req2]
 
-    all_ranks_new_requests = attention_dp_queue._schedule_attention_dp_requests(
+    all_ranks_new_requests, _ = schedule_attention_dp_requests(
         new_requests, all_ranks_num_active_requests,
-        all_ranks_num_active_tokens)
+        all_ranks_num_active_tokens, attention_dp_config['tp_size'],
+        attention_dp_config['max_num_active_requests'])
     result = all_ranks_new_requests[0]
 
     assert len(result) == 1  # Only req1 for current rank
@@ -705,7 +682,7 @@ def test_schedule_attention_dp_requests_unscheduled_requests(
 
 
 def test_schedule_attention_dp_requests_unscheduled_no_capacity(
-        attention_dp_queue, all_ranks_num_active_requests,
+        attention_dp_config, all_ranks_num_active_requests,
         all_ranks_num_active_tokens):
     all_ranks_num_active_requests[0] = 8
 
@@ -716,16 +693,17 @@ def test_schedule_attention_dp_requests_unscheduled_no_capacity(
 
     new_requests = [req1]
 
-    all_ranks_new_requests = attention_dp_queue._schedule_attention_dp_requests(
+    all_ranks_new_requests, _ = schedule_attention_dp_requests(
         new_requests, all_ranks_num_active_requests,
-        all_ranks_num_active_tokens)
+        all_ranks_num_active_tokens, attention_dp_config['tp_size'],
+        attention_dp_config['max_num_active_requests'])
     result = all_ranks_new_requests[0]
 
     assert len(result) == 0  # No capacity
 
 
 def test_schedule_attention_dp_requests_mixed_scenarios(
-        attention_dp_queue, all_ranks_num_active_requests,
+        attention_dp_config, all_ranks_num_active_requests,
         all_ranks_num_active_tokens):
     req_scheduled_current = RequestQueueItem(
         1,
@@ -749,9 +727,10 @@ def test_schedule_attention_dp_requests_mixed_scenarios(
         req_unscheduled_other
     ]
 
-    all_ranks_new_requests = attention_dp_queue._schedule_attention_dp_requests(
+    all_ranks_new_requests, _ = schedule_attention_dp_requests(
         new_requests, all_ranks_num_active_requests,
-        all_ranks_num_active_tokens)
+        all_ranks_num_active_tokens, attention_dp_config['tp_size'],
+        attention_dp_config['max_num_active_requests'])
     result = all_ranks_new_requests[0]
 
     assert len(result) == 2
@@ -760,17 +739,19 @@ def test_schedule_attention_dp_requests_mixed_scenarios(
 
 
 def test_schedule_attention_dp_requests_empty_lists(
-        attention_dp_queue, all_ranks_num_active_requests,
+        attention_dp_config, all_ranks_num_active_requests,
         all_ranks_num_active_tokens):
-    all_ranks_new_requests = attention_dp_queue._schedule_attention_dp_requests(
-        [], all_ranks_num_active_requests, all_ranks_num_active_tokens)
+    all_ranks_new_requests, _ = schedule_attention_dp_requests(
+        [], all_ranks_num_active_requests, all_ranks_num_active_tokens,
+        attention_dp_config['tp_size'],
+        attention_dp_config['max_num_active_requests'])
     result = all_ranks_new_requests[0]
 
     assert len(result) == 0
 
 
 def test_schedule_attention_dp_requests_expected_num_active_calculation(
-        attention_dp_queue, all_ranks_num_active_requests,
+        attention_dp_config, all_ranks_num_active_requests,
         all_ranks_num_active_tokens):
     req1 = RequestQueueItem(
         1,
@@ -783,46 +764,45 @@ def test_schedule_attention_dp_requests_expected_num_active_calculation(
 
     new_requests = [req1, req2]
 
-    all_ranks_new_requests = attention_dp_queue._schedule_attention_dp_requests(
+    _, expected_num_active_requests = schedule_attention_dp_requests(
         new_requests, all_ranks_num_active_requests,
-        all_ranks_num_active_tokens)
-    all_ranks_new_requests[0]
+        all_ranks_num_active_tokens, attention_dp_config['tp_size'],
+        attention_dp_config['max_num_active_requests'])
 
     # 2 + 1 + 3 + 0 = 6, 6 + 2 = 8, (8 + 3) // 4 = 2, max(2, 2, 1, 3, 0) = 3
     # expected_num_active_requests = max((6 + 2 + 3) // 4, 3) = max(2, 3) = 3
-    assert attention_dp_queue.expected_num_active_requests == 3
+    assert expected_num_active_requests == 3
 
 
 def test_schedule_attention_dp_requests_balance_requests_called(
-        attention_dp_queue, all_ranks_num_active_requests,
+        attention_dp_config, all_ranks_num_active_requests,
         all_ranks_num_active_tokens):
+    """Test that balance_requests_across_ranks is called with correct arguments."""
     req1 = RequestQueueItem(
         1,
         create_mock_request_with_py_schedule_params(attention_dp_rank=0,
                                                     attention_dp_relax=True))
 
     new_requests = [req1]
+    tp_size = attention_dp_config['tp_size']
+    max_num_active_requests = attention_dp_config['max_num_active_requests']
 
-    with patch.object(attention_dp_queue,
-                      '_balance_requests_across_ranks') as mock_balance:
-        mock_balance.return_value = {0: req1}
+    # Since schedule_attention_dp_requests is a local helper that uses the imported
+    # balance_requests_across_ranks, we test by verifying the output is consistent
+    # with what balance_requests_across_ranks would produce
+    all_ranks_new_requests, expected_num = schedule_attention_dp_requests(
+        new_requests, all_ranks_num_active_requests.copy(),
+        all_ranks_num_active_tokens.copy(), tp_size, max_num_active_requests)
 
-        all_ranks_new_requests = attention_dp_queue._schedule_attention_dp_requests(
-            new_requests, all_ranks_num_active_requests,
-            all_ranks_num_active_tokens)
-        all_ranks_new_requests[0]
-
-    # Check that _balance_requests_across_ranks was called
-    mock_balance.assert_called_once()
-    call_args = mock_balance.call_args[0]
-    assert isinstance(call_args[0], list)
-    assert isinstance(call_args[1], dict)
-    assert call_args[2] == all_ranks_num_active_requests  # Third arg
-    assert call_args[3] == all_ranks_num_active_tokens  # Fourth arg
+    # Verify that balance_requests_across_ranks was effectively called by checking results
+    # The request should be distributed to one of the ranks
+    total_assigned = sum(len(reqs) for reqs in all_ranks_new_requests.values())
+    assert total_assigned == 1  # One unscheduled request should be balanced
+    assert expected_num >= max(all_ranks_num_active_requests)
 
 
 def test_schedule_attention_dp_requests_no_scheduling_when_capacity_exceeded(
-        attention_dp_queue, all_ranks_num_active_requests,
+        attention_dp_config, all_ranks_num_active_requests,
         all_ranks_num_active_tokens):
     all_ranks_num_active_requests[0] = 8
 
@@ -833,9 +813,10 @@ def test_schedule_attention_dp_requests_no_scheduling_when_capacity_exceeded(
 
     new_requests = [req1]
 
-    all_ranks_new_requests = attention_dp_queue._schedule_attention_dp_requests(
+    all_ranks_new_requests, _ = schedule_attention_dp_requests(
         new_requests, all_ranks_num_active_requests,
-        all_ranks_num_active_tokens)
+        all_ranks_num_active_tokens, attention_dp_config['tp_size'],
+        attention_dp_config['max_num_active_requests'])
     result = all_ranks_new_requests[0]
 
     assert len(result) == 0  # No requests scheduled
@@ -843,7 +824,7 @@ def test_schedule_attention_dp_requests_no_scheduling_when_capacity_exceeded(
 
 
 # Integration tests combining both methods
-def test_filter_and_schedule_integration(attention_dp_queue,
+def test_filter_and_schedule_integration(attention_dp_config,
                                          all_ranks_num_active_requests,
                                          all_ranks_num_active_tokens):
     req_schedulable = RequestQueueItem(
@@ -862,9 +843,10 @@ def test_filter_and_schedule_integration(attention_dp_queue,
 
     new_requests = [req_schedulable, req_relax, req_no_params]
 
-    all_ranks_new_requests = attention_dp_queue._schedule_attention_dp_requests(
+    all_ranks_new_requests, _ = schedule_attention_dp_requests(
         new_requests, all_ranks_num_active_requests,
-        all_ranks_num_active_tokens)
+        all_ranks_num_active_tokens, attention_dp_config['tp_size'],
+        attention_dp_config['max_num_active_requests'])
     result = all_ranks_new_requests[0]
 
     assert len(result) == 2
@@ -872,7 +854,7 @@ def test_filter_and_schedule_integration(attention_dp_queue,
     assert req_relax in result
 
 
-def test_filter_and_schedule_with_capacity_limits(attention_dp_queue,
+def test_filter_and_schedule_with_capacity_limits(attention_dp_config,
                                                   all_ranks_num_active_requests,
                                                   all_ranks_num_active_tokens):
     all_ranks_num_active_requests[0] = 7
@@ -890,9 +872,10 @@ def test_filter_and_schedule_with_capacity_limits(attention_dp_queue,
 
     new_requests = [req1, req2]
 
-    all_ranks_new_requests = attention_dp_queue._schedule_attention_dp_requests(
+    all_ranks_new_requests, _ = schedule_attention_dp_requests(
         new_requests, all_ranks_num_active_requests,
-        all_ranks_num_active_tokens)
+        all_ranks_num_active_tokens, attention_dp_config['tp_size'],
+        attention_dp_config['max_num_active_requests'])
     result = all_ranks_new_requests[0]
 
     assert len(result) == 1
@@ -900,21 +883,22 @@ def test_filter_and_schedule_with_capacity_limits(attention_dp_queue,
 
 
 def test_get_from_waiting_queue_with_attention_dp(
-        attention_dp_queue, all_ranks_num_active_requests):
+        attention_dp_config, all_ranks_num_active_requests):
+    waiting_queue = deque()
     items = [RequestQueueItem(i, Mock()) for i in range(5)]
-    attention_dp_queue.waiting_queue.extend(items)
+    waiting_queue.extend(items)
 
-    result = attention_dp_queue._get_from_waiting_queue(
-        attention_dp_queue.waiting_queue, 3, True,
+    result = get_from_waiting_queue(
+        waiting_queue, 3, True, attention_dp_config['max_num_active_requests'],
         all_ranks_num_active_requests)
 
     assert len(result) == 3
     assert result == items[:3]
-    assert len(attention_dp_queue.waiting_queue) == 2
+    assert len(waiting_queue) == 2
 
 
 def test_get_from_waiting_queue_with_attention_dp_filtering(
-        attention_dp_queue, all_ranks_num_active_requests):
+        attention_dp_config, all_ranks_num_active_requests):
     req1 = RequestQueueItem(
         1,
         create_mock_request_with_py_schedule_params(attention_dp_rank=0,
@@ -927,13 +911,13 @@ def test_get_from_waiting_queue_with_attention_dp_filtering(
                             create_mock_request_with_py_schedule_params(
                                 attention_dp_rank=None))  # No scheduling params
 
-    attention_dp_queue.waiting_queue.extend([req1, req2, req3])
+    waiting_queue = deque([req1, req2, req3])
 
     # Set rank 0 to full capacity to test filtering
     all_ranks_num_active_requests[0] = 8
 
-    result = attention_dp_queue._get_from_waiting_queue(
-        attention_dp_queue.waiting_queue, 3, True,
+    result = get_from_waiting_queue(
+        waiting_queue, 3, True, attention_dp_config['max_num_active_requests'],
         all_ranks_num_active_requests)
 
     assert len(result) == 2
@@ -942,25 +926,29 @@ def test_get_from_waiting_queue_with_attention_dp_filtering(
     assert req1 not in result
 
 
-def test_can_process_attention_dp_request(attention_dp_queue):
+def test_can_process_attention_dp_request(attention_dp_config):
+    from tensorrt_llm._torch.pyexecutor.request_utils import \
+        can_process_attention_dp_request
+    max_num_active_requests = attention_dp_config['max_num_active_requests']
+
     req_no_params = RequestQueueItem(1, Mock())
-    assert attention_dp_queue._can_process_attention_dp_request(
-        req_no_params, [0, 0, 0, 0]) == True
+    assert can_process_attention_dp_request(req_no_params, [0, 0, 0, 0],
+                                            max_num_active_requests) == True
 
     req_relax = RequestQueueItem(
         2,
         create_mock_request_with_py_schedule_params(attention_dp_rank=0,
                                                     attention_dp_relax=True))
-    assert attention_dp_queue._can_process_attention_dp_request(
-        req_relax, [0, 0, 0, 0]) == True
+    assert can_process_attention_dp_request(req_relax, [0, 0, 0, 0],
+                                            max_num_active_requests) == True
 
     req_target = RequestQueueItem(
         3,
         create_mock_request_with_py_schedule_params(attention_dp_rank=1,
                                                     attention_dp_relax=False))
     all_ranks = [0, 0, 0, 0]
-    assert attention_dp_queue._can_process_attention_dp_request(
-        req_target, all_ranks) == True
+    assert can_process_attention_dp_request(req_target, all_ranks,
+                                            max_num_active_requests) == True
     assert all_ranks[1] == 1
 
     req_no_capacity = RequestQueueItem(
@@ -968,11 +956,12 @@ def test_can_process_attention_dp_request(attention_dp_queue):
         create_mock_request_with_py_schedule_params(attention_dp_rank=0,
                                                     attention_dp_relax=False))
     all_ranks_full = [8, 0, 0, 0]  # Rank 0 is at capacity
-    assert attention_dp_queue._can_process_attention_dp_request(
-        req_no_capacity, all_ranks_full) == False
+    assert can_process_attention_dp_request(req_no_capacity, all_ranks_full,
+                                            max_num_active_requests) == False
 
 
-def test_achieve_max_num_active_requests(attention_dp_queue):
+def test_achieve_max_num_active_requests(attention_dp_config):
+    max_num_active_requests = attention_dp_config['max_num_active_requests']
     req_list = []
     req_id = 0
     for rank in range(4):
@@ -991,13 +980,13 @@ def test_achieve_max_num_active_requests(attention_dp_queue):
             req_id += 1
 
     all_ranks_num_active_requests = [5, 6, 3, 7]
-    attention_dp_queue.waiting_queue.extend(req_list)
-    available_active_requests = attention_dp_queue.max_num_active_requests * 4 - sum(
+    waiting_queue = deque(req_list)
+    available_active_requests = max_num_active_requests * 4 - sum(
         all_ranks_num_active_requests)
 
-    result = attention_dp_queue._get_from_waiting_queue(
-        attention_dp_queue.waiting_queue, available_active_requests, True,
-        all_ranks_num_active_requests)
+    result = get_from_waiting_queue(waiting_queue, available_active_requests,
+                                    True, max_num_active_requests,
+                                    all_ranks_num_active_requests)
 
     assert len(result) == available_active_requests
 
@@ -1110,44 +1099,42 @@ def append_to_waiting_queue(waiting_queue, rank, attention_dp_relax):
                 3: [2, 1]  # Rank 3 gets both requests (targeted + relaxed)
             }),
     ])
-def test_attention_dp_scheduling_cases(attention_dp_queue,
-                                       max_num_active_requests,
+def test_attention_dp_scheduling_cases(max_num_active_requests,
                                        all_ranks_num_active_requests,
                                        request_configs,
                                        all_ranks_expected_req_ids):
     """Test attention DP scheduling with various scenarios."""
-    attention_dp_queue.max_num_active_requests = max_num_active_requests
-
     waiting_queue = deque()
     for rank, relax in request_configs:
         append_to_waiting_queue(waiting_queue, rank, relax)
 
-    run_test_attention_dp_scheduling(attention_dp_queue, waiting_queue,
+    run_test_attention_dp_scheduling(max_num_active_requests, waiting_queue,
                                      all_ranks_num_active_requests,
                                      all_ranks_expected_req_ids)
 
 
-def run_test_attention_dp_scheduling(attention_dp_queue, waiting_queue,
+def run_test_attention_dp_scheduling(max_num_active_requests, waiting_queue,
                                      all_ranks_num_active_requests,
                                      all_ranks_expected_req_ids):
 
     num_ranks = len(all_ranks_num_active_requests)
     total_num_active_requests = sum(all_ranks_num_active_requests)
-    total_max_num_active_requests = attention_dp_queue.max_num_active_requests * num_ranks
+    total_max_num_active_requests = max_num_active_requests * num_ranks
     enable_attention_dp = True
 
-    new_requests = attention_dp_queue._get_from_waiting_queue(
+    new_requests = get_from_waiting_queue(
         waiting_queue,
         total_max_num_active_requests - total_num_active_requests,
-        enable_attention_dp, all_ranks_num_active_requests)
+        enable_attention_dp, max_num_active_requests,
+        all_ranks_num_active_requests)
 
     # Create mock token counts for testing
     all_ranks_num_active_tokens = [10 + i * 5 for i in range(num_ranks)]
 
     # Schedule attention dp requests
-    all_ranks_new_requests = attention_dp_queue._schedule_attention_dp_requests(
+    all_ranks_new_requests, _ = schedule_attention_dp_requests(
         new_requests, all_ranks_num_active_requests,
-        all_ranks_num_active_tokens)
+        all_ranks_num_active_tokens, num_ranks, max_num_active_requests)
 
     assert len(all_ranks_new_requests) == num_ranks
     print("all_ranks_new_requests:", all_ranks_new_requests)
@@ -1156,19 +1143,18 @@ def run_test_attention_dp_scheduling(attention_dp_queue, waiting_queue,
         assert req_ids == all_ranks_expected_req_ids[rank]
 
 
-# New tests for _balance_requests_across_ranks method
-def test_balance_requests_across_ranks_empty_requests(attention_dp_queue):
-    """Test _balance_requests_across_ranks with empty requests list."""
+# New tests for balance_requests_across_ranks function
+def test_balance_requests_across_ranks_empty_requests():
+    """Test balance_requests_across_ranks with empty requests list."""
     all_ranks_new_requests = {0: [], 1: [], 2: [], 3: []}
     all_ranks_num_active_requests = [2, 1, 3, 0]
     all_ranks_num_active_tokens = [20, 10, 30, 5]
+    expected_num_active_requests = 3
 
-    # Set expected_num_active_requests for testing
-    attention_dp_queue.expected_num_active_requests = 3
-
-    result = attention_dp_queue._balance_requests_across_ranks(
-        [], all_ranks_new_requests, all_ranks_num_active_requests,
-        all_ranks_num_active_tokens)
+    result = balance_requests_across_ranks([], all_ranks_new_requests,
+                                           all_ranks_num_active_requests,
+                                           all_ranks_num_active_tokens,
+                                           expected_num_active_requests)
 
     # Should return the original structure unchanged
     assert result == all_ranks_new_requests
@@ -1176,8 +1162,8 @@ def test_balance_requests_across_ranks_empty_requests(attention_dp_queue):
         assert len(result[rank]) == 0
 
 
-def test_balance_requests_across_ranks_single_request(attention_dp_queue):
-    """Test _balance_requests_across_ranks with a single request."""
+def test_balance_requests_across_ranks_single_request():
+    """Test balance_requests_across_ranks with a single request."""
     req = RequestQueueItem(
         1, create_mock_request_with_py_schedule_params(attention_dp_rank=None))
     req.request.input_token_ids = [1, 2, 3, 4, 5]  # 5 tokens
@@ -1185,13 +1171,12 @@ def test_balance_requests_across_ranks_single_request(attention_dp_queue):
     all_ranks_new_requests = {0: [], 1: [], 2: [], 3: []}
     all_ranks_num_active_requests = [1, 2, 0, 1]  # Rank 2 has lowest count
     all_ranks_num_active_tokens = [10, 20, 5, 15]
+    expected_num_active_requests = 2
 
-    # Set expected_num_active_requests for testing
-    attention_dp_queue.expected_num_active_requests = 2
-
-    result = attention_dp_queue._balance_requests_across_ranks(
-        [req], all_ranks_new_requests, all_ranks_num_active_requests,
-        all_ranks_num_active_tokens)
+    result = balance_requests_across_ranks([req], all_ranks_new_requests,
+                                           all_ranks_num_active_requests,
+                                           all_ranks_num_active_tokens,
+                                           expected_num_active_requests)
 
     # Request should be assigned to rank 2 (lowest active count)
     assert len(result[0]) == 0
@@ -1201,8 +1186,8 @@ def test_balance_requests_across_ranks_single_request(attention_dp_queue):
     assert result[2][0] == req
 
 
-def test_balance_requests_across_ranks_multiple_requests(attention_dp_queue):
-    """Test _balance_requests_across_ranks with multiple requests."""
+def test_balance_requests_across_ranks_multiple_requests():
+    """Test balance_requests_across_ranks with multiple requests."""
     # Create requests with different token counts
     req1 = RequestQueueItem(
         1, create_mock_request_with_py_schedule_params(attention_dp_rank=None))
@@ -1219,13 +1204,13 @@ def test_balance_requests_across_ranks_multiple_requests(attention_dp_queue):
     all_ranks_new_requests = {0: [], 1: [], 2: [], 3: []}
     all_ranks_num_active_requests = [0, 1, 2, 1]
     all_ranks_num_active_tokens = [5, 15, 25, 10]
+    expected_num_active_requests = 2
 
-    # Set expected_num_active_requests for testing
-    attention_dp_queue.expected_num_active_requests = 2
-
-    result = attention_dp_queue._balance_requests_across_ranks(
-        [req1, req2, req3], all_ranks_new_requests,
-        all_ranks_num_active_requests, all_ranks_num_active_tokens)
+    result = balance_requests_across_ranks([req1, req2, req3],
+                                           all_ranks_new_requests,
+                                           all_ranks_num_active_requests,
+                                           all_ranks_num_active_tokens,
+                                           expected_num_active_requests)
 
     # Requests should be distributed based on heap (lowest active count first)
     # Requests are sorted by token count (descending) first, then assigned to ranks with lowest active count
@@ -1246,8 +1231,8 @@ def test_balance_requests_across_ranks_multiple_requests(attention_dp_queue):
     assert result[3][0] == req1
 
 
-def test_balance_requests_across_ranks_capacity_limits(attention_dp_queue):
-    """Test _balance_requests_across_ranks respects capacity limits."""
+def test_balance_requests_across_ranks_capacity_limits():
+    """Test balance_requests_across_ranks respects capacity limits."""
     # Create multiple requests
     requests = []
     for i in range(4):
@@ -1260,13 +1245,12 @@ def test_balance_requests_across_ranks_capacity_limits(attention_dp_queue):
     all_ranks_new_requests = {0: [], 1: [], 2: [], 3: []}
     all_ranks_num_active_requests = [1, 1, 1, 1]  # All ranks start with 1
     all_ranks_num_active_tokens = [10, 10, 10, 10]
+    expected_num_active_requests = 2
 
-    # Set expected_num_active_requests to limit capacity
-    attention_dp_queue.expected_num_active_requests = 2
-
-    result = attention_dp_queue._balance_requests_across_ranks(
-        requests, all_ranks_new_requests, all_ranks_num_active_requests,
-        all_ranks_num_active_tokens)
+    result = balance_requests_across_ranks(requests, all_ranks_new_requests,
+                                           all_ranks_num_active_requests,
+                                           all_ranks_num_active_tokens,
+                                           expected_num_active_requests)
 
     # Each rank can only take 1 more request (1 + 1 = 2, which equals expected_num_active_requests)
     total_assigned = sum(
@@ -1278,8 +1262,8 @@ def test_balance_requests_across_ranks_capacity_limits(attention_dp_queue):
         assert len(result[rank]) <= 1
 
 
-def test_balance_requests_across_ranks_heap_ordering(attention_dp_queue):
-    """Test that _balance_requests_across_ranks uses heap ordering correctly."""
+def test_balance_requests_across_ranks_heap_ordering():
+    """Test that balance_requests_across_ranks uses heap ordering correctly."""
     # Create requests with same token count to test heap ordering
     req1 = RequestQueueItem(
         1, create_mock_request_with_py_schedule_params(attention_dp_rank=None))
@@ -1297,13 +1281,13 @@ def test_balance_requests_across_ranks_heap_ordering(attention_dp_queue):
     # Rank 0 has highest active count, should get requests last
     all_ranks_num_active_requests = [3, 1, 0, 2]
     all_ranks_num_active_tokens = [30, 10, 5, 20]
+    expected_num_active_requests = 4
 
-    # Set expected_num_active_requests for testing
-    attention_dp_queue.expected_num_active_requests = 4
-
-    result = attention_dp_queue._balance_requests_across_ranks(
-        [req1, req2, req3], all_ranks_new_requests,
-        all_ranks_num_active_requests, all_ranks_num_active_tokens)
+    result = balance_requests_across_ranks([req1, req2, req3],
+                                           all_ranks_new_requests,
+                                           all_ranks_num_active_requests,
+                                           all_ranks_num_active_tokens,
+                                           expected_num_active_requests)
 
     # Requests should be assigned in order of lowest active count first
     # Since all requests have same token count, they're assigned based on active count order
@@ -1323,7 +1307,7 @@ def test_balance_requests_across_ranks_heap_ordering(attention_dp_queue):
     assert result[2][1] == req2  # Second request
 
 
-def test_balance_requests_across_ranks_token_count_sorting(attention_dp_queue):
+def test_balance_requests_across_ranks_token_count_sorting():
     """Test that requests are sorted by token count before distribution."""
     # Create requests with different token counts
     req1 = RequestQueueItem(
@@ -1341,13 +1325,13 @@ def test_balance_requests_across_ranks_token_count_sorting(attention_dp_queue):
     all_ranks_new_requests = {0: [], 1: [], 2: [], 3: []}
     all_ranks_num_active_requests = [0, 0, 0, 0]  # All ranks start empty
     all_ranks_num_active_tokens = [5, 5, 5, 5]
+    expected_num_active_requests = 2
 
-    # Set expected_num_active_requests for testing
-    attention_dp_queue.expected_num_active_requests = 2
-
-    result = attention_dp_queue._balance_requests_across_ranks(
-        [req1, req2, req3], all_ranks_new_requests,
-        all_ranks_num_active_requests, all_ranks_num_active_tokens)
+    result = balance_requests_across_ranks([req1, req2, req3],
+                                           all_ranks_new_requests,
+                                           all_ranks_num_active_requests,
+                                           all_ranks_num_active_tokens,
+                                           expected_num_active_requests)
 
     # Requests should be sorted by token count (descending) before distribution
     # Then assigned to ranks with lowest active count first

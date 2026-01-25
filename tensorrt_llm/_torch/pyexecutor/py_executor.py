@@ -6,6 +6,7 @@ import pickle  # nosec B403
 import threading
 import time
 import traceback
+from collections import deque
 from contextlib import contextmanager
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -22,7 +23,7 @@ except ImportError:
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManagerType, request_context)
 from tensorrt_llm._utils import (customized_gc_thresholds, is_trace_enabled,
-                                 nvtx_range, trace_func)
+                                 mpi_disabled, nvtx_range, trace_func)
 from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             FinishReason, InflightBatchingStats,
                                             IterationStats, KvCacheStats,
@@ -52,6 +53,9 @@ from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
                           LlmResponse, get_draft_token_length)
 from .model_engine import ModelEngine
+from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
+                            balance_requests_across_ranks,
+                            get_from_waiting_queue, merge_requests)
 from .resource_manager import ResourceManager
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors, TRTLLMSampler)
@@ -424,16 +428,27 @@ class PyExecutor:
         self._set_global_steady_clock_offset()
         self.executor_request_queue = ExecutorRequestQueue(
             dist=self.dist,
-            enable_attention_dp=self.enable_attention_dp,
             max_batch_size=max_batch_size,
             max_beam_width=self.max_beam_width,
-            max_num_active_requests=self.max_num_active_requests,
             enable_iter_perf_stats=self.enable_iter_perf_stats,
             batch_wait_timeout_ms=self.batch_wait_timeout_ms,
             hang_detector=self.hang_detector,
         )
         self.executor_request_queue.set_exclude_last_generation_logits(
             self.disable_overlap_scheduler, self.dist.pp_size)
+
+        # Request processing state (managed by executor)
+        self.canceled_req_ids: List[int] = []
+        self.control_requests: List[RequestQueueItem] = []
+        self.request_accumulated: List[RequestQueueItem] = []
+        self.new_active_requests_queue_latency_ms = 0.0
+        self._disable_mpi = mpi_disabled()
+        self.request_broadcaster = RequestBroadcaster(self.dist,
+                                                      self.hang_detector)
+
+        # Waiting queue for requests that have been fetched but not yet scheduled
+        self.waiting_queue: deque[RequestQueueItem] = deque()
+
         self.control_request_barrier = threading.Event()
         self.control_action_done = threading.Event()
 
@@ -698,7 +713,7 @@ class PyExecutor:
     @property
     def should_stop_processing(self):
         return self.is_shutdown and len(self.active_requests) == 0 and \
-            self.executor_request_queue.get_waiting_queue_size() == 0
+            len(self.waiting_queue) == 0
 
     @contextmanager
     def _profiler(self):
@@ -774,8 +789,8 @@ class PyExecutor:
                     f"iter = {self.iter_counter}, "
                     f"global_rank = {self.global_rank}, "
                     f"rank = {self.dist.rank}, "
-                    f"currank_total_requests = {self.executor_request_queue.num_fetch_requests_cur_rank}/"
-                    f"{self.executor_request_queue.num_fetch_requests}, "
+                    f"currank_total_requests = {self.num_fetch_requests_cur_rank}/"
+                    f"{self.num_fetch_requests}, "
                     f"host_step_time = {host_step_time}ms, "
                     f"prev_device_step_time = {prev_device_step_time}, "
                     f"timestamp = {formatted_timestamp}, "
@@ -1136,8 +1151,7 @@ class PyExecutor:
                 if self.enable_iter_perf_stats:
                     iter_stats = self._get_init_iter_stats(
                         len(new_requests),
-                        self.executor_request_queue.
-                        get_new_active_requests_queue_latency())
+                        self._get_new_active_requests_queue_latency())
 
                 self._pad_attention_dp_dummy_request()
 
@@ -1393,8 +1407,7 @@ class PyExecutor:
         if self.enable_iter_perf_stats:
             iter_stats = self._get_init_iter_stats(
                 len(new_requests),
-                self.executor_request_queue.
-                get_new_active_requests_queue_latency())
+                self._get_new_active_requests_queue_latency())
 
         self._pad_attention_dp_dummy_request()
 
@@ -1631,14 +1644,14 @@ class PyExecutor:
 
     def _handle_control_request(self):
         if len(self.active_requests) == 0 and \
-            self.executor_request_queue.get_waiting_queue_size() == 0 and \
-            len(self.executor_request_queue.control_requests) > 0:
-            assert len(self.executor_request_queue.control_requests) == 1, (
+            len(self.waiting_queue) == 0 and \
+            len(self.control_requests) > 0:
+            assert len(self.control_requests) == 1, (
                 f"Expected exactly one control request to be processed at a time, "
-                f"but found {len(self.executor_request_queue.control_requests)} control requests. "
+                f"but found {len(self.control_requests)} control requests. "
                 f"This may indicate a race condition or improper control request handling."
             )
-            self.executor_request_queue.control_requests.pop(0)
+            self.control_requests.pop(0)
             self.control_request_barrier.set()
             self.control_action_done.wait()
             self.control_action_done.clear()
@@ -1696,7 +1709,7 @@ class PyExecutor:
                 # to ensure consistent batch sizes for accurate performance measurement.
                 if not self.is_warmup and not can_forward:
                     if self.enable_attention_dp:
-                        local_can_forward = self.executor_request_queue.num_fetch_requests + \
+                        local_can_forward = self.num_fetch_requests + \
                             len(scheduled_batch.generation_requests) >= self.benchmark_req_queues_size
                         all_can_forward = self.dist.tp_allgather(
                             local_can_forward)
@@ -1706,7 +1719,7 @@ class PyExecutor:
                         else:
                             if self.dist.rank == 0:
                                 logger.info(
-                                    f"sleep 10 seconds, num_fetched_requests: {self.executor_request_queue.num_fetch_requests}, scheduled_gen_batch: {len(scheduled_batch.generation_requests)}"
+                                    f"sleep 10 seconds, num_fetched_requests: {self.num_fetch_requests}, scheduled_gen_batch: {len(scheduled_batch.generation_requests)}"
                                 )
                             time.sleep(10)
                             continue
@@ -2016,6 +2029,276 @@ class PyExecutor:
                     self.model_engine.model.lm_head.num_embeddings):
                 raise ValueError("Token ID out of range")
 
+    # ========== Request fetching and processing methods ==========
+    # These methods handle fetching requests from the queue, processing them,
+    # and preparing them for execution. They were moved from ExecutorRequestQueue
+    # to keep request processing state (canceled_req_ids, control_requests, etc.)
+    # centralized in the executor.
+
+    def _fetch_and_process_requests(
+        self,
+        waiting_queue: deque[RequestQueueItem],
+        total_num_active_requests: int,
+        total_max_num_active_requests: int,
+        enable_attention_dp: bool,
+        all_ranks_num_active_requests: Optional[List[int]] = None
+    ) -> List[RequestQueueItem]:
+        """Common logic for fetching and processing requests from the queue.
+
+        Args:
+            waiting_queue: The waiting queue managed by executor.
+            total_num_active_requests: Total number of active requests.
+            total_max_num_active_requests: Maximum number of active requests.
+            enable_attention_dp: Whether to enable attention DP scheduling.
+            all_ranks_num_active_requests: Number of active requests for each rank.
+
+        Returns:
+            List of requests that can be processed.
+        """
+        # Block new request processing while control requests are pending.
+        # Control requests must be handled exclusively to ensure proper synchronization.
+        if len(self.control_requests) != 0:
+            return []
+        # Calculate timeout
+        idle = (total_num_active_requests == 0) and len(waiting_queue) == 0
+        if idle:
+            # In Ray path (TLLM_DISABLE_MPI=1), use a periodic heartbeat timeout so rank 0
+            # reaches the broadcast path regularly to prevent trtllm-serve timeout when idle.
+            timeout = datetime.timedelta(
+                seconds=1200) if self._disable_mpi else None
+        else:
+            timeout = datetime.timedelta(0)
+
+        # Fetch requests from rank 0
+        new_requests = []
+        if self.dist.rank == 0:
+            # Process accumulated requests that were queued during control request handling.
+            if len(self.request_accumulated) != 0:
+                new_requests.extend(self.request_accumulated)
+                self.request_accumulated.clear()
+                # Reset timeout to 0 to avoid hanging when no new requests are available
+                timeout = datetime.timedelta(0)
+            with self.hang_detector.pause():
+                new_requests.extend(
+                    self.executor_request_queue.get_from_request_queue(timeout))
+
+        # Broadcast requests and handle Python objects
+        new_requests, py_request_objects = self.request_broadcaster.broadcast(
+            new_requests)
+
+        # Validate and filter requests
+        new_requests = self._handle_special_queue_items(new_requests)
+
+        # Attach Python objects to requests
+        if py_request_objects and (self.dist.tp_size > 1 or self.dist.has_pp
+                                   or self.dist.cp_size
+                                   > 1) and self.dist.rank > 0:
+            attach_py_objects_to_requests(new_requests, py_request_objects)
+        waiting_queue.extend(new_requests)
+
+        new_requests = get_from_waiting_queue(
+            waiting_queue,
+            total_max_num_active_requests - total_num_active_requests,
+            enable_attention_dp, self.max_num_active_requests,
+            all_ranks_num_active_requests)
+
+        # Update performance metrics
+        if self.enable_iter_perf_stats and self.dist.rank == 0:
+            self._update_new_active_requests_queue_latency(new_requests)
+
+        return new_requests
+
+    @nvtx_range("_fetch_new_requests")
+    def _fetch_new_requests(
+            self, waiting_queue: deque[RequestQueueItem],
+            activate_requests: List[LlmRequest]) -> List[LlmRequest]:
+        """Fetch new requests from the queue.
+
+        Args:
+            waiting_queue: The waiting queue managed by executor.
+            activate_requests: List of currently active requests.
+
+        Returns:
+            List of LlmRequest objects ready for execution.
+        """
+        if self.enable_attention_dp:
+            return self._fetch_new_requests_attention_dp(
+                waiting_queue, activate_requests)
+        else:
+            return self._fetch_new_requests_attention_tp(
+                waiting_queue, len(activate_requests))
+
+    def _fetch_new_requests_attention_tp(
+            self, waiting_queue: deque[RequestQueueItem],
+            num_active_requests: int) -> List[LlmRequest]:
+        """Handle standard (non-attention DP) request fetching."""
+        total_num_active_requests = num_active_requests
+        total_max_num_active_requests = self.max_num_active_requests
+
+        # fetch and process requests into waiting queue
+        new_requests = self._fetch_and_process_requests(
+            waiting_queue,
+            total_num_active_requests,
+            total_max_num_active_requests,
+            enable_attention_dp=False)
+
+        # Merge requests and add to active list
+        return merge_requests(new_requests,
+                              cp_config=self.dist.cp_config,
+                              cp_rank=self.dist.cp_rank,
+                              cp_size=self.dist.cp_size,
+                              exclude_last_generation_logits=self.
+                              _should_exclude_last_generation_logits())
+
+    def _fetch_new_requests_attention_dp(
+            self, waiting_queue: deque[RequestQueueItem],
+            activate_requests: List[LlmRequest]) -> List[LlmRequest]:
+        """Handle attention DP request fetching with load balancing."""
+        # Get active request counts across all ranks
+        all_ranks_num_active_requests = []
+        all_ranks_num_active_tokens = []
+        num_active_tokens = sum(
+            [req.py_orig_prompt_len for req in activate_requests])
+        responses_list = self.dist.tp_allgather(
+            [len(activate_requests), num_active_tokens])
+        for num_active_requests, num_active_tokens in responses_list:
+            all_ranks_num_active_requests.append(num_active_requests)
+            all_ranks_num_active_tokens.append(num_active_tokens)
+
+        total_num_active_requests = sum(all_ranks_num_active_requests)
+        total_max_num_active_requests = self.dist.tp_size * self.max_num_active_requests
+
+        # fetch and process requests into waiting queue
+        new_requests = self._fetch_and_process_requests(
+            waiting_queue,
+            total_num_active_requests,
+            total_max_num_active_requests,
+            enable_attention_dp=True,
+            all_ranks_num_active_requests=all_ranks_num_active_requests)
+
+        # Schedule attention dp requests
+        all_ranks_new_requests = self._schedule_attention_dp_requests(
+            new_requests, all_ranks_num_active_requests,
+            all_ranks_num_active_tokens)
+        new_requests_cur_rank = all_ranks_new_requests[self.dist.tp_rank]
+
+        # Update performance metrics
+        if self.enable_iter_perf_stats and self.executor_request_queue.start_times:
+            self._update_new_active_requests_queue_latency(
+                new_requests_cur_rank)
+
+        # Update counters
+        self.num_fetch_requests += len(new_requests)
+        self.num_fetch_requests_cur_rank += len(new_requests_cur_rank)
+
+        # Merge requests and add to active list
+        return merge_requests(new_requests_cur_rank,
+                              cp_config=self.dist.cp_config,
+                              cp_rank=self.dist.cp_rank,
+                              cp_size=self.dist.cp_size,
+                              exclude_last_generation_logits=self.
+                              _should_exclude_last_generation_logits())
+
+    def _schedule_attention_dp_requests(
+        self, new_requests: List[RequestQueueItem],
+        all_ranks_num_active_requests: List[int],
+        all_ranks_num_active_tokens: List[int]
+    ) -> Dict[int, List[RequestQueueItem]]:
+        """Schedule attention dp requests."""
+
+        # Map from ranks to new requests
+        all_ranks_new_requests = {
+            tp_rank: []
+            for tp_rank in range(self.dist.tp_size)
+        }
+
+        # Prioritize the requests that are not in relax mode
+        def get_relax_value(req_item):
+            scheduling_params = getattr(req_item.request,
+                                        'py_scheduling_params', None)
+            if scheduling_params is None:
+                return True
+            return scheduling_params.attention_dp_relax
+
+        new_requests = sorted(new_requests, key=get_relax_value, reverse=True)
+
+        # Try to put the requests to the target dp rank until the max_num_active_requests is reached
+        remaining_unscheduled = []
+        for req_item in new_requests:
+            scheduled = False
+            scheduling_params = getattr(req_item.request,
+                                        'py_scheduling_params', None)
+            if scheduling_params is not None:
+                target_dp_rank = scheduling_params.attention_dp_rank
+                if target_dp_rank is not None and all_ranks_num_active_requests[
+                        target_dp_rank] < self.max_num_active_requests:
+                    all_ranks_num_active_requests[target_dp_rank] += 1
+                    scheduled = True
+                    all_ranks_new_requests[target_dp_rank].append(req_item)
+
+            if not scheduled:
+                remaining_unscheduled.append(req_item)
+
+        # Balance the remaining unscheduled requests across ranks
+        num_new_requests_all_ranks = len(remaining_unscheduled)
+        total_num_active_requests = sum(all_ranks_num_active_requests)
+        self.expected_num_active_requests = max(
+            (total_num_active_requests + num_new_requests_all_ranks +
+             self.dist.tp_size - 1) // self.dist.tp_size,
+            max(all_ranks_num_active_requests),
+        )
+
+        all_ranks_new_requests = balance_requests_across_ranks(
+            remaining_unscheduled, all_ranks_new_requests,
+            all_ranks_num_active_requests, all_ranks_num_active_tokens,
+            self.expected_num_active_requests)
+
+        return all_ranks_new_requests
+
+    def _handle_special_queue_items(
+            self,
+            new_requests: List[RequestQueueItem]) -> List[RequestQueueItem]:
+        """Handle special signals."""
+        accepted_new_requests = []
+        for idx, req_item in enumerate(new_requests):
+            if req_item.is_shutdown_request:
+                self.is_shutdown = True
+                break
+            elif req_item.is_canceled_request:
+                self.canceled_req_ids.append(req_item.id)
+            elif req_item.is_control_request:
+                self.control_requests.append(req_item)
+                if self.dist.rank == 0:
+                    self.request_accumulated.extend(new_requests[idx + 1:])
+                break
+            else:
+                accepted_new_requests.append(req_item)
+
+        return accepted_new_requests
+
+    def _update_new_active_requests_queue_latency(
+            self, new_requests: List[RequestQueueItem]):
+        """Update queue latency metrics for new requests."""
+        now = time.time()
+        start_times = self.executor_request_queue.start_times
+        for req_item in new_requests:
+            if req_item.id in start_times:
+                self.new_active_requests_queue_latency_ms += now - start_times.pop(
+                    req_item.id)
+            if req_item.child_req_ids:
+                for child_id in req_item.child_req_ids:
+                    self.new_active_requests_queue_latency_ms += now - start_times.pop(
+                        child_id)
+
+    def _get_new_active_requests_queue_latency(self) -> float:
+        return self.new_active_requests_queue_latency_ms
+
+    def _should_exclude_last_generation_logits(self) -> bool:
+        return self.executor_request_queue.should_exclude_last_generation_logits_flag(
+        )
+
+    # ========== End of request fetching and processing methods ==========
+
     def _fetch_and_activate_new_requests(self) -> List[LlmRequest]:
 
         def _respond_if_invalid(request: LlmRequest) -> bool:
@@ -2031,11 +2314,8 @@ class PyExecutor:
                 self._handle_errors(str(e), requests=[request])
                 return True
 
-        new_requests_cur_rank = self.executor_request_queue.fetch_new_requests(
-            self.active_requests)
-        self.is_shutdown = self.executor_request_queue.is_shutdown
-        self.expected_num_active_requests = self.executor_request_queue.get_expected_num_active_requests(
-        )
+        new_requests_cur_rank = self._fetch_new_requests(
+            self.waiting_queue, self.active_requests)
 
         validated_requests = [
             request for request in new_requests_cur_rank
@@ -2635,20 +2915,20 @@ class PyExecutor:
 
     @nvtx_range("_handle_canceled_requests")
     def _handle_canceled_requests(self):
-        if self.executor_request_queue.get_canceled_req_ids_size() == 0:
+        if len(self.canceled_req_ids) == 0:
             return
 
-        # Remove cancel request in the waiting queue
-        self.executor_request_queue.update_waiting_queue()
-
         # Create set from list of canceled request ids to speed up canceled test
-        canceled_req_ids = set(
-            self.executor_request_queue.get_canceled_req_ids())
+        canceled_req_ids_set = set(self.canceled_req_ids)
+
+        # Remove canceled requests from the waiting queue
+        self.waiting_queue = deque(req for req in self.waiting_queue
+                                   if req.id not in canceled_req_ids_set)
 
         still_pending_canceled_ids = []
         for request in self.active_requests:
             req_id = request.py_request_id if not request.is_child else request.parent_request_id
-            if req_id not in canceled_req_ids:
+            if req_id not in canceled_req_ids_set:
                 continue
 
             is_cancelled = self._try_cancel_request(request)
@@ -2661,9 +2941,8 @@ class PyExecutor:
                 still_pending_canceled_ids.append(req_id)
 
         # Clear list of requests marked for cancellation and add back those that failed to cancel.
-        self.executor_request_queue.canceled_req_ids.clear()
-        self.executor_request_queue.canceled_req_ids.extend(
-            still_pending_canceled_ids)
+        self.canceled_req_ids.clear()
+        self.canceled_req_ids.extend(still_pending_canceled_ids)
 
     @nvtx_range("_enqueue_responses")
     def _enqueue_responses(self, responses: Iterable[Tuple[int, LlmResponse]]):
