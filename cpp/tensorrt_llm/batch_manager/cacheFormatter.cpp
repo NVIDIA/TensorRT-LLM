@@ -39,6 +39,129 @@
 #include <future>
 #include <numeric>
 
+namespace tensorrt_llm::batch_manager
+{
+size_t computeBufferIdx(size_t processIdx, executor::kv_cache::TargetRanksInfo const& targetInfo)
+{
+    size_t bufferTpRank = (processIdx / targetInfo.mDomainPPSize) / targetInfo.mPeerDupHeadFactor;
+    return (bufferTpRank * targetInfo.mDomainPPSize) + (processIdx % targetInfo.mDomainPPSize);
+}
+
+void sendBuffer(TransferSession& session, int deviceId, size_t processIdx,
+    std::vector<runtime::ITensor::SharedPtr> const& outputBuffers, size_t bufferCoverTargetNum,
+    runtime::ITensor::SharedPtr const& preAllocSendBuffer, runtime::BufferManager const& bufferManager,
+    executor::kv_cache::TargetRanksInfo const& targetInfo)
+{
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " send processIdx: %ld", processIdx);
+    NVTX3_SCOPED_RANGE(sendBuffer);
+    TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
+    TLLM_CHECK(session.getConnections().size() > (processIdx / targetInfo.mPeerDupHeadFactor));
+    TLLM_CHECK(outputBuffers.size() > (processIdx / targetInfo.mPeerDupHeadFactor));
+
+    auto startTime = LlmRequest::getSteadyClockNow();
+
+    size_t bufferIdx = computeBufferIdx(processIdx, targetInfo);
+    size_t size = outputBuffers[bufferIdx]->getSizeInBytes();
+
+    if (bufferIdx < bufferCoverTargetNum)
+    {
+        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " send processIdx: %ld bufferIdx: %ld size:%ld", processIdx,
+            bufferIdx, outputBuffers[bufferIdx]->getSizeInBytes());
+        session.send(processIdx, outputBuffers[bufferIdx]->data(), outputBuffers[bufferIdx]->getSizeInBytes());
+        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " end send processIdx: %ld bufferIdx: %ld size:%ld", processIdx,
+            bufferIdx, outputBuffers[bufferIdx]->getSizeInBytes());
+    }
+    else
+    {
+        // If cacheIdx< bufferCoverTargetNum, the ouputSplitCaches.at(cacheIdx) is allocated by cudaMallocAsync,
+        // which is unable to be transferred by UCX GPU-direct RDMA. We need copy the data to pre-allocated
+        // cudaMalloc buffer,and then start send.
+        // bufferCoverTargetNum == 0, mSendBuffer size < one outputSlice
+        // send multiple times
+
+        // TODO: why's it processIdx instead of bufferIdx?
+        size_t remainSendSize = outputBuffers[processIdx]->getSize();
+        size_t needSendSize = outputBuffers[processIdx]->getSize();
+        auto sendBufferIdx = bufferCoverTargetNum == 0 ? 0 : bufferIdx % bufferCoverTargetNum;
+
+        auto sendUseAllocBuffer = bufferCoverTargetNum == 0 ? preAllocSendBuffer : outputBuffers[sendBufferIdx];
+
+        while (remainSendSize > 0)
+        {
+            TLLM_CHECK(sendUseAllocBuffer != nullptr);
+            auto sendBufferEleSize = sendUseAllocBuffer->getSize();
+            auto sendSize = std::min(remainSendSize, sendBufferEleSize);
+
+            auto copySlice = runtime::ITensor::slice(outputBuffers[bufferIdx], needSendSize - remainSendSize, sendSize);
+            auto copyTargetSlice = runtime::ITensor::slice(sendUseAllocBuffer, 0, sendSize);
+            bufferManager.copy(*copySlice, *copyTargetSlice);
+            bufferManager.getStream().synchronize();
+            session.send(processIdx, copyTargetSlice->data(), copyTargetSlice->getSizeInBytes());
+            remainSendSize -= sendSize;
+        }
+    }
+
+    auto endTime = LlmRequest::getSteadyClockNow();
+    session.appendMeasure(startTime, endTime, size);
+}
+
+void sendAllBuffers(TransferSession& session, int deviceId,
+    std::vector<runtime::ITensor::SharedPtr> const& outputBuffers, size_t bufferCoverTargetNum,
+    runtime::ITensor::SharedPtr const& preAllocSendBuffer, runtime::BufferManager const& bufferManager,
+    executor::kv_cache::TargetRanksInfo const& targetInfo)
+{
+    size_t targetNum = session.getConnections().size();
+
+    if (targetNum > 1)
+    {
+        if (!common::getEnvEnableReceiveKVCacheParallel())
+        {
+            TLLM_LOG_DEBUG("Disable parallel receiving of the KV cache.");
+            for (size_t i = 0; i < targetNum; i++)
+            {
+                sendBuffer(session, deviceId, i, outputBuffers, bufferCoverTargetNum, preAllocSendBuffer, bufferManager,
+                    targetInfo);
+            }
+        }
+        else
+        {
+            // concurrency num should <=bufferCoverTargetNum to avoid data-race.
+            auto concurrencyNum = std::min(std::max(static_cast<size_t>(1), bufferCoverTargetNum), targetNum);
+
+            auto remainSendNum = targetNum;
+            while (remainSendNum > 0)
+            {
+                auto sendConcurrencyNum = std::min(remainSendNum, concurrencyNum);
+                std::vector<std::future<void>> futures;
+                futures.reserve(sendConcurrencyNum);
+
+                for (size_t i = 0; i < sendConcurrencyNum; i++)
+                {
+                    size_t idx = i + (targetNum - remainSendNum);
+                    TLLM_CHECK(idx < targetNum);
+                    futures.push_back(std::async(std::launch::async,
+                        [&, idx]()
+                        {
+                            sendBuffer(session, deviceId, idx, outputBuffers, bufferCoverTargetNum, preAllocSendBuffer,
+                                bufferManager, targetInfo);
+                        }));
+                }
+                for (auto& future : futures)
+                {
+                    future.get();
+                }
+                remainSendNum -= sendConcurrencyNum;
+            }
+        }
+    }
+    else
+    {
+        sendBuffer(
+            session, deviceId, 0, outputBuffers, bufferCoverTargetNum, preAllocSendBuffer, bufferManager, targetInfo);
+    }
+}
+} // namespace tensorrt_llm::batch_manager
+
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
@@ -434,106 +557,10 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
             TLLM_CHECK(preAllocSendBuffer->getDataType()
                 == inputKvCacheBlocksPerWindow.begin()->second.front()->getDataType());
         }
-        auto sendBufferFun = [&](int deviceId, size_t processIdx)
-        {
-            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " send processIdx: %ld", processIdx);
-            NVTX3_SCOPED_RANGE(sendBufferFun);
-            TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
-            TLLM_CHECK(connections.size() > (processIdx / peerDuplicateHeadFactor));
-            TLLM_CHECK(outputSplitCaches.size() > (processIdx / peerDuplicateHeadFactor));
-            auto startTime = LlmRequest::getSteadyClockNow();
 
-            size_t ppDomainSize = targetInfo.mDomainPPSize;
-            size_t bufferTpRank = (processIdx / ppDomainSize) / peerDuplicateHeadFactor;
-            size_t bufferIdx = (bufferTpRank * ppDomainSize) + (processIdx % ppDomainSize);
-            size_t size = outputSplitCaches[bufferIdx]->getSizeInBytes();
+        sendAllBuffers(
+            session, deviceId, outputSplitCaches, bufferCoverTargetNum, preAllocSendBuffer, bufferManager, targetInfo);
 
-            if (bufferIdx < bufferCoverTargetNum)
-            {
-                TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " send processIdx: %d bufferIdx: %d size:%ld",
-                    processIdx, bufferIdx, outputSplitCaches[bufferIdx]->getSizeInBytes());
-                session.send(
-                    processIdx, outputSplitCaches[bufferIdx]->data(), outputSplitCaches[bufferIdx]->getSizeInBytes());
-                TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " end send processIdx: %d bufferIdx: %d size:%ld",
-                    processIdx, bufferIdx, outputSplitCaches[bufferIdx]->getSizeInBytes());
-            }
-            else
-            {
-                // If cacheIdx< bufferCoverTargetNum, the ouputSplitCaches.at(cacheIdx) is allocated by cudaMallocAsync,
-                // which is unable to be transferred by UCX GPU-direct RDMA. We need copy the data to pre-allocated
-                // cudaMalloc buffer,and then start send.
-                // bufferCoverTargetNum == 0, mSendBuffer size < one outputSlice
-                // send multiple times
-
-                size_t remainSendSize = outputSplitCaches[processIdx]->getSize();
-                size_t needSendSize = outputSplitCaches[processIdx]->getSize();
-                auto sendBufferIdx = bufferCoverTargetNum == 0 ? 0 : bufferIdx % bufferCoverTargetNum;
-
-                auto sendUseAllocBuffer
-                    = bufferCoverTargetNum == 0 ? preAllocSendBuffer : outputSplitCaches[sendBufferIdx];
-
-                while (remainSendSize > 0)
-                {
-                    TLLM_CHECK(sendUseAllocBuffer != nullptr);
-                    auto sendBufferEleSize = sendUseAllocBuffer->getSize();
-
-                    auto sendSize = std::min(remainSendSize, sendBufferEleSize);
-                    auto copySlice = runtime::ITensor::slice(
-                        outputSplitCaches[bufferIdx], needSendSize - remainSendSize, sendSize);
-                    auto copyTargetSlice = runtime::ITensor::slice(sendUseAllocBuffer, 0, sendSize);
-                    bufferManager.copy(*copySlice, *copyTargetSlice);
-                    bufferManager.getStream().synchronize();
-                    session.send(processIdx, copyTargetSlice->data(), copyTargetSlice->getSizeInBytes());
-                    remainSendSize -= sendSize;
-                }
-            }
-
-            auto endTime = LlmRequest::getSteadyClockNow();
-            session.appendMeasure(startTime, endTime, size);
-        };
-
-        if (connections.size() > 1)
-        {
-            if (!common::getEnvEnableReceiveKVCacheParallel())
-            {
-                TLLM_LOG_DEBUG("Disable parallel receiving of the KV cache.");
-
-                for (size_t i = 0; i < connections.size(); i++)
-                {
-                    sendBufferFun(deviceId, i);
-                }
-            }
-            else
-            {
-                // concurrency num should <=bufferCoverTargetNum to avoid data-race.
-                auto concurrencyNum
-                    = std::min(std::max(static_cast<size_t>(1), bufferCoverTargetNum), connections.size());
-
-                auto remainSendNum = connections.size();
-
-                while (remainSendNum > 0)
-                {
-                    auto sendConcurrencyNum = std::min(remainSendNum, concurrencyNum);
-                    std::vector<std::future<void>> futures;
-                    futures.reserve(sendConcurrencyNum);
-                    for (size_t i = 0; i < sendConcurrencyNum; i++)
-                    {
-                        TLLM_CHECK((i + (connections.size() - remainSendNum)) < connections.size());
-                        futures.push_back(std::async(
-                            std::launch::async, sendBufferFun, deviceId, i + (connections.size() - remainSendNum)));
-                    }
-                    for (auto& future : futures)
-                    {
-                        future.get();
-                    }
-                    remainSendNum -= sendConcurrencyNum;
-                }
-            }
-        }
-        else
-        {
-            sendBufferFun(deviceId, 0);
-        }
         session.setTime(TransferSession::kTimeTransmissions);
 
         mCacheTransBufferManager->freeBufferIndexForSend(cacheBufferId);

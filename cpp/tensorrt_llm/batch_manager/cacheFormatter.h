@@ -38,7 +38,18 @@
 namespace tensorrt_llm::batch_manager
 {
 class TransferSession;
-}
+size_t computeBufferIdx(size_t processIdx, executor::kv_cache::TargetRanksInfo const& targetInfo);
+
+void sendBuffer(TransferSession& session, int deviceId, size_t processIdx,
+    std::vector<runtime::ITensor::SharedPtr> const& outputBuffers, size_t bufferCoverTargetNum,
+    runtime::ITensor::SharedPtr const& preAllocSendBuffer, runtime::BufferManager const& bufferManager,
+    executor::kv_cache::TargetRanksInfo const& targetInfo);
+
+void sendAllBuffers(TransferSession& session, int deviceId,
+    std::vector<runtime::ITensor::SharedPtr> const& outputBuffers, size_t bufferCoverTargetNum,
+    runtime::ITensor::SharedPtr const& preAllocSendBuffer, runtime::BufferManager const& bufferManager,
+    executor::kv_cache::TargetRanksInfo const& targetInfo);
+} // namespace tensorrt_llm::batch_manager
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {

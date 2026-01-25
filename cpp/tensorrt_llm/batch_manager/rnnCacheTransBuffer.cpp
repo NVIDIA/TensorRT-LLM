@@ -33,8 +33,9 @@ size_t RnnCacheTransBufferManager::computeTransferBufferSize(
 
 RnnCacheTransBufferManager::RnnCacheTransBufferManager(
     RnnStateManager* rnnStateManager, std::optional<size_t> maxNumTokens)
-    : BaseTransBufferManager(
-        computeTransferBufferSize(rnnStateManager, maxNumTokens), nvinfer1::DataType::kHALF, maxNumTokens)
+    : BaseTransBufferManager(computeTransferBufferSize(rnnStateManager, maxNumTokens),
+        nvinfer1::DataType::kUINT8, // Use byte buffer for mixed dtypes
+        maxNumTokens)
     , mRnnStateManager{rnnStateManager}
 {
     TLLM_CHECK(mRnnStateManager != nullptr);
