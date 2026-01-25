@@ -273,6 +273,61 @@ typing_extensions = {version = ">=4.5", markers = "python_version < \"3.13\""}
 trio = ["trio (>=0.31.0) ; python_version < \"3.10\"", "trio (>=0.32.0) ; python_version >= \"3.10\""]
 
 [[package]]
+name = "apache-tvm-ffi"
+version = "0.1.8.post2"
+description = "tvm ffi"
+optional = false
+python-versions = ">=3.8"
+groups = ["main"]
+files = [
+    {file = "apache_tvm_ffi-0.1.8.post2-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:e11e03c865297c65c2f206c90b8014890bc52a3059d8148b47cd2c2759bcea90"},
+    {file = "apache_tvm_ffi-0.1.8.post2-cp310-cp310-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:e855f2b3f60ec16939b00e1b594ce7f488f96e387b12547e98643177f70ab2b1"},
+    {file = "apache_tvm_ffi-0.1.8.post2-cp310-cp310-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:854ecd90a1039d542c531fa6a4928f5633452aedf1ed7f646f3bbbeca8217156"},
+    {file = "apache_tvm_ffi-0.1.8.post2-cp310-cp310-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:e1894b6f9c2b45bc9df8e407d041e575128591b998ced09f974675d2bb6b8bc9"},
+    {file = "apache_tvm_ffi-0.1.8.post2-cp310-cp310-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:ef922ef3ed971a4e161a0385ef9f67af379d52b0d83d62c08b79f6707b6660b5"},
+    {file = "apache_tvm_ffi-0.1.8.post2-cp310-cp310-win_amd64.whl", hash = "sha256:146f98dcd21052eeed96ad07472bdffd8189fb2106edc6e3de91e28e3b000bf8"},
+    {file = "apache_tvm_ffi-0.1.8.post2-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:40f5fba3e06617f16888a0fdaf7ab4049841ff6e741644be822400438b771fe7"},
+    {file = "apache_tvm_ffi-0.1.8.post2-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:9eb6d228fa22b6a5da140d761962f022a154746c91fe7608c49062deaf671f9f"},
+    {file = "apache_tvm_ffi-0.1.8.post2-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:581c0acf845859be0cc26ac79f3663a83393b662c97c7125ebb78f0228b69d96"},
+    {file = "apache_tvm_ffi-0.1.8.post2-cp311-cp311-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:beadc7bb480ae02d02e2108543f6f4b4170d77e361ab3ccb43697d174ec185b0"},
+    {file = "apache_tvm_ffi-0.1.8.post2-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:e593d191c7ca0726ebcd3b024a4bc8140694fdfce2e7b02493f38ad5c4c9ecf7"},
+    {file = "apache_tvm_ffi-0.1.8.post2-cp311-cp311-win_amd64.whl", hash = "sha256:1c685f19d0f26d9356c7c77a1cb652a3632ec9ee6cd21aa1d8cfb968743ec1fd"},
+    {file = "apache_tvm_ffi-0.1.8.post2-cp312-abi3-macosx_11_0_arm64.whl", hash = "sha256:c13ec7fc8f255767998b301ace0cd1e7d17ba76b48ffeb97ca9eb22a3314e250"},
+    {file = "apache_tvm_ffi-0.1.8.post2-cp312-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:8c78b4caf17304a1f47881bccdb2f9ac24d98b3b7fbe761a6dd4fd0585934d96"},
+    {file = "apache_tvm_ffi-0.1.8.post2-cp312-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:4a48da3fa8f47130f3502134f01e97044388c5217e7b91be4b0acec4feab81a0"},
+    {file = "apache_tvm_ffi-0.1.8.post2-cp312-abi3-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:61cc98e489ebc03bc96d1a966dc863eb1c0a607383f6bf4a416ff0a96170ca85"},
+    {file = "apache_tvm_ffi-0.1.8.post2-cp312-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:caa48509f0c7d9b896823b492a9ee42afac2548065c1ec7ef07f9a0dc30d2796"},
+    {file = "apache_tvm_ffi-0.1.8.post2-cp312-abi3-win_amd64.whl", hash = "sha256:985831722d1dd562d13e8e34102fd99f42f964c53fc7cf9d80fc4f7602f89196"},
+    {file = "apache_tvm_ffi-0.1.8.post2-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:4a3f6cb1173cfe19a1b66fd8577a6f3ce644bdc22691961c07c64304a7c3f17a"},
+    {file = "apache_tvm_ffi-0.1.8.post2-cp314-cp314t-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:ac6c2d4e117ca63974bcd20fdf5715d01f3b4d0ed78921f493461050daf7c1a3"},
+    {file = "apache_tvm_ffi-0.1.8.post2-cp314-cp314t-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:0bc5456f971097dcd973daba32cb6f321893873c53235159ab6426b0c7bef7e2"},
+    {file = "apache_tvm_ffi-0.1.8.post2-cp314-cp314t-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:7f2016b4b31e7f75d71c638bbd1ae43d6e239cf8e20b539fb9de6917b3fb25bc"},
+    {file = "apache_tvm_ffi-0.1.8.post2-cp314-cp314t-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:4c0ca7be630d0888eae163a4298ddfb3f7bd837112c7e6ffcd7157e34e78215b"},
+    {file = "apache_tvm_ffi-0.1.8.post2-cp314-cp314t-win_amd64.whl", hash = "sha256:ecb0d9f7f410ba3b4d92547c2477f73f8406455448f4ea8c146515671fd20210"},
+    {file = "apache_tvm_ffi-0.1.8.post2-cp38-cp38-macosx_11_0_arm64.whl", hash = "sha256:b66fefb359d9aa73a542bf4caf6a82978727d064e01d082a186f1fe5a61c5356"},
+    {file = "apache_tvm_ffi-0.1.8.post2-cp38-cp38-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:a353fbad2013aa8f510a6c69d0506a0f6749deed6bba9f6e00ba96af46ba2616"},
+    {file = "apache_tvm_ffi-0.1.8.post2-cp38-cp38-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:ccad194f9be71bf7200fd39d89cb98ab3f62ece1bee3487846b3fb46658e07a4"},
+    {file = "apache_tvm_ffi-0.1.8.post2-cp38-cp38-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:6604c0ee7fcc617f26b6c50ee92ad4d3fcd5467a1b607361345afc6235553359"},
+    {file = "apache_tvm_ffi-0.1.8.post2-cp38-cp38-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:9908d713e8decdda7ff3cf9dab2b582d36ec08e598e99744759cf03c6538b80a"},
+    {file = "apache_tvm_ffi-0.1.8.post2-cp38-cp38-win_amd64.whl", hash = "sha256:9b2848151ff4ea055229e7d77c283c5e9772b4684ce88f5fefefe6c8b1a9d33f"},
+    {file = "apache_tvm_ffi-0.1.8.post2-cp39-cp39-macosx_11_0_arm64.whl", hash = "sha256:4099dd5f91fa12814c74624c01689d9b02805844099cf7cb3e1a3df3cc19bdf3"},
+    {file = "apache_tvm_ffi-0.1.8.post2-cp39-cp39-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:2ec6dc04d5d17b64f538583a64a75763f4c5d6ea57473ceeaea7be989790aa9c"},
+    {file = "apache_tvm_ffi-0.1.8.post2-cp39-cp39-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:1e50149b78ef0443cc1714bdfc9b5e1080f25e21189cd35561fd975eddcd531f"},
+    {file = "apache_tvm_ffi-0.1.8.post2-cp39-cp39-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:9a0417b5a580b40592f6a37e0ce92bb1eea21bb4d633654a98cbfc5e7cb890d0"},
+    {file = "apache_tvm_ffi-0.1.8.post2-cp39-cp39-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:54208c6d06fb3926e1fd86972ead72f3f8dcc3663c916a390fd593e29f59165f"},
+    {file = "apache_tvm_ffi-0.1.8.post2-cp39-cp39-win_amd64.whl", hash = "sha256:7c9e0fdc39807cb4d6aab541b87770c7254ce910c82a94da81b9e0552f5cb65f"},
+    {file = "apache_tvm_ffi-0.1.8.post2.tar.gz", hash = "sha256:4513e38852894f290172ecfefcbc18d34e817fd29c16a0f1770e130c82b4067e"},
+]
+
+[package.dependencies]
+typing-extensions = ">=4.5"
+
+[package.extras]
+cpp = ["ninja"]
+test = ["ninja", "numpy", "pytest", "setuptools", "torch ; python_version < \"3.14\""]
+torch = ["ninja", "setuptools", "torch"]
+
+[[package]]
 name = "async-timeout"
 version = "5.0.1"
 description = "Timeout context manager for asyncio programs"
@@ -1291,23 +1346,26 @@ files = [
 
 [[package]]
 name = "flashinfer-python"
-version = "0.3.1.post1"
+version = "0.6.2"
 description = "FlashInfer: Kernel Library for LLM Serving"
 optional = false
-python-versions = "<4.0,>=3.9"
+python-versions = "<4.0,>=3.10"
 groups = ["main"]
 files = [
-    {file = "flashinfer_python-0.3.1.post1.tar.gz", hash = "sha256:d32218c7e33bcbf907719d3e51ddbea84d94a87fd0425378d70bcd28728f342e"},
+    {file = "flashinfer_python-0.6.2-py3-none-any.whl", hash = "sha256:8c3bc7d961d85697d12b8c52097ccf093ab722447494d087ee71bc4585ebca51"},
+    {file = "flashinfer_python-0.6.2.tar.gz", hash = "sha256:6f787ae77c351657630fbe40c4904c61a78ec5b786944a8e3df9d5348e3bd6bb"},
 ]
 
 [package.dependencies]
+apache-tvm-ffi = ">=0.1.6,<0.1.8 || >0.1.8,<0.1.8.post0 || >0.1.8.post0,<0.2"
 click = "*"
 einops = "*"
 ninja = "*"
 numpy = "*"
 nvidia-cudnn-frontend = ">=1.13.0"
+nvidia-cutlass-dsl = ">=4.3.4"
+nvidia-ml-py = "*"
 packaging = ">=24.2"
-pynvml = "*"
 requests = "*"
 tabulate = "*"
 torch = "*"
@@ -4806,24 +4864,6 @@ files = [
 windows-terminal = ["colorama (>=0.4.6)"]
 
 [[package]]
-name = "pynvml"
-version = "13.0.1"
-description = "Python utilities for the NVIDIA Management Library"
-optional = false
-python-versions = ">=3.9"
-groups = ["main"]
-files = [
-    {file = "pynvml-13.0.1-py3-none-any.whl", hash = "sha256:e2b20e0a501eeec951e2455b7ab444759cf048e0e13a57b08049fa2775266aa8"},
-    {file = "pynvml-13.0.1.tar.gz", hash = "sha256:1245991d9db786b4d2f277ce66869bd58f38ac654e38c9397d18f243c8f6e48f"},
-]
-
-[package.dependencies]
-nvidia-ml-py = ">=12.0.0"
-
-[package.extras]
-test = ["pytest (>=3.6)", "pytest-cov", "pytest-runner"]
-
-[[package]]
 name = "pyparsing"
 version = "3.3.2"
 description = "pyparsing - Classes and methods to define and execute parsing grammars"
@@ -5263,14 +5303,14 @@ use-chardet-on-py3 = ["chardet (>=3.0.2,<6)"]
 
 [[package]]
 name = "rich"
-version = "14.2.0"
+version = "14.3.1"
 description = "Render rich text, tables, progress bars, syntax highlighting, markdown and more to the terminal"
 optional = false
 python-versions = ">=3.8.0"
 groups = ["main"]
 files = [
-    {file = "rich-14.2.0-py3-none-any.whl", hash = "sha256:76bc51fe2e57d2b1be1f96c524b890b816e334ab4c1e45888799bfaab0021edd"},
-    {file = "rich-14.2.0.tar.gz", hash = "sha256:73ff50c7c0c1c77c8243079283f4edb376f0f6442433aecb8ce7e6d0b92d1fe4"},
+    {file = "rich-14.3.1-py3-none-any.whl", hash = "sha256:da750b1aebbff0b372557426fb3f35ba56de8ef954b3190315eb64076d6fb54e"},
+    {file = "rich-14.3.1.tar.gz", hash = "sha256:b8c5f568a3a749f9290ec6bddedf835cec33696bfc1e48bcfecb276c7386e4b8"},
 ]
 
 [package.dependencies]
@@ -6832,4 +6872,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "51dd957190b56cbf87c695c5435a1d05f29da28fda4ce11df383f1c5631800aa"
+content-hash = "1f26b1eecc7f21e53dc4380f7865392092be221df4ccf54b27c7d0e3e1c8b812"

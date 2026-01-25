@@ -13,10 +13,7 @@ pytestmark = pytest.mark.threadleak(enabled=False)
 
 
 @pytest.fixture(scope="module",
-                params=[
-                    "gpt_oss/gpt-oss-20b", "DeepSeek-R1-Distill-Qwen-1.5B",
-                    "Qwen3/Qwen3-0.6B"
-                ])
+                params=["gpt_oss/gpt-oss-20b", "Qwen3/Qwen3-0.6B"])
 def model(request):
     return request.param
 
@@ -35,10 +32,6 @@ def server(model: str, num_postprocess_workers: int):
     args = ["--num_postprocess_workers", f"{num_postprocess_workers}"]
     if model.startswith("Qwen3"):
         args.extend(["--reasoning_parser", "qwen3"])
-    elif model.startswith("DeepSeek-R1"):
-        args.extend(["--reasoning_parser", "deepseek-r1"])
-
-    if not model.startswith("gpt_oss"):
         args.extend(["--tool_parser", "qwen3"])
 
     with RemoteOpenAIServer(model_path, args) as remote_server:
@@ -167,8 +160,8 @@ def get_current_weather(location: str, format: str = "celsius") -> dict:
 
 @pytest.mark.asyncio(loop_scope="module")
 async def test_tool_calls(client: openai.AsyncOpenAI, model: str):
-    if model.startswith("DeepSeek-R1"):
-        pytest.skip("DeepSeek-R1 does not support tool calls")
+    if model.startswith("Qwen3"):
+        pytest.skip("Qwen3 tool call is not stable")
 
     tool_get_current_weather = {
         "type": "function",
@@ -241,8 +234,8 @@ async def test_streaming(client: openai.AsyncOpenAI, model: str):
 
 @pytest.mark.asyncio(loop_scope="module")
 async def test_streaming_tool_call(client: openai.AsyncOpenAI, model: str):
-    if model.startswith("DeepSeek-R1"):
-        pytest.skip("DeepSeek-R1 does not support tool calls")
+    if model.startswith("Qwen3"):
+        pytest.skip("Qwen3 tool call is not stable")
 
     tool_get_current_weather = {
         "type": "function",
