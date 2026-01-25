@@ -77,7 +77,9 @@ dependencies = [
     "partial-json-parser (>=0.2.1.1.post7,<0.3.0.0)",
     "torch-c-dlpack-ext (==0.1.3)",
     "mistral-common (==1.8.6)",
-    "torchao (>=0.14.1)"
+    "torchao (>=0.14.1)",
+    "cuda-core (>=0.5.1,<0.6.0)",
+    "dynamic-path-manager (>=1.0.1,<2.0.0)"
 ]
 
 
