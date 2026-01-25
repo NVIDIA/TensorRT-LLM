@@ -287,6 +287,9 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
                     "sharding_source": ['factory', 'heuristic'],
                     "sharding_dims": ['ep', 'bmm'],
                 },
+                "fuse_fp8_moe": {
+                    "allow_different_input_scales": True,
+                },
             }
         }
 
