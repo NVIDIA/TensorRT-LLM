@@ -37,7 +37,8 @@ pydantic>=2.9.1
 pydantic-settings[yaml]
 omegaconf
 pillow
-wheel<=0.45.1
+# WAR against https://github.com/advisories/GHSA-8rrh-rw8j-w5fx
+wheel>=0.46.2
 optimum
 # evaluate needs datasets>=2.0.0 which triggers datasets>3.1.0 which is not stable: https://github.com/huggingface/datasets/issues/7467
 datasets==3.1.0
