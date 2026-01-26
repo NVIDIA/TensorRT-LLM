@@ -21,6 +21,16 @@ from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 
 _thread_local = threading.local()
 
+from ..flashinfer_utils import current_flashinfer_allreduce_workspace
+
+try:
+    import flashinfer.comm as flashinfer_comm
+except ImportError:
+    print(
+        "FlashInfer comm module not found. Follow readme to install Flashinfer >=2.8.0."
+    )
+    exit(1)
+
 
 def get_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
     if not hasattr(_thread_local, f'allreduce_workspaces_{mapping.pp_rank}'):
@@ -959,3 +969,60 @@ class MoEAllReduce(nn.Module):
                 nranks=self.mapping.tp_size,
                 eps=all_reduce_params.eps,
             )
+
+
+class FlashInferVLLMAllReduce(nn.Module):
+
+    def __init__(self, mapping: Mapping, dtype: torch.dtype):
+        super().__init__()
+        self.mapping = mapping
+        self.dtype = dtype
+
+        self.reg_buffer_size = 8192 * 8192 * 2
+        self.workspace = current_flashinfer_allreduce_workspace()
+
+    def custom_all_reduce(self, input: torch.Tensor, registered: bool = False):
+        input_tensor = input.contiguous()
+        output_tensor = torch.empty_like(input_tensor)
+
+        try:
+            if registered:
+                flashinfer_comm.vllm_all_reduce(self.workspace.fa, input_tensor,
+                                                output_tensor, 0, 0, 36)
+            else:
+                flashinfer_comm.vllm_all_reduce(
+                    self.workspace.fa,
+                    input_tensor,
+                    output_tensor,
+                    self.workspace.buffer_ptrs_ipc.peer_ptrs[
+                        self.mapping.tp_rank],
+                    self.reg_buffer_size,
+                    36,  # CTA upper bounds: 36 as mentioned in the API
+                )
+        except Exception as e:
+            logger.error(f"FlashInferVLLMAllReduce failed: {e}")
+            raise
+
+        return output_tensor
+
+    def forward(
+        self,
+        input: torch.Tensor,
+        *,
+        all_reduce_params: Optional[AllReduceParams] = None,
+    ) -> torch.Tensor:
+        """
+        Forward pass for vLLM custom AllReduce.
+        Args:
+            input (torch.Tensor): Input tensor to be reduced
+            all_reduce_params (Optional[AllReduceParams]): Parameters for fused operations
+        Returns:
+            torch.Tensor: Reduced tensor
+        """
+        if self.workspace._is_capturing:
+            if torch.cuda.is_current_stream_capturing():
+                return self.custom_all_reduce(input, registered=True)
+            else:
+                return torch.empty_like(input)
+        else:
+            return self.custom_all_reduce(input, registered=False)

@@ -5,7 +5,7 @@ from .moe_alltoall import MoeAlltoAll
 from .ops import (AllReduce, AllReduceParams, AllReduceStrategy,
                   HelixAllToAllNative, MoEAllReduce, MoEAllReduceParams,
                   allgather, alltoall_helix, cp_allgather, reducescatter,
-                  userbuffers_allreduce_finalize)
+                  userbuffers_allreduce_finalize, FlashInferVLLMAllReduce)
 
 __all__ = [
     "allgather",

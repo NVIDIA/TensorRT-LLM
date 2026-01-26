@@ -2352,7 +2352,7 @@ class Linear(nn.Module):
         disable_deep_gemm: bool = False,
         fused_weight_shard_indices_mapping: Optional[dict] = None,
         nvfp4_allowed_backends: Optional[List[str]] = None,
-        enable_gemm_allreduce_fusion: bool = True,
+        use_flashinfer_allreduce: bool = True,
     ):
         """
         Args:
@@ -2362,7 +2362,7 @@ class Linear(nn.Module):
                 Valid backends: 'cutlass', 'cublaslt', 'cutedsl', 'cuda_core'.
                 Configure via nvfp4_gemm_config.allowed_backends in extra_llm_api_options.yaml.
         """
-        from ..distributed import AllReduce
+        from ..distributed import AllReduce, FlashInferVLLMAllReduce
 
         super().__init__()
         self.has_bias = bias
@@ -2415,6 +2415,17 @@ class Linear(nn.Module):
         self.all_reduce = AllReduce(mapping=self.mapping,
                                     strategy=allreduce_strategy,
                                     dtype=self.dtype) if reduce_output else None
+
+        self.use_flashinfer_allreduce = use_flashinfer_allreduce
+        self.flashinfer_vllm = self.use_flashinfer_allreduce and os.getenv(
+            "_USE_FLASHINFER_VLLM_ALLREDUCE", "0") == "1"
+        self.flashinfer_token_threshold = int(
+            os.getenv("_FLASHINFER_TOKEN_THRESHOLD", "256"))
+
+        if self.flashinfer_vllm:
+            self.flash_infer_all_reduce = FlashInferVLLMAllReduce(
+                mapping=self.mapping,
+                dtype=self.dtype) if reduce_output else None
 
         self._weights_created = False
         self.reduce_output = reduce_output
@@ -2588,8 +2599,17 @@ class Linear(nn.Module):
                     bias = None if fuse_bias else bias
                     output = self.apply_linear(input, bias, lora_params,
                                                layer_idx)
-                    output = self.all_reduce(
-                        output, all_reduce_params=all_reduce_params)
+                    if self.flashinfer_vllm and output.size(
+                            0) <= self.flashinfer_token_threshold:
+                        output = self.flash_infer_all_reduce(
+                            output,
+                            all_reduce_params=None,
+                        )
+                    else:
+                        output = self.all_reduce(
+                            output,
+                            all_reduce_params=all_reduce_params,
+                        )
             else:
                 output = self.apply_linear(input, bias, lora_params, layer_idx)
         elif self.tp_mode == TensorParallelMode.COLUMN:
