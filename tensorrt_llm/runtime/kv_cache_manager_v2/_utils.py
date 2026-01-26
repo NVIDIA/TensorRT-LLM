@@ -21,12 +21,14 @@ import itertools
 import operator
 import os
 import platform
+import sys
 import traceback
 import warnings
 import weakref
 from abc import ABC, abstractmethod
 from collections import defaultdict, deque
 from collections.abc import Set
+from contextlib import contextmanager
 from ctypes.util import find_library
 from itertools import pairwise
 from typing import (
@@ -943,3 +945,15 @@ class CudaStreamWrapper:
 
     def __cuda_stream__(self) -> tuple[int, int]:
         return 0, int(self._stream)
+
+
+@contextmanager
+def temporary_sys_path(path: str) -> Iterator[None]:
+    already_in_path = path in sys.path
+    if not already_in_path:
+        sys.path.insert(0, path)
+    try:
+        yield
+    finally:
+        if not already_in_path:
+            sys.path.remove(path)

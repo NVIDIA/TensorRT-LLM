@@ -25,6 +25,7 @@ from .. import rawref
 from .._block_radix_tree import Block, RootBlock, UselessBlockError
 from .._common import (
     BAD_PAGE_INDEX,
+    DEFAULT_BEAM_INDEX,
     GPU_LEVEL,
     NDEBUG,
     BeamIndex,
@@ -312,7 +313,7 @@ class _KVCache:
     # Due to constraints of the current kernels, K/V data blocks and the correspondding quant scale blocks
     # share the same indices, so the output for DataRole.KEY_DATA and DataRole.KEY_BLOCK_SCALE are the same.
     def get_page_indices(
-        self, layer_group_id: LayerGroupId, beam_id: BeamIndex = BeamIndex(0)
+        self, layer_group_id: LayerGroupId, beam_id: BeamIndex = DEFAULT_BEAM_INDEX
     ) -> IndexSeq:
         indices = self._page_indices[beam_id][layer_group_id]
         assert NDEBUG or all(
@@ -330,11 +331,20 @@ class _KVCache:
             yield self._page_indices[beam_id][lc]
 
     def get_slot_indices(
-        self, layer_group_id: LayerGroupId, beam_id: BeamIndex = BeamIndex(0)
+        self, layer_group_id: LayerGroupId, beam_id: BeamIndex = DEFAULT_BEAM_INDEX
     ) -> Iterator[int]:
         """
         Get the internal slot indices for the given layer group and beam.
         Each slot is a group of coalesced buffers in one memory pool group.
+        This API exposes internal slot indices, mainly for efficient data transfer.
+        For computation, use get_page_indices() instead.
+
+        Args:
+            layer_group_id: Layer group to inspect.
+            beam_id: Beam index to read. Defaults to DEFAULT_BEAM_INDEX.
+
+        Yields:
+            Slot indices per block, or BAD_PAGE_INDEX when a holder is missing.
         """
         for b in self._blocks:
             holder = b.pages[beam_id][layer_group_id]
@@ -619,7 +629,7 @@ class _KVCache:
         )
         seq_block = self._blocks[ordinal]
         assert typed_len(seq_block.pages) == 1, "Must have 1 beam only"
-        beam_idx = BeamIndex(0)
+        beam_idx = DEFAULT_BEAM_INDEX
         beam_block = seq_block.pages[beam_idx]
         tokens_per_block = self.tokens_per_block
         start = ordinal * tokens_per_block
@@ -767,7 +777,7 @@ class _KVCache:
         assert self._blocks[ordinal].is_committed
         ret = unwrap_optional(self._blocks[ordinal].tree_block)
         if not NDEBUG:
-            for b in self._block(ordinal, BeamIndex(0)):
+            for b in self._block(ordinal, DEFAULT_BEAM_INDEX):
                 assert b is None or (isinstance(b.page, CommittedPage) and b.page.block() is ret)
         return ret
 
@@ -936,7 +946,7 @@ class _KVCache:
             ],
         )
 
-        beam_idx = BeamIndex(0)
+        beam_idx = DEFAULT_BEAM_INDEX
         for lc_idx, lc in life_cycles.items():
             stale_start, stale_end = _KVCache._get_stale_range(
                 tokens_per_block, get_num_matched_tokens(matched), lc
@@ -1022,7 +1032,7 @@ class _KVCache:
         return old
 
     def _get_page_indices_ref(
-        self, lc: LifeCycleId, beam_id: BeamIndex = BeamIndex(0)
+        self, lc: LifeCycleId, beam_id: BeamIndex = DEFAULT_BEAM_INDEX
     ) -> Iterator[int | None]:
         assert beam_id < self.beam_width
         assert self.is_active
