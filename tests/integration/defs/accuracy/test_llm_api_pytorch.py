@@ -1126,6 +1126,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_hopper
     def test_fp8_vswa_reuse(self):
         # NOTE: Test with VSWA kv cache config.
         kv_cache_config = KvCacheConfig(
@@ -1140,6 +1141,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_hopper
     @pytest.mark.parametrize("backend", ["xgrammar"])
     def test_fp8_guided_decoding_vswa_reuse(self, backend: str, mocker):
         mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
@@ -5102,7 +5104,7 @@ class TestDeepSeekR1LongBenchV2(LlmapiAccuracyTestHarness):
             pytest.skip(f"Model directory {model_dir} does not exist")
 
         # Configure model settings
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
                                         enable_block_reuse=True,
                                         enable_partial_reuse=False,
                                         dtype="fp8")

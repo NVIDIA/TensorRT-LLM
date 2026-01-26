@@ -87,6 +87,7 @@ l0_b200:
   - unittest/tools/test_layer_wise_benchmarks.py::test_nemotron_gen_dep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_qwen3_next_gen_tep[1]
   - unittest/_torch/modeling/test_modeling_exaone4.py::TestEXAONE4::test_llm_load_1_FP8
+  - unittest/kv_cache_manager_v2_tests/
 - condition:
     ranges:
       system_gpu_count:

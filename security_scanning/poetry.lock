@@ -1026,6 +1026,41 @@ cuda-pathfinder = ">=1.1,<2.0"
 all = ["cuda-toolkit[cufile] (==13.*) ; sys_platform == \"linux\"", "cuda-toolkit[nvjitlink,nvrtc,nvvm] (==13.*)"]
 
 [[package]]
+name = "cuda-core"
+version = "0.5.1"
+description = "cuda.core: (experimental) pythonic CUDA module"
+optional = false
+python-versions = ">=3.10"
+groups = ["main"]
+files = [
+    {file = "cuda_core-0.5.1-cp310-cp310-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:c6fb9cb9aba53f2e924dac34843165cbb64b9d6367c6113ec4d8845320f459bf"},
+    {file = "cuda_core-0.5.1-cp310-cp310-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:d32e780f6963253dc3d54646ad9aea733934c9df0899d7a0b01c3d564f6d55fd"},
+    {file = "cuda_core-0.5.1-cp310-cp310-win_amd64.whl", hash = "sha256:0c25ece5b96252f2c56b17b2e49a28c35022681b64f32c3e92f02362ee481096"},
+    {file = "cuda_core-0.5.1-cp311-cp311-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:b0a998f241dde08d3e64b05d1f0d6bec004a5ed24fef42f9bebb9f17c274f31f"},
+    {file = "cuda_core-0.5.1-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:019894ed5799b687df8e603214cd241dcf24b94e4be9c3d4e957981e5e2eb0bd"},
+    {file = "cuda_core-0.5.1-cp311-cp311-win_amd64.whl", hash = "sha256:8e2aa198e4baf4a5273cb3c27e22447d1e870189200b8fb889e956b26bcaf6be"},
+    {file = "cuda_core-0.5.1-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:78876c513d484ec94ac08402d9b9059d1d8665ffd8cdc33a23b93424747c3c47"},
+    {file = "cuda_core-0.5.1-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:82e687b0a5d4fde99d7bb266c60996fc266a55dc00c888eb0d7dba70bb127a09"},
+    {file = "cuda_core-0.5.1-cp312-cp312-win_amd64.whl", hash = "sha256:f192a0fd39836343158aa4e5b0e8e24280b26debb414ebad2af3794585731988"},
+    {file = "cuda_core-0.5.1-cp313-cp313-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:c89270e8a332f8c9e18e423d7e1d08d6a82115419ec813f53784d48116fc6fc6"},
+    {file = "cuda_core-0.5.1-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:fbfbdd753d58609c6b882bce5cbb6e341a338a150603b3849039a96641474b1d"},
+    {file = "cuda_core-0.5.1-cp313-cp313-win_amd64.whl", hash = "sha256:1826a17a06dbc46e0d9ddfb306bd0baac5cf9218b700fe517d380f8113b676e6"},
+    {file = "cuda_core-0.5.1-cp314-cp314-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:d5ae3c8ecfa8f56afa6ca1b67c2516b1c32576427b6f57af7ebb6233373b46b0"},
+    {file = "cuda_core-0.5.1-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:0197d7e105266055166ce1bdfcf6a752b4fc54c5e1599fc76dfe258f9d1ccca4"},
+    {file = "cuda_core-0.5.1-cp314-cp314-win_amd64.whl", hash = "sha256:45ec19853081bcf12de3173baf24aa2aedb63c62376dfa3504c86b9e9258f4c4"},
+    {file = "cuda_core-0.5.1-cp314-cp314t-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:6d3899efd6326df0097baeaadcf55ecbd5dd259a2cf97f27629f716d69ef1285"},
+    {file = "cuda_core-0.5.1-cp314-cp314t-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:66ea03faa965d594993fdc1cb00351debc1fff57479bfbe6c8715240f6dab9a5"},
+    {file = "cuda_core-0.5.1-cp314-cp314t-win_amd64.whl", hash = "sha256:ce5d6745926fb42f23a7640fe66cb6cd0fda302a6a6b74ed2267625a9971fbea"},
+]
+
+[package.dependencies]
+numpy = "*"
+
+[package.extras]
+cu12 = ["cuda-bindings[all] (==12.*)"]
+cu13 = ["cuda-bindings[all] (==13.*)"]
+
+[[package]]
 name = "cuda-pathfinder"
 version = "1.3.3"
 description = "Pathfinder for CUDA components"
@@ -1222,6 +1257,22 @@ files = [
 ]
 
 [[package]]
+name = "dynamic-path-manager"
+version = "1.0.1"
+description = "A Python context manager for temporarily adding and removing paths from sys.path"
+optional = false
+python-versions = ">=3.7"
+groups = ["main"]
+files = [
+    {file = "dynamic_path_manager-1.0.1-py3-none-any.whl", hash = "sha256:bfb15bd7df1ce932798d9a6acb1784efe040888202d8613c4356ddee5b00dc91"},
+    {file = "dynamic_path_manager-1.0.1.tar.gz", hash = "sha256:efd1b16aabaa0c14b8a8b6756c9bea80c82ccff7fd87b3cdc7528bb1ee88088c"},
+]
+
+[package.extras]
+dev = ["black (>=21.0)", "flake8 (>=3.8)", "isort (>=5.0)", "mypy (>=0.800)", "pytest (>=6.0)", "pytest-cov (>=2.0)"]
+docs = ["sphinx (>=4.0)", "sphinx-rtd-theme (>=1.0)"]
+
+[[package]]
 name = "einops"
 version = "0.8.1"
 description = "A new flavour of deep learning operations"
@@ -1346,14 +1397,14 @@ files = [
 
 [[package]]
 name = "flashinfer-python"
-version = "0.6.1"
+version = "0.6.2"
 description = "FlashInfer: Kernel Library for LLM Serving"
 optional = false
 python-versions = "<4.0,>=3.10"
 groups = ["main"]
 files = [
-    {file = "flashinfer_python-0.6.1-py3-none-any.whl", hash = "sha256:610dd4ac15e7a0874b79e7577d027cb35133e8dc31dc3137c2f2d6497fe46f18"},
-    {file = "flashinfer_python-0.6.1.tar.gz", hash = "sha256:8dc2fc5dc187fc70151d5f39ef560fde8a38117a4f6cf40dce0ddb09cbd4f0bf"},
+    {file = "flashinfer_python-0.6.2-py3-none-any.whl", hash = "sha256:8c3bc7d961d85697d12b8c52097ccf093ab722447494d087ee71bc4585ebca51"},
+    {file = "flashinfer_python-0.6.2.tar.gz", hash = "sha256:6f787ae77c351657630fbe40c4904c61a78ec5b786944a8e3df9d5348e3bd6bb"},
 ]
 
 [package.dependencies]
@@ -5303,14 +5354,14 @@ use-chardet-on-py3 = ["chardet (>=3.0.2,<6)"]
 
 [[package]]
 name = "rich"
-version = "14.2.0"
+version = "14.3.1"
 description = "Render rich text, tables, progress bars, syntax highlighting, markdown and more to the terminal"
 optional = false
 python-versions = ">=3.8.0"
 groups = ["main"]
 files = [
-    {file = "rich-14.2.0-py3-none-any.whl", hash = "sha256:76bc51fe2e57d2b1be1f96c524b890b816e334ab4c1e45888799bfaab0021edd"},
-    {file = "rich-14.2.0.tar.gz", hash = "sha256:73ff50c7c0c1c77c8243079283f4edb376f0f6442433aecb8ce7e6d0b92d1fe4"},
+    {file = "rich-14.3.1-py3-none-any.whl", hash = "sha256:da750b1aebbff0b372557426fb3f35ba56de8ef954b3190315eb64076d6fb54e"},
+    {file = "rich-14.3.1.tar.gz", hash = "sha256:b8c5f568a3a749f9290ec6bddedf835cec33696bfc1e48bcfecb276c7386e4b8"},
 ]
 
 [package.dependencies]
@@ -6872,4 +6923,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "9508ad357f1f5f320c5b1546eea30e075615e3bb923056591377ade70eae6c64"
+content-hash = "d963a7cb6519ea03c73557ef97c8bc97285a28234095513445571776604129cd"

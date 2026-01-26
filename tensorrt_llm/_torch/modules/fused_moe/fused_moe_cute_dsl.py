@@ -175,7 +175,8 @@ class CuteDslFusedMoENvfp4InputsHelper(GroupedGemmInputsHelper):
     def inputs_pre_hook(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
         x, token_selected_experts, *others = inputs
         num_tokens = token_selected_experts.size(0)
-        num_tokens_per_expert = self.generate_num_tokens_per_expert(num_tokens)
+        num_tokens_per_expert = self.generate_num_tokens_per_expert(
+            num_tokens, approx_max_load=True)
 
         new_token_selected_experts = []
         for i, curr_num_tokens in enumerate(num_tokens_per_expert,
@@ -258,6 +259,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                                   ConstraintSpec(
                                       4, 0, helper.infer_shape_num_tokens)),
                 inputs_pre_hook=helper.inputs_pre_hook,
+                use_cold_l2_cache=True,
             )
         return self.__class__.tuning_config_cache[key]
 
