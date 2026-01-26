@@ -272,15 +272,13 @@ def create_sampling_params_from_proto(
     if proto_config.num_return_sequences > 0:
         kwargs["n"] = proto_config.num_return_sequences
 
-    # Temperature and sampling parameters
-    if proto_config.HasField("temperature"):
-        kwargs["temperature"] = proto_config.temperature if proto_config.temperature > 0 else 1.0
+    # Temperature and sampling parameters (with sensible defaults as safety guard)
+    kwargs["temperature"] = proto_config.temperature if proto_config.HasField("temperature") else 1.0
+    kwargs["top_p"] = proto_config.top_p if proto_config.HasField("top_p") else 1.0
     if proto_config.HasField("top_k"):
-        kwargs["top_k"] = proto_config.top_k if proto_config.top_k > 0 else -1
-    if proto_config.HasField("top_p"):
-        kwargs["top_p"] = proto_config.top_p if proto_config.top_p > 0 else 1.0
+        kwargs["top_k"] = proto_config.top_k
     if proto_config.HasField("min_p"):
-        kwargs["min_p"] = proto_config.min_p if proto_config.min_p > 0 else 0.0
+        kwargs["min_p"] = proto_config.min_p
 
     # Top-P decay parameters
     if proto_config.HasField("top_p_min"):
@@ -298,9 +296,8 @@ def create_sampling_params_from_proto(
     if proto_config.HasField("min_tokens"):
         kwargs["min_tokens"] = proto_config.min_tokens
 
-    # Penalties
-    if proto_config.HasField("repetition_penalty"):
-        kwargs["repetition_penalty"] = proto_config.repetition_penalty if proto_config.repetition_penalty > 0 else 1.0
+    # Penalties (repetition_penalty defaults to 1.0 = no penalty)
+    kwargs["repetition_penalty"] = proto_config.repetition_penalty if proto_config.HasField("repetition_penalty") else 1.0
     if proto_config.HasField("presence_penalty"):
         kwargs["presence_penalty"] = proto_config.presence_penalty
     if proto_config.HasField("frequency_penalty"):
