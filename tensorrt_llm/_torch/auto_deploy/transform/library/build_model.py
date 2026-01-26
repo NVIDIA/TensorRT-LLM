@@ -46,6 +46,9 @@ class BuildModel(BaseTransform):
         # build the model
         model = factory.build_model(self.config.device)
 
+        # update the kv cache config
+        cm.update_kv_cache_config(**factory.get_cache_config_updates())
+
         # by convention, we say the model is always clean
         info = TransformInfo(skipped=False, num_matches=1, is_clean=True, has_valid_shapes=True)
 

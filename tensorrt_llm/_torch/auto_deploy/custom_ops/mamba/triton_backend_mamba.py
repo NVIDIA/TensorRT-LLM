@@ -24,17 +24,17 @@ from tensorrt_llm._torch.modules.mamba.mamba2_metadata import cu_seqlens_to_chun
 from tensorrt_llm._torch.modules.mamba.selective_state_update import selective_state_update
 from tensorrt_llm._torch.modules.mamba.ssd_combined import mamba_chunk_scan_combined
 
+from .....llmapi.llm_args import KvCacheConfig
 from ...utils.node_utils import extract_op_args
 from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
-    CacheConfig,
-    CacheInitializerDict,
     Constant,
     MHACallable,
     PrepareMetadataCallable,
-    SequenceInfo,
+    ResourceHandlerDict,
+    StateResourceHandler,
 )
 
 
@@ -270,10 +270,6 @@ def _triton_cached_ssm_fake(
 @AttentionRegistry.register("triton_ssm")
 class TritonBackendSSM(AttentionDescriptor):
     @classmethod
-    def is_paged(cls) -> bool:
-        return True
-
-    @classmethod
     def get_attention_layout(cls) -> AttentionLayout:
         # Hidden states follow [b, s, n, d]
         return "bsnd"
@@ -308,8 +304,8 @@ class TritonBackendSSM(AttentionDescriptor):
 
     @classmethod
     def get_cache_initializers(
-        cls, source_attn_node: Node, cache_config: CacheConfig
-    ) -> CacheInitializerDict:
+        cls, source_attn_node: Node, cache_config: KvCacheConfig
+    ) -> ResourceHandlerDict:
         # Shapes from fake tensors
         hs_fake: torch.Tensor = source_attn_node.args[0].meta["val"]
         B_fake: torch.Tensor = source_attn_node.args[2].meta["val"]
@@ -323,19 +319,13 @@ class TritonBackendSSM(AttentionDescriptor):
             ssm_state_size = max(1, B_fake.shape[-1])
 
         # extract ssm_state_dtype from cache_config or hs_fake
-        ssm_state_dtype = cache_config.mamba_dtype or hs_fake.dtype
+        ssm_state_dtype = cls.resolve_cache_dtype(cache_config.mamba_ssm_cache_dtype, hs_fake.dtype)
 
-        def _get_ssm_cache(si: SequenceInfo):
-            return torch.empty(
-                si.max_state_slots,
-                num_heads,
-                head_dim,
-                ssm_state_size,
-                device=si.device,
-                dtype=ssm_state_dtype,
+        return {
+            "ssm_state_cache": StateResourceHandler(
+                num_heads, head_dim, ssm_state_size, dtype=ssm_state_dtype
             )
-
-        return {"ssm_state_cache": _get_ssm_cache}
+        }
 
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:

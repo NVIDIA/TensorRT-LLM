@@ -112,6 +112,7 @@ class MambaCacheManager(BaseResourceManager):
         # save mamba state indices for requests
         self.state_indices_list: List[int] = []
 
+    @torch.inference_mode()
     def _prepare_mamba_cache_blocks(self, request_ids: List[int]):
         self.state_indices_list.clear()
         for r in request_ids:
