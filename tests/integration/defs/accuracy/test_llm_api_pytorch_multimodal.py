@@ -2,8 +2,9 @@ import pytest
 
 from tensorrt_llm import LLM
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MoeConfig, SamplingParams
+from tensorrt_llm.quantization import QuantAlgo
 
-from ..conftest import llm_models_root, skip_post_blackwell, skip_pre_blackwell, skip_pre_hopper
+from ..conftest import llm_models_root, skip_pre_blackwell, skip_pre_hopper
 from .accuracy_core import MMMU, LlmapiAccuracyTestHarness
 
 
@@ -51,6 +52,30 @@ class TestQwen2_5_VL_7B(LlmapiAccuracyTestHarness):
             max_num_tokens=self.MAX_NUM_TOKENS,
             kv_cache_config=self.kv_cache_config,
         ) as llm:
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=self.sampling_params)
+
+    @skip_pre_hopper
+    def test_fp8(self):
+        model_path = f"{llm_models_root()}/multimodals/Qwen2.5-VL-7B-Instruct-FP8"
+        with LLM(
+            model_path,
+            max_num_tokens=self.MAX_NUM_TOKENS,
+            kv_cache_config=self.kv_cache_config,
+        ) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=self.sampling_params)
+
+    @skip_pre_blackwell
+    def test_nvfp4(self):
+        model_path = f"{llm_models_root()}/multimodals/Qwen2.5-VL-7B-Instruct-FP4"
+        with LLM(
+            model_path,
+            max_num_tokens=self.MAX_NUM_TOKENS,
+            kv_cache_config=self.kv_cache_config,
+        ) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             task = MMMU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=self.sampling_params)
 
@@ -217,7 +242,6 @@ class TestPhi4MMFusedVisionLora(LlmapiAccuracyTestHarness):
 
 
 @skip_pre_hopper
-@skip_post_blackwell
 class TestGemma3_27BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "google/gemma-3-27b-it"
     # Note: This has only the LLM part quantized. Vision part is in bfloat16.
@@ -236,17 +260,28 @@ class TestGemma3_27BInstruct(LlmapiAccuracyTestHarness):
         dtype="fp8",
     )
 
-    def test_fp8_prequantized(self):
+    def _make_llm(self, model_path: str):
         # Gemma3 VLM needs FlashInfer attention backend for custom mask support.
-        with LLM(
-            self.MODEL_PATH,
+        return LLM(
+            model_path,
             max_batch_size=16,
             max_num_tokens=self.MAX_NUM_TOKENS,
             max_seq_len=8704,  # 8192 + 512.
             kv_cache_config=self.kv_cache_config,
             attn_backend="FLASHINFER",
             enable_chunked_prefill=False,
-        ) as llm:
+        )
+
+    def test_fp8_prequantized(self):
+        with self._make_llm(self.MODEL_PATH) as llm:
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=self.sampling_params)
+
+    @skip_pre_blackwell
+    def test_nvfp4_prequantized(self):
+        model_path = f"{llm_models_root()}/gemma/gemma-3-27b-it-FP4"
+        with self._make_llm(model_path) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             task = MMMU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=self.sampling_params)
 

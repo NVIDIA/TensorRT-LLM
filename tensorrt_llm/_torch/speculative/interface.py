@@ -12,10 +12,14 @@ from tensorrt_llm.logger import logger
 
 from ..._utils import get_sm_version
 from ..attention_backend.trtllm import AttentionBackend, TrtllmAttention
+from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..pyexecutor.resource_manager import BaseResourceManager
 
 if TYPE_CHECKING:
     from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
+
+if IS_FLASHINFER_AVAILABLE:
+    import flashinfer
 
 # Environment variable name for forcing the number of accepted tokens in speculative decoding
 FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR = "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS"
@@ -371,6 +375,9 @@ class SpecWorkerBase(nn.Module, ABC):
         super().__init__()
         self.guided_decoder: Optional["CapturableGuidedDecoder"] = None
         self.force_num_accepted_tokens = get_force_num_accepted_tokens()
+        self.use_flashinfer = IS_FLASHINFER_AVAILABLE and flashinfer.__version__ >= "0.6.0"
+        self.seed = 0
+        self.offset = 0
 
     @property
     @abstractmethod
@@ -416,6 +423,177 @@ class SpecWorkerBase(nn.Module, ABC):
         self.guided_decoder = guided_decoder
         return True
 
+    def _prepare_attn_metadata_for_spec_dec(self, attn_metadata):
+        """
+        Prepare attention metadata before speculative decoding draft token generation.
+        Saves current state for later restoration.
+        """
+        attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
+
+    def _restore_attn_metadata_from_spec_dec(self, attn_metadata):
+        """
+        Restore attention metadata after speculative decoding draft token generation.
+        """
+        attn_metadata.restore_from_spec_dec()
+        attn_metadata.on_update()
+
+    def _apply_force_accepted_tokens(self, num_accepted_tokens, num_contexts):
+        """
+        Apply forced number of accepted tokens if environment variable is set.
+        This is used for testing and debugging.
+
+        Args:
+            num_accepted_tokens: Tensor of shape [batch_size] with current accepted counts
+            num_contexts: Number of context (prefill) requests
+
+        Returns:
+            Modified num_accepted_tokens tensor
+
+        Note:
+            For MTPWorker, self.max_draft_len equals num_nextn_predict_layers (mtp_num_modules).
+            For Eagle3OneModelWorker, self.max_draft_len equals spec_config.max_draft_len.
+        """
+        if self.force_num_accepted_tokens != 0:
+            # total tokens per iteration = accepted draft tokens + 1 target token
+            force_total_tokens = min(self.force_num_accepted_tokens + 1,
+                                     self.max_draft_len + 1)
+            num_accepted_tokens[num_contexts:] = force_total_tokens
+        return num_accepted_tokens
+
+    def _sample_and_accept_draft_tokens_base(
+        self,
+        logits: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        num_contexts: int,
+        batch_size: int,
+        spec_metadata,
+    ):
+        """
+        Base implementation for sampling and accepting draft tokens.
+        Uses strict acceptance (token equality with cumulative product).
+
+        This is the common logic shared between Eagle3 and MTP (when relaxed
+        acceptance is disabled).
+
+        Args:
+            logits: [num_tokens, vocab_size] - Target model logits
+            draft_tokens: [num_gens, max_draft_len] - Previously predicted draft tokens
+            num_contexts: Number of context requests
+            batch_size: Total number of requests
+            spec_metadata: Speculative decoding metadata
+
+        Returns:
+            accepted_tokens: [batch_size, max_draft_len + 1] - Accepted tokens
+            num_accepted_tokens: [batch_size] - Number of accepted tokens per request
+        """
+        num_gens = batch_size - num_contexts
+
+        if logits.dim() == 1:
+            logits = logits.unsqueeze(0)
+
+        # Allocate return buffers
+        accepted_tokens = torch.empty((batch_size, self.max_draft_len + 1),
+                                      dtype=torch.int,
+                                      device=logits.device)
+        num_accepted_tokens = torch.ones(batch_size,
+                                         dtype=torch.int,
+                                         device=logits.device)
+
+        # Sample tokens using per-request sampling parameters
+        target_tokens = self._sample_tokens_for_batch(logits, spec_metadata,
+                                                      num_contexts, batch_size)
+
+        # Context requests: only accept the sampled token (no draft tokens yet)
+        accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts]
+
+        # Generation requests: verify draft tokens against target tokens
+        gen_target_tokens = target_tokens[num_contexts:].reshape(
+            num_gens, self.max_draft_len + 1)
+        accepted_tokens[num_contexts:, :] = gen_target_tokens
+
+        # Compare draft tokens with target tokens using cumulative product
+        # Counts consecutive matches from the start
+        num_accepted_tokens[num_contexts:] += torch.cumprod(
+            (draft_tokens == gen_target_tokens[:, :self.max_draft_len]).int(),
+            dim=-1).sum(1)
+
+        # Apply force override if set
+        num_accepted_tokens = self._apply_force_accepted_tokens(
+            num_accepted_tokens, num_contexts)
+
+        return accepted_tokens, num_accepted_tokens
+
+    def _draft_sampler_greedy(self, logits: torch.Tensor, d2t=None):
+        """
+        Simple greedy draft token sampling using argmax.
+
+        Args:
+            logits: [num_tokens, vocab_size] - Draft model logits
+            d2t: Optional dictionary offset tensor for vocab mapping
+
+        Returns:
+            draft_tokens: [num_tokens] - Sampled draft token ids (int32)
+        """
+        draft_tokens = torch.argmax(logits, dim=-1)
+
+        # Apply d2t (offsets between draft and target model dictionaries)
+        if d2t is not None:
+            draft_tokens = d2t[draft_tokens] + draft_tokens
+
+        return draft_tokens.type(torch.int32)
+
+    def _execute_guided_decoder_if_present(self, logits):
+        """Execute guided decoder on target model logits if available."""
+        if self.guided_decoder is not None:
+            self.guided_decoder.execute(logits)
+
+    def _prepare_next_new_tokens(self, accepted_tokens, next_draft_tokens,
+                                 batch_indices_cuda, batch_size,
+                                 num_accepted_tokens):
+        """
+        Prepare next_new_tokens for overlap scheduler support.
+
+        Args:
+            accepted_tokens: [batch_size, max_draft_len + 1] - Accepted tokens
+            next_draft_tokens: [batch_size, max_draft_len] - Predicted draft tokens
+            batch_indices_cuda: Batch indices tensor
+            batch_size: Number of requests
+            num_accepted_tokens: [batch_size] - Number of accepted tokens per request
+
+        Returns:
+            next_new_tokens: [batch_size, max_draft_len + 1] - Input tokens for next iteration
+        """
+        next_new_tokens = accepted_tokens[batch_indices_cuda[:batch_size],
+                                          num_accepted_tokens - 1].unsqueeze(1)
+        next_new_tokens = torch.concat([next_new_tokens, next_draft_tokens],
+                                       dim=1)
+        return next_new_tokens
+
+    def _prepare_context_input_ids(self, input_ids, num_ctx_tokens, gather_ids,
+                                   accepted_tokens, num_contexts):
+        """
+        Prepare context input IDs for draft model forward.
+        Shifts input IDs left by 1 and places the first accepted token at gather positions.
+
+        Args:
+            input_ids: Original input IDs tensor
+            num_ctx_tokens: Number of context tokens
+            gather_ids: Indices for placing accepted tokens (last token positions)
+            accepted_tokens: [batch_size, max_draft_len + 1] - Accepted tokens
+            num_contexts: Number of context requests
+
+        Returns:
+            input_ids_ctx: Prepared context input IDs
+        """
+        input_prompt_ids = input_ids[:num_ctx_tokens]
+        input_ids_ctx = torch.empty_like(input_prompt_ids,
+                                         dtype=torch.int32,
+                                         device="cuda")
+        input_ids_ctx[:-1].copy_(input_prompt_ids[1:])
+        input_ids_ctx[
+            gather_ids[:num_contexts]] = accepted_tokens[:num_contexts, 0]
+        return input_ids_ctx
+
     def _sample_tokens_for_batch(
         self,
         logits: torch.Tensor,
@@ -446,8 +624,17 @@ class SpecWorkerBase(nn.Module, ABC):
             top_ks = spec_metadata.top_ks[:num_tokens]
             top_ps = spec_metadata.top_ps[:num_tokens]
 
+            if self.use_flashinfer:
+                self.seed += 1
+
             sampled_tokens = sampling_batch_spec_dec_one_model(
-                logits, temperatures, top_ks, top_ps)
+                logits,
+                temperatures,
+                top_ks,
+                top_ps,
+                use_flashinfer=self.use_flashinfer,
+                seed=self.seed,
+                offset=self.offset)
         else:
             sampled_tokens = torch.argmax(logits, dim=-1)
 

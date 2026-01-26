@@ -4,7 +4,7 @@ import os
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Generic, List, Optional, TypeVar
+from typing import Any, Dict, Generic, List, Optional, TypeVar
 
 import filelock
 import torch
@@ -360,6 +360,50 @@ class ModelConfig(Generic[TConfig]):
             else:
                 quant_config.exclude_modules = default_exclude
 
+        # NOTE: This is for llm-compressor's quantized checkpoints.
+        elif hf_quant_config.get("quant_method") == "compressed-tensors":
+            config_groups = hf_quant_config.get("config_groups")
+            if config_groups is None:
+                raise ValueError(
+                    f"config_groups is not set in {hf_quant_config}.")
+
+            weights_quant_config = config_groups["group_0"]["weights"]
+            inputs_quant_config = config_groups["group_0"]["input_activations"]
+            weights_quant_strategy = weights_quant_config["strategy"]
+            inputs_quant_strategy = inputs_quant_config["strategy"]
+
+            if weights_quant_config["num_bits"] == 8:
+                if weights_quant_strategy == "channel":
+                    if inputs_quant_strategy != "token":
+                        raise ValueError(
+                            f"Unsupported inputs_quant_strategy: {inputs_quant_strategy}."
+                        )
+                    quant_config.quant_algo = QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN
+                elif weights_quant_strategy == "block":
+                    if inputs_quant_strategy != "group":
+                        raise ValueError(
+                            f"Unsupported inputs_quant_strategy: {inputs_quant_strategy}."
+                        )
+                    quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
+                    group_size = inputs_quant_config["group_size"]
+
+                    # NOTE: TRT-LLM only supports group_size=128 for FP8_BLOCK_SCALES.
+                    if group_size != 128:
+                        raise ValueError(
+                            f"Unsupported group_size: {group_size}. Supported: 128."
+                        )
+                    quant_config.group_size = group_size
+
+                else:
+                    raise ValueError(
+                        f"Unsupported weights_quant_strategy: {weights_quant_strategy}. "
+                        "Supported strategies: 'channel', 'block'.")
+            else:
+                raise ValueError(
+                    f"Unsupported quant_bits: {weights_quant_config['num_bits']}. "
+                    "Supported: 8.")
+
+            quant_config.exclude_modules = hf_quant_config.get("ignore", [])
         return quant_config, layer_quant_config
 
     @staticmethod
@@ -470,6 +514,56 @@ class ModelConfig(Generic[TConfig]):
         # Some checkpoints lack torch_dtype, populate with dtype
         pretrained_config.torch_dtype = getattr(pretrained_config, 'dtype',
                                                 None)
+
+        # Apply model_kwargs to override config parameters if provided
+        model_kwargs = kwargs.pop('model_kwargs', None)
+        if model_kwargs:
+
+            def _recursive_update_config(config: transformers.PretrainedConfig,
+                                         update_dict: Dict[str, Any]):
+                """
+                Recursively update a PretrainedConfig object with values from update_dict.
+                Args:
+                    config: PretrainedConfig object to update
+                    update_dict: Dictionary with values to update in the config
+                """
+                for key, value_new in update_dict.items():
+                    if not hasattr(config, key):
+                        logger.warning(
+                            f"model_kwargs key '{key}' not found in pretrained_config, ignoring."
+                        )
+                        continue
+
+                    target_value = getattr(config, key)
+
+                    # Handle nested PretrainedConfig objects when value is a dict
+                    if isinstance(value_new, dict) and isinstance(
+                            target_value, transformers.PretrainedConfig):
+                        # Recursively update the nested config
+                        logger.info(
+                            f"Recursively updating nested config: {key}")
+                        _recursive_update_config(target_value, value_new)
+                    elif (key in ["torch_dtype", "dtype"]
+                          and isinstance(value_new, str)
+                          and value_new != "auto"):
+                        # check special handling of torch_dtype (DEPRECATED!) and dtype keys to ensure we
+                        # use the correct torch.dtype object instead of a string.
+                        dtype = getattr(torch, value_new)
+                        assert isinstance(dtype,
+                                          torch.dtype), f"Invalid {dtype=}"
+                        setattr(config, key, dtype)
+                        logger.info(
+                            f"Applied model_kwargs: {key}={dtype} (previous value: {target_value})"
+                        )
+                    else:
+                        # Direct update for simple values
+                        setattr(config, key, value_new)
+                        logger.info(
+                            f"Applied model_kwargs: {key}={value_new} (previous value: {target_value})"
+                        )
+
+            _recursive_update_config(pretrained_config, model_kwargs)
+
         quant_config = QuantConfig()
         layer_quant_config = None
         moe_backend = kwargs.get('moe_backend', 'CUTLASS')
@@ -522,11 +616,17 @@ class ModelConfig(Generic[TConfig]):
             attn_tp_size * attn_cp_size)
 
         hidden_size = self.pretrained_config.hidden_size // attn_tp_size
+        num_layers = self.pretrained_config.num_hidden_layers
+        num_attention_layers = self.get_num_attention_layers()
+        if (self.spec_config is not None
+                and self.spec_config.spec_dec_mode.is_mtp_one_model()):
+            num_layers += self.spec_config.num_nextn_predict_layers
+            num_attention_layers += self.spec_config.num_nextn_predict_layers
 
         model_config_cpp = ModelConfigCpp(
             vocab_size=self.pretrained_config.vocab_size,
-            num_layers=self.pretrained_config.num_hidden_layers,
-            num_attention_layers=self.get_num_attention_layers(),
+            num_layers=num_layers,
+            num_attention_layers=num_attention_layers,
             num_rnn_layers=0,
             num_heads=num_heads,
             hidden_size=hidden_size,

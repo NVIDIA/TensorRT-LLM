@@ -167,6 +167,7 @@ class ConfigurableMoE(MoE):
             swiglu_limit=kwargs.get("swiglu_limit"),
             init_load_balancer=False,
             without_comm=True,
+            activation_type=self.activation_type,
         )
 
         self.validate_backend(backend)
@@ -1144,6 +1145,25 @@ class ConfigurableMoE(MoE):
             f"Backend {self.backend.__class__.__name__} must implement post_load_weights()"
         )
         return self.backend.post_load_weights()
+
+    def process_weights_after_loading(self):
+        """
+        Process weights after loading - delegated to backend
+
+        """
+        assert hasattr(self.backend, "process_weights_after_loading"), (
+            f"Backend {self.backend.__class__.__name__} must implement process_weights_after_loading()"
+        )
+        return self.backend.process_weights_after_loading()
+
+    def pre_reload_weights(self):
+        """
+        Pre reload weights - delegated to backend
+        """
+        assert hasattr(self.backend, "pre_reload_weights"), (
+            f"Backend {self.backend.__class__.__name__} must implement pre_reload_weights()"
+        )
+        return self.backend.pre_reload_weights()
 
     # ========== Communication and Quantization Properties ==========
 

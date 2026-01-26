@@ -373,11 +373,11 @@ void PeftCacheManager::addRequestPeft(std::shared_ptr<LlmRequest> llmRequest, bo
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
-std::tuple<std::map<uint64_t, std::future<void>>, std::map<uint64_t, std::vector<uint64_t>>>
+std::tuple<std::unordered_map<uint64_t, std::future<void>>, BasePeftCacheManager::TaskIdToReqIds>
 PeftCacheManager::getTaskMaps(RequestVector const& contextRequests, RequestVector const& generationRequests)
 {
-    std::map<uint64_t, std::vector<uint64_t>> taskIdToReqIds;
-    std::map<uint64_t, std::future<void>> taskIdToFuture;
+    TaskIdToReqIds taskIdToReqIds;
+    std::unordered_map<uint64_t, std::future<void>> taskIdToFuture;
     std::lock_guard<std::mutex> futuresLock(mPutFuturesMutex);
     for (auto const& requests : {contextRequests, generationRequests})
     {
@@ -415,7 +415,7 @@ PeftCacheManager::getTaskMaps(RequestVector const& contextRequests, RequestVecto
     return {std::move(taskIdToFuture), taskIdToReqIds};
 }
 
-PeftCacheManager::PeftTable PeftCacheManager::ensureBatch(
+PeftCacheManager::EnsureBatchTaskResult PeftCacheManager::ensureBatchMapTaskId(
     RequestVector const& contextRequests, RequestVector const& generationRequests, bool resetGpuCache)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
@@ -426,7 +426,7 @@ PeftCacheManager::PeftTable PeftCacheManager::ensureBatch(
     auto [taskIdToFuture_, taskIdToReqIds] = getTaskMaps(contextRequests, generationRequests);
     auto taskIdToFuture = std::move(taskIdToFuture_); // captured structured bindings are a C++20 extension
 
-    std::map<uint64_t, std::future<std::vector<runtime::LoraCache::TaskLayerModuleConfig>>> ensureFutures;
+    std::unordered_map<uint64_t, std::future<std::vector<runtime::LoraCache::TaskLayerModuleConfig>>> ensureFutures;
     for (auto& [taskId, taskFuture] : taskIdToFuture)
     {
         auto fn = [&taskIdToFuture, taskId = taskId, this]() -> std::vector<runtime::LoraCache::TaskLayerModuleConfig>
@@ -457,18 +457,31 @@ PeftCacheManager::PeftTable PeftCacheManager::ensureBatch(
         ensureFutures.try_emplace(taskId, std::move(f));
     }
 
-    PeftTable peftTable{};
+    TaskPeftTable peftTable{};
     for (auto const& [taskId, reqIds] : taskIdToReqIds)
     {
         auto&& f = ensureFutures.at(taskId);
         auto const values = f.get();
-        for (auto const& reqId : reqIds)
-        {
-            peftTable.try_emplace(reqId, values);
-        }
+        peftTable.try_emplace(taskId, values);
     }
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
-    return peftTable;
+    return {std::move(peftTable), std::move(taskIdToReqIds)};
+}
+
+PeftCacheManager::PeftTable PeftCacheManager::ensureBatch(
+    RequestVector const& contextRequests, RequestVector const& generationRequests, bool resetGpuCache)
+{
+    auto [taskTable, taskIdToReqIds] = ensureBatchMapTaskId(contextRequests, generationRequests, resetGpuCache);
+    PeftTable requestTable{};
+    for (auto const& [taskId, values] : taskTable)
+    {
+        auto const& reqIds = taskIdToReqIds.at(taskId);
+        for (auto const reqId : reqIds)
+        {
+            requestTable.try_emplace(reqId, values);
+        }
+    }
+    return requestTable;
 }
 
 bool PeftCacheManager::isTaskCached(uint64_t taskId) const
@@ -484,6 +497,11 @@ bool PeftCacheManager::isTaskDone(uint64_t taskId) const
 bool PeftCacheManager::isTaskDoneDevice(uint64_t taskId) const
 {
     return mDeviceLoraCache->isDone(taskId);
+}
+
+bool PeftCacheManager::isTaskCachedDevice(uint64_t const taskId) const
+{
+    return mDeviceLoraCache->has(taskId);
 }
 
 void PeftCacheManager::updateTaskState(uint64_t taskId, uint64_t reqId, bool terminate, bool pause)
@@ -645,3 +663,5 @@ SizeType32 NoOpPeftCacheManager::determineNumPages(std::shared_ptr<LlmRequest> l
     return 0;
 }
 } // namespace tensorrt_llm::batch_manager
+
+// TODO: merge C++ LoRA caching status with Py Slot manager

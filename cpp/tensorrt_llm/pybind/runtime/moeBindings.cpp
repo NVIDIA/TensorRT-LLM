@@ -96,7 +96,9 @@ void initMoeBindings(pybind11::module_& m)
         .def("get_pointer", &tr::SingleLayerMoeLoadBalancer::getSelfPtr,
             "Get the pointer of the SingleLayerMoeLoadBalancer", py::call_guard<py::gil_scoped_release>())
         .def("get_layer_id", &tr::SingleLayerMoeLoadBalancer::getLayerId,
-            "Get the layer id of the SingleLayerMoeLoadBalancer", py::call_guard<py::gil_scoped_release>());
+            "Get the layer id of the SingleLayerMoeLoadBalancer", py::call_guard<py::gil_scoped_release>())
+        .def("get_old_rank_expert_ids", &tr::SingleLayerMoeLoadBalancer::getOldRankExpertIds,
+            "Get the old rank expert ids of the SingleLayerMoeLoadBalancer", py::call_guard<py::gil_scoped_release>());
 
     // Bind MoeLoadBalancer class
     py::class_<tr::MoeLoadBalancer>(m, "MoeLoadBalancer")
