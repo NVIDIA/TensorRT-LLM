@@ -440,6 +440,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
         # Predict draft tokens
         next_draft_tokens = []
+        draft_logits_list = []
         original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
 
         # Get the draft KV cache manager if using separate layouts
@@ -495,6 +496,10 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                                                             d2t,
                                                             draft_step=i)
 
+                # Capture draft logits for rejection sampling
+                if spec_metadata.use_rejection_sampling:
+                    draft_logits_list.append(logits.clone())
+
                 new_draft_token = self.draft_decoder(logits, draft_model)
                 next_draft_tokens.append(new_draft_token)
                 # update inputs
@@ -527,6 +532,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     "spec_metadata": spec_metadata,
                 }
         next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
+
+        # Compute and store draft probs for next iteration's rejection sampling
+        if spec_metadata.use_rejection_sampling and draft_logits_list:
+            self._compute_and_store_draft_probs(draft_logits_list,
+                                                spec_metadata, batch_size)
 
         # restore attn_metadata to support cuda graph
         self._restore_attn_metadata_from_spec_dec(attn_metadata)
@@ -562,6 +572,20 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # Reshape draft tokens for base implementation
         draft_tokens = spec_metadata.draft_tokens.reshape(
             num_gens, self.max_draft_len)
+
+        if self._can_use_rejection_sampling(spec_metadata, num_contexts):
+            vocab_size = spec_metadata.draft_probs_vocab_size
+            # Reshape to [batch_size, max_draft_len, vocab_size]
+            draft_probs = spec_metadata.draft_probs[:batch_size *
+                                                    self.max_draft_len *
+                                                    vocab_size].reshape(
+                                                        batch_size,
+                                                        self.max_draft_len,
+                                                        vocab_size)
+
+            # Use rejection sampling implementation
+            return self._sample_and_accept_draft_tokens_rejection(
+                logits, draft_tokens, draft_probs, batch_size, spec_metadata)
 
         # Use base implementation for strict acceptance
         return self._sample_and_accept_draft_tokens_base(

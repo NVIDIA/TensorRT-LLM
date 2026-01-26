@@ -520,6 +520,7 @@ class MTPWorker(SpecWorkerBase):
 
         # Run MTP layers to predict draft tokens
         next_draft_tokens = []
+        draft_logits_list = []
         last_tokens_idx = torch.cumsum(
             attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
 
@@ -544,6 +545,10 @@ class MTPWorker(SpecWorkerBase):
                     self.guided_decoder.execute_draft_batch(logits,
                                                             draft_step=i)
 
+                # Capture draft logits for rejection sampling (only the last token per sequence)
+                if spec_metadata.use_rejection_sampling:
+                    draft_logits_list.append(logits[last_tokens_idx].clone())
+
                 new_draft_token = self.draft_sampler(logits)
                 next_draft_tokens.append(new_draft_token)
                 # shift input_ids and hidden_states
@@ -561,6 +566,11 @@ class MTPWorker(SpecWorkerBase):
                     "attn_metadata": draft_inputs["attn_metadata"],
                 }
             next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
+
+        # Compute and store draft probs for next iteration's rejection sampling
+        if spec_metadata.use_rejection_sampling and draft_logits_list:
+            self._compute_and_store_draft_probs(draft_logits_list,
+                                                spec_metadata, batch_size)
 
         # restore attn metadata
         if attn_metadata is not None:
@@ -903,7 +913,7 @@ class MTPWorker(SpecWorkerBase):
             num_accepted_tokens = self._apply_force_accepted_tokens(
                 num_accepted_tokens, num_contexts)
 
-        # Strict acceptance
+        # Strict acceptance or rejection sampling
         else:
             if self.is_thop:
                 # Temporary buffer
@@ -918,6 +928,22 @@ class MTPWorker(SpecWorkerBase):
                 # Apply force override for THOP path
                 num_accepted_tokens = self._apply_force_accepted_tokens(
                     num_accepted_tokens, num_contexts)
+            elif self._can_use_rejection_sampling(spec_metadata, num_contexts):
+                draft_tokens = spec_metadata.draft_tokens.reshape(
+                    num_gens, mtp_num_modules)
+                vocab_size = spec_metadata.draft_probs_vocab_size
+                # Reshape to [batch_size, mtp_num_modules, vocab_size]
+                draft_probs = spec_metadata.draft_probs[:batch_size *
+                                                        mtp_num_modules *
+                                                        vocab_size].reshape(
+                                                            batch_size,
+                                                            mtp_num_modules,
+                                                            vocab_size)
+
+                # Use rejection sampling implementation
+                accepted_tokens, num_accepted_tokens = self._sample_and_accept_draft_tokens_rejection(
+                    logits, draft_tokens, draft_probs, batch_size,
+                    spec_metadata)
             else:
                 # Reshape draft tokens for base implementation
                 draft_tokens = spec_metadata.draft_tokens.reshape(

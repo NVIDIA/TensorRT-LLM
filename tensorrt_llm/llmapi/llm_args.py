@@ -689,6 +689,22 @@ class DecodingBaseConfig(StrictBaseModel):
         "rolling average over the last N completed requests (N = acceptance_window) drops below this value. "
         "PyTorch backend only.")
 
+    # If true, uses rejection sampling for draft token acceptance instead of strict token equality.
+    # Rejection sampling provides lossless acceleration that exactly matches the target model's
+    # distribution. Requires allow_advanced_sampling=True. Only applicable to 1-model code paths.
+    use_rejection_sampling: bool = False
+
+    # Validate acceptance controls at field level so they run on model creation
+    @field_validator('acceptance_window')
+    @classmethod
+    def _validate_acceptance_window(cls, v: Optional[int]):
+        if v is None:
+            return v
+        if v < 0:
+            raise ValueError(
+                f"acceptance_window must be >= 0 (0 disables), got {v}")
+        return v
+
     allow_advanced_sampling: bool = Field(
         default=False,
         status="prototype",
