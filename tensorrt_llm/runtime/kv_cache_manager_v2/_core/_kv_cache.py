@@ -329,6 +329,17 @@ class _KVCache:
             lc = layer_to_lc_ids[layer_id]
             yield self._page_indices[beam_id][lc]
 
+    def get_slot_indices(
+        self, layer_group_id: LayerGroupId, beam_id: BeamIndex = BeamIndex(0)
+    ) -> Iterator[int]:
+        """
+        Get the internal slot indices for the given layer group and beam.
+        Each slot is a group of coalesced buffers in one memory pool group.
+        """
+        for b in self._blocks:
+            holder = b.pages[beam_id][layer_group_id]
+            yield BAD_PAGE_INDEX if holder is None else holder.page.slot_id
+
     # reserve space for next inference. Request new blocks from KVCacheManager if necessary.
     # if capacity is increased and beam_width > 1, blocks containing new tokens should be allocated for each beam.
     # Decrease of capacity may destroy stale blocks (if not used by other requests).
