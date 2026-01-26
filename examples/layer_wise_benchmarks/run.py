@@ -229,7 +229,11 @@ if args.run_type == "GEN":
         max(1, 20480 // ctx_seq_len_q),
     )
     ctx_attn_workspace = torch.empty((0,), device="cuda", dtype=torch.int8)
-    with mock.patch.dict(os.environ, {"TRTLLM_FORCE_ALLTOALL_METHOD": "NotEnabled"}, clear=False):
+    with mock.patch.dict(
+        os.environ,
+        {"TRTLLM_FORCE_ALLTOALL_METHOD": "NotEnabled", "TRTLLM_FORCE_COMM_METHOD": "ALLGATHER"},
+        clear=False,
+    ):
         ctx_runner = Runner(
             args.model,
             mapping,
