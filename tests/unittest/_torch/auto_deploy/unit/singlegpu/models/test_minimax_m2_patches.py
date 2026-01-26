@@ -8,7 +8,7 @@ import types
 
 import pytest
 import torch
-from _model_test_utils import _hf_model_dir_or_hub_id
+from test_common.llm_data import hf_id_to_local_model_dir
 from transformers import AutoConfig, AutoModelForCausalLM
 
 # Import custom_ops to register torch.ops.auto_deploy.torch_moe
@@ -69,7 +69,7 @@ def _load_minimax_m2_moe_layer(model_name_or_path):
     "model_name",
     [
         pytest.param(
-            _hf_model_dir_or_hub_id("MiniMax-M2/MiniMax-M2", "MiniMaxAI/MiniMax-M2"),
+            hf_id_to_local_model_dir("MiniMaxAI/MiniMax-M2"),
         ),
     ],
 )
