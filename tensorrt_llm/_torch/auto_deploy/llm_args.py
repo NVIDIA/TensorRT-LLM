@@ -50,6 +50,7 @@ _TRANSFORMS_SHORTCUT_LOOKUP = {
     "free_mem_ratio": ("resize_kv_cache.free_mem_ratio",),
     "compile_backend": ("compile_model.backend",),
     "cuda_graph_batch_sizes": ("compile_model.cuda_graph_batch_sizes",),
+    "use_pt_cache_backend": ("insert_cached_attention.use_pt_cache_backend",),
 }
 
 
@@ -199,6 +200,14 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
             "List of batch sizes for CUDA graph creation. If not provided, a heuristic will"
             " be used to determine the batch sizes.",
             "cuda_graph_batch_sizes",
+        ),
+    )
+    use_pt_cache_backend: bool = Field(
+        default=False,
+        description=_shortcut_description(
+            "Use PT's KVCacheManager for efficient metadata preparation (TRT-LLM backend only). "
+            "Provides ~50% faster metadata preparation via C++ code paths.",
+            "use_pt_cache_backend",
         ),
     )
 

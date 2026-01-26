@@ -32,6 +32,7 @@ from ...custom_ops.attention_interface import (
     Constant,
     PrepareMetadataCallable,
 )
+from ...custom_ops.trtllm_attention import enable_pt_cache_backend
 from ...distributed.common import all_gather_object, get_world_size
 from ...distributed.common import is_initialized as is_distributed_initialized
 from ...models.factory import ModelFactory
@@ -54,6 +55,14 @@ class InsertCachedAttentionConfig(TransformConfig):
     backend: Optional[str] = Field(default=None, description="The attention backend to use.")
     cache_config: CacheConfig = Field(
         default_factory=CacheConfig, description="The custom cache configuration to use."
+    )
+    use_pt_cache_backend: bool = Field(
+        default=False,
+        description=(
+            "Use PT's KVCacheManager for efficient metadata preparation (TRT-LLM backend only). "
+            "This provides ~50% faster metadata preparation via C++ code paths and "
+            "pre-allocated tensors for CUDA graph compatibility."
+        ),
     )
 
 
@@ -180,6 +189,11 @@ class InsertCachedAttention(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         """Replace uncached source attention node with corresponding cached attn node."""
+        # Enable PT cache backend if configured (must be before attn_descriptor is used)
+        if self.config.use_pt_cache_backend and self.config.backend == "trtllm":
+            enable_pt_cache_backend(True)
+            self._log_info("Enabled PTCacheBackend for TRT-LLM attention")
+
         attn_descriptor = self.attn_descriptor
 
         # run field-wise or to combine the cache config from the transform and the factory
