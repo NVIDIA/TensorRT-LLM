@@ -1,0 +1,10 @@
+Curl Responses Client
+=====================
+Refer to the `trtllm-serve documentation <https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve.html>`_ for starting a server.
+
+Source https://github.com/NVIDIA/TensorRT-LLM/blob/45d7022cc33903509fd8045bbc577d77dd1d3e2f/examples/serve/curl_responses_client.sh.
+
+.. literalinclude:: ../../../examples/serve/curl_responses_client.sh
+    :lines: 1-9
+    :language: bash
+    :linenos:
