@@ -876,6 +876,125 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
             self.setup_quant_scales(module)
 
 
+class DeepSeekFP8TRTLLMGenBlockScalesFusedMoEMethod(
+        DeepSeekFP8BlockScalesFusedMoEMethod):
+
+    # Cache the permute indices during weight loading to avoid recompute
+    # This assumes the same input shape always results in the same permute indices
+    _cache_permute_indices: Dict[torch.Size, torch.Tensor] = {}
+
+    @staticmethod
+    def convert_to_block_layout(input_tensor: torch.Tensor,
+                                blockK: int) -> torch.Tensor:
+        M, K = input_tensor.shape
+        assert K % blockK == 0, "K must be divisible by blockK"
+        return input_tensor.view(M, K // blockK,
+                                 blockK).permute(1, 0,
+                                                 2).contiguous().view(M, K)
+
+    def load_expert_w3_w1_weight(self,
+                                 module: torch.nn.Module,
+                                 w1_weight: torch.Tensor,
+                                 w3_weight: torch.Tensor,
+                                 dst_w3_w1_weight: torch.Tensor,
+                                 allow_partial_loading: bool = False):
+        # device don't have to be 'cuda', e.g. 'cpu' for online EPLB
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        dst_on_gpu = dst_w3_w1_weight.device.type == "cuda"
+        dst_w3_w1_weight_gpu = dst_w3_w1_weight if dst_on_gpu else dst_w3_w1_weight.cuda(
+        )
+        if not allow_partial_loading:
+            assert w1_weight is not None and w3_weight is not None
+        w1_weight_shard = load_weight_shard(
+            w1_weight,
+            module.tp_size,
+            module.tp_rank,
+            TensorParallelMode.COLUMN,
+            device=device) if w1_weight is not None else None
+        w3_weight_shard = load_weight_shard(
+            w3_weight,
+            module.tp_size,
+            module.tp_rank,
+            TensorParallelMode.COLUMN,
+            device=device) if w3_weight is not None else None
+
+        # FIXME: this depends on the kernel internals
+        epilogue_tile_m = 64
+
+        # Keep weights in device buffer
+        dst_w3_weight, dst_w1_weight = dst_w3_w1_weight_gpu.split(
+            module.intermediate_size_per_partition, dim=0)
+
+        dst_w3_weight.copy_(w3_weight_shard.view(dst_w3_weight.dtype))
+        dst_w1_weight.copy_(w1_weight_shard.view(dst_w1_weight.dtype))
+
+        # Get permute indices
+        # Use w2 shuffling here because w31 one also reorders the for gated act, which is not fused for DS FP8
+        permute_indices = trtllmgen_maybe_get_cached_w2_permute_indices(
+            dst_w3_w1_weight_gpu, self._cache_permute_indices, epilogue_tile_m)
+
+        # Shuffle the weight according to permute indices
+        processed_w31_weight_shard = torch.ops.trtllm.shuffle_matrix(
+            dst_w3_w1_weight_gpu.view(torch.uint8),
+            permute_indices.to(dst_w3_w1_weight_gpu.device))
+
+        # Convert to block row-major layout
+        processed_w31_weight_shard = self.convert_to_block_layout(
+            processed_w31_weight_shard, 128)
+
+        # Copy the result into device buffer
+        dst_w3_w1_weight_gpu.copy_(processed_w31_weight_shard.view(
+            dst_w3_w1_weight_gpu.dtype),
+                                   non_blocking=dst_on_gpu)
+        if not dst_on_gpu:
+            dst_w3_w1_weight.copy_(dst_w3_w1_weight_gpu)
+
+    # Helper function
+    def load_expert_w2_weight(self,
+                              module: torch.nn.Module,
+                              w2_weight: torch.Tensor,
+                              dst_w2_weight: torch.Tensor,
+                              allow_partial_loading: bool = False):
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        dst_on_gpu = dst_w2_weight.device.type == "cuda"
+        dst_w2_weight_gpu = dst_w2_weight if dst_on_gpu else dst_w2_weight.cuda(
+        )
+        if not allow_partial_loading:
+            assert w2_weight is not None
+        w2_weight_shard = load_weight_shard(w2_weight,
+                                            module.tp_size,
+                                            module.tp_rank,
+                                            TensorParallelMode.ROW,
+                                            device=device)
+
+        # FIXME: this depends on the kernel internals
+        epilogue_tile_m = 64
+
+        # Keep weights in device buffer
+        dst_w2_weight_gpu.copy_(w2_weight_shard.view(dst_w2_weight_gpu.dtype),
+                                non_blocking=dst_on_gpu)
+        # Get permuted indices
+        permute_indices = trtllmgen_maybe_get_cached_w2_permute_indices(
+            dst_w2_weight_gpu, self._cache_permute_indices, epilogue_tile_m)
+
+        # Shuffle the weight according to permute indices
+        processed_w2_weight = torch.ops.trtllm.shuffle_matrix(
+            dst_w2_weight_gpu.view(torch.uint8),
+            permute_indices.to(dst_w2_weight_gpu.device))
+
+        # Convert to block row-major layout
+        processed_w2_weight = self.convert_to_block_layout(
+            processed_w2_weight, 128)
+
+        # Copy the result into device buffer
+        dst_w2_weight_gpu.copy_(processed_w2_weight.view(
+            dst_w2_weight_gpu.dtype),
+                                non_blocking=dst_on_gpu)
+
+        if not dst_on_gpu:
+            dst_w2_weight.copy_(dst_w2_weight_gpu)
+
+
 class INT8WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
 
     def create_weights(self, module: torch.nn.Module):
