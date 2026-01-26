@@ -86,6 +86,7 @@ RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install_ucx.sh && \
     rm install_ucx.sh && \
     rm install_nixl.sh && \
     rm install_etcd.sh && \
+    rm -rf /root/.cache/pip && \
     rm -rf /root/.cache/uv/archive-v0 && \
     # WAR against https://github.com/advisories/GHSA-58pv-8j8x-9vj2
     rm -rf /usr/local/lib/python3.12/dist-packages/setuptools/_vendor/jaraco.context-5.3.0.dist-info
