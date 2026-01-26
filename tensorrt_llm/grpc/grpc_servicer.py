@@ -13,8 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-gRPC Servicer for TensorRT-LLM
+"""gRPC Servicer for TensorRT-LLM.
 
 Implements the TrtLlmEngine gRPC service for high-performance communication
 with external routers (e.g., sgl-router) using pre-tokenized input.
@@ -23,7 +22,6 @@ with external routers (e.g., sgl-router) using pre-tokenized input.
 import asyncio
 import time
 from collections.abc import AsyncGenerator
-from typing import Optional
 
 import grpc
 
@@ -32,15 +30,14 @@ from tensorrt_llm.logger import logger
 from . import trtllm_engine_pb2, trtllm_engine_pb2_grpc
 from .grpc_request_manager import (
     GrpcRequestManager,
-    create_sampling_params_from_proto,
-    create_lora_request_from_proto,
     create_disaggregated_params_from_proto,
+    create_lora_request_from_proto,
+    create_sampling_params_from_proto,
 )
 
 
 class TrtLlmEngineServicer(trtllm_engine_pb2_grpc.TrtLlmEngineServicer):
-    """
-    gRPC servicer implementing the TrtLlmEngine service.
+    """gRPC servicer implementing the TrtLlmEngine service.
 
     Handles RPCs:
     - Generate: Streaming text generation
@@ -52,8 +49,7 @@ class TrtLlmEngineServicer(trtllm_engine_pb2_grpc.TrtLlmEngineServicer):
     """
 
     def __init__(self, request_manager: GrpcRequestManager, model_path: str = ""):
-        """
-        Initialize the servicer.
+        """Initialize the servicer.
 
         Args:
             request_manager: The GrpcRequestManager instance
@@ -69,8 +65,7 @@ class TrtLlmEngineServicer(trtllm_engine_pb2_grpc.TrtLlmEngineServicer):
         request: trtllm_engine_pb2.GenerateRequest,
         context: grpc.aio.ServicerContext,
     ) -> AsyncGenerator[trtllm_engine_pb2.GenerateResponse, None]:
-        """
-        Handle streaming generation requests.
+        """Handle streaming generation requests.
 
         Args:
             request: The GenerateRequest protobuf
@@ -94,7 +89,11 @@ class TrtLlmEngineServicer(trtllm_engine_pb2_grpc.TrtLlmEngineServicer):
                 return
 
             prompt_token_ids = list(request.tokenized.input_token_ids)
-            query_token_ids = list(request.tokenized.query_token_ids) if request.tokenized.query_token_ids else None
+            query_token_ids = (
+                list(request.tokenized.query_token_ids)
+                if request.tokenized.query_token_ids
+                else None
+            )
 
             # Build sampling params with detokenize=False (key optimization!)
             sampling_params = create_sampling_params_from_proto(
@@ -106,7 +105,9 @@ class TrtLlmEngineServicer(trtllm_engine_pb2_grpc.TrtLlmEngineServicer):
                 pad_id=request.pad_id if request.HasField("pad_id") else None,
                 bad_words=list(request.bad_words) if request.bad_words else None,
                 stop_words=list(request.stop_words) if request.stop_words else None,
-                guided_decoding=request.guided_decoding if request.HasField("guided_decoding") else None,
+                guided_decoding=request.guided_decoding
+                if request.HasField("guided_decoding")
+                else None,
                 embedding_bias=list(request.embedding_bias) if request.embedding_bias else None,
             )
 
@@ -163,8 +164,7 @@ class TrtLlmEngineServicer(trtllm_engine_pb2_grpc.TrtLlmEngineServicer):
         request: trtllm_engine_pb2.EmbedRequest,
         context: grpc.aio.ServicerContext,
     ) -> trtllm_engine_pb2.EmbedResponse:
-        """
-        Handle embedding requests.
+        """Handle embedding requests.
 
         Args:
             request: The EmbedRequest protobuf
@@ -187,8 +187,7 @@ class TrtLlmEngineServicer(trtllm_engine_pb2_grpc.TrtLlmEngineServicer):
         request: trtllm_engine_pb2.HealthCheckRequest,
         context: grpc.aio.ServicerContext,
     ) -> trtllm_engine_pb2.HealthCheckResponse:
-        """
-        Handle health check requests.
+        """Handle health check requests.
 
         Args:
             request: The HealthCheckRequest protobuf
@@ -209,8 +208,7 @@ class TrtLlmEngineServicer(trtllm_engine_pb2_grpc.TrtLlmEngineServicer):
         request: trtllm_engine_pb2.AbortRequest,
         context: grpc.aio.ServicerContext,
     ) -> trtllm_engine_pb2.AbortResponse:
-        """
-        Handle abort requests.
+        """Handle abort requests.
 
         Args:
             request: The AbortRequest protobuf
@@ -234,8 +232,7 @@ class TrtLlmEngineServicer(trtllm_engine_pb2_grpc.TrtLlmEngineServicer):
         request: trtllm_engine_pb2.GetModelInfoRequest,
         context: grpc.aio.ServicerContext,
     ) -> trtllm_engine_pb2.GetModelInfoResponse:
-        """
-        Handle model info requests.
+        """Handle model info requests.
 
         Args:
             request: The GetModelInfoRequest protobuf
@@ -258,8 +255,7 @@ class TrtLlmEngineServicer(trtllm_engine_pb2_grpc.TrtLlmEngineServicer):
         request: trtllm_engine_pb2.GetServerInfoRequest,
         context: grpc.aio.ServicerContext,
     ) -> trtllm_engine_pb2.GetServerInfoResponse:
-        """
-        Handle server info requests.
+        """Handle server info requests.
 
         Args:
             request: The GetServerInfoRequest protobuf
@@ -270,6 +266,7 @@ class TrtLlmEngineServicer(trtllm_engine_pb2_grpc.TrtLlmEngineServicer):
         """
         try:
             import tensorrt_llm
+
             version = getattr(tensorrt_llm, "__version__", "unknown")
         except Exception:
             version = "unknown"
@@ -291,8 +288,8 @@ class TrtLlmEngineServicer(trtllm_engine_pb2_grpc.TrtLlmEngineServicer):
         gen_result,
         prompt_token_ids: list,
     ) -> trtllm_engine_pb2.GenerateResponse:
-        """
-        Build a streaming chunk response from GenerationResult.
+        """Build a streaming chunk response from GenerationResult.
+
         Uses token_ids_diff to get delta tokens.
 
         Args:
@@ -313,7 +310,9 @@ class TrtLlmEngineServicer(trtllm_engine_pb2_grpc.TrtLlmEngineServicer):
                     token_ids=[],
                     prompt_tokens=len(prompt_token_ids),
                     completion_tokens=0,
-                    cached_tokens=gen_result.cached_tokens if hasattr(gen_result, 'cached_tokens') else 0,
+                    cached_tokens=gen_result.cached_tokens
+                    if hasattr(gen_result, "cached_tokens")
+                    else 0,
                 ),
             )
 
@@ -325,7 +324,7 @@ class TrtLlmEngineServicer(trtllm_engine_pb2_grpc.TrtLlmEngineServicer):
             sequence_index=completion.index,
             prompt_tokens=len(prompt_token_ids),
             completion_tokens=len(completion.token_ids) if completion.token_ids else 0,
-            cached_tokens=gen_result.cached_tokens if hasattr(gen_result, 'cached_tokens') else 0,
+            cached_tokens=gen_result.cached_tokens if hasattr(gen_result, "cached_tokens") else 0,
         )
 
         # Add logprobs if available
@@ -349,8 +348,7 @@ class TrtLlmEngineServicer(trtllm_engine_pb2_grpc.TrtLlmEngineServicer):
         gen_result,
         prompt_token_ids: list,
     ) -> trtllm_engine_pb2.GenerateResponse:
-        """
-        Build a final completion response from GenerationResult.
+        """Build a final completion response from GenerationResult.
 
         Args:
             request_id: The request ID
@@ -384,11 +382,11 @@ class TrtLlmEngineServicer(trtllm_engine_pb2_grpc.TrtLlmEngineServicer):
             finish_reason=completion.finish_reason or "stop",
             prompt_tokens=len(prompt_token_ids),
             completion_tokens=len(output_tokens),
-            cached_tokens=gen_result.cached_tokens if hasattr(gen_result, 'cached_tokens') else 0,
+            cached_tokens=gen_result.cached_tokens if hasattr(gen_result, "cached_tokens") else 0,
         )
 
         # Add stop reason if available
-        if hasattr(completion, 'stop_reason') and completion.stop_reason:
+        if hasattr(completion, "stop_reason") and completion.stop_reason:
             complete.stop_reason = str(completion.stop_reason)
 
         # Add logprobs if available
@@ -402,7 +400,7 @@ class TrtLlmEngineServicer(trtllm_engine_pb2_grpc.TrtLlmEngineServicer):
                     complete.logprobs.append(token_logprob)
 
         # Add prompt logprobs if available
-        if hasattr(completion, 'prompt_logprobs') and completion.prompt_logprobs:
+        if hasattr(completion, "prompt_logprobs") and completion.prompt_logprobs:
             for lp in completion.prompt_logprobs:
                 if isinstance(lp, dict):
                     token_logprob = trtllm_engine_pb2.TokenLogprob(
@@ -423,8 +421,7 @@ class TrtLlmEngineServicer(trtllm_engine_pb2_grpc.TrtLlmEngineServicer):
         error_type: str,
         code: int,
     ) -> trtllm_engine_pb2.GenerateResponse:
-        """
-        Build an error response.
+        """Build an error response.
 
         Args:
             request_id: The request ID

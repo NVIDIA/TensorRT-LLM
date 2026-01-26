@@ -289,16 +289,17 @@ def launch_grpc_server(host: str, port: int, llm_args: dict):
                 ("grpc.max_receive_message_length", -1),  # Unlimited
                 ("grpc.keepalive_time_ms", 30000),  # 30s keepalive
                 ("grpc.keepalive_timeout_ms", 10000),  # 10s timeout
-            ],
-        )
+            ], )
 
         # Add servicer to server
-        trtllm_engine_pb2_grpc.add_TrtLlmEngineServicer_to_server(servicer, server)
+        trtllm_engine_pb2_grpc.add_TrtLlmEngineServicer_to_server(
+            servicer, server)
 
         # Enable reflection for grpcurl and other tools
         if REFLECTION_AVAILABLE:
             service_names = (
-                trtllm_engine_pb2.DESCRIPTOR.services_by_name["TrtLlmEngine"].full_name,
+                trtllm_engine_pb2.DESCRIPTOR.services_by_name["TrtLlmEngine"].
+                full_name,
                 reflection.SERVICE_NAME,
             )
             reflection.enable_server_reflection(service_names, server)
@@ -589,11 +590,12 @@ class ChoiceWithAlias(click.Choice):
                   "Specify a custom chat template. "
                   "Can be a file path or one-liner template string",
                   "prototype"))
-@click.option("--grpc",
-              is_flag=True,
-              default=False,
-              help="Run gRPC server instead of OpenAI HTTP server. "
-              "gRPC server accepts pre-tokenized requests and returns raw token IDs.")
+@click.option(
+    "--grpc",
+    is_flag=True,
+    default=False,
+    help="Run gRPC server instead of OpenAI HTTP server. "
+    "gRPC server accepts pre-tokenized requests and returns raw token IDs.")
 def serve(
         model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
         host: str, port: int, log_level: str, backend: str, max_beam_width: int,
@@ -609,7 +611,8 @@ def serve(
         fail_fast_on_attention_window_too_large: bool,
         otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
         disagg_cluster_uri: Optional[str], media_io_kwargs: Optional[str],
-        custom_module_dirs: list[Path], chat_template: Optional[str], grpc: bool):
+        custom_module_dirs: list[Path], chat_template: Optional[str],
+        grpc: bool):
     """Running an OpenAI API compatible server (or gRPC server with --grpc flag)
 
     MODEL: model name | HF checkpoint path | TensorRT engine path

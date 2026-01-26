@@ -13,8 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-gRPC Request Manager for TensorRT-LLM
+"""gRPC Request Manager for TensorRT-LLM.
 
 Manages request lifecycle for gRPC requests, converting between protobuf
 and TensorRT-LLM types. Designed for high-performance communication with
@@ -39,8 +38,7 @@ from . import trtllm_engine_pb2 as pb2
 
 
 class GrpcRequestManager:
-    """
-    Manages gRPC request lifecycle for TensorRT-LLM.
+    """Manages gRPC request lifecycle for TensorRT-LLM.
 
     Responsibilities:
     - Convert protobuf requests to TensorRT-LLM types
@@ -54,8 +52,7 @@ class GrpcRequestManager:
     """
 
     def __init__(self, llm: Any):
-        """
-        Initialize the request manager.
+        """Initialize the request manager.
 
         Args:
             llm: The TensorRT-LLM LLM instance (tensorrt_llm.LLM or tensorrt_llm._tensorrt_engine.LLM)
@@ -79,8 +76,7 @@ class GrpcRequestManager:
         disaggregated_params: Optional[DisaggregatedParams] = None,
         cache_salt: Optional[str] = None,
     ) -> AsyncGenerator[GenerationResult, None]:
-        """
-        Submit a generation request and stream outputs.
+        """Submit a generation request and stream outputs.
 
         Args:
             request_id: Unique request identifier (for tracking/abort)
@@ -134,8 +130,7 @@ class GrpcRequestManager:
             self._rid_to_result.pop(request_id, None)
 
     async def abort(self, request_id: str) -> bool:
-        """
-        Abort a running request.
+        """Abort a running request.
 
         Args:
             request_id: The request ID to abort
@@ -161,8 +156,7 @@ class GrpcRequestManager:
             return False
 
     async def health_check(self) -> Tuple[bool, str]:
-        """
-        Check if the engine is healthy.
+        """Check if the engine is healthy.
 
         Returns:
             Tuple of (is_healthy, message)
@@ -182,8 +176,7 @@ class GrpcRequestManager:
             return False, f"Error: {e}"
 
     def get_model_config(self) -> Dict[str, Any]:
-        """
-        Get model configuration information.
+        """Get model configuration information.
 
         Returns:
             Dictionary with model config details
@@ -209,10 +202,14 @@ class GrpcRequestManager:
 
             # Check for multimodal support
             if hasattr(self.llm, "input_processor"):
-                config["supports_vision"] = not isinstance(
-                    self.llm.input_processor,
-                    type(self.llm.input_processor).__bases__[0]  # DefaultInputProcessor check
-                ) if hasattr(self.llm.input_processor, "__bases__") else False
+                config["supports_vision"] = (
+                    not isinstance(
+                        self.llm.input_processor,
+                        type(self.llm.input_processor).__bases__[0],  # DefaultInputProcessor check
+                    )
+                    if hasattr(self.llm.input_processor, "__bases__")
+                    else False
+                )
 
         except Exception as e:
             logger.warning(f"Error getting model config: {e}")
@@ -220,8 +217,7 @@ class GrpcRequestManager:
         return config
 
     def get_num_unfinished_requests(self) -> int:
-        """
-        Get the number of currently running requests.
+        """Get the number of currently running requests.
 
         Returns:
             Number of unfinished requests
@@ -241,8 +237,7 @@ def create_sampling_params_from_proto(
     guided_decoding: Optional[pb2.GuidedDecodingParams] = None,
     embedding_bias: Optional[List[float]] = None,
 ) -> SamplingParams:
-    """
-    Convert protobuf configuration to TensorRT-LLM SamplingParams.
+    """Convert protobuf configuration to TensorRT-LLM SamplingParams.
 
     Args:
         proto_config: Protobuf SamplingConfig message
@@ -273,7 +268,9 @@ def create_sampling_params_from_proto(
         kwargs["n"] = proto_config.num_return_sequences
 
     # Temperature and sampling parameters (with sensible defaults as safety guard)
-    kwargs["temperature"] = proto_config.temperature if proto_config.HasField("temperature") else 1.0
+    kwargs["temperature"] = (
+        proto_config.temperature if proto_config.HasField("temperature") else 1.0
+    )
     kwargs["top_p"] = proto_config.top_p if proto_config.HasField("top_p") else 1.0
     if proto_config.HasField("top_k"):
         kwargs["top_k"] = proto_config.top_k
@@ -297,7 +294,9 @@ def create_sampling_params_from_proto(
         kwargs["min_tokens"] = proto_config.min_tokens
 
     # Penalties (repetition_penalty defaults to 1.0 = no penalty)
-    kwargs["repetition_penalty"] = proto_config.repetition_penalty if proto_config.HasField("repetition_penalty") else 1.0
+    kwargs["repetition_penalty"] = (
+        proto_config.repetition_penalty if proto_config.HasField("repetition_penalty") else 1.0
+    )
     if proto_config.HasField("presence_penalty"):
         kwargs["presence_penalty"] = proto_config.presence_penalty
     if proto_config.HasField("frequency_penalty"):
@@ -365,8 +364,7 @@ def create_sampling_params_from_proto(
 def create_lora_request_from_proto(
     proto_config: Optional[pb2.LoraConfig],
 ) -> Optional[LoRARequest]:
-    """
-    Convert protobuf LoraConfig to TensorRT-LLM LoRARequest.
+    """Convert protobuf LoraConfig to TensorRT-LLM LoRARequest.
 
     Args:
         proto_config: Protobuf LoraConfig message
@@ -386,8 +384,7 @@ def create_lora_request_from_proto(
 def create_disaggregated_params_from_proto(
     proto_config: Optional[pb2.DisaggregatedParams],
 ) -> Optional[DisaggregatedParams]:
-    """
-    Convert protobuf DisaggregatedParams to TensorRT-LLM DisaggregatedParams.
+    """Convert protobuf DisaggregatedParams to TensorRT-LLM DisaggregatedParams.
 
     Args:
         proto_config: Protobuf DisaggregatedParams message
@@ -404,10 +401,7 @@ def create_disaggregated_params_from_proto(
         pb2.DisaggregatedParams.REQUEST_TYPE_GENERATION_ONLY: "generation_only",
     }
 
-    request_type = request_type_map.get(
-        proto_config.request_type,
-        "context_and_generation"
-    )
+    request_type = request_type_map.get(proto_config.request_type, "context_and_generation")
 
     params = DisaggregatedParams(request_type=request_type)
 
