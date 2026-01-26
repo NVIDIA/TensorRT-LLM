@@ -168,6 +168,7 @@ class Eagle3SpecMetadata(SpecMetadata):
             self.is_spec_dec_dynamic_tree = False
 
     def prepare(self):
+        super().prepare()
         is_first_draft = self.eagle3_resource_manager.is_first_draft
         spec_tree_manager = self.eagle3_resource_manager.spec_tree_manager
         # Update start indices
@@ -334,6 +335,7 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
         return layer_id in self.layers_to_capture
 
     def prepare(self):
+        super().prepare()
         assert self.request_ids is not None
         # update batch indices
         num_seqs = len(self.request_ids)
@@ -440,6 +442,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
         # Predict draft tokens
         next_draft_tokens = []
+        draft_logits_list = []
         original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
 
         # Get the draft KV cache manager if using separate layouts
@@ -495,6 +498,10 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                                                             d2t,
                                                             draft_step=i)
 
+                # Capture draft logits for rejection sampling
+                if spec_metadata.use_rejection_sampling:
+                    draft_logits_list.append(logits.clone())
+
                 new_draft_token = self.draft_decoder(logits, draft_model)
                 next_draft_tokens.append(new_draft_token)
                 # update inputs
@@ -528,6 +535,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 }
         next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
 
+        # Compute and store draft probs for next iteration's rejection sampling
+        if spec_metadata.use_rejection_sampling and draft_logits_list:
+            self._compute_and_store_draft_probs(draft_logits_list,
+                                                spec_metadata, batch_size)
+
         # restore attn_metadata to support cuda graph
         self._restore_attn_metadata_from_spec_dec(attn_metadata)
         # restore all_rank_num_tokens for attention DP
@@ -559,13 +571,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
 
-        # Reshape draft tokens for base implementation
         draft_tokens = spec_metadata.draft_tokens.reshape(
             num_gens, self.max_draft_len)
 
-        # Use base implementation for strict acceptance
-        return self._sample_and_accept_draft_tokens_base(
-            logits, draft_tokens, num_contexts, batch_size, spec_metadata)
+        return self._accept_draft_tokens(logits, draft_tokens, num_contexts,
+                                         batch_size, spec_metadata)
 
     def draft_decoder(
         self,
