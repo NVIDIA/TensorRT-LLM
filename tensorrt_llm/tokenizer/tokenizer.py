@@ -1,4 +1,5 @@
 import os
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -55,7 +56,18 @@ class TransformersTokenizer(TokenizerBase):
         return self.tokenizer.decode(token_ids, *args, **kwargs)
 
     def batch_encode_plus(self, texts: List[str], *args, **kwargs) -> dict:
-        return self.tokenizer.batch_encode_plus(texts, *args, **kwargs)
+        """Deprecated: Use tokenizer(texts, ...) instead.
+
+        This method is deprecated since Transformers v5.0.0.
+        Use the __call__ method directly: tokenizer(texts, ...)
+        """
+        warnings.warn(
+            "batch_encode_plus is deprecated since Transformers v5.0.0. "
+            "Use tokenizer(texts, ...) instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.tokenizer(texts, *args, **kwargs)
 
     def get_chat_template(self,
                           chat_template: Optional[str] = None,

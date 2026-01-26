@@ -19,6 +19,7 @@ from typing import Optional
 import torch
 from transformers import PretrainedConfig
 
+from ..._utils import get_rope_theta
 from ..attention_backend.interface import PositionalEmbeddingParams
 from ..model_config import ModelConfig
 from ..modules.attention import Attention
@@ -49,7 +50,7 @@ def compute_yarn_parameters(
                                        None) != "yarn":
         return 1.0, 0, 0, 1.0
 
-    base = config.rope_theta
+    base = get_rope_theta(config)
     partial_rotary_factor = config.partial_rotary_factor if hasattr(
         config, "partial_rotary_factor") else 1.0
     head_dim = getattr(config, "head_dim",

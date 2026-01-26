@@ -14,6 +14,7 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.tokenization_utils_base import BatchEncoding
 
 from tensorrt_llm._torch.utils import ActivationType
+from tensorrt_llm._utils import get_rope_theta
 from tensorrt_llm.inputs.utils import HF_CHAT_TEMPLATE_EXCEPTIONS
 
 from ..nemotron_flash import NemotronFlashForCausalLMFactory
@@ -63,10 +64,22 @@ class NemotronFlashPreTrainedTokenizerFast(PreTrainedTokenizerFast):
         else:
             return input_ids
 
-    def _batch_encode_plus(self, *args, **kwargs) -> BatchEncoding:
-        batch_encoding = super()._batch_encode_plus(*args, **kwargs)
+    def __call__(self, *args, **kwargs) -> BatchEncoding:
+        """Override __call__ to add memory tokens after encoding.
+
+        This is the primary encoding method in Transformers v5+.
+        """
+        batch_encoding = super().__call__(*args, **kwargs)
         batch_encoding.data["input_ids"] = self._add_memory_tokens(batch_encoding.data["input_ids"])
         return batch_encoding
+
+    def _batch_encode_plus(self, *args, **kwargs) -> BatchEncoding:
+        """Override for backward compatibility with Transformers < v5.
+
+        Note: This internal method is deprecated in Transformers v5.
+        The __call__ method above handles the v5+ encoding path.
+        """
+        return self.__call__(*args, **kwargs)
 
     def _decode(self, token_ids: Union[int, list[int]], *args, **kwargs) -> str:
         if isinstance(token_ids, list):
@@ -546,7 +559,7 @@ class NemotronFlashAttention(nn.Module):
         self.num_heads = config.num_attention_heads
         self.head_dim = self.hidden_size // self.num_heads
         self.max_position_embeddings = config.max_position_embeddings
-        self.rope_theta = config.rope_theta
+        self.rope_theta = get_rope_theta(config)
 
         self.kq_head_dim = config.kq_head_dim if config.kq_head_dim > 0 else self.head_dim
         self.v_head_dim = config.v_head_dim if config.v_head_dim > 0 else self.head_dim

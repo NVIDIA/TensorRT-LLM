@@ -6,6 +6,8 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 from datasets import load_dataset
 
+# Re-export get_rope_theta from _utils for backward compatibility
+from .._utils import get_rope_theta  # noqa: F401
 from .._utils import torch_dtype_to_str
 from ..logger import logger
 from ..quantization import QuantAlgo
