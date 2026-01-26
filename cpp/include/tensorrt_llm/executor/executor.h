@@ -461,21 +461,21 @@ public:
     [[nodiscard]] bool operator==(ContextPhaseParams const&) const noexcept;
 
     [[nodiscard]] VecTokens const& getFirstGenTokens() const& noexcept;
-    void setFirstGenTokens(VecTokens firstGenTokens) noexcept;
+    void setFirstGenTokens(VecTokens const& firstGenTokens) noexcept;
     [[nodiscard]] std::optional<VecTokens> const& getDraftTokens() const& noexcept;
-    void setDraftTokens(std::optional<VecTokens> draftTokens) noexcept;
+    void setDraftTokens(std::optional<VecTokens> const& draftTokens) noexcept;
     [[nodiscard]] VecTokens popFirstGenTokens() && noexcept;
     [[nodiscard]] RequestIdType getReqId() const noexcept;
-    void setReqId(RequestIdType reqId) noexcept;
+    void setReqId(RequestIdType const& reqId) noexcept;
     [[nodiscard]] void const* getState() const noexcept;
     [[nodiscard]] void* getState() noexcept;
     [[nodiscard]] void* releaseState() noexcept;
     [[nodiscard]] std::vector<char> getSerializedState() const noexcept;
 
     [[nodiscard]] std::optional<SizeType32> getCtxDpRank() const noexcept;
-    void setCtxDpRank(std::optional<SizeType32> ctxDpRank) noexcept;
+    void setCtxDpRank(std::optional<SizeType32> const& ctxDpRank) noexcept;
     [[nodiscard]] std::optional<std::string> const& getDisaggInfoEndpoint() const noexcept;
-    void setDisaggInfoEndpoint(std::optional<std::string> disaggInfoEndpoint) noexcept;
+    void setDisaggInfoEndpoint(std::optional<std::string> const& disaggInfoEndpoint) noexcept;
 
 private:
     friend class Serialization;

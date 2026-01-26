@@ -101,9 +101,9 @@ VecTokens const& ContextPhaseParams::getFirstGenTokens() const& noexcept
     return mFirstGenTokens;
 }
 
-void ContextPhaseParams::setFirstGenTokens(VecTokens firstGenTokens) noexcept
+void ContextPhaseParams::setFirstGenTokens(VecTokens const& firstGenTokens) noexcept
 {
-    mFirstGenTokens = std::move(firstGenTokens);
+    mFirstGenTokens = firstGenTokens;
 }
 
 std::optional<VecTokens> const& ContextPhaseParams::getDraftTokens() const& noexcept
@@ -111,9 +111,9 @@ std::optional<VecTokens> const& ContextPhaseParams::getDraftTokens() const& noex
     return mDraftTokens;
 }
 
-void ContextPhaseParams::setDraftTokens(std::optional<VecTokens> draftTokens) noexcept
+void ContextPhaseParams::setDraftTokens(std::optional<VecTokens> const& draftTokens) noexcept
 {
-    mDraftTokens = std::move(draftTokens);
+    mDraftTokens = draftTokens;
 }
 
 VecTokens ContextPhaseParams::popFirstGenTokens() && noexcept
@@ -126,7 +126,7 @@ ContextPhaseParams::RequestIdType ContextPhaseParams::getReqId() const noexcept
     return mReqId;
 }
 
-void ContextPhaseParams::setReqId(RequestIdType reqId) noexcept
+void ContextPhaseParams::setReqId(RequestIdType const& reqId) noexcept
 {
     mReqId = reqId;
 }
@@ -156,7 +156,7 @@ std::optional<SizeType32> ContextPhaseParams::getCtxDpRank() const noexcept
     return mCtxDpRank;
 }
 
-void ContextPhaseParams::setCtxDpRank(std::optional<SizeType32> ctxDpRank) noexcept
+void ContextPhaseParams::setCtxDpRank(std::optional<SizeType32> const& ctxDpRank) noexcept
 {
     mCtxDpRank = ctxDpRank;
 }
@@ -166,9 +166,9 @@ std::optional<std::string> const& ContextPhaseParams::getDisaggInfoEndpoint() co
     return mDisaggInfoEndpoint;
 }
 
-void ContextPhaseParams::setDisaggInfoEndpoint(std::optional<std::string> disaggInfoEndpoint) noexcept
+void ContextPhaseParams::setDisaggInfoEndpoint(std::optional<std::string> const& disaggInfoEndpoint) noexcept
 {
-    mDisaggInfoEndpoint = std::move(disaggInfoEndpoint);
+    mDisaggInfoEndpoint = disaggInfoEndpoint;
 }
 
 void ContextPhaseParams::deleter(void const* data)
