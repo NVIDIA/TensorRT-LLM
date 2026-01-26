@@ -128,7 +128,15 @@ def _run_ssm_prefill(
     ssm_state_cache: torch.Tensor,
     time_step_limit: List[float],
     chunk_size: int,
+    out: Optional[torch.Tensor] = None,
 ) -> Tuple[Optional[torch.Tensor], int, int, int, int]:
+    """Run SSM prefill.
+
+    Args:
+        out: Optional preallocated output tensor. If provided, the output is written
+            directly to this tensor and y_prefill is returned as None. This avoids
+            an extra memcpy when merging prefill and decode outputs.
+    """
     num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
     num_seq = num_prefill + num_decode
     num_total_tokens = num_prefill_tokens + num_decode
@@ -152,27 +160,54 @@ def _run_ssm_prefill(
         chunk_indices = None
         chunk_offsets = None
 
-    y_prefill, varlen_states = mamba_chunk_scan_combined(
-        hs_prefill,
-        dt_prefill,
-        A,
-        B_prefill,
-        C_prefill,
-        chunk_size=chunk_size,
-        D=D,
-        z=None,
-        dt_bias=dt_bias,
-        initial_states=initial_states,
-        seq_idx=seq_idx_prefill,
-        chunk_indices=chunk_indices,
-        chunk_offsets=chunk_offsets,
-        cu_seqlens=cu_seqlen[: num_prefill + 1],
-        dt_softplus=True,
-        dt_limit=(time_step_limit[0], time_step_limit[1]),
-        return_final_states=False,
-        return_varlen_states=True,
-        mamba_ssm_cache_dtype=ssm_state_cache.dtype,
-    )
+    if out is not None:
+        # Preallocation path: output written to 'out', returns only varlen_states
+        varlen_states = mamba_chunk_scan_combined(
+            hs_prefill,
+            dt_prefill,
+            A,
+            B_prefill,
+            C_prefill,
+            chunk_size=chunk_size,
+            D=D,
+            z=None,
+            dt_bias=dt_bias,
+            initial_states=initial_states,
+            seq_idx=seq_idx_prefill,
+            chunk_indices=chunk_indices,
+            chunk_offsets=chunk_offsets,
+            cu_seqlens=cu_seqlen[: num_prefill + 1],
+            dt_softplus=True,
+            dt_limit=(time_step_limit[0], time_step_limit[1]),
+            return_final_states=False,
+            return_varlen_states=True,
+            out=out,
+            state_dtype=ssm_state_cache.dtype,
+        )
+        y_prefill = None
+    else:
+        # Standard path: returns (y_prefill, varlen_states)
+        y_prefill, varlen_states = mamba_chunk_scan_combined(
+            hs_prefill,
+            dt_prefill,
+            A,
+            B_prefill,
+            C_prefill,
+            chunk_size=chunk_size,
+            D=D,
+            z=None,
+            dt_bias=dt_bias,
+            initial_states=initial_states,
+            seq_idx=seq_idx_prefill,
+            chunk_indices=chunk_indices,
+            chunk_offsets=chunk_offsets,
+            cu_seqlens=cu_seqlen[: num_prefill + 1],
+            dt_softplus=True,
+            dt_limit=(time_step_limit[0], time_step_limit[1]),
+            return_final_states=False,
+            return_varlen_states=True,
+            mamba_ssm_cache_dtype=ssm_state_cache.dtype,
+        )
 
     ssm_state_cache.index_copy_(0, slot_idx[:num_prefill], varlen_states.to(ssm_state_cache.dtype))
     return y_prefill, num_prefill, num_prefill_tokens, num_total_tokens, num_seq
