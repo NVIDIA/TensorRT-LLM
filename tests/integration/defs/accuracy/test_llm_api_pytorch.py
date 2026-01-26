@@ -4881,6 +4881,10 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                 "https://nvbugs/5636916: Remaining Hopper Eagle Accuracy Issue for only TP=4"
             )
 
+        # Rejection sampling is only supported for one_model
+        if not one_model and use_rejection_sampling:
+            pytest.skip("Rejection sampling is not supported for two_model")
+
         MAX_OUTPUT_LEN = 128179
         MAX_INPUT_LEN = 32768
 
