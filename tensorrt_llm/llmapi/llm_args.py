@@ -690,6 +690,11 @@ class DecodingBaseConfig(StrictBaseModel):
     # to 1-model code paths; non-greedy sampling is always enabled on 2-model paths.
     allow_advanced_sampling: bool = False
 
+    # If true, uses rejection sampling for draft token acceptance instead of strict token equality.
+    # Rejection sampling provides lossless acceleration that exactly matches the target model's
+    # distribution. Requires allow_advanced_sampling=True. Only applicable to 1-model code paths.
+    use_rejection_sampling: bool = False
+
     # Validate acceptance controls at field level so they run on model creation
     @field_validator('acceptance_window')
     @classmethod
