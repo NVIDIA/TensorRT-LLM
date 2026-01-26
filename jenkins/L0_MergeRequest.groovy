@@ -249,7 +249,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
     case "agent":
         containerConfig = """
                   - name: alpine
-                    image: urm.nvidia.com/docker/alpine:latest
+                    image: urm.nvidia.com/sw-tensorrt-docker-local/alpine-golem:latest
                     command: ['cat']
                     tty: true
                     resources:
@@ -1369,10 +1369,6 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
  * Retrieve failed stages from the current build using the bot's failures.py script
  */
 def getFailedStages() {
-    // Ensure python3 and required modules are available (alpine doesn't have them by default)
-    sh "which python3 || apk add --no-cache python3 py3-pip"
-    sh "pip3 install --break-system-packages requests"
-
     def status = sh(
         script: """rm -f failed_stages.json failed_stages_error.txt && \
             python3 ${BOT_ROOT}/bin/failures.py \
