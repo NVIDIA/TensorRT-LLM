@@ -5800,6 +5800,42 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
+    @pytest.mark.skip(reason="Skip MTP test due to no model path file in CI")
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(8)
+    def test_nvfp4_8gpus_mtp(self):
+        # Test MTP (Multi-Token Prediction) accuracy with nvfp4-fp8kv model.
+        # This test uses MTP with max_draft_len=3 and one_model mode.
+        mtp_config = MTPDecodingConfig(
+            num_nextn_predict_layers=3,
+            mtp_eagle_one_model=True,
+        )
+        model_path = f"{llm_models_root()}/nemotron-super-sft-repeated-mtp-iter-0010600-nvfp4-fp8kv"
+        with LLM(
+                model_path,
+                kv_cache_config=KvCacheConfig(
+                    enable_block_reuse=False,
+                    mamba_ssm_cache_dtype="float16",
+                    free_gpu_memory_fraction=0.5,
+                ),
+                max_batch_size=128,
+                tensor_parallel_size=8,
+                moe_expert_parallel_size=8,
+                pipeline_parallel_size=1,
+                enable_attention_dp=False,
+                cuda_graph_config=CudaGraphConfig(max_batch_size=32,
+                                                  enable_padding=True),
+                disable_overlap_scheduler=False,
+                moe_config=MoeConfig(backend="CUTLASS"),
+                decoding_config=mtp_config,
+        ) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
 
 @skip_pre_hopper
 class TestMiniMaxM2(LlmapiAccuracyTestHarness):
