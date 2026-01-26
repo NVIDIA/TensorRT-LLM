@@ -3,6 +3,7 @@ import functools
 import json
 import zlib
 from enum import Enum
+from typing import Optional
 
 import nvtx
 import torch
@@ -75,7 +76,16 @@ class Calibrator:
         self.mode = Mode.NONE
         self._started = False
 
-    def init(self, mode: str, file_path: str, layer_indices: list[int], mapping, dist):
+    def init(
+        self,
+        mode: str,
+        file_path: str,
+        layer_indices: list[int],
+        *,
+        replay_verify_metadata: Optional[bool] = None,
+        mapping,
+        dist=None,
+    ):
         """Initialize the calibrator.
 
         Args:
@@ -84,16 +94,22 @@ class Calibrator:
             layer_indices: Optional list of layer indices to filter.
                           COLLECT mode: If None, all layers are collected.
                           REPLAY mode: Cannot be None.
+            replay_verify_metadata: Whether to verify actual metadata in REPLAY mode matches calibration data.
             mapping: Tensor parallel mapping containing rank and world_size.
             dist: Distributed communication wrapper.
         """
+        if self.mode != Mode.NONE:
+            raise ValueError("double init")
+
         self.mode = Mode[mode]
 
         if self.mode == Mode.COLLECT:
             self._init_collect_mode(file_path, layer_indices, dist)
 
         if self.mode == Mode.REPLAY:
-            self._init_replay_mode(file_path, layer_indices, mapping)
+            if replay_verify_metadata is None:
+                raise ValueError("missing replay_verify_metadata")
+            self._init_replay_mode(file_path, layer_indices, replay_verify_metadata, mapping)
 
     def _init_collect_mode(self, file_path, layer_indices, dist):
         """Initialize buffers for COLLECT mode."""
@@ -117,7 +133,7 @@ class Calibrator:
             device="cuda",
         )
 
-    def _init_replay_mode(self, file_path, layer_indices, mapping):
+    def _init_replay_mode(self, file_path, layer_indices, replay_verify_metadata, mapping):
         """Initialize replay database from file."""
         with open(file_path) as f:
             data = json.load(f)
@@ -187,11 +203,13 @@ class Calibrator:
 
         # GPU buffers for deferred metadata verification (must be created before CUDA Graph capture)
         # These are used during forward() which may be captured into CUDA Graphs
-        self._actual_metadata_list = []
-        self._actual_metadata_idx_gpu = torch.empty((), dtype=torch.long, device="cuda")
-        self._metadata_idx_range_gpu = torch.arange(
-            self.MAX_NUM_METADATA, dtype=torch.long, device="cuda"
-        )
+        self._replay_verify_metadata = replay_verify_metadata
+        if self._replay_verify_metadata:
+            self._actual_metadata_list = []
+            self._actual_metadata_idx_gpu = torch.empty((), dtype=torch.long, device="cuda")
+            self._metadata_idx_range_gpu = torch.arange(
+                self.MAX_NUM_METADATA, dtype=torch.long, device="cuda"
+            )
 
     def maybe_wrap_model(self, model):
         """Wrap model and layer forward methods for data collection/replay.
@@ -291,15 +309,18 @@ class Calibrator:
                 output = forward_orig(*args, **kwargs)
 
                 # Store metadata and copy index to GPU (for deferred verification)
-                metadata_idx = len(self._actual_metadata_list)
-                self._actual_metadata_list.append(self._cur_iter_actual_metadata)
-                if metadata_idx >= len(self._metadata_idx_range_gpu):
-                    raise ValueError(
-                        f"Metadata index overflow: {metadata_idx} >= {len(self._metadata_idx_range_gpu)}. "
-                        f"Increase MAX_NUM_METADATA if more iterations are needed."
-                    )
-                with nvtx.annotate("layer_wise_benchmarks ignore"):
-                    self._actual_metadata_idx_gpu.copy_(self._metadata_idx_range_gpu[metadata_idx])
+                if self._replay_verify_metadata:
+                    metadata_idx = len(self._actual_metadata_list)
+                    self._actual_metadata_list.append(self._cur_iter_actual_metadata)
+                    if metadata_idx >= len(self._metadata_idx_range_gpu):
+                        raise ValueError(
+                            f"Metadata index overflow: {metadata_idx} >= {len(self._metadata_idx_range_gpu)}. "
+                            f"Increase MAX_NUM_METADATA if more iterations are needed."
+                        )
+                    with nvtx.annotate("layer_wise_benchmarks ignore"):
+                        self._actual_metadata_idx_gpu.copy_(
+                            self._metadata_idx_range_gpu[metadata_idx]
+                        )
 
                 # Verify all replay data was consumed
                 if self._started and self._replay_chunk_idx != len(self._cur_iter_metadata):
@@ -449,6 +470,7 @@ class Calibrator:
 
     def start(self):
         """Start calibration. Call before the profiling loop."""
+        assert not self._started
         self._started = True
 
         if self.mode != Mode.NONE:
@@ -473,7 +495,7 @@ class Calibrator:
             # (context phase, not using CUDA Graphs)
             self._use_eager_mode = False
 
-        if self.mode == Mode.REPLAY:
+        if self.mode == Mode.REPLAY and self._replay_verify_metadata:
             # Per-iteration storage buffers for deferred metadata verification
             # Note: _actual_metadata_list, _actual_metadata_idx_gpu, _metadata_idx_range_gpu
             # are created in _init_replay_mode() before CUDA Graph capture
@@ -537,7 +559,7 @@ class Calibrator:
             # Reset eager mode for next step
             self._use_eager_mode = False
 
-        if self.mode == Mode.REPLAY and self._started:
+        if self.mode == Mode.REPLAY and self._started and self._replay_verify_metadata:
             # Record metadata index on GPU (no sync), verification deferred to stop()
             record_idx = len(self._collected_iterations)
             self._collected_actual_metadata_idx[record_idx].copy_(
@@ -548,10 +570,12 @@ class Calibrator:
 
     def stop(self):
         """Stop calibration and save data. Call after the profiling loop."""
-        if self.mode == Mode.COLLECT and self._started:
+        assert self._started
+
+        if self.mode == Mode.COLLECT:
             self._save_collected_data()
 
-        if self.mode == Mode.REPLAY and self._started:
+        if self.mode == Mode.REPLAY and self._replay_verify_metadata:
             self._verify_replay_metadata()
 
         self._started = False

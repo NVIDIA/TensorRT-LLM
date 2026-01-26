@@ -85,6 +85,11 @@ parser.add_argument("--balance-ratio", type=comma_separated_floats, dest="balanc
 parser.add_argument("--replay-file-path", type=str)
 parser.add_argument("--replay-start-iter", type=int)
 parser.add_argument("--replay-stop-iter", type=int)
+group = parser.add_mutually_exclusive_group()
+group.add_argument("--replay-verify-metadata", action="store_true", dest="replay_verify_metadata")
+group.add_argument(
+    "--no-replay-verify-metadata", action="store_false", dest="replay_verify_metadata"
+)
 # Schedule
 parser.add_argument("--warmup-times", type=int, default=20)
 parser.add_argument("--run-times", type=int, default=100)
@@ -139,6 +144,8 @@ if args.use_cuda_graph is None:
     args.use_cuda_graph = False
 if (args.replay_start_iter is None) != (args.replay_stop_iter is None):
     parser.error("Both --replay-start-iter and --replay-stop-iter must be provided or none")
+if args.replay_verify_metadata is None:
+    args.replay_verify_metadata = True
 print(args)
 
 # MPI args
@@ -189,7 +196,13 @@ logger.info("Layer-wise benchmarks: Create runner  ... Done")
 
 calibrator = get_calibrator()
 if args.replay_file_path:
-    calibrator.init("REPLAY", args.replay_file_path, args.layer_indices, mapping, None)
+    calibrator.init(
+        "REPLAY",
+        args.replay_file_path,
+        args.layer_indices,
+        replay_verify_metadata=args.replay_verify_metadata,
+        mapping=mapping,
+    )
     if args.replay_start_iter is None:
         replay_start_iter, replay_stop_iter = calibrator.get_replay_iteration_range()
     else:
@@ -198,7 +211,13 @@ if args.replay_file_path:
         f"Layer-wise benchmarks: Replay iteration range [{replay_start_iter}, {replay_stop_iter}]"
     )
 else:
-    calibrator.init("NONE", None, args.layer_indices, mapping, None)
+    calibrator.init(
+        "NONE",
+        None,
+        args.layer_indices,
+        replay_verify_metadata=args.replay_verify_metadata,
+        mapping=mapping,
+    )
     replay_start_iter, replay_stop_iter = 1, 1  # To avoid None in mathematics
 calibrator.maybe_wrap_model(runner.model)
 

@@ -360,7 +360,8 @@ def create_py_executor(
     calibrator.init(layer_wise_benchmarks_config.calibration_mode,
                     layer_wise_benchmarks_config.calibration_file_path,
                     layer_wise_benchmarks_config.calibration_layer_indices,
-                    mapping, dist)
+                    mapping=mapping,
+                    dist=dist)
     model_engine.model = calibrator.maybe_wrap_model(model_engine.model)
 
     if has_draft_model_engine:
