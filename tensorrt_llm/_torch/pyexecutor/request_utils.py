@@ -20,8 +20,7 @@ from tensorrt_llm.mapping import CpType
 
 from ..distributed import Distributed
 from .hang_detector import HangDetector
-from .llm_request import (ExecutorRequest, LlmRequest,
-                          executor_request_to_llm_request)
+from .llm_request import ExecutorRequest, LlmRequest, executor_request_to_llm_request
 
 # Type alias for request queue items (to avoid circular import)
 # The actual RequestQueueItem class is defined in executor_request_queue.py
@@ -37,13 +36,12 @@ def get_num_child_requests(request: ExecutorRequest) -> int:
         Number of child requests (0 if beam search, otherwise num_return_sequences - 1).
     """
     sampling_config = request.sampling_config
-    return 0 if sampling_config.beam_width > 1 else (
-        sampling_config.num_return_sequences or 1) - 1
+    return 0 if sampling_config.beam_width > 1 else (sampling_config.num_return_sequences or 1) - 1
 
 
 def collect_py_objects_from_requests(
-        requests: List,
-        attribute_name: str) -> Optional[Tuple[str, Dict]]:
+    requests: List, attribute_name: str
+) -> Optional[Tuple[str, Dict]]:
     """Collect Python-only objects from requests.
 
     Args:
@@ -64,8 +62,7 @@ def collect_py_objects_from_requests(
     return None if not req_id_to_obj else (attribute_name, req_id_to_obj)
 
 
-def attach_py_objects_to_requests(requests: List,
-                                  py_request_objects: Tuple) -> None:
+def attach_py_objects_to_requests(requests: List, py_request_objects: Tuple) -> None:
     """Attach Python-only objects to each request.
 
     Args:
@@ -81,11 +78,11 @@ def attach_py_objects_to_requests(requests: List,
 
 
 def schedule_attention_dp_requests(
-        new_requests: List[Any],
-        all_ranks_num_active_requests: List[int],
-        all_ranks_num_active_tokens: List[int],
-        tp_size: int,
-        max_num_active_requests: int
+    new_requests: List[Any],
+    all_ranks_num_active_requests: List[int],
+    all_ranks_num_active_tokens: List[int],
+    tp_size: int,
+    max_num_active_requests: int,
 ) -> Tuple[Dict[int, List[Any]], int]:
     """Schedule attention DP requests across ranks.
 
@@ -110,8 +107,7 @@ def schedule_attention_dp_requests(
 
     # Prioritize the requests that are not in relax mode
     def get_relax_value(req_item):
-        scheduling_params = getattr(req_item.request, 'py_scheduling_params',
-                                    None)
+        scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
         if scheduling_params is None:
             return True
         return scheduling_params.attention_dp_relax
@@ -122,12 +118,13 @@ def schedule_attention_dp_requests(
     remaining_unscheduled = []
     for req_item in new_requests:
         scheduled = False
-        scheduling_params = getattr(req_item.request, 'py_scheduling_params',
-                                    None)
+        scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
         if scheduling_params is not None:
             target_dp_rank = scheduling_params.attention_dp_rank
-            if target_dp_rank is not None and all_ranks_num_active_requests[
-                    target_dp_rank] < max_num_active_requests:
+            if (
+                target_dp_rank is not None
+                and all_ranks_num_active_requests[target_dp_rank] < max_num_active_requests
+            ):
                 all_ranks_num_active_requests[target_dp_rank] += 1
                 scheduled = True
                 all_ranks_new_requests[target_dp_rank].append(req_item)
@@ -139,25 +136,28 @@ def schedule_attention_dp_requests(
     num_new_requests_all_ranks = len(remaining_unscheduled)
     total_num_active_requests = sum(all_ranks_num_active_requests)
     expected_num_active_requests = max(
-        (total_num_active_requests + num_new_requests_all_ranks + tp_size - 1)
-        // tp_size,
+        (total_num_active_requests + num_new_requests_all_ranks + tp_size - 1) // tp_size,
         max(all_ranks_num_active_requests),
     )
 
     all_ranks_new_requests = balance_requests_across_ranks(
-        remaining_unscheduled, all_ranks_new_requests,
-        all_ranks_num_active_requests, all_ranks_num_active_tokens,
-        expected_num_active_requests)
+        remaining_unscheduled,
+        all_ranks_new_requests,
+        all_ranks_num_active_requests,
+        all_ranks_num_active_tokens,
+        expected_num_active_requests,
+    )
 
     return all_ranks_new_requests, expected_num_active_requests
 
 
 def balance_requests_across_ranks(
-        new_requests: List,
-        all_ranks_new_requests: Dict[int, List],
-        all_ranks_num_active_requests: List[int],
-        all_ranks_num_active_tokens: List[int],
-        expected_num_active_requests: int) -> Dict[int, List]:
+    new_requests: List,
+    all_ranks_new_requests: Dict[int, List],
+    all_ranks_num_active_requests: List[int],
+    all_ranks_num_active_tokens: List[int],
+    expected_num_active_requests: int,
+) -> Dict[int, List]:
     """Balance requests across ranks for attention DP.
 
     Uses a heap-based algorithm to distribute requests evenly across ranks,
@@ -175,9 +175,7 @@ def balance_requests_across_ranks(
     """
     if new_requests:
         # Balance context tokens across ranks using heap
-        HeapVal = namedtuple(
-            'HeapVal',
-            ['num_tokens', 'num_requests', 'rank', 'request_list'])
+        HeapVal = namedtuple("HeapVal", ["num_tokens", "num_requests", "rank", "request_list"])
 
         all_ranks_new_requests_heap = [
             HeapVal(all_ranks_num_active_tokens[tp_rank], val, tp_rank, [])
@@ -185,13 +183,13 @@ def balance_requests_across_ranks(
         ]
 
         all_ranks_new_requests_heap = [
-            val for val in all_ranks_new_requests_heap
+            val
+            for val in all_ranks_new_requests_heap
             if val.num_requests < expected_num_active_requests
         ]
 
         all_ranks_new_scheduled_requests = {
-            val.rank: val.request_list
-            for val in all_ranks_new_requests_heap
+            val.rank: val.request_list for val in all_ranks_new_requests_heap
         }
 
         heapq.heapify(all_ranks_new_requests_heap)
@@ -199,17 +197,16 @@ def balance_requests_across_ranks(
         # Sort by token count (descending) for better load balancing
         new_requests = sorted(
             new_requests,
-            key=lambda x: len(getattr(x.request, 'input_token_ids', []))
-            if x.request else 0,
-            reverse=True)
+            key=lambda x: len(getattr(x.request, "input_token_ids", [])) if x.request else 0,
+            reverse=True,
+        )
 
         # Distribute requests across ranks
         for req_item in new_requests:
-
             val = heapq.heappop(all_ranks_new_requests_heap)
-            token_count = len(
-                getattr(req_item.request, 'input_token_ids',
-                        [])) if req_item.request else 0
+            token_count = (
+                len(getattr(req_item.request, "input_token_ids", [])) if req_item.request else 0
+            )
             # Update the heap value with the new request
             val = val._replace(
                 num_tokens=val.num_tokens + token_count,
@@ -229,9 +226,8 @@ def balance_requests_across_ranks(
 
 
 def can_process_attention_dp_request(
-        req_item,
-        all_ranks_num_active_requests: List[int],
-        max_num_active_requests: int) -> bool:
+    req_item, all_ranks_num_active_requests: List[int], max_num_active_requests: int
+) -> bool:
     """Check if a request can be processed immediately for attention DP.
 
     Args:
@@ -242,7 +238,7 @@ def can_process_attention_dp_request(
     Returns:
         True if the request can be processed, False otherwise.
     """
-    scheduling_params = getattr(req_item.request, 'py_scheduling_params', None)
+    scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
     if scheduling_params is None:
         return True
 
@@ -284,21 +280,24 @@ def get_from_waiting_queue(
     pending_requests = []
 
     # Track the request with strict requirements
-    scheduling_all_ranks_num_active_requests = all_ranks_num_active_requests.copy(
-    ) if enable_attention_dp else None
+    scheduling_all_ranks_num_active_requests = (
+        all_ranks_num_active_requests.copy() if enable_attention_dp else None
+    )
 
     while req_count < max_req_count and waiting_queue:
         req_item = waiting_queue[0]
-        num_children = len(
-            req_item.child_req_ids) if req_item.child_req_ids else 0
+        num_children = len(req_item.child_req_ids) if req_item.child_req_ids else 0
         if (req_count + 1 + num_children) > max_req_count:
             break
         req_item = waiting_queue.popleft()
 
-        can_process = can_process_attention_dp_request(
-            req_item, scheduling_all_ranks_num_active_requests,
-            max_num_active_requests
-        ) if enable_attention_dp else True
+        can_process = (
+            can_process_attention_dp_request(
+                req_item, scheduling_all_ranks_num_active_requests, max_num_active_requests
+            )
+            if enable_attention_dp
+            else True
+        )
 
         if can_process:
             items.append(req_item)
@@ -314,11 +313,8 @@ def get_from_waiting_queue(
 
 
 def partition_context_for_star_attention(
-        ctx_ids_list: List[int],
-        cp_rank: int,
-        cp_size: int,
-        block_size: int,
-        anchor_block_size: int) -> Tuple[List[List[int]], List[List[int]], int]:
+    ctx_ids_list: List[int], cp_rank: int, cp_size: int, block_size: int, anchor_block_size: int
+) -> Tuple[List[List[int]], List[List[int]], int]:
     """Partition context for Star Attention CP.
 
     Args:
@@ -339,28 +335,25 @@ def partition_context_for_star_attention(
     if anchor_block_size is None:
         anchor_block_size = block_size
 
-    assert anchor_block_size <= block_size, \
-        f'cp_anchor_size {anchor_block_size} should be smaller than block_size {block_size}'
+    assert anchor_block_size <= block_size, (
+        f"cp_anchor_size {anchor_block_size} should be smaller than block_size {block_size}"
+    )
 
     padding = 0
     if ctx_len % block_size != 0:
         padding = block_size - (ctx_len % block_size)
-        assert padding <= ctx_len, \
-            f'block size is too large for context, please set it smaller'
-        ctx_ids = torch.cat(
-            (ctx_ids, torch.zeros_like(ctx_ids)[:, :padding]), dim=-1)
+        assert padding <= ctx_len, "block size is too large for context, please set it smaller"
+        ctx_ids = torch.cat((ctx_ids, torch.zeros_like(ctx_ids)[:, :padding]), dim=-1)
     position_ids = torch.arange(0, ctx_ids.shape[-1]).unsqueeze(0)
 
-    ctx_ids_blocks = torch.tensor_split(
-        torch.stack(ctx_ids.split(block_size, dim=-1)), cp_size)
+    ctx_ids_blocks = torch.tensor_split(torch.stack(ctx_ids.split(block_size, dim=-1)), cp_size)
     position_ids_blocks = torch.tensor_split(
-        torch.stack(position_ids.split(block_size, dim=-1)), cp_size)
+        torch.stack(position_ids.split(block_size, dim=-1)), cp_size
+    )
 
     if cp_rank != 0:
         ctx_blocks = [ctx_ids_blocks[0][0].tolist()[0][:anchor_block_size]]
-        position_blocks = [
-            position_ids_blocks[0][0].tolist()[0][:anchor_block_size]
-        ]
+        position_blocks = [position_ids_blocks[0][0].tolist()[0][:anchor_block_size]]
     else:
         ctx_blocks, position_blocks = [], []
 
@@ -374,10 +367,8 @@ def partition_context_for_star_attention(
 
 
 def partition_context_for_helix(
-        input_token_ids: List[int],
-        cp_rank: int,
-        cp_size: int,
-        tokens_per_block: int) -> Tuple[List[int], List[int], int, int]:
+    input_token_ids: List[int], cp_rank: int, cp_size: int, tokens_per_block: int
+) -> Tuple[List[int], List[int], int, int]:
     """Partition context for Helix CP.
 
     Args:
@@ -392,8 +383,7 @@ def partition_context_for_helix(
     Raises:
         ValueError: If there aren't enough tokens for at least one block per CP rank.
     """
-    all_input_ids = torch.tensor(input_token_ids,
-                                 dtype=torch.int64).unsqueeze(0)
+    all_input_ids = torch.tensor(input_token_ids, dtype=torch.int64).unsqueeze(0)
     input_len = all_input_ids.shape[-1]
 
     num_total_blocks = (input_len + tokens_per_block - 1) // tokens_per_block
@@ -410,19 +400,18 @@ def partition_context_for_helix(
         padding_len = tokens_per_block - (input_len % tokens_per_block)
         padding_ids = torch.zeros([1, padding_len], dtype=torch.int64)
         all_input_ids = torch.cat((all_input_ids, padding_ids), dim=-1)
-    all_position_ids = torch.arange(0,
-                                    input_len + padding_len,
-                                    dtype=torch.int64).unsqueeze(0)
+    all_position_ids = torch.arange(0, input_len + padding_len, dtype=torch.int64).unsqueeze(0)
 
     input_id_blocks_per_rank = torch.tensor_split(
-        torch.stack(all_input_ids.split(tokens_per_block, dim=-1)), cp_size)
+        torch.stack(all_input_ids.split(tokens_per_block, dim=-1)), cp_size
+    )
     position_id_blocks_per_rank = torch.tensor_split(
-        torch.stack(all_position_ids.split(tokens_per_block, dim=-1)), cp_size)
+        torch.stack(all_position_ids.split(tokens_per_block, dim=-1)), cp_size
+    )
 
     # Get the input_ids and position_ids for this rank.
     input_ids_this_rank = input_id_blocks_per_rank[cp_rank].flatten().tolist()
-    position_ids_this_rank = position_id_blocks_per_rank[
-        cp_rank].flatten().tolist()
+    position_ids_this_rank = position_id_blocks_per_rank[cp_rank].flatten().tolist()
 
     # Undo the padding. Only last rank's last block will be padded right now
     # given contiguous block assignment.
@@ -434,8 +423,8 @@ def partition_context_for_helix(
 
 
 def merge_requests_to_llm_requests(
-        new_requests: List,
-        exclude_last_generation_logits: bool) -> List[LlmRequest]:
+    new_requests: List, exclude_last_generation_logits: bool
+) -> List[LlmRequest]:
     """Merge RequestQueueItems to LlmRequests (basic case without CP).
 
     Args:
@@ -447,9 +436,9 @@ def merge_requests_to_llm_requests(
     """
     req_with_children = []
     for req_item in new_requests:
-        req = executor_request_to_llm_request(req_item.id, req_item.request,
-                                              req_item.child_req_ids,
-                                              exclude_last_generation_logits)
+        req = executor_request_to_llm_request(
+            req_item.id, req_item.request, req_item.child_req_ids, exclude_last_generation_logits
+        )
         req_with_children.append(req)
         if req.child_requests:
             req_with_children.extend(req.child_requests)
@@ -457,11 +446,12 @@ def merge_requests_to_llm_requests(
 
 
 def merge_helix_requests(
-        new_requests: List,
-        cp_rank: int,
-        cp_size: int,
-        tokens_per_block: int,
-        exclude_last_generation_logits: bool) -> List[LlmRequest]:
+    new_requests: List,
+    cp_rank: int,
+    cp_size: int,
+    tokens_per_block: int,
+    exclude_last_generation_logits: bool,
+) -> List[LlmRequest]:
     """Merge requests for Helix CP.
 
     Note: Helix parallelism is a decode-only feature run with disaggregated serving.
@@ -480,12 +470,9 @@ def merge_helix_requests(
     req_with_children = []
 
     for req_item in new_requests:
-        input_ids_this_rank, position_ids_this_rank, input_len, _ = \
-            partition_context_for_helix(
-                req_item.request.input_token_ids,
-                cp_rank,
-                cp_size,
-                tokens_per_block)
+        input_ids_this_rank, position_ids_this_rank, input_len, _ = partition_context_for_helix(
+            req_item.request.input_token_ids, cp_rank, cp_size, tokens_per_block
+        )
 
         req = executor_request_to_llm_request(
             req_id=req_item.id,
@@ -505,11 +492,12 @@ def merge_helix_requests(
 
 
 def merge_star_attention_requests(
-        new_requests: List,
-        cp_rank: int,
-        cp_size: int,
-        cp_config: dict,
-        exclude_last_generation_logits: bool) -> List[LlmRequest]:
+    new_requests: List,
+    cp_rank: int,
+    cp_size: int,
+    cp_config: dict,
+    exclude_last_generation_logits: bool,
+) -> List[LlmRequest]:
     """Merge requests for Star Attention CP.
 
     Args:
@@ -523,20 +511,16 @@ def merge_star_attention_requests(
         List of LlmRequest objects.
     """
     result = []
-    block_size = cp_config['block_size']
-    anchor_block_size = cp_config['cp_anchor_size']
+    block_size = cp_config["block_size"]
+    anchor_block_size = cp_config["cp_anchor_size"]
 
     for req_item in new_requests:
         req_id, exe_req, query_token_ids = req_item.id, req_item.request, req_item.query
         ctx_len0 = len(exe_req.input_token_ids)
 
-        ctx_blocks, position_blocks, last_block_padding_num = \
-            partition_context_for_star_attention(
-                exe_req.input_token_ids,
-                cp_rank,
-                cp_size,
-                block_size,
-                anchor_block_size)
+        ctx_blocks, position_blocks, last_block_padding_num = partition_context_for_star_attention(
+            exe_req.input_token_ids, cp_rank, cp_size, block_size, anchor_block_size
+        )
 
         if cp_rank == cp_size - 1 and last_block_padding_num > 0:
             ctx_blocks[-1] = ctx_blocks[-1][:-last_block_padding_num]
@@ -545,13 +529,11 @@ def merge_star_attention_requests(
         # if has query
         if query_token_ids:
             ctx_blocks.append(query_token_ids)
-            position_blocks.append(
-                [i for i in range(ctx_len0, ctx_len0 + len(query_token_ids))])
+            position_blocks.append([i for i in range(ctx_len0, ctx_len0 + len(query_token_ids))])
 
         # insert the dummy block to align the number of ctx iterations of each rank
         total_blocks = (ctx_len0 + block_size - 1) // block_size
-        num_blocks_per_rank = (total_blocks + cp_size -
-                               1) // cp_size + 1  # 1 for query block
+        num_blocks_per_rank = (total_blocks + cp_size - 1) // cp_size + 1  # 1 for query block
         if len(ctx_blocks) == num_blocks_per_rank:
             ctx_blocks.insert(1, [])
             position_blocks.insert(1, [])
@@ -560,16 +542,17 @@ def merge_star_attention_requests(
             pass
         else:
             print(
-                f'rank = {cp_rank}, len(ctx_blocks)  = {len(ctx_blocks) }, '
-                f'num_blocks_per_rank = {num_blocks_per_rank}')
-            assert False, f'invalid context partition'
+                f"rank = {cp_rank}, len(ctx_blocks)  = {len(ctx_blocks)}, "
+                f"num_blocks_per_rank = {num_blocks_per_rank}"
+            )
+            assert False, "invalid context partition"
 
         # fake data for scheduler
         ctx_blocks_list = [0] * (block_size + anchor_block_size)
 
-        req = executor_request_to_llm_request(req_id, exe_req,
-                                              exclude_last_generation_logits,
-                                              ctx_blocks_list)
+        req = executor_request_to_llm_request(
+            req_id, exe_req, exclude_last_generation_logits, ctx_blocks_list
+        )
         req.gen_iters = 0
         req.ctx_iters = 0
         req.ctx_blocks = ctx_blocks
@@ -582,11 +565,13 @@ def merge_star_attention_requests(
 
 
 @nvtx_range("merge_requests")
-def merge_requests(new_requests: List,
-                   cp_config: dict,
-                   cp_rank: int,
-                   cp_size: int,
-                   exclude_last_generation_logits: bool) -> List[LlmRequest]:
+def merge_requests(
+    new_requests: List,
+    cp_config: dict,
+    cp_rank: int,
+    cp_size: int,
+    exclude_last_generation_logits: bool,
+) -> List[LlmRequest]:
     """Merge RequestQueueItems to LlmRequests based on CP configuration.
 
     This is a router function that dispatches to the appropriate merge function
@@ -606,27 +591,28 @@ def merge_requests(new_requests: List,
     Raises:
         NotImplementedError: If cp_type is not supported.
     """
-    if 'cp_type' in cp_config:
-        cp_type = cp_config['cp_type']
+    if "cp_type" in cp_config:
+        cp_type = cp_config["cp_type"]
         if cp_type == CpType.STAR:
             return merge_star_attention_requests(
                 new_requests,
                 cp_rank=cp_rank,
                 cp_size=cp_size,
                 cp_config=cp_config,
-                exclude_last_generation_logits=exclude_last_generation_logits)
+                exclude_last_generation_logits=exclude_last_generation_logits,
+            )
         elif cp_type == CpType.HELIX:
             return merge_helix_requests(
                 new_requests,
                 cp_rank=cp_rank,
                 cp_size=cp_size,
-                tokens_per_block=cp_config['tokens_per_block'],
-                exclude_last_generation_logits=exclude_last_generation_logits)
+                tokens_per_block=cp_config["tokens_per_block"],
+                exclude_last_generation_logits=exclude_last_generation_logits,
+            )
         else:
-            raise NotImplementedError(f'Unsupported cp type {cp_type.name}.')
+            raise NotImplementedError(f"Unsupported cp type {cp_type.name}.")
 
-    return merge_requests_to_llm_requests(new_requests,
-                                          exclude_last_generation_logits)
+    return merge_requests_to_llm_requests(new_requests, exclude_last_generation_logits)
 
 
 class RequestBroadcaster:
@@ -674,7 +660,8 @@ class RequestBroadcaster:
         else:
             with self.hang_detector.pause():
                 new_requests, py_request_objects = self._broadcast_requests(
-                    new_requests, py_request_objects)
+                    new_requests, py_request_objects
+                )
 
         return new_requests, py_request_objects
 
@@ -688,24 +675,30 @@ class RequestBroadcaster:
             Tuple of collected Python objects.
         """
         py_logits_post_processors = collect_py_objects_from_requests(
-            new_requests, "py_logits_post_processors")
-        py_multimodal_data = collect_py_objects_from_requests(
-            new_requests, "py_multimodal_data")
+            new_requests, "py_logits_post_processors"
+        )
+        py_multimodal_data = collect_py_objects_from_requests(new_requests, "py_multimodal_data")
         py_scheduling_params = collect_py_objects_from_requests(
-            new_requests, "py_scheduling_params")
-        py_num_logprobs = collect_py_objects_from_requests(
-            new_requests, "py_num_logprobs")
+            new_requests, "py_scheduling_params"
+        )
+        py_num_logprobs = collect_py_objects_from_requests(new_requests, "py_num_logprobs")
 
         return tuple(
-            filter(None, [
-                py_logits_post_processors, py_multimodal_data,
-                py_scheduling_params, py_num_logprobs
-            ]))
+            filter(
+                None,
+                [
+                    py_logits_post_processors,
+                    py_multimodal_data,
+                    py_scheduling_params,
+                    py_num_logprobs,
+                ],
+            )
+        )
 
     @nvtx_range("broadcast_requests")
     def _broadcast_requests(
-            self, new_requests: List,
-            py_request_objects) -> Tuple[List, Optional[Dict]]:
+        self, new_requests: List, py_request_objects
+    ) -> Tuple[List, Optional[Dict]]:
         """Broadcast new_requests and Python-only metadata across pipeline stages.
 
         Args:
@@ -738,15 +731,17 @@ class RequestBroadcaster:
         # 1. rank1 will wait on nccl.send(rank2), without invoking mpi.wait(isend-handle)
         # 2. rank2 will wait on mpi.recv(rank1) but never receive the new requests.
         # 3. rank1 will hang on nccl.send because rank2 will never reach nccl.recv(rank1).
-        pp_send_func = self.dist.isend_object if os.environ.get(
-            "TRTLLM_PP_REQ_SEND_ASYNC", "0") == "1" else self.dist.send_object
+        pp_send_func = (
+            self.dist.isend_object
+            if os.environ.get("TRTLLM_PP_REQ_SEND_ASYNC", "0") == "1"
+            else self.dist.send_object
+        )
 
         if not self.dist.is_last_pp_rank:
             if self.send_requests_handler is not None:
                 with nvtx_range("wait_prev_send_requests_handler"):
                     self.send_requests_handler.wait()
             with nvtx_range("send_requests_to_next_pp"):
-                self.send_requests_handler = pp_send_func(
-                    payloads, self.dist.next_pp_rank, tag)
+                self.send_requests_handler = pp_send_func(payloads, self.dist.next_pp_rank, tag)
 
         return payloads

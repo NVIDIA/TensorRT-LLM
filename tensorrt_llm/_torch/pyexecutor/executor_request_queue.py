@@ -64,8 +64,6 @@ class ExecutorRequestQueue:
         self.batch_wait_timeout_ms = batch_wait_timeout_ms
         self.hang_detector = hang_detector or HangDetector()
 
-        self.should_exclude_last_generation_logits = False
-
     def _get_from_request_queue(
             self,
             timeout: Optional[datetime.timedelta]) -> List[RequestQueueItem]:
@@ -199,25 +197,6 @@ class ExecutorRequestQueue:
             List of RequestQueueItem fetched from the queue.
         """
         return self._get_from_request_queue(timeout)
-
-    def set_exclude_last_generation_logits(self,
-                                           disable_overlap_scheduler: bool,
-                                           pp_size: int) -> None:
-        # When overlap scheduler is enabled then when starting to handle a new prompt,
-        # sample_async is called twice before the first call to update_requests:
-        # - 1st time as a context request that handles on the 1st generated token
-        # - 2nd time as a generation request that handles on the 2nd generated token.
-        # and only after these two calls the sampler's update_request method is called.
-        # So in a sampler that works by the expected flow of handling the logits in
-        # sample_async, every update_request doesn't handle the newest token, but one
-        # before it. Since all these calls work on the same request object, then its
-        # logits storage contains the logits of both the token update_requests should work
-        # on, and also its next token. Thus, excluding the last generation logits from any
-        # getter is required.
-        self.should_exclude_last_generation_logits = not disable_overlap_scheduler and pp_size == 1
-
-    def should_exclude_last_generation_logits_flag(self) -> bool:
-        return self.should_exclude_last_generation_logits
 
     def get_request_queue_size(self) -> int:
         return self.request_queue.qsize()
