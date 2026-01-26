@@ -291,7 +291,7 @@ class Mamba2Mixer(nn.Module):
             is_target_verify = attn_metadata.kv_cache_manager.is_speculative(
             ) and spec_metadata is not None
             if is_target_verify:
-                # TODO: support dynamic speculation, will add current_draft_len later
+                # TODO: support dynamic speculation, will add current_draft_len later [TRTLLM-10319]
                 draft_token_num = spec_metadata.max_draft_len + 1
                 intermediate_conv_states = layer_cache.intermediate_conv_window
 
@@ -303,7 +303,7 @@ class Mamba2Mixer(nn.Module):
                 # Reshape for batch processing
                 xbc_d_reshaped = xbc_d.view(num_decodes, draft_token_num,
                                             -1).transpose(1, 2)
-                # TODO:support tree structure
+                # TODO:support tree structure [TRTLLM-10320]
                 xbc_d_processed = causal_conv1d_update_triton(
                     xbc_d_reshaped,
                     conv_states,

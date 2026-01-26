@@ -14,7 +14,6 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-from dataclasses import fields as dataclass_fields
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 import torch
@@ -56,15 +55,6 @@ class MambaCacheManager(BaseResourceManager):
             for k, v in vars(self).items():
                 kwargs[k] = v[layer]
             return type(self)(**kwargs)
-
-        def mem_usage_bytes(self):
-            """Calculate total memory usage in bytes."""
-            total = 0
-            for f in dataclass_fields(self):
-                tensor = getattr(self, f.name)
-                if isinstance(tensor, torch.Tensor):
-                    total += tensor.element_size() * tensor.nelement()
-            return total
 
     @dataclass(frozen=True, kw_only=True)
     class SpeculativeState(State):
@@ -142,7 +132,7 @@ class MambaCacheManager(BaseResourceManager):
         # create state container
         if speculative_num_draft_tokens is not None:
 
-            # Cache intermediate SSM states per draft token(include new sampled token) during target verify
+            # Cache intermediate SSM states per draft token(include new sampled token) during target model verification phase
             intermediate_ssm_states = torch.zeros(
                 size=(num_local_layers, self.spec_state_size,
                       speculative_num_draft_tokens + 1) + ssm_state_shape,
@@ -150,7 +140,7 @@ class MambaCacheManager(BaseResourceManager):
                 device=device,
             )
 
-            # Cache intermediate conv windows per draft token(include new sampled token) during target verify
+            # Cache intermediate conv windows per draft token(include new sampled token) during target model verification phase
             intermediate_conv_window_cache = torch.zeros(
                 size=(num_local_layers, self.spec_state_size,
                       speculative_num_draft_tokens + 1) + conv_state_shape,

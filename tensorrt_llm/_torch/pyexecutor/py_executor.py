@@ -1322,7 +1322,6 @@ class PyExecutor:
                                                 'attn_metadata', None)
                         kv_cache_dtype_byte_size = getattr(
                             self.model_engine, 'kv_cache_dtype_byte_size', None)
-
                         self.resource_manager.update_resources(
                             previous_scheduled_batch, attn_metadata,
                             kv_cache_dtype_byte_size)
@@ -1570,7 +1569,6 @@ class PyExecutor:
                                             None)
                     kv_cache_dtype_byte_size = getattr(
                         self.model_engine, 'kv_cache_dtype_byte_size', None)
-
                     self.resource_manager.update_resources(
                         scheduled_batch, attn_metadata,
                         kv_cache_dtype_byte_size)
