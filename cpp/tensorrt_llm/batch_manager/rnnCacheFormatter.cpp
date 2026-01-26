@@ -53,7 +53,7 @@ void RnnCacheFormatter::format(TransferSession& session)
     auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
     auto& bufferManager = session.getBufferManager();
 
-    auto targetInfo = targetIRanks(destConfig, selfConfig, selfIdx);
+    auto targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
     auto const targetNum = connections.size();
     if (targetNum == 0)
     {
@@ -62,20 +62,61 @@ void RnnCacheFormatter::format(TransferSession& session)
     }
 
     auto const slotIdx = mRnnStateManager->getCacheIndex(llmRequest.mRequestId);
+    int deviceId;
+    TLLM_CUDA_CHECK(cudaGetDevice(&deviceId));
 
     auto const& selfParallel = selfConfig.getParallelConfig();
     auto const selfTPNum = selfParallel.mTensorParallelism;
     auto const selfPPRank = selfIdx / selfTPNum;
     auto const& selfLayersPerPP = selfParallel.mRnnLayerNumPerPP;
 
-    // TODO: add zero data copy path
-
     SizeType32 selfStartLayer = 0; // global layer id
     for (SizeType32 pp = 0; pp < selfPPRank; pp++)
     {
         selfStartLayer += selfLayersPerPP[pp];
     }
-    SizeType32 const selfNumLayers = selfLayersPerPP[selfPPRank];
+    SizeType32 const numLocalLayers = selfLayersPerPP[selfPPRank];
+
+    if (common::getEnvTryZCopyForKVCacheTransfer() && destConfig == selfConfig)
+    {
+        TLLM_LOG_DEBUG("Try using zero-copy for the RNN cache.");
+        NVTX3_SCOPED_RANGE(RnnZeroCopySend);
+
+        TLLM_CHECK(connections.size() == 1);
+
+        TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
+        for (size_t i = 0; i < connections.size(); i++)
+        {
+            for (SizeType32 layer = 0; layer < numLocalLayers; layer++)
+            {
+                SizeType32 globalLayerIdx = selfStartLayer + layer;
+
+                // Get conv state for this layer: shape is [maxBatchSize, convDim, dConv-1]
+                auto convState = mRnnStateManager->getConvStates(globalLayerIdx);
+                // Slice out the specific slot: shape becomes [convDim, dConv-1]
+                auto slotConv = runtime::ITensor::slice(convState, slotIdx, 1);
+                slotConv->squeeze(0);
+
+                // Receive conv state
+                // llmRequest.updateKvCacheSize(slotConv->getSizeInBytes());
+                session.send(i, slotConv->data(), slotConv->getSizeInBytes());
+
+                // Get SSM state for this layer: shape is [maxBatchSize, numHeads, headDim, dState]
+                auto ssmState = mRnnStateManager->getSsmStates(globalLayerIdx);
+                // Slice out the specific slot: shape becomes [numHeads, headDim, dState]
+                auto slotSsm = runtime::ITensor::slice(ssmState, slotIdx, 1);
+                slotSsm->squeeze(0);
+
+                // Receive SSM state
+                // llmRequest.updateKvCacheSize(slotSsm->getSizeInBytes());
+                session.send(i, slotSsm->data(), slotSsm->getSizeInBytes());
+            }
+        }
+        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "End the sending of RNN cache for the request ID: %ld.",
+            llmRequest.mRequestId);
+
+        return;
+    }
 
     // Calculate buffer sizes for each target
     //    Each target gets: conv states + ssm states for overlapping layers
@@ -142,8 +183,6 @@ void RnnCacheFormatter::format(TransferSession& session)
     session.setTime(TransferSession::kTimePreprocess);
 
     auto preAllocSendBuffer = mRnnCacheTransBufferManager->getSendBuffer(cacheBufferId);
-    int deviceId;
-    TLLM_CUDA_CHECK(cudaGetDevice(&deviceId));
 
     sendAllBuffers(
         session, deviceId, outputBuffers, bufferCoverTargetNum, preAllocSendBuffer, bufferManager, targetInfo);
@@ -173,8 +212,12 @@ void RnnCacheFormatter::unformat(TransferSession& session)
     auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
     auto& bufferManager = session.getBufferManager();
 
-    auto sourceInfo = targetIRanks(destConfig, selfConfig, selfIdx);
-    auto const sourceNum = connections.size();
+    auto sourceInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
+    int deviceId;
+    TLLM_CUDA_CHECK(cudaGetDevice(&deviceId));
+
+    auto pickUpConnections = pickRecvConnections(connections.size(), selfConfig, selfIdx, destConfig);
+    auto const sourceNum = pickUpConnections.size();
 
     if (sourceNum == 0)
     {
@@ -182,7 +225,8 @@ void RnnCacheFormatter::unformat(TransferSession& session)
         return;
     }
 
-    auto const slotIdx = mRnnStateManager->addRequest(llmRequest.mRequestId);
+    // Since allocation happens earlier
+    auto const slotIdx = mRnnStateManager->getCacheIndex(llmRequest.mRequestId);
 
     auto const& selfParallel = selfConfig.getParallelConfig();
     auto const selfTPNum = selfParallel.mTensorParallelism;
@@ -193,6 +237,47 @@ void RnnCacheFormatter::unformat(TransferSession& session)
     for (SizeType32 pp = 0; pp < selfPPRank; pp++)
     {
         selfStartLayer += selfLayersPerPP[pp];
+    }
+    SizeType32 const numLocalLayers = selfLayersPerPP[selfPPRank];
+
+    if (common::getEnvTryZCopyForKVCacheTransfer() && destConfig == selfConfig)
+    {
+        TLLM_LOG_DEBUG("try zcopy for RNN cache");
+        NVTX3_SCOPED_RANGE(RnnZeroCopyRecv);
+
+        TLLM_CHECK(sourceNum == 1);
+
+        TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
+        for (size_t i = 0; i < sourceNum; i++)
+        {
+            for (SizeType32 layer = 0; layer < numLocalLayers; layer++)
+            {
+                SizeType32 globalLayerIdx = selfStartLayer + layer;
+
+                // Get conv state for this layer: shape is [maxBatchSize, convDim, dConv-1]
+                auto convState = mRnnStateManager->getConvStates(globalLayerIdx);
+                // Slice out the specific slot: shape becomes [convDim, dConv-1]
+                auto slotConv = runtime::ITensor::slice(convState, slotIdx, 1);
+                slotConv->squeeze(0);
+
+                // Send conv state
+                // llmRequest.updateKvCacheSize(slotConv->getSizeInBytes());
+                session.recv(pickUpConnections[i], slotConv->data(), slotConv->getSizeInBytes());
+
+                // Get SSM state for this layer: shape is [maxBatchSize, numHeads, headDim, dState]
+                auto ssmState = mRnnStateManager->getSsmStates(globalLayerIdx);
+                // Slice out the specific slot: shape becomes [numHeads, headDim, dState]
+                auto slotSsm = runtime::ITensor::slice(ssmState, slotIdx, 1);
+                slotSsm->squeeze(0);
+
+                // Send SSM state
+                // llmRequest.updateKvCacheSize(slotSsm->getSizeInBytes());
+                session.recv(pickUpConnections[i], slotSsm->data(), slotSsm->getSizeInBytes());
+            }
+        }
+        TLLM_LOG_DEBUG(
+            mpi::MpiComm::world().getRank(), "End receiving RNN cache for request ID: %ld.", llmRequest.mRequestId);
+        return;
     }
 
     // Calculate buffer sizes
@@ -236,9 +321,6 @@ void RnnCacheFormatter::unformat(TransferSession& session)
         TLLM_CHECK(preAllocRecvBuffer != nullptr);
     }
 
-    int deviceId;
-    TLLM_CUDA_CHECK(cudaGetDevice(&deviceId));
-
     auto recvBufferFun = [&](int devId, size_t srcIdx)
     {
         NVTX3_SCOPED_RANGE(recvBufferFun);
@@ -254,7 +336,7 @@ void RnnCacheFormatter::unformat(TransferSession& session)
             size = buffer->getSizeInBytes();
             TLLM_LOG_DEBUG(
                 mpi::MpiComm::world().getRank(), " start recv srcIdx: %lu size:%lu", srcIdx, buffer->getSizeInBytes());
-            session.recv(srcIdx, buffer->data(), buffer->getSizeInBytes());
+            session.recv(pickUpConnections[srcIdx], buffer->data(), buffer->getSizeInBytes());
             TLLM_LOG_DEBUG(
                 mpi::MpiComm::world().getRank(), " recv srcIdx: %lu size:%lu", srcIdx, buffer->getSizeInBytes());
         }
@@ -275,7 +357,7 @@ void RnnCacheFormatter::unformat(TransferSession& session)
                 auto recvSlice = runtime::ITensor::slice(recvBufferUsed, 0, recvSize);
                 auto copySlice = runtime::ITensor::slice(recvBuffers[srcIdx], needRecvSize - remainRecvSize, recvSize);
                 size += recvSlice->getSizeInBytes();
-                session.recv(srcIdx, recvSlice->data(), recvSlice->getSizeInBytes());
+                session.recv(pickUpConnections[srcIdx], recvSlice->data(), recvSlice->getSizeInBytes());
                 // Use cudaMemcpyAsync since we're copying bytes
                 TLLM_CUDA_CHECK(cudaMemcpyAsync(copySlice->data(), recvSlice->data(), recvSlice->getSizeInBytes(),
                     cudaMemcpyDeviceToDevice, bufferManager.getStream().get()));
@@ -442,7 +524,7 @@ bool RnnCacheFormatter::inquireSupport(RnnCacheState const& selfConfig, RnnCache
 std::vector<RnnCacheFormatter::SizeType32> RnnCacheFormatter::getCounterparts(
     RnnCacheState const& selfConfig, SizeType32 selfIdx, RnnCacheState const& destConfig) const
 {
-    auto targetInfo = targetIRanks(destConfig, selfConfig, selfIdx);
+    auto targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
     return targetInfo.mIRanks;
 }
 
@@ -450,9 +532,10 @@ std::vector<size_t> RnnCacheFormatter::pickRecvConnections(
     size_t numConnections, RnnCacheState const& selfConfig, SizeType32 selfIdx, RnnCacheState const& destConfig) const
 {
     // no duplication for RNN so all ranks are valid
-    auto targetInfo = targetIRanks(destConfig, selfConfig, selfIdx);
+    auto targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
     std::vector<size_t> ret(numConnections);
     std::iota(ret.begin(), ret.end(), 0);
+    TLLM_CHECK(numConnections == targetInfo.mIRanks.size());
     return ret;
 }
 

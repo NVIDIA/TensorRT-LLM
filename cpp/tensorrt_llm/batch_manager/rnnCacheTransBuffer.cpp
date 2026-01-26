@@ -16,7 +16,7 @@
  */
 
 #include "rnnCacheTransBuffer.h"
-#include "cacheTransBuffer.h" // For FabricMemory
+#include "cacheTransBuffer.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 
@@ -26,9 +26,36 @@ namespace tensorrt_llm::batch_manager::rnn_state_manager
 size_t RnnCacheTransBufferManager::computeTransferBufferSize(
     RnnStateManager* rnnStateManager, std::optional<size_t> maxNumTokens)
 {
-    // TODO: Compute based on RNN state sizes when needed
-    // For now, use the environment variable default
-    return common::getEnvMemSizeForKVCacheTransferBuffer();
+    SizeType32 numLocalLayers = rnnStateManager->getNumLocalLayers();
+
+    // Get the tensor for one layer to determine per-slot dimensions
+    // Conv state shape per layer: [maxBatchSize, convDim_local, dConv-1]
+    // SSM state shape per layer:  [maxBatchSize, numHeads_local, headDim, dState]
+    // The tensors are shaped [maxBatchSize, ...], so one slot = total_size / maxBatchSize
+    auto convState = rnnStateManager->getConvStates(0); // Get first layer's tensor
+    auto ssmState = rnnStateManager->getSsmStates(0);
+
+    auto convShape = convState->getShape();
+    auto ssmShape = ssmState->getShape();
+
+    // Compute elements per slot per layer (divide total volume by batch size)
+    size_t convElemsPerSlotPerLayer = runtime::ITensor::volume(convShape) / convShape.d[0];
+    size_t ssmElemsPerSlotPerLayer = runtime::ITensor::volume(ssmShape) / ssmShape.d[0];
+
+    size_t convDtypeSize = common::getDTypeSize(rnnStateManager->getConvStateDataType());
+    size_t ssmDtypeSize = common::getDTypeSize(rnnStateManager->getSsmStateDataType());
+
+    size_t convBytesPerSlotPerLayer = convElemsPerSlotPerLayer * convDtypeSize;
+    size_t ssmBytesPerSlotPerLayer = ssmElemsPerSlotPerLayer * ssmDtypeSize;
+
+    size_t bufferSizePerSlot = numLocalLayers * (convBytesPerSlotPerLayer + ssmBytesPerSlotPerLayer);
+
+    TLLM_LOG_DEBUG(
+        "RNN computeTransferBufferSize: numLocalLayers=%d, convBytesPerLayer=%lu, ssmBytesPerLayer=%lu, "
+        "totalPerSlot=%lu",
+        numLocalLayers, convBytesPerSlotPerLayer, ssmBytesPerSlotPerLayer, bufferSizePerSlot);
+
+    return bufferSizePerSlot > 0 ? bufferSizePerSlot : common::getEnvMemSizeForKVCacheTransferBuffer();
 }
 
 RnnCacheTransBufferManager::RnnCacheTransBufferManager(
