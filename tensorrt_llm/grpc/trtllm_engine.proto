@@ -120,15 +120,15 @@ message TokenizedInput {
   string original_text = 1;
 
   // Pre-tokenized input token IDs (REQUIRED)
-  repeated int32 input_token_ids = 2;
+  repeated uint32 input_token_ids = 2;
 
   // Query token IDs for VLM star attention (optional)
-  repeated int32 query_token_ids = 3;
+  repeated uint32 query_token_ids = 3;
 }
 
 // Sequence of token IDs (for stop/bad words)
 message TokenSequence {
-  repeated int32 token_ids = 1;
+  repeated uint32 token_ids = 1;
 }
 
 // ============================================================================
@@ -321,7 +321,7 @@ message DisaggregatedParams {
 
 message ContextPhaseParams {
   // First generated token ID from context phase
-  int32 first_gen_token_id = 1;
+  uint32 first_gen_token_id = 1;
 
   // KV cache block pointers (serialized)
   bytes kv_cache_blocks = 2;
@@ -356,7 +356,7 @@ message GenerateResponse {
 // Streaming chunk containing delta tokens (new tokens since last chunk)
 message GenerateStreamChunk {
   // NEW token IDs only (delta from previous chunk)
-  repeated int32 token_ids = 1;
+  repeated uint32 token_ids = 1;
 
   // Beam/sequence index (for beam_width > 1 or n > 1)
   int32 sequence_index = 2;
@@ -373,7 +373,7 @@ message GenerateStreamChunk {
 // Final/complete response with all output tokens
 message GenerateComplete {
   // All output token IDs (cumulative, not delta)
-  repeated int32 output_token_ids = 1;
+  repeated uint32 output_token_ids = 1;
 
   // Beam/sequence index
   int32 sequence_index = 2;
@@ -407,7 +407,7 @@ message GenerateComplete {
 
 // Token log probability information
 message TokenLogprob {
-  int32 token_id = 1;
+  uint32 token_id = 1;
   float logprob = 2;
 
   // Top alternative tokens and their log probabilities
@@ -415,7 +415,7 @@ message TokenLogprob {
 }
 
 message TopLogprob {
-  int32 token_id = 1;
+  uint32 token_id = 1;
   float logprob = 2;
 }
 
