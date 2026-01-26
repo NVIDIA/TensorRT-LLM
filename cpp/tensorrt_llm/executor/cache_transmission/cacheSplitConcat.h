@@ -55,8 +55,11 @@ struct TargetRanksInfo
 TargetRanksInfo targetIRanks(
     kv_cache::CacheState const& peerCacheState, kv_cache::CacheState const& selfCacheState, int selfRank);
 
-TargetRanksInfo TargetRanksInfoForDP(
-    kv_cache::CacheState const& peerCacheState, kv_cache::CacheState const& selfCacheState, int selfRank);
+TargetRanksInfo targetIRanks(
+    rnn_cache::RnnCacheState const& peerCacheState, rnn_cache::RnnCacheState const& selfCacheState, int selfRank);
+
+// TargetRanksInfo TargetRanksInfoForDP(
+//     kv_cache::CacheState const& peerCacheState, kv_cache::CacheState const& selfCacheState, int selfRank);
 
 /**
  * @brief Calculate the number of blocks allocated to a specific Context Parallelism (CP) rank.
@@ -104,5 +107,4 @@ void concatKvCacheV2Dispatch(std::vector<runtime::ITensor::SharedPtr> const& inp
     std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>& outputKvCacheBlocksPerWindow,
     kv_cache::CacheState const& peerCacheState, kv_cache::CacheState const& selfCacheState, int selfIdx,
     runtime::BufferManager const& bufferManager, bool isIndexerKCache = false);
-
 } // namespace tensorrt_llm::executor::kv_cache

@@ -53,7 +53,7 @@ void RnnCacheFormatter::format(TransferSession& session)
     auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
     auto& bufferManager = session.getBufferManager();
 
-    auto targetInfo = rnnTargetIRanks(destConfig, selfConfig, selfIdx);
+    auto targetInfo = targetIRanks(destConfig, selfConfig, selfIdx);
     auto const targetNum = connections.size();
     if (targetNum == 0)
     {
@@ -173,7 +173,7 @@ void RnnCacheFormatter::unformat(TransferSession& session)
     auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
     auto& bufferManager = session.getBufferManager();
 
-    auto sourceInfo = rnnTargetIRanks(destConfig, selfConfig, selfIdx);
+    auto sourceInfo = targetIRanks(destConfig, selfConfig, selfIdx);
     auto const sourceNum = connections.size();
 
     if (sourceNum == 0)
@@ -442,92 +442,18 @@ bool RnnCacheFormatter::inquireSupport(RnnCacheState const& selfConfig, RnnCache
 std::vector<RnnCacheFormatter::SizeType32> RnnCacheFormatter::getCounterparts(
     RnnCacheState const& selfConfig, SizeType32 selfIdx, RnnCacheState const& destConfig) const
 {
-    auto targetInfo = rnnTargetIRanks(destConfig, selfConfig, selfIdx);
+    auto targetInfo = targetIRanks(destConfig, selfConfig, selfIdx);
     return targetInfo.mIRanks;
 }
 
 std::vector<size_t> RnnCacheFormatter::pickRecvConnections(
     size_t numConnections, RnnCacheState const& selfConfig, SizeType32 selfIdx, RnnCacheState const& destConfig) const
 {
-    // TODO: Implement connection selection for RNN cache transfer
-    TLLM_THROW("RnnCacheFormatter::pickRecvConnections not yet implemented");
-    return {};
-}
-
-executor::kv_cache::TargetRanksInfo rnnTargetIRanks(executor::rnn_cache::RnnCacheState const& peerState,
-    executor::rnn_cache::RnnCacheState const& selfState, int selfRank)
-{
-
-    auto const& peerParConfig = peerState.getParallelConfig();
-    auto const& selfParConfig = selfState.getParallelConfig();
-
-    auto const peerPPNum = peerParConfig.mPipelineParallelism;
-    auto const selfPPNum = selfParConfig.mPipelineParallelism;
-    auto const peerTPNum = peerParConfig.mTensorParallelism;
-    auto const selfTPNum = selfParConfig.mTensorParallelism;
-
-    // We require same TP for RNN (checked in inquireSupport)
-    // TODO
-    TLLM_CHECK(selfTPNum == peerTPNum);
-
-    // Compute self ranks (no CP for RNN)
-    auto const selfTPRank = selfRank % selfTPNum;
-    auto const selfPPRank = selfRank / selfTPNum;
-
-    // Get layer distribution per PP rank
-    auto const& peerNumLayerPerPP = peerParConfig.mRnnLayerNumPerPP;
-    auto const& selfNumLayerPerPP = selfParConfig.mRnnLayerNumPerPP;
-    TLLM_CHECK(peerNumLayerPerPP.size() == static_cast<size_t>(peerPPNum));
-    TLLM_CHECK(selfNumLayerPerPP.size() == static_cast<size_t>(selfPPNum));
-
-    // Find peer PP ranks that have overlapping layers
-    int selfStartLayerId = 0;
-    for (int ppRank = 0; ppRank < selfPPRank; ppRank++)
-    {
-        selfStartLayerId += selfNumLayerPerPP[ppRank];
-    }
-    int selfEndLayerId = selfStartLayerId + selfNumLayerPerPP[selfPPRank];
-
-    std::vector<int> targetPeerPPRanks;
-    std::vector<int> targetPeerPPLayerNum;
-    int prePeerPPLayerId = 0;
-
-    for (int ppRank = 0; ppRank < peerPPNum; ppRank++)
-    {
-        int peerPPStartLayerId = prePeerPPLayerId;
-        int peerPPEndLayerId = peerPPStartLayerId + peerNumLayerPerPP[ppRank];
-        prePeerPPLayerId += peerNumLayerPerPP[ppRank];
-
-        // Check if layer ranges overlap
-        if (selfStartLayerId < peerPPEndLayerId && selfEndLayerId > peerPPStartLayerId)
-        {
-            targetPeerPPRanks.push_back(ppRank);
-            int layerNumInDomainPP
-                = std::min(peerPPEndLayerId, selfEndLayerId) - std::max(peerPPStartLayerId, selfStartLayerId);
-            targetPeerPPLayerNum.push_back(layerNumInDomainPP);
-        }
-    }
-
-    int mDomainPPSize = static_cast<int>(targetPeerPPRanks.size());
-    TLLM_CHECK(mDomainPPSize > 0);
-
-    // Rank formula: ppRank * tpNum + tpRank
-    std::vector<int> retRanks;
-    for (int ppRank : targetPeerPPRanks)
-    {
-        int irank = ppRank * peerTPNum + selfTPRank;
-        retRanks.push_back(irank);
-    }
-
-    return executor::kv_cache::TargetRanksInfo{
-        mDomainPPSize,                  // mDomainPPSize
-        1,                              // mDomainTPSize (1:1 since same TP)
-        1,                              // mDomainCPSize (no CP for RNN)
-        std::move(retRanks),            // mIRanks
-        1,                              // mDupHeadFactor (no head duplication)
-        1,                              // mPeerDupHeadFactor
-        std::move(targetPeerPPLayerNum) // mPeerAttentionLayerNumInDomainPP
-    };
+    // no duplication for RNN so all ranks are valid
+    auto targetInfo = targetIRanks(destConfig, selfConfig, selfIdx);
+    std::vector<size_t> ret(numConnections);
+    std::iota(ret.begin(), ret.end(), 0);
+    return ret;
 }
 
 } // namespace tensorrt_llm::batch_manager

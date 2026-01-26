@@ -133,13 +133,4 @@ private:
     rnn_state_manager::RnnCacheTransBufferManager* mRnnCacheTransBufferManager;
 };
 
-/// @brief Calculate target ranks for RNN cache transfer.
-/// @param peerState The peer's RNN cache state.
-/// @param selfState This instance's RNN cache state.
-/// @param selfRank This instance's rank.
-/// @return Target ranks information.
-[[nodiscard]] tensorrt_llm::executor::kv_cache::TargetRanksInfo rnnTargetIRanks(
-    executor::rnn_cache::RnnCacheState const& peerState, executor::rnn_cache::RnnCacheState const& selfState,
-    int selfRank);
-
 } // namespace tensorrt_llm::batch_manager
