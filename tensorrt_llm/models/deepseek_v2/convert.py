@@ -23,7 +23,7 @@ from tensorrt_llm.layers import MoeConfig
 from ..._utils import pad_vocab_size, release_gc, str_dtype_to_torch
 from ...logger import logger
 from ...mapping import Mapping
-from ..convert_utils import get_tllm_linear_weight
+from ..convert_utils import get_rope_theta, get_tllm_linear_weight
 
 # `Override num_hidden_layers` used for reduce number of hidden layers in DeepseekV2ForCausalLM for debug purpose
 OVERRIDE_HIDDEN_LAYERS = None  # 2
@@ -52,7 +52,7 @@ def create_trt_config_from_hf(model_dir,
     vocab_size = hf_config.vocab_size
     n_positions = hf_config.max_position_embeddings
     hidden_act = 'swiglu'  # TRT-LLM request make gated activation explicit for MOE implementation
-    rotary_base = hf_config.rope_theta
+    rotary_base = get_rope_theta(hf_config)
     rms_norm_eps = hf_config.rms_norm_eps
     rotary_scaling_beta_fast = hf_config.rope_scaling['beta_fast']
     rotary_scaling_beta_slow = hf_config.rope_scaling['beta_slow']

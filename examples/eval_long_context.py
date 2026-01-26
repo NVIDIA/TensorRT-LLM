@@ -297,9 +297,9 @@ def main(args):
         if runtime_rank == 0:
             output_ids = outputs['output_ids']
             output_beams_list = [
-                tokenizer.batch_decode(output_ids[batch_idx, :,
-                                                  input_lengths[batch_idx]:],
-                                       skip_special_tokens=True)
+                tokenizer.decode(output_ids[batch_idx, :,
+                                            input_lengths[batch_idx]:],
+                                 skip_special_tokens=True)
                 for batch_idx in range(args.batch_size)
             ]
 

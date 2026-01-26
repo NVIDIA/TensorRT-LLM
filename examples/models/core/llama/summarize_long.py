@@ -210,8 +210,8 @@ def summarize_hf(datapoint, tokenizer, hf_model, args):
     tokens_list = output[:, len(line_encoded[0]):].tolist()
     output = output.reshape([args.batch_size, args.num_beams, -1])
     output_lines_list = [
-        tokenizer.batch_decode(output[:, i, len(line_encoded[0]):],
-                               skip_special_tokens=True)
+        tokenizer.decode(output[:, i, len(line_encoded[0]):],
+                         skip_special_tokens=True)
         for i in range(args.num_beams)
     ]
 
@@ -289,9 +289,9 @@ def summarize_tensorrt_llm(datapoint, tokenizer, tensorrt_llm_llama, args):
     # Extract a list of tensors of shape beam_width x output_ids.
     if tensorrt_llm_llama.mapping.is_first_pp_rank():
         output_beams_list = [
-            tokenizer.batch_decode(output_ids[batch_idx, :,
-                                              input_lengths[batch_idx]:],
-                                   skip_special_tokens=True)
+            tokenizer.decode(output_ids[batch_idx, :,
+                                        input_lengths[batch_idx]:],
+                             skip_special_tokens=True)
             for batch_idx in range(args.batch_size)
         ]
         return output_beams_list, output_ids[:, :, max_length:].tolist()

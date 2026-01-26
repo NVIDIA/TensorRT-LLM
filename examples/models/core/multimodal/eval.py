@@ -264,11 +264,10 @@ if args.test_trtllm or args.test_hf:
             input_length = inputs.input_ids.shape[-1]
             hf_output = hf_model.generate(**inputs,
                                           max_new_tokens=args.max_new_tokens)
-            hf_result = (hf_processor.batch_decode(
-                hf_output, skip_special_tokens=True)[0] if args.model_type in [
-                    'blip2'
-                ] else hf_processor.decode(hf_output[0][input_length:],
-                                           skip_special_tokens=True))
+            hf_result = (
+                hf_processor.decode(hf_output, skip_special_tokens=True)[0]
+                if args.model_type in ['blip2'] else hf_processor.decode(
+                    hf_output[0][input_length:], skip_special_tokens=True))
             hf_correct += eval(hf_result, args.eval_task, data)
             profiler.stop('hf')
 

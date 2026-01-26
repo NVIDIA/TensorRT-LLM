@@ -137,7 +137,7 @@ class TritonPythonModel:
 
             req_idx_offsets.append(req_idx_offset)
 
-        all_outputs = self.tokenizer.batch_decode(
+        all_outputs = self.tokenizer.decode(
             list_of_tokens, skip_special_tokens=self.skip_special_tokens)
 
         # construct responses
