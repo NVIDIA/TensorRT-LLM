@@ -1370,16 +1370,21 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
  */
 def getFailedStages() {
     def status = sh(
-        script: """python3 ${BOT_ROOT}/bin/failures.py \
-            --jenkins-url ${JENKINS_URL} \
-            --build-path ${env.JOB_NAME} \
-            --build-number ${env.BUILD_NUMBER} \
-            --json > failed_stages.json 2>&1""",
-        returnStatus: true
+        script: """rm -f failed_stages.json failed_stages_error.txt && \
+            python3 ${BOT_ROOT}/bin/failures.py \
+                --jenkins-url ${JENKINS_URL} \
+                --build-path ${env.JOB_NAME} \
+                --build-number ${env.BUILD_NUMBER} \
+                --json \
+                > failed_stages.json 2>failed_stages_error.txt""",
+        returnStatus: true,
+        label: "Retrieving failed stages"
     )
 
     if (status != 0) {
-        echo "WARNING: Failed to retrieve failed stages (exit code: ${status})"
+        echo "ERROR: Failed to retrieve failed stages (exit code: ${status})"
+        sh "cat failed_stages_error.txt 2>/dev/null || true"
+        sh "cat failed_stages.json 2>/dev/null || true"
         return null
     }
 
