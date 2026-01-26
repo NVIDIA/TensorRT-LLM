@@ -238,6 +238,7 @@ TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=
     "llama_v3.3_nemotron_super_49b_fp8",
     "llama_v3.1_nemotron_ultra_253b",
     "llama_v3.1_nemotron_ultra_253b_fp8",
+    "kimi_k2_nvfp4",
 }
 
 # Autodeploy model configs - maps model name to config file path (relative to TRT-LLM root)
