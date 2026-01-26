@@ -63,8 +63,23 @@ RnnStateManager::RnnStateManager(SizeType32 maxNumSequences, tensorrt_llm::runti
     }();
     auto const convStateShape = tensorrt_llm::runtime::ITensor::makeShape(
         {localNbLayers, mMaxNumSequences * mBeamSlotsPerSequence, convKernel - 1, rnnConvDimSize});
-    pagedRnnStates = bufferManager.gpu(rnnStateShape, nvinfer1::DataType::kFLOAT);
-    pagedConvStates = bufferManager.gpu(convStateShape, dataType);
+
+    mDtype = dataType;
+    mSsmCacheDtype = nvinfer1::DataType::kFLOAT;
+
+    // Store RNN model config for CacheTransceiver
+    mDState = stateSize;
+    mDConv = convKernel;
+    mHiddenSize = rnnHiddenSize;
+    mHeadDim = rnnHeadSize;
+    mConvDimSize = rnnConvDimSize;
+    mNGroups = 0; // Not available in ModelConfig-based constructor
+    mNumLayers = modelConfig.getNbRnnLayers();
+    mNumHeads = rnnHeadSize > 0 ? (rnnHiddenSize / rnnHeadSize) : 0;
+    mNumLocalLayers = localNbLayers;
+
+    pagedRnnStates = bufferManager.gpu(rnnStateShape, mSsmCacheDtype);
+    pagedConvStates = bufferManager.gpu(convStateShape, mDtype);
 
     auto const statePtrsShape = tensorrt_llm::runtime::ITensor::makeShape({localNbLayers});
     rnnStatePtrs = tensorrt_llm::runtime::BufferManager::cpu(statePtrsShape, TRTDataType<void*>::value);
@@ -92,6 +107,17 @@ RnnStateManager::RnnStateManager(SizeType32 dState, SizeType32 dConv, SizeType32
     , mMaxBeamWidth{1}
     , mBeamSlotsPerSequence{1}
     , mBufferManager{std::make_shared<CudaStream>(reinterpret_cast<cudaStream_t>(stream))}
+    , mDtype{dtype}
+    , mSsmCacheDtype{ssmCacheDtype} // Store global RNN model config
+    , mDState{dState}
+    , mDConv{dConv}
+    , mHiddenSize{headDim * numHeads}
+    , mHeadDim{headDim}
+    , mConvDimSize{headDim * numHeads + 2 * nGroups * dState}
+    , mNGroups{nGroups}
+    , mNumLayers{numLayers}
+    , mNumHeads{numHeads}
+// Note: mNumLocalLayers is set in the body after ppLayers is computed
 {
     auto const tpSize = worldConfig.getTensorParallelism();
 
@@ -106,6 +132,9 @@ RnnStateManager::RnnStateManager(SizeType32 dState, SizeType32 dConv, SizeType32
     nheads = nheads / tpSize;
 
     auto const numLocalLayers = static_cast<SizeType32>(ppLayers.size());
+
+    // Store local layer count
+    mNumLocalLayers = numLocalLayers;
 
     for (SizeType32 offset = 0; offset < numLocalLayers; ++offset)
     {
@@ -263,6 +292,27 @@ RnnStateManager::TensorPtr RnnStateManager::getSsmStates(SizeType32 layerIdx) co
     auto result = ITensor::slice(pagedRnnStates, it->second, 1);
     result->squeeze(0);
     return result;
+}
+
+nvinfer1::DataType RnnStateManager::getConvStateDataType() const noexcept
+{
+    return mDtype;
+}
+
+nvinfer1::DataType RnnStateManager::getSsmStateDataType() const noexcept
+{
+    return mSsmCacheDtype;
+}
+
+executor::rnn_cache::RnnCacheState::ModelConfig RnnStateManager::getRnnCacheStateModelConfig() const noexcept
+{
+    return executor::rnn_cache::RnnCacheState::ModelConfig{
+        mDState, mDConv, mHiddenSize, mHeadDim, mConvDimSize, mNGroups, mNumLayers, mNumHeads};
+}
+
+RnnStateManager::SizeType32 RnnStateManager::getNumLocalLayers() const noexcept
+{
+    return mNumLocalLayers;
 }
 
 } // namespace tensorrt_llm::batch_manager::rnn_state_manager

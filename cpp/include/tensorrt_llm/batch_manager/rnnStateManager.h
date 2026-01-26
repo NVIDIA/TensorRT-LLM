@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/common.h"
+#include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
@@ -63,6 +64,15 @@ public:
 
     [[nodiscard]] TensorPtr getSsmStates(SizeType32 layerIdx) const;
 
+    [[nodiscard]] nvinfer1::DataType getConvStateDataType() const noexcept;
+
+    [[nodiscard]] nvinfer1::DataType getSsmStateDataType() const noexcept;
+
+    [[nodiscard]] executor::rnn_cache::RnnCacheState::ModelConfig getRnnCacheStateModelConfig() const noexcept;
+
+    /// Returns the number of local RNN layers on this PP rank
+    [[nodiscard]] SizeType32 getNumLocalLayers() const noexcept;
+
 private:
     static std::vector<SizeType32> getPpLayers(SizeType32 numLayers, runtime::WorldConfig const& worldConfig,
         std::optional<std::vector<bool>> const& layerMask);
@@ -85,6 +95,19 @@ private:
     std::vector<SizeType32> mFreeBlocks;
     std::unordered_map<RequestIdType, SizeType32> mCacheIndex;
     std::optional<runtime::BufferManager> mBufferManager;
+    nvinfer1::DataType mDtype{nvinfer1::DataType::kFLOAT};
+    nvinfer1::DataType mSsmCacheDtype{nvinfer1::DataType::kFLOAT};
+
+    // RNN model config (global values before TP/PP split)
+    SizeType32 mDState{0};
+    SizeType32 mDConv{0};
+    SizeType32 mHiddenSize{0};
+    SizeType32 mHeadDim{0};
+    SizeType32 mConvDimSize{0};
+    SizeType32 mNGroups{0};
+    SizeType32 mNumLayers{0};
+    SizeType32 mNumHeads{0};
+    SizeType32 mNumLocalLayers{0};
 };
 
 } // namespace tensorrt_llm::batch_manager::rnn_state_manager

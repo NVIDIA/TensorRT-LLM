@@ -41,6 +41,9 @@
 #include "tensorrt_llm/batch_manager/kvCacheUtils.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/mlaCacheFormatter.h"
+#include "tensorrt_llm/batch_manager/rnnCacheFormatter.h"
+#include "tensorrt_llm/batch_manager/rnnCacheTransBuffer.h"
+#include "tensorrt_llm/batch_manager/rnnStateManager.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/cache_transmission/mpi_utils/connection.h"
@@ -118,8 +121,10 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     executor::kv_cache::CacheState::ModelConfig const& cacheStateModelCfg, runtime::WorldConfig const& worldConfig,
     std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
     executor::kv_cache::CacheState::AttentionType attentionType,
-    std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig)
+    std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig,
+    rnn_state_manager::RnnStateManager* rnnStateManager, std::vector<SizeType32> const& rnnLayerNumPerPP)
     : mCacheTransceiverConfig{cacheTransceiverConfig}
+    , mRnnStateManager{rnnStateManager}
 {
     using tensorrt_llm::batch_manager::kv_cache_manager::CacheFormatter;
     if (useMPI())
@@ -185,6 +190,33 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     {
         mCacheTransBufferManagerPtrs.push_back(manager.get());
     }
+
+    // RNN specific setup
+    if (mRnnStateManager != nullptr)
+    {
+        TLLM_LOG_INFO("Setting up RNN cache transfer components.");
+        TLLM_CHECK(!rnnLayerNumPerPP.empty());
+
+        mRnnCacheTransBufferManager
+            = std::make_unique<rnn_state_manager::RnnCacheTransBufferManager>(mRnnStateManager, maxNumTokens);
+
+        auto rnnModelCfg = mRnnStateManager->getRnnCacheStateModelConfig();
+
+        auto const convStateDataType = mRnnStateManager->getConvStateDataType();
+        auto const ssmStateDataType = mRnnStateManager->getSsmStateDataType();
+
+        executor::rnn_cache::RnnCacheState::ParallelConfig rnnParallelCfg{worldConfig.getTensorParallelism(),
+            worldConfig.getPipelineParallelism(),
+            // can reuse the same values as kv cache
+            mCacheState->getParallelConfig().mEnableAttentionDP, mCacheState->getParallelConfig().mDPrank,
+            mCacheState->getParallelConfig().mDPsize, rnnLayerNumPerPP};
+
+        mRnnCacheState = std::make_unique<executor::rnn_cache::RnnCacheState>(
+            rnnModelCfg, rnnParallelCfg, convStateDataType, ssmStateDataType);
+
+        TLLM_LOG_INFO("RNN cache transfer components initialized.");
+    }
+
     if (backendType.value() == executor::CacheTransceiverConfig::BackendType::UCX)
     {
         std::lock_guard<std::mutex> lock(mDllMutex);
@@ -227,13 +259,22 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         TLLM_THROW("Unsupported cache transceiver backend type ");
     }
 
-    // TODO(shreyasm)
     auto makeFormatter = [cacheManager, isMLA, this]()
     { return createCacheFormatter(cacheManager, mCacheTransBufferManagerPtrs, isMLA); };
 
-    mCacheSender = std::make_unique<CacheSender>(mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter());
-    mCacheReceiver
-        = std::make_unique<CacheReceiver>(mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter());
+    auto makeRnnFormatter = [this]() -> std::unique_ptr<RnnCacheFormatter>
+    {
+        if (mRnnStateManager != nullptr && mRnnCacheTransBufferManager != nullptr)
+        {
+            return std::make_unique<RnnCacheFormatter>(mRnnStateManager, mRnnCacheTransBufferManager.get());
+        }
+        return nullptr;
+    };
+
+    mCacheSender = std::make_unique<CacheSender>(mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter(),
+        mRnnCacheState ? std::make_optional(*mRnnCacheState) : std::nullopt, makeRnnFormatter());
+    mCacheReceiver = std::make_unique<CacheReceiver>(mManager.get(), *mCacheState, worldConfig.getRank(),
+        makeFormatter(), mRnnCacheState ? std::make_optional(*mRnnCacheState) : std::nullopt, makeRnnFormatter());
 
     initializeCommState();
 }
@@ -258,6 +299,10 @@ void CacheTransceiver::setContextState(LlmRequest* llmRequest)
     auto contextState = std::make_unique<executor::DataTransceiverState>();
     contextState->setCommState(*mCommState);
     contextState->setCacheState(*mCacheState);
+    if (mRnnCacheState != nullptr)
+    {
+        contextState->setRnnCacheState(*mRnnCacheState);
+    }
     if (!llmRequest->hasDraftTokens())
     {
         llmRequest->setContextPhaseParams(
