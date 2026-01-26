@@ -26,10 +26,17 @@ from pathlib import Path
 from typing import ClassVar, NamedTuple, Sequence, cast
 
 import cuda.bindings.driver as drv
-from dynamic_path_manager import DynamicPathManager
 
 from ._common import Address, CacheTier, CudaStream, MemAddress
-from ._utils import CachedCudaEvent, HomoTuple, HostMem, _unwrap, div_up, stream_wait_events
+from ._utils import (
+    CachedCudaEvent,
+    HomoTuple,
+    HostMem,
+    _unwrap,
+    div_up,
+    stream_wait_events,
+    temporary_sys_path,
+)
 
 if "tensorrt_llm" in sys.modules:
     from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (  # noqa # type: ignore
@@ -50,7 +57,7 @@ else:
     # fast path for dev, avoids importing the whole tensorrt_llm module
     spec = find_spec("kv_cache_manager_v2")
     assert spec is not None and spec.origin is not None
-    with DynamicPathManager(str(Path(spec.origin).parent.parent.parent), clear_cache=False):
+    with temporary_sys_path(str(Path(spec.origin).parent.parent.parent)):
         from bindings.internal.batch_manager.kv_cache_manager_v2_utils import (  # noqa
             DiskAddress,
             DiskToDiskTask,

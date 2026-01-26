@@ -34,6 +34,7 @@ from typing import (
 
 # From _common.py
 NDEBUG: Final[int]
+DEFAULT_BEAM_INDEX: Final[BeamIndex]
 
 class CacheTier(enum.IntEnum):
     GPU_MEM = 0
@@ -160,7 +161,7 @@ class _KVCache:
         self, beam_id: BeamIndex, buf_ids: Iterable[tuple[LayerId, DataRole]]
     ) -> Iterator[IndexSeq]: ...
     def get_slot_indices(
-        self, layer_group_id: LayerGroupId, beam_id: BeamIndex = BeamIndex(0)
+        self, layer_group_id: LayerGroupId, beam_id: BeamIndex = DEFAULT_BEAM_INDEX
     ) -> Iterator[int]: ...
     def resize(self, capacity: int | None, history_length: int | None = None) -> bool: ...
     @property
@@ -196,7 +197,7 @@ class MemoryPoolDesc:
 @dataclass(slots=True, frozen=True)
 class MemoryPoolGroupDesc:
     num_pages: int
-    pools: list[MemoryPoolDesc]
+    pools: Sequence[MemoryPoolDesc]
 
 class BufferId(NamedTuple):
     layer_id: LayerId
@@ -205,7 +206,7 @@ class BufferId(NamedTuple):
 @dataclass(slots=True, frozen=True)
 class CoalescedBuffer:
     single_buffer_size: int
-    buffer_ids: list[BufferId]
+    buffer_ids: Sequence[BufferId]
     @property
     def size(self) -> int: ...
     @property
@@ -213,13 +214,13 @@ class CoalescedBuffer:
 
 @dataclass(slots=True, frozen=True)
 class SlotDescVariant:
-    coalesced_buffers: tuple[CoalescedBuffer, ...]
+    coalesced_buffers: Sequence[CoalescedBuffer]
     @property
     def layer_group_id(self) -> LayerGroupId: ...
 
 @dataclass(slots=True, frozen=True)
 class SlotDesc:
-    variants: tuple[SlotDescVariant, ...]
+    variants: Sequence[SlotDescVariant]
 
 # From _core/_kv_cache_manager.py
 class KVCacheManager:
@@ -238,7 +239,7 @@ class KVCacheManager:
     def resize(self, cache_level: CacheLevel, quota: int, best_efforts: bool = False) -> bool: ...
     def get_quota(self, cache_level: CacheLevel) -> int: ...
     @property
-    def cache_tier_list(self) -> tuple[CacheTier, ...]: ...
+    def cache_tier_list(self) -> Sequence[CacheTier]: ...
     @property
     def tokens_per_block(self) -> int: ...
     @property
@@ -247,7 +248,7 @@ class KVCacheManager:
     def enable_partial_match(self) -> bool: ...
     def get_layer_group_id(self, layer_id: LayerId) -> int: ...
     @property
-    def layer_grouping(self) -> tuple[tuple[LayerId, ...], ...]: ...
+    def layer_grouping(self) -> Sequence[Sequence[LayerId]]: ...
     @property
     def num_pool_groups(self) -> PoolGroupIndex: ...
     def get_gpu_memory_pool_groups(

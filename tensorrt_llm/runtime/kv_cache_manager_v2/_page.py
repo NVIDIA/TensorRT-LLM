@@ -21,6 +21,7 @@ from . import rawref
 from ._block_radix_tree import Block
 from ._common import (
     BAD_PAGE_INDEX,
+    DEFAULT_BEAM_INDEX,
     GPU_LEVEL,
     NDEBUG,
     BeamIndex,
@@ -142,7 +143,7 @@ class UncommittedPage(Page):
         life_cycle: LifeCycleId,
         cache_level: CacheLevel,
         slot: Slot,
-        beam_index: BeamIndex = BeamIndex(0),
+        beam_index: BeamIndex = DEFAULT_BEAM_INDEX,
     ):
         self.kv_cache = rawref.ref(kv_cache)
         self.ordinal = ordinal

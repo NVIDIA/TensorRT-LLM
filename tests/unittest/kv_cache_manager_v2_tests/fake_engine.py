@@ -35,6 +35,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         exact_div,
         get_uniform_attribute,
         overlap,
+        temporary_sys_path,
         typed_range,
         value_or,
     )
@@ -55,15 +56,14 @@ else:
         exact_div,
         get_uniform_attribute,
         overlap,
+        temporary_sys_path,
         typed_range,
         value_or,
     )
 
 import os
 
-from dynamic_path_manager import DynamicPathManager
-
-with DynamicPathManager(os.path.dirname(os.path.abspath(__file__)), clear_cache=False):
+with temporary_sys_path(os.path.dirname(os.path.abspath(__file__))):
     from kernels import check_values, fill_values
 
 

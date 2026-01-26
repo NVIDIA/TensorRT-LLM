@@ -131,7 +131,6 @@ class StorageConfig:
         for pg in self.slot_desc_list:
             for slot in pg.variants:
                 life_cycle = slot.life_cycle_id
-                assert len(slot.coalesced_buffers) == 1
                 page = slot.coalesced_buffers[0]
                 ret[life_cycle] = page.num_buffers
         return ret
