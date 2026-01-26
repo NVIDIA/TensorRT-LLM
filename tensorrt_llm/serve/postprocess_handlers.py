@@ -547,7 +547,9 @@ def chat_harmony_streaming_post_processor(
         request_id=args.request_id,
         done=rsp._done,
         num_prompt_tokens=args.num_prompt_tokens,
+        first_iteration=args.first_iteration,
     )
+    args.first_iteration = False
     return response
 
 
