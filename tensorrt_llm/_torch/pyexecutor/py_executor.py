@@ -44,6 +44,9 @@ from ..speculative.drafter import Drafter
 from ..speculative.mtp import SampleStateTensorsMTP
 from ..speculative.speculation_gate import SpeculationGate
 from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
+from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
+                            get_from_waiting_queue, merge_requests,
+                            schedule_attention_dp_requests)
 from .guided_decoder import GuidedDecoder
 from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
@@ -53,9 +56,6 @@ from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
                           LlmResponse, get_draft_token_length)
 from .model_engine import ModelEngine
-from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
-                            get_from_waiting_queue, merge_requests,
-                            schedule_attention_dp_requests)
 from .resource_manager import ResourceManager
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors, TRTLLMSampler)
@@ -443,8 +443,7 @@ class PyExecutor:
         self.request_accumulated: List[RequestQueueItem] = []
         self.new_active_requests_queue_latency_ms = 0.0
         self._disable_mpi = mpi_disabled()
-        self.request_broadcaster = RequestBroadcaster(self.dist,
-                                                      self.hang_detector)
+        self.request_broadcaster = RequestBroadcaster(self.dist, self.hang_detector)
 
         # Waiting queue for requests that have been fetched but not yet scheduled
         self.waiting_queue: deque[RequestQueueItem] = deque()
@@ -2099,7 +2098,8 @@ class PyExecutor:
         new_requests = get_from_waiting_queue(
             waiting_queue,
             total_max_num_active_requests - total_num_active_requests,
-            enable_attention_dp, self.max_num_active_requests,
+            enable_attention_dp,
+            self.max_num_active_requests,
             all_ranks_num_active_requests)
 
         # Update performance metrics
@@ -2110,7 +2110,8 @@ class PyExecutor:
 
     @nvtx_range("_fetch_new_requests")
     def _fetch_new_requests(
-            self, waiting_queue: deque[RequestQueueItem],
+            self,
+            waiting_queue: deque[RequestQueueItem],
             activate_requests: List[LlmRequest]) -> List[LlmRequest]:
         """Fetch new requests from the queue.
 
@@ -2129,7 +2130,8 @@ class PyExecutor:
                 waiting_queue, len(activate_requests))
 
     def _fetch_new_requests_attention_tp(
-            self, waiting_queue: deque[RequestQueueItem],
+            self,
+            waiting_queue: deque[RequestQueueItem],
             num_active_requests: int) -> List[LlmRequest]:
         """Handle standard (non-attention DP) request fetching."""
         total_num_active_requests = num_active_requests
@@ -2143,15 +2145,17 @@ class PyExecutor:
             enable_attention_dp=False)
 
         # Merge requests and add to active list
-        return merge_requests(new_requests,
-                              cp_config=self.dist.cp_config,
-                              cp_rank=self.dist.cp_rank,
-                              cp_size=self.dist.cp_size,
-                              exclude_last_generation_logits=self.
-                              _should_exclude_last_generation_logits())
+        return merge_requests(
+            new_requests,
+            cp_config=self.dist.cp_config,
+            cp_rank=self.dist.cp_rank,
+            cp_size=self.dist.cp_size,
+            exclude_last_generation_logits=self.
+            _should_exclude_last_generation_logits())
 
     def _fetch_new_requests_attention_dp(
-            self, waiting_queue: deque[RequestQueueItem],
+            self,
+            waiting_queue: deque[RequestQueueItem],
             activate_requests: List[LlmRequest]) -> List[LlmRequest]:
         """Handle attention DP request fetching with load balancing."""
         # Get active request counts across all ranks
@@ -2192,18 +2196,18 @@ class PyExecutor:
         self.num_fetch_requests_cur_rank += len(new_requests_cur_rank)
 
         # Merge requests and add to active list
-        return merge_requests(new_requests_cur_rank,
-                              cp_config=self.dist.cp_config,
-                              cp_rank=self.dist.cp_rank,
-                              cp_size=self.dist.cp_size,
-                              exclude_last_generation_logits=self.
-                              _should_exclude_last_generation_logits())
+        return merge_requests(
+            new_requests_cur_rank,
+            cp_config=self.dist.cp_config,
+            cp_rank=self.dist.cp_rank,
+            cp_size=self.dist.cp_size,
+            exclude_last_generation_logits=self.
+            _should_exclude_last_generation_logits())
 
     def _schedule_attention_dp_requests(
-        self, new_requests: List[RequestQueueItem],
-        all_ranks_num_active_requests: List[int],
-        all_ranks_num_active_tokens: List[int]
-    ) -> Dict[int, List[RequestQueueItem]]:
+            self, new_requests: List[RequestQueueItem],
+            all_ranks_num_active_requests: List[int],
+            all_ranks_num_active_tokens: List[int]) -> Dict[int, List[RequestQueueItem]]:
         """Schedule attention dp requests."""
         all_ranks_new_requests, self.expected_num_active_requests = \
             schedule_attention_dp_requests(
@@ -2251,8 +2255,7 @@ class PyExecutor:
         return self.new_active_requests_queue_latency_ms
 
     def _should_exclude_last_generation_logits(self) -> bool:
-        return self.executor_request_queue.should_exclude_last_generation_logits_flag(
-        )
+        return self.executor_request_queue.should_exclude_last_generation_logits_flag()
 
     # ========== End of request fetching and processing methods ==========
 
@@ -2879,8 +2882,8 @@ class PyExecutor:
         canceled_req_ids_set = set(self.canceled_req_ids)
 
         # Remove canceled requests from the waiting queue
-        self.waiting_queue = deque(req for req in self.waiting_queue
-                                   if req.id not in canceled_req_ids_set)
+        self.waiting_queue = deque(
+            req for req in self.waiting_queue if req.id not in canceled_req_ids_set)
 
         still_pending_canceled_ids = []
         for request in self.active_requests:
