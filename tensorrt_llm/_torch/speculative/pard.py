@@ -36,6 +36,7 @@ class PARDSpecMetadata(SpecMetadata):
         self.is_spec_dec_dynamic_tree = False
 
     def prepare(self):
+        super().prepare()
         assert self.request_ids is not None
 
         num_seqs = len(self.request_ids)
@@ -210,7 +211,7 @@ class PARDWorker(SpecWorkerBase):
         else:
             logits_for_accept = logits
 
-        accepted_tokens, num_accepted_tokens = self._sample_and_accept_draft_tokens_base(
+        accepted_tokens, num_accepted_tokens = self._accept_draft_tokens(
             logits_for_accept, draft_tokens, num_contexts, batch_size, spec_metadata
         )
 
@@ -296,6 +297,13 @@ class PARDWorker(SpecWorkerBase):
                     gen_draft_tokens = self.sa_enhancer.maybe_override_all_draft_tokens(
                         gen_draft_tokens
                     )
+
+                # Compute and store draft probs for next iteration's rejection sampling.
+                # PARD produces all K draft logits in one forward pass, so split into
+                # a list of K tensors of shape [num_gens, vocab_size].
+                if spec_metadata.use_rejection_sampling:
+                    draft_logits_list = [gen_logits[:, i, :] for i in range(self.max_draft_len)]
+                    self._compute_and_store_draft_probs(draft_logits_list, spec_metadata, num_gens)
 
                 # Pad from (num_gens, K) to (num_gens, 2K-1).
                 if K > 1:
