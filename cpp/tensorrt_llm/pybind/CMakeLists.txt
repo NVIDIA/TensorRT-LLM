@@ -10,6 +10,7 @@ set(SRCS
     batch_manager/cacheTransceiver.cpp
     batch_manager/kvCacheConnector.cpp
     batch_manager/kvCacheManager.cpp
+    batch_manager/kvCacheManagerV2Utils.cpp
     batch_manager/llmRequest.cpp
     executor/bindings.cpp
     executor/executor.cpp

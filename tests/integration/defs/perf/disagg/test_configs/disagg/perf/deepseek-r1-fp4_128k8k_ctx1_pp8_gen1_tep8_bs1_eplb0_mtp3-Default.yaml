@@ -87,7 +87,7 @@ worker_config:
     max_seq_len: 131104
     tensor_parallel_size: 1
     moe_expert_parallel_size: 1
-    enable_attention_dp: true
+    enable_attention_dp: false
     pipeline_parallel_size: 8
     print_iter_log: true
     cuda_graph_config: null

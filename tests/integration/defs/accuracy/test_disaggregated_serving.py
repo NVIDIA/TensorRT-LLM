@@ -524,20 +524,26 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
     @skip_pre_hopper
     @pytest.mark.skip_less_device(2)
-    @pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
+    @pytest.mark.parametrize("ctx_disable_overlap_scheduler", [False, True])
+    @pytest.mark.parametrize("gen_disable_overlap_scheduler", [False, True])
     @pytest.mark.parametrize("ctx_enable_block_reuse", [True, False])
     @pytest.mark.parametrize("gen_enable_block_reuse", [True, False])
-    def test_auto_dtype(self, disable_overlap_scheduler, ctx_enable_block_reuse,
+    def test_auto_dtype(self, ctx_disable_overlap_scheduler,
+                        gen_disable_overlap_scheduler, ctx_enable_block_reuse,
                         gen_enable_block_reuse):
+        if ctx_enable_block_reuse and not ctx_disable_overlap_scheduler:
+            pytest.skip(
+                "Skip this test because overlap scheduler is not supported with block reuse for context server"
+            )
         ctx_server_config = {
-            "disable_overlap_scheduler": True,
+            "disable_overlap_scheduler": ctx_disable_overlap_scheduler,
             "kv_cache_config": {
                 "enable_block_reuse": ctx_enable_block_reuse
             }
         }
         ctx_server_config["cache_transceiver_config"] = {"backend": "DEFAULT"}
         gen_server_config = {
-            "disable_overlap_scheduler": disable_overlap_scheduler,
+            "disable_overlap_scheduler": gen_disable_overlap_scheduler,
             "kv_cache_config": {
                 "enable_block_reuse": gen_enable_block_reuse
             }
