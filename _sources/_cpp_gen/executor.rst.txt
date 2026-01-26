@@ -4,24 +4,6 @@ Executor
 .. Here are files in the cpp/include/executor
 .. We manually add subsection to enable detailed description in the future
 .. It is also doable to automatically generate this file and list all the modules in the conf.py
-transferAgent.h
-_______________
-
-.. doxygenfile:: transferAgent.h
-   :project: TensorRT-LLM
-
-types.h
-_______
-
-.. doxygenfile:: types.h
-   :project: TensorRT-LLM
-
-cacheCommunicator.h
-___________________
-
-.. doxygenfile:: cacheCommunicator.h
-   :project: TensorRT-LLM
-
 disaggServerUtil.h
 __________________
 
@@ -32,6 +14,24 @@ tensor.h
 ________
 
 .. doxygenfile:: tensor.h
+   :project: TensorRT-LLM
+
+transferAgent.h
+_______________
+
+.. doxygenfile:: transferAgent.h
+   :project: TensorRT-LLM
+
+serialization.h
+_______________
+
+.. doxygenfile:: serialization.h
+   :project: TensorRT-LLM
+
+types.h
+_______
+
+.. doxygenfile:: types.h
    :project: TensorRT-LLM
 
 executor.h
@@ -46,9 +46,9 @@ ______________________
 .. doxygenfile:: dataTransceiverState.h
    :project: TensorRT-LLM
 
-serialization.h
-_______________
+cacheCommunicator.h
+___________________
 
-.. doxygenfile:: serialization.h
+.. doxygenfile:: cacheCommunicator.h
    :project: TensorRT-LLM
 

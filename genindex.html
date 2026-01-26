@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -75,7 +75,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc0" />
+  <meta name="docsearch:version" content="1.3.0rc1" />
 
 
   </head>
@@ -1683,6 +1683,8 @@
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.__init__">(tensorrt_llm.llmapi.DynamicBatchConfig method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.__init__">(tensorrt_llm.llmapi.Eagle3DecodingConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.__init__">(tensorrt_llm.llmapi.EagleDecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.__init__">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig method)</a>
@@ -1765,6 +1767,8 @@
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.acceptance_length_threshold">(tensorrt_llm.llmapi.DraftTargetDecodingConfig attribute)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.acceptance_length_threshold">(tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.acceptance_length_threshold">(tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.acceptance_length_threshold">(tensorrt_llm.llmapi.LookaheadDecodingConfig attribute)</a>
@@ -1784,6 +1788,8 @@
 
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.acceptance_window">(tensorrt_llm.llmapi.DraftTargetDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.acceptance_window">(tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.acceptance_window">(tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
 </li>
@@ -1842,14 +1848,16 @@
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.PositionEmbeddingType.alibi_with_scale">alibi_with_scale (tensorrt_llm.functional.PositionEmbeddingType attribute)</a>
 </li>
-      <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.allgather">allgather() (in module tensorrt_llm.functional)</a>
-</li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.allgather">allgather() (in module tensorrt_llm.functional)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.allow_advanced_sampling">allow_advanced_sampling (tensorrt_llm.llmapi.AutoDecodingConfig attribute)</a>
 
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.allow_advanced_sampling">(tensorrt_llm.llmapi.DraftTargetDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.allow_advanced_sampling">(tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.allow_advanced_sampling">(tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
 </li>
@@ -2148,8 +2156,12 @@
         <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.PretrainedModel.check_config">(tensorrt_llm.models.PretrainedModel method)</a>
 </li>
       </ul></li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.check_eagle_choices">check_eagle_choices() (tensorrt_llm.llmapi.EagleDecodingConfig method)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.check_eagle_choices">check_eagle_choices() (tensorrt_llm.llmapi.Eagle3DecodingConfig method)</a>
+
+      <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.check_eagle_choices">(tensorrt_llm.llmapi.EagleDecodingConfig method)</a>
 </li>
+      </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.checkpoint_format">checkpoint_format (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.checkpoint_loader">checkpoint_loader (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
@@ -2273,6 +2285,8 @@
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.construct">(tensorrt_llm.llmapi.DynamicBatchConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.construct">(tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.construct">(tensorrt_llm.llmapi.EagleDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.construct">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig class method)</a>
@@ -2376,6 +2390,8 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.copy">(tensorrt_llm.llmapi.DraftTargetDecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.copy">(tensorrt_llm.llmapi.DynamicBatchConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.copy">(tensorrt_llm.llmapi.Eagle3DecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.copy">(tensorrt_llm.llmapi.EagleDecodingConfig method)</a>
 </li>
@@ -2539,6 +2555,8 @@
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.decoding_type">(tensorrt_llm.llmapi.DraftTargetDecodingConfig attribute)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.decoding_type">(tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.decoding_type">(tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.decoding_type">(tensorrt_llm.llmapi.LookaheadDecodingConfig attribute)</a>
@@ -2601,6 +2619,8 @@
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.dict">(tensorrt_llm.llmapi.DynamicBatchConfig method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.dict">(tensorrt_llm.llmapi.Eagle3DecodingConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.dict">(tensorrt_llm.llmapi.EagleDecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.dict">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig method)</a>
@@ -2648,6 +2668,8 @@
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.disable_overlap_scheduler">disable_overlap_scheduler (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DisaggregatedParams.disagg_request_id">disagg_request_id (tensorrt_llm.llmapi.DisaggregatedParams attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CompletionOutput.disaggregated_params">disaggregated_params (tensorrt_llm.llmapi.CompletionOutput attribute)</a>
 
       <ul>
@@ -2670,6 +2692,8 @@
 
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.draft_len_schedule">(tensorrt_llm.llmapi.DraftTargetDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.draft_len_schedule">(tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.draft_len_schedule">(tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
 </li>
@@ -2730,8 +2754,12 @@
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.dynamic_batch_moving_average_window">dynamic_batch_moving_average_window (tensorrt_llm.llmapi.DynamicBatchConfig attribute)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.dynamic_tree_max_topK">dynamic_tree_max_topK (tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.dynamic_tree_max_topK">dynamic_tree_max_topK (tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
+
+      <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.dynamic_tree_max_topK">(tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
 </li>
+      </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig">DynamicBatchConfig (class in tensorrt_llm.llmapi)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.Config">DynamicBatchConfig.Config (class in tensorrt_llm.llmapi)</a>
@@ -2744,19 +2772,35 @@
   <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.SpeculativeDecodingMode.EAGLE">EAGLE (tensorrt_llm.models.SpeculativeDecodingMode attribute)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.eagle3_layers_to_capture">eagle3_layers_to_capture (tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.eagle3_layers_to_capture">eagle3_layers_to_capture (tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.eagle3_layers_to_capture">(tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.eagle3_layers_to_capture">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig attribute)</a>
 </li>
       </ul></li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.eagle3_model_arch">eagle3_model_arch (tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
-</li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.eagle3_one_model">eagle3_one_model (tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
-</li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.eagle_choices">eagle_choices (tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.eagle3_model_arch">eagle3_model_arch (tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.eagle3_model_arch">(tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.eagle3_one_model">eagle3_one_model (tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
+
+      <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.eagle3_one_model">(tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig">Eagle3DecodingConfig (class in tensorrt_llm.llmapi)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.Config">Eagle3DecodingConfig.Config (class in tensorrt_llm.llmapi)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.eagle_choices">eagle_choices (tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
+
+      <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.eagle_choices">(tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.eagle_choices">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig attribute)</a>
 </li>
       </ul></li>
@@ -2868,10 +2912,10 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantAlgo.encode">(tensorrt_llm.llmapi.QuantAlgo method)</a>
 </li>
       </ul></li>
-      <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.EncDecModelRunner.encoder_run">encoder_run() (tensorrt_llm.runtime.EncDecModelRunner method)</a>
-</li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.EncDecModelRunner.encoder_run">encoder_run() (tensorrt_llm.runtime.EncDecModelRunner method)</a>
+</li>
       <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.EncoderModel">EncoderModel (class in tensorrt_llm.models)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.end_id">end_id (tensorrt_llm.llmapi.SamplingParams attribute)</a>
@@ -2958,6 +3002,8 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.Config.extra">(tensorrt_llm.llmapi.DraftTargetDecodingConfig.Config attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.Config.extra">(tensorrt_llm.llmapi.DynamicBatchConfig.Config attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.Config.extra">(tensorrt_llm.llmapi.Eagle3DecodingConfig.Config attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.Config.extra">(tensorrt_llm.llmapi.EagleDecodingConfig.Config attribute)</a>
 </li>
@@ -3283,6 +3329,8 @@
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.from_dict">(tensorrt_llm.llmapi.DraftTargetDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.from_dict">(tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.from_dict">(tensorrt_llm.llmapi.EagleDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.from_dict">(tensorrt_llm.llmapi.LookaheadDecodingConfig class method)</a>
@@ -3420,6 +3468,8 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.from_orm">(tensorrt_llm.llmapi.DraftTargetDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.from_orm">(tensorrt_llm.llmapi.DynamicBatchConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.from_orm">(tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.from_orm">(tensorrt_llm.llmapi.EagleDecodingConfig class method)</a>
 </li>
@@ -3630,8 +3680,6 @@
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.GemmaConfig.get_hf_config">get_hf_config() (tensorrt_llm.models.GemmaConfig static method)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.get_indices_block_size">get_indices_block_size() (tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig method)</a>
 
       <ul>
@@ -3640,6 +3688,8 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig.get_indices_block_size">(tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig method)</a>
 </li>
       </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AsyncLLM.get_kv_cache_events">get_kv_cache_events() (tensorrt_llm.llmapi.AsyncLLM method)</a>
 
       <ul>
@@ -3760,8 +3810,12 @@
       </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.GuidedDecodingParams.grammar">grammar (tensorrt_llm.llmapi.GuidedDecodingParams attribute)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.greedy_sampling">greedy_sampling (tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.greedy_sampling">greedy_sampling (tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
+
+      <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.greedy_sampling">(tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
 </li>
+      </ul></li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.group_norm">group_norm() (in module tensorrt_llm.functional)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.group_size">group_size (tensorrt_llm.llmapi.QuantConfig attribute)</a>
@@ -3927,6 +3981,8 @@
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.is_linear_tree">(tensorrt_llm.llmapi.DraftTargetDecodingConfig property)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.is_linear_tree">(tensorrt_llm.llmapi.Eagle3DecodingConfig property)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.is_linear_tree">(tensorrt_llm.llmapi.EagleDecodingConfig property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.is_linear_tree">(tensorrt_llm.llmapi.LookaheadDecodingConfig property)</a>
@@ -3954,10 +4010,10 @@
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.PositionEmbeddingType.is_rope">is_rope() (tensorrt_llm.functional.PositionEmbeddingType method)</a>
 </li>
-      <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.Tensor.is_trt_wrapper">is_trt_wrapper() (tensorrt_llm.functional.Tensor method)</a>
-</li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.Tensor.is_trt_wrapper">is_trt_wrapper() (tensorrt_llm.functional.Tensor method)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.is_use_oldest">is_use_oldest (tensorrt_llm.llmapi.NGramDecodingConfig attribute)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.MoEAllReduceParams.is_valid">is_valid() (tensorrt_llm.functional.MoEAllReduceParams method)</a>
@@ -4134,6 +4190,8 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.json">(tensorrt_llm.llmapi.DraftTargetDecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.json">(tensorrt_llm.llmapi.DynamicBatchConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.json">(tensorrt_llm.llmapi.Eagle3DecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.json">(tensorrt_llm.llmapi.EagleDecodingConfig method)</a>
 </li>
@@ -4328,6 +4386,8 @@
 
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.load_format">(tensorrt_llm.llmapi.DraftTargetDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.load_format">(tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.load_format">(tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
 </li>
@@ -4553,6 +4613,8 @@
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.max_concurrency">(tensorrt_llm.llmapi.DraftTargetDecodingConfig attribute)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.max_concurrency">(tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.max_concurrency">(tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.max_concurrency">(tensorrt_llm.llmapi.LookaheadDecodingConfig attribute)</a>
@@ -4574,6 +4636,8 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BuildConfig.max_draft_len">(tensorrt_llm.llmapi.BuildConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.max_draft_len">(tensorrt_llm.llmapi.DraftTargetDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.max_draft_len">(tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.max_draft_len">(tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
 </li>
@@ -4612,8 +4676,12 @@
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.max_ngram_size">max_ngram_size (tensorrt_llm.llmapi.LookaheadDecodingConfig attribute)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.max_non_leaves_per_layer">max_non_leaves_per_layer (tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.max_non_leaves_per_layer">max_non_leaves_per_layer (tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
+
+      <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.max_non_leaves_per_layer">(tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
 </li>
+      </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchCompileConfig.max_num_streams">max_num_streams (tensorrt_llm.llmapi.TorchCompileConfig attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BuildConfig.max_num_tokens">max_num_tokens (tensorrt_llm.llmapi.BuildConfig attribute)</a>
@@ -4674,6 +4742,8 @@
 
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.max_total_draft_tokens">(tensorrt_llm.llmapi.DraftTargetDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.max_total_draft_tokens">(tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.max_total_draft_tokens">(tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
 </li>
@@ -4848,6 +4918,8 @@
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.model_computed_fields">(tensorrt_llm.llmapi.DynamicBatchConfig attribute)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.model_computed_fields">(tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.model_computed_fields">(tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.model_computed_fields">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig attribute)</a>
@@ -4895,6 +4967,8 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.model_config">(tensorrt_llm.llmapi.DraftTargetDecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.model_config">(tensorrt_llm.llmapi.DynamicBatchConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.model_config">(tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.model_config">(tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
 </li>
@@ -4944,6 +5018,8 @@
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.model_construct">(tensorrt_llm.llmapi.DynamicBatchConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.model_construct">(tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.model_construct">(tensorrt_llm.llmapi.EagleDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.model_construct">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig class method)</a>
@@ -4991,6 +5067,8 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.model_copy">(tensorrt_llm.llmapi.DraftTargetDecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.model_copy">(tensorrt_llm.llmapi.DynamicBatchConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.model_copy">(tensorrt_llm.llmapi.Eagle3DecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.model_copy">(tensorrt_llm.llmapi.EagleDecodingConfig method)</a>
 </li>
@@ -5040,6 +5118,8 @@
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.model_dump">(tensorrt_llm.llmapi.DynamicBatchConfig method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.model_dump">(tensorrt_llm.llmapi.Eagle3DecodingConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.model_dump">(tensorrt_llm.llmapi.EagleDecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.model_dump">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig method)</a>
@@ -5088,6 +5168,8 @@
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.model_dump_json">(tensorrt_llm.llmapi.DynamicBatchConfig method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.model_dump_json">(tensorrt_llm.llmapi.Eagle3DecodingConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.model_dump_json">(tensorrt_llm.llmapi.EagleDecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.model_dump_json">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig method)</a>
@@ -5117,8 +5199,6 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.model_dump_json">(tensorrt_llm.llmapi.UserProvidedDecodingConfig method)</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.model_extra">model_extra (tensorrt_llm.llmapi.AttentionDpConfig property)</a>
 
       <ul>
@@ -5137,6 +5217,8 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.model_extra">(tensorrt_llm.llmapi.DraftTargetDecodingConfig property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.model_extra">(tensorrt_llm.llmapi.DynamicBatchConfig property)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.model_extra">(tensorrt_llm.llmapi.Eagle3DecodingConfig property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.model_extra">(tensorrt_llm.llmapi.EagleDecodingConfig property)</a>
 </li>
@@ -5167,6 +5249,8 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.model_extra">(tensorrt_llm.llmapi.UserProvidedDecodingConfig property)</a>
 </li>
       </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.model_fields">model_fields (tensorrt_llm.llmapi.AttentionDpConfig attribute)</a>
 
       <ul>
@@ -5185,6 +5269,8 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.model_fields">(tensorrt_llm.llmapi.DraftTargetDecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.model_fields">(tensorrt_llm.llmapi.DynamicBatchConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.model_fields">(tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.model_fields">(tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
 </li>
@@ -5233,6 +5319,8 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.model_fields_set">(tensorrt_llm.llmapi.DraftTargetDecodingConfig property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.model_fields_set">(tensorrt_llm.llmapi.DynamicBatchConfig property)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.model_fields_set">(tensorrt_llm.llmapi.Eagle3DecodingConfig property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.model_fields_set">(tensorrt_llm.llmapi.EagleDecodingConfig property)</a>
 </li>
@@ -5288,6 +5376,8 @@
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.model_json_schema">(tensorrt_llm.llmapi.DynamicBatchConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.model_json_schema">(tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.model_json_schema">(tensorrt_llm.llmapi.EagleDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.model_json_schema">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig class method)</a>
@@ -5317,6 +5407,12 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.model_json_schema">(tensorrt_llm.llmapi.UserProvidedDecodingConfig class method)</a>
 </li>
       </ul></li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.model_kwargs">model_kwargs (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
+
+      <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.model_kwargs">(tensorrt_llm.llmapi.TrtLlmArgs attribute)</a>
+</li>
+      </ul></li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.ModelConfig.model_name">model_name (tensorrt_llm.runtime.ModelConfig attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.model_parametrized_name">model_parametrized_name() (tensorrt_llm.llmapi.AttentionDpConfig class method)</a>
@@ -5337,6 +5433,8 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.model_parametrized_name">(tensorrt_llm.llmapi.DraftTargetDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.model_parametrized_name">(tensorrt_llm.llmapi.DynamicBatchConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.model_parametrized_name">(tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.model_parametrized_name">(tensorrt_llm.llmapi.EagleDecodingConfig class method)</a>
 </li>
@@ -5385,6 +5483,8 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.model_post_init">(tensorrt_llm.llmapi.DraftTargetDecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.model_post_init">(tensorrt_llm.llmapi.DynamicBatchConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.model_post_init">(tensorrt_llm.llmapi.Eagle3DecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.model_post_init">(tensorrt_llm.llmapi.EagleDecodingConfig method)</a>
 </li>
@@ -5436,6 +5536,8 @@
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.model_rebuild">(tensorrt_llm.llmapi.DynamicBatchConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.model_rebuild">(tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.model_rebuild">(tensorrt_llm.llmapi.EagleDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.model_rebuild">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig class method)</a>
@@ -5483,6 +5585,8 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.model_validate">(tensorrt_llm.llmapi.DraftTargetDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.model_validate">(tensorrt_llm.llmapi.DynamicBatchConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.model_validate">(tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.model_validate">(tensorrt_llm.llmapi.EagleDecodingConfig class method)</a>
 </li>
@@ -5532,6 +5636,8 @@
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.model_validate_json">(tensorrt_llm.llmapi.DynamicBatchConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.model_validate_json">(tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.model_validate_json">(tensorrt_llm.llmapi.EagleDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.model_validate_json">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig class method)</a>
@@ -5579,6 +5685,8 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.model_validate_strings">(tensorrt_llm.llmapi.DraftTargetDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.model_validate_strings">(tensorrt_llm.llmapi.DynamicBatchConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.model_validate_strings">(tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.model_validate_strings">(tensorrt_llm.llmapi.EagleDecodingConfig class method)</a>
 </li>
@@ -5814,20 +5922,26 @@
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.SamplingConfig.num_beams">num_beams (tensorrt_llm.runtime.SamplingConfig attribute)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.num_capture_layers">num_capture_layers (tensorrt_llm.llmapi.EagleDecodingConfig property)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.num_capture_layers">num_capture_layers (tensorrt_llm.llmapi.Eagle3DecodingConfig property)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.num_capture_layers">(tensorrt_llm.llmapi.EagleDecodingConfig property)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.num_capture_layers">(tensorrt_llm.llmapi.MTPDecodingConfig property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.num_capture_layers">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig property)</a>
 </li>
       </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.num_draft_tokens">num_draft_tokens (tensorrt_llm.runtime.GenerationSession attribute)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.num_eagle_layers">num_eagle_layers (tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.num_eagle_layers">num_eagle_layers (tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
+
+      <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.num_eagle_layers">(tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
 </li>
+      </ul></li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.num_heads">num_heads (tensorrt_llm.runtime.GenerationSession property)</a>
 
       <ul>
@@ -6001,6 +6115,8 @@
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.parse_file">(tensorrt_llm.llmapi.DynamicBatchConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.parse_file">(tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.parse_file">(tensorrt_llm.llmapi.EagleDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.parse_file">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig class method)</a>
@@ -6049,6 +6165,8 @@
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.parse_obj">(tensorrt_llm.llmapi.DynamicBatchConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.parse_obj">(tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.parse_obj">(tensorrt_llm.llmapi.EagleDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.parse_obj">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig class method)</a>
@@ -6096,6 +6214,8 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.parse_raw">(tensorrt_llm.llmapi.DraftTargetDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.parse_raw">(tensorrt_llm.llmapi.DynamicBatchConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.parse_raw">(tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.parse_raw">(tensorrt_llm.llmapi.EagleDecodingConfig class method)</a>
 </li>
@@ -6176,8 +6296,12 @@
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.LayerNormPositionType.post_layernorm">post_layernorm (tensorrt_llm.functional.LayerNormPositionType attribute)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.posterior_threshold">posterior_threshold (tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.posterior_threshold">posterior_threshold (tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
+
+      <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.posterior_threshold">(tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
 </li>
+      </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RequestOutput.PostprocWorker.Input.postproc_params">postproc_params (tensorrt_llm.llmapi.RequestOutput.PostprocWorker.Input attribute)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.Attention.postprocess">postprocess() (tensorrt_llm.layers.attention.Attention method)</a>
@@ -6789,6 +6913,8 @@
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.schema">(tensorrt_llm.llmapi.DynamicBatchConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.schema">(tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.schema">(tensorrt_llm.llmapi.EagleDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.schema">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig class method)</a>
@@ -6836,6 +6962,8 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.schema_json">(tensorrt_llm.llmapi.DraftTargetDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.schema_json">(tensorrt_llm.llmapi.DynamicBatchConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.schema_json">(tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.schema_json">(tensorrt_llm.llmapi.EagleDecodingConfig class method)</a>
 </li>
@@ -7031,6 +7159,8 @@
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.spec_dec_mode">(tensorrt_llm.llmapi.DraftTargetDecodingConfig property)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.spec_dec_mode">(tensorrt_llm.llmapi.Eagle3DecodingConfig property)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.spec_dec_mode">(tensorrt_llm.llmapi.EagleDecodingConfig property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.spec_dec_mode">(tensorrt_llm.llmapi.LookaheadDecodingConfig property)</a>
@@ -7060,6 +7190,8 @@
 
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.speculative_model">(tensorrt_llm.llmapi.DraftTargetDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.speculative_model">(tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.speculative_model">(tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
 </li>
@@ -7206,6 +7338,8 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.supports_backend">(tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.supports_backend">(tensorrt_llm.llmapi.DraftTargetDecodingConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.supports_backend">(tensorrt_llm.llmapi.Eagle3DecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.supports_backend">(tensorrt_llm.llmapi.EagleDecodingConfig method)</a>
 </li>
@@ -8361,11 +8495,13 @@
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache15BaseAgentConfigE">tensorrt_llm::executor::kv_cache::BaseAgentConfig (C++ struct)</a>
 </li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache15BaseAgentConfig13backendParamsE">tensorrt_llm::executor::kv_cache::BaseAgentConfig::backendParams (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache15BaseAgentConfig15enableTelemetryE">tensorrt_llm::executor::kv_cache::BaseAgentConfig::enableTelemetry (C++ member)</a>
+</li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache15BaseAgentConfig5mNameE">tensorrt_llm::executor::kv_cache::BaseAgentConfig::mName (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache15BaseAgentConfig11multiThreadE">tensorrt_llm::executor::kv_cache::BaseAgentConfig::multiThread (C++ member)</a>
-</li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache15BaseAgentConfig10numWorkersE">tensorrt_llm::executor::kv_cache::BaseAgentConfig::numWorkers (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache15BaseAgentConfig15useListenThreadE">tensorrt_llm::executor::kv_cache::BaseAgentConfig::useListenThread (C++ member)</a>
 </li>
@@ -9275,6 +9411,8 @@
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor7Request21getCrossAttentionMaskEv">tensorrt_llm::executor::Request::getCrossAttentionMask (C++ function)</a>
 </li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor7Request18getDisaggRequestIdEv">tensorrt_llm::executor::Request::getDisaggRequestId (C++ function)</a>
+</li>
       <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor7Request14getEagleConfigEv">tensorrt_llm::executor::Request::getEagleConfig (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor7Request16getEmbeddingBiasEv">tensorrt_llm::executor::Request::getEmbeddingBias (C++ function)</a>
@@ -9345,7 +9483,7 @@
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor7RequestaSERK7Request">tensorrt_llm::executor::Request::operator= (C++ function)</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor7RequestaSERR7Request">[1]</a>
 </li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor7Request7RequestE9VecTokens10SizeType32bRK14SamplingConfigRK12OutputConfigRKNSt8optionalI10SizeType32EERKNSt8optionalI10SizeType32EENSt8optionalINSt6vectorI10SizeType32EEEENSt8optionalINSt4listI9VecTokensEEEENSt8optionalINSt4listI9VecTokensEEEENSt8optionalI6TensorEENSt8optionalI25ExternalDraftTokensConfigEENSt8optionalI18PromptTuningConfigEENSt8optionalI15MultimodalInputEENSt8optionalI6TensorEENSt8optionalI11MropeConfigEENSt8optionalI10LoraConfigEENSt8optionalI23LookaheadDecodingConfigEENSt8optionalI22KvCacheRetentionConfigEENSt8optionalINSt6stringEEENSt8optionalI19LogitsPostProcessorEENSt8optionalI9VecTokensEENSt8optionalI6IdTypeEEb12PriorityType11RequestTypeNSt8optionalI18ContextPhaseParamsEENSt8optionalI6TensorEENSt8optionalI10SizeType32EENSt8optionalI6TensorEE10SizeType32NSt8optionalI11EagleConfigEENSt8optionalI6TensorEENSt8optionalI20GuidedDecodingParamsEENSt8optionalI10SizeType32EENSt8optionalI16MillisecondsTypeEENSt8optionalI15CacheSaltIDTypeEE">tensorrt_llm::executor::Request::Request (C++ function)</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor7Request7RequestERK7Request">[1]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor7Request7RequestERR7Request">[2]</a>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor7Request7RequestE9VecTokens10SizeType32bRK14SamplingConfigRK12OutputConfigRKNSt8optionalI10SizeType32EERKNSt8optionalI10SizeType32EENSt8optionalINSt6vectorI10SizeType32EEEENSt8optionalINSt4listI9VecTokensEEEENSt8optionalINSt4listI9VecTokensEEEENSt8optionalI6TensorEENSt8optionalI25ExternalDraftTokensConfigEENSt8optionalI18PromptTuningConfigEENSt8optionalI15MultimodalInputEENSt8optionalI6TensorEENSt8optionalI11MropeConfigEENSt8optionalI10LoraConfigEENSt8optionalI23LookaheadDecodingConfigEENSt8optionalI22KvCacheRetentionConfigEENSt8optionalINSt6stringEEENSt8optionalI19LogitsPostProcessorEENSt8optionalI9VecTokensEENSt8optionalI6IdTypeEEb12PriorityType11RequestTypeNSt8optionalI18ContextPhaseParamsEENSt8optionalI6TensorEENSt8optionalI10SizeType32EENSt8optionalI6TensorEE10SizeType32NSt8optionalI11EagleConfigEENSt8optionalI6TensorEENSt8optionalI20GuidedDecodingParamsEENSt8optionalI10SizeType32EENSt8optionalI16MillisecondsTypeEENSt8optionalI15CacheSaltIDTypeEENSt8optionalI6IdTypeEE">tensorrt_llm::executor::Request::Request (C++ function)</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor7Request7RequestERK7Request">[1]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor7Request7RequestERR7Request">[2]</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor7Request17setAllottedTimeMsE16MillisecondsType">tensorrt_llm::executor::Request::setAllottedTimeMs (C++ function)</a>
 </li>
@@ -9358,6 +9496,8 @@
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor7Request21setContextPhaseParamsE18ContextPhaseParams">tensorrt_llm::executor::Request::setContextPhaseParams (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor7Request21setCrossAttentionMaskE6Tensor">tensorrt_llm::executor::Request::setCrossAttentionMask (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor7Request18setDisaggRequestIdE6IdType">tensorrt_llm::executor::Request::setDisaggRequestId (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor7Request14setEagleConfigERKNSt8optionalI11EagleConfigEE">tensorrt_llm::executor::Request::setEagleConfig (C++ function)</a>
 </li>
@@ -10465,12 +10605,12 @@
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kINT64EE4typeE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT64&gt;::type (C++ type)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_cpp_gen/runtime.html#_CPPv4IEN12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType5kINT8EEE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT8&gt; (C++ struct)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType5kINT8EE4nameE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT8&gt;::name (C++ member)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType5kINT8EE4sizeE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT8&gt;::size (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType5kINT8EE4typeE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT8&gt;::type (C++ type)</a>
@@ -13781,6 +13921,8 @@
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.update_forward_refs">(tensorrt_llm.llmapi.DynamicBatchConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.update_forward_refs">(tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.update_forward_refs">(tensorrt_llm.llmapi.EagleDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.update_forward_refs">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig class method)</a>
@@ -13834,8 +13976,12 @@
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.use_beam_search">use_beam_search (tensorrt_llm.llmapi.SamplingParams attribute)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.use_dynamic_tree">use_dynamic_tree (tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.use_dynamic_tree">use_dynamic_tree (tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
+
+      <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.use_dynamic_tree">(tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
 </li>
+      </ul></li>
       <li><a href="legacy/python-api/tensorrt_llm.plugin.html#tensorrt_llm.plugin.PluginConfig.use_fp8_context_fmha">use_fp8_context_fmha (tensorrt_llm.plugin.PluginConfig attribute)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.plugin.html#tensorrt_llm.plugin.PluginConfig.use_fused_mlp">use_fused_mlp (tensorrt_llm.plugin.PluginConfig attribute)</a>
@@ -13925,6 +14071,8 @@
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.validate">(tensorrt_llm.llmapi.DynamicBatchConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.validate">(tensorrt_llm.llmapi.Eagle3DecodingConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.validate">(tensorrt_llm.llmapi.EagleDecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.validate">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig class method)</a>
@@ -13987,6 +14135,8 @@
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.validate_draft_len_schedule_and_sort">(tensorrt_llm.llmapi.DraftTargetDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.validate_draft_len_schedule_and_sort">(tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.validate_draft_len_schedule_and_sort">(tensorrt_llm.llmapi.EagleDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.validate_draft_len_schedule_and_sort">(tensorrt_llm.llmapi.LookaheadDecodingConfig class method)</a>
@@ -14012,10 +14162,18 @@
   <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="legacy/python-api/tensorrt_llm.plugin.html#tensorrt_llm.plugin.PluginConfig.validate_dtype_not_auto">validate_dtype_not_auto() (tensorrt_llm.plugin.PluginConfig class method)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.validate_eagle_choices">validate_eagle_choices() (tensorrt_llm.llmapi.EagleDecodingConfig class method)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.validate_eagle_choices">validate_eagle_choices() (tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
+
+      <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.validate_eagle_choices">(tensorrt_llm.llmapi.EagleDecodingConfig class method)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.validate_eagle_config">validate_eagle_config() (tensorrt_llm.llmapi.EagleDecodingConfig method)</a>
+      </ul></li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.validate_eagle_config">validate_eagle_config() (tensorrt_llm.llmapi.Eagle3DecodingConfig method)</a>
+
+      <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.validate_eagle_config">(tensorrt_llm.llmapi.EagleDecodingConfig method)</a>
 </li>
+      </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.validate_enable_build_cache">validate_enable_build_cache() (tensorrt_llm.llmapi.TrtLlmArgs method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.validate_free_gpu_memory_fraction">validate_free_gpu_memory_fraction() (tensorrt_llm.llmapi.KvCacheConfig class method)</a>
@@ -14339,9 +14497,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on January 18, 2026.</p>
+  <p>Last updated on January 25, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0af1a0e">0af1a0e</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/45d7022">45d7022</a>.</p>
   
 </div></div>
       

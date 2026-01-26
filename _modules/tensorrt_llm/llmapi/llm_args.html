@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -75,7 +75,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc0" />
+  <meta name="docsearch:version" content="1.3.0rc1" />
 
 
   </head>
@@ -1297,6 +1297,8 @@
     <span class="n">_allow_chain_drafter</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">PrivateAttr</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span>
     <span class="c1"># If set, drafting uses greedy sampling, irrespective of sampling parameters.</span>
     <span class="n">_allow_greedy_draft_tokens</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">PrivateAttr</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span>
+    <span class="c1"># Internal: record decoding_type alias used during parsing (for warnings).</span>
+    <span class="n">_decoding_type_alias</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">PrivateAttr</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
 
     <span class="nd">@field_validator</span><span class="p">(</span><span class="s1">&#39;draft_len_schedule&#39;</span><span class="p">)</span>
     <span class="nd">@classmethod</span>
@@ -1344,13 +1346,14 @@
         <span class="k">return</span> <span class="n">v</span>
 
     <span class="nd">@classmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">from_dict</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">dict</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_dict</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">dict</span><span class="p">,</span> <span class="n">backend</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
         <span class="c1"># dispatch to the correct decoding config</span>
         <span class="n">decoding_type</span> <span class="o">=</span> <span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;decoding_type&quot;</span><span class="p">)</span>
         <span class="n">config_classes</span> <span class="o">=</span> <span class="p">{</span>
             <span class="s2">&quot;MTP&quot;</span><span class="p">:</span> <span class="n">MTPDecodingConfig</span><span class="p">,</span>
             <span class="s2">&quot;Medusa&quot;</span><span class="p">:</span> <span class="n">MedusaDecodingConfig</span><span class="p">,</span>
             <span class="s2">&quot;Eagle&quot;</span><span class="p">:</span> <span class="n">EagleDecodingConfig</span><span class="p">,</span>
+            <span class="s2">&quot;Eagle3&quot;</span><span class="p">:</span> <span class="n">Eagle3DecodingConfig</span><span class="p">,</span>
             <span class="s2">&quot;Lookahead&quot;</span><span class="p">:</span> <span class="n">LookaheadDecodingConfig</span><span class="p">,</span>
             <span class="s2">&quot;NGram&quot;</span><span class="p">:</span> <span class="n">NGramDecodingConfig</span><span class="p">,</span>
             <span class="s2">&quot;DraftTarget&quot;</span><span class="p">:</span> <span class="n">DraftTargetDecodingConfig</span><span class="p">,</span>
@@ -1358,6 +1361,14 @@
             <span class="s2">&quot;UserProvided&quot;</span><span class="p">:</span> <span class="n">UserProvidedDecodingConfig</span><span class="p">,</span>
             <span class="s2">&quot;AUTO&quot;</span><span class="p">:</span> <span class="n">AutoDecodingConfig</span><span class="p">,</span>
         <span class="p">}</span>
+
+        <span class="n">backend</span> <span class="o">=</span> <span class="n">backend</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">backend</span><span class="p">,</span> <span class="nb">str</span><span class="p">)</span> <span class="k">else</span> <span class="n">backend</span>
+        <span class="k">if</span> <span class="n">decoding_type</span> <span class="o">==</span> <span class="s2">&quot;Eagle&quot;</span> <span class="ow">and</span> <span class="n">backend</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">&quot;pytorch&quot;</span><span class="p">,</span> <span class="s2">&quot;_autodeploy&quot;</span><span class="p">):</span>
+            <span class="n">data</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="n">data</span><span class="p">)</span>
+            <span class="n">data</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s2">&quot;decoding_type&quot;</span><span class="p">)</span>
+            <span class="n">spec_cfg</span> <span class="o">=</span> <span class="n">Eagle3DecodingConfig</span><span class="p">(</span><span class="o">**</span><span class="n">data</span><span class="p">)</span>
+            <span class="n">spec_cfg</span><span class="o">.</span><span class="n">_decoding_type_alias</span> <span class="o">=</span> <span class="s2">&quot;Eagle&quot;</span>
+            <span class="k">return</span> <span class="n">spec_cfg</span>
 
         <span class="n">config_class</span> <span class="o">=</span> <span class="n">config_classes</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">decoding_type</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">config_class</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
@@ -1599,6 +1610,13 @@
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">eagle_choices</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_dynamic_tree</span> <span class="ow">is</span> <span class="kc">False</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">True</span>
         <span class="k">return</span> <span class="kc">False</span></div>
+
+
+
+<div class="viewcode-block" id="Eagle3DecodingConfig">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">Eagle3DecodingConfig</span><span class="p">(</span><span class="n">EagleDecodingConfig</span><span class="p">):</span>
+    <span class="n">decoding_type</span><span class="p">:</span> <span class="n">ClassVar</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;Eagle3&quot;</span></div>
 
 
 
@@ -1869,7 +1887,7 @@
 <span class="k">class</span><span class="w"> </span><span class="nc">RayPlacementConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">    Configuration for Ray GPU workers placement.</span>
-<span class="sd">    This config is only used with AsyncLLM for RL scenarios.</span>
+<span class="sd">    Currently, this config is only used with AsyncLLM for RL scenarios.</span>
 <span class="sd">    &quot;&quot;&quot;</span>
     <span class="n">defer_workers_init</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
@@ -1883,8 +1901,11 @@
 
     <span class="n">placement_bundle_indices</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;List of bundle indices for each placement group. &quot;</span>
-        <span class="s2">&quot;Outer list corresponds to placement_groups, inner list contains bundle indices for that group.&quot;</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;List of lists of bundle indices. The outer list corresponds to &quot;</span>
+        <span class="s2">&quot;`placement_groups`. Each inner list specifies the bundle indices to use within &quot;</span>
+        <span class="s2">&quot;that placement group. For example, if `placement_groups=[pg1, pg2]`, &quot;</span>
+        <span class="s2">&quot;`[[0, 1], [0, 1]]` assigns bundles 0 and 1 from `pg1` and bundles 0 and 1 from `pg2`.&quot;</span>
     <span class="p">)</span>
 
     <span class="n">per_worker_gpu_share</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
@@ -1909,12 +1930,15 @@
                     <span class="sa">f</span><span class="s2">&quot;placement_groups length (</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">placement_groups</span><span class="p">)</span><span class="si">}</span><span class="s2">) must equal &quot;</span>
                     <span class="sa">f</span><span class="s2">&quot;placement_bundle_indices length (</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">placement_bundle_indices</span><span class="p">)</span><span class="si">}</span><span class="s2">)&quot;</span>
                 <span class="p">)</span>
-            <span class="k">if</span> <span class="n">PlacementGroup</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">pg</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">placement_groups</span><span class="p">):</span>
-                    <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">pg</span><span class="p">,</span> <span class="n">PlacementGroup</span><span class="p">):</span>
-                        <span class="k">raise</span> <span class="ne">TypeError</span><span class="p">(</span>
-                            <span class="sa">f</span><span class="s2">&quot;placement_groups[</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s2">] must be a Ray PlacementGroup, &quot;</span>
-                            <span class="sa">f</span><span class="s2">&quot;got </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">pg</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">PlacementGroup</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="s2">&quot;Ray must be installed to use `placement_groups`&quot;</span><span class="p">)</span>
+
+            <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">pg</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">placement_groups</span><span class="p">):</span>
+                <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">pg</span><span class="p">,</span> <span class="n">PlacementGroup</span><span class="p">):</span>
+                    <span class="k">raise</span> <span class="ne">TypeError</span><span class="p">(</span>
+                        <span class="sa">f</span><span class="s2">&quot;placement_groups[</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s2">] must be a Ray PlacementGroup, &quot;</span>
+                        <span class="sa">f</span><span class="s2">&quot;got </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">pg</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">per_worker_gpu_share</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">if</span> <span class="ow">not</span> <span class="p">(</span><span class="mi">0</span> <span class="o">&lt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">per_worker_gpu_share</span> <span class="o">&lt;=</span> <span class="mf">1.0</span><span class="p">):</span>
@@ -2663,6 +2687,13 @@
 
     <span class="c1"># Below are all remaining arguments</span>
 
+    <span class="n">model_kwargs</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Optional parameters overriding model config defaults. &quot;</span>
+        <span class="s2">&quot;Precedence: (1) model_kwargs, (2) model config file, (3) model config class defaults. &quot;</span>
+        <span class="s2">&quot;Unknown keys are ignored&quot;</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">)</span>
+
     <span class="n">pipeline_parallel_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The pipeline parallel size.&quot;</span><span class="p">)</span>
 
@@ -3268,6 +3299,11 @@
                     <span class="n">decoding_mode</span><span class="o">=</span><span class="n">DecodingMode</span><span class="o">.</span><span class="n">Medusa</span><span class="p">(),</span>
                     <span class="n">medusa_choices</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">medusa_choices</span><span class="p">)</span>
 
+            <span class="k">elif</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">,</span> <span class="n">Eagle3DecodingConfig</span><span class="p">):</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="s2">&quot;speculative_config.decoding_type &#39;Eagle3&#39; is only supported on the PyTorch backend. &quot;</span>
+                    <span class="s2">&quot;Use decoding_type &#39;Eagle&#39; for the TensorRT backend.&quot;</span><span class="p">)</span>
+
             <span class="k">elif</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">,</span> <span class="n">EagleDecodingConfig</span><span class="p">):</span>
                 <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">&gt;</span> <span class="mi">0</span>
                 <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">speculative_model</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">&quot;EAGLE3 draft model must be specified.&quot;</span>
@@ -3826,6 +3862,14 @@
                     <span class="sa">f</span><span class="s2">&quot;support backend </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">backend</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
 
             <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">,</span> <span class="n">EagleDecodingConfig</span><span class="p">):</span>
+                <span class="k">if</span> <span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">,</span> <span class="s2">&quot;_decoding_type_alias&quot;</span><span class="p">,</span>
+                            <span class="kc">None</span><span class="p">)</span> <span class="o">==</span> <span class="s2">&quot;Eagle&quot;</span> <span class="ow">or</span> <span class="nb">type</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">)</span>
+                        <span class="ow">is</span> <span class="n">EagleDecodingConfig</span><span class="p">):</span>
+                    <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                        <span class="s2">&quot;speculative_config.decoding_type &#39;Eagle&#39; is not supported on the PyTorch backend; only &#39;Eagle3&#39; is supported. &quot;</span>
+                        <span class="s2">&quot;&#39;Eagle&#39; is treated as &#39;Eagle3&#39; for backward compatibility. &quot;</span>
+                        <span class="s2">&quot;EAGLE (v1/v2) draft checkpoints are incompatible with Eagle3—use an Eagle3 draft model.&quot;</span>
+                    <span class="p">)</span>
                 <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">&gt;</span> <span class="mi">0</span>
                 <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">speculative_model</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">&quot;EAGLE3 draft model must be specified.&quot;</span>
             <span class="k">elif</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">,</span> <span class="n">NGramDecodingConfig</span><span class="p">):</span>
@@ -4164,8 +4208,14 @@
         <span class="k">if</span> <span class="n">field_name</span> <span class="ow">in</span> <span class="n">llm_args_dict</span><span class="p">:</span>
             <span class="c1"># Some fields need to be converted manually.</span>
             <span class="k">if</span> <span class="n">field_name</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;speculative_config&quot;</span><span class="p">,</span> <span class="s2">&quot;sparse_attention_config&quot;</span><span class="p">]:</span>
-                <span class="n">llm_args_dict</span><span class="p">[</span><span class="n">field_name</span><span class="p">]</span> <span class="o">=</span> <span class="n">field_type</span><span class="o">.</span><span class="n">from_dict</span><span class="p">(</span>
-                    <span class="n">llm_args_dict</span><span class="p">[</span><span class="n">field_name</span><span class="p">])</span>
+                <span class="k">if</span> <span class="n">field_name</span> <span class="o">==</span> <span class="s2">&quot;speculative_config&quot;</span><span class="p">:</span>
+                    <span class="n">backend</span> <span class="o">=</span> <span class="n">llm_args_dict</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;backend&quot;</span><span class="p">)</span> <span class="ow">or</span> <span class="n">llm_args</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
+                        <span class="s2">&quot;backend&quot;</span><span class="p">)</span>
+                    <span class="n">llm_args_dict</span><span class="p">[</span><span class="n">field_name</span><span class="p">]</span> <span class="o">=</span> <span class="n">field_type</span><span class="o">.</span><span class="n">from_dict</span><span class="p">(</span>
+                        <span class="n">llm_args_dict</span><span class="p">[</span><span class="n">field_name</span><span class="p">],</span> <span class="n">backend</span><span class="o">=</span><span class="n">backend</span><span class="p">)</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="n">llm_args_dict</span><span class="p">[</span><span class="n">field_name</span><span class="p">]</span> <span class="o">=</span> <span class="n">field_type</span><span class="o">.</span><span class="n">from_dict</span><span class="p">(</span>
+                        <span class="n">llm_args_dict</span><span class="p">[</span><span class="n">field_name</span><span class="p">])</span>
             <span class="k">else</span><span class="p">:</span>
                 <span class="n">llm_args_dict</span><span class="p">[</span><span class="n">field_name</span><span class="p">]</span> <span class="o">=</span> <span class="n">field_type</span><span class="p">(</span>
                     <span class="o">**</span><span class="n">llm_args_dict</span><span class="p">[</span><span class="n">field_name</span><span class="p">])</span>
@@ -4350,9 +4400,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on January 18, 2026.</p>
+  <p>Last updated on January 25, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0af1a0e">0af1a0e</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/45d7022">45d7022</a>.</p>
   
 </div></div>
       
