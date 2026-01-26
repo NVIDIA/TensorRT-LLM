@@ -109,7 +109,7 @@ def trtllm_quant_fp8_moe_fused(
     routing_weights: torch.Tensor,
     fc1_expert_weights: torch.Tensor,
     fc2_expert_weights: torch.Tensor,
-    fc1_act_scale_max: torch.Tensor,
+    fc1_act_scale: torch.Tensor,
     fc1_dequant_scale: torch.Tensor,
     fc2_act_scale_reciprocal: torch.Tensor,
     fc2_dequant_scale: torch.Tensor,
@@ -134,7 +134,7 @@ def trtllm_quant_fp8_moe_fused(
         routing_weights: Routing weights (B*S, TOP_K)
         fc1_expert_weights: FC1 weights [E, 2*I, H] for gated_mlp, [E, I, H] for mlp
         fc2_expert_weights: FC2 weights [E, H, I]
-        fc1_act_scale_max: FC1 activation scale max (scalar)
+        fc1_act_scale: FC1 activation scalar (scalar)
         fc1_dequant_scale: FC1 dequant scale [E]
         fc2_act_scale_reciprocal: FC2 activation scale reciprocal (scalar)
         fc2_dequant_scale: FC2 dequant scale [E]
@@ -153,7 +153,7 @@ def trtllm_quant_fp8_moe_fused(
     x2d = x.view(-1, x_shape[-1])
 
     # Quantize the input using precomputed max scale
-    x_q_fp8 = _quantize_fp8(x2d, fc1_act_scale_max)
+    x_q_fp8 = _quantize_fp8(x2d, fc1_act_scale)
 
     # Prepare quant_scales for TensorRT-LLM (Cutlass) FP8 format:
     # [fc1_dequant_scale, fc2_act_scale_reciprocal, fc2_dequant_scale, gemm1_input_dequant_scale]
@@ -161,7 +161,7 @@ def trtllm_quant_fp8_moe_fused(
     # - fc1_dequant_scale: w1_weight_scale * max(w1_input_scale) [E]
     # - fc2_act_scale_reciprocal: 1 / max(w2_input_scale) (scalar)
     # - fc2_dequant_scale: w2_weight_scale * max(w2_input_scale) [E]
-    # - fc1_act_scale_max: max(w1_input_scale) (scalar)
+    # - fc1_act_scale: max(w1_input_scale) (scalar)
 
     assert fc1_dequant_scale.ndim == 1, "fc1_dequant_scale must be 1D"
     assert fc2_dequant_scale.ndim == 1, "fc2_dequant_scale must be 1D"
@@ -169,7 +169,7 @@ def trtllm_quant_fp8_moe_fused(
         fc1_dequant_scale,
         fc2_act_scale_reciprocal,
         fc2_dequant_scale,
-        fc1_act_scale_max,
+        fc1_act_scale,
     ]
 
     # Ensure contiguous tensors
@@ -201,7 +201,7 @@ def trtllm_quant_fp8_moe_fused_fake(
     routing_weights: torch.Tensor,
     fc1_expert_weights: torch.Tensor,
     fc2_expert_weights: torch.Tensor,
-    fc1_act_scale_max: torch.Tensor,
+    fc1_act_scale: torch.Tensor,
     fc1_dequant_scale: torch.Tensor,
     fc2_act_scale_reciprocal: torch.Tensor,
     fc2_dequant_scale: torch.Tensor,
