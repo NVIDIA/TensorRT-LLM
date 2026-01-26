@@ -20,11 +20,16 @@
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/executor/executor.h"
+
 #include <NvInferRuntimeBase.h>
 #include <mutex>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
+
+// ============================================================================
+// FabricMemory Implementation
+// ============================================================================
 
 class FabricMemory::Impl
 {
@@ -182,45 +187,46 @@ bool FabricMemory::supportFbaricMemory()
 #endif
 }
 
-CacheTransBufferManager::CacheTransBufferManager(
+// ============================================================================
+// CacheTransBufferManager Implementation
+// ============================================================================
+
+size_t CacheTransBufferManager::computeTransferBufferSize(
     KVCacheManager::BaseKVCacheManager* cacheManager, std::optional<size_t> maxNumTokens, bool transferIndexerKCache)
-    : mCacheManager{cacheManager}
-    , mBufferManager{std::make_shared<runtime::CudaStream>()}
-    , mMaxNumTokens{maxNumTokens}
 {
-    // TODO: FP4 dataSize
-    TLLM_CHECK(mCacheManager);
+    nvinfer1::DataType dataType;
     if (transferIndexerKCache)
     {
-        mDataType = mCacheManager->getIndexerKCachePool()->getDataType();
+        dataType = cacheManager->getIndexerKCachePool()->getDataType();
     }
     else
     {
-        mDataType = mCacheManager->getPrimaryPool(0)->getDataType();
+        dataType = cacheManager->getPrimaryPool(0)->getDataType();
     }
 
-    auto tokensPerBlock = mCacheManager->getBlockManager().getTokensPerBlock();
+    auto tokensPerBlock = cacheManager->getBlockManager().getTokensPerBlock();
     size_t bufferSizeFromMaxNumToken = 0;
+
     if (maxNumTokens.has_value())
     {
         TLLM_CHECK(maxNumTokens.value() % tokensPerBlock == 0);
-        auto dataSize = common::getDTypeSize(mDataType);
+        auto dataSize = common::getDTypeSize(dataType);
         SizeType32 kvCacheByteSizePerTokenPerLayer = 0;
         if (transferIndexerKCache)
         {
             kvCacheByteSizePerTokenPerLayer
-                = mCacheManager->getIndexerKCachePool()->getDimension<-1>() * dataSize / tokensPerBlock;
+                = cacheManager->getIndexerKCachePool()->getDimension<-1>() * dataSize / tokensPerBlock;
         }
         else
         {
-            auto primaryPool = mCacheManager->getPrimaryPool(0);
+            auto primaryPool = cacheManager->getPrimaryPool(0);
             kvCacheByteSizePerTokenPerLayer
                 = primaryPool->getDimension<-1>() * primaryPool->getDimension<2>() * dataSize / tokensPerBlock;
         }
-        for (auto layerId = 0; layerId < mCacheManager->getBlockManager().getNumLayers(); layerId++)
+        for (auto layerId = 0; layerId < cacheManager->getBlockManager().getNumLayers(); layerId++)
         {
-            auto poolIdx = mCacheManager->getBlockManager().getLayerPoolIdx(layerId);
-            auto windowSize = static_cast<size_t>(mCacheManager->getBlockManager().getPoolWindowSize(poolIdx));
+            auto poolIdx = cacheManager->getBlockManager().getLayerPoolIdx(layerId);
+            auto windowSize = static_cast<size_t>(cacheManager->getBlockManager().getPoolWindowSize(poolIdx));
             auto alignedWindowSize = (windowSize + tokensPerBlock - 1) / tokensPerBlock * tokensPerBlock;
             auto validTokenNum = (alignedWindowSize < maxNumTokens.value() ? alignedWindowSize : maxNumTokens.value());
             if (common::getEnvKVCacheTransferAllBlocksForWindow())
@@ -233,26 +239,19 @@ CacheTransBufferManager::CacheTransBufferManager(
         }
     }
 
-    mTransferBufferSize
-        = maxNumTokens.has_value() ? bufferSizeFromMaxNumToken : common::getEnvMemSizeForKVCacheTransferBuffer();
-    mOnlyUseDynamicBuffer = mTransferBufferSize == 0;
-    mRecvBufferCount = common::getEnvRequestKVCacheConcurrent() ? common::getEnvKVCacheRecvBufferCount() : 1;
-    mSendBufferCount = common::getEnvKVCacheSendMaxConcurrenceNum();
-    mUseFabricMemory = !(common::getEnvKVCacheTransferUseSyncBuffer() || common::getEnvKVCacheTransferUseAsyncBuffer())
-        && FabricMemory::supportFbaricMemory();
-    if (mUseFabricMemory)
-    {
-        mTransferBufferSize = FabricMemory::getAlignedSize(mTransferBufferSize);
-    }
-    mPreAllocBufferSize = mTransferBufferSize * (mRecvBufferCount + mSendBufferCount);
-    TLLM_LOG_INFO(
-        "CacheTransBufferManager: mMaxNumTokens:%ld, mRecvBufferCount:%ld, "
-        "mSendBufferCount:%ld,mTransferBufferSize:%ld, mPreAllocBufferSize:%ld,mOnlyUseDynamicBuffer:%d "
-        "mUseFabricMemory:%d mDataType:%d",
-        maxNumTokens.has_value() ? maxNumTokens.value() : 0, mRecvBufferCount, mSendBufferCount, mTransferBufferSize,
-        mPreAllocBufferSize, mOnlyUseDynamicBuffer, mUseFabricMemory, mDataType);
+    return maxNumTokens.has_value() ? bufferSizeFromMaxNumToken : common::getEnvMemSizeForKVCacheTransferBuffer();
+}
 
-    allocateBuffer();
+CacheTransBufferManager::CacheTransBufferManager(
+    KVCacheManager::BaseKVCacheManager* cacheManager, std::optional<size_t> maxNumTokens, bool transferIndexerKCache)
+    : BaseTransBufferManager(computeTransferBufferSize(cacheManager, maxNumTokens, transferIndexerKCache),
+        transferIndexerKCache ? cacheManager->getIndexerKCachePool()->getDataType()
+                              : cacheManager->getPrimaryPool(0)->getDataType(),
+        maxNumTokens)
+    , mCacheManager{cacheManager}
+{
+    TLLM_CHECK(mCacheManager);
+    TLLM_LOG_INFO("CacheTransBufferManager created for KV cache");
 }
 
 size_t CacheTransBufferManager::preAllocBufferSize(
@@ -296,235 +295,6 @@ size_t CacheTransBufferManager::preAllocBufferSize(
     size_t sendBufferCount = common::getEnvKVCacheSendMaxConcurrenceNum();
     size_t preAllocBufferSize = transferBufferSize * (recvBufferCount + sendBufferCount);
     return preAllocBufferSize;
-}
-
-std::optional<int> CacheTransBufferManager::assignBufferIndexForSend()
-{
-    return assignBufferIndex(mConcurrenceSendResource, mSendBufferCount, mOnlyUseDynamicBuffer);
-}
-
-void CacheTransBufferManager::freeBufferIndexForSend(std::optional<int> bufferId)
-{
-    freeBufferIndex(mConcurrenceSendResource, bufferId, mSendBufferCount, mOnlyUseDynamicBuffer);
-}
-
-std::optional<int> CacheTransBufferManager::assignBufferIndexForRecv()
-{
-    return assignBufferIndex(mConcurrenceRecvResource, mRecvBufferCount, mOnlyUseDynamicBuffer);
-}
-
-void CacheTransBufferManager::freeBufferIndexForRecv(std::optional<int> bufferId)
-{
-    freeBufferIndex(mConcurrenceRecvResource, bufferId, mRecvBufferCount, mOnlyUseDynamicBuffer);
-}
-
-std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> CacheTransBufferManager::getOrAllocateSendBuffers(
-    std::optional<int> bufferId, int targetNum, std::vector<size_t> const& requestedNumberOfElements,
-    runtime::BufferManager const& bufferManagerToUse)
-{
-    return getOrAllocateBuffers(
-        bufferId, targetNum, requestedNumberOfElements, bufferManagerToUse, mConcurrenceSendResource);
-}
-
-std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> CacheTransBufferManager::getOrAllocateRecvBuffers(
-    std::optional<int> bufferId, int targetNum, std::vector<size_t> const& requestedNumberOfElements,
-    runtime::BufferManager const& bufferManagerToUse)
-{
-    return getOrAllocateBuffers(
-        bufferId, targetNum, requestedNumberOfElements, bufferManagerToUse, mConcurrenceRecvResource);
-}
-
-runtime::ITensor::SharedPtr CacheTransBufferManager::getSendBuffer(std::optional<int> bufferId)
-{
-    TLLM_CHECK(bufferId.has_value() || mOnlyUseDynamicBuffer);
-    if (bufferId.has_value())
-    {
-        TLLM_CHECK(static_cast<size_t>(bufferId.value()) < mSendBufferCount);
-        return mConcurrenceSendResource.mBuffers[bufferId.value()];
-    }
-    return nullptr;
-}
-
-runtime::ITensor::SharedPtr CacheTransBufferManager::getRecvBuffer(std::optional<int> bufferId)
-{
-    TLLM_CHECK(bufferId.has_value() || mOnlyUseDynamicBuffer);
-    if (bufferId.has_value())
-    {
-        TLLM_CHECK(static_cast<size_t>(bufferId.value()) < mRecvBufferCount);
-        // TLLM_CHECK(mConcurrenceRecvResource.mBufferIndexFlag[bufferId.value()] == 1);
-        return mConcurrenceRecvResource.mBuffers[bufferId.value()];
-    }
-    return nullptr;
-}
-
-std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> CacheTransBufferManager::getOrAllocateBuffers(
-    std::optional<int> bufferId, int targetNum, std::vector<size_t> const& requestedNumberOfElements,
-    runtime::BufferManager const& bufferManagerToUse, ConcurrenceResource& concurrenceResource)
-{
-    TLLM_CHECK(bufferId.has_value() || mOnlyUseDynamicBuffer);
-    TLLM_CHECK(requestedNumberOfElements.size() >= static_cast<size_t>(targetNum));
-    std::vector<runtime::ITensor::SharedPtr> retSplitCaches;
-
-    size_t bufferCoverTargetNum = 0;
-
-    if (bufferId.has_value())
-    {
-        TLLM_CHECK(static_cast<size_t>(bufferId.value()) < concurrenceResource.mBuffers.size());
-        TLLM_CHECK(concurrenceResource.mBufferIndexFlag[bufferId.value()] == 1);
-        size_t preBufferEleSize = 0;
-        for (int i = 0; i < targetNum; i++)
-        {
-            // Strict checking.
-            if (preBufferEleSize + requestedNumberOfElements[i] <= mNumberOfElements)
-            {
-                auto slice = runtime::ITensor::slice(
-                    concurrenceResource.mBuffers[bufferId.value()], preBufferEleSize, requestedNumberOfElements[i]);
-                preBufferEleSize += requestedNumberOfElements[i];
-                bufferCoverTargetNum++;
-                retSplitCaches.push_back(std::move(slice));
-            }
-            else
-            {
-                retSplitCaches.push_back(bufferManagerToUse.gpu(
-                    runtime::ITensor::makeShape({static_cast<int64_t>(requestedNumberOfElements[i])}), mDataType));
-            }
-        }
-        TLLM_LOG_DEBUG("getOrAllocateBuffers bufferCoverTargetNum:%d", bufferCoverTargetNum);
-        if (bufferCoverTargetNum < static_cast<size_t>(targetNum))
-        {
-            TLLM_LOG_WARNING(
-                "CacheTransceiver getOrAllocateBuffers: bufferCoverTargetNum:%d < targetNum:%d, may use dynamic "
-                "buffer which will fail with NIXL backend. It is recommended to set "
-                "cacheTransceiverConfig.MaxTokensInBuffer (cache_transceiver_config.max_tokens_in_buffer in config "
-                "YAML file) to a value greater than the maximum ISL of the processed requests. Otherwise, performance "
-                "may be degraded or transfer may fail.  requestedNumberOfElements.size():%ld, "
-                "mNumberOfElements:%ld, requestedNumberOfElements[0]:%ld",
-                bufferCoverTargetNum, targetNum, requestedNumberOfElements.size(), mNumberOfElements,
-                requestedNumberOfElements[0]);
-        }
-    }
-    else
-    {
-        for (int i = 0; i < targetNum; i++)
-        {
-            retSplitCaches.push_back(bufferManagerToUse.gpu(
-                runtime::ITensor::makeShape({static_cast<int64_t>(requestedNumberOfElements[i])}), mDataType));
-        }
-        bufferCoverTargetNum = targetNum;
-    }
-
-    return std::make_tuple(retSplitCaches, bufferCoverTargetNum, mOnlyUseDynamicBuffer);
-}
-
-void CacheTransBufferManager::allocateBuffer()
-{
-    if (mOnlyUseDynamicBuffer)
-    {
-        return;
-    }
-    mNumberOfElements = mTransferBufferSize / common::getDTypeSize(mDataType);
-    mConcurrenceSendResource.mBufferIndexFlag.resize(mSendBufferCount, 0);
-    mConcurrenceRecvResource.mBufferIndexFlag.resize(mRecvBufferCount, 0);
-    if (mUseFabricMemory)
-    {
-        mFabricMemory.reserve(mSendBufferCount + mRecvBufferCount);
-        for (size_t i = 0; i < mSendBufferCount; i++)
-        {
-            mFabricMemory.emplace_back(std::make_unique<FabricMemory>(mTransferBufferSize));
-            mConcurrenceSendResource.mBuffers[i] = runtime::ITensor::wrap(mFabricMemory.back()->getPtr(), mDataType,
-                runtime::ITensor::makeShape({static_cast<int64_t>(mNumberOfElements)}), mNumberOfElements);
-        }
-        for (size_t i = 0; i < mRecvBufferCount; i++)
-        {
-            mFabricMemory.emplace_back(std::make_unique<FabricMemory>(mTransferBufferSize));
-            mConcurrenceRecvResource.mBuffers[i] = runtime::ITensor::wrap(mFabricMemory.back()->getPtr(), mDataType,
-                runtime::ITensor::makeShape({static_cast<int64_t>(mNumberOfElements)}), mNumberOfElements);
-        }
-    }
-    else if (common::getEnvKVCacheTransferUseAsyncBuffer())
-    {
-        for (size_t i = 0; i < mSendBufferCount; i++)
-        {
-            mConcurrenceSendResource.mBuffers[i]
-                = mBufferManager.gpu(runtime::ITensor::makeShape({static_cast<int64_t>(mNumberOfElements)}), mDataType);
-        }
-        for (size_t i = 0; i < mRecvBufferCount; i++)
-        {
-            mConcurrenceRecvResource.mBuffers[i]
-                = mBufferManager.gpu(runtime::ITensor::makeShape({static_cast<int64_t>(mNumberOfElements)}), mDataType);
-        }
-        mBufferManager.getStream().synchronize();
-    }
-    else
-    {
-        for (size_t i = 0; i < mSendBufferCount; i++)
-        {
-            mConcurrenceSendResource.mBuffers[i] = mBufferManager.gpuSync(
-                runtime::ITensor::makeShape({static_cast<int64_t>(mNumberOfElements)}), mDataType);
-        }
-        for (size_t i = 0; i < mRecvBufferCount; i++)
-        {
-            mConcurrenceRecvResource.mBuffers[i] = mBufferManager.gpuSync(
-                runtime::ITensor::makeShape({static_cast<int64_t>(mNumberOfElements)}), mDataType);
-        }
-    }
-}
-
-std::optional<int> CacheTransBufferManager::assignBufferIndex(
-    ConcurrenceResource& resource, size_t bufferCount, bool onlyUseDynamicBuffer)
-{
-    if (onlyUseDynamicBuffer)
-    {
-        return std::nullopt;
-    }
-    std::unique_lock lk(resource.mBuffersMutex);
-    resource.mBuffersCV.wait(
-        lk, [&resource, bufferCount]() { return static_cast<size_t>(resource.mConcurrence) < bufferCount; });
-    int bufferId = -1;
-    for (size_t i = 0; i < bufferCount; i++)
-    {
-        if (resource.mBufferIndexFlag[i] == 0)
-        {
-            bufferId = i;
-            resource.mBufferIndexFlag[bufferId] = 1;
-            resource.mConcurrence++;
-            break;
-        }
-    }
-    TLLM_CHECK_WITH_INFO(bufferId >= 0 && static_cast<size_t>(bufferId) < bufferCount,
-        " assignBufferIndex: Buffer index already assigned");
-
-    return bufferId;
-}
-
-void CacheTransBufferManager::freeBufferIndex(
-    ConcurrenceResource& resource, std::optional<int> bufferId, size_t bufferCount, bool onlyUseDynamicBuffer)
-{
-    if (onlyUseDynamicBuffer)
-    {
-        return;
-    }
-    if (bufferId.has_value())
-    {
-
-        TLLM_CHECK(static_cast<size_t>(bufferId.value()) < bufferCount);
-        {
-            std::scoped_lock lk(resource.mBuffersMutex);
-            resource.mBufferIndexFlag[bufferId.value()] = 0;
-        }
-        resource.mConcurrence--;
-        resource.mBuffersCV.notify_one();
-    }
-}
-
-size_t CacheTransBufferManager::getRecvBufferCount()
-{
-    return mRecvBufferCount;
-}
-
-size_t CacheTransBufferManager::getSendBufferCount()
-{
-    return mSendBufferCount;
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager
