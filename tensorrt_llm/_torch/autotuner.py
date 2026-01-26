@@ -371,7 +371,7 @@ class AutoTunerProfilingCache:
 
         # Track which ops use which distributed strategy
         # Maps custom_op name -> DistributedTuningStrategy
-        self._op_strategy_map: Dict[str, DistributedTuningStrategy] = {}
+        self.independent_op: Set[str] = set()
 
         # Cache metadata for local storage and validation
         self.lib_version = tensorrt_llm.__version__
@@ -391,7 +391,7 @@ class AutoTunerProfilingCache:
 
     def clear(self) -> None:
         self.cache.clear()
-        self._op_strategy_map.clear()
+        self.independent_op.clear()
 
     def fallback_entry(self) -> Tuple:
         # runner_id = 0, tactic = -1
@@ -456,14 +456,10 @@ class AutoTunerProfilingCache:
     def get_specific_custom_op(self, custom_op: str) -> Dict[Tuple, Tuple]:
         return {k: v for k, v in self.cache.items() if k[0] == custom_op}
 
-    def update_op_strategy(self, custom_op: str,
+    def add_independent_op(self, custom_op: str,
                            strategy: DistributedTuningStrategy) -> None:
-        self._op_strategy_map[custom_op] = strategy
-
-    def _is_independent_op(self, custom_op: str) -> bool:
-        strategy = self._op_strategy_map.get(
-            custom_op, DistributedTuningStrategy.INDEPENDENT)
-        return strategy == DistributedTuningStrategy.INDEPENDENT
+        if strategy != DistributedTuningStrategy.INDEPENDENT:
+            self.independent_op.add(custom_op)
 
     def _partition_cache_by_strategy(
             self) -> Tuple[Dict[Tuple, Tuple], Dict[Tuple, Tuple]]:
@@ -479,7 +475,7 @@ class AutoTunerProfilingCache:
 
         for key, value in self.cache.items():
             custom_op = key[0]  # First element of cache key is custom_op name
-            if self._is_independent_op(custom_op):
+            if custom_op not in self.independent_op:
                 rank_cache[key] = value
             else:
                 shared_cache[key] = value
@@ -572,14 +568,18 @@ class AutoTunerProfilingCache:
                 current_cache_contents = json.load(f)
                 self._deserialize_metadata(current_cache_contents["metadata"])
 
-            # Start with empty cache
+            # Start with empty cache and independent ops set
             self.cache = {}
+            self.independent_op = set()
 
             # Load shared cache entries (non-INDEPENDENT ops)
             if self.SHARED_CACHE_KEY in current_cache_contents:
                 shared_cache = self._deserialize_cache_data(
                     current_cache_contents[self.SHARED_CACHE_KEY])
                 self.cache.update(shared_cache)
+                # add custom op in shared cache to independent ops set
+                for key in shared_cache.keys():
+                    self.independent_op.add(key[0])
                 logger.debug(
                     f"[AutoTuner] Loaded {len(shared_cache)} shared cache entries"
                 )
@@ -596,6 +596,10 @@ class AutoTunerProfilingCache:
 
             logger.info(
                 f"[AutoTuner] Successfully loaded cache from {file_path} using JSON format (total {len(self.cache)} entries)"
+            )
+
+            logger.info(
+                f"[AutoTuner] independent_op: {type(self.independent_op) if hasattr(self, 'independent_op') else 'not found'}"
             )
         except Exception as e:
             logger.error(f"[AutoTuner] Failed to load cache with JSON: {e}")
@@ -731,8 +735,6 @@ class AutoTuner:
         self._last_capture: Optional['AutoTuner.TacticsCapture'] = None
 
         # Dsitributed tuning state
-        self._map_op_to_distributed_strategy: Dict[
-            str, DistributedTuningStrategy] = {}
         self._dist: Optional[Distributed] = None
         self._has_received_cache: bool = False
         self.mapping: Mapping = Mapping()
@@ -939,11 +941,8 @@ class AutoTuner:
             "All Given runners must be subclass of TunableRunner"
 
         # Record the distributed tuning strategy for the custom_op
-        self._map_op_to_distributed_strategy[
-            custom_op] = tuning_config.distributed_tuning_strategy
-        # Also update the cache's strategy map for save/load partitioning
-        self.profiling_cache.update_op_strategy(
-            custom_op, tuning_config.distributed_tuning_strategy)
+        self.profiling_cache.add_independent_op(
+            custom_op, strategy=tuning_config.distributed_tuning_strategy)
 
         tuning_start_time = time.perf_counter()
         profiles = self._optimization_profiles(tuning_config, inputs)

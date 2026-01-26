@@ -803,6 +803,10 @@ def _distributed_worker_function(world_size, strategy):
             f"rank {rank} should have 2 entries, got {len(cache_data[f'rank_{rank}'])}"
         assert has_op_in_section(cache_data[f'rank_{rank}'], f'test_distributed_{strategy.value}'), \
             f"rank {rank} should have test_distributed_{strategy.value}"
+
+        assert len(
+            AutoTuner.get().profiling_cache.independent_op
+        ) == 0, f"Non-INDEPENDENT ops should not be present in the cache"
     else:
         # Non-INDEPENDENT ops go to shared section
         assert 'shared' in cache_data, "shared section should be present"
@@ -815,6 +819,10 @@ def _distributed_worker_function(world_size, strategy):
         # The parameterized op should be in shared section
         assert has_op_in_section(cache_data['shared'], f'test_distributed_{strategy.value}'), \
             f"shared should have test_distributed_{strategy.value}"
+
+        assert "test_distributed_normal_gemm" not in AutoTuner.get().profiling_cache.independent_op and \
+            f"test_distributed_{strategy.value}" in AutoTuner.get().profiling_cache.independent_op, \
+            f"Distributed tuning strategy is not recovered correctly from cache"
 
     if strategy == DistributedTuningStrategy.BROADCAST:
         # All ranks should select tactic 0
