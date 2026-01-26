@@ -390,16 +390,12 @@ def test_can_process_attention_dp_request(attention_dp_config):
     max_num_active_requests = attention_dp_config["max_num_active_requests"]
 
     req_no_params = RequestQueueItem(1, Mock())
-    assert can_process_attention_dp_request(
-        req_no_params, [0, 0, 0, 0], max_num_active_requests
-    )
+    assert can_process_attention_dp_request(req_no_params, [0, 0, 0, 0], max_num_active_requests)
 
     req_relax = RequestQueueItem(
         2, create_mock_request_with_py_schedule_params(attention_dp_rank=0, attention_dp_relax=True)
     )
-    assert can_process_attention_dp_request(
-        req_relax, [0, 0, 0, 0], max_num_active_requests
-    )
+    assert can_process_attention_dp_request(req_relax, [0, 0, 0, 0], max_num_active_requests)
 
     req_target = RequestQueueItem(
         3,
