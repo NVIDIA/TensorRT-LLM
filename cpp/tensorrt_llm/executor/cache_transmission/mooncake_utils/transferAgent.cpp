@@ -98,13 +98,14 @@ TransferState MooncakeTransferStatus::wait(int64_t timeout_ms) const
             mBatchFreed = true;
             TLLM_LOG_DEBUG("Batch ID %lu freed in wait()", mBatchId);
             syncSegmentCache(mEngine);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
             return TransferState::kSUCCESS;
         }
 
         // If timeout_ms < 0, wait indefinitely
         if (timeout_ms < 0)
         {
-            std::this_thread::yield();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
             continue;
         }
 
@@ -117,7 +118,7 @@ TransferState MooncakeTransferStatus::wait(int64_t timeout_ms) const
             return TransferState::kIN_PROGRESS;
         }
 
-        std::this_thread::yield();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 }
 

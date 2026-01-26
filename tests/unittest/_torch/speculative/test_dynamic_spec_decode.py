@@ -9,7 +9,7 @@ from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-from tensorrt_llm.llmapi import (CudaGraphConfig, EagleDecodingConfig,
+from tensorrt_llm.llmapi import (CudaGraphConfig, Eagle3DecodingConfig,
                                  KvCacheConfig)
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -54,7 +54,7 @@ def test_dynamic_spec_decode(enforce_single_worker,
         max_seq_len=8192,
     )
 
-    spec_config = EagleDecodingConfig(
+    spec_config = Eagle3DecodingConfig(
         max_draft_len=max_draft_len,
         speculative_model=eagle_model_dir,
         # Llama 3 does not support one model eagle.

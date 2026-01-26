@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import pytest
+from defs.conftest import skip_pre_blackwell
 from test_common.llm_data import hf_id_to_local_model_dir, llm_models_root
 
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
@@ -70,6 +71,24 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize("enable_chunked_prefill", [False, True])
     def test_auto_dtype(self, world_size, enable_chunked_prefill):
         kwargs = self.get_default_kwargs(enable_chunked_prefill)
+        sampling_params = self.get_default_sampling_params()
+        with AutoDeployLLM(model=self.MODEL_PATH,
+                           tokenizer=self.MODEL_PATH,
+                           world_size=world_size,
+                           **kwargs) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=sampling_params)
+
+    @pytest.mark.skip_less_device_memory(32000)
+    @pytest.mark.skip_less_device(2)
+    @pytest.mark.parametrize("world_size", [2, 4])
+    def test_attention_dp(self, world_size):
+        """Test attention data parallelism mode where TP sharding is disabled."""
+        kwargs = self.get_default_kwargs(enable_chunked_prefill=True)
+        # Enable attention DP - this disables TP sharding
+        kwargs["transforms"]["detect_sharding"] = {"enable_attention_dp": True}
         sampling_params = self.get_default_sampling_params()
         with AutoDeployLLM(model=self.MODEL_PATH,
                            tokenizer=self.MODEL_PATH,
@@ -142,7 +161,7 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Nemotron-MOE"
     MODEL_PATH_BF16 = f"{llm_models_root()}/Nemotron-Nano-3-30B-A3.5B-dev-1024"
     MODEL_PATH_FP8 = f"{llm_models_root()}/Nemotron-Nano-3-30B-A3.5B-FP8-KVFP8-dev"
-    MODEL_PATH_NVFP4 = f"{llm_models_root()}/Nemotron-3-Nano-30B-A3B-NVFP4"
+    MODEL_PATH_NVFP4 = f"{llm_models_root()}/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"
 
     def get_default_kwargs(self):
         return {
@@ -220,11 +239,13 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @pytest.mark.skip(reason="NVFP4 model is not in the CI yet")
-    def test_nvfp4(self):
+    @skip_pre_blackwell
+    @pytest.mark.parametrize("world_size", [1, 2, 4])
+    def test_nvfp4(self, world_size):
         kwargs = self.get_default_kwargs()
         with AutoDeployLLM(model=self.MODEL_PATH_NVFP4,
                            tokenizer=self.MODEL_PATH_NVFP4,
+                           world_size=world_size,
                            **kwargs) as llm:
             # Manually set quant_config for NVFP4 model to get the accuracy threshold
             llm.args.quant_config.quant_algo = QuantAlgo.NVFP4
@@ -296,7 +317,7 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip("Skipping FP8 test until it is supported")
     @pytest.mark.skip_less_device_memory(180000)
-    @pytest.mark.parametrize("world_size", [4, 8])
+    @pytest.mark.parametrize("world_size", [1, 4, 8])
     def test_fp8(self, world_size):
         if get_device_count() < world_size:
             pytest.skip("Not enough devices for world size, skipping test")

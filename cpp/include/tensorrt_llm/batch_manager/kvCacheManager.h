@@ -366,6 +366,9 @@ private:
     std::optional<std::chrono::steady_clock::time_point::duration> mExpirationTime;
     // Hash for the event manager
     size_t mHash;
+
+    // Mutex for the next blocks
+    mutable std::mutex mNextBlocksMutex;
 };
 
 class GenerationRequest
@@ -1019,7 +1022,7 @@ private:
     std::shared_ptr<kv_connector::KvCacheConnectorManager> mKvCacheConnectorManager;
 
     // Mutex for the cached blocks root
-    std::mutex mCachedBlocksRootMutex;
+    mutable std::mutex mCachedBlocksRootMutex;
 
     // Record which sequence is using the block
     std::map<KVCacheBlock::IdType, LlmRequest::RequestIdType> mBlockToSequence;
