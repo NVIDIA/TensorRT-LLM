@@ -2046,30 +2046,29 @@ class PyExecutor:
     # to keep request processing state (canceled_req_ids, control_requests, etc.)
     # centralized in the executor.
 
-    def _fetch_and_process_requests(
-        self,
-        waiting_queue: deque[RequestQueueItem],
-        total_num_active_requests: int,
-        total_max_num_active_requests: int,
-        enable_attention_dp: bool,
-        all_ranks_num_active_requests: Optional[List[int]] = None
-    ) -> List[RequestQueueItem]:
-        """Common logic for fetching and processing requests from the queue.
+    def _fetch_and_enqueue_requests(self,
+                                    waiting_queue: deque[RequestQueueItem],
+                                    total_num_active_requests: int) -> None:
+        """Fetch requests from the queue and enqueue them to the waiting queue.
+
+        This method handles:
+        1. Control request blocking check
+        2. Timeout calculation based on idle state
+        3. Fetching requests from rank 0 (including accumulated requests)
+        4. Broadcasting requests across ranks
+        5. Validating and filtering special requests
+        6. Attaching Python objects for non-rank-0 workers
+        7. Enqueueing to the waiting queue
 
         Args:
             waiting_queue: The waiting queue managed by executor.
             total_num_active_requests: Total number of active requests.
-            total_max_num_active_requests: Maximum number of active requests.
-            enable_attention_dp: Whether to enable attention DP scheduling.
-            all_ranks_num_active_requests: Number of active requests for each rank.
-
-        Returns:
-            List of requests that can be processed.
         """
         # Block new request processing while control requests are pending.
         # Control requests must be handled exclusively to ensure proper synchronization.
         if len(self.control_requests) != 0:
-            return []
+            return
+
         # Calculate timeout
         idle = (total_num_active_requests == 0) and len(waiting_queue) == 0
         if idle:
@@ -2105,25 +2104,82 @@ class PyExecutor:
                                    or self.dist.cp_size
                                    > 1) and self.dist.rank > 0:
             attach_py_objects_to_requests(new_requests, py_request_objects)
+
         waiting_queue.extend(new_requests)
+
+    def _select_requests_for_tp(
+            self, waiting_queue: deque[RequestQueueItem],
+            activate_requests: List[LlmRequest]) -> List[RequestQueueItem]:
+        """Select requests from waiting queue for standard (non-attention DP) mode.
+
+        Args:
+            waiting_queue: The waiting queue managed by executor.
+            activate_requests: List of currently active requests.
+
+        Returns:
+            List of requests that can be processed.
+        """
+        num_active_requests = len(activate_requests)
+        max_new_requests = self.max_num_active_requests - num_active_requests
 
         new_requests = get_from_waiting_queue(
             waiting_queue,
-            total_max_num_active_requests - total_num_active_requests,
-            enable_attention_dp, self.max_num_active_requests,
-            all_ranks_num_active_requests)
-
-        # Update performance metrics
-        if self.enable_iter_perf_stats and self.dist.rank == 0:
-            self._update_new_active_requests_queue_latency(new_requests)
+            max_new_requests,
+            enable_attention_dp=False,
+            max_num_active_requests=self.max_num_active_requests,
+            all_ranks_num_active_requests=None)
 
         return new_requests
+
+    def _select_requests_for_dp(
+            self, waiting_queue: deque[RequestQueueItem],
+            all_ranks_num_active_requests: List[int],
+            all_ranks_num_active_tokens: List[int]) -> List[RequestQueueItem]:
+        """Select requests from waiting queue for attention DP mode with load balancing.
+
+        Args:
+            waiting_queue: The waiting queue managed by executor.
+            all_ranks_num_active_requests: Number of active requests for each rank.
+            all_ranks_num_active_tokens: Number of active tokens for each rank.
+
+        Returns:
+            List of requests assigned to the current rank.
+        """
+        total_num_active_requests = sum(all_ranks_num_active_requests)
+        total_max_num_active_requests = self.dist.tp_size * self.max_num_active_requests
+        max_new_requests = total_max_num_active_requests - total_num_active_requests
+
+        new_requests = get_from_waiting_queue(
+            waiting_queue,
+            max_new_requests,
+            enable_attention_dp=True,
+            max_num_active_requests=self.max_num_active_requests,
+            all_ranks_num_active_requests=all_ranks_num_active_requests)
+
+        # Schedule attention dp requests across ranks
+        all_ranks_new_requests = self._schedule_attention_dp_requests(
+            new_requests, all_ranks_num_active_requests,
+            all_ranks_num_active_tokens)
+        new_requests_cur_rank = all_ranks_new_requests[self.dist.tp_rank]
+
+        # Update counters
+        self.num_fetch_requests += len(new_requests)
+        self.num_fetch_requests_cur_rank += len(new_requests_cur_rank)
+
+        return new_requests_cur_rank
 
     @nvtx_range("_fetch_new_requests")
     def _fetch_new_requests(
             self, waiting_queue: deque[RequestQueueItem],
             activate_requests: List[LlmRequest]) -> List[LlmRequest]:
         """Fetch new requests from the queue.
+
+        Flow:
+        1. Gather info (DP needs allgather)
+        2. Fetch and enqueue (unified)
+        3. Select requests from waiting queue (DP/TP different)
+        4. Update performance metrics (unified)
+        5. Merge requests (unified)
 
         Args:
             waiting_queue: The waiting queue managed by executor.
@@ -2132,78 +2188,40 @@ class PyExecutor:
         Returns:
             List of LlmRequest objects ready for execution.
         """
+        # 1. Gather info and calculate total_num_active_requests
         if self.enable_attention_dp:
-            return self._fetch_new_requests_attention_dp(
-                waiting_queue, activate_requests)
+            all_ranks_num_active_requests = []
+            all_ranks_num_active_tokens = []
+            num_active_tokens = sum(
+                [req.py_orig_prompt_len for req in activate_requests])
+            responses_list = self.dist.tp_allgather(
+                [len(activate_requests), num_active_tokens])
+            for num_active_requests, num_active_tokens in responses_list:
+                all_ranks_num_active_requests.append(num_active_requests)
+                all_ranks_num_active_tokens.append(num_active_tokens)
+            total_num_active_requests = sum(all_ranks_num_active_requests)
         else:
-            return self._fetch_new_requests_attention_tp(
-                waiting_queue, len(activate_requests))
+            total_num_active_requests = len(activate_requests)
 
-    def _fetch_new_requests_attention_tp(
-            self, waiting_queue: deque[RequestQueueItem],
-            num_active_requests: int) -> List[LlmRequest]:
-        """Handle standard (non-attention DP) request fetching."""
-        total_num_active_requests = num_active_requests
-        total_max_num_active_requests = self.max_num_active_requests
+        # 2. Fetch and enqueue (unified)
+        self._fetch_and_enqueue_requests(waiting_queue,
+                                         total_num_active_requests)
 
-        # fetch and process requests into waiting queue
-        new_requests = self._fetch_and_process_requests(
-            waiting_queue,
-            total_num_active_requests,
-            total_max_num_active_requests,
-            enable_attention_dp=False)
+        # 3. Select requests from waiting queue (DP/TP different)
+        if self.enable_attention_dp:
+            new_requests = self._select_requests_for_dp(
+                waiting_queue, all_ranks_num_active_requests,
+                all_ranks_num_active_tokens)
+        else:
+            new_requests = self._select_requests_for_tp(waiting_queue,
+                                                        activate_requests)
 
-        # Merge requests and add to active list
+        # 4. Update performance metrics (unified)
+        if self.enable_iter_perf_stats and self.dist.rank == 0:
+            self._update_new_active_requests_queue_latency(new_requests)
+
+        # 5. Merge requests (unified)
         return merge_requests(new_requests,
-                              cp_config=self.dist.cp_config,
-                              cp_rank=self.dist.cp_rank,
-                              cp_size=self.dist.cp_size,
-                              exclude_last_generation_logits=self.
-                              _should_exclude_last_generation_logits())
-
-    def _fetch_new_requests_attention_dp(
-            self, waiting_queue: deque[RequestQueueItem],
-            activate_requests: List[LlmRequest]) -> List[LlmRequest]:
-        """Handle attention DP request fetching with load balancing."""
-        # Get active request counts across all ranks
-        all_ranks_num_active_requests = []
-        all_ranks_num_active_tokens = []
-        num_active_tokens = sum(
-            [req.py_orig_prompt_len for req in activate_requests])
-        responses_list = self.dist.tp_allgather(
-            [len(activate_requests), num_active_tokens])
-        for num_active_requests, num_active_tokens in responses_list:
-            all_ranks_num_active_requests.append(num_active_requests)
-            all_ranks_num_active_tokens.append(num_active_tokens)
-
-        total_num_active_requests = sum(all_ranks_num_active_requests)
-        total_max_num_active_requests = self.dist.tp_size * self.max_num_active_requests
-
-        # fetch and process requests into waiting queue
-        new_requests = self._fetch_and_process_requests(
-            waiting_queue,
-            total_num_active_requests,
-            total_max_num_active_requests,
-            enable_attention_dp=True,
-            all_ranks_num_active_requests=all_ranks_num_active_requests)
-
-        # Schedule attention dp requests
-        all_ranks_new_requests = self._schedule_attention_dp_requests(
-            new_requests, all_ranks_num_active_requests,
-            all_ranks_num_active_tokens)
-        new_requests_cur_rank = all_ranks_new_requests[self.dist.tp_rank]
-
-        # Update performance metrics
-        if self.enable_iter_perf_stats and self.executor_request_queue.start_times:
-            self._update_new_active_requests_queue_latency(
-                new_requests_cur_rank)
-
-        # Update counters
-        self.num_fetch_requests += len(new_requests)
-        self.num_fetch_requests_cur_rank += len(new_requests_cur_rank)
-
-        # Merge requests and add to active list
-        return merge_requests(new_requests_cur_rank,
                               cp_config=self.dist.cp_config,
                               cp_rank=self.dist.cp_rank,
                               cp_size=self.dist.cp_size,
@@ -2248,15 +2266,9 @@ class PyExecutor:
             self, new_requests: List[RequestQueueItem]):
         """Update queue latency metrics for new requests."""
         now = time.time()
-        start_times = self.executor_request_queue.start_times
-        for req_item in new_requests:
-            if req_item.id in start_times:
-                self.new_active_requests_queue_latency_ms += now - start_times.pop(
-                    req_item.id)
-            if req_item.child_req_ids:
-                for child_id in req_item.child_req_ids:
-                    self.new_active_requests_queue_latency_ms += now - start_times.pop(
-                        child_id)
+        latency = self.executor_request_queue.calculate_queue_latency(
+            new_requests, now)
+        self.new_active_requests_queue_latency_ms += latency
 
     def _get_new_active_requests_queue_latency(self) -> float:
         return self.new_active_requests_queue_latency_ms

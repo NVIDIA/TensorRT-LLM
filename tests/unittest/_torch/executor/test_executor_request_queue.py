@@ -214,7 +214,7 @@ def test_get_from_request_queue_no_timeout(executor_queue):
     executor_queue.request_queue.put(item1)
     executor_queue.request_queue.put(item2)
 
-    items = executor_queue._get_from_request_queue(None)
+    items = executor_queue.get_from_request_queue(None)
 
     assert len(items) == 2
     assert items[0] == item1
@@ -227,7 +227,7 @@ def test_get_from_request_queue_with_timeout(executor_queue):
 
     # Empty queue should return empty list quickly
     start_time = time.time()
-    items = executor_queue._get_from_request_queue(timeout)
+    items = executor_queue.get_from_request_queue(timeout)
     elapsed = time.time() - start_time
 
     assert len(items) == 0
@@ -258,7 +258,7 @@ def test_get_from_request_queue_async_behavior(executor_queue):
 
     # Get requests immediately - should only get the initial ones
     start_time = time.time()
-    items = executor_queue._get_from_request_queue(None)
+    items = executor_queue.get_from_request_queue(None)
     elapsed = time.time() - start_time
 
     assert len(items) == initial_requests
@@ -287,7 +287,7 @@ def test_get_from_request_queue_async_behavior(executor_queue):
 
     # Get requests with batch_wait_timeout_ms - should wait and get all
     start_time = time.time()
-    items = executor_queue._get_from_request_queue(None)
+    items = executor_queue.get_from_request_queue(None)
     elapsed = time.time() - start_time
 
     # Should wait and return all requests

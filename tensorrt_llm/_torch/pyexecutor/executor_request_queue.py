@@ -64,47 +64,6 @@ class ExecutorRequestQueue:
         self.batch_wait_timeout_ms = batch_wait_timeout_ms
         self.hang_detector = hang_detector or HangDetector()
 
-    def _get_from_request_queue(
-            self,
-            timeout: Optional[datetime.timedelta]) -> List[RequestQueueItem]:
-
-        items = []
-        timeout_secs = timeout.total_seconds() if timeout is not None else None
-
-        try:
-            if self.request_queue.empty() and (timeout_secs is None
-                                               or timeout_secs > 0):
-                # if queue is empty and want to wait, wait
-                items.append(self.request_queue.get(timeout=timeout_secs))
-            else:
-                # if not empty or don't want to wait, just return all items in queue
-                while True:
-                    queue_item = self.request_queue.get_nowait()
-                    items.append(queue_item)
-        except queue.Empty:
-            pass
-
-        if self.batch_wait_timeout_ms == 0:
-            return items
-
-        if len(items) >= self.max_batch_size:
-            return items
-
-        deadline = time.monotonic() + self.batch_wait_timeout_ms / 1000.0
-        while len(items) < self.max_batch_size:
-            remaining_timeout = deadline - time.monotonic()
-
-            if remaining_timeout <= 0:
-                break
-
-            try:
-                item = self.request_queue.get(timeout=remaining_timeout)
-                items.append(item)
-            except queue.Empty:
-                break
-
-        return items
-
     def _get_request_id(self, request: Optional[ExecutorRequest] = None):
         # if request has a disagg_request_id, use it as request id so that
         # corresponding context and generation requests have the same request id
@@ -196,10 +155,65 @@ class ExecutorRequestQueue:
         Returns:
             List of RequestQueueItem fetched from the queue.
         """
-        return self._get_from_request_queue(timeout)
+        items = []
+        timeout_secs = timeout.total_seconds() if timeout is not None else None
+
+        try:
+            if self.request_queue.empty() and (timeout_secs is None
+                                               or timeout_secs > 0):
+                # if queue is empty and want to wait, wait
+                items.append(self.request_queue.get(timeout=timeout_secs))
+            else:
+                # if not empty or don't want to wait, just return all items in queue
+                while True:
+                    queue_item = self.request_queue.get_nowait()
+                    items.append(queue_item)
+        except queue.Empty:
+            pass
+
+        if self.batch_wait_timeout_ms == 0:
+            return items
+
+        if len(items) >= self.max_batch_size:
+            return items
+
+        deadline = time.monotonic() + self.batch_wait_timeout_ms / 1000.0
+        while len(items) < self.max_batch_size:
+            remaining_timeout = deadline - time.monotonic()
+
+            if remaining_timeout <= 0:
+                break
+
+            try:
+                item = self.request_queue.get(timeout=remaining_timeout)
+                items.append(item)
+            except queue.Empty:
+                break
+
+        return items
 
     def get_request_queue_size(self) -> int:
         return self.request_queue.qsize()
 
     def get_request_queue(self) -> queue.Queue[RequestQueueItem]:
         return self.request_queue
+
+    def calculate_queue_latency(self, request_items: List[RequestQueueItem],
+                                now: float) -> float:
+        if not self.enable_iter_perf_stats:
+            return 0.0
+
+        total_latency = 0.0
+
+        for req_item in request_items:
+            # Handle parent request
+            if req_item.id in self.start_times:
+                total_latency += now - self.start_times.pop(req_item.id)
+
+            # Handle child requests
+            if req_item.child_req_ids:
+                for child_id in req_item.child_req_ids:
+                    if child_id in self.start_times:
+                        total_latency += now - self.start_times.pop(child_id)
+
+        return total_latency
