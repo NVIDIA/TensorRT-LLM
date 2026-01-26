@@ -51,7 +51,6 @@ set(SRCS
     rnnStateBuffers.cpp
     rnnStateManager.cpp
     rnnCacheFormatter.cpp
-    rnnCacheTransceiver.cpp
     rnnCacheTransBuffer.cpp
     runtimeBuffers.cpp
     sequenceSlotManager.cpp

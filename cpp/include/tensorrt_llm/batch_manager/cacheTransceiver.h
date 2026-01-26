@@ -20,6 +20,8 @@
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
+#include "tensorrt_llm/batch_manager/rnnCacheTransBuffer.h"
+#include "tensorrt_llm/batch_manager/rnnStateManager.h"
 #include "tensorrt_llm/executor/cacheCommunicator.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
@@ -230,17 +232,21 @@ public:
         std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
         executor::kv_cache::CacheState::AttentionType attentionType
         = executor::kv_cache::CacheState::AttentionType::kDEFAULT,
-        std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt);
+        std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt,
+        rnn_state_manager::RnnStateManager* rnnStateManager = nullptr,
+        std::vector<SizeType32> const& rnnLayerNumPerPP = {});
 
     CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheManager, std::vector<SizeType32> numKvHeadsPerLayer,
         SizeType32 sizePerHead, SizeType32 tokensPerBlock, runtime::WorldConfig const& worldConfig,
         std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
         executor::kv_cache::CacheState::AttentionType attentionType
         = executor::kv_cache::CacheState::AttentionType::kDEFAULT,
-        std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt)
+        std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt,
+        rnn_state_manager::RnnStateManager* rnnStateManager = nullptr,
+        std::vector<SizeType32> const& rnnLayerNumPerPP = {})
         : CacheTransceiver(cacheManager,
             executor::kv_cache::CacheState::ModelConfig{numKvHeadsPerLayer, sizePerHead, tokensPerBlock}, worldConfig,
-            attentionLayerNumPerPP, dataType, attentionType, cacheTransceiverConfig)
+            attentionLayerNumPerPP, dataType, attentionType, cacheTransceiverConfig, rnnStateManager, rnnLayerNumPerPP)
     {
     }
 
@@ -283,6 +289,12 @@ private:
     std::optional<executor::CacheTransceiverConfig> mCacheTransceiverConfig;
     std::vector<std::unique_ptr<kv_cache_manager::CacheTransBufferManager>> mCacheTransBufferManagers;
     std::vector<kv_cache_manager::CacheTransBufferManager*> mCacheTransBufferManagerPtrs;
+
+    rnn_state_manager::RnnStateManager* mRnnStateManager{nullptr};
+    std::unique_ptr<executor::rnn_cache::RnnCacheState> mRnnCacheState{nullptr};
+    // TODO(shreyasm): update this to use same container as kv by using base trans buffers instead
+    std::unique_ptr<rnn_state_manager::RnnCacheTransBufferManager> mRnnCacheTransBufferManager{nullptr};
+
     // library handle to the communicator related features,
     // this is used to defer dependency resolution until needed.
     static std::mutex mDllMutex;

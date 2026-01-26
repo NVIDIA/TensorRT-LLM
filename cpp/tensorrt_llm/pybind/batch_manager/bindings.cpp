@@ -450,7 +450,8 @@ void initBindings(pybind11::module_& m)
         .def("free_cache_block", &tb::rnn_state_manager::RnnStateManager::freeCacheBlock, py::arg("request_id"),
             py::call_guard<py::gil_scoped_release>())
         .def("get_state_indices", &tb::rnn_state_manager::RnnStateManager::getStateIndices, py::arg("request_ids"),
-            py::arg("is_padding"), py::call_guard<py::gil_scoped_release>());
+            py::arg("is_padding"), py::call_guard<py::gil_scoped_release>())
+        .def("get_num_local_layers", &tb::rnn_state_manager::RnnStateManager::getNumLocalLayers);
 
     m.def(
         "add_new_tokens_to_requests",
