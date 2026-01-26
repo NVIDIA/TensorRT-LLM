@@ -598,7 +598,7 @@ def stress_test(config,
 
         # Set MOE backend based on GPU architecture and checkpoint type
         # B200/GB200 (Blackwell, SM100+) with FP8 checkpoints: use DEEPGEMM backend
-        # B200/GB200 (Blackwell, SM100+) with NVFP4 checkpoints: use TRTLLM backend
+        # B200/GB200 (Blackwell, SM100+) with NVFP4 checkpoints: use CUTEDSL backend
         # H100/H200 (Hopper, SM90) with FP8 checkpoints: use CUTLASS backend (default)
         try:
             import torch
@@ -609,7 +609,7 @@ def stress_test(config,
 
                 if is_blackwell:
                     if is_nvfp4:
-                        moe_backend = "TRTLLM"
+                        moe_backend = "CUTEDSL"
                     else:
                         moe_backend = "DEEPGEMM"
 
