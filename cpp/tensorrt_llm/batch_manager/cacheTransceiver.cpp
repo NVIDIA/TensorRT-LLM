@@ -227,6 +227,7 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         TLLM_THROW("Unsupported cache transceiver backend type ");
     }
 
+    // TODO(shreyasm)
     auto makeFormatter = [cacheManager, isMLA, this]()
     { return createCacheFormatter(cacheManager, mCacheTransBufferManagerPtrs, isMLA); };
 
@@ -399,6 +400,7 @@ void updateKVCacheTransferBW(std::shared_ptr<CacheTransceiverComm> const& mComm,
     }
 
     // Handle KV cache size separately - gather all sizes to the leader rank
+    // TODO(shreyasm)
     std::size_t localKVCacheSize = request->getKvCacheSize();
     std::vector<std::size_t> allKVCacheSizes(worldSize, 0);
 

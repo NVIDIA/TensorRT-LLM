@@ -92,10 +92,48 @@ int getGlobalBlockIdAccountingForCP(int localBlockIdx, int cpSize, int cpRank, i
     }
 }
 
+namespace state_specific_detail
+{
+
+// ============ Context Parallelism ============
+inline SizeType32 getContextParallelism(kv_cache::CacheState::ParallelConfig const& config)
+{
+    return config.mContextParallelism;
+}
+
+inline SizeType32 getContextParallelism(rnn_cache::RnnCacheState::ParallelConfig const&)
+{
+    return 1; // RNN has no CP
+}
+
+// ============ Layer Num Per PP ============
+inline std::vector<SizeType32> const& getLayerNumPerPP(kv_cache::CacheState::ParallelConfig const& config)
+{
+    return config.mAttentionLayerNumPerPP;
+}
+
+inline std::vector<SizeType32> const& getLayerNumPerPP(rnn_cache::RnnCacheState::ParallelConfig const& config)
+{
+    return config.mRnnLayerNumPerPP;
+}
+
+// ============ Heads Per Layer ============
+inline SizeType32 getNbHeadsPerLayer(kv_cache::CacheState::ModelConfig const& config)
+{
+    return config.mNbKvHeadsPerLayer[0];
+}
+
+inline SizeType32 getNbHeadsPerLayer(rnn_cache::RnnCacheState::ModelConfig const& config)
+{
+    return config.mNumHeads;
+}
+
+} // namespace state_specific_detail
+
 // inputBlockNums: [outputBlockNum, inputRanks.size]
 // [PP, TP]
-TargetRanksInfo TargetRanksInfoForDP(
-    kv_cache::CacheState const& peerCacheState, kv_cache::CacheState const& selfCacheState, int selfRank)
+template <typename CacheStateT>
+TargetRanksInfo TargetRanksInfoForDP(CacheStateT const& peerCacheState, CacheStateT const& selfCacheState, int selfRank)
 {
     auto const& peerParConfig = peerCacheState.getParallelConfig();
     auto const& selfParConfig = selfCacheState.getParallelConfig();
@@ -104,8 +142,8 @@ TargetRanksInfo TargetRanksInfoForDP(
     auto const selfPPNum = selfParConfig.mPipelineParallelism;
     auto const peerTPNum = peerParConfig.mTensorParallelism;
     auto const selfTPNum = selfParConfig.mTensorParallelism;
-    auto const peerCPNum = peerParConfig.mContextParallelism;
-    auto const selfCPNum = selfParConfig.mContextParallelism;
+    auto const peerCPNum = state_specific_detail::getContextParallelism(peerParConfig);
+    auto const selfCPNum = state_specific_detail::getContextParallelism(selfParConfig);
 
     auto const selfCPRank = selfRank % selfCPNum;
     auto const selfTPRank = (selfRank % (selfTPNum * selfCPNum)) / selfCPNum;
@@ -114,8 +152,8 @@ TargetRanksInfo TargetRanksInfoForDP(
     int peerPPRankStart = 0;
     int mDomainPPSize = 1;
     int peerPPRankEnd = 0;
-    std::vector<SizeType32> peerNumLayerPerPP = peerParConfig.mAttentionLayerNumPerPP;
-    std::vector<SizeType32> selfNumLayerPerPP = selfParConfig.mAttentionLayerNumPerPP;
+    std::vector<SizeType32> const& peerNumLayerPerPP = state_specific_detail::getLayerNumPerPP(peerParConfig);
+    std::vector<SizeType32> const& selfNumLayerPerPP = state_specific_detail::getLayerNumPerPP(selfParConfig);
     TLLM_CHECK(peerNumLayerPerPP.size() == peerPPNum);
     TLLM_CHECK(selfNumLayerPerPP.size() == selfPPNum);
     int selfStartLayerId = 0;
@@ -165,8 +203,8 @@ TargetRanksInfo TargetRanksInfoForDP(
     int const selfTPSizePerDPGroup = selfParConfig.mEnableAttentionDP ? selfTPNum / selfParConfig.mDPsize : selfTPNum;
     int const peerTPSizePerDPGroup = peerParConfig.mEnableAttentionDP ? peerTPNum / peerParConfig.mDPsize : peerTPNum;
 
-    int const selfNbHeadsPerLayer = selfCacheState.getModelConfig().mNbKvHeadsPerLayer[0];
-    int const peerNbHeadsPerLayer = peerCacheState.getModelConfig().mNbKvHeadsPerLayer[0];
+    int const selfNbHeadsPerLayer = state_specific_detail::getNbHeadsPerLayer(selfCacheState.getModelConfig());
+    int const peerNbHeadsPerLayer = state_specific_detail::getNbHeadsPerLayer(peerCacheState.getModelConfig());
     int const selfTPrankInDPGroup = selfTPRank % selfTPSizePerDPGroup;
     for (auto val : {peerTPSizePerDPGroup, selfTPSizePerDPGroup})
     {
@@ -256,6 +294,12 @@ TargetRanksInfo TargetRanksInfoForDP(
 
 TargetRanksInfo targetIRanks(
     kv_cache::CacheState const& peerCacheState, kv_cache::CacheState const& selfCacheState, int selfRank)
+{
+    return TargetRanksInfoForDP(peerCacheState, selfCacheState, selfRank);
+}
+
+TargetRanksInfo targetIRanks(
+    rnn_cache::RnnCacheState const& peerCacheState, rnn_cache::RnnCacheState const& selfCacheState, int selfRank)
 {
     return TargetRanksInfoForDP(peerCacheState, selfCacheState, selfRank);
 }
@@ -1793,4 +1837,8 @@ void concatKvCacheV2Dispatch(std::vector<runtime::ITensor::SharedPtr> const& inp
     }
 }
 
+template TargetRanksInfo TargetRanksInfoForDP<kv_cache::CacheState>(
+    kv_cache::CacheState const&, kv_cache::CacheState const&, int);
+template TargetRanksInfo TargetRanksInfoForDP<rnn_cache::RnnCacheState>(
+    rnn_cache::RnnCacheState const&, rnn_cache::RnnCacheState const&, int);
 } // namespace tensorrt_llm::executor::kv_cache
