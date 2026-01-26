@@ -374,3 +374,6 @@ llmapi/test_llm_examples.py::test_llmapi_tensorrt_engine SKIP (https://nvbugs/58
 unittest/_torch/misc/test_autotuner.py::test_autotuner_distributed_strategy[2-DistributedTuningStrategy.INDEPENDENT] SKIP (https://nvbugs/5823194)
 accuracy/test_disaggregated_serving.py::TestQwen3_30B_A3B::test_mixed_ctx_gen_model[ctxpp2gentp2] SKIP (https://nvbugs/5748664)
 perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp4_v2_grace_blackwell-r1_fp4_v2_tep4_mtp3_8k1k] SKIP (https://nvbugs/5819053)
+unittest/_torch/thop/serial/test_moe.py::TestMoeFp4::test_gptoss_style_nvfp4[limitinf-beta0-alpha0.1-RoutingGPTOSS-512-512-1] SKIP (https://nvbugs/5819042)
+accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_fp8_blockscale[throughput_mtp] SKIP (https://nvbugs/5839155)
+disaggregated/test_disaggregated.py::test_disaggregated_benchmark_on_diff_backends[llama-v3-8b-hf] SKIP (https://nvbugs/5839137)
