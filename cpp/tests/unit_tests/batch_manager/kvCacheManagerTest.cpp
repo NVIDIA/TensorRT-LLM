@@ -4004,13 +4004,20 @@ TEST_F(KVCacheManagerTest, GetPriorityByBlockId)
     auto constexpr tokensPerBlock = 4;
     auto constexpr numBlocks = 8;
     auto constexpr maxAttentionWindow = 32;
+    auto constexpr maxNumSequences = 4;
     auto constexpr beamWidth = 1;
+    auto constexpr dtype = nvinfer1::DataType::kHALF;
+    auto const stream = std::make_shared<tr::CudaStream>();
     SizeType32 constexpr maxNewTokens = 4;
     tr::SamplingConfig const samplingConfig{beamWidth};
     bool constexpr isStreaming{false};
 
-    auto kvCacheManager = createKvCacheManager(numLayers, numKvHeads, sizePerHead, tokensPerBlock,
-        blocksAndWindow(numBlocks, maxAttentionWindow), /* sinkTokenLength */ 0, maxAttentionWindow);
+    auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {numBlocks, 0}}};
+
+    KVCacheManager kvCacheManager(numLayers, numKvHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, std::nullopt, dtype, 0, stream,
+        maxAttentionWindow, true);
+    kvCacheManager.allocatePools(false);
 
     // Create a sequence and set a custom priority
     auto inputTokens = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7});
