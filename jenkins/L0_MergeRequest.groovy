@@ -1369,6 +1369,9 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
  * Retrieve failed stages from the current build using the bot's failures.py script
  */
 def getFailedStages() {
+    // Ensure python3 is available (alpine doesn't have it by default)
+    sh "which python3 || apk add --no-cache python3"
+
     def status = sh(
         script: """rm -f failed_stages.json failed_stages_error.txt && \
             python3 ${BOT_ROOT}/bin/failures.py \
