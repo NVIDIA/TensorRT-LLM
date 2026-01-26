@@ -23,6 +23,7 @@ from typing import (
     Final,
     Iterable,
     Iterator,
+    NamedTuple,
     NewType,
     Protocol,
     Sequence,
@@ -49,6 +50,7 @@ CudaStream = NewType("CudaStream", int)
 BeamIndex = NewType("BeamIndex", int)
 MemAddress = NewType("MemAddress", int)
 Priority = NewType("Priority", int)
+PoolGroupIndex = NewType("PoolGroupIndex", int)
 
 # From _config.py
 DataRole = NewType("DataRole", str)
@@ -157,6 +159,9 @@ class _KVCache:
     def get_all_page_indices(
         self, beam_id: BeamIndex, buf_ids: Iterable[tuple[LayerId, DataRole]]
     ) -> Iterator[IndexSeq]: ...
+    def get_slot_indices(
+        self, layer_group_id: LayerGroupId, beam_id: BeamIndex = BeamIndex(0)
+    ) -> Iterator[int]: ...
     def resize(self, capacity: int | None, history_length: int | None = None) -> bool: ...
     @property
     def capacity(self) -> int: ...
@@ -182,6 +187,39 @@ class _KVCache:
     def is_active(self) -> bool: ...
     @property
     def tokens_per_block(self) -> int: ...
+
+@dataclass(slots=True, frozen=True)
+class MemoryPoolDesc:
+    base: MemAddress
+    page_size: int
+
+@dataclass(slots=True, frozen=True)
+class MemoryPoolGroupDesc:
+    num_pages: int
+    pools: list[MemoryPoolDesc]
+
+class BufferId(NamedTuple):
+    layer_id: LayerId
+    role: DataRole
+
+@dataclass(slots=True, frozen=True)
+class CoalescedBuffer:
+    single_buffer_size: int
+    buffer_ids: list[BufferId]
+    @property
+    def size(self) -> int: ...
+    @property
+    def num_buffers(self) -> int: ...
+
+@dataclass(slots=True, frozen=True)
+class SlotDescVariant:
+    coalesced_buffers: tuple[CoalescedBuffer, ...]
+    @property
+    def layer_group_id(self) -> LayerGroupId: ...
+
+@dataclass(slots=True, frozen=True)
+class SlotDesc:
+    variants: tuple[SlotDescVariant, ...]
 
 # From _core/_kv_cache_manager.py
 class KVCacheManager:
@@ -210,4 +248,10 @@ class KVCacheManager:
     def get_layer_group_id(self, layer_id: LayerId) -> int: ...
     @property
     def layer_grouping(self) -> tuple[tuple[LayerId, ...], ...]: ...
+    @property
+    def num_pool_groups(self) -> PoolGroupIndex: ...
+    def get_gpu_memory_pool_groups(
+        self, pool_group_index: PoolGroupIndex
+    ) -> MemoryPoolGroupDesc: ...
+    def get_slot_desc(self, pool_group_index: PoolGroupIndex) -> SlotDesc: ...
     def clamp_max_seq_len_for_mem(self, batch_size: int, model_max_seq_len: int) -> int: ...

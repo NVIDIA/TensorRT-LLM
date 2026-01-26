@@ -14,6 +14,7 @@
 # limitations under the License.
 
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import Any, cast
 
 from .._block_radix_tree import BlockRadixTree
@@ -31,8 +32,8 @@ from .._common import (
 )
 from .._config import DataRole, KVCacheManagerConfig
 from .._life_cycle_registry import LayerGroupId, LifeCycle, LifeCycleId, LifeCycleRegistry
-from .._storage._config import create_storage_config
-from .._storage._core import PoolGroupIndex
+from .._storage._config import SlotDesc, create_storage_config
+from .._storage._core import GpuSlotPool, PoolGroupIndex, PoolIndex
 from .._storage_manager import StorageManager
 from .._utils import (
     HomoTuple,
@@ -46,6 +47,18 @@ from .._utils import (
     unwrap_rawref,
 )
 from ._kv_cache import _KVCache
+
+
+@dataclass(slots=True, frozen=True)
+class MemoryPoolDesc:
+    base: MemAddress
+    page_size: int
+
+
+@dataclass(slots=True, frozen=True)
+class MemoryPoolGroupDesc:
+    num_pages: int
+    pools: TypedIndexList[PoolIndex, MemoryPoolDesc]
 
 
 class KVCacheManager:
@@ -163,12 +176,38 @@ class KVCacheManager:
 
     @property
     def layer_grouping(self) -> HomoTuple[HomoTuple[LayerId]]:
+        """
+        Layers are divided into multiple groups.
+        Buffers in the same layer group for the same token block are always allocated/deallocated together.
+        """
         layer_to_life_cycle_ids = self._storage._layer_to_life_cycle_ids
         num_life_cycles = self._life_cycles.size
         grouping = dict[LifeCycleId, list[LayerId]]({i: [] for i in typed_range(num_life_cycles)})
         for layer_id, life_cycle_id in typed_enumerate(layer_to_life_cycle_ids):
             grouping[life_cycle_id].append(layer_id)
         return tuple(tuple(grouping[i]) for i in typed_range(num_life_cycles))
+
+    @property
+    def num_pool_groups(self) -> PoolGroupIndex:
+        """
+        Internally, we maintain multiple groups of memory pools.
+        Each layer group statically maps to one memory pool group.
+        But multiple layer groups can share the same memory pool group.
+        """
+        return self._storage.num_pool_groups
+
+    def get_gpu_memory_pool_groups(self, pool_group_index: PoolGroupIndex) -> MemoryPoolGroupDesc:
+        pg = self._storage._levels[GPU_LEVEL].storage._pool_groups[pool_group_index]
+        pools = []
+        for pool in pg._pools:
+            assert type(pool) is GpuSlotPool
+            pools.append(MemoryPoolDesc(pool.slot_address(0), pool.slot_size))
+        return MemoryPoolGroupDesc(
+            pg.num_slots, cast(TypedIndexList[PoolIndex, MemoryPoolDesc], pools)
+        )
+
+    def get_slot_desc(self, pool_group_index: PoolGroupIndex) -> SlotDesc:
+        return self._storage._slot_desc_list[pool_group_index]
 
     # @TODO: need updating when dynamic resizing is supported.
     def clamp_max_seq_len_for_mem(self, batch_size: int, model_max_seq_len: int) -> int:
