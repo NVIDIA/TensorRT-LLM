@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -75,7 +75,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc0" />
+  <meta name="docsearch:version" content="1.3.0rc1" />
 
 
   </head>
@@ -545,6 +545,8 @@
 <span class="sd">        ctx_request_id (int): The context request id</span>
 <span class="sd">        opaque_state(bytes): Any additional state needing to be exchanged between context and gen instances</span>
 <span class="sd">        draft_tokens (List[int]): The draft tokens of the generation request</span>
+<span class="sd">        disagg_request_id (int): The disaggregated request id, if set, both context and generation requests will use it</span>
+<span class="sd">         as underlying request id.</span>
 
 <span class="sd">        multimodal_embedding_handles (List[Dict[str, Any]]): The resulting multimodal embedding handles from ViT.</span>
 <span class="sd">        multimodal_hashes (List[List[int]]): The multimodal hashes of each multimodal item in the request.</span>
@@ -556,6 +558,8 @@
     <span class="n">ctx_request_id</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">opaque_state</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">bytes</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">draft_tokens</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># If disagg_request_id is set, both context and generation requests will use it as underlying request id.</span>
+    <span class="n">disagg_request_id</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="c1"># E-P Disaggregated Params</span>
     <span class="n">multimodal_embedding_handles</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]]]</span> <span class="o">=</span> <span class="p">(</span>
@@ -570,8 +574,12 @@
 <div class="viewcode-block" id="DisaggregatedParams.get_context_phase_params">
 <a class="viewcode-back" href="../../llm-api/reference.html#tensorrt_llm.llmapi.DisaggregatedParams.get_context_phase_params">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_context_phase_params</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">tllme</span><span class="o">.</span><span class="n">ContextPhaseParams</span><span class="p">:</span>
+        <span class="c1"># Prefer disagg_request_id over ctx_request_id</span>
+        <span class="n">request_id</span> <span class="o">=</span> <span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">disagg_request_id</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">disagg_request_id</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="bp">self</span><span class="o">.</span><span class="n">ctx_request_id</span>
+        <span class="p">)</span>
         <span class="k">return</span> <span class="n">tllme</span><span class="o">.</span><span class="n">ContextPhaseParams</span><span class="p">(</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">first_gen_tokens</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">ctx_request_id</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">opaque_state</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">draft_tokens</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">first_gen_tokens</span><span class="p">,</span> <span class="n">request_id</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">opaque_state</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">draft_tokens</span>
         <span class="p">)</span></div>
 
 
@@ -731,9 +739,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on January 18, 2026.</p>
+  <p>Last updated on January 25, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0af1a0e">0af1a0e</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/45d7022">45d7022</a>.</p>
   
 </div></div>
       
