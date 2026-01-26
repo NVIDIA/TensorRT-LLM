@@ -2660,6 +2660,50 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
 
 
 @pytest.mark.timeout(14400)
+@pytest.mark.skip_less_device(8)
+class TestDeepSeekV3(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "deepseek-ai/DeepSeek-V3-0324"
+    MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3-0324-FP4"
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device_memory(95000)
+    @pytest.mark.parametrize(
+        "target_sparsity,thr_prefill,thr_decode",
+        [
+            (0.9, 1418.142868970396, 863.147841750025),
+        ],
+        ids=["target_sparsity_0.9"],
+    )
+    def test_skip_softmax_attention_multi_gpus(self, target_sparsity: float,
+                                               thr_prefill: float,
+                                               thr_decode: float):
+        sparse_attention_config = SkipSoftmaxAttentionConfig(
+            threshold_scale_factor={
+                "prefill": thr_prefill,
+                "decode": thr_decode,
+            })
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.70,
+                                        enable_block_reuse=False)
+
+        sm_version = get_sm_version()
+        if sm_version not in (100, 103):
+            pytest.skip(
+                f"Skip softmax MLA attention is not supported on SM {sm_version}"
+            )
+
+        with LLM(self.MODEL_PATH,
+                 attn_backend="TRTLLM",
+                 tensor_parallel_size=8,
+                 max_batch_size=32,
+                 max_num_tokens=100000,
+                 kv_cache_config=kv_cache_config,
+                 sparse_attention_config=sparse_attention_config) as llm:
+            task = LongBenchV1(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_acc_spec=f"target_sparsity={target_sparsity}")
+
+
+@pytest.mark.timeout(14400)
 @pytest.mark.skip_less_device_memory(80000)
 class TestDeepSeekV32(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V3.2-Exp"
