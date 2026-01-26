@@ -740,6 +740,8 @@ def test_nvfp4_gather_grouped_gemm_swiglu_blackwell(
     token_final_scales, token_selected_experts = routing_logits.topk(top_k, dim=-1)
     token_selected_experts = token_selected_experts.to(torch.int32)
     token_final_scales = token_final_scales.softmax(dim=-1).to(torch.float32)
+    # Ensure at least one valid token
+    token_selected_experts[0] = 0
 
     (
         tile_idx_to_group_idx,
