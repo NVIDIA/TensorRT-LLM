@@ -240,14 +240,6 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
             }
         }
 
-        if (options.mUseDeepSeekFp8)
-        {
-            if (!acceptIf(options.mUseShuffledMatrixA == false, "useShuffledMatrixA should be false for DeepSeek Fp8"))
-            {
-                continue;
-            }
-        }
-
         if (options.mFusedAct)
         {
             if (!acceptIf(options.mActType == static_cast<batchedGemm::gemmGatedAct::ActType>(mOptions.actType),
@@ -452,7 +444,7 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, int32_t va
     bmm.runInitBeforeWorldSync(config, gemmData, static_cast<void*>(stream));
 
     auto const err = bmm.run(config, workspace, gemmData, static_cast<void*>(stream), multiProcessorCount,
-        tensorrt_llm::common::getEnvEnablePDL(), globalTrtllmGenBatchedGemmModuleCache);
+        tensorrt_llm::common::getEnvEnablePDL(), /* pinnedHostBuffer */ nullptr, globalTrtllmGenBatchedGemmModuleCache);
 
     CUresult cuErr = static_cast<CUresult>(err);
     char const* cuErrStr = nullptr;
