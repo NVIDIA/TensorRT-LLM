@@ -298,8 +298,8 @@ class Calibrator:
                         f"Metadata index overflow: {metadata_idx} >= {len(self._metadata_idx_range_gpu)}. "
                         f"Increase MAX_NUM_METADATA if more iterations are needed."
                     )
-                # TODO: do not parse this `copy_`
-                self._actual_metadata_idx_gpu.copy_(self._metadata_idx_range_gpu[metadata_idx])
+                with nvtx.annotate("layer_wise_benchmarks ignore"):
+                    self._actual_metadata_idx_gpu.copy_(self._metadata_idx_range_gpu[metadata_idx])
 
                 # Verify all replay data was consumed
                 if self._started and self._replay_chunk_idx != len(self._cur_iter_metadata):

@@ -80,7 +80,7 @@ for start, text in df.itertuples(index=False):
         problem_start.append(start)
         problem_set.append(
             {
-                "spec": json.loads(text[len("layer_wise_benchmarks problem_spec") :]),
+                "spec": json.loads(text[len("layer_wise_benchmarks problem_spec ") :]),
                 "text": "",
                 "runs": [],
                 "runs_end": [],
@@ -92,15 +92,19 @@ for start, text in df.itertuples(index=False):
 query = """SELECT T1.start, T1.end, T2.value AS text
     FROM NVTX_EVENTS AS T1
     JOIN StringIds AS T2 ON T1.textId = T2.id
-    WHERE eventType = ? AND T2.value NOT LIKE ? AND T2.value NOT LIKE ? AND domainId != ?"""
+    WHERE eventType = ? AND T2.value NOT LIKE ? AND domainId != ?"""
 df = pd.read_sql_query(
     query,
     conn,
-    params=(event_id_NvtxPushPopRange, "layer_wise_benchmarks %", "[DG]%", nccl_domain_id),
+    params=(event_id_NvtxPushPopRange, "[DG]%", nccl_domain_id),
 )
 for start, end, text in df.itertuples(index=False):
     problem_id = bisect.bisect(problem_start, start) - 1
-    assert problem_id != -1
+    if text.startswith("layer_wise_benchmarks "):
+        if text != "layer_wise_benchmarks ignore":
+            continue
+    else:
+        assert problem_id != -1
     if re.match(r"b=\d+ s=\d+ ", text):
         problem_set[problem_id]["text"] = text
         problem_set[problem_id]["runs"].append(start)
@@ -163,7 +167,9 @@ for (
     for range_id in ranges:
         problem["kernel_count_per_range"][range_id] += 1
     range_names = [problem["ranges"][i][2] for i in ranges]
-    if args.module is None or args.module in range_names:
+    if (
+        args.module is None or args.module in range_names
+    ) and "layer_wise_benchmarks ignore" not in range_names:
         kernel_list.append(
             (
                 problem_id,
