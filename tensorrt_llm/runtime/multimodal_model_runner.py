@@ -27,9 +27,9 @@ from transformers import (AutoConfig, AutoModelForCausalLM, AutoProcessor,
                           AutoTokenizer)
 
 from .. import profiler
-from .._utils import (mpi_rank, str_dtype_to_torch, str_dtype_to_trt,
-                      supports_inflight_batching, torch_dtype_to_trt,
-                      trt_dtype_to_torch)
+from .._utils import (get_rope_theta, mpi_rank, str_dtype_to_torch,
+                      str_dtype_to_trt, supports_inflight_batching,
+                      torch_dtype_to_trt, trt_dtype_to_torch)
 from ..functional import RopeEmbeddingUtils, RotaryScalingType
 from ..layers import MropeParams
 from ..logger import logger
@@ -412,7 +412,7 @@ class MultimodalModelRunner:
             self.max_position_embeddings = hf_config.max_position_embeddings
             self.hidden_size = hf_config.hidden_size
             self.num_attention_heads = hf_config.num_attention_heads
-            self.rope_theta = hf_config.rope_theta
+            self.rope_theta = get_rope_theta(hf_config)
         if self.model_type == 'llava_onevision':
             self.num_frames = self.args.video_num_frames
             if self.num_frames is None:
@@ -1590,10 +1590,11 @@ class MultimodalModelRunner:
             # Extract a list of tensors of shape beam_width x output_ids.
             profiler.start("Tokenizer decode")
             output_beams_list = [
-                self.tokenizer.batch_decode(
-                    output_ids[batch_idx, :, input_lengths[batch_idx]:],
-                    skip_special_tokens=True) for batch_idx in range(
-                        min(self.args.batch_size, input_lengths.shape[0]))
+                self.tokenizer.decode(output_ids[batch_idx, :,
+                                                 input_lengths[batch_idx]:],
+                                      skip_special_tokens=True)
+                for batch_idx in range(
+                    min(self.args.batch_size, input_lengths.shape[0]))
             ]
 
             stripped_text = [[

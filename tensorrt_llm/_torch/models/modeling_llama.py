@@ -3,11 +3,11 @@ import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
+from huggingface_hub import load_torch_model
 from PIL.Image import Image
 from torch import nn
 from transformers import (AutoProcessor, AutoTokenizer, Llama4Config,
                           Llama4VisionModel, LlamaConfig, PretrainedConfig)
-from transformers.modeling_utils import load_sharded_checkpoint
 from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector
 
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
@@ -1101,9 +1101,9 @@ class Llama4VisionEncoder(nn.Module):
 
         # Otherwise, load the weights from the checkpoint.
         else:
-            load_sharded_checkpoint(module_dict,
-                                    self.pretrained_config._name_or_path,
-                                    strict=False)
+            load_torch_model(module_dict,
+                             self.pretrained_config._name_or_path,
+                             strict=False)
 
         self.vision_model = module_dict["vision_model"].to(self.device)
         self.mm_projector = module_dict["multi_modal_projector"].to(self.device)
