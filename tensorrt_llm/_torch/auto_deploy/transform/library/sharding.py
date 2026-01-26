@@ -51,6 +51,7 @@ from ...utils.node_utils import (
     is_any_lin_op,
     is_any_moe_op,
     is_any_ssm_op,
+    is_fake_quantized_linear_op,
     is_op,
     is_weight_node,
     num_users_of_weight_node,
@@ -69,6 +70,26 @@ from ..interface import (
     TransformInfo,
     TransformRegistry,
 )
+
+
+########################################################
+#  Helper functions
+########################################################
+def is_quantized_linear_scale_tensor(node: "Node", weight_node_key: str) -> bool:
+    """Check if a weight node is a scale tensor for a quantized linear op.
+
+    Scale tensors (e.g., weight_scale_inv for HF FP8) are in "block space" and should
+    not be sharded with the same min_local_shape as the actual weight tensor.
+    They are handled separately by quantization_cb.
+
+    Args:
+        node: The linear operation node
+        weight_node_key: The parameter key of the weight node (e.g., "model.layers.0.self_attn.v_proj.weight_scale_inv")
+
+    Returns:
+        True if this is a scale tensor for a quantized linear op, False otherwise
+    """
+    return is_fake_quantized_linear_op(node) and "_scale" in weight_node_key
 
 
 ########################################################
@@ -1440,6 +1461,12 @@ def _shard_parameter_node(
             min_local_shape=min_local_shape,
             fused_weight_dims=fused_weight_dims,
         )
+        if is_quantized_linear_scale_tensor(node, weight_node.node_key):
+            ad_logger.debug(
+                f"Skipping scale tensor {weight_node.node_key} in shard_weight_tensor - "
+                f"will be handled by weight's quantization_cb"
+            )
+            continue
         if quantization_cb is not None:
             quantization_cb(
                 gm=gm,
