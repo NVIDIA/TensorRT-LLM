@@ -81,6 +81,24 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=sampling_params)
 
+    @pytest.mark.skip_less_device_memory(32000)
+    @pytest.mark.skip_less_device(2)
+    @pytest.mark.parametrize("world_size", [2, 4])
+    def test_attention_dp(self, world_size):
+        """Test attention data parallelism mode where TP sharding is disabled."""
+        kwargs = self.get_default_kwargs(enable_chunked_prefill=True)
+        # Enable attention DP - this disables TP sharding
+        kwargs["transforms"]["detect_sharding"] = {"enable_attention_dp": True}
+        sampling_params = self.get_default_sampling_params()
+        with AutoDeployLLM(model=self.MODEL_PATH,
+                           tokenizer=self.MODEL_PATH,
+                           world_size=world_size,
+                           **kwargs) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=sampling_params)
+
 
 class TestNemotronH(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Nemotron-H-8B-Base-8K"
@@ -305,7 +323,7 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip("Skipping FP8 test until it is supported")
     @pytest.mark.skip_less_device_memory(180000)
-    @pytest.mark.parametrize("world_size", [4, 8])
+    @pytest.mark.parametrize("world_size", [1, 4, 8])
     def test_fp8(self, world_size):
         if get_device_count() < world_size:
             pytest.skip("Not enough devices for world size, skipping test")

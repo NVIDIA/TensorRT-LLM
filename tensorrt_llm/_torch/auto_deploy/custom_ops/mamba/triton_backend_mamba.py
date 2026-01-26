@@ -23,7 +23,6 @@ from ..attention_interface import AttentionRegistry, MHACallable
 from .mamba_backend_common import (
     BaseBackendSSM,
     _flatten_ssm_inputs,
-    _merge_ssm_outputs,
     _prepare_ssm_decode_inputs,
     _run_ssm_prefill,
 )
@@ -59,7 +58,23 @@ def _triton_cached_ssm(
     )
     ssm_state_size = B.shape[3]
 
-    y_prefill, num_prefill, num_prefill_tokens, num_total_tokens, num_seq = _run_ssm_prefill(
+    # Preallocate output tensor to avoid memcpy cost for merging prefill
+    # and decode outputs
+    preallocated_ssm_out = torch.empty(
+        [bs, num_heads, head_dim],
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
+    )
+
+    # Get batch info for slicing
+    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    num_total_tokens = num_prefill_tokens + num_decode
+
+    preallocated_ssm_out_p = preallocated_ssm_out[:num_prefill_tokens]
+    preallocated_ssm_out_d = preallocated_ssm_out[num_prefill_tokens:num_total_tokens]
+
+    # Prefill: use helper with preallocated output
+    _, num_prefill, num_prefill_tokens, num_total_tokens, num_seq = _run_ssm_prefill(
         hs_flat,
         B_flat,
         C_flat,
@@ -77,9 +92,10 @@ def _triton_cached_ssm(
         ssm_state_cache,
         time_step_limit,
         chunk_size,
+        out=preallocated_ssm_out_p.unsqueeze(0),
     )
 
-    num_decode = num_total_tokens - num_prefill_tokens
+    # Decode: batch single-token updates via selective_state_update
     decode_inputs = _prepare_ssm_decode_inputs(
         hs_flat,
         B_flat,
@@ -98,7 +114,6 @@ def _triton_cached_ssm(
         ssm_state_size,
     )
 
-    y_decode = None
     if decode_inputs is not None:
         (
             slot_idx_decode,
@@ -110,7 +125,7 @@ def _triton_cached_ssm(
             A_full,
             D_full,
         ) = decode_inputs
-        y_decode = selective_state_update(
+        selective_state_update(
             ssm_state_cache,
             x_decode,
             dt_hp,
@@ -122,22 +137,18 @@ def _triton_cached_ssm(
             dt_bias=dt_bias_hp,
             dt_softplus=True,
             state_batch_indices=slot_idx_decode,
+            out=preallocated_ssm_out_d,
         )
 
-    return _merge_ssm_outputs(
-        hidden_states,
-        y_prefill,
-        y_decode,
-        num_prefill,
-        num_decode,
-        num_prefill_tokens,
-        num_total_tokens,
-        bs,
-        b,
-        s,
-        num_heads,
-        head_dim,
-    )
+    # Return the preallocated output reshaped to original dimensions
+    if num_total_tokens > 0:
+        return (
+            preallocated_ssm_out[:num_total_tokens]
+            .view(b, s, num_heads, head_dim)
+            .to(hidden_states.dtype)
+        )
+    else:
+        return torch.empty_like(hidden_states)
 
 
 @_triton_cached_ssm.register_fake
